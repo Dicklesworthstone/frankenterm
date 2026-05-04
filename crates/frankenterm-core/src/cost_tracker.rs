@@ -107,8 +107,30 @@ impl BudgetThreshold {
     pub fn new(agent_type: impl Into<String>, max_cost_usd: f64, warning_fraction: f64) -> Self {
         Self {
             agent_type: agent_type.into(),
-            max_cost_usd,
-            warning_fraction: warning_fraction.clamp(0.0, 1.0),
+            max_cost_usd: Self::normalize_max_cost_usd(max_cost_usd),
+            warning_fraction: Self::normalize_warning_fraction(warning_fraction),
+        }
+    }
+
+    fn normalized(mut self) -> Self {
+        self.max_cost_usd = Self::normalize_max_cost_usd(self.max_cost_usd);
+        self.warning_fraction = Self::normalize_warning_fraction(self.warning_fraction);
+        self
+    }
+
+    fn normalize_max_cost_usd(max_cost_usd: f64) -> f64 {
+        if max_cost_usd.is_finite() && max_cost_usd > 0.0 {
+            max_cost_usd
+        } else {
+            0.0
+        }
+    }
+
+    fn normalize_warning_fraction(warning_fraction: f64) -> f64 {
+        if warning_fraction.is_finite() {
+            warning_fraction.clamp(0.0, 1.0)
+        } else {
+            1.0
         }
     }
 }
@@ -118,6 +140,19 @@ impl BudgetThreshold {
 pub struct CostTrackerConfig {
     /// Per-provider budget thresholds.
     pub budgets: Vec<BudgetThreshold>,
+}
+
+impl CostTrackerConfig {
+    /// Return a copy of this config with all numeric thresholds finite and bounded.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        self.budgets = self
+            .budgets
+            .into_iter()
+            .map(BudgetThreshold::normalized)
+            .collect();
+        self
+    }
 }
 
 // =============================================================================
@@ -289,7 +324,7 @@ impl CostTracker {
         Self {
             panes: BTreeMap::new(),
             pane_order: VecDeque::new(),
-            config,
+            config: config.normalized(),
             telemetry: CostTelemetry::new(),
         }
     }
@@ -414,7 +449,8 @@ impl CostTracker {
                 .find(|s| s.agent_type == threshold.agent_type);
             if let Some(summary) = matching {
                 if threshold.max_cost_usd > 0.0 {
-                    let fraction = summary.total_cost_usd / threshold.max_cost_usd;
+                    let fraction =
+                        finite_usage_fraction(summary.total_cost_usd, threshold.max_cost_usd);
                     if fraction >= 1.0 {
                         self.telemetry.alerts_triggered += 1;
                         alerts.push(BudgetAlert {
@@ -497,7 +533,7 @@ impl CostTracker {
 
     /// Update budget configuration.
     pub fn set_config(&mut self, config: CostTrackerConfig) {
-        self.config = config;
+        self.config = config.normalized();
     }
 
     fn touch_pane_order(&mut self, pane_id: u64) {
@@ -514,6 +550,15 @@ impl Default for CostTracker {
     }
 }
 
+fn finite_usage_fraction(current_cost_usd: f64, max_cost_usd: f64) -> f64 {
+    let fraction = current_cost_usd / max_cost_usd;
+    if fraction.is_finite() {
+        fraction
+    } else {
+        f64::MAX
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -521,6 +566,7 @@ impl Default for CostTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn tracker_new_is_empty() {
@@ -823,6 +869,57 @@ mod tests {
 
         let threshold = BudgetThreshold::new("codex", 10.0, -0.5);
         assert!(threshold.warning_fraction.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_threshold_new_normalizes_invalid_numeric_limits() {
+        for max_cost_usd in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let threshold = BudgetThreshold::new("codex", max_cost_usd, f64::NAN);
+            assert!(threshold.max_cost_usd.abs() < f64::EPSILON);
+            assert!((threshold.warning_fraction - 1.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn deserialized_budget_config_is_normalized_on_update() {
+        let mut tracker = CostTracker::new();
+        tracker.record_usage(1, AgentType::Codex, 100_000, 1.0, 100);
+        tracker.set_config(CostTrackerConfig {
+            budgets: vec![BudgetThreshold {
+                agent_type: "codex".to_string(),
+                max_cost_usd: f64::NAN,
+                warning_fraction: f64::NAN,
+            }],
+        });
+
+        let alerts = tracker.budget_alerts();
+        assert!(alerts.is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn budget_threshold_alerts_keep_finite_fractions(
+            max_cost_usd in any::<f64>(),
+            warning_fraction in any::<f64>(),
+            cost_usd in 0.0f64..1.0e9,
+        ) {
+            let config = CostTrackerConfig {
+                budgets: vec![BudgetThreshold {
+                    agent_type: "codex".to_string(),
+                    max_cost_usd,
+                    warning_fraction,
+                }],
+            };
+            let mut tracker = CostTracker::with_config(config);
+            tracker.record_usage(1, AgentType::Codex, 100_000, cost_usd, 100);
+
+            for alert in tracker.budget_alerts() {
+                prop_assert!(alert.budget_limit_usd.is_finite());
+                prop_assert!(alert.budget_limit_usd > 0.0);
+                prop_assert!(alert.usage_fraction.is_finite());
+                prop_assert!(alert.usage_fraction >= 0.0);
+            }
+        }
     }
 
     #[test]
