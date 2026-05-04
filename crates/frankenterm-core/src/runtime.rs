@@ -4557,12 +4557,12 @@ fn percentile_from_samples(samples: &StdMutex<VecDeque<u64>>, percentile: usize)
 }
 
 /// Get current time as epoch milliseconds.
+///
+/// br-ft-0n4nx: route through the shared clock-anomaly helper so a
+/// pre-epoch host clock surfaces in operator telemetry instead of
+/// silently flattening every runtime telemetry timestamp to 0.
 fn epoch_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
+    crate::clock_anomaly::epoch_ms_i64("ft.runtime.clock")
 }
 
 fn epoch_ms_u64() -> u64 {

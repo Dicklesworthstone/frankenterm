@@ -2,11 +2,26 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{count_newlines, memchr_last_newline};
-
 // AARSP Bead: ft-2p9cb.3.2 - Zero-Copy Ingestion Parser
 
 // AARSP Bead: ft-2p9cb.3.2.1
+
+/// Find the position of the first newline byte in a slice.
+#[cfg(test)]
+fn memchr_newline(data: &[u8]) -> Option<usize> {
+    data.iter().position(|&b| b == b'\n')
+}
+
+/// Find the position of the last newline byte in a slice.
+fn memchr_last_newline(data: &[u8]) -> Option<usize> {
+    data.iter().rposition(|&b| b == b'\n')
+}
+
+/// Count newline bytes in a slice.
+#[allow(clippy::naive_bytecount)]
+fn count_newlines(data: &[u8]) -> usize {
+    data.iter().filter(|&&b| b == b'\n').count()
+}
 
 /// Ingestion chunk: a borrowed byte slice with metadata for zero-copy parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,5 +391,292 @@ impl IngestParser {
             buffered_bytes: self.buffer.len(),
             degradation: self.detect_degradation(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ingest_parser_complete_line() {
+        let mut parser = IngestParser::with_defaults();
+        let result = parser.feed(b"hello world\n");
+        assert_eq!(
+            result,
+            ParseResult::Complete {
+                lines: 1,
+                bytes_consumed: 12,
+            }
+        );
+        assert_eq!(parser.snapshot().total_lines, 1);
+    }
+
+    #[test]
+    fn test_ingest_parser_partial_then_complete() {
+        let mut parser = IngestParser::with_defaults();
+        let r1 = parser.feed(b"hello ");
+        let is_partial = matches!(r1, ParseResult::Partial { .. });
+        assert!(is_partial);
+
+        let r2 = parser.feed(b"world\n");
+        assert_eq!(
+            r2,
+            ParseResult::Complete {
+                lines: 1,
+                bytes_consumed: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn test_ingest_parser_multiple_lines() {
+        let mut parser = IngestParser::with_defaults();
+        let result = parser.feed(b"line1\nline2\nline3\n");
+        assert_eq!(
+            result,
+            ParseResult::Complete {
+                lines: 3,
+                bytes_consumed: 18,
+            }
+        );
+    }
+
+    #[test]
+    fn test_ingest_parser_zero_copy_ratio() {
+        let mut parser = IngestParser::with_defaults();
+        parser.feed(b"complete line\n");
+        let ratio = parser.zero_copy_ratio();
+        assert!((ratio - 1.0).abs() < 1e-10, "Expected 1.0, got {}", ratio);
+    }
+
+    #[test]
+    fn test_ingest_parser_flush() {
+        let mut parser = IngestParser::with_defaults();
+        parser.feed(b"incomplete");
+        let result = parser.flush();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(
+            r,
+            ParseResult::Complete {
+                lines: 1,
+                bytes_consumed: 10,
+            }
+        );
+        assert_eq!(parser.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_ingest_parser_flush_empty() {
+        let mut parser = IngestParser::with_defaults();
+        assert!(parser.flush().is_none());
+    }
+
+    #[test]
+    fn test_ingest_parser_max_line_reject() {
+        let config = IngestParserConfig {
+            max_line_bytes: 10,
+            ..Default::default()
+        };
+        let mut parser = IngestParser::new(config);
+        let result = parser.feed(b"this is a very long line without newline");
+        let is_invalid = matches!(result, ParseResult::Invalid { .. });
+        assert!(is_invalid, "Expected Invalid, got {:?}", result);
+    }
+
+    #[test]
+    fn test_ingest_parser_snapshot_serde() {
+        let snap = IngestParserSnapshot {
+            total_bytes: 1000,
+            total_lines: 50,
+            total_chunks: 10,
+            total_invalid_bytes: 0,
+            buffered_bytes: 5,
+            zero_copy_ratio: 0.8,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: IngestParserSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap.total_bytes, back.total_bytes);
+        assert_eq!(snap.total_lines, back.total_lines);
+    }
+
+    #[test]
+    fn test_ingest_parser_config_serde() {
+        let cfg = IngestParserConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: IngestParserConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn test_ingest_parser_config_default() {
+        let cfg = IngestParserConfig::default();
+        assert_eq!(cfg.max_line_bytes, 16384);
+        assert_eq!(cfg.max_buffered_chunks, 64);
+        assert!(cfg.checksum);
+    }
+
+    #[test]
+    fn test_parse_result_serde() {
+        let results = vec![
+            ParseResult::Complete {
+                lines: 3,
+                bytes_consumed: 30,
+            },
+            ParseResult::Partial { bytes_buffered: 10 },
+            ParseResult::Invalid {
+                bytes_skipped: 5,
+                reason: "corrupt".to_string(),
+            },
+        ];
+        for r in &results {
+            let json = serde_json::to_string(r).unwrap();
+            let back: ParseResult = serde_json::from_str(&json).unwrap();
+            assert_eq!(*r, back);
+        }
+    }
+
+    #[test]
+    fn test_ingest_chunk_serde() {
+        let chunk = IngestChunk {
+            pane_id: 1,
+            offset: 100,
+            length: 50,
+            line_aligned: true,
+            captured_us: 5000,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let back: IngestChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(chunk, back);
+    }
+
+    #[test]
+    fn test_ingest_parser_status_line() {
+        let parser = IngestParser::with_defaults();
+        let line = parser.status_line();
+        assert!(line.contains("ingest"));
+        assert!(line.contains("bytes=0"));
+    }
+
+    #[test]
+    fn test_memchr_newline() {
+        assert_eq!(memchr_newline(b"hello\nworld"), Some(5));
+        assert_eq!(memchr_newline(b"no newline"), None);
+        assert_eq!(memchr_newline(b"\n"), Some(0));
+    }
+
+    #[test]
+    fn test_count_newlines() {
+        assert_eq!(count_newlines(b"a\nb\nc\n"), 3);
+        assert_eq!(count_newlines(b"no newlines"), 0);
+    }
+
+    #[test]
+    fn test_ingest_parser_line_with_remainder() {
+        let mut parser = IngestParser::with_defaults();
+        let result = parser.feed(b"line1\npartial");
+        assert_eq!(
+            result,
+            ParseResult::Complete {
+                lines: 1,
+                bytes_consumed: 6,
+            }
+        );
+        assert_eq!(parser.buffered_bytes(), 7);
+    }
+
+    #[test]
+    fn test_ingest_parser_reset() {
+        let mut parser = IngestParser::with_defaults();
+        parser.feed(b"hello\n");
+        parser.feed(b"world");
+        assert!(parser.total_bytes() > 0);
+
+        parser.reset();
+        assert_eq!(parser.total_bytes(), 0);
+        assert_eq!(parser.total_lines(), 0);
+        assert_eq!(parser.total_chunks(), 0);
+        assert_eq!(parser.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_ingest_degradation_healthy() {
+        let parser = IngestParser::with_defaults();
+        assert_eq!(parser.detect_degradation(), IngestDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_ingest_degradation_high_buffer() {
+        let config = IngestParserConfig {
+            max_line_bytes: 20,
+            ..Default::default()
+        };
+        let mut parser = IngestParser::new(config);
+        parser.feed(b"0123456789abcdef");
+        let degradation = parser.detect_degradation();
+        let is_high = matches!(degradation, IngestDegradation::HighBufferPressure { .. });
+        assert!(
+            is_high,
+            "Expected HighBufferPressure, got {:?}",
+            degradation
+        );
+    }
+
+    #[test]
+    fn test_ingest_log_entry() {
+        let mut parser = IngestParser::with_defaults();
+        parser.feed(b"test line\n");
+        let entry = parser.log_entry();
+        assert_eq!(entry.total_lines, 1);
+        assert_eq!(entry.degradation, IngestDegradation::Healthy);
+    }
+
+    #[test]
+    fn test_ingest_degradation_serde() {
+        let variants = vec![
+            IngestDegradation::Healthy,
+            IngestDegradation::HighBufferPressure {
+                buffered_bytes: 100,
+                max_line_bytes: 120,
+            },
+            IngestDegradation::DataCorruption {
+                invalid_bytes: 10,
+                total_bytes: 200,
+            },
+            IngestDegradation::LowZeroCopy {
+                ratio: 0.3,
+                threshold: 0.5,
+            },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: IngestDegradation = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back);
+        }
+    }
+
+    #[test]
+    fn test_ingest_log_entry_serde() {
+        let entry = IngestLogEntry {
+            total_bytes: 1000,
+            total_lines: 50,
+            zero_copy_ratio: 0.8,
+            buffered_bytes: 5,
+            degradation: IngestDegradation::Healthy,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: IngestLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn test_ingest_degradation_display() {
+        assert_eq!(format!("{}", IngestDegradation::Healthy), "HEALTHY");
+        let buf = IngestDegradation::HighBufferPressure {
+            buffered_bytes: 100,
+            max_line_bytes: 120,
+        };
+        assert!(format!("{}", buf).contains("100/120"));
     }
 }

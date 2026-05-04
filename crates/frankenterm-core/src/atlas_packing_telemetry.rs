@@ -255,11 +255,11 @@ impl<W: Write> Drop for PackingScenarioRecorder<W> {
     }
 }
 
+/// br-ft-0n4nx: route through the shared clock-anomaly helper so
+/// atlas-packing telemetry timestamps don't silently flatten to 0
+/// during a host clock anomaly.
 fn default_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::clock_anomaly::epoch_ms_u64("ft.atlas_packing.clock")
 }
 
 #[cfg(test)]

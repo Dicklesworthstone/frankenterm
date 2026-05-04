@@ -154,6 +154,7 @@ pub mod chaos;
 pub mod chaos_scale_harness;
 pub mod circuit_breaker;
 pub mod cleanup;
+pub mod clock_anomaly;
 #[cfg(feature = "subprocess-bridge")]
 pub mod code_scanner;
 pub mod codel_queue;

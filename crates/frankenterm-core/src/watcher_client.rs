@@ -53,11 +53,18 @@ use crate::policy::ActionKind;
 pub struct ClientId(pub String);
 
 impl ClientId {
+    /// br-ft-0n4nx: route through the shared clock-anomaly helper.
+    /// Pre-fix this used `unwrap_or_default()` which silently
+    /// produced `cl-0-<counter>` IDs during a clock anomaly window;
+    /// because `counter` is a per-process AtomicU64 that resets
+    /// across process restarts, two restart cycles inside the
+    /// anomaly window could mint colliding ClientId values. Routing
+    /// through `clock_anomaly::epoch_ms_u64` still yields ts=0 on
+    /// the Err branch (the format-string contract stays the same),
+    /// but the anomaly is now observable so an operator can detect
+    /// the collision risk.
     fn generate(counter: u64) -> Self {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let ts = crate::clock_anomaly::epoch_ms_u64("ft.watcher_client.clock");
         Self(format!("cl-{ts:x}-{counter:04x}"))
     }
 }

@@ -613,11 +613,10 @@ fn save_restore_checkpoint(
     pane_id_map: &HashMap<u64, u64>,
 ) -> Result<i64, RestoreError> {
     let mut conn = open_conn(db_path)?;
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0);
+    // br-ft-0n4nx: route through the shared clock-anomaly helper so
+    // a pre-epoch host clock can't silently produce checkpoint_at=0
+    // for every persisted record (collision on the persisted column).
+    let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.clock");
 
     let metadata = serde_json::json!({
         "old_to_new": pane_id_map.iter()
@@ -662,11 +661,10 @@ fn finalize_restore(
     mark_clean: bool,
 ) -> Result<i64, RestoreError> {
     let mut conn = open_conn(db_path)?;
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0);
+    // br-ft-0n4nx: route through the shared clock-anomaly helper so
+    // a pre-epoch host clock can't silently produce checkpoint_at=0
+    // for every persisted record (collision on the persisted column).
+    let now_ms = crate::clock_anomaly::epoch_ms_i64("ft.session_restore.clock");
 
     let metadata = serde_json::json!({
         "old_to_new": pane_id_map.iter()

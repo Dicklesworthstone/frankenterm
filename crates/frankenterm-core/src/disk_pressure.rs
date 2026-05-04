@@ -636,11 +636,11 @@ impl DiskPressureMonitor {
 // Internal helpers
 // =============================================================================
 
+/// br-ft-0n4nx: route through the shared clock-anomaly helper so a
+/// pre-epoch system clock surfaces in operator telemetry instead of
+/// silently producing timestamp=0 on every disk-pressure event.
 fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::clock_anomaly::epoch_ms_u64("ft.disk_pressure.clock")
 }
 
 fn classify_tier(usage_fraction: f64, thresholds: PressureThresholds) -> DiskPressureTier {
