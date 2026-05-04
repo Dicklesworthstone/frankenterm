@@ -2673,6 +2673,48 @@ proptest! {
         prop_assert_eq!(pool.free_count(), initial);
     }
 
+    /// Invalid frees do not mutate the pool or break accounting invariants.
+    #[test]
+    fn pool_invalid_free_is_noop_ft_nyvo1(
+        initial in 1_usize..32,
+        alloc_count in 1_usize..64,
+        invalid_offset in 1_u64..10_000,
+    ) {
+        let max_blocks = initial.max(alloc_count);
+        let config = PoolConfig {
+            initial_blocks: initial,
+            max_blocks,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+        let mut ids = Vec::new();
+
+        for _ in 0..alloc_count {
+            match pool.allocate() {
+                AllocResult::FromFreeList { block_id } | AllocResult::Grown { block_id } => {
+                    ids.push(block_id);
+                }
+                AllocResult::PoolExhausted => {}
+            }
+        }
+
+        let foreign_id = max_blocks as u64 + invalid_offset;
+        let before_foreign_free = pool.snapshot();
+        prop_assert!(!pool.free(foreign_id));
+        prop_assert_eq!(pool.snapshot(), before_foreign_free);
+
+        if let Some(id) = ids.pop() {
+            prop_assert!(pool.free(id));
+            let before_double_free = pool.snapshot();
+            prop_assert!(!pool.free(id));
+            prop_assert_eq!(pool.snapshot(), before_double_free);
+        }
+
+        let snapshot = pool.snapshot();
+        prop_assert_eq!(snapshot.in_use + snapshot.free_count, snapshot.total_blocks);
+        prop_assert_eq!(snapshot.total_allocs, snapshot.total_frees + snapshot.in_use as u64);
+    }
+
     /// Shrink reduces total_blocks correctly.
     #[test]
     fn pool_shrink_bounded(

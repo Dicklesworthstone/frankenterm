@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,7 @@ pub struct PoolSnapshot {
 pub struct MemoryPool {
     config: PoolConfig,
     free_list: Vec<u64>,
+    in_use_blocks: HashSet<u64>,
     next_block_id: u64,
     total_blocks: usize,
     in_use: usize,
@@ -168,6 +170,7 @@ impl MemoryPool {
             next_block_id: initial as u64,
             total_blocks: initial,
             in_use: 0,
+            in_use_blocks: HashSet::new(),
             free_list,
             total_allocs: 0,
             total_frees: 0,
@@ -186,6 +189,7 @@ impl MemoryPool {
         // Try free list first.
         if let Some(block_id) = self.free_list.pop() {
             self.in_use += 1;
+            self.in_use_blocks.insert(block_id);
             self.total_allocs += 1;
             return AllocResult::FromFreeList { block_id };
         }
@@ -196,6 +200,7 @@ impl MemoryPool {
             self.next_block_id += 1;
             self.total_blocks += 1;
             self.in_use += 1;
+            self.in_use_blocks.insert(block_id);
             self.total_allocs += 1;
             return AllocResult::Grown { block_id };
         }
@@ -205,10 +210,18 @@ impl MemoryPool {
     }
 
     /// Free a block (return to free list).
-    pub fn free(&mut self, block_id: u64) {
+    ///
+    /// Returns `true` when `block_id` was currently owned by the pool and in use.
+    /// Duplicate frees and foreign block ids are rejected without mutating pool
+    /// accounting.
+    pub fn free(&mut self, block_id: u64) -> bool {
+        if !self.in_use_blocks.remove(&block_id) {
+            return false;
+        }
         self.free_list.push(block_id);
-        self.in_use = self.in_use.saturating_sub(1);
+        self.in_use -= 1;
         self.total_frees += 1;
+        true
     }
 
     /// Current utilization (in_use / total_blocks).
@@ -290,6 +303,7 @@ impl MemoryPool {
     pub fn reset(&mut self) {
         let initial = self.config.initial_blocks.min(self.config.max_blocks);
         self.free_list = (0..initial as u64).collect();
+        self.in_use_blocks.clear();
         self.next_block_id = initial as u64;
         self.total_blocks = initial;
         self.in_use = 0;
@@ -392,5 +406,35 @@ impl MemoryPool {
             total_blocks: self.total_blocks,
             degradation: self.detect_degradation(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_rejects_double_free_and_foreign_block_ids_ft_nyvo1() {
+        let config = PoolConfig {
+            initial_blocks: 1,
+            max_blocks: 1,
+            ..Default::default()
+        };
+        let mut pool = MemoryPool::new(config);
+        let block_id = match pool.allocate() {
+            AllocResult::FromFreeList { block_id } => block_id,
+            other => panic!("expected free-list allocation, got {other:?}"),
+        };
+
+        assert!(pool.free(block_id));
+        let snapshot_after_valid_free = pool.snapshot();
+
+        assert!(!pool.free(block_id));
+        assert!(!pool.free(block_id + 10_000));
+        assert_eq!(pool.snapshot(), snapshot_after_valid_free);
+        assert_eq!(
+            pool.snapshot().total_allocs,
+            pool.snapshot().total_frees + pool.snapshot().in_use as u64
+        );
     }
 }
