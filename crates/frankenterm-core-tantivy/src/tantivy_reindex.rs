@@ -4118,6 +4118,31 @@ mod tests {
                 .map(|d| d.event_id.as_str())
                 .collect();
             assert_eq!(ids, vec!["e5", "e6", "e7"]);
+
+            // br-ft-zvue8: pin that the persisted checkpoint /
+            // current_ordinal stops at the LAST IN-RANGE ordinal
+            // (7) — NOT the first out-of-range ordinal (8).
+            // Pre-fix the loop wrote `last_offset =
+            // Some(record.offset.clone())` BEFORE breaking on the
+            // out-of-range record, advancing the high-water mark
+            // past the indexed events and lying to operators /
+            // follow-on repair flows about what was processed.
+            assert_eq!(
+                progress.current_ordinal,
+                Some(7),
+                "br-ft-zvue8: current_ordinal must be the last in-range ordinal (7), not first out-of-range (8)"
+            );
+
+            let cp = storage
+                .read_checkpoint("range-exclusive-test")
+                .await
+                .unwrap()
+                .expect("checkpoint must be persisted after the in-range batch");
+            assert_eq!(
+                cp.upto_offset.ordinal, 7,
+                "br-ft-zvue8: persisted checkpoint upto_offset must be the last in-range ordinal (7), not first out-of-range (8); got {}",
+                cp.upto_offset.ordinal
+            );
         });
     }
 
@@ -4221,6 +4246,75 @@ mod tests {
                 "indexed event_ids must match across legacy and cx paths"
             );
             assert_eq!(ids_cx, vec!["e5", "e6", "e7"]);
+
+            // br-ft-zvue8: same checkpoint contract as the legacy
+            // path — current_ordinal must reflect the last in-
+            // range ordinal (7), not the first out-of-range (8).
+            assert_eq!(p_legacy.current_ordinal, Some(7));
+            assert_eq!(p_cx.current_ordinal, Some(7));
+        });
+    }
+
+    /// br-ft-zvue8: regression coverage for the observed-range
+    /// path. Legacy `reindex_observed_range` shares the same
+    /// exclusive-bound bug as `reindex_range`. Build a 0..10 log
+    /// and pin that [5,8) indexes e5/e6/e7 AND that the persisted
+    /// checkpoint stops at ordinal 7.
+    #[test]
+    fn reindex_observed_range_checkpoint_stops_at_last_in_range_ft_zvue8() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let scfg = test_storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+            let events: Vec<_> = (0..10)
+                .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect();
+            populate_log(&storage, events).await;
+
+            let source = RecorderSourceDescriptor::AppendLog {
+                data_path: dir.path().join("events.log"),
+            };
+
+            let from = RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 5,
+            };
+            let to = RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 8,
+            };
+
+            let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+            let progress = pipeline
+                .reindex_observed_range(
+                    &storage,
+                    &source,
+                    from,
+                    to,
+                    "observed-range-test-zvue8",
+                    20,
+                    false,
+                    RECORDER_EVENT_SCHEMA_VERSION_V1,
+                    &mut crate::tantivy_reindex::NoopReindexObserver,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(progress.events_indexed, 3);
+            assert_eq!(
+                progress.current_ordinal,
+                Some(7),
+                "br-ft-zvue8 (observed): current_ordinal must stop at 7, not 8"
+            );
+            let cp = storage
+                .read_checkpoint("observed-range-test-zvue8")
+                .await
+                .unwrap()
+                .expect("checkpoint must be persisted");
+            assert_eq!(cp.upto_offset.ordinal, 7);
         });
     }
 
