@@ -1991,7 +1991,7 @@ pub enum OperatorOverrideKind {
 }
 
 /// A single operator override with activation metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OperatorOverride {
     /// Unique identifier for this override.
     pub override_id: String,
