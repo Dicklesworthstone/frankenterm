@@ -7,9 +7,14 @@
 //! it can be used as a regression anchor without depending on live panes.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::hardware_profile::{
+    HardwareProfileReport, HardwareProofStatus, ProbeValue, collect_hardware_profile,
+};
 use crate::memory_budget::{MemoryBudgetConfig, MemoryBudgetManager};
 use crate::policy::ActorKind;
 use crate::recorder_audit::{AccessTier, ActorIdentity};
@@ -28,6 +33,10 @@ use crate::storage_telemetry::StorageTelemetry;
 
 /// Version string for large-swarm replay corpus artifacts.
 pub const LARGE_SWARM_REPLAY_CORPUS_VERSION: &str = "ft.large_swarm_replay.v1";
+/// Version string for high-scale proof-gauntlet manifests.
+pub const LARGE_SWARM_PROOF_GAUNTLET_VERSION: &str = "ft.large_swarm_proof_gauntlet.v1";
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Scenario parameters for deterministic large-swarm trace generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +249,260 @@ pub struct LargeSwarmTelemetryCollectorSummary {
     pub storage_flushes: u64,
 }
 
+/// Whether a manifest came from a synthetic smoke replay or a real hardware run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LargeSwarmProofEvidenceMode {
+    /// Deterministic replay smoke path; useful for parser/schema checks only.
+    SyntheticSmoke,
+    /// Operator asserts this manifest was collected during a real hardware run.
+    RealHardwareRun,
+}
+
+/// Top-level truth status for high-scale swarm proof manifests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LargeSwarmProofGauntletStatus {
+    /// Hardware predicates, evidence mode, and replay thresholds all passed.
+    Proven,
+    /// The manifest is valid but must not be used as release proof.
+    SkippedNotProven,
+    /// The gauntlet ran and produced regression failures.
+    Failed,
+}
+
+/// Operator/run context captured before a high-scale proof attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmProofRunContext {
+    /// Stable run identifier supplied by the caller.
+    pub run_id: String,
+    /// Synthetic smoke vs real hardware evidence mode.
+    pub evidence_mode: LargeSwarmProofEvidenceMode,
+    /// Build profile or CI profile used for the run.
+    pub build_profile: String,
+    /// Kernel/OS identifier captured before the run.
+    pub kernel: String,
+    /// Digest of `$FT_WORKSPACE/.ft/config.toml`, or an explicit unavailable marker.
+    pub ft_config_digest: String,
+    /// Runtime feature flags compiled into the binary.
+    pub runtime_feature_flags: Vec<String>,
+    /// Agent count requested for the run.
+    pub agent_count: u64,
+    /// Requested input rate in events/second.
+    pub input_rate_events_per_sec: u64,
+    /// Requested capture rate in events/second.
+    pub capture_rate_events_per_sec: u64,
+    /// Query/search mix recorded before the run starts.
+    pub search_query_mix: BTreeMap<String, u64>,
+}
+
+/// One requested core/memory/pane scale point in the proof gauntlet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmProofScaleRequest {
+    /// Logical CPU count requested for this scale point.
+    pub requested_logical_cores: u64,
+    /// Memory footprint requested for this scale point.
+    pub requested_memory_bytes: u64,
+    /// Deterministic replay scenario backing the scale point.
+    pub scenario: LargeSwarmScenario,
+}
+
+impl LargeSwarmProofScaleRequest {
+    fn validate(&self) -> Result<(), LargeSwarmReplayError> {
+        if self.requested_logical_cores == 0 {
+            return Err(LargeSwarmReplayError::InvalidProofConfig(
+                "requested_logical_cores must be greater than zero".into(),
+            ));
+        }
+        if self.requested_memory_bytes == 0 {
+            return Err(LargeSwarmReplayError::InvalidProofConfig(
+                "requested_memory_bytes must be greater than zero".into(),
+            ));
+        }
+        self.scenario.validate()
+    }
+}
+
+/// Config used to build a high-scale proof-gauntlet manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmProofGauntletConfig {
+    /// Run context captured before replay/soak work starts.
+    pub run_context: LargeSwarmProofRunContext,
+    /// Requested scale points to execute and summarize.
+    pub scale_requests: Vec<LargeSwarmProofScaleRequest>,
+}
+
+impl LargeSwarmProofGauntletConfig {
+    /// Default release-gauntlet shape for the 64-core / 256 GiB claim.
+    #[must_use]
+    pub fn high_scale_release(run_id: impl Into<String>) -> Self {
+        Self {
+            run_context: LargeSwarmProofRunContext {
+                run_id: run_id.into(),
+                evidence_mode: LargeSwarmProofEvidenceMode::RealHardwareRun,
+                build_profile: default_build_profile(),
+                kernel: default_kernel_identifier(),
+                ft_config_digest: "unrecorded".into(),
+                runtime_feature_flags: compiled_runtime_feature_flags(),
+                agent_count: 1_000,
+                input_rate_events_per_sec: 10_000,
+                capture_rate_events_per_sec: 10_000,
+                search_query_mix: default_search_query_mix(),
+            },
+            scale_requests: high_scale_proof_requests(),
+        }
+    }
+
+    /// Small deterministic path for parser/schema tests and local smoke checks.
+    #[must_use]
+    pub fn synthetic_smoke(run_id: impl Into<String>) -> Self {
+        let mut config = Self::high_scale_release(run_id);
+        config.run_context.evidence_mode = LargeSwarmProofEvidenceMode::SyntheticSmoke;
+        config.run_context.agent_count = 10;
+        config.run_context.input_rate_events_per_sec = 100;
+        config.run_context.capture_rate_events_per_sec = 100;
+        config.scale_requests = vec![LargeSwarmProofScaleRequest {
+            requested_logical_cores: 1,
+            requested_memory_bytes: GIB,
+            scenario: LargeSwarmScenario::scale_point(10).expect("10-pane scenario exists"),
+        }];
+        config
+    }
+
+    /// Override the evidence mode while preserving the rest of the config.
+    #[must_use]
+    pub fn with_evidence_mode(mut self, mode: LargeSwarmProofEvidenceMode) -> Self {
+        self.run_context.evidence_mode = mode;
+        self
+    }
+
+    fn validate(&self) -> Result<(), LargeSwarmReplayError> {
+        if self.run_context.run_id.trim().is_empty() {
+            return Err(LargeSwarmReplayError::InvalidProofConfig(
+                "run_id must not be empty".into(),
+            ));
+        }
+        if self.run_context.build_profile.trim().is_empty() {
+            return Err(LargeSwarmReplayError::InvalidProofConfig(
+                "build_profile must not be empty".into(),
+            ));
+        }
+        if self.run_context.kernel.trim().is_empty() {
+            return Err(LargeSwarmReplayError::InvalidProofConfig(
+                "kernel must not be empty".into(),
+            ));
+        }
+        if self.scale_requests.is_empty() {
+            return Err(LargeSwarmReplayError::InvalidProofConfig(
+                "scale_requests must not be empty".into(),
+            ));
+        }
+        for request in &self.scale_requests {
+            request.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// One executed proof-gauntlet scale artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmProofScaleArtifact {
+    /// Scale point requested before execution.
+    pub request: LargeSwarmProofScaleRequest,
+    /// Deterministic replay summary for this scale point.
+    pub summary: LargeSwarmReplaySummary,
+    /// Thresholds used for the verdict.
+    pub thresholds: LargeSwarmRegressionThresholds,
+    /// Pass/fail verdict for the scale point.
+    pub verdict: LargeSwarmRegressionVerdict,
+}
+
+/// Machine-readable proof manifest consumed by release evidence tooling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmProofGauntletManifest {
+    /// Artifact schema version.
+    pub version: String,
+    /// Truth status for the entire manifest.
+    pub status: LargeSwarmProofGauntletStatus,
+    /// Hardware facts collected before execution.
+    pub hardware_profile: HardwareProfileReport,
+    /// Run context captured before execution.
+    pub run_context: LargeSwarmProofRunContext,
+    /// Per-scale replay artifacts.
+    pub scale_artifacts: Vec<LargeSwarmProofScaleArtifact>,
+    /// Reasons this manifest must not be counted as release proof.
+    pub skip_reasons: Vec<String>,
+    /// Regression failures observed during the gauntlet.
+    pub failure_reasons: Vec<String>,
+    /// Stable digest over the proof-critical manifest fields.
+    pub summary_digest: String,
+}
+
+impl LargeSwarmProofGauntletManifest {
+    fn digest_input(&self) -> String {
+        let mut input = format!(
+            "{}|{:?}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.version,
+            self.status,
+            self.run_context.run_id,
+            self.run_context.evidence_mode,
+            self.run_context.build_profile,
+            self.run_context.kernel,
+            self.run_context.ft_config_digest,
+            self.run_context.agent_count,
+            self.run_context.input_rate_events_per_sec,
+            self.run_context.capture_rate_events_per_sec,
+            self.hardware_profile.proof_predicates.reason,
+            self.hardware_profile_probe_digest()
+        );
+        for flag in &self.run_context.runtime_feature_flags {
+            input.push_str("|feature=");
+            input.push_str(flag);
+        }
+        for (kind, count) in &self.run_context.search_query_mix {
+            input.push_str("|search=");
+            input.push_str(kind);
+            input.push('=');
+            input.push_str(&count.to_string());
+        }
+        for artifact in &self.scale_artifacts {
+            input.push_str("|scale=");
+            input.push_str(&artifact.request.requested_logical_cores.to_string());
+            input.push(':');
+            input.push_str(&artifact.request.requested_memory_bytes.to_string());
+            input.push(':');
+            input.push_str(&artifact.request.scenario.pane_count.to_string());
+            input.push(':');
+            input.push_str(&artifact.summary.summary_digest);
+            input.push(':');
+            input.push_str(if artifact.verdict.passed {
+                "passed"
+            } else {
+                "failed"
+            });
+        }
+        for reason in &self.skip_reasons {
+            input.push_str("|skip=");
+            input.push_str(reason);
+        }
+        for reason in &self.failure_reasons {
+            input.push_str("|failure=");
+            input.push_str(reason);
+        }
+        input
+    }
+
+    fn hardware_profile_probe_digest(&self) -> String {
+        format!(
+            "cpu={};mem={};storage={};nofile={}",
+            probe_usize_digest(&self.hardware_profile.cpu.logical_cores),
+            probe_u64_digest(&self.hardware_profile.memory.total_bytes),
+            probe_u64_digest(&self.hardware_profile.storage.available_bytes),
+            probe_u64_digest(&self.hardware_profile.file_descriptors.nofile_soft)
+        )
+    }
+}
+
 /// Regression thresholds for a large-swarm replay summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LargeSwarmRegressionThresholds {
@@ -306,6 +569,8 @@ pub struct LargeSwarmRegressionVerdict {
 pub enum LargeSwarmReplayError {
     /// Scenario parameters are invalid.
     InvalidScenario(String),
+    /// Proof-gauntlet configuration is invalid.
+    InvalidProofConfig(String),
     /// Existing replay engine rejected the generated trace.
     Replay(ReplayError),
 }
@@ -315,6 +580,9 @@ impl std::fmt::Display for LargeSwarmReplayError {
         match self {
             Self::InvalidScenario(message) => {
                 write!(formatter, "invalid large-swarm scenario: {message}")
+            }
+            Self::InvalidProofConfig(message) => {
+                write!(formatter, "invalid large-swarm proof config: {message}")
             }
             Self::Replay(error) => write!(formatter, "large-swarm replay failed: {error}"),
         }
@@ -363,6 +631,83 @@ pub fn summarize_required_scale_points()
             summarize_large_swarm_replay(&corpus)
         })
         .collect()
+}
+
+/// Build a high-scale proof manifest from live hardware probes.
+pub fn build_large_swarm_proof_gauntlet_manifest(
+    workspace_root: &Path,
+    mut config: LargeSwarmProofGauntletConfig,
+) -> Result<LargeSwarmProofGauntletManifest, LargeSwarmReplayError> {
+    if config.run_context.ft_config_digest == "unrecorded" {
+        config.run_context.ft_config_digest = workspace_ft_config_digest(workspace_root);
+    }
+    let hardware_profile = collect_hardware_profile(workspace_root);
+    build_large_swarm_proof_gauntlet_manifest_from_hardware(hardware_profile, config)
+}
+
+/// Build a high-scale proof manifest from an already-collected hardware profile.
+pub fn build_large_swarm_proof_gauntlet_manifest_from_hardware(
+    hardware_profile: HardwareProfileReport,
+    config: LargeSwarmProofGauntletConfig,
+) -> Result<LargeSwarmProofGauntletManifest, LargeSwarmReplayError> {
+    config.validate()?;
+
+    let mut scale_artifacts = Vec::with_capacity(config.scale_requests.len());
+    let mut failure_reasons = Vec::new();
+    for request in &config.scale_requests {
+        let corpus = generate_large_swarm_corpus(&request.scenario)?;
+        let summary = summarize_large_swarm_replay(&corpus)?;
+        let thresholds = LargeSwarmRegressionThresholds::for_scenario(&request.scenario);
+        let verdict = evaluate_large_swarm_thresholds(&summary, &thresholds);
+        if !verdict.passed {
+            failure_reasons.push(format!(
+                "scale {} cores / {} bytes / {} panes failed {} threshold(s)",
+                request.requested_logical_cores,
+                request.requested_memory_bytes,
+                request.scenario.pane_count,
+                verdict.diffs.len()
+            ));
+        }
+        scale_artifacts.push(LargeSwarmProofScaleArtifact {
+            request: request.clone(),
+            summary,
+            thresholds,
+            verdict,
+        });
+    }
+
+    let mut skip_reasons = Vec::new();
+    if hardware_profile.proof_predicates.proof_status != HardwareProofStatus::ProvenPredicateMet {
+        skip_reasons.push(hardware_profile.proof_predicates.reason.clone());
+    }
+    if config.run_context.evidence_mode != LargeSwarmProofEvidenceMode::RealHardwareRun {
+        skip_reasons
+            .push("synthetic smoke replay cannot prove the 64-core/256GB release claim".into());
+    }
+    if !has_high_scale_release_request(&config.scale_requests) {
+        skip_reasons.push("scale requests do not include a 64-core / 256 GiB release point".into());
+    }
+
+    let status = if !failure_reasons.is_empty() {
+        LargeSwarmProofGauntletStatus::Failed
+    } else if skip_reasons.is_empty() {
+        LargeSwarmProofGauntletStatus::Proven
+    } else {
+        LargeSwarmProofGauntletStatus::SkippedNotProven
+    };
+
+    let mut manifest = LargeSwarmProofGauntletManifest {
+        version: LARGE_SWARM_PROOF_GAUNTLET_VERSION.into(),
+        status,
+        hardware_profile,
+        run_context: config.run_context,
+        scale_artifacts,
+        skip_reasons,
+        failure_reasons,
+        summary_digest: String::new(),
+    };
+    manifest.summary_digest = stable_digest(&manifest.digest_input());
+    Ok(manifest)
 }
 
 /// Replay a corpus through `ReplaySession` and return a deterministic summary.
@@ -745,9 +1090,114 @@ fn push_threshold_diff(
     });
 }
 
+fn high_scale_proof_requests() -> Vec<LargeSwarmProofScaleRequest> {
+    [
+        (1, GIB, 10),
+        (8, 8 * GIB, 50),
+        (16, 32 * GIB, 200),
+        (32, 128 * GIB, 1_000),
+        (64, 256 * GIB, 1_000),
+    ]
+    .into_iter()
+    .map(
+        |(requested_logical_cores, requested_memory_bytes, pane_count)| {
+            LargeSwarmProofScaleRequest {
+                requested_logical_cores,
+                requested_memory_bytes,
+                scenario: LargeSwarmScenario::scale_point(pane_count)
+                    .expect("built-in large-swarm scale point exists"),
+            }
+        },
+    )
+    .collect()
+}
+
+fn has_high_scale_release_request(requests: &[LargeSwarmProofScaleRequest]) -> bool {
+    requests.iter().any(|request| {
+        request.requested_logical_cores >= 64 && request.requested_memory_bytes >= 256 * GIB
+    })
+}
+
+fn default_search_query_mix() -> BTreeMap<String, u64> {
+    BTreeMap::from([
+        ("exact_tail_lookup".into(), 40),
+        ("lexical_search".into(), 35),
+        ("semantic_search".into(), 15),
+        ("operator_filter".into(), 10),
+    ])
+}
+
+fn default_build_profile() -> String {
+    if cfg!(debug_assertions) {
+        "debug".into()
+    } else {
+        "release".into()
+    }
+}
+
+fn default_kernel_identifier() -> String {
+    Command::new("uname")
+        .args(["-srmo"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| format!("{} {}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+fn compiled_runtime_feature_flags() -> Vec<String> {
+    vec![
+        format!(
+            "asupersync-runtime={}",
+            cfg!(feature = "asupersync-runtime")
+        ),
+        format!("distributed={}", cfg!(feature = "distributed")),
+        format!("frankensearch={}", cfg!(feature = "frankensearch")),
+        format!("mcp={}", cfg!(feature = "mcp")),
+        format!("metrics={}", cfg!(feature = "metrics")),
+        format!("native-wezterm={}", cfg!(feature = "native-wezterm")),
+        format!("recorder-lexical={}", cfg!(feature = "recorder-lexical")),
+        format!("semantic-search={}", cfg!(feature = "semantic-search")),
+    ]
+}
+
+fn workspace_ft_config_digest(workspace_root: &Path) -> String {
+    let config_path = workspace_root.join(".ft").join("config.toml");
+    match std::fs::read(&config_path) {
+        Ok(bytes) => stable_digest_bytes(&bytes),
+        Err(error) => format!("unavailable:{:?}", error.kind()),
+    }
+}
+
+fn probe_usize_digest(probe: &ProbeValue<usize>) -> String {
+    match probe {
+        ProbeValue::Known { value } => value.to_string(),
+        ProbeValue::Unavailable { reason } => format!("unavailable:{reason}"),
+        ProbeValue::Unsupported { reason } => format!("unsupported:{reason}"),
+    }
+}
+
+fn probe_u64_digest(probe: &ProbeValue<u64>) -> String {
+    match probe {
+        ProbeValue::Known { value } => value.to_string(),
+        ProbeValue::Unavailable { reason } => format!("unavailable:{reason}"),
+        ProbeValue::Unsupported { reason } => format!("unsupported:{reason}"),
+    }
+}
+
 fn stable_digest(input: &str) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in input.as_bytes() {
+    let hash = 0xcbf2_9ce4_8422_2325_u64;
+    stable_digest_bytes_with_seed(input.as_bytes(), hash)
+}
+
+fn stable_digest_bytes(bytes: &[u8]) -> String {
+    stable_digest_bytes_with_seed(bytes, 0xcbf2_9ce4_8422_2325_u64)
+}
+
+fn stable_digest_bytes_with_seed(bytes: &[u8], mut hash: u64) -> String {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }

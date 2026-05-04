@@ -30348,8 +30348,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 })
                 .collect();
 
-            let hardware_profile_report =
-                frankenterm_core::hardware_profile::collect_hardware_profile(&layout.root);
+            let large_swarm_proof_gauntlet_report =
+                frankenterm_core::large_swarm_replay::build_large_swarm_proof_gauntlet_manifest(
+                    &layout.root,
+                    frankenterm_core::large_swarm_replay::LargeSwarmProofGauntletConfig::high_scale_release(
+                        "ft-doctor-high-scale",
+                    )
+                    .with_evidence_mode(
+                        frankenterm_core::large_swarm_replay::LargeSwarmProofEvidenceMode::SyntheticSmoke,
+                    ),
+                );
+            let hardware_profile_report = large_swarm_proof_gauntlet_report
+                .as_ref()
+                .map(|report| report.hardware_profile.clone())
+                .unwrap_or_else(|_| {
+                    frankenterm_core::hardware_profile::collect_hardware_profile(&layout.root)
+                });
 
             // Determine overall status
             let has_errors = all_checks
@@ -30410,6 +30424,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .unwrap_or(serde_json::Value::Null);
                 result["hardware_profile"] = serde_json::to_value(&hardware_profile_report)
                     .unwrap_or(serde_json::Value::Null);
+                result["large_swarm_proof_gauntlet"] = match &large_swarm_proof_gauntlet_report {
+                    Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+                    Err(error) => serde_json::json!({
+                        "version": frankenterm_core::large_swarm_replay::LARGE_SWARM_PROOF_GAUNTLET_VERSION,
+                        "status": "failed",
+                        "error": error.to_string(),
+                    }),
+                };
 
                 if let Some(report) = runtime_report.as_ref() {
                     let runtime_health =
@@ -30486,6 +30508,26 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!("  {} {} - {}", status, line.name, line.detail);
                     if let Some(recommendation) = line.recommendation {
                         println!("       -> {recommendation}");
+                    }
+                }
+
+                println!();
+                println!("High-Scale Proof Gauntlet:");
+                match &large_swarm_proof_gauntlet_report {
+                    Ok(report) => {
+                        println!(
+                            "  status={:?} evidence_mode={:?} digest={}",
+                            report.status, report.run_context.evidence_mode, report.summary_digest
+                        );
+                        for reason in &report.skip_reasons {
+                            println!("       -> SKIPPED_NOT_PROVEN: {reason}");
+                        }
+                        for reason in &report.failure_reasons {
+                            println!("       -> FAILED: {reason}");
+                        }
+                    }
+                    Err(error) => {
+                        println!("  [WARN] manifest unavailable - {error}");
                     }
                 }
 

@@ -1,7 +1,14 @@
+use frankenterm_core::hardware_profile::{
+    CgroupProfile, CpuProfile, FileDescriptorProfile, HardwareProfileReport, HardwareProofStatus,
+    HighScaleProofPredicates, MemoryProfile, NumaProfile, ProbeValue, StorageProfile,
+};
 use frankenterm_core::large_swarm_replay::{
-    LARGE_SWARM_REPLAY_CORPUS_VERSION, LargeSwarmRegressionThresholds, LargeSwarmReplayCorpus,
-    LargeSwarmScenario, evaluate_large_swarm_thresholds, generate_large_swarm_corpus,
-    summarize_large_swarm_replay, summarize_required_scale_points,
+    LARGE_SWARM_PROOF_GAUNTLET_VERSION, LARGE_SWARM_REPLAY_CORPUS_VERSION,
+    LargeSwarmProofEvidenceMode, LargeSwarmProofGauntletConfig, LargeSwarmProofGauntletManifest,
+    LargeSwarmProofGauntletStatus, LargeSwarmRegressionThresholds, LargeSwarmReplayCorpus,
+    LargeSwarmScenario, build_large_swarm_proof_gauntlet_manifest_from_hardware,
+    evaluate_large_swarm_thresholds, generate_large_swarm_corpus, summarize_large_swarm_replay,
+    summarize_required_scale_points,
 };
 use frankenterm_core::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
 
@@ -129,6 +136,114 @@ fn summarize_required_scale_points_returns_deterministic_digest_set() {
             .iter()
             .all(|summary| summary.summary_digest.starts_with("fnv1a64:"))
     );
+}
+
+#[test]
+fn proof_gauntlet_high_scale_release_requests_required_core_and_memory_points() {
+    let config = LargeSwarmProofGauntletConfig::high_scale_release("contract");
+
+    let requested_cores: Vec<u64> = config
+        .scale_requests
+        .iter()
+        .map(|request| request.requested_logical_cores)
+        .collect();
+    let requested_memory: Vec<u64> = config
+        .scale_requests
+        .iter()
+        .map(|request| request.requested_memory_bytes)
+        .collect();
+    let requested_panes: Vec<u64> = config
+        .scale_requests
+        .iter()
+        .map(|request| request.scenario.pane_count)
+        .collect();
+
+    assert_eq!(
+        config.run_context.evidence_mode,
+        LargeSwarmProofEvidenceMode::RealHardwareRun
+    );
+    assert_eq!(requested_cores, vec![1, 8, 16, 32, 64]);
+    assert_eq!(
+        requested_memory,
+        vec![gib(1), gib(8), gib(32), gib(128), gib(256)]
+    );
+    assert_eq!(requested_panes, vec![10, 50, 200, 1_000, 1_000]);
+}
+
+#[test]
+fn proof_gauntlet_synthetic_smoke_manifest_is_machine_readable_but_not_proof() {
+    let config = LargeSwarmProofGauntletConfig::synthetic_smoke("local-smoke");
+    let manifest =
+        build_large_swarm_proof_gauntlet_manifest_from_hardware(high_scale_hardware(), config)
+            .expect("build smoke manifest");
+
+    assert_eq!(manifest.version, LARGE_SWARM_PROOF_GAUNTLET_VERSION);
+    assert_eq!(
+        manifest.status,
+        LargeSwarmProofGauntletStatus::SkippedNotProven
+    );
+    assert_eq!(manifest.scale_artifacts.len(), 1);
+    assert!(manifest.failure_reasons.is_empty());
+    assert!(
+        manifest
+            .skip_reasons
+            .iter()
+            .any(|reason| reason.contains("synthetic smoke replay"))
+    );
+    assert!(
+        manifest
+            .skip_reasons
+            .iter()
+            .any(|reason| reason.contains("64-core / 256 GiB release point"))
+    );
+    assert!(manifest.summary_digest.starts_with("fnv1a64:"));
+
+    let json = serde_json::to_string(&manifest).expect("serialize proof manifest");
+    let roundtrip: LargeSwarmProofGauntletManifest =
+        serde_json::from_str(&json).expect("deserialize proof manifest");
+    assert_eq!(roundtrip, manifest);
+}
+
+#[test]
+fn proof_gauntlet_fails_closed_when_hardware_predicates_are_missing() {
+    let manifest = build_large_swarm_proof_gauntlet_manifest_from_hardware(
+        insufficient_hardware(),
+        LargeSwarmProofGauntletConfig::synthetic_smoke("insufficient")
+            .with_evidence_mode(LargeSwarmProofEvidenceMode::RealHardwareRun),
+    )
+    .expect("build insufficient-hardware manifest");
+
+    assert_eq!(
+        manifest.status,
+        LargeSwarmProofGauntletStatus::SkippedNotProven
+    );
+    assert!(manifest.failure_reasons.is_empty());
+    assert!(
+        manifest
+            .skip_reasons
+            .iter()
+            .any(|reason| reason.contains("hardware predicates not met"))
+    );
+    assert!(
+        manifest
+            .scale_artifacts
+            .iter()
+            .all(|artifact| artifact.verdict.passed)
+    );
+}
+
+#[test]
+fn proof_gauntlet_status_is_proven_only_for_real_mode_and_passing_thresholds() {
+    let manifest = build_large_swarm_proof_gauntlet_manifest_from_hardware(
+        high_scale_hardware(),
+        LargeSwarmProofGauntletConfig::high_scale_release("real-hardware-release"),
+    )
+    .expect("build real-mode manifest");
+
+    assert_eq!(manifest.status, LargeSwarmProofGauntletStatus::Proven);
+    assert!(manifest.skip_reasons.is_empty());
+    assert!(manifest.failure_reasons.is_empty());
+    assert_eq!(manifest.scale_artifacts.len(), 5);
 }
 
 // ── br-ft-o60ul cc1 property-test slice ────────────────────────────
@@ -267,4 +382,71 @@ fn threshold_diffs_are_actionable_for_every_field_ft_o60ul() {
             diff.message
         );
     }
+}
+
+fn high_scale_hardware() -> HardwareProfileReport {
+    hardware_profile(64, gib(256), HardwareProofStatus::ProvenPredicateMet)
+}
+
+fn insufficient_hardware() -> HardwareProfileReport {
+    hardware_profile(8, gib(32), HardwareProofStatus::SkippedNotProven)
+}
+
+fn hardware_profile(
+    logical_cores: usize,
+    memory_bytes: u64,
+    proof_status: HardwareProofStatus,
+) -> HardwareProfileReport {
+    let proof_met = proof_status == HardwareProofStatus::ProvenPredicateMet;
+    HardwareProfileReport {
+        schema_version: 1,
+        platform: "test".into(),
+        cpu: CpuProfile {
+            logical_cores: ProbeValue::known(logical_cores),
+            physical_cores: ProbeValue::known(logical_cores / 2),
+            topology_source: "test".into(),
+        },
+        memory: MemoryProfile {
+            total_bytes: ProbeValue::known(memory_bytes),
+            available_bytes: ProbeValue::known(memory_bytes / 2),
+            source: "test".into(),
+        },
+        numa: NumaProfile {
+            nodes: ProbeValue::known(vec![0, 1]),
+            source: "test".into(),
+        },
+        page_size_bytes: ProbeValue::known(4096),
+        file_descriptors: FileDescriptorProfile {
+            nofile_soft: ProbeValue::known(65_536),
+            nofile_hard: ProbeValue::known(65_536),
+            current_open_fds: ProbeValue::known(128),
+        },
+        storage: StorageProfile {
+            path: "/tmp/frankenterm-test".into(),
+            total_bytes: ProbeValue::known(gib(1024)),
+            available_bytes: ProbeValue::known(gib(512)),
+            filesystem: ProbeValue::known("testfs".into()),
+        },
+        cgroup: CgroupProfile {
+            memory_max_bytes: ProbeValue::unsupported("test"),
+            cpu_quota: ProbeValue::unsupported("test"),
+        },
+        proof_predicates: HighScaleProofPredicates {
+            required_logical_cores: 64,
+            required_memory_bytes: gib(256),
+            logical_cores_ok: proof_met,
+            memory_ok: proof_met,
+            proof_status,
+            reason: if proof_met {
+                "hardware predicates met: >= 64 logical cores and >= 256.0 GiB memory".into()
+            } else {
+                "hardware predicates not met or unverifiable: need >= 64 logical cores and >= 256.0 GiB memory".into()
+            },
+        },
+        recommendations: Vec::new(),
+    }
+}
+
+fn gib(value: u64) -> u64 {
+    value * 1024 * 1024 * 1024
 }
