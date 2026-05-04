@@ -796,8 +796,9 @@ impl FleetMemoryController {
             self.consecutive_at_tier += 1;
         }
 
-        // Determine actions for current compound tier
-        let actions = recommend_actions(self.compound_tier, signals);
+        // Determine actions for current compound tier.
+        let mut actions = recommend_actions(self.compound_tier, signals);
+        add_tier_budget_reclamation_actions(&mut actions, tier_budget.as_ref());
         self.last_actions.clone_from(&actions);
         self.last_tier_budget.clone_from(&tier_budget);
 
@@ -898,6 +899,31 @@ pub fn recommend_actions(
         FleetPressureTier::Emergency => {
             vec![FleetMemoryAction::EmergencyCleanup]
         }
+    }
+}
+
+fn add_tier_budget_reclamation_actions(
+    actions: &mut Vec<FleetMemoryAction>,
+    tier_budget: Option<&FleetMemoryTierBudgetSnapshot>,
+) {
+    let Some(tier_budget) = tier_budget else {
+        return;
+    };
+    if actions.contains(&FleetMemoryAction::EmergencyCleanup) {
+        return;
+    }
+    let should_evict_scrollback = tier_budget.reclamation_targets().iter().any(|target| {
+        matches!(
+            target.action,
+            FleetMemoryTierReclamationAction::EvictWarmToCold
+                | FleetMemoryTierReclamationAction::DemoteHotToWarm
+        )
+    });
+    if should_evict_scrollback && !actions.contains(&FleetMemoryAction::EvictWarmScrollback) {
+        if actions == &[FleetMemoryAction::None] {
+            actions.clear();
+        }
+        actions.push(FleetMemoryAction::EvictWarmScrollback);
     }
 }
 
@@ -1442,6 +1468,38 @@ mod tests {
                 .as_ref()
                 .map(FleetMemoryTierBudgetSnapshot::pressure_tier),
             Some(FleetPressureTier::Critical)
+        );
+    }
+
+    #[test]
+    fn elevated_tier_budget_warm_overage_requests_eviction_for_small_fleet_ft_08wlf() {
+        let tier_budget =
+            FleetMemoryTierBudgetSnapshot::from_tiers([FleetMemoryTierBudgetRecord::new(
+                FleetMemoryTier::WarmCompressed,
+                1_000,
+                1_040,
+            )
+            .with_reclaimable_bytes(40)]);
+        assert_eq!(tier_budget.pressure_tier(), FleetPressureTier::Elevated);
+
+        let mut ctrl = FleetMemoryController::new(FleetMemoryConfig {
+            escalation_threshold: 1,
+            deescalation_threshold: 1,
+            ..FleetMemoryConfig::default()
+        });
+        let actions = ctrl.evaluate_with_tier_budget(
+            &PressureSignals {
+                pane_count: 4,
+                ..green_signals()
+            },
+            tier_budget,
+        );
+
+        assert_eq!(ctrl.compound_tier(), FleetPressureTier::Elevated);
+        assert!(actions.contains(&FleetMemoryAction::ThrottlePolling));
+        assert!(
+            actions.contains(&FleetMemoryAction::EvictWarmScrollback),
+            "warm-tier budget overage must produce a reclaiming action even below the pane-count heuristic"
         );
     }
 
