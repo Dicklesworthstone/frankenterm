@@ -970,12 +970,22 @@ impl<'a> FleetLauncher<'a> {
 ///
 /// Uses largest-remainder method (Hamilton's method) for deterministic,
 /// proportionally fair allocation with no wasted slots.
+///
+/// br-ft-4x6de: weights are summed via `saturating_add` so a hostile
+/// or malformed `AgentMix` (operator-controlled TOML / CLI flags
+/// / persisted state) can never produce a wrap-around `total_weight`.
+/// The pre-fix unchecked `sum()` panicked in debug and wrapped to a
+/// small number in release, then the quotas blew up to absurd
+/// values. Saturating at `u32::MAX` keeps the largest-remainder
+/// math finite and the resulting allocation grossly proportional.
 fn allocate_weighted(total: u32, mix: &[AgentMixEntry]) -> Vec<u32> {
     if mix.is_empty() || total == 0 {
         return vec![0; mix.len()];
     }
 
-    let total_weight: u32 = mix.iter().map(|e| e.weight).sum();
+    let total_weight: u32 = mix
+        .iter()
+        .fold(0u32, |acc, e| acc.saturating_add(e.weight));
     if total_weight == 0 {
         return vec![0; mix.len()];
     }
@@ -1212,6 +1222,46 @@ mod tests {
     fn allocate_weighted_empty_mix() {
         let alloc = allocate_weighted(5, &[]);
         assert!(alloc.is_empty());
+    }
+
+    // ── br-ft-4x6de: weight-sum overflow guard ──
+
+    #[test]
+    fn allocate_weighted_does_not_panic_on_overflowing_weights_ft_4x6de() {
+        // br-ft-4x6de: pre-fix, two entries each carrying u32::MAX
+        // panicked the unchecked .sum() in debug and wrapped to a
+        // small total_weight in release. The saturating_add path
+        // clamps to u32::MAX and produces a finite (if grossly
+        // proportional) allocation.
+        let mix = vec![
+            agent_mix("a", u32::MAX),
+            agent_mix("b", u32::MAX),
+        ];
+        let alloc = allocate_weighted(10, &mix);
+        // Allocation must sum to exactly `total` (no slots lost or
+        // duplicated) and contain no negative-weight artifacts.
+        let sum: u32 = alloc.iter().sum();
+        assert_eq!(sum, 10, "overflow guard must preserve slot conservation");
+        assert_eq!(alloc.len(), 2);
+    }
+
+    #[test]
+    fn allocate_weighted_handles_many_large_weights_ft_4x6de() {
+        // 5 entries of weight=1_000_000_000 sum to 5e9 > u32::MAX
+        // (~4.29e9). Saturating_add clamps to u32::MAX; the
+        // function must still produce a conservation-preserving
+        // allocation.
+        let mix = vec![
+            agent_mix("a", 1_000_000_000),
+            agent_mix("b", 1_000_000_000),
+            agent_mix("c", 1_000_000_000),
+            agent_mix("d", 1_000_000_000),
+            agent_mix("e", 1_000_000_000),
+        ];
+        let alloc = allocate_weighted(20, &mix);
+        let sum: u32 = alloc.iter().sum();
+        assert_eq!(sum, 20);
+        assert_eq!(alloc.len(), 5);
     }
 
     #[test]
