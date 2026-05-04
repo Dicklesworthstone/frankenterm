@@ -32,6 +32,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fleet_memory_controller::{FleetMemoryTierBudgetSnapshot, FleetPressureTier};
+use crate::latency_stages::StagePressure;
+use crate::priority::PanePriority;
 use crate::swarm_work_queue::{AgentSlotId, QueueStats, SwarmWorkQueue, WorkItemId};
 
 // =============================================================================
@@ -942,12 +945,562 @@ pub fn compute_queue_pressure(queue: &SwarmWorkQueue) -> QueuePressure {
 }
 
 // =============================================================================
+// Global admission controller
+// =============================================================================
+
+/// How much mission-level protection a work request should receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionCriticality {
+    /// Opportunistic work that may be stopped first under pressure.
+    Background,
+    /// Normal operator work.
+    Standard,
+    /// Important work that should degrade before being shed.
+    Critical,
+    /// Work explicitly tied to keeping the swarm usable.
+    MissionCritical,
+}
+
+impl MissionCriticality {
+    const fn protection_units(self) -> u8 {
+        match self {
+            Self::Background | Self::Standard => 0,
+            Self::Critical => 1,
+            Self::MissionCritical => 2,
+        }
+    }
+}
+
+/// Requested work item being admitted against current resource pressure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmissionRequest {
+    /// Pane associated with the request, when the request is pane scoped.
+    pub pane_id: Option<u64>,
+    /// Pane resource priority from the existing priority classifier.
+    pub pane_priority: PanePriority,
+    /// Mission criticality supplied by the caller.
+    pub mission_criticality: MissionCriticality,
+    /// Work-queue priority. Lower numbers are more important.
+    pub work_priority: u32,
+    /// Estimated effort units from the work queue.
+    pub estimated_effort: u32,
+    /// Explicit operator override allowing priority protection to exceed normal caps.
+    pub operator_priority_override: bool,
+}
+
+impl AdmissionRequest {
+    /// Build a standard request for non-pane work.
+    #[must_use]
+    pub const fn standard(work_priority: u32, estimated_effort: u32) -> Self {
+        Self {
+            pane_id: None,
+            pane_priority: PanePriority::Medium,
+            mission_criticality: MissionCriticality::Standard,
+            work_priority,
+            estimated_effort,
+            operator_priority_override: false,
+        }
+    }
+}
+
+/// Live telemetry consumed by the global admission controller.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SwarmAdmissionTelemetry {
+    /// Queue pressure derived from [`SwarmWorkQueue`] statistics.
+    pub queue_pressure: Option<QueuePressure>,
+    /// Compound fleet pressure from [`crate::fleet_memory_controller`].
+    pub fleet_pressure: Option<FleetPressureTier>,
+    /// Optional memory tier budget snapshot; absent data fails closed.
+    pub memory_tier_budget: Option<FleetMemoryTierBudgetSnapshot>,
+    /// Per-latency-stage budget pressure.
+    pub latency_stage_pressures: Option<Vec<StagePressure>>,
+}
+
+impl SwarmAdmissionTelemetry {
+    /// Construct telemetry from known queue and fleet pressure surfaces.
+    #[must_use]
+    pub fn new(
+        queue_pressure: QueuePressure,
+        fleet_pressure: FleetPressureTier,
+        memory_tier_budget: FleetMemoryTierBudgetSnapshot,
+        latency_stage_pressures: Vec<StagePressure>,
+    ) -> Self {
+        Self {
+            queue_pressure: Some(queue_pressure),
+            fleet_pressure: Some(fleet_pressure),
+            memory_tier_budget: Some(memory_tier_budget),
+            latency_stage_pressures: Some(latency_stage_pressures),
+        }
+    }
+}
+
+/// Admission result severity. Ordered from least to most disruptive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionAction {
+    /// Admit immediately.
+    Admit,
+    /// Defer until pressure drops or more telemetry arrives.
+    Defer,
+    /// Admit only in a reduced-quality mode.
+    Degrade,
+    /// Shed the request without scheduling work.
+    Shed,
+}
+
+impl AdmissionAction {
+    /// Numeric severity for counters, tests, and dashboards.
+    #[must_use]
+    pub const fn severity(self) -> u8 {
+        match self {
+            Self::Admit => 0,
+            Self::Defer => 1,
+            Self::Degrade => 2,
+            Self::Shed => 3,
+        }
+    }
+}
+
+/// Stable reason codes emitted by the admission controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionReasonCode {
+    /// All pressure inputs were below configured thresholds.
+    Healthy,
+    /// Queue utilization crossed the defer threshold.
+    QueueElevated,
+    /// Queue utilization crossed the degrade threshold.
+    QueueSaturated,
+    /// Queue utilization or backlog crossed the shed threshold.
+    QueueOverCapacity,
+    /// Failure rate is high enough that more admission would amplify churn.
+    FailureRateHigh,
+    /// Compound fleet pressure is above normal.
+    FleetPressure,
+    /// Memory-tier budget pressure is above normal.
+    MemoryTierPressure,
+    /// At least one latency stage is over its current budget.
+    LatencyStageOverBudget,
+    /// Queue telemetry was missing.
+    MissingQueueTelemetry,
+    /// Fleet-pressure telemetry was missing.
+    MissingFleetTelemetry,
+    /// Memory-tier telemetry was missing.
+    MissingMemoryTierTelemetry,
+    /// Latency-stage telemetry was missing.
+    MissingLatencyTelemetry,
+    /// Telemetry contained non-finite values and was treated as unsafe.
+    NonFiniteTelemetry,
+    /// Pane/work priority reduced the requested disruption severity.
+    PriorityProtected,
+    /// Operator priority override expanded protection beyond normal caps.
+    OperatorOverride,
+    /// Missing telemetry prevented an otherwise-admitted decision.
+    FailClosedMissingTelemetry,
+}
+
+/// Per-evaluation counters for operator-facing telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionDecisionCounters {
+    /// Number of admitted requests represented by this summary.
+    pub admitted: u64,
+    /// Number of deferred requests represented by this summary.
+    pub deferred: u64,
+    /// Number of degraded requests represented by this summary.
+    pub degraded: u64,
+    /// Number of shed requests represented by this summary.
+    pub shed: u64,
+}
+
+impl AdmissionDecisionCounters {
+    const fn from_action(action: AdmissionAction) -> Self {
+        match action {
+            AdmissionAction::Admit => Self {
+                admitted: 1,
+                deferred: 0,
+                degraded: 0,
+                shed: 0,
+            },
+            AdmissionAction::Defer => Self {
+                admitted: 0,
+                deferred: 1,
+                degraded: 0,
+                shed: 0,
+            },
+            AdmissionAction::Degrade => Self {
+                admitted: 0,
+                deferred: 0,
+                degraded: 1,
+                shed: 0,
+            },
+            AdmissionAction::Shed => Self {
+                admitted: 0,
+                deferred: 0,
+                degraded: 0,
+                shed: 1,
+            },
+        }
+    }
+}
+
+/// Operator-facing result for a single admission evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResourceAdmissionDecisionSummary {
+    /// Final admission action.
+    pub action: AdmissionAction,
+    /// Stable reason codes explaining the action.
+    pub reason_codes: Vec<AdmissionReasonCode>,
+    /// Per-action counters for dashboards.
+    pub counters: AdmissionDecisionCounters,
+    /// Raw resource pressure severity before priority protection.
+    pub raw_pressure_severity: u8,
+    /// Final pressure severity after priority protection and fail-closed gates.
+    pub effective_pressure_severity: u8,
+    /// Protection units applied from pane priority, work priority, and mission criticality.
+    pub priority_protection_units: u8,
+    /// Queue utilization seen by the controller.
+    pub queue_utilization: Option<f64>,
+    /// Pending queue items seen by the controller.
+    pub pending_items: Option<u32>,
+    /// Compound fleet pressure input.
+    pub fleet_pressure: Option<FleetPressureTier>,
+    /// Pressure derived from the memory-tier budget snapshot.
+    pub memory_tier_pressure: Option<FleetPressureTier>,
+    /// Maximum latency-stage over-budget ratio, if latency telemetry was available.
+    pub max_latency_over_budget_ratio: Option<f64>,
+}
+
+/// Deterministic threshold policy for global admission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdmissionControllerConfig {
+    /// Queue utilization at which non-protected requests are deferred.
+    pub defer_queue_utilization: f64,
+    /// Queue utilization at which non-protected requests are degraded.
+    pub degrade_queue_utilization: f64,
+    /// Queue utilization at which non-protected requests are shed.
+    pub shed_queue_utilization: f64,
+    /// Failure rate at which requests are degraded.
+    pub degrade_failure_rate: f64,
+    /// Failure rate at which requests are shed.
+    pub shed_failure_rate: f64,
+    /// Latency over-budget ratio that starts deferral.
+    pub defer_stage_over_budget_ratio: f64,
+    /// Latency over-budget ratio that starts degradation.
+    pub degrade_stage_over_budget_ratio: f64,
+    /// Latency over-budget ratio that starts shedding.
+    pub shed_stage_over_budget_ratio: f64,
+    /// Minimum severity assigned when mandatory telemetry is absent.
+    pub missing_telemetry_severity: u8,
+}
+
+impl Default for AdmissionControllerConfig {
+    fn default() -> Self {
+        Self {
+            defer_queue_utilization: 0.80,
+            degrade_queue_utilization: 0.90,
+            shed_queue_utilization: 1.0,
+            degrade_failure_rate: 0.50,
+            shed_failure_rate: 0.80,
+            defer_stage_over_budget_ratio: 0.05,
+            degrade_stage_over_budget_ratio: 0.25,
+            shed_stage_over_budget_ratio: 1.0,
+            missing_telemetry_severity: 1,
+        }
+    }
+}
+
+/// Global admission controller that converts live pressure into one decision.
+#[derive(Debug, Clone)]
+pub struct SwarmAdmissionController {
+    config: AdmissionControllerConfig,
+}
+
+impl SwarmAdmissionController {
+    /// Create a controller from a deterministic threshold config.
+    #[must_use]
+    pub const fn new(config: AdmissionControllerConfig) -> Self {
+        Self { config }
+    }
+
+    /// Read-only access to the current admission policy.
+    #[must_use]
+    pub const fn config(&self) -> &AdmissionControllerConfig {
+        &self.config
+    }
+
+    /// Evaluate a request against the current resource-pressure telemetry.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        request: &AdmissionRequest,
+        telemetry: &SwarmAdmissionTelemetry,
+    ) -> ResourceAdmissionDecisionSummary {
+        let mut reasons = Vec::new();
+        let mut missing_telemetry = false;
+        let mut raw_severity = 0_u8;
+
+        let queue_utilization = telemetry
+            .queue_pressure
+            .as_ref()
+            .map(|pressure| pressure.utilization);
+        let pending_items = telemetry
+            .queue_pressure
+            .as_ref()
+            .map(|pressure| pressure.pending_items);
+
+        match telemetry.queue_pressure.as_ref() {
+            Some(queue) => {
+                raw_severity = raw_severity.max(self.queue_severity(queue, &mut reasons));
+            }
+            None => {
+                missing_telemetry = true;
+                push_reason(&mut reasons, AdmissionReasonCode::MissingQueueTelemetry);
+                raw_severity = raw_severity.max(self.config.missing_telemetry_severity.min(3));
+            }
+        }
+
+        match telemetry.fleet_pressure {
+            Some(fleet_pressure) => {
+                raw_severity =
+                    raw_severity.max(fleet_pressure_severity(fleet_pressure, &mut reasons));
+            }
+            None => {
+                missing_telemetry = true;
+                push_reason(&mut reasons, AdmissionReasonCode::MissingFleetTelemetry);
+                raw_severity = raw_severity.max(self.config.missing_telemetry_severity.min(3));
+            }
+        }
+
+        let memory_tier_pressure = match telemetry.memory_tier_budget.as_ref() {
+            Some(snapshot) => {
+                let tier = snapshot.pressure_tier();
+                raw_severity = raw_severity.max(fleet_pressure_severity(tier, &mut reasons));
+                if tier > FleetPressureTier::Normal {
+                    push_reason(&mut reasons, AdmissionReasonCode::MemoryTierPressure);
+                }
+                Some(tier)
+            }
+            None => {
+                missing_telemetry = true;
+                push_reason(
+                    &mut reasons,
+                    AdmissionReasonCode::MissingMemoryTierTelemetry,
+                );
+                raw_severity = raw_severity.max(self.config.missing_telemetry_severity.min(3));
+                None
+            }
+        };
+
+        let max_latency_over_budget_ratio = match telemetry.latency_stage_pressures.as_ref() {
+            Some(pressures) if !pressures.is_empty() => {
+                let (severity, ratio) = self.latency_severity(pressures, &mut reasons);
+                raw_severity = raw_severity.max(severity);
+                ratio
+            }
+            _ => {
+                missing_telemetry = true;
+                push_reason(&mut reasons, AdmissionReasonCode::MissingLatencyTelemetry);
+                raw_severity = raw_severity.max(self.config.missing_telemetry_severity.min(3));
+                None
+            }
+        };
+
+        if raw_severity == 0 {
+            push_reason(&mut reasons, AdmissionReasonCode::Healthy);
+        }
+
+        let priority_protection_units = priority_protection_units(request);
+        let mut effective_severity = raw_severity.saturating_sub(priority_protection_units);
+        if priority_protection_units > 0 && raw_severity > effective_severity {
+            push_reason(&mut reasons, AdmissionReasonCode::PriorityProtected);
+        }
+        if request.operator_priority_override {
+            push_reason(&mut reasons, AdmissionReasonCode::OperatorOverride);
+        }
+
+        let mut action = action_for_severity(effective_severity);
+        if missing_telemetry && action == AdmissionAction::Admit {
+            action = AdmissionAction::Defer;
+            effective_severity = AdmissionAction::Defer.severity();
+            push_reason(
+                &mut reasons,
+                AdmissionReasonCode::FailClosedMissingTelemetry,
+            );
+        }
+
+        ResourceAdmissionDecisionSummary {
+            action,
+            reason_codes: reasons,
+            counters: AdmissionDecisionCounters::from_action(action),
+            raw_pressure_severity: raw_severity,
+            effective_pressure_severity: effective_severity,
+            priority_protection_units,
+            queue_utilization,
+            pending_items,
+            fleet_pressure: telemetry.fleet_pressure,
+            memory_tier_pressure,
+            max_latency_over_budget_ratio,
+        }
+    }
+
+    fn queue_severity(&self, queue: &QueuePressure, reasons: &mut Vec<AdmissionReasonCode>) -> u8 {
+        if !queue.utilization.is_finite()
+            || !queue.ready_ratio.is_finite()
+            || !queue.failure_rate.is_finite()
+        {
+            push_reason(reasons, AdmissionReasonCode::NonFiniteTelemetry);
+            return 2;
+        }
+
+        let mut severity = 0_u8;
+        if queue.failure_rate >= self.config.shed_failure_rate {
+            push_reason(reasons, AdmissionReasonCode::FailureRateHigh);
+            severity = severity.max(3);
+        } else if queue.failure_rate >= self.config.degrade_failure_rate {
+            push_reason(reasons, AdmissionReasonCode::FailureRateHigh);
+            severity = severity.max(2);
+        }
+
+        if queue.total_capacity == 0 && queue.pending_items > 0 {
+            push_reason(reasons, AdmissionReasonCode::QueueSaturated);
+            severity = severity.max(2);
+        } else if queue.utilization >= self.config.shed_queue_utilization
+            || (queue.total_capacity > 0
+                && queue.pending_items > queue.total_capacity.saturating_mul(4))
+        {
+            push_reason(reasons, AdmissionReasonCode::QueueOverCapacity);
+            severity = severity.max(3);
+        } else if queue.utilization >= self.config.degrade_queue_utilization {
+            push_reason(reasons, AdmissionReasonCode::QueueSaturated);
+            severity = severity.max(2);
+        } else if queue.utilization >= self.config.defer_queue_utilization
+            || queue.starvation_count > 0
+        {
+            push_reason(reasons, AdmissionReasonCode::QueueElevated);
+            severity = severity.max(1);
+        }
+
+        severity
+    }
+
+    fn latency_severity(
+        &self,
+        pressures: &[StagePressure],
+        reasons: &mut Vec<AdmissionReasonCode>,
+    ) -> (u8, Option<f64>) {
+        let mut max_ratio = 0.0_f64;
+        let mut severity = 0_u8;
+
+        for pressure in pressures {
+            if !pressure.observed_p95_us.is_finite() || !pressure.budget_p95_us.is_finite() {
+                push_reason(reasons, AdmissionReasonCode::NonFiniteTelemetry);
+                severity = severity.max(2);
+                continue;
+            }
+
+            let ratio = if pressure.budget_p95_us <= 0.0 {
+                if pressure.observed_p95_us > 0.0 {
+                    f64::INFINITY
+                } else {
+                    0.0
+                }
+            } else {
+                (pressure.observed_p95_us - pressure.budget_p95_us) / pressure.budget_p95_us
+            };
+
+            if ratio > max_ratio {
+                max_ratio = ratio;
+            }
+        }
+
+        if max_ratio >= self.config.shed_stage_over_budget_ratio {
+            push_reason(reasons, AdmissionReasonCode::LatencyStageOverBudget);
+            severity = severity.max(3);
+        } else if max_ratio >= self.config.degrade_stage_over_budget_ratio {
+            push_reason(reasons, AdmissionReasonCode::LatencyStageOverBudget);
+            severity = severity.max(2);
+        } else if max_ratio >= self.config.defer_stage_over_budget_ratio {
+            push_reason(reasons, AdmissionReasonCode::LatencyStageOverBudget);
+            severity = severity.max(1);
+        }
+
+        (severity, Some(max_ratio.max(0.0)))
+    }
+}
+
+impl Default for SwarmAdmissionController {
+    fn default() -> Self {
+        Self::new(AdmissionControllerConfig::default())
+    }
+}
+
+impl SwarmScheduler {
+    /// Evaluate resource admission using the same queue-pressure model as scheduling.
+    #[must_use]
+    pub fn evaluate_admission(
+        &self,
+        request: &AdmissionRequest,
+        telemetry: &SwarmAdmissionTelemetry,
+    ) -> ResourceAdmissionDecisionSummary {
+        SwarmAdmissionController::default().evaluate(request, telemetry)
+    }
+}
+
+fn priority_protection_units(request: &AdmissionRequest) -> u8 {
+    let mut units = 0_u8;
+
+    if request.pane_priority >= PanePriority::High {
+        units = units.saturating_add(1);
+    }
+    if request.pane_priority == PanePriority::Critical {
+        units = units.saturating_add(1);
+    }
+    units = units.saturating_add(request.mission_criticality.protection_units());
+    if request.work_priority <= 1 {
+        units = units.saturating_add(1);
+    }
+
+    let normal_cap = if request.operator_priority_override {
+        3
+    } else {
+        2
+    };
+    units.min(normal_cap)
+}
+
+fn action_for_severity(severity: u8) -> AdmissionAction {
+    match severity {
+        0 => AdmissionAction::Admit,
+        1 => AdmissionAction::Defer,
+        2 => AdmissionAction::Degrade,
+        _ => AdmissionAction::Shed,
+    }
+}
+
+fn fleet_pressure_severity(tier: FleetPressureTier, reasons: &mut Vec<AdmissionReasonCode>) -> u8 {
+    let severity = tier.as_u8();
+    if severity > 0 {
+        push_reason(reasons, AdmissionReasonCode::FleetPressure);
+    }
+    severity
+}
+
+fn push_reason(reasons: &mut Vec<AdmissionReasonCode>, reason: AdmissionReasonCode) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet_memory_controller::{FleetMemoryTier, FleetMemoryTierBudgetRecord};
+    use crate::latency_stages::LatencyStage;
     use crate::swarm_work_queue::{WorkItem, WorkQueueConfig};
 
     fn test_config() -> SchedulerConfig {
@@ -990,6 +1543,86 @@ mod tests {
         }
     }
 
+    fn admission_queue_pressure(utilization: f64) -> QueuePressure {
+        QueuePressure {
+            ready_ratio: 0.10,
+            utilization,
+            starvation_count: 0,
+            failure_rate: 0.0,
+            pending_items: 6,
+            active_agents: 2,
+            total_capacity: 6,
+        }
+    }
+
+    fn healthy_tier_budget() -> FleetMemoryTierBudgetSnapshot {
+        FleetMemoryTierBudgetSnapshot::from_tiers([FleetMemoryTierBudgetRecord::new(
+            FleetMemoryTier::HotResident,
+            1_000,
+            900,
+        )])
+    }
+
+    fn over_budget_tier_budget() -> FleetMemoryTierBudgetSnapshot {
+        FleetMemoryTierBudgetSnapshot::from_tiers([FleetMemoryTierBudgetRecord::new(
+            FleetMemoryTier::HotResident,
+            1_000,
+            1_800,
+        )
+        .with_counters(0, 0, 1)])
+    }
+
+    fn healthy_stage_pressure() -> Vec<StagePressure> {
+        vec![StagePressure::compute(
+            LatencyStage::PtyCapture,
+            500.0,
+            1_000.0,
+        )]
+    }
+
+    fn over_budget_stage_pressure(ratio: f64) -> Vec<StagePressure> {
+        let budget = 1_000.0;
+        vec![StagePressure::compute(
+            LatencyStage::StorageWrite,
+            budget * (1.0 + ratio),
+            budget,
+        )]
+    }
+
+    fn admission_telemetry(
+        utilization: f64,
+        fleet_pressure: FleetPressureTier,
+    ) -> SwarmAdmissionTelemetry {
+        SwarmAdmissionTelemetry::new(
+            admission_queue_pressure(utilization),
+            fleet_pressure,
+            healthy_tier_budget(),
+            healthy_stage_pressure(),
+        )
+    }
+
+    fn background_admission_request() -> AdmissionRequest {
+        AdmissionRequest {
+            pane_id: Some(42),
+            pane_priority: PanePriority::Background,
+            mission_criticality: MissionCriticality::Background,
+            work_priority: 9,
+            estimated_effort: 1,
+            operator_priority_override: false,
+        }
+    }
+
+    fn mission_critical_admission_request() -> AdmissionRequest {
+        AdmissionRequest {
+            pane_id: Some(7),
+            pane_priority: PanePriority::Critical,
+            mission_criticality: MissionCriticality::MissionCritical,
+            work_priority: 0,
+            estimated_effort: 1,
+            operator_priority_override: false,
+        }
+    }
+
     #[allow(dead_code)]
     fn make_dep_item(id: &str, priority: u32, deps: Vec<&str>) -> WorkItem {
         WorkItem {
@@ -1002,6 +1635,180 @@ mod tests {
             preferred_program: None,
             metadata: HashMap::new(),
         }
+    }
+
+    // =========================================================================
+    // Global admission controller tests (ft-t1ktp)
+    // =========================================================================
+
+    #[test]
+    fn admission_threshold_boundaries_map_to_admit_defer_degrade_shed_ft_t1ktp() {
+        let controller = SwarmAdmissionController::default();
+        let request = background_admission_request();
+
+        let healthy = controller.evaluate(
+            &request,
+            &admission_telemetry(0.799, FleetPressureTier::Normal),
+        );
+        assert_eq!(healthy.action, AdmissionAction::Admit);
+        assert!(healthy.reason_codes.contains(&AdmissionReasonCode::Healthy));
+
+        let defer = controller.evaluate(
+            &request,
+            &admission_telemetry(0.800, FleetPressureTier::Normal),
+        );
+        assert_eq!(defer.action, AdmissionAction::Defer);
+        assert!(
+            defer
+                .reason_codes
+                .contains(&AdmissionReasonCode::QueueElevated)
+        );
+
+        let degrade = controller.evaluate(
+            &request,
+            &admission_telemetry(0.900, FleetPressureTier::Normal),
+        );
+        assert_eq!(degrade.action, AdmissionAction::Degrade);
+        assert!(
+            degrade
+                .reason_codes
+                .contains(&AdmissionReasonCode::QueueSaturated)
+        );
+
+        let shed = controller.evaluate(
+            &request,
+            &admission_telemetry(1.000, FleetPressureTier::Normal),
+        );
+        assert_eq!(shed.action, AdmissionAction::Shed);
+        assert!(
+            shed.reason_codes
+                .contains(&AdmissionReasonCode::QueueOverCapacity)
+        );
+    }
+
+    #[test]
+    fn admission_fails_closed_when_live_telemetry_is_missing_ft_t1ktp() {
+        let controller = SwarmAdmissionController::default();
+        let telemetry = SwarmAdmissionTelemetry {
+            queue_pressure: Some(admission_queue_pressure(0.0)),
+            fleet_pressure: Some(FleetPressureTier::Normal),
+            memory_tier_budget: None,
+            latency_stage_pressures: Some(healthy_stage_pressure()),
+        };
+        let request = mission_critical_admission_request();
+
+        let summary = controller.evaluate(&request, &telemetry);
+
+        assert_eq!(summary.action, AdmissionAction::Defer);
+        assert!(
+            summary
+                .reason_codes
+                .contains(&AdmissionReasonCode::MissingMemoryTierTelemetry)
+        );
+        assert!(
+            summary
+                .reason_codes
+                .contains(&AdmissionReasonCode::FailClosedMissingTelemetry)
+        );
+        assert_eq!(summary.counters.deferred, 1);
+    }
+
+    #[test]
+    fn admission_priority_protection_prevents_low_priority_inversion_ft_t1ktp() {
+        let controller = SwarmAdmissionController::default();
+        let telemetry = admission_telemetry(0.0, FleetPressureTier::Emergency);
+
+        let low = controller.evaluate(&background_admission_request(), &telemetry);
+        let high = controller.evaluate(&mission_critical_admission_request(), &telemetry);
+
+        assert_eq!(low.action, AdmissionAction::Shed);
+        assert_eq!(high.action, AdmissionAction::Defer);
+        assert!(low.action.severity() >= high.action.severity());
+        assert!(
+            high.reason_codes
+                .contains(&AdmissionReasonCode::PriorityProtected)
+        );
+    }
+
+    #[test]
+    fn admission_decisions_are_monotonic_as_pressure_increases_ft_t1ktp() {
+        let controller = SwarmAdmissionController::default();
+        let request = background_admission_request();
+
+        let mut previous = AdmissionAction::Admit;
+        for tier in [
+            FleetPressureTier::Normal,
+            FleetPressureTier::Elevated,
+            FleetPressureTier::Critical,
+            FleetPressureTier::Emergency,
+        ] {
+            let summary = controller.evaluate(&request, &admission_telemetry(0.0, tier));
+            assert!(
+                summary.action.severity() >= previous.severity(),
+                "tier {tier:?} produced non-monotonic action {:?} after {:?}",
+                summary.action,
+                previous
+            );
+            previous = summary.action;
+        }
+
+        let mut previous = AdmissionAction::Admit;
+        for utilization in [0.0, 0.80, 0.90, 1.0] {
+            let summary = controller.evaluate(
+                &request,
+                &admission_telemetry(utilization, FleetPressureTier::Normal),
+            );
+            assert!(
+                summary.action.severity() >= previous.severity(),
+                "utilization {utilization} produced non-monotonic action {:?} after {:?}",
+                summary.action,
+                previous
+            );
+            previous = summary.action;
+        }
+    }
+
+    #[test]
+    fn admission_high_load_summary_surfaces_shed_reasons_and_is_replay_stable_ft_t1ktp() {
+        let controller = SwarmAdmissionController::default();
+        let request = background_admission_request();
+        let telemetry = SwarmAdmissionTelemetry::new(
+            admission_queue_pressure(1.10),
+            FleetPressureTier::Emergency,
+            over_budget_tier_budget(),
+            over_budget_stage_pressure(1.25),
+        );
+
+        let first = controller.evaluate(&request, &telemetry);
+        let second = controller.evaluate(&request, &telemetry);
+
+        assert_eq!(first, second);
+        assert_eq!(first.action, AdmissionAction::Shed);
+        assert_eq!(first.counters.shed, 1);
+        assert!(
+            first
+                .reason_codes
+                .contains(&AdmissionReasonCode::QueueOverCapacity)
+        );
+        assert!(
+            first
+                .reason_codes
+                .contains(&AdmissionReasonCode::FleetPressure)
+        );
+        assert!(
+            first
+                .reason_codes
+                .contains(&AdmissionReasonCode::MemoryTierPressure)
+        );
+        assert!(
+            first
+                .reason_codes
+                .contains(&AdmissionReasonCode::LatencyStageOverBudget)
+        );
+
+        let json = serde_json::to_string(&first).expect("serialize admission summary");
+        assert!(json.contains("\"action\":\"shed\""));
+        assert!(json.contains("memory_tier_pressure"));
     }
 
     // =========================================================================
