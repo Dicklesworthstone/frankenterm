@@ -445,10 +445,23 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
 /// Intentionally lighter than the `wa.workflow_run` pattern at mcp_tools.rs:2242:
 /// no `ApprovalStore::attach_to_decision` plumbing here, since these handlers
 /// don't have an async storage handle in scope at the gate point and wiring
-/// one is a larger refactor. RequireApproval surfaces as `MCP_ERR_POLICY`
-/// with a hint telling the caller to obtain an allow-once token. Upgrading
-/// to the full `attach_to_decision` flow (issuing the token from this path)
-/// is a deliberate follow-up.
+/// one is a larger refactor.
+///
+/// br-ft-6h1rv: RequireApproval is now an EXPLICIT FAIL-CLOSED dead end
+/// for this surface. Pre-fix the hint advised "obtain an allow-once
+/// approval token and retry via the approving client" — but no token
+/// was issued from this path and no surface accepts one for these
+/// tools, so the operator was sent on an impossible errand. The
+/// audit row used `REASON_CODE_REQUIRE_APPROVAL`, which conflated
+/// these dead-end rows with the approval-supported flow. Now: the
+/// audit row uses `REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED` and
+/// `DECISION_REQUIRE_APPROVAL_UNSUPPORTED` so operators querying
+/// the audit table can distinguish the dead-end class, and the
+/// hint names the limitation explicitly + lists the alternatives
+/// (change the policy rule to Allow/Deny, or use an approval-aware
+/// surface like `wa.workflow_run`). Wiring `attach_to_decision` so
+/// these tools support the full flow is still tracked as a future
+/// follow-up; this fix removes the misleading dead end.
 fn mcp_authorize_mcp_mutation(
     config: &Config,
     policy_rate_limiter: &SharedRateLimiter,
@@ -502,17 +515,28 @@ fn mcp_authorize_mcp_mutation(
         return Some(envelope_to_content(envelope));
     }
     if decision.requires_approval() {
-        let reason = policy_reason(&decision)
-            .unwrap_or("This MCP mutation requires allow-once approval")
+        // br-ft-6h1rv: this surface does not wire ApprovalStore;
+        // RequireApproval is a fail-closed dead end here. Surface
+        // the limitation explicitly in BOTH the audit row (via the
+        // _UNSUPPORTED decision/reason codes) AND the client hint
+        // (which now names the alternatives instead of dispatching
+        // the client to an impossible token-fetch).
+        let policy_reason_text = policy_reason(&decision)
+            .unwrap_or("Policy requires approval for this MCP mutation")
             .to_string();
+        let reason = format!(
+            "{policy_reason_text} — but the {summary} MCP surface does not support \
+             allow-once approval (br-ft-6h1rv); fail-closed."
+        );
         tracing::warn!(
             target: "ft::security::policy",
             tool = %summary,
             command = %command_text,
-            decision = "require_approval",
+            decision = "require_approval_unsupported",
             rule_id = ?decision.rule_id(),
             reason = %reason,
-            "MCP mutation requires allow-once approval"
+            "MCP mutation policy returned RequireApproval but tool surface does not \
+             support approval flow; fail-closed (br-ft-6h1rv)"
         );
         persist_mcp_policy_denial(
             config,
@@ -520,12 +544,17 @@ fn mcp_authorize_mcp_mutation(
             command_text,
             &reason,
             decision.rule_id(),
-            crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
-            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+            crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL_UNSUPPORTED,
+            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED,
         );
-        let hint = Some(
-            "Obtain an allow-once approval token and retry via the approving client.".to_string(),
-        );
+        let hint = Some(format!(
+            "br-ft-6h1rv: the {summary} MCP tool does not support the allow-once \
+             approval flow (no ApprovalStore::attach_to_decision plumbing on this \
+             surface). Either change the policy rule for this tool to Allow or Deny \
+             outright, OR drive the operation through an approval-aware surface \
+             (e.g., wa.workflow_run with attached approval_token). Pre-fix this \
+             path returned a misleading 'obtain an allow-once token and retry' hint."
+        ));
         let envelope = McpEnvelope::<()>::error(MCP_ERR_POLICY, reason, hint, elapsed_ms(start));
         return Some(envelope_to_content(envelope));
     }
@@ -9424,6 +9453,174 @@ exit 17",
             super::mcp_clock_anomaly_count(),
             2,
             "br-ft-rnpuc: counter must reflect actual overflow collapses"
+        );
+    }
+
+    // ── br-ft-6h1rv: RequireApproval fail-closed dead end ──────────────
+
+    /// br-ft-6h1rv: build a Config that forces a RequireApproval
+    /// policy decision for a specific MCP exec_command pattern.
+    /// Mirrors the existing `deny_mcp_exec_command_config` helper
+    /// used by the deny-path tests in this module.
+    fn require_approval_mcp_exec_command_config(
+        command_pattern: &str,
+        message: &str,
+    ) -> Arc<Config> {
+        let mut cfg = Config::default();
+        cfg.safety.rules.enabled = true;
+        cfg.safety.rules.rules.push(crate::config::PolicyRule {
+            id: format!("test.require_approval.mcp.{command_pattern}"),
+            description: Some(format!(
+                "force RequireApproval for {command_pattern} MCP mutations"
+            )),
+            priority: 1,
+            match_on: crate::config::PolicyRuleMatch {
+                actions: vec!["exec_command".to_string()],
+                actors: vec!["mcp".to_string()],
+                surfaces: vec!["mcp".to_string()],
+                command_patterns: vec![format!("^{command_pattern}$")],
+                ..Default::default()
+            },
+            decision: crate::config::PolicyRuleDecision::RequireApproval,
+            message: Some(message.to_string()),
+        });
+        Arc::new(cfg)
+    }
+
+    /// br-ft-6h1rv: when the policy returns RequireApproval for a
+    /// `wa.tx_run` invocation, the helper now returns a fail-closed
+    /// envelope with an explicit hint that names the limitation +
+    /// lists the alternatives. Pre-fix the hint advised "obtain an
+    /// allow-once approval token and retry via the approving
+    /// client" — but no token was issued from this path, sending the
+    /// operator on an impossible errand.
+    #[test]
+    fn mcp_authorize_mutation_tx_run_require_approval_is_fail_closed_ft_6h1rv() {
+        let cfg = require_approval_mcp_exec_command_config("tx\\.run", "test require approval");
+        let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
+        let result = super::mcp_authorize_mcp_mutation(
+            cfg.as_ref(),
+            &rate_limiter,
+            "wa.tx_run",
+            "tx.run",
+            std::time::Instant::now(),
+        );
+        let envelope_content = result
+            .expect("RequireApproval policy must produce an error envelope")
+            .expect("envelope_to_content infallible for valid envelope");
+        let envelope = parse_json_content(envelope_content);
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+
+        let err_str = envelope["error"].as_str().expect("error string");
+        assert!(
+            err_str.contains("br-ft-6h1rv"),
+            "ft-6h1rv: error must reference the bead breadcrumb; got {err_str}"
+        );
+        assert!(
+            err_str.contains("does not support") && err_str.contains("approval"),
+            "ft-6h1rv: error must explicitly say the surface does not support approval; got {err_str}"
+        );
+        assert!(
+            err_str.contains("fail-closed"),
+            "ft-6h1rv: error must surface the fail-closed posture; got {err_str}"
+        );
+
+        let hint = envelope["hint"].as_str().expect("hint string");
+        assert!(
+            hint.contains("br-ft-6h1rv"),
+            "ft-6h1rv: hint must reference the bead breadcrumb; got {hint}"
+        );
+        assert!(
+            hint.contains("Allow") && hint.contains("Deny"),
+            "ft-6h1rv: hint must point operators at the policy-rule alternatives; got {hint}"
+        );
+        assert!(
+            hint.contains("wa.workflow_run") || hint.contains("approval-aware"),
+            "ft-6h1rv: hint must point at an approval-aware alternative surface; got {hint}"
+        );
+        assert!(
+            !hint.contains("Obtain an allow-once approval token and retry"),
+            "ft-6h1rv: pre-fix dead-end hint must not appear; got {hint}"
+        );
+    }
+
+    /// br-ft-6h1rv: same fail-closed posture for `wa.mission_pause`
+    /// (the bead body explicitly named tx_run AND mission_pause as
+    /// the regression targets).
+    #[test]
+    fn mcp_authorize_mutation_mission_pause_require_approval_is_fail_closed_ft_6h1rv() {
+        let cfg =
+            require_approval_mcp_exec_command_config("mission\\.pause", "test require approval");
+        let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
+        let result = super::mcp_authorize_mcp_mutation(
+            cfg.as_ref(),
+            &rate_limiter,
+            "wa.mission_pause",
+            "mission.pause",
+            std::time::Instant::now(),
+        );
+        let envelope_content = result
+            .expect("RequireApproval policy must produce an error envelope")
+            .expect("envelope_to_content infallible for valid envelope");
+        let envelope = parse_json_content(envelope_content);
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        let err_str = envelope["error"].as_str().expect("error string");
+        assert!(
+            err_str.contains("br-ft-6h1rv") && err_str.contains("wa.mission_pause"),
+            "ft-6h1rv: error must reference the bead AND the tool name; got {err_str}"
+        );
+    }
+
+    /// br-ft-6h1rv: vacuous-regression guard. When the policy does
+    /// NOT return RequireApproval (default config has no policy
+    /// rules; helper returns None → Allow), the helper returns None
+    /// and the tool proceeds. This pins that the new fail-closed
+    /// language doesn't false-positive on the legitimate Allow path.
+    #[test]
+    fn mcp_authorize_mutation_returns_none_on_allow_ft_6h1rv() {
+        let cfg = config();
+        let rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
+        let result = super::mcp_authorize_mcp_mutation(
+            cfg.as_ref(),
+            &rate_limiter,
+            "wa.tx_run",
+            "tx.run",
+            std::time::Instant::now(),
+        );
+        assert!(
+            result.is_none(),
+            "ft-6h1rv: default-config Allow path must return None (proceed)"
+        );
+    }
+
+    /// br-ft-6h1rv: serde stability for the new audit-record
+    /// constants. Pins the wire format so external operator tooling
+    /// querying the audit table can branch on the new
+    /// `require_approval_unsupported` decision/reason codes.
+    #[test]
+    fn require_approval_unsupported_audit_constants_are_stable_ft_6h1rv() {
+        assert_eq!(
+            crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL_UNSUPPORTED,
+            "require_approval_unsupported"
+        );
+        assert_eq!(
+            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED,
+            "require_approval_unsupported"
+        );
+        // The pre-existing constants must NOT collide with the new
+        // ones — operators reading the audit table need to
+        // distinguish the dead-end class from the supported flow.
+        assert_ne!(
+            crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+            crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL_UNSUPPORTED
+        );
+        assert_ne!(
+            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED
         );
     }
 }

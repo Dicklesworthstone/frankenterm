@@ -132,10 +132,24 @@ impl PolicyDeniedAuditRecord {
     pub const REASON_CODE_DENIED: &'static str = "policy_denied";
     /// Stable `reason_code` for require-approval policy decisions.
     pub const REASON_CODE_REQUIRE_APPROVAL: &'static str = "require_approval";
+    /// br-ft-6h1rv: stable `reason_code` for require-approval decisions
+    /// returned by an MCP tool surface that does NOT support the
+    /// allow-once approval flow (no `ApprovalStore::attach_to_decision`
+    /// plumbing). Pre-fix these audit rows used `REASON_CODE_REQUIRE_APPROVAL`
+    /// and the client got a misleading "obtain an allow-once token and
+    /// retry" hint with no path to actually obtain such a token.
+    /// Operators querying the audit table can now distinguish this
+    /// dead-end class from approval-supported require-approval rows.
+    pub const REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED: &'static str =
+        "require_approval_unsupported";
     /// Stable decision string for denied policy decisions.
     pub const DECISION_DENIED: &'static str = "denied";
     /// Stable decision string for require-approval policy decisions.
     pub const DECISION_REQUIRE_APPROVAL: &'static str = "require_approval";
+    /// br-ft-6h1rv: stable decision string for require-approval decisions
+    /// on tool surfaces that don't support the approval flow. See
+    /// [`Self::REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED`].
+    pub const DECISION_REQUIRE_APPROVAL_UNSUPPORTED: &'static str = "require_approval_unsupported";
 }
 
 /// Redacted audit record for JSONL streaming.
