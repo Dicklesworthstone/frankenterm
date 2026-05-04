@@ -7663,9 +7663,13 @@ impl SwarmCapacityTelemetrySnapshot {
         let selected_stages = config.normalized_selected_stages();
         let stages = selected_stages
             .into_iter()
-            .filter_map(|stage| self.stage(stage))
-            .filter(|stage| stage_has_capacity_telemetry(stage))
-            .map(|stage| compile_stage_certificate(stage, self.enabled, &config))
+            .map(|stage| {
+                let stage_snapshot = self
+                    .stage(stage)
+                    .cloned()
+                    .unwrap_or_else(|| empty_capacity_stage_snapshot(stage));
+                compile_stage_certificate(&stage_snapshot, self.enabled, &config)
+            })
             .collect::<Vec<_>>();
         let observation_window_secs = config.observation_window_secs().unwrap_or_default();
 
@@ -8659,16 +8663,8 @@ fn stage_terminal_count(stage: &SwarmCapacityStageSnapshot) -> u64 {
     .fold(0u64, u64::saturating_add)
 }
 
-fn stage_has_capacity_telemetry(stage: &SwarmCapacityStageSnapshot) -> bool {
-    stage.arrivals > 0
-        || stage.completions > 0
-        || stage.cancellations > 0
-        || stage.timeouts > 0
-        || stage.errors > 0
-        || stage.service_time_ms.count > 0
-        || stage.queue_depth.count > 0
-        || stage.wait_time_ms.count > 0
-        || stage.retry_latency_ms.count > 0
+fn empty_capacity_stage_snapshot(stage: SwarmCapacityStage) -> SwarmCapacityStageSnapshot {
+    SwarmCapacityStageMetrics::new(stage, 1).snapshot()
 }
 
 fn required_service_quantiles_missing(summary: &HistogramSummary) -> bool {
