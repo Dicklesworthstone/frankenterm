@@ -727,9 +727,22 @@ impl WorkflowStepPolicySummary {
         }
     }
 
+    /// br-ft-zhnaw: a parse failure bumps
+    /// `workflows_parse_drop_count()` (separate from ft-zkthg's
+    /// `workflows_serde_drop_count` which is the write path) and
+    /// emits a structured `tracing::warn` with the serialized
+    /// payload length so operators can detect downstream consumer
+    /// schema drift. Returns `None` so the scalar contract stays
+    /// the same.
     #[must_use]
     pub fn parse(serialized: &str) -> Option<Self> {
-        serde_json::from_str(serialized).ok()
+        match serde_json::from_str(serialized) {
+            Ok(decision) => Some(decision),
+            Err(err) => {
+                super::record_workflows_parse_drop(serialized.len(), &err);
+                None
+            }
+        }
     }
 
     #[must_use]

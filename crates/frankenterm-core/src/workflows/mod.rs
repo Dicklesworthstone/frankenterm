@@ -127,6 +127,46 @@ pub(super) fn record_workflows_serde_drop() {
     WORKFLOWS_SERDE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+// br-ft-zhnaw: separate counter for the *parse* (deserialization)
+// path. Distinct from `WORKFLOWS_SERDE_DROP_COUNT` (the write path
+// under ft-zkthg) because the operator response is different: a
+// parse counter raise means downstream replay/audit consumers can't
+// read what the writers persisted (schema drift on consumers); a
+// serialize counter raise means writers couldn't produce a record
+// in the first place. Same shape as ft-k6uwb (policy parse counter
+// vs ft-yygus serialize counter).
+static WORKFLOWS_PARSE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-zhnaw: cumulative count of workflow-decision payloads
+/// that could not be parsed back into a `WorkflowDecision` since
+/// process load. > 0 means investigate consumer schema drift
+/// against the persisted-decision JSON shape.
+#[must_use]
+pub fn workflows_parse_drop_count() -> u64 {
+    WORKFLOWS_PARSE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// br-ft-zhnaw: test helper to reset the parse-drop counter.
+#[cfg(test)]
+pub fn reset_workflows_parse_drop_count_for_test() {
+    WORKFLOWS_PARSE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// br-ft-zhnaw: bump the parse-drop counter and emit a structured
+/// `tracing::warn` carrying the serialized payload length plus the
+/// breadcrumb. Public to the workflows submodules so the parse site
+/// in `engine.rs` can route through it.
+pub(super) fn record_workflows_parse_drop(serialized_len: usize, error: &dyn std::fmt::Display) {
+    WORKFLOWS_PARSE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        target: "ft.workflows.audit",
+        event = "workflow_decision_parse_drop",
+        serialized_len = serialized_len,
+        error = %error,
+        "workflow-decision payload could not be parsed; consumer will see None (br-ft-zhnaw)"
+    );
+}
+
 /// Type alias for a boxed future used in dyn-compatible traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type PolicyInjector = crate::policy::PolicyGatedInjector<crate::wezterm::WeztermHandle>;
@@ -11874,5 +11914,49 @@ You've hit your usage limit. Try again at 5:00 PM.";
         super::record_workflows_serde_drop();
         super::record_workflows_serde_drop();
         assert_eq!(super::workflows_serde_drop_count(), 4);
+    }
+
+    // ── br-ft-zhnaw: parse-drop counter ──
+
+    #[test]
+    fn workflows_parse_drop_counter_starts_at_zero_after_reset_ft_zhnaw() {
+        let _guard = workflows_serde_drop_test_lock();
+        super::reset_workflows_parse_drop_count_for_test();
+        assert_eq!(super::workflows_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn workflows_parse_drop_counter_bumps_on_malformed_decision_ft_zhnaw() {
+        // br-ft-zhnaw: a malformed serialized WorkflowDecision
+        // payload bumps the parse counter exactly once.
+        let _guard = workflows_serde_drop_test_lock();
+        super::reset_workflows_parse_drop_count_for_test();
+
+        let bad = r#"{"definitely":"not","a":"WorkflowDecision"}"#;
+        let parsed = crate::workflows::engine::WorkflowDecision::parse(bad);
+        assert!(parsed.is_none());
+        assert_eq!(super::workflows_parse_drop_count(), 1);
+
+        // A second malformed parse bumps again.
+        let _ = crate::workflows::engine::WorkflowDecision::parse("{not json");
+        assert_eq!(super::workflows_parse_drop_count(), 2);
+    }
+
+
+    #[test]
+    fn workflows_parse_drop_counter_independent_of_serde_drop_counter_ft_zhnaw() {
+        // The parse-drop counter must not bleed into the
+        // serialize-drop counter and vice versa.
+        let _guard = workflows_serde_drop_test_lock();
+        super::reset_workflows_parse_drop_count_for_test();
+        super::reset_workflows_serde_drop_count_for_test();
+
+        let _ = crate::workflows::engine::WorkflowDecision::parse("{bad");
+        assert_eq!(super::workflows_parse_drop_count(), 1);
+        assert_eq!(
+            super::workflows_serde_drop_count(),
+            0,
+            "parse-side drop must NOT spill into the write-side counter"
+        );
     }
 }
