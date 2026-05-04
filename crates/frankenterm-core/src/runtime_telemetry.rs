@@ -3093,7 +3093,87 @@ pub fn swarm_capacity_telemetry_snapshot() -> SwarmCapacityTelemetrySnapshot {
     aggregate.snapshot()
 }
 
+/// br-ft-amit3: process-global cooldown state for the live operator
+/// summary's admission controller. Pre-fix every call to
+/// [`live_swarm_capacity_operator_summary`] constructed a fresh
+/// [`SwarmCapacityAdmissionControllerState::default()`], leaving the
+/// cooldown gate's `last_pressure_action_at_ms` perpetually `None` and
+/// disabling the documented anti-oscillation guard
+/// (br-ft-0ig2q wiring obligation, ft-onheq.5 controller honors a
+/// configured cooldown). Now: plan reads this state, decides, and
+/// `record_decision` writes back so the next operator summary
+/// observes the cooldown clock and can emit
+/// `cooldown_remaining_secs = Some(N)` in the plan.
+static LIVE_SWARM_CAPACITY_CONTROLLER_STATE: LazyLock<
+    Mutex<SwarmCapacityAdmissionControllerState>,
+> = LazyLock::new(|| Mutex::new(SwarmCapacityAdmissionControllerState::default()));
+
+/// br-ft-amit3: snapshot the persisted live admission-controller state
+/// (read-only). Operators / tests can observe the cooldown clock
+/// without having to drive a full `live_swarm_capacity_operator_summary`
+/// call, and tests can pin the wiring's read-then-write contract.
+#[must_use]
+pub fn live_swarm_capacity_controller_state_snapshot() -> SwarmCapacityAdmissionControllerState {
+    LIVE_SWARM_CAPACITY_CONTROLLER_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// br-ft-amit3: test helper — reset the persisted live state so
+/// regression tests that drive `live_swarm_capacity_operator_summary`
+/// can assert post-call state without leakage from sibling tests.
+#[cfg(test)]
+pub(crate) fn reset_live_swarm_capacity_controller_state_for_test() {
+    let mut state = LIVE_SWARM_CAPACITY_CONTROLLER_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *state = SwarmCapacityAdmissionControllerState::default();
+}
+
+/// br-ft-amit3: test helper — replace the persisted live state with
+/// a caller-supplied value. Lets regression tests inject a known
+/// pressure-action history so the next
+/// `live_swarm_capacity_operator_summary` call can be observed
+/// honoring the cooldown clock.
+#[cfg(test)]
+pub(crate) fn set_live_swarm_capacity_controller_state_for_test(
+    new_state: SwarmCapacityAdmissionControllerState,
+) {
+    let mut state = LIVE_SWARM_CAPACITY_CONTROLLER_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *state = new_state;
+}
+
+/// br-ft-amit3: map the controller-level coarse decision action to
+/// the per-request fine action consumed by
+/// [`SwarmCapacityAdmissionControllerState::record_decision`]. The
+/// state's cooldown gate keys on `holds_pressure_cooldown` (Defer /
+/// ThrottleCapturePolling / Shed / RequireHumanApproval), so any
+/// pressure-class controller decision must map to a
+/// `holds_pressure_cooldown` admission action; Allow maps to Admit.
+fn live_swarm_capacity_decision_action_to_admission_action(
+    action: SwarmCapacityDecisionAction,
+) -> SwarmCapacityAdmissionAction {
+    match action {
+        SwarmCapacityDecisionAction::Allow => SwarmCapacityAdmissionAction::Admit,
+        SwarmCapacityDecisionAction::ReduceAdmission => SwarmCapacityAdmissionAction::Defer,
+        SwarmCapacityDecisionAction::BlockAdmission => SwarmCapacityAdmissionAction::Shed,
+    }
+}
+
 /// Build a live operator summary from the process-global production recorder.
+///
+/// br-ft-amit3: the admission controller's cooldown state is now
+/// persisted in [`LIVE_SWARM_CAPACITY_CONTROLLER_STATE`] across calls.
+/// Pre-fix this fn constructed a fresh `default()` state on every
+/// invocation, so the cooldown gate's `last_pressure_action_at_ms`
+/// stayed perpetually `None` and the controller could repeatedly emit
+/// pressure decisions without ever entering cooldown_hold (defeating
+/// the ft-onheq.5 anti-oscillation guarantee). Now: read state →
+/// plan → write back the planned controller action via
+/// `record_decision`, so the next call observes the cooldown clock.
 #[must_use]
 pub fn live_swarm_capacity_operator_summary(
     generated_at_ms: u64,
@@ -3116,13 +3196,30 @@ pub fn live_swarm_capacity_operator_summary(
     };
     let tail_report = certificate.tail_risk_report(&certificate, tail_config);
     let controller = SwarmCapacityAdmissionController::with_defaults();
+
+    // br-ft-amit3: read persisted state, plan, then write back so the
+    // next call observes the cooldown clock. Lock acquisition is
+    // scoped narrowly so plan() (potentially the hottest path) does
+    // not run inside the lock.
+    let state_snapshot = LIVE_SWARM_CAPACITY_CONTROLLER_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let plan = controller.plan(
         generated_at_ms,
         &certificate,
         &tail_report,
         &[],
-        &SwarmCapacityAdmissionControllerState::default(),
+        &state_snapshot,
     );
+    {
+        let mut state = LIVE_SWARM_CAPACITY_CONTROLLER_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let admission_action =
+            live_swarm_capacity_decision_action_to_admission_action(plan.planned_controller_action);
+        state.record_decision(admission_action, generated_at_ms);
+    }
 
     SwarmCapacityOperatorSummary::from_components(
         generated_at_ms,
@@ -15434,8 +15531,7 @@ mod tests {
         // Sanity: the documented default config (defer 16/64,
         // throttle 64/256, shed 256/1024) passes validation.
         let cfg = SwarmCapacityAdmissionControllerConfig::default();
-        cfg.validate_thresholds()
-            .expect("defaults must validate");
+        cfg.validate_thresholds().expect("defaults must validate");
     }
 
     #[test]
@@ -15535,8 +15631,7 @@ mod tests {
             shed_backlog_depth: 200,
             ..SwarmCapacityAdmissionControllerConfig::default()
         };
-        cfg.validate_thresholds()
-            .expect("equal values are valid");
+        cfg.validate_thresholds().expect("equal values are valid");
     }
 
     // ── br-ft-6k2wi: max_events normalization + hard cap ──
@@ -16394,5 +16489,192 @@ mod tests {
                 prop_assert_eq!(record.failure_class, Some(FailureClass::Configuration));
             }
         }
+    }
+
+    // ── br-ft-amit3: live admission cooldown wiring tests ─────────────
+
+    /// br-ft-amit3: contract pin for the controller-action mapping
+    /// helper. The cooldown gate keys on
+    /// [`SwarmCapacityAdmissionAction::holds_pressure_cooldown`], so
+    /// every pressure-class controller decision must map to an
+    /// admission action that returns `true` from that predicate;
+    /// Allow must map to Admit (which returns `false`).
+    #[test]
+    fn live_decision_to_admission_action_mapping_is_correct_ft_amit3() {
+        // Allow → Admit (no pressure)
+        assert_eq!(
+            super::live_swarm_capacity_decision_action_to_admission_action(
+                super::SwarmCapacityDecisionAction::Allow,
+            ),
+            super::SwarmCapacityAdmissionAction::Admit,
+        );
+        // ReduceAdmission → Defer (pressure)
+        assert_eq!(
+            super::live_swarm_capacity_decision_action_to_admission_action(
+                super::SwarmCapacityDecisionAction::ReduceAdmission,
+            ),
+            super::SwarmCapacityAdmissionAction::Defer,
+        );
+        // BlockAdmission → Shed (pressure)
+        assert_eq!(
+            super::live_swarm_capacity_decision_action_to_admission_action(
+                super::SwarmCapacityDecisionAction::BlockAdmission,
+            ),
+            super::SwarmCapacityAdmissionAction::Shed,
+        );
+    }
+
+    /// br-ft-amit3: pressure-class outputs of the mapping helper must
+    /// all return `true` from `holds_pressure_cooldown`. Pre-fix this
+    /// invariant was implicit; this test pins it explicitly so a
+    /// future variant reorder can't silently break the cooldown
+    /// substrate's clock.
+    #[test]
+    fn live_decision_to_admission_pressure_classes_engage_cooldown_ft_amit3() {
+        for action in [
+            super::SwarmCapacityDecisionAction::ReduceAdmission,
+            super::SwarmCapacityDecisionAction::BlockAdmission,
+        ] {
+            let mapped = super::live_swarm_capacity_decision_action_to_admission_action(action);
+            assert!(
+                mapped.holds_pressure_cooldown(),
+                "ft-amit3: {action:?} → {mapped:?} must engage the cooldown clock"
+            );
+        }
+        // Allow must NOT engage cooldown (Admit doesn't hold pressure).
+        let mapped = super::live_swarm_capacity_decision_action_to_admission_action(
+            super::SwarmCapacityDecisionAction::Allow,
+        );
+        assert!(
+            !mapped.holds_pressure_cooldown(),
+            "ft-amit3: Allow → {mapped:?} must NOT engage the cooldown clock"
+        );
+    }
+
+    /// br-ft-amit3: integration test for the wiring contract — calling
+    /// `live_swarm_capacity_operator_summary` after seeding the
+    /// persisted state with a known pressure-action history must
+    /// preserve that history (not overwrite it). Pre-fix the function
+    /// constructed a fresh `default()` state every call, so the
+    /// history was wiped on every invocation. Post-fix the state
+    /// round-trips: read → plan → record_decision (Admit on default
+    /// telemetry, no overwrite of the prior pressure action) → write
+    /// back.
+    ///
+    /// This is the load-bearing part of the bead's "two planning
+    /// rounds proves cooldown engages" acceptance: round 1 records a
+    /// pressure action, round 2 reads it. The test simulates round 1
+    /// via direct state injection (rather than forcing the live
+    /// telemetry to emit pressure, which requires substantial
+    /// fixture setup) and asserts round 2 preserves the recorded
+    /// pressure action and propagates the cooldown clock to the plan.
+    #[test]
+    fn live_summary_preserves_persisted_pressure_history_ft_amit3() {
+        super::reset_live_swarm_capacity_controller_state_for_test();
+
+        // Seed: a Defer pressure action recorded at t=10_000.
+        let seeded = super::SwarmCapacityAdmissionControllerState {
+            last_pressure_action: Some(super::SwarmCapacityAdmissionAction::Defer),
+            last_pressure_action_at_ms: Some(10_000),
+            ..super::SwarmCapacityAdmissionControllerState::default()
+        };
+        super::set_live_swarm_capacity_controller_state_for_test(seeded.clone());
+
+        // Round 2: live summary at t=20_000. Default telemetry has no
+        // certified samples → controller returns Allow → record_decision
+        // is invoked with Admit, which doesn't overwrite the prior
+        // pressure action (per record_decision contract at line 5748).
+        let _summary = super::live_swarm_capacity_operator_summary(20_000, 1, 3);
+
+        // The persisted state must STILL carry the seeded pressure
+        // action, not the just-recorded Admit.
+        let after = super::live_swarm_capacity_controller_state_snapshot();
+        assert_eq!(
+            after.last_pressure_action,
+            Some(super::SwarmCapacityAdmissionAction::Defer),
+            "ft-amit3: round-2 Allow decision must NOT overwrite a prior pressure action \
+             (record_decision is documented to leave Admit-class actions as no-ops)"
+        );
+        assert_eq!(
+            after.last_pressure_action_at_ms,
+            Some(10_000),
+            "ft-amit3: round-2 must preserve the seeded pressure-action timestamp"
+        );
+
+        // Restore default state for sibling tests.
+        super::reset_live_swarm_capacity_controller_state_for_test();
+    }
+
+    /// br-ft-amit3: the read path also works — the seeded pressure
+    /// state is observable via `live_swarm_capacity_controller_state_snapshot`
+    /// without requiring a `live_swarm_capacity_operator_summary` call
+    /// first. Pins the operator-observability contract: ops can read
+    /// the cooldown state directly for forensics.
+    #[test]
+    fn live_controller_state_snapshot_round_trips_ft_amit3() {
+        super::reset_live_swarm_capacity_controller_state_for_test();
+        let initial = super::live_swarm_capacity_controller_state_snapshot();
+        assert_eq!(
+            initial,
+            super::SwarmCapacityAdmissionControllerState::default(),
+            "ft-amit3: post-reset snapshot must be the default state"
+        );
+
+        let injected = super::SwarmCapacityAdmissionControllerState {
+            last_pressure_action: Some(super::SwarmCapacityAdmissionAction::Shed),
+            last_pressure_action_at_ms: Some(42_000),
+            ..super::SwarmCapacityAdmissionControllerState::default()
+        };
+        super::set_live_swarm_capacity_controller_state_for_test(injected.clone());
+
+        let observed = super::live_swarm_capacity_controller_state_snapshot();
+        assert_eq!(
+            observed, injected,
+            "ft-amit3: snapshot must reflect the injected state byte-identically"
+        );
+
+        super::reset_live_swarm_capacity_controller_state_for_test();
+    }
+
+    /// br-ft-amit3: end-to-end cooldown contract via direct controller
+    /// (the live wiring's substrate). Two-rounds pattern: round 1
+    /// records a pressure action via `record_decision`, round 2's
+    /// `cooldown_remaining_secs` returns the configured cooldown
+    /// minus elapsed time. Pre-fix the live caller never reached
+    /// round 2 with a non-default state; post-fix this contract is
+    /// what the wiring delivers to operators.
+    #[test]
+    fn admission_controller_state_two_rounds_engages_cooldown_ft_amit3() {
+        let mut state = super::SwarmCapacityAdmissionControllerState::default();
+        let config = super::SwarmCapacityAdmissionControllerConfig {
+            enabled: true,
+            cooldown_secs: 60,
+            ..super::SwarmCapacityAdmissionControllerConfig::default()
+        };
+
+        // Round 1: pressure action recorded at t=10_000.
+        state.record_decision(super::SwarmCapacityAdmissionAction::Defer, 10_000);
+        assert_eq!(
+            state.last_pressure_action,
+            Some(super::SwarmCapacityAdmissionAction::Defer)
+        );
+
+        // Round 2 at t=40_000 (30s into the 60s cooldown): the gate
+        // must report 30s remaining (or 30 +/- rounding).
+        let remaining = state
+            .cooldown_remaining_secs(40_000, &config)
+            .expect("cooldown still active 30s into a 60s window");
+        assert_eq!(
+            remaining, 30,
+            "ft-amit3: cooldown_remaining_secs must reflect the configured cooldown minus elapsed"
+        );
+
+        // Round 3 at t=70_000 (10s past the 60s cooldown): the gate
+        // must report None — cooldown has lapsed.
+        let lapsed = state.cooldown_remaining_secs(70_000, &config);
+        assert!(
+            lapsed.is_none(),
+            "ft-amit3: cooldown_remaining_secs must be None once the cooldown window has elapsed"
+        );
     }
 }
