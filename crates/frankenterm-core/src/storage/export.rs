@@ -75,6 +75,68 @@ fn export_limit_value(limit: usize) -> Result<ToSqlValue<'static>> {
     })
 }
 
+// ============================================================================
+// br-ft-l3u5k: export JSON-column parse-drop observability
+// ============================================================================
+
+/// br-ft-l3u5k: cumulative count of `optional_json_value` parse
+/// failures observed since process load. Pre-fix `.ok()` silently
+/// turned a corrupted JSON column into `Ok(None)` — indistinguishable
+/// from "column was actually NULL". A backup/audit export then had
+/// missing fields that looked intentional. Export is operator-facing
+/// and meant to be a faithful snapshot, so silent drops corrupt the
+/// downstream forensic record.
+///
+/// NULL column is NOT counted (legitimate absence — handled by the
+/// early return on `optional_string -> None`); only column-present-
+/// but-fails-to-parse bumps the counter.
+///
+/// Same observability defect family as ft-yygus, ft-k6uwb, ft-zhnaw,
+/// ft-94cdu, ft-lqj5g, ft-4ymqn, ft-bn6qi, ft-crpvd, ft-0n4nx.
+static STORAGE_EXPORT_JSON_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// br-ft-l3u5k: cumulative count of export JSON-column parse failures.
+#[must_use]
+pub fn storage_export_json_parse_drop_count() -> u64 {
+    STORAGE_EXPORT_JSON_PARSE_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// br-ft-l3u5k: test helper to reset the parse-drop counter.
+#[cfg(test)]
+pub fn reset_storage_export_json_parse_drop_count_for_test() {
+    STORAGE_EXPORT_JSON_PARSE_DROP_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// br-ft-l3u5k: parse a JSON column value and bump the parse-drop
+/// counter on failure. Extracted so unit tests can exercise the
+/// counter contract without constructing a `RowReader` over a
+/// real storage backend. Returns `Some(Value)` on Ok,
+/// `None` on Err (the calling helper turns that into `Ok(None)`).
+fn parse_export_json_column(
+    raw: &str,
+    label: &str,
+    column: usize,
+) -> Option<serde_json::Value> {
+    match serde_json::from_str(raw) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            STORAGE_EXPORT_JSON_PARSE_DROP_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                target: "ft.storage.export",
+                event = "storage_export_json_parse_drop",
+                label = label,
+                column = column,
+                raw_len = raw.len(),
+                error = %err,
+                "export JSON column failed to parse; consumer will see None (br-ft-l3u5k)"
+            );
+            None
+        }
+    }
+}
+
 fn optional_json_value(
     reader: &RowReader<'_>,
     column: usize,
@@ -86,7 +148,47 @@ fn optional_json_value(
     else {
         return Ok(None);
     };
-    Ok(serde_json::from_str(&raw).ok())
+    Ok(parse_export_json_column(&raw, label, column))
+}
+
+#[cfg(test)]
+mod export_json_parse_drop_tests {
+    use super::*;
+
+    #[test]
+    fn well_formed_does_not_bump_ft_l3u5k() {
+        reset_storage_export_json_parse_drop_count_for_test();
+        let v = parse_export_json_column(r#"{"k":"v"}"#, "test", 0);
+        assert!(v.is_some());
+        assert_eq!(storage_export_json_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn malformed_bumps_counter_ft_l3u5k() {
+        // br-ft-l3u5k: a malformed JSON payload bumps the counter
+        // exactly once.
+        reset_storage_export_json_parse_drop_count_for_test();
+        let v = parse_export_json_column("{not json", "test", 5);
+        assert!(v.is_none());
+        assert_eq!(storage_export_json_parse_drop_count(), 1);
+
+        // Second malformed call bumps again — every event observable.
+        let _ = parse_export_json_column("[unclosed", "another", 7);
+        assert_eq!(storage_export_json_parse_drop_count(), 2);
+    }
+
+    #[test]
+    fn null_input_path_does_not_bump_ft_l3u5k() {
+        // The NULL path (optional_string returning None) doesn't
+        // even reach this helper — the early return at
+        // optional_json_value handles it. Pin the contract via the
+        // helper directly: an empty-but-valid JSON shouldn't bump.
+        reset_storage_export_json_parse_drop_count_for_test();
+        let v = parse_export_json_column("null", "test", 0);
+        assert!(v.is_some());
+        assert_eq!(v.unwrap(), serde_json::Value::Null);
+        assert_eq!(storage_export_json_parse_drop_count(), 0);
+    }
 }
 
 fn optional_f64(reader: &RowReader<'_>, column: usize, label: &str) -> Result<Option<f64>> {
