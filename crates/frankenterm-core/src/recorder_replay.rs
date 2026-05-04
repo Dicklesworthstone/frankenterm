@@ -226,6 +226,19 @@ pub enum ReplayError {
     SessionCompleted,
     /// Checkpoint state does not match scheduler bounds.
     InvalidCheckpoint { cursor: usize, total_events: usize },
+    /// br-ft-oxjlo: checkpoint claims more decisions emitted than
+    /// could possibly have been produced by the cursor or total
+    /// event count. Decisions are 1-per-passing-event so the
+    /// cumulative emit count can never exceed `cursor` (and
+    /// therefore `total_events`). A forged or corrupt checkpoint
+    /// with `decisions_emitted > cursor` would let resume install
+    /// inconsistent decision-trace state, hiding replay
+    /// divergence after the resume point.
+    InconsistentDecisionsEmitted {
+        decisions_emitted: usize,
+        cursor: usize,
+        total_events: usize,
+    },
 }
 
 impl std::fmt::Display for ReplayError {
@@ -250,6 +263,15 @@ impl std::fmt::Display for ReplayError {
                 f,
                 "invalid checkpoint cursor {} for scheduler with {} events",
                 cursor, total_events
+            ),
+            Self::InconsistentDecisionsEmitted {
+                decisions_emitted,
+                cursor,
+                total_events,
+            } => write!(
+                f,
+                "br-ft-oxjlo: checkpoint decisions_emitted {} exceeds cursor {} (total events {}); decisions are 1-per-passing-event and cannot exceed cursor",
+                decisions_emitted, cursor, total_events
             ),
         }
     }
@@ -304,7 +326,7 @@ pub struct ReplaySession {
 impl ReplaySession {
     /// Create a new replay session from query results.
     ///
-    /// Events are sorted by (occurred_at_ms, sequence) for deterministic replay.
+    /// Events are sorted by a total replay key for deterministic replay.
     pub fn new(
         mut events: Vec<QueryResultEvent>,
         config: ReplayConfig,
@@ -318,8 +340,10 @@ impl ReplaySession {
             return Err(ReplayError::EmptySession);
         }
 
-        // Sort events deterministically.
-        events.sort_by_key(|e| (e.occurred_at_ms, e.sequence));
+        // ft-se2ep: query results may contain multiple panes with the same
+        // timestamp and per-pane sequence. Use a total key so equivalent input
+        // sets replay identically regardless of query merge order.
+        events.sort_by(query_result_replay_cmp);
 
         // Compute original duration.
         let first_ts = events.first().map(|e| e.occurred_at_ms).unwrap_or(0);
@@ -608,6 +632,32 @@ impl ReplaySession {
     }
 }
 
+fn query_result_replay_cmp(
+    left: &QueryResultEvent,
+    right: &QueryResultEvent,
+) -> std::cmp::Ordering {
+    query_result_replay_key(left).cmp(&query_result_replay_key(right))
+}
+
+fn query_result_replay_key(event: &QueryResultEvent) -> (u64, u64, u8, u64, &str) {
+    (
+        event.occurred_at_ms,
+        event.pane_id,
+        query_event_kind_rank(event.event_kind),
+        event.sequence,
+        event.event_id.as_str(),
+    )
+}
+
+fn query_event_kind_rank(kind: QueryEventKind) -> u8 {
+    match kind {
+        QueryEventKind::IngressText => StreamKind::Ingress.rank(),
+        QueryEventKind::EgressOutput => StreamKind::Egress.rank(),
+        QueryEventKind::ControlMarker => StreamKind::Control.rank(),
+        QueryEventKind::LifecycleMarker => StreamKind::Lifecycle.rank(),
+    }
+}
+
 // =============================================================================
 // Replay builder
 // =============================================================================
@@ -893,6 +943,21 @@ impl ReplayScheduler {
                 total_events: self.events.len(),
             });
         }
+        // br-ft-oxjlo: decisions_emitted must be <= cursor because
+        // the scheduler emits at most one decision per processed
+        // event, and cursor counts processed events. A checkpoint
+        // claiming more decisions than that is forged or corrupt;
+        // accepting it would install inconsistent decision-trace
+        // state that subsequent next_step() calls would build on,
+        // hiding divergence in proof artifacts (decision_trace_bytes).
+        // Reject fail-closed.
+        if state.decisions_emitted > state.cursor {
+            return Err(ReplayError::InconsistentDecisionsEmitted {
+                decisions_emitted: state.decisions_emitted,
+                cursor: state.cursor,
+                total_events: self.events.len(),
+            });
+        }
         self.cursor = state.cursor;
         self.clock = VirtualClock::from_snapshot(self.config.speed, state.clock)?;
         if self.decisions.len() > state.decisions_emitted {
@@ -1042,6 +1107,7 @@ fn build_decision_record(event: &RecorderEvent) -> ReplayDecisionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
 
     use crate::policy::ActorKind;
@@ -1074,6 +1140,36 @@ mod tests {
             redacted: false,
             sensitivity: SensitivityTier::T1Standard,
             event_kind: kind,
+        }
+    }
+
+    fn make_result_event_with_id(
+        event_id: String,
+        pane_id: u64,
+        seq: u64,
+        ts_ms: u64,
+        kind: QueryEventKind,
+    ) -> QueryResultEvent {
+        QueryResultEvent {
+            event_id,
+            pane_id,
+            source: RecorderEventSource::WeztermMux,
+            occurred_at_ms: ts_ms,
+            sequence: seq,
+            session_id: None,
+            text: Some(format!("pane-{pane_id}-{seq}")),
+            redacted: false,
+            sensitivity: SensitivityTier::T1Standard,
+            event_kind: kind,
+        }
+    }
+
+    fn query_kind_from_rank(rank: u8) -> QueryEventKind {
+        match rank % 4 {
+            0 => QueryEventKind::LifecycleMarker,
+            1 => QueryEventKind::ControlMarker,
+            2 => QueryEventKind::IngressText,
+            _ => QueryEventKind::EgressOutput,
         }
     }
 
@@ -2732,7 +2828,14 @@ mod tests {
     }
 
     #[test]
-    fn replay_scheduler_resume_allows_larger_decisions_emitted_hint() {
+    fn replay_scheduler_resume_rejects_decisions_emitted_above_cursor_ft_oxjlo() {
+        // br-ft-oxjlo: pre-fix this test asserted the permissive
+        // path (`scheduler.resume(checkpoint).unwrap()` with
+        // decisions_emitted=10 against cursor=1). That codified a
+        // forged-checkpoint accept. Post-fix the resume must
+        // REJECT with InconsistentDecisionsEmitted because
+        // decisions are 1-per-passing-event and cannot exceed
+        // cursor.
         let events = vec![
             make_recorder_ingress(1, 0, 1000, 1000, "a"),
             make_recorder_control(1, 1, 1100, 1100),
@@ -2742,8 +2845,113 @@ mod tests {
 
         let mut checkpoint = scheduler.checkpoint();
         checkpoint.decisions_emitted = 10;
-        scheduler.resume(checkpoint).unwrap();
+        let err = scheduler
+            .resume(checkpoint)
+            .expect_err("br-ft-oxjlo: forged decisions_emitted must be rejected");
+        match err {
+            ReplayError::InconsistentDecisionsEmitted {
+                decisions_emitted,
+                cursor,
+                total_events,
+            } => {
+                assert_eq!(decisions_emitted, 10);
+                assert_eq!(cursor, 1);
+                assert_eq!(total_events, 2);
+            }
+            other => panic!("br-ft-oxjlo: expected InconsistentDecisionsEmitted; got {other:?}"),
+        }
+        // Pre-existing decisions buffer must be untouched after a
+        // rejected resume — fail-closed must NOT install partial
+        // state.
         assert_eq!(scheduler.decisions().len(), 1);
+    }
+
+    #[test]
+    fn replay_scheduler_resume_accepts_decisions_emitted_equal_to_cursor_ft_oxjlo() {
+        // Boundary case: decisions_emitted == cursor is the
+        // strongest valid checkpoint (every processed event
+        // emitted a decision). MUST accept.
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_control(1, 1, 1100, 1100),
+        ];
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let _ = scheduler.next_step().unwrap();
+
+        let checkpoint = scheduler.checkpoint();
+        // checkpoint produced by .checkpoint() always has
+        // decisions_emitted == self.decisions.len(), and after one
+        // next_step() this is 1, matching cursor=1.
+        assert_eq!(checkpoint.decisions_emitted, checkpoint.cursor);
+        scheduler
+            .resume(checkpoint)
+            .expect("equal-count resume must succeed");
+    }
+
+    #[test]
+    fn replay_scheduler_resume_accepts_decisions_emitted_below_cursor_ft_oxjlo() {
+        // After filtering events drops some, decisions_emitted may
+        // legitimately be less than cursor (cursor counts events
+        // walked; decisions count events that passed filters).
+        // MUST accept.
+        let events = vec![
+            make_recorder_ingress(1, 0, 1000, 1000, "a"),
+            make_recorder_control(1, 1, 1100, 1100),
+        ];
+        let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+        let _ = scheduler.next_step().unwrap();
+        let _ = scheduler.next_step();
+
+        let mut checkpoint = scheduler.checkpoint();
+        let real_cursor = checkpoint.cursor;
+        // Force decisions_emitted = 0 (operator dropped all trace)
+        // — should still resume cleanly because it's <= cursor.
+        checkpoint.decisions_emitted = 0;
+        scheduler
+            .resume(checkpoint)
+            .expect("zero decisions <= cursor must accept");
+        assert_eq!(scheduler.cursor(), real_cursor);
+        assert!(scheduler.decisions().is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            ..ProptestConfig::default()
+        })]
+
+        /// br-ft-oxjlo: for any combination of (cursor,
+        /// decisions_emitted) checkpoint values against an N-event
+        /// scheduler, resume must accept iff
+        ///   cursor <= total_events AND decisions_emitted <= cursor.
+        /// Pin the contract: no forged checkpoint slips through.
+        #[test]
+        fn replay_scheduler_resume_accepts_iff_cursor_and_decisions_consistent_ft_oxjlo(
+            event_count in 1usize..=8,
+            cursor in 0usize..=12,
+            decisions_emitted in 0usize..=12,
+        ) {
+            let events: Vec<RecorderEvent> = (0..event_count)
+                .map(|i| make_recorder_ingress(1, i as u64, 1000 + (i as u64) * 10, 1000 + (i as u64) * 10, "x"))
+                .collect();
+            let mut scheduler = ReplayScheduler::new(events, ReplayConfig::instant()).unwrap();
+            let total = scheduler.total_events();
+            let checkpoint = ReplaySchedulerState {
+                cursor,
+                clock: VirtualClockSnapshot::default(),
+                decisions_emitted,
+            };
+            let result = scheduler.resume(checkpoint);
+            let cursor_ok = cursor <= total;
+            let decisions_ok = decisions_emitted <= cursor;
+            let should_accept = cursor_ok && decisions_ok;
+            prop_assert_eq!(
+                result.is_ok(),
+                should_accept,
+                "br-ft-oxjlo: resume must accept iff cursor <= total ({} <= {}) AND decisions_emitted <= cursor ({} <= {}); cursor_ok={} decisions_ok={}",
+                cursor, total, decisions_emitted, cursor, cursor_ok, decisions_ok
+            );
+        }
     }
 
     #[test]

@@ -446,7 +446,7 @@ impl FdBudget {
             warn!(
                 current_fds = current,
                 first_in_window = first,
-                growth = current - first,
+                growth = audit_growth(current, first),
                 "potential FD leak detected: monotonic increase over {} audits",
                 self.config.leak_detection_count
             );
@@ -475,6 +475,10 @@ impl FdBudget {
     pub fn pane_breakdown(&self) -> HashMap<u64, u64> {
         self.pane_fds.entries().into_iter().collect()
     }
+}
+
+fn audit_growth(current: u64, first: u64) -> u64 {
+    current.saturating_sub(first)
 }
 
 // =============================================================================
@@ -549,6 +553,7 @@ pub struct AuditResult {
 #[allow(clippy::float_cmp, clippy::overly_complex_bool_expr)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn test_config() -> FdBudgetConfig {
         FdBudgetConfig {
@@ -716,6 +721,17 @@ mod tests {
         assert!(result.current_fds > 0);
         assert_eq!(result.audit_count, 1);
         assert!(!result.leak_detected);
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_audit_growth_is_saturating(current in any::<u64>(), first in any::<u64>()) {
+            let growth = audit_growth(current, first);
+            prop_assert_eq!(growth, current.saturating_sub(first));
+            if current < first {
+                prop_assert_eq!(growth, 0);
+            }
+        }
     }
 
     #[test]
