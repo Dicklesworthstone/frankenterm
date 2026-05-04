@@ -5794,6 +5794,38 @@ impl ToolHandler for WaEventsAnnotateTool {
             return envelope_to_content(envelope);
         }
 
+        // br-ft-wztvw: emptiness + size bounds for free-text fields.
+        if let Some(note) = params.note.as_deref() {
+            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+                note,
+                "note",
+                crate::mcp_types::MAX_EVENT_NOTE_BYTES,
+            ) {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        }
+        if let Some(by) = params.by.as_deref() {
+            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+                by,
+                "by",
+                crate::mcp_types::MAX_EVENT_ACTOR_BYTES,
+            ) {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        }
+
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
             &self.policy_rate_limiter,
@@ -5989,6 +6021,38 @@ impl ToolHandler for WaEventsTriageTool {
             return envelope_to_content(envelope);
         }
 
+        // br-ft-wztvw: emptiness + size bounds for free-text fields.
+        if let Some(state) = params.state.as_deref() {
+            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+                state,
+                "state",
+                crate::mcp_types::MAX_EVENT_TRIAGE_STATE_BYTES,
+            ) {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        }
+        if let Some(by) = params.by.as_deref() {
+            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+                by,
+                "by",
+                crate::mcp_types::MAX_EVENT_ACTOR_BYTES,
+            ) {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        }
+
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
             &self.policy_rate_limiter,
@@ -6181,6 +6245,43 @@ impl ToolHandler for WaEventsLabelTool {
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
+        }
+
+        // br-ft-wztvw: emptiness + size bounds for label and actor.
+        for (value, field) in [
+            (params.add.as_deref(), "add"),
+            (params.remove.as_deref(), "remove"),
+        ] {
+            if let Some(v) = value {
+                if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+                    v,
+                    field,
+                    crate::mcp_types::MAX_EVENT_LABEL_BYTES,
+                ) {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        None,
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        }
+        if let Some(by) = params.by.as_deref() {
+            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+                by,
+                "by",
+                crate::mcp_types::MAX_EVENT_ACTOR_BYTES,
+            ) {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
         }
 
         if let Some(deny) = mcp_authorize_mcp_mutation(
