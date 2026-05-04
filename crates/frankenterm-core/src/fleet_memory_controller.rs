@@ -1,13 +1,15 @@
 //! Fleet memory orchestration controller (ft-iehgn.3).
 //!
-//! Synthesizes decisions across the 5 independent memory subsystems into a
-//! unified pressure tier with coordinated action dispatch for 200+ pane swarms.
+//! Synthesizes decisions across memory pressure signals and operator-visible
+//! tier budgets into a unified pressure tier with coordinated action dispatch
+//! for 200+ pane swarms.
 //!
 //! # Subsystems Unified
 //!
 //! 1. [`BackpressureTier`] — queue-depth driven (Green/Yellow/Red/Black)
 //! 2. [`MemoryPressureTier`] — system memory utilization (Green/Yellow/Orange/Red)
 //! 3. [`BudgetLevel`] — per-pane memory budget (Normal/Throttled/OverBudget)
+//! 4. [`FleetMemoryTierBudgetSnapshot`] — hot/warm/cold/cache/buffer budgets
 //!
 //! # Decision Logic
 //!
@@ -62,6 +64,336 @@ impl std::fmt::Display for FleetPressureTier {
             Self::Emergency => write!(f, "EMERGENCY"),
         }
     }
+}
+
+// =============================================================================
+// Operator-visible tier budget model
+// =============================================================================
+
+/// Operator-visible memory tiers coordinated by the fleet governor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetMemoryTier {
+    /// Hot resident pane/session data that directly contributes to RSS.
+    HotResident,
+    /// Warm compressed scrollback that can be evicted to the cold disk tier.
+    WarmCompressed,
+    /// Cold disk-backed history. This is budgeted, but does not reclaim RSS.
+    ColdDisk,
+    /// Lexical/semantic search and index caches that can be rebuilt.
+    SearchIndexCache,
+    /// GUI/render cache data that can be repopulated from authoritative state.
+    RenderCache,
+    /// Short-lived ingestion buffers, decode queues, and staging payloads.
+    TransientIngestion,
+    /// Allocator arenas and reusable pools that can be trimmed under pressure.
+    AllocatorPools,
+}
+
+impl FleetMemoryTier {
+    /// Stable display order for operator surfaces.
+    pub const ALL: [Self; 7] = [
+        Self::HotResident,
+        Self::WarmCompressed,
+        Self::ColdDisk,
+        Self::SearchIndexCache,
+        Self::RenderCache,
+        Self::TransientIngestion,
+        Self::AllocatorPools,
+    ];
+
+    /// Lower values reclaim first.
+    #[must_use]
+    pub const fn reclamation_priority(self) -> u8 {
+        match self {
+            Self::TransientIngestion => 10,
+            Self::SearchIndexCache => 20,
+            Self::RenderCache => 30,
+            Self::WarmCompressed => 40,
+            Self::AllocatorPools => 50,
+            Self::HotResident => 60,
+            Self::ColdDisk => u8::MAX,
+        }
+    }
+
+    /// Whether bytes in this tier contribute to resident memory pressure.
+    #[must_use]
+    pub const fn is_resident(self) -> bool {
+        !matches!(self, Self::ColdDisk)
+    }
+
+    /// Reclamation action for this tier, if reclaiming it can reduce RSS.
+    #[must_use]
+    pub const fn reclamation_action(self) -> Option<FleetMemoryTierReclamationAction> {
+        match self {
+            Self::TransientIngestion => {
+                Some(FleetMemoryTierReclamationAction::DropTransientBuffers)
+            }
+            Self::SearchIndexCache => Some(FleetMemoryTierReclamationAction::ShrinkSearchCache),
+            Self::RenderCache => Some(FleetMemoryTierReclamationAction::ShrinkRenderCache),
+            Self::WarmCompressed => Some(FleetMemoryTierReclamationAction::EvictWarmToCold),
+            Self::AllocatorPools => Some(FleetMemoryTierReclamationAction::TrimAllocatorPools),
+            Self::HotResident => Some(FleetMemoryTierReclamationAction::DemoteHotToWarm),
+            Self::ColdDisk => None,
+        }
+    }
+}
+
+/// Concrete reclamation operation the governor can request for a tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetMemoryTierReclamationAction {
+    /// Drop or shrink transient ingestion buffers.
+    DropTransientBuffers,
+    /// Shrink search/index caches without deleting authoritative indexes.
+    ShrinkSearchCache,
+    /// Shrink render caches without changing terminal state.
+    ShrinkRenderCache,
+    /// Evict warm compressed scrollback pages to the cold disk tier.
+    EvictWarmToCold,
+    /// Return idle allocator pool memory to the system allocator.
+    TrimAllocatorPools,
+    /// Demote hot resident history to warm compressed storage.
+    DemoteHotToWarm,
+}
+
+/// Per-tier budget and observed accounting counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetMemoryTierBudgetRecord {
+    /// Tier being accounted.
+    pub tier: FleetMemoryTier,
+    /// Operator-visible budget for the tier.
+    pub budget_bytes: u64,
+    /// Current observed bytes for the tier.
+    pub actual_bytes: u64,
+    /// Bytes that could be reclaimed without losing authoritative history/state.
+    pub reclaimable_bytes: u64,
+    /// Cumulative bytes reclaimed from this tier.
+    pub reclaimed_bytes: u64,
+    /// Cumulative bytes evicted from this tier into a colder tier.
+    pub evicted_bytes: u64,
+    /// Bytes refused admission because this tier was at budget.
+    pub refused_bytes: u64,
+}
+
+impl FleetMemoryTierBudgetRecord {
+    /// Construct a tier budget record with no prior reclamation counters.
+    #[must_use]
+    pub const fn new(tier: FleetMemoryTier, budget_bytes: u64, actual_bytes: u64) -> Self {
+        Self {
+            tier,
+            budget_bytes,
+            actual_bytes,
+            reclaimable_bytes: actual_bytes,
+            reclaimed_bytes: 0,
+            evicted_bytes: 0,
+            refused_bytes: 0,
+        }
+    }
+
+    /// Set the current reclaimable byte estimate.
+    #[must_use]
+    pub const fn with_reclaimable_bytes(mut self, reclaimable_bytes: u64) -> Self {
+        self.reclaimable_bytes = reclaimable_bytes;
+        self
+    }
+
+    /// Set cumulative reclamation/eviction/refusal counters for this tier.
+    #[must_use]
+    pub const fn with_counters(
+        mut self,
+        reclaimed_bytes: u64,
+        evicted_bytes: u64,
+        refused_bytes: u64,
+    ) -> Self {
+        self.reclaimed_bytes = reclaimed_bytes;
+        self.evicted_bytes = evicted_bytes;
+        self.refused_bytes = refused_bytes;
+        self
+    }
+
+    /// Bytes above this tier's budget.
+    #[must_use]
+    pub const fn over_budget_bytes(&self) -> u64 {
+        self.actual_bytes.saturating_sub(self.budget_bytes)
+    }
+
+    /// Remaining byte budget before this tier starts refusing or reclaiming.
+    #[must_use]
+    pub const fn remaining_budget_bytes(&self) -> u64 {
+        self.budget_bytes.saturating_sub(self.actual_bytes)
+    }
+
+    /// Whether this tier currently has budget pressure.
+    #[must_use]
+    pub const fn has_pressure(&self) -> bool {
+        self.actual_bytes > self.budget_bytes || self.refused_bytes > 0
+    }
+}
+
+/// Aggregate budget/actual/counter totals across all memory tiers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetMemoryTierBudgetTotals {
+    /// Total budgeted bytes across all tiers.
+    pub budget_bytes: u64,
+    /// Total budgeted bytes across RSS-contributing tiers.
+    pub resident_budget_bytes: u64,
+    /// Total observed bytes across all tiers.
+    pub actual_bytes: u64,
+    /// Total observed resident bytes, excluding cold disk.
+    pub resident_actual_bytes: u64,
+    /// Sum of each tier's over-budget bytes.
+    pub over_budget_bytes: u64,
+    /// Sum of RSS-contributing tiers' over-budget bytes.
+    pub resident_over_budget_bytes: u64,
+    /// Bytes that can be reclaimed without losing authoritative state/history.
+    pub reclaimable_bytes: u64,
+    /// Cumulative reclaimed bytes across tiers.
+    pub reclaimed_bytes: u64,
+    /// Cumulative evicted bytes across tiers.
+    pub evicted_bytes: u64,
+    /// Cumulative refused bytes across tiers.
+    pub refused_bytes: u64,
+}
+
+impl FleetMemoryTierBudgetTotals {
+    fn add_record(&mut self, record: &FleetMemoryTierBudgetRecord) {
+        self.budget_bytes = self.budget_bytes.saturating_add(record.budget_bytes);
+        self.actual_bytes = self.actual_bytes.saturating_add(record.actual_bytes);
+        if record.tier.is_resident() {
+            self.resident_budget_bytes = self
+                .resident_budget_bytes
+                .saturating_add(record.budget_bytes);
+            self.resident_actual_bytes = self
+                .resident_actual_bytes
+                .saturating_add(record.actual_bytes);
+            self.resident_over_budget_bytes = self
+                .resident_over_budget_bytes
+                .saturating_add(record.over_budget_bytes());
+        }
+        self.over_budget_bytes = self
+            .over_budget_bytes
+            .saturating_add(record.over_budget_bytes());
+        self.reclaimable_bytes = self
+            .reclaimable_bytes
+            .saturating_add(record.reclaimable_bytes);
+        self.reclaimed_bytes = self.reclaimed_bytes.saturating_add(record.reclaimed_bytes);
+        self.evicted_bytes = self.evicted_bytes.saturating_add(record.evicted_bytes);
+        self.refused_bytes = self.refused_bytes.saturating_add(record.refused_bytes);
+    }
+}
+
+/// Operator-visible memory budget snapshot consumed by the fleet governor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetMemoryTierBudgetSnapshot {
+    /// Per-tier records in stable [`FleetMemoryTier`] order.
+    pub tiers: Vec<FleetMemoryTierBudgetRecord>,
+    /// Precomputed aggregate counters for dashboards and audit records.
+    pub totals: FleetMemoryTierBudgetTotals,
+}
+
+impl FleetMemoryTierBudgetSnapshot {
+    /// Build a deterministic snapshot from per-tier records.
+    #[must_use]
+    pub fn from_tiers<I>(tiers: I) -> Self
+    where
+        I: IntoIterator<Item = FleetMemoryTierBudgetRecord>,
+    {
+        let mut tiers: Vec<FleetMemoryTierBudgetRecord> = tiers.into_iter().collect();
+        tiers.sort_by_key(|record| record.tier);
+
+        let mut totals = FleetMemoryTierBudgetTotals::default();
+        for record in &tiers {
+            totals.add_record(record);
+        }
+
+        Self { tiers, totals }
+    }
+
+    /// Derive the fleet pressure tier represented by this budget snapshot.
+    #[must_use]
+    pub fn pressure_tier(&self) -> FleetPressureTier {
+        if self.totals.refused_bytes > 0 && self.totals.resident_over_budget_bytes > 0 {
+            return FleetPressureTier::Emergency;
+        }
+        if self.totals.refused_bytes > 0 {
+            return FleetPressureTier::Critical;
+        }
+        if self.totals.resident_over_budget_bytes == 0 {
+            return FleetPressureTier::Normal;
+        }
+        if self.totals.resident_budget_bytes == 0 {
+            return FleetPressureTier::Emergency;
+        }
+
+        let over_pct_x100 = self
+            .totals
+            .resident_over_budget_bytes
+            .saturating_mul(10_000)
+            / self.totals.resident_budget_bytes;
+
+        if over_pct_x100 <= 500 {
+            FleetPressureTier::Elevated
+        } else if over_pct_x100 <= 2_500 {
+            FleetPressureTier::Critical
+        } else {
+            FleetPressureTier::Emergency
+        }
+    }
+
+    /// Build RSS-reducing reclamation targets for the current over-budget bytes.
+    #[must_use]
+    pub fn reclamation_targets(&self) -> Vec<FleetMemoryTierReclamationTarget> {
+        let mut remaining = self.totals.resident_over_budget_bytes;
+        if remaining == 0 {
+            return Vec::new();
+        }
+
+        let mut candidates: Vec<&FleetMemoryTierBudgetRecord> = self
+            .tiers
+            .iter()
+            .filter(|record| {
+                record.tier.reclamation_action().is_some() && record.reclaimable_bytes > 0
+            })
+            .collect();
+        candidates.sort_by_key(|record| (record.tier.reclamation_priority(), record.tier));
+
+        let mut targets = Vec::new();
+        for record in candidates {
+            if remaining == 0 {
+                break;
+            }
+            let bytes_to_reclaim = remaining.min(record.reclaimable_bytes);
+            if bytes_to_reclaim == 0 {
+                continue;
+            }
+            targets.push(FleetMemoryTierReclamationTarget {
+                tier: record.tier,
+                action: record
+                    .tier
+                    .reclamation_action()
+                    .expect("candidate filter requires reclaimable tier"),
+                bytes_to_reclaim,
+                over_budget_bytes: record.over_budget_bytes(),
+            });
+            remaining = remaining.saturating_sub(bytes_to_reclaim);
+        }
+
+        targets
+    }
+}
+
+/// Reclamation target emitted for a single memory tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetMemoryTierReclamationTarget {
+    /// Tier to reclaim from.
+    pub tier: FleetMemoryTier,
+    /// Concrete action to take for this tier.
+    pub action: FleetMemoryTierReclamationAction,
+    /// Bytes the controller wants reclaimed from this tier.
+    pub bytes_to_reclaim: u64,
+    /// Current over-budget bytes for this tier.
+    pub over_budget_bytes: u64,
 }
 
 // =============================================================================
@@ -132,6 +464,9 @@ pub struct DecisionRecord {
     pub compound_tier: FleetPressureTier,
     /// Recommended actions.
     pub actions: Vec<FleetMemoryAction>,
+    /// Optional operator-visible tier budget snapshot used in the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_budget: Option<FleetMemoryTierBudgetSnapshot>,
 }
 
 // =============================================================================
@@ -261,6 +596,9 @@ pub struct FleetMemorySnapshot {
     pub consecutive_at_tier: u64,
     /// Last recommended actions.
     pub last_actions: Vec<FleetMemoryAction>,
+    /// Last operator-visible tier budget snapshot evaluated by the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_budget: Option<FleetMemoryTierBudgetSnapshot>,
 }
 
 // =============================================================================
@@ -286,6 +624,8 @@ pub struct FleetMemoryController {
     consecutive_at_tier: u64,
     /// Last recommended actions.
     last_actions: Vec<FleetMemoryAction>,
+    /// Last tier budget snapshot evaluated by the controller.
+    last_tier_budget: Option<FleetMemoryTierBudgetSnapshot>,
     /// Audit trail of recent decisions.
     audit_trail: VecDeque<DecisionRecord>,
 }
@@ -303,6 +643,7 @@ impl FleetMemoryController {
             total_transitions: 0,
             consecutive_at_tier: 0,
             last_actions: vec![FleetMemoryAction::None],
+            last_tier_budget: None,
             audit_trail: VecDeque::new(),
         }
     }
@@ -352,6 +693,7 @@ impl FleetMemoryController {
             total_transitions: self.total_transitions,
             consecutive_at_tier: self.consecutive_at_tier,
             last_actions: self.last_actions.clone(),
+            tier_budget: self.last_tier_budget.clone(),
         }
     }
 
@@ -359,15 +701,44 @@ impl FleetMemoryController {
     ///
     /// Returns the recommended actions for this evaluation cycle.
     pub fn evaluate(&mut self, signals: &PressureSignals) -> Vec<FleetMemoryAction> {
+        self.evaluate_inner(signals, None)
+    }
+
+    /// Evaluate pressure signals plus an operator-visible tier budget snapshot.
+    ///
+    /// Existing callers can continue using [`Self::evaluate`]. New runtime,
+    /// GUI, and search-cache callers can feed this snapshot to make tier-local
+    /// overages/refusals visible in pressure, audit, and snapshot surfaces.
+    pub fn evaluate_with_tier_budget(
+        &mut self,
+        signals: &PressureSignals,
+        tier_budget: FleetMemoryTierBudgetSnapshot,
+    ) -> Vec<FleetMemoryAction> {
+        self.evaluate_inner(signals, Some(tier_budget))
+    }
+
+    fn evaluate_inner(
+        &mut self,
+        signals: &PressureSignals,
+        tier_budget: Option<FleetMemoryTierBudgetSnapshot>,
+    ) -> Vec<FleetMemoryAction> {
         self.total_evaluations += 1;
 
         // Map each subsystem to fleet tier
         let backpressure_tier = map_backpressure(signals.backpressure);
         let mem_pressure_tier = map_memory_pressure(signals.memory_pressure);
         let budget_tier = map_budget_level(signals.worst_budget);
+        let tier_budget_pressure = tier_budget
+            .as_ref()
+            .map_or(FleetPressureTier::Normal, |snapshot| {
+                snapshot.pressure_tier()
+            });
 
         // Compound: worst-of all subsystems
-        let raw = backpressure_tier.max(mem_pressure_tier).max(budget_tier);
+        let raw = backpressure_tier
+            .max(mem_pressure_tier)
+            .max(budget_tier)
+            .max(tier_budget_pressure);
 
         // Hysteresis: require sustained readings before transitioning
         self.recent_raw_tiers.push_back(raw);
@@ -428,6 +799,7 @@ impl FleetMemoryController {
         // Determine actions for current compound tier
         let actions = recommend_actions(self.compound_tier, signals);
         self.last_actions.clone_from(&actions);
+        self.last_tier_budget.clone_from(&tier_budget);
 
         // Record decision
         let record = DecisionRecord {
@@ -435,6 +807,7 @@ impl FleetMemoryController {
             signals: signals.clone(),
             compound_tier: self.compound_tier,
             actions: actions.clone(),
+            tier_budget,
         };
         self.audit_trail.push_back(record);
         if self.audit_trail.len() > self.config.max_audit_trail {
@@ -452,6 +825,7 @@ impl FleetMemoryController {
         self.total_transitions = 0;
         self.consecutive_at_tier = 0;
         self.last_actions = vec![FleetMemoryAction::None];
+        self.last_tier_budget = None;
         self.audit_trail.clear();
     }
 }
@@ -741,6 +1115,11 @@ impl Default for FleetScrollbackOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::byte_compression::CompressionLevel;
+    use crate::scrollback_tiers::{
+        ColdPageData, ColdRetrievalError, ColdTierRetriever, ScrollbackConfig,
+        ScrollbackLocationHint, TieredScrollback,
+    };
 
     fn green_signals() -> PressureSignals {
         PressureSignals {
@@ -779,6 +1158,50 @@ mod tests {
             worst_budget: BudgetLevel::OverBudget,
             pane_count: 200,
             paused_pane_count: 100,
+        }
+    }
+
+    fn ft_08wlf_stress_line(pane_id: u64, line_no: usize) -> String {
+        format!(
+            "pane-{pane_id:03}-line-{line_no:05}: deterministic cold-query payload for ft-08wlf"
+        )
+    }
+
+    fn ft_08wlf_pane_info(pane_id: u64, scrollback: &TieredScrollback) -> PaneScrollbackInfo {
+        let snap = scrollback.snapshot();
+        PaneScrollbackInfo {
+            pane_id,
+            activity_counter: snap.activity_counter,
+            warm_bytes: snap.warm_bytes,
+            warm_pages: snap.warm_pages,
+            estimated_memory_bytes: scrollback.estimated_memory_bytes(),
+        }
+    }
+
+    struct GeneratedColdHistory {
+        pane_id: u64,
+        page_size: usize,
+        lines_per_pane: usize,
+    }
+
+    impl ColdTierRetriever for GeneratedColdHistory {
+        fn retrieve_page(&self, page_index: u64) -> Result<ColdPageData, ColdRetrievalError> {
+            let start = usize::try_from(page_index)
+                .ok()
+                .and_then(|page| page.checked_mul(self.page_size))
+                .ok_or(ColdRetrievalError::PageNotFound { page_index })?;
+            if start >= self.lines_per_pane {
+                return Err(ColdRetrievalError::PageNotFound { page_index });
+            }
+            let end = start
+                .saturating_add(self.page_size)
+                .min(self.lines_per_pane);
+            Ok(ColdPageData {
+                page_index,
+                lines: (start..end)
+                    .map(|line_no| ft_08wlf_stress_line(self.pane_id, line_no))
+                    .collect(),
+            })
         }
     }
 
@@ -911,6 +1334,258 @@ mod tests {
             let rt: FleetMemoryAction = serde_json::from_str(&json).unwrap();
             assert_eq!(rt, action);
         }
+    }
+
+    #[test]
+    fn tier_budget_snapshot_aggregates_operator_visible_counters_ft_08wlf() {
+        let snapshot = FleetMemoryTierBudgetSnapshot::from_tiers([
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::RenderCache, 100, 180)
+                .with_reclaimable_bytes(120)
+                .with_counters(20, 0, 0),
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::ColdDisk, 5_000, 4_000)
+                .with_reclaimable_bytes(0)
+                .with_counters(0, 300, 7),
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::WarmCompressed, 500, 650)
+                .with_reclaimable_bytes(500)
+                .with_counters(100, 200, 0),
+        ]);
+
+        assert_eq!(snapshot.tiers[0].tier, FleetMemoryTier::WarmCompressed);
+        assert_eq!(snapshot.tiers[1].tier, FleetMemoryTier::ColdDisk);
+        assert_eq!(snapshot.tiers[2].tier, FleetMemoryTier::RenderCache);
+        assert_eq!(snapshot.totals.budget_bytes, 5_600);
+        assert_eq!(snapshot.totals.resident_budget_bytes, 600);
+        assert_eq!(snapshot.totals.actual_bytes, 4_830);
+        assert_eq!(snapshot.totals.resident_actual_bytes, 830);
+        assert_eq!(snapshot.totals.over_budget_bytes, 230);
+        assert_eq!(snapshot.totals.resident_over_budget_bytes, 230);
+        assert_eq!(snapshot.totals.reclaimable_bytes, 620);
+        assert_eq!(snapshot.totals.reclaimed_bytes, 120);
+        assert_eq!(snapshot.totals.evicted_bytes, 500);
+        assert_eq!(snapshot.totals.refused_bytes, 7);
+        assert_eq!(snapshot.pressure_tier(), FleetPressureTier::Emergency);
+    }
+
+    #[test]
+    fn tier_budget_reclamation_targets_prioritize_rebuildable_state_ft_08wlf() {
+        let snapshot = FleetMemoryTierBudgetSnapshot::from_tiers([
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::HotResident, 1_000, 1_300)
+                .with_reclaimable_bytes(300),
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::WarmCompressed, 2_000, 2_500)
+                .with_reclaimable_bytes(500),
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::ColdDisk, 2_000, 1_500)
+                .with_reclaimable_bytes(500),
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::SearchIndexCache, 1_000, 800)
+                .with_reclaimable_bytes(300),
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::RenderCache, 100, 400)
+                .with_reclaimable_bytes(300),
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::TransientIngestion, 100, 300)
+                .with_reclaimable_bytes(100),
+        ]);
+
+        let targets = snapshot.reclamation_targets();
+        let target_tiers: Vec<FleetMemoryTier> = targets.iter().map(|target| target.tier).collect();
+        assert_eq!(
+            target_tiers,
+            vec![
+                FleetMemoryTier::TransientIngestion,
+                FleetMemoryTier::SearchIndexCache,
+                FleetMemoryTier::RenderCache,
+                FleetMemoryTier::WarmCompressed,
+                FleetMemoryTier::HotResident,
+            ]
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.bytes_to_reclaim)
+                .sum::<u64>(),
+            snapshot.totals.resident_over_budget_bytes
+        );
+        assert_eq!(
+            targets[3].action,
+            FleetMemoryTierReclamationAction::EvictWarmToCold
+        );
+        assert!(!target_tiers.contains(&FleetMemoryTier::ColdDisk));
+    }
+
+    #[test]
+    fn evaluate_with_tier_budget_escalates_and_audits_snapshot_ft_08wlf() {
+        let tier_budget =
+            FleetMemoryTierBudgetSnapshot::from_tiers([FleetMemoryTierBudgetRecord::new(
+                FleetMemoryTier::HotResident,
+                1_000,
+                1_150,
+            )
+            .with_reclaimable_bytes(150)]);
+        let mut ctrl = FleetMemoryController::new(FleetMemoryConfig {
+            escalation_threshold: 1,
+            deescalation_threshold: 1,
+            ..FleetMemoryConfig::default()
+        });
+
+        let actions = ctrl.evaluate_with_tier_budget(&green_signals(), tier_budget.clone());
+
+        assert_eq!(ctrl.compound_tier(), FleetPressureTier::Critical);
+        assert!(actions.contains(&FleetMemoryAction::EvictWarmScrollback));
+        assert!(actions.contains(&FleetMemoryAction::PauseIdlePanes));
+        assert_eq!(
+            ctrl.snapshot()
+                .tier_budget
+                .as_ref()
+                .map(|snapshot| snapshot.totals),
+            Some(tier_budget.totals)
+        );
+        assert_eq!(
+            ctrl.audit_trail()[0]
+                .tier_budget
+                .as_ref()
+                .map(FleetMemoryTierBudgetSnapshot::pressure_tier),
+            Some(FleetPressureTier::Critical)
+        );
+    }
+
+    #[test]
+    fn tier_budget_stress_bounds_resident_bytes_and_keeps_cold_history_queryable_ft_08wlf() {
+        const PANE_COUNT: u64 = 64;
+        const LINES_PER_PANE: usize = 384;
+        const PAGE_SIZE: usize = 8;
+
+        let config = ScrollbackConfig {
+            hot_lines: 24,
+            page_size: PAGE_SIZE,
+            warm_max_bytes: usize::MAX,
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: true,
+        };
+        let mut panes: Vec<(u64, TieredScrollback)> = (0..PANE_COUNT)
+            .map(|pane_id| {
+                let mut scrollback = TieredScrollback::new(config.clone());
+                scrollback.push_lines(
+                    (0..LINES_PER_PANE).map(|line_no| ft_08wlf_stress_line(pane_id, line_no)),
+                );
+                (pane_id, scrollback)
+            })
+            .collect();
+        let pane_infos: Vec<PaneScrollbackInfo> = panes
+            .iter()
+            .map(|(pane_id, scrollback)| ft_08wlf_pane_info(*pane_id, scrollback))
+            .collect();
+
+        let before_resident_bytes: usize = pane_infos
+            .iter()
+            .map(|pane| pane.estimated_memory_bytes)
+            .sum();
+        let before_warm_bytes: usize = pane_infos.iter().map(|pane| pane.warm_bytes).sum();
+        let before_hot_bytes = before_resident_bytes.saturating_sub(before_warm_bytes);
+        assert!(
+            before_warm_bytes > 0,
+            "stress fixture must create warm pages"
+        );
+
+        let resident_budget_bytes =
+            before_hot_bytes.saturating_add(before_warm_bytes.saturating_div(4));
+        let before_tier_budget =
+            FleetMemoryTierBudgetSnapshot::from_tiers([FleetMemoryTierBudgetRecord::new(
+                FleetMemoryTier::WarmCompressed,
+                u64::try_from(resident_budget_bytes).unwrap(),
+                u64::try_from(before_resident_bytes).unwrap(),
+            )
+            .with_reclaimable_bytes(u64::try_from(before_warm_bytes).unwrap())]);
+        assert_ne!(
+            before_tier_budget.pressure_tier(),
+            FleetPressureTier::Normal,
+            "fixture should put the fleet over its resident budget"
+        );
+
+        let mut controller = FleetMemoryController::new(FleetMemoryConfig {
+            escalation_threshold: 1,
+            deescalation_threshold: 1,
+            ..FleetMemoryConfig::default()
+        });
+        let actions = controller.evaluate_with_tier_budget(
+            &PressureSignals {
+                pane_count: usize::try_from(PANE_COUNT).unwrap(),
+                ..green_signals()
+            },
+            before_tier_budget,
+        );
+        assert!(
+            actions.contains(&FleetMemoryAction::EvictWarmScrollback)
+                || actions.contains(&FleetMemoryAction::EmergencyCleanup),
+            "over-budget resident memory should request a reclaiming action"
+        );
+
+        let mut orchestrator = FleetScrollbackOrchestrator::new();
+        let plan = orchestrator
+            .plan_eviction(controller.compound_tier(), &pane_infos)
+            .expect("over-budget warm resident data should produce an eviction plan");
+        assert!(plan.fleet_warm_bytes_target < plan.fleet_warm_bytes_before);
+
+        let first_target_pane = plan
+            .targets
+            .first()
+            .map(|target| target.pane_id)
+            .expect("eviction plan should target at least one pane");
+        for target in &plan.targets {
+            let scrollback = panes
+                .iter_mut()
+                .find(|(pane_id, _)| *pane_id == target.pane_id)
+                .map(|(_, scrollback)| scrollback)
+                .expect("eviction target should refer to an existing pane");
+            assert_eq!(
+                scrollback.evict_warm_pages(target.pages_to_evict),
+                target.pages_to_evict
+            );
+        }
+
+        let after_resident_bytes: usize = panes
+            .iter()
+            .map(|(_, scrollback)| scrollback.estimated_memory_bytes())
+            .sum();
+        let after_warm_bytes: usize = panes
+            .iter()
+            .map(|(_, scrollback)| scrollback.warm_total_bytes())
+            .sum();
+        assert!(
+            after_warm_bytes <= plan.fleet_warm_bytes_target,
+            "warm bytes should honor the fleet eviction target: after={after_warm_bytes} target={}",
+            plan.fleet_warm_bytes_target
+        );
+        assert!(
+            after_resident_bytes < before_resident_bytes,
+            "eviction should reduce resident memory: before={before_resident_bytes} after={after_resident_bytes}"
+        );
+        assert!(
+            after_resident_bytes <= before_hot_bytes + plan.fleet_warm_bytes_target,
+            "resident memory should be bounded by hot bytes plus the planned warm target"
+        );
+
+        let (_, target_scrollback) = panes
+            .iter()
+            .find(|(pane_id, _)| *pane_id == first_target_pane)
+            .expect("first target pane should still exist");
+        assert!(
+            target_scrollback.snapshot().cold_lines > 0,
+            "planned eviction should move reachable history into the cold tier"
+        );
+        let oldest_offset =
+            usize::try_from(target_scrollback.total_line_count().saturating_sub(1)).unwrap();
+        let cold_hint = target_scrollback
+            .locate_offset(oldest_offset)
+            .expect("oldest retained line should have a location hint");
+        assert!(matches!(cold_hint, ScrollbackLocationHint::Cold { .. }));
+        let retriever = GeneratedColdHistory {
+            pane_id: first_target_pane,
+            page_size: PAGE_SIZE,
+            lines_per_pane: LINES_PER_PANE,
+        };
+        assert_eq!(
+            target_scrollback
+                .cold_line(&cold_hint, &retriever)
+                .expect("cold-tier line should be queryable"),
+            ft_08wlf_stress_line(first_target_pane, 0)
+        );
     }
 
     #[test]
