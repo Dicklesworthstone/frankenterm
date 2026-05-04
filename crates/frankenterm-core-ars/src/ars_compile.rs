@@ -105,6 +105,24 @@ pub enum CompileError {
     OperatorLocked { cluster_id: String },
     /// The evidence ledger rejects this reflex.
     EvidenceRejected { reason: String },
+    /// br-ft-hcvcn: the evidence ledger digest is incomplete —
+    /// `is_complete` is false, meaning at least one required
+    /// category is missing. The compiler is the promotion
+    /// boundary from evidence to executable workflow; an
+    /// incomplete digest cannot satisfy the proof contract and
+    /// must not produce a descriptor. Pre-fix, only an explicit
+    /// `Reject` verdict was rejected; a `Neutral` or `Support`
+    /// verdict on an incomplete ledger silently passed through.
+    IncompleteEvidence {
+        entry_count: usize,
+        is_complete: bool,
+    },
+    /// br-ft-hcvcn: the evidence digest's root_hash is empty or
+    /// malformed. A valid hash-chain root must be a non-empty
+    /// hex digest; a constructible default with `root_hash:
+    /// String::new()` cannot have come from a real ledger and
+    /// must not produce a descriptor.
+    MalformedEvidenceRoot { reason: String },
     /// A template variable failed safety validation.
     UnsafeParameter {
         variable: String,
@@ -130,6 +148,17 @@ impl std::fmt::Display for CompileError {
             Self::EvidenceRejected { reason } => {
                 write!(f, "evidence rejected: {reason}")
             }
+            Self::IncompleteEvidence {
+                entry_count,
+                is_complete,
+            } => write!(
+                f,
+                "br-ft-hcvcn: evidence digest is incomplete (entry_count={entry_count}, is_complete={is_complete}) — required categories missing"
+            ),
+            Self::MalformedEvidenceRoot { reason } => write!(
+                f,
+                "br-ft-hcvcn: evidence digest root_hash is malformed: {reason}"
+            ),
             Self::UnsafeParameter {
                 variable,
                 value,
@@ -251,6 +280,32 @@ impl ArsCompiler {
                     "ledger verdict is Reject ({} entries, complete={})",
                     input.evidence_digest.entry_count, input.evidence_digest.is_complete,
                 ),
+            });
+        }
+
+        // br-ft-hcvcn: evidence completeness gate. An ARS reflex
+        // is the promotion boundary from collected evidence to an
+        // executable workflow descriptor; a digest with
+        // is_complete=false (missing required categories) cannot
+        // satisfy the proof contract and must not produce a
+        // descriptor. Pre-fix, only an explicit `Reject` verdict
+        // was rejected; a `Neutral` or `Support` verdict on an
+        // incomplete ledger — including the freely-constructible
+        // default with entry_count=0 + categories_present=[] +
+        // is_complete=false — silently passed through.
+        if !input.evidence_digest.is_complete {
+            return Err(CompileError::IncompleteEvidence {
+                entry_count: input.evidence_digest.entry_count,
+                is_complete: input.evidence_digest.is_complete,
+            });
+        }
+
+        // br-ft-hcvcn: evidence root_hash gate. A valid hash-chain
+        // root must be non-empty; a default `String::new()` cannot
+        // have come from a real ledger and is fail-closed.
+        if input.evidence_digest.root_hash.is_empty() {
+            return Err(CompileError::MalformedEvidenceRoot {
+                reason: "root_hash is empty (no hash-chain anchor)".to_string(),
             });
         }
 

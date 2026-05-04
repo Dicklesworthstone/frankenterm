@@ -257,6 +257,75 @@ proptest! {
         let result = compiler.compile(&input);
         prop_assert!(result.is_ok(), "Neutral verdict should succeed");
     }
+
+    /// br-ft-hcvcn: a Support or Neutral verdict on an INCOMPLETE
+    /// digest must still be rejected. Pre-fix only Reject verdict
+    /// was rejected; an incomplete digest with Support/Neutral
+    /// verdict slipped through, producing a workflow descriptor
+    /// even though the ledger said required proof categories
+    /// were missing.
+    #[test]
+    fn incomplete_digest_rejected_regardless_of_verdict_ft_hcvcn(
+        texts in prop::collection::vec(arb_command_text(), 1..5),
+        timeout_ms in 500..60000u64,
+        verdict in prop_oneof![
+            Just(EvidenceVerdict::Support),
+            Just(EvidenceVerdict::Neutral),
+        ],
+    ) {
+        let compiler = ArsCompiler::with_defaults();
+        let mut input = build_input(&texts, timeout_ms, verdict);
+        input.evidence_digest.is_complete = false;
+        let result = compiler.compile(&input);
+        prop_assert!(result.is_err(), "br-ft-hcvcn: incomplete digest must be rejected; got Ok");
+        let err = result.unwrap_err();
+        prop_assert!(
+            matches!(err, CompileError::IncompleteEvidence { is_complete: false, .. }),
+            "br-ft-hcvcn: must produce IncompleteEvidence; got {err:?}"
+        );
+    }
+
+    /// br-ft-hcvcn: an empty `root_hash` is the freely-
+    /// constructible default and indicates the digest did not
+    /// come from a real ledger. Reject regardless of verdict
+    /// (Support/Neutral) and is_complete=true.
+    #[test]
+    fn empty_root_hash_rejected_ft_hcvcn(
+        texts in prop::collection::vec(arb_command_text(), 1..5),
+        timeout_ms in 500..60000u64,
+    ) {
+        let compiler = ArsCompiler::with_defaults();
+        let mut input = build_input(&texts, timeout_ms, EvidenceVerdict::Support);
+        input.evidence_digest.root_hash = String::new();
+        let result = compiler.compile(&input);
+        prop_assert!(result.is_err(), "br-ft-hcvcn: empty root_hash must be rejected");
+        prop_assert!(
+            matches!(result.unwrap_err(), CompileError::MalformedEvidenceRoot { .. }),
+            "br-ft-hcvcn: must produce MalformedEvidenceRoot"
+        );
+    }
+
+    /// br-ft-hcvcn: complete digest WITH a non-empty root_hash
+    /// continues to succeed under Support/Neutral. Pin the
+    /// happy-path so the new gates don't over-reject.
+    #[test]
+    fn complete_digest_with_root_hash_succeeds_ft_hcvcn(
+        texts in prop::collection::vec(arb_command_text(), 1..5),
+        timeout_ms in 500..60000u64,
+        verdict in prop_oneof![
+            Just(EvidenceVerdict::Support),
+            Just(EvidenceVerdict::Neutral),
+        ],
+    ) {
+        let compiler = ArsCompiler::with_defaults();
+        let input = build_input(&texts, timeout_ms, verdict);
+        // arb_digest already sets is_complete: true and a 64-char
+        // root_hash; pin the happy-path explicitly.
+        prop_assert!(input.evidence_digest.is_complete);
+        prop_assert!(!input.evidence_digest.root_hash.is_empty());
+        let result = compiler.compile(&input);
+        prop_assert!(result.is_ok(), "br-ft-hcvcn: complete + root-hashed digest must succeed");
+    }
 }
 
 // =============================================================================
