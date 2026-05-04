@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 // =============================================================================
@@ -727,11 +728,22 @@ impl Default for EvidenceBuilder {
 // Hash computation
 // =============================================================================
 
-/// Compute SHA-256 hash for an evidence entry using FNV-1a as a simpler
-/// alternative (we don't need cryptographic strength for the test suite,
-/// but provide the same interface).
+/// br-ft-dl088: Compute the SHA-256 entry hash for an evidence
+/// ledger entry. Pre-fix this function used a 4-round FNV-1a
+/// expansion that produced 64 hex chars (visual SHA-256 lookalike)
+/// but had ZERO cryptographic strength — the file's module doc
+/// (line 13-14) advertised "cryptographically structured using
+/// SHA-256 hash chains, making tampering detectable", but the
+/// actual implementation was a non-cryptographic checksum.
+/// Operators relying on the ledger for tamper-detection got false
+/// assurance.
 ///
-/// Uses the same FNV-1a approach as recorder_audit.rs for consistency.
+/// Now: real SHA-256 over a deterministic byte stream. The byte
+/// stream uses length-prefixed concatenation of every field so
+/// distinct field values can never collide via boundary
+/// ambiguity (e.g., (summary="ab", prev="cd") vs
+/// (summary="abc", prev="d")). Output is the canonical
+/// 64-character lowercase-hex SHA-256 digest.
 fn compute_entry_hash(
     seq: u64,
     category: EvidenceCategory,
@@ -740,34 +752,48 @@ fn compute_entry_hash(
     payload: &BTreeMap<String, EvidenceValue>,
     prev_hash: &str,
 ) -> String {
-    // FNV-1a 64-bit.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hasher = Sha256::new();
 
-    let mix = |h: &mut u64, bytes: &[u8]| {
-        for &b in bytes {
-            *h ^= b as u64;
-            *h = h.wrapping_mul(0x0100_0000_01b3);
-        }
+    // br-ft-dl088: length-prefixed mix to prevent boundary-collision
+    // attacks. Every variable-length input is preceded by an 8-byte
+    // little-endian length so two distinct field assignments cannot
+    // produce the same canonical byte stream (e.g., (a="xy", b="z")
+    // vs (a="x", b="yz")). Fixed-length inputs (seq, timestamp_us,
+    // category) are mixed without a length prefix since they have
+    // no parsing ambiguity.
+    let mix_field = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     };
 
-    mix(&mut hash, &seq.to_le_bytes());
-    mix(&mut hash, format!("{}", category).as_bytes());
-    mix(&mut hash, &timestamp_us.to_le_bytes());
-    mix(&mut hash, summary.as_bytes());
+    hasher.update(seq.to_le_bytes());
+    let category_str = format!("{}", category);
+    mix_field(&mut hasher, category_str.as_bytes());
+    hasher.update(timestamp_us.to_le_bytes());
+    mix_field(&mut hasher, summary.as_bytes());
 
-    // Hash payload using canonical JSON serialization for determinism
-    // across serde roundtrips (avoids f64 precision issues with raw bytes).
+    // Hash payload using canonical JSON serialization for
+    // determinism across serde roundtrips (avoids f64 precision
+    // issues with raw bytes). BTreeMap ordering already gives us
+    // a canonical key sequence.
     let payload_json = serde_json::to_string(payload).unwrap_or_default();
-    mix(&mut hash, payload_json.as_bytes());
+    mix_field(&mut hasher, payload_json.as_bytes());
 
-    mix(&mut hash, prev_hash.as_bytes());
+    mix_field(&mut hasher, prev_hash.as_bytes());
 
-    // Produce a 64-char hex string (zero-padded).
-    // Use two FNV rounds to get 128 bits for visual similarity to SHA-256.
-    let hash2 = hash.wrapping_mul(0x0100_0000_01b3) ^ 0xdead_beef;
-    let hash3 = hash2.wrapping_mul(0x0100_0000_01b3) ^ 0xcafe_babe;
-    let hash4 = hash3.wrapping_mul(0x0100_0000_01b3) ^ 0x1234_5678;
-    format!("{:016x}{:016x}{:016x}{:016x}", hash, hash2, hash3, hash4)
+    // SHA-256 produces a 32-byte digest → 64 lowercase hex chars,
+    // matching the documented `entry_hash` shape (line 120 of this
+    // file) AND the historical 4-round FNV output length (so
+    // existing entry_hash field consumers don't need a width
+    // change). Pre-fix the FNV output also matched this width but
+    // had zero cryptographic strength.
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{:02x}", byte);
+    }
+    hex
 }
 
 // =============================================================================
@@ -1382,5 +1408,243 @@ mod tests {
         );
         let verification = ledger.verify_chain();
         assert!(verification.is_valid);
+    }
+
+    // =========================================================================
+    // br-ft-dl088: real SHA-256 entry hash (was a 4-round FNV-1a lookalike)
+    // =========================================================================
+
+    /// br-ft-dl088: the entry hash MUST be a real SHA-256 digest,
+    /// not the pre-fix 4-round FNV-1a lookalike. Pin both the
+    /// length (64 lowercase hex chars = 32-byte SHA-256 digest)
+    /// and a known-answer test against `Sha256::digest` of the
+    /// same canonical byte stream so a future refactor that
+    /// regresses to a non-cryptographic hash trips here loudly.
+    #[test]
+    fn entry_hash_is_real_sha256_known_answer_ft_dl088() {
+        // Compute the entry hash via the production helper.
+        let computed = compute_entry_hash(
+            42,
+            EvidenceCategory::ChangeDetection,
+            1_700_000_000_000_000,
+            "ft-dl088 known-answer test",
+            &BTreeMap::new(),
+            "prev-hash-anchor",
+        );
+
+        // Canonical SHA-256 produces a 32-byte digest → 64 hex
+        // characters lowercase. Pre-fix the 4-round FNV produced
+        // the same width (visual lookalike) but with no
+        // cryptographic strength — width alone isn't proof, so we
+        // also recompute the expected digest from the same
+        // canonical byte stream and assert byte-equality.
+        assert_eq!(
+            computed.len(),
+            64,
+            "ft-dl088: SHA-256 hex digest must be exactly 64 chars"
+        );
+        assert!(
+            computed
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "ft-dl088: digest must be lowercase hex; got `{computed}`"
+        );
+
+        // Recompute via canonical byte-stream + Sha256::digest as
+        // an external known-answer baseline. The byte stream MUST
+        // match `compute_entry_hash`'s canonical-form construction
+        // exactly (length-prefixed mix for variable-length fields).
+        let mut hasher = Sha256::new();
+        hasher.update(42_u64.to_le_bytes());
+        let category_str = format!("{}", EvidenceCategory::ChangeDetection);
+        hasher.update((category_str.as_bytes().len() as u64).to_le_bytes());
+        hasher.update(category_str.as_bytes());
+        hasher.update(1_700_000_000_000_000_u64.to_le_bytes());
+        let summary = "ft-dl088 known-answer test";
+        hasher.update((summary.as_bytes().len() as u64).to_le_bytes());
+        hasher.update(summary.as_bytes());
+        let payload_json = "{}";
+        hasher.update((payload_json.as_bytes().len() as u64).to_le_bytes());
+        hasher.update(payload_json.as_bytes());
+        let prev = "prev-hash-anchor";
+        hasher.update((prev.as_bytes().len() as u64).to_le_bytes());
+        hasher.update(prev.as_bytes());
+        let expected_digest = hasher.finalize();
+        let mut expected_hex = String::with_capacity(64);
+        for byte in expected_digest.iter() {
+            use std::fmt::Write as _;
+            let _ = write!(&mut expected_hex, "{:02x}", byte);
+        }
+
+        assert_eq!(
+            computed, expected_hex,
+            "ft-dl088: entry hash must equal SHA-256 of the canonical byte stream — \
+             a future regression to FNV-1a (or any non-cryptographic hash) trips here"
+        );
+    }
+
+    /// br-ft-dl088: SHA-256 cryptographic property — distinct
+    /// inputs MUST produce distinct outputs (modulo astronomical
+    /// collision probability). Pre-fix the FNV-1a expansion was a
+    /// deterministic permutation of a single 64-bit hash; modifying
+    /// any field perturbed the output, but the entire 256-bit space
+    /// was structurally limited to ~2^64 distinct outputs (one per
+    /// distinct FNV state). Real SHA-256 has the full 2^256
+    /// preimage-resistance budget. This test proves that varying
+    /// EACH input field changes the digest.
+    #[test]
+    fn entry_hash_changes_when_any_field_changes_ft_dl088() {
+        let baseline = compute_entry_hash(
+            1,
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "summary",
+            &BTreeMap::new(),
+            "prev",
+        );
+        // Vary `seq` — must produce distinct hash.
+        let vary_seq = compute_entry_hash(
+            2,
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "summary",
+            &BTreeMap::new(),
+            "prev",
+        );
+        assert_ne!(baseline, vary_seq, "ft-dl088: varying seq must change hash");
+
+        // Vary `category`.
+        let vary_category = compute_entry_hash(
+            1,
+            EvidenceCategory::SymbolicSafety,
+            1000,
+            "summary",
+            &BTreeMap::new(),
+            "prev",
+        );
+        assert_ne!(
+            baseline, vary_category,
+            "ft-dl088: varying category must change hash"
+        );
+
+        // Vary `timestamp_us`.
+        let vary_ts = compute_entry_hash(
+            1,
+            EvidenceCategory::ChangeDetection,
+            2000,
+            "summary",
+            &BTreeMap::new(),
+            "prev",
+        );
+        assert_ne!(
+            baseline, vary_ts,
+            "ft-dl088: varying timestamp must change hash"
+        );
+
+        // Vary `summary`.
+        let vary_summary = compute_entry_hash(
+            1,
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "different",
+            &BTreeMap::new(),
+            "prev",
+        );
+        assert_ne!(
+            baseline, vary_summary,
+            "ft-dl088: varying summary must change hash"
+        );
+
+        // Vary `prev_hash` (chain-tampering vector).
+        let vary_prev = compute_entry_hash(
+            1,
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "summary",
+            &BTreeMap::new(),
+            "tampered-prev",
+        );
+        assert_ne!(
+            baseline, vary_prev,
+            "ft-dl088: varying prev_hash must change hash (chain-tamper detection)"
+        );
+    }
+
+    /// br-ft-dl088: length-prefix boundary collision resistance.
+    /// Pre-fix the FNV-1a mix concatenated raw bytes with no
+    /// length prefix, so distinct field assignments could collide
+    /// via boundary ambiguity. Concrete example pinned here:
+    /// (summary="ab", prev="cd") vs (summary="abc", prev="d")
+    /// MUST produce distinct hashes (which they do post-fix
+    /// because the length-prefixed mix encodes each field's
+    /// length explicitly).
+    #[test]
+    fn entry_hash_resists_boundary_collision_ft_dl088() {
+        let h1 = compute_entry_hash(
+            1,
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "ab",
+            &BTreeMap::new(),
+            "cd",
+        );
+        let h2 = compute_entry_hash(
+            1,
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "abc",
+            &BTreeMap::new(),
+            "d",
+        );
+        assert_ne!(
+            h1, h2,
+            "ft-dl088: length-prefixed mix must prevent boundary collision \
+             between (summary=`ab`, prev=`cd`) and (summary=`abc`, prev=`d`)"
+        );
+    }
+
+    /// br-ft-dl088: SHA-256 KAT for the empty payload + zero seq +
+    /// empty strings case. Pins the canonical-form byte stream
+    /// shape against any future regression that re-orders or
+    /// drops a length prefix. Computing the expected hash via an
+    /// inline construction (rather than hardcoded hex) keeps the
+    /// test maintainable when the canonical form intentionally
+    /// changes — the test will then fail at the inline expected,
+    /// not at a hardcoded literal.
+    #[test]
+    fn entry_hash_canonical_form_pinned_ft_dl088() {
+        let computed = compute_entry_hash(
+            0,
+            EvidenceCategory::ChangeDetection,
+            0,
+            "",
+            &BTreeMap::new(),
+            "",
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(0_u64.to_le_bytes());
+        let category_str = format!("{}", EvidenceCategory::ChangeDetection);
+        hasher.update((category_str.as_bytes().len() as u64).to_le_bytes());
+        hasher.update(category_str.as_bytes());
+        hasher.update(0_u64.to_le_bytes());
+        hasher.update(0_u64.to_le_bytes()); // empty summary len
+        hasher.update(b""); // empty summary
+        let payload_json = "{}";
+        hasher.update((payload_json.as_bytes().len() as u64).to_le_bytes());
+        hasher.update(payload_json.as_bytes());
+        hasher.update(0_u64.to_le_bytes()); // empty prev len
+        hasher.update(b""); // empty prev
+        let expected = hasher.finalize();
+        let mut expected_hex = String::with_capacity(64);
+        for byte in expected.iter() {
+            use std::fmt::Write as _;
+            let _ = write!(&mut expected_hex, "{:02x}", byte);
+        }
+
+        assert_eq!(
+            computed, expected_hex,
+            "ft-dl088: empty-input canonical form must match the documented byte stream"
+        );
     }
 }
