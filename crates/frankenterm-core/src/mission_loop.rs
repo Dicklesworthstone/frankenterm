@@ -1952,6 +1952,36 @@ impl OperatorOverride {
     }
 }
 
+/// br-ft-i4brq: why an operator override couldn't be activated.
+///
+/// Today the only failure mode is the active-cap; structured as an
+/// enum so future reasons (e.g. duplicate target, missing TTL on a
+/// non-privileged source) can be added without breaking callers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OperatorOverrideRejection {
+    /// The active override vec already holds `cap` entries; the
+    /// rejected override is returned so the caller can log / surface
+    /// it rather than silently drop the operator's intent.
+    ActiveCapReached {
+        cap: usize,
+        rejected: OperatorOverride,
+    },
+}
+
+impl std::fmt::Display for OperatorOverrideRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActiveCapReached { cap, rejected } => write!(
+                f,
+                "br-ft-i4brq: active override cap of {cap} reached; rejected override_id={}",
+                rejected.override_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OperatorOverrideRejection {}
+
 /// Aggregate operator override state tracked in the mission loop.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OperatorOverrideState {
@@ -1966,9 +1996,43 @@ pub struct OperatorOverrideState {
 impl OperatorOverrideState {
     const MAX_HISTORY: usize = 100;
 
+    /// br-ft-i4brq: hard cap on the number of simultaneously
+    /// active overrides. Each evaluation scans the full active
+    /// vector for expiry, exclusions, reprioritize deltas, and
+    /// pins, so an unbounded vec turns the scheduler into a DoS
+    /// target. The cap matches the history bound order-of-
+    /// magnitude (history is the audit trail; active is the live
+    /// working set, which should generally be much smaller).
+    pub const MAX_ACTIVE: usize = 100;
+
     /// Add an override, making it immediately active.
+    ///
+    /// br-ft-i4brq: fail-closed when the active cap is reached.
+    /// The infallible `activate` is preserved for callers that
+    /// have already validated capacity (e.g. internal helpers
+    /// that just moved an override out of `active`); external
+    /// code paths should prefer [`Self::try_activate`] which
+    /// returns an error on cap exhaustion.
     pub fn activate(&mut self, ovr: OperatorOverride) {
         self.active.push(ovr);
+    }
+
+    /// br-ft-i4brq: fallible activator that rejects new overrides
+    /// once the active cap is reached. Returns the override back
+    /// to the caller via the error so it can be logged / surfaced
+    /// rather than silently dropped.
+    pub fn try_activate(
+        &mut self,
+        ovr: OperatorOverride,
+    ) -> Result<(), OperatorOverrideRejection> {
+        if self.active.len() >= Self::MAX_ACTIVE {
+            return Err(OperatorOverrideRejection::ActiveCapReached {
+                cap: Self::MAX_ACTIVE,
+                rejected: ovr,
+            });
+        }
+        self.active.push(ovr);
+        Ok(())
     }
 
     /// Clear (deactivate) an override by ID, moving it to history.
@@ -2097,7 +2161,8 @@ pub struct ReprioritizedBeadRecord {
 
 impl MissionLoop {
     /// Apply an operator override, making it immediately active.
-    /// Returns an error string if the override is invalid (e.g., duplicate ID).
+    /// Returns an error string if the override is invalid (e.g.,
+    /// duplicate ID, active cap reached).
     pub fn apply_override(&mut self, ovr: OperatorOverride) -> Result<(), String> {
         // Validate: no duplicate override IDs.
         if self
@@ -2109,8 +2174,13 @@ impl MissionLoop {
         {
             return Err(format!("override ID '{}' already active", ovr.override_id));
         }
-        self.state.override_state.activate(ovr);
-        Ok(())
+        // br-ft-i4brq: fail closed at the active cap so a
+        // control-plane caller can't accumulate unbounded permanent
+        // overrides and inflate every mission evaluation's scan.
+        self.state
+            .override_state
+            .try_activate(ovr)
+            .map_err(|err| err.to_string())
     }
 
     /// Clear an operator override by its ID.
@@ -5457,6 +5527,115 @@ mod tests {
             ml.state.last_override_summary.is_none(),
             "no overrides = no summary"
         );
+    }
+
+    #[test]
+    fn override_active_cap_rejects_overflow_ft_i4brq() {
+        // br-ft-i4brq: the active vec is scanned on every mission
+        // evaluation. A control-plane caller that accumulates more
+        // than MAX_ACTIVE overrides must be rejected, not allowed
+        // to grow the scan boundlessly.
+        let mut state = OperatorOverrideState::default();
+        for i in 0..OperatorOverrideState::MAX_ACTIVE {
+            let ovr = make_override(
+                &format!("active-{i}"),
+                OperatorOverrideKind::Exclude {
+                    bead_id: format!("b{i}"),
+                },
+            );
+            state
+                .try_activate(ovr)
+                .expect("under cap, must accept");
+        }
+        assert_eq!(state.active.len(), OperatorOverrideState::MAX_ACTIVE);
+
+        // The next one must fail closed, returning the rejected
+        // override so the caller can log / surface it.
+        let overflow = make_override(
+            "overflow",
+            OperatorOverrideKind::Exclude {
+                bead_id: "overflow".to_string(),
+            },
+        );
+        let err = state
+            .try_activate(overflow.clone())
+            .expect_err("at cap, must reject");
+        match err {
+            OperatorOverrideRejection::ActiveCapReached { cap, rejected } => {
+                assert_eq!(cap, OperatorOverrideState::MAX_ACTIVE);
+                assert_eq!(rejected.override_id, "overflow");
+            }
+        }
+        // Active count unchanged after rejection.
+        assert_eq!(state.active.len(), OperatorOverrideState::MAX_ACTIVE);
+    }
+
+    #[test]
+    fn apply_override_propagates_active_cap_error_ft_i4brq() {
+        // The MissionLoop wrapper must propagate the cap error.
+        let mut loop_inst = MissionLoop::new(MissionLoopConfig::default());
+        for i in 0..OperatorOverrideState::MAX_ACTIVE {
+            loop_inst
+                .apply_override(make_override(
+                    &format!("active-{i}"),
+                    OperatorOverrideKind::Exclude {
+                        bead_id: format!("b{i}"),
+                    },
+                ))
+                .expect("under cap");
+        }
+        let err = loop_inst
+            .apply_override(make_override(
+                "overflow",
+                OperatorOverrideKind::Exclude {
+                    bead_id: "overflow".to_string(),
+                },
+            ))
+            .expect_err("at cap, must reject");
+        assert!(err.contains("br-ft-i4brq"));
+        assert!(err.contains("override_id=overflow"));
+    }
+
+    #[test]
+    fn override_clear_frees_slot_for_new_activation_ft_i4brq() {
+        // After clear() removes an active override, a new one
+        // should fit. Pin the active-vec semantics so a future
+        // refactor that adjusts the cap arithmetic doesn't make
+        // the slot accounting inconsistent.
+        let mut state = OperatorOverrideState::default();
+        for i in 0..OperatorOverrideState::MAX_ACTIVE {
+            state
+                .try_activate(make_override(
+                    &format!("active-{i}"),
+                    OperatorOverrideKind::Exclude {
+                        bead_id: format!("b{i}"),
+                    },
+                ))
+                .unwrap();
+        }
+        // At cap, reject.
+        assert!(state
+            .try_activate(make_override(
+                "extra",
+                OperatorOverrideKind::Exclude {
+                    bead_id: "extra".to_string(),
+                },
+            ))
+            .is_err());
+
+        // Clear one, freeing a slot.
+        assert!(state.clear("active-0", 1000));
+        assert_eq!(state.active.len(), OperatorOverrideState::MAX_ACTIVE - 1);
+
+        // Now the new one fits.
+        state
+            .try_activate(make_override(
+                "extra",
+                OperatorOverrideKind::Exclude {
+                    bead_id: "extra".to_string(),
+                },
+            ))
+            .expect("slot now available");
     }
 
     #[test]

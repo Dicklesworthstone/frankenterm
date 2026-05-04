@@ -13,12 +13,13 @@
 //! - RS-10: Medium only → Review
 //! - RS-11: Info/Low only → Pass
 //! - RS-12: max_severity is max of individual severities
-//! - RS-13: total_risk_score is sum of individual scores
+//! - RS-13: base_severity_score is sum of individual severity scores
 //! - RS-14: Count invariant: critical+high+medium+low+info = total scores
 //! - RS-15: Shifted divergences always classify as Info
 //! - RS-16: Custom rules override default classification
 //! - RS-17: Confidence is in [0, 1]
 //! - RS-18: SeverityConfig from TOML roundtrip
+//! - RS-19: impact radius and confidence affect aggregate risk totals
 
 use proptest::prelude::*;
 
@@ -249,13 +250,13 @@ proptest! {
         prop_assert_eq!(agg.max_severity, expected_max);
     }
 
-    // ── RS-13: total_risk_score is sum ─────────────────────────────────
+    // ── RS-13: base_severity_score is sum ──────────────────────────────
 
     #[test]
-    fn rs13_total_score_sum(scores in prop::collection::vec(arb_risk_score(), 0..10)) {
+    fn rs13_base_severity_score_sum(scores in prop::collection::vec(arb_risk_score(), 0..10)) {
         let expected_sum: u64 = scores.iter().map(|s| s.severity.score() as u64).sum();
         let agg = AggregateRisk::from_scores(&scores);
-        prop_assert_eq!(agg.total_risk_score, expected_sum);
+        prop_assert_eq!(agg.base_severity_score, expected_sum);
     }
 
     // ── RS-14: Count invariant ─────────────────────────────────────────
@@ -362,5 +363,46 @@ proptest! {
         let restored = SeverityConfig::from_toml(&toml_str).unwrap();
         prop_assert_eq!(restored.rules.len(), 1);
         prop_assert_eq!(restored.rules[0].severity, sev);
+    }
+
+    // ── RS-19: Aggregate impact/confidence weighting ───────────────────
+
+    #[test]
+    fn rs19_impact_radius_and_confidence_affect_aggregate_total(
+        severity in arb_severity(),
+        base_radius in 0u64..=64,
+        extra_radius in 1u64..=64,
+        low_confidence_pct in 0u8..=50,
+        high_confidence_pct in 51u8..=100,
+    ) {
+        let low_impact = AggregateRisk::from_scores(&[RiskScore {
+            severity,
+            impact_radius: base_radius,
+            confidence: 1.0,
+            explanation: String::new(),
+        }]);
+        let high_impact = AggregateRisk::from_scores(&[RiskScore {
+            severity,
+            impact_radius: base_radius.saturating_add(extra_radius),
+            confidence: 1.0,
+            explanation: String::new(),
+        }]);
+        prop_assert_eq!(low_impact.base_severity_score, high_impact.base_severity_score);
+        prop_assert!(high_impact.total_risk_score > low_impact.total_risk_score);
+
+        let low_confidence = AggregateRisk::from_scores(&[RiskScore {
+            severity,
+            impact_radius: base_radius.saturating_add(extra_radius),
+            confidence: f64::from(low_confidence_pct) / 100.0,
+            explanation: String::new(),
+        }]);
+        let high_confidence = AggregateRisk::from_scores(&[RiskScore {
+            severity,
+            impact_radius: base_radius.saturating_add(extra_radius),
+            confidence: f64::from(high_confidence_pct) / 100.0,
+            explanation: String::new(),
+        }]);
+        prop_assert_eq!(low_confidence.base_severity_score, high_confidence.base_severity_score);
+        prop_assert!(high_confidence.total_risk_score >= low_confidence.total_risk_score);
     }
 }

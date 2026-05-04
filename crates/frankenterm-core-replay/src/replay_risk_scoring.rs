@@ -368,6 +368,16 @@ impl RiskScorer {
         AggregateRisk::from_scores(&scores)
     }
 
+    /// Score multiple divergences with caller-supplied downstream impact radii.
+    #[must_use]
+    pub fn aggregate_with_impact_radii(&self, divergences: &[(Divergence, u64)]) -> AggregateRisk {
+        let scores: Vec<RiskScore> = divergences
+            .iter()
+            .map(|(divergence, impact_radius)| self.score(divergence, *impact_radius))
+            .collect();
+        AggregateRisk::from_scores(&scores)
+    }
+
     /// Infer decision type from divergence nodes.
     #[allow(clippy::unused_self)]
     fn infer_decision_type(&self, divergence: &Divergence) -> Option<DecisionType> {
@@ -875,6 +885,22 @@ mod tests {
         let agg = AggregateRisk::from_scores(&[score_with(DivergenceSeverity::Medium, 4, 1.0)]);
         assert_eq!(agg.total_risk_score, BLOCK_TOTAL_RISK_SCORE);
         assert_eq!(agg.recommendation, Recommendation::Block);
+    }
+
+    #[test]
+    fn aggregate_with_impact_radii_uses_callers_radius_ft_9fna2() {
+        let scorer = RiskScorer::new();
+        let div = make_divergence(DivergenceType::Modified, "rule_a", RootCause::Unknown);
+
+        let zero_radius = scorer.aggregate(&[div.clone()]);
+        let caller_radius = scorer.aggregate_with_impact_radii(&[(div, 4)]);
+
+        assert_eq!(
+            zero_radius.base_severity_score,
+            caller_radius.base_severity_score
+        );
+        assert_eq!(caller_radius.total_impact_radius, 4);
+        assert!(caller_radius.total_risk_score > zero_radius.total_risk_score);
     }
 
     // ── Custom severity rule ───────────────────────────────────────────
