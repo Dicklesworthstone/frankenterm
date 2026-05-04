@@ -30348,6 +30348,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 })
                 .collect();
 
+            let hardware_profile_report =
+                frankenterm_core::hardware_profile::collect_hardware_profile(&layout.root);
+
             // Determine overall status
             let has_errors = all_checks
                 .iter()
@@ -30404,6 +30407,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 // TieredAtlasRegion registry; standalone ft binary
                 // reports the no-atlases sentinel.
                 result["atlas_tier_swap"] = serde_json::to_value(&tier_swap_doctor_report)
+                    .unwrap_or(serde_json::Value::Null);
+                result["hardware_profile"] = serde_json::to_value(&hardware_profile_report)
                     .unwrap_or(serde_json::Value::Null);
 
                 if let Some(report) = runtime_report.as_ref() {
@@ -30468,6 +30473,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
 
                 print_swarm_capacity_doctor_section(&swarm_capacity_summary);
+
+                println!();
+                println!("Hardware Profile:");
+                for line in hardware_profile_report.diagnostic_lines() {
+                    let status = match line.status {
+                        frankenterm_core::hardware_profile::HardwareDiagnosticStatus::Ok => "[OK]",
+                        frankenterm_core::hardware_profile::HardwareDiagnosticStatus::Warn => {
+                            "[WARN]"
+                        }
+                    };
+                    println!("  {} {} - {}", status, line.name, line.detail);
+                    if let Some(recommendation) = line.recommendation {
+                        println!("       -> {recommendation}");
+                    }
+                }
 
                 println!();
                 println!("Crash History:");
