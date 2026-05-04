@@ -14315,6 +14315,122 @@ mod tests {
 
     // ── UnifiedTelemetryRecord ──
 
+    // ── br-ft-7cqhu: id redaction policy ──
+
+    #[test]
+    fn unified_runtime_record_passthrough_keeps_raw_ids_ft_7cqhu() {
+        // Sanity: the legacy default (Passthrough) preserves the
+        // existing contract.
+        let event = RuntimeTelemetryEventBuilder::new(
+            "rt.error",
+            RuntimeTelemetryKind::TransientError,
+        )
+        .scope_id("daemon:capture:pane_42")
+        .correlation("session-secret-123")
+        .reason("error.recovering.transient")
+        .timestamp_ms(1111)
+        .build();
+
+        let record = UnifiedTelemetryRecord::from_runtime_event_with_id_redaction(
+            &event,
+            IdRedactionPolicy::Passthrough,
+        );
+        assert_eq!(record.scope_id.as_deref(), Some("daemon:capture:pane_42"));
+        assert_eq!(record.correlation_id.as_deref(), Some("session-secret-123"));
+        assert!(record.record_id.contains("session-secret-123"));
+    }
+
+    #[test]
+    fn unified_runtime_record_hash_redacts_scope_and_correlation_ft_7cqhu() {
+        // br-ft-7cqhu: with IdRedactionPolicy::Hash, the raw
+        // scope_id and correlation_id values must not appear in
+        // any field of the serialized unified record (including
+        // record_id which embeds correlation_id).
+        let event = RuntimeTelemetryEventBuilder::new(
+            "rt.error",
+            RuntimeTelemetryKind::TransientError,
+        )
+        .scope_id("daemon:capture:pane_42")
+        .correlation("session-secret-123")
+        .reason("error.recovering.transient")
+        .timestamp_ms(1111)
+        .build();
+
+        let record = UnifiedTelemetryRecord::from_runtime_event_with_id_redaction(
+            &event,
+            IdRedactionPolicy::Hash,
+        );
+
+        let scope = record.scope_id.as_deref().unwrap();
+        assert!(scope.starts_with("hash:"));
+        assert!(!scope.contains("daemon:capture:pane_42"));
+        assert!(!scope.contains("pane_42"));
+
+        let corr = record.correlation_id.as_deref().unwrap();
+        assert!(corr.starts_with("hash:"));
+        assert!(!corr.contains("session-secret-123"));
+        assert!(!corr.contains("secret"));
+
+        // record_id must NOT contain the raw correlation_id.
+        assert!(
+            !record.record_id.contains("session-secret-123"),
+            "record_id leaked raw correlation: {}",
+            record.record_id
+        );
+        // ...and must contain the hashed form (since the original
+        // record_id format embeds correlation_id).
+        assert!(record.record_id.contains(corr));
+
+        // Serialized record contains no raw identifiers.
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            !json.contains("daemon:capture:pane_42"),
+            "raw scope leaked in JSON: {json}"
+        );
+        assert!(
+            !json.contains("session-secret-123"),
+            "raw correlation leaked in JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn unified_runtime_record_hash_is_deterministic_for_correlation_ft_7cqhu() {
+        // Cross-record correlation is preserved: two records
+        // sharing a raw correlation_id share the hashed form.
+        let event_a = RuntimeTelemetryEventBuilder::new("rt.a", RuntimeTelemetryKind::Heartbeat)
+            .correlation("corr-shared")
+            .timestamp_ms(1000)
+            .reason("heartbeat")
+            .build();
+        let event_b = RuntimeTelemetryEventBuilder::new("rt.b", RuntimeTelemetryKind::Heartbeat)
+            .correlation("corr-shared")
+            .timestamp_ms(2000)
+            .reason("heartbeat")
+            .build();
+
+        let rec_a = UnifiedTelemetryRecord::from_runtime_event_with_id_redaction(
+            &event_a,
+            IdRedactionPolicy::Hash,
+        );
+        let rec_b = UnifiedTelemetryRecord::from_runtime_event_with_id_redaction(
+            &event_b,
+            IdRedactionPolicy::Hash,
+        );
+
+        assert_eq!(rec_a.correlation_id, rec_b.correlation_id);
+        // But different inputs → different hashes.
+        let event_c = RuntimeTelemetryEventBuilder::new("rt.c", RuntimeTelemetryKind::Heartbeat)
+            .correlation("corr-different")
+            .timestamp_ms(3000)
+            .reason("heartbeat")
+            .build();
+        let rec_c = UnifiedTelemetryRecord::from_runtime_event_with_id_redaction(
+            &event_c,
+            IdRedactionPolicy::Hash,
+        );
+        assert_ne!(rec_a.correlation_id, rec_c.correlation_id);
+    }
+
     #[test]
     fn unified_runtime_record_redacts_sensitive_details() {
         let event =

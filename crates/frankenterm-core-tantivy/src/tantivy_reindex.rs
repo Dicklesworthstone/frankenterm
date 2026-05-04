@@ -61,6 +61,10 @@ fn cursor_err(e: EventCursorError) -> IndexerError {
     ))
 }
 
+fn should_resume_full_reindex(clear_before_start: bool, checkpoint_present: bool) -> bool {
+    checkpoint_present && !clear_before_start
+}
+
 // ---------------------------------------------------------------------------
 // Extended writer trait for reindex operations
 // ---------------------------------------------------------------------------
@@ -144,7 +148,10 @@ pub struct ReindexConfig {
     pub dedup_on_replay: bool,
     /// Expected recorder event schema version.
     pub expected_event_schema: String,
-    /// Whether to clear the entire index before starting.
+    /// Whether to clear the entire index and rebuild from ordinal 0 before starting.
+    ///
+    /// Existing full-reindex checkpoints are ignored when this is true. Set this
+    /// to false to resume from a previous full-reindex checkpoint.
     pub clear_before_start: bool,
     /// Stop after this many batches (0 = unlimited).
     pub max_batches: usize,
@@ -337,9 +344,10 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
     /// Perform a full reindex from ordinal 0.
     ///
     /// If `config.clear_before_start` is true, all existing documents are
-    /// deleted before indexing begins. The operation is resumable: if
-    /// interrupted, the next call with the same consumer ID continues from
-    /// the last checkpoint.
+    /// deleted before indexing begins and any existing full-reindex checkpoint
+    /// is ignored so the rebuild starts from ordinal 0. Set
+    /// `clear_before_start=false` for resumable continuation from the last
+    /// checkpoint.
     pub async fn full_reindex<S: RecorderStorage>(
         &mut self,
         storage: &S,
@@ -353,18 +361,18 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         let mut progress = ReindexProgress::new();
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
-        // Optionally clear the index
-        if config.clear_before_start {
-            let existing_checkpoint = storage.read_checkpoint(&consumer_id).await?;
-            // Only clear if we're starting fresh (no existing checkpoint)
-            if existing_checkpoint.is_none() {
-                let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
-                progress.docs_cleared = cleared;
+        let checkpoint = if config.clear_before_start {
+            let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
+            progress.docs_cleared = cleared;
+            None
+        } else {
+            let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+            if should_resume_full_reindex(config.clear_before_start, checkpoint.is_some()) {
+                checkpoint
+            } else {
+                None
             }
-        }
-
-        // Read checkpoint for resume
-        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+        };
 
         let mut cursor = match &checkpoint {
             Some(cp) => {
@@ -423,24 +431,34 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         let mut progress = ReindexProgress::new();
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
-        if config.clear_before_start {
+        let checkpoint = if config.clear_before_start {
+            let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
+            progress.docs_cleared = cleared;
+
+            cx.checkpoint().map_err(|err| {
+                IndexerError::Config(format!(
+                    "full_reindex cancelled after clear_all (docs_cleared={}): {err}",
+                    progress.docs_cleared
+                ))
+            })?;
+
+            None
+        } else {
+            cx.checkpoint().map_err(|err| {
+                IndexerError::Config(format!(
+                    "full_reindex cancelled before checkpoint read (docs_cleared={}): {err}",
+                    progress.docs_cleared
+                ))
+            })?;
+
             // Tick 75/76 refactor: Cx-first trait sibling.
-            let existing_checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
-            if existing_checkpoint.is_none() {
-                let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
-                progress.docs_cleared = cleared;
+            let checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
+            if should_resume_full_reindex(config.clear_before_start, checkpoint.is_some()) {
+                checkpoint
+            } else {
+                None
             }
-        }
-
-        cx.checkpoint().map_err(|err| {
-            IndexerError::Config(format!(
-                "full_reindex cancelled after clear_all (docs_cleared={}): {err}",
-                progress.docs_cleared
-            ))
-        })?;
-
-        // Tick 75/76 refactor: Cx-first trait sibling.
-        let checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
+        };
 
         let mut cursor = match &checkpoint {
             Some(cp) => {

@@ -731,6 +731,7 @@ impl MissionLoop {
         self.state.last_override_summary = if override_summary.excluded_beads.is_empty()
             && override_summary.excluded_agents.is_empty()
             && override_summary.pinned_assignments.is_empty()
+            && override_summary.rejected_pinned_assignments.is_empty()
             && override_summary.reprioritized_beads.is_empty()
             && override_summary.expired_overrides == 0
         {
