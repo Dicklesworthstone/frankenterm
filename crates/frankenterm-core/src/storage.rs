@@ -4183,8 +4183,11 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            get_latest_checkpoint_hash(&conn, &session_id)
+            // br-ft-l1jgo: trait-typed pooled_backend (was direct
+            // PooledReadConn::acquire + get_latest_checkpoint_hash).
+            pooled_backend(db_path.as_str(), |backend| {
+                get_latest_checkpoint_hash_backend(backend, &session_id)
+            })
         })
         .await
     }
@@ -5079,9 +5082,11 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_max_seq(&conn, pane_id)
+            // br-ft-l1jgo: trait-typed pooled_backend (was direct
+            // PooledReadConn::acquire + query_max_seq).
+            pooled_backend(db_path.as_str(), |backend| {
+                query_max_seq_backend(backend, pane_id)
+            })
         })
         .await
     }
@@ -7324,7 +7329,7 @@ where
 
 #[cfg(test)]
 mod writer_bridge_tests {
-    use super::{with_writer_backend, Connection, WRITER_PLACEHOLDER_POOL};
+    use super::{Connection, WRITER_PLACEHOLDER_POOL, with_writer_backend};
 
     /// Pinned: the live `Connection` is restored even when `f` panics.
     /// Pre-fix the `mem::replace(conn, placeholder)` had already
@@ -10410,6 +10415,11 @@ fn mark_session_shutdown_clean_backend(
 }
 
 /// Get the state_hash of the latest checkpoint for a session (read-only).
+///
+/// Direct-rusqlite path. Kept as a fallback while the
+/// [`get_latest_checkpoint_hash_backend`] migration target settles
+/// in (br-ft-l1jgo); will be removed once no callers remain.
+#[allow(dead_code)]
 pub fn get_latest_checkpoint_hash(conn: &Connection, session_id: &str) -> Result<Option<String>> {
     let result = conn
         .query_row(
@@ -10424,6 +10434,26 @@ pub fn get_latest_checkpoint_hash(conn: &Connection, session_id: &str) -> Result
             StorageError::Database(format!("Failed to get latest checkpoint hash: {e}"))
         })?;
     Ok(result)
+}
+
+/// br-ft-l1jgo: trait-typed sibling of [`get_latest_checkpoint_hash`].
+///
+/// `state_hash` is a content hash (SHA-derived) and the column is
+/// NOT NULL by schema, so `query_row_typed`'s string-substrate path
+/// — which can't distinguish NULL from empty TEXT — is sound here.
+fn get_latest_checkpoint_hash_backend(
+    backend: &dyn StorageBackend,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let row = backend
+        .query_row_typed(
+            "SELECT state_hash FROM session_checkpoints
+             WHERE session_id = ?1
+             ORDER BY checkpoint_at DESC LIMIT 1",
+            &[ToSqlValue::Text(session_id)],
+        )
+        .map_err(|err| storage_backend_error("Get latest checkpoint hash", err))?;
+    Ok(row.and_then(|cells| cells.into_iter().next()))
 }
 
 fn pane_bookmark_from_backend_row(row: &[String]) -> Result<PaneBookmarkRecord> {
@@ -14929,7 +14959,12 @@ fn query_action_history(
     Ok(results)
 }
 
-/// Query maximum sequence number for a pane
+/// Query maximum sequence number for a pane.
+///
+/// Direct-rusqlite path. Kept as a fallback while the
+/// [`query_max_seq_backend`] migration target settles in
+/// (br-ft-l1jgo); will be removed once no callers remain.
+#[allow(dead_code)]
 fn query_max_seq(conn: &Connection, pane_id: u64) -> Result<Option<u64>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
 
@@ -14945,6 +14980,36 @@ fn query_max_seq(conn: &Connection, pane_id: u64) -> Result<Option<u64>> {
     .optional()
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
     .map(Option::flatten)
+}
+
+/// br-ft-l1jgo: trait-typed sibling of [`query_max_seq`].
+///
+/// `MAX(seq)` returns SQL NULL when no rows match the WHERE clause
+/// (empty pane). The string-substrate path can't distinguish NULL
+/// from `Integer(0)` cleanly, so this migration uses
+/// `query_row_cells` which preserves the storage-class
+/// distinction. The original returned `None` for both
+/// "no row" and "row with NULL MAX"; we mirror that.
+fn query_max_seq_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<Option<u64>> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let row = backend
+        .query_row_cells(
+            "SELECT MAX(seq) FROM output_segments WHERE pane_id = ?1",
+            &[ToSqlValue::Integer(pane_id_i64)],
+        )
+        .map_err(|err| storage_backend_error("Query max seq", err))?;
+    let max = row.and_then(|cells| {
+        cells.into_iter().next().and_then(|cell| match cell {
+            SqlCell::Integer(v) => Some(v),
+            // SQL NULL (empty table or no matching pane_id) maps to None.
+            SqlCell::Null => None,
+            // MAX over an INTEGER column should never return REAL/TEXT/BLOB;
+            // treat unexpected types as "no value".
+            _ => None,
+        })
+    });
+    #[allow(clippy::cast_sign_loss)]
+    Ok(max.map(|v| v as u64))
 }
 
 /// Query all panes
