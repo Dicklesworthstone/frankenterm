@@ -9030,10 +9030,13 @@ fn query_event_identity_key(conn: &Connection, event_id: i64) -> Result<Option<S
         let pane_uuid: Option<String> = row
             .get(4)
             .map_err(|e| StorageError::Database(format!("Failed to read pane_uuid: {e}")))?;
-        let extracted = extracted_str
-            .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or(serde_json::Value::Null);
+        // br-ft-4d6ic: route silent serde failure through observability counter.
+        let extracted = parse_storage_json_col::<serde_json::Value>(
+            extracted_str.as_deref(),
+            "events",
+            "extracted",
+        )
+        .unwrap_or(serde_json::Value::Null);
 
         let detection = crate::patterns::Detection {
             rule_id,
@@ -9638,8 +9641,7 @@ fn parse_storage_json_col<T: serde::de::DeserializeOwned>(
     match serde_json::from_str(raw) {
         Ok(parsed) => Some(parsed),
         Err(err) => {
-            STORAGE_JSON_COL_PARSE_DROP_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            STORAGE_JSON_COL_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 target: "ft.storage.json_col",
                 event = "json_col_parse_drop",
@@ -9696,8 +9698,7 @@ fn parse_pane_bookmark_tags(raw: &str, bookmark_id: i64, pane_id: u64) -> Option
     match serde_json::from_str::<Vec<String>>(raw) {
         Ok(tags) => Some(tags),
         Err(err) => {
-            PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 target: "ft.storage.pane_bookmark",
                 event = "pane_bookmark_tags_parse_drop",
@@ -9720,10 +9721,7 @@ mod pane_bookmark_tags_parse_drop_tests {
     fn well_formed_tags_no_bump_ft_pewat() {
         reset_pane_bookmark_tags_parse_drop_count_for_test();
         let tags = parse_pane_bookmark_tags(r#"["urgent","review"]"#, 1, 7);
-        assert_eq!(
-            tags,
-            Some(vec!["urgent".to_string(), "review".to_string()])
-        );
+        assert_eq!(tags, Some(vec!["urgent".to_string(), "review".to_string()]));
         assert_eq!(pane_bookmark_tags_parse_drop_count(), 0);
     }
 
@@ -9788,6 +9786,119 @@ mod workflow_execution_row_parse_drop_tests {
             parse_workflow_execution_column(Some("{also broken"), "context");
         assert!(r2.is_none());
         assert_eq!(workflow_execution_row_parse_drop_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod storage_json_col_parse_drop_tests {
+    //! br-ft-4d6ic: tests pinning the umbrella JSON-column parse
+    //! observability counter. The 7 silent serde drops in storage.rs
+    //! query paths (events.extracted ×4, agent_sessions.external_meta
+    //! ×3) all route through `parse_storage_json_col` which bumps a
+    //! single shared counter and emits structured tracing::warn with
+    //! per-site (table, column) tags.
+    use super::*;
+
+    /// br-ft-4d6ic: NULL column (None input) does not bump the
+    /// counter. NULL is legitimate absence; only column-present-but-
+    /// fails-to-parse counts as a drop.
+    #[test]
+    fn null_column_does_not_bump_ft_4d6ic() {
+        reset_storage_json_col_parse_drop_count_for_test();
+        let result: Option<serde_json::Value> = parse_storage_json_col(None, "events", "extracted");
+        assert!(result.is_none());
+        assert_eq!(storage_json_col_parse_drop_count(), 0);
+    }
+
+    /// br-ft-4d6ic: well-formed JSON returns Some + does not bump.
+    #[test]
+    fn well_formed_column_does_not_bump_ft_4d6ic() {
+        reset_storage_json_col_parse_drop_count_for_test();
+        let result: Option<serde_json::Value> =
+            parse_storage_json_col(Some(r#"{"key":"value"}"#), "events", "extracted");
+        assert!(result.is_some());
+        assert_eq!(storage_json_col_parse_drop_count(), 0);
+    }
+
+    /// br-ft-4d6ic: malformed JSON bumps the umbrella counter once.
+    /// Pre-fix this drop was a silent `.ok()` — operators had ZERO
+    /// signal that JSON-column parse fidelity was degrading.
+    #[test]
+    fn malformed_column_bumps_counter_ft_4d6ic() {
+        reset_storage_json_col_parse_drop_count_for_test();
+        let result: Option<serde_json::Value> =
+            parse_storage_json_col(Some("{not json"), "events", "extracted");
+        assert!(result.is_none());
+        assert_eq!(storage_json_col_parse_drop_count(), 1);
+    }
+
+    /// br-ft-4d6ic: drops from DIFFERENT (table, column) pairs all
+    /// accumulate into the SAME umbrella counter. Operators read
+    /// the counter for the high-level question; the per-site
+    /// discrimination comes through the structured tracing::warn's
+    /// table+column tags. This test pins both the accumulation
+    /// behavior AND that table/column don't accidentally split into
+    /// per-pair counters.
+    #[test]
+    fn drops_accumulate_across_distinct_tables_ft_4d6ic() {
+        reset_storage_json_col_parse_drop_count_for_test();
+
+        let _: Option<serde_json::Value> =
+            parse_storage_json_col(Some("{ malformed"), "events", "extracted");
+        assert_eq!(storage_json_col_parse_drop_count(), 1);
+
+        let _: Option<serde_json::Value> =
+            parse_storage_json_col(Some("[malformed"), "agent_sessions", "external_meta");
+        assert_eq!(
+            storage_json_col_parse_drop_count(),
+            2,
+            "ft-4d6ic: drops from a different (table, column) pair must accumulate \
+             into the same umbrella counter"
+        );
+
+        // Drop from the same pair again — counter advances by 1.
+        let _: Option<serde_json::Value> =
+            parse_storage_json_col(Some("definitely not json"), "events", "extracted");
+        assert_eq!(storage_json_col_parse_drop_count(), 3);
+    }
+
+    /// br-ft-4d6ic: counter independence — the umbrella counter must
+    /// NOT spill into the sibling per-table counters
+    /// (PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT,
+    /// WORKFLOW_EXECUTION_ROW_PARSE_DROP_COUNT) and vice versa.
+    /// Pins the boundary between the umbrella and the dedicated
+    /// per-table counters so a future refactor that consolidates
+    /// can't silently merge classes operators rely on for
+    /// discrimination.
+    #[test]
+    fn umbrella_counter_independent_of_per_table_counters_ft_4d6ic() {
+        reset_storage_json_col_parse_drop_count_for_test();
+        reset_pane_bookmark_tags_parse_drop_count_for_test();
+        reset_workflow_execution_row_parse_drop_count_for_test();
+
+        // Umbrella bump only.
+        let _: Option<serde_json::Value> =
+            parse_storage_json_col(Some("{not json"), "events", "extracted");
+        assert_eq!(storage_json_col_parse_drop_count(), 1);
+        assert_eq!(
+            pane_bookmark_tags_parse_drop_count(),
+            0,
+            "ft-4d6ic: umbrella bump must NOT spill into pane_bookmark counter"
+        );
+        assert_eq!(
+            workflow_execution_row_parse_drop_count(),
+            0,
+            "ft-4d6ic: umbrella bump must NOT spill into workflow_execution counter"
+        );
+
+        // Pane-bookmark bump only.
+        let _ = parse_pane_bookmark_tags("{not array", 1, 2);
+        assert_eq!(pane_bookmark_tags_parse_drop_count(), 1);
+        assert_eq!(
+            storage_json_col_parse_drop_count(),
+            1,
+            "ft-4d6ic: pane_bookmark bump must NOT spill into umbrella counter"
+        );
     }
 }
 
@@ -11111,7 +11222,10 @@ fn record_usage_metrics_batch_backend(
         },
         Err(batch_err) => {
             let _ = backend.execute("ROLLBACK");
-            Err(storage_backend_error("Insert usage metric batch", batch_err))
+            Err(storage_backend_error(
+                "Insert usage metric batch",
+                batch_err,
+            ))
         }
     }?;
     Ok(inserted)
@@ -14064,9 +14178,12 @@ fn query_agent_session(conn: &Connection, session_id: i64) -> Result<Option<Agen
         [session_id],
         |row| {
             let external_meta_str: Option<String> = row.get(5)?;
-            let external_meta = external_meta_str
-                .as_ref()
-                .and_then(|value| serde_json::from_str(value).ok());
+            // br-ft-4d6ic: route silent serde failure through observability counter.
+            let external_meta = parse_storage_json_col::<serde_json::Value>(
+                external_meta_str.as_deref(),
+                "agent_sessions",
+                "external_meta",
+            );
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
                 pane_id: {
@@ -14110,9 +14227,12 @@ fn query_active_sessions(conn: &Connection) -> Result<Vec<AgentSessionRecord>> {
     let rows = stmt
         .query_map([], |row| {
             let external_meta_str: Option<String> = row.get(5)?;
-            let external_meta = external_meta_str
-                .as_ref()
-                .and_then(|value| serde_json::from_str(value).ok());
+            // br-ft-4d6ic: route silent serde failure through observability counter.
+            let external_meta = parse_storage_json_col::<serde_json::Value>(
+                external_meta_str.as_deref(),
+                "agent_sessions",
+                "external_meta",
+            );
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
                 pane_id: {
@@ -14162,9 +14282,12 @@ fn query_sessions_for_pane(conn: &Connection, pane_id: u64) -> Result<Vec<AgentS
     let rows = stmt
         .query_map([pane_id_i64], |row| {
             let external_meta_str: Option<String> = row.get(5)?;
-            let external_meta = external_meta_str
-                .as_ref()
-                .and_then(|value| serde_json::from_str(value).ok());
+            // br-ft-4d6ic: route silent serde failure through observability counter.
+            let external_meta = parse_storage_json_col::<serde_json::Value>(
+                external_meta_str.as_deref(),
+                "agent_sessions",
+                "external_meta",
+            );
             Ok(AgentSessionRecord {
                 id: row.get(0)?,
                 pane_id: {
@@ -14215,9 +14338,12 @@ fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredE
     let rows = stmt
         .query_map([limit_i64], |row| {
             let extracted_str: Option<String> = row.get(7)?;
-            let extracted = extracted_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            // br-ft-4d6ic: route silent serde failure through observability counter.
+            let extracted = parse_storage_json_col::<serde_json::Value>(
+                extracted_str.as_deref(),
+                "events",
+                "extracted",
+            );
 
             Ok(StoredEvent {
                 id: row.get(0)?,
@@ -14380,9 +14506,12 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
             let extracted_str: Option<String> = row.get(7)?;
-            let extracted = extracted_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            // br-ft-4d6ic: route silent serde failure through observability counter.
+            let extracted = parse_storage_json_col::<serde_json::Value>(
+                extracted_str.as_deref(),
+                "events",
+                "extracted",
+            );
 
             Ok(StoredEvent {
                 id: row.get(0)?,
@@ -14476,9 +14605,12 @@ fn query_events_stream(conn: &Connection, query: &EventStreamQuery) -> Result<Ve
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params), |row| {
             let extracted_str: Option<String> = row.get(7)?;
-            let extracted = extracted_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            // br-ft-4d6ic: route silent serde failure through observability counter.
+            let extracted = parse_storage_json_col::<serde_json::Value>(
+                extracted_str.as_deref(),
+                "events",
+                "extracted",
+            );
 
             Ok(StoredEvent {
                 id: row.get(0)?,
@@ -15584,10 +15716,8 @@ fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<Workflo
             // schema-skewed row column bumps the observability
             // counter instead of silently turning into None.
             let wait_condition_str: Option<String> = row.get(6)?;
-            let wait_condition = parse_workflow_execution_column(
-                wait_condition_str.as_deref(),
-                "wait_condition",
-            );
+            let wait_condition =
+                parse_workflow_execution_column(wait_condition_str.as_deref(), "wait_condition");
 
             let context_str: Option<String> = row.get(7)?;
             let context = parse_workflow_execution_column(context_str.as_deref(), "context");
@@ -15772,10 +15902,8 @@ fn query_incomplete_workflows(conn: &Connection) -> Result<Vec<WorkflowRecord>> 
             // schema-skewed row column bumps the observability
             // counter instead of silently turning into None.
             let wait_condition_str: Option<String> = row.get(6)?;
-            let wait_condition = parse_workflow_execution_column(
-                wait_condition_str.as_deref(),
-                "wait_condition",
-            );
+            let wait_condition =
+                parse_workflow_execution_column(wait_condition_str.as_deref(), "wait_condition");
 
             let context_str: Option<String> = row.get(7)?;
             let context = parse_workflow_execution_column(context_str.as_deref(), "context");
