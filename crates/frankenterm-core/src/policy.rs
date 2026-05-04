@@ -1929,6 +1929,42 @@ pub(crate) fn record_policy_decision_context_serde_drop() {
     POLICY_DECISION_CONTEXT_SERDE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+// br-ft-k6uwb: separate counter for the *parse* (deserialization) path
+// — `parse_serialized_decision_context` and
+// `parse_serialized_decision_surface`. Distinct from
+// `POLICY_DECISION_CONTEXT_SERDE_DROP_COUNT` (the write path under
+// ft-yygus): operators reading a raised parse counter should
+// investigate downstream schema-skew on consumers, not the writers.
+static POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of audit-record decision_context payloads that
+/// could not be parsed back into a `DecisionContext` (or into a raw
+/// JSON object for legacy surface extraction) since process load.
+/// Each increment represents one consumer that lost the WHY of a
+/// policy decision. > 0 means investigate schema drift between
+/// writers and downstream replay/audit consumers.
+#[must_use]
+pub fn policy_decision_context_parse_drop_count() -> u64 {
+    POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// br-ft-k6uwb: test helper to reset the parse-drop counter.
+#[cfg(test)]
+pub(crate) fn reset_policy_decision_context_parse_drop_count_for_test() {
+    POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_policy_decision_context_parse_drop(phase: &'static str) {
+    POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        target: "ft.policy.audit",
+        event = "policy_decision_context_parse_drop",
+        phase = phase,
+        "audit-record decision_context payload could not be parsed; consumer will see None (br-ft-k6uwb)"
+    );
+}
+
 /// Cumulative count of regex compile failures observed inside the
 /// CommandPattern matching paths since process load. Each increment
 /// represents one rule whose `command_patterns` regex failed to
@@ -2121,25 +2157,61 @@ impl DecisionContext {
 }
 
 /// Parse a serialized decision context emitted in audit records.
+///
+/// br-ft-k6uwb: a parse failure bumps
+/// [`POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT`] with phase
+/// `"typed_context"` so an operator can distinguish writer-skew
+/// from downstream consumer-skew. Returns `None` so the scalar
+/// contract stays the same; `None` from `serialized` (caller
+/// passed nothing) is NOT counted as a drop because there's
+/// nothing to lose.
 #[must_use]
 pub fn parse_serialized_decision_context(serialized: Option<&str>) -> Option<DecisionContext> {
-    serde_json::from_str(serialized?).ok()
+    let raw = serialized?;
+    match serde_json::from_str(raw) {
+        Ok(ctx) => Some(ctx),
+        Err(_) => {
+            record_policy_decision_context_parse_drop("typed_context");
+            None
+        }
+    }
 }
 
 /// Extract the best-known policy surface from serialized decision context.
 ///
 /// This prefers typed [`DecisionContext`] payloads but tolerates older audit
 /// records that only stored a raw JSON object with a `"surface"` field.
+///
+/// br-ft-k6uwb: each fallback arm has its own discriminating
+/// phase tag on the parse-drop counter:
+///   * `typed_context` — first attempt failed (handled inside
+///     `parse_serialized_decision_context`).
+///   * `raw_value_shape` — fallback couldn't even parse the JSON
+///     payload as a `Value` (severe corruption).
+///   * `surface_from_value` — `Value` parsed but `"surface"` field
+///     was missing or its content failed to deserialize as
+///     `PolicySurface` (schema rename / removal).
 #[must_use]
 pub fn parse_serialized_decision_surface(serialized: Option<&str>) -> Option<PolicySurface> {
     parse_serialized_decision_context(serialized)
         .map(|context| context.surface)
         .or_else(|| {
-            let surface = serde_json::from_str::<serde_json::Value>(serialized?)
-                .ok()?
-                .get("surface")
-                .cloned()?;
-            serde_json::from_value(surface).ok()
+            let raw = serialized?;
+            let value: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(_) => {
+                    record_policy_decision_context_parse_drop("raw_value_shape");
+                    return None;
+                }
+            };
+            let surface = value.get("surface").cloned()?;
+            match serde_json::from_value(surface) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    record_policy_decision_context_parse_drop("surface_from_value");
+                    None
+                }
+            }
         })
 }
 
@@ -12139,6 +12211,85 @@ mod tests {
         );
         assert_eq!(parse_serialized_decision_surface(Some("{not json")), None);
         assert_eq!(parse_serialized_decision_surface(None), None);
+    }
+
+    // ── br-ft-k6uwb: parse-drop counter observability ──
+
+    #[test]
+    fn parse_drop_counter_unchanged_for_well_formed_typed_context_ft_k6uwb() {
+        super::reset_policy_decision_context_parse_drop_count_for_test();
+        let mut ctx = DecisionContext::empty();
+        ctx.surface = PolicySurface::Workflow;
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(parse_serialized_decision_context(Some(&json)).is_some());
+        assert_eq!(
+            super::policy_decision_context_parse_drop_count(),
+            0,
+            "well-formed payload must not bump the counter"
+        );
+    }
+
+    #[test]
+    fn parse_drop_counter_unchanged_for_none_input_ft_k6uwb() {
+        // None means "caller had nothing to parse"; no audit
+        // payload was lost.
+        super::reset_policy_decision_context_parse_drop_count_for_test();
+        assert!(parse_serialized_decision_context(None).is_none());
+        assert_eq!(super::policy_decision_context_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn parse_drop_counter_bumps_on_typed_context_failure_ft_k6uwb() {
+        // br-ft-k6uwb: malformed JSON that can't deserialize as
+        // DecisionContext bumps the counter exactly once via the
+        // typed_context phase.
+        super::reset_policy_decision_context_parse_drop_count_for_test();
+        let bad = r#"{"surface":"workflow","action":"NOT_A_REAL_ACTION"}"#;
+        assert!(parse_serialized_decision_context(Some(bad)).is_none());
+        assert_eq!(super::policy_decision_context_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn parse_drop_counter_bumps_on_raw_value_shape_failure_ft_k6uwb() {
+        // br-ft-k6uwb: a payload that's not even valid JSON falls
+        // through to the surface-extractor's raw_value_shape arm.
+        // The typed_context arm bumps once first, then the
+        // raw_value_shape arm bumps a second time when the same
+        // payload fails the surface extraction's value parse.
+        super::reset_policy_decision_context_parse_drop_count_for_test();
+        assert!(parse_serialized_decision_surface(Some("{not json")).is_none());
+        // Both the typed_context AND raw_value_shape phases fire
+        // for invalid-JSON input.
+        assert_eq!(super::policy_decision_context_parse_drop_count(), 2);
+    }
+
+    #[test]
+    fn parse_drop_counter_bumps_on_surface_from_value_failure_ft_k6uwb() {
+        // br-ft-k6uwb: a JSON that parses as Value but whose
+        // "surface" field is an unknown variant fires the
+        // surface_from_value arm. typed_context fires first
+        // (the Value-shape can't deserialize as DecisionContext
+        // because of the bad variant), so we expect 2 bumps:
+        // typed_context + surface_from_value.
+        super::reset_policy_decision_context_parse_drop_count_for_test();
+        let bad = r#"{"surface":"NOT_A_REAL_SURFACE"}"#;
+        assert!(parse_serialized_decision_surface(Some(bad)).is_none());
+        assert_eq!(super::policy_decision_context_parse_drop_count(), 2);
+    }
+
+    #[test]
+    fn parse_drop_counter_independent_of_serde_drop_counter_ft_k6uwb() {
+        // The parse-drop counter must not bleed into the
+        // serialization-drop counter (ft-yygus) and vice versa.
+        super::reset_policy_decision_context_parse_drop_count_for_test();
+        super::reset_policy_decision_context_serde_drop_count_for_test();
+        assert!(parse_serialized_decision_context(Some("{bad")).is_none());
+        assert_eq!(super::policy_decision_context_parse_drop_count(), 1);
+        assert_eq!(
+            super::policy_decision_context_serde_drop_count(),
+            0,
+            "parse-side drop must NOT spill into the write-side counter"
+        );
     }
 
     #[test]
