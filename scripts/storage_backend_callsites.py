@@ -114,16 +114,16 @@ PATTERNS: list[tuple[str, str, str | None, str | None, str]] = [
     (
         "conn_prepare_cached",
         r"\.prepare_cached\s*\(",
-        None,
-        None,
-        "Statement caching is not yet on the trait surface. Wired-pass needs a Statement abstraction (ft-qgj81 follow-on).",
+        "execute_many",
+        "storage_backend_trait",
+        "Bulk-execute pattern (prepare_cached + loop execute). Migrate to StorageBackend::execute_many (ft-qgj81 slice 5).",
     ),
     (
         "conn_prepare",
         r"\.prepare\s*\(",
-        None,
-        None,
-        "Same blocker as prepare_cached — Statement abstraction missing.",
+        "query_row_typed",
+        "storage_backend_trait",
+        "prepare followed by query_row/query_map: migrate to query_row_typed/query_map_typed. prepare followed by loop execute: migrate to execute_many. See the prepare/prepare_cached recipe in the migration guide.",
     ),
     (
         "conn_pragma_query",

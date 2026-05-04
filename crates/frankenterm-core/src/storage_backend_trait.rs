@@ -285,6 +285,69 @@ pub trait StorageBackend: Send + Sync {
             })
             .collect())
     }
+
+    // ------------------------------------------------------------------
+    // br-ft-qgj81 substrate-pass slice 5: bulk-execute (the
+    // `prepare_cached(sql) + loop execute(params)` migration target).
+    //
+    // The trait surface previously had no equivalent for the
+    // prepare-once-execute-many pattern in storage.rs (~12 callsites,
+    // mostly bulk INSERT inside a transaction). The migration guide
+    // marked these "currently blocked" pending this method. Adding it
+    // unblocks the full storage.rs callsite migration (ft-l1jgo).
+    //
+    // Object-safe: no method-level generics; `&[Vec<ToSqlValue<'_>>]`
+    // dispatches cleanly through `dyn StorageBackend`.
+    // ------------------------------------------------------------------
+
+    /// Execute the same `sql` once per row of params, returning the
+    /// number of param rows successfully submitted.
+    ///
+    /// Migration target for the rusqlite idiom:
+    /// ```ignore
+    /// let mut stmt = conn.prepare_cached(sql)?;
+    /// for row in rows {
+    ///     stmt.execute(params)?;
+    /// }
+    /// ```
+    ///
+    /// Default impl iterates [`crate::storage_backend_helpers::execute_typed`]
+    /// per row, which re-prepares the statement on each iteration.
+    /// Backends with a real prepared-statement cache (e.g.
+    /// [`RusqliteBackend`] overrides with `prepare_cached`) avoid that
+    /// cost. The override stays correctness-equivalent.
+    ///
+    /// Stops on the first error and returns it; the rows already
+    /// submitted before the error remain submitted (each iteration is
+    /// its own SQLite transaction unless the caller wraps the call in
+    /// `BEGIN`/`COMMIT`). Callers that need atomic-batch semantics
+    /// should wrap [`Self::execute_many`] inside a `BEGIN`/`COMMIT`
+    /// pair via [`Self::execute`].
+    ///
+    /// Returns the count of param rows submitted, NOT the per-call
+    /// SQLite `rows-affected`. The override path can't carry per-call
+    /// rows-affected through `prepare_cached`'s iteration cleanly, so
+    /// the public contract is the simpler "rows submitted" count.
+    fn execute_many(
+        &self,
+        sql: &str,
+        param_rows: &[Vec<ToSqlValue<'_>>],
+    ) -> Result<usize, BackendError> {
+        // Inline the `execute_typed` body (route through
+        // `query_row_typed` and discard the result) so the default
+        // impl doesn't need `Self: Sized`. Calling
+        // `storage_backend_helpers::execute_typed(self, ...)` would
+        // require coercing `&Self` to `&dyn StorageBackend`, which
+        // is illegal in object-safe trait default methods without
+        // a `Sized` bound that would in turn make this method
+        // un-callable on `dyn StorageBackend`.
+        let mut total = 0usize;
+        for row in param_rows {
+            self.query_row_typed(sql, row)?;
+            total = total.saturating_add(1);
+        }
+        Ok(total)
+    }
 }
 
 /// Owned typed cell. Mirrors [`ToSqlValue`]'s shape but in `'static`
@@ -839,6 +902,31 @@ impl StorageBackend for MockBackend {
         ));
         Ok(state.map_responses.pop_front().unwrap_or_default())
     }
+
+    /// MockBackend's bulk-execute override records each param row
+    /// in the executed log so tests can assert "we called this SQL
+    /// N times with these params" without juggling FIFO responses.
+    /// Each iteration is logged with the same SQL prefixed by
+    /// `"execute_many: "` so the log distinguishes batch calls
+    /// from one-shot `execute` calls.
+    fn execute_many(
+        &self,
+        sql: &str,
+        param_rows: &[Vec<ToSqlValue<'_>>],
+    ) -> Result<usize, BackendError> {
+        let mut state = self.inner.lock().unwrap();
+        for row in param_rows {
+            let canonical_params: Vec<String> =
+                row.iter().map(ToSqlValue::to_canonical_string).collect();
+            // Encode as `execute_many: <sql>` so test assertions can
+            // separate batch from single-shot writes in the executed log.
+            state.executed.push(format!(
+                "execute_many: {sql} | params=[{}]",
+                canonical_params.join(", ")
+            ));
+        }
+        Ok(param_rows.len())
+    }
 }
 
 /// Real rusqlite-backed implementation of [`StorageBackend`].
@@ -1195,6 +1283,39 @@ impl StorageBackend for RusqliteBackend {
         }
         Ok(out)
     }
+
+    /// Native bulk-execute via `prepare_cached`. Locks the mutex
+    /// once, prepares the statement once, iterates the param rows
+    /// binding each, and drops the prepared statement on exit. The
+    /// trait's default impl re-prepares on every iteration, which
+    /// loses the rusqlite prepared-statement cache; this override
+    /// preserves it.
+    ///
+    /// Stops on the first error and returns it. Already-submitted
+    /// rows remain submitted (each iteration is autocommit unless
+    /// the caller wraps in `BEGIN`/`COMMIT`).
+    fn execute_many(
+        &self,
+        sql: &str,
+        param_rows: &[Vec<ToSqlValue<'_>>],
+    ) -> Result<usize, BackendError> {
+        if param_rows.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let mut stmt = conn
+            .prepare_cached(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut total = 0usize;
+        for row in param_rows {
+            let typed_values: Vec<rusqlite::types::Value> =
+                row.iter().map(to_sqlite_value).collect();
+            stmt.execute(rusqlite::params_from_iter(typed_values.iter()))
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            total = total.saturating_add(1);
+        }
+        Ok(total)
+    }
 }
 
 /// Translate a [`ToSqlValue`] into a [`rusqlite::types::Value`] for
@@ -1278,6 +1399,136 @@ mod tests {
         assert_eq!(log.len(), 2);
         assert!(log[0].contains("CREATE TABLE"));
         assert!(log[1].contains("INSERT"));
+    }
+
+    // ── execute_many: bulk-execute migration target (br-ft-qgj81 slice 5) ──
+
+    #[test]
+    fn execute_many_empty_param_rows_is_a_zero_op() {
+        let mock = MockBackend::new();
+        let count = mock
+            .execute_many("INSERT INTO t (a) VALUES (?1)", &[])
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(mock.executed().is_empty(), "no calls should be logged");
+    }
+
+    #[test]
+    fn execute_many_iterates_param_rows_and_logs_each() {
+        let mock = MockBackend::new();
+        let rows = vec![
+            vec![ToSqlValue::Integer(1), ToSqlValue::Text("alpha")],
+            vec![ToSqlValue::Integer(2), ToSqlValue::Text("beta")],
+            vec![ToSqlValue::Integer(3), ToSqlValue::Null],
+        ];
+        let count = mock
+            .execute_many("INSERT INTO t (id, name) VALUES (?1, ?2)", &rows)
+            .unwrap();
+        assert_eq!(count, 3, "submitted row count must equal param_rows.len()");
+
+        let log = mock.executed();
+        assert_eq!(log.len(), 3);
+        // Each entry begins with the `execute_many:` prefix so test
+        // assertions can split batch from one-shot writes.
+        for entry in &log {
+            assert!(
+                entry.starts_with("execute_many: INSERT INTO t"),
+                "log entry must carry execute_many prefix: {entry:?}"
+            );
+        }
+        // Each entry carries its row's params in canonical form.
+        assert!(log[0].contains("alpha"));
+        assert!(log[1].contains("beta"));
+        // ToSqlValue::Null encodes to "" in canonical form; we just
+        // check that the third entry is structurally present.
+        assert!(log[2].contains("INSERT INTO t"));
+    }
+
+    #[test]
+    fn rusqlite_execute_many_native_override_persists_all_rows() {
+        // Pin the RusqliteBackend native override against a real
+        // in-memory DB. This is the override that uses `prepare_cached`
+        // for the prepare-once optimization; the trait-level default
+        // would also persist all rows but re-prepare each time.
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute("CREATE TABLE bulk_pin (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        let rows = vec![
+            vec![ToSqlValue::Integer(1), ToSqlValue::Text("alpha")],
+            vec![ToSqlValue::Integer(2), ToSqlValue::Text("beta")],
+            vec![ToSqlValue::Integer(3), ToSqlValue::Text("gamma")],
+        ];
+        let count = backend
+            .execute_many("INSERT INTO bulk_pin (id, name) VALUES (?1, ?2)", &rows)
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // All three rows must be readable via the trait surface.
+        let all = backend
+            .query_map_typed("SELECT id, name FROM bulk_pin ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0][0], "1");
+        assert_eq!(all[0][1], "alpha");
+        assert_eq!(all[2][1], "gamma");
+    }
+
+    #[test]
+    fn rusqlite_execute_many_stops_on_first_error() {
+        // SQLite UNIQUE constraint violation aborts the batch; the
+        // public contract is "stops on first error and returns it".
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute("CREATE TABLE bulk_unique (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+            .unwrap();
+
+        let rows = vec![
+            vec![ToSqlValue::Integer(1), ToSqlValue::Text("alpha")],
+            vec![ToSqlValue::Integer(2), ToSqlValue::Text("alpha")], // duplicate "alpha"
+            vec![ToSqlValue::Integer(3), ToSqlValue::Text("gamma")], // never reached
+        ];
+        let result =
+            backend.execute_many("INSERT INTO bulk_unique (id, name) VALUES (?1, ?2)", &rows);
+        assert!(matches!(result, Err(BackendError::Query(_))));
+
+        // First row was committed before the second triggered the
+        // UNIQUE violation (each iteration is autocommit). The third
+        // never ran.
+        let all = backend
+            .query_map_typed("SELECT id FROM bulk_unique", &[])
+            .unwrap();
+        assert_eq!(all.len(), 1, "only the first row should persist");
+    }
+
+    #[test]
+    fn rusqlite_execute_many_inside_explicit_transaction_is_atomic() {
+        // Wrapping execute_many in BEGIN/COMMIT gives atomic-batch
+        // semantics: a constraint violation rolls back ALL rows
+        // (including ones that already executed).
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute("CREATE TABLE bulk_atomic (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+            .unwrap();
+
+        backend.execute("BEGIN").unwrap();
+        let rows = vec![
+            vec![ToSqlValue::Integer(1), ToSqlValue::Text("alpha")],
+            vec![ToSqlValue::Integer(2), ToSqlValue::Text("alpha")],
+        ];
+        let result =
+            backend.execute_many("INSERT INTO bulk_atomic (id, name) VALUES (?1, ?2)", &rows);
+        assert!(result.is_err());
+        backend.execute("ROLLBACK").unwrap();
+
+        let all = backend
+            .query_map_typed("SELECT id FROM bulk_atomic", &[])
+            .unwrap();
+        assert!(
+            all.is_empty(),
+            "rollback must undo the row that succeeded before the error"
+        );
     }
 
     #[test]

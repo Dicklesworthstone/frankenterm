@@ -172,11 +172,88 @@ execute_typed(
 
 ### `prepare` / `prepare_cached`
 
-**Currently blocked.** The substrate does not yet expose a
-`Statement` abstraction; the analyzer's `missing_substrate` field
-flags every callsite using these. Track [`ft-qgj81`][qgj81] for the
-trait extension; defer the migration of these call sites until
-that lands.
+The substrate exposes two distinct migration paths depending on
+how the prepared statement is used:
+
+#### Pattern A — single-shot prepare + `query_row` / `query_map`
+
+Migrate to [`StorageBackend::query_row_typed`][trait] /
+[`StorageBackend::query_map_typed`][trait]. The prepare step is
+internal to those methods; no separate Statement abstraction is
+needed.
+
+**Before:**
+
+```rust
+let mut stmt = conn.prepare(
+    "SELECT name FROM accounts WHERE id = ?1",
+)?;
+let name: Option<String> = stmt
+    .query_row(params![id], |row| row.get(0))
+    .optional()?;
+```
+
+**After:**
+
+```rust
+use frankenterm_core::storage_backend_trait::ToSqlValue;
+
+let row = backend.query_row_typed(
+    "SELECT name FROM accounts WHERE id = ?1",
+    &[ToSqlValue::Integer(id)],
+)?;
+let name = row.and_then(|cells| cells.into_iter().next());
+```
+
+#### Pattern B — `prepare_cached` + loop `execute` (bulk insert/update)
+
+Migrate to [`StorageBackend::execute_many`][trait]. The trait
+method takes a `&[Vec<ToSqlValue<'_>>]` of param rows and submits
+each in turn; `RusqliteBackend` overrides the default impl with
+`prepare_cached` so the prepare-once optimization is preserved.
+
+**Before:**
+
+```rust
+let mut stmt = tx.prepare_cached(
+    "INSERT INTO usage_metrics (timestamp, count) VALUES (?1, ?2)",
+)?;
+for record in records {
+    stmt.execute(params![record.timestamp, record.count])?;
+}
+```
+
+**After:**
+
+```rust
+use frankenterm_core::storage_backend_trait::ToSqlValue;
+
+let rows: Vec<Vec<ToSqlValue<'_>>> = records
+    .iter()
+    .map(|r| vec![
+        ToSqlValue::Integer(r.timestamp),
+        ToSqlValue::Integer(r.count),
+    ])
+    .collect();
+backend.execute_many(
+    "INSERT INTO usage_metrics (timestamp, count) VALUES (?1, ?2)",
+    &rows,
+)?;
+```
+
+For atomic-batch semantics (rollback on any error), wrap the
+`execute_many` call between explicit `BEGIN`/`COMMIT`:
+
+```rust
+backend.execute("BEGIN")?;
+let result = backend.execute_many(sql, &rows);
+match result {
+    Ok(_) => { backend.execute("COMMIT")?; }
+    Err(e) => { backend.execute("ROLLBACK")?; return Err(e); }
+}
+```
+
+The trait substrate landed under [`ft-qgj81`][qgj81] slice 5.
 
 [qgj81]: https://github.com/frankenterm/frankenterm/issues?q=ft-qgj81
 
@@ -276,15 +353,17 @@ operator-facing knobs the trait surfaces uniformly across backends.
 ## Non-recipes (defer until trait extends)
 
 The analyzer's `missing_substrate` list reflects the current state
-of the trait. As of this writing two patterns are blocked:
+of the trait. As of this writing one pattern is blocked:
 
-- `conn_prepare` / `conn_prepare_cached` — needs a `Statement`
-  abstraction. Tracked under [`ft-qgj81`][qgj81].
 - `conn_transaction` — needs a closure-based transaction helper.
   Tracked under [`ft-qgj81`'s follow-on slices][qgj81].
 
-When those land the analyzer's `missing_substrate` drops to empty
-and the migration can complete.
+`conn_prepare` / `conn_prepare_cached` were unblocked by the
+`execute_many` substrate (slice 5); see the prepare/prepare_cached
+recipe above.
+
+When the transaction helper lands the analyzer's
+`missing_substrate` drops to empty and the migration can complete.
 
 ## Testing
 

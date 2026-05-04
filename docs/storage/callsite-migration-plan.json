@@ -1,27 +1,25 @@
 {
   "bead": "ft-l1jgo",
-  "generated_at_utc": "2026-05-03T04:26:04Z",
+  "generated_at_utc": "2026-05-03T20:52:06Z",
   "migration_priority": [
     "row_get_index",
     "conn_execute",
-    "conn_query_row_scalar",
+    "conn_prepare",
     "conn_query_map",
+    "conn_query_row_scalar",
     "rusqlite_optional",
     "conn_execute_batch",
     "params_from_iter",
-    "rusqlite_params_macro",
     "row_get_typed",
-    "rusqlite_connection_open"
-  ],
-  "missing_substrate": [
-    "conn_prepare",
+    "rusqlite_connection_open",
     "conn_prepare_cached"
   ],
+  "missing_substrate": [],
   "patterns": [
     {
       "name": "conn_query_row_scalar",
       "notes": "Single-row read with typed params. Use the trait's ToSqlValue path.",
-      "occurrences": 35,
+      "occurrences": 23,
       "regex": "\\.query_row\\s*\\(",
       "replacement": "query_row_typed",
       "replacement_module": "storage_backend_trait"
@@ -29,7 +27,7 @@
     {
       "name": "conn_query_map",
       "notes": "Multi-row read returning Vec<Vec<String>>; typed cells via storage_backend_cells.",
-      "occurrences": 30,
+      "occurrences": 23,
       "regex": "\\.query_map\\s*\\(",
       "replacement": "query_map_typed",
       "replacement_module": "storage_backend_trait"
@@ -37,7 +35,7 @@
     {
       "name": "conn_execute_batch",
       "notes": "DDL / multi-statement execution. Trait method already covers this.",
-      "occurrences": 8,
+      "occurrences": 9,
       "regex": "\\.execute_batch\\s*\\(",
       "replacement": "execute_batch",
       "replacement_module": "storage_backend_trait"
@@ -45,26 +43,26 @@
     {
       "name": "conn_execute",
       "notes": "Single-statement execute with typed params. Helper wraps the trait.",
-      "occurrences": 76,
+      "occurrences": 49,
       "regex": "\\bconn(?:ection)?\\.execute\\s*\\(",
       "replacement": "execute_typed",
       "replacement_module": "storage_backend_helpers"
     },
     {
       "name": "conn_prepare_cached",
-      "notes": "Statement caching is not yet on the trait surface. Wired-pass needs a Statement abstraction (ft-qgj81 follow-on).",
+      "notes": "Bulk-execute pattern (prepare_cached + loop execute). Migrate to StorageBackend::execute_many (ft-qgj81 slice 5).",
       "occurrences": 1,
       "regex": "\\.prepare_cached\\s*\\(",
-      "replacement": null,
-      "replacement_module": null
+      "replacement": "execute_many",
+      "replacement_module": "storage_backend_trait"
     },
     {
       "name": "conn_prepare",
-      "notes": "Same blocker as prepare_cached \u2014 Statement abstraction missing.",
-      "occurrences": 37,
+      "notes": "prepare followed by query_row/query_map: migrate to query_row_typed/query_map_typed. prepare followed by loop execute: migrate to execute_many. See the prepare/prepare_cached recipe in the migration guide.",
+      "occurrences": 30,
       "regex": "\\.prepare\\s*\\(",
-      "replacement": null,
-      "replacement_module": null
+      "replacement": "query_row_typed",
+      "replacement_module": "storage_backend_trait"
     },
     {
       "name": "conn_pragma_query",
@@ -85,7 +83,7 @@
     {
       "name": "rusqlite_params_macro",
       "notes": "Parameter binding via ToSqlValue \u2014 convert each param at call time.",
-      "occurrences": 5,
+      "occurrences": 0,
       "regex": "\\brusqlite::params!\\s*\\[",
       "replacement": "ToSqlValue",
       "replacement_module": "storage_backend_trait"
@@ -101,7 +99,7 @@
     {
       "name": "rusqlite_optional",
       "notes": "rusqlite's ::optional() chains \u2014 replace with the trait's Option<...> return.",
-      "occurrences": 24,
+      "occurrences": 16,
       "regex": "\\.optional\\s*\\(\\s*\\)",
       "replacement": "query_row_typed",
       "replacement_module": "storage_backend_trait"
@@ -109,7 +107,7 @@
     {
       "name": "row_get_typed",
       "notes": "Per-column typed reads inside a query_map closure \u2014 RowReader bundles them.",
-      "occurrences": 4,
+      "occurrences": 3,
       "regex": "row\\.get(?:_unwrap)?::\\s*<",
       "replacement": "RowReader",
       "replacement_module": "storage_backend_row_helpers"
@@ -117,7 +115,7 @@
     {
       "name": "row_get_index",
       "notes": "Indexed row reads \u2014 RowReader's i64/text/blob accessors mirror this.",
-      "occurrences": 428,
+      "occurrences": 346,
       "regex": "row\\.get(?:_unwrap)?\\s*\\(\\s*\\d+",
       "replacement": "RowReader",
       "replacement_module": "storage_backend_row_helpers"
@@ -141,6 +139,6 @@
   ],
   "schema_version": 1,
   "source": "crates/frankenterm-core/src/storage.rs",
-  "source_line_count": 18849,
-  "total_callsites": 655
+  "source_line_count": 19638,
+  "total_callsites": 507
 }
