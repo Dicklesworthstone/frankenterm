@@ -136,6 +136,12 @@ impl SearchQuery {
 
         self.pagination.validate()?;
         self.snippet_config.validate()?;
+        // br-ft-m5bne: validate every filter — range filters need
+        // min <= max so a misordered config doesn't silently match
+        // zero documents.
+        for filter in &self.filters {
+            filter.validate()?;
+        }
         for (field, boost) in &self.field_boosts {
             if !boost.is_finite() {
                 return invalid_query(format!("field boost for {field:?} must be finite"));
@@ -222,6 +228,61 @@ pub enum EventDirection {
 }
 
 impl SearchFilter {
+    /// br-ft-m5bne: validate that range filters carry consistent
+    /// `min <= max` bounds. A misordered range produces a predicate
+    /// that no document can satisfy (`x >= 2000 AND x <= 1000`),
+    /// silently returning zero results — operators chasing a
+    /// forensic incident see "no matches" rather than "your filter
+    /// is malformed". Catch the misorder at `validate()` so the
+    /// error surfaces in the InvalidQuery path before any backend
+    /// dispatch.
+    pub fn validate(&self) -> Result<(), SearchError> {
+        match self {
+            Self::TimeRange { min_ms, max_ms } => {
+                if let (Some(min), Some(max)) = (min_ms, max_ms) {
+                    if min > max {
+                        return invalid_query(format!(
+                            "TimeRange filter has misordered bounds: min_ms={min} > max_ms={max} (br-ft-m5bne)"
+                        ));
+                    }
+                }
+            }
+            Self::RecordedTimeRange { min_ms, max_ms } => {
+                if let (Some(min), Some(max)) = (min_ms, max_ms) {
+                    if min > max {
+                        return invalid_query(format!(
+                            "RecordedTimeRange filter has misordered bounds: min_ms={min} > max_ms={max} (br-ft-m5bne)"
+                        ));
+                    }
+                }
+            }
+            Self::SequenceRange { min_seq, max_seq } => {
+                if let (Some(min), Some(max)) = (min_seq, max_seq) {
+                    if min > max {
+                        return invalid_query(format!(
+                            "SequenceRange filter has misordered bounds: min_seq={min} > max_seq={max} (br-ft-m5bne)"
+                        ));
+                    }
+                }
+            }
+            Self::LogOffsetRange {
+                min_offset,
+                max_offset,
+            } => {
+                if let (Some(min), Some(max)) = (min_offset, max_offset) {
+                    if min > max {
+                        return invalid_query(format!(
+                            "LogOffsetRange filter has misordered bounds: min_offset={min} > max_offset={max} (br-ft-m5bne)"
+                        ));
+                    }
+                }
+            }
+            // Other variants have no order invariant.
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Check whether a document matches this filter.
     pub fn matches(&self, doc: &IndexDocumentFields) -> bool {
         match self {
@@ -3052,5 +3113,92 @@ mod tests {
             doc.is_some(),
             "newly committed doc should be visible after reload"
         );
+    }
+
+    // ── br-ft-m5bne: range filter min/max validation ──
+
+    #[test]
+    fn time_range_filter_rejects_misordered_bounds_ft_m5bne() {
+        // br-ft-m5bne: TimeRange{min_ms: 2000, max_ms: 1000} would
+        // silently match no documents because the predicate
+        // `>=2000 AND <=1000` is unsatisfiable. validate() must
+        // catch this at config time.
+        let bad = SearchFilter::TimeRange {
+            min_ms: Some(2000),
+            max_ms: Some(1000),
+        };
+        let err = bad.validate().expect_err("misordered TimeRange must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("br-ft-m5bne"), "error must cite breadcrumb: {msg}");
+        assert!(msg.contains("min_ms=2000") && msg.contains("max_ms=1000"));
+    }
+
+    #[test]
+    fn recorded_time_range_filter_rejects_misordered_bounds_ft_m5bne() {
+        let bad = SearchFilter::RecordedTimeRange {
+            min_ms: Some(5000),
+            max_ms: Some(100),
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn sequence_range_filter_rejects_misordered_bounds_ft_m5bne() {
+        let bad = SearchFilter::SequenceRange {
+            min_seq: Some(1000),
+            max_seq: Some(10),
+        };
+        let err = bad.validate().expect_err("misordered SequenceRange must reject");
+        assert!(format!("{err:?}").contains("min_seq=1000"));
+    }
+
+    #[test]
+    fn log_offset_range_filter_rejects_misordered_bounds_ft_m5bne() {
+        let bad = SearchFilter::LogOffsetRange {
+            min_offset: Some(999),
+            max_offset: Some(1),
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn range_filter_accepts_min_equals_max_ft_m5bne() {
+        // Boundary: min == max is a legitimate "exactly this
+        // value" filter, not misordered.
+        let ok = SearchFilter::TimeRange {
+            min_ms: Some(1000),
+            max_ms: Some(1000),
+        };
+        ok.validate()
+            .expect("min == max must validate (single-value selection)");
+    }
+
+    #[test]
+    fn range_filter_accepts_one_sided_bounds_ft_m5bne() {
+        // Half-open ranges (only min OR only max) have no
+        // ordering constraint.
+        let only_min = SearchFilter::TimeRange {
+            min_ms: Some(1000),
+            max_ms: None,
+        };
+        only_min.validate().expect("min-only must validate");
+        let only_max = SearchFilter::SequenceRange {
+            min_seq: None,
+            max_seq: Some(50),
+        };
+        only_max.validate().expect("max-only must validate");
+    }
+
+    #[test]
+    fn search_query_validate_propagates_filter_errors_ft_m5bne() {
+        // br-ft-m5bne: misordered range filter must surface through
+        // SearchQuery::validate so the InvalidQuery error path
+        // fires at config time, not at backend dispatch.
+        let q = SearchQuery::simple("hello").with_filter(SearchFilter::TimeRange {
+            min_ms: Some(2000),
+            max_ms: Some(1000),
+        });
+        let err = q.validate().expect_err("misordered filter must propagate");
+        assert!(format!("{err:?}").contains("br-ft-m5bne"));
     }
 }
