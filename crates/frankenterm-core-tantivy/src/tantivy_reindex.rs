@@ -4227,7 +4227,7 @@ mod tests {
             );
 
             let cp = storage
-                .read_checkpoint("range-exclusive-test")
+                .read_checkpoint(&CheckpointConsumerId("range-exclusive-test".to_string()))
                 .await
                 .unwrap()
                 .expect("checkpoint must be persisted after the in-range batch");
@@ -4404,7 +4404,7 @@ mod tests {
                 "br-ft-zvue8 (observed): current_ordinal must stop at 7, not 8"
             );
             let cp = storage
-                .read_checkpoint("observed-range-test-zvue8")
+                .read_checkpoint(&CheckpointConsumerId("observed-range-test-zvue8".to_string()))
                 .await
                 .unwrap()
                 .expect("checkpoint must be persisted");

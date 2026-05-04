@@ -6080,4 +6080,252 @@ mod tests {
         assert_eq!(pin1, pin2);
         assert_ne!(pin1, excl);
     }
+
+    // ── br-ft-gweu3: Pin override safety-envelope validation ─────────
+
+    /// br-ft-gweu3: a Pin override targeting an agent that is also
+    /// excluded by an `ExcludeAgent` override must NOT produce a
+    /// `PinnedAssignmentRecord` (which would route work to the
+    /// excluded agent and contradict the safety envelope). Instead
+    /// it must be recorded as a `RejectedPinRecord` with reason
+    /// `AgentExcluded`. Pre-fix the pin loop only checked
+    /// `agent_exists` and silently routed the pin.
+    #[test]
+    fn pin_to_excluded_agent_is_rejected_with_reason_ft_gweu3() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![sample_detail("b1", BeadStatus::Open, 0, &[])];
+        let agents = vec![ready_agent("a1"), ready_agent("a2")];
+        let ctx = PlannerExtractionContext::default();
+
+        ml.apply_override(make_override(
+            "excl-a1",
+            OperatorOverrideKind::ExcludeAgent {
+                agent_id: "a1".to_string(),
+            },
+        ))
+        .expect("apply ExcludeAgent");
+        ml.apply_override(make_override(
+            "pin-b1-a1",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "a1".to_string(),
+            },
+        ))
+        .expect("apply Pin");
+
+        let _decision = ml.evaluate(
+            5_000,
+            MissionTrigger::ManualTrigger {
+                reason: "ft-gweu3 test".to_string(),
+            },
+            &issues,
+            &agents,
+            &ctx,
+        );
+
+        let summary = ml
+            .state()
+            .last_override_summary
+            .as_ref()
+            .expect("override summary must be present when overrides applied");
+
+        assert!(
+            summary.pinned_assignments.iter().all(|p| p.bead_id != "b1"),
+            "ft-gweu3: pin to excluded agent must NOT produce a PinnedAssignmentRecord"
+        );
+        assert!(
+            !summary.rejected_pinned_assignments.is_empty(),
+            "ft-gweu3: rejected_pinned_assignments must be populated when a pin is rejected"
+        );
+        let rejected = summary
+            .rejected_pinned_assignments
+            .iter()
+            .find(|r| r.bead_id == "b1" && r.agent_id == "a1")
+            .expect("rejected pin record for (b1, a1) must exist");
+        assert_eq!(
+            rejected.reason,
+            PinRejectionReason::AgentExcluded,
+            "ft-gweu3: rejection reason must be AgentExcluded"
+        );
+        assert_eq!(
+            rejected.override_id, "pin-b1-a1",
+            "ft-gweu3: rejected record must reference the originating override_id"
+        );
+    }
+
+    /// br-ft-gweu3: a Pin override whose target_agent does not exist
+    /// in the candidate agents list must be recorded as
+    /// `AgentNotFound` rejection. Pre-fix this case was a silent
+    /// drop (the `agent_exists` check just made the pin disappear).
+    #[test]
+    fn pin_to_nonexistent_agent_is_rejected_with_reason_ft_gweu3() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![sample_detail("b1", BeadStatus::Open, 0, &[])];
+        let agents = vec![ready_agent("a1")];
+        let ctx = PlannerExtractionContext::default();
+
+        ml.apply_override(make_override(
+            "pin-b1-ghost",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "agent-does-not-exist".to_string(),
+            },
+        ))
+        .expect("apply Pin to nonexistent agent");
+
+        let _ = ml.evaluate(
+            5_000,
+            MissionTrigger::ManualTrigger {
+                reason: "ft-gweu3 test".to_string(),
+            },
+            &issues,
+            &agents,
+            &ctx,
+        );
+
+        let summary = ml
+            .state()
+            .last_override_summary
+            .as_ref()
+            .expect("override summary must be present");
+        let rejected = summary
+            .rejected_pinned_assignments
+            .iter()
+            .find(|r| r.agent_id == "agent-does-not-exist")
+            .expect("rejected pin record for nonexistent agent must exist");
+        assert_eq!(rejected.reason, PinRejectionReason::AgentNotFound);
+    }
+
+    /// br-ft-gweu3: a Pin override whose target_agent has zero
+    /// effective capacity (paused / offline / degraded-to-zero) must
+    /// be recorded as `AgentZeroCapacity` rejection — the bead body
+    /// explicitly calls out "pins to unavailable/capacity-zero
+    /// agents" as a case requiring rejection.
+    #[test]
+    fn pin_to_zero_capacity_agent_is_rejected_with_reason_ft_gweu3() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![sample_detail("b1", BeadStatus::Open, 0, &[])];
+        let mut paused_agent = ready_agent("a-paused");
+        paused_agent.availability = crate::plan::MissionAgentAvailability::Paused {
+            reason: "operator-pause".to_string(),
+        };
+        let agents = vec![paused_agent, ready_agent("a-ready")];
+        let ctx = PlannerExtractionContext::default();
+
+        ml.apply_override(make_override(
+            "pin-b1-paused",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "a-paused".to_string(),
+            },
+        ))
+        .expect("apply Pin to paused agent");
+
+        let _ = ml.evaluate(
+            5_000,
+            MissionTrigger::ManualTrigger {
+                reason: "ft-gweu3 test".to_string(),
+            },
+            &issues,
+            &agents,
+            &ctx,
+        );
+
+        let summary = ml
+            .state()
+            .last_override_summary
+            .as_ref()
+            .expect("override summary must be present");
+        let rejected = summary
+            .rejected_pinned_assignments
+            .iter()
+            .find(|r| r.agent_id == "a-paused")
+            .expect("rejected pin record for zero-capacity agent must exist");
+        assert_eq!(rejected.reason, PinRejectionReason::AgentZeroCapacity);
+    }
+
+    /// br-ft-gweu3: a healthy Pin override (scored bead, real
+    /// non-excluded non-zero-capacity agent) still produces a
+    /// `PinnedAssignmentRecord` and an empty
+    /// `rejected_pinned_assignments`. Vacuous-regression guard
+    /// against the new validation false-positiving on the legitimate
+    /// happy path.
+    #[test]
+    fn healthy_pin_still_produces_pinned_assignment_ft_gweu3() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![sample_detail("b1", BeadStatus::Open, 0, &[])];
+        let agents = vec![ready_agent("a1")];
+        let ctx = PlannerExtractionContext::default();
+
+        ml.apply_override(make_override(
+            "pin-b1-a1",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "a1".to_string(),
+            },
+        ))
+        .expect("apply Pin");
+
+        let _ = ml.evaluate(
+            5_000,
+            MissionTrigger::ManualTrigger {
+                reason: "ft-gweu3 test".to_string(),
+            },
+            &issues,
+            &agents,
+            &ctx,
+        );
+
+        let summary = ml
+            .state()
+            .last_override_summary
+            .as_ref()
+            .expect("override summary must be present");
+        assert!(
+            summary
+                .pinned_assignments
+                .iter()
+                .any(|p| p.bead_id == "b1" && p.agent_id == "a1"),
+            "ft-gweu3: healthy pin must still produce PinnedAssignmentRecord"
+        );
+        assert!(
+            summary.rejected_pinned_assignments.is_empty(),
+            "ft-gweu3: healthy pin must NOT populate rejected_pinned_assignments"
+        );
+    }
+
+    /// br-ft-gweu3: serde stability for the new RejectedPinRecord +
+    /// PinRejectionReason types. Pins the wire format so external
+    /// operator tooling can parse rejection records without
+    /// surprise renames. Universal-quantifier sweep over all four
+    /// reason variants.
+    #[test]
+    fn rejected_pin_record_serde_roundtrip_ft_gweu3() {
+        for reason in [
+            PinRejectionReason::AgentExcluded,
+            PinRejectionReason::AgentNotFound,
+            PinRejectionReason::AgentZeroCapacity,
+            PinRejectionReason::BeadNotScored,
+        ] {
+            let original = RejectedPinRecord {
+                bead_id: "b1".to_string(),
+                agent_id: "a1".to_string(),
+                override_id: "pin-1".to_string(),
+                reason: reason.clone(),
+            };
+            let json = serde_json::to_string(&original).expect("serialize");
+            let roundtrip: RejectedPinRecord = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(roundtrip, original, "ft-gweu3: roundtrip must be lossless");
+            let expected_str = match reason {
+                PinRejectionReason::AgentExcluded => "agent_excluded",
+                PinRejectionReason::AgentNotFound => "agent_not_found",
+                PinRejectionReason::AgentZeroCapacity => "agent_zero_capacity",
+                PinRejectionReason::BeadNotScored => "bead_not_scored",
+            };
+            assert!(
+                json.contains(expected_str),
+                "ft-gweu3: reason must serialize as `{expected_str}` (got json: {json})"
+            );
+        }
+    }
 }

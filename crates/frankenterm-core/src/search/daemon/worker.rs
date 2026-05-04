@@ -56,6 +56,19 @@ impl EmbedWorker {
     }
 }
 
+/// br-ft-023t1: hard cap on the hash-embedder dimension that
+/// daemon requests can ask for. The daemon allocates
+/// `vec![0.0f32; dim]` per embedding (4 bytes per slot), so an
+/// uncapped dimension turns the daemon into a 4-byte-per-unit
+/// resource amplifier — a request frame of `model="fnv1a-hash-
+/// 1000000000"` is well under the 4 MiB wire cap but asks the
+/// worker for ~4 GB of f32 output. The cap matches the order of
+/// magnitude of the highest dimensions used by supported FastEmbed
+/// ONNX models (~1536 for OpenAI ada-002 sized output) with a
+/// generous safety margin so legitimate operator-tuned hash
+/// embedders remain accepted.
+pub const MAX_HASH_EMBEDDER_DIMENSION: usize = 16_384;
+
 fn build_embedder(model: Option<&str>) -> Result<Box<dyn Embedder>, String> {
     match model.map(str::trim) {
         None | Some("" | "hash" | "fnv1a-hash") => Ok(Box::new(HashEmbedder::default())),
@@ -66,6 +79,14 @@ fn build_embedder(model: Option<&str>) -> Result<Box<dyn Embedder>, String> {
                     .map_err(|_| format!("invalid hash embedder dimension: {dim_raw}"))?;
                 if dim == 0 {
                     return Err("hash embedder dimension must be > 0".to_string());
+                }
+                if dim > MAX_HASH_EMBEDDER_DIMENSION {
+                    // br-ft-023t1: reject before HashEmbedder::new
+                    // so no allocation happens for the rejected
+                    // request.
+                    return Err(format!(
+                        "br-ft-023t1: hash embedder dimension {dim} exceeds cap {MAX_HASH_EMBEDDER_DIMENSION}"
+                    ));
                 }
                 return Ok(Box::new(HashEmbedder::new(dim)));
             }
@@ -368,5 +389,57 @@ mod tests {
             .process(&req(1, "test", Some("fnv1a-hash-1024")))
             .unwrap();
         assert_eq!(resp.vector.len(), 1024);
+    }
+
+    // ── br-ft-023t1: dimension cap rejects resource-amplification ──
+
+    #[test]
+    fn dimension_at_cap_is_accepted_ft_023t1() {
+        // The cap itself must not be off-by-one — a request asking
+        // for exactly MAX_HASH_EMBEDDER_DIMENSION succeeds.
+        let worker = EmbedWorker::new(1);
+        let resp = worker
+            .process(&req(
+                1,
+                "test",
+                Some(&format!("fnv1a-hash-{MAX_HASH_EMBEDDER_DIMENSION}")),
+            ))
+            .unwrap();
+        assert_eq!(resp.vector.len(), MAX_HASH_EMBEDDER_DIMENSION);
+    }
+
+    #[test]
+    fn dimension_above_cap_is_rejected_ft_023t1() {
+        // br-ft-023t1: a request asking for dim > cap must fail
+        // BEFORE allocation (HashEmbedder::new vec![0.0; dim]).
+        // The pre-fix "fnv1a-hash-1000000000" example would have
+        // tried to allocate ~4 GB of f32; post-fix it errors out.
+        let worker = EmbedWorker::new(1);
+        let oversized = MAX_HASH_EMBEDDER_DIMENSION + 1;
+        let err = worker
+            .process(&req(
+                1,
+                "test",
+                Some(&format!("fnv1a-hash-{oversized}")),
+            ))
+            .unwrap_err();
+        assert!(err.contains("br-ft-023t1"), "error must cite breadcrumb: {err}");
+        assert!(err.contains(&oversized.to_string()));
+        assert!(err.contains(&MAX_HASH_EMBEDDER_DIMENSION.to_string()));
+        // No allocation should be observable: processed counter
+        // shouldn't increment on a failed embedder build.
+        assert_eq!(worker.processed(), 0);
+    }
+
+    #[test]
+    fn dimension_at_amplification_target_is_rejected_ft_023t1() {
+        // The bead's specific worry: model="fnv1a-hash-1000000000"
+        // (~4 GB allocation). Must fail closed.
+        let worker = EmbedWorker::new(1);
+        let err = worker
+            .process(&req(1, "test", Some("fnv1a-hash-1000000000")))
+            .unwrap_err();
+        assert!(err.contains("br-ft-023t1"));
+        assert_eq!(worker.processed(), 0);
     }
 }

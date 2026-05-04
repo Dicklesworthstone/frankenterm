@@ -10482,14 +10482,36 @@ mod tests {
                 });
 
         assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unknown);
-        assert!(certificate.stages.is_empty());
+        assert_eq!(certificate.stages.len(), 1);
         assert!(certificate.bottleneck_stage.is_none());
         assert!(certificate.bottleneck_utilization.is_none());
+        let empty_robot_mcp =
+            capacity_stage_certificate(&certificate, SwarmCapacityStage::RobotMcp);
+        assert_eq!(
+            empty_robot_mcp.status,
+            SwarmCapacityCertificateStatus::Unknown
+        );
+        assert_eq!(empty_robot_mcp.completions, 0);
+        assert!(
+            empty_robot_mcp
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::InsufficientSamples)
+        );
+        assert!(
+            empty_robot_mcp
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::NoCompletions)
+        );
+        assert!(
+            empty_robot_mcp
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::MissingServiceQuantiles)
+        );
         assert!(
             certificate
                 .assumption_flags
                 .contains(&SwarmCapacityAssumptionFlag::InsufficientSamples),
-            "InsufficientSamples must always fire when stages are empty"
+            "InsufficientSamples must always fire when selected stages have no samples"
         );
         assert!(
             !certificate
@@ -10526,6 +10548,108 @@ mod tests {
                 .contains(&SwarmCapacityAssumptionFlag::InvalidObservationWindow),
             "zero window must surface as InvalidObservationWindow"
         );
+    }
+
+    #[test]
+    fn swarm_capacity_certificate_preserves_unobserved_selected_stage() {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 32,
+        });
+
+        for _ in 0..10 {
+            telemetry.record_arrival(SwarmCapacityStage::RobotMcp, 0);
+            telemetry.record_completion(SwarmCapacityStage::RobotMcp, 10.0, 0);
+        }
+
+        let certificate =
+            telemetry
+                .snapshot()
+                .capacity_certificate(SwarmCapacityCertificateConfig {
+                    workload_class: SwarmCapacityWorkloadClass::RobotMcpBurst,
+                    pane_scale: 50,
+                    observation_window_secs: 60.0,
+                    selected_stages: vec![SwarmCapacityStage::RobotMcp, SwarmCapacityStage::MuxIpc],
+                    min_samples_per_stage: 5,
+                    ..SwarmCapacityCertificateConfig::default()
+                });
+
+        assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unknown);
+        assert_eq!(certificate.stages.len(), 2);
+        assert!(
+            capacity_stage_certificate(&certificate, SwarmCapacityStage::RobotMcp)
+                .assumption_flags
+                .is_empty()
+        );
+
+        let missing_mux = capacity_stage_certificate(&certificate, SwarmCapacityStage::MuxIpc);
+        assert_eq!(missing_mux.status, SwarmCapacityCertificateStatus::Unknown);
+        assert_eq!(missing_mux.completions, 0);
+        assert!(
+            missing_mux
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::InsufficientSamples)
+        );
+        assert!(
+            missing_mux
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::NoCompletions)
+        );
+        assert!(
+            missing_mux
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::MissingServiceQuantiles)
+        );
+        assert!(
+            certificate
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::InsufficientSamples)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_swarm_capacity_certificate_preserves_selected_stage_count(
+            missing_index in 0usize..SwarmCapacityStage::COUNT
+        ) {
+            let missing = SwarmCapacityStage::ALL[missing_index];
+            let observed = SwarmCapacityStage::ALL[(missing_index + 1) % SwarmCapacityStage::COUNT];
+            let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+                enabled: true,
+                max_samples_per_stage: 32,
+            });
+
+            for _ in 0..8 {
+                telemetry.record_arrival(observed, 0);
+                telemetry.record_completion(observed, 10.0, 0);
+            }
+
+            let certificate =
+                telemetry
+                    .snapshot()
+                    .capacity_certificate(SwarmCapacityCertificateConfig {
+                        workload_class: SwarmCapacityWorkloadClass::RobotMcpBurst,
+                        pane_scale: 50,
+                        observation_window_secs: 60.0,
+                        selected_stages: vec![observed, missing],
+                        min_samples_per_stage: 5,
+                        ..SwarmCapacityCertificateConfig::default()
+                    });
+
+            prop_assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unknown);
+            prop_assert_eq!(certificate.stages.len(), 2);
+            let missing_stage = capacity_stage_certificate(&certificate, missing);
+            prop_assert_eq!(missing_stage.status, SwarmCapacityCertificateStatus::Unknown);
+            prop_assert!(missing_stage
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::InsufficientSamples));
+            prop_assert!(missing_stage
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::NoCompletions));
+            prop_assert!(missing_stage
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::MissingServiceQuantiles));
+        }
     }
 
     #[test]
