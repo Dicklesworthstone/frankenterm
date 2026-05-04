@@ -741,10 +741,57 @@ impl UndoExecutor {
     }
 }
 
+// ============================================================================
+// br-ft-4ymqn: undo-payload parse-drop observability
+// ============================================================================
+
+/// br-ft-4ymqn: cumulative count of `ActionUndoRecord.undo_payload`
+/// values that could not be parsed as JSON since process load.
+/// Pre-fix the `.ok()` chain silently turned a corrupted undo
+/// payload into `None`, and callers fell through to "no
+/// execution_id available" — operators saw "undo did nothing"
+/// without knowing whether the action was never recorded for undo
+/// or the record exists but is corrupted. Different remediation
+/// paths.
+///
+/// `None` (NULL undo_payload column) is NOT counted (legitimate
+/// absence — the action wasn't undoable). Only payload-present-
+/// but-fails-to-parse bumps the counter.
+///
+/// Same observability shape as ft-yygus, ft-k6uwb, ft-zhnaw,
+/// ft-94cdu, ft-lqj5g.
+static UNDO_PAYLOAD_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// br-ft-4ymqn: cumulative count of undo-payload parse failures.
+#[must_use]
+pub fn undo_payload_parse_drop_count() -> u64 {
+    UNDO_PAYLOAD_PARSE_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// br-ft-4ymqn: test helper to reset the parse-drop counter.
+#[cfg(test)]
+pub fn reset_undo_payload_parse_drop_count_for_test() {
+    UNDO_PAYLOAD_PARSE_DROP_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn parse_undo_payload(undo: &ActionUndoRecord) -> Option<serde_json::Value> {
-    undo.undo_payload
-        .as_deref()
-        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+    let payload = undo.undo_payload.as_deref()?;
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            UNDO_PAYLOAD_PARSE_DROP_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                target: "ft.undo.parse",
+                event = "undo_payload_parse_drop",
+                audit_action_id = undo.audit_action_id,
+                error = %err,
+                "ActionUndoRecord.undo_payload could not be parsed as JSON; consumer will see None (br-ft-4ymqn)"
+            );
+            None
+        }
+    }
 }
 
 fn execution_id_from_undo(
@@ -2745,5 +2792,51 @@ mod tests {
         let val = parse_undo_payload(&undo);
         assert!(val.is_some());
         assert_eq!(val.unwrap(), serde_json::Value::Bool(true));
+    }
+
+    // ── br-ft-4ymqn: parse-drop counter ──
+
+    fn make_undo_record(audit_action_id: i64, payload: Option<&str>) -> ActionUndoRecord {
+        ActionUndoRecord {
+            audit_action_id,
+            undoable: true,
+            undo_strategy: "custom".to_string(),
+            undo_hint: None,
+            undo_payload: payload.map(str::to_string),
+            undone_at: None,
+            undone_by: None,
+        }
+    }
+
+    #[test]
+    fn parse_undo_payload_null_does_not_bump_counter_ft_4ymqn() {
+        // NULL undo_payload is legitimate absence (action wasn't
+        // undoable); the counter must NOT bump.
+        super::reset_undo_payload_parse_drop_count_for_test();
+        let undo = make_undo_record(1, None);
+        assert!(parse_undo_payload(&undo).is_none());
+        assert_eq!(super::undo_payload_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn parse_undo_payload_well_formed_does_not_bump_counter_ft_4ymqn() {
+        super::reset_undo_payload_parse_drop_count_for_test();
+        let undo = make_undo_record(1, Some(r#"{"execution_id":"e-1"}"#));
+        assert!(parse_undo_payload(&undo).is_some());
+        assert_eq!(super::undo_payload_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn parse_undo_payload_malformed_bumps_counter_ft_4ymqn() {
+        // br-ft-4ymqn: a malformed undo payload bumps the counter
+        // exactly once. Multiple drops accumulate.
+        super::reset_undo_payload_parse_drop_count_for_test();
+        let undo1 = make_undo_record(1, Some("{not json"));
+        assert!(parse_undo_payload(&undo1).is_none());
+        assert_eq!(super::undo_payload_parse_drop_count(), 1);
+
+        let undo2 = make_undo_record(2, Some("[unclosed"));
+        assert!(parse_undo_payload(&undo2).is_none());
+        assert_eq!(super::undo_payload_parse_drop_count(), 2);
     }
 }
