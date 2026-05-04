@@ -449,6 +449,70 @@ impl<'de> Deserialize<'de> for TxExecutionLedger {
         let serialized = TxExecutionLedgerSerde::deserialize(deserializer)?;
         let key_index = build_ledger_key_index(&serialized.records).map_err(de::Error::custom)?;
 
+        // br-ft-ddm8k: validate trust-boundary invariants before
+        // installing the deserialized state. Pre-fix the impl
+        // accepted any (next_ordinal, last_hash, ordinal sequence)
+        // combination as long as idem_keys were unique. A forged
+        // persisted ledger could:
+        //   (a) set next_ordinal to a value already present in
+        //       records, causing the next append() to reuse the
+        //       ordinal and corrupt order-by-ordinal queries;
+        //   (b) set last_hash to anything (or empty) regardless
+        //       of the actual records vec, breaking the chain-of-
+        //       hashes anchor so subsequent appends compute
+        //       prev_hash from the wrong tip;
+        //   (c) supply non-monotonic / sparse ordinals, breaking
+        //       resume / dedup / forensic-bundle semantics that
+        //       all assume strict 0..records.len() ordinals.
+        // Each of these is rejected fail-closed below.
+
+        // (1) Ordinal density + monotonicity: 0..records.len().
+        for (expected, record) in serialized.records.iter().enumerate() {
+            let expected_u64 = u64::try_from(expected).map_err(|_| {
+                de::Error::custom(
+                    "br-ft-ddm8k: TxExecutionLedger record count exceeds u64 range",
+                )
+            })?;
+            if record.ordinal != expected_u64 {
+                return Err(de::Error::custom(format!(
+                    "br-ft-ddm8k: TxExecutionLedger record at index {} has ordinal {} (expected dense 0..len, must equal index)",
+                    expected, record.ordinal
+                )));
+            }
+        }
+
+        // (2) next_ordinal must equal records.len() (strictly
+        // greater than every record ordinal; equal to len because
+        // ordinals are dense 0..len).
+        let expected_next = u64::try_from(serialized.records.len()).map_err(|_| {
+            de::Error::custom("br-ft-ddm8k: TxExecutionLedger record count exceeds u64 range")
+        })?;
+        if serialized.next_ordinal != expected_next {
+            return Err(de::Error::custom(format!(
+                "br-ft-ddm8k: TxExecutionLedger next_ordinal {} does not match records.len() {} — append would reuse an existing ordinal or skip into a gap",
+                serialized.next_ordinal, expected_next
+            )));
+        }
+
+        // (3) last_hash must equal records.last().hash() — empty
+        // when records is empty, otherwise the last record's
+        // hash. The chain-of-hashes anchor is the load-bearing
+        // dedup primitive; a detached anchor lets append() compute
+        // prev_hash from the wrong tip and silently break chain
+        // continuity (verify_chain_continuity then fails AFTER
+        // the corruption is committed, instead of at load time).
+        let expected_last_hash = serialized
+            .records
+            .last()
+            .map(StepExecutionRecord::hash)
+            .unwrap_or_default();
+        if serialized.last_hash != expected_last_hash {
+            return Err(de::Error::custom(format!(
+                "br-ft-ddm8k: TxExecutionLedger last_hash `{}` does not match records.last().hash() `{}` — chain anchor is detached from the record vec",
+                serialized.last_hash, expected_last_hash
+            )));
+        }
+
         Ok(Self {
             execution_id: serialized.execution_id,
             plan_id: serialized.plan_id,
@@ -2002,6 +2066,120 @@ mod tests {
         assert_eq!(back.phase(), TxPhase::Preparing);
         assert!(back.is_executed(&key));
     }
+
+    // ── br-ft-ddm8k: TxExecutionLedger deserialize trust-boundary ────────
+
+    /// Build a JSON ledger string with explicit (records, next_ordinal,
+    /// last_hash) so tests can plant forged combinations.
+    fn ledger_json(
+        records: &[StepExecutionRecord],
+        next_ordinal: u64,
+        last_hash: &str,
+    ) -> String {
+        let records_json = serde_json::to_string(records).unwrap();
+        format!(
+            r#"{{"execution_id":"e","plan_id":"p","plan_hash":42,"phase":"preparing","records":{records},"last_hash":"{last_hash}","next_ordinal":{next_ordinal}}}"#,
+            records = records_json
+        )
+    }
+
+    fn build_record(plan_id: &str, step_id: &str, ordinal: u64, prev_hash: &str) -> StepExecutionRecord {
+        StepExecutionRecord {
+            ordinal,
+            idem_key: make_key(plan_id, step_id),
+            execution_id: "e".to_string(),
+            timestamp_ms: 1000 + ordinal,
+            outcome: StepOutcome::Success { result: None },
+            risk: StepRisk::Low,
+            prev_hash: prev_hash.to_string(),
+            agent_id: "a".to_string(),
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_next_ordinal_below_records_len_ft_ddm8k() {
+        // Forged: records=[r0, r1] but next_ordinal=1.
+        // Pre-fix accepted; next append() would reuse ordinal 1.
+        let r0 = build_record("p", "s0", 0, "");
+        let r0_hash = r0.hash();
+        let r1 = build_record("p", "s1", 1, &r0_hash);
+        let r1_hash = r1.hash();
+        let json = ledger_json(&[r0, r1], 1, &r1_hash);
+        let err = serde_json::from_str::<TxExecutionLedger>(&json)
+            .expect_err("br-ft-ddm8k: forged next_ordinal must be rejected");
+        assert!(
+            err.to_string().contains("next_ordinal"),
+            "br-ft-ddm8k: error message must reference next_ordinal; got {err}"
+        );
+        assert!(err.to_string().contains("br-ft-ddm8k"));
+    }
+
+    #[test]
+    fn deserialize_rejects_non_monotonic_ordinals_ft_ddm8k() {
+        // Forged: records have ordinals 0, 5, 2 (not 0..len).
+        let r0 = build_record("p", "s0", 0, "");
+        let r5 = build_record("p", "s5", 5, "anyhash"); // hash chain doesn't matter for this gate
+        let r2 = build_record("p", "s2", 2, "anyhash");
+        let json = ledger_json(&[r0, r5, r2], 6, "anyhash");
+        let err = serde_json::from_str::<TxExecutionLedger>(&json)
+            .expect_err("br-ft-ddm8k: non-monotonic ordinals must be rejected");
+        assert!(
+            err.to_string().contains("dense 0..len") || err.to_string().contains("ordinal"),
+            "br-ft-ddm8k: error must reference ordinal density; got {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_detached_last_hash_ft_ddm8k() {
+        // Forged: records=[r0] with valid ordinal/next_ordinal,
+        // but last_hash="" (detached from r0.hash()).
+        let r0 = build_record("p", "s0", 0, "");
+        let json = ledger_json(&[r0], 1, "");
+        let err = serde_json::from_str::<TxExecutionLedger>(&json)
+            .expect_err("br-ft-ddm8k: detached last_hash must be rejected");
+        assert!(
+            err.to_string().contains("last_hash") || err.to_string().contains("detached"),
+            "br-ft-ddm8k: error must reference last_hash; got {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_accepts_well_formed_empty_ledger_ft_ddm8k() {
+        // Empty ledger: records=[], next_ordinal=0, last_hash="".
+        // All three invariants trivially satisfied.
+        let json = r#"{"execution_id":"e","plan_id":"p","plan_hash":42,"phase":"preparing","records":[],"last_hash":"","next_ordinal":0}"#;
+        let ledger = serde_json::from_str::<TxExecutionLedger>(json)
+            .expect("empty well-formed ledger must deserialize");
+        assert_eq!(ledger.record_count(), 0);
+        assert_eq!(ledger.next_ordinal, 0);
+    }
+
+    #[test]
+    fn deserialize_accepts_well_formed_populated_ledger_ft_ddm8k() {
+        // Negative pin: a normal append() roundtrip ledger MUST
+        // pass all three new gates. If it doesn't, the validator
+        // is over-rejecting.
+        let mut ledger = TxExecutionLedger::new("e", "p", 42);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        for i in 0..3 {
+            let key = make_key("p", &format!("s{i}"));
+            ledger
+                .append(
+                    key,
+                    StepOutcome::Success { result: None },
+                    StepRisk::Low,
+                    "a",
+                    1000 + i,
+                )
+                .unwrap();
+        }
+        let json = serde_json::to_string(&ledger).unwrap();
+        let back: TxExecutionLedger = serde_json::from_str(&json)
+            .expect("br-ft-ddm8k: well-formed roundtrip must accept; over-rejection regression");
+        assert_eq!(back.record_count(), 3);
+        assert_eq!(back.next_ordinal, 3);
+    }
+}
 
     // ── DeduplicationGuard tests ──
 
