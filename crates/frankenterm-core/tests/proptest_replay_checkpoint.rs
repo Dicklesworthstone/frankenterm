@@ -174,8 +174,12 @@ proptest! {
 
     #[test]
     fn cp4_resume_restores_position(state in arb_checkpoint_state()) {
-        let ckpt = ReplayCheckpointer::with_defaults("cp4".into());
-        ckpt.resume_from(&state);
+        // br-ft-cnxnr: resume_from now validates run_id and
+        // schema. Construct the checkpointer with the SAME run_id
+        // as the generated state so this happy-path test still
+        // exercises the restore-state contract.
+        let ckpt = ReplayCheckpointer::with_defaults(state.replay_run_id.clone());
+        ckpt.resume_from(&state).expect("matching run_id must accept");
         let restored = ckpt.current_state();
         prop_assert_eq!(restored.event_position, state.event_position);
         prop_assert_eq!(restored.virtual_clock_ms, state.virtual_clock_ms);

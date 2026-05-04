@@ -287,16 +287,16 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
     }
 
     fn clear_scrollback(&self) {
-        let _ = self
-            .store
-            .lock()
-            .expect("live scrollback spill store mutex poisoned")
-            .clear_pane(self.pane_id);
         *self
             .state
             .lock()
             .expect("live scrollback spill state mutex poisoned") =
             LiveScrollbackSpillState::default();
+        let _ = self
+            .store
+            .lock()
+            .expect("live scrollback spill store mutex poisoned")
+            .clear_pane(self.pane_id);
     }
 }
 
@@ -558,6 +558,41 @@ mod tests {
             .expect("oldest retained row should hydrate");
         assert!(oldest.as_str().starts_with("busy-row-0992-"));
         assert!(sink.load_scrollback_line(991).is_none());
+    }
+
+    #[test]
+    fn live_scrollback_spill_sink_clear_resets_retained_rows() {
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 10,
+            domain_id: 3,
+            command_description: "clear-shell".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create live spill sink");
+        let attrs = CellAttributes::blank();
+        let before = Line::from_text("before-clear", &attrs, 1, None);
+
+        assert!(sink.store_scrollback_line(4, &before, 8));
+        assert!(sink.load_scrollback_line(4).is_some());
+
+        sink.clear_scrollback();
+
+        assert_eq!(sink.retained_scrollback_rows(), 0);
+        assert_eq!(sink.oldest_scrollback_row(), None);
+        assert!(sink.load_scrollback_line(4).is_none());
+
+        let after = Line::from_text("after-clear", &attrs, 2, None);
+        assert!(sink.store_scrollback_line(20, &after, 8));
+
+        assert!(sink.load_scrollback_line(4).is_none());
+        assert_eq!(
+            sink.load_scrollback_line(20)
+                .expect("row stored after clear should hydrate")
+                .as_str()
+                .as_ref(),
+            "after-clear"
+        );
     }
 
     #[test]

@@ -101,6 +101,77 @@ impl Default for QoEGuardrailConfig {
     }
 }
 
+/// Invalid QoE guardrail configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QoEGuardrailConfigError {
+    /// SLO target is NaN or infinite.
+    NonFiniteTarget,
+    /// SLO percentile is NaN or infinite.
+    NonFinitePercentile,
+    /// SLO percentile is outside the inclusive 0.0..=1.0 range.
+    PercentileOutOfRange,
+    /// Rolling windows must retain at least one sample.
+    ZeroWindowSize,
+    /// SLO evaluation must require at least one sample.
+    ZeroMinSamples,
+    /// Minimum samples cannot exceed the retained rolling window.
+    MinSamplesExceedsWindow,
+}
+
+impl QoESLO {
+    /// Validate a single SLO target.
+    pub fn validate(&self) -> Result<(), QoEGuardrailConfigError> {
+        if !self.target.is_finite() {
+            return Err(QoEGuardrailConfigError::NonFiniteTarget);
+        }
+        validate_percentile(self.percentile)
+    }
+}
+
+impl QoEGuardrailConfig {
+    /// Validate serde/operator supplied QoE guardrail settings before use.
+    pub fn validate(&self) -> Result<(), QoEGuardrailConfigError> {
+        if self.window_size == 0 {
+            return Err(QoEGuardrailConfigError::ZeroWindowSize);
+        }
+        if self.min_samples == 0 {
+            return Err(QoEGuardrailConfigError::ZeroMinSamples);
+        }
+        if self.min_samples > self.window_size {
+            return Err(QoEGuardrailConfigError::MinSamplesExceedsWindow);
+        }
+        for slo in &self.slos {
+            slo.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validated_or_default(self) -> Self {
+        if self.validate().is_ok() {
+            self
+        } else {
+            Self::default()
+        }
+    }
+}
+
+fn validate_percentile(percentile: f64) -> Result<(), QoEGuardrailConfigError> {
+    if !percentile.is_finite() {
+        return Err(QoEGuardrailConfigError::NonFinitePercentile);
+    }
+    if !(0.0..=1.0).contains(&percentile) {
+        return Err(QoEGuardrailConfigError::PercentileOutOfRange);
+    }
+    Ok(())
+}
+
+fn percentile_index(percentile: f64, len: usize) -> Option<usize> {
+    if len == 0 || validate_percentile(percentile).is_err() {
+        return None;
+    }
+    Some(((percentile * len as f64) as usize).min(len - 1))
+}
+
 /// SLO evaluation result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SLOVerdict {
@@ -180,6 +251,7 @@ pub struct QoEGuardrail {
 impl QoEGuardrail {
     /// Create a new guardrail.
     pub fn new(config: QoEGuardrailConfig) -> Self {
+        let config = config.validated_or_default();
         Self {
             config,
             windows: HashMap::new(),
@@ -187,8 +259,17 @@ impl QoEGuardrail {
         }
     }
 
+    /// Try to create a new guardrail, rejecting malformed configuration.
+    pub fn try_new(config: QoEGuardrailConfig) -> Result<Self, QoEGuardrailConfigError> {
+        config.validate()?;
+        Ok(Self::new(config))
+    }
+
     /// Record a measurement.
     pub fn record(&mut self, measurement: QoEMeasurement) {
+        if !measurement.value.is_finite() {
+            return;
+        }
         let window = self.windows.entry(measurement.metric).or_default();
         window.push_back(measurement.value);
         if window.len() > self.config.window_size {
@@ -214,9 +295,20 @@ impl QoEGuardrail {
                 required: self.config.min_samples,
             };
         }
+        if slo.validate().is_err() {
+            return SLOVerdict::InsufficientData {
+                samples: window.len(),
+                required: self.config.min_samples,
+            };
+        }
         let mut sorted: Vec<f64> = window.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let idx = ((slo.percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
+        sorted.sort_by(f64::total_cmp);
+        let Some(idx) = percentile_index(slo.percentile, sorted.len()) else {
+            return SLOVerdict::InsufficientData {
+                samples: window.len(),
+                required: self.config.min_samples,
+            };
+        };
         let measured = sorted[idx];
         // For smoothness, higher is better (target is minimum).
         // For latency/jitter, lower is better (target is maximum).
@@ -375,9 +467,8 @@ impl QoEGuardrail {
             return None;
         }
         let mut sorted: Vec<f64> = window.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let idx = ((percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
-        Some(sorted[idx])
+        sorted.sort_by(f64::total_cmp);
+        percentile_index(percentile, sorted.len()).map(|idx| sorted[idx])
     }
 
     /// Whether all SLOs are met (or insufficient data).
@@ -391,6 +482,7 @@ impl QoEGuardrail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn slo(metric: QoEMetric, target: f64) -> QoESLO {
         QoESLO {
@@ -449,5 +541,153 @@ mod tests {
             guard.detect_degradation(),
             QoEDegradation::SLOBreach { breach_count: 1 }
         ));
+    }
+
+    #[test]
+    fn config_validation_rejects_invalid_percentiles_and_targets() {
+        let mut config = QoEGuardrailConfig::default();
+        config.slos[0].percentile = f64::NAN;
+        assert_eq!(
+            config.validate(),
+            Err(QoEGuardrailConfigError::NonFinitePercentile)
+        );
+
+        let mut config = QoEGuardrailConfig::default();
+        config.slos[0].percentile = 1.25;
+        assert_eq!(
+            config.validate(),
+            Err(QoEGuardrailConfigError::PercentileOutOfRange)
+        );
+
+        let mut config = QoEGuardrailConfig::default();
+        config.slos[0].target = f64::INFINITY;
+        assert_eq!(
+            config.validate(),
+            Err(QoEGuardrailConfigError::NonFiniteTarget)
+        );
+
+        let mut config = QoEGuardrailConfig::default();
+        config.min_samples = config.window_size + 1;
+        assert_eq!(
+            config.validate(),
+            Err(QoEGuardrailConfigError::MinSamplesExceedsWindow)
+        );
+    }
+
+    #[test]
+    fn new_normalizes_invalid_config_and_try_new_rejects_it() {
+        let mut config = QoEGuardrailConfig::default();
+        config.slos[0].percentile = f64::NEG_INFINITY;
+
+        assert_eq!(
+            QoEGuardrail::try_new(config.clone()).map(|_| ()),
+            Err(QoEGuardrailConfigError::NonFinitePercentile)
+        );
+
+        let guard = QoEGuardrail::new(config);
+        assert_eq!(guard.config(), &QoEGuardrailConfig::default());
+    }
+
+    #[test]
+    fn non_finite_measurements_are_ignored() {
+        let config = QoEGuardrailConfig {
+            window_size: 8,
+            min_samples: 1,
+            ..Default::default()
+        };
+        let mut guard = QoEGuardrail::new(config);
+
+        guard.record_batch(
+            QoEMetric::InputToPaint,
+            &[f64::NAN, 12.0, f64::INFINITY, f64::NEG_INFINITY],
+            100,
+        );
+
+        assert_eq!(guard.total_measurements(), 1);
+        assert_eq!(guard.window_len(QoEMetric::InputToPaint), 1);
+        assert_eq!(
+            guard.current_percentile(QoEMetric::InputToPaint, 0.50),
+            Some(12.0)
+        );
+    }
+
+    #[test]
+    fn invalid_current_percentile_returns_none() {
+        let config = QoEGuardrailConfig {
+            window_size: 8,
+            min_samples: 1,
+            ..Default::default()
+        };
+        let mut guard = QoEGuardrail::new(config);
+        guard.record(QoEMeasurement {
+            metric: QoEMetric::InputToPaint,
+            value: 12.0,
+            timestamp_us: 1,
+        });
+
+        assert_eq!(
+            guard.current_percentile(QoEMetric::InputToPaint, f64::NAN),
+            None
+        );
+        assert_eq!(guard.current_percentile(QoEMetric::InputToPaint, -0.1), None);
+        assert_eq!(guard.current_percentile(QoEMetric::InputToPaint, 1.1), None);
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_config_validation_rejects_bad_percentiles(
+            bad_percentile in prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -1000.0f64..0.0,
+                1.000_001f64..1000.0,
+            ],
+        ) {
+            let mut config = QoEGuardrailConfig::default();
+            config.slos[0].percentile = bad_percentile;
+
+            prop_assert!(matches!(
+                config.validate(),
+                Err(QoEGuardrailConfigError::NonFinitePercentile | QoEGuardrailConfigError::PercentileOutOfRange)
+            ));
+            prop_assert!(QoEGuardrail::try_new(config.clone()).is_err());
+            prop_assert_eq!(QoEGuardrail::new(config).config(), &QoEGuardrailConfig::default());
+        }
+
+        #[test]
+        fn proptest_guardrail_retains_only_finite_samples(
+            values in prop::collection::vec(
+                prop_oneof![
+                    Just(f64::NAN),
+                    Just(f64::INFINITY),
+                    Just(f64::NEG_INFINITY),
+                    -1_000_000.0f64..1_000_000.0,
+                ],
+                0..64
+            ),
+        ) {
+            let config = QoEGuardrailConfig {
+                window_size: 128,
+                min_samples: 1,
+                ..Default::default()
+            };
+            let mut guard = QoEGuardrail::new(config);
+            guard.record_batch(QoEMetric::InputToPaint, &values, 0);
+
+            let finite_count = values.iter().filter(|value| value.is_finite()).count();
+            prop_assert_eq!(guard.total_measurements(), finite_count as u64);
+            prop_assert_eq!(guard.window_len(QoEMetric::InputToPaint), finite_count);
+
+            if finite_count == 0 {
+                prop_assert_eq!(guard.current_percentile(QoEMetric::InputToPaint, 0.50), None);
+            } else {
+                prop_assert!(
+                    guard
+                        .current_percentile(QoEMetric::InputToPaint, 0.50)
+                        .is_some_and(f64::is_finite)
+                );
+            }
+        }
     }
 }
