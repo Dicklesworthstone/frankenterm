@@ -738,14 +738,54 @@ impl Aggregator {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// br-ft-crpvd: cumulative count of `SystemTime::now() < UNIX_EPOCH`
+/// events observed by the wire-protocol [`epoch_ms_now`]. Same
+/// observability shape as `web::sse::EPOCH_CLOCK_ANOMALY_COUNT`
+/// (ft-bn6qi) and `recording::RECORDING_CLOCK_ANOMALY_COUNT`
+/// (ft-crpvd). Wire-protocol envelopes get replayed and audit-traced,
+/// so a silent timestamp=0 during a clock anomaly window corrupts
+/// distributed ordering across agents.
+static WIRE_PROTOCOL_CLOCK_ANOMALY_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// br-ft-crpvd: cumulative count of wire-protocol clock-before-1970
+/// anomalies. See [`WIRE_PROTOCOL_CLOCK_ANOMALY_COUNT`].
+#[must_use]
+pub fn wire_protocol_clock_anomaly_count() -> u64 {
+    WIRE_PROTOCOL_CLOCK_ANOMALY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// br-ft-crpvd: test-only reset for the clock-anomaly counter.
+#[cfg(test)]
+pub(crate) fn reset_wire_protocol_clock_anomaly_count_for_test() {
+    WIRE_PROTOCOL_CLOCK_ANOMALY_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn epoch_ms_now() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(i64::MAX)
+    epoch_ms_now_from(std::time::SystemTime::now())
+}
+
+/// br-ft-crpvd: testable inner helper. Takes a `SystemTime` so a
+/// regression test can inject a pre-epoch instant without depending
+/// on the host clock. Pre-fix this used `unwrap_or_default()` which
+/// silently produced timestamp=0 for every envelope during a clock
+/// anomaly window — distributed wa communication would lose temporal
+/// ordering across agents with no diagnostic.
+fn epoch_ms_now_from(now: std::time::SystemTime) -> i64 {
+    match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(ts) => i64::try_from(ts.as_millis()).unwrap_or(i64::MAX),
+        Err(err) => {
+            WIRE_PROTOCOL_CLOCK_ANOMALY_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                target: "ft.wire_protocol.clock",
+                event = "wire_protocol_clock_anomaly",
+                pre_epoch_secs = err.duration().as_secs(),
+                "system clock is before UNIX_EPOCH; wire-protocol envelope timestamp falling back to 0 (br-ft-crpvd)"
+            );
+            0
+        }
+    }
 }
 
 /// Validate a sender identity against the default wire-protocol limits.
@@ -2876,5 +2916,27 @@ mod tests {
                 "agent-{a} should have last_seq={msgs}"
             );
         }
+    }
+
+    // ── br-ft-crpvd: wire-protocol clock-anomaly observability ──
+
+    #[test]
+    fn wire_protocol_epoch_ms_post_epoch_no_anomaly_ft_crpvd() {
+        super::reset_wire_protocol_clock_anomaly_count_for_test();
+        let post = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_704_067_200);
+        let ms = super::epoch_ms_now_from(post);
+        assert!(ms > 0);
+        assert_eq!(super::wire_protocol_clock_anomaly_count(), 0);
+    }
+
+    #[test]
+    fn wire_protocol_epoch_ms_pre_epoch_bumps_counter_ft_crpvd() {
+        super::reset_wire_protocol_clock_anomaly_count_for_test();
+        let pre = std::time::UNIX_EPOCH
+            - std::time::Duration::from_secs(100);
+        let ms = super::epoch_ms_now_from(pre);
+        assert_eq!(ms, 0);
+        assert_eq!(super::wire_protocol_clock_anomaly_count(), 1);
     }
 }

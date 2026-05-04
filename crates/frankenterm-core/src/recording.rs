@@ -1004,13 +1004,60 @@ pub fn action_to_ingress_kind(
     }
 }
 
+/// br-ft-crpvd: cumulative count of `SystemTime::now() < UNIX_EPOCH`
+/// events observed by [`epoch_ms_now`]. Same observability shape as
+/// `web::sse::EPOCH_CLOCK_ANOMALY_COUNT` (ft-bn6qi). The recorder is
+/// the forensic-truth surface — a silent timestamp=0 during a clock
+/// anomaly window turns the monotonic-sequence promise into "all
+/// events claim the same instant", so the counter+warn pattern is
+/// the cheap fix.
+static RECORDING_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-crpvd: cumulative count of recording clock-before-1970
+/// anomalies. See [`RECORDING_CLOCK_ANOMALY_COUNT`].
+#[must_use]
+pub fn recording_clock_anomaly_count() -> u64 {
+    RECORDING_CLOCK_ANOMALY_COUNT.load(Ordering::Relaxed)
+}
+
+/// br-ft-crpvd: test-only reset for the clock-anomaly counter.
+#[cfg(test)]
+pub(crate) fn reset_recording_clock_anomaly_count_for_test() {
+    RECORDING_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
+}
+
 /// Returns the current Unix epoch in milliseconds.
+///
+/// br-ft-crpvd: pre-fix this used `unwrap_or_default()` which silently
+/// substituted 0 for every captured event during a clock anomaly
+/// window (NTP fail / container restart with un-synced clock). The
+/// recorder feeds replay_capture and the forensic ledger, so a flat
+/// line of timestamp=0 across an anomaly is forensically catastrophic.
+/// Now: bump the anomaly counter, emit a structured tracing::warn,
+/// still return 0 so the scalar-u64 contract stays the same.
 #[must_use]
 pub fn epoch_ms_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    epoch_ms_now_from(std::time::SystemTime::now())
+}
+
+/// br-ft-crpvd: testable inner helper. Takes a `SystemTime` so a
+/// regression test can inject `UNIX_EPOCH - 100s` (a valid
+/// pre-epoch SystemTime) to exercise the Err branch without
+/// depending on the host system clock.
+fn epoch_ms_now_from(now: std::time::SystemTime) -> u64 {
+    match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(ts) => ts.as_millis() as u64,
+        Err(err) => {
+            RECORDING_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "ft.recording.clock",
+                event = "recording_clock_anomaly",
+                pre_epoch_secs = err.duration().as_secs(),
+                "system clock is before UNIX_EPOCH; recorder timestamp falling back to 0 (br-ft-crpvd)"
+            );
+            0
+        }
+    }
 }
 
 /// Thread-safe monotonic sequence counter for recorder events.
@@ -2204,6 +2251,40 @@ mod tests {
         let ms = epoch_ms_now();
         assert!(ms > 1_735_689_600_000);
         assert!(ms < 4_102_444_800_000);
+    }
+
+    // ── br-ft-crpvd: clock-anomaly observability ──
+
+    #[test]
+    fn epoch_ms_now_from_post_epoch_no_anomaly_ft_crpvd() {
+        // Sanity: a valid post-epoch SystemTime returns positive
+        // ms and does NOT bump the anomaly counter.
+        super::reset_recording_clock_anomaly_count_for_test();
+        let post = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_704_067_200);
+        let ms = super::epoch_ms_now_from(post);
+        assert!(ms > 0);
+        assert_eq!(
+            super::recording_clock_anomaly_count(),
+            0,
+            "post-epoch path must not bump anomaly counter"
+        );
+    }
+
+    #[test]
+    fn epoch_ms_now_from_pre_epoch_bumps_counter_ft_crpvd() {
+        // br-ft-crpvd: pre-epoch SystemTime triggers the Err
+        // branch. Returns 0 (preserves scalar contract) and bumps
+        // the process-global counter.
+        super::reset_recording_clock_anomaly_count_for_test();
+        let pre = std::time::UNIX_EPOCH
+            - std::time::Duration::from_secs(100);
+        let ms = super::epoch_ms_now_from(pre);
+        assert_eq!(ms, 0);
+        assert_eq!(super::recording_clock_anomaly_count(), 1);
+        // Second call bumps again — every event observable.
+        let _ = super::epoch_ms_now_from(pre);
+        assert_eq!(super::recording_clock_anomaly_count(), 2);
     }
 
     #[test]
