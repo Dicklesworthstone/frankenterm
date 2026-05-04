@@ -23,9 +23,10 @@
 //!
 //! # Consistency with tx_idempotency
 //!
-//! Uses the same FNV-1a hash scheme as [`crate::tx_idempotency::IdempotencyKey`]
-//! for deterministic key generation. The `rk:` prefix distinguishes robot keys
-//! from `txk:` transaction keys.
+//! Uses the same FNV-1a hash primitive as [`crate::tx_idempotency::IdempotencyKey`]
+//! for deterministic key generation, with a robot-key-specific length-prefixed
+//! preimage. The `rk:` prefix distinguishes robot keys from `txk:` transaction
+//! keys.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -49,10 +50,15 @@ impl MutationKey {
     /// Derive a key from action kind and a fingerprint of the parameters.
     ///
     /// The fingerprint should capture all semantically significant parameters.
-    /// For example, for `send_text`: `"{pane_id}|{text_hash}"`.
+    /// It is encoded as one length-prefixed field, so delimiter-like bytes in
+    /// either input cannot move data across the action/fingerprint boundary.
     #[must_use]
     pub fn derive(action: &str, fingerprint: &str) -> Self {
-        let hash = fnv1a_hash(&format!("{action}|{fingerprint}"));
+        Self::derive_from_parts(action, &[fingerprint])
+    }
+
+    fn derive_from_parts(action: &str, fingerprint_parts: &[&str]) -> Self {
+        let hash = fnv1a_hash_mutation_key(action, fingerprint_parts);
         Self {
             key: format!("rk:{hash:016x}"),
             action: action.to_string(),
@@ -472,46 +478,77 @@ impl MutationGuard {
 #[must_use]
 pub fn send_text_key(pane_id: u64, text: &str) -> MutationKey {
     let text_hash = fnv1a_hash(text);
-    MutationKey::derive("send_text", &format!("{pane_id}|{text_hash:016x}"))
+    let pane_id = pane_id.to_string();
+    let text_hash = format!("{text_hash:016x}");
+    MutationKey::derive_from_parts("send_text", &[&pane_id, &text_hash])
 }
 
 /// Helper to derive a mutation key for `split_pane` actions.
 #[must_use]
 pub fn split_pane_key(pane_id: u64, direction: &str) -> MutationKey {
-    MutationKey::derive("split_pane", &format!("{pane_id}|{direction}"))
+    let pane_id = pane_id.to_string();
+    MutationKey::derive_from_parts("split_pane", &[&pane_id, direction])
 }
 
 /// Helper to derive a mutation key for `close_pane` actions.
 #[must_use]
 pub fn close_pane_key(pane_id: u64) -> MutationKey {
-    MutationKey::derive("close_pane", &format!("{pane_id}"))
+    let pane_id = pane_id.to_string();
+    MutationKey::derive_from_parts("close_pane", &[&pane_id])
 }
 
 /// Helper to derive a mutation key for `event_annotate` actions.
 #[must_use]
 pub fn event_annotate_key(event_id: i64, annotation_hash: &str) -> MutationKey {
-    MutationKey::derive("event_annotate", &format!("{event_id}|{annotation_hash}"))
+    let event_id = event_id.to_string();
+    MutationKey::derive_from_parts("event_annotate", &[&event_id, annotation_hash])
 }
 
 /// Helper to derive a mutation key for `workflow_run` actions.
 #[must_use]
 pub fn workflow_run_key(workflow_id: &str, input_hash: &str) -> MutationKey {
-    MutationKey::derive("workflow_run", &format!("{workflow_id}|{input_hash}"))
+    MutationKey::derive_from_parts("workflow_run", &[workflow_id, input_hash])
 }
 
 /// Helper to derive a mutation key for `agent_configure` actions.
 #[must_use]
 pub fn agent_configure_key(pane_id: u64, config_hash: &str) -> MutationKey {
-    MutationKey::derive("agent_configure", &format!("{pane_id}|{config_hash}"))
+    let pane_id = pane_id.to_string();
+    MutationKey::derive_from_parts("agent_configure", &[&pane_id, config_hash])
 }
 
 // ── FNV-1a Hash ─────────────────────────────────────────────────────────────
 
 /// FNV-1a 64-bit hash, consistent with `tx_idempotency` and `tx_plan_compiler`.
 fn fnv1a_hash(data: &str) -> u64 {
+    fnv1a_hash_bytes(data.as_bytes())
+}
+
+fn fnv1a_hash_mutation_key(action: &str, fingerprint_parts: &[&str]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in data.bytes() {
-        hash ^= byte as u64;
+    hash = fnv1a_update(hash, b"robot_mutation_key_v2");
+    hash = fnv1a_update_len_prefixed(hash, action.as_bytes());
+    let part_count = u64::try_from(fingerprint_parts.len()).unwrap_or(u64::MAX);
+    hash = fnv1a_update(hash, &part_count.to_be_bytes());
+    for part in fingerprint_parts {
+        hash = fnv1a_update_len_prefixed(hash, part.as_bytes());
+    }
+    hash
+}
+
+fn fnv1a_hash_bytes(data: &[u8]) -> u64 {
+    fnv1a_update(0xcbf29ce484222325, data)
+}
+
+fn fnv1a_update_len_prefixed(hash: u64, bytes: &[u8]) -> u64 {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let hash = fnv1a_update(hash, &len.to_be_bytes());
+    fnv1a_update(hash, bytes)
+}
+
+fn fnv1a_update(mut hash: u64, data: &[u8]) -> u64 {
+    for byte in data {
+        hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
@@ -545,6 +582,25 @@ mod tests {
         let k1 = MutationKey::derive("send_text", "42|abc");
         let k2 = MutationKey::derive("send_text", "42|xyz");
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn key_derive_does_not_collide_on_action_fingerprint_boundary() {
+        // The previous `"{action}|{fingerprint}"` preimage made
+        // these two distinct calls hash identical bytes: "a|b|c".
+        let k1 = MutationKey::derive("a", "b|c");
+        let k2 = MutationKey::derive("a|b", "c");
+        assert_ne!(k1.as_str(), k2.as_str());
+    }
+
+    #[test]
+    fn workflow_run_key_does_not_collide_on_workflow_input_boundary() {
+        // The helper used to build one fingerprint string with `|`,
+        // so workflow_id="wf" + input_hash="a|b" collided with
+        // workflow_id="wf|a" + input_hash="b".
+        let k1 = workflow_run_key("wf", "a|b");
+        let k2 = workflow_run_key("wf|a", "b");
+        assert_ne!(k1.as_str(), k2.as_str());
     }
 
     #[test]

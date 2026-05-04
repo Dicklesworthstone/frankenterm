@@ -380,10 +380,17 @@ pub struct ApplyReceipt {
 /// Inputs are canonicalised before hashing so the same logical apply
 /// produces a stable hash regardless of HashMap iteration order:
 ///
-/// 1. `env_overrides` is sorted by key.
-/// 2. The pre-image is `"<name>\0<updated_at_ms>\0<count>\0<env>"`
-///    where `<env>` is each `key=value` pair sorted, joined by NUL.
-/// 3. SHA-256 over the pre-image, hex-encoded lowercase.
+/// 1. A version tag is written first so future encodings cannot
+///    collide with this one.
+/// 2. String and byte-vector fields are length-prefixed before their
+///    bytes are written.
+/// 3. `env_overrides` entries are sorted by key and encoded as
+///    length-prefixed key/value pairs.
+/// 4. SHA-256 over the pre-image, hex-encoded lowercase.
+///
+/// The length prefixes are required because profile env overrides may
+/// contain separator-like bytes such as `=` or NUL; delimiter-based
+/// encodings make `{A: "B\0C=D"}` collide with `{A: "B", C: "D"}`.
 ///
 /// The pre-image format is **not** stable across major releases —
 /// receipts written under one version may not match receipts written
@@ -398,22 +405,26 @@ pub fn compute_apply_content_hash(
 ) -> String {
     use sha2::{Digest as _, Sha256};
 
+    fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        hasher.update(len.to_be_bytes());
+        hasher.update(bytes);
+    }
+
     let mut hasher = Sha256::new();
-    hasher.update(profile_name.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(profile_updated_at_ms.to_string().as_bytes());
-    hasher.update([0u8]);
-    hasher.update(count.to_string().as_bytes());
-    hasher.update([0u8]);
+    hasher.update(b"robot_profile_apply_hash_v2");
+    hash_len_prefixed(&mut hasher, profile_name.as_bytes());
+    hasher.update(profile_updated_at_ms.to_be_bytes());
+    hasher.update(count.to_be_bytes());
 
     // Sort env_overrides by key for deterministic hashing.
     let mut env_sorted: Vec<(&String, &String)> = env_overrides.iter().collect();
     env_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let env_len = u64::try_from(env_sorted.len()).unwrap_or(u64::MAX);
+    hasher.update(env_len.to_be_bytes());
     for (k, v) in env_sorted {
-        hasher.update(k.as_bytes());
-        hasher.update([b'=']);
-        hasher.update(v.as_bytes());
-        hasher.update([0u8]);
+        hash_len_prefixed(&mut hasher, k.as_bytes());
+        hash_len_prefixed(&mut hasher, v.as_bytes());
     }
 
     format!("{:x}", hasher.finalize())
@@ -495,19 +506,16 @@ mod apply_receipt_tests {
 
     #[test]
     fn hash_no_collision_between_separator_chars_in_value() {
-        // Defensive: a value containing the NUL separator should
-        // not collide with an env containing two distinct keys.
+        // Defensive: the previous delimiter-based pre-image made
+        // these two distinct maps encode to the same bytes:
+        // "A=B\0C=D\0".
         let mut env_a = HashMap::new();
-        env_a.insert("FOO".to_string(), "bar\0BAR=baz".to_string());
+        env_a.insert("A".to_string(), "B\0C=D".to_string());
 
         let mut env_b = HashMap::new();
-        env_b.insert("FOO".to_string(), "bar".to_string());
-        env_b.insert("BAR".to_string(), "baz".to_string());
+        env_b.insert("A".to_string(), "B".to_string());
+        env_b.insert("C".to_string(), "D".to_string());
 
-        // The hashes should differ because env_a has 1 entry
-        // (FOO=bar\0BAR=baz) while env_b has 2 entries
-        // (BAR=baz; FOO=bar) — even though the literal pre-image
-        // bytes happen to look similar after NUL separation.
         assert_ne!(
             compute_apply_content_hash("p", 0, 1, &env_a),
             compute_apply_content_hash("p", 0, 1, &env_b),
