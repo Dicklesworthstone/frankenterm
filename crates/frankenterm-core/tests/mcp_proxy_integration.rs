@@ -1,7 +1,7 @@
 #![cfg(all(feature = "mcp", feature = "mcp-client"))]
 
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::build_server_with_db;
+use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
 };
@@ -240,7 +240,7 @@ fn proxy_mounts_remote_tools_with_prefixed_routes() {
         discovery_path.display(),
         script_path.display()
     );
-    let server = build_server_with_db(&config, None).expect("build proxy-enabled server");
+    let server = build_server_degraded(&config).expect("build degraded proxy-enabled server");
     let tool_names: BTreeSet<String> = server.tools().into_iter().map(|tool| tool.name).collect();
 
     eprintln!("Registered tool names: {tool_names:?}");
@@ -280,7 +280,7 @@ fn proxy_does_not_let_failed_server_claim_shared_route_prefix() {
     let config =
         make_proxy_config_with_servers(&discovery_path, &["GitHub Copilot", "GitHub/Copilot"]);
 
-    let server = build_server_with_db(&config, None).expect("build proxy-enabled server");
+    let server = build_server_degraded(&config).expect("build degraded proxy-enabled server");
     let tool_names: BTreeSet<String> = server.tools().into_iter().map(|tool| tool.name).collect();
 
     eprintln!("Tool names after broken-then-valid shared-prefix servers: {tool_names:?}");
@@ -308,7 +308,7 @@ fn proxy_routes_calls_to_remote_tools() {
         &["-u".to_string(), script_path.display().to_string()],
     );
     let config = make_proxy_config(&discovery_path, "mock");
-    let server = build_server_with_db(&config, None).expect("build proxy-enabled server");
+    let server = build_server_degraded(&config).expect("build degraded proxy-enabled server");
 
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
@@ -426,7 +426,7 @@ fn proxy_fallback_preserves_local_tools_when_remote_is_unavailable() {
         "Building MCP server with fallback mode and missing command: {}",
         missing_command
     );
-    let server = build_server_with_db(&config, None).expect("fallback mode should keep local MCP");
+    let server = build_server_degraded(&config).expect("fallback mode should keep local MCP");
     let tool_names: BTreeSet<String> = server.tools().into_iter().map(|tool| tool.name).collect();
 
     eprintln!("Tool names in fallback mode: {tool_names:?}");
@@ -453,7 +453,8 @@ fn proxy_strict_mode_fails_startup_when_remote_is_unavailable() {
     config.mcp_client.proxy_strict = true;
     config.mcp_client.proxy_fallback_to_local = false;
 
-    let err = match build_server_with_db(&config, None) {
+    let db_path = temp_dir.path().join("strict_proxy.sqlite3");
+    let err = match build_server_with_db(&config, Some(db_path)) {
         Ok(_) => panic!("strict mode must fail on connect"),
         Err(err) => err,
     };
@@ -462,5 +463,34 @@ fn proxy_strict_mode_fails_startup_when_remote_is_unavailable() {
     assert!(
         message.contains("mcp proxy connect failed for server"),
         "unexpected strict-mode error message: {message}"
+    );
+}
+
+#[test]
+fn build_server_with_db_none_fails_before_proxy_composition_ft_71dap() {
+    init_test_logging();
+    let temp_dir = tempdir().expect("temp dir");
+    let discovery_path = write_discovery_config(
+        temp_dir.path(),
+        "broken",
+        "nonexistent_proxy_command_for_ft",
+        &Vec::<String>::new(),
+    );
+    let mut config = make_proxy_config(&discovery_path, "broken");
+    config.mcp_client.proxy_strict = true;
+    config.mcp_client.proxy_fallback_to_local = false;
+
+    let err = match build_server_with_db(&config, None) {
+        Ok(_) => panic!("None db_path must fail early"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("build_server_with_db called with db_path=None"),
+        "strict no-db error should come from the bridge boundary: {message}"
+    );
+    assert!(
+        !message.contains("mcp proxy connect failed"),
+        "None db_path must fail before proxy composition: {message}"
     );
 }

@@ -20,13 +20,15 @@
 //! any change requires an explicit `UPDATE_GOLDEN=1` regeneration pass.
 
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::build_server_with_db;
+use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
     framework_create_memory_transport_pair,
 };
+use proptest::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +46,7 @@ struct RulesTestGoldenCapture {
 fn spawn_client() -> FrameworkTestClient {
     let mut config = Config::default();
     config.safety.require_prompt_active = false;
-    let server = build_server_with_db(&config, None).expect("build MCP server");
+    let server = build_server_degraded(&config).expect("build degraded MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
         let _ = server.run_transport(server_transport);
@@ -64,6 +66,35 @@ fn tool_input_schema(client: &mut FrameworkTestClient, tool_name: &str) -> Value
         .find(|tool: &FrameworkTool| tool.name == tool_name)
         .map(|tool| tool.input_schema)
         .unwrap_or_else(|| panic!("missing tool {tool_name}"))
+}
+
+proptest! {
+    #[test]
+    fn no_db_mcp_test_builders_use_explicit_degraded_contract_ft_71dap(
+        require_prompt_active in any::<bool>(),
+    ) {
+        let mut config = Config::default();
+        config.safety.require_prompt_active = require_prompt_active;
+
+        prop_assert!(
+            build_server_with_db(&config, None).is_err(),
+            "build_server_with_db(None) must stay on the strict bridge error path"
+        );
+
+        let server = build_server_degraded(&config)
+            .expect("explicit degraded MCP server should build");
+        let tool_names: BTreeSet<String> =
+            server.tools().into_iter().map(|tool| tool.name).collect();
+
+        prop_assert!(
+            tool_names.contains("wa.rules_test"),
+            "rules conformance helper must keep wa.rules_test available in degraded mode: {tool_names:?}"
+        );
+        prop_assert!(
+            !tool_names.contains("wa.search"),
+            "degraded conformance helper must not expose storage-backed tools: {tool_names:?}"
+        );
+    }
 }
 
 fn manifest_tool_schema(tool_name: &str) -> Value {

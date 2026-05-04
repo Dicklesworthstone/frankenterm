@@ -1334,6 +1334,42 @@ mod tests {
         }
 
         #[test]
+        fn proptest_no_db_test_builders_preserve_explicit_degraded_contract_ft_71dap(
+            panes in pane_filter_config_strategy(),
+            require_prompt_active in any::<bool>(),
+        ) {
+            let mut config = Config::default();
+            config.ingest.panes = panes;
+            config.safety.require_prompt_active = require_prompt_active;
+
+            prop_assert!(
+                build_server_with_db(&config, None).is_err(),
+                "build_server_with_db(None) must stay on the strict error path"
+            );
+
+            let degraded = build_server_degraded(&config)
+                .expect("explicit degraded builder must remain callable");
+            let legacy = build_server(&config)
+                .expect("legacy no-db builder must route through explicit degraded mode");
+
+            let degraded_tools: BTreeSet<String> = degraded
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            let legacy_tools: BTreeSet<String> = legacy
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            prop_assert_eq!(
+                legacy_tools,
+                degraded_tools,
+                "legacy build_server must expose the same no-db tool catalog as build_server_degraded"
+            );
+        }
+
+        #[test]
         fn proptest_toon_roundtrip_preserves_json_semantics(value in json_value_strategy()) {
             let toon = toon_rust::encode(value.clone(), None);
             let decoded = toon_rust::try_decode(&toon, None).expect("decode should succeed");
@@ -1437,7 +1473,7 @@ mod tests {
 
     #[test]
     fn mcp_server_without_db_only_exposes_non_storage_resources() {
-        let server = build_server_with_db(&Config::default(), None).expect("build mcp server");
+        let server = build_server_degraded(&Config::default()).expect("build degraded mcp server");
 
         let resources = uri_set(server.resources().into_iter().map(|r| r.uri));
         let templates = uri_set(
@@ -1705,7 +1741,7 @@ mod tests {
 
     #[test]
     fn non_storage_tools_registered_without_db() {
-        let server = build_server_with_db(&Config::default(), None).expect("build mcp server");
+        let server = build_server_degraded(&Config::default()).expect("build degraded mcp server");
         let tool_defs = server.tools();
         let tool_names: BTreeSet<String> = tool_defs.into_iter().map(|t| t.name).collect();
 
@@ -1716,10 +1752,13 @@ mod tests {
             "wa.wait_for",
             "wa.rules_list",
             "wa.rules_test",
+            "wa.cass_search",
+            "wa.cass_view",
+            "wa.cass_status",
             "wa.tx_plan",
-            "wa.tx_run",
-            "wa.tx_rollback",
             "wa.tx_show",
+            "wa.mission_state",
+            "wa.mission_explain",
         ];
         for name in &always_present {
             assert!(
@@ -1738,6 +1777,13 @@ mod tests {
             "wa.reservations",
             "wa.reserve",
             "wa.release",
+            "wa.send",
+            "wa.workflow_status",
+            "wa.tx_run",
+            "wa.tx_rollback",
+            "wa.mission_pause",
+            "wa.mission_resume",
+            "wa.mission_abort",
         ];
         for name in &storage_only {
             assert!(
