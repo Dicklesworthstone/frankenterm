@@ -216,9 +216,52 @@ impl ReplayHarness {
     }
 
     /// Validate a reflex against historical incidents.
+    ///
+    /// Legacy entry: skips the trigger-matching contract (the
+    /// reflex's trigger pattern is not threaded through). Use
+    /// [`Self::validate_with_trigger`] when the caller knows the
+    /// reflex's trigger and wants `PatternMismatch` enforcement.
     pub fn validate(
         &mut self,
         reflex_id: ReflexId,
+        proposed_commands: &[String],
+        incidents: &[HistoricalIncident],
+        timestamp_ms: u64,
+    ) -> ReplaySession {
+        self.validate_inner(reflex_id, None, proposed_commands, incidents, timestamp_ms)
+    }
+
+    /// br-ft-q5ts7: validate a reflex against historical incidents
+    /// with the reflex's trigger pattern threaded through. Each
+    /// incident's `trigger_pattern` is byte-compared against
+    /// `reflex_trigger`; mismatches emit `FailReason::PatternMismatch`
+    /// instead of being silently scored on commands/output alone.
+    ///
+    /// This is the recommended entry point for promotion gates —
+    /// the legacy `validate()` only checks command/output similarity
+    /// and so cannot prove the reflex would actually re-trigger on
+    /// the original incident shape.
+    pub fn validate_with_trigger(
+        &mut self,
+        reflex_id: ReflexId,
+        reflex_trigger: &[u8],
+        proposed_commands: &[String],
+        incidents: &[HistoricalIncident],
+        timestamp_ms: u64,
+    ) -> ReplaySession {
+        self.validate_inner(
+            reflex_id,
+            Some(reflex_trigger),
+            proposed_commands,
+            incidents,
+            timestamp_ms,
+        )
+    }
+
+    fn validate_inner(
+        &mut self,
+        reflex_id: ReflexId,
+        reflex_trigger: Option<&[u8]>,
         proposed_commands: &[String],
         incidents: &[HistoricalIncident],
         timestamp_ms: u64,
@@ -244,7 +287,7 @@ impl ReplayHarness {
         let mut verdicts = Vec::with_capacity(replay_count);
 
         for incident in incidents.iter().take(replay_count) {
-            let verdict = self.replay_incident(proposed_commands, incident);
+            let verdict = self.replay_incident(reflex_trigger, proposed_commands, incident);
             verdicts.push(verdict);
         }
 
@@ -297,12 +340,24 @@ impl ReplayHarness {
     }
 
     /// Replay a single incident.
-    #[allow(clippy::unused_self)]
+    ///
+    /// br-ft-q5ts7: `reflex_trigger` is the reflex's trigger pattern;
+    /// when `Some`, this replay requires `incident.trigger_pattern`
+    /// to byte-match the reflex's pattern, otherwise emits
+    /// `FailReason::PatternMismatch`. The `validate()` legacy entry
+    /// passes `None` to preserve the pre-fix behavior; callers who
+    /// know their reflex's trigger should use
+    /// `validate_with_trigger` to thread the check through.
+    /// Timeout enforcement is independent of the trigger argument:
+    /// the per-incident wall clock is measured and a `Timeout`
+    /// verdict is emitted if `max_replay_ms` is exceeded.
     fn replay_incident(
         &self,
+        reflex_trigger: Option<&[u8]>,
         proposed_commands: &[String],
         incident: &HistoricalIncident,
     ) -> ReplayVerdict {
+        let started = std::time::Instant::now();
         let incident_id = incident.incident_id.clone();
 
         // Skip failed originals — can't validate against known failures.
@@ -313,9 +368,30 @@ impl ReplayHarness {
             };
         }
 
+        // br-ft-q5ts7: trigger pattern check (when reflex_trigger
+        // is supplied). The reflex must match the historical
+        // incident's trigger byte-for-byte; otherwise a future
+        // promotion of this reflex would not actually re-trigger
+        // on the same incident shape.
+        if let Some(trigger) = reflex_trigger {
+            if trigger != incident.trigger_pattern.as_slice() {
+                return ReplayVerdict::Fail {
+                    incident_id,
+                    reason: FailReason::PatternMismatch,
+                };
+            }
+        }
+
         // Check command similarity.
         let cmd_similarity = command_similarity(proposed_commands, &incident.actual_commands);
         if cmd_similarity < 0.3 {
+            // br-ft-q5ts7: even for a fast comparison branch,
+            // honor the per-incident timeout so a degenerate
+            // input (e.g. enormous command vec) can't blow past
+            // the budget without surfacing it.
+            if let Some(verdict) = self.maybe_timeout(&incident_id, started) {
+                return verdict;
+            }
             return ReplayVerdict::Fail {
                 incident_id,
                 reason: FailReason::CommandMismatch {
@@ -331,6 +407,14 @@ impl ReplayHarness {
         // Score combines command match and output characteristics.
         let match_score = cmd_similarity.mul_add(0.7, output_sim * 0.3);
 
+        // br-ft-q5ts7: terminal timeout check before emitting any
+        // pass/fail verdict. If the per-incident replay budget
+        // was exceeded by the cumulative work above, surface
+        // Timeout so operators see the budget breach.
+        if let Some(verdict) = self.maybe_timeout(&incident_id, started) {
+            return verdict;
+        }
+
         if match_score >= 0.5 {
             ReplayVerdict::Pass {
                 incident_id,
@@ -345,6 +429,34 @@ impl ReplayHarness {
                 },
             }
         }
+    }
+
+    /// br-ft-q5ts7: shared per-incident timeout helper. If the
+    /// elapsed wall-clock since `started` exceeds `max_replay_ms`,
+    /// returns `Some(ReplayVerdict::Fail { Timeout { elapsed, max } })`
+    /// so call sites can short-circuit cleanly. Returns `None` when
+    /// the budget is `0` (operators can disable timing by setting
+    /// max_replay_ms=0; the budget is then "infinite" by convention)
+    /// or when the elapsed time is within budget.
+    fn maybe_timeout(
+        &self,
+        incident_id: &str,
+        started: std::time::Instant,
+    ) -> Option<ReplayVerdict> {
+        if self.config.max_replay_ms == 0 {
+            return None;
+        }
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if elapsed_ms > self.config.max_replay_ms {
+            return Some(ReplayVerdict::Fail {
+                incident_id: incident_id.to_string(),
+                reason: FailReason::Timeout {
+                    elapsed_ms,
+                    max_ms: self.config.max_replay_ms,
+                },
+            });
+        }
+        None
     }
 
     /// Count passes (and applicable total).
@@ -782,5 +894,167 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         let decoded: ReplayStats = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, stats);
+    }
+
+    // ── br-ft-q5ts7: trigger matching + timeout validation ──
+
+    #[test]
+    fn validate_with_trigger_passes_on_matching_pattern_ft_q5ts7() {
+        // br-ft-q5ts7: when reflex trigger matches the historical
+        // incident's trigger_pattern, replay proceeds normally.
+        let mut harness = ReplayHarness::with_defaults();
+        let incidents = make_incidents(3);
+        // make_incident uses trigger_pattern = vec![1, 2, 3].
+        let session = harness.validate_with_trigger(
+            42,
+            &[1, 2, 3],
+            &["systemctl restart app".to_string()],
+            &incidents,
+            1000,
+        );
+        // No PatternMismatch should appear — all verdicts should
+        // be Pass or some other non-PatternMismatch shape.
+        for v in &session.verdicts {
+            if let ReplayVerdict::Fail {
+                reason: FailReason::PatternMismatch,
+                ..
+            } = v
+            {
+                panic!("matching trigger must not produce PatternMismatch: {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn validate_with_trigger_fails_on_mismatched_pattern_ft_q5ts7() {
+        // br-ft-q5ts7: a reflex whose trigger pattern doesn't
+        // match the historical incident must fail with
+        // PatternMismatch — pre-fix this would silently score
+        // the reflex on commands/output alone.
+        let mut harness = ReplayHarness::with_defaults();
+        let incidents = make_incidents(3);
+        let session = harness.validate_with_trigger(
+            42,
+            &[9, 9, 9], // different from incident's [1, 2, 3]
+            &["systemctl restart app".to_string()],
+            &incidents,
+            1000,
+        );
+        let pattern_fails = session
+            .verdicts
+            .iter()
+            .filter(|v| {
+                matches!(
+                    v,
+                    ReplayVerdict::Fail {
+                        reason: FailReason::PatternMismatch,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            pattern_fails, 3,
+            "all 3 mismatched incidents must fail with PatternMismatch; got {:?}",
+            session.verdicts
+        );
+        assert!(
+            !session.assessment.is_validated(),
+            "reflex with mismatched trigger must not validate"
+        );
+    }
+
+    #[test]
+    fn validate_legacy_skips_pattern_check_ft_q5ts7() {
+        // The legacy validate() entry preserves pre-fix behavior
+        // (no trigger matching). Useful for compatibility while
+        // call sites migrate to validate_with_trigger.
+        let mut harness = ReplayHarness::with_defaults();
+        let incidents = make_incidents(3);
+        let session = harness.validate(
+            42,
+            &["systemctl restart app".to_string()],
+            &incidents,
+            1000,
+        );
+        for v in &session.verdicts {
+            if let ReplayVerdict::Fail {
+                reason: FailReason::PatternMismatch,
+                ..
+            } = v
+            {
+                panic!("legacy validate must not emit PatternMismatch: {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_disabled_when_max_replay_ms_zero_ft_q5ts7() {
+        // br-ft-q5ts7: max_replay_ms=0 is the documented "infinite
+        // budget" sentinel. Even an instantaneous replay must not
+        // emit Timeout.
+        let config = ReplayConfig {
+            max_replay_ms: 0,
+            min_incidents: 1,
+            ..ReplayConfig::default()
+        };
+        let mut harness = ReplayHarness::new(config);
+        let incidents = vec![make_incident("inc-0", true)];
+        let session = harness.validate(
+            42,
+            &["systemctl restart app".to_string()],
+            &incidents,
+            1000,
+        );
+        for v in &session.verdicts {
+            if let ReplayVerdict::Fail {
+                reason: FailReason::Timeout { .. },
+                ..
+            } = v
+            {
+                panic!("max_replay_ms=0 must not emit Timeout: {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_helper_emits_fail_on_budget_overrun_ft_q5ts7() {
+        // br-ft-q5ts7: directly exercise maybe_timeout to pin the
+        // contract. With a 0ms budget (but >0 disables; use 1ms)
+        // and a sleep, the helper must return Fail{Timeout}.
+        let config = ReplayConfig {
+            max_replay_ms: 1,
+            ..ReplayConfig::default()
+        };
+        let harness = ReplayHarness::new(config);
+        let started = std::time::Instant::now();
+        // Sleep >1ms to ensure elapsed > budget.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let verdict = harness.maybe_timeout("inc-test", started);
+        assert!(verdict.is_some(), "must surface Timeout after budget overrun");
+        let v = verdict.unwrap();
+        match v {
+            ReplayVerdict::Fail {
+                reason: FailReason::Timeout { elapsed_ms, max_ms },
+                ..
+            } => {
+                assert!(elapsed_ms >= 5);
+                assert_eq!(max_ms, 1);
+            }
+            other => panic!("expected Fail{{Timeout}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeout_helper_passes_on_within_budget_ft_q5ts7() {
+        // Sanity: an instant call returns None (within budget).
+        let config = ReplayConfig {
+            max_replay_ms: 5000,
+            ..ReplayConfig::default()
+        };
+        let harness = ReplayHarness::new(config);
+        let started = std::time::Instant::now();
+        let verdict = harness.maybe_timeout("inc-fast", started);
+        assert!(verdict.is_none(), "fast replay must not surface Timeout");
     }
 }
