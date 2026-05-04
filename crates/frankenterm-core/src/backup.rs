@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike, Weekday};
@@ -16,6 +17,91 @@ use sha2::{Digest, Sha256};
 
 use crate::storage::SCHEMA_VERSION;
 use crate::{Error, Result};
+
+// br-ft-r3d4e: backup-manifest enumeration observability. The
+// `list_backups` walker reads each candidate `manifest.json` via
+// `fs::read_to_string(&path).ok().and_then(|d| serde_json::from_str::<BackupManifest>(&d).ok())`.
+// Both .ok() drops are silent — operators trying to restore see a
+// backup with no created_at and can't tell whether the manifest was
+// (a) missing on disk, (b) read-failed (permissions / IO error), or
+// (c) parse-failed (schema-skewed JSON). Each case has a different
+// remediation. This counter aggregates both failure modes (the
+// `phase` field in the structured warn discriminates).
+//
+// Same observability defect family as ft-iwg7x
+// (robot_profile_bootstrap_serde_drop_count), ft-zkthg
+// (workflows_serde_drop_count), ft-jyywz (audit_chain_export_dropped_count),
+// ft-yygus (policy_decision_context_serde_drop_count), ft-rnpuc
+// (mcp_clock_anomaly_count), ft-bn6qi (epoch_clock_anomaly_count),
+// ft-ncijf (mcp_workflow_plan_serde_drop_count).
+static BACKUP_MANIFEST_PARSE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-r3d4e: cumulative count of backup-manifest enumeration
+/// failures observed in `list_backups`. Each increment represents one
+/// candidate backup directory whose `manifest.json` either failed to
+/// read (permissions, IO error) or failed to deserialize as
+/// `BackupManifest` (schema bump, hand-edit, truncation). > 0 means
+/// investigate the affected directories: a corrupted manifest hides
+/// the canonical `created_at` + integrity metadata used to select
+/// restore points.
+#[must_use]
+pub fn backup_manifest_parse_drop_count() -> u64 {
+    BACKUP_MANIFEST_PARSE_DROP_COUNT.load(AtomicOrdering::Relaxed)
+}
+
+/// Test helper: reset the counter so regression tests can assert
+/// post-bump values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_backup_manifest_parse_drop_count_for_test() {
+    BACKUP_MANIFEST_PARSE_DROP_COUNT.store(0, AtomicOrdering::Relaxed);
+}
+
+#[inline]
+fn record_backup_manifest_parse_drop() {
+    BACKUP_MANIFEST_PARSE_DROP_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// br-ft-r3d4e: read + parse a backup manifest with audit-fidelity
+/// counter bump + structured warn on either failure. Replaces the
+/// silent `fs::read_to_string(p).ok().and_then(|d| serde_json::from_str(&d).ok())`
+/// pattern in `list_backups` so manifest corruption (read or parse)
+/// surfaces via metrics scrape AND log search instead of dissolving
+/// into a backup row with no created_at.
+fn read_backup_manifest(manifest_path: &Path) -> Option<BackupManifest> {
+    let raw = match fs::read_to_string(manifest_path) {
+        Ok(s) => s,
+        Err(err) => {
+            record_backup_manifest_parse_drop();
+            tracing::warn!(
+                target: "frankenterm::backup",
+                event = "br-ft-r3d4e",
+                phase = "read_fail",
+                error = %err,
+                manifest_path = %manifest_path.display(),
+                "failed to read backup manifest.json; backup row will report \
+                 created_at=None making it indistinguishable from an unfinalised backup"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_str::<BackupManifest>(&raw) {
+        Ok(m) => Some(m),
+        Err(err) => {
+            record_backup_manifest_parse_drop();
+            tracing::warn!(
+                target: "frankenterm::backup",
+                event = "br-ft-r3d4e",
+                phase = "parse_fail",
+                error = %err,
+                manifest_path = %manifest_path.display(),
+                manifest_len = raw.len(),
+                "backup manifest.json failed to deserialize as BackupManifest; \
+                 backup row will report created_at=None"
+            );
+            None
+        }
+    }
+}
 
 /// Manifest describing a backup archive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -605,10 +691,11 @@ pub fn list_backup_entries(base_dir: &Path) -> Result<Vec<BackupEntry>> {
 
         let manifest_path = path.join("manifest.json");
         let (created_at, created_ts) = if manifest_path.exists() {
-            match fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|data| serde_json::from_str::<BackupManifest>(&data).ok())
-            {
+            // br-ft-r3d4e: route through read_backup_manifest so
+            // read-fail and parse-fail bump BACKUP_MANIFEST_PARSE_DROP_COUNT
+            // and emit a phase-tagged structured warn instead of
+            // silently substituting None.
+            match read_backup_manifest(&manifest_path) {
                 Some(manifest) => {
                     let ts = parse_manifest_timestamp(&manifest.created_at);
                     (Some(manifest.created_at), ts)
@@ -2820,5 +2907,131 @@ mod tests {
             !manifest.compressed,
             "compressed should default to false for old manifests"
         );
+    }
+}
+
+// br-ft-r3d4e: serialize tests that touch the process-global
+// BACKUP_MANIFEST_PARSE_DROP_COUNT counter so concurrent test
+// threads don't race on reset/observe pairs.
+#[cfg(test)]
+mod manifest_parse_drop_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+    use tempfile::TempDir;
+
+    static MANIFEST_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> MutexGuard<'static, ()> {
+        MANIFEST_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn well_formed_manifest_json() -> String {
+        r#"{
+            "wa_version": "0.0.0-test",
+            "schema_version": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+            "workspace": "/tmp",
+            "db_size_bytes": 1,
+            "db_checksum": "0",
+            "stats": {"panes": 0, "segments": 0, "events": 0, "audit_actions": 0, "workflow_executions": 0}
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn well_formed_manifest_does_not_bump() {
+        let _g = lock();
+        reset_backup_manifest_parse_drop_count_for_test();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("manifest.json");
+        fs::write(&path, well_formed_manifest_json()).unwrap();
+        let manifest = read_backup_manifest(&path);
+        assert!(manifest.is_some());
+        assert_eq!(backup_manifest_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn missing_file_bumps_counter_via_read_fail() {
+        let _g = lock();
+        reset_backup_manifest_parse_drop_count_for_test();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("does_not_exist.json");
+        let manifest = read_backup_manifest(&path);
+        assert!(manifest.is_none());
+        assert_eq!(backup_manifest_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn malformed_json_bumps_counter_via_parse_fail() {
+        let _g = lock();
+        reset_backup_manifest_parse_drop_count_for_test();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("manifest.json");
+        fs::write(&path, "{ not valid json").unwrap();
+        let manifest = read_backup_manifest(&path);
+        assert!(manifest.is_none());
+        assert_eq!(backup_manifest_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn wrong_shape_bumps_counter_via_parse_fail() {
+        let _g = lock();
+        reset_backup_manifest_parse_drop_count_for_test();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("manifest.json");
+        // valid JSON but missing every required BackupManifest field
+        fs::write(&path, r#"{"unrelated": true}"#).unwrap();
+        let manifest = read_backup_manifest(&path);
+        assert!(manifest.is_none());
+        assert_eq!(backup_manifest_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn repeated_parse_failures_bump_monotonically() {
+        let _g = lock();
+        reset_backup_manifest_parse_drop_count_for_test();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("manifest.json");
+        fs::write(&path, "garbage").unwrap();
+        for _ in 0..6 {
+            let _ = read_backup_manifest(&path);
+        }
+        assert_eq!(backup_manifest_parse_drop_count(), 6);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(48))]
+
+        // br-ft-r3d4e: any non-BackupManifest JSON or non-JSON content
+        // must bump the counter exactly once and yield None.
+        #[test]
+        fn arbitrary_malformed_content_always_bumps(
+            shape in proptest::sample::select(vec![
+                "null".to_string(),
+                "true".to_string(),
+                "false".to_string(),
+                "42".to_string(),
+                "\"a string\"".to_string(),
+                "[]".to_string(),
+                "[1,2,3]".to_string(),
+                "{}".to_string(),
+                "{\"unknown\":42}".to_string(),
+                "{\"wa_version\":\"x\"}".to_string(),
+                "not json at all".to_string(),
+                "".to_string(),
+                "{".to_string(),
+            ]),
+        ) {
+            let _g = lock();
+            reset_backup_manifest_parse_drop_count_for_test();
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("manifest.json");
+            fs::write(&path, &shape).unwrap();
+            let manifest = read_backup_manifest(&path);
+            proptest::prop_assert!(manifest.is_none());
+            proptest::prop_assert_eq!(backup_manifest_parse_drop_count(), 1);
+        }
     }
 }
