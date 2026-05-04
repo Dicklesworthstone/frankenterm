@@ -246,12 +246,30 @@ For atomic-batch semantics (rollback on any error), wrap the
 
 ```rust
 backend.execute("BEGIN")?;
-let result = backend.execute_many(sql, &rows);
-match result {
-    Ok(_) => { backend.execute("COMMIT")?; }
-    Err(e) => { backend.execute("ROLLBACK")?; return Err(e); }
+match backend.execute_many(sql, &rows) {
+    Ok(count) => {
+        backend.execute("COMMIT")?;
+        Ok(count)
+    }
+    Err(e) => {
+        // Best-effort ROLLBACK — even if it fails (e.g., the
+        // connection is already in a bad state), propagate the
+        // ORIGINAL error rather than masking it with a rollback
+        // failure. SQLite auto-rolls back on most failure modes
+        // anyway; the explicit ROLLBACK here closes the
+        // statement-level rollback that constraint violations
+        // perform without ending the surrounding transaction.
+        let _ = backend.execute("ROLLBACK");
+        Err(e)
+    }
 }
 ```
+
+Note: do NOT propagate ROLLBACK errors with `?` — that masks
+the original failure. Do NOT skip the COMMIT error: a failed
+COMMIT means the data was NOT persisted, so the caller needs to
+know. SQLite auto-rolls back on COMMIT failure, so no explicit
+ROLLBACK is required after a failed COMMIT.
 
 The trait substrate landed under [`ft-qgj81`][qgj81] slice 5.
 
