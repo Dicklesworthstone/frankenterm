@@ -27,6 +27,12 @@ Read the rest only when the loop deviates from steady-state.
 
 ---
 
+For 64+ CPU / 256 GiB hosts, follow
+[`docs/high-core-swarm-runbook.md`](high-core-swarm-runbook.md) before
+claiming high-scale proof or changing large-fleet tuning.
+
+---
+
 ## 1. Pre-flight
 
 Before sending the first marching order, verify the environment.
@@ -73,7 +79,7 @@ will pay 30+ minutes recovering shared context later.
    - The setup checklist (read AGENTS.md, identify slug, claim a
      ready bead, confirm rch usage, ship-or-surface within an hour).
    - A reminder that committed changes ship via `br close + sync +
-     git push origin main + git push origin main:master`.
+     git push origin main`.
 
 5. **Record session-start timestamp.** Used later for `commits-1h`
    computations during convergence detection.
