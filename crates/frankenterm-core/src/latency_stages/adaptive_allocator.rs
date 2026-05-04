@@ -161,7 +161,7 @@ pub struct LaneAllocation {
 }
 
 impl LaneAllocation {
-    fn new(stage: LatencyStage, default_p95_us: f64) -> Self {
+    pub(super) fn new(stage: LatencyStage, default_p95_us: f64) -> Self {
         Self {
             stage,
             default_p95_us,

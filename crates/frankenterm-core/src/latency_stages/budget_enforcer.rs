@@ -148,15 +148,15 @@ impl LatencyWindow {
         Some(sorted[idx])
     }
 
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.samples.len()
     }
 
-    fn total_count(&self) -> u64 {
+    pub(super) fn total_count(&self) -> u64 {
         self.count
     }
 
-    fn mean(&self) -> Option<f64> {
+    pub(super) fn mean(&self) -> Option<f64> {
         if self.samples.is_empty() {
             return None;
         }

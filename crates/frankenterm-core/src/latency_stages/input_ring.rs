@@ -100,9 +100,9 @@ pub struct InputRing {
     tail: usize,
     len: usize,
     next_seq: u64,
-    total_enqueued: u64,
-    total_dequeued: u64,
-    total_dropped: u64,
+    pub(super) total_enqueued: u64,
+    pub(super) total_dequeued: u64,
+    pub(super) total_dropped: u64,
     sojourn_sum_us: f64,
     sojourn_count: u64,
 }

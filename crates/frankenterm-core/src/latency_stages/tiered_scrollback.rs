@@ -167,7 +167,7 @@ pub struct TieredScrollbackManager {
     cold_bytes: u64,
     migration_events: Vec<TierMigrationEvent>,
     max_events: usize,
-    total_migrations: u64,
+    pub(super) total_migrations: u64,
 }
 
 impl TieredScrollbackManager {

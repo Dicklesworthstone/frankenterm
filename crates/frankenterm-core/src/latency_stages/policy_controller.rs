@@ -145,7 +145,7 @@ pub struct PolicyControllerSnapshot {
 /// flapping and a critical floor for safety.
 #[derive(Debug, Clone)]
 pub struct PolicyController {
-    config: PolicyControllerConfig,
+    pub(super) config: PolicyControllerConfig,
     /// Current action.
     current_action: PolicyAction,
     /// Total decisions made.

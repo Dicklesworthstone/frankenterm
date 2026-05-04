@@ -228,7 +228,7 @@ pub struct LaneState {
 }
 
 impl LaneState {
-    fn new(lane: SchedulerLane, capacity: usize) -> Self {
+    pub(super) fn new(lane: SchedulerLane, capacity: usize) -> Self {
         Self {
             lane,
             depth: 0,
