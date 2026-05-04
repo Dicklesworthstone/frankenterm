@@ -66,6 +66,30 @@ impl CostTelemetry {
             alerts_triggered: self.alerts_triggered,
         }
     }
+
+    fn record_usage_call(&mut self) {
+        self.usages_recorded = self.usages_recorded.saturating_add(1);
+    }
+
+    fn record_invalid_usage_rejected(&mut self) {
+        self.invalid_usages_rejected = self.invalid_usages_rejected.saturating_add(1);
+    }
+
+    fn record_pane_evicted_lru(&mut self) {
+        self.panes_evicted_lru = self.panes_evicted_lru.saturating_add(1);
+    }
+
+    fn record_pane_removed(&mut self) {
+        self.panes_removed = self.panes_removed.saturating_add(1);
+    }
+
+    fn record_alert_evaluation(&mut self) {
+        self.alert_evaluations = self.alert_evaluations.saturating_add(1);
+    }
+
+    fn record_alert_triggered(&mut self) {
+        self.alerts_triggered = self.alerts_triggered.saturating_add(1);
+    }
 }
 
 /// Serializable snapshot of cost tracker telemetry.
@@ -205,7 +229,7 @@ impl PaneCostState {
     fn record(&mut self, tokens: u64, cost_usd: f64, at_ms: i64) {
         self.total_tokens = self.total_tokens.saturating_add(tokens);
         self.total_cost_usd += cost_usd;
-        self.record_count += 1;
+        self.record_count = self.record_count.saturating_add(1);
         if at_ms > self.last_updated_ms {
             self.last_updated_ms = at_ms;
         }
@@ -338,15 +362,14 @@ impl CostTracker {
         cost_usd: f64,
         at_ms: i64,
     ) {
-        self.telemetry.usages_recorded = self.telemetry.usages_recorded.saturating_add(1);
+        self.telemetry.record_usage_call();
 
         let current_cost = self
             .panes
             .get(&pane_id)
             .map_or(0.0, |state| state.total_cost_usd);
         if !cost_usd.is_finite() || cost_usd < 0.0 || !(current_cost + cost_usd).is_finite() {
-            self.telemetry.invalid_usages_rejected =
-                self.telemetry.invalid_usages_rejected.saturating_add(1);
+            self.telemetry.record_invalid_usage_rejected();
             return;
         }
 
@@ -354,7 +377,7 @@ impl CostTracker {
         if !self.panes.contains_key(&pane_id) && self.panes.len() >= MAX_TRACKED_PANES {
             if let Some(oldest_id) = self.pane_order.pop_front() {
                 self.panes.remove(&oldest_id);
-                self.telemetry.panes_evicted_lru += 1;
+                self.telemetry.record_pane_evicted_lru();
             }
         }
 
@@ -380,7 +403,7 @@ impl CostTracker {
                 total_tokens = total_tokens.saturating_add(state.total_tokens);
                 total_cost += state.total_cost_usd;
                 pane_count += 1;
-                record_count += state.record_count;
+                record_count = record_count.saturating_add(state.record_count);
             }
         }
 
@@ -439,7 +462,7 @@ impl CostTracker {
     /// Evaluate budget thresholds and return active alerts.
     #[must_use]
     pub fn budget_alerts(&mut self) -> Vec<BudgetAlert> {
-        self.telemetry.alert_evaluations += 1;
+        self.telemetry.record_alert_evaluation();
         let summaries = self.all_provider_summaries();
         let mut alerts = Vec::new();
 
@@ -452,7 +475,7 @@ impl CostTracker {
                     let fraction =
                         finite_usage_fraction(summary.total_cost_usd, threshold.max_cost_usd);
                     if fraction >= 1.0 {
-                        self.telemetry.alerts_triggered += 1;
+                        self.telemetry.record_alert_triggered();
                         alerts.push(BudgetAlert {
                             agent_type: threshold.agent_type.clone(),
                             current_cost_usd: summary.total_cost_usd,
@@ -461,7 +484,7 @@ impl CostTracker {
                             severity: AlertSeverity::Critical,
                         });
                     } else if fraction >= threshold.warning_fraction {
-                        self.telemetry.alerts_triggered += 1;
+                        self.telemetry.record_alert_triggered();
                         alerts.push(BudgetAlert {
                             agent_type: threshold.agent_type.clone(),
                             current_cost_usd: summary.total_cost_usd,
@@ -514,7 +537,7 @@ impl CostTracker {
     /// Remove a pane from tracking (e.g., when pane is closed).
     pub fn remove_pane(&mut self, pane_id: u64) {
         if self.panes.remove(&pane_id).is_some() {
-            self.telemetry.panes_removed += 1;
+            self.telemetry.record_pane_removed();
         }
         self.pane_order.retain(|&id| id != pane_id);
     }
@@ -919,6 +942,41 @@ mod tests {
                 prop_assert!(alert.usage_fraction.is_finite());
                 prop_assert!(alert.usage_fraction >= 0.0);
             }
+        }
+
+        #[test]
+        fn ft_nqy7d_telemetry_counters_saturate_at_u64_max(
+            delta in 0u64..=3,
+        ) {
+            let mut tracker = CostTracker::with_config(CostTrackerConfig {
+                budgets: vec![BudgetThreshold::new("codex", 1.0, 0.5)],
+            });
+            for pane_id in 0..MAX_TRACKED_PANES as u64 {
+                tracker.record_usage(pane_id, AgentType::Codex, 1, 0.01, pane_id as i64);
+            }
+
+            let baseline = u64::MAX - delta;
+            tracker.telemetry = CostTelemetry {
+                usages_recorded: baseline,
+                invalid_usages_rejected: baseline,
+                panes_evicted_lru: baseline,
+                panes_removed: baseline,
+                alert_evaluations: baseline,
+                alerts_triggered: baseline,
+            };
+
+            tracker.record_usage(42, AgentType::Codex, 1, f64::NAN, 1);
+            tracker.record_usage(MAX_TRACKED_PANES as u64 + 1, AgentType::Codex, 1, 2.0, 2);
+            tracker.remove_pane(MAX_TRACKED_PANES as u64 + 1);
+            let _ = tracker.budget_alerts();
+
+            let snapshot = tracker.telemetry().snapshot();
+            prop_assert_eq!(snapshot.usages_recorded, baseline.saturating_add(2));
+            prop_assert_eq!(snapshot.invalid_usages_rejected, baseline.saturating_add(1));
+            prop_assert_eq!(snapshot.panes_evicted_lru, baseline.saturating_add(1));
+            prop_assert_eq!(snapshot.panes_removed, baseline.saturating_add(1));
+            prop_assert_eq!(snapshot.alert_evaluations, baseline.saturating_add(1));
+            prop_assert_eq!(snapshot.alerts_triggered, baseline.saturating_add(1));
         }
     }
 
