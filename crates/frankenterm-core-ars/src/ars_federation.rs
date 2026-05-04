@@ -29,11 +29,51 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ars_blast_radius::MaturityTier;
 use crate::ars_evolve::VersionStatus;
 use crate::ars_fst::ReflexId;
 use crate::ars_serialize::{EvidenceSummary, ReflexRecord, ReflexStore};
+
+// br-ft-jtcrv: federation webhook payload serialization observability.
+// `to_generic_payload` previously called `serde_json::to_string(self).unwrap_or_default()`
+// — on Err the function silently substituted "" and the webhook delivery
+// pipeline sent an empty body to the remote receiver, looking like a
+// successful delivery but carrying no data.
+//
+// Same observability defect family as ft-iwg7x
+// (robot_profile_bootstrap_serde_drop_count), ft-zkthg
+// (workflows_serde_drop_count), ft-jyywz (audit_chain_export_dropped_count),
+// ft-yygus (policy_decision_context_serde_drop_count), ft-rnpuc
+// (mcp_clock_anomaly_count), ft-bn6qi (epoch_clock_anomaly_count),
+// ft-ncijf (mcp_workflow_plan_serde_drop_count), and ft-r3d4e
+// (backup_manifest_parse_drop_count).
+static ARS_FEDERATION_PAYLOAD_SERDE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-jtcrv: cumulative count of federation webhook payload
+/// serialization failures observed in `to_generic_payload`. Each
+/// increment represents one webhook delivery where the remote
+/// receiver was sent an empty body because the typed payload
+/// failed to serialize. > 0 means investigate the typed payload
+/// shape (likely a future refactor introduced a non-Serialize field
+/// or a custom Serialize impl that returns Err on certain values).
+#[must_use]
+pub fn ars_federation_payload_serde_drop_count() -> u64 {
+    ARS_FEDERATION_PAYLOAD_SERDE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so regression tests can assert
+/// post-bump values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_ars_federation_payload_serde_drop_count_for_test() {
+    ARS_FEDERATION_PAYLOAD_SERDE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_ars_federation_payload_serde_drop() {
+    ARS_FEDERATION_PAYLOAD_SERDE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 // =============================================================================
 // Export types
@@ -255,8 +295,33 @@ impl FederationEvent {
     }
 
     /// Format as generic webhook payload.
+    ///
+    /// br-ft-jtcrv: previously absorbed `serde_json::to_string` failure
+    /// via `unwrap_or_default`, silently sending an empty body to
+    /// downstream webhook receivers. Now bumps
+    /// `ARS_FEDERATION_PAYLOAD_SERDE_DROP_COUNT` and emits a structured
+    /// warn so a hypothetical refactor that breaks the typed payload's
+    /// `Serialize` contract surfaces in metrics + logs instead of
+    /// silently corrupting webhook bodies. Returns "" on failure so
+    /// the existing delivery contract (always a String, never panic)
+    /// is preserved.
     pub fn to_generic_payload(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        match serde_json::to_string(self) {
+            Ok(s) => s,
+            Err(err) => {
+                record_ars_federation_payload_serde_drop();
+                tracing::warn!(
+                    target: "frankenterm::ars::federation",
+                    event = "br-ft-jtcrv",
+                    error = %err,
+                    cluster_id = %self.cluster_id,
+                    reflex_id = ?self.reflex_id,
+                    "federation webhook payload failed to serialize; \
+                     remote receiver will get an empty body"
+                );
+                String::new()
+            }
+        }
     }
 
     /// Format payload for a specific webhook kind.
@@ -1036,5 +1101,142 @@ mod tests {
     fn tier_rank_ordering() {
         assert!(tier_to_rank(MaturityTier::Incubating) < tier_to_rank(MaturityTier::Graduated));
         assert!(tier_to_rank(MaturityTier::Graduated) < tier_to_rank(MaturityTier::Veteran));
+    }
+}
+
+// br-ft-jtcrv: serialize tests that touch the process-global
+// ARS_FEDERATION_PAYLOAD_SERDE_DROP_COUNT counter so concurrent test
+// threads don't race on reset/observe pairs.
+#[cfg(test)]
+mod federation_payload_drop_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static FEDERATION_PAYLOAD_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> MutexGuard<'static, ()> {
+        FEDERATION_PAYLOAD_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn sample_event() -> FederationEvent {
+        FederationEvent {
+            kind: FederationEventKind::ReflexExported,
+            swarm_id: "s1".to_string(),
+            reflex_id: 42,
+            cluster_id: "net".to_string(),
+            summary: "Test event".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn well_formed_event_serializes_without_bump() {
+        let _g = lock();
+        reset_ars_federation_payload_serde_drop_count_for_test();
+        let event = sample_event();
+        let payload = event.to_generic_payload();
+        assert!(!payload.is_empty());
+        // Must round-trip back to a FederationEvent.
+        let parsed: FederationEvent = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed.swarm_id, event.swarm_id);
+        assert_eq!(ars_federation_payload_serde_drop_count(), 0);
+    }
+
+    #[test]
+    fn payload_is_valid_json_for_every_kind() {
+        let _g = lock();
+        reset_ars_federation_payload_serde_drop_count_for_test();
+        for kind in [
+            FederationEventKind::ReflexExported,
+            FederationEventKind::ReflexEvolved,
+            FederationEventKind::ReflexPruned,
+            FederationEventKind::DriftDetected,
+            FederationEventKind::TierPromotion,
+            FederationEventKind::ReflexImported,
+        ] {
+            let mut event = sample_event();
+            event.kind = kind;
+            let payload = event.to_generic_payload();
+            // Confirm it is parseable JSON.
+            let _: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        }
+        assert_eq!(ars_federation_payload_serde_drop_count(), 0);
+    }
+
+    #[test]
+    fn many_serializations_do_not_bump_counter() {
+        let _g = lock();
+        reset_ars_federation_payload_serde_drop_count_for_test();
+        for i in 0..32 {
+            let mut event = sample_event();
+            event.reflex_id = i;
+            event.summary = format!("event-{i}");
+            event.metadata.insert(format!("k{i}"), format!("v{i}"));
+            let payload = event.to_generic_payload();
+            assert!(!payload.is_empty());
+        }
+        // Typed Serialize never fails for this struct; counter must stay at zero.
+        assert_eq!(ars_federation_payload_serde_drop_count(), 0);
+    }
+
+    #[test]
+    fn counter_helpers_are_independent_of_payload_state() {
+        let _g = lock();
+        reset_ars_federation_payload_serde_drop_count_for_test();
+        // Manually invoke the recorder and confirm accessor reflects it.
+        // Validates the test-helper / accessor / recorder contract
+        // independent of any serde failure mode (which is hard to
+        // synthesise for a typed Serialize derive).
+        record_ars_federation_payload_serde_drop();
+        record_ars_federation_payload_serde_drop();
+        record_ars_federation_payload_serde_drop();
+        assert_eq!(ars_federation_payload_serde_drop_count(), 3);
+        reset_ars_federation_payload_serde_drop_count_for_test();
+        assert_eq!(ars_federation_payload_serde_drop_count(), 0);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(48))]
+
+        // br-ft-jtcrv: any well-formed FederationEvent (arbitrary
+        // string fields, kind, ids, metadata) round-trips through
+        // to_generic_payload without bumping the counter.
+        #[test]
+        fn arbitrary_event_serializes_without_bump(
+            swarm_id in "[a-zA-Z0-9_-]{0,32}",
+            reflex_id in 0u64..1_000_000,
+            cluster_id in "[a-zA-Z0-9_-]{0,32}",
+            summary in ".*",
+            timestamp_ms in 0u64..i64::MAX as u64,
+            kind_idx in 0usize..6,
+        ) {
+            let _g = lock();
+            reset_ars_federation_payload_serde_drop_count_for_test();
+            let kind = match kind_idx {
+                0 => FederationEventKind::ReflexExported,
+                1 => FederationEventKind::ReflexEvolved,
+                2 => FederationEventKind::ReflexPruned,
+                3 => FederationEventKind::DriftDetected,
+                4 => FederationEventKind::TierPromotion,
+                _ => FederationEventKind::ReflexImported,
+            };
+            let event = FederationEvent {
+                kind,
+                swarm_id,
+                reflex_id,
+                cluster_id,
+                summary,
+                timestamp_ms,
+                metadata: HashMap::new(),
+            };
+            let payload = event.to_generic_payload();
+            proptest::prop_assert!(!payload.is_empty());
+            let parsed: Result<FederationEvent, _> = serde_json::from_str(&payload);
+            proptest::prop_assert!(parsed.is_ok());
+            proptest::prop_assert_eq!(ars_federation_payload_serde_drop_count(), 0);
+        }
     }
 }
