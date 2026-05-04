@@ -26,11 +26,10 @@ use fs2::FileExt;
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
 use super::mcp_types::{
-    self,
-    AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams, CassViewParams,
-    EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams, GetTextParams,
-    McpAccountInfo, McpAccountsData, McpAccountsRefreshData, McpEnvelope, McpEventItem,
-    McpEventMutationData, McpEventsData, McpGetTextData, McpMissionControlData,
+    self, AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams,
+    CassViewParams, EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams,
+    GetTextParams, McpAccountInfo, McpAccountsData, McpAccountsRefreshData, McpEnvelope,
+    McpEventItem, McpEventMutationData, McpEventsData, McpGetTextData, McpMissionControlData,
     McpMissionExplainData, McpMissionStateData, McpPaneState, McpReleaseData, McpReservationInfo,
     McpReservationsData, McpReserveData, McpRuleItem, McpRuleMatchItem, McpRuleTraceInfo,
     McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData, McpTxPlanData,
@@ -160,6 +159,75 @@ pub(crate) fn mcp_audit_ts_ms_from_u64(ts_ms: u64) -> i64 {
 /// [`mcp_audit_ts_ms_from_u64`].
 pub(crate) fn mcp_now_ms_i64() -> i64 {
     mcp_audit_ts_ms_from_u64(now_ms())
+}
+
+// br-ft-ncijf: workflow-status plan_json deserialize observability.
+// `workflow_status_data` calls `serde_json::from_str::<ActionPlan>(&plan_record.plan_json).ok()`
+// — when a persisted plan_json fails to parse (schema bump, hand-edit,
+// truncation, encoding skew), the operator-facing WorkflowStatusDetailData
+// silently returns `plan_step_name = None` and `total_steps = None`.
+// The operator running `mcp__frankenterm__workflow_status` sees the
+// workflow as "running step ?" with no signal that the plan record is
+// corrupt. This counter bumps on every malformed parse so operators
+// can cross-reference against the workflow_action_plans table when
+// investigating "missing plan metadata" reports.
+//
+// Same observability defect family as ft-iwg7x
+// (robot_profile_bootstrap_serde_drop_count), ft-zkthg
+// (workflows_serde_drop_count), ft-jyywz (audit_chain_export_dropped_count),
+// ft-yygus (policy_decision_context_serde_drop_count), ft-rnpuc
+// (mcp_clock_anomaly_count), and ft-bn6qi (epoch_clock_anomaly_count).
+static MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-ncijf: cumulative count of workflow `plan_json` deserialize
+/// failures observed in `workflow_status_data`. Each increment
+/// represents one workflow_status response where the operator's
+/// stored plan record was schema-skewed and the response silently
+/// substituted `plan_step_name = None` + `total_steps = None`.
+/// > 0 means investigate the `workflow_action_plans` table for
+/// schema-bump or hand-edit corruption.
+#[must_use]
+pub fn mcp_workflow_plan_serde_drop_count() -> u64 {
+    MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so regression tests can assert
+/// post-bump values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_mcp_workflow_plan_serde_drop_count_for_test() {
+    MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_mcp_workflow_plan_serde_drop() {
+    MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// br-ft-ncijf: parse workflow plan_json with audit-fidelity counter
+/// bump + structured warn on serde failure. Replaces the silent
+/// `serde_json::from_str::<ActionPlan>(&plan_json).ok()` pattern at
+/// `workflow_status_data` so plan-record corruption surfaces via
+/// metrics scrape AND log search.
+pub(crate) fn parse_workflow_plan_json(
+    plan_json: &str,
+    plan_id: &str,
+) -> Option<crate::plan::ActionPlan> {
+    match serde_json::from_str::<crate::plan::ActionPlan>(plan_json) {
+        Ok(plan) => Some(plan),
+        Err(err) => {
+            record_mcp_workflow_plan_serde_drop();
+            tracing::warn!(
+                target: "frankenterm::mcp_tools",
+                event = "br-ft-ncijf",
+                error = %err,
+                plan_id = %plan_id,
+                plan_json_len = plan_json.len(),
+                "workflow plan_json failed to deserialize as ActionPlan; \
+                 status response will report plan_step_name=None and total_steps=None"
+            );
+            None
+        }
+    }
 }
 
 /// Hard cap for MCP pane-output waits.
@@ -3353,8 +3421,10 @@ fn workflow_status_data(
     verbose: bool,
 ) -> WorkflowStatusDetailData {
     let (action_plan, plan_step_name, total_steps) = if let Some(plan_record) = action_plan_record {
-        let parsed_plan =
-            serde_json::from_str::<crate::plan::ActionPlan>(&plan_record.plan_json).ok();
+        // br-ft-ncijf: route through parse_workflow_plan_json so
+        // a malformed plan_json bumps MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT
+        // and emits a structured warn instead of returning None silently.
+        let parsed_plan = parse_workflow_plan_json(&plan_record.plan_json, &plan_record.plan_id);
         let step_name = parsed_plan
             .as_ref()
             .and_then(|plan| plan.steps.get(record.current_step))
@@ -6457,22 +6527,23 @@ mod tests {
     #[cfg(unix)]
     use super::set_cass_test_binary_override;
     use super::{
-        ActionKind, ActorKind, CompatRuntime, CompatRuntimeBuilder, Config, Content,
-        MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities,
-        PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool,
-        WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
-        WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
-        WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
-        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
-        WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
-        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
-        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
-        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
-        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
+        ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
+        CompatRuntimeBuilder, Config, Content, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES,
+        McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool,
+        ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool,
+        WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool,
+        WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool,
+        WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
+        WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
+        WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+        WaWorkflowStatusTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        redact_mcp_pane_state_fields, serialize_mcp_audit_decision_context,
+        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
@@ -9733,5 +9804,116 @@ exit 17",
             crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
             crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL_UNSUPPORTED
         );
+    }
+}
+
+// br-ft-ncijf: serialize tests that touch the process-global
+// MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT counter so concurrent test
+// threads don't trample each other's reset/observe pairs.
+#[cfg(test)]
+mod workflow_plan_serde_drop_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static PLAN_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> MutexGuard<'static, ()> {
+        PLAN_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn well_formed_plan_parses_without_bump() {
+        let _g = lock();
+        reset_mcp_workflow_plan_serde_drop_count_for_test();
+        // Use the public builder so the test follows the live
+        // ActionPlan construction contract instead of depending on
+        // a synthetic Default impl.
+        let plan = crate::plan::ActionPlan::builder("test plan", "test-workspace").build();
+        let raw = serde_json::to_string(&plan).expect("serialize default plan");
+        let parsed = parse_workflow_plan_json(&raw, "plan-001");
+        assert!(parsed.is_some());
+        assert_eq!(mcp_workflow_plan_serde_drop_count(), 0);
+    }
+
+    #[test]
+    fn malformed_json_bumps_counter() {
+        let _g = lock();
+        reset_mcp_workflow_plan_serde_drop_count_for_test();
+        // Truncated JSON (closing brace stripped).
+        let parsed = parse_workflow_plan_json("{\"steps\":", "plan-trunc");
+        assert!(parsed.is_none());
+        assert_eq!(mcp_workflow_plan_serde_drop_count(), 1);
+    }
+
+    #[test]
+    fn wrong_shape_object_bumps_counter() {
+        let _g = lock();
+        reset_mcp_workflow_plan_serde_drop_count_for_test();
+        // Valid JSON object but missing every ActionPlan-required field.
+        let parsed = parse_workflow_plan_json("{\"unrelated\":\"value\"}", "plan-shape");
+        assert!(parsed.is_none());
+        assert_eq!(mcp_workflow_plan_serde_drop_count(), 1);
+    }
+
+    #[test]
+    fn primitive_top_level_bumps_counter() {
+        let _g = lock();
+        reset_mcp_workflow_plan_serde_drop_count_for_test();
+        // Primitive at root: not a serde_json::Map, fails ActionPlan deserialization.
+        let parsed = parse_workflow_plan_json("42", "plan-prim");
+        assert!(parsed.is_none());
+        assert_eq!(mcp_workflow_plan_serde_drop_count(), 1);
+    }
+
+    #[test]
+    fn repeated_failures_bump_monotonically() {
+        let _g = lock();
+        reset_mcp_workflow_plan_serde_drop_count_for_test();
+        for i in 0..7 {
+            let id = format!("plan-{i}");
+            let parsed = parse_workflow_plan_json("not json at all", &id);
+            assert!(parsed.is_none());
+        }
+        assert_eq!(mcp_workflow_plan_serde_drop_count(), 7);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(48))]
+
+        // br-ft-ncijf: any non-ActionPlan-shaped JSON or non-JSON
+        // input must bump the counter exactly once and yield None.
+        #[test]
+        fn arbitrary_malformed_input_always_bumps(
+            shape in proptest::sample::select(vec![
+                "null".to_string(),
+                "true".to_string(),
+                "false".to_string(),
+                "0".to_string(),
+                "-1".to_string(),
+                "\"a string\"".to_string(),
+                "[]".to_string(),
+                "[1,2,3]".to_string(),
+                "{}".to_string(),
+                "{\"unknown\":42}".to_string(),
+                "{\"steps\":\"not an array\"}".to_string(),
+                "not json".to_string(),
+                "".to_string(),
+                "{".to_string(),
+            ]),
+        ) {
+            let _g = lock();
+            reset_mcp_workflow_plan_serde_drop_count_for_test();
+            let parsed = parse_workflow_plan_json(&shape, "plan-prop");
+            // Some inputs (e.g. "{}") might happen to deserialize
+            // if all ActionPlan fields are #[serde(default)]. We
+            // assert: parse-Ok ⟺ counter unchanged; parse-None ⟺
+            // counter bumped exactly once.
+            match parsed {
+                Some(_) => proptest::prop_assert_eq!(mcp_workflow_plan_serde_drop_count(), 0),
+                None => proptest::prop_assert_eq!(mcp_workflow_plan_serde_drop_count(), 1),
+            }
+        }
     }
 }
