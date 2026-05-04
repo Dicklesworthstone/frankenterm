@@ -449,6 +449,23 @@ impl ScanPipeline {
         }
     }
 
+    /// br-ft-djjnj: fallible custom-trigger constructor.
+    ///
+    /// Builds the [`TriggerScanner`] via [`TriggerScanner::try_new`]
+    /// (which validates pattern non-emptiness + length cap) and then
+    /// the pipeline. Use this from any code path that loads custom
+    /// triggers from a non-trusted source — the infallible
+    /// [`Self::with_custom_triggers`] is reserved for callers that
+    /// have already validated their pattern set.
+    pub fn try_with_custom_triggers(
+        config: ScanPipelineConfig,
+        patterns: Vec<crate::pattern_trigger::TriggerPattern>,
+        max_pattern_len: usize,
+    ) -> Result<Self, crate::pattern_trigger::TriggerScannerError> {
+        let trigger_scanner = TriggerScanner::try_new(patterns, max_pattern_len)?;
+        Ok(Self::with_custom_triggers(config, trigger_scanner))
+    }
+
     fn compute_trigger_overlap_bytes(trigger_scanner: &TriggerScanner) -> usize {
         trigger_scanner
             .patterns()
@@ -941,6 +958,94 @@ mod tests {
         assert_eq!(custom, 1);
     }
 
+    // ── br-ft-djjnj: fallible custom-trigger validation ──
+
+    #[test]
+    fn try_with_custom_triggers_rejects_empty_pattern() {
+        use crate::pattern_trigger::{DEFAULT_MAX_TRIGGER_PATTERN_LEN, TriggerScannerError};
+        let patterns = vec![
+            TriggerPattern::new("good", TriggerCategory::Custom),
+            TriggerPattern::new("   ", TriggerCategory::Custom),
+        ];
+        let err = ScanPipeline::try_with_custom_triggers(
+            ScanPipelineConfig::default(),
+            patterns,
+            DEFAULT_MAX_TRIGGER_PATTERN_LEN,
+        )
+        .expect_err("empty pattern must reject");
+        assert_eq!(err, TriggerScannerError::EmptyPattern { index: 1 });
+        assert!(err.to_string().contains("br-ft-djjnj"));
+    }
+
+    #[test]
+    fn try_with_custom_triggers_rejects_oversized_pattern() {
+        use crate::pattern_trigger::TriggerScannerError;
+        let big = "a".repeat(2048);
+        let patterns = vec![TriggerPattern::new(&big, TriggerCategory::Custom)];
+        let err = ScanPipeline::try_with_custom_triggers(
+            ScanPipelineConfig::default(),
+            patterns,
+            1024, // cap below the pattern length
+        )
+        .expect_err("oversized pattern must reject");
+        match err {
+            TriggerScannerError::PatternTooLong {
+                index: 0,
+                len: 2048,
+                max_pattern_len: 1024,
+            } => {}
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_with_custom_triggers_succeeds_on_valid_set() {
+        use crate::pattern_trigger::DEFAULT_MAX_TRIGGER_PATTERN_LEN;
+        let patterns = vec![
+            TriggerPattern::new("alpha", TriggerCategory::Custom),
+            TriggerPattern::case_insensitive("BETA", TriggerCategory::Custom),
+        ];
+        let pipeline = ScanPipeline::try_with_custom_triggers(
+            ScanPipelineConfig::default(),
+            patterns,
+            DEFAULT_MAX_TRIGGER_PATTERN_LEN,
+        )
+        .expect("valid pattern set");
+        let out = pipeline.process(b"alpha then beta then BETA\n");
+        let triggers = out.triggers.as_ref().expect("triggers present");
+        // Both case-sensitive "alpha" and case-insensitive "BETA"
+        // should fire. 1 alpha + 2 betas (lowercase "beta" + uppercase "BETA").
+        assert_eq!(
+            triggers.get(&TriggerCategory::Custom).copied().unwrap_or(0),
+            3
+        );
+    }
+
+    #[test]
+    fn try_with_custom_triggers_caps_chunked_overlap_window() {
+        // br-ft-djjnj: the chunked pipeline retains
+        // (max_pattern_len - 1) bytes per chunk to recover
+        // cross-boundary matches. With a 1024-byte cap, a hostile
+        // operator can never force more than 1023 bytes of retained
+        // overlap regardless of how many patterns they configure.
+        use crate::pattern_trigger::DEFAULT_MAX_TRIGGER_PATTERN_LEN;
+        let patterns: Vec<TriggerPattern> = (0..10)
+            .map(|i| TriggerPattern::new(&format!("p{i:040}"), TriggerCategory::Custom))
+            .collect();
+        let pipeline = ScanPipeline::try_with_custom_triggers(
+            ScanPipelineConfig::default(),
+            patterns,
+            DEFAULT_MAX_TRIGGER_PATTERN_LEN,
+        )
+        .expect("valid");
+        // Largest pattern is 41 bytes ("p" + 40 zeros), so overlap is 40.
+        assert!(
+            pipeline.trigger_overlap_bytes <= 40,
+            "overlap window must be bounded by max pattern length: got {}",
+            pipeline.trigger_overlap_bytes
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Chunked pipeline tests
     // -----------------------------------------------------------------------
@@ -1145,9 +1250,7 @@ mod tests {
         // the documented contract.
         let pipeline = ScanPipeline::default();
         let mut state = ChunkedPipelineState::try_new(64).unwrap();
-        let _ = pipeline
-            .try_process_chunk(&[b'x'; 80], &mut state)
-            .unwrap();
+        let _ = pipeline.try_process_chunk(&[b'x'; 80], &mut state).unwrap();
         assert!(state.should_flush());
         let summary = pipeline
             .try_process_chunk(&[], &mut state)
@@ -1165,7 +1268,10 @@ mod tests {
         let mut state = ChunkedPipelineState::try_new(64).unwrap();
 
         let _ = pipeline
-            .try_process_chunk(b"ERROR: enough to fill the chunked buffer past 64 bytes\n", &mut state)
+            .try_process_chunk(
+                b"ERROR: enough to fill the chunked buffer past 64 bytes\n",
+                &mut state,
+            )
             .unwrap();
         assert!(state.should_flush());
 

@@ -452,7 +452,150 @@ fn build_trigger_automaton(patterns: &[String], case_insensitive: bool) -> Optio
     }))
 }
 
+/// br-ft-djjnj: default cap on the maximum byte length of a single
+/// custom trigger pattern. Patterns longer than this are rejected by
+/// [`TriggerScanner::try_new`] / [`ScanPipeline::try_with_custom_triggers`]
+/// because the chunked pipeline retains a per-stream overlap window
+/// of `max_pattern_len - 1` bytes per chunk to recover cross-boundary
+/// matches. A 64KiB cap keeps the worst-case retained overlap below
+/// 64 KiB even for hostile operator/plugin trigger sets, which is
+/// well within typical pane chunk sizes.
+pub const DEFAULT_MAX_TRIGGER_PATTERN_LEN: usize = 64 * 1024;
+
+/// br-ft-djjnj: error from the fallible custom-trigger constructor.
+///
+/// `TriggerScanner::try_new` rejects pattern sets that would otherwise
+/// (a) panic during Aho-Corasick build, or (b) force an unbounded
+/// retained-overlap window in the chunked pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerScannerError {
+    /// A pattern at the given index was empty after trimming. Empty
+    /// patterns either match every position (degenerate) or get
+    /// rejected by Aho-Corasick depending on the build flags; either
+    /// way the operator intent is unclear so we fail closed.
+    EmptyPattern { index: usize },
+    /// A pattern exceeded the configured `max_pattern_len`. The
+    /// scanner records both the index, the observed length, and the
+    /// cap so an operator can grep their config.
+    PatternTooLong {
+        index: usize,
+        len: usize,
+        max_pattern_len: usize,
+    },
+    /// Aho-Corasick build failed for a reason other than an empty
+    /// or too-long pattern. The infallible constructor would have
+    /// panicked here.
+    AutomatonBuildFailed { reason: String },
+}
+
+impl std::fmt::Display for TriggerScannerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPattern { index } => write!(
+                f,
+                "br-ft-djjnj: trigger pattern at index {index} is empty after trimming"
+            ),
+            Self::PatternTooLong {
+                index,
+                len,
+                max_pattern_len,
+            } => write!(
+                f,
+                "br-ft-djjnj: trigger pattern at index {index} is {len} bytes; max is {max_pattern_len}"
+            ),
+            Self::AutomatonBuildFailed { reason } => {
+                write!(f, "br-ft-djjnj: aho-corasick build failed: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TriggerScannerError {}
+
 impl TriggerScanner {
+    /// br-ft-djjnj: fallible constructor for custom trigger sets.
+    ///
+    /// Validates each pattern (rejects empty after trim; rejects
+    /// patterns longer than `max_pattern_len` so the chunked
+    /// pipeline's retained overlap stays bounded), then builds the
+    /// Aho-Corasick automaton. Returns [`TriggerScannerError`] on
+    /// any of the documented failure modes instead of panicking.
+    ///
+    /// Use this in any code path that loads custom triggers from a
+    /// non-trusted source (operator config, plugin payload, etc.).
+    /// The infallible [`Self::new`] is preserved for the built-in
+    /// static trigger sets where compile-drift is intentionally
+    /// fatal.
+    pub fn try_new(
+        patterns: Vec<TriggerPattern>,
+        max_pattern_len: usize,
+    ) -> Result<Self, TriggerScannerError> {
+        for (i, p) in patterns.iter().enumerate() {
+            if p.pattern.trim().is_empty() {
+                return Err(TriggerScannerError::EmptyPattern { index: i });
+            }
+            if p.pattern.len() > max_pattern_len {
+                return Err(TriggerScannerError::PatternTooLong {
+                    index: i,
+                    len: p.pattern.len(),
+                    max_pattern_len,
+                });
+            }
+        }
+
+        let mut exact_patterns: Vec<String> = Vec::new();
+        let mut nocase_patterns: Vec<String> = Vec::new();
+        let mut exact_indices: Vec<usize> = Vec::new();
+        let mut nocase_indices: Vec<usize> = Vec::new();
+
+        for (i, p) in patterns.iter().enumerate() {
+            if p.case_insensitive {
+                nocase_patterns.push(p.pattern.clone());
+                nocase_indices.push(i);
+            } else {
+                exact_patterns.push(p.pattern.clone());
+                exact_indices.push(i);
+            }
+        }
+
+        let automaton = if exact_patterns.is_empty() {
+            AhoCorasick::new(Vec::<&str>::new()).map_err(|err| {
+                TriggerScannerError::AutomatonBuildFailed {
+                    reason: format!("empty automaton: {err}"),
+                }
+            })?
+        } else {
+            let mut builder = AhoCorasickBuilder::new();
+            builder.match_kind(MatchKind::LeftmostFirst);
+            builder.build(&exact_patterns).map_err(|err| {
+                TriggerScannerError::AutomatonBuildFailed {
+                    reason: format!("case-sensitive: {err}"),
+                }
+            })?
+        };
+
+        let automaton_ci = if nocase_patterns.is_empty() {
+            None
+        } else {
+            let mut builder = AhoCorasickBuilder::new();
+            builder.match_kind(MatchKind::LeftmostFirst);
+            builder.ascii_case_insensitive(true);
+            Some(builder.build(&nocase_patterns).map_err(|err| {
+                TriggerScannerError::AutomatonBuildFailed {
+                    reason: format!("case-insensitive: {err}"),
+                }
+            })?)
+        };
+
+        Ok(Self {
+            automaton,
+            automaton_ci,
+            patterns,
+            nocase_indices,
+            exact_indices,
+        })
+    }
+
     /// Build a scanner from a list of trigger patterns.
     ///
     /// The patterns are split into case-sensitive and case-insensitive groups,
