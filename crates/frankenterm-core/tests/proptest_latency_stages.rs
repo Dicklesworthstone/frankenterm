@@ -1748,6 +1748,45 @@ proptest! {
         }
     }
 
+    /// Background QoS cannot starve forever under finite input pressure: after
+    /// the configured shed streak, the scheduler opens one admit window.
+    #[test]
+    fn scheduler_background_qos_eventually_gets_guard_window(
+        guard_after in 1_u64..16,
+        extra_attempts in 0_u64..8,
+    ) {
+        let cfg = LaneSchedulerConfig {
+            input_queue_capacity: 4,
+            input_pressure_threshold: 0.75,
+            qos_starvation_admit_after_sheds: guard_after,
+            ..Default::default()
+        };
+        let mut sched = LaneScheduler::new(cfg);
+        sched.begin_epoch(1_000_000.0);
+        for i in 0..3 {
+            sched.admit(LatencyStage::PtyCapture, 10.0, &format!("qos-input-{i}"), 0, 0);
+        }
+        prop_assert!(sched.input_under_pressure());
+
+        let mut admitted = false;
+        for i in 0..=(guard_after + extra_attempts) {
+            let (_, decision) = sched.admit_with_qos(
+                LatencyStage::StorageWrite,
+                10.0,
+                &format!("background-{i}"),
+                0,
+                0,
+                QosScope::new(QosClass::Background),
+            );
+            if decision == AdmissionDecision::Admitted {
+                admitted = true;
+                break;
+            }
+        }
+
+        prop_assert!(admitted, "background QoS must get a bounded starvation-guard admit window");
+    }
+
     /// LaneSchedulerConfig: default CPU shares sum to 1.0.
     #[test]
     fn scheduler_config_shares_sum(_dummy in 0..1_u8) {

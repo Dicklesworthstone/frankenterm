@@ -4549,6 +4549,7 @@ mod tests {
         let item = WorkItem {
             id: 42,
             lane: SchedulerLane::Input,
+            qos: QosScope::for_pane(QosClass::Interactive, 7),
             stage: LatencyStage::PtyCapture,
             estimated_cost_us: 500.0,
             correlation_id: "serde-test".into(),
@@ -4565,6 +4566,9 @@ mod tests {
         let event = SchedulingEvent {
             item_id: 1,
             lane: SchedulerLane::Bulk,
+            qos_class: QosClass::BulkSearch,
+            pane_id: Some(7),
+            mission_id: Some("bulk-search".into()),
             stage: LatencyStage::StorageWrite,
             decision: AdmissionDecision::Shed,
             queue_depth_before: 1024,

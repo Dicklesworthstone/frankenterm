@@ -73,6 +73,150 @@ impl fmt::Display for SchedulerLane {
     }
 }
 
+/// Operator-facing QoS class for pane and mission work.
+///
+/// The enum is intentionally separate from [`SchedulerLane`]: lanes are the
+/// concrete queues, while QoS classes describe caller intent before admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QosClass {
+    /// Safety-critical operator or control-plane work.
+    Critical = 0,
+    /// Directly user-visible pane interaction.
+    Interactive = 1,
+    /// Replay/restore work with bounded catch-up latency.
+    Replay = 2,
+    /// Ordinary background maintenance.
+    Background = 3,
+    /// Bulk lexical/vector search and indexing work.
+    BulkSearch = 4,
+}
+
+impl QosClass {
+    /// All QoS classes in priority order (highest first).
+    pub const ALL: &'static [Self] = &[
+        Self::Critical,
+        Self::Interactive,
+        Self::Replay,
+        Self::Background,
+        Self::BulkSearch,
+    ];
+
+    /// Priority value (lower = higher priority).
+    pub fn priority(self) -> u8 {
+        self as u8
+    }
+
+    /// Default QoS for a pipeline stage when callers do not provide one.
+    pub fn from_stage(stage: LatencyStage) -> Self {
+        match stage {
+            LatencyStage::PtyCapture
+            | LatencyStage::DeltaExtraction
+            | LatencyStage::ApiResponse => Self::Interactive,
+            LatencyStage::EventEmission
+            | LatencyStage::WorkflowDispatch
+            | LatencyStage::ActionExecution => Self::Critical,
+            LatencyStage::StorageWrite | LatencyStage::EndToEndCapture => Self::Background,
+            LatencyStage::PatternDetection | LatencyStage::EndToEndAction => Self::BulkSearch,
+        }
+    }
+
+    /// Queue lane selected by this QoS class.
+    pub fn lane(self) -> SchedulerLane {
+        match self {
+            Self::Interactive => SchedulerLane::Input,
+            Self::Critical | Self::Replay => SchedulerLane::Control,
+            Self::Background | Self::BulkSearch => SchedulerLane::Bulk,
+        }
+    }
+
+    /// Default deadline budget for items without an explicit deadline.
+    pub fn default_deadline_budget_us(self) -> u64 {
+        match self {
+            Self::Critical => 2_000,
+            Self::Interactive => 5_000,
+            Self::Replay => 100_000,
+            Self::Background => 500_000,
+            Self::BulkSearch => 2_000_000,
+        }
+    }
+
+    /// Relative CPU weight for diagnostic budget inheritance.
+    pub fn cpu_weight(self) -> u8 {
+        match self {
+            Self::Critical => 100,
+            Self::Interactive => 80,
+            Self::Replay => 40,
+            Self::Background => 20,
+            Self::BulkSearch => 10,
+        }
+    }
+
+    /// Whether sustained pressure should eventually open an admit window.
+    pub fn starvation_protected(self) -> bool {
+        matches!(self, Self::Replay | Self::Background)
+    }
+
+    /// Human-readable name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::Interactive => "interactive",
+            Self::Replay => "replay",
+            Self::Background => "background",
+            Self::BulkSearch => "bulk_search",
+        }
+    }
+}
+
+impl fmt::Display for QosClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Pane/mission scope attached to a schedulable item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QosScope {
+    pub class: QosClass,
+    pub pane_id: Option<u64>,
+    pub mission_id: Option<String>,
+}
+
+impl QosScope {
+    pub fn new(class: QosClass) -> Self {
+        Self {
+            class,
+            pane_id: None,
+            mission_id: None,
+        }
+    }
+
+    pub fn for_pane(class: QosClass, pane_id: u64) -> Self {
+        Self {
+            class,
+            pane_id: Some(pane_id),
+            mission_id: None,
+        }
+    }
+
+    pub fn for_mission(class: QosClass, mission_id: impl Into<String>) -> Self {
+        Self {
+            class,
+            pane_id: None,
+            mission_id: Some(mission_id.into()),
+        }
+    }
+
+    pub fn for_pane_mission(class: QosClass, pane_id: u64, mission_id: impl Into<String>) -> Self {
+        Self {
+            class,
+            pane_id: Some(pane_id),
+            mission_id: Some(mission_id.into()),
+        }
+    }
+}
+
 /// Map a pipeline stage to its scheduling lane.
 pub fn stage_to_lane(stage: LatencyStage) -> SchedulerLane {
     match stage {
@@ -95,6 +239,8 @@ pub struct WorkItem {
     pub id: u64,
     /// Which lane this item belongs to.
     pub lane: SchedulerLane,
+    /// QoS class and optional pane/mission owner.
+    pub qos: QosScope,
     /// Which pipeline stage this work is for.
     pub stage: LatencyStage,
     /// Estimated cost in microseconds.
@@ -150,6 +296,9 @@ pub struct LaneSchedulerConfig {
     pub enable_deadline_promotion: bool,
     /// Deadline promotion threshold: if remaining time < this fraction of deadline, promote.
     pub deadline_promotion_fraction: f64,
+    /// Number of consecutive protected low-priority sheds before opening
+    /// one QoS starvation-guard admit window.
+    pub qos_starvation_admit_after_sheds: u64,
 }
 
 impl Default for LaneSchedulerConfig {
@@ -164,6 +313,7 @@ impl Default for LaneSchedulerConfig {
             input_pressure_threshold: 0.75,
             enable_deadline_promotion: true,
             deadline_promotion_fraction: 0.25,
+            qos_starvation_admit_after_sheds: 64,
         }
     }
 }
@@ -190,6 +340,9 @@ impl LaneSchedulerConfig {
                 "deadline_promotion_fraction must be in (0.0, 1.0), got {}",
                 self.deadline_promotion_fraction
             ));
+        }
+        if self.qos_starvation_admit_after_sheds == 0 {
+            errors.push("qos_starvation_admit_after_sheds must be > 0".into());
         }
         errors
     }
@@ -262,6 +415,9 @@ impl LaneState {
 pub struct SchedulingEvent {
     pub item_id: u64,
     pub lane: SchedulerLane,
+    pub qos_class: QosClass,
+    pub pane_id: Option<u64>,
+    pub mission_id: Option<String>,
     pub stage: LatencyStage,
     pub decision: AdmissionDecision,
     pub queue_depth_before: usize,
@@ -277,7 +433,14 @@ pub struct SchedulerSnapshot {
     pub lanes: Vec<LaneState>,
     pub total_items_processed: u64,
     pub input_pressure: bool,
+    pub qos_starvation_shed_streak: u64,
     pub config: LaneSchedulerConfig,
+}
+
+#[derive(Debug, Clone)]
+struct AdmissionTrace {
+    decision: AdmissionDecision,
+    reason_code: Option<String>,
 }
 
 /// The three-lane scheduler.
@@ -299,6 +462,7 @@ pub struct LaneScheduler {
     next_item_id: u64,
     events: VecDeque<SchedulingEvent>,
     max_events: usize,
+    qos_starvation_shed_streak: u64,
 }
 
 impl LaneScheduler {
@@ -316,6 +480,7 @@ impl LaneScheduler {
             next_item_id: 1,
             events: VecDeque::new(),
             max_events: 1000,
+            qos_starvation_shed_streak: 0,
         }
     }
 
@@ -335,25 +500,60 @@ impl LaneScheduler {
         deadline_us: u64,
         now_us: u64,
     ) -> (WorkItem, AdmissionDecision) {
-        let lane = stage_to_lane(stage);
+        self.admit_with_qos(
+            stage,
+            estimated_cost_us,
+            correlation_id,
+            deadline_us,
+            now_us,
+            QosScope::new(QosClass::from_stage(stage)),
+        )
+    }
+
+    /// Admit a pane/mission-scoped item with an explicit QoS class.
+    ///
+    /// QoS can override the stage's default lane, e.g. replay storage
+    /// recovery work can enter the control lane while bulk search remains in
+    /// bulk even with an explicit deadline.
+    pub fn admit_with_qos(
+        &mut self,
+        stage: LatencyStage,
+        estimated_cost_us: f64,
+        correlation_id: &str,
+        deadline_us: u64,
+        now_us: u64,
+        qos: QosScope,
+    ) -> (WorkItem, AdmissionDecision) {
+        let default_lane = stage_to_lane(stage);
+        let qos_class = qos.class;
+        let lane = qos_class.lane();
         let item_id = self.next_item_id;
         self.next_item_id += 1;
 
         let item = WorkItem {
             id: item_id,
             lane,
+            qos,
             stage,
             estimated_cost_us,
             correlation_id: correlation_id.to_string(),
-            deadline_us,
+            deadline_us: if deadline_us == 0 && now_us > 0 {
+                now_us.saturating_add(qos_class.default_deadline_budget_us())
+            } else {
+                deadline_us
+            },
         };
 
-        let decision = self.apply_admission(&item, now_us);
+        let admission = self.apply_admission(&item, now_us);
+        let decision = admission.decision;
 
         let lane_state = &self.lanes[lane as usize];
         self.push_event(SchedulingEvent {
             item_id,
             lane,
+            qos_class: item.qos.class,
+            pane_id: item.qos.pane_id,
+            mission_id: item.qos.mission_id.clone(),
             stage,
             decision: decision.clone(),
             queue_depth_before: if matches!(decision, AdmissionDecision::Admitted) {
@@ -363,12 +563,13 @@ impl LaneScheduler {
             },
             queue_depth_after: lane_state.depth,
             correlation_id: correlation_id.to_string(),
-            reason_code: match &decision {
-                AdmissionDecision::Deferred => Some("BULK_QUEUE_FULL".into()),
-                AdmissionDecision::Shed => Some("QUEUE_OVERFLOW".into()),
-                AdmissionDecision::Promoted { .. } => Some("DEADLINE_PROMOTION".into()),
-                AdmissionDecision::Admitted => None,
-            },
+            reason_code: admission.reason_code.or_else(|| {
+                if lane != default_lane {
+                    Some("QOS_CLASS_LANE_OVERRIDE".into())
+                } else {
+                    None
+                }
+            }),
         });
 
         (item, decision)
@@ -411,6 +612,7 @@ impl LaneScheduler {
             lanes: self.lanes.clone(),
             total_items_processed: self.lanes.iter().map(|l| l.total_completed).sum(),
             input_pressure: self.input_under_pressure(),
+            qos_starvation_shed_streak: self.qos_starvation_shed_streak,
             config: self.config.clone(),
         }
     }
@@ -436,13 +638,29 @@ impl LaneScheduler {
         )
     }
 
-    fn apply_admission(&mut self, item: &WorkItem, now_us: u64) -> AdmissionDecision {
+    fn apply_admission(&mut self, item: &WorkItem, now_us: u64) -> AdmissionTrace {
         let lane_idx = item.lane as usize;
 
         // Check if input lane is under pressure — shed bulk items.
         if item.lane == SchedulerLane::Bulk && self.input_under_pressure() {
+            if item.qos.class.starvation_protected()
+                && self.qos_starvation_shed_streak >= self.config.qos_starvation_admit_after_sheds
+                && !self.lanes[lane_idx].is_full()
+            {
+                self.qos_starvation_shed_streak = 0;
+                self.lanes[lane_idx].depth += 1;
+                self.lanes[lane_idx].total_admitted += 1;
+                return AdmissionTrace {
+                    decision: AdmissionDecision::Admitted,
+                    reason_code: Some("QOS_STARVATION_GUARD".into()),
+                };
+            }
+            self.qos_starvation_shed_streak = self.qos_starvation_shed_streak.saturating_add(1);
             self.lanes[lane_idx].total_shed += 1;
-            return AdmissionDecision::Shed;
+            return AdmissionTrace {
+                decision: AdmissionDecision::Shed,
+                reason_code: Some("INPUT_PRESSURE_SHED".into()),
+            };
         }
 
         // Check for deadline-based promotion.
@@ -460,9 +678,13 @@ impl LaneScheduler {
                 if !self.lanes[control_idx].is_full() {
                     self.lanes[control_idx].depth += 1;
                     self.lanes[control_idx].total_admitted += 1;
-                    return AdmissionDecision::Promoted {
-                        from: SchedulerLane::Bulk,
-                        to: SchedulerLane::Control,
+                    self.qos_starvation_shed_streak = 0;
+                    return AdmissionTrace {
+                        decision: AdmissionDecision::Promoted {
+                            from: SchedulerLane::Bulk,
+                            to: SchedulerLane::Control,
+                        },
+                        reason_code: Some("DEADLINE_PROMOTION".into()),
                     };
                 }
             }
@@ -476,17 +698,31 @@ impl LaneScheduler {
             match item.lane {
                 SchedulerLane::Input | SchedulerLane::Control => {
                     state.total_deferred += 1;
-                    AdmissionDecision::Deferred
+                    AdmissionTrace {
+                        decision: AdmissionDecision::Deferred,
+                        reason_code: Some("QUEUE_FULL_DEFER".into()),
+                    }
                 }
                 SchedulerLane::Bulk => {
                     state.total_shed += 1;
-                    AdmissionDecision::Shed
+                    self.qos_starvation_shed_streak =
+                        self.qos_starvation_shed_streak.saturating_add(1);
+                    AdmissionTrace {
+                        decision: AdmissionDecision::Shed,
+                        reason_code: Some("QUEUE_OVERFLOW".into()),
+                    }
                 }
             }
         } else {
             state.depth += 1;
             state.total_admitted += 1;
-            AdmissionDecision::Admitted
+            if item.lane == SchedulerLane::Bulk && item.qos.class.starvation_protected() {
+                self.qos_starvation_shed_streak = 0;
+            }
+            AdmissionTrace {
+                decision: AdmissionDecision::Admitted,
+                reason_code: None,
+            }
         }
     }
 
@@ -658,4 +894,122 @@ pub struct SchedulerLogEntry {
     pub input_pressure: bool,
     pub degradation: SchedulerDegradation,
     pub fairness: Vec<(SchedulerLane, f64)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pressure_config() -> LaneSchedulerConfig {
+        LaneSchedulerConfig {
+            input_queue_capacity: 4,
+            input_pressure_threshold: 0.75,
+            qos_starvation_admit_after_sheds: 2,
+            ..Default::default()
+        }
+    }
+
+    fn fill_input_pressure(scheduler: &mut LaneScheduler) {
+        for i in 0..3 {
+            scheduler.admit(LatencyStage::PtyCapture, 10.0, &format!("input-{i}"), 0, 0);
+        }
+        assert!(scheduler.input_under_pressure());
+    }
+
+    #[test]
+    fn qos_class_ordering_and_lane_mapping_are_stable() {
+        assert_eq!(QosClass::ALL.len(), 5);
+        assert!(QosClass::Critical < QosClass::Interactive);
+        assert!(QosClass::Interactive < QosClass::Replay);
+        assert!(QosClass::Replay < QosClass::Background);
+        assert!(QosClass::Background < QosClass::BulkSearch);
+
+        assert_eq!(QosClass::Interactive.lane(), SchedulerLane::Input);
+        assert_eq!(QosClass::Critical.lane(), SchedulerLane::Control);
+        assert_eq!(QosClass::Replay.lane(), SchedulerLane::Control);
+        assert_eq!(QosClass::Background.lane(), SchedulerLane::Bulk);
+        assert_eq!(QosClass::BulkSearch.lane(), SchedulerLane::Bulk);
+    }
+
+    #[test]
+    fn explicit_qos_records_scope_and_can_override_stage_lane() {
+        let mut scheduler = LaneScheduler::with_defaults();
+        let scope = QosScope::for_pane_mission(QosClass::Replay, 42, "restore-pane-42");
+
+        let (item, decision) = scheduler.admit_with_qos(
+            LatencyStage::StorageWrite,
+            100.0,
+            "restore",
+            0,
+            1_000,
+            scope,
+        );
+
+        assert_eq!(decision, AdmissionDecision::Admitted);
+        assert_eq!(item.lane, SchedulerLane::Control);
+        assert_eq!(item.qos.class, QosClass::Replay);
+        assert_eq!(item.qos.pane_id, Some(42));
+        assert_eq!(item.qos.mission_id.as_deref(), Some("restore-pane-42"));
+        assert_eq!(item.deadline_us, 101_000);
+
+        let event = scheduler.recent_events(1).pop().unwrap();
+        assert_eq!(event.qos_class, QosClass::Replay);
+        assert_eq!(event.pane_id, Some(42));
+        assert_eq!(event.mission_id.as_deref(), Some("restore-pane-42"));
+        assert_eq!(
+            event.reason_code.as_deref(),
+            Some("QOS_CLASS_LANE_OVERRIDE")
+        );
+    }
+
+    #[test]
+    fn bulk_search_still_sheds_under_input_pressure() {
+        let mut scheduler = LaneScheduler::new(pressure_config());
+        fill_input_pressure(&mut scheduler);
+
+        let (_item, decision) = scheduler.admit_with_qos(
+            LatencyStage::PatternDetection,
+            100.0,
+            "search",
+            0,
+            0,
+            QosScope::new(QosClass::BulkSearch),
+        );
+
+        assert_eq!(decision, AdmissionDecision::Shed);
+        let event = scheduler.recent_events(1).pop().unwrap();
+        assert_eq!(event.reason_code.as_deref(), Some("INPUT_PRESSURE_SHED"));
+    }
+
+    #[test]
+    fn background_qos_gets_starvation_guard_admit_window() {
+        let mut scheduler = LaneScheduler::new(pressure_config());
+        fill_input_pressure(&mut scheduler);
+
+        for i in 0..2 {
+            let (_item, decision) = scheduler.admit_with_qos(
+                LatencyStage::StorageWrite,
+                100.0,
+                &format!("background-shed-{i}"),
+                0,
+                0,
+                QosScope::new(QosClass::Background),
+            );
+            assert_eq!(decision, AdmissionDecision::Shed);
+        }
+
+        let (_item, decision) = scheduler.admit_with_qos(
+            LatencyStage::StorageWrite,
+            100.0,
+            "background-guard",
+            0,
+            0,
+            QosScope::new(QosClass::Background),
+        );
+
+        assert_eq!(decision, AdmissionDecision::Admitted);
+        assert_eq!(scheduler.lane_state(SchedulerLane::Bulk).depth, 1);
+        let event = scheduler.recent_events(1).pop().unwrap();
+        assert_eq!(event.reason_code.as_deref(), Some("QOS_STARVATION_GUARD"));
+    }
 }
