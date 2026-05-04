@@ -160,6 +160,69 @@ impl Default for FleetMemoryConfig {
     }
 }
 
+/// br-ft-diccw: why a `FleetMemoryConfig` was rejected by validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetMemoryConfigError {
+    /// `escalation_threshold == 0`. Combined with the
+    /// `len() >= esc && esc > 0` guard at the evaluate path, a
+    /// zero threshold makes `sustained_high` always `Normal`,
+    /// silently disabling all tier escalations.
+    ZeroEscalationThreshold,
+    /// `deescalation_threshold == 0`. Same shape: `sustained_low`
+    /// defaults to `compound_tier`, so de-escalation never fires.
+    ZeroDeescalationThreshold,
+    /// `max_audit_trail == 0`. Each evaluation pushes a record and
+    /// then immediately drops it (the `len() > 0` trim trips on
+    /// every cycle), leaving the audit trail permanently empty.
+    /// The disable knob is "don't read audit_trail()", not zero
+    /// the cap.
+    ZeroMaxAuditTrail,
+}
+
+impl std::fmt::Display for FleetMemoryConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroEscalationThreshold => write!(
+                f,
+                "br-ft-diccw: escalation_threshold must be >= 1 (zero silently disables tier escalation)"
+            ),
+            Self::ZeroDeescalationThreshold => write!(
+                f,
+                "br-ft-diccw: deescalation_threshold must be >= 1 (zero silently disables tier de-escalation)"
+            ),
+            Self::ZeroMaxAuditTrail => write!(
+                f,
+                "br-ft-diccw: max_audit_trail must be >= 1 (zero leaves the audit trail permanently empty)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FleetMemoryConfigError {}
+
+impl FleetMemoryConfig {
+    /// br-ft-diccw: validate the controller's hysteresis thresholds
+    /// before installing the config. A zero `escalation_threshold`
+    /// or `deescalation_threshold` silently disables tier
+    /// transitions because the per-cycle guard at
+    /// `fleet_memory_controller.rs:298` requires `esc > 0` to
+    /// compute a non-default `sustained_high`. Catch the misconfig
+    /// at construction so the operator sees an explicit error
+    /// instead of a stuck-at-Normal compound tier.
+    pub fn validate(&self) -> Result<(), FleetMemoryConfigError> {
+        if self.escalation_threshold == 0 {
+            return Err(FleetMemoryConfigError::ZeroEscalationThreshold);
+        }
+        if self.deescalation_threshold == 0 {
+            return Err(FleetMemoryConfigError::ZeroDeescalationThreshold);
+        }
+        if self.max_audit_trail == 0 {
+            return Err(FleetMemoryConfigError::ZeroMaxAuditTrail);
+        }
+        Ok(())
+    }
+}
+
 // =============================================================================
 // Snapshot
 // =============================================================================
@@ -1291,5 +1354,101 @@ mod tests {
         assert_eq!(plan.fleet_warm_bytes_before, total_warm);
         assert!(plan.fleet_warm_bytes_target < total_warm);
         assert!(!plan.targets.is_empty());
+    }
+
+    // ── br-ft-diccw: FleetMemoryConfig hysteresis-threshold validation ──
+
+    #[test]
+    fn fleet_memory_config_default_validates_ft_diccw() {
+        // Sanity: documented defaults must not trip the validator.
+        FleetMemoryConfig::default()
+            .validate()
+            .expect("default config must validate");
+    }
+
+    #[test]
+    fn fleet_memory_config_zero_escalation_rejects_ft_diccw() {
+        // br-ft-diccw: with escalation_threshold=0 the per-cycle
+        // guard at evaluate path leaves sustained_high stuck at
+        // Normal, silently disabling all tier escalations.
+        let cfg = FleetMemoryConfig {
+            escalation_threshold: 0,
+            ..FleetMemoryConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("zero escalation_threshold must reject");
+        assert_eq!(err, FleetMemoryConfigError::ZeroEscalationThreshold);
+        assert!(err.to_string().contains("br-ft-diccw"));
+    }
+
+    #[test]
+    fn fleet_memory_config_zero_deescalation_rejects_ft_diccw() {
+        let cfg = FleetMemoryConfig {
+            deescalation_threshold: 0,
+            ..FleetMemoryConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(FleetMemoryConfigError::ZeroDeescalationThreshold)
+        );
+    }
+
+    #[test]
+    fn fleet_memory_config_zero_max_audit_trail_rejects_ft_diccw() {
+        let cfg = FleetMemoryConfig {
+            max_audit_trail: 0,
+            ..FleetMemoryConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(FleetMemoryConfigError::ZeroMaxAuditTrail)
+        );
+    }
+
+    #[test]
+    fn fleet_memory_config_finite_thresholds_pass_ft_diccw() {
+        let cfg = FleetMemoryConfig {
+            max_audit_trail: 50,
+            escalation_threshold: 1,
+            deescalation_threshold: 1,
+        };
+        cfg.validate().expect("min-finite thresholds must validate");
+    }
+
+    #[test]
+    fn fleet_memory_evaluate_with_zero_escalation_silently_holds_normal_ft_diccw() {
+        // Pre-fix demonstration: a zero-threshold config installs
+        // without complaint, then the controller silently refuses
+        // to escalate under sustained pressure. validate() now
+        // catches this before construction; this test pins the
+        // pre-fix behavior so a future refactor that bypasses
+        // validation still surfaces the "stuck at Normal" symptom
+        // through the evaluate path.
+        let cfg = FleetMemoryConfig {
+            max_audit_trail: 100,
+            escalation_threshold: 0,
+            deescalation_threshold: 5,
+        };
+        // validate() rejects, but the constructor still accepts
+        // (callers haven't migrated yet); pin both behaviors.
+        assert!(cfg.validate().is_err());
+        let mut ctrl = FleetMemoryController::new(cfg);
+
+        // Drive 10 evaluations of Black-tier pressure.
+        for _ in 0..10 {
+            let _actions = ctrl.evaluate(&PressureSignals {
+                backpressure: BackpressureTier::Black,
+                memory_pressure: MemoryPressureTier::Red,
+                worst_budget: BudgetLevel::OverBudget,
+                pane_count: 50,
+                paused_pane_count: 5,
+            });
+        }
+        assert_eq!(
+            ctrl.compound_tier(),
+            FleetPressureTier::Normal,
+            "pre-fix demonstration: zero-threshold config never escalates even under sustained Black pressure"
+        );
     }
 }
