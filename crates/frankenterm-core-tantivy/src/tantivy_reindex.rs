@@ -4382,7 +4382,7 @@ mod tests {
 
             let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
             let mut observer = NullObserver;
-            let progress = pipeline
+            let (progress, _stats) = pipeline
                 .reindex_range_observed(
                     &storage,
                     &source,
