@@ -285,13 +285,14 @@ Notes:
 - **Do NOT skip the COMMIT error path** — a failed COMMIT means
   the data was NOT persisted, AND (per SQLite) the transaction
   may still be open. Both pieces of state matter to the caller.
-- **Single-batch optimization**: if the entire body of
-  `execute_many` is the only DML in the transaction, the
-  surrounding BEGIN/COMMIT contributes nothing — `execute_many`
-  inside a connection that's already in autocommit mode is
-  itself per-row autocommit. Skip the wrapper unless you have
-  multiple `execute_many` (or other DML) in the same logical
-  unit.
+- **Wrap bulk batches in BEGIN/COMMIT even when `execute_many`
+  is the only DML.** This is a real performance fix, not just an
+  atomicity nicety. Without the wrapper each per-row `execute`
+  is its own autocommit transaction → one fsync (or WAL frame
+  flush) per row. For a 1 000-row bulk insert that's 1 000
+  syncs against the disk vs. exactly one with BEGIN/COMMIT
+  around the call. The atomicity benefit (whole-batch rollback
+  on any per-row failure) is icing on top.
 
 The trait substrate landed under [`ft-qgj81`][qgj81] slice 5.
 
