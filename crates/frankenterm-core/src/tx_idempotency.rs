@@ -469,9 +469,7 @@ impl<'de> Deserialize<'de> for TxExecutionLedger {
         // (1) Ordinal density + monotonicity: 0..records.len().
         for (expected, record) in serialized.records.iter().enumerate() {
             let expected_u64 = u64::try_from(expected).map_err(|_| {
-                de::Error::custom(
-                    "br-ft-ddm8k: TxExecutionLedger record count exceeds u64 range",
-                )
+                de::Error::custom("br-ft-ddm8k: TxExecutionLedger record count exceeds u64 range")
             })?;
             if record.ordinal != expected_u64 {
                 return Err(de::Error::custom(format!(
@@ -2071,11 +2069,7 @@ mod tests {
 
     /// Build a JSON ledger string with explicit (records, next_ordinal,
     /// last_hash) so tests can plant forged combinations.
-    fn ledger_json(
-        records: &[StepExecutionRecord],
-        next_ordinal: u64,
-        last_hash: &str,
-    ) -> String {
+    fn ledger_json(records: &[StepExecutionRecord], next_ordinal: u64, last_hash: &str) -> String {
         let records_json = serde_json::to_string(records).unwrap();
         format!(
             r#"{{"execution_id":"e","plan_id":"p","plan_hash":42,"phase":"preparing","records":{records},"last_hash":"{last_hash}","next_ordinal":{next_ordinal}}}"#,
@@ -2083,7 +2077,12 @@ mod tests {
         )
     }
 
-    fn build_record(plan_id: &str, step_id: &str, ordinal: u64, prev_hash: &str) -> StepExecutionRecord {
+    fn build_record(
+        plan_id: &str,
+        step_id: &str,
+        ordinal: u64,
+        prev_hash: &str,
+    ) -> StepExecutionRecord {
         StepExecutionRecord {
             ordinal,
             idem_key: make_key(plan_id, step_id),
@@ -2179,7 +2178,6 @@ mod tests {
         assert_eq!(back.record_count(), 3);
         assert_eq!(back.next_ordinal, 3);
     }
-}
 
     // ── DeduplicationGuard tests ──
 
