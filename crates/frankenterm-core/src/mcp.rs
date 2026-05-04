@@ -89,7 +89,10 @@ mod mcp_types;
 
 #[cfg(test)]
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
-pub use mcp_bridge::{build_server, build_server_with_db, run_stdio_server};
+pub use mcp_bridge::{
+    build_server, build_server_degraded, build_server_with_db,
+    mcp_bridge_tools_skipped_no_db_count, run_stdio_server,
+};
 use mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
 #[cfg(test)]
 use mcp_middleware::{
@@ -1092,6 +1095,7 @@ mod tests {
     // sites below are test-only setup/roundtrip invariants, not production MCP
     // request handling paths.
     use super::*;
+    use crate::config::PaneFilterRule;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use tempfile::TempDir;
@@ -1123,6 +1127,24 @@ mod tests {
                     }
                 ),
             ]
+        })
+    }
+
+    fn pane_filter_config_strategy() -> impl Strategy<Value = PaneFilterConfig> {
+        (0_usize..=3, 0_usize..=3).prop_map(|(include_count, exclude_count)| {
+            let include = (0..include_count)
+                .map(|idx| {
+                    PaneFilterRule::new(format!("include-{idx}"))
+                        .with_domain(format!("domain-{idx}"))
+                })
+                .collect();
+            let exclude = (0..exclude_count)
+                .map(|idx| {
+                    PaneFilterRule::new(format!("exclude-{idx}"))
+                        .with_title(format!("blocked-{idx}"))
+                })
+                .collect();
+            PaneFilterConfig { include, exclude }
         })
     }
 
@@ -1288,6 +1310,29 @@ mod tests {
     }
 
     proptest::proptest! {
+        #[test]
+        fn proptest_strict_no_db_error_points_to_callable_public_degraded_api_ft_58osz(
+            panes in pane_filter_config_strategy(),
+        ) {
+            let mut config = Config::default();
+            config.ingest.panes = panes;
+
+            let Err(err) = build_server_with_db(&config, None) else {
+                panic!("None db_path must stay on the strict error path");
+            };
+            let msg = err.to_string();
+            prop_assert!(
+                msg.contains("build_server_degraded"),
+                "strict no-db error must name the public degraded constructor: {msg}"
+            );
+
+            let server = crate::mcp::build_server_degraded(&config)
+                .expect("public degraded constructor named by the error must be callable");
+            let _observed_counter = crate::mcp::mcp_bridge_tools_skipped_no_db_count();
+
+            prop_assert!(!server.tools().is_empty());
+        }
+
         #[test]
         fn proptest_toon_roundtrip_preserves_json_semantics(value in json_value_strategy()) {
             let toon = toon_rust::encode(value.clone(), None);

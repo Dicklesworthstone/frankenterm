@@ -586,6 +586,39 @@ pub struct UnifiedTelemetryRecord {
     pub attributes: BTreeMap<String, serde_json::Value>,
 }
 
+/// br-ft-7cqhu: redaction policy applied to top-level identity
+/// fields (`scope_id`, `correlation_id`, embedded record_id
+/// segments) when normalizing into a [`UnifiedTelemetryRecord`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdRedactionPolicy {
+    /// Copy raw values from the source event. Legacy default.
+    Passthrough,
+    /// Replace each identity field with a deterministic FNV-1a
+    /// hash of its original value (formatted as `"hash:<u64-hex>"`).
+    /// Cross-record correlation is preserved (same input → same
+    /// hash); raw user-controlled identifiers do not appear in the
+    /// serialized record.
+    Hash,
+}
+
+impl Default for IdRedactionPolicy {
+    fn default() -> Self {
+        Self::Passthrough
+    }
+}
+
+/// br-ft-7cqhu: deterministic hash of an identity field. Uses the
+/// project's FNV-1a hash so two records sharing a correlation_id
+/// share the same hashed value (cross-record correlation
+/// preserved). The output shape is `"hash:<16-hex>"` so a triage
+/// dashboard reading the hashed string can tell it's a hash, not
+/// a literal value.
+fn hash_identity_field(value: &str) -> String {
+    let digest = crate::replay_capture::fnv1a_hash_text(value);
+    format!("hash:{digest:016x}")
+}
+
 impl UnifiedTelemetryRecord {
     /// br-ft-7cqhu: redaction policy for the top-level identity
     /// fields when normalizing into a [`UnifiedTelemetryRecord`].

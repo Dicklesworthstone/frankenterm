@@ -2215,6 +2215,16 @@ pub struct OverrideApplicationSummary {
     pub excluded_agents: Vec<String>,
     /// Beads pinned to specific agents.
     pub pinned_assignments: Vec<PinnedAssignmentRecord>,
+    /// br-ft-gweu3: pin overrides that were rejected before producing
+    /// a `PinnedAssignmentRecord` because the target agent was
+    /// concurrently excluded, did not exist, or had zero effective
+    /// capacity. Pre-fix these rejections were silent (the original
+    /// loop simply skipped pins whose target wasn't in the agents
+    /// list and ignored exclusions entirely). Operators reading the
+    /// summary now see explicit reject records with `reason` so the
+    /// mission safety envelope is observable end-to-end.
+    #[serde(default)]
+    pub rejected_pinned_assignments: Vec<RejectedPinRecord>,
     /// Beads whose scores were adjusted.
     pub reprioritized_beads: Vec<ReprioritizedBeadRecord>,
     /// Overrides that were evicted due to TTL expiry this cycle.
@@ -2227,6 +2237,41 @@ pub struct PinnedAssignmentRecord {
     pub bead_id: String,
     pub agent_id: String,
     pub override_id: String,
+}
+
+/// br-ft-gweu3: an operator pin that was REJECTED before producing a
+/// `PinnedAssignmentRecord`. The pin target violated the mission
+/// safety envelope (excluded agent, nonexistent agent, or zero
+/// effective capacity). The originating override is left active in
+/// the override state so operators can decide to clear it; the
+/// rejection just prevents the pin from forcing an assignment that
+/// would contradict the safety gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectedPinRecord {
+    pub bead_id: String,
+    pub agent_id: String,
+    pub override_id: String,
+    /// Stable enum-shaped reason the pin was rejected.
+    pub reason: PinRejectionReason,
+}
+
+/// br-ft-gweu3: stable taxonomy of pin-rejection reasons. Encoded as
+/// snake_case in serialized output so operator tooling can branch on
+/// the variant without parsing the human-facing message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PinRejectionReason {
+    /// Target agent is also excluded by an `ExcludeAgent` override.
+    AgentExcluded,
+    /// Target agent is not present in the candidate agents list at all.
+    AgentNotFound,
+    /// Target agent exists but `effective_capacity()` is 0
+    /// (paused / offline / degraded-to-zero).
+    AgentZeroCapacity,
+    /// Bead is not in the scored candidate set (filtered out
+    /// upstream — e.g., via an `ExcludeBead` override or a
+    /// safety gate).
+    BeadNotScored,
 }
 
 /// Record of a reprioritized bead's score adjustment.
@@ -2338,30 +2383,66 @@ impl MissionLoop {
         });
 
         // 4. Generate pin assignments (forced assignments bypass solver).
+        //
+        // br-ft-gweu3: pin validation now checks the full mission safety
+        // envelope before producing a PinnedAssignmentRecord. Pre-fix the
+        // loop only required (in_scored && agent_exists) and silently
+        // dropped pins that didn't match — including pins whose target
+        // agent was simultaneously excluded by an ExcludeAgent override.
+        // That created a fail-open path: the operator report could show
+        // an agent as excluded while the emitted AssignmentSet routed
+        // work there. Now we validate against the excluded-agent set
+        // and against effective_capacity, and surface every rejection
+        // via summary.rejected_pinned_assignments with a typed reason
+        // so operators can see the conflict in the report.
         let pins = self.state.override_state.active_pins();
         for (bead_id, target_agent) in &pins {
-            // Verify the bead is in the scored set (it's a real candidate).
-            let in_scored = scored.scored.iter().any(|c| c.bead_id == *bead_id);
-            // Verify the target agent exists.
-            let agent_exists = agents.iter().any(|a| a.agent_id == *target_agent);
-            if in_scored && agent_exists {
-                // Find the override_id for audit trail.
-                let override_id = self
-                    .state
-                    .override_state
-                    .active
-                    .iter()
-                    .find(|o| matches!(&o.kind, OperatorOverrideKind::Pin { bead_id: b, target_agent: t } if b == bead_id && t == target_agent))
-                    .map(|o| o.override_id.clone())
-                    .unwrap_or_default();
-                summary.pinned_assignments.push(PinnedAssignmentRecord {
+            let target_agent_string = (*target_agent).to_string();
+            // Find the override_id for audit trail.
+            let override_id = self
+                .state
+                .override_state
+                .active
+                .iter()
+                .find(|o| matches!(&o.kind, OperatorOverrideKind::Pin { bead_id: b, target_agent: t } if b == bead_id && t == target_agent))
+                .map(|o| o.override_id.clone())
+                .unwrap_or_default();
+
+            // Validation in the order operators most expect to see in
+            // a rejection report: bead-level → agent existence → agent
+            // availability → agent exclusion. Each rejection produces
+            // exactly one RejectedPinRecord and skips the pin emission.
+            let rejection_reason = if !scored.scored.iter().any(|c| c.bead_id == *bead_id) {
+                Some(PinRejectionReason::BeadNotScored)
+            } else if let Some(agent) = agents.iter().find(|a| a.agent_id == *target_agent) {
+                if excluded_agents.contains(target_agent) {
+                    Some(PinRejectionReason::AgentExcluded)
+                } else if agent.effective_capacity() == 0 {
+                    Some(PinRejectionReason::AgentZeroCapacity)
+                } else {
+                    None
+                }
+            } else {
+                Some(PinRejectionReason::AgentNotFound)
+            };
+
+            if let Some(reason) = rejection_reason {
+                summary.rejected_pinned_assignments.push(RejectedPinRecord {
                     bead_id: (*bead_id).to_string(),
-                    agent_id: (*target_agent).to_string(),
+                    agent_id: target_agent_string,
                     override_id,
+                    reason,
                 });
-                // Remove from scored set so solver doesn't double-assign.
-                scored.scored.retain(|c| c.bead_id != *bead_id);
+                continue;
             }
+
+            summary.pinned_assignments.push(PinnedAssignmentRecord {
+                bead_id: (*bead_id).to_string(),
+                agent_id: target_agent_string,
+                override_id,
+            });
+            // Remove from scored set so solver doesn't double-assign.
+            scored.scored.retain(|c| c.bead_id != *bead_id);
         }
 
         summary
