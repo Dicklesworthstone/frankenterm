@@ -270,4 +270,14 @@ mod tests {
         assert!(err.contains("no authentication boundary"));
         assert!(err.contains("dangerous public-bind opt-in"));
     }
+
+    #[test]
+    fn validate_bind_config_rejects_public_ipv6_without_auth_boundary() {
+        let config = WebServerConfig::new(8080).with_host("2001:db8::1");
+        let err = validate_bind_config(&config)
+            .expect_err("public IPv6 bind must fail closed until web auth lands")
+            .to_string();
+        assert!(err.contains("2001:db8::1"));
+        assert!(err.contains("no authentication boundary"));
+    }
 }

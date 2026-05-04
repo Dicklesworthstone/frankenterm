@@ -7,7 +7,7 @@
 use crate::Result;
 use crate::events::EventBus;
 use crate::storage::StorageHandle;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::web_framework::{App, FrameworkWebRuntime, QueryString, Request, Response, StatusCode};
@@ -225,7 +225,14 @@ impl WebServerConfig {
 
     #[must_use]
     fn bind_addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        let host = if self.host.starts_with('[') && self.host.ends_with(']') {
+            self.host.clone()
+        } else if matches!(self.host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{host}:{}", self.port)
     }
 
     /// Returns `true` when the configured host is a loopback address.
@@ -431,6 +438,18 @@ mod tests {
     fn config_bind_addr_formats_correctly() {
         let cfg = WebServerConfig::new(8080).with_host("10.0.0.1");
         assert_eq!(cfg.bind_addr(), "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn config_bind_addr_brackets_raw_ipv6_loopback() {
+        let cfg = WebServerConfig::new(8080).with_host("::1");
+        assert_eq!(cfg.bind_addr(), "[::1]:8080");
+    }
+
+    #[test]
+    fn config_bind_addr_preserves_bracketed_ipv6_loopback() {
+        let cfg = WebServerConfig::new(8080).with_host("[::1]");
+        assert_eq!(cfg.bind_addr(), "[::1]:8080");
     }
 
     #[test]
