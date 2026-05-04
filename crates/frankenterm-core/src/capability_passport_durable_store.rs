@@ -269,9 +269,8 @@ impl DurablePassportStore {
         agent_id: &str,
     ) -> Result<Vec<CapabilityPassport>, DurablePassportStoreError> {
         let conn = self.conn.lock().expect("connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT payload FROM passports WHERE agent_id = ?1 ORDER BY pane_id",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT payload FROM passports WHERE agent_id = ?1 ORDER BY pane_id")?;
         let rows = stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))?;
         let mut passports = Vec::new();
         for row in rows {
@@ -305,12 +304,9 @@ impl DurablePassportStore {
 
     /// Delete every passport with `signed_at_ms < cutoff_ms`.
     /// Returns the number of rows pruned.
-    pub fn prune_older_than(
-        &self,
-        cutoff_ms: u64,
-    ) -> Result<usize, DurablePassportStoreError> {
-        let cutoff_i64 = i64::try_from(cutoff_ms)
-            .map_err(|_| DurablePassportStoreError::KeyOverflow)?;
+    pub fn prune_older_than(&self, cutoff_ms: u64) -> Result<usize, DurablePassportStoreError> {
+        let cutoff_i64 =
+            i64::try_from(cutoff_ms).map_err(|_| DurablePassportStoreError::KeyOverflow)?;
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let n = conn.execute(
             "DELETE FROM passports WHERE signed_at_ms < ?1",
@@ -328,10 +324,7 @@ impl DurablePassportStore {
 
     /// Remove a passport at the supplied composite key. Returns
     /// true when a row was removed, false when no matching row.
-    pub fn delete(
-        &self,
-        key: &PassportKey,
-    ) -> Result<bool, DurablePassportStoreError> {
+    pub fn delete(&self, key: &PassportKey) -> Result<bool, DurablePassportStoreError> {
         let pane_id_storage = Self::pane_id_for_storage(key.pane_id)?;
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let n = conn.execute(
@@ -345,9 +338,7 @@ impl DurablePassportStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability_passport::{
-        CapabilityEntry, CapabilityVerification, RedactedProof,
-    };
+    use crate::capability_passport::{CapabilityEntry, CapabilityVerification, RedactedProof};
 
     fn passport(agent: &str, pane: Option<u64>, generation: u64) -> CapabilityPassport {
         CapabilityPassport {
@@ -402,7 +393,11 @@ mod tests {
     #[test]
     fn fetch_by_missing_key_returns_none() {
         let s = store();
-        assert!(s.fetch_by_key(&PassportKey::pane("nobody", 1)).unwrap().is_none());
+        assert!(
+            s.fetch_by_key(&PassportKey::pane("nobody", 1))
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ── Generation-monotonic enforcement ─────────────────────────────────
@@ -418,7 +413,10 @@ mod tests {
                 previous_generation: 1
             }
         );
-        let back = s.fetch_by_key(&PassportKey::pane("cc1", 1)).unwrap().unwrap();
+        let back = s
+            .fetch_by_key(&PassportKey::pane("cc1", 1))
+            .unwrap()
+            .unwrap();
         assert_eq!(back.generation, 2);
         assert_eq!(s.row_count().unwrap(), 1);
     }
@@ -435,7 +433,10 @@ mod tests {
                 incoming_generation: 5,
             }
         );
-        let back = s.fetch_by_key(&PassportKey::pane("cc1", 1)).unwrap().unwrap();
+        let back = s
+            .fetch_by_key(&PassportKey::pane("cc1", 1))
+            .unwrap()
+            .unwrap();
         assert_eq!(back.generation, 5);
     }
 
@@ -530,7 +531,11 @@ mod tests {
         let s = store();
         s.upsert(&passport("cc1", Some(1), 1)).unwrap();
         assert!(s.delete(&PassportKey::pane("cc1", 1)).unwrap());
-        assert!(s.fetch_by_key(&PassportKey::pane("cc1", 1)).unwrap().is_none());
+        assert!(
+            s.fetch_by_key(&PassportKey::pane("cc1", 1))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

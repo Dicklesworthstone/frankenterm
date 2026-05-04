@@ -659,9 +659,7 @@ impl Redactor {
         for pattern in SECRET_PATTERNS {
             for mat in pattern.regex.find_iter(text) {
                 let (start, end) = (mat.start(), mat.end());
-                let overlaps = detections
-                    .iter()
-                    .any(|&(_, s, e)| start < e && end > s);
+                let overlaps = detections.iter().any(|&(_, s, e)| start < e && end > s);
                 if !overlaps {
                     detections.push((pattern.name, start, end));
                 }
@@ -1236,8 +1234,7 @@ mod tests {
         // `openai_key` regex (whose body charset accepts `ant-`).
         // Pre-fix detect() would push BOTH matches; post-fix the
         // priority-ordered dedup keeps only `anthropic_key`.
-        let token =
-            "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let token = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let r = Redactor::new();
         let detections = r.detect(token);
         assert_eq!(
@@ -1253,8 +1250,7 @@ mod tests {
         // The bead's tamper-evidence concern: evidence.matches
         // should equal the number of distinct secrets in the
         // input, not the cumulative cross-pattern hit count.
-        let token =
-            "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let token = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let result = Redactor::new().redact_bytes_with_evidence(token.as_bytes());
         assert_eq!(
             result.evidence.matches, 1,

@@ -366,9 +366,7 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         "robot.timeout" | "robot.cass_timeout" => {
             "Retry after a short backoff; consider raising the per-call timeout if persistent."
         }
-        "robot.rate_limited" => {
-            "Back off and retry; the operation tripped the rate limiter."
-        }
+        "robot.rate_limited" => "Back off and retry; the operation tripped the rate limiter.",
         // Policy / approval
         "robot.policy_denied" => {
             "Run `ft policy explain <action>` to see which rule blocked the request."
@@ -376,9 +374,7 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         "robot.require_approval" => {
             "Approve via `ft approve <id>` or wait for the configured approver."
         }
-        "robot.approval_error" => {
-            "Approval pipeline failed; check the approval-store status."
-        }
+        "robot.approval_error" => "Approval pipeline failed; check the approval-store status.",
         // Storage
         "robot.storage_error" => {
             "Check disk space and storage health (`ft storage doctor`); retry after recovery."
@@ -420,9 +416,7 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
             "Reduce the cass query scope; the output exceeded the buffered cap."
         }
         // Config / unsupported
-        "robot.config_error" => {
-            "Validate frankenterm.toml; the loaded configuration was rejected."
-        }
+        "robot.config_error" => "Validate frankenterm.toml; the loaded configuration was rejected.",
         "robot.feature_not_available" | "robot.unsupported" | "robot.not_implemented" => {
             "Feature is gated or not built into this binary — check feature flags."
         }

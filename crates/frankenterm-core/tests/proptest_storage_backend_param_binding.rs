@@ -82,8 +82,7 @@ fn round_trip_cell(value: ToSqlValue<'_>) -> Option<SqlCell> {
     backend
         .query_row_typed("INSERT INTO bench (cell) VALUES (?1)", &[value])
         .expect("insert");
-    let row =
-        query_row_cells(&backend, "SELECT cell FROM bench LIMIT 1", &[]).expect("select");
+    let row = query_row_cells(&backend, "SELECT cell FROM bench LIMIT 1", &[]).expect("select");
     row.map(|r| r.cell(0).cloned().expect("at least one cell"))
 }
 

@@ -146,9 +146,7 @@ impl StorageDistinctSketch {
     /// Total memory used by the three sketches in bytes.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.panes.memory_bytes()
-            + self.sessions.memory_bytes()
-            + self.embedders.memory_bytes()
+        self.panes.memory_bytes() + self.sessions.memory_bytes() + self.embedders.memory_bytes()
     }
 
     /// Snapshot for inclusion in storage-doctor / runtime-telemetry
@@ -228,10 +226,7 @@ mod tests {
         s.record_session_id("session-A");
         // Sessions only got 1 insert; embedders got 0.
         let panes = s.estimated_distinct_panes();
-        assert!(
-            panes >= 2 && panes <= 4,
-            "panes ≈ 3 expected (got {panes})"
-        );
+        assert!(panes >= 2 && panes <= 4, "panes ≈ 3 expected (got {panes})");
         let sessions = s.estimated_distinct_sessions();
         assert!(
             sessions >= 1 && sessions <= 2,

@@ -178,7 +178,10 @@ mod tests {
         }
         assert_eq!(layer.bound(), None, "warmup: bound is None until N ≥ 30");
         layer.record(29.0);
-        assert!(layer.bound().is_some(), "post-warmup: bound is Some at N = 30");
+        assert!(
+            layer.bound().is_some(),
+            "post-warmup: bound is Some at N = 30"
+        );
     }
 
     #[test]

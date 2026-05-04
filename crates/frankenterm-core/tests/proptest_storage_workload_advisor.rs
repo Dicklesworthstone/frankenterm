@@ -39,8 +39,8 @@ use frankenterm_core::events::MetricsSnapshot;
 use frankenterm_core::storage_cardinality_sketch::StorageDistinctSketchSnapshot;
 use frankenterm_core::storage_workload_advisor::{
     AdvisorMetrics, AdvisorReport, BackendChoice, HotTableSnapshot, IndexChoice, MigrationPriority,
-    SearchBackendsInUse, TailLatencySnapshot, WorkloadMix, WorkloadProfile, advise_from_event_bus_metrics,
-    classify,
+    SearchBackendsInUse, TailLatencySnapshot, WorkloadMix, WorkloadProfile,
+    advise_from_event_bus_metrics, classify,
 };
 use proptest::prelude::*;
 
@@ -65,41 +65,32 @@ fn init_test_tracing_json() {
 
 fn arb_workload_profile() -> impl Strategy<Value = WorkloadProfile> {
     (
-        0u64..=10_000, // total_writes
-        0u64..=10_000, // total_reads
-        0u64..=10_000, // total_searches
-        any::<bool>(), // fts_enabled
-        any::<bool>(), // tantivy_enabled
-        0u64..=1_000,  // distinct_panes
-        0u64..=100,    // distinct_sessions
-        0u64..=200_000, // p99_write_us
-        0u64..=200_000, // p99_read_us
+        0u64..=10_000,      // total_writes
+        0u64..=10_000,      // total_reads
+        0u64..=10_000,      // total_searches
+        any::<bool>(),      // fts_enabled
+        any::<bool>(),      // tantivy_enabled
+        0u64..=1_000,       // distinct_panes
+        0u64..=100,         // distinct_sessions
+        0u64..=200_000,     // p99_write_us
+        0u64..=200_000,     // p99_read_us
         0u64..=200_000_000, // checkpoint_lag_bytes (up to 200 MiB)
     )
         .prop_map(
-            |(
-                writes,
-                reads,
-                searches,
-                fts,
-                tantivy,
-                panes,
-                sessions,
-                p99_w,
-                p99_r,
-                lag,
-            )| WorkloadProfile {
-                total_writes: writes,
-                total_reads: reads,
-                total_searches: searches,
-                fts_enabled: fts,
-                tantivy_enabled: tantivy,
-                estimated_distinct_panes: panes,
-                estimated_distinct_sessions: sessions,
-                hot_table: None,
-                p99_write_latency_us: p99_w,
-                p99_read_latency_us: p99_r,
-                checkpoint_lag_bytes: lag,
+            |(writes, reads, searches, fts, tantivy, panes, sessions, p99_w, p99_r, lag)| {
+                WorkloadProfile {
+                    total_writes: writes,
+                    total_reads: reads,
+                    total_searches: searches,
+                    fts_enabled: fts,
+                    tantivy_enabled: tantivy,
+                    estimated_distinct_panes: panes,
+                    estimated_distinct_sessions: sessions,
+                    hot_table: None,
+                    p99_write_latency_us: p99_w,
+                    p99_read_latency_us: p99_r,
+                    checkpoint_lag_bytes: lag,
+                }
             },
         )
 }

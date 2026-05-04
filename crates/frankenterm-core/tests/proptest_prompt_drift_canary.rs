@@ -32,9 +32,7 @@
 
 use std::sync::Once;
 
-use frankenterm_core::prompt_drift_canary::{
-    DriftAlert, DriftStatistic, DriftStatisticParams,
-};
+use frankenterm_core::prompt_drift_canary::{DriftAlert, DriftStatistic, DriftStatisticParams};
 use proptest::prelude::*;
 
 fn init_test_tracing_json() {

@@ -2681,10 +2681,7 @@ mod tests {
         };
         assert_ne!(make(StepRisk::Low).hash(), make(StepRisk::Critical).hash());
         assert_ne!(make(StepRisk::Low).hash(), make(StepRisk::Medium).hash());
-        assert_ne!(
-            make(StepRisk::Medium).hash(),
-            make(StepRisk::High).hash()
-        );
+        assert_ne!(make(StepRisk::Medium).hash(), make(StepRisk::High).hash());
     }
 
     #[test]

@@ -277,19 +277,55 @@ mod tests {
         vec![
             // Dominated: high latency + high resources + low quality.
             point(
-                4, 100, 1, 1000, 500, 1000, 5000, 10000, 20000, 1_000_000, 50_000, 30_000, 800,
+                4,
+                100,
+                1,
+                1000,
+                500,
+                1000,
+                5000,
+                10000,
+                20000,
+                1_000_000,
+                50_000,
+                30_000,
+                800,
                 "darwin-arm64-12c-32g",
                 "replay-write-heavy-1k",
             ),
             // Dominator: lower latency + lower resources + higher quality.
             point(
-                2, 200, 2, 800, 400, 800, 3000, 7000, 15000, 800_000, 40_000, 25_000, 950,
+                2,
+                200,
+                2,
+                800,
+                400,
+                800,
+                3000,
+                7000,
+                15000,
+                800_000,
+                40_000,
+                25_000,
+                950,
                 "darwin-arm64-12c-32g",
                 "replay-write-heavy-1k",
             ),
             // Frontier sibling: trades p50 for memory.
             point(
-                8, 400, 0, 2000, 1000, 1500, 2000, 9000, 18000, 1_500_000, 60_000, 35_000, 900,
+                8,
+                400,
+                0,
+                2000,
+                1000,
+                1500,
+                2000,
+                9000,
+                18000,
+                1_500_000,
+                60_000,
+                35_000,
+                900,
                 "darwin-arm64-12c-32g",
                 "replay-write-heavy-1k",
             ),
@@ -411,9 +447,15 @@ mod tests {
         let text = PlannerReportRenderer::new().render_text(&report);
         // At least one of the latency or resource dimension names
         // must appear in the dominated section.
-        let has_dim = ["p50_us", "p95_us", "p99_us", "memory_bytes", "cpu_percent_e3"]
-            .iter()
-            .any(|d| text.contains(d));
+        let has_dim = [
+            "p50_us",
+            "p95_us",
+            "p99_us",
+            "memory_bytes",
+            "cpu_percent_e3",
+        ]
+        .iter()
+        .any(|d| text.contains(d));
         assert!(
             has_dim,
             "dominated section must surface at least one strict winning dimension; got {text}"

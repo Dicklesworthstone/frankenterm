@@ -720,9 +720,11 @@ impl Domain for LocalDomain {
             promise::spawn::spawn_into_new_thread(move || slave.spawn_command(cmd)).await;
         let mut writer = WriterWrapper::new(master.take_writer()?);
 
+        let term_config =
+            config::TermConfig::new_for_pane(pane_id, self.id, command_description.clone());
         let mut terminal = frankenterm_term::Terminal::new(
             size,
-            std::sync::Arc::new(config::TermConfig::new()),
+            std::sync::Arc::new(term_config),
             "WezTerm",
             config::wezterm_version(),
             Box::new(writer.clone()),

@@ -36,8 +36,8 @@
 use std::sync::Once;
 
 use frankenterm_core::pareto_frontier_planner::{
-    KnobConfig, LatencyMetrics, MeasurementPoint, PlannerReport, ResourceMetrics,
-    compute_frontier, is_dominated_by, plan,
+    KnobConfig, LatencyMetrics, MeasurementPoint, PlannerReport, ResourceMetrics, compute_frontier,
+    is_dominated_by, plan,
 };
 use proptest::prelude::*;
 use tracing::info;
@@ -78,14 +78,14 @@ fn arb_latency() -> impl Strategy<Value = LatencyMetrics> {
 }
 
 fn arb_resources() -> impl Strategy<Value = ResourceMetrics> {
-    (0u64..=10, 0u32..=10, 0u32..=10, 0u32..=10).prop_map(
-        |(mem, cpu, storage, quality)| ResourceMetrics {
+    (0u64..=10, 0u32..=10, 0u32..=10, 0u32..=10).prop_map(|(mem, cpu, storage, quality)| {
+        ResourceMetrics {
             memory_bytes: mem,
             cpu_percent_e3: cpu,
             storage_write_pressure_e3: storage,
             token_output_quality_e3: quality,
-        },
-    )
+        }
+    })
 }
 
 fn arb_measurement_point() -> impl Strategy<Value = MeasurementPoint> {

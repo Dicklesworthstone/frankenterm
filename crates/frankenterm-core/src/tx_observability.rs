@@ -1266,9 +1266,11 @@ mod tests {
         );
 
         assert!(timeline.iter().any(|entry| entry.summary == "matching"));
-        assert!(timeline
-            .iter()
-            .all(|entry| !entry.summary.starts_with("wrong-")));
+        assert!(
+            timeline
+                .iter()
+                .all(|entry| !entry.summary.starts_with("wrong-"))
+        );
     }
 
     proptest! {
@@ -1518,14 +1520,18 @@ mod tests {
 
         assert_eq!(bundle.metadata.workspace, "[REDACTED]");
         assert_eq!(bundle.metadata.track, "[REDACTED]");
-        assert!(bundle
-            .redaction
-            .categories
-            .contains(&"command_text".to_string()));
-        assert!(bundle
-            .redaction
-            .categories
-            .contains(&"workspace_labels".to_string()));
+        assert!(
+            bundle
+                .redaction
+                .categories
+                .contains(&"command_text".to_string())
+        );
+        assert!(
+            bundle
+                .redaction
+                .categories
+                .contains(&"workspace_labels".to_string())
+        );
         assert!(bundle.redaction.fields_redacted > 0);
     }
 

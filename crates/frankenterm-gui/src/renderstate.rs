@@ -11,7 +11,7 @@ use ::window::glium::{
 };
 use ::window::*;
 use anyhow::Context;
-use frankenterm_core::atlas_tier_doctor::TierSwapDoctorReport;
+use frankenterm_core::{atlas_tier_doctor::TierSwapDoctorReport, atlas_tiered_swap::MemoryBudget};
 use frankenterm_font::FontConfiguration;
 use std::cell::{Ref, RefCell, RefMut};
 use std::convert::TryInto;
@@ -20,6 +20,41 @@ use wgpu::util::DeviceExt;
 
 const INDICES_PER_CELL: usize = 6;
 const QUAD_CAPACITY_GROWTH_GRANULARITY: usize = 128;
+const TEXTURE_ATLAS_BYTES_PER_PIXEL: u64 = 4;
+
+fn texture_atlas_footprint_bytes(side: usize) -> u64 {
+    (side as u64)
+        .saturating_mul(side as u64)
+        .saturating_mul(TEXTURE_ATLAS_BYTES_PER_PIXEL)
+}
+
+fn max_texture_atlas_side_for_budget(budget_bytes: u64) -> usize {
+    let mut side = 1usize;
+    while side <= usize::MAX / 2 {
+        let next = side * 2;
+        if texture_atlas_footprint_bytes(next) > budget_bytes {
+            break;
+        }
+        side = next;
+    }
+    side
+}
+
+fn texture_atlas_vram_budget_bytes() -> u64 {
+    MemoryBudget::default().vram_budget_bytes
+}
+
+fn enforce_texture_atlas_budget(size: usize) -> Result<(), OutOfTextureSpace> {
+    let budget = texture_atlas_vram_budget_bytes();
+    if texture_atlas_footprint_bytes(size) <= budget {
+        return Ok(());
+    }
+
+    Err(OutOfTextureSpace {
+        size: None,
+        current_size: max_texture_atlas_side_for_budget(budget),
+    })
+}
 
 fn build_quad_indices(num_quads: usize) -> Vec<u32> {
     let mut indices = Vec::with_capacity(num_quads * INDICES_PER_CELL);
@@ -99,6 +134,7 @@ impl RenderContext {
     }
 
     pub fn allocate_texture_atlas(&self, size: usize) -> anyhow::Result<Rc<dyn Texture2d>> {
+        enforce_texture_atlas_budget(size)?;
         match self {
             Self::Glium(context) => {
                 let caps = context.get_capabilities();
@@ -801,7 +837,9 @@ impl RenderState {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDICES_PER_CELL, QUAD_CAPACITY_GROWTH_GRANULARITY, build_quad_indices, round_quad_capacity,
+        INDICES_PER_CELL, QUAD_CAPACITY_GROWTH_GRANULARITY, build_quad_indices,
+        enforce_texture_atlas_budget, max_texture_atlas_side_for_budget, round_quad_capacity,
+        texture_atlas_footprint_bytes,
     };
     use crate::quad::{V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT, VERTICES_PER_CELL};
 
@@ -860,5 +898,24 @@ mod tests {
             round_quad_capacity(257),
             QUAD_CAPACITY_GROWTH_GRANULARITY * 3
         );
+    }
+
+    #[test]
+    fn texture_atlas_budget_caps_default_vram_side() {
+        let budget = 256 * 1024 * 1024;
+        let side = max_texture_atlas_side_for_budget(budget);
+
+        assert_eq!(side, 8192);
+        assert_eq!(texture_atlas_footprint_bytes(side), budget);
+        assert!(texture_atlas_footprint_bytes(side * 2) > budget);
+    }
+
+    #[test]
+    fn texture_atlas_budget_rejects_one_gib_atlas_growth() {
+        let err = enforce_texture_atlas_budget(16_384)
+            .expect_err("1 GiB atlas should exceed the default VRAM budget");
+
+        assert_eq!(err.size, None);
+        assert_eq!(err.current_size, 8192);
     }
 }

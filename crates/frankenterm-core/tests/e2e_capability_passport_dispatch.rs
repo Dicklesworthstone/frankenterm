@@ -49,13 +49,7 @@ use frankenterm_core::session_topology::{
 // ── Test fixture helpers ─────────────────────────────────────────────────
 
 fn pane_identity(local_id: u64) -> LifecycleIdentity {
-    LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        "ws-yim20",
-        "local",
-        local_id,
-        1,
-    )
+    LifecycleIdentity::new(LifecycleEntityKind::Pane, "ws-yim20", "local", local_id, 1)
 }
 
 fn make_command(local_id: u64) -> CommandRequest {
@@ -128,10 +122,7 @@ fn build_swarm() -> (HeadlessMuxServer, Arc<PassportStore>) {
     let mut runner_bravo = ProbeRunner::new();
     runner_bravo
         .add_probe(ToolAvailabilityProbe::new("bash", vec!["bash".into()]))
-        .add_probe(ToolAvailabilityProbe::new(
-            "write",
-            vec!["bash".into()],
-        ));
+        .add_probe(ToolAvailabilityProbe::new("write", vec!["bash".into()]));
     let mut bravo_pass = store
         .get(&PassportKey::pane("bravo", 2))
         .expect("bravo registered");
@@ -256,7 +247,10 @@ fn preflight_rpc_reports_present_at_for_partially_declared_passport_yim20() {
     let PreflightOutcome::MissingCapabilities { unmet, present_at } = outcome else {
         panic!("expected MissingCapabilities for bravo write");
     };
-    assert_eq!(unmet, vec![CapabilityClass::ToolAvailability("write".into())]);
+    assert_eq!(
+        unmet,
+        vec![CapabilityClass::ToolAvailability("write".into())]
+    );
     // bravo declared write but the probe couldn't verify it →
     // present_at carries the Declared verification, distinguishing
     // "never declared" from "declared but not verified".

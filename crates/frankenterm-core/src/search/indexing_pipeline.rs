@@ -1320,7 +1320,10 @@ mod tests {
             "br-ft-vnhao: first tick must consume all 150 same-ms lines (extended past limit); got {}",
             report.total_lines_consumed
         );
-        assert_eq!(report.panes_truncated, 1, "br-ft-vnhao: still flagged as truncated for visibility");
+        assert_eq!(
+            report.panes_truncated, 1,
+            "br-ft-vnhao: still flagged as truncated for visibility"
+        );
 
         // Second tick on identical input must process 0 lines —
         // they're all at-or-below the watermark.

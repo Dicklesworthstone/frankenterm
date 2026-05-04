@@ -39,8 +39,7 @@ use frankenterm_core::causal_graph_console::{
     render_robot_toon, render_timeline_text,
 };
 use frankenterm_core::explainability_console::{
-    CausalEvidenceKind, CausalGraphEdge, CausalGraphNode, CausalNodeKind,
-    CausalTraversalDirection,
+    CausalEvidenceKind, CausalGraphEdge, CausalGraphNode, CausalNodeKind, CausalTraversalDirection,
 };
 use proptest::prelude::*;
 
@@ -87,8 +86,7 @@ fn arb_node(idx: usize) -> impl Strategy<Value = CausalGraphNode> {
 }
 
 fn arb_node_set() -> impl Strategy<Value = Vec<CausalGraphNode>> {
-    (1usize..=8)
-        .prop_flat_map(|n| (0..n).map(arb_node).collect::<Vec<_>>())
+    (1usize..=8).prop_flat_map(|n| (0..n).map(arb_node).collect::<Vec<_>>())
 }
 
 proptest! {
@@ -364,8 +362,7 @@ fn uncertainty_marker_classification_thresholds() {
     // 6_000 is LowConfidence → in uncertain_edges.
     // 1_000 is Uncertain → in uncertain_edges.
     assert_eq!(r.uncertain_edges.len(), 2);
-    let markers: Vec<UncertaintyMarker> =
-        r.uncertain_edges.iter().map(|e| e.marker).collect();
+    let markers: Vec<UncertaintyMarker> = r.uncertain_edges.iter().map(|e| e.marker).collect();
     assert!(markers.contains(&UncertaintyMarker::LowConfidence));
     assert!(markers.contains(&UncertaintyMarker::Uncertain));
 }

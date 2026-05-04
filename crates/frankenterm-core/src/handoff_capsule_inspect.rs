@@ -382,11 +382,10 @@ pub fn save_capsule_to_path(
     capsule: &HandoffCapsule,
     path: &std::path::Path,
 ) -> Result<(), CapsuleSaveError> {
-    let bytes =
-        serde_json::to_vec_pretty(capsule).map_err(|source| CapsuleSaveError::Encode {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let bytes = serde_json::to_vec_pretty(capsule).map_err(|source| CapsuleSaveError::Encode {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -595,12 +594,12 @@ pub fn load_and_validate_capsule(
             path: path.to_path_buf(),
             source,
         })?;
-    let outcome = capsule.validate_for_destination(destination_passport).map_err(|source| {
-        CapsuleValidateError::Validation {
+    let outcome = capsule
+        .validate_for_destination(destination_passport)
+        .map_err(|source| CapsuleValidateError::Validation {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     let mut out = CapsuleInspector::at(now_ms).inspect_text(&capsule);
     out.push_str(&render_validation_outcome_text(&outcome));
     Ok(out)
@@ -629,12 +628,12 @@ pub fn load_and_validate_capsule_json(
             path: path.to_path_buf(),
             source,
         })?;
-    let outcome = capsule.validate_for_destination(destination_passport).map_err(|source| {
-        CapsuleValidateError::Validation {
+    let outcome = capsule
+        .validate_for_destination(destination_passport)
+        .map_err(|source| CapsuleValidateError::Validation {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     let inspection = CapsuleInspector::at(now_ms).inspect(&capsule);
     let document = ValidatedCapsuleDocument {
         inspection,
@@ -1190,8 +1189,7 @@ mod tests {
         let path = dir.path().join("capsule.json");
         save_capsule_to_path(&capsule, &path).expect("first save succeeds");
 
-        let err = save_capsule_to_path(&capsule, &path)
-            .expect_err("second save must refuse");
+        let err = save_capsule_to_path(&capsule, &path).expect_err("second save must refuse");
         match err {
             CapsuleSaveError::AlreadyExists { path: p } => assert_eq!(p, path),
             other => panic!("expected AlreadyExists, got {other:?}"),
@@ -1203,9 +1201,8 @@ mod tests {
         let capsule = capsule_with(Vec::new(), 1_000);
         // A path inside a non-existent parent directory triggers a
         // Write error (NotFound on the parent).
-        let path = std::path::PathBuf::from(
-            "/tmp/ft-r6kg2-canary-no-such-dir/handoff/capsule.json",
-        );
+        let path =
+            std::path::PathBuf::from("/tmp/ft-r6kg2-canary-no-such-dir/handoff/capsule.json");
         let err = save_capsule_to_path(&capsule, &path).expect_err("must error");
         match err {
             CapsuleSaveError::Write { path: p, .. } => assert_eq!(p, path),
@@ -1239,8 +1236,7 @@ mod tests {
             1_000,
         );
         let tmp = write_capsule_to_temp(&capsule);
-        let text = load_and_validate_capsule(tmp.path(), None, 2_000)
-            .expect("validation succeeds");
+        let text = load_and_validate_capsule(tmp.path(), None, 2_000).expect("validation succeeds");
         assert!(text.contains("validation: accepted=2 skipped=0 fully_accepted=true"));
         assert!(text.contains("accepted_indices: 0, 1"));
         // Capsule shape header still present from inspect_text prefix.
@@ -1283,8 +1279,8 @@ mod tests {
         let passport = passport_with(vec![CapabilityClass::SafetyConstraint(
             "inherit_mission_state".to_string(),
         )]);
-        let text = load_and_validate_capsule(tmp.path(), Some(&passport), 2_000)
-            .expect("validates");
+        let text =
+            load_and_validate_capsule(tmp.path(), Some(&passport), 2_000).expect("validates");
         assert!(text.contains("validation: accepted=1 skipped=0 fully_accepted=true"));
     }
 
@@ -1311,8 +1307,8 @@ mod tests {
         let passport = passport_with(vec![CapabilityClass::SafetyConstraint(
             "inherit_mission_state".to_string(),
         )]);
-        let text = load_and_validate_capsule(tmp.path(), Some(&passport), 2_000)
-            .expect("validates");
+        let text =
+            load_and_validate_capsule(tmp.path(), Some(&passport), 2_000).expect("validates");
         assert!(text.contains("validation: accepted=2 skipped=1 fully_accepted=false"));
         assert!(text.contains("[skip 2] causal_summary"));
         assert!(text.contains("safety:inherit_causal_summary"));
@@ -1347,10 +1343,9 @@ mod tests {
 
     #[test]
     fn load_and_validate_capsule_returns_read_error_for_missing_path() {
-        let path =
-            std::path::Path::new("/tmp/ft-r6kg2-no-such-file-canary-zzzzzzz");
-        let err = load_and_validate_capsule(path, None, 1_000)
-            .expect_err("missing path must error");
+        let path = std::path::Path::new("/tmp/ft-r6kg2-no-such-file-canary-zzzzzzz");
+        let err =
+            load_and_validate_capsule(path, None, 1_000).expect_err("missing path must error");
         match err {
             CapsuleValidateError::Read { path: p, .. } => assert_eq!(p, path),
             other => panic!("expected Read, got {other:?}"),
@@ -1366,10 +1361,8 @@ mod tests {
             1_000,
         );
         let tmp = write_capsule_to_temp(&capsule);
-        let json = load_and_validate_capsule_json(tmp.path(), None, 2_000)
-            .expect("json validates");
-        let parsed: ValidatedCapsuleDocument =
-            serde_json::from_str(&json).expect("parse envelope");
+        let json = load_and_validate_capsule_json(tmp.path(), None, 2_000).expect("json validates");
+        let parsed: ValidatedCapsuleDocument = serde_json::from_str(&json).expect("parse envelope");
         assert_eq!(parsed.inspection.version, 1);
         assert_eq!(parsed.validation.accepted_count, 1);
         assert_eq!(parsed.validation.skipped_count, 0);
@@ -1385,8 +1378,7 @@ mod tests {
             1_000,
         );
         let tmp = write_capsule_to_temp(&capsule);
-        let json = load_and_validate_capsule_json(tmp.path(), None, 2_000)
-            .expect("json validates");
+        let json = load_and_validate_capsule_json(tmp.path(), None, 2_000).expect("json validates");
         let parsed: ValidatedCapsuleDocument = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.validation.skipped.len(), 1);
         let skip = &parsed.validation.skipped[0];
@@ -1403,8 +1395,7 @@ mod tests {
     /// landed in `accepted` or `skipped`.
     #[test]
     fn load_and_validate_capsule_does_not_leak_planted_credential_ft_r6kg2() {
-        const PLANTED: &str =
-            "ANTHROPIC_API_KEY=sk-fake-r6kg2-canary-1122334455MNOPQRSTUVWX";
+        const PLANTED: &str = "ANTHROPIC_API_KEY=sk-fake-r6kg2-canary-1122334455MNOPQRSTUVWX";
         let capsule = capsule_with(
             vec![
                 CapsuleSection::ContextSummary {

@@ -1472,11 +1472,7 @@ impl EventBus {
         tracker.record_send();
         match crate::runtime_async::broadcast_send(sender, event) {
             Ok(count) => {
-                Self::record_timestamp(
-                    times,
-                    self.capacity,
-                    &self.metrics.bus_lock_poisoned_count,
-                );
+                Self::record_timestamp(times, self.capacity, &self.metrics.bus_lock_poisoned_count);
                 count
             }
             Err(_) => {
@@ -3011,7 +3007,10 @@ mod tests {
             let _guard = times.lock().unwrap();
             panic!("br-ft-skec1 force-poison");
         }));
-        assert!(times.is_poisoned(), "panic-while-held must poison the mutex");
+        assert!(
+            times.is_poisoned(),
+            "panic-while-held must poison the mutex"
+        );
 
         let poison_counter = AtomicU64::new(0);
         // queued_len > 0 forces the function past the early-return.
@@ -5331,7 +5330,10 @@ mod tests {
             delivered_second, 0,
             "duplicate delta must short-circuit at dedup gate (got delivered={delivered_second})"
         );
-        assert_eq!(snap.events_published, 2, "both publishes count toward published");
+        assert_eq!(
+            snap.events_published, 2,
+            "both publishes count toward published"
+        );
         assert!(
             snap.events_dropped_dedup >= 1,
             "br-ft-8cyii: dedup-drop counter must increment on duplicate delta \
@@ -5377,8 +5379,7 @@ mod tests {
             json.contains("events_dropped_dedup"),
             "snapshot JSON must include events_dropped_dedup field; got {json}"
         );
-        let parsed: MetricsSnapshot =
-            serde_json::from_str(&json).expect("snapshot deserializes");
+        let parsed: MetricsSnapshot = serde_json::from_str(&json).expect("snapshot deserializes");
         assert_eq!(parsed.events_dropped_dedup, snap.events_dropped_dedup);
     }
 
@@ -5397,7 +5398,10 @@ mod tests {
         let parsed: MetricsSnapshot =
             serde_json::from_str(old_json).expect("old format must still deserialize");
         assert_eq!(parsed.events_published, 100);
-        assert_eq!(parsed.events_dropped_dedup, 0, "missing field defaults to 0");
+        assert_eq!(
+            parsed.events_dropped_dedup, 0,
+            "missing field defaults to 0"
+        );
         assert_eq!(parsed.events_delivered, 0, "missing field defaults to 0");
     }
 
@@ -5562,17 +5566,14 @@ mod tests {
 
         // br-ft-2z16v closed forensic invariant.
         let lhs = snap.events_published;
-        let rhs = snap.events_delivered
-            + snap.events_dropped_no_subscribers
-            + snap.events_dropped_dedup;
+        let rhs =
+            snap.events_delivered + snap.events_dropped_no_subscribers + snap.events_dropped_dedup;
         assert_eq!(
             lhs, rhs,
             "br-ft-2z16v: forensic invariant must hold — \
              events_published ({lhs}) == events_delivered ({}) + \
              events_dropped_no_subscribers ({}) + events_dropped_dedup ({}) = {rhs}",
-            snap.events_delivered,
-            snap.events_dropped_no_subscribers,
-            snap.events_dropped_dedup,
+            snap.events_delivered, snap.events_dropped_no_subscribers, snap.events_dropped_dedup,
         );
     }
 

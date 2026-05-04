@@ -797,9 +797,12 @@ impl Domain for RemoteSshDomain {
 
         let writer = WriterWrapper::new(writer);
 
+        let command_description = "RemoteSshDomain".to_string();
+        let term_config =
+            config::TermConfig::new_for_pane(pane_id, self.id, command_description.clone());
         let terminal = frankenterm_term::Terminal::new(
             size,
-            std::sync::Arc::new(config::TermConfig::new()),
+            std::sync::Arc::new(term_config),
             "WezTerm",
             config::wezterm_version(),
             Box::new(writer.clone()),
@@ -812,7 +815,7 @@ impl Domain for RemoteSshDomain {
             pty,
             Box::new(writer),
             self.id,
-            "RemoteSshDomain".to_string(),
+            command_description,
         ));
         let mux = Mux::try_get()
             .ok_or_else(|| anyhow::anyhow!("cannot add SSH pane: no mux configured"))?;

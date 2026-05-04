@@ -112,8 +112,8 @@ fn bench_bridge_with_placeholder_alloc(c: &mut Criterion) {
             // ships it (sans the closure indirection so the
             // benched cost is the wrap mechanics, not the call
             // site's lambda overhead).
-            let placeholder = Connection::open_in_memory()
-                .expect("placeholder Connection for bridge dance");
+            let placeholder =
+                Connection::open_in_memory().expect("placeholder Connection for bridge dance");
             let owned = std::mem::replace(&mut conn, placeholder);
             let backend = RusqliteBackend::new(owned);
             execute_typed(&backend, UPDATE_SQL, &[ToSqlValue::Text(SESSION_ID)])
@@ -136,9 +136,8 @@ fn bench_bridge_with_placeholder_alloc(c: &mut Criterion) {
 /// `cached_placeholder = Some(open_in_memory())`).
 fn bench_bridge_without_placeholder_alloc(c: &mut Criterion) {
     let mut conn = fresh_seeded_conn();
-    let mut cached_placeholder = Some(
-        Connection::open_in_memory().expect("cache the placeholder once"),
-    );
+    let mut cached_placeholder =
+        Some(Connection::open_in_memory().expect("cache the placeholder once"));
     c.bench_function("writer_bridge/with_writer_backend_dance_cached", |b| {
         b.iter(|| {
             // Borrow the cached placeholder out of its slot.
@@ -155,8 +154,7 @@ fn bench_bridge_without_placeholder_alloc(c: &mut Criterion) {
             // placeholder from the slot in a single swap. Now
             // the placeholder is in `recovered_placeholder` and
             // can go back into the cache for the next iter.
-            let recovered_placeholder =
-                std::mem::replace(&mut conn, backend.into_connection());
+            let recovered_placeholder = std::mem::replace(&mut conn, backend.into_connection());
             cached_placeholder = Some(recovered_placeholder);
             black_box(&conn);
         });

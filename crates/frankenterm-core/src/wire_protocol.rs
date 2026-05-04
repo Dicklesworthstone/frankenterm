@@ -464,8 +464,7 @@ impl AgentStreamer {
                     // Count + log the saturation so it doesn't disappear into
                     // a silent "messages_sent stopped going up" mystery; see
                     // `messages_seq_exhausted()` for semantics.
-                    self.messages_seq_exhausted =
-                        self.messages_seq_exhausted.saturating_add(1);
+                    self.messages_seq_exhausted = self.messages_seq_exhausted.saturating_add(1);
                     if self.messages_seq_exhausted == 1 {
                         // Once-per-streamer warning. The condition is
                         // permanent (seq never decreases), so subsequent

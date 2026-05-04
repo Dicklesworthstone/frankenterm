@@ -986,8 +986,7 @@ fn record_mcp_audit_sync(
     let decision = if ok { "allow" } else { "deny" };
     let result = if ok { "success" } else { "error" };
     let spawn_tool_name = tool_name.clone();
-    let retry_window =
-        max_retry_duration.unwrap_or_else(|| std::time::Duration::from_secs(10));
+    let retry_window = max_retry_duration.unwrap_or_else(|| std::time::Duration::from_secs(10));
 
     // Spawn a background task to record audit — non-blocking, fire-and-forget
     if let Err(e) = std::thread::Builder::new()

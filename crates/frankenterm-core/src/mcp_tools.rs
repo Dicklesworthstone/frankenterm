@@ -3021,7 +3021,6 @@ impl ToolHandler for WaWorkflowRunTool {
                 "properties": {
                     "name": { "type": "string", "description": "Workflow name" },
                     "pane_id": { "type": "integer", "minimum": 0, "description": "Target pane ID" },
-                    "force": { "type": "boolean", "default": false, "description": "Force run (bypass handled guard)" },
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview without executing" }
                 },
                 "required": ["name", "pane_id"],
@@ -3048,7 +3047,7 @@ impl ToolHandler for WaWorkflowRunTool {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
                     format!("Invalid params: {err}"),
-                    Some("Expected object with name, pane_id, force, dry_run".to_string()),
+                    Some("Expected object with name, pane_id, dry_run".to_string()),
                     elapsed_ms(start),
                 );
                 return envelope_to_content(envelope);
@@ -3189,7 +3188,6 @@ impl ToolHandler for WaWorkflowRunTool {
                     });
                 }
 
-                let _ = params.force;
                 let runner = workflow_assembly.runner();
                 let workflow = runner.find_workflow_by_name(&params.name).ok_or_else(|| {
                     McpToolError::new(
@@ -7553,6 +7551,18 @@ mod tests {
     }
 
     #[test]
+    fn workflow_run_definition_does_not_advertise_ignored_force() {
+        let def = WaWorkflowRunTool::new(config(), db_path()).definition();
+
+        assert_eq!(def.name, "wa.workflow_run");
+        assert_eq!(def.input_schema["additionalProperties"], false);
+        assert!(def.input_schema["properties"].get("name").is_some());
+        assert!(def.input_schema["properties"].get("pane_id").is_some());
+        assert!(def.input_schema["properties"].get("dry_run").is_some());
+        assert!(def.input_schema["properties"].get("force").is_none());
+    }
+
+    #[test]
     fn workflow_status_requires_filter_param() {
         let tool = WaWorkflowStatusTool::new(db_path());
 
@@ -9111,11 +9121,7 @@ exit 17",
                 .await
                 .expect("storage should open");
             storage
-                .append_segment(
-                    pane_id,
-                    "distributed-pane-needle-marker-9ia4p",
-                    None,
-                )
+                .append_segment(pane_id, "distributed-pane-needle-marker-9ia4p", None)
                 .await
                 .expect("output segment should append");
             let _ = storage.shutdown().await;

@@ -65,15 +65,19 @@ fn arb_capability_entry() -> impl Strategy<Value = CapabilityEntry> {
         ],
         proptest::option::of(0u64..=10_000_000_000_u64),
     )
-        .prop_map(|(class, verification, last_observed_at_ms)| CapabilityEntry {
-            class,
-            verification,
-            last_observed_at_ms,
-            proof: RedactedProof::empty(),
-        })
+        .prop_map(
+            |(class, verification, last_observed_at_ms)| CapabilityEntry {
+                class,
+                verification,
+                last_observed_at_ms,
+                proof: RedactedProof::empty(),
+            },
+        )
 }
 
-fn arb_passport_with_caps(cap_range: std::ops::RangeInclusive<usize>) -> impl Strategy<Value = CapabilityPassport> {
+fn arb_passport_with_caps(
+    cap_range: std::ops::RangeInclusive<usize>,
+) -> impl Strategy<Value = CapabilityPassport> {
     (
         "[a-zA-Z0-9_-]{1,32}",
         proptest::option::of(1u64..=10_000),
@@ -81,13 +85,15 @@ fn arb_passport_with_caps(cap_range: std::ops::RangeInclusive<usize>) -> impl St
         0u64..1_000,
         0u64..=10_000_000_000_u64,
     )
-        .prop_map(|(agent_id, pane_id, capabilities, generation, signed_at_ms)| CapabilityPassport {
-            agent_id,
-            pane_id,
-            capabilities,
-            generation,
-            signed_at_ms,
-        })
+        .prop_map(
+            |(agent_id, pane_id, capabilities, generation, signed_at_ms)| CapabilityPassport {
+                agent_id,
+                pane_id,
+                capabilities,
+                generation,
+                signed_at_ms,
+            },
+        )
 }
 
 fn arb_capsule_section() -> impl Strategy<Value = CapsuleSection> {

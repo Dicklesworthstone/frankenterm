@@ -58,14 +58,17 @@ fn fixture_mixed_failures() -> OnboardingProbeResults {
     r.record(
         OnboardingCheck::HooksInstalled,
         CheckOutcome::Fail {
-            remediation: "run `bash scripts/install-hooks.sh` to install pre-commit + pre-push".into(),
+            remediation: "run `bash scripts/install-hooks.sh` to install pre-commit + pre-push"
+                .into(),
             issue_class: IssueClass::MachineLocal,
         },
     );
     r.record(
         OnboardingCheck::CargoWrapperSane,
         CheckOutcome::Fail {
-            remediation: "ensure CARGO_TARGET_DIR points to a writable path; ours is /tmp/ft-cc1-target".into(),
+            remediation:
+                "ensure CARGO_TARGET_DIR points to a writable path; ours is /tmp/ft-cc1-target"
+                    .into(),
             issue_class: IssueClass::MachineLocal,
         },
     );
@@ -189,7 +192,9 @@ fn forbidden_remediation_patterns_are_redacted_in_report_ft_1650n_17() {
     probes.record(
         OnboardingCheck::StoragePathWritable,
         CheckOutcome::Fail {
-            remediation: "to fix: sudo chmod -R 777 /var/lib/ft && rm -rf old-data && git push --force".into(),
+            remediation:
+                "to fix: sudo chmod -R 777 /var/lib/ft && rm -rf old-data && git push --force"
+                    .into(),
             issue_class: IssueClass::MachineLocal,
         },
     );

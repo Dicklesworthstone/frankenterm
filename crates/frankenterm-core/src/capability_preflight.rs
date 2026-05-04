@@ -244,7 +244,11 @@ mod tests {
         store
     }
 
-    fn entry(class: CapabilityClass, v: CapabilityVerification, observed_ms: Option<u64>) -> CapabilityEntry {
+    fn entry(
+        class: CapabilityClass,
+        v: CapabilityVerification,
+        observed_ms: Option<u64>,
+    ) -> CapabilityEntry {
         CapabilityEntry {
             class,
             verification: v,
@@ -253,7 +257,11 @@ mod tests {
         }
     }
 
-    fn passport_with(agent: &str, pane: Option<u64>, capabilities: Vec<CapabilityEntry>) -> CapabilityPassport {
+    fn passport_with(
+        agent: &str,
+        pane: Option<u64>,
+        capabilities: Vec<CapabilityEntry>,
+    ) -> CapabilityPassport {
         CapabilityPassport {
             agent_id: agent.into(),
             pane_id: pane,
@@ -331,11 +339,17 @@ mod tests {
         let PreflightOutcome::MissingCapabilities { unmet, present_at } = outcome else {
             panic!("expected MissingCapabilities");
         };
-        assert_eq!(unmet, vec![CapabilityClass::ToolAvailability("write".into())]);
+        assert_eq!(
+            unmet,
+            vec![CapabilityClass::ToolAvailability("write".into())]
+        );
         // present_at carries None for the missing class — distinguishes
         // "never declared" from "declared but not verified".
         assert_eq!(present_at.len(), 1);
-        assert_eq!(present_at[0].0, CapabilityClass::ToolAvailability("write".into()));
+        assert_eq!(
+            present_at[0].0,
+            CapabilityClass::ToolAvailability("write".into())
+        );
         assert_eq!(present_at[0].1, None);
     }
 
@@ -380,7 +394,11 @@ mod tests {
             &[CapabilityClass::ToolAvailability("bash".into())],
             10_000,
         );
-        let PreflightOutcome::StalePassport { oldest_observed_at_ms, max_age_ms } = outcome else {
+        let PreflightOutcome::StalePassport {
+            oldest_observed_at_ms,
+            max_age_ms,
+        } = outcome
+        else {
             panic!("expected StalePassport (got {outcome:?})");
         };
         assert_eq!(oldest_observed_at_ms, 1_000);
@@ -417,7 +435,10 @@ mod tests {
             10_000,
         );
         match outcome {
-            PreflightOutcome::StalePassport { oldest_observed_at_ms, .. } => {
+            PreflightOutcome::StalePassport {
+                oldest_observed_at_ms,
+                ..
+            } => {
                 assert_eq!(oldest_observed_at_ms, 2_000);
             }
             other => panic!("expected StalePassport carrying oldest=2000 (got {other:?})"),
@@ -539,7 +560,10 @@ mod tests {
     #[test]
     fn outcome_labels_are_stable_strings() {
         assert_eq!(PreflightOutcome::Allowed.label(), "allowed");
-        assert_eq!(PreflightOutcome::MissingPassport.label(), "missing_passport");
+        assert_eq!(
+            PreflightOutcome::MissingPassport.label(),
+            "missing_passport"
+        );
         assert_eq!(
             PreflightOutcome::StalePassport {
                 oldest_observed_at_ms: 0,
@@ -556,6 +580,9 @@ mod tests {
             .label(),
             "missing_capabilities"
         );
-        assert_eq!(PreflightOutcome::StoreUnavailable.label(), "store_unavailable");
+        assert_eq!(
+            PreflightOutcome::StoreUnavailable.label(),
+            "store_unavailable"
+        );
     }
 }

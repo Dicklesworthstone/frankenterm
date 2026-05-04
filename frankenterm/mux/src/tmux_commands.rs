@@ -256,9 +256,15 @@ impl TmuxDomainState {
             child_state,
         );
 
+        let command_description = "tmux pane".to_string();
+        let term_config = config::TermConfig::new_for_pane(
+            local_pane_id,
+            self.domain_id,
+            command_description.clone(),
+        );
         let terminal = frankenterm_term::Terminal::new(
             size,
-            std::sync::Arc::new(config::TermConfig::new()),
+            std::sync::Arc::new(term_config),
             "WezTerm",
             config::wezterm_version(),
             Box::new(writer.clone()),
@@ -271,7 +277,7 @@ impl TmuxDomainState {
             Box::new(pane_pty),
             Box::new(writer),
             self.domain_id,
-            "tmux pane".to_string(),
+            command_description,
         )))
     }
 

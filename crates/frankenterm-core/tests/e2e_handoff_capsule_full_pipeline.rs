@@ -40,13 +40,7 @@ use frankenterm_core::session_topology::{
 // ── Fixture helpers ────────────────────────────────────────────────────
 
 fn actor_identity() -> LifecycleIdentity {
-    LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        "ws-pipeline",
-        "local",
-        11,
-        1,
-    )
+    LifecycleIdentity::new(LifecycleEntityKind::Pane, "ws-pipeline", "local", 11, 1)
 }
 
 fn actor_key() -> PassportKey {
@@ -84,9 +78,9 @@ impl frankenterm_core::capability_probe::CapabilityProbe for SafetyConstraintPro
         &self,
         _deadline: std::time::Instant,
     ) -> frankenterm_core::capability_probe::ProbeOutcome {
-        frankenterm_core::capability_probe::ProbeOutcome::Verified(
-            RedactedProof::from_value(self.name.as_bytes()),
-        )
+        frankenterm_core::capability_probe::ProbeOutcome::Verified(RedactedProof::from_value(
+            self.name.as_bytes(),
+        ))
     }
 }
 fn probe_for_safety(name: &str) -> SafetyConstraintProbe {
@@ -193,7 +187,10 @@ fn full_pipeline_register_promote_apply_then_preflight_allows_inherited_dispatch
 
     // Inherited passport is now visible in the store.
     let inherited = store.get(&inherited_pane_key()).expect("inherited present");
-    assert_eq!(inherited.capabilities[0].verification, CapabilityVerification::Verified);
+    assert_eq!(
+        inherited.capabilities[0].verification,
+        CapabilityVerification::Verified
+    );
 
     // Step 4: PassportPreflight against the inherited key for its
     // newly-Verified ToolAvailability("bash") — Allowed.

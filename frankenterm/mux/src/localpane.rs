@@ -377,7 +377,7 @@ impl Pane for LocalPane {
     }
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
-        crate::pane::impl_get_lines_via_with_lines(self, lines)
+        terminal_get_lines(&mut self.terminal.lock(), lines)
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {

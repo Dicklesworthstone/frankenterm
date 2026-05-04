@@ -261,7 +261,10 @@ impl CanaryRolloutConfig {
                     reason: AllowlistEntryError::EmptyOrWhitespace,
                 });
             }
-            if let Some(j) = self.canary_agent_allowlist[..i].iter().position(|e| e == raw) {
+            if let Some(j) = self.canary_agent_allowlist[..i]
+                .iter()
+                .position(|e| e == raw)
+            {
                 return Err(CanaryConfigError::InvalidAllowlistEntry {
                     index: i,
                     reason: AllowlistEntryError::Duplicate { first_index: j },
@@ -1678,11 +1681,7 @@ mod tests {
     #[test]
     fn allowlist_duplicate_entry_rejected() {
         let config = CanaryRolloutConfig {
-            canary_agent_allowlist: vec![
-                "a1".to_string(),
-                "a2".to_string(),
-                "a1".to_string(),
-            ],
+            canary_agent_allowlist: vec!["a1".to_string(), "a2".to_string(), "a1".to_string()],
             ..Default::default()
         };
         let err = CanaryRolloutController::try_new(config).expect_err("duplicate must reject");
@@ -1702,11 +1701,7 @@ mod tests {
         // agent. Now stale entries are dropped and surfaced via
         // stale_allowlist_agents() so operators can spot drift.
         let config = CanaryRolloutConfig {
-            canary_agent_allowlist: vec![
-                "a1".to_string(),
-                "a2".to_string(),
-                "ghost".to_string(),
-            ],
+            canary_agent_allowlist: vec!["a1".to_string(), "a2".to_string(), "ghost".to_string()],
             ..Default::default()
         };
         let mut ctrl = CanaryRolloutController::new(config);
@@ -2227,11 +2222,15 @@ mod tests {
             "br-ft-q5sn3: Shadow + unexpected_executions must mark unhealthy"
         );
         assert!(
-            check.failure_reasons.contains(&HealthFailureReason::UnexpectedExecutions),
+            check
+                .failure_reasons
+                .contains(&HealthFailureReason::UnexpectedExecutions),
             "br-ft-q5sn3: UnexpectedExecutions reason must fire in Shadow"
         );
         assert!(
-            check.failure_reasons.contains(&HealthFailureReason::ShadowDispatchLeak),
+            check
+                .failure_reasons
+                .contains(&HealthFailureReason::ShadowDispatchLeak),
             "br-ft-q5sn3: ShadowDispatchLeak must fire when Shadow sees unexpected executions"
         );
     }
@@ -2244,7 +2243,9 @@ mod tests {
         let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
         let check = controller.compute_health_check(1, 1000, &diff, &metrics);
         assert!(
-            check.failure_reasons.contains(&HealthFailureReason::ShadowDispatchLeak),
+            check
+                .failure_reasons
+                .contains(&HealthFailureReason::ShadowDispatchLeak),
             "br-ft-q5sn3: Shadow + execution_rejections > 0 must trigger ShadowDispatchLeak"
         );
     }
@@ -2279,11 +2280,15 @@ mod tests {
         let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
         let check = controller.compute_health_check(1, 1000, &diff, &metrics);
         assert!(
-            check.failure_reasons.contains(&HealthFailureReason::UnexpectedExecutions),
+            check
+                .failure_reasons
+                .contains(&HealthFailureReason::UnexpectedExecutions),
             "Canary + unexpected_executions must trigger UnexpectedExecutions"
         );
         assert!(
-            !check.failure_reasons.contains(&HealthFailureReason::ShadowDispatchLeak),
+            !check
+                .failure_reasons
+                .contains(&HealthFailureReason::ShadowDispatchLeak),
             "br-ft-q5sn3: ShadowDispatchLeak is Shadow-only; must NOT fire in Canary"
         );
     }

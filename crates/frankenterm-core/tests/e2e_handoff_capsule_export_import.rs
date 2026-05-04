@@ -22,14 +22,12 @@
 
 use std::time::Duration;
 
-use frankenterm_core::capability_passport::{
-    CapabilityClass, CapabilityVerification,
-};
+use frankenterm_core::capability_passport::{CapabilityClass, CapabilityVerification};
 use frankenterm_core::capability_passport_store::PassportKey;
 use frankenterm_core::capability_probe::{ProbeRunner, ToolAvailabilityProbe};
 use frankenterm_core::handoff_capsule::{
-    CapsuleEndpoint, CapsuleSection, CapsuleValidationError, HandoffCapsule,
-    HANDOFF_CAPSULE_VERSION,
+    CapsuleEndpoint, CapsuleSection, CapsuleValidationError, HANDOFF_CAPSULE_VERSION,
+    HandoffCapsule,
 };
 
 // ── Fixture helpers ─────────────────────────────────────────────────────
@@ -317,12 +315,9 @@ fn end_to_end_serialize_transmit_deserialize_validate_yqupz() {
     // SSH-piped JSON, USB-stick file transfer, etc.
 
     // Destination: deserialize + validate.
-    let dest_capsule: HandoffCapsule =
-        serde_json::from_slice(&wire_bytes).expect("deserialize");
-    let dest_passport = dest_passport_with_partial_safety(&[
-        "inherit_mission_state",
-        "accept_passport_excerpt",
-    ]);
+    let dest_capsule: HandoffCapsule = serde_json::from_slice(&wire_bytes).expect("deserialize");
+    let dest_passport =
+        dest_passport_with_partial_safety(&["inherit_mission_state", "accept_passport_excerpt"]);
     let outcome = dest_capsule
         .validate_for_destination(Some(&dest_passport))
         .expect("validate ok");

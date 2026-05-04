@@ -300,10 +300,7 @@ pub fn cell_string(row: &[SqlCell], idx: usize) -> Result<String, BackendError> 
 /// - `SqlCell::Null` → `None`
 /// - `SqlCell::Text(s)` → `Some(s)` (including `Some(String::new())`)
 /// - any other variant → [`BackendError::Query`]
-pub fn cell_optional_string(
-    row: &[SqlCell],
-    idx: usize,
-) -> Result<Option<String>, BackendError> {
+pub fn cell_optional_string(row: &[SqlCell], idx: usize) -> Result<Option<String>, BackendError> {
     match cell_at(row, idx)? {
         SqlCell::Null => Ok(None),
         SqlCell::Text(s) => Ok(Some(s.clone())),
@@ -329,10 +326,7 @@ pub fn cell_i64(row: &[SqlCell], idx: usize) -> Result<i64, BackendError> {
 }
 
 /// Read a column as `Option<i64>`. NULL → None.
-pub fn cell_optional_i64(
-    row: &[SqlCell],
-    idx: usize,
-) -> Result<Option<i64>, BackendError> {
+pub fn cell_optional_i64(row: &[SqlCell], idx: usize) -> Result<Option<i64>, BackendError> {
     match cell_at(row, idx)? {
         SqlCell::Null => Ok(None),
         SqlCell::Integer(i) => Ok(Some(*i)),

@@ -925,10 +925,8 @@ impl HeadlessMuxServer {
                                 CapsuleSection::PassportExcerpt {
                                     passport: excerpt_passport,
                                 } => {
-                                    let store_ref = self
-                                        .passport_preflight
-                                        .as_ref()
-                                        .map(|c| c.store());
+                                    let store_ref =
+                                        self.passport_preflight.as_ref().map(|c| c.store());
                                     let result = if let Some(store) = store_ref {
                                         apply_passport_excerpt_to_store(section, store)
                                     } else {
@@ -983,7 +981,9 @@ impl HeadlessMuxServer {
                     Err(CapsuleValidationError::IntegrityMismatch { .. }) => {
                         RemoteResponse::Error {
                             code: "capsule_integrity_mismatch".into(),
-                            message: "handoff capsule integrity hash did not match recomputed digest".into(),
+                            message:
+                                "handoff capsule integrity hash did not match recomputed digest"
+                                    .into(),
                         }
                     }
                     Err(CapsuleValidationError::UnsupportedVersion { got, expected }) => {
@@ -2343,10 +2343,7 @@ mod tests {
         }
     }
 
-    fn build_handoff_capsule(
-        sections: Vec<CapsuleSection>,
-        actor_pane_id: u64,
-    ) -> HandoffCapsule {
+    fn build_handoff_capsule(sections: Vec<CapsuleSection>, actor_pane_id: u64) -> HandoffCapsule {
         HandoffCapsule::build(
             CapsuleEndpoint {
                 agent_id: "source-agent".into(),
@@ -2370,8 +2367,8 @@ mod tests {
     fn apply_handoff_capsule_inserts_passport_excerpt_into_store_ft_1650n_5() {
         let store = Arc::new(PassportStore::new());
         store.insert(handoff_actor_passport_with(&["accept_passport_excerpt"]));
-        let mut server = HeadlessMuxServer::new(ServerConfig::default())
-            .with_passport_store(store.clone());
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store.clone());
 
         let inherited = passport_excerpt_to_inherit(1);
         let capsule = build_handoff_capsule(
@@ -2410,8 +2407,8 @@ mod tests {
     fn apply_handoff_capsule_is_idempotent_on_repeated_apply_ft_1650n_5() {
         let store = Arc::new(PassportStore::new());
         store.insert(handoff_actor_passport_with(&["accept_passport_excerpt"]));
-        let mut server = HeadlessMuxServer::new(ServerConfig::default())
-            .with_passport_store(store.clone());
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store.clone());
 
         let capsule = build_handoff_capsule(
             vec![CapsuleSection::PassportExcerpt {
@@ -2445,8 +2442,8 @@ mod tests {
         // Actor has NO accept_passport_excerpt capability.
         let store = Arc::new(PassportStore::new());
         store.insert(handoff_actor_passport_with(&["unrelated_constraint"]));
-        let mut server = HeadlessMuxServer::new(ServerConfig::default())
-            .with_passport_store(store.clone());
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store.clone());
 
         let inherited = passport_excerpt_to_inherit(1);
         let capsule = build_handoff_capsule(
@@ -2469,7 +2466,11 @@ mod tests {
         assert!(summary.passport_excerpt_applies.is_empty());
 
         // Store does NOT contain the inherited passport.
-        assert!(store.get(&PassportKey::pane("inherited-agent", 99)).is_none());
+        assert!(
+            store
+                .get(&PassportKey::pane("inherited-agent", 99))
+                .is_none()
+        );
     }
 
     /// Tampered capsule produces capsule_integrity_mismatch error
@@ -2478,8 +2479,8 @@ mod tests {
     fn apply_handoff_capsule_integrity_mismatch_short_circuits_ft_1650n_5() {
         let store = Arc::new(PassportStore::new());
         store.insert(handoff_actor_passport_with(&["accept_passport_excerpt"]));
-        let mut server = HeadlessMuxServer::new(ServerConfig::default())
-            .with_passport_store(store.clone());
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store.clone());
 
         let mut capsule = build_handoff_capsule(
             vec![CapsuleSection::PassportExcerpt {
@@ -2504,7 +2505,11 @@ mod tests {
             other => panic!("expected integrity_mismatch error, got {other:?}"),
         }
         // Store untouched.
-        assert!(store.get(&PassportKey::pane("inherited-agent", 99)).is_none());
+        assert!(
+            store
+                .get(&PassportKey::pane("inherited-agent", 99))
+                .is_none()
+        );
     }
 
     /// Sections of kind other than PassportExcerpt land in the
@@ -2520,14 +2525,11 @@ mod tests {
             "accept_passport_excerpt",
             "inherit_causal_summary",
         ]));
-        let mut server = HeadlessMuxServer::new(ServerConfig::default())
-            .with_passport_store(store);
+        let mut server = HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
 
         let capsule = build_handoff_capsule(
             vec![
-                CapsuleSection::ContextSummary {
-                    text: "ctx".into(),
-                },
+                CapsuleSection::ContextSummary { text: "ctx".into() },
                 CapsuleSection::PassportExcerpt {
                     passport: passport_excerpt_to_inherit(1),
                 },

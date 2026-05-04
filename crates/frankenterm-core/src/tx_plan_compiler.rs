@@ -1352,11 +1352,7 @@ mod tests {
             make_assignment(""),
             make_assignment("b2"),
         ];
-        let result = compile_tx_plan_strict(
-            "p",
-            &assignments,
-            &CompilerConfig::default(),
-        );
+        let result = compile_tx_plan_strict("p", &assignments, &CompilerConfig::default());
         match result {
             Err(TxPlanCompileError::EmptyBeadId { assignment_index }) => {
                 assert_eq!(assignment_index, 1);
@@ -1372,11 +1368,7 @@ mod tests {
             make_assignment("b1"),
             make_assignment("b0"), // duplicate of index 0
         ];
-        let result = compile_tx_plan_strict(
-            "p",
-            &assignments,
-            &CompilerConfig::default(),
-        );
+        let result = compile_tx_plan_strict("p", &assignments, &CompilerConfig::default());
         match result {
             Err(TxPlanCompileError::DuplicateBeadId {
                 bead_id,
@@ -1398,12 +1390,8 @@ mod tests {
             make_assignment("b1"),
             make_assignment("b2"),
         ];
-        let plan = compile_tx_plan_strict(
-            "p",
-            &assignments,
-            &CompilerConfig::default(),
-        )
-        .expect("strict mode accepts unique non-empty bead_ids");
+        let plan = compile_tx_plan_strict("p", &assignments, &CompilerConfig::default())
+            .expect("strict mode accepts unique non-empty bead_ids");
         assert_eq!(plan.steps.len(), 3);
         // All step ids unique post-compile.
         let mut ids: Vec<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();

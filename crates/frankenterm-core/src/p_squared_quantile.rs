@@ -110,8 +110,8 @@ impl PSquaredEstimator {
                 for i in 0..MARKER_COUNT {
                     self.q[i] = sorted[i];
                     self.n[i] = i as f64;
-                    self.n_desired[i] = (i as f64) * (MARKER_COUNT as f64 - 1.0)
-                        / (MARKER_COUNT as f64 - 1.0); // 0,1,2,3,4 initially
+                    self.n_desired[i] =
+                        (i as f64) * (MARKER_COUNT as f64 - 1.0) / (MARKER_COUNT as f64 - 1.0); // 0,1,2,3,4 initially
                 }
                 // n_desired refines based on quantile after the first record.
                 self.n_desired[0] = 0.0;
@@ -226,8 +226,7 @@ fn parabolic(d: f64, q: &[f64; MARKER_COUNT], n: &[f64; MARKER_COUNT], i: usize)
     let nm = n[i - 1];
     let np = n[i + 1];
     qi + d / (np - nm)
-        * ((ni - nm + d) * (qp - qi) / (np - ni)
-            + (np - ni - d) * (qi - qm) / (ni - nm))
+        * ((ni - nm + d) * (qp - qi) / (np - ni) + (np - ni - d) * (qi - qm) / (ni - nm))
 }
 
 fn linear(d: f64, q: &[f64; MARKER_COUNT], n: &[f64; MARKER_COUNT], i: usize) -> f64 {

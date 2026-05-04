@@ -19,9 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability_passport::{
-    CapabilityEntry, CapabilityPassport, CapabilityVerification,
-};
+use crate::capability_passport::{CapabilityEntry, CapabilityPassport, CapabilityVerification};
 
 /// Default freshness window the renderer consults when deciding
 /// whether to mark an entry's `freshness` as `fresh`, `stale`, or

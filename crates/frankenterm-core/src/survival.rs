@@ -873,7 +873,10 @@ impl SurvivalModel {
             .fetch_add(1, Ordering::Relaxed);
 
         {
-            let mut observations = self.observations.write().unwrap_or_else(record_poison_and_recover);
+            let mut observations = self
+                .observations
+                .write()
+                .unwrap_or_else(record_poison_and_recover);
             observations.push(obs);
 
             // Trim to max capacity (keep most recent)
@@ -1090,12 +1093,18 @@ impl SurvivalModel {
     ///
     /// Uses a single gradient step per call (online learning).
     fn update_parameters(&self) {
-        let observations = self.observations.read().unwrap_or_else(record_poison_and_recover);
+        let observations = self
+            .observations
+            .read()
+            .unwrap_or_else(record_poison_and_recover);
         if observations.is_empty() {
             return;
         }
 
-        let mut params = self.params.write().unwrap_or_else(record_poison_and_recover);
+        let mut params = self
+            .params
+            .write()
+            .unwrap_or_else(record_poison_and_recover);
         let lr = self.config.learning_rate;
 
         // Compute gradient of log-likelihood w.r.t. beta

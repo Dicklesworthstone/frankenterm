@@ -112,7 +112,10 @@ impl EventCuckooDedup {
     /// Create a new dedup with explicit CuckooConfig.
     #[must_use]
     pub fn with_config(config: CuckooConfig) -> Self {
-        let expected = config.num_buckets.saturating_mul(config.bucket_size).max(16);
+        let expected = config
+            .num_buckets
+            .saturating_mul(config.bucket_size)
+            .max(16);
         Self {
             filter: CuckooFilter::with_config(config),
             expected_items: expected,

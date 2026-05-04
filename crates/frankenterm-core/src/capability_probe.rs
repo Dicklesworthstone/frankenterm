@@ -126,7 +126,11 @@ impl CapabilityProbe for ToolAvailabilityProbe {
     }
 
     fn probe(&self, _deadline: Instant) -> ProbeOutcome {
-        if self.available_tools.iter().any(|t| t == &self.requested_tool) {
+        if self
+            .available_tools
+            .iter()
+            .any(|t| t == &self.requested_tool)
+        {
             // The tool name is the proof — but we hash it through
             // RedactedProof so the digest format matches every other
             // verification in the passport.
@@ -281,9 +285,7 @@ impl ProbeRunner {
                     report.timed_out += 1;
                 }
             }
-            report
-                .per_class
-                .push((class, outcome_label.to_string()));
+            report.per_class.push((class, outcome_label.to_string()));
         }
         report
     }
@@ -298,11 +300,7 @@ fn promote_class_to_verified(
     proof: RedactedProof,
     now_ms: u64,
 ) -> bool {
-    if let Some(entry) = passport
-        .capabilities
-        .iter_mut()
-        .find(|e| &e.class == class)
-    {
+    if let Some(entry) = passport.capabilities.iter_mut().find(|e| &e.class == class) {
         if entry.verification == CapabilityVerification::Verified {
             // Already verified — fail-closed monotonic: do not
             // overwrite proof with a fresh probe's. Operators
@@ -395,30 +393,40 @@ mod tests {
     #[test]
     fn tool_probe_class_matches_requested_tool() {
         let probe = ToolAvailabilityProbe::new("write", vec![]);
-        assert_eq!(
-            probe.class(),
-            Cap::ToolAvailability("write".into())
-        );
+        assert_eq!(probe.class(), Cap::ToolAvailability("write".into()));
     }
 
     // ── FilesystemScopeProbe ─────────────────────────────────────────────
 
     #[test]
     fn fs_scope_probe_verifies_when_cwd_is_inside() {
-        let probe = FilesystemScopeProbe::new("/Users/jemanuel/projects", "/Users/jemanuel/projects/frankenterm");
-        assert!(matches!(probe.probe(deadline_in(100)), ProbeOutcome::Verified(_)));
+        let probe = FilesystemScopeProbe::new(
+            "/Users/jemanuel/projects",
+            "/Users/jemanuel/projects/frankenterm",
+        );
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Verified(_)
+        ));
     }
 
     #[test]
     fn fs_scope_probe_verifies_when_cwd_equals_scope() {
         let probe = FilesystemScopeProbe::new("/Users/jemanuel", "/Users/jemanuel");
-        assert!(matches!(probe.probe(deadline_in(100)), ProbeOutcome::Verified(_)));
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Verified(_)
+        ));
     }
 
     #[test]
     fn fs_scope_probe_fails_when_cwd_is_sibling() {
-        let probe = FilesystemScopeProbe::new("/Users/jemanuel/projects", "/Users/jemanuel/Downloads");
-        assert!(matches!(probe.probe(deadline_in(100)), ProbeOutcome::Failed { .. }));
+        let probe =
+            FilesystemScopeProbe::new("/Users/jemanuel/projects", "/Users/jemanuel/Downloads");
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Failed { .. }
+        ));
     }
 
     #[test]
@@ -426,30 +434,34 @@ mod tests {
         // /foo/bar is NOT inside /foo/ba even though string-prefix
         // would say yes — component-wise comparison required.
         let probe = FilesystemScopeProbe::new("/foo/ba", "/foo/bar");
-        assert!(matches!(probe.probe(deadline_in(100)), ProbeOutcome::Failed { .. }));
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Failed { .. }
+        ));
     }
 
     #[test]
     fn fs_scope_probe_class_carries_declared_scope_string() {
         let probe = FilesystemScopeProbe::new("/srv/scope", "/srv/scope/sub");
-        assert_eq!(
-            probe.class(),
-            Cap::FilesystemScope("/srv/scope".into())
-        );
+        assert_eq!(probe.class(), Cap::FilesystemScope("/srv/scope".into()));
     }
 
     // ── ProbeRunner promotion semantics ──────────────────────────────────
 
     #[test]
     fn runner_promotes_declared_to_verified_on_match() {
-        let mut passport = passport_with(vec![declared_entry(Cap::ToolAvailability("bash".into()))]);
+        let mut passport =
+            passport_with(vec![declared_entry(Cap::ToolAvailability("bash".into()))]);
         let mut runner = ProbeRunner::new();
         runner.add_probe(ToolAvailabilityProbe::new("bash", vec!["bash".into()]));
         let report = runner.run(&mut passport, Duration::from_millis(100));
         assert_eq!(report.invocations, 1);
         assert_eq!(report.verified, 1);
         assert_eq!(report.failed, 0);
-        assert_eq!(passport.capabilities[0].verification, CapabilityVerification::Verified);
+        assert_eq!(
+            passport.capabilities[0].verification,
+            CapabilityVerification::Verified
+        );
     }
 
     #[test]
@@ -473,14 +485,21 @@ mod tests {
         assert_eq!(report.invocations, 1);
         assert_eq!(report.verified, 0);
         assert_eq!(report.no_op, 1);
-        assert_eq!(passport.capabilities[0].verification, CapabilityVerification::Verified);
+        assert_eq!(
+            passport.capabilities[0].verification,
+            CapabilityVerification::Verified
+        );
         assert_eq!(passport.capabilities[0].proof, original_proof);
-        assert_eq!(passport.capabilities[0].last_observed_at_ms, original_observed_at);
+        assert_eq!(
+            passport.capabilities[0].last_observed_at_ms,
+            original_observed_at
+        );
     }
 
     #[test]
     fn runner_failed_outcome_preserves_existing_declared_state() {
-        let mut passport = passport_with(vec![declared_entry(Cap::ToolAvailability("bash".into()))]);
+        let mut passport =
+            passport_with(vec![declared_entry(Cap::ToolAvailability("bash".into()))]);
         let mut runner = ProbeRunner::new();
         // Probe targets bash but bash NOT in available tools — Failed.
         runner.add_probe(ToolAvailabilityProbe::new("bash", vec!["rg".into()]));
@@ -489,7 +508,10 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert_eq!(report.verified, 0);
         // Fail-closed: Declared is preserved, NOT downgraded to Unknown.
-        assert_eq!(passport.capabilities[0].verification, CapabilityVerification::Declared);
+        assert_eq!(
+            passport.capabilities[0].verification,
+            CapabilityVerification::Declared
+        );
     }
 
     #[test]
@@ -507,8 +529,14 @@ mod tests {
         assert_eq!(report.invocations, 1);
         assert_eq!(report.verified, 1);
         assert_eq!(passport.capabilities.len(), 1);
-        assert_eq!(passport.capabilities[0].class, Cap::ToolAvailability("bash".into()));
-        assert_eq!(passport.capabilities[0].verification, CapabilityVerification::Verified);
+        assert_eq!(
+            passport.capabilities[0].class,
+            Cap::ToolAvailability("bash".into())
+        );
+        assert_eq!(
+            passport.capabilities[0].verification,
+            CapabilityVerification::Verified
+        );
     }
 
     #[test]
@@ -525,17 +553,21 @@ mod tests {
         assert_eq!(report.invocations, 2);
         assert_eq!(report.verified, 2);
         assert_eq!(report.failed, 0);
-        assert!(passport
-            .capabilities
-            .iter()
-            .all(|c| c.verification == CapabilityVerification::Verified));
+        assert!(
+            passport
+                .capabilities
+                .iter()
+                .all(|c| c.verification == CapabilityVerification::Verified)
+        );
     }
 
     #[test]
     fn outcome_serde_roundtrip() {
         let cases = vec![
             ProbeOutcome::Verified(RedactedProof::from_value(b"some-proof")),
-            ProbeOutcome::Failed { reason: "no go".into() },
+            ProbeOutcome::Failed {
+                reason: "no go".into(),
+            },
             ProbeOutcome::TimedOut,
         ];
         for outcome in cases {

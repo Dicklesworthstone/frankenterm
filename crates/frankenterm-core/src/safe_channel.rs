@@ -297,7 +297,11 @@ impl<T> Clone for SafeSender<T> {
 impl<T: Send> SafeSender<T> {
     /// Non-blocking send. Returns `Full` if at capacity, `Closed` if shut down.
     pub fn try_send(&self, item: T) -> Result<(), SafeChannelError> {
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         if state.closed {
             state.total_send_failures += 1;
             return Err(SafeChannelError::Closed);
@@ -315,7 +319,11 @@ impl<T: Send> SafeSender<T> {
 
     /// Blocking send. Waits until space is available or channel is closed.
     pub fn send(&self, item: T) -> Result<(), SafeChannelError> {
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         loop {
             if state.closed {
                 state.total_send_failures += 1;
@@ -343,7 +351,11 @@ impl<T: Send> SafeSender<T> {
         token: &CancellationToken,
     ) -> Result<(), SafeChannelError> {
         let poll = Duration::from_millis(self.shared.config.cancellation_poll_ms);
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         loop {
             if state.closed {
                 state.total_send_failures += 1;
@@ -375,7 +387,11 @@ impl<T: Send> SafeSender<T> {
 
     /// Close the sending side. Pending items can still be reserved/committed.
     pub fn close(&self) {
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         state.closed = true;
         // Wake all waiters so they see the closed state
         self.shared.not_empty.notify_all();
@@ -385,7 +401,11 @@ impl<T: Send> SafeSender<T> {
 
     /// Current queue length (excludes reserved items).
     pub fn len(&self) -> usize {
-        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         state.queue.len()
     }
 
@@ -396,13 +416,21 @@ impl<T: Send> SafeSender<T> {
 
     /// Whether the channel is closed.
     pub fn is_closed(&self) -> bool {
-        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         state.closed
     }
 
     /// Snapshot current metrics.
     pub fn metrics(&self) -> SafeChannelMetrics {
-        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         state.snapshot_metrics()
     }
 }
@@ -427,7 +455,11 @@ impl<T: Send> SafeReceiver<T> {
     /// [`Reservation`] handle. Returns `Empty` if nothing available, or
     /// `ReservationLimitReached` if too many items are in-flight.
     pub fn try_reserve(&self) -> Result<Reservation<T>, SafeChannelError> {
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         if state.active_reservations >= self.shared.config.max_reservations {
             return Err(SafeChannelError::ReservationLimitReached);
         }
@@ -459,7 +491,11 @@ impl<T: Send> SafeReceiver<T> {
 
     /// Blocking reserve. Waits until an item is available.
     pub fn reserve(&self) -> Result<Reservation<T>, SafeChannelError> {
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         loop {
             let reservation_full = state.active_reservations >= self.shared.config.max_reservations;
             if !reservation_full {
@@ -502,7 +538,11 @@ impl<T: Send> SafeReceiver<T> {
         token: &CancellationToken,
     ) -> Result<Reservation<T>, SafeChannelError> {
         let poll = Duration::from_millis(self.shared.config.cancellation_poll_ms);
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         loop {
             let reservation_full = state.active_reservations >= self.shared.config.max_reservations;
             if !reservation_full {
@@ -565,13 +605,21 @@ impl<T: Send> SafeReceiver<T> {
 
     /// Whether the queue and reservations are both empty.
     pub fn is_drained(&self) -> bool {
-        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         state.queue.is_empty() && state.active_reservations == 0
     }
 
     /// Snapshot current metrics.
     pub fn metrics(&self) -> SafeChannelMetrics {
-        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         state.snapshot_metrics()
     }
 }
@@ -616,7 +664,11 @@ impl<T: Send> Reservation<T> {
     pub fn commit(mut self) -> T {
         self.resolved = true;
         let item = self.item.take().expect("reservation already resolved");
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         state.total_committed += 1;
         state.active_reservations = state.active_reservations.saturating_sub(1);
         drop(state);
@@ -629,7 +681,11 @@ impl<T: Send> Reservation<T> {
     pub fn rollback(mut self) {
         self.resolved = true;
         let item = self.item.take().expect("reservation already resolved");
-        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         state.queue.push_front(item);
         state.total_rollbacks += 1;
         state.active_reservations = state.active_reservations.saturating_sub(1);
@@ -652,7 +708,11 @@ impl<T> Drop for Reservation<T> {
                 // Automatic rollback — the cancellation-safety guarantee.
                 // Use unwrap_or_else to handle mutex poisoning gracefully
                 // (we must not panic in a destructor).
-                let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
+                let mut state = self
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(record_poison_and_recover);
                 state.queue.push_front(item);
                 state.total_drop_rollbacks += 1;
                 state.active_reservations = state.active_reservations.saturating_sub(1);

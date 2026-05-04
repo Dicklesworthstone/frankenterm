@@ -263,10 +263,7 @@ impl ContextBudgetTracker {
         self.compactions.push_back(event);
         self.total_compactions += 1;
         self.estimated_tokens = tokens_after;
-        self.peak_tokens = self
-            .peak_tokens
-            .max(tokens_before)
-            .max(tokens_after);
+        self.peak_tokens = self.peak_tokens.max(tokens_before).max(tokens_after);
         self.last_updated_ms = epoch_ms();
 
         // Evict old history
@@ -693,6 +690,10 @@ mod tests {
         // contributes its max to the high-water mark.
         tracker.record_compaction(20_000, 99_000, CompactionTrigger::Automatic);
         assert_eq!(tracker.peak_tokens, 99_000);
+        assert_eq!(
+            tracker.compactions.back().unwrap().estimate_anomaly,
+            Some(CompactionEstimateAnomaly::TokensIncreased)
+        );
     }
 
     #[test]

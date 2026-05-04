@@ -403,9 +403,28 @@ impl FdBudget {
     }
 
     /// Check if a new pane can be admitted within the FD budget.
+    ///
+    /// br-ft-aj20l: when `effective_limit == 0` the budget is in
+    /// an unavailable / unconfigured state — fail closed. Without
+    /// this guard, the `projected / limit` division produces
+    /// `f64::INFINITY` (or NaN if both are zero), which then
+    /// compared against the warn / refuse thresholds via `>=` —
+    /// Inf >= threshold is true, so admission would actually
+    /// refuse — but that's incidental, and a NaN comparison
+    /// returns false (admitting silently). Explicit fail-closed
+    /// at the boundary makes the contract obvious.
     pub fn can_admit_pane(&self) -> AdmitDecision {
         let current = self.total_allocated.load(Ordering::SeqCst);
         let projected = current.saturating_add(self.config.fds_per_pane);
+
+        if self.effective_limit == 0 {
+            return AdmitDecision::Refused {
+                current_fds: current,
+                limit: 0,
+                projected,
+            };
+        }
+
         let ratio = projected as f64 / self.effective_limit as f64;
 
         if ratio >= self.config.refuse_threshold {
@@ -470,13 +489,29 @@ impl FdBudget {
         let total_allocated = self.total_allocated.load(Ordering::SeqCst);
         let pane_count = self.pane_fds.len();
 
+        // br-ft-aj20l: when `effective_limit == 0` the budget is
+        // unconfigured / unavailable. Use a saturated 1.0 sentinel
+        // for the operator-facing ratios rather than f64::INFINITY
+        // / NaN. Dashboards compute `>= 0.95` checks against these
+        // ratios; Inf passes those checks (correct fail-closed
+        // intent), but NaN does NOT (NaN comparisons are false).
+        // 1.0 is the consistent fail-closed value.
+        let (usage_ratio, budget_ratio) = if self.effective_limit == 0 {
+            (1.0, 1.0)
+        } else {
+            (
+                current_open as f64 / self.effective_limit as f64,
+                total_allocated as f64 / self.effective_limit as f64,
+            )
+        };
+
         FdSnapshot {
             current_open,
             total_allocated,
             effective_limit: self.effective_limit,
             pane_count,
-            usage_ratio: current_open as f64 / self.effective_limit as f64,
-            budget_ratio: total_allocated as f64 / self.effective_limit as f64,
+            usage_ratio,
+            budget_ratio,
         }
     }
 
@@ -515,7 +550,14 @@ impl FdBudget {
             false
         };
 
-        let usage_ratio = current as f64 / self.effective_limit as f64;
+        // br-ft-aj20l: same fail-closed sentinel as snapshot() —
+        // 1.0 when limit is zero so the warn threshold check fires
+        // (NaN would silently disable the warning).
+        let usage_ratio = if self.effective_limit == 0 {
+            1.0
+        } else {
+            current as f64 / self.effective_limit as f64
+        };
         let warning = usage_ratio >= self.config.warn_threshold;
 
         if leak_detected {
@@ -820,6 +862,74 @@ mod tests {
         assert!(snap.usage_ratio >= 0.0);
         assert!(snap.budget_ratio >= 0.0 && snap.budget_ratio <= 1.0);
         assert_eq!(snap.effective_limit, 10_000);
+    }
+
+    // ── br-ft-aj20l: zero effective_limit fail-closed contract ──
+
+    #[test]
+    fn can_admit_pane_refuses_when_limit_zero_ft_aj20l() {
+        // br-ft-aj20l: a zero (unconfigured / unavailable) limit
+        // must fail closed at admission. Without the explicit
+        // guard, ratio = nonzero / 0 = INFINITY, which happens to
+        // trip the >= refuse_threshold comparison correctly — but
+        // ratio = 0 / 0 = NaN, and NaN >= threshold is FALSE,
+        // which would silently admit. Explicit guard is the
+        // boundary contract.
+        let budget = FdBudget::with_limit(test_config(), 0);
+        let decision = budget.can_admit_pane();
+        assert!(!decision.is_allowed(), "zero limit must fail closed");
+        assert!(matches!(decision, AdmitDecision::Refused { limit: 0, .. }));
+    }
+
+    #[test]
+    fn can_admit_pane_refuses_when_limit_zero_with_zero_fds_per_pane_ft_aj20l() {
+        // The explicit NaN trap: limit=0 AND fds_per_pane=0 means
+        // ratio = (current + 0) / 0. If `current == 0` that's the
+        // NaN case (0/0). The fail-closed boundary catches it.
+        let config = FdBudgetConfig {
+            fds_per_pane: 0,
+            ..test_config()
+        };
+        let budget = FdBudget::with_limit(config, 0);
+        let decision = budget.can_admit_pane();
+        assert!(!decision.is_allowed());
+    }
+
+    #[test]
+    fn snapshot_ratios_are_finite_when_limit_zero_ft_aj20l() {
+        // Operator telemetry must never carry NaN/Inf — dashboards
+        // that compute `>= 0.95` checks would silently miss the
+        // fail-closed signal on NaN. 1.0 is the saturated sentinel.
+        let budget = FdBudget::with_limit(test_config(), 0);
+        let snap = budget.snapshot();
+        assert!(
+            snap.usage_ratio.is_finite(),
+            "usage_ratio must be finite, got {}",
+            snap.usage_ratio
+        );
+        assert!(
+            snap.budget_ratio.is_finite(),
+            "budget_ratio must be finite, got {}",
+            snap.budget_ratio
+        );
+        assert_eq!(snap.usage_ratio, 1.0, "saturated sentinel for limit=0");
+        assert_eq!(snap.budget_ratio, 1.0);
+    }
+
+    #[test]
+    fn audit_usage_ratio_is_finite_when_limit_zero_ft_aj20l() {
+        let budget = FdBudget::with_limit(test_config(), 0);
+        let result = budget.audit();
+        assert!(
+            result.usage_ratio.is_finite(),
+            "audit usage_ratio must be finite, got {}",
+            result.usage_ratio
+        );
+        assert_eq!(result.usage_ratio, 1.0);
+        assert!(
+            result.warning,
+            "warning threshold must fire at saturated sentinel"
+        );
     }
 
     // ── AdmitDecision ──

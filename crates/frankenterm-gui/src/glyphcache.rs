@@ -366,6 +366,12 @@ struct DecodedFrame {
     height: usize,
 }
 
+impl DecodedFrame {
+    fn decoded_bytes(&self) -> usize {
+        self.width.saturating_mul(self.height).saturating_mul(4)
+    }
+}
+
 struct FrameDecoder {}
 
 impl FrameDecoder {
@@ -616,6 +622,17 @@ impl FrameState {
     fn frame_hash(&self) -> [u8; 32] {
         self.current_frame.lease.content_id().as_hash_bytes()
     }
+
+    fn retained_bytes(&self) -> usize {
+        let frames_bytes = self.frames.iter().fold(0usize, |acc, frame| {
+            acc.saturating_add(frame.decoded_bytes())
+        });
+        if frames_bytes == 0 {
+            self.current_frame.decoded_bytes()
+        } else {
+            frames_bytes
+        }
+    }
 }
 
 impl std::fmt::Debug for FrameState {
@@ -698,6 +715,17 @@ impl DecodedImage {
             },
         }
     }
+
+    fn retained_bytes(&self) -> usize {
+        let image_bytes = self.image.len();
+        let frame_bytes = self
+            .frames
+            .borrow()
+            .as_ref()
+            .map(FrameState::retained_bytes)
+            .unwrap_or(0);
+        image_bytes.saturating_add(frame_bytes)
+    }
 }
 
 /// A number of items here are HashMaps rather than LfuCaches;
@@ -707,6 +735,8 @@ pub struct GlyphCache {
     pub atlas: Atlas,
     pub fonts: Rc<FontConfiguration>,
     pub image_cache: LfuCache<[u8; 32], DecodedImage>,
+    image_cache_retained_bytes: usize,
+    image_cache_entry_bytes: HashMap<[u8; 32], usize>,
     frame_cache: HashMap<[u8; 32], Sprite>,
     line_glyphs: HashMap<LineKey, Sprite>,
     pub block_glyphs: HashMap<SizedBlockKey, Sprite>,
@@ -737,6 +767,8 @@ impl GlyphCache {
                 |config| config.glyph_cache_image_cache_size,
                 &fonts.config(),
             ),
+            image_cache_retained_bytes: 0,
+            image_cache_entry_bytes: HashMap::new(),
             frame_cache: HashMap::new(),
             atlas,
             line_glyphs: HashMap::new(),
@@ -767,6 +799,8 @@ impl GlyphCache {
                 |config| config.glyph_cache_image_cache_size,
                 &fonts.config(),
             ),
+            image_cache_retained_bytes: 0,
+            image_cache_entry_bytes: HashMap::new(),
             frame_cache: HashMap::new(),
             atlas,
             line_glyphs: HashMap::new(),
@@ -783,6 +817,81 @@ impl GlyphCache {
     fn atlas_footprint_bytes(&self) -> u64 {
         let side = self.atlas.size() as u64;
         side.saturating_mul(side).saturating_mul(4)
+    }
+
+    fn image_cache_max_bytes() -> usize {
+        MemoryBudget::default()
+            .host_ram_budget_bytes
+            .try_into()
+            .unwrap_or(usize::MAX)
+    }
+
+    fn forget_decoded_image_bytes(&mut self, hash: &[u8; 32], decoded: &DecodedImage) {
+        let bytes = self
+            .image_cache_entry_bytes
+            .remove(hash)
+            .unwrap_or_else(|| decoded.retained_bytes());
+        self.image_cache_retained_bytes = self.image_cache_retained_bytes.saturating_sub(bytes);
+    }
+
+    fn apply_image_cache_evictions(&mut self, evicted: Vec<([u8; 32], DecodedImage)>) {
+        for (hash, decoded) in evicted {
+            self.forget_decoded_image_bytes(&hash, &decoded);
+        }
+    }
+
+    fn cache_decoded_image(&mut self, hash: [u8; 32], decoded: DecodedImage) {
+        let bytes = decoded.retained_bytes();
+        self.cache_decoded_image_with_bytes(hash, decoded, bytes);
+    }
+
+    fn cache_decoded_image_with_bytes(
+        &mut self,
+        hash: [u8; 32],
+        decoded: DecodedImage,
+        bytes: usize,
+    ) {
+        let max_bytes = Self::image_cache_max_bytes();
+        if bytes > max_bytes {
+            return;
+        }
+
+        let evicted = self.image_cache.put_capturing_evictions(hash, decoded);
+        self.apply_image_cache_evictions(evicted);
+        self.image_cache_entry_bytes.insert(hash, bytes);
+        self.image_cache_retained_bytes = self.image_cache_retained_bytes.saturating_add(bytes);
+        self.enforce_image_cache_byte_budget();
+    }
+
+    fn refresh_cached_image_bytes(&mut self, hash: [u8; 32], bytes: usize) {
+        if bytes > Self::image_cache_max_bytes() {
+            if let Some((removed_hash, decoded)) = self.image_cache.remove(&hash) {
+                self.forget_decoded_image_bytes(&removed_hash, &decoded);
+            }
+            return;
+        }
+
+        let old = self
+            .image_cache_entry_bytes
+            .insert(hash, bytes)
+            .unwrap_or(0);
+        self.image_cache_retained_bytes = self
+            .image_cache_retained_bytes
+            .saturating_sub(old)
+            .saturating_add(bytes);
+        self.enforce_image_cache_byte_budget();
+    }
+
+    fn enforce_image_cache_byte_budget(&mut self) {
+        let max_bytes = Self::image_cache_max_bytes();
+        while self.image_cache_retained_bytes > max_bytes {
+            let Some((hash, decoded)) = self.image_cache.evict_lfu() else {
+                self.image_cache_retained_bytes = 0;
+                self.image_cache_entry_bytes.clear();
+                break;
+            };
+            self.forget_decoded_image_bytes(&hash, &decoded);
+        }
     }
 
     pub fn tier_swap_doctor_row(&self, label: impl Into<String>) -> TierSwapDoctorRow {
@@ -1052,7 +1161,9 @@ impl GlyphCache {
 
     pub fn config_changed(&mut self) {
         let config = self.fonts.config();
-        self.image_cache.update_config(&config);
+        let evicted = self.image_cache.update_config_capturing_evictions(&config);
+        self.apply_image_cache_evictions(evicted);
+        self.enforce_image_cache_byte_budget();
         self.cursor_glyphs.clear();
     }
 
@@ -1483,28 +1594,35 @@ impl GlyphCache {
     ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
         let hash = image_data.hash();
 
-        if let Some(decoded) = self.image_cache.get(&hash) {
-            Self::cached_image_impl(
-                &mut self.frame_cache,
-                &mut self.atlas,
-                decoded,
-                padding,
-                self.min_frame_duration,
-                allow_image,
-            )
-        } else {
-            let decoded = DecodedImage::load(image_data);
-            let res = Self::cached_image_impl(
-                &mut self.frame_cache,
-                &mut self.atlas,
-                &decoded,
-                padding,
-                self.min_frame_duration,
-                allow_image,
-            )?;
-            self.image_cache.put(hash, decoded);
-            Ok(res)
+        let cached = {
+            self.image_cache.get(&hash).map(|decoded| {
+                let result = Self::cached_image_impl(
+                    &mut self.frame_cache,
+                    &mut self.atlas,
+                    decoded,
+                    padding,
+                    self.min_frame_duration,
+                    allow_image,
+                );
+                (result, decoded.retained_bytes())
+            })
+        };
+        if let Some((result, retained_bytes)) = cached {
+            self.refresh_cached_image_bytes(hash, retained_bytes);
+            return result;
         }
+
+        let decoded = DecodedImage::load(image_data);
+        let res = Self::cached_image_impl(
+            &mut self.frame_cache,
+            &mut self.atlas,
+            &decoded,
+            padding,
+            self.min_frame_duration,
+            allow_image,
+        )?;
+        self.cache_decoded_image(hash, decoded);
+        Ok(res)
     }
 
     pub fn cached_color(&mut self, color: RgbColor, alpha: f32) -> anyhow::Result<Sprite> {
@@ -2445,5 +2563,74 @@ mod tests {
         assert!(next_due.is_none());
         assert_eq!(sprite.coords.size.width, 1);
         assert_eq!(sprite.coords.size.height, 1);
+    }
+
+    fn small_decoded_image() -> DecodedImage {
+        DecodedImage::load(&Arc::new(ImageData::with_data(
+            ImageDataType::new_single_frame(1, 1, vec![0, 0, 0, 0]),
+        )))
+    }
+
+    #[test]
+    fn glyph_image_cache_refuses_single_decoded_image_over_host_budget() {
+        let (mut cache, _) = test_glyph_cache();
+        let decoded = small_decoded_image();
+
+        cache.cache_decoded_image_with_bytes(
+            [7; 32],
+            decoded,
+            GlyphCache::image_cache_max_bytes() + 1,
+        );
+
+        assert_eq!(cache.image_cache.len(), 0);
+        assert_eq!(cache.image_cache_retained_bytes, 0);
+        assert!(cache.image_cache_entry_bytes.is_empty());
+    }
+
+    #[test]
+    fn glyph_image_cache_removes_entry_that_grows_over_host_budget() {
+        let (mut cache, _) = test_glyph_cache();
+        let hash = [9; 32];
+        let decoded = small_decoded_image();
+
+        cache.cache_decoded_image(hash, decoded);
+        assert_eq!(cache.image_cache.len(), 1);
+        assert!(cache.image_cache_retained_bytes > 0);
+
+        cache.refresh_cached_image_bytes(hash, GlyphCache::image_cache_max_bytes() + 1);
+
+        assert_eq!(cache.image_cache.len(), 0);
+        assert_eq!(cache.image_cache_retained_bytes, 0);
+        assert!(cache.image_cache_entry_bytes.is_empty());
+    }
+
+    #[test]
+    fn glyph_image_cache_evicts_cumulative_decoded_bytes_by_lfu() {
+        let (mut cache, _) = test_glyph_cache();
+        let hot_hash = [1; 32];
+        let cold_hash = [2; 32];
+        let newest_hash = [3; 32];
+
+        cache.cache_decoded_image(hot_hash, small_decoded_image());
+        cache.cache_decoded_image(cold_hash, small_decoded_image());
+        cache.cache_decoded_image(newest_hash, small_decoded_image());
+
+        assert!(cache.image_cache.get(&hot_hash).is_some());
+
+        let half_budget = GlyphCache::image_cache_max_bytes() / 2;
+        for hash in [hot_hash, cold_hash, newest_hash] {
+            cache.image_cache_entry_bytes.insert(hash, half_budget);
+        }
+        cache.image_cache_retained_bytes = half_budget * 3;
+
+        cache.enforce_image_cache_byte_budget();
+
+        assert_eq!(cache.image_cache.len(), 2);
+        assert_eq!(cache.image_cache_retained_bytes, half_budget * 2);
+        assert!(
+            cache.image_cache.get(&hot_hash).is_some(),
+            "frequently-used decoded image should survive cumulative byte pressure"
+        );
+        assert_eq!(cache.image_cache_entry_bytes.len(), 2);
     }
 }

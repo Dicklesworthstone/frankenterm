@@ -135,8 +135,11 @@ impl Ucb1Bandit {
         let ln_n = n_total.ln().max(0.0);
         let mut best_arm = 0;
         let mut best_score = f64::NEG_INFINITY;
-        for (i, (&pulls, &reward)) in
-            self.arm_pulls.iter().zip(self.arm_rewards.iter()).enumerate()
+        for (i, (&pulls, &reward)) in self
+            .arm_pulls
+            .iter()
+            .zip(self.arm_rewards.iter())
+            .enumerate()
         {
             // Confidence interval: sqrt(2 ln N / n_a).
             let confidence = (2.0 * ln_n / pulls as f64).sqrt();
@@ -308,7 +311,11 @@ mod tests {
         // arm 0: 0.5 + sqrt(2 × 3.93 / 50) ≈ 0.5 + 0.397 = 0.897
         // arm 1: 0.0 + sqrt(2 × 3.93 / 1) ≈ 0.0 + 2.804 = 2.804
         // arm 1 wins via exploration bonus.
-        assert_eq!(b.select(), 1, "UCB exploration must select arm 1 despite lower reward");
+        assert_eq!(
+            b.select(),
+            1,
+            "UCB exploration must select arm 1 despite lower reward"
+        );
     }
 
     #[test]
@@ -352,7 +359,9 @@ mod tests {
         b.record_reward(2, 0.1);
         // Constrain to arms 1 and 2 (e.g., arm 0 is circuit-broken).
         let allowed = [false, true, true];
-        let selected = b.select_constrained(&allowed).expect("at least one allowed");
+        let selected = b
+            .select_constrained(&allowed)
+            .expect("at least one allowed");
         assert!(selected == 1 || selected == 2);
         assert_ne!(selected, 0, "disallowed arm 0 must not be selected");
     }

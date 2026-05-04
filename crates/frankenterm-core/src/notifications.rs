@@ -242,7 +242,10 @@ where
 
     fn send<'a>(&'a self, payload: &'a NotificationPayload) -> NotificationFuture<'a> {
         let now = Instant::now();
-        let mut guard = self.last_sent.lock().unwrap_or_else(record_poison_and_recover);
+        let mut guard = self
+            .last_sent
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         let within_window = guard
             .as_ref()
             .is_some_and(|last| now.duration_since(*last) < self.min_interval);
@@ -273,7 +276,10 @@ where
         payload: &'a NotificationPayload,
     ) -> NotificationFuture<'a> {
         let now = Instant::now();
-        let mut guard = self.last_sent.lock().unwrap_or_else(record_poison_and_recover);
+        let mut guard = self
+            .last_sent
+            .lock()
+            .unwrap_or_else(record_poison_and_recover);
         let within_window = guard
             .as_ref()
             .is_some_and(|last| now.duration_since(*last) < self.min_interval);

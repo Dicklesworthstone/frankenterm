@@ -261,9 +261,12 @@ where
 
     /// Whether the map is empty.
     pub fn is_empty(&self) -> bool {
-        self.shards
-            .iter()
-            .all(|s| s.map.read().unwrap_or_else(record_poison_and_recover).is_empty())
+        self.shards.iter().all(|s| {
+            s.map
+                .read()
+                .unwrap_or_else(record_poison_and_recover)
+                .is_empty()
+        })
     }
 
     /// Apply a function to a value under a read lock.
@@ -510,9 +513,12 @@ impl<V> PaneMap<V> {
 
     /// Whether the map is empty.
     pub fn is_empty(&self) -> bool {
-        self.shards
-            .iter()
-            .all(|s| s.map.read().unwrap_or_else(record_poison_and_recover).is_empty())
+        self.shards.iter().all(|s| {
+            s.map
+                .read()
+                .unwrap_or_else(record_poison_and_recover)
+                .is_empty()
+        })
     }
 
     /// All pane IDs.

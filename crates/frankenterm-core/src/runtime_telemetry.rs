@@ -15527,7 +15527,10 @@ mod tests {
         assert_eq!(record.health_tier, HealthTier::Black);
         assert_eq!(record.failure_class, Some(FailureClass::Corruption));
         assert!(
-            record.attributes["failure_rate"].as_f64().unwrap().is_finite(),
+            record.attributes["failure_rate"]
+                .as_f64()
+                .unwrap()
+                .is_finite(),
             "failure_rate must be finite even with overflowing terminal sum"
         );
         assert!(

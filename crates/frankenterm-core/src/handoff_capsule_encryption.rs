@@ -410,7 +410,11 @@ mod tests {
         let capsule = sample_capsule();
         let envelope = EncryptedCapsuleEnvelope::seal(&capsule, &seal_hook).expect("seal");
         let err = envelope
-            .open(&open_hook, capsule.source.clone(), capsule.destination.clone())
+            .open(
+                &open_hook,
+                capsule.source.clone(),
+                capsule.destination.clone(),
+            )
             .unwrap_err();
         let EnvelopeOpenError::Decryption(EncryptionError::DecryptionFailed { reason }) = err
         else {
@@ -474,7 +478,11 @@ mod tests {
             }
         }
         let err = envelope
-            .open(&OtherHook, capsule.source.clone(), capsule.destination.clone())
+            .open(
+                &OtherHook,
+                capsule.source.clone(),
+                capsule.destination.clone(),
+            )
             .unwrap_err();
         let EnvelopeOpenError::WrongHook {
             envelope_hook,
@@ -495,8 +503,7 @@ mod tests {
         let capsule = sample_capsule();
         let envelope = EncryptedCapsuleEnvelope::seal(&capsule, &hook).expect("seal");
         let json = serde_json::to_string(&envelope).expect("serialize");
-        let back: EncryptedCapsuleEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let back: EncryptedCapsuleEnvelope = serde_json::from_str(&json).expect("deserialize");
         // Roundtripped envelope's integrity still verifies.
         back.verify_integrity().expect("integrity preserved");
         let recovered = back

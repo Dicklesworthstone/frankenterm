@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory_budget::{MemoryBudgetConfig, MemoryBudgetManager};
 use crate::policy::ActorKind;
 use crate::recorder_audit::{AccessTier, ActorIdentity};
 use crate::recorder_query::{QueryEventKind, QueryResultEvent};
@@ -20,6 +21,10 @@ use crate::recording::{
     RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
     RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
+use crate::runtime_telemetry::{
+    SwarmCapacityStage, SwarmCapacityTelemetry, SwarmCapacityTelemetrySnapshot,
+};
+use crate::storage_telemetry::StorageTelemetry;
 
 /// Version string for large-swarm replay corpus artifacts.
 pub const LARGE_SWARM_REPLAY_CORPUS_VERSION: &str = "ft.large_swarm_replay.v1";
@@ -170,6 +175,8 @@ pub struct LargeSwarmReplaySummary {
     pub mission_actions: u64,
     /// Event counts by replay event kind.
     pub by_kind: BTreeMap<String, u64>,
+    /// Distilled replay output from the live telemetry collectors.
+    pub collectors: LargeSwarmTelemetryCollectorSummary,
     /// Stable digest over the canonical summary fields.
     pub summary_digest: String,
 }
@@ -189,7 +196,16 @@ impl LargeSwarmReplaySummary {
             self.output_bytes,
             self.compaction_waves,
             self.search_queries,
-            self.mission_actions
+            self.mission_actions,
+            self.collectors.latency_arrivals,
+            self.collectors.latency_completions,
+            self.collectors.admission_arrivals,
+            self.collectors.admission_completions,
+            self.collectors.memory_panes_registered,
+            self.collectors.memory_samples,
+            self.collectors.storage_events_appended,
+            self.collectors.storage_batches,
+            self.collectors.storage_flushes
         );
         for (kind, count) in &self.by_kind {
             input.push('|');
@@ -199,6 +215,29 @@ impl LargeSwarmReplaySummary {
         }
         input
     }
+}
+
+/// Compact deterministic proof that the corpus replayed through live collectors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmTelemetryCollectorSummary {
+    /// Arrival observations recorded in the capacity/latency collector.
+    pub latency_arrivals: u64,
+    /// Completion observations recorded in the capacity/latency collector.
+    pub latency_completions: u64,
+    /// Admission observations recorded through the Robot/MCP capacity stage.
+    pub admission_arrivals: u64,
+    /// Admission completions recorded through the Robot/MCP capacity stage.
+    pub admission_completions: u64,
+    /// Panes registered in the memory budget telemetry manager.
+    pub memory_panes_registered: u64,
+    /// Memory sample passes recorded by the memory budget manager.
+    pub memory_samples: u64,
+    /// Events appended into the storage telemetry collector.
+    pub storage_events_appended: u64,
+    /// Append batches recorded by the storage telemetry collector.
+    pub storage_batches: u64,
+    /// Flush operations recorded by the storage telemetry collector.
+    pub storage_flushes: u64,
 }
 
 /// Regression thresholds for a large-swarm replay summary.
@@ -378,6 +417,7 @@ pub fn summarize_large_swarm_replay(
     }
 
     let max_events_per_pane = events_per_pane.values().copied().max().unwrap_or(0);
+    let collectors = replay_against_telemetry_collectors(corpus, output_bytes);
     let mut summary = LargeSwarmReplaySummary {
         version: corpus.version.clone(),
         scenario_id: corpus.scenario.scenario_id.clone(),
@@ -392,6 +432,7 @@ pub fn summarize_large_swarm_replay(
         search_queries,
         mission_actions,
         by_kind,
+        collectors,
         summary_digest: String::new(),
     };
     summary.summary_digest = stable_digest(&summary.digest_input());
@@ -433,6 +474,91 @@ pub fn evaluate_large_swarm_thresholds(
     LargeSwarmRegressionVerdict {
         passed: diffs.is_empty(),
         diffs,
+    }
+}
+
+fn replay_against_telemetry_collectors(
+    corpus: &LargeSwarmReplayCorpus,
+    output_bytes: u64,
+) -> LargeSwarmTelemetryCollectorSummary {
+    let mut latency = SwarmCapacityTelemetry::with_defaults();
+    let mut admission = SwarmCapacityTelemetry::with_defaults();
+    let memory = MemoryBudgetManager::new(MemoryBudgetConfig {
+        use_cgroups: false,
+        ..MemoryBudgetConfig::default()
+    });
+    let storage = StorageTelemetry::with_defaults();
+
+    for pane_id in 1..=corpus.scenario.pane_count {
+        memory.register_pane(pane_id, None);
+    }
+    let _memory_budget_summary = memory.sample_all();
+
+    for event in &corpus.events {
+        let queue_depth = event.pane_id % 64;
+        let stage = capacity_stage_for_event(event);
+        latency.record_arrival(stage, queue_depth);
+        latency.record_wait_time_ms(stage, 1.0);
+        latency.record_completion(stage, 2.0, queue_depth);
+
+        if is_admission_event(event) {
+            admission.record_arrival(SwarmCapacityStage::RobotMcp, queue_depth);
+            admission.record_wait_time_ms(SwarmCapacityStage::RobotMcp, 1.0);
+            admission.record_completion(SwarmCapacityStage::RobotMcp, 2.0, queue_depth);
+        }
+    }
+
+    storage.record_append(100.0, corpus.events.len(), output_bytes, false);
+    storage.record_flush(200.0);
+
+    let latency_snapshot = latency.snapshot();
+    let admission_snapshot = admission.snapshot();
+    let memory_snapshot = memory.telemetry().snapshot();
+    let storage_snapshot = storage.snapshot();
+
+    let (latency_arrivals, latency_completions) = capacity_snapshot_totals(&latency_snapshot);
+    let (admission_arrivals, admission_completions) = capacity_snapshot_totals(&admission_snapshot);
+
+    LargeSwarmTelemetryCollectorSummary {
+        latency_arrivals,
+        latency_completions,
+        admission_arrivals,
+        admission_completions,
+        memory_panes_registered: memory_snapshot.panes_registered,
+        memory_samples: memory_snapshot.samples,
+        storage_events_appended: storage_snapshot.total_events_appended,
+        storage_batches: storage_snapshot.total_batches,
+        storage_flushes: storage_snapshot.total_flushes,
+    }
+}
+
+fn capacity_snapshot_totals(snapshot: &SwarmCapacityTelemetrySnapshot) -> (u64, u64) {
+    snapshot.stages.iter().fold((0, 0), |acc, stage| {
+        (
+            acc.0.saturating_add(stage.arrivals),
+            acc.1.saturating_add(stage.completions),
+        )
+    })
+}
+
+fn capacity_stage_for_event(event: &RecorderEvent) -> SwarmCapacityStage {
+    match &event.payload {
+        RecorderEventPayload::IngressText { .. } => SwarmCapacityStage::RobotMcp,
+        RecorderEventPayload::EgressOutput { .. } => SwarmCapacityStage::IngestCapture,
+        RecorderEventPayload::ControlMarker { .. } => SwarmCapacityStage::WorkflowRunner,
+        RecorderEventPayload::LifecycleMarker { .. } => SwarmCapacityStage::EventBusFanout,
+    }
+}
+
+fn is_admission_event(event: &RecorderEvent) -> bool {
+    match &event.payload {
+        RecorderEventPayload::IngressText { text, .. } => text.starts_with("ft robot search "),
+        RecorderEventPayload::ControlMarker { details, .. } => {
+            details.get("activity").and_then(serde_json::Value::as_str)
+                == Some("mission_loop_action")
+        }
+        RecorderEventPayload::EgressOutput { .. }
+        | RecorderEventPayload::LifecycleMarker { .. } => false,
     }
 }
 

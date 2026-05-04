@@ -90,7 +90,7 @@ fn arb_unknown() -> impl Strategy<Value = UnknownReason> {
 
 fn arb_action() -> impl Strategy<Value = ProposedAction> {
     (
-        prop::collection::vec(0u64..=999, 0..=5),  // target_panes
+        prop::collection::vec(0u64..=999, 0..=5), // target_panes
         prop::collection::vec("cmd_[a-z]{1,4}", 0..=4), // commands
         prop::collection::vec("/tmp/[a-z]{1,4}", 0..=4), // touched_files
         arb_credentials(),

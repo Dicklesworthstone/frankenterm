@@ -67,12 +67,7 @@ fn init_test_tracing_json() {
 /// digits, Greek/Cyrillic/CJK letters, etc.) are now stripped
 /// as separators at both sides.
 fn is_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || c == '_'
-        || c == '.'
-        || c == '/'
-        || c == ':'
-        || c == '-'
+    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '/' || c == ':' || c == '-'
 }
 
 /// ASCII string covering the full 0x00..=0x7F byte range. Used

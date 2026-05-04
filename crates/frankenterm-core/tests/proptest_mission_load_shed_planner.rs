@@ -81,15 +81,20 @@ fn arb_candidate_set() -> impl Strategy<Value = Vec<PaneCandidate>> {
 }
 
 fn arb_signals() -> impl Strategy<Value = OverloadSignals> {
-    (0u32..=1000, 0u32..=1000, 0u32..=1000, 0u32..=1000, 0u32..=1000).prop_map(
-        |(cpu, mem, storage, api, attn)| OverloadSignals {
+    (
+        0u32..=1000,
+        0u32..=1000,
+        0u32..=1000,
+        0u32..=1000,
+        0u32..=1000,
+    )
+        .prop_map(|(cpu, mem, storage, api, attn)| OverloadSignals {
             cpu_e3: cpu,
             memory_e3: mem,
             storage_e3: storage,
             api_quota_e3: api,
             human_attention_e3: attn,
-        },
-    )
+        })
 }
 
 fn arb_signal_sequence() -> impl Strategy<Value = Vec<OverloadSignals>> {

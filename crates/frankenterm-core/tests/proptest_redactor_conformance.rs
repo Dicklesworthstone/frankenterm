@@ -214,13 +214,7 @@ fn mixed_text() -> impl Strategy<Value = String> {
                     Just(GITHUB_FINE_GRAINED_PAT.to_string()),
                     Just(AWS_ACCESS_KEY.to_string()),
                 ],
-                prop_oneof![
-                    Just(" "),
-                    Just("\n"),
-                    Just(","),
-                    Just(":"),
-                    Just(";"),
-                ],
+                prop_oneof![Just(" "), Just("\n"), Just(","), Just(":"), Just(";"),],
             )
                 .prop_map(|(sample, sep)| format!("{sample}{sep}")),
         ],

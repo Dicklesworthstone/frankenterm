@@ -187,20 +187,14 @@ impl<T> Clone for Worker<T> {
 impl<T> Worker<T> {
     /// Push an item onto the bottom of the deque.
     pub fn push(&self, item: T) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
+        let mut state = self.state.lock().unwrap_or_else(record_poison_and_recover);
         state.buffer.push_back(item);
         state.total_pushed += 1;
     }
 
     /// Pop an item from the bottom of the deque (LIFO).
     pub fn pop(&self) -> Option<T> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
+        let mut state = self.state.lock().unwrap_or_else(record_poison_and_recover);
         let item = state.buffer.pop_back();
         if item.is_some() {
             state.total_popped += 1;
@@ -210,10 +204,7 @@ impl<T> Worker<T> {
 
     /// Number of items currently in the deque.
     pub fn len(&self) -> usize {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
+        let state = self.state.lock().unwrap_or_else(record_poison_and_recover);
         state.buffer.len()
     }
 
@@ -224,10 +215,7 @@ impl<T> Worker<T> {
 
     /// Get statistics.
     pub fn stats(&self) -> WsDequeStats {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
+        let state = self.state.lock().unwrap_or_else(record_poison_and_recover);
         WsDequeStats {
             len: state.buffer.len(),
             total_pushed: state.total_pushed,

@@ -24,13 +24,11 @@
 use std::collections::BTreeMap;
 
 use frankenterm_core::causal_graph_console::{
-    EvidenceSnippet, FocusOptions, OperatorTextOptions, UncertaintyMarker,
-    render_dependency_tree, render_evidence_snippets, render_operator_text, render_robot_toon,
-    render_timeline_text,
+    EvidenceSnippet, FocusOptions, OperatorTextOptions, UncertaintyMarker, render_dependency_tree,
+    render_evidence_snippets, render_operator_text, render_robot_toon, render_timeline_text,
 };
 use frankenterm_core::explainability_console::{
-    CausalEvidenceKind, CausalGraphEdge, CausalGraphNode, CausalNodeKind,
-    CausalTraversalDirection,
+    CausalEvidenceKind, CausalGraphEdge, CausalGraphNode, CausalNodeKind, CausalTraversalDirection,
 };
 
 // ── Fixture helpers ────────────────────────────────────────────────────
@@ -41,38 +39,68 @@ use frankenterm_core::explainability_console::{
 /// must show every UncertaintyMarker variant.
 fn dense_incident_graph() -> (Vec<CausalGraphNode>, Vec<CausalGraphEdge>) {
     let nodes = vec![
-        CausalGraphNode::new("n1", CausalNodeKind::PaneEvent, 1_000, "pane 1 stderr burst")
-            .with_pane_id(1)
-            .with_context("session_id", "incident-X")
-            .with_context("excerpt", "[REDACTED] stderr line"),
-        CausalGraphNode::new("n2", CausalNodeKind::PatternMatch, 1_050, "rule:auth_fail matched")
-            .with_pane_id(1)
-            .with_context("session_id", "incident-X")
-            .with_context("rule_id", "auth_fail")
-            .with_context("matched_excerpt", "auth failed for [REDACTED]"),
-        CausalGraphNode::new("n3", CausalNodeKind::PolicyDecision, 1_100, "policy:require_approval")
-            .with_pane_id(1)
-            .with_context("session_id", "incident-X")
-            .with_context("decision", "require_approval"),
+        CausalGraphNode::new(
+            "n1",
+            CausalNodeKind::PaneEvent,
+            1_000,
+            "pane 1 stderr burst",
+        )
+        .with_pane_id(1)
+        .with_context("session_id", "incident-X")
+        .with_context("excerpt", "[REDACTED] stderr line"),
+        CausalGraphNode::new(
+            "n2",
+            CausalNodeKind::PatternMatch,
+            1_050,
+            "rule:auth_fail matched",
+        )
+        .with_pane_id(1)
+        .with_context("session_id", "incident-X")
+        .with_context("rule_id", "auth_fail")
+        .with_context("matched_excerpt", "auth failed for [REDACTED]"),
+        CausalGraphNode::new(
+            "n3",
+            CausalNodeKind::PolicyDecision,
+            1_100,
+            "policy:require_approval",
+        )
+        .with_pane_id(1)
+        .with_context("session_id", "incident-X")
+        .with_context("decision", "require_approval"),
         CausalGraphNode::new("n4", CausalNodeKind::Approval, 1_200, "operator approved")
             .with_pane_id(1)
             .with_context("session_id", "incident-X")
             .with_context("operator", "[REDACTED]"),
-        CausalGraphNode::new("n5", CausalNodeKind::RecoveryAction, 1_300, "rollback to checkpoint cp-7")
-            .with_pane_id(1)
-            .with_context("session_id", "incident-X")
-            .with_context("checkpoint_id", "cp-7"),
+        CausalGraphNode::new(
+            "n5",
+            CausalNodeKind::RecoveryAction,
+            1_300,
+            "rollback to checkpoint cp-7",
+        )
+        .with_pane_id(1)
+        .with_context("session_id", "incident-X")
+        .with_context("checkpoint_id", "cp-7"),
         // Different pane — same incident, parallel timeline.
         CausalGraphNode::new("n6", CausalNodeKind::PaneEvent, 1_010, "pane 2 lockup")
             .with_pane_id(2)
             .with_context("session_id", "incident-X"),
-        CausalGraphNode::new("n7", CausalNodeKind::WorkflowTrigger, 1_150, "workflow:diag_dump")
-            .with_pane_id(2)
-            .with_context("session_id", "incident-X"),
+        CausalGraphNode::new(
+            "n7",
+            CausalNodeKind::WorkflowTrigger,
+            1_150,
+            "workflow:diag_dump",
+        )
+        .with_pane_id(2)
+        .with_context("session_id", "incident-X"),
         // Out-of-incident pane (different session) to verify focus filter.
-        CausalGraphNode::new("n8", CausalNodeKind::PaneEvent, 1_500, "pane 3 unrelated heartbeat")
-            .with_pane_id(3)
-            .with_context("session_id", "other-session"),
+        CausalGraphNode::new(
+            "n8",
+            CausalNodeKind::PaneEvent,
+            1_500,
+            "pane 3 unrelated heartbeat",
+        )
+        .with_pane_id(3)
+        .with_context("session_id", "other-session"),
     ];
     let edges = vec![
         CausalGraphEdge {
@@ -146,7 +174,11 @@ fn timeline_one_line_per_node_in_chronological_order_ft_1650n_16() {
         .filter(|l| l.starts_with("["))
         .copied()
         .collect();
-    assert_eq!(entry_lines.len(), 8, "expected 8 entries, got: {entry_lines:?}");
+    assert_eq!(
+        entry_lines.len(),
+        8,
+        "expected 8 entries, got: {entry_lines:?}"
+    );
     // Entries must be in ascending timestamp order (1000, 1010,
     // 1050, 1100, 1150, 1200, 1300, 1500).
     let timestamps: Vec<u64> = entry_lines
@@ -156,7 +188,10 @@ fn timeline_one_line_per_node_in_chronological_order_ft_1650n_16() {
             s.parse().ok()
         })
         .collect();
-    assert_eq!(timestamps, vec![1_000, 1_010, 1_050, 1_100, 1_150, 1_200, 1_300, 1_500]);
+    assert_eq!(
+        timestamps,
+        vec![1_000, 1_010, 1_050, 1_100, 1_150, 1_200, 1_300, 1_500]
+    );
 }
 
 /// Pane focus filter restricts the timeline to a single pane's
@@ -191,7 +226,11 @@ fn timeline_time_window_focus_filter_inclusive_ft_1650n_16() {
     };
     let text = render_timeline_text(&nodes, &edges, &opts);
     let entry_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("[")).collect();
-    assert_eq!(entry_lines.len(), 4, "window [1050, 1200] should keep 4 nodes");
+    assert_eq!(
+        entry_lines.len(),
+        4,
+        "window [1050, 1200] should keep 4 nodes"
+    );
 }
 
 /// Uncertain inbound edges flag the target node with the documented
@@ -346,11 +385,8 @@ fn toon_rendering_covers_same_nodes_and_uncertainty_variants_ft_1650n_16() {
     // at LowConfidence-or-worse; Confident edges may still appear
     // if the substrate decides to surface them — both behaviors
     // acceptable for this E2E gate).
-    let markers: Vec<UncertaintyMarker> = rendering
-        .uncertain_edges
-        .iter()
-        .map(|e| e.marker)
-        .collect();
+    let markers: Vec<UncertaintyMarker> =
+        rendering.uncertain_edges.iter().map(|e| e.marker).collect();
     assert!(
         markers.contains(&UncertaintyMarker::LowConfidence),
         "expected LowConfidence marker in uncertain edges (n6→n7)"

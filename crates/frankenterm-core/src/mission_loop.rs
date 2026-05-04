@@ -4684,25 +4684,27 @@ mod tests {
     fn operator_report_health_section_degraded() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         // Inject metrics samples with high conflict rate
-        ml.state.metrics_history.push_back(MissionCycleMetricsSample {
-            cycle_id: 1,
-            timestamp_ms: 1000,
-            evaluation_latency_ms: 50,
-            assignments: 3,
-            rejections: 2,
-            conflict_rejections: 2,
-            policy_denials: 1,
-            unblocked_transitions: 0,
-            planner_churn_events: 2,
-            throughput_assignments_per_minute: 5.0,
-            unblock_velocity_per_minute: 1.0,
-            conflict_rate: 0.25,
-            planner_churn_rate: 0.35,
-            policy_deny_rate: 0.1,
-            assignments_by_agent: HashMap::new(),
-            workspace_label: "test".to_string(),
-            track_label: "mission".to_string(),
-        });
+        ml.state
+            .metrics_history
+            .push_back(MissionCycleMetricsSample {
+                cycle_id: 1,
+                timestamp_ms: 1000,
+                evaluation_latency_ms: 50,
+                assignments: 3,
+                rejections: 2,
+                conflict_rejections: 2,
+                policy_denials: 1,
+                unblocked_transitions: 0,
+                planner_churn_events: 2,
+                throughput_assignments_per_minute: 5.0,
+                unblock_velocity_per_minute: 1.0,
+                conflict_rate: 0.25,
+                planner_churn_rate: 0.35,
+                policy_deny_rate: 0.1,
+                assignments_by_agent: HashMap::new(),
+                workspace_label: "test".to_string(),
+                track_label: "mission".to_string(),
+            });
 
         let report = ml.generate_operator_report(None, None);
         assert_eq!(report.health.overall, "degraded");
@@ -4713,25 +4715,27 @@ mod tests {
     #[test]
     fn operator_report_health_section_critical() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
-        ml.state.metrics_history.push_back(MissionCycleMetricsSample {
-            cycle_id: 1,
-            timestamp_ms: 1000,
-            evaluation_latency_ms: 100,
-            assignments: 1,
-            rejections: 5,
-            conflict_rejections: 4,
-            policy_denials: 3,
-            unblocked_transitions: 0,
-            planner_churn_events: 0,
-            throughput_assignments_per_minute: 1.0,
-            unblock_velocity_per_minute: 0.0,
-            conflict_rate: 0.5,
-            planner_churn_rate: 0.0,
-            policy_deny_rate: 0.6,
-            assignments_by_agent: HashMap::new(),
-            workspace_label: "test".to_string(),
-            track_label: "mission".to_string(),
-        });
+        ml.state
+            .metrics_history
+            .push_back(MissionCycleMetricsSample {
+                cycle_id: 1,
+                timestamp_ms: 1000,
+                evaluation_latency_ms: 100,
+                assignments: 1,
+                rejections: 5,
+                conflict_rejections: 4,
+                policy_denials: 3,
+                unblocked_transitions: 0,
+                planner_churn_events: 0,
+                throughput_assignments_per_minute: 1.0,
+                unblock_velocity_per_minute: 0.0,
+                conflict_rate: 0.5,
+                planner_churn_rate: 0.0,
+                policy_deny_rate: 0.6,
+                assignments_by_agent: HashMap::new(),
+                workspace_label: "test".to_string(),
+                track_label: "mission".to_string(),
+            });
 
         let report = ml.generate_operator_report(None, None);
         assert_eq!(report.health.overall, "critical");

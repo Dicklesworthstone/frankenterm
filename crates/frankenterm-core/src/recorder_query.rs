@@ -449,10 +449,7 @@ impl InMemoryEventStore {
 
     /// Add events to the store.
     pub fn insert(&self, events: impl IntoIterator<Item = RecorderEvent>) {
-        let mut store = self
-            .events
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
+        let mut store = self.events.lock().unwrap_or_else(record_poison_and_recover);
         store.extend(events);
         store.sort_by_key(|e| (e.occurred_at_ms, e.sequence));
     }
@@ -484,10 +481,7 @@ impl Default for InMemoryEventStore {
 
 impl RecorderEventReader for InMemoryEventStore {
     fn read_events(&self, filter: &EventFilter) -> Vec<RecorderEvent> {
-        let store = self
-            .events
-            .lock()
-            .unwrap_or_else(record_poison_and_recover);
+        let store = self.events.lock().unwrap_or_else(record_poison_and_recover);
         store
             .iter()
             .filter(|e| {

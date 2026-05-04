@@ -175,9 +175,7 @@ const fn confidence_label(c: Confidence) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_workload_advisor::{
-        HotTableSnapshot, WorkloadProfile, classify,
-    };
+    use crate::storage_workload_advisor::{HotTableSnapshot, WorkloadProfile, classify};
 
     fn write_heavy_profile() -> WorkloadProfile {
         WorkloadProfile {
@@ -354,8 +352,7 @@ mod tests {
             ],
         });
         let text = WorkloadAdvisorDoctor::new().render_text(&report);
-        let json =
-            serde_json::to_string(&WorkloadAdvisorDoctor::new().render(&report)).unwrap();
+        let json = serde_json::to_string(&WorkloadAdvisorDoctor::new().render(&report)).unwrap();
         let text_count = text.matches(PLANTED_CMD).count();
         let json_count = json.matches(PLANTED_CMD).count();
         // Two occurrences in the source vector — renderer should

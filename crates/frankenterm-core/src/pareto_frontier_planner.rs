@@ -232,10 +232,8 @@ pub struct DominatedExplanation {
 pub fn explain_dominated(points: &[MeasurementPoint]) -> Vec<DominatedExplanation> {
     let mut out = Vec::new();
     for p in points {
-        let mut dominators: Vec<&MeasurementPoint> = points
-            .iter()
-            .filter(|q| is_dominated_by(p, q))
-            .collect();
+        let mut dominators: Vec<&MeasurementPoint> =
+            points.iter().filter(|q| is_dominated_by(p, q)).collect();
         if dominators.is_empty() {
             continue;
         }
@@ -271,8 +269,7 @@ fn strict_winning_dimensions(
     if dominator.resources.cpu_percent_e3 < dominated.resources.cpu_percent_e3 {
         dims.push("cpu_percent_e3".to_string());
     }
-    if dominator.resources.storage_write_pressure_e3
-        < dominated.resources.storage_write_pressure_e3
+    if dominator.resources.storage_write_pressure_e3 < dominated.resources.storage_write_pressure_e3
     {
         dims.push("storage_write_pressure_e3".to_string());
     }
@@ -468,14 +465,13 @@ mod tests {
                 // dominator beat — at minimum p50_us, p95_us,
                 // p99_us, cpu_percent_e3, token_output_quality_e3
                 // (memory_bytes ties at 200).
-                assert!(dominated[0]
-                    .strict_dimensions
-                    .iter()
-                    .any(|d| d == "p99_us"));
-                assert!(dominated[0]
-                    .strict_dimensions
-                    .iter()
-                    .any(|d| d == "token_output_quality_e3"));
+                assert!(dominated[0].strict_dimensions.iter().any(|d| d == "p99_us"));
+                assert!(
+                    dominated[0]
+                        .strict_dimensions
+                        .iter()
+                        .any(|d| d == "token_output_quality_e3")
+                );
             }
             other => panic!("expected Frontier, got {other:?}"),
         }

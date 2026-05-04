@@ -239,9 +239,7 @@ fn fixture_pgp_signed_review_snippet_scrubs_signature_only() {
     // logging context cannot tell signed-data plaintext apart
     // from key material; defense-in-depth.
     let r = Redactor::new();
-    let review = format!(
-        "review note:\nplease verify:\n{PGP_SIGNED}\nthanks!\n"
-    );
+    let review = format!("review note:\nplease verify:\n{PGP_SIGNED}\nthanks!\n");
     let out = r.redact(&review);
     assert!(out.contains("review note:"));
     assert!(out.contains("thanks!"));

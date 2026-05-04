@@ -1628,6 +1628,7 @@ fn compiled_plan_from_contract(contract: &MissionTxContract) -> crate::tx_plan_c
             overall_risk: crate::tx_plan_compiler::StepRisk::Low,
         },
         rejected_edges: Vec::new(),
+        rejected_assignments: Vec::new(),
     }
 }
 

@@ -701,10 +701,7 @@ mod tests {
             max_wait_ms: 0,
             ..DaemonBridgeConfig::default()
         };
-        assert_eq!(
-            cfg.validate(),
-            Err(DaemonBridgeConfigError::ZeroMaxWaitMs)
-        );
+        assert_eq!(cfg.validate(), Err(DaemonBridgeConfigError::ZeroMaxWaitMs));
     }
 
     #[test]

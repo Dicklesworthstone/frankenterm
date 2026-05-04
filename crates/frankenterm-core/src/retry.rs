@@ -909,7 +909,10 @@ mod tests {
                 .delay_for_attempt_with_mode(2, JitterMode::LegacyEqual)
                 .as_millis() as f64;
             // attempt=2 + backoff=2 → base=4000ms; ±10% → [3600, 4400].
-            assert!(d >= 3600.0 && d <= 4400.0, "LegacyEqual delay {d} outside [3600, 4400]");
+            assert!(
+                d >= 3600.0 && d <= 4400.0,
+                "LegacyEqual delay {d} outside [3600, 4400]"
+            );
         }
     }
 
@@ -929,7 +932,10 @@ mod tests {
             let d = policy
                 .delay_for_attempt_with_mode(2, JitterMode::Full)
                 .as_millis() as f64;
-            assert!(d >= 0.0 && d <= 4000.0, "Full jitter delay {d} outside [0, 4000]");
+            assert!(
+                d >= 0.0 && d <= 4000.0,
+                "Full jitter delay {d} outside [0, 4000]"
+            );
         }
     }
 
@@ -982,7 +988,9 @@ mod tests {
             let d = policy
                 .delay_for_attempt_with_mode(
                     1,
-                    JitterMode::Decorrelated { prev_delay_ms: 2000 },
+                    JitterMode::Decorrelated {
+                        prev_delay_ms: 2000,
+                    },
                 )
                 .as_millis() as f64;
             assert!(
@@ -1007,13 +1015,12 @@ mod tests {
                 .delay_for_attempt_with_mode(
                     1,
                     // prev=10s → 3× = 30s, but max is 5s — must cap.
-                    JitterMode::Decorrelated { prev_delay_ms: 10_000 },
+                    JitterMode::Decorrelated {
+                        prev_delay_ms: 10_000,
+                    },
                 )
                 .as_millis() as f64;
-            assert!(
-                d <= 5000.0,
-                "Decorrelated delay {d} exceeds max_delay 5000"
-            );
+            assert!(d <= 5000.0, "Decorrelated delay {d} exceeds max_delay 5000");
         }
     }
 

@@ -3544,10 +3544,18 @@ mod tests {
 
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for a in &result.assignments {
-            assert!(seen.insert(a.bead_id.as_str()), "double-counted {}", a.bead_id);
+            assert!(
+                seen.insert(a.bead_id.as_str()),
+                "double-counted {}",
+                a.bead_id
+            );
         }
         for r in &result.rejected {
-            assert!(seen.insert(r.bead_id.as_str()), "double-counted {}", r.bead_id);
+            assert!(
+                seen.insert(r.bead_id.as_str()),
+                "double-counted {}",
+                r.bead_id
+            );
         }
         assert_eq!(seen.len(), 5, "every input must appear exactly once");
     }
@@ -5077,10 +5085,7 @@ mod tests {
             },
             ..MissionRuntimeConfig::default()
         };
-        assert_validate_rejects_with_field(
-            &config,
-            "extraction_overrides.impact_unblock_weight",
-        );
+        assert_validate_rejects_with_field(&config, "extraction_overrides.impact_unblock_weight");
     }
 
     #[test]

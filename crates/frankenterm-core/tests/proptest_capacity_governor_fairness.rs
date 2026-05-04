@@ -95,14 +95,14 @@ fn arb_workload_category() -> impl Strategy<Value = WorkloadCategory> {
 /// default `load_average_block_threshold = 12.0`.
 fn arb_pressure_signals() -> impl Strategy<Value = PressureSignals> {
     (
-        0.0..=1.0_f64, // cpu_utilization
-        0.0..=1.0_f64, // memory_utilization
-        0u32..=8,      // active_heavy_workloads
-        0u32..=16,     // active_medium_workloads
-        0.0..=20.0_f64, // load_average_1m
-        any::<bool>(), // rch_available
-        0u32..=8,      // rch_workers_available
-        0.0..=1.0_f64, // io_pressure
+        0.0..=1.0_f64,     // cpu_utilization
+        0.0..=1.0_f64,     // memory_utilization
+        0u32..=8,          // active_heavy_workloads
+        0u32..=16,         // active_medium_workloads
+        0.0..=20.0_f64,    // load_average_1m
+        any::<bool>(),     // rch_available
+        0u32..=8,          // rch_workers_available
+        0.0..=1.0_f64,     // io_pressure
         0u64..=10_000_000, // timestamp_ms
     )
         .prop_map(

@@ -296,10 +296,18 @@ mod tests {
         let t0 = Instant::now();
         // First above-target observation at t=0.
         let s = q.record_sojourn(Duration::from_millis(20), t0);
-        assert_eq!(s, CodelState::NotDropping, "first above-target = streak begins, no transition yet");
+        assert_eq!(
+            s,
+            CodelState::NotDropping,
+            "first above-target = streak begins, no transition yet"
+        );
         // Second above-target observation at t = interval (100ms).
         let s = q.record_sojourn(Duration::from_millis(20), t0 + Duration::from_millis(100));
-        assert_eq!(s, CodelState::Dropping, "above-target streak ≥ interval → Dropping");
+        assert_eq!(
+            s,
+            CodelState::Dropping,
+            "above-target streak ≥ interval → Dropping"
+        );
     }
 
     #[test]
@@ -327,11 +335,12 @@ mod tests {
         assert_eq!(s, CodelState::NotDropping, "single spike must not promote");
         // Even if we later go above-target again, the streak restarts.
         q.record_sojourn(Duration::from_millis(20), t0 + Duration::from_millis(100));
-        let s = q.record_sojourn(
-            Duration::from_millis(20),
-            t0 + Duration::from_millis(150),
+        let s = q.record_sojourn(Duration::from_millis(20), t0 + Duration::from_millis(150));
+        assert_eq!(
+            s,
+            CodelState::NotDropping,
+            "streak restarted at t=100ms; only 50ms elapsed"
         );
-        assert_eq!(s, CodelState::NotDropping, "streak restarted at t=100ms; only 50ms elapsed");
     }
 
     #[test]

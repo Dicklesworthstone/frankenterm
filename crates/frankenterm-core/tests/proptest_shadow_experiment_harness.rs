@@ -81,23 +81,19 @@ fn arb_pair(idx: usize) -> impl Strategy<Value = ShadowDecisionPair> {
 }
 
 fn arb_pair_sequence() -> impl Strategy<Value = Vec<ShadowDecisionPair>> {
-    (1usize..=20).prop_flat_map(|n| {
-        (0..n)
-            .map(arb_pair)
-            .collect::<Vec<_>>()
-    })
+    (1usize..=20).prop_flat_map(|n| (0..n).map(arb_pair).collect::<Vec<_>>())
 }
 
 /// Bounded budget generator. Caps stay small so the
 /// abort/cap interactions get exercised without explosion.
 fn arb_budget() -> impl Strategy<Value = ExperimentBudget> {
-    (1u64..=15, 1u64..=15_000, 1u64..=120_000).prop_map(
-        |(max_events, max_per_event, max_total)| ExperimentBudget {
+    (1u64..=15, 1u64..=15_000, 1u64..=120_000).prop_map(|(max_events, max_per_event, max_total)| {
+        ExperimentBudget {
             max_events,
             max_overhead_us_per_event: max_per_event,
             max_total_overhead_us: max_total,
-        },
-    )
+        }
+    })
 }
 
 proptest! {

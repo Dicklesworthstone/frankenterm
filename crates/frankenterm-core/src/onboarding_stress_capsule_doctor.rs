@@ -132,7 +132,8 @@ impl OnboardingDoctor {
         if report.passed.is_empty() {
             out.push_str("  passed: ∅\n");
         } else {
-            let labels: Vec<&'static str> = report.passed.iter().copied().map(check_label).collect();
+            let labels: Vec<&'static str> =
+                report.passed.iter().copied().map(check_label).collect();
             out.push_str(&format!("  passed: {}\n", labels.join(", ")));
         }
         out
