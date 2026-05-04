@@ -11,6 +11,52 @@ use crate::wezterm::CwdInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// br-ft-175qi: cass-summary metadata deserialization observability.
+// `extract_summary_from_meta` reads the persisted CassSessionSummary
+// from session metadata via:
+//     meta.get("cass_summary").and_then(|v| serde_json::from_value(v.clone()).ok())
+// On schema bump or hand-edit the .ok() drop is silent — the refresh
+// path falls through to "summary unavailable" with no signal whether
+// (a) summary was never persisted, (b) it was persisted but in a
+// different shape, or (c) extraction succeeded but produced a None.
+// Different remediation paths.
+//
+// Same observability defect family as ft-iwg7x
+// (robot_profile_bootstrap_serde_drop_count), ft-zkthg
+// (workflows_serde_drop_count), ft-jyywz (audit_chain_export_dropped_count),
+// ft-yygus (policy_decision_context_serde_drop_count), ft-rnpuc
+// (mcp_clock_anomaly_count), ft-bn6qi (epoch_clock_anomaly_count),
+// ft-ncijf (mcp_workflow_plan_serde_drop_count), ft-r3d4e
+// (backup_manifest_parse_drop_count), ft-jtcrv
+// (ars_federation_payload_serde_drop_count), and ft-zs9v0
+// (lock_metadata_parse_drop_count).
+static CASS_SUMMARY_PARSE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-175qi: cumulative count of cass-summary metadata
+/// deserialization failures observed in `extract_summary_from_meta`.
+/// Each increment represents one session-summary refresh where the
+/// persisted `cass_summary` value was schema-skewed and the refresh
+/// path silently fell through to "summary unavailable". > 0 means
+/// investigate session metadata authoring (likely a schema bump or
+/// upstream cass response shape change).
+#[must_use]
+pub fn cass_summary_parse_drop_count() -> u64 {
+    CASS_SUMMARY_PARSE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so regression tests can assert
+/// post-bump values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_cass_summary_parse_drop_count_for_test() {
+    CASS_SUMMARY_PARSE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_cass_summary_parse_drop() {
+    CASS_SUMMARY_PARSE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Correlation algorithm version (for metadata/auditing).
 pub const CASS_CORRELATION_VERSION: &str = "v1";
@@ -702,8 +748,57 @@ fn extract_refresh_ms(meta: &Value) -> Option<i64> {
 }
 
 fn extract_summary_from_meta(meta: &Value) -> Option<CassSessionSummary> {
-    meta.get("cass_summary")
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    let value = meta.get("cass_summary")?;
+    if !cass_summary_value_has_known_shape(value) {
+        record_cass_summary_parse_drop();
+        tracing::warn!(
+            target: "frankenterm::session_correlation",
+            event = "br-ft-175qi",
+            "session metadata cass_summary did not contain any known CassSessionSummary fields; \
+             refresh path will report summary as unavailable"
+        );
+        return None;
+    }
+    // br-ft-175qi: `cass_summary` key is present — a parse failure
+    // here is a schema-skew or hand-edit, distinct from the
+    // intentional "key absent" case (the early `?` above). Bump the
+    // counter and emit a structured warn so operators can surface the
+    // silent drop via metrics scrape AND log search.
+    match serde_json::from_value::<CassSessionSummary>(value.clone()) {
+        Ok(summary) => Some(summary),
+        Err(err) => {
+            record_cass_summary_parse_drop();
+            tracing::warn!(
+                target: "frankenterm::session_correlation",
+                event = "br-ft-175qi",
+                error = %err,
+                "session metadata cass_summary failed to deserialize as CassSessionSummary; \
+                 refresh path will report summary as unavailable"
+            );
+            None
+        }
+    }
+}
+
+fn cass_summary_value_has_known_shape(value: &Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return true;
+    };
+
+    const KNOWN_CASS_SUMMARY_FIELDS: [&str; 8] = [
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "message_count",
+        "session_started_at_ms",
+        "session_ended_at_ms",
+        "first_message_at_ms",
+        "last_message_at_ms",
+    ];
+
+    KNOWN_CASS_SUMMARY_FIELDS
+        .iter()
+        .any(|field| map.contains_key(*field))
 }
 
 fn now_ms() -> i64 {
@@ -1436,5 +1531,138 @@ mod tests {
 
             handle.shutdown().await.unwrap();
         });
+    }
+}
+
+// br-ft-175qi: serialize tests that touch the process-global
+// CASS_SUMMARY_PARSE_DROP_COUNT counter so concurrent test threads
+// don't race on reset/observe pairs.
+#[cfg(test)]
+mod summary_parse_drop_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
+
+    static SUMMARY_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> MutexGuard<'static, ()> {
+        SUMMARY_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn missing_key_does_not_bump_counter() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        let meta = json!({"unrelated": "value"});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        // br-ft-175qi: absent key is the intentional None-return path.
+        assert_eq!(cass_summary_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn null_value_in_key_bumps_counter() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        // The key is present but the value is null — that's a parse
+        // failure (CassSessionSummary is a struct, not Option).
+        let meta = json!({"cass_summary": null});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        assert_eq!(cass_summary_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn primitive_in_key_bumps_counter() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        let meta = json!({"cass_summary": 42});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        assert_eq!(cass_summary_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn empty_object_bumps_counter_instead_of_defaulting_to_empty_summary() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        // serde defaults would otherwise turn {} into an all-empty
+        // CassSessionSummary. The writer never emits that shape, so
+        // treating it as a cache hit hides hand-edited or truncated
+        // metadata.
+        let meta = json!({"cass_summary": {}});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        assert_eq!(cass_summary_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn partial_known_summary_object_succeeds_via_serde_defaults_no_bump() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        let meta = json!({"cass_summary": {"message_count": 3}});
+        let summary = extract_summary_from_meta(&meta).expect("known summary field should parse");
+        assert_eq!(summary.message_count, 3);
+        assert_eq!(cass_summary_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn wrong_field_type_bumps_counter() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        // total_tokens is Option<i64> — a string in that slot is
+        // unambiguously a parse failure regardless of serde defaults.
+        let meta = json!({"cass_summary": {"total_tokens": "not a number"}});
+        let summary = extract_summary_from_meta(&meta);
+        assert!(summary.is_none());
+        assert_eq!(cass_summary_parse_drop_count(), 1);
+    }
+
+    #[test]
+    fn repeated_failures_bump_monotonically() {
+        let _g = lock();
+        reset_cass_summary_parse_drop_count_for_test();
+        // String at root is a clear parse failure (struct expected).
+        let meta = json!({"cass_summary": "not an object at all"});
+        for _ in 0..7 {
+            let _ = extract_summary_from_meta(&meta);
+        }
+        assert_eq!(cass_summary_parse_drop_count(), 7);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(48))]
+
+        // br-ft-175qi: malformed or object-shaped-but-unknown values
+        // must bump the counter exactly once. Known summary fields can
+        // still rely on CassSessionSummary serde defaults for fields
+        // omitted by older cache writers.
+        #[test]
+        fn arbitrary_malformed_or_unknown_summary_value_always_bumps(
+            shape in proptest::sample::select(vec![
+                json!(null),
+                json!(true),
+                json!(false),
+                json!(0),
+                json!(-1),
+                json!(""),
+                json!("a string"),
+                json!([]),
+                json!([1, 2, 3]),
+                json!({}),
+                json!({"random": "object"}),
+                json!({"id": 5}),
+                json!({"summary": "missing other fields"}),
+            ]),
+        ) {
+            let _g = lock();
+            reset_cass_summary_parse_drop_count_for_test();
+            let meta = json!({"cass_summary": shape});
+            let summary = extract_summary_from_meta(&meta);
+            proptest::prop_assert!(summary.is_none());
+            proptest::prop_assert_eq!(cass_summary_parse_drop_count(), 1);
+        }
     }
 }
