@@ -20,7 +20,7 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -233,19 +233,38 @@ impl ArtifactManifest {
         let mut seen = std::collections::HashSet::new();
 
         for entry in &self.artifacts {
-            if !seen.insert(&entry.path) {
-                errors.push(ManifestValidationError::DuplicatePath {
-                    path: entry.path.clone(),
-                });
+            let normalized_path = if entry.path.is_empty() {
+                errors.push(ManifestValidationError::EmptyPath);
+                None
+            } else {
+                match normalize_artifact_path(&entry.path) {
+                    Ok(path) => Some(path),
+                    Err(reason) => {
+                        errors.push(ManifestValidationError::InvalidPath {
+                            path: entry.path.clone(),
+                            reason,
+                        });
+                        None
+                    }
+                }
+            };
+            if let Some(path_key) = normalized_path {
+                if !seen.insert(path_key) {
+                    errors.push(ManifestValidationError::DuplicatePath {
+                        path: entry.path.clone(),
+                    });
+                }
             }
             if entry.sha256.len() != 64 {
                 errors.push(ManifestValidationError::InvalidChecksum {
                     path: entry.path.clone(),
                     reason: format!("expected 64 hex chars, got {}", entry.sha256.len()),
                 });
-            }
-            if entry.path.is_empty() {
-                errors.push(ManifestValidationError::EmptyPath);
+            } else if !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                errors.push(ManifestValidationError::InvalidChecksum {
+                    path: entry.path.clone(),
+                    reason: "expected lowercase or uppercase hex characters".to_string(),
+                });
             }
         }
 
@@ -268,6 +287,10 @@ pub enum ManifestValidationError {
         path: String,
         reason: String,
     },
+    InvalidPath {
+        path: String,
+        reason: String,
+    },
     EmptyPath,
     MissingFile {
         path: String,
@@ -277,6 +300,51 @@ pub enum ManifestValidationError {
         expected: String,
         actual: String,
     },
+}
+
+fn normalize_artifact_path(path: &str) -> Result<String, String> {
+    if path.is_empty() {
+        return Err("artifact path must not be empty".to_string());
+    }
+    if path.as_bytes().contains(&0) {
+        return Err("artifact path must not contain NUL bytes".to_string());
+    }
+    if path.contains('\\') {
+        return Err(
+            "artifact path must use '/' separators and not contain backslashes".to_string(),
+        );
+    }
+
+    let mut segments = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(segment) => {
+                let segment = segment
+                    .to_str()
+                    .ok_or_else(|| "artifact path must be valid UTF-8".to_string())?;
+                segments.push(segment.to_string());
+            }
+            Component::CurDir => {
+                return Err(
+                    "artifact path must not contain current-directory components".to_string(),
+                );
+            }
+            Component::ParentDir => {
+                return Err(
+                    "artifact path must not contain parent-directory components".to_string()
+                );
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("artifact path must be relative to the artifact base".to_string());
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Err("artifact path must not be empty".to_string());
+    }
+
+    Ok(segments.join("/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +461,10 @@ pub trait FsBackend: Send + Sync {
     fn file_size(&self, path: &Path) -> Result<u64, String>;
     /// Remove a file.
     fn remove_file(&self, path: &Path) -> Result<(), String>;
+    /// Canonicalize a path for confinement checks.
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf, String> {
+        Ok(path.to_path_buf())
+    }
 }
 
 /// Real filesystem backend.
@@ -415,6 +487,10 @@ impl FsBackend for RealFs {
 
     fn remove_file(&self, path: &Path) -> Result<(), String> {
         std::fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))
+    }
+
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf, String> {
+        std::fs::canonicalize(path).map_err(|e| format!("canonicalize {}: {e}", path.display()))
     }
 }
 
@@ -449,9 +525,19 @@ impl ArtifactRegistry {
         self.manifest
     }
 
-    /// Resolve a relative path against the base directory.
-    fn resolve(&self, relative: &str) -> PathBuf {
-        self.base_dir.join(relative)
+    /// Resolve a normalized relative artifact path against the base directory.
+    fn resolve(&self, relative: &str) -> Result<PathBuf, String> {
+        Ok(self.base_dir.join(normalize_artifact_path(relative)?))
+    }
+
+    fn resolve_existing_for_access(&self, relative: &str) -> Result<PathBuf, String> {
+        let full_path = self.resolve(relative)?;
+        let canonical_base = self.fs.canonicalize(&self.base_dir)?;
+        let canonical_path = self.fs.canonicalize(&full_path)?;
+        if !canonical_path.starts_with(&canonical_base) {
+            return Err(format!("artifact path escapes base directory: {relative}"));
+        }
+        Ok(canonical_path)
     }
 
     // ── List ─────────────────────────────────────────────────────────────
@@ -493,11 +579,12 @@ impl ArtifactRegistry {
             .ok_or_else(|| format!("artifact not found in manifest: {path}"))?
             .clone();
 
-        let full_path = self.resolve(path);
+        let full_path = self.resolve(&entry.path)?;
         let file_exists = self.fs.file_exists(&full_path);
 
         let integrity_ok = if file_exists {
-            match self.fs.read_file(&full_path) {
+            let access_path = self.resolve_existing_for_access(&entry.path)?;
+            match self.fs.read_file(&access_path) {
                 Ok(bytes) => sha256_bytes(&bytes) == entry.sha256,
                 Err(_) => false,
             }
@@ -529,17 +616,19 @@ impl ArtifactRegistry {
         sensitivity: ArtifactSensitivityTier,
         now_ms: u64,
     ) -> Result<(), String> {
+        let normalized_path = normalize_artifact_path(path)?;
         // Reject duplicate
-        if self.manifest.find(path).is_some() {
-            return Err(format!("artifact already registered: {path}"));
+        if self.manifest.find(&normalized_path).is_some() {
+            return Err(format!("artifact already registered: {normalized_path}"));
         }
 
-        let full_path = self.resolve(path);
+        let full_path = self.resolve(&normalized_path)?;
         if !self.fs.file_exists(&full_path) {
             return Err(format!("file not found: {}", full_path.display()));
         }
 
-        let bytes = self.fs.read_file(&full_path)?;
+        let access_path = self.resolve_existing_for_access(&normalized_path)?;
+        let bytes = self.fs.read_file(&access_path)?;
         let sha256 = sha256_bytes(&bytes);
         let size_bytes = bytes.len() as u64;
 
@@ -547,7 +636,7 @@ impl ArtifactRegistry {
         let (event_count, decision_count) = parse_event_counts(&bytes);
 
         let entry = ArtifactEntry {
-            path: path.to_string(),
+            path: normalized_path,
             label: label.to_string(),
             sha256,
             event_count,
@@ -613,9 +702,10 @@ impl ArtifactRegistry {
 
         for (path, size) in &to_prune {
             if !opts.dry_run {
-                let full_path = self.resolve(path);
-                // Best-effort removal — don't fail the whole prune on one missing file
-                let _ = self.fs.remove_file(&full_path);
+                if let Ok(full_path) = self.resolve_existing_for_access(path) {
+                    // Best-effort removal — don't fail the whole prune on one missing file
+                    let _ = self.fs.remove_file(&full_path);
+                }
             }
             pruned_paths.push(path.clone());
             bytes_freed += size;
@@ -650,20 +740,29 @@ impl ArtifactRegistry {
             if entry.status == ArtifactStatus::Retired {
                 continue; // retired artifacts may have been pruned
             }
-            let full_path = self.resolve(&entry.path);
+            let Ok(full_path) = self.resolve(&entry.path) else {
+                continue;
+            };
             if !self.fs.file_exists(&full_path) {
                 errors.push(ManifestValidationError::MissingFile {
                     path: entry.path.clone(),
                 });
-            } else if let Ok(bytes) = self.fs.read_file(&full_path) {
-                let actual = sha256_bytes(&bytes);
-                if actual != entry.sha256 {
-                    errors.push(ManifestValidationError::ChecksumMismatch {
-                        path: entry.path.clone(),
-                        expected: entry.sha256.clone(),
-                        actual,
-                    });
+            } else if let Ok(access_path) = self.resolve_existing_for_access(&entry.path) {
+                if let Ok(bytes) = self.fs.read_file(&access_path) {
+                    let actual = sha256_bytes(&bytes);
+                    if actual != entry.sha256 {
+                        errors.push(ManifestValidationError::ChecksumMismatch {
+                            path: entry.path.clone(),
+                            expected: entry.sha256.clone(),
+                            actual,
+                        });
+                    }
                 }
+            } else {
+                errors.push(ManifestValidationError::InvalidPath {
+                    path: entry.path.clone(),
+                    reason: "resolved artifact path escapes base directory".to_string(),
+                });
             }
         }
 
@@ -772,22 +871,27 @@ fn truncate_str(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     // Mock filesystem for deterministic testing.
+    #[derive(Clone)]
     struct MockFs {
-        files: Mutex<HashMap<PathBuf, Vec<u8>>>,
+        files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
     }
 
     impl MockFs {
         fn new() -> Self {
             Self {
-                files: Mutex::new(HashMap::new()),
+                files: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
         fn add_file(&self, path: PathBuf, content: Vec<u8>) {
             self.files.lock().unwrap().insert(path, content);
+        }
+
+        fn contains_file(&self, path: &Path) -> bool {
+            self.files.lock().unwrap().contains_key(path)
         }
     }
 
@@ -959,6 +1063,45 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ManifestValidationError::EmptyPath))
         );
+    }
+
+    #[test]
+    fn manifest_validate_rejects_path_escape_forms() {
+        let mut m = ArtifactManifest::new();
+        let content = b"x";
+        m.artifacts
+            .push(make_entry("/absolute.ftreplay", "absolute", content));
+        m.artifacts
+            .push(make_entry("../parent.ftreplay", "parent", content));
+        m.artifacts
+            .push(make_entry("./current.ftreplay", "current", content));
+        m.artifacts.push(make_entry(
+            "windows\\separator.ftreplay",
+            "backslash",
+            content,
+        ));
+
+        let errors = m.validate();
+        let invalid_path_count = errors
+            .iter()
+            .filter(|e| matches!(e, ManifestValidationError::InvalidPath { .. }))
+            .count();
+        assert_eq!(invalid_path_count, 4, "{errors:?}");
+    }
+
+    #[test]
+    fn manifest_validate_rejects_non_hex_checksum() {
+        let mut m = ArtifactManifest::new();
+        let mut entry = make_entry("bad_hex.ftreplay", "bad-hex", b"x");
+        entry.sha256 = "g".repeat(64);
+        m.artifacts.push(entry);
+
+        let errors = m.validate();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ManifestValidationError::InvalidChecksum { reason, .. }
+                if reason.contains("hex")
+        )));
     }
 
     // ── Sensitivity tier tests ───────────────────────────────────────────
@@ -1136,6 +1279,18 @@ mod tests {
         assert!(reg.inspect("missing.ftreplay").is_err());
     }
 
+    #[test]
+    fn inspect_rejects_manifest_path_escape_before_reading() {
+        let content = b"outside";
+        let entry = make_entry("/outside.ftreplay", "outside", content);
+        let fs = MockFs::new();
+        fs.add_file(PathBuf::from("/outside.ftreplay"), content.to_vec());
+        let reg = setup_registry(vec![entry], fs);
+
+        let err = reg.inspect("/outside.ftreplay").unwrap_err();
+        assert!(err.contains("relative"), "{err}");
+    }
+
     // ── Registry add tests ───────────────────────────────────────────────
 
     #[test]
@@ -1177,6 +1332,36 @@ mod tests {
         let result = reg.add("missing.ftreplay", "m", ArtifactSensitivityTier::T1, 2000);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn add_rejects_path_escape_before_filesystem_read() {
+        let content = b"outside";
+        let fs = MockFs::new();
+        fs.add_file(PathBuf::from("/outside.ftreplay"), content.to_vec());
+        fs.add_file(PathBuf::from("/base/../parent.ftreplay"), content.to_vec());
+        let mut reg = setup_registry(vec![], fs);
+
+        let absolute_err = reg
+            .add(
+                "/outside.ftreplay",
+                "outside",
+                ArtifactSensitivityTier::T1,
+                2000,
+            )
+            .unwrap_err();
+        assert!(absolute_err.contains("relative"), "{absolute_err}");
+
+        let parent_err = reg
+            .add(
+                "../parent.ftreplay",
+                "parent",
+                ArtifactSensitivityTier::T1,
+                2000,
+            )
+            .unwrap_err();
+        assert!(parent_err.contains("parent-directory"), "{parent_err}");
+        assert!(reg.manifest().artifacts.is_empty());
     }
 
     #[test]
@@ -1368,6 +1553,29 @@ mod tests {
         assert_eq!(result.bytes_freed, 8);
     }
 
+    #[test]
+    fn prune_does_not_remove_path_escape_artifacts() {
+        let content = b"outside";
+        let mut entry = make_entry("/outside.ftreplay", "outside", content);
+        entry.status = ArtifactStatus::Retired;
+        entry.retired_at_ms = Some(1000);
+        let fs = MockFs::new();
+        fs.add_file(PathBuf::from("/outside.ftreplay"), content.to_vec());
+        let mut reg = setup_registry(vec![entry], fs.clone());
+
+        let result = reg.prune(&PruneOptions {
+            dry_run: false,
+            max_age_days: 0,
+            now_ms: 1000 + 24 * 60 * 60 * 1000,
+        });
+
+        assert_eq!(result.pruned_count, 1);
+        assert!(
+            fs.contains_file(Path::new("/outside.ftreplay")),
+            "invalid manifest path must not trigger outside-base removal"
+        );
+    }
+
     // ── Registry validate tests ──────────────────────────────────────────
 
     #[test]
@@ -1381,6 +1589,27 @@ mod tests {
             errors
                 .iter()
                 .any(|e| matches!(e, ManifestValidationError::MissingFile { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_reports_invalid_manifest_paths_without_fs_access() {
+        let content = b"exists";
+        let entry = make_entry("../outside.ftreplay", "outside", content);
+        let fs = MockFs::new();
+        fs.add_file(PathBuf::from("/base/../outside.ftreplay"), content.to_vec());
+        let reg = setup_registry(vec![entry], fs);
+
+        let errors = reg.validate();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ManifestValidationError::InvalidPath { path, .. }
+                if path == "../outside.ftreplay"
+        )));
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ManifestValidationError::ChecksumMismatch { .. }))
         );
     }
 

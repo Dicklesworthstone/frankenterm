@@ -108,15 +108,17 @@ fn build_event(
 /// scheduler's sort step has work to do.
 fn arb_event() -> impl Strategy<Value = RecorderEvent> {
     (
-        1u64..=4u64,            // pane_id (small range to force collisions on this axis)
-        0u64..=64u64,            // sequence (small range to force ties on this axis)
-        0u64..=1_000_000u64,     // recorded_at_ms
-        0u64..=1_000_000u64,     // occurred_at_ms (independent — clock anomalies allowed)
-        any::<u32>(),            // event_id_seed (uniqueness driver)
+        1u64..=4u64,         // pane_id (small range to force collisions on this axis)
+        0u64..=64u64,        // sequence (small range to force ties on this axis)
+        0u64..=1_000_000u64, // recorded_at_ms
+        0u64..=1_000_000u64, // occurred_at_ms (independent — clock anomalies allowed)
+        any::<u32>(),        // event_id_seed (uniqueness driver)
     )
-        .prop_map(|(pane_id, sequence, recorded_at_ms, occurred_at_ms, seed)| {
-            build_event(pane_id, sequence, recorded_at_ms, occurred_at_ms, seed)
-        })
+        .prop_map(
+            |(pane_id, sequence, recorded_at_ms, occurred_at_ms, seed)| {
+                build_event(pane_id, sequence, recorded_at_ms, occurred_at_ms, seed)
+            },
+        )
 }
 
 /// Strategy for non-empty event vectors.

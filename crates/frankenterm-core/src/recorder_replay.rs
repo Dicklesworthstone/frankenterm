@@ -1173,6 +1173,21 @@ mod tests {
         }
     }
 
+    fn replayed_event_ids(events: Vec<QueryResultEvent>) -> Vec<String> {
+        ReplaySession::new(
+            events,
+            ReplayConfig::instant(),
+            human(),
+            AccessTier::A2FullQuery,
+            "ft-se2ep-order",
+        )
+        .unwrap()
+        .collect_remaining()
+        .into_iter()
+        .map(|frame| frame.event.event_id)
+        .collect()
+    }
+
     fn make_text_event(pane_id: u64, seq: u64, ts_ms: u64, text: &str) -> QueryResultEvent {
         make_result_event(pane_id, seq, ts_ms, Some(text), QueryEventKind::IngressText)
     }
@@ -1389,6 +1404,52 @@ mod tests {
         // Events should be in timestamp order.
         for window in frames.windows(2) {
             assert!(window[0].original_ts_ms <= window[1].original_ts_ms);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn replay_session_total_order_is_independent_of_input_permutation(
+            raw_events in prop::collection::vec(
+                (
+                    0u64..=7,
+                    0u8..=3,
+                    "[a-z0-9]{1,8}",
+                ),
+                1..=32,
+            )
+        ) {
+            let events: Vec<QueryResultEvent> = raw_events
+                .into_iter()
+                .enumerate()
+                .map(|(index, (pane_id, kind_rank, suffix))| {
+                    make_result_event_with_id(
+                        format!("ft-se2ep-{index:02}-{suffix}"),
+                        pane_id,
+                        7,
+                        1_000,
+                        query_kind_from_rank(kind_rank),
+                    )
+                })
+                .collect();
+
+            let original = replayed_event_ids(events.clone());
+
+            let mut reversed = events.clone();
+            reversed.reverse();
+            prop_assert_eq!(replayed_event_ids(reversed), original);
+
+            if events.len() > 1 {
+                let mut rotated = events;
+                let split_at = rotated.len() / 2;
+                rotated.rotate_left(split_at);
+                prop_assert_eq!(replayed_event_ids(rotated), original);
+            }
         }
     }
 

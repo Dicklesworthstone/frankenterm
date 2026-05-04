@@ -57,14 +57,50 @@ impl Default for RegressionBudget {
 }
 
 impl RegressionBudget {
+    /// Validate budget bounds before applying them to a gate.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.skip_budget_percent.is_finite() {
+            return Err("skip_budget_percent must be finite".into());
+        }
+        if !(0.0..=100.0).contains(&self.skip_budget_percent) {
+            return Err("skip_budget_percent must be between 0.0 and 100.0".into());
+        }
+        if self.time_budget_ms == 0 {
+            return Err("time_budget_ms must be positive".into());
+        }
+        Ok(())
+    }
+
     /// Parse a budget from TOML.
     pub fn from_toml(s: &str) -> Result<Self, String> {
-        toml::from_str(s).map_err(|e| format!("budget TOML parse error: {}", e))
+        let budget: Self =
+            toml::from_str(s).map_err(|e| format!("budget TOML parse error: {}", e))?;
+        budget.validate()?;
+        Ok(budget)
     }
 
     /// Serialize to TOML.
     pub fn to_toml(&self) -> Result<String, String> {
+        self.validate()?;
         toml::to_string(self).map_err(|e| format!("budget TOML serialize error: {}", e))
+    }
+
+    fn fail_closed() -> Self {
+        Self {
+            max_critical: 0,
+            max_high: 0,
+            max_medium: 0,
+            skip_budget_percent: 0.0,
+            time_budget_ms: 1,
+        }
+    }
+
+    fn validated_or_fail_closed(self) -> Self {
+        if self.validate().is_ok() {
+            self
+        } else {
+            Self::fail_closed()
+        }
     }
 }
 
@@ -215,7 +251,15 @@ impl GateEvaluator {
     /// Create an evaluator with the given budget.
     #[must_use]
     pub fn new(budget: RegressionBudget) -> Self {
-        Self { budget }
+        Self {
+            budget: budget.validated_or_fail_closed(),
+        }
+    }
+
+    /// Create an evaluator with the given budget, rejecting invalid bounds.
+    pub fn try_new(budget: RegressionBudget) -> Result<Self, String> {
+        budget.validate()?;
+        Ok(Self { budget })
     }
 
     /// Create an evaluator with the default budget.
@@ -871,6 +915,66 @@ time_budget_ms = 3600000
     fn malformed_toml_rejected() {
         let result = RegressionBudget::from_toml("not valid [[[toml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_budget_bounds_rejected() {
+        for skip_budget_percent in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 100.1] {
+            let budget = RegressionBudget {
+                skip_budget_percent,
+                ..Default::default()
+            };
+            assert!(budget.validate().is_err());
+            assert!(GateEvaluator::try_new(budget).is_err());
+        }
+
+        let budget = RegressionBudget {
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        assert!(budget.validate().is_err());
+        assert!(GateEvaluator::try_new(budget).is_err());
+    }
+
+    #[test]
+    fn invalid_budget_toml_rejected() {
+        for toml in [
+            "skip_budget_percent = -0.1",
+            "skip_budget_percent = 100.1",
+            "time_budget_ms = 0",
+        ] {
+            assert!(RegressionBudget::from_toml(toml).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_programmatic_budget_fails_closed() {
+        let budget = RegressionBudget {
+            max_critical: 99,
+            max_high: 99,
+            max_medium: 99,
+            skip_budget_percent: f64::NAN,
+            time_budget_ms: 0,
+        };
+        let eval = GateEvaluator::new(budget);
+        assert!((eval.budget().skip_budget_percent - 0.0).abs() < f64::EPSILON);
+        assert_eq!(eval.budget().time_budget_ms, 1);
+
+        let ctx = EvaluationContext {
+            total_artifacts: 10,
+            skipped_artifacts: 1,
+            replay_duration_ms: 2,
+            ..Default::default()
+        };
+        let result = eval.evaluate(&empty_report(), &ctx);
+        assert!(result.is_fail());
+        let dimensions: Vec<_> = result
+            .violations()
+            .iter()
+            .map(|violation| violation.budget_dimension.as_str())
+            .collect();
+        assert!(dimensions.contains(&"skip_budget_percent"));
+        assert!(dimensions.contains(&"time_budget_ms"));
     }
 
     // ── Zero total artifacts → no skip check ──────────────────────────
