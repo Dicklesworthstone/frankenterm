@@ -223,12 +223,12 @@ use crate::mcp_framework::{
 };
 
 use super::mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
-use crate::Result;
 use crate::config::{Config, McpClientConfig};
 use crate::mcp_client::{
-    ExternalServerConfig, FtMcpClient, McpClientContentItem, McpClientToolDefinition,
-    discover_servers,
+    discover_servers, ExternalServerConfig, FtMcpClient, McpClientContentItem,
+    McpClientToolDefinition,
 };
+use crate::Result;
 
 const LOG_TARGET: &str = "ft::mcp_proxy";
 
@@ -983,10 +983,10 @@ impl ToolHandler for RemoteProxyToolHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ExternalServerConfig, McpClientConfig, McpClientToolDefinition, Server,
         compose_proxy_tools, filter_remote_tools, insert_route_prefix,
         mcp_proxy_destructive_filtered_count, reset_mcp_proxy_destructive_filtered_count_for_test,
-        sanitize_prefix_segment, select_proxy_servers,
+        sanitize_prefix_segment, select_proxy_servers, Config, ExternalServerConfig,
+        McpClientConfig, McpClientToolDefinition, Server,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
@@ -1174,7 +1174,7 @@ mod tests {
             annotations: Some(serde_json::json!({"destructive": true})),
         };
 
-        let filtered = filter_remote_tools(&settings, vec![safe, destructive]);
+        let filtered = locked_filter_remote_tools(&settings, vec![safe, destructive]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "safe");
     }
@@ -1228,7 +1228,7 @@ mod tests {
             annotations: Some(serde_json::json!({"destructiveHint": true, "readOnly": true})),
         };
 
-        let filtered = filter_remote_tools(
+        let filtered = locked_filter_remote_tools(
             &settings,
             vec![
                 read_only,
@@ -1272,7 +1272,7 @@ mod tests {
         };
 
         let filtered =
-            filter_remote_tools(&settings, vec![missing_annotations, malformed_annotations]);
+            locked_filter_remote_tools(&settings, vec![missing_annotations, malformed_annotations]);
 
         assert!(filtered.is_empty());
     }
@@ -1281,6 +1281,7 @@ mod tests {
     /// new cumulative counter by exactly 1.
     #[test]
     fn filter_remote_tools_bumps_destructive_counter() {
+        let _guard = proxy_counter_test_lock();
         reset_mcp_proxy_destructive_filtered_count_for_test();
         let before = mcp_proxy_destructive_filtered_count();
 
@@ -1316,6 +1317,7 @@ mod tests {
     /// per-tool one.
     #[test]
     fn filter_remote_tools_destructive_counter_matches_filter_count() {
+        let _guard = proxy_counter_test_lock();
         reset_mcp_proxy_destructive_filtered_count_for_test();
         let before = mcp_proxy_destructive_filtered_count();
 
@@ -1371,6 +1373,7 @@ mod tests {
     /// happens and the counter stays untouched.
     #[test]
     fn filter_remote_tools_allow_mutating_does_not_bump_counter() {
+        let _guard = proxy_counter_test_lock();
         reset_mcp_proxy_destructive_filtered_count_for_test();
         let before = mcp_proxy_destructive_filtered_count();
 
@@ -1522,7 +1525,7 @@ mod tests {
             },
         ];
 
-        let filtered = filter_remote_tools(&settings, tools);
+        let filtered = locked_filter_remote_tools(&settings, tools);
         let names: Vec<&str> = filtered.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"drop_db"), "explicit destructive admitted");
         assert!(names.contains(&"write_file"), "explicit mutating admitted");
@@ -1550,7 +1553,7 @@ mod tests {
             annotations: None,
         }];
 
-        let filtered = filter_remote_tools(&settings, tools);
+        let filtered = locked_filter_remote_tools(&settings, tools);
         assert!(
             filtered.is_empty(),
             "missing-annotations tools must remain blocked even with opt-in"
@@ -1576,7 +1579,7 @@ mod tests {
             annotations: Some(serde_json::json!(["not", "an", "object"])),
         }];
 
-        let filtered = filter_remote_tools(&settings, tools);
+        let filtered = locked_filter_remote_tools(&settings, tools);
         assert!(
             filtered.is_empty(),
             "malformed-annotations tools must remain blocked even with opt-in"
@@ -1586,7 +1589,7 @@ mod tests {
     #[test]
     fn filter_remote_tools_empty_input() {
         let settings = McpClientConfig::default();
-        let filtered = filter_remote_tools(&settings, Vec::new());
+        let filtered = locked_filter_remote_tools(&settings, Vec::new());
         assert!(filtered.is_empty());
     }
 
@@ -1725,11 +1728,11 @@ mod tests {
 
             let mut settings = McpClientConfig::default();
             settings.proxy_allow_mutating_tools = false;
-            let filtered = filter_remote_tools(&settings, vec![safe.clone(), destructive.clone()]);
+            let filtered = locked_filter_remote_tools(&settings, vec![safe.clone(), destructive.clone()]);
             prop_assert_eq!(filtered.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec![safe_name.as_str()]);
 
             settings.proxy_allow_mutating_tools = true;
-            let unfiltered = filter_remote_tools(&settings, vec![safe, destructive]);
+            let unfiltered = locked_filter_remote_tools(&settings, vec![safe, destructive]);
             prop_assert_eq!(unfiltered.len(), 2);
         }
 
@@ -1768,11 +1771,40 @@ mod tests {
 
             let mut settings = McpClientConfig::default();
             settings.proxy_allow_mutating_tools = false;
-            prop_assert!(filter_remote_tools(&settings, vec![tool.clone()]).is_empty());
+            prop_assert!(locked_filter_remote_tools(&settings, vec![tool.clone()]).is_empty());
 
             settings.proxy_allow_mutating_tools = true;
-            let unfiltered = filter_remote_tools(&settings, vec![tool]);
+            let unfiltered = locked_filter_remote_tools(&settings, vec![tool]);
             prop_assert_eq!(unfiltered.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec![name.as_str()]);
+        }
+
+        #[test]
+        fn prop_destructive_counter_delta_is_serialized_by_test_lock(count in 0usize..=16) {
+            let _guard = proxy_counter_test_lock();
+            reset_mcp_proxy_destructive_filtered_count_for_test();
+            let settings = McpClientConfig {
+                enabled: true,
+                proxy_enabled: true,
+                proxy_allow_mutating_tools: false,
+                ..McpClientConfig::default()
+            };
+            let tools: Vec<McpClientToolDefinition> = (0..count)
+                .map(|idx| McpClientToolDefinition {
+                    name: format!("drop_db_{idx}"),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: Some(serde_json::json!({"destructive": true})),
+                })
+                .collect();
+
+            let filtered = filter_remote_tools(&settings, tools);
+
+            prop_assert!(filtered.is_empty());
+            prop_assert_eq!(mcp_proxy_destructive_filtered_count(), count as u64);
         }
     }
 
@@ -1786,6 +1818,14 @@ mod tests {
     fn proxy_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn locked_filter_remote_tools(
+        settings: &McpClientConfig,
+        tools: Vec<McpClientToolDefinition>,
+    ) -> Vec<McpClientToolDefinition> {
+        let _guard = proxy_counter_test_lock();
+        filter_remote_tools(settings, tools)
     }
 
     #[test]
@@ -2058,7 +2098,10 @@ mod tests {
 
         let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
         let result = compose_proxy_tools(builder, &config, None);
-        let err = result.expect_err("strict no-db must return Err");
+        let err = match result {
+            Ok(_) => panic!("strict no-db must return Err"),
+            Err(err) => err,
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("br-ft-eljxp"),
