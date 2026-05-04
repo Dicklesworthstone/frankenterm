@@ -1397,4 +1397,62 @@ mod tests {
         assert_eq!(super::sse_events_dropped_count(), 0);
         assert_eq!(super::sse_streams_terminated_by_drop_cap_count(), 0);
     }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// br-ft-bn6qi: for any SystemTime drawn from
+        /// `UNIX_EPOCH ± offset_secs`, epoch_ms_from returns
+        ///   - a NON-NEGATIVE i64 always (the contract)
+        ///   - 0 iff the input was strictly before UNIX_EPOCH
+        ///     (the fallback is never confused with a real ts=0)
+        ///   - bumps the anomaly counter exactly once per pre-
+        ///     epoch input, never on a post-epoch input.
+        /// Pin the contract against fuzzed inputs so the
+        /// fail-loud counter cannot regress to silent-default.
+        #[test]
+        fn epoch_ms_from_anomaly_iff_pre_epoch_ft_bn6qi(
+            offset_secs in -10_000_i64..=10_000_i64,
+        ) {
+            let _guard = drop_counter_test_lock();
+            super::reset_epoch_clock_anomaly_count_for_test();
+            let before = super::epoch_clock_anomaly_count();
+
+            let now = if offset_secs >= 0 {
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(offset_secs as u64)
+            } else {
+                std::time::UNIX_EPOCH
+                    - std::time::Duration::from_secs((-offset_secs) as u64)
+            };
+            let ms = super::epoch_ms_from(now);
+            let after = super::epoch_clock_anomaly_count();
+            let bumped = after > before;
+            let is_pre_epoch = offset_secs < 0;
+            proptest::prop_assert_eq!(
+                bumped,
+                is_pre_epoch,
+                "br-ft-bn6qi: counter must bump iff input is pre-epoch; offset_secs={} bumped={} is_pre_epoch={}",
+                offset_secs, bumped, is_pre_epoch
+            );
+            proptest::prop_assert!(ms >= 0, "br-ft-bn6qi: epoch_ms_from must never return negative");
+            if is_pre_epoch {
+                proptest::prop_assert_eq!(
+                    ms, 0,
+                    "br-ft-bn6qi: pre-epoch input must produce timestamp=0 (the documented fallback)"
+                );
+            } else {
+                // Post-epoch with offset==0 is exactly UNIX_EPOCH → ms=0,
+                // but does NOT bump the counter (already pinned by `bumped`).
+                let expected_ms: i64 = (offset_secs as i64) * 1000;
+                proptest::prop_assert_eq!(
+                    ms, expected_ms,
+                    "br-ft-bn6qi: post-epoch ms must equal offset_secs*1000"
+                );
+            }
+        }
+    }
 }
