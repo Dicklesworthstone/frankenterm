@@ -446,7 +446,20 @@ pub fn parse_commands(tokens: &[ShellToken]) -> Vec<ParsedCommand> {
                 current_redirects.clear();
                 is_piped = false;
             }
-            ShellToken::Redirect(_) => unreachable!(),
+            // br-ft-8us8t: structurally unreachable — Redirect tokens are
+            // consumed earlier in this loop by the
+            // expect_redirect_target-driven branches (the
+            // `expect_redirect_target.is_some()` arm above pulls the
+            // operand and pairs it with the pending operator). The
+            // named message surfaces the invariant if a future
+            // refactor moves or removes the upstream consumption.
+            // Same shape as ft-4l0lk's named-message fix for
+            // fleet_memory_controller.
+            ShellToken::Redirect(_) => unreachable!(
+                "Redirect tokens are consumed earlier in the loop by the \
+                 expect_redirect_target-driven branches; this match arm \
+                 is structurally unreachable"
+            ),
         }
     }
 
