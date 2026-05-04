@@ -744,9 +744,11 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                 progress.events_read += 1;
                 let ordinal = record.offset.ordinal;
 
+                // br-ft-zvue8: do NOT update last_offset for the
+                // out-of-range record; same fix as the legacy +
+                // Cx paths.
                 if ordinal >= exclusive_range.to_ordinal {
                     progress.caught_up = true;
-                    last_offset = Some(record.offset.clone());
                     break;
                 }
 
@@ -966,9 +968,10 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                 progress.events_read += 1;
                 let ordinal = record.offset.ordinal;
 
+                // br-ft-zvue8: same exclusive-bound checkpoint
+                // fix as the other range loops in this file.
                 if ordinal >= exclusive_range.to_ordinal {
                     progress.caught_up = true;
-                    last_offset = Some(record.offset.clone());
                     break;
                 }
 
@@ -1473,10 +1476,19 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                 progress.events_read += 1;
                 let ordinal = record.offset.ordinal;
 
-                // Exclusive upper bound: stop at to_ordinal
+                // Exclusive upper bound: stop at to_ordinal.
+                // br-ft-zvue8: do NOT update last_offset here —
+                // this record is OUTSIDE the requested range and
+                // was not indexed, so persisting its offset as the
+                // checkpoint/current_ordinal would falsely tell
+                // operators (and any follow-on repair flow) that
+                // the boundary event has been handled. The exclusive
+                // upper bound `[from, to)` requires that
+                // checkpoint/current_ordinal/progress reflect the
+                // last in-range processed offset, never the first
+                // out-of-range one.
                 if ordinal >= range.to_ordinal {
                     progress.caught_up = true;
-                    last_offset = Some(record.offset.clone());
                     break;
                 }
 
@@ -1592,9 +1604,11 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                 progress.events_read += 1;
                 let ordinal = record.offset.ordinal;
 
+                // br-ft-zvue8: same exclusive-bound fix as the
+                // legacy path above — do not advance last_offset
+                // when the record is out of the requested range.
                 if ordinal >= range.to_ordinal {
                     progress.caught_up = true;
-                    last_offset = Some(record.offset.clone());
                     break;
                 }
 

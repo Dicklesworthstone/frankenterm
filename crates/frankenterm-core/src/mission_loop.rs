@@ -53,6 +53,63 @@ pub enum MissionTrigger {
     ExternalSignal { source: String, payload: String },
 }
 
+/// br-ft-zdpou: hard cap on bytes retained for an
+/// `ExternalSignal::payload`. External callers (webhooks, CI
+/// completion, robot bridges) often post large blobs containing
+/// bearer tokens / URLs / sensitive metadata. The mission loop
+/// preserves these strings in `pending_triggers`, `last_decision`,
+/// and reportable state, so an unbounded payload turns the loop
+/// into a memory + secrets-leak surface. 2 KiB matches the
+/// canonical "URL line + headers" envelope size.
+pub const MAX_EXTERNAL_TRIGGER_PAYLOAD_BYTES: usize = 2048;
+
+/// br-ft-zdpou: hard cap on the in-memory pending-trigger queue.
+/// `tick()` uses the most-recent trigger as the decision trigger,
+/// so dropping older entries when the cap is reached preserves the
+/// live-signal semantics. Anything larger than this is just memory
+/// pressure with no scheduling value (the next `tick()` only reads
+/// the tail).
+pub const MAX_PENDING_TRIGGERS: usize = 256;
+
+/// br-ft-zdpou: marker appended to a truncated `ExternalSignal`
+/// payload so consumers (logs, audit ledgers, debugger eyes) can
+/// distinguish a naturally-short payload from one that was
+/// truncated by the cap. The original byte length is included so
+/// forensic queries (e.g. "did we get the full webhook?") have
+/// the answer without re-fetching.
+fn external_payload_truncation_marker(original_byte_len: usize) -> String {
+    format!(
+        "...[br-ft-zdpou: truncated; original {original_byte_len} bytes]"
+    )
+}
+
+/// br-ft-zdpou: shorten an `ExternalSignal::payload` to fit within
+/// [`MAX_EXTERNAL_TRIGGER_PAYLOAD_BYTES`]. Truncates on a UTF-8
+/// boundary (so we never split a multibyte char) and appends a
+/// truncation marker citing the original byte length. Other
+/// trigger variants pass through unchanged.
+fn redact_trigger_payload(trigger: MissionTrigger) -> MissionTrigger {
+    if let MissionTrigger::ExternalSignal { source, payload } = trigger {
+        let original_len = payload.len();
+        if original_len <= MAX_EXTERNAL_TRIGGER_PAYLOAD_BYTES {
+            return MissionTrigger::ExternalSignal { source, payload };
+        }
+        // Find a UTF-8 boundary at or before the cap.
+        let mut cut = MAX_EXTERNAL_TRIGGER_PAYLOAD_BYTES;
+        while cut > 0 && !payload.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut shortened = payload[..cut].to_string();
+        shortened.push_str(&external_payload_truncation_marker(original_len));
+        MissionTrigger::ExternalSignal {
+            source,
+            payload: shortened,
+        }
+    } else {
+        trigger
+    }
+}
+
 /// Mission-level limiter envelope for assignment safety.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionSafetyEnvelopeConfig {
@@ -514,7 +571,29 @@ impl MissionLoop {
     }
 
     /// Enqueue a trigger event for the next evaluation.
+    ///
+    /// br-ft-zdpou: bounded enqueue + payload-size cap.
+    ///
+    ///   * `ExternalSignal` payloads are truncated to
+    ///     [`MAX_EXTERNAL_TRIGGER_PAYLOAD_BYTES`] before storage so a
+    ///     hostile webhook posting a multi-MB blob can't pin that
+    ///     blob in `pending_triggers` / `last_decision` /
+    ///     reportable state. The truncated form preserves a UTF-8
+    ///     boundary and appends a marker showing the original byte
+    ///     length.
+    ///   * `pending_triggers` is treated as a bounded ring of size
+    ///     [`MAX_PENDING_TRIGGERS`]: when full, the oldest entry is
+    ///     dropped to make room for the new one. This bounds memory
+    ///     between ticks even under burst loads, while preserving
+    ///     the most-recent-trigger semantics that `tick()` relies on.
     pub fn trigger(&mut self, trigger: MissionTrigger) {
+        let trigger = redact_trigger_payload(trigger);
+        if self.state.pending_triggers.len() >= MAX_PENDING_TRIGGERS {
+            // Drop oldest to make room for the newest. `tick()` uses
+            // the most-recent trigger as the decision trigger, so
+            // this preserves the live-signal semantics.
+            self.state.pending_triggers.remove(0);
+        }
         self.state.pending_triggers.push(trigger);
     }
 
