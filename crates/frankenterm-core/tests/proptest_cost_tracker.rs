@@ -242,6 +242,7 @@ proptest! {
     ) {
         let snap = CostTelemetrySnapshot {
             usages_recorded: usages,
+            invalid_usages_rejected: 0,
             panes_evicted_lru: evictions,
             panes_removed: removals,
             alert_evaluations: evals,
@@ -461,6 +462,36 @@ proptest! {
             tracker.record_usage(*pane_id, *agent_type, *tokens, *cost, *ts);
         }
         prop_assert_eq!(tracker.telemetry().snapshot().usages_recorded, records.len() as u64);
+    }
+
+    // =========================================================================
+    // ft-2lirs: invalid usage costs are rejected before they poison totals
+    // =========================================================================
+
+    #[test]
+    fn ft_2lirs_invalid_usage_costs_do_not_enter_totals(
+        pane_id in arb_pane_id(),
+        agent_type in arb_agent_type(),
+        tokens in arb_tokens(),
+        invalid_cost in prop_oneof![
+            Just(f64::NAN),
+            Just(f64::INFINITY),
+            Just(f64::NEG_INFINITY),
+            -1_000_000.0f64..-0.0001,
+        ],
+        ts in arb_timestamp_ms(),
+    ) {
+        let mut tracker = CostTracker::new();
+        tracker.record_usage(pane_id, agent_type, tokens, invalid_cost, ts);
+
+        let telemetry = tracker.telemetry().snapshot();
+        prop_assert_eq!(telemetry.usages_recorded, 1);
+        prop_assert_eq!(telemetry.invalid_usages_rejected, 1);
+        prop_assert_eq!(tracker.tracked_pane_count(), 0);
+        prop_assert!(tracker.pane_summary(pane_id).is_none());
+        prop_assert_eq!(tracker.grand_total_tokens(), 0);
+        prop_assert_eq!(tracker.grand_total_cost(), 0.0);
+        prop_assert!(tracker.dashboard_snapshot().grand_total_cost_usd.is_finite());
     }
 
     // =========================================================================

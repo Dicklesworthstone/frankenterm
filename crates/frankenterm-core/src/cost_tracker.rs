@@ -35,6 +35,8 @@ use std::collections::{BTreeMap, VecDeque};
 pub struct CostTelemetry {
     /// Total record_usage calls.
     pub usages_recorded: u64,
+    /// Usage records rejected before aggregation because the cost was invalid.
+    pub invalid_usages_rejected: u64,
     /// Panes evicted via LRU when MAX_TRACKED_PANES exceeded.
     pub panes_evicted_lru: u64,
     /// Panes explicitly removed via remove_pane().
@@ -57,6 +59,7 @@ impl CostTelemetry {
     pub fn snapshot(&self) -> CostTelemetrySnapshot {
         CostTelemetrySnapshot {
             usages_recorded: self.usages_recorded,
+            invalid_usages_rejected: self.invalid_usages_rejected,
             panes_evicted_lru: self.panes_evicted_lru,
             panes_removed: self.panes_removed,
             alert_evaluations: self.alert_evaluations,
@@ -70,6 +73,8 @@ impl CostTelemetry {
 pub struct CostTelemetrySnapshot {
     /// Total record_usage calls.
     pub usages_recorded: u64,
+    /// Usage records rejected before aggregation because the cost was invalid.
+    pub invalid_usages_rejected: u64,
     /// Panes evicted via LRU when MAX_TRACKED_PANES exceeded.
     pub panes_evicted_lru: u64,
     /// Panes explicitly removed via remove_pane().
@@ -298,7 +303,17 @@ impl CostTracker {
         cost_usd: f64,
         at_ms: i64,
     ) {
-        self.telemetry.usages_recorded += 1;
+        self.telemetry.usages_recorded = self.telemetry.usages_recorded.saturating_add(1);
+
+        let current_cost = self
+            .panes
+            .get(&pane_id)
+            .map_or(0.0, |state| state.total_cost_usd);
+        if !cost_usd.is_finite() || cost_usd < 0.0 || !(current_cost + cost_usd).is_finite() {
+            self.telemetry.invalid_usages_rejected =
+                self.telemetry.invalid_usages_rejected.saturating_add(1);
+            return;
+        }
 
         // Evict oldest pane if at capacity
         if !self.panes.contains_key(&pane_id) && self.panes.len() >= MAX_TRACKED_PANES {
@@ -773,6 +788,7 @@ mod tests {
     fn cost_telemetry_snapshot_serde_roundtrip() {
         let snap = CostTelemetrySnapshot {
             usages_recorded: 42,
+            invalid_usages_rejected: 0,
             panes_evicted_lru: 3,
             panes_removed: 1,
             alert_evaluations: 10,
