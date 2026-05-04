@@ -197,6 +197,84 @@ pub enum SearchBridgeError {
     /// frankensearch returned a non-cancellation error.
     #[error("search failed: {0}")]
     Search(#[source] SearchError),
+    /// br-ft-qfklb: request failed pre-flight validation. Surfaces
+    /// before any side effect so an invalid request never reaches
+    /// the underlying frankensearch surface.
+    #[error("search bridge request validation failed: {0}")]
+    ValidationError(String),
+}
+
+/// br-ft-qfklb: minimum acceptable `limit` on a `SearchBridgeRequest`.
+/// `0` is structurally meaningless (asks for zero results, paying the
+/// search cost for no gain) and is rejected at the validation gate.
+pub const SEARCH_BRIDGE_MIN_LIMIT: usize = 1;
+
+/// br-ft-qfklb: maximum acceptable `limit` on a `SearchBridgeRequest`.
+/// Caps unbounded asks (e.g., `usize::MAX`) at a value matching the
+/// MCP-layer cap on `wa.cass_search` (LIMIT_MAX = 1000) plus a 10x
+/// headroom for non-MCP callers that may legitimately need larger
+/// pages. Anything above this is rejected at the validation gate.
+pub const SEARCH_BRIDGE_MAX_LIMIT: usize = 10_000;
+
+/// br-ft-qfklb: minimum acceptable `timeout` on a `SearchBridgeRequest`.
+/// `Duration::ZERO` is structurally meaningless (the timeout machinery
+/// fires immediately, before any work, returning a confusing 'timeout'
+/// on every call). Rejected at the validation gate.
+pub const SEARCH_BRIDGE_MIN_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// br-ft-qfklb: maximum acceptable `timeout` on a `SearchBridgeRequest`.
+/// Caps the upper end at 10 minutes — same value as the MCP-layer
+/// `wa.cass_*` `timeout_secs` bound (CASS_TIMEOUT_SECS_MAX = 600,
+/// shipped at ft-aylbh). Prevents misconfigured callers from pinning
+/// the bridge on a slow query indefinitely.
+pub const SEARCH_BRIDGE_MAX_TIMEOUT: Duration = Duration::from_secs(600);
+
+impl SearchBridgeRequest {
+    /// br-ft-qfklb: validate the request against the bridge's
+    /// invariants before any side effect. Returns
+    /// `Err(SearchBridgeError::ValidationError(reason))` on any
+    /// violation; `Ok(())` when the request is well-formed.
+    ///
+    /// Pre-fix the bridge accepted any usize / Duration without
+    /// validation. Operators relying on per-tool MCP-layer caps
+    /// (wa.cass_* via ft-aylbh) got protected, but anyone
+    /// instantiating SearchBridgeRequest from a non-MCP path
+    /// (e.g., embedded library use) had zero protection. This
+    /// gate is now the single source of truth that every bridge
+    /// dispatch path runs through.
+    pub fn validate(&self) -> std::result::Result<(), SearchBridgeError> {
+        if self.limit < SEARCH_BRIDGE_MIN_LIMIT {
+            return Err(SearchBridgeError::ValidationError(format!(
+                "br-ft-qfklb: limit must be >= {SEARCH_BRIDGE_MIN_LIMIT} (got {}); \
+                 a zero limit asks for zero results which is structurally meaningless",
+                self.limit
+            )));
+        }
+        if self.limit > SEARCH_BRIDGE_MAX_LIMIT {
+            return Err(SearchBridgeError::ValidationError(format!(
+                "br-ft-qfklb: limit must be <= {SEARCH_BRIDGE_MAX_LIMIT} (got {}); \
+                 prevents unbounded result allocation",
+                self.limit
+            )));
+        }
+        if let Some(timeout) = self.timeout {
+            if timeout < SEARCH_BRIDGE_MIN_TIMEOUT {
+                return Err(SearchBridgeError::ValidationError(format!(
+                    "br-ft-qfklb: timeout must be >= {SEARCH_BRIDGE_MIN_TIMEOUT:?} when set \
+                     (got {timeout:?}); zero timeout fires before any work and returns a \
+                     confusing 'timeout' on every call"
+                )));
+            }
+            if timeout > SEARCH_BRIDGE_MAX_TIMEOUT {
+                return Err(SearchBridgeError::ValidationError(format!(
+                    "br-ft-qfklb: timeout must be <= {SEARCH_BRIDGE_MAX_TIMEOUT:?} when set \
+                     (got {timeout:?}); caps the upper end to match the MCP-layer wa.cass_* \
+                     bound (ft-aylbh CASS_TIMEOUT_SECS_MAX=600)"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Tokio-facing bridge wrapper around `TwoTierSearcher`.
@@ -328,6 +406,13 @@ impl SearchBridge {
         request: SearchBridgeRequest,
         mut on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
+        // br-ft-qfklb: pre-flight request validation before any side
+        // effect. Catches limit=0/usize::MAX and timeout=ZERO/MAX
+        // misconfigurations at the boundary, returning a structured
+        // ValidationError before reaching the timeout-thread spawn,
+        // cancellation-thread spawn, or the underlying searcher.
+        request.validate()?;
+
         let SearchBridgeRequest {
             query,
             limit,
@@ -1667,6 +1752,171 @@ mod tests {
                     "reason should surface in Display: {text}"
                 );
             });
+        }
+    }
+
+    // ── br-ft-qfklb: SearchBridgeRequest validation tests ─────────────
+
+    /// br-ft-qfklb: limit=0 must reject with a structured
+    /// ValidationError. Pre-fix limit=0 silently produced an empty-
+    /// result search, paying the search cost for no gain.
+    #[test]
+    fn validate_rejects_zero_limit_ft_qfklb() {
+        let req = SearchBridgeRequest::new("query", 0);
+        let err = req.validate().expect_err("limit=0 must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-qfklb") && msg.contains("limit must be >="),
+            "ft-qfklb: error must reference the bead + the lower-bound rule; got {msg}"
+        );
+        assert!(
+            msg.contains("(got 0)"),
+            "ft-qfklb: error must cite the rejected value; got {msg}"
+        );
+    }
+
+    /// br-ft-qfklb: limit > SEARCH_BRIDGE_MAX_LIMIT must reject.
+    /// Pre-fix limit=usize::MAX would pass through to frankensearch
+    /// and trigger unbounded allocation downstream.
+    #[test]
+    fn validate_rejects_above_max_limit_ft_qfklb() {
+        let req = SearchBridgeRequest::new("query", SEARCH_BRIDGE_MAX_LIMIT + 1);
+        let err = req.validate().expect_err("limit > MAX must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-qfklb") && msg.contains("limit must be <="),
+            "ft-qfklb: error must reference the bead + the upper-bound rule; got {msg}"
+        );
+    }
+
+    /// br-ft-qfklb: limit=usize::MAX is the practical worst case for
+    /// the upper-bound check. Pin it explicitly so a future cap
+    /// change doesn't accidentally let MAX through.
+    #[test]
+    fn validate_rejects_usize_max_limit_ft_qfklb() {
+        let req = SearchBridgeRequest::new("query", usize::MAX);
+        let err = req.validate().expect_err("limit=usize::MAX must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-qfklb"),
+            "ft-qfklb: error must reference the bead; got {msg}"
+        );
+    }
+
+    /// br-ft-qfklb: timeout=Duration::ZERO must reject when set.
+    /// Pre-fix this would fire the timeout machinery immediately,
+    /// returning a confusing 'timeout' on every call.
+    #[test]
+    fn validate_rejects_zero_timeout_ft_qfklb() {
+        let req = SearchBridgeRequest::new("query", 10).with_timeout(Duration::ZERO);
+        let err = req.validate().expect_err("timeout=ZERO must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-qfklb") && msg.contains("timeout must be >="),
+            "ft-qfklb: error must reference the bead + the lower-bound rule; got {msg}"
+        );
+    }
+
+    /// br-ft-qfklb: timeout > SEARCH_BRIDGE_MAX_TIMEOUT must reject.
+    /// Pre-fix Duration::from_secs(u64::MAX) was accepted, allowing
+    /// a misconfigured caller to pin the bridge for billions of years.
+    #[test]
+    fn validate_rejects_above_max_timeout_ft_qfklb() {
+        let req = SearchBridgeRequest::new("query", 10)
+            .with_timeout(SEARCH_BRIDGE_MAX_TIMEOUT + Duration::from_secs(1));
+        let err = req.validate().expect_err("timeout > MAX must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-qfklb") && msg.contains("timeout must be <="),
+            "ft-qfklb: error must reference the bead + the upper-bound rule; got {msg}"
+        );
+    }
+
+    /// br-ft-qfklb: a well-formed request (limit in range, no
+    /// timeout) must validate cleanly. Vacuous-regression guard
+    /// against the new gate false-positiving on the legitimate
+    /// happy path.
+    #[test]
+    fn validate_accepts_well_formed_request_ft_qfklb() {
+        let req = SearchBridgeRequest::new("query", 10);
+        req.validate()
+            .expect("well-formed request without timeout must validate");
+
+        let req_with_timeout =
+            SearchBridgeRequest::new("query", 10).with_timeout(Duration::from_secs(30));
+        req_with_timeout
+            .validate()
+            .expect("well-formed request with valid timeout must validate");
+
+        // Boundary values: MIN and MAX inclusive must pass.
+        let min_req = SearchBridgeRequest::new("query", SEARCH_BRIDGE_MIN_LIMIT)
+            .with_timeout(SEARCH_BRIDGE_MIN_TIMEOUT);
+        min_req.validate().expect("MIN-boundary values must pass");
+
+        let max_req = SearchBridgeRequest::new("query", SEARCH_BRIDGE_MAX_LIMIT)
+            .with_timeout(SEARCH_BRIDGE_MAX_TIMEOUT);
+        max_req.validate().expect("MAX-boundary values must pass");
+    }
+
+    /// br-ft-qfklb: property-style sweep across the four
+    /// equivalence classes:
+    ///   - in-range limit + no timeout → Ok
+    ///   - in-range limit + in-range timeout → Ok
+    ///   - out-of-range limit (low or high) → Err
+    ///   - in-range limit + out-of-range timeout (low or high) → Err
+    /// Pins the cross-product invariant against drift in either
+    /// constant.
+    #[test]
+    fn validate_property_sweep_ft_qfklb() {
+        // In-range limits — no timeout
+        for &limit in &[
+            SEARCH_BRIDGE_MIN_LIMIT,
+            10,
+            100,
+            1000,
+            SEARCH_BRIDGE_MAX_LIMIT,
+        ] {
+            let req = SearchBridgeRequest::new("q", limit);
+            assert!(
+                req.validate().is_ok(),
+                "ft-qfklb: in-range limit={limit} must pass"
+            );
+        }
+
+        // Out-of-range limits
+        for &limit in &[0_usize, SEARCH_BRIDGE_MAX_LIMIT + 1, usize::MAX] {
+            let req = SearchBridgeRequest::new("q", limit);
+            assert!(
+                req.validate().is_err(),
+                "ft-qfklb: out-of-range limit={limit} must reject"
+            );
+        }
+
+        // In-range timeouts (with valid limit)
+        for &timeout in &[
+            SEARCH_BRIDGE_MIN_TIMEOUT,
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            SEARCH_BRIDGE_MAX_TIMEOUT,
+        ] {
+            let req = SearchBridgeRequest::new("q", 10).with_timeout(timeout);
+            assert!(
+                req.validate().is_ok(),
+                "ft-qfklb: in-range timeout={timeout:?} must pass"
+            );
+        }
+
+        // Out-of-range timeouts (with valid limit)
+        for &timeout in &[
+            Duration::ZERO,
+            SEARCH_BRIDGE_MAX_TIMEOUT + Duration::from_secs(1),
+            Duration::from_secs(u64::MAX / 2), // effectively unbounded
+        ] {
+            let req = SearchBridgeRequest::new("q", 10).with_timeout(timeout);
+            assert!(
+                req.validate().is_err(),
+                "ft-qfklb: out-of-range timeout={timeout:?} must reject"
+            );
         }
     }
 }
