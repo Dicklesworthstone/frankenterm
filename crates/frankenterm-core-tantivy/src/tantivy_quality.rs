@@ -21,6 +21,7 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::tantivy_ingest::IndexDocumentFields;
 use crate::tantivy_query::{LexicalSearchService, SearchFilter, SearchQuery, SearchResults};
@@ -81,6 +82,54 @@ pub enum RelevanceAssertion {
     FirstResult { event_id: String },
     /// All results must pass the given filter.
     AllMatchFilter(SearchFilter),
+}
+
+/// Invalid golden-query suite configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum QualityConfigError {
+    /// `InTopN` with `n == 0` is unsatisfiable for every result set.
+    #[error(
+        "golden query {query_index} ('{query_name}') assertion {assertion_index} for event_id '{event_id}' uses InTopN with n=0; top-N assertions require n >= 1"
+    )]
+    InTopNRequiresPositiveN {
+        /// Index of the query in the suite.
+        query_index: usize,
+        /// Human-readable query name.
+        query_name: String,
+        /// Index of the assertion within the query.
+        assertion_index: usize,
+        /// Event id targeted by the assertion.
+        event_id: String,
+    },
+}
+
+impl GoldenQuery {
+    /// Validate this query's assertions before it is admitted to a harness.
+    pub fn validate_at(&self, query_index: usize) -> Result<(), QualityConfigError> {
+        for (assertion_index, assertion) in self.assertions.iter().enumerate() {
+            assertion.validate_at(query_index, &self.name, assertion_index)?;
+        }
+        Ok(())
+    }
+}
+
+impl RelevanceAssertion {
+    fn validate_at(
+        &self,
+        query_index: usize,
+        query_name: &str,
+        assertion_index: usize,
+    ) -> Result<(), QualityConfigError> {
+        if let Self::InTopN { event_id, n: 0 } = self {
+            return Err(QualityConfigError::InTopNRequiresPositiveN {
+                query_index,
+                query_name: query_name.to_string(),
+                assertion_index,
+                event_id: event_id.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +229,7 @@ pub struct QualityReport {
 }
 
 /// The quality harness runner.
+#[derive(Debug)]
 pub struct QualityHarness {
     /// Golden queries to execute.
     queries: Vec<GoldenQuery>,
@@ -189,16 +239,19 @@ pub struct QualityHarness {
 
 impl QualityHarness {
     /// Create a harness with the given golden queries and default latency budgets.
-    pub fn new(queries: Vec<GoldenQuery>) -> Self {
-        Self {
-            queries,
-            budgets: default_latency_budgets(),
-        }
+    pub fn new(queries: Vec<GoldenQuery>) -> Result<Self, QualityConfigError> {
+        Self::with_budgets(queries, default_latency_budgets())
     }
 
     /// Create a harness with custom latency budgets.
-    pub fn with_budgets(queries: Vec<GoldenQuery>, budgets: Vec<LatencyBudget>) -> Self {
-        Self { queries, budgets }
+    pub fn with_budgets(
+        queries: Vec<GoldenQuery>,
+        budgets: Vec<LatencyBudget>,
+    ) -> Result<Self, QualityConfigError> {
+        for (query_index, query) in queries.iter().enumerate() {
+            query.validate_at(query_index)?;
+        }
+        Ok(Self { queries, budgets })
     }
 
     /// Run all golden queries against the given search service.
@@ -856,6 +909,33 @@ mod tests {
     }
 
     #[test]
+    fn harness_rejects_zero_top_n_before_run() {
+        let queries = vec![GoldenQuery {
+            name: "bad_top_n".to_string(),
+            class: QueryClass::SimpleTerm,
+            query: SearchQuery::simple("error"),
+            assertions: vec![RelevanceAssertion::InTopN {
+                event_id: "out-build-error".to_string(),
+                n: 0,
+            }],
+            description: "Invalid top-N config should fail before search".to_string(),
+        }];
+
+        let err = QualityHarness::new(queries).expect_err("n=0 must reject during construction");
+        assert_eq!(
+            err,
+            QualityConfigError::InTopNRequiresPositiveN {
+                query_index: 0,
+                query_name: "bad_top_n".to_string(),
+                assertion_index: 0,
+                event_id: "out-build-error".to_string(),
+            }
+        );
+        assert!(err.to_string().contains("n=0"));
+        assert!(err.to_string().contains("top-N assertions require n >= 1"));
+    }
+
+    #[test]
     fn ranked_before_check() {
         let svc = corpus_service();
         let results = svc.search(&SearchQuery::simple("error")).unwrap();
@@ -938,7 +1018,7 @@ mod tests {
     fn harness_runs_forensic_suite() {
         let svc = corpus_service();
         let queries = forensic_golden_queries();
-        let harness = QualityHarness::new(queries);
+        let harness = QualityHarness::new(queries).unwrap();
         let report = harness.run(&svc);
 
         assert!(report.all_passed, "forensic suite failed: {:#?}", report);
@@ -950,7 +1030,7 @@ mod tests {
     fn harness_runs_agent_workflow_suite() {
         let svc = corpus_service();
         let queries = agent_workflow_golden_queries();
-        let harness = QualityHarness::new(queries);
+        let harness = QualityHarness::new(queries).unwrap();
         let report = harness.run(&svc);
 
         assert!(
@@ -974,7 +1054,7 @@ mod tests {
             description: "This should fail".to_string(),
         }];
 
-        let harness = QualityHarness::new(queries);
+        let harness = QualityHarness::new(queries).unwrap();
         let report = harness.run(&svc);
 
         assert!(!report.all_passed);
@@ -997,7 +1077,7 @@ mod tests {
             description: "This should exceed latency budget".to_string(),
         }];
 
-        let harness = QualityHarness::with_budgets(queries, budgets);
+        let harness = QualityHarness::with_budgets(queries, budgets).unwrap();
         let report = harness.run(&svc);
 
         // Assertions pass but latency fails
@@ -1020,7 +1100,7 @@ mod tests {
             description: "Empty query should error".to_string(),
         }];
 
-        let harness = QualityHarness::new(queries);
+        let harness = QualityHarness::new(queries).unwrap();
         let report = harness.run(&svc);
 
         assert!(!report.all_passed);
@@ -1183,7 +1263,7 @@ mod tests {
         let mut all_queries = forensic_golden_queries();
         all_queries.extend(agent_workflow_golden_queries());
 
-        let harness = QualityHarness::new(all_queries);
+        let harness = QualityHarness::new(all_queries).unwrap();
         let report = harness.run(&svc);
 
         for r in &report.results {
@@ -1518,7 +1598,7 @@ mod tests {
 
     #[test]
     fn quality_harness_empty_queries() {
-        let harness = QualityHarness::new(vec![]);
+        let harness = QualityHarness::new(vec![]).unwrap();
         let svc = corpus_service();
         let report = harness.run(&svc);
         assert_eq!(report.total_queries, 0);

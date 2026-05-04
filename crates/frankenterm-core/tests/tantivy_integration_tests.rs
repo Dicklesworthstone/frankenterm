@@ -629,7 +629,7 @@ fn quality_harness_on_indexed_forensic_corpus() {
 
         // Run forensic golden queries
         let forensic_queries = forensic_golden_queries();
-        let harness = QualityHarness::new(forensic_queries);
+        let harness = QualityHarness::new(forensic_queries).unwrap();
         let report = harness.run(&svc);
 
         assert!(
@@ -641,7 +641,7 @@ fn quality_harness_on_indexed_forensic_corpus() {
 
         // Run agent workflow queries
         let agent_queries = agent_workflow_golden_queries();
-        let harness2 = QualityHarness::new(agent_queries);
+        let harness2 = QualityHarness::new(agent_queries).unwrap();
         let report2 = harness2.run(&svc);
 
         assert!(
@@ -745,7 +745,7 @@ fn custom_golden_queries_on_ingested_data() {
             },
         ];
 
-        let harness = QualityHarness::new(queries);
+        let harness = QualityHarness::new(queries).unwrap();
         let report = harness.run(&svc);
 
         for r in &report.results {
@@ -1178,7 +1178,7 @@ fn full_pipeline_reindex_query_quality() {
             },
         ];
 
-        let harness = QualityHarness::new(queries);
+        let harness = QualityHarness::new(queries).unwrap();
         let report = harness.run(&svc);
 
         for r in &report.results {
