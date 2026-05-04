@@ -1,16 +1,32 @@
 //! Embedding worker — deterministic embedding generation for daemon requests.
 
+use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::protocol::{EmbedRequest, EmbedResponse};
 use crate::search::{Embedder, HashEmbedder};
 
+type SharedEmbedder = Arc<dyn Embedder>;
+
 /// Worker that processes embedding requests.
-#[derive(Debug)]
 pub struct EmbedWorker {
     id: u32,
     processed: AtomicU64,
+    embedders: Mutex<HashMap<String, SharedEmbedder>>,
+}
+
+impl fmt::Debug for EmbedWorker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cached_embedders = self.embedders.lock().map_or(0, |cache| cache.len());
+        f.debug_struct("EmbedWorker")
+            .field("id", &self.id)
+            .field("processed", &self.processed())
+            .field("cached_embedders", &cached_embedders)
+            .finish()
+    }
 }
 
 impl EmbedWorker {
@@ -19,6 +35,7 @@ impl EmbedWorker {
         Self {
             id,
             processed: AtomicU64::new(0),
+            embedders: Mutex::new(HashMap::new()),
         }
     }
 
@@ -32,6 +49,11 @@ impl EmbedWorker {
         self.processed.load(Ordering::Relaxed)
     }
 
+    /// Get the number of cached embedders.
+    pub fn cached_embedders(&self) -> usize {
+        self.embedders.lock().map_or(0, |cache| cache.len())
+    }
+
     /// Process an embedding request.
     ///
     /// Supported model selectors:
@@ -40,7 +62,7 @@ impl EmbedWorker {
     /// - `"fastembed"`, `"fastembed-<model>"` => FastEmbed ONNX embedder (requires `semantic-search` feature)
     pub fn process(&self, request: &EmbedRequest) -> Result<EmbedResponse, String> {
         let started = Instant::now();
-        let embedder = build_embedder(request.model.as_deref())?;
+        let embedder = self.embedder_for(request.model.as_deref())?;
         let vector = embedder
             .embed(&request.text)
             .map_err(|err| err.to_string())?;
@@ -53,6 +75,30 @@ impl EmbedWorker {
             model: embedder.info().name,
             elapsed_ms,
         })
+    }
+
+    fn embedder_for(&self, model: Option<&str>) -> Result<SharedEmbedder, String> {
+        let selector = normalize_model_selector(model)?;
+        {
+            let cache = self
+                .embedders
+                .lock()
+                .map_err(|_| "embedder cache lock poisoned".to_string())?;
+            if let Some(embedder) = cache.get(&selector) {
+                return Ok(Arc::clone(embedder));
+            }
+        }
+
+        let embedder = build_embedder_from_normalized_selector(&selector)?;
+        let mut cache = self
+            .embedders
+            .lock()
+            .map_err(|_| "embedder cache lock poisoned".to_string())?;
+        Ok(Arc::clone(
+            cache
+                .entry(selector)
+                .or_insert_with(|| Arc::clone(&embedder)),
+        ))
     }
 }
 
@@ -69,10 +115,24 @@ impl EmbedWorker {
 /// embedders remain accepted.
 pub const MAX_HASH_EMBEDDER_DIMENSION: usize = 16_384;
 
-fn build_embedder(model: Option<&str>) -> Result<Box<dyn Embedder>, String> {
+fn normalize_model_selector(model: Option<&str>) -> Result<String, String> {
     match model.map(str::trim) {
-        None | Some("" | "hash" | "fnv1a-hash") => Ok(Box::new(HashEmbedder::default())),
-        Some(raw) => {
+        None | Some("" | "hash" | "fnv1a-hash") => Ok("fnv1a-hash-128".to_string()),
+        Some(raw) if raw == "fastembed" || raw.starts_with("fastembed-") => Ok(raw.to_string()),
+        Some(raw) if raw.starts_with("fnv1a-hash-") => Ok(raw.to_string()),
+        Some(raw) => Err(format!("unsupported embed model: {raw}")),
+    }
+}
+
+fn build_embedder(model: Option<&str>) -> Result<SharedEmbedder, String> {
+    let selector = normalize_model_selector(model)?;
+    build_embedder_from_normalized_selector(&selector)
+}
+
+fn build_embedder_from_normalized_selector(selector: &str) -> Result<SharedEmbedder, String> {
+    match selector {
+        "fnv1a-hash-128" => Ok(Arc::new(HashEmbedder::default())),
+        raw => {
             if let Some(dim_raw) = raw.strip_prefix("fnv1a-hash-") {
                 let dim = dim_raw
                     .parse::<usize>()
@@ -88,7 +148,7 @@ fn build_embedder(model: Option<&str>) -> Result<Box<dyn Embedder>, String> {
                         "br-ft-023t1: hash embedder dimension {dim} exceeds cap {MAX_HASH_EMBEDDER_DIMENSION}"
                     ));
                 }
-                return Ok(Box::new(HashEmbedder::new(dim)));
+                return Ok(Arc::new(HashEmbedder::new(dim)));
             }
             // FastEmbed ONNX models (requires semantic-search feature).
             #[cfg(feature = "semantic-search")]
@@ -104,7 +164,7 @@ fn build_embedder(model: Option<&str>) -> Result<Box<dyn Embedder>, String> {
 
 /// Build a FastEmbed embedder from a model selector string.
 #[cfg(feature = "semantic-search")]
-fn build_fastembed_embedder(selector: &str) -> Result<Box<dyn Embedder>, String> {
+fn build_fastembed_embedder(selector: &str) -> Result<SharedEmbedder, String> {
     use crate::search::fastembed_embedder::{
         FastEmbedConfig, FastEmbedEmbedder, resolve_fastembed_model_selector,
     };
@@ -113,12 +173,14 @@ fn build_fastembed_embedder(selector: &str) -> Result<Box<dyn Embedder>, String>
 
     let config = FastEmbedConfig::default().with_model(model);
     let emb = FastEmbedEmbedder::try_new(config).map_err(|e| e.to_string())?;
-    Ok(Box::new(emb))
+    Ok(Arc::new(emb))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     fn req(id: u64, text: &str, model: Option<&str>) -> EmbedRequest {
         EmbedRequest {
@@ -288,6 +350,56 @@ mod tests {
     }
 
     #[test]
+    fn worker_reuses_default_hash_embedder_aliases_ft_1o34x() {
+        let worker = EmbedWorker::new(1);
+        for (idx, model) in [
+            None,
+            Some(""),
+            Some("hash"),
+            Some("fnv1a-hash"),
+            Some(" fnv1a-hash "),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            worker
+                .process(&req(idx as u64, "cache alias", model))
+                .unwrap();
+        }
+
+        assert_eq!(worker.cached_embedders(), 1);
+        assert_eq!(worker.processed(), 5);
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_worker_cache_cardinality_matches_unique_valid_selectors_ft_1o34x(
+            dims in proptest::collection::vec(1_usize..=256, 1..40),
+        ) {
+            let worker = EmbedWorker::new(1);
+            let mut expected = BTreeSet::new();
+
+            for (idx, dim) in dims.iter().copied().enumerate() {
+                let model = match idx % 4 {
+                    0 => None,
+                    1 => Some("hash".to_string()),
+                    2 => Some(format!("fnv1a-hash-{dim}")),
+                    _ => Some(format!(" fnv1a-hash-{dim} ")),
+                };
+                let model_ref = model.as_deref();
+                let selector = normalize_model_selector(model_ref).unwrap();
+                expected.insert(selector);
+                worker
+                    .process(&req(idx as u64, "cache property", model_ref))
+                    .unwrap();
+            }
+
+            prop_assert_eq!(worker.cached_embedders(), expected.len());
+            prop_assert_eq!(worker.processed(), dims.len() as u64);
+        }
+    }
+
+    #[test]
     fn response_id_matches_request_id() {
         let worker = EmbedWorker::new(1);
         for id in [0, 1, 100, u64::MAX] {
@@ -417,13 +529,12 @@ mod tests {
         let worker = EmbedWorker::new(1);
         let oversized = MAX_HASH_EMBEDDER_DIMENSION + 1;
         let err = worker
-            .process(&req(
-                1,
-                "test",
-                Some(&format!("fnv1a-hash-{oversized}")),
-            ))
+            .process(&req(1, "test", Some(&format!("fnv1a-hash-{oversized}"))))
             .unwrap_err();
-        assert!(err.contains("br-ft-023t1"), "error must cite breadcrumb: {err}");
+        assert!(
+            err.contains("br-ft-023t1"),
+            "error must cite breadcrumb: {err}"
+        );
         assert!(err.contains(&oversized.to_string()));
         assert!(err.contains(&MAX_HASH_EMBEDDER_DIMENSION.to_string()));
         // No allocation should be observable: processed counter
