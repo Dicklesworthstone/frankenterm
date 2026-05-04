@@ -44,7 +44,13 @@ catch common omissions.
    `scripts/attestation-verify.sh` + the smoke test.
    Block tagging if the bundle is partial or any verification
    step fails (ft-187kv).
-8. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
+8. **Run the high-scale release evidence gate.** Ensure
+   `cargo test -p frankenterm-core --test large_swarm_replay_corpus release_evidence --no-default-features`
+   passes before publishing any 64-core / 256 GiB swarm-performance
+   claim. Synthetic/local smoke manifests must render
+   `SKIPPED_NOT_PROVEN`; only a real-hardware proof-gauntlet manifest
+   with linked replay artifacts may render as proven.
+9. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
    The release workflow at `.github/workflows/release.yml`
    handles the rest (binaries, checksums, GitHub release notes,
    sigstore-signed attestation bundle).

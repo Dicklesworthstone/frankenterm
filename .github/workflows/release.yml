@@ -21,8 +21,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  high-scale-evidence-gate:
+    name: High-scale release evidence gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-high-scale-evidence
+
+      - name: Verify high-scale evidence scoreboard
+        run: |
+          cargo test -p frankenterm-core --test large_swarm_replay_corpus release_evidence --no-default-features
+
   build:
     name: Build ${{ matrix.target }}
+    needs: high-scale-evidence-gate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:

@@ -35,6 +35,9 @@ use crate::storage_telemetry::StorageTelemetry;
 pub const LARGE_SWARM_REPLAY_CORPUS_VERSION: &str = "ft.large_swarm_replay.v1";
 /// Version string for high-scale proof-gauntlet manifests.
 pub const LARGE_SWARM_PROOF_GAUNTLET_VERSION: &str = "ft.large_swarm_proof_gauntlet.v1";
+/// Version string for release evidence scoreboards derived from proof artifacts.
+pub const LARGE_SWARM_RELEASE_EVIDENCE_SCOREBOARD_VERSION: &str =
+    "ft.large_swarm_release_evidence.v1";
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -503,6 +506,133 @@ impl LargeSwarmProofGauntletManifest {
     }
 }
 
+/// Truth tier assigned to a release-facing high-scale swarm claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LargeSwarmReleaseClaimStatus {
+    /// Claim exists as a roadmap/release checklist item but has no artifact yet.
+    Planned,
+    /// Synthetic generation or threshold work exists, but replay/proof failed.
+    Simulated,
+    /// A local synthetic smoke artifact exists and is useful only as a parser/schema check.
+    LocalSmoke,
+    /// Deterministic replay artifacts passed, but real hardware predicates are not met.
+    ReplayProven,
+    /// Real 64-core / 256 GiB hardware predicates and replay thresholds passed.
+    RealHardwareProven,
+}
+
+impl LargeSwarmReleaseClaimStatus {
+    /// Stable release/docs spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Simulated => "simulated",
+            Self::LocalSmoke => "local-smoke",
+            Self::ReplayProven => "replay-proven",
+            Self::RealHardwareProven => "real-hardware-proven",
+        }
+    }
+}
+
+/// Machine-readable artifact kind referenced by the release evidence scoreboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LargeSwarmReleaseArtifactKind {
+    /// Top-level proof-gauntlet manifest.
+    ProofGauntletManifest,
+    /// Per-scale deterministic replay summary inside the gauntlet manifest.
+    ReplaySummary,
+}
+
+impl LargeSwarmReleaseArtifactKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProofGauntletManifest => "proof-gauntlet-manifest",
+            Self::ReplaySummary => "replay-summary",
+        }
+    }
+}
+
+/// One proof or replay artifact reference attached to a release claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmReleaseArtifactRef {
+    /// Artifact class.
+    pub artifact_kind: LargeSwarmReleaseArtifactKind,
+    /// Stable artifact identifier.
+    pub artifact_id: String,
+    /// Artifact schema/version string.
+    pub version: String,
+    /// Stable digest over the referenced artifact's proof-critical fields.
+    pub digest: String,
+}
+
+/// One operator-facing release claim and the artifacts backing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmReleaseEvidenceClaim {
+    /// Stable claim identifier for docs and release gates.
+    pub claim_id: String,
+    /// Human-readable claim text.
+    pub claim: String,
+    /// Current truth tier.
+    pub status: LargeSwarmReleaseClaimStatus,
+    /// Minimum truth tier required before release docs may call this claim proven.
+    pub required_status: LargeSwarmReleaseClaimStatus,
+    /// Linked proof-gauntlet and replay artifacts.
+    pub artifact_refs: Vec<LargeSwarmReleaseArtifactRef>,
+    /// Reasons the release gate must block or render SKIPPED_NOT_PROVEN.
+    pub release_blockers: Vec<String>,
+}
+
+/// Release-facing scoreboard for high-scale swarm proof claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeSwarmReleaseEvidenceScoreboard {
+    /// Scoreboard schema version.
+    pub version: String,
+    /// All allowed truth tiers, in promotion order.
+    pub status_ladder: Vec<LargeSwarmReleaseClaimStatus>,
+    /// Release claims covered by this scoreboard.
+    pub claims: Vec<LargeSwarmReleaseEvidenceClaim>,
+    /// Whether any claim is below its required truth tier.
+    pub release_blocked: bool,
+    /// Stable digest over the scoreboard's proof-critical fields.
+    pub summary_digest: String,
+}
+
+impl LargeSwarmReleaseEvidenceScoreboard {
+    fn digest_input(&self) -> String {
+        let mut input = format!("{}|blocked={}", self.version, self.release_blocked);
+        for status in &self.status_ladder {
+            input.push_str("|status=");
+            input.push_str(status.as_str());
+        }
+        for claim in &self.claims {
+            input.push_str("|claim=");
+            input.push_str(&claim.claim_id);
+            input.push(':');
+            input.push_str(claim.status.as_str());
+            input.push(':');
+            input.push_str(claim.required_status.as_str());
+            for artifact in &claim.artifact_refs {
+                input.push_str("|artifact=");
+                input.push_str(artifact.artifact_kind.as_str());
+                input.push(':');
+                input.push_str(&artifact.artifact_id);
+                input.push(':');
+                input.push_str(&artifact.version);
+                input.push(':');
+                input.push_str(&artifact.digest);
+            }
+            for blocker in &claim.release_blockers {
+                input.push_str("|blocker=");
+                input.push_str(blocker);
+            }
+        }
+        input
+    }
+}
+
 /// Regression thresholds for a large-swarm replay summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LargeSwarmRegressionThresholds {
@@ -571,6 +701,8 @@ pub enum LargeSwarmReplayError {
     InvalidScenario(String),
     /// Proof-gauntlet configuration is invalid.
     InvalidProofConfig(String),
+    /// Release evidence scoreboard is invalid or would over-claim proof.
+    InvalidReleaseEvidence(String),
     /// Existing replay engine rejected the generated trace.
     Replay(ReplayError),
 }
@@ -583,6 +715,9 @@ impl std::fmt::Display for LargeSwarmReplayError {
             }
             Self::InvalidProofConfig(message) => {
                 write!(formatter, "invalid large-swarm proof config: {message}")
+            }
+            Self::InvalidReleaseEvidence(message) => {
+                write!(formatter, "invalid large-swarm release evidence: {message}")
             }
             Self::Replay(error) => write!(formatter, "large-swarm replay failed: {error}"),
         }
@@ -708,6 +843,166 @@ pub fn build_large_swarm_proof_gauntlet_manifest_from_hardware(
     };
     manifest.summary_digest = stable_digest(&manifest.digest_input());
     Ok(manifest)
+}
+
+/// Return every release-claim truth tier in promotion order.
+#[must_use]
+pub fn large_swarm_release_claim_status_ladder() -> Vec<LargeSwarmReleaseClaimStatus> {
+    vec![
+        LargeSwarmReleaseClaimStatus::Planned,
+        LargeSwarmReleaseClaimStatus::Simulated,
+        LargeSwarmReleaseClaimStatus::LocalSmoke,
+        LargeSwarmReleaseClaimStatus::ReplayProven,
+        LargeSwarmReleaseClaimStatus::RealHardwareProven,
+    ]
+}
+
+/// Derive the release-facing truth tier for the 64-core / 256 GiB swarm claim.
+#[must_use]
+pub fn large_swarm_release_claim_status(
+    manifest: Option<&LargeSwarmProofGauntletManifest>,
+) -> LargeSwarmReleaseClaimStatus {
+    let Some(manifest) = manifest else {
+        return LargeSwarmReleaseClaimStatus::Planned;
+    };
+
+    if manifest.status == LargeSwarmProofGauntletStatus::Proven
+        && manifest.run_context.evidence_mode == LargeSwarmProofEvidenceMode::RealHardwareRun
+        && manifest.hardware_profile.proof_predicates.proof_status
+            == HardwareProofStatus::ProvenPredicateMet
+        && has_high_scale_release_artifact(manifest)
+    {
+        return LargeSwarmReleaseClaimStatus::RealHardwareProven;
+    }
+
+    if manifest.run_context.evidence_mode == LargeSwarmProofEvidenceMode::SyntheticSmoke {
+        return LargeSwarmReleaseClaimStatus::LocalSmoke;
+    }
+
+    if has_high_scale_release_artifact(manifest)
+        && manifest
+            .scale_artifacts
+            .iter()
+            .all(|artifact| artifact.verdict.passed)
+    {
+        return LargeSwarmReleaseClaimStatus::ReplayProven;
+    }
+
+    LargeSwarmReleaseClaimStatus::Simulated
+}
+
+/// Build a release evidence scoreboard from an optional high-scale proof manifest.
+#[must_use]
+pub fn build_large_swarm_release_evidence_scoreboard(
+    manifest: Option<&LargeSwarmProofGauntletManifest>,
+) -> LargeSwarmReleaseEvidenceScoreboard {
+    let status = large_swarm_release_claim_status(manifest);
+    let release_blockers = large_swarm_release_blockers(status, manifest);
+    let claim = LargeSwarmReleaseEvidenceClaim {
+        claim_id: "64-core-256gib-swarm-responsiveness".into(),
+        claim:
+            "64-core / 256 GiB massive-agent-swarm responsiveness and resource-utilization claim"
+                .into(),
+        status,
+        required_status: LargeSwarmReleaseClaimStatus::RealHardwareProven,
+        artifact_refs: manifest.map(release_artifact_refs).unwrap_or_default(),
+        release_blockers,
+    };
+    let release_blocked = claim.status != claim.required_status;
+    let mut scoreboard = LargeSwarmReleaseEvidenceScoreboard {
+        version: LARGE_SWARM_RELEASE_EVIDENCE_SCOREBOARD_VERSION.into(),
+        status_ladder: large_swarm_release_claim_status_ladder(),
+        claims: vec![claim],
+        release_blocked,
+        summary_digest: String::new(),
+    };
+    scoreboard.summary_digest = stable_digest(&scoreboard.digest_input());
+    scoreboard
+}
+
+/// Validate that a release evidence scoreboard cannot mark high-scale claims
+/// proven without linked proof-gauntlet and replay artifacts.
+pub fn validate_large_swarm_release_evidence_scoreboard(
+    scoreboard: &LargeSwarmReleaseEvidenceScoreboard,
+) -> Result<(), LargeSwarmReplayError> {
+    if scoreboard.version != LARGE_SWARM_RELEASE_EVIDENCE_SCOREBOARD_VERSION {
+        return Err(LargeSwarmReplayError::InvalidReleaseEvidence(format!(
+            "unsupported scoreboard version {}",
+            scoreboard.version
+        )));
+    }
+    if scoreboard.claims.is_empty() {
+        return Err(LargeSwarmReplayError::InvalidReleaseEvidence(
+            "scoreboard must contain at least one claim".into(),
+        ));
+    }
+    if scoreboard.status_ladder != large_swarm_release_claim_status_ladder() {
+        return Err(LargeSwarmReplayError::InvalidReleaseEvidence(
+            "scoreboard status ladder does not match the release contract".into(),
+        ));
+    }
+
+    let expected_release_blocked = scoreboard
+        .claims
+        .iter()
+        .any(|claim| claim.status != claim.required_status);
+    if scoreboard.release_blocked != expected_release_blocked {
+        return Err(LargeSwarmReplayError::InvalidReleaseEvidence(
+            "scoreboard release_blocked flag disagrees with claim statuses".into(),
+        ));
+    }
+
+    for claim in &scoreboard.claims {
+        validate_large_swarm_release_claim(claim)?;
+    }
+
+    Ok(())
+}
+
+/// Render the high-scale release evidence scoreboard for docs/release notes.
+#[must_use]
+pub fn render_large_swarm_release_evidence_markdown(
+    scoreboard: &LargeSwarmReleaseEvidenceScoreboard,
+) -> String {
+    let mut output = String::from(
+        "| Claim | Status | Required | Evidence | Release gate |\n\
+         |---|---:|---:|---|---|\n",
+    );
+
+    for claim in &scoreboard.claims {
+        let evidence = if claim.artifact_refs.is_empty() {
+            "none".to_string()
+        } else {
+            claim
+                .artifact_refs
+                .iter()
+                .map(|artifact| {
+                    format!(
+                        "{}:{}@{}",
+                        artifact.artifact_kind.as_str(),
+                        artifact.artifact_id,
+                        artifact.digest
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("<br>")
+        };
+        let gate = if claim.status == claim.required_status {
+            "PROVEN".to_string()
+        } else {
+            format!("SKIPPED_NOT_PROVEN: {}", claim.release_blockers.join("; "))
+        };
+        output.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            claim.claim,
+            claim.status.as_str(),
+            claim.required_status.as_str(),
+            evidence,
+            gate
+        ));
+    }
+
+    output
 }
 
 /// Replay a corpus through `ReplaySession` and return a deterministic summary.
@@ -1116,6 +1411,141 @@ fn has_high_scale_release_request(requests: &[LargeSwarmProofScaleRequest]) -> b
     requests.iter().any(|request| {
         request.requested_logical_cores >= 64 && request.requested_memory_bytes >= 256 * GIB
     })
+}
+
+fn has_high_scale_release_artifact(manifest: &LargeSwarmProofGauntletManifest) -> bool {
+    manifest.scale_artifacts.iter().any(|artifact| {
+        artifact.request.requested_logical_cores >= 64
+            && artifact.request.requested_memory_bytes >= 256 * GIB
+            && artifact.request.scenario.pane_count >= 1_000
+    })
+}
+
+fn release_artifact_refs(
+    manifest: &LargeSwarmProofGauntletManifest,
+) -> Vec<LargeSwarmReleaseArtifactRef> {
+    let mut refs = Vec::with_capacity(manifest.scale_artifacts.len() + 1);
+    refs.push(LargeSwarmReleaseArtifactRef {
+        artifact_kind: LargeSwarmReleaseArtifactKind::ProofGauntletManifest,
+        artifact_id: format!("proof-gauntlet:{}", manifest.run_context.run_id),
+        version: manifest.version.clone(),
+        digest: manifest.summary_digest.clone(),
+    });
+
+    for artifact in &manifest.scale_artifacts {
+        refs.push(LargeSwarmReleaseArtifactRef {
+            artifact_kind: LargeSwarmReleaseArtifactKind::ReplaySummary,
+            artifact_id: format!(
+                "replay-summary:{}:{}cores:{}gib:{}panes",
+                artifact.summary.scenario_id,
+                artifact.request.requested_logical_cores,
+                artifact.request.requested_memory_bytes / GIB,
+                artifact.request.scenario.pane_count
+            ),
+            version: artifact.summary.version.clone(),
+            digest: artifact.summary.summary_digest.clone(),
+        });
+    }
+
+    refs
+}
+
+fn large_swarm_release_blockers(
+    status: LargeSwarmReleaseClaimStatus,
+    manifest: Option<&LargeSwarmProofGauntletManifest>,
+) -> Vec<String> {
+    if status == LargeSwarmReleaseClaimStatus::RealHardwareProven {
+        return Vec::new();
+    }
+
+    let Some(manifest) = manifest else {
+        return vec!["no proof-gauntlet manifest supplied for this release claim".into()];
+    };
+
+    let mut blockers = Vec::new();
+    blockers.extend(manifest.skip_reasons.iter().cloned());
+    blockers.extend(manifest.failure_reasons.iter().cloned());
+    match status {
+        LargeSwarmReleaseClaimStatus::Planned => {
+            blockers.push("claim remains planned until a proof-gauntlet manifest exists".into());
+        }
+        LargeSwarmReleaseClaimStatus::Simulated => {
+            blockers.push(
+                "synthetic or failed simulation evidence cannot prove the release claim".into(),
+            );
+        }
+        LargeSwarmReleaseClaimStatus::LocalSmoke => {
+            blockers
+                .push("local smoke evidence is parser/schema coverage, not release proof".into());
+        }
+        LargeSwarmReleaseClaimStatus::ReplayProven => {
+            blockers.push(
+                "deterministic replay passed, but real 64-core / 256 GiB hardware proof is missing"
+                    .into(),
+            );
+        }
+        LargeSwarmReleaseClaimStatus::RealHardwareProven => {}
+    }
+    blockers.sort();
+    blockers.dedup();
+    blockers
+}
+
+fn validate_large_swarm_release_claim(
+    claim: &LargeSwarmReleaseEvidenceClaim,
+) -> Result<(), LargeSwarmReplayError> {
+    if claim.claim_id.trim().is_empty() {
+        return Err(LargeSwarmReplayError::InvalidReleaseEvidence(
+            "claim_id must not be empty".into(),
+        ));
+    }
+    if claim.claim.trim().is_empty() {
+        return Err(LargeSwarmReplayError::InvalidReleaseEvidence(
+            "claim text must not be empty".into(),
+        ));
+    }
+    if claim.status != claim.required_status && claim.release_blockers.is_empty() {
+        return Err(LargeSwarmReplayError::InvalidReleaseEvidence(format!(
+            "claim {} is below its required status but has no blockers",
+            claim.claim_id
+        )));
+    }
+    if claim.status == LargeSwarmReleaseClaimStatus::RealHardwareProven {
+        let has_manifest = claim.artifact_refs.iter().any(|artifact| {
+            artifact.artifact_kind == LargeSwarmReleaseArtifactKind::ProofGauntletManifest
+                && artifact.version == LARGE_SWARM_PROOF_GAUNTLET_VERSION
+                && artifact.digest.starts_with("fnv1a64:")
+        });
+        let replay_count = claim
+            .artifact_refs
+            .iter()
+            .filter(|artifact| {
+                artifact.artifact_kind == LargeSwarmReleaseArtifactKind::ReplaySummary
+                    && artifact.version == LARGE_SWARM_REPLAY_CORPUS_VERSION
+                    && artifact.digest.starts_with("fnv1a64:")
+            })
+            .count();
+        if !has_manifest {
+            return Err(LargeSwarmReplayError::InvalidReleaseEvidence(format!(
+                "PROVEN claim {} is missing a proof-gauntlet manifest artifact",
+                claim.claim_id
+            )));
+        }
+        if replay_count < 5 {
+            return Err(LargeSwarmReplayError::InvalidReleaseEvidence(format!(
+                "PROVEN claim {} is missing the full five-point replay artifact set",
+                claim.claim_id
+            )));
+        }
+        if !claim.release_blockers.is_empty() {
+            return Err(LargeSwarmReplayError::InvalidReleaseEvidence(format!(
+                "PROVEN claim {} still carries release blockers",
+                claim.claim_id
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn default_search_query_mix() -> BTreeMap<String, u64> {

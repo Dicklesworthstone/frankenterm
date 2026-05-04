@@ -3,12 +3,15 @@ use frankenterm_core::hardware_profile::{
     HighScaleProofPredicates, MemoryProfile, NumaProfile, ProbeValue, StorageProfile,
 };
 use frankenterm_core::large_swarm_replay::{
-    LARGE_SWARM_PROOF_GAUNTLET_VERSION, LARGE_SWARM_REPLAY_CORPUS_VERSION,
-    LargeSwarmProofEvidenceMode, LargeSwarmProofGauntletConfig, LargeSwarmProofGauntletManifest,
-    LargeSwarmProofGauntletStatus, LargeSwarmRegressionThresholds, LargeSwarmReplayCorpus,
-    LargeSwarmScenario, build_large_swarm_proof_gauntlet_manifest_from_hardware,
-    evaluate_large_swarm_thresholds, generate_large_swarm_corpus, summarize_large_swarm_replay,
-    summarize_required_scale_points,
+    LARGE_SWARM_PROOF_GAUNTLET_VERSION, LARGE_SWARM_RELEASE_EVIDENCE_SCOREBOARD_VERSION,
+    LARGE_SWARM_REPLAY_CORPUS_VERSION, LargeSwarmProofEvidenceMode, LargeSwarmProofGauntletConfig,
+    LargeSwarmProofGauntletManifest, LargeSwarmProofGauntletStatus, LargeSwarmRegressionThresholds,
+    LargeSwarmReleaseClaimStatus, LargeSwarmReplayCorpus, LargeSwarmScenario,
+    build_large_swarm_proof_gauntlet_manifest_from_hardware,
+    build_large_swarm_release_evidence_scoreboard, evaluate_large_swarm_thresholds,
+    generate_large_swarm_corpus, large_swarm_release_claim_status,
+    render_large_swarm_release_evidence_markdown, summarize_large_swarm_replay,
+    summarize_required_scale_points, validate_large_swarm_release_evidence_scoreboard,
 };
 use frankenterm_core::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
 
@@ -244,6 +247,140 @@ fn proof_gauntlet_status_is_proven_only_for_real_mode_and_passing_thresholds() {
     assert!(manifest.skip_reasons.is_empty());
     assert!(manifest.failure_reasons.is_empty());
     assert_eq!(manifest.scale_artifacts.len(), 5);
+}
+
+#[test]
+fn release_evidence_scoreboard_tracks_truth_status_transitions() {
+    assert_eq!(
+        large_swarm_release_claim_status(None),
+        LargeSwarmReleaseClaimStatus::Planned
+    );
+
+    let smoke_manifest = build_large_swarm_proof_gauntlet_manifest_from_hardware(
+        high_scale_hardware(),
+        LargeSwarmProofGauntletConfig::synthetic_smoke("local-smoke"),
+    )
+    .expect("build smoke manifest");
+    assert_eq!(
+        large_swarm_release_claim_status(Some(&smoke_manifest)),
+        LargeSwarmReleaseClaimStatus::LocalSmoke
+    );
+
+    let replay_only_manifest = build_large_swarm_proof_gauntlet_manifest_from_hardware(
+        insufficient_hardware(),
+        LargeSwarmProofGauntletConfig::high_scale_release("replay-only"),
+    )
+    .expect("build replay-only manifest");
+    assert_eq!(
+        large_swarm_release_claim_status(Some(&replay_only_manifest)),
+        LargeSwarmReleaseClaimStatus::ReplayProven
+    );
+
+    let proven_manifest = build_large_swarm_proof_gauntlet_manifest_from_hardware(
+        high_scale_hardware(),
+        LargeSwarmProofGauntletConfig::high_scale_release("real-hardware-release"),
+    )
+    .expect("build proven manifest");
+    assert_eq!(
+        large_swarm_release_claim_status(Some(&proven_manifest)),
+        LargeSwarmReleaseClaimStatus::RealHardwareProven
+    );
+
+    let mut simulated_manifest = smoke_manifest.clone();
+    simulated_manifest.run_context.evidence_mode = LargeSwarmProofEvidenceMode::RealHardwareRun;
+    simulated_manifest
+        .failure_reasons
+        .push("forced failure".into());
+    simulated_manifest.scale_artifacts[0].verdict.passed = false;
+    assert_eq!(
+        large_swarm_release_claim_status(Some(&simulated_manifest)),
+        LargeSwarmReleaseClaimStatus::Simulated
+    );
+}
+
+#[test]
+fn release_evidence_scoreboard_links_manifest_and_replay_artifacts() {
+    let manifest = build_large_swarm_proof_gauntlet_manifest_from_hardware(
+        high_scale_hardware(),
+        LargeSwarmProofGauntletConfig::high_scale_release("release-evidence"),
+    )
+    .expect("build proven manifest");
+    let scoreboard = build_large_swarm_release_evidence_scoreboard(Some(&manifest));
+
+    assert_eq!(
+        scoreboard.version,
+        LARGE_SWARM_RELEASE_EVIDENCE_SCOREBOARD_VERSION
+    );
+    assert!(!scoreboard.release_blocked);
+    assert!(scoreboard.summary_digest.starts_with("fnv1a64:"));
+    assert_eq!(scoreboard.claims.len(), 1);
+    assert_eq!(
+        scoreboard.claims[0].status,
+        LargeSwarmReleaseClaimStatus::RealHardwareProven
+    );
+    assert_eq!(scoreboard.claims[0].artifact_refs.len(), 6);
+    assert!(
+        scoreboard.claims[0]
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact.digest == manifest.summary_digest)
+    );
+    for scale_artifact in &manifest.scale_artifacts {
+        assert!(
+            scoreboard.claims[0]
+                .artifact_refs
+                .iter()
+                .any(|artifact| artifact.digest == scale_artifact.summary.summary_digest),
+            "scoreboard should link replay summary {}",
+            scale_artifact.summary.scenario_id
+        );
+    }
+
+    validate_large_swarm_release_evidence_scoreboard(&scoreboard)
+        .expect("proven scoreboard should validate");
+
+    let json = serde_json::to_string(&scoreboard).expect("serialize scoreboard");
+    let roundtrip: frankenterm_core::large_swarm_replay::LargeSwarmReleaseEvidenceScoreboard =
+        serde_json::from_str(&json).expect("deserialize scoreboard");
+    assert_eq!(roundtrip, scoreboard);
+}
+
+#[test]
+fn release_evidence_scoreboard_renders_unsupported_claims_as_not_proven() {
+    let manifest = build_large_swarm_proof_gauntlet_manifest_from_hardware(
+        high_scale_hardware(),
+        LargeSwarmProofGauntletConfig::synthetic_smoke("local-smoke"),
+    )
+    .expect("build smoke manifest");
+    let scoreboard = build_large_swarm_release_evidence_scoreboard(Some(&manifest));
+    let rendered = render_large_swarm_release_evidence_markdown(&scoreboard);
+
+    assert!(scoreboard.release_blocked);
+    assert!(rendered.contains("local-smoke"));
+    assert!(rendered.contains("SKIPPED_NOT_PROVEN"));
+    assert!(rendered.contains("local smoke evidence is parser/schema coverage"));
+    assert!(!rendered.contains("| real-hardware-proven | real-hardware-proven |"));
+}
+
+#[test]
+fn release_evidence_gate_rejects_proven_claim_without_manifest_artifacts() {
+    let manifest = build_large_swarm_proof_gauntlet_manifest_from_hardware(
+        high_scale_hardware(),
+        LargeSwarmProofGauntletConfig::high_scale_release("release-evidence"),
+    )
+    .expect("build proven manifest");
+    let mut scoreboard = build_large_swarm_release_evidence_scoreboard(Some(&manifest));
+    scoreboard.claims[0].artifact_refs.clear();
+    scoreboard.summary_digest = "fnv1a64:tampered".into();
+
+    let error = validate_large_swarm_release_evidence_scoreboard(&scoreboard)
+        .expect_err("proven claim without artifacts must fail the release gate");
+    assert!(
+        error
+            .to_string()
+            .contains("missing a proof-gauntlet manifest artifact"),
+        "{error}"
+    );
 }
 
 // ── br-ft-o60ul cc1 property-test slice ────────────────────────────
