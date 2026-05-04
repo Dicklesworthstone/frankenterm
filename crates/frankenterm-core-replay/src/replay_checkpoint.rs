@@ -985,4 +985,81 @@ mod tests {
             assert_eq!(kind, back);
         }
     }
+
+    // ── br-ft-cnxnr: resume_from trust-boundary validation ───────────────
+
+    #[test]
+    fn resume_from_rejects_mismatched_run_id_ft_cnxnr() {
+        let config = CheckpointConfig::default();
+        let ckpt = ReplayCheckpointer::new("run-A".into(), config.clone(), FailureMode::Default);
+        // Construct a foreign checkpoint claiming a different run.
+        let foreign = CheckpointState::new("run-B".into());
+        let err = ckpt
+            .resume_from(&foreign)
+            .expect_err("br-ft-cnxnr: foreign run_id must be rejected");
+        match err {
+            CheckpointResumeError::RunIdMismatch { expected, actual } => {
+                assert_eq!(expected, "run-A");
+                assert_eq!(actual, "run-B");
+            }
+            other => panic!("expected RunIdMismatch; got {other:?}"),
+        }
+        // Pre-existing live state must be untouched.
+        let state = ckpt.current_state();
+        assert_eq!(state.replay_run_id, "run-A");
+        assert_eq!(state.event_position, 0);
+    }
+
+    #[test]
+    fn resume_from_rejects_stale_schema_ft_cnxnr() {
+        let config = CheckpointConfig::default();
+        let ckpt = ReplayCheckpointer::new("run-X".into(), config, FailureMode::Default);
+        let mut stale = CheckpointState::new("run-X".into());
+        stale.checkpoint_version = "ft.replay.checkpoint.v0".into(); // old schema
+
+        let err = ckpt
+            .resume_from(&stale)
+            .expect_err("br-ft-cnxnr: stale schema must be rejected");
+        match err {
+            CheckpointResumeError::SchemaMismatch { expected, actual } => {
+                assert_eq!(expected, CHECKPOINT_VERSION);
+                assert_eq!(actual, "ft.replay.checkpoint.v0");
+            }
+            other => panic!("expected SchemaMismatch; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_from_accepts_matching_checkpoint_ft_cnxnr() {
+        let config = CheckpointConfig::default();
+        let ckpt = ReplayCheckpointer::new("run-Z".into(), config, FailureMode::Default);
+        let mut state = CheckpointState::new("run-Z".into());
+        state.event_position = 42;
+        state.decisions_made = 17;
+        ckpt.resume_from(&state)
+            .expect("matching run_id + version must accept");
+        let restored = ckpt.current_state();
+        assert_eq!(restored.event_position, 42);
+        assert_eq!(restored.decisions_made, 17);
+    }
+
+    #[test]
+    fn resume_from_does_not_clear_halted_on_rejection_ft_cnxnr() {
+        // Pre-fix resume_from cleared halted/completed flags
+        // unconditionally. Post-fix a rejected resume must leave
+        // them as they were.
+        let config = CheckpointConfig::default();
+        let ckpt = ReplayCheckpointer::new("run-H".into(), config, FailureMode::Default);
+        ckpt.halt(ReplayError {
+            kind: ReplayErrorKind::CorruptEvent,
+            event_position: 5,
+            event_id: None,
+            message: "test halt".into(),
+            context: None,
+        });
+        let foreign = CheckpointState::new("run-OTHER".into());
+        let _ = ckpt.resume_from(&foreign).expect_err("must reject");
+        // Halt state preserved across rejection.
+        assert!(ckpt.is_halted(), "br-ft-cnxnr: rejected resume must NOT clear halted flag");
+    }
 }

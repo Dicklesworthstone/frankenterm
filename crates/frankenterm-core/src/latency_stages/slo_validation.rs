@@ -629,7 +629,10 @@ mod tests {
             guard.current_percentile(QoEMetric::InputToPaint, f64::NAN),
             None
         );
-        assert_eq!(guard.current_percentile(QoEMetric::InputToPaint, -0.1), None);
+        assert_eq!(
+            guard.current_percentile(QoEMetric::InputToPaint, -0.1),
+            None
+        );
         assert_eq!(guard.current_percentile(QoEMetric::InputToPaint, 1.1), None);
     }
 
