@@ -30,6 +30,8 @@
 //! Timeout calculation is O(n) for n observations (parameter estimation)
 //! plus O(1) for the optimization (closed-form for log-normal).
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
@@ -410,7 +412,13 @@ impl TimeoutCalculator {
 pub struct TimeoutTracker {
     config: TimeoutConfig,
     /// Observed durations in milliseconds.
-    observations: Vec<f64>,
+    ///
+    /// br-ft-ykrsq: VecDeque so the FIFO eviction at
+    /// `max_observations` is O(1) (`pop_front`) rather than O(N)
+    /// (`Vec::remove(0)` shifts all elements left). Under sustained
+    /// reflex activity with `max_observations = 1000`, every record
+    /// past the boundary paid a 1000-element shift.
+    observations: VecDeque<f64>,
     /// Maximum observations to retain (ring buffer).
     max_observations: usize,
     /// Total observations ever recorded.
@@ -427,7 +435,7 @@ impl TimeoutTracker {
     pub fn new(config: TimeoutConfig) -> Self {
         Self {
             config,
-            observations: Vec::new(),
+            observations: VecDeque::new(),
             max_observations: 1000,
             total_recorded: 0,
             total_timeouts: 0,
@@ -442,12 +450,14 @@ impl TimeoutTracker {
     }
 
     /// Record an observed duration (in milliseconds).
+    ///
+    /// br-ft-ykrsq: O(1) FIFO eviction via VecDeque::pop_front.
     pub fn record(&mut self, duration_ms: f64) {
         if duration_ms > 0.0 {
             if self.observations.len() >= self.max_observations {
-                self.observations.remove(0);
+                self.observations.pop_front();
             }
-            self.observations.push(duration_ms);
+            self.observations.push_back(duration_ms);
             self.total_recorded += 1;
         }
     }
@@ -463,10 +473,18 @@ impl TimeoutTracker {
     }
 
     /// Get the current recommended timeout.
+    ///
+    /// br-ft-ykrsq: VecDeque doesn't auto-deref to `&[f64]` because
+    /// it's two contiguous slices internally; collect into a Vec
+    /// for the duration of the calculation. The collection is O(N)
+    /// but happens only on the recommended_timeout query path
+    /// (cold), not the per-observation hot path. The hot path is
+    /// what mattered for the eviction perf bug.
     #[must_use]
     pub fn recommended_timeout(&self) -> TimeoutDecision {
         let calc = TimeoutCalculator::new(self.config.clone());
-        calc.calculate(&self.observations)
+        let snapshot: Vec<f64> = self.observations.iter().copied().collect();
+        calc.calculate(&snapshot)
     }
 
     /// Number of observations currently stored.
@@ -491,9 +509,13 @@ impl TimeoutTracker {
     }
 
     /// Get statistics for current observations.
+    ///
+    /// br-ft-ykrsq: same VecDeque-to-slice consideration as
+    /// [`Self::recommended_timeout`] — cold path, snapshot OK.
     #[must_use]
     pub fn current_stats(&self) -> Option<DurationStats> {
-        DurationStats::from_durations(&self.observations)
+        let snapshot: Vec<f64> = self.observations.iter().copied().collect();
+        DurationStats::from_durations(&snapshot)
     }
 }
 
@@ -1091,5 +1113,71 @@ mod tests {
         let decoded: DurationStats = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.count, stats.count);
         assert!((decoded.mean_ms - stats.mean_ms).abs() < 1e-10);
+    }
+
+    /// br-ft-ykrsq: VecDeque-backed observations preserve FIFO
+    /// ordering — the oldest record is the first evicted when the
+    /// ring fills. Pre-fix Vec::remove(0) had the same FIFO
+    /// semantics but was O(N); post-fix VecDeque::pop_front is
+    /// O(1). This test pins the FIFO contract is preserved by
+    /// asserting the OLDEST sample is gone after capacity overflow
+    /// AND the NEWEST sample is present.
+    #[test]
+    fn tracker_vec_deque_eviction_preserves_fifo_order_ft_ykrsq() {
+        let mut tracker = TimeoutTracker::new(TimeoutConfig::default());
+        tracker.max_observations = 3;
+
+        // Fill ring + push one beyond capacity. Order: 100, 200, 300, then 400.
+        // After the 4th push: 100 evicted, ring = [200, 300, 400].
+        tracker.record(100.0);
+        tracker.record(200.0);
+        tracker.record(300.0);
+        tracker.record(400.0);
+
+        assert_eq!(
+            tracker.observation_count(),
+            3,
+            "ft-ykrsq: ring must respect max_observations cap"
+        );
+
+        // Snapshot internal state via the cold-path stats helper
+        // (snapshot copies observations into a Vec for stats calc).
+        let stats = tracker
+            .current_stats()
+            .expect("ft-ykrsq: stats available after 3+ obs");
+        // Mean = (200 + 300 + 400) / 3 = 300.0 — proves 100 was
+        // evicted (oldest) and 400 is present (newest). If FIFO
+        // were broken (e.g., evicted newest instead), mean would
+        // be (100 + 200 + 300) / 3 = 200.0.
+        assert!(
+            (stats.mean_ms - 300.0).abs() < 1e-9,
+            "ft-ykrsq: post-eviction mean must be (200+300+400)/3 = 300.0 \
+             (proves oldest=100 evicted, newest=400 present); got {}",
+            stats.mean_ms
+        );
+    }
+
+    /// br-ft-ykrsq: heavy ring-buffer churn must remain correct.
+    /// Pre-fix this test ran in O(N²) due to Vec::remove(0); post-
+    /// fix it's O(N) via VecDeque::pop_front. Pins both the
+    /// correctness property (count == max) and exercises the hot
+    /// path that motivated the perf fix.
+    #[test]
+    fn tracker_high_churn_eviction_terminates_quickly_ft_ykrsq() {
+        let mut tracker = TimeoutTracker::new(TimeoutConfig::default());
+        tracker.max_observations = 100;
+        for i in 0..10_000 {
+            tracker.record(f64::from(i % 1000) + 1.0);
+        }
+        assert_eq!(
+            tracker.observation_count(),
+            100,
+            "ft-ykrsq: post-churn count must equal max_observations"
+        );
+        assert_eq!(
+            tracker.total_observations(),
+            10_000,
+            "ft-ykrsq: total counter tracks all-time records (separate from ring)"
+        );
     }
 }
