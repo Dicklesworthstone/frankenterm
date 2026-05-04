@@ -281,8 +281,16 @@ impl<'de> Deserialize<'de> for TriggerCategoryCounts {
             }
             fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Self::Value, M::Error> {
                 let mut out = TriggerCategoryCounts::new();
+                let mut seen = [false; TRIGGER_CATEGORY_COUNT];
                 while let Some((cat, count)) = access.next_entry::<TriggerCategory, u64>()? {
-                    out.0[cat.as_index()] = count;
+                    let idx = cat.as_index();
+                    if seen[idx] {
+                        return Err(<M::Error as serde::de::Error>::custom(format!(
+                            "duplicate count for trigger category {cat}"
+                        )));
+                    }
+                    seen[idx] = true;
+                    out.0[idx] = count;
                 }
                 Ok(out)
             }
@@ -292,7 +300,7 @@ impl<'de> Deserialize<'de> for TriggerCategoryCounts {
 }
 
 /// Aggregated scan results with per-category counts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct TriggerScanResult {
     /// Per-category match counts.
     pub counts: TriggerCategoryCounts,
@@ -303,6 +311,30 @@ pub struct TriggerScanResult {
 }
 
 impl TriggerScanResult {
+    fn validate_count_invariants(&self) -> std::result::Result<(), String> {
+        let mut sum = 0_u64;
+        for (category, count) in self.counts.iter() {
+            if count > self.total_matches {
+                return Err(format!(
+                    "trigger category {category} count {count} exceeds total_matches {}",
+                    self.total_matches
+                ));
+            }
+            sum = sum.checked_add(count).ok_or_else(|| {
+                "trigger category counts overflow u64 before matching total_matches".to_string()
+            })?;
+        }
+
+        if sum != self.total_matches {
+            return Err(format!(
+                "trigger category counts sum {sum} does not equal total_matches {}",
+                self.total_matches
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Get the count for a specific category — `Some(&n)` when non-zero,
     /// `None` otherwise (preserves the legacy HashMap-equivalent semantic).
     #[must_use]
@@ -320,6 +352,28 @@ impl TriggerScanResult {
     #[must_use]
     pub fn has_completions(&self) -> bool {
         self.counts.count(TriggerCategory::Completion) > 0
+    }
+}
+
+impl<'de> Deserialize<'de> for TriggerScanResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawTriggerScanResult {
+            counts: TriggerCategoryCounts,
+            total_matches: u64,
+            bytes_scanned: u64,
+        }
+
+        let raw = RawTriggerScanResult::deserialize(deserializer)?;
+        let result = Self {
+            counts: raw.counts,
+            total_matches: raw.total_matches,
+            bytes_scanned: raw.bytes_scanned,
+        };
+        result
+            .validate_count_invariants()
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+        Ok(result)
     }
 }
 
@@ -1008,6 +1062,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trigger_scan_result_deserialize_rejects_total_mismatch() {
+        let err = serde_json::from_str::<TriggerScanResult>(
+            r#"{"counts":{"error":2,"completion":1},"total_matches":2,"bytes_scanned":128}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not equal total_matches"));
+    }
+
+    #[test]
+    fn trigger_scan_result_deserialize_rejects_category_count_above_total() {
+        let err = serde_json::from_str::<TriggerScanResult>(
+            r#"{"counts":{"error":3},"total_matches":2,"bytes_scanned":128}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds total_matches"));
+    }
+
+    #[test]
+    fn trigger_scan_result_deserialize_rejects_count_sum_overflow() {
+        let err = serde_json::from_str::<TriggerScanResult>(
+            r#"{"counts":{"error":18446744073709551615,"warning":1},"total_matches":18446744073709551615,"bytes_scanned":128}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("overflow u64"));
+    }
+
+    #[test]
+    fn trigger_scan_result_deserialize_accepts_sparse_legacy_counts() {
+        let rt: TriggerScanResult = serde_json::from_str(
+            r#"{"counts":{"error":2,"test_result":1},"total_matches":3,"bytes_scanned":128}"#,
+        )
+        .unwrap();
+        assert_eq!(rt.counts.count(TriggerCategory::Error), 2);
+        assert_eq!(rt.counts.count(TriggerCategory::TestResult), 1);
+        assert_eq!(rt.counts.count(TriggerCategory::Warning), 0);
+        assert_eq!(rt.total_matches, 3);
+        assert_eq!(rt.bytes_scanned, 128);
+    }
+
     // -- Pattern count --
 
     #[test]
@@ -1100,6 +1194,19 @@ mod tests {
         assert_eq!(c.count(TriggerCategory::Warning), 0);
         assert_eq!(c.get(&TriggerCategory::Error), Some(&7));
         assert_eq!(c.get(&TriggerCategory::Warning), None);
+    }
+
+    #[test]
+    fn trigger_category_counts_rejects_duplicate_category_keys() {
+        let err =
+            serde_json::from_str::<TriggerCategoryCounts>(r#"{"error":1,"error":2}"#).unwrap_err();
+        assert!(err.to_string().contains("duplicate count"));
+    }
+
+    #[test]
+    fn trigger_category_counts_rejects_array_wire_format() {
+        let err = serde_json::from_str::<TriggerCategoryCounts>("[1,2,3,4,5,6]").unwrap_err();
+        assert!(err.to_string().contains("map"));
     }
 
     #[test]
