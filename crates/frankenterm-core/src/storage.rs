@@ -9584,6 +9584,172 @@ fn parse_workflow_execution_column<T: serde::de::DeserializeOwned>(
     }
 }
 
+// ============================================================================
+// br-ft-4d6ic: umbrella JSON-column parse-drop observability
+// ============================================================================
+//
+// 7 silent serde drops in storage.rs (post ft-pewat sweep) read
+// JSON-typed columns across 3 distinct (table, column) pairs:
+//
+//   - events.extracted (3 sites: 9035 + 14054 + 14219 + 14315 — 4
+//     actually; pane_uuid lookup at 9035 also reads `extracted`)
+//   - agent_sessions.external_meta (3 sites: 13903 + 13949 + 14001)
+//
+// Per-site counters would create 6+ separate observability surfaces.
+// Operators don't need that resolution — table+column tags in the
+// structured tracing::warn give per-site discrimination through
+// logs, while a single umbrella counter answers the high-level
+// question "is JSON-column parse fidelity silently degrading?".
+// Same shape as ft-yygus, ft-k6uwb, ft-zhnaw, ft-94cdu, ft-lqj5g,
+// ft-pewat, ft-l3u5k, ft-bn6qi.
+
+static STORAGE_JSON_COL_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// br-ft-4d6ic: cumulative count of JSON-typed column parse
+/// failures across storage.rs query paths since process load.
+/// NULL columns are NOT counted (legitimate absence); only
+/// column-present-but-fails-to-parse bumps. Operators reading
+/// this > 0 should investigate schema drift on the tagged
+/// (table, column) pair.
+#[must_use]
+pub fn storage_json_col_parse_drop_count() -> u64 {
+    STORAGE_JSON_COL_PARSE_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// br-ft-4d6ic: test helper to reset the umbrella parse-drop counter.
+#[cfg(test)]
+pub fn reset_storage_json_col_parse_drop_count_for_test() {
+    STORAGE_JSON_COL_PARSE_DROP_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// br-ft-4d6ic: parse a JSON-typed column from a storage row.
+/// `None` input (NULL column) returns `None` with no counter
+/// bump. A column that fails to parse bumps the umbrella counter,
+/// emits a structured `tracing::warn` at target `ft.storage.json_col`
+/// with the (table, column) tags + raw_len + error, and returns
+/// `None` so the scalar contract stays the same.
+fn parse_storage_json_col<T: serde::de::DeserializeOwned>(
+    value: Option<&str>,
+    table: &'static str,
+    column: &'static str,
+) -> Option<T> {
+    let raw = value?;
+    match serde_json::from_str(raw) {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            STORAGE_JSON_COL_PARSE_DROP_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                target: "ft.storage.json_col",
+                event = "json_col_parse_drop",
+                table = table,
+                column = column,
+                raw_len = raw.len(),
+                error = %err,
+                "storage JSON-typed column failed to parse; consumer will see None (br-ft-4d6ic)"
+            );
+            None
+        }
+    }
+}
+
+// ============================================================================
+// br-ft-pewat: pane_bookmark.tags parse-drop observability
+// ============================================================================
+
+/// br-ft-pewat: cumulative count of `pane_bookmarks.tags` column
+/// parse failures observed since process load. The tags column
+/// stores a JSON `Vec<String>`; a malformed value (schema drift,
+/// manual DB edit, corrupted backup) silently turned into
+/// `tags = None` pre-fix — indistinguishable from "no tags set".
+/// Operators running tag-based filtering saw bookmarks "missing"
+/// with no signal.
+///
+/// NULL column is NOT counted (legitimate "no tags set"); only
+/// column-present-but-fails-to-parse bumps.
+///
+/// Same observability defect family as ft-yygus, ft-k6uwb,
+/// ft-zhnaw, ft-94cdu, ft-lqj5g, ft-4ymqn, ft-l3u5k, ft-bn6qi,
+/// ft-crpvd, ft-0n4nx.
+static PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// br-ft-pewat: cumulative count of pane_bookmark.tags parse failures.
+#[must_use]
+pub fn pane_bookmark_tags_parse_drop_count() -> u64 {
+    PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// br-ft-pewat: test helper to reset the parse-drop counter.
+#[cfg(test)]
+pub fn reset_pane_bookmark_tags_parse_drop_count_for_test() {
+    PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// br-ft-pewat: parse the `pane_bookmarks.tags` JSON column. On
+/// failure bumps the counter, emits a structured `tracing::warn`
+/// at target `ft.storage.pane_bookmark` with bookmark_id,
+/// pane_id, raw_len, and error, then returns `None` so the
+/// scalar contract stays the same.
+fn parse_pane_bookmark_tags(raw: &str, bookmark_id: i64, pane_id: u64) -> Option<Vec<String>> {
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(tags) => Some(tags),
+        Err(err) => {
+            PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                target: "ft.storage.pane_bookmark",
+                event = "pane_bookmark_tags_parse_drop",
+                bookmark_id = bookmark_id,
+                pane_id = pane_id,
+                raw_len = raw.len(),
+                error = %err,
+                "pane_bookmarks.tags column failed to parse; consumer will see None (br-ft-pewat)"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod pane_bookmark_tags_parse_drop_tests {
+    use super::*;
+
+    #[test]
+    fn well_formed_tags_no_bump_ft_pewat() {
+        reset_pane_bookmark_tags_parse_drop_count_for_test();
+        let tags = parse_pane_bookmark_tags(r#"["urgent","review"]"#, 1, 7);
+        assert_eq!(
+            tags,
+            Some(vec!["urgent".to_string(), "review".to_string()])
+        );
+        assert_eq!(pane_bookmark_tags_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn empty_tags_array_no_bump_ft_pewat() {
+        // Boundary: legitimate empty tag list.
+        reset_pane_bookmark_tags_parse_drop_count_for_test();
+        let tags = parse_pane_bookmark_tags("[]", 1, 7);
+        assert_eq!(tags, Some(Vec::<String>::new()));
+        assert_eq!(pane_bookmark_tags_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn malformed_tags_bumps_counter_ft_pewat() {
+        // br-ft-pewat: a malformed tags value bumps the counter.
+        reset_pane_bookmark_tags_parse_drop_count_for_test();
+        let tags = parse_pane_bookmark_tags("{not an array", 42, 100);
+        assert!(tags.is_none());
+        assert_eq!(pane_bookmark_tags_parse_drop_count(), 1);
+
+        // Wrong shape (object, not array): also bumps.
+        let _ = parse_pane_bookmark_tags(r#"{"k":"v"}"#, 43, 101);
+        assert_eq!(pane_bookmark_tags_parse_drop_count(), 2);
+    }
+}
+
 #[cfg(test)]
 mod workflow_execution_row_parse_drop_tests {
     use super::*;
@@ -10567,6 +10733,9 @@ fn get_latest_checkpoint_hash_backend(
 
 fn pane_bookmark_from_backend_row(row: &[String]) -> Result<PaneBookmarkRecord> {
     let reader = RowReader::new(row);
+    let bookmark_id = reader
+        .i64(0)
+        .map_err(|err| storage_backend_error("Pane bookmark id", err))?;
     let pane_id_i64 = reader
         .i64(1)
         .map_err(|err| storage_backend_error("Pane bookmark pane_id", err))?;
@@ -10575,11 +10744,16 @@ fn pane_bookmark_from_backend_row(row: &[String]) -> Result<PaneBookmarkRecord> 
     let tags_raw = reader
         .optional_string(3)
         .map_err(|err| storage_backend_error("Pane bookmark tags", err))?;
-    let tags = tags_raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+    // br-ft-pewat: route through the parse-drop helper so a
+    // malformed tags JSON (schema drift, manual DB edit) bumps
+    // PANE_BOOKMARK_TAGS_PARSE_DROP_COUNT instead of silently
+    // turning into None — operators running tag-filtered queries
+    // would otherwise see bookmarks "missing" with no signal.
+    let tags = tags_raw
+        .as_deref()
+        .and_then(|s| parse_pane_bookmark_tags(s, bookmark_id, pane_id));
     Ok(PaneBookmarkRecord {
-        id: reader
-            .i64(0)
-            .map_err(|err| storage_backend_error("Pane bookmark id", err))?,
+        id: bookmark_id,
         pane_id,
         alias: reader
             .string(2)
