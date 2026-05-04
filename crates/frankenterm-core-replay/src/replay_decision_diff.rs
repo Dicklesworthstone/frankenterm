@@ -245,7 +245,7 @@ impl DecisionDiff {
 
         // Pass 1: Iterate baseline nodes, find matches in candidate.
         for (exact_key, node) in &base_indexed {
-            if let Some(cand_node) = cand_exact.get(&exact_key) {
+            if let Some(cand_node) = cand_exact.get(exact_key) {
                 // Exact match on key.
                 matched_cand.insert(exact_key.clone());
                 if node.output_hash == cand_node.output_hash {
@@ -315,7 +315,7 @@ impl DecisionDiff {
 
         // Pass 2: Find added candidate nodes (not matched).
         for (exact_key, node) in &cand_indexed {
-            if !matched_cand.contains(&exact_key) {
+            if !matched_cand.contains(exact_key) {
                 divergences.push(Divergence {
                     position,
                     divergence_type: DivergenceType::Added,
