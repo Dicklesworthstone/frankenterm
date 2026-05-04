@@ -506,6 +506,23 @@ pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()>
 mod tests {
     use super::*;
 
+    /// br-ft-kske1: module-local mutex serializing every test that
+    /// constructs a server (degraded or full). The
+    /// `MCP_BRIDGE_TOOLS_SKIPPED_NO_DB` counter is process-global,
+    /// so any test that calls `reset_..._for_test()` followed by
+    /// `build_server_degraded` (or `build_server`) and asserts the
+    /// post-build delta MUST hold this lock; otherwise a sibling
+    /// test that builds a server in parallel can bump the counter
+    /// between the reset and the post-build read, breaking exact-
+    /// delta assertions. Tests that only check structural
+    /// properties (tool/resource registration manifests) also
+    /// hold the lock to keep the counter coherent for any
+    /// concurrent reset+read sibling.
+    fn mcp_bridge_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// br-ft-647cj: passing `db_path=None` to `build_server_with_db`
     /// is now an explicit error. The silent-degradation path was
     /// removed; callers must use `build_server_degraded` to opt
@@ -532,6 +549,9 @@ mod tests {
     /// manifest-derived skipped-registration count.
     #[test]
     fn build_server_degraded_bumps_counter() {
+        // br-ft-kske1: hold the module-local lock so a sibling
+        // test cannot race the reset → build → read window.
+        let _guard = mcp_bridge_counter_test_lock();
         reset_mcp_bridge_tools_skipped_no_db_count_for_test();
         let before = mcp_bridge_tools_skipped_no_db_count();
         let config = Config::default();
@@ -550,6 +570,7 @@ mod tests {
     /// NOT bump the degraded counter — full surface is registered.
     #[test]
     fn build_server_with_db_does_not_bump_degraded_counter() {
+        let _guard = mcp_bridge_counter_test_lock();
         reset_mcp_bridge_tools_skipped_no_db_count_for_test();
         let before = mcp_bridge_tools_skipped_no_db_count();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -568,6 +589,7 @@ mod tests {
     /// callers don't see the new Err variant. Behavior preserved.
     #[test]
     fn build_server_routes_through_explicit_degraded() {
+        let _guard = mcp_bridge_counter_test_lock();
         reset_mcp_bridge_tools_skipped_no_db_count_for_test();
         let before = mcp_bridge_tools_skipped_no_db_count();
         let config = Config::default();
@@ -663,6 +685,7 @@ mod tests {
     /// storage-backed audited handler.
     #[test]
     fn degraded_server_omits_db_gated_tool_manifest_except_replacements_ft_jb5l7() {
+        let _guard = mcp_bridge_counter_test_lock();
         let config = Config::default();
         let server = build_server_degraded(&config).expect("degraded build must succeed");
         let tool_names = tool_names(&server);
@@ -703,6 +726,7 @@ mod tests {
     /// resource/template URI named in the telemetry manifest.
     #[test]
     fn degraded_server_omits_db_gated_resource_manifest_ft_jb5l7() {
+        let _guard = mcp_bridge_counter_test_lock();
         let config = Config::default();
         let server = build_server_degraded(&config).expect("degraded build must succeed");
         let uris = resource_registration_uris(&server);
@@ -728,6 +752,7 @@ mod tests {
     /// built Server via `Server::tools()` and asserts the contract.
     #[test]
     fn degraded_server_does_not_expose_mutating_tools_ft_p4y8d() {
+        let _guard = mcp_bridge_counter_test_lock();
         let config = Config::default();
         let server = build_server_degraded(&config).expect("degraded build must succeed");
         let tool_names = tool_names(&server);
@@ -746,6 +771,7 @@ mod tests {
     /// authoritative list against accidental additions.
     #[test]
     fn degraded_server_exposes_exactly_base_catalog_ft_p4y8d() {
+        let _guard = mcp_bridge_counter_test_lock();
         let config = Config::default();
         let server = build_server_degraded(&config).expect("degraded build must succeed");
         let tool_names = tool_names(&server);
@@ -820,6 +846,7 @@ mod tests {
     /// documented contract.
     #[test]
     fn every_degraded_tool_appears_in_documented_catalog_ft_p4y8d() {
+        let _guard = mcp_bridge_counter_test_lock();
         let config = Config::default();
         let server = build_server_degraded(&config).expect("degraded build must succeed");
 
@@ -835,6 +862,51 @@ mod tests {
                  documented DEGRADED_MODE_BASE_TOOL_NAMES — either add it to \
                  the const (if intentional) or move it to the db-gated branch",
                 tool.name
+            );
+        }
+    }
+
+    /// br-ft-kske1: serialized concurrent-build test. Each thread
+    /// holds the module-local lock, resets the counter, builds a
+    /// degraded server, and asserts the post-build delta equals
+    /// the manifest-derived skipped-entries constant. Pre-fix
+    /// (no lock) this test would race with sibling tests calling
+    /// `build_server_degraded` and produce off-by-N deltas. Post-
+    /// fix the lock guarantees serialized reset → build → read so
+    /// the exact delta assertion holds.
+    #[test]
+    fn concurrent_degraded_builds_each_observe_exact_delta_ft_kske1() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let skipped = mcp_bridge_degraded_mode_skipped_entries();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let observed = Arc::clone(&observed);
+                thread::spawn(move || {
+                    let _guard = mcp_bridge_counter_test_lock();
+                    reset_mcp_bridge_tools_skipped_no_db_count_for_test();
+                    let before = mcp_bridge_tools_skipped_no_db_count();
+                    let config = Config::default();
+                    let _server = build_server_degraded(&config)
+                        .expect("explicit degraded build must succeed");
+                    let after = mcp_bridge_tools_skipped_no_db_count();
+                    observed.lock().unwrap_or_else(|p| p.into_inner()).push(after - before);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread must not panic");
+        }
+
+        let deltas = observed.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(deltas.len(), 4);
+        for delta in &deltas {
+            assert_eq!(
+                *delta, skipped,
+                "br-ft-kske1: each serialized worker must see the exact skipped-entries delta; got {delta} expected {skipped}"
             );
         }
     }
