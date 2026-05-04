@@ -78,9 +78,7 @@ pub const MAX_PENDING_TRIGGERS: usize = 256;
 /// forensic queries (e.g. "did we get the full webhook?") have
 /// the answer without re-fetching.
 fn external_payload_truncation_marker(original_byte_len: usize) -> String {
-    format!(
-        "...[br-ft-zdpou: truncated; original {original_byte_len} bytes]"
-    )
+    format!("...[br-ft-zdpou: truncated; original {original_byte_len} bytes]")
 }
 
 /// br-ft-zdpou: shorten an `ExternalSignal::payload` to fit within
@@ -2101,10 +2099,7 @@ impl OperatorOverrideState {
     /// once the active cap is reached. Returns the override back
     /// to the caller via the error so it can be logged / surfaced
     /// rather than silently dropped.
-    pub fn try_activate(
-        &mut self,
-        ovr: OperatorOverride,
-    ) -> Result<(), OperatorOverrideRejection> {
+    pub fn try_activate(&mut self, ovr: OperatorOverride) -> Result<(), OperatorOverrideRejection> {
         if self.active.len() >= Self::MAX_ACTIVE {
             return Err(OperatorOverrideRejection::ActiveCapReached {
                 cap: Self::MAX_ACTIVE,
@@ -2275,6 +2270,17 @@ pub enum PinRejectionReason {
     BeadNotScored,
 }
 
+impl PinRejectionReason {
+    fn safety_gate_name(&self) -> Option<&'static str> {
+        match self {
+            Self::AgentExcluded => Some("operator.override.pin.agent_excluded"),
+            Self::AgentNotFound => Some("operator.override.pin.agent_not_found"),
+            Self::AgentZeroCapacity => Some("operator.override.pin.agent_zero_capacity"),
+            Self::BeadNotScored => None,
+        }
+    }
+}
+
 /// Record of a reprioritized bead's score adjustment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReprioritizedBeadRecord {
@@ -2418,7 +2424,11 @@ impl MissionLoop {
             } else if let Some(agent) = agents.iter().find(|a| a.agent_id == *target_agent) {
                 if excluded_agents.contains(target_agent) {
                     Some(PinRejectionReason::AgentExcluded)
-                } else if agent.effective_capacity() == 0 {
+                } else if agent
+                    .effective_capacity()
+                    .saturating_sub(agent.current_load)
+                    == 0
+                {
                     Some(PinRejectionReason::AgentZeroCapacity)
                 } else {
                     None
@@ -2428,6 +2438,12 @@ impl MissionLoop {
             };
 
             if let Some(reason) = rejection_reason {
+                if let Some(gate_name) = reason.safety_gate_name() {
+                    solver_config.safety_gates.push(SafetyGate {
+                        name: gate_name.to_string(),
+                        denied_bead_ids: vec![(*bead_id).to_string()],
+                    });
+                }
                 summary.rejected_pinned_assignments.push(RejectedPinRecord {
                     bead_id: (*bead_id).to_string(),
                     agent_id: target_agent_string,
@@ -2949,6 +2965,8 @@ pub fn format_operator_report_plain(report: &OperatorStatusReport) -> String {
 mod tests {
     use super::*;
     use crate::beads_types::{BeadDependencyRef, BeadIssueType, BeadStatus};
+    use crate::plan::MissionAgentAvailability;
+    use proptest::prelude::*;
 
     fn sample_detail(
         id: &str,
@@ -5566,6 +5584,128 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_with_pin_and_exclude_agent_rejects_pinned_bead() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.apply_override(make_override(
+            "pin-b1",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "alpha".to_string(),
+            },
+        ))
+        .unwrap();
+        ml.apply_override(make_override(
+            "exclude-alpha",
+            OperatorOverrideKind::ExcludeAgent {
+                agent_id: "alpha".to_string(),
+            },
+        ))
+        .unwrap();
+
+        let issues = vec![sample_detail("b1", BeadStatus::Open, 1, &[])];
+        let agents = vec![ready_agent("alpha"), ready_agent("beta")];
+        let ctx = PlannerExtractionContext::default();
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        assert!(decision.assignment_set.get_assignment("b1").is_none());
+        let rejection = decision
+            .assignment_set
+            .get_rejection("b1")
+            .expect("invalid pin should reject the bead instead of reassigning it");
+        assert!(rejection.reasons.iter().any(|reason| matches!(
+            reason,
+            RejectionReason::SafetyGateDenied { gate_name }
+                if gate_name == "operator.override.pin.agent_excluded"
+        )));
+
+        let summary = ml.state.last_override_summary.as_ref().unwrap();
+        assert!(summary.pinned_assignments.is_empty());
+        assert_eq!(summary.rejected_pinned_assignments.len(), 1);
+        assert_eq!(
+            summary.rejected_pinned_assignments[0].reason,
+            PinRejectionReason::AgentExcluded
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn invalid_pin_targets_never_emit_assignments(
+            mode in 0u8..4,
+            max_parallel in 0usize..4,
+        ) {
+            let mut ml = MissionLoop::new(MissionLoopConfig::default());
+            let target_agent = if mode == 1 { "ghost" } else { "alpha" };
+            ml.apply_override(make_override(
+                "pin-b1",
+                OperatorOverrideKind::Pin {
+                    bead_id: "b1".to_string(),
+                    target_agent: target_agent.to_string(),
+                },
+            ))
+            .unwrap();
+
+            let expected_reason = match mode {
+                0 => {
+                    ml.apply_override(make_override(
+                        "exclude-alpha",
+                        OperatorOverrideKind::ExcludeAgent {
+                            agent_id: "alpha".to_string(),
+                        },
+                    ))
+                    .unwrap();
+                    PinRejectionReason::AgentExcluded
+                }
+                1 => PinRejectionReason::AgentNotFound,
+                2 => PinRejectionReason::AgentZeroCapacity,
+                _ => PinRejectionReason::AgentZeroCapacity,
+            };
+
+            let mut alpha = ready_agent("alpha");
+            if mode == 2 {
+                alpha.max_parallel_assignments = max_parallel;
+                alpha.current_load = max_parallel;
+            } else if mode == 3 {
+                alpha.availability = MissionAgentAvailability::Paused {
+                    reason_code: "maintenance".to_string(),
+                };
+            }
+            let agents = if mode == 1 {
+                vec![ready_agent("beta")]
+            } else {
+                vec![alpha, ready_agent("beta")]
+            };
+
+            let issues = vec![sample_detail("b1", BeadStatus::Open, 1, &[])];
+            let ctx = PlannerExtractionContext::default();
+            let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+            prop_assert!(
+                decision.assignment_set.get_assignment("b1").is_none(),
+                "invalid pin target must not assign the pinned bead to any agent"
+            );
+            let rejection = decision
+                .assignment_set
+                .get_rejection("b1")
+                .expect("invalid pin target should become a solver rejection");
+            prop_assert!(rejection.reasons.iter().any(|reason| matches!(
+                reason,
+                RejectionReason::SafetyGateDenied { gate_name }
+                    if gate_name == expected_reason.safety_gate_name().unwrap()
+            )));
+
+            let summary = ml.state.last_override_summary.as_ref().unwrap();
+            prop_assert!(summary.pinned_assignments.is_empty());
+            prop_assert_eq!(summary.rejected_pinned_assignments.len(), 1);
+            prop_assert_eq!(
+                summary.rejected_pinned_assignments[0].reason.clone(),
+                expected_reason
+            );
+        }
+    }
+
+    #[test]
     fn evaluate_with_reprioritize_boost() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         // Give "low" bead a massive boost.
@@ -5809,9 +5949,7 @@ mod tests {
                     bead_id: format!("b{i}"),
                 },
             );
-            state
-                .try_activate(ovr)
-                .expect("under cap, must accept");
+            state.try_activate(ovr).expect("under cap, must accept");
         }
         assert_eq!(state.active.len(), OperatorOverrideState::MAX_ACTIVE);
 
@@ -5880,14 +6018,16 @@ mod tests {
                 .unwrap();
         }
         // At cap, reject.
-        assert!(state
-            .try_activate(make_override(
-                "extra",
-                OperatorOverrideKind::Exclude {
-                    bead_id: "extra".to_string(),
-                },
-            ))
-            .is_err());
+        assert!(
+            state
+                .try_activate(make_override(
+                    "extra",
+                    OperatorOverrideKind::Exclude {
+                        bead_id: "extra".to_string(),
+                    },
+                ))
+                .is_err()
+        );
 
         // Clear one, freeing a slot.
         assert!(state.clear("active-0", 1000));

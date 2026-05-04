@@ -1931,6 +1931,7 @@ mod tests {
         RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
         RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
     };
+    use proptest::prelude::*;
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::path::Path;
@@ -2215,6 +2216,21 @@ mod tests {
     // Full reindex tests
     // =========================================================================
 
+    proptest! {
+        #[test]
+        fn full_reindex_resume_policy_ignores_checkpoints_when_clearing(
+            clear_before_start in any::<bool>(),
+            checkpoint_present in any::<bool>(),
+        ) {
+            let resumes = should_resume_full_reindex(clear_before_start, checkpoint_present);
+
+            prop_assert_eq!(resumes, checkpoint_present && !clear_before_start);
+            if clear_before_start {
+                prop_assert!(!resumes);
+            }
+        }
+    }
+
     #[test]
     fn full_reindex_cold_start() {
         run_async_test(async {
@@ -2271,7 +2287,7 @@ mod tests {
                 consumer_id: "resume-reindex".to_string(),
                 batch_size: 3,
                 dedup_on_replay: true,
-                clear_before_start: true,
+                clear_before_start: false,
                 max_batches: 1,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -2282,15 +2298,74 @@ mod tests {
             assert_eq!(p1.events_indexed, 3);
             assert!(!p1.caught_up);
 
-            // Second run: should NOT clear (checkpoint exists), indexes next 3
+            // Second run: with clear disabled, resume from the existing checkpoint.
             let mut pipeline2 = ReindexPipeline::new(MockReindexWriter::new());
             let p2 = pipeline2.full_reindex(&storage, &config).await.unwrap();
             assert_eq!(p2.events_indexed, 3);
-            assert_eq!(p2.docs_cleared, 0); // no clear because checkpoint exists
+            assert_eq!(p2.docs_cleared, 0);
             assert!(!pipeline2.writer().cleared);
 
             // Verify docs start from ordinal 3
             assert_eq!(pipeline2.writer().docs[0].event_id, "e3");
+        });
+    }
+
+    #[test]
+    fn full_reindex_clear_before_start_ignores_existing_checkpoint_ft_d58zy() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let scfg = test_storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+            let events: Vec<_> = (0..10)
+                .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+                .collect();
+            populate_log(&storage, events).await;
+
+            let config = ReindexConfig {
+                source: RecorderSourceDescriptor::AppendLog {
+                    data_path: dir.path().join("events.log"),
+                },
+                consumer_id: "clear-ignores-checkpoint-ft-d58zy".to_string(),
+                batch_size: 3,
+                dedup_on_replay: false,
+                clear_before_start: true,
+                max_batches: 1,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            };
+
+            let mut pipeline = ReindexPipeline::new(MockReindexWriter::new());
+            let p1 = pipeline.full_reindex(&storage, &config).await.unwrap();
+            assert_eq!(p1.events_indexed, 3);
+            assert_eq!(p1.current_ordinal, Some(2));
+
+            let mut writer = MockReindexWriter::new();
+            writer.docs.push(map_event_to_document(
+                &sample_event("stale", 1, 99, "stale"),
+                99,
+            ));
+            let mut pipeline2 = ReindexPipeline::new(writer);
+            let p2 = pipeline2.full_reindex(&storage, &config).await.unwrap();
+
+            assert!(
+                pipeline2.writer().cleared,
+                "clear_before_start=true must clear even when a checkpoint exists"
+            );
+            assert_eq!(p2.docs_cleared, 1);
+            assert_eq!(p2.events_indexed, 3);
+            assert_eq!(p2.current_ordinal, Some(2));
+
+            let ids: Vec<&str> = pipeline2
+                .writer()
+                .docs
+                .iter()
+                .map(|doc| doc.event_id.as_str())
+                .collect();
+            assert_eq!(ids, vec!["e0", "e1", "e2"]);
+            assert!(
+                !ids.contains(&"stale"),
+                "stale pre-clear document must not survive a clean full reindex"
+            );
         });
     }
 
