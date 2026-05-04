@@ -5608,6 +5608,111 @@ mod tests {
         );
     }
 
+    // ── br-ft-zdpou: external trigger payload bound + queue cap ──
+
+    #[test]
+    fn trigger_truncates_oversized_external_payload_ft_zdpou() {
+        // br-ft-zdpou: a hostile webhook posting a multi-MB blob
+        // must not pin that blob in pending_triggers state.
+        let mut loop_inst = MissionLoop::new(MissionLoopConfig::default());
+        let big_payload = "a".repeat(10_000); // 10 KB > 2 KB cap
+        loop_inst.trigger(MissionTrigger::ExternalSignal {
+            source: "webhook".to_string(),
+            payload: big_payload,
+        });
+
+        let pending = &loop_inst.state.pending_triggers;
+        assert_eq!(pending.len(), 1);
+        match &pending[0] {
+            MissionTrigger::ExternalSignal { payload, .. } => {
+                assert!(
+                    payload.len() <= MAX_EXTERNAL_TRIGGER_PAYLOAD_BYTES + 100,
+                    "truncated payload exceeded cap+marker: {} bytes",
+                    payload.len()
+                );
+                assert!(
+                    payload.contains("br-ft-zdpou"),
+                    "truncated payload must carry breadcrumb: {}",
+                    payload
+                );
+                assert!(
+                    payload.contains("original 10000 bytes"),
+                    "truncated payload must report original length"
+                );
+            }
+            other => panic!("expected ExternalSignal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_preserves_under_cap_external_payload_ft_zdpou() {
+        let mut loop_inst = MissionLoop::new(MissionLoopConfig::default());
+        let small_payload = "{\"event\":\"build_complete\"}".to_string();
+        let original = small_payload.clone();
+        loop_inst.trigger(MissionTrigger::ExternalSignal {
+            source: "ci".to_string(),
+            payload: small_payload,
+        });
+
+        match &loop_inst.state.pending_triggers[0] {
+            MissionTrigger::ExternalSignal { payload, .. } => {
+                assert_eq!(
+                    payload, &original,
+                    "under-cap payload must not be truncated"
+                );
+            }
+            other => panic!("expected ExternalSignal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_truncation_respects_utf8_boundary_ft_zdpou() {
+        // The truncation must not split a multibyte UTF-8 char.
+        let mut loop_inst = MissionLoop::new(MissionLoopConfig::default());
+        // 4-byte chars repeated until well past the cap.
+        let big_payload = "🦀".repeat(1024);
+        assert!(big_payload.len() > MAX_EXTERNAL_TRIGGER_PAYLOAD_BYTES);
+        loop_inst.trigger(MissionTrigger::ExternalSignal {
+            source: "ci".to_string(),
+            payload: big_payload,
+        });
+
+        match &loop_inst.state.pending_triggers[0] {
+            MissionTrigger::ExternalSignal { payload, .. } => {
+                // Must be valid UTF-8 (truncation didn't split a char).
+                let _ = payload.chars().count();
+                assert!(payload.contains("br-ft-zdpou"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn trigger_queue_drops_oldest_when_at_cap_ft_zdpou() {
+        // br-ft-zdpou: pending_triggers is bounded; a burst of
+        // triggers without any tick() in between must not grow
+        // memory unboundedly.
+        let mut loop_inst = MissionLoop::new(MissionLoopConfig::default());
+        for i in 0..(MAX_PENDING_TRIGGERS + 50) {
+            loop_inst.trigger(MissionTrigger::ManualTrigger {
+                reason: format!("burst-{i}"),
+            });
+        }
+        assert_eq!(
+            loop_inst.state.pending_triggers.len(),
+            MAX_PENDING_TRIGGERS,
+            "queue must respect MAX_PENDING_TRIGGERS"
+        );
+        // The most-recent trigger (which tick() reads) must be the
+        // last one we sent.
+        match loop_inst.state.pending_triggers.last().unwrap() {
+            MissionTrigger::ManualTrigger { reason } => {
+                assert_eq!(reason, &format!("burst-{}", MAX_PENDING_TRIGGERS + 50 - 1));
+            }
+            _ => unreachable!(),
+        }
+    }
+
     #[test]
     fn override_active_cap_rejects_overflow_ft_i4brq() {
         // br-ft-i4brq: the active vec is scanned on every mission
