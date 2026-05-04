@@ -1442,13 +1442,13 @@ mod tests {
 
             let mut reversed = events.clone();
             reversed.reverse();
-            prop_assert_eq!(replayed_event_ids(reversed), original);
+            prop_assert_eq!(replayed_event_ids(reversed), original.clone());
 
             if events.len() > 1 {
                 let mut rotated = events;
                 let split_at = rotated.len() / 2;
                 rotated.rotate_left(split_at);
-                prop_assert_eq!(replayed_event_ids(rotated), original);
+                prop_assert_eq!(replayed_event_ids(rotated), original.clone());
             }
         }
     }

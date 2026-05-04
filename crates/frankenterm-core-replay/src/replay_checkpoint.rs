@@ -119,6 +119,51 @@ pub struct CheckpointState {
 /// Checkpoint format version.
 pub const CHECKPOINT_VERSION: &str = "ft.replay.checkpoint.v1";
 
+/// br-ft-cnxnr: structured error returned by
+/// [`ReplayCheckpointer::resume_from`] when a checkpoint fails
+/// the trust-boundary validation. Replay checkpoints are a trust
+/// boundary for deterministic resume; a stale-schema or foreign-
+/// run-id checkpoint can rewind/advance another replay run and
+/// produce reports under the wrong replay_run_id. Validation is
+/// fail-closed: rejected checkpoints leave the existing
+/// checkpointer state untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointResumeError {
+    /// Checkpoint's `checkpoint_version` does not match the
+    /// constant compiled into this engine. Indicates a stale
+    /// persisted checkpoint from a prior schema or a forged
+    /// payload claiming a different version.
+    SchemaMismatch {
+        expected: String,
+        actual: String,
+    },
+    /// Checkpoint's `replay_run_id` does not match the
+    /// checkpointer's current run id. Indicates a checkpoint
+    /// from a different replay run was supplied — accepting it
+    /// would resume one run with another's deterministic state.
+    RunIdMismatch {
+        expected: String,
+        actual: String,
+    },
+}
+
+impl std::fmt::Display for CheckpointResumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SchemaMismatch { expected, actual } => write!(
+                f,
+                "br-ft-cnxnr: checkpoint schema mismatch — expected `{expected}`, got `{actual}`"
+            ),
+            Self::RunIdMismatch { expected, actual } => write!(
+                f,
+                "br-ft-cnxnr: checkpoint replay_run_id mismatch — checkpointer is `{expected}`, checkpoint claims `{actual}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointResumeError {}
+
 impl CheckpointState {
     /// Create a new checkpoint state.
     #[must_use]
@@ -387,13 +432,40 @@ impl ReplayCheckpointer {
     }
 
     /// Resume from a checkpoint state.
-    pub fn resume_from(&self, checkpoint: &CheckpointState) {
+    ///
+    /// br-ft-cnxnr: validates that the checkpoint's
+    /// `checkpoint_version` matches [`CHECKPOINT_VERSION`] and
+    /// that its `replay_run_id` matches this checkpointer's run
+    /// id BEFORE installing any state. A stale-schema or foreign-
+    /// run checkpoint is rejected with
+    /// [`CheckpointResumeError`] and the live state is untouched.
+    /// Pre-fix `resume_from` blindly cloned the supplied
+    /// checkpoint into `inner.state` and cleared
+    /// halted/completed flags, letting a forged payload rewind
+    /// another run.
+    pub fn resume_from(
+        &self,
+        checkpoint: &CheckpointState,
+    ) -> std::result::Result<(), CheckpointResumeError> {
+        if checkpoint.checkpoint_version != CHECKPOINT_VERSION {
+            return Err(CheckpointResumeError::SchemaMismatch {
+                expected: CHECKPOINT_VERSION.to_string(),
+                actual: checkpoint.checkpoint_version.clone(),
+            });
+        }
+        if checkpoint.replay_run_id != self.replay_run_id {
+            return Err(CheckpointResumeError::RunIdMismatch {
+                expected: self.replay_run_id.clone(),
+                actual: checkpoint.replay_run_id.clone(),
+            });
+        }
         let mut inner = self.inner.lock().unwrap();
         inner.state = checkpoint.clone();
         inner.events_since_checkpoint = 0;
         inner.last_checkpoint_wall_ms = checkpoint.checkpoint_created_ms;
         inner.halted = false;
         inner.completed = false;
+        Ok(())
     }
 
     /// Get the failure mode.
@@ -627,7 +699,7 @@ mod tests {
 
         // Resume from checkpoint
         let ckpt2 = ReplayCheckpointer::new("run_res".into(), config, FailureMode::Default);
-        ckpt2.resume_from(&cp);
+        ckpt2.resume_from(&cp).expect("matching run id + version must succeed");
         assert_eq!(ckpt2.current_state().event_position, 3);
         ckpt2.advance(300, 3000);
         assert_eq!(ckpt2.current_state().event_position, 4);
@@ -664,7 +736,7 @@ mod tests {
         // So cp.decisions_made = 5.
 
         let run2 = ReplayCheckpointer::new("run_r1".into(), config, FailureMode::Default);
-        run2.resume_from(&cp);
+        run2.resume_from(&cp).expect("matching run id + version must succeed");
         // Record the decision for event 5 that was lost in the checkpoint boundary.
         run2.record_decision();
         for i in 6..10 {

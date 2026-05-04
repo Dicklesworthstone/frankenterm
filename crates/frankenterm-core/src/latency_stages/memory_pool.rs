@@ -103,6 +103,21 @@ impl Default for PoolConfig {
     }
 }
 
+impl PoolConfig {
+    fn normalized(mut self) -> Self {
+        self.high_water_mark = normalize_high_water_mark(self.high_water_mark);
+        self
+    }
+}
+
+fn normalize_high_water_mark(high_water_mark: f64) -> f64 {
+    if high_water_mark.is_finite() {
+        high_water_mark.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// Allocation result from a pool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AllocResult {
@@ -164,6 +179,7 @@ pub struct MemoryPool {
 impl MemoryPool {
     /// Create a new pool.
     pub fn new(config: PoolConfig) -> Self {
+        let config = config.normalized();
         let initial = config.initial_blocks.min(config.max_blocks);
         let free_list: Vec<u64> = (0..initial as u64).collect();
         Self {
@@ -412,6 +428,7 @@ impl MemoryPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn free_rejects_double_free_and_foreign_block_ids_ft_nyvo1() {
@@ -436,5 +453,35 @@ mod tests {
             pool.snapshot().total_allocs,
             pool.snapshot().total_frees + pool.snapshot().in_use as u64
         );
+    }
+
+    #[test]
+    fn non_finite_high_water_mark_fails_closed_to_pressure_ft_esr81() {
+        let pool = MemoryPool::new(PoolConfig {
+            initial_blocks: 1,
+            max_blocks: 1,
+            high_water_mark: f64::NAN,
+            ..Default::default()
+        });
+
+        assert_eq!(pool.config.high_water_mark, 0.0);
+        assert!(pool.under_pressure());
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_high_water_mark_is_finite_and_bounded_ft_esr81(high_water_mark in any::<f64>()) {
+            let pool = MemoryPool::new(PoolConfig {
+                high_water_mark,
+                ..Default::default()
+            });
+
+            prop_assert!(pool.config.high_water_mark.is_finite());
+            prop_assert!((0.0..=1.0).contains(&pool.config.high_water_mark));
+
+            let expected = normalize_high_water_mark(high_water_mark);
+            prop_assert_eq!(pool.config.high_water_mark, expected);
+            prop_assert_eq!(pool.under_pressure(), pool.utilization() >= expected);
+        }
     }
 }

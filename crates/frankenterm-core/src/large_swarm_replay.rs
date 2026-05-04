@@ -184,7 +184,7 @@ pub struct LargeSwarmReplaySummary {
 impl LargeSwarmReplaySummary {
     fn digest_input(&self) -> String {
         let mut input = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.version,
             self.scenario_id,
             self.pane_count,
