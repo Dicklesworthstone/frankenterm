@@ -143,12 +143,23 @@ pub struct DecisionRecord {
 #[serde(default)]
 pub struct FleetMemoryConfig {
     /// Maximum decision records to keep in audit trail.
+    ///
+    /// Caller-supplied values are normalized to
+    /// `[1, MAX_FLEET_MEMORY_AUDIT_RECORDS]` at the
+    /// [`FleetMemoryController::new`] boundary.
     pub max_audit_trail: usize,
     /// Minimum evaluations at a tier before escalating (hysteresis).
     pub escalation_threshold: u64,
     /// Minimum evaluations at a tier before de-escalating.
     pub deescalation_threshold: u64,
 }
+
+/// Hard upper bound on retained fleet-memory decision records.
+///
+/// The controller is process-global and evaluates on every backpressure cycle,
+/// so a restored or malformed config must not be able to turn the audit trail
+/// into an effectively unbounded in-memory log.
+pub const MAX_FLEET_MEMORY_AUDIT_RECORDS: usize = 4096;
 
 impl Default for FleetMemoryConfig {
     fn default() -> Self {
@@ -201,6 +212,16 @@ impl std::fmt::Display for FleetMemoryConfigError {
 impl std::error::Error for FleetMemoryConfigError {}
 
 impl FleetMemoryConfig {
+    /// Clamp `max_audit_trail` to the finite retention range used by the
+    /// controller. Zero becomes a one-record ring rather than disabling
+    /// retention; callers that want no audit reads should ignore
+    /// [`FleetMemoryController::audit_trail`].
+    #[must_use]
+    pub fn normalized_max_audit_trail(&self) -> usize {
+        self.max_audit_trail
+            .clamp(1, MAX_FLEET_MEMORY_AUDIT_RECORDS)
+    }
+
     /// br-ft-diccw: validate the controller's hysteresis thresholds
     /// before installing the config. A zero `escalation_threshold`
     /// or `deescalation_threshold` silently disables tier
@@ -272,7 +293,8 @@ pub struct FleetMemoryController {
 impl FleetMemoryController {
     /// Create a new controller with given configuration.
     #[must_use]
-    pub fn new(config: FleetMemoryConfig) -> Self {
+    pub fn new(mut config: FleetMemoryConfig) -> Self {
+        config.max_audit_trail = config.normalized_max_audit_trail();
         Self {
             config,
             compound_tier: FleetPressureTier::Normal,
@@ -1110,6 +1132,26 @@ mod tests {
         assert_eq!(ctrl.audit_trail()[0].sequence, 6);
     }
 
+    #[test]
+    fn audit_trail_clamps_pathological_config_cap_ft_v3gd9() {
+        let mut ctrl = FleetMemoryController::new(FleetMemoryConfig {
+            max_audit_trail: usize::MAX,
+            ..FleetMemoryConfig::default()
+        });
+
+        assert_eq!(
+            ctrl.config().max_audit_trail,
+            MAX_FLEET_MEMORY_AUDIT_RECORDS
+        );
+
+        for _ in 0..MAX_FLEET_MEMORY_AUDIT_RECORDS + 3 {
+            ctrl.evaluate(&green_signals());
+        }
+
+        assert_eq!(ctrl.audit_trail().len(), MAX_FLEET_MEMORY_AUDIT_RECORDS);
+        assert_eq!(ctrl.audit_trail()[0].sequence, 4);
+    }
+
     // ── Reset ────────────────────────────────────────────────────────
 
     #[test]
@@ -1414,6 +1456,32 @@ mod tests {
             deescalation_threshold: 1,
         };
         cfg.validate().expect("min-finite thresholds must validate");
+    }
+
+    #[test]
+    fn fleet_memory_config_normalizes_max_audit_trail_ft_v3gd9() {
+        assert_eq!(
+            FleetMemoryConfig::default().normalized_max_audit_trail(),
+            FleetMemoryConfig::default().max_audit_trail
+        );
+
+        assert_eq!(
+            FleetMemoryConfig {
+                max_audit_trail: 0,
+                ..FleetMemoryConfig::default()
+            }
+            .normalized_max_audit_trail(),
+            1
+        );
+
+        assert_eq!(
+            FleetMemoryConfig {
+                max_audit_trail: usize::MAX,
+                ..FleetMemoryConfig::default()
+            }
+            .normalized_max_audit_trail(),
+            MAX_FLEET_MEMORY_AUDIT_RECORDS
+        );
     }
 
     #[test]
