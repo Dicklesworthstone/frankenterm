@@ -977,6 +977,31 @@ impl TuningConfig {
         if self.web.stream_keepalive_secs < 1 {
             errors.push("tuning.web.stream_keepalive_secs must be >= 1".into());
         }
+        // br-ft-g681u: SSE rate and body-size invariants. The
+        // runtime path forces `max_hz.max(1)` and divides by
+        // `max_request_body_bytes` for body-too-large rejection,
+        // so zero values produce contradictory behavior:
+        // advertised max_hz=0 while the scheduler runs at 1Hz, or
+        // Content-Length accidentally turning into deny-all. Catch
+        // at validate() so the operator sees a config error
+        // instead of a confusing runtime mismatch.
+        if self.web.max_request_body_bytes < 1 {
+            errors.push("br-ft-g681u: tuning.web.max_request_body_bytes must be >= 1".into());
+        }
+        if self.web.stream_default_max_hz < 1 {
+            errors.push("br-ft-g681u: tuning.web.stream_default_max_hz must be >= 1".into());
+        }
+        if self.web.stream_max_max_hz < self.web.stream_default_max_hz {
+            errors.push(
+                "br-ft-g681u: tuning.web.stream_max_max_hz must be >= tuning.web.stream_default_max_hz".into(),
+            );
+        }
+        if self.web.stream_scan_limit < 1 {
+            errors.push("br-ft-g681u: tuning.web.stream_scan_limit must be >= 1".into());
+        }
+        if self.web.stream_scan_max_pages < 1 {
+            errors.push("br-ft-g681u: tuning.web.stream_scan_max_pages must be >= 1".into());
+        }
 
         // Workflows
         if self.workflows.max_steps < 4 {
@@ -1225,6 +1250,91 @@ default_port = 9000
         assert!(
             errors.len() >= 6,
             "expected multiple errors including ingest/search bounds: {errors:?}"
+        );
+    }
+
+    // ── br-ft-g681u: web SSE rate + body-size invariants ──
+
+    #[test]
+    fn validation_catches_zero_max_request_body_bytes_ft_g681u() {
+        // br-ft-g681u: max_request_body_bytes=0 turns Content-
+        // Length rejection into accidental deny-all.
+        let mut cfg = TuningConfig::default();
+        cfg.web.max_request_body_bytes = 0;
+        let errors = cfg.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("br-ft-g681u")
+                    && e.contains("max_request_body_bytes must be >= 1")),
+            "expected max_request_body_bytes error; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validation_catches_zero_stream_default_max_hz_ft_g681u() {
+        // br-ft-g681u: stream_default_max_hz=0 produces an
+        // advertised max_hz of 0 in SSE open frames while the
+        // scheduler runs at 1Hz.
+        let mut cfg = TuningConfig::default();
+        cfg.web.stream_default_max_hz = 0;
+        let errors = cfg.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("br-ft-g681u")
+                    && e.contains("stream_default_max_hz must be >= 1")),
+            "expected stream_default_max_hz error; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validation_catches_misordered_stream_max_hz_ft_g681u() {
+        // br-ft-g681u: stream_max_max_hz < stream_default_max_hz
+        // would let the actual max go below the documented default.
+        let mut cfg = TuningConfig::default();
+        cfg.web.stream_default_max_hz = 30;
+        cfg.web.stream_max_max_hz = 10;
+        let errors = cfg.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("br-ft-g681u")
+                && e.contains("stream_max_max_hz must be >= tuning.web.stream_default_max_hz")),
+            "expected stream_max_max_hz ordering error; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validation_catches_zero_stream_scan_limits_ft_g681u() {
+        let mut cfg = TuningConfig::default();
+        cfg.web.stream_scan_limit = 0;
+        cfg.web.stream_scan_max_pages = 0;
+        let errors = cfg.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("br-ft-g681u")
+                    && e.contains("stream_scan_limit must be >= 1")),
+            "expected stream_scan_limit error; got {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("br-ft-g681u")
+                    && e.contains("stream_scan_max_pages must be >= 1")),
+            "expected stream_scan_max_pages error; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validation_default_passes_web_invariants_ft_g681u() {
+        // Sanity: defaults must not trip any of the new checks.
+        let cfg = TuningConfig::default();
+        let errors = cfg.validate();
+        // No web errors at all.
+        let web_errors: Vec<&String> = errors.iter().filter(|e| e.contains("tuning.web.")).collect();
+        assert!(
+            web_errors.is_empty(),
+            "default web tuning must validate; got {web_errors:?}"
         );
     }
 
