@@ -11,6 +11,51 @@ use crate::events::EventBus;
 use crate::policy::Redactor;
 use crate::storage::StorageHandle;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// =============================================================================
+// br-ft-10i8s: redaction recursion depth bound
+// =============================================================================
+
+/// Maximum recursion depth for [`redact_json_value`].
+///
+/// br-ft-10i8s: a hostile JSON payload like `[[[[[...]]]]]` (one
+/// bracket per body byte) parses into a tree whose depth is
+/// proportional to body length. Without a depth bound, the recursive
+/// walker blows the stack on most platforms (each frame > 64 bytes
+/// against a 2 MiB default stack means ~32K levels is enough).
+/// Hitting the cap causes the walker to early-return without
+/// descending further — the truncated subtree's strings stay
+/// un-redacted, so the cap is set well above any legitimate event-
+/// payload depth (event JSON is rarely > 10 levels deep).
+pub const MAX_REDACT_RECURSION_DEPTH: usize = 64;
+
+/// br-ft-10i8s: cumulative count of times [`redact_json_value`] hit
+/// the depth cap and stopped descending. A non-zero value means a
+/// hostile or malformed JSON payload tried to drive the walker past
+/// the safe recursion limit; its remaining subtree was passed
+/// through un-redacted. Same observability-counter pattern as
+/// `EPOCH_CLOCK_ANOMALY_COUNT` (ft-bn6qi) and the SSE drop counters
+/// (ft-95fd3).
+static REDACT_DEPTH_LIMIT_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-10i8s: cumulative count of times the redaction walker
+/// stopped at [`MAX_REDACT_RECURSION_DEPTH`].
+#[must_use]
+pub fn redact_depth_limit_hit_count() -> u64 {
+    REDACT_DEPTH_LIMIT_HIT_COUNT.load(Ordering::Relaxed)
+}
+
+/// br-ft-10i8s: test helper to reset the depth-cap counter.
+#[cfg(test)]
+pub(crate) fn reset_redact_depth_limit_hit_count_for_test() {
+    REDACT_DEPTH_LIMIT_HIT_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_redact_depth_limit_hit() {
+    REDACT_DEPTH_LIMIT_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 // =============================================================================
 // State extractors
@@ -129,19 +174,42 @@ pub(super) fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
 // =============================================================================
 
 /// Recursively redact string values in a JSON tree using the given [`Redactor`].
+///
+/// br-ft-10i8s: descent is bounded by [`MAX_REDACT_RECURSION_DEPTH`]
+/// to prevent stack overflow on hostile / malformed JSON. A subtree
+/// past the cap is left un-redacted; [`REDACT_DEPTH_LIMIT_HIT_COUNT`]
+/// bumps once per hit so operators can detect when the cap fires.
 pub(super) fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
+    redact_json_value_with_depth(value, redactor, 0);
+}
+
+fn redact_json_value_with_depth(
+    value: &mut serde_json::Value,
+    redactor: &Redactor,
+    depth: usize,
+) {
+    if depth >= MAX_REDACT_RECURSION_DEPTH {
+        record_redact_depth_limit_hit();
+        tracing::warn!(
+            target: "ft.web.redact",
+            event = "redact_depth_limit_hit",
+            max_depth = MAX_REDACT_RECURSION_DEPTH,
+            "redact_json_value stopped at depth cap; subtree left un-redacted (br-ft-10i8s)"
+        );
+        return;
+    }
     match value {
         serde_json::Value::String(s) => {
             *s = redactor.redact(s);
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                redact_json_value(item, redactor);
+                redact_json_value_with_depth(item, redactor, depth + 1);
             }
         }
         serde_json::Value::Object(map) => {
             for v in map.values_mut() {
-                redact_json_value(v, redactor);
+                redact_json_value_with_depth(v, redactor, depth + 1);
             }
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
@@ -310,5 +378,74 @@ mod tests {
         let mut value = serde_json::json!({"outer": {"inner": "text"}});
         redact_json_value(&mut value, &redactor);
         assert_eq!(value["outer"]["inner"], "text");
+    }
+
+    // ── br-ft-10i8s: depth cap ──
+
+    #[test]
+    fn redact_depth_cap_stops_at_max_depth_ft_10i8s() {
+        // br-ft-10i8s: deeply nested arrays past the cap leave the
+        // remaining subtree un-redacted but DO NOT stack-overflow.
+        // Pre-fix this would have caused a SIGSEGV on most
+        // platforms.
+        super::reset_redact_depth_limit_hit_count_for_test();
+        let redactor = Redactor::new();
+
+        // Build 100 levels of nested arrays — well over the cap (64).
+        let mut value = serde_json::json!("leaf");
+        for _ in 0..100 {
+            value = serde_json::json!([value]);
+        }
+
+        redact_json_value(&mut value, &redactor);
+
+        // Counter incremented at least once (the walker hit the cap
+        // on the leaf descent).
+        assert!(
+            super::redact_depth_limit_hit_count() >= 1,
+            "depth cap must bump the counter; got {}",
+            super::redact_depth_limit_hit_count()
+        );
+    }
+
+    #[test]
+    fn redact_depth_cap_under_limit_does_not_bump_counter_ft_10i8s() {
+        // Sanity: realistic event-payload depth (5 levels) does not
+        // bump the cap counter.
+        super::reset_redact_depth_limit_hit_count_for_test();
+        let redactor = Redactor::new();
+        let mut value = serde_json::json!({
+            "a": {
+                "b": {
+                    "c": {
+                        "d": {
+                            "e": "leaf"
+                        }
+                    }
+                }
+            }
+        });
+        redact_json_value(&mut value, &redactor);
+        assert_eq!(super::redact_depth_limit_hit_count(), 0);
+    }
+
+    #[test]
+    fn redact_at_exact_cap_does_not_truncate_ft_10i8s() {
+        // Boundary: a tree exactly MAX_REDACT_RECURSION_DEPTH-1
+        // levels deep should fully redact (no off-by-one
+        // truncation). MAX is 64, so we build a 60-level tree to
+        // stay safely under.
+        super::reset_redact_depth_limit_hit_count_for_test();
+        let redactor = Redactor::new();
+        let mut value = serde_json::json!("leaf");
+        for _ in 0..60 {
+            value = serde_json::json!([value]);
+        }
+        redact_json_value(&mut value, &redactor);
+        assert_eq!(
+            super::redact_depth_limit_hit_count(),
+            0,
+            "60 < cap=64 must not trigger truncation"
+        );
     }
 }
