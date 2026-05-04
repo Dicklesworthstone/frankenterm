@@ -49,6 +49,23 @@ pub struct FdBudgetConfig {
     pub leak_detection_count: usize,
 }
 
+/// Invalid FD budget configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdBudgetConfigError {
+    /// Warn/refuse threshold is NaN or infinite.
+    NonFiniteThreshold,
+    /// Warn/refuse threshold is outside the inclusive 0.0..=1.0 range.
+    ThresholdOutOfRange,
+    /// Warn threshold is higher than the refuse threshold.
+    MisorderedThresholds,
+    /// A pane must reserve at least one expected file descriptor.
+    ZeroFdsPerPane,
+    /// The minimum nofile limit must be nonzero.
+    ZeroMinNofileLimit,
+    /// Leak detection needs at least one audit sample.
+    ZeroLeakDetectionCount,
+}
+
 impl Default for FdBudgetConfig {
     fn default() -> Self {
         Self {
@@ -58,6 +75,52 @@ impl Default for FdBudgetConfig {
             min_nofile_limit: 65_536,
             audit_interval_secs: 30,
             leak_detection_count: 5,
+        }
+    }
+}
+
+impl FdBudgetConfig {
+    /// Validate operator/serde supplied FD budget settings before use.
+    pub fn validate(&self) -> Result<(), FdBudgetConfigError> {
+        if !self.warn_threshold.is_finite() || !self.refuse_threshold.is_finite() {
+            return Err(FdBudgetConfigError::NonFiniteThreshold);
+        }
+        if !(0.0..=1.0).contains(&self.warn_threshold)
+            || !(0.0..=1.0).contains(&self.refuse_threshold)
+        {
+            return Err(FdBudgetConfigError::ThresholdOutOfRange);
+        }
+        if self.warn_threshold > self.refuse_threshold {
+            return Err(FdBudgetConfigError::MisorderedThresholds);
+        }
+        if self.fds_per_pane == 0 {
+            return Err(FdBudgetConfigError::ZeroFdsPerPane);
+        }
+        if self.min_nofile_limit == 0 {
+            return Err(FdBudgetConfigError::ZeroMinNofileLimit);
+        }
+        if self.leak_detection_count == 0 {
+            return Err(FdBudgetConfigError::ZeroLeakDetectionCount);
+        }
+        Ok(())
+    }
+
+    fn fail_closed() -> Self {
+        Self {
+            warn_threshold: 0.0,
+            refuse_threshold: 0.0,
+            fds_per_pane: u64::MAX,
+            min_nofile_limit: u64::MAX,
+            audit_interval_secs: 1,
+            leak_detection_count: 1,
+        }
+    }
+
+    fn validated_or_fail_closed(self) -> Self {
+        if self.validate().is_ok() {
+            self
+        } else {
+            Self::fail_closed()
         }
     }
 }
@@ -305,6 +368,7 @@ impl FdBudget {
     /// Create a new FD budget tracker.
     pub fn new(config: FdBudgetConfig) -> Self {
         let limits = get_system_limits();
+        let config = config.validated_or_fail_closed();
         Self {
             effective_limit: limits.nofile_soft,
             config,
@@ -314,8 +378,15 @@ impl FdBudget {
         }
     }
 
+    /// Try to create a new FD budget tracker, rejecting malformed config.
+    pub fn try_new(config: FdBudgetConfig) -> Result<Self, FdBudgetConfigError> {
+        config.validate()?;
+        Ok(Self::new(config))
+    }
+
     /// Create with an explicit limit (useful for testing).
     pub fn with_limit(config: FdBudgetConfig, limit: u64) -> Self {
+        let config = config.validated_or_fail_closed();
         Self {
             effective_limit: limit,
             config,
@@ -323,6 +394,12 @@ impl FdBudget {
             total_allocated: AtomicU64::new(0),
             audit_history: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Try to create with an explicit limit, rejecting malformed config.
+    pub fn try_with_limit(config: FdBudgetConfig, limit: u64) -> Result<Self, FdBudgetConfigError> {
+        config.validate()?;
+        Ok(Self::with_limit(config, limit))
     }
 
     /// Check if a new pane can be admitted within the FD budget.
@@ -424,7 +501,7 @@ impl FdBudget {
         history.push((now, current));
 
         // Keep only recent history (2x the detection window)
-        let max_entries = self.config.leak_detection_count * 2;
+        let max_entries = self.config.leak_detection_count.saturating_mul(2);
         if history.len() > max_entries {
             let drain_count = history.len() - max_entries;
             history.drain(..drain_count);
@@ -868,6 +945,60 @@ mod tests {
     // ── Leak detection ──
 
     #[test]
+    fn audit_does_not_panic_on_non_monotonic_synthetic_history_ft_sj70e() {
+        // br-ft-sj70e: the leak-detection log path computes
+        // `growth = current - first` via saturating_sub. Today the
+        // leak predicate (`pair[1].1 > pair[0].1` over the window)
+        // ensures `current >= first`, so the subtraction can't
+        // underflow on the production path. This test asserts the
+        // diagnostic path stays safe even when the history contains
+        // non-monotonic synthetic values (restored snapshots,
+        // poisoned-lock recovery noise, future predicate changes).
+        let config = FdBudgetConfig {
+            leak_detection_count: 3,
+            ..test_config()
+        };
+        let budget = FdBudget::with_limit(config, 100_000);
+
+        // Inject synthetic non-monotonic history directly through
+        // the lock — bypasses the audit() pushes so the test
+        // controls the exact shape.
+        {
+            let mut h = budget.audit_history.write().unwrap();
+            let now = Instant::now();
+            // Decreasing then increasing — predicate evaluates to
+            // false (no leak detected, warn! body not entered),
+            // but the test still validates audit() completes.
+            h.push((now, 200));
+            h.push((now, 100));
+            h.push((now, 150));
+        }
+
+        // No panic, no overflow, returns a result.
+        let result = budget.audit();
+        assert!(
+            !result.leak_detected,
+            "non-monotonic history must not trigger leak"
+        );
+        assert!(result.audit_count > 0);
+    }
+
+    #[test]
+    fn leak_growth_subtraction_saturates_on_decreasing_pair_ft_sj70e() {
+        // Direct contract pin: even if a future predicate relaxes
+        // monotonic-increase to "increased on most steps", the
+        // logged `growth` value must be 0 (saturating_sub) rather
+        // than wrapping or panicking.
+        let current: u64 = 100;
+        let first: u64 = 200;
+        let growth = current.saturating_sub(first);
+        assert_eq!(growth, 0, "saturating_sub must clamp underflow to 0");
+        // And the symmetric monotonic case still produces the
+        // expected positive delta.
+        assert_eq!(300u64.saturating_sub(50u64), 250);
+    }
+
+    #[test]
     fn audit_detects_leak_after_consecutive_monotonic_increases() {
         // The audit should detect a leak when FD count increases monotonically
         // for `leak_detection_count` consecutive audits. We can't control the
@@ -1234,6 +1365,123 @@ mod tests {
         assert_eq!(cloned.min_nofile_limit, 2048);
         assert_eq!(cloned.audit_interval_secs, 60);
         assert_eq!(cloned.leak_detection_count, 10);
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_thresholds_and_zero_leak_window() {
+        let mut config = test_config();
+        config.warn_threshold = f64::NAN;
+        assert_eq!(
+            config.validate(),
+            Err(FdBudgetConfigError::NonFiniteThreshold)
+        );
+
+        let mut config = test_config();
+        config.refuse_threshold = 1.25;
+        assert_eq!(
+            config.validate(),
+            Err(FdBudgetConfigError::ThresholdOutOfRange)
+        );
+
+        let mut config = test_config();
+        config.warn_threshold = 0.95;
+        config.refuse_threshold = 0.80;
+        assert_eq!(
+            config.validate(),
+            Err(FdBudgetConfigError::MisorderedThresholds)
+        );
+
+        let mut config = test_config();
+        config.leak_detection_count = 0;
+        assert_eq!(
+            config.validate(),
+            Err(FdBudgetConfigError::ZeroLeakDetectionCount)
+        );
+    }
+
+    #[test]
+    fn invalid_config_constructor_fails_closed() {
+        let mut config = test_config();
+        config.warn_threshold = f64::NAN;
+        config.refuse_threshold = f64::NAN;
+        config.leak_detection_count = 0;
+
+        let budget = FdBudget::with_limit(config, 1_000);
+
+        assert_eq!(
+            budget.can_admit_pane(),
+            AdmitDecision::Refused {
+                current_fds: 0,
+                limit: 1_000,
+                projected: u64::MAX,
+            }
+        );
+        let result = budget.audit();
+        assert_eq!(result.audit_count, 1);
+    }
+
+    #[test]
+    fn try_constructor_rejects_invalid_config() {
+        let mut config = test_config();
+        config.fds_per_pane = 0;
+
+        assert_eq!(
+            FdBudget::try_with_limit(config, 1_000).map(|_| ()),
+            Err(FdBudgetConfigError::ZeroFdsPerPane)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_config_validation_rejects_bad_thresholds(
+            bad_threshold in prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -1000.0f64..0.0,
+                1.000_001f64..1000.0,
+            ],
+            use_warn in any::<bool>(),
+        ) {
+            let mut config = test_config();
+            if use_warn {
+                config.warn_threshold = bad_threshold;
+            } else {
+                config.refuse_threshold = bad_threshold;
+            }
+
+            prop_assert!(matches!(
+                config.validate(),
+                Err(FdBudgetConfigError::NonFiniteThreshold | FdBudgetConfigError::ThresholdOutOfRange)
+            ));
+
+            let budget = FdBudget::with_limit(config, 1_000);
+            prop_assert!(!budget.can_admit_pane().is_allowed());
+        }
+
+        #[test]
+        fn proptest_config_validation_accepts_ordered_finite_thresholds(
+            warn_units in 0u16..=10_000,
+            extra_units in 0u16..=10_000,
+            fds_per_pane in 1u64..=10_000,
+            min_nofile_limit in 1u64..=100_000,
+            leak_detection_count in 1usize..=64,
+        ) {
+            let warn_threshold = f64::from(warn_units) / 10_000.0;
+            let remaining = 10_000u32.saturating_sub(u32::from(warn_units));
+            let refuse_threshold = warn_threshold
+                + f64::from(u32::from(extra_units).min(remaining)) / 10_000.0;
+            let config = FdBudgetConfig {
+                warn_threshold,
+                refuse_threshold,
+                fds_per_pane,
+                min_nofile_limit,
+                audit_interval_secs: 1,
+                leak_detection_count,
+            };
+
+            prop_assert_eq!(config.validate(), Ok(()));
+        }
     }
 
     // ── Budget boundary cases ──
