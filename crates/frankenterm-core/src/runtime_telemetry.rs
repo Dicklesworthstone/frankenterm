@@ -100,8 +100,15 @@ use crate::connector_host_runtime::{
     ConnectorCapability, ConnectorFailureClass, ConnectorLifecyclePhase,
 };
 use crate::diagnostic_redaction::DiagnosticFieldPolicy;
+use crate::fleet_memory_controller::{
+    FleetMemoryTier, FleetMemoryTierBudgetRecord, FleetMemoryTierBudgetSnapshot,
+    FleetMemoryTierReclamationAction, FleetPressureTier,
+};
 use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
-use crate::swarm_scheduler::{ScaleEventType, SchedulerSnapshot};
+use crate::swarm_scheduler::{
+    AdmissionAction, AdmissionReasonCode, ResourceAdmissionDecisionSummary, ScaleEventType,
+    SchedulerSnapshot,
+};
 use crate::swarm_work_queue::QueueStats;
 use crate::telemetry::{Histogram, HistogramSummary};
 use frankenterm_core_connector_types::CredentialBrokerTelemetrySnapshot;
@@ -2580,7 +2587,10 @@ pub const MAX_SWARM_CAPACITY_CONTEXT_KEY_BYTES: usize = 64;
 pub const MAX_SWARM_CAPACITY_CONTEXT_VALUE_BYTES: usize = 512;
 
 /// Schema version for robot/doctor capacity operator summaries.
-pub const SWARM_CAPACITY_OPERATOR_SUMMARY_SCHEMA_VERSION: u32 = 1;
+pub const SWARM_CAPACITY_OPERATOR_SUMMARY_SCHEMA_VERSION: u32 = 2;
+
+/// Schema version for nested swarm resource cockpit snapshots.
+pub const SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum request decisions surfaced in one operator summary.
 pub const MAX_SWARM_CAPACITY_OPERATOR_DECISIONS: usize = 8;
@@ -2590,6 +2600,18 @@ pub const MAX_SWARM_CAPACITY_OPERATOR_REASON_CODES: usize = 16;
 
 /// Maximum stage rows surfaced in one operator summary.
 pub const MAX_SWARM_CAPACITY_OPERATOR_STAGES: usize = 8;
+
+/// Maximum memory-tier rows surfaced in one resource cockpit snapshot.
+pub const MAX_SWARM_RESOURCE_COCKPIT_MEMORY_TIERS: usize = 8;
+
+/// Maximum latency cohorts surfaced in one resource cockpit snapshot.
+pub const MAX_SWARM_RESOURCE_COCKPIT_LATENCY_COHORTS: usize = 4;
+
+/// Maximum admission decisions surfaced in one resource cockpit snapshot.
+pub const MAX_SWARM_RESOURCE_COCKPIT_ADMISSION_DECISIONS: usize = 8;
+
+/// Maximum mitigation/drilldown rows surfaced in one resource cockpit snapshot.
+pub const MAX_SWARM_RESOURCE_COCKPIT_DRILLDOWNS: usize = 12;
 
 const SWARM_CAPACITY_HISTOGRAMS_PER_STAGE: usize = 4;
 const SWARM_CAPACITY_TELEMETRY_SHARDS: usize = 64;
@@ -6367,6 +6389,272 @@ pub struct SwarmCapacityOperatorProofArtifacts {
     pub replay_pointer: String,
 }
 
+/// Proof/capacity gate state summarized for the resource cockpit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmResourceCockpitProofGate {
+    /// Capacity evidence permits normal operation.
+    Healthy,
+    /// Capacity evidence is near budget and needs operator attention.
+    Pressured,
+    /// Capacity evidence is unsafe, unknown, or already degrading work.
+    Degraded,
+    /// No proof was available for this snapshot.
+    SkippedProof,
+}
+
+impl SwarmResourceCockpitProofGate {
+    /// Stable proof-gate label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Pressured => "pressured",
+            Self::Degraded => "degraded",
+            Self::SkippedProof => "skipped_proof",
+        }
+    }
+}
+
+/// Per-tier memory accounting row for the swarm resource cockpit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitMemoryTierSummary {
+    /// Memory tier.
+    pub tier: FleetMemoryTier,
+    /// Stable tier label.
+    pub tier_name: String,
+    /// Whether bytes in this tier contribute to resident pressure.
+    pub resident: bool,
+    /// Operator-configured budget.
+    pub budget_bytes: u64,
+    /// Current observed bytes.
+    pub actual_bytes: u64,
+    /// Bytes above budget.
+    pub over_budget_bytes: u64,
+    /// Bytes remaining before this tier reaches budget.
+    pub remaining_budget_bytes: u64,
+    /// Bytes that can be reclaimed without losing authoritative state.
+    pub reclaimable_bytes: u64,
+    /// Cumulative reclaimed bytes.
+    pub reclaimed_bytes: u64,
+    /// Cumulative bytes evicted to a colder tier.
+    pub evicted_bytes: u64,
+    /// Bytes refused admission at this tier.
+    pub refused_bytes: u64,
+    /// Whether this tier is currently pressured.
+    pub has_pressure: bool,
+    /// Preferred reclamation operation for this tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reclamation_action: Option<FleetMemoryTierReclamationAction>,
+}
+
+/// Latency cohort row for the swarm resource cockpit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitLatencyCohort {
+    /// Fixed capacity stage.
+    pub stage: SwarmCapacityStage,
+    /// Stable stage label.
+    pub stage_name: String,
+    /// Stage-local status.
+    pub certificate_status: SwarmCapacityCertificateStatus,
+    /// Stage tail-risk status, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_risk_status: Option<SwarmTailRiskStatus>,
+    /// Stage-local reason code.
+    pub reason_code: String,
+    /// Stage utilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
+    /// Observed p99 latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_p99_ms: Option<f64>,
+    /// Modeled p99 latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modeled_p99_ms: Option<f64>,
+    /// Observed/model p99 ratio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p99_over_model_ratio: Option<f64>,
+}
+
+/// Operator-facing mitigation or drilldown row for the resource cockpit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitDrilldown {
+    /// Stable subject bucket.
+    pub subject: String,
+    /// Stable reason code.
+    pub reason_code: String,
+    /// Concise operator detail.
+    pub detail: String,
+}
+
+/// Resource cockpit snapshot nested under the existing capacity operator summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitSnapshot {
+    /// Cockpit schema version.
+    pub schema_version: u32,
+    /// When this cockpit snapshot was generated.
+    pub generated_at_ms: u64,
+    /// Source surface for this cockpit.
+    pub source: String,
+    /// Capacity/operator status copied from the parent summary.
+    pub status: SwarmCapacityOperatorStatus,
+    /// Proof gate state for healthy/pressured/degraded/skipped views.
+    pub proof_gate: SwarmResourceCockpitProofGate,
+    /// Stable one-line status summary.
+    pub summary: String,
+    /// Recommended next operator move.
+    pub next_operator_move: String,
+    /// Worst memory pressure represented by memory/admission inputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<FleetPressureTier>,
+    /// Hot/warm/cold/cache tier budget rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_tiers: Vec<SwarmResourceCockpitMemoryTierSummary>,
+    /// Slowest stage cohorts by observed p99 latency.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slowest_latency_cohorts: Vec<SwarmResourceCockpitLatencyCohort>,
+    /// Capacity admission decisions from the capacity controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capacity_admission_decisions: Vec<SwarmCapacityOperatorDecisionSummary>,
+    /// Resource admission decisions from the global admission controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_admission_decisions: Vec<ResourceAdmissionDecisionSummary>,
+    /// Mitigation history distilled from memory and admission decisions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mitigation_history: Vec<SwarmResourceCockpitDrilldown>,
+    /// Drilldowns answering why work was deferred/degraded/reclaimed/skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drilldowns: Vec<SwarmResourceCockpitDrilldown>,
+}
+
+impl SwarmResourceCockpitSnapshot {
+    /// Build a cockpit view from an operator capacity summary plus optional resource inputs.
+    #[must_use]
+    pub fn from_capacity_summary(
+        summary: &SwarmCapacityOperatorSummary,
+        memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
+        resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
+    ) -> Self {
+        let memory_tiers = memory_budget
+            .map(swarm_resource_cockpit_memory_tiers)
+            .unwrap_or_default();
+        let resource_admission_decisions = resource_admission_decisions
+            .iter()
+            .take(MAX_SWARM_RESOURCE_COCKPIT_ADMISSION_DECISIONS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let memory_pressure =
+            swarm_resource_cockpit_memory_pressure(memory_budget, &resource_admission_decisions);
+        let slowest_latency_cohorts = swarm_resource_cockpit_latency_cohorts(&summary.stages);
+        let capacity_admission_decisions = summary
+            .decisions
+            .iter()
+            .take(MAX_SWARM_RESOURCE_COCKPIT_ADMISSION_DECISIONS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let proof_gate = swarm_resource_cockpit_proof_gate(summary.status);
+        let mitigation_history = swarm_resource_cockpit_mitigations(
+            proof_gate,
+            &memory_tiers,
+            &capacity_admission_decisions,
+            &resource_admission_decisions,
+        );
+        let drilldowns = swarm_resource_cockpit_drilldowns(
+            proof_gate,
+            &memory_tiers,
+            &capacity_admission_decisions,
+            &resource_admission_decisions,
+        );
+
+        Self {
+            schema_version: SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION,
+            generated_at_ms: summary.generated_at_ms,
+            source: "runtime_telemetry.swarm_resource_cockpit".to_string(),
+            status: summary.status,
+            proof_gate,
+            summary: summary.summary.clone(),
+            next_operator_move: summary.next_operator_move.clone(),
+            memory_pressure,
+            memory_tiers,
+            slowest_latency_cohorts,
+            capacity_admission_decisions,
+            resource_admission_decisions,
+            mitigation_history,
+            drilldowns,
+        }
+    }
+
+    /// Concise stable rows for the human doctor surface.
+    #[must_use]
+    pub fn compact_table_rows(&self) -> Vec<String> {
+        let memory_pressure = self
+            .memory_pressure
+            .map(fleet_pressure_tier_name)
+            .unwrap_or("unknown");
+        let mut rows = vec![format!(
+            "status={} proof_gate={} memory_pressure={} stages={} capacity_decisions={} resource_decisions={}",
+            self.status.as_str(),
+            self.proof_gate.as_str(),
+            memory_pressure,
+            self.slowest_latency_cohorts.len(),
+            self.capacity_admission_decisions.len(),
+            self.resource_admission_decisions.len()
+        )];
+
+        for tier in self.memory_tiers.iter().take(3) {
+            rows.push(format!(
+                "mem {} actual={} budget={} over={} reclaimable={} reclaimed={} refused={}",
+                tier.tier_name,
+                tier.actual_bytes,
+                tier.budget_bytes,
+                tier.over_budget_bytes,
+                tier.reclaimable_bytes,
+                tier.reclaimed_bytes,
+                tier.refused_bytes
+            ));
+        }
+        for cohort in self.slowest_latency_cohorts.iter().take(3) {
+            let p99 = optional_f64_label(cohort.observed_p99_ms);
+            let utilization = optional_f64_label(cohort.utilization);
+            rows.push(format!(
+                "stage {} p99_ms={} utilization={} reason={}",
+                cohort.stage_name, p99, utilization, cohort.reason_code
+            ));
+        }
+        for decision in self.resource_admission_decisions.iter().take(3) {
+            rows.push(format!(
+                "resource_admission action={} reasons={} queue_utilization={} pending_items={}",
+                resource_admission_action_name(decision.action),
+                resource_admission_reason_codes_label(&decision.reason_codes),
+                optional_f64_label(decision.queue_utilization),
+                decision
+                    .pending_items
+                    .map_or_else(|| "unknown".to_string(), |items| items.to_string())
+            ));
+        }
+        for decision in self.capacity_admission_decisions.iter().take(3) {
+            rows.push(format!(
+                "capacity_admission action={} reason={} retry_after_secs={}",
+                decision.action.as_str(),
+                decision.reason_code,
+                decision
+                    .retry_after_secs
+                    .map_or_else(|| "none".to_string(), |secs| secs.to_string())
+            ));
+        }
+        for drilldown in self.drilldowns.iter().take(3) {
+            rows.push(format!(
+                "drilldown subject={} reason={} detail={}",
+                drilldown.subject, drilldown.reason_code, drilldown.detail
+            ));
+        }
+        if rows.len() == 1 {
+            rows.push("no cockpit detail at this transparency level".to_string());
+        }
+        rows
+    }
+}
+
 /// Redacted, bounded capacity summary for robot/status/doctor surfaces.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwarmCapacityOperatorSummary {
@@ -6429,6 +6717,9 @@ pub struct SwarmCapacityOperatorSummary {
     /// Proof and replay pointers, present at transparency level 3.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proof_artifacts: Option<SwarmCapacityOperatorProofArtifacts>,
+    /// Nested resource cockpit, present at transparency level 2+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_cockpit: Option<SwarmResourceCockpitSnapshot>,
 }
 
 impl SwarmCapacityOperatorSummary {
@@ -6436,7 +6727,7 @@ impl SwarmCapacityOperatorSummary {
     #[must_use]
     pub fn unavailable(generated_at_ms: u64, transparency_level: u8, source: &str) -> Self {
         let level = normalized_swarm_capacity_transparency_level(transparency_level);
-        Self {
+        let mut summary = Self {
             schema_version: SWARM_CAPACITY_OPERATOR_SUMMARY_SCHEMA_VERSION,
             generated_at_ms,
             transparency_level: level,
@@ -6470,7 +6761,13 @@ impl SwarmCapacityOperatorSummary {
                 latest_record_id: None,
                 replay_pointer: "ft robot capacity --level 3".to_string(),
             }),
+            resource_cockpit: None,
+        };
+        if level >= 2 {
+            let cockpit = SwarmResourceCockpitSnapshot::from_capacity_summary(&summary, None, &[]);
+            summary.resource_cockpit = Some(cockpit);
         }
+        summary
     }
 
     /// Build a redacted operator summary from certificate, monitor, controller, and ledger evidence.
@@ -6525,7 +6822,7 @@ impl SwarmCapacityOperatorSummary {
             None
         };
 
-        Self {
+        let mut summary = Self {
             schema_version: SWARM_CAPACITY_OPERATOR_SUMMARY_SCHEMA_VERSION,
             generated_at_ms,
             transparency_level: level,
@@ -6548,7 +6845,31 @@ impl SwarmCapacityOperatorSummary {
             stages,
             decisions,
             proof_artifacts,
+            resource_cockpit: None,
+        };
+        if level >= 2 {
+            let cockpit = SwarmResourceCockpitSnapshot::from_capacity_summary(&summary, None, &[]);
+            summary.resource_cockpit = Some(cockpit);
         }
+        summary
+    }
+
+    /// Return this summary with resource cockpit inputs attached.
+    #[must_use]
+    pub fn with_resource_cockpit_inputs(
+        mut self,
+        memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
+        resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
+    ) -> Self {
+        if self.transparency_level >= 2 {
+            let cockpit = SwarmResourceCockpitSnapshot::from_capacity_summary(
+                &self,
+                memory_budget,
+                resource_admission_decisions,
+            );
+            self.resource_cockpit = Some(cockpit);
+        }
+        self
     }
 
     /// Return the same summary reduced to the requested transparency level.
@@ -6569,8 +6890,321 @@ impl SwarmCapacityOperatorSummary {
         if level < 3 {
             summary.proof_artifacts = None;
         }
+        if level < 2 {
+            summary.resource_cockpit = None;
+        }
         summary
     }
+}
+
+fn swarm_resource_cockpit_memory_tiers(
+    snapshot: &FleetMemoryTierBudgetSnapshot,
+) -> Vec<SwarmResourceCockpitMemoryTierSummary> {
+    snapshot
+        .tiers
+        .iter()
+        .take(MAX_SWARM_RESOURCE_COCKPIT_MEMORY_TIERS)
+        .map(swarm_resource_cockpit_memory_tier)
+        .collect()
+}
+
+fn swarm_resource_cockpit_memory_tier(
+    record: &FleetMemoryTierBudgetRecord,
+) -> SwarmResourceCockpitMemoryTierSummary {
+    SwarmResourceCockpitMemoryTierSummary {
+        tier: record.tier,
+        tier_name: fleet_memory_tier_name(record.tier).to_string(),
+        resident: record.tier.is_resident(),
+        budget_bytes: record.budget_bytes,
+        actual_bytes: record.actual_bytes,
+        over_budget_bytes: record.over_budget_bytes(),
+        remaining_budget_bytes: record.remaining_budget_bytes(),
+        reclaimable_bytes: record.reclaimable_bytes,
+        reclaimed_bytes: record.reclaimed_bytes,
+        evicted_bytes: record.evicted_bytes,
+        refused_bytes: record.refused_bytes,
+        has_pressure: record.has_pressure(),
+        reclamation_action: record.tier.reclamation_action(),
+    }
+}
+
+fn swarm_resource_cockpit_memory_pressure(
+    memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
+    resource_decisions: &[ResourceAdmissionDecisionSummary],
+) -> Option<FleetPressureTier> {
+    let budget_pressure = memory_budget.map(FleetMemoryTierBudgetSnapshot::pressure_tier);
+    let decision_pressure = resource_decisions
+        .iter()
+        .flat_map(|decision| [decision.fleet_pressure, decision.memory_tier_pressure])
+        .flatten()
+        .max();
+
+    match (budget_pressure, decision_pressure) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(tier), None) | (None, Some(tier)) => Some(tier),
+        (None, None) => None,
+    }
+}
+
+fn swarm_resource_cockpit_latency_cohorts(
+    stages: &[SwarmCapacityOperatorStageSummary],
+) -> Vec<SwarmResourceCockpitLatencyCohort> {
+    let mut cohorts = stages
+        .iter()
+        .map(|stage| SwarmResourceCockpitLatencyCohort {
+            stage: stage.stage,
+            stage_name: stage.stage_name.clone(),
+            certificate_status: stage.certificate_status,
+            tail_risk_status: stage.tail_risk_status,
+            reason_code: stage.reason_code.clone(),
+            utilization: stage.utilization,
+            observed_p99_ms: stage.observed_p99_ms,
+            modeled_p99_ms: stage.modeled_p99_ms,
+            p99_over_model_ratio: p99_over_model_ratio(stage.observed_p99_ms, stage.modeled_p99_ms),
+        })
+        .collect::<Vec<_>>();
+    cohorts.sort_by(|left, right| {
+        compare_optional_f64_desc(left.observed_p99_ms, right.observed_p99_ms)
+            .then_with(|| compare_optional_f64_desc(left.utilization, right.utilization))
+            .then_with(|| left.stage_name.cmp(&right.stage_name))
+    });
+    cohorts.truncate(MAX_SWARM_RESOURCE_COCKPIT_LATENCY_COHORTS);
+    cohorts
+}
+
+fn p99_over_model_ratio(observed: Option<f64>, modeled: Option<f64>) -> Option<f64> {
+    match (observed, modeled) {
+        (Some(observed), Some(modeled))
+            if observed.is_finite() && modeled.is_finite() && modeled > 0.0 =>
+        {
+            Some(observed / modeled)
+        }
+        _ => None,
+    }
+}
+
+fn compare_optional_f64_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
+    let left = left.filter(|value| value.is_finite());
+    let right = right.filter(|value| value.is_finite());
+    match (left, right) {
+        (Some(left), Some(right)) => right
+            .partial_cmp(&left)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+const fn swarm_resource_cockpit_proof_gate(
+    status: SwarmCapacityOperatorStatus,
+) -> SwarmResourceCockpitProofGate {
+    match status {
+        SwarmCapacityOperatorStatus::Ready => SwarmResourceCockpitProofGate::Healthy,
+        SwarmCapacityOperatorStatus::Watch => SwarmResourceCockpitProofGate::Pressured,
+        SwarmCapacityOperatorStatus::Violated | SwarmCapacityOperatorStatus::Unknown => {
+            SwarmResourceCockpitProofGate::Degraded
+        }
+        SwarmCapacityOperatorStatus::Unavailable => SwarmResourceCockpitProofGate::SkippedProof,
+    }
+}
+
+fn swarm_resource_cockpit_mitigations(
+    proof_gate: SwarmResourceCockpitProofGate,
+    memory_tiers: &[SwarmResourceCockpitMemoryTierSummary],
+    capacity_decisions: &[SwarmCapacityOperatorDecisionSummary],
+    resource_decisions: &[ResourceAdmissionDecisionSummary],
+) -> Vec<SwarmResourceCockpitDrilldown> {
+    let mut rows = Vec::new();
+    for tier in memory_tiers.iter().filter(|tier| tier.has_pressure) {
+        push_cockpit_row(
+            &mut rows,
+            "memory_tier",
+            "resource.memory_tier_pressure",
+            format!(
+                "tier={} action={} reclaimable_bytes={} refused_bytes={}",
+                tier.tier_name,
+                tier.reclamation_action
+                    .map(fleet_memory_reclamation_action_name)
+                    .unwrap_or("none"),
+                tier.reclaimable_bytes,
+                tier.refused_bytes
+            ),
+        );
+    }
+    for decision in resource_decisions
+        .iter()
+        .filter(|decision| decision.action != AdmissionAction::Admit)
+    {
+        let reason = decision
+            .reason_codes
+            .first()
+            .copied()
+            .map(resource_admission_reason_code_name)
+            .unwrap_or("resource.admission.pressure");
+        push_cockpit_row(
+            &mut rows,
+            "resource_admission",
+            reason,
+            format!(
+                "action={} queue_utilization={} pending_items={}",
+                resource_admission_action_name(decision.action),
+                optional_f64_label(decision.queue_utilization),
+                decision
+                    .pending_items
+                    .map_or_else(|| "unknown".to_string(), |items| items.to_string())
+            ),
+        );
+    }
+    for decision in capacity_decisions
+        .iter()
+        .filter(|decision| decision.action != SwarmCapacityAdmissionAction::Admit)
+    {
+        push_cockpit_row(
+            &mut rows,
+            "capacity_admission",
+            decision.reason_code.clone(),
+            format!(
+                "action={} retry_after_secs={} would_apply={}",
+                decision.action.as_str(),
+                decision
+                    .retry_after_secs
+                    .map_or_else(|| "none".to_string(), |secs| secs.to_string()),
+                decision.would_apply
+            ),
+        );
+    }
+    if proof_gate == SwarmResourceCockpitProofGate::SkippedProof {
+        push_cockpit_row(
+            &mut rows,
+            "proof_gate",
+            "resource.proof.skipped",
+            "capacity proof was not available for this cockpit snapshot".to_string(),
+        );
+    }
+    rows
+}
+
+fn swarm_resource_cockpit_drilldowns(
+    proof_gate: SwarmResourceCockpitProofGate,
+    memory_tiers: &[SwarmResourceCockpitMemoryTierSummary],
+    capacity_decisions: &[SwarmCapacityOperatorDecisionSummary],
+    resource_decisions: &[ResourceAdmissionDecisionSummary],
+) -> Vec<SwarmResourceCockpitDrilldown> {
+    let mut rows = swarm_resource_cockpit_mitigations(
+        proof_gate,
+        memory_tiers,
+        capacity_decisions,
+        resource_decisions,
+    );
+    if rows.is_empty() && proof_gate == SwarmResourceCockpitProofGate::Healthy {
+        push_cockpit_row(
+            &mut rows,
+            "proof_gate",
+            "resource.proof.healthy",
+            "capacity proof is healthy and no mitigation is active".to_string(),
+        );
+    }
+    rows
+}
+
+fn push_cockpit_row(
+    rows: &mut Vec<SwarmResourceCockpitDrilldown>,
+    subject: impl Into<String>,
+    reason_code: impl Into<String>,
+    detail: impl Into<String>,
+) {
+    if rows.len() >= MAX_SWARM_RESOURCE_COCKPIT_DRILLDOWNS {
+        return;
+    }
+    rows.push(SwarmResourceCockpitDrilldown {
+        subject: subject.into(),
+        reason_code: reason_code.into(),
+        detail: detail.into(),
+    });
+}
+
+const fn fleet_pressure_tier_name(tier: FleetPressureTier) -> &'static str {
+    match tier {
+        FleetPressureTier::Normal => "normal",
+        FleetPressureTier::Elevated => "elevated",
+        FleetPressureTier::Critical => "critical",
+        FleetPressureTier::Emergency => "emergency",
+    }
+}
+
+const fn fleet_memory_tier_name(tier: FleetMemoryTier) -> &'static str {
+    match tier {
+        FleetMemoryTier::HotResident => "hot_resident",
+        FleetMemoryTier::WarmCompressed => "warm_compressed",
+        FleetMemoryTier::ColdDisk => "cold_disk",
+        FleetMemoryTier::SearchIndexCache => "search_index_cache",
+        FleetMemoryTier::RenderCache => "render_cache",
+        FleetMemoryTier::TransientIngestion => "transient_ingestion",
+        FleetMemoryTier::AllocatorPools => "allocator_pools",
+    }
+}
+
+const fn fleet_memory_reclamation_action_name(
+    action: FleetMemoryTierReclamationAction,
+) -> &'static str {
+    match action {
+        FleetMemoryTierReclamationAction::DropTransientBuffers => "drop_transient_buffers",
+        FleetMemoryTierReclamationAction::ShrinkSearchCache => "shrink_search_cache",
+        FleetMemoryTierReclamationAction::ShrinkRenderCache => "shrink_render_cache",
+        FleetMemoryTierReclamationAction::EvictWarmToCold => "evict_warm_to_cold",
+        FleetMemoryTierReclamationAction::TrimAllocatorPools => "trim_allocator_pools",
+        FleetMemoryTierReclamationAction::DemoteHotToWarm => "demote_hot_to_warm",
+    }
+}
+
+const fn resource_admission_action_name(action: AdmissionAction) -> &'static str {
+    match action {
+        AdmissionAction::Admit => "admit",
+        AdmissionAction::Defer => "defer",
+        AdmissionAction::Degrade => "degrade",
+        AdmissionAction::Shed => "shed",
+    }
+}
+
+fn resource_admission_reason_codes_label(reasons: &[AdmissionReasonCode]) -> String {
+    if reasons.is_empty() {
+        return "none".to_string();
+    }
+    reasons
+        .iter()
+        .copied()
+        .map(resource_admission_reason_code_name)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+const fn resource_admission_reason_code_name(reason: AdmissionReasonCode) -> &'static str {
+    match reason {
+        AdmissionReasonCode::Healthy => "healthy",
+        AdmissionReasonCode::QueueElevated => "queue_elevated",
+        AdmissionReasonCode::QueueSaturated => "queue_saturated",
+        AdmissionReasonCode::QueueOverCapacity => "queue_over_capacity",
+        AdmissionReasonCode::FailureRateHigh => "failure_rate_high",
+        AdmissionReasonCode::FleetPressure => "fleet_pressure",
+        AdmissionReasonCode::MemoryTierPressure => "memory_tier_pressure",
+        AdmissionReasonCode::LatencyStageOverBudget => "latency_stage_over_budget",
+        AdmissionReasonCode::MissingQueueTelemetry => "missing_queue_telemetry",
+        AdmissionReasonCode::MissingFleetTelemetry => "missing_fleet_telemetry",
+        AdmissionReasonCode::MissingMemoryTierTelemetry => "missing_memory_tier_telemetry",
+        AdmissionReasonCode::MissingLatencyTelemetry => "missing_latency_telemetry",
+        AdmissionReasonCode::NonFiniteTelemetry => "non_finite_telemetry",
+        AdmissionReasonCode::InvalidLatencyTelemetry => "invalid_latency_telemetry",
+        AdmissionReasonCode::PriorityProtected => "priority_protected",
+        AdmissionReasonCode::OperatorOverride => "operator_override",
+        AdmissionReasonCode::FailClosedMissingTelemetry => "fail_closed_missing_telemetry",
+    }
+}
+
+fn optional_f64_label(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map_or_else(|| "unknown".to_string(), |value| format!("{value:.3}"))
 }
 
 #[must_use]
@@ -13529,12 +14163,262 @@ mod tests {
             SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 9, "test.missing");
 
         assert_eq!(summary.transparency_level, 3);
+        assert_eq!(summary.schema_version, 2);
         assert_eq!(summary.status, SwarmCapacityOperatorStatus::Unavailable);
         assert_eq!(
             summary.reason_codes,
             vec!["capacity.operator.unavailable".to_string()]
         );
         assert!(summary.proof_artifacts.is_some());
+        assert_eq!(
+            summary
+                .resource_cockpit
+                .as_ref()
+                .expect("level 2+ includes cockpit")
+                .proof_gate,
+            SwarmResourceCockpitProofGate::SkippedProof
+        );
+    }
+
+    #[test]
+    fn swarm_resource_cockpit_schema_includes_memory_and_admission_drilldowns_ft_gl0n0() {
+        let baseline = capacity_trace_baseline_profile(
+            SwarmCapacityStage::StorageWrite,
+            SwarmCapacityWorkloadClass::StorageWriteSaturation,
+        );
+        let live = CapacityTraceTelemetryProfile {
+            service_time_ms: 15.0,
+            queue_depth: 8,
+            ..baseline
+        };
+        let baseline_certificate = capacity_trace_certificate(baseline);
+        let live_certificate = capacity_trace_certificate(live);
+        let report = baseline_certificate.tail_risk_report(
+            &live_certificate,
+            capacity_trace_monitor_config(live.stage, None, None),
+        );
+        let request = SwarmCapacityAdmissionRequest::new(
+            "pane:raw-secret-id",
+            live.workload_class,
+            SwarmCapacityWorkClass::Maintenance,
+            0,
+        );
+        let plan = capacity_trace_controller().plan(
+            1_700_000_010_000,
+            &live_certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let tier_budget =
+            crate::fleet_memory_controller::FleetMemoryTierBudgetSnapshot::from_tiers([
+                crate::fleet_memory_controller::FleetMemoryTierBudgetRecord::new(
+                    crate::fleet_memory_controller::FleetMemoryTier::HotResident,
+                    1_024,
+                    2_048,
+                )
+                .with_counters(128, 0, 64),
+                crate::fleet_memory_controller::FleetMemoryTierBudgetRecord::new(
+                    crate::fleet_memory_controller::FleetMemoryTier::WarmCompressed,
+                    4_096,
+                    6_144,
+                )
+                .with_counters(512, 1_024, 0),
+                crate::fleet_memory_controller::FleetMemoryTierBudgetRecord::new(
+                    crate::fleet_memory_controller::FleetMemoryTier::ColdDisk,
+                    16_384,
+                    8_192,
+                )
+                .with_reclaimable_bytes(0),
+            ]);
+        let resource_decision = crate::swarm_scheduler::ResourceAdmissionDecisionSummary {
+            action: crate::swarm_scheduler::AdmissionAction::Degrade,
+            reason_codes: vec![
+                crate::swarm_scheduler::AdmissionReasonCode::MemoryTierPressure,
+                crate::swarm_scheduler::AdmissionReasonCode::LatencyStageOverBudget,
+            ],
+            counters: crate::swarm_scheduler::AdmissionDecisionCounters {
+                admitted: 0,
+                deferred: 0,
+                degraded: 1,
+                shed: 0,
+            },
+            raw_pressure_severity: 3,
+            effective_pressure_severity: 2,
+            priority_protection_units: 1,
+            queue_utilization: Some(0.91),
+            pending_items: Some(512),
+            fleet_pressure: Some(crate::fleet_memory_controller::FleetPressureTier::Critical),
+            memory_tier_pressure: Some(
+                crate::fleet_memory_controller::FleetPressureTier::Emergency,
+            ),
+            max_latency_over_budget_ratio: Some(1.75),
+        };
+
+        let summary = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_010_001,
+            3,
+            &live_certificate,
+            &report,
+            &plan,
+            None,
+        )
+        .with_resource_cockpit_inputs(Some(&tier_budget), &[resource_decision]);
+        let cockpit = summary
+            .resource_cockpit
+            .as_ref()
+            .expect("level 2+ summary includes resource cockpit");
+        let json = serde_json::to_value(&summary).expect("summary serializes");
+
+        assert_eq!(
+            cockpit.schema_version,
+            SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            cockpit.memory_pressure,
+            Some(crate::fleet_memory_controller::FleetPressureTier::Emergency)
+        );
+        assert!(
+            cockpit
+                .memory_tiers
+                .iter()
+                .any(|tier| tier.tier_name == "hot_resident"
+                    && tier.actual_bytes == 2_048
+                    && tier.refused_bytes == 64)
+        );
+        assert!(!cockpit.slowest_latency_cohorts.is_empty());
+        assert_eq!(
+            cockpit.resource_admission_decisions[0].action,
+            crate::swarm_scheduler::AdmissionAction::Degrade
+        );
+        assert!(cockpit.drilldowns.iter().any(|row| {
+            row.subject == "resource_admission" && row.reason_code == "memory_tier_pressure"
+        }));
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["resource_cockpit"]["schema_version"], 1);
+        assert_eq!(
+            json["resource_cockpit"]["memory_tiers"][0]["tier"],
+            "hot_resident"
+        );
+        assert!(
+            cockpit
+                .compact_table_rows()
+                .iter()
+                .any(|row| row.contains("resource_admission action=degrade"))
+        );
+        assert!(
+            !serde_json::to_string(&summary)
+                .expect("json string")
+                .contains("raw-secret-id")
+        );
+    }
+
+    #[test]
+    fn swarm_resource_cockpit_golden_states_cover_cli_rows_ft_gl0n0() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "healthy",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            0,
+        );
+        let green_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let watch_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Watch);
+        let violated_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Violated);
+
+        let healthy_plan = controller.plan(
+            1_700_000_020_000,
+            &certificate,
+            &green_report,
+            std::slice::from_ref(&request),
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let healthy = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_020_001,
+            2,
+            &certificate,
+            &green_report,
+            &healthy_plan,
+            None,
+        );
+
+        let watch_plan = controller.plan(
+            1_700_000_020_000,
+            &certificate,
+            &watch_report,
+            std::slice::from_ref(&request),
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let pressured = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_020_001,
+            2,
+            &certificate,
+            &watch_report,
+            &watch_plan,
+            None,
+        );
+
+        let degraded_plan = controller.plan(
+            1_700_000_020_000,
+            &certificate,
+            &violated_report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let degraded = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_020_001,
+            2,
+            &certificate,
+            &violated_report,
+            &degraded_plan,
+            None,
+        );
+        let skipped =
+            SwarmCapacityOperatorSummary::unavailable(1_700_000_020_001, 2, "test.missing");
+
+        let first_row = |summary: &SwarmCapacityOperatorSummary| {
+            summary
+                .resource_cockpit
+                .as_ref()
+                .expect("cockpit present")
+                .compact_table_rows()
+                .into_iter()
+                .next()
+                .expect("first row")
+        };
+
+        assert_eq!(
+            first_row(&healthy),
+            "status=ready proof_gate=healthy memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0"
+        );
+        assert_eq!(
+            first_row(&pressured),
+            "status=watch proof_gate=pressured memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0"
+        );
+        assert_eq!(
+            first_row(&degraded),
+            "status=violated proof_gate=degraded memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0"
+        );
+        assert_eq!(
+            first_row(&skipped),
+            "status=unavailable proof_gate=skipped_proof memory_pressure=unknown stages=0 capacity_decisions=0 resource_decisions=0"
+        );
+        assert!(
+            skipped
+                .resource_cockpit
+                .as_ref()
+                .expect("cockpit present")
+                .compact_table_rows()
+                .iter()
+                .any(|row| row.contains("resource.proof.skipped"))
+        );
     }
 
     #[test]

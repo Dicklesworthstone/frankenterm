@@ -11108,6 +11108,12 @@ fn print_swarm_capacity_doctor_section(
     if !summary.reason_codes.is_empty() {
         println!("  Reasons: {}", summary.reason_codes.join(", "));
     }
+    if let Some(cockpit) = &summary.resource_cockpit {
+        println!("  Cockpit:");
+        for row in cockpit.compact_table_rows() {
+            println!("    {row}");
+        }
+    }
 }
 
 fn attach_runtime_health_payload(
