@@ -79,7 +79,7 @@ jobs:
           - '0xBADC0DE'
           - '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -130,7 +130,7 @@ jobs:
 
       - name: Upload per-seed log + summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lab-runtime-seed-${{ matrix.seed }}
           path: target/ci-logs/seed-${{ matrix.seed }}.*
@@ -148,7 +148,7 @@ jobs:
     if: always()
     timeout-minutes: 5
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: lab-runtime-seed-*
@@ -189,7 +189,7 @@ jobs:
           PY
 
       - name: Upload aggregated summary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lab-runtime-multi-seed-summary
           path: out/lab-runtime-multi-seed-summary.json
