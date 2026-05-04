@@ -7,6 +7,9 @@
 //! - [`ScenarioResult`] — Per-scenario outcome with decision diffs.
 
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // DiffSummary — decision-level diff between baseline and candidate
@@ -299,16 +302,22 @@ impl MatrixConfig {
 pub type DecisionGenerator =
     Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync>;
 
+type SharedDecisionGenerator =
+    Arc<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync>;
+
 /// Executes a scenario matrix, collecting decision diffs.
 pub struct ScenarioMatrixRunner {
     config: MatrixConfig,
-    generator: DecisionGenerator,
+    generator: SharedDecisionGenerator,
 }
 
 impl ScenarioMatrixRunner {
     /// Create a runner with a decision generator callback.
     pub fn new(config: MatrixConfig, generator: DecisionGenerator) -> Self {
-        Self { config, generator }
+        Self {
+            config,
+            generator: generator.into(),
+        }
     }
 
     /// Execute the matrix. Returns results and emits progress events to the callback.
@@ -318,67 +327,190 @@ impl ScenarioMatrixRunner {
     {
         let pairs = self.config.scenario_pairs();
         let total = pairs.len();
-        let mut results = Vec::with_capacity(total);
+        if total == 0 {
+            return MatrixResult::from_results(Vec::new());
+        }
 
-        for (completed, (art, ovr)) in pairs.iter().enumerate() {
+        let mut results = vec![None; total];
+        let fail_fast = self.config.config.fail_fast;
+        let concurrency = if fail_fast {
+            1
+        } else {
+            self.config.config.concurrency.max(1).min(total)
+        };
+        let timeout = Duration::from_millis(self.config.config.timeout_per_scenario_ms);
+        let (tx, rx) = mpsc::channel();
+        let mut next = 0usize;
+        let mut active = 0usize;
+
+        while next < total && active < concurrency {
+            Self::spawn_scenario(
+                next,
+                pairs[next].0.clone(),
+                pairs[next].1.clone(),
+                Arc::clone(&self.generator),
+                timeout,
+                tx.clone(),
+            );
+            let (art, ovr) = &pairs[next];
             let override_label = ovr.as_ref().map(|o| o.label.clone()).unwrap_or_default();
 
             on_progress(ProgressEvent {
-                completed,
+                completed: next,
                 total,
                 current_artifact: art.label.clone(),
-                current_override: override_label.clone(),
+                current_override: override_label,
             });
 
-            // Run baseline.
-            let baseline_result = (self.generator)(&art.path, None);
-            // Run candidate (with override if present).
-            let candidate_result =
-                (self.generator)(&art.path, ovr.as_ref().map(|o| o.path.as_str()));
-
-            let scenario = match (baseline_result, candidate_result) {
-                (Ok(baseline), Ok(candidate)) => {
-                    let diff = DiffSummary::compute(&baseline, &candidate);
-                    ScenarioResult {
-                        artifact_label: art.label.clone(),
-                        override_label: override_label.clone(),
-                        baseline_decisions: baseline,
-                        candidate_decisions: candidate,
-                        diff,
-                        error: None,
-                        duration_ms: 0, // Would be tracked in real impl.
-                    }
-                }
-                (Err(e), _) => ScenarioResult {
-                    artifact_label: art.label.clone(),
-                    override_label: override_label.clone(),
-                    baseline_decisions: vec![],
-                    candidate_decisions: vec![],
-                    diff: DiffSummary::default(),
-                    error: Some(format!("baseline error: {e}")),
-                    duration_ms: 0,
-                },
-                (_, Err(e)) => ScenarioResult {
-                    artifact_label: art.label.clone(),
-                    override_label: override_label.clone(),
-                    baseline_decisions: vec![],
-                    candidate_decisions: vec![],
-                    diff: DiffSummary::default(),
-                    error: Some(format!("candidate error: {e}")),
-                    duration_ms: 0,
-                },
-            };
-
-            let has_divergence = scenario.has_divergence();
-            results.push(scenario);
-
-            // fail_fast: stop on first divergence.
-            if self.config.config.fail_fast && has_divergence {
+            next += 1;
+            active += 1;
+        }
+        while active > 0 {
+            let Ok((index, scenario)) = rx.recv() else {
                 break;
+            };
+            active -= 1;
+            let should_stop = fail_fast && (!scenario.is_ok() || scenario.has_divergence());
+            results[index] = Some(scenario);
+
+            if should_stop {
+                break;
+            }
+
+            while next < total && active < concurrency {
+                Self::spawn_scenario(
+                    next,
+                    pairs[next].0.clone(),
+                    pairs[next].1.clone(),
+                    Arc::clone(&self.generator),
+                    timeout,
+                    tx.clone(),
+                );
+                let (art, ovr) = &pairs[next];
+                let override_label = ovr.as_ref().map(|o| o.label.clone()).unwrap_or_default();
+                on_progress(ProgressEvent {
+                    completed: next,
+                    total,
+                    current_artifact: art.label.clone(),
+                    current_override: override_label,
+                });
+
+                next += 1;
+                active += 1;
             }
         }
 
-        MatrixResult::from_results(results)
+        MatrixResult::from_results(results.into_iter().flatten().collect())
+    }
+
+    fn spawn_scenario(
+        index: usize,
+        art: ArtifactEntry,
+        ovr: Option<OverrideEntry>,
+        generator: SharedDecisionGenerator,
+        timeout: Duration,
+        tx: mpsc::Sender<(usize, ScenarioResult)>,
+    ) {
+        drop(thread::spawn(move || {
+            let result = Self::run_scenario_with_timeout(art, ovr, generator, timeout);
+            if tx.send((index, result)).is_err() {
+                return;
+            }
+        }));
+    }
+
+    fn run_scenario_with_timeout(
+        art: ArtifactEntry,
+        ovr: Option<OverrideEntry>,
+        generator: SharedDecisionGenerator,
+        timeout: Duration,
+    ) -> ScenarioResult {
+        let started = Instant::now();
+        let artifact_label = art.label.clone();
+        let artifact_path = art.path.clone();
+        let override_label = ovr.as_ref().map(|o| o.label.clone()).unwrap_or_default();
+        let override_path = ovr.as_ref().map(|o| o.path.clone());
+        let (work_tx, work_rx) = mpsc::channel();
+
+        drop(thread::spawn(move || {
+            let baseline_result = generator(&artifact_path, None);
+            let candidate_result = generator(&artifact_path, override_path.as_deref());
+            if work_tx.send((baseline_result, candidate_result)).is_err() {
+                return;
+            }
+        }));
+
+        match work_rx.recv_timeout(timeout) {
+            Ok((baseline_result, candidate_result)) => Self::scenario_from_generator_results(
+                artifact_label,
+                override_label,
+                baseline_result,
+                candidate_result,
+                started,
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => ScenarioResult {
+                artifact_label,
+                override_label,
+                baseline_decisions: Vec::new(),
+                candidate_decisions: Vec::new(),
+                diff: DiffSummary::default(),
+                error: Some(format!(
+                    "scenario timeout after {} ms",
+                    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+                )),
+                duration_ms: elapsed_ms(started),
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => ScenarioResult {
+                artifact_label,
+                override_label,
+                baseline_decisions: Vec::new(),
+                candidate_decisions: Vec::new(),
+                diff: DiffSummary::default(),
+                error: Some("scenario worker disconnected".to_string()),
+                duration_ms: elapsed_ms(started),
+            },
+        }
+    }
+
+    fn scenario_from_generator_results(
+        artifact_label: String,
+        override_label: String,
+        baseline_result: Result<Vec<String>, String>,
+        candidate_result: Result<Vec<String>, String>,
+        started: Instant,
+    ) -> ScenarioResult {
+        match (baseline_result, candidate_result) {
+            (Ok(baseline), Ok(candidate)) => {
+                let diff = DiffSummary::compute(&baseline, &candidate);
+                ScenarioResult {
+                    artifact_label,
+                    override_label,
+                    baseline_decisions: baseline,
+                    candidate_decisions: candidate,
+                    diff,
+                    error: None,
+                    duration_ms: elapsed_ms(started),
+                }
+            }
+            (Err(e), _) => ScenarioResult {
+                artifact_label,
+                override_label,
+                baseline_decisions: Vec::new(),
+                candidate_decisions: Vec::new(),
+                diff: DiffSummary::default(),
+                error: Some(format!("baseline error: {e}")),
+                duration_ms: elapsed_ms(started),
+            },
+            (_, Err(e)) => ScenarioResult {
+                artifact_label,
+                override_label,
+                baseline_decisions: Vec::new(),
+                candidate_decisions: Vec::new(),
+                diff: DiffSummary::default(),
+                error: Some(format!("candidate error: {e}")),
+                duration_ms: elapsed_ms(started),
+            },
+        }
     }
 
     /// Get the matrix config.
@@ -388,6 +520,10 @@ impl ScenarioMatrixRunner {
     }
 }
 
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -395,6 +531,8 @@ impl ScenarioMatrixRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sample_matrix_toml() -> &'static str {
         r#"
@@ -440,6 +578,39 @@ fail_fast = false
 
     fn error_generator() -> DecisionGenerator {
         Box::new(|_art, _ovr| Err("simulated failure".into()))
+    }
+
+    fn matrix_for_runner_budget_tests(
+        scenario_count: usize,
+        concurrency: usize,
+        timeout_per_scenario_ms: u64,
+        fail_fast: bool,
+    ) -> MatrixConfig {
+        MatrixConfig {
+            artifacts: (0..scenario_count)
+                .map(|idx| ArtifactEntry {
+                    path: format!("trace_{idx}.ftreplay"),
+                    label: format!("trace_{idx}"),
+                })
+                .collect(),
+            overrides: Vec::new(),
+            config: RunnerConfig {
+                concurrency,
+                timeout_per_scenario_ms,
+                fail_fast,
+            },
+        }
+    }
+
+    fn record_max_observed(max_active: &AtomicUsize, active: usize) {
+        let mut observed = max_active.load(Ordering::SeqCst);
+        while active > observed {
+            match max_active.compare_exchange(observed, active, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(next) => observed = next,
+            }
+        }
     }
 
     // ── MatrixConfig parsing ────────────────────────────────────────────
@@ -708,6 +879,83 @@ label = "a"
     }
 
     #[test]
+    fn runner_fail_fast_stops_on_generator_error() {
+        let config = matrix_for_runner_budget_tests(3, 3, 1_000, true);
+        let dg = error_generator();
+        let runner = ScenarioMatrixRunner::new(config, dg);
+
+        let result = runner.run(|_| {});
+
+        assert_eq!(result.total_scenarios, 1);
+        assert_eq!(result.error_count, 1);
+    }
+
+    #[test]
+    fn runner_records_real_duration_for_successful_scenarios() {
+        let config = matrix_for_runner_budget_tests(1, 1, 1_000, false);
+        let dg = Box::new(|_art: &str, _ovr: Option<&str>| {
+            thread::sleep(Duration::from_millis(5));
+            Ok(vec!["decision".into()])
+        });
+        let runner = ScenarioMatrixRunner::new(config, dg);
+
+        let result = runner.run(|_| {});
+
+        assert_eq!(result.total_scenarios, 1);
+        assert!(result.scenarios[0].duration_ms > 0);
+        assert_eq!(result.total_duration_ms, result.scenarios[0].duration_ms);
+    }
+
+    #[test]
+    fn runner_times_out_slow_scenario_and_fail_fast_stops_on_error() {
+        let config = matrix_for_runner_budget_tests(2, 4, 20, true);
+        let dg = Box::new(|_art: &str, _ovr: Option<&str>| {
+            thread::sleep(Duration::from_millis(250));
+            Ok(vec!["late".into()])
+        });
+        let runner = ScenarioMatrixRunner::new(config, dg);
+        let started = Instant::now();
+
+        let result = runner.run(|_| {});
+
+        assert_eq!(result.total_scenarios, 1);
+        assert_eq!(result.error_count, 1);
+        assert!(
+            result.scenarios[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("scenario timeout"))
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "runner did not return near the configured timeout"
+        );
+    }
+
+    #[test]
+    fn runner_enforces_concurrency_cap() {
+        let config = matrix_for_runner_budget_tests(6, 2, 1_000, false);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let active_for_generator = Arc::clone(&active);
+        let max_for_generator = Arc::clone(&max_active);
+        let dg = Box::new(move |_art: &str, _ovr: Option<&str>| {
+            let now_active = active_for_generator.fetch_add(1, Ordering::SeqCst) + 1;
+            record_max_observed(&max_for_generator, now_active);
+            thread::sleep(Duration::from_millis(25));
+            active_for_generator.fetch_sub(1, Ordering::SeqCst);
+            Ok(vec!["decision".into()])
+        });
+        let runner = ScenarioMatrixRunner::new(config, dg);
+
+        let result = runner.run(|_| {});
+
+        assert_eq!(result.total_scenarios, 6);
+        assert!(result.all_passed());
+        assert!(max_active.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[test]
     fn runner_no_overrides_baseline_only() {
         let toml = r#"
 [[artifacts]]
@@ -748,6 +996,39 @@ label = "b"
         assert_eq!(events[0].completed, 0);
         assert_eq!(events[0].total, 4);
         assert_eq!(events[3].completed, 3);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn runner_property_never_exceeds_configured_concurrency(
+            scenario_count in 1usize..8,
+            concurrency in 1usize..5,
+        ) {
+            let config = matrix_for_runner_budget_tests(scenario_count, concurrency, 1_000, false);
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let active_for_generator = Arc::clone(&active);
+            let max_for_generator = Arc::clone(&max_active);
+            let dg = Box::new(move |_art: &str, _ovr: Option<&str>| {
+                let now_active = active_for_generator.fetch_add(1, Ordering::SeqCst) + 1;
+                record_max_observed(&max_for_generator, now_active);
+                thread::sleep(Duration::from_millis(2));
+                active_for_generator.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec!["decision".into()])
+            });
+            let runner = ScenarioMatrixRunner::new(config, dg);
+
+            let result = runner.run(|_| {});
+
+            prop_assert_eq!(result.total_scenarios, scenario_count);
+            prop_assert!(result.all_passed());
+            prop_assert!(
+                max_active.load(Ordering::SeqCst) <= concurrency.min(scenario_count),
+                "max active generator calls exceeded configured concurrency"
+            );
+        }
     }
 
     // ── Serde roundtrips ────────────────────────────────────────────────

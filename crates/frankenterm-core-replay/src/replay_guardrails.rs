@@ -70,7 +70,7 @@ impl Drop for SimulationGuard {
 // ============================================================================
 
 /// Configurable resource limits for replay/simulation runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Maximum events to process before halting.
     pub max_events: u64,
@@ -96,10 +96,74 @@ impl Default for ResourceLimits {
     }
 }
 
+/// Invalid replay/simulation resource limit configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceLimitsError {
+    /// Event limit must be positive.
+    ZeroMaxEvents,
+    /// Wall-clock limit must be positive.
+    ZeroMaxWallClock,
+    /// Memory-warning threshold must be positive.
+    ZeroMemoryWarningEvents,
+    /// Concurrency limit must be positive.
+    ZeroMaxConcurrent,
+    /// Watchdog timeout must be positive.
+    ZeroWatchdogTimeout,
+}
+
+impl std::fmt::Display for ResourceLimitsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroMaxEvents => write!(f, "max_events must be greater than zero"),
+            Self::ZeroMaxWallClock => write!(f, "max_wall_clock_ms must be greater than zero"),
+            Self::ZeroMemoryWarningEvents => {
+                write!(f, "memory_warning_events must be greater than zero")
+            }
+            Self::ZeroMaxConcurrent => write!(f, "max_concurrent must be greater than zero"),
+            Self::ZeroWatchdogTimeout => {
+                write!(f, "watchdog_timeout_ms must be greater than zero")
+            }
+        }
+    }
+}
+
 impl ResourceLimits {
     /// Load from TOML string.
     pub fn from_toml(toml_str: &str) -> Result<Self, String> {
-        toml::from_str(toml_str).map_err(|e| format!("resource limits parse error: {e}"))
+        let limits: Self =
+            toml::from_str(toml_str).map_err(|e| format!("resource limits parse error: {e}"))?;
+        limits
+            .validate()
+            .map_err(|e| format!("resource limits validation error: {e}"))?;
+        Ok(limits)
+    }
+
+    /// Validate resource limits before they drive replay guardrails.
+    pub fn validate(&self) -> Result<(), ResourceLimitsError> {
+        if self.max_events == 0 {
+            return Err(ResourceLimitsError::ZeroMaxEvents);
+        }
+        if self.max_wall_clock_ms == 0 {
+            return Err(ResourceLimitsError::ZeroMaxWallClock);
+        }
+        if self.memory_warning_events == 0 {
+            return Err(ResourceLimitsError::ZeroMemoryWarningEvents);
+        }
+        if self.max_concurrent == 0 {
+            return Err(ResourceLimitsError::ZeroMaxConcurrent);
+        }
+        if self.watchdog_timeout_ms == 0 {
+            return Err(ResourceLimitsError::ZeroWatchdogTimeout);
+        }
+        Ok(())
+    }
+
+    fn validated_or_default(self) -> Self {
+        if self.validate().is_ok() {
+            self
+        } else {
+            Self::default()
+        }
     }
 }
 
@@ -198,6 +262,7 @@ impl ResourceTracker {
     /// Create a new tracker with the given limits.
     #[must_use]
     pub fn new(limits: ResourceLimits, start_wall_ms: u64) -> Self {
+        let limits = limits.validated_or_default();
         Self {
             limits,
             inner: Mutex::new(TrackerInner {
@@ -410,6 +475,17 @@ impl GuardrailReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn non_interfering_limits() -> ResourceLimits {
+        ResourceLimits {
+            max_events: u64::MAX,
+            max_wall_clock_ms: u64::MAX,
+            memory_warning_events: u64::MAX,
+            max_concurrent: u32::MAX,
+            watchdog_timeout_ms: u64::MAX,
+        }
+    }
 
     // ── SimulationGuard ─────────────────────────────────────────────────
 
@@ -469,11 +545,72 @@ watchdog_timeout_ms = 5000
     }
 
     #[test]
+    fn limits_from_toml_rejects_zero_guardrails() {
+        let toml = r"
+max_events = 0
+max_wall_clock_ms = 10000
+memory_warning_events = 200
+max_concurrent = 2
+watchdog_timeout_ms = 5000
+";
+        let err = ResourceLimits::from_toml(toml).unwrap_err();
+        assert!(err.contains("max_events must be greater than zero"));
+    }
+
+    #[test]
     fn limits_serde_roundtrip() {
         let limits = ResourceLimits::default();
         let json = serde_json::to_string(&limits).unwrap();
         let restored: ResourceLimits = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.max_events, limits.max_events);
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_resource_limits_validation_rejects_any_zero(
+            zero_field in 0usize..5,
+            max_events in 1u64..1_000_000,
+            max_wall_clock_ms in 1u64..1_000_000,
+            memory_warning_events in 1u64..1_000_000,
+            max_concurrent in 1u32..1024,
+            watchdog_timeout_ms in 1u64..1_000_000,
+        ) {
+            let mut limits = ResourceLimits {
+                max_events,
+                max_wall_clock_ms,
+                memory_warning_events,
+                max_concurrent,
+                watchdog_timeout_ms,
+            };
+            match zero_field {
+                0 => limits.max_events = 0,
+                1 => limits.max_wall_clock_ms = 0,
+                2 => limits.memory_warning_events = 0,
+                3 => limits.max_concurrent = 0,
+                _ => limits.watchdog_timeout_ms = 0,
+            }
+
+            prop_assert!(limits.validate().is_err());
+        }
+
+        #[test]
+        fn proptest_resource_limits_validation_accepts_positive_limits(
+            max_events in 1u64..1_000_000,
+            max_wall_clock_ms in 1u64..1_000_000,
+            memory_warning_events in 1u64..1_000_000,
+            max_concurrent in 1u32..1024,
+            watchdog_timeout_ms in 1u64..1_000_000,
+        ) {
+            let limits = ResourceLimits {
+                max_events,
+                max_wall_clock_ms,
+                memory_warning_events,
+                max_concurrent,
+                watchdog_timeout_ms,
+            };
+
+            prop_assert_eq!(limits.validate(), Ok(()));
+        }
     }
 
     // ── ResourceTracker ─────────────────────────────────────────────────
@@ -482,9 +619,7 @@ watchdog_timeout_ms = 5000
     fn tracker_events_within_limit() {
         let limits = ResourceLimits {
             max_events: 10,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            ..Default::default()
+            ..non_interfering_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..10u64 {
@@ -498,9 +633,7 @@ watchdog_timeout_ms = 5000
     fn tracker_halts_at_event_limit() {
         let limits = ResourceLimits {
             max_events: 5,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            ..Default::default()
+            ..non_interfering_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..5u64 {
@@ -515,10 +648,8 @@ watchdog_timeout_ms = 5000
     #[test]
     fn tracker_wall_clock_halt() {
         let limits = ResourceLimits {
-            max_events: 0,
             max_wall_clock_ms: 1000,
-            memory_warning_events: 0,
-            ..Default::default()
+            ..non_interfering_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         // Within limit.
@@ -535,10 +666,8 @@ watchdog_timeout_ms = 5000
     #[test]
     fn tracker_memory_warning() {
         let limits = ResourceLimits {
-            max_events: 0,
-            max_wall_clock_ms: 0,
             memory_warning_events: 5,
-            ..Default::default()
+            ..non_interfering_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..4u64 {
@@ -558,11 +687,8 @@ watchdog_timeout_ms = 5000
     #[test]
     fn tracker_watchdog_detects_stall() {
         let limits = ResourceLimits {
-            max_events: 0,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
             watchdog_timeout_ms: 1000,
-            ..Default::default()
+            ..non_interfering_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         tracker.record_event(100); // progress at 100ms.
@@ -581,9 +707,7 @@ watchdog_timeout_ms = 5000
     fn tracker_violations_accumulate() {
         let limits = ResourceLimits {
             max_events: 3,
-            max_wall_clock_ms: 0,
-            memory_warning_events: 0,
-            ..Default::default()
+            ..non_interfering_limits()
         };
         let tracker = ResourceTracker::new(limits, 0);
         for i in 0..5u64 {
@@ -704,30 +828,24 @@ watchdog_timeout_ms = 5000
         assert!(v.to_string().contains("write_pane"));
     }
 
-    // ── Disabled limits (0 means no limit) ──────────────────────────────
+    // ── Invalid zero limits ─────────────────────────────────────────────
 
     #[test]
-    fn disabled_event_limit() {
+    fn zero_limits_normalize_to_defaults_for_direct_tracker_construction() {
         let limits = ResourceLimits {
             max_events: 0,
             max_wall_clock_ms: 0,
             memory_warning_events: 0,
+            max_concurrent: 0,
             watchdog_timeout_ms: 0,
-            ..Default::default()
         };
         let tracker = ResourceTracker::new(limits, 0);
-        for i in 0..1000u64 {
-            assert_eq!(tracker.record_event(i), CheckResult::Ok);
-        }
-    }
-
-    #[test]
-    fn disabled_watchdog() {
-        let limits = ResourceLimits {
-            watchdog_timeout_ms: 0,
-            ..Default::default()
-        };
-        let tracker = ResourceTracker::new(limits, 0);
-        assert_eq!(tracker.check_watchdog(999_999), CheckResult::Ok);
+        assert_eq!(
+            tracker.check_watchdog(ResourceLimits::default().watchdog_timeout_ms + 1),
+            CheckResult::Halt(LimitViolation::WatchdogTimeout {
+                timeout_ms: ResourceLimits::default().watchdog_timeout_ms,
+                stall_ms: ResourceLimits::default().watchdog_timeout_ms + 1,
+            })
+        );
     }
 }

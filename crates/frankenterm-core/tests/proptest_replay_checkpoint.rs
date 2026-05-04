@@ -536,4 +536,38 @@ proptest! {
                 "checkpoint vclock must not decrease");
         }
     }
+
+    // ── br-ft-cnxnr: resume_from validates run_id + schema ───────────────
+
+    /// br-ft-cnxnr: for any (checkpointer_run, checkpoint_run,
+    /// checkpoint_version) triple, resume_from accepts iff the
+    /// run_ids match AND the schema version equals the engine's
+    /// CHECKPOINT_VERSION constant. Pin the trust-boundary
+    /// contract against fuzzed input.
+    #[test]
+    fn cp5_resume_validates_run_id_and_schema_ft_cnxnr(
+        ckpt_run in "[a-z]{2,8}",
+        state_run in "[a-z]{2,8}",
+        version_choice in 0u8..=2u8,
+    ) {
+        let ckpt = ReplayCheckpointer::with_defaults(ckpt_run.clone());
+        let mut state = CheckpointState::new(state_run.clone());
+        // Three version choices: canonical, v0 (stale), or empty.
+        match version_choice {
+            0 => {} // keep canonical
+            1 => state.checkpoint_version = "ft.replay.checkpoint.v0".into(),
+            _ => state.checkpoint_version = String::new(),
+        }
+        let result = ckpt.resume_from(&state);
+        let canonical_version = state.checkpoint_version
+            == frankenterm_core_replay::replay_checkpoint::CHECKPOINT_VERSION;
+        let runs_match = ckpt_run == state_run;
+        let should_accept = canonical_version && runs_match;
+        prop_assert_eq!(
+            result.is_ok(),
+            should_accept,
+            "br-ft-cnxnr: resume must accept iff schema canonical AND run_ids match; canonical_version={} runs_match={}",
+            canonical_version, runs_match
+        );
+    }
 }

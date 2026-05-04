@@ -247,29 +247,51 @@ For atomic-batch semantics (rollback on any error), wrap the
 ```rust
 backend.execute("BEGIN")?;
 match backend.execute_many(sql, &rows) {
-    Ok(count) => {
-        backend.execute("COMMIT")?;
-        Ok(count)
-    }
-    Err(e) => {
-        // Best-effort ROLLBACK — even if it fails (e.g., the
-        // connection is already in a bad state), propagate the
-        // ORIGINAL error rather than masking it with a rollback
-        // failure. SQLite auto-rolls back on most failure modes
-        // anyway; the explicit ROLLBACK here closes the
-        // statement-level rollback that constraint violations
-        // perform without ending the surrounding transaction.
+    Ok(count) => match backend.execute("COMMIT") {
+        Ok(_) => Ok(count),
+        Err(commit_err) => {
+            // COMMIT can fail without auto-rolling back. The
+            // canonical case is SQLITE_BUSY: another connection
+            // holds a SHARED lock so this writer can't elevate
+            // to EXCLUSIVE for the commit. Per SQLite docs the
+            // transaction stays open in that case (and in
+            // SQLITE_FULL / SQLITE_IOERR the post-COMMIT state
+            // is indeterminate). Attempt ROLLBACK to release
+            // locks for the next writer, but suppress its error
+            // so the ORIGINAL commit failure surfaces.
+            let _ = backend.execute("ROLLBACK");
+            Err(commit_err)
+        }
+    },
+    Err(batch_err) => {
+        // execute_many error: the offending statement is
+        // statement-level rolled back by SQLite, but the
+        // surrounding transaction stays open (constraint
+        // violations end the statement, not the transaction).
+        // The explicit ROLLBACK closes the transaction. Same
+        // suppress-and-propagate pattern: ROLLBACK is
+        // best-effort and must not mask the batch failure.
         let _ = backend.execute("ROLLBACK");
-        Err(e)
+        Err(batch_err)
     }
 }
 ```
 
-Note: do NOT propagate ROLLBACK errors with `?` — that masks
-the original failure. Do NOT skip the COMMIT error: a failed
-COMMIT means the data was NOT persisted, so the caller needs to
-know. SQLite auto-rolls back on COMMIT failure, so no explicit
-ROLLBACK is required after a failed COMMIT.
+Notes:
+
+- **Do NOT propagate ROLLBACK errors with `?`** — that masks the
+  original failure. ROLLBACK is best-effort; the caller cares
+  about the operation that failed, not the cleanup.
+- **Do NOT skip the COMMIT error path** — a failed COMMIT means
+  the data was NOT persisted, AND (per SQLite) the transaction
+  may still be open. Both pieces of state matter to the caller.
+- **Single-batch optimization**: if the entire body of
+  `execute_many` is the only DML in the transaction, the
+  surrounding BEGIN/COMMIT contributes nothing — `execute_many`
+  inside a connection that's already in autocommit mode is
+  itself per-row autocommit. Skip the wrapper unless you have
+  multiple `execute_many` (or other DML) in the same logical
+  unit.
 
 The trait substrate landed under [`ft-qgj81`][qgj81] slice 5.
 

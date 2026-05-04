@@ -2124,11 +2124,34 @@ impl RuntimeTelemetryEventBuilder {
 // Telemetry log (bounded buffer)
 // =============================================================================
 
+/// br-ft-6k2wi: default in-memory event retention for the runtime
+/// telemetry log. Matches the pre-fix `Default::default()` value
+/// (2048) so existing callers see no behavior change.
+pub const DEFAULT_RUNTIME_TELEMETRY_LOG_EVENTS: usize = 2048;
+
+/// br-ft-6k2wi: hard upper bound on the in-memory event retention
+/// for the runtime telemetry log. Matches the order of magnitude of
+/// the existing capacity-telemetry caps (`MAX_SWARM_CAPACITY_LEDGER_RECORDS
+/// = 8192`); the log is process-global and long-lived, so a malformed
+/// config that sets `max_events = usize::MAX` would otherwise turn it
+/// into an unbounded memory sink under high event rates. The
+/// normalization clamps to this cap so the bounded-buffer doc
+/// contract holds for every code path that emits to the log.
+pub const MAX_RUNTIME_TELEMETRY_LOG_EVENTS: usize = 65_536;
+
 /// Configuration for the runtime telemetry log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuntimeTelemetryLogConfig {
     /// Maximum events retained in the in-memory buffer.
+    ///
+    /// br-ft-6k2wi: caller-supplied value; clamped to
+    /// `[1, MAX_RUNTIME_TELEMETRY_LOG_EVENTS]` at the
+    /// `RuntimeTelemetryLog::new` boundary via
+    /// [`RuntimeTelemetryLogConfig::normalized_max_events`]. A value
+    /// of `0` is documented to fall back to the cap-1 behavior
+    /// (one-event ring), not "disable retention" — use the
+    /// `enabled: false` field for that.
     pub max_events: usize,
     /// Whether telemetry collection is enabled.
     pub enabled: bool,
@@ -2137,9 +2160,23 @@ pub struct RuntimeTelemetryLogConfig {
 impl Default for RuntimeTelemetryLogConfig {
     fn default() -> Self {
         Self {
-            max_events: 2048,
+            max_events: DEFAULT_RUNTIME_TELEMETRY_LOG_EVENTS,
             enabled: true,
         }
+    }
+}
+
+impl RuntimeTelemetryLogConfig {
+    /// br-ft-6k2wi: clamp `max_events` to
+    /// `[1, MAX_RUNTIME_TELEMETRY_LOG_EVENTS]`. Zero is treated as
+    /// 1 (a degenerate single-event ring) rather than "disable" —
+    /// the `enabled` field is the disable knob. The clamp applies
+    /// at log construction time so the bounded-buffer doc contract
+    /// holds for every code path.
+    #[must_use]
+    pub fn normalized_max_events(&self) -> usize {
+        self.max_events
+            .clamp(1, MAX_RUNTIME_TELEMETRY_LOG_EVENTS)
     }
 }
 
@@ -2159,8 +2196,18 @@ pub struct RuntimeTelemetryLog {
 
 impl RuntimeTelemetryLog {
     /// Create a new telemetry log with the given configuration.
+    ///
+    /// br-ft-6k2wi: `config.max_events` is clamped to
+    /// `[1, MAX_RUNTIME_TELEMETRY_LOG_EVENTS]` via
+    /// [`RuntimeTelemetryLogConfig::normalized_max_events`] before
+    /// the value is stored on the log. The stored config carries
+    /// the *normalized* value so callers reading `log.config()`
+    /// see the actual bound in effect, and the eviction loop in
+    /// `append` operates against a finite bound regardless of
+    /// what the original config supplied.
     #[must_use]
-    pub fn new(config: RuntimeTelemetryLogConfig) -> Self {
+    pub fn new(mut config: RuntimeTelemetryLogConfig) -> Self {
+        config.max_events = config.normalized_max_events();
         Self {
             config,
             events: VecDeque::new(),
@@ -14978,6 +15025,103 @@ mod tests {
         assert_eq!(snap2.sequence, snap1.sequence);
         assert_eq!(snap2.total_emitted, snap1.total_emitted);
         assert_eq!(snap2.total_evicted, snap1.total_evicted);
+    }
+
+    // ── br-ft-6k2wi: max_events normalization + hard cap ──
+
+    #[test]
+    fn config_normalize_clamps_caller_unbounded_value_ft_6k2wi() {
+        // br-ft-6k2wi: a malformed config that sets max_events to
+        // usize::MAX would otherwise let the in-memory log grow
+        // without bound. Normalization clamps to the hard cap.
+        let cfg = RuntimeTelemetryLogConfig {
+            max_events: usize::MAX,
+            enabled: true,
+        };
+        assert_eq!(
+            cfg.normalized_max_events(),
+            MAX_RUNTIME_TELEMETRY_LOG_EVENTS
+        );
+    }
+
+    #[test]
+    fn config_normalize_promotes_zero_to_one_ft_6k2wi() {
+        // br-ft-6k2wi: zero is treated as a degenerate single-event
+        // ring (clamp lower bound = 1). The disable knob is the
+        // `enabled` field, not max_events=0.
+        let cfg = RuntimeTelemetryLogConfig {
+            max_events: 0,
+            enabled: true,
+        };
+        assert_eq!(cfg.normalized_max_events(), 1);
+    }
+
+    #[test]
+    fn config_normalize_preserves_in_range_value_ft_6k2wi() {
+        let cfg = RuntimeTelemetryLogConfig {
+            max_events: 1024,
+            enabled: true,
+        };
+        assert_eq!(cfg.normalized_max_events(), 1024);
+    }
+
+    #[test]
+    fn log_new_clamps_caller_unbounded_max_events_ft_6k2wi() {
+        // The constructor must apply normalization so the stored
+        // `config.max_events` (visible via `log.config()`) reflects
+        // the actual bound and the eviction loop operates against
+        // it.
+        let cfg = RuntimeTelemetryLogConfig {
+            max_events: usize::MAX,
+            enabled: true,
+        };
+        let log = RuntimeTelemetryLog::new(cfg);
+        assert_eq!(log.config.max_events, MAX_RUNTIME_TELEMETRY_LOG_EVENTS);
+    }
+
+    #[test]
+    fn log_buffer_never_exceeds_normalized_cap_ft_6k2wi() {
+        // Append more events than the configured (unbounded) cap;
+        // the buffer must respect the normalized cap, not the raw
+        // caller value.
+        let cfg = RuntimeTelemetryLogConfig {
+            // Tiny cap so the test runs fast.
+            max_events: 4,
+            enabled: true,
+        };
+        let mut log = RuntimeTelemetryLog::new(cfg);
+        for i in 0..32u64 {
+            log.emit(
+                RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                    .reason(format!("event-{i}")),
+            );
+        }
+        let snap = log.snapshot();
+        assert_eq!(snap.buffered_events, 4, "buffer must respect cap");
+        assert_eq!(snap.total_emitted, 32);
+        assert_eq!(snap.total_evicted, 28);
+    }
+
+    #[test]
+    fn log_with_zero_max_events_keeps_one_event_ft_6k2wi() {
+        // Document the zero-config behavior: the log keeps exactly
+        // one event (the most recent). This matches the clamp
+        // lower bound of 1.
+        let cfg = RuntimeTelemetryLogConfig {
+            max_events: 0,
+            enabled: true,
+        };
+        let mut log = RuntimeTelemetryLog::new(cfg);
+        for i in 0..5u64 {
+            log.emit(
+                RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                    .reason(format!("event-{i}")),
+            );
+        }
+        let snap = log.snapshot();
+        assert_eq!(snap.buffered_events, 1, "zero-config promotes to 1");
+        assert_eq!(snap.total_emitted, 5);
+        assert_eq!(snap.total_evicted, 4);
     }
 
     // ── Policy metrics dashboard adapter ──

@@ -1049,17 +1049,25 @@ mod tests {
         // unconditionally. Post-fix a rejected resume must leave
         // them as they were.
         let config = CheckpointConfig::default();
-        let ckpt = ReplayCheckpointer::new("run-H".into(), config, FailureMode::Default);
-        ckpt.halt(ReplayError {
-            kind: ReplayErrorKind::CorruptEvent,
-            event_position: 5,
-            event_id: None,
-            message: "test halt".into(),
-            context: None,
-        });
+        let ckpt = ReplayCheckpointer::new("run-H".into(), config, FailureMode::Strict);
+        // Strict mode + handle_error halts without checkpointing.
+        let _ = ckpt.handle_error(
+            ReplayError {
+                kind: ReplayErrorKind::CorruptEvent,
+                event_position: 5,
+                event_id: None,
+                message: "test halt".into(),
+                context: None,
+            },
+            0,
+        );
+        assert!(ckpt.is_halted(), "preconditions: handle_error should halt under Strict");
         let foreign = CheckpointState::new("run-OTHER".into());
         let _ = ckpt.resume_from(&foreign).expect_err("must reject");
         // Halt state preserved across rejection.
-        assert!(ckpt.is_halted(), "br-ft-cnxnr: rejected resume must NOT clear halted flag");
+        assert!(
+            ckpt.is_halted(),
+            "br-ft-cnxnr: rejected resume must NOT clear halted flag"
+        );
     }
 }

@@ -86,8 +86,14 @@ pub struct RiskScore {
 pub struct AggregateRisk {
     /// Highest individual severity.
     pub max_severity: DivergenceSeverity,
-    /// Sum of all individual severity scores.
+    /// Sum of confidence-adjusted, impact-weighted individual risk scores.
     pub total_risk_score: u64,
+    /// Sum of unweighted individual severity scores.
+    pub base_severity_score: u64,
+    /// Sum of all downstream impact-radius counts.
+    pub total_impact_radius: u64,
+    /// Mean normalized confidence across scored divergences.
+    pub average_confidence: f64,
     /// Count of Critical divergences.
     pub critical_count: u64,
     /// Count of High divergences.
@@ -110,6 +116,9 @@ impl AggregateRisk {
             return Self {
                 max_severity: DivergenceSeverity::Info,
                 total_risk_score: 0,
+                base_severity_score: 0,
+                total_impact_radius: 0,
+                average_confidence: 1.0,
                 critical_count: 0,
                 high_count: 0,
                 medium_count: 0,
@@ -121,6 +130,9 @@ impl AggregateRisk {
 
         let mut max_severity = DivergenceSeverity::Info;
         let mut total_risk_score = 0u64;
+        let mut base_severity_score = 0u64;
+        let mut total_impact_radius = 0u64;
+        let mut total_confidence = 0.0f64;
         let mut critical_count = 0u64;
         let mut high_count = 0u64;
         let mut medium_count = 0u64;
@@ -131,7 +143,10 @@ impl AggregateRisk {
             if score.severity > max_severity {
                 max_severity = score.severity;
             }
-            total_risk_score += score.severity.score() as u64;
+            base_severity_score = base_severity_score.saturating_add(score.severity.score() as u64);
+            total_risk_score = total_risk_score.saturating_add(weighted_score(score));
+            total_impact_radius = total_impact_radius.saturating_add(score.impact_radius);
+            total_confidence += normalized_confidence(score.confidence);
             match score.severity {
                 DivergenceSeverity::Critical => critical_count += 1,
                 DivergenceSeverity::High => high_count += 1,
@@ -141,17 +156,22 @@ impl AggregateRisk {
             }
         }
 
-        let recommendation = if critical_count > 0 || high_count > 0 {
-            Recommendation::Block
-        } else if medium_count > 0 {
-            Recommendation::Review
-        } else {
-            Recommendation::Pass
-        };
+        let average_confidence = total_confidence / scores.len() as f64;
+        let recommendation =
+            if critical_count > 0 || high_count > 0 || total_risk_score >= BLOCK_TOTAL_RISK_SCORE {
+                Recommendation::Block
+            } else if medium_count > 0 || total_risk_score >= REVIEW_TOTAL_RISK_SCORE {
+                Recommendation::Review
+            } else {
+                Recommendation::Pass
+            };
 
         Self {
             max_severity,
             total_risk_score,
+            base_severity_score,
+            total_impact_radius,
+            average_confidence,
             critical_count,
             high_count,
             medium_count,
@@ -159,6 +179,34 @@ impl AggregateRisk {
             info_count,
             recommendation,
         }
+    }
+}
+
+const REVIEW_TOTAL_RISK_SCORE: u64 = 10;
+const BLOCK_TOTAL_RISK_SCORE: u64 = 25;
+
+fn normalized_confidence(confidence: f64) -> f64 {
+    if confidence.is_finite() {
+        confidence.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn weighted_score(score: &RiskScore) -> u64 {
+    let base = score.severity.score() as u64;
+    let impact_multiplier = score.impact_radius.saturating_add(1);
+    let impact_weighted = base.saturating_mul(impact_multiplier);
+    let confidence = normalized_confidence(score.confidence);
+    if confidence <= 0.0 {
+        return 0;
+    }
+
+    let weighted = (impact_weighted as f64) * confidence;
+    if weighted >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        weighted.ceil() as u64
     }
 }
 
@@ -490,6 +538,7 @@ impl Default for RiskScorer {
 mod tests {
     use super::*;
     use crate::replay_decision_diff::{DivergenceNode, DivergenceType, RootCause};
+    use proptest::prelude::*;
 
     fn make_divergence(dtype: DivergenceType, rule_id: &str, root_cause: RootCause) -> Divergence {
         let node = DivergenceNode {
@@ -544,6 +593,25 @@ mod tests {
             root_cause: RootCause::DroppedDecision {
                 rule_id: rule_id.into(),
             },
+        }
+    }
+
+    fn severity_from_rank(rank: u8) -> DivergenceSeverity {
+        match rank % 5 {
+            0 => DivergenceSeverity::Info,
+            1 => DivergenceSeverity::Low,
+            2 => DivergenceSeverity::Medium,
+            3 => DivergenceSeverity::High,
+            _ => DivergenceSeverity::Critical,
+        }
+    }
+
+    fn score_with(severity: DivergenceSeverity, impact_radius: u64, confidence: f64) -> RiskScore {
+        RiskScore {
+            severity,
+            impact_radius,
+            confidence,
+            explanation: String::new(),
         }
     }
 
@@ -781,6 +849,34 @@ mod tests {
         assert_eq!(agg.medium_count, 1);
     }
 
+    // ── Aggregate weighting ────────────────────────────────────────────
+
+    #[test]
+    fn aggregate_uses_impact_radius_and_confidence_ft_9fna2() {
+        let low_blast =
+            AggregateRisk::from_scores(&[score_with(DivergenceSeverity::Medium, 0, 1.0)]);
+        let high_blast =
+            AggregateRisk::from_scores(&[score_with(DivergenceSeverity::Medium, 9, 1.0)]);
+        assert_eq!(
+            low_blast.base_severity_score,
+            high_blast.base_severity_score
+        );
+        assert!(high_blast.total_risk_score > low_blast.total_risk_score);
+        assert_eq!(high_blast.total_impact_radius, 9);
+
+        let low_confidence =
+            AggregateRisk::from_scores(&[score_with(DivergenceSeverity::Medium, 9, 0.1)]);
+        assert!(high_blast.total_risk_score > low_confidence.total_risk_score);
+        assert!(low_confidence.average_confidence < high_blast.average_confidence);
+    }
+
+    #[test]
+    fn aggregate_blocks_high_blast_radius_medium_ft_9fna2() {
+        let agg = AggregateRisk::from_scores(&[score_with(DivergenceSeverity::Medium, 4, 1.0)]);
+        assert_eq!(agg.total_risk_score, BLOCK_TOTAL_RISK_SCORE);
+        assert_eq!(agg.recommendation, Recommendation::Block);
+    }
+
     // ── Custom severity rule ───────────────────────────────────────────
 
     #[test]
@@ -872,21 +968,51 @@ mod tests {
     #[test]
     fn total_risk_score() {
         let scores = vec![
-            RiskScore {
-                severity: DivergenceSeverity::Info,
-                impact_radius: 0,
-                confidence: 1.0,
-                explanation: String::new(),
-            },
-            RiskScore {
-                severity: DivergenceSeverity::Critical,
-                impact_radius: 0,
-                confidence: 1.0,
-                explanation: String::new(),
-            },
+            score_with(DivergenceSeverity::Info, 0, 1.0),
+            score_with(DivergenceSeverity::Critical, 0, 1.0),
         ];
         let agg = AggregateRisk::from_scores(&scores);
         assert_eq!(agg.total_risk_score, 1 + 25); // Info(1) + Critical(25)
+        assert_eq!(agg.base_severity_score, 1 + 25);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 96,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn aggregate_total_increases_with_impact_radius_ft_9fna2(
+            severity_rank in 0u8..=4,
+            base_radius in 0u64..=128,
+            extra_radius in 1u64..=128,
+        ) {
+            let severity = severity_from_rank(severity_rank);
+            let base = AggregateRisk::from_scores(&[score_with(severity, base_radius, 1.0)]);
+            let higher = AggregateRisk::from_scores(&[
+                score_with(severity, base_radius.saturating_add(extra_radius), 1.0),
+            ]);
+
+            prop_assert_eq!(base.base_severity_score, higher.base_severity_score);
+            prop_assert!(higher.total_risk_score > base.total_risk_score);
+        }
+
+        #[test]
+        fn aggregate_total_increases_with_confidence_ft_9fna2(
+            severity_rank in 0u8..=4,
+            low_confidence_pct in 0u8..=50,
+            high_confidence_pct in 51u8..=100,
+        ) {
+            let severity = severity_from_rank(severity_rank);
+            let low_confidence = f64::from(low_confidence_pct) / 100.0;
+            let high_confidence = f64::from(high_confidence_pct) / 100.0;
+            let low = AggregateRisk::from_scores(&[score_with(severity, 100, low_confidence)]);
+            let high = AggregateRisk::from_scores(&[score_with(severity, 100, high_confidence)]);
+
+            prop_assert_eq!(low.base_severity_score, high.base_severity_score);
+            prop_assert!(high.total_risk_score > low.total_risk_score);
+        }
     }
 
     // ── SeverityConfig from TOML ───────────────────────────────────────

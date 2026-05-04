@@ -20,6 +20,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::tantivy_ingest::IndexDocumentFields;
 
+/// Maximum results a single lexical search page may request.
+pub const MAX_SEARCH_LIMIT: usize = 500;
+/// Maximum UTF-8 bytes accepted in the free-text query.
+pub const MAX_SEARCH_TEXT_BYTES: usize = 16 * 1024;
+/// Maximum tokenized terms accepted from one query.
+pub const MAX_QUERY_TERMS: usize = 128;
+/// Maximum UTF-8 bytes accepted in one tokenized query term.
+pub const MAX_QUERY_TERM_BYTES: usize = 256;
+/// Maximum snippet fragment length accepted from query config.
+pub const MAX_SNIPPET_FRAGMENT_LEN: usize = 4096;
+/// Maximum snippets accepted per hit.
+pub const MAX_SNIPPET_FRAGMENTS: usize = 16;
+/// Maximum UTF-8 bytes accepted in either highlight marker.
+pub const MAX_HIGHLIGHT_TAG_BYTES: usize = 64;
+/// Maximum accepted boost for a single field.
+pub const MAX_FIELD_BOOST: f32 = 100.0;
+
 // ---------------------------------------------------------------------------
 // Query parameters
 // ---------------------------------------------------------------------------
@@ -81,6 +98,13 @@ impl SearchQuery {
         self
     }
 
+    /// Set snippet extraction bounds.
+    #[must_use]
+    pub fn with_snippet_config(mut self, snippet_config: SnippetConfig) -> Self {
+        self.snippet_config = snippet_config;
+        self
+    }
+
     /// Effective boost for the `text` field.
     pub fn text_boost(&self) -> f32 {
         *self.field_boosts.get("text").unwrap_or(&1.0)
@@ -89,6 +113,41 @@ impl SearchQuery {
     /// Effective boost for the `text_symbols` field.
     pub fn text_symbols_boost(&self) -> f32 {
         *self.field_boosts.get("text_symbols").unwrap_or(&1.25)
+    }
+
+    /// Validate caller-controlled knobs before a search backend consumes them.
+    pub fn validate(&self) -> Result<(), SearchError> {
+        if self.text.len() > MAX_SEARCH_TEXT_BYTES {
+            return invalid_query(format!("query text exceeds {MAX_SEARCH_TEXT_BYTES} bytes"));
+        }
+
+        let terms = tokenize_query(&self.text);
+        if terms.is_empty() && self.filters.is_empty() {
+            return invalid_query("query must have terms or at least one filter");
+        }
+        if terms.len() > MAX_QUERY_TERMS {
+            return invalid_query(format!("query has more than {MAX_QUERY_TERMS} terms"));
+        }
+        if let Some(term) = terms.iter().find(|term| term.len() > MAX_QUERY_TERM_BYTES) {
+            return invalid_query(format!(
+                "query term exceeds {MAX_QUERY_TERM_BYTES} bytes: {term:?}"
+            ));
+        }
+
+        self.pagination.validate()?;
+        self.snippet_config.validate()?;
+        for (field, boost) in &self.field_boosts {
+            if !boost.is_finite() {
+                return invalid_query(format!("field boost for {field:?} must be finite"));
+            }
+            if !(0.0..=MAX_FIELD_BOOST).contains(boost) {
+                return invalid_query(format!(
+                    "field boost for {field:?} must be in 0.0..={MAX_FIELD_BOOST}"
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -311,7 +370,16 @@ impl TieBreakKey {
 }
 
 fn score_millis(score: f32) -> i64 {
-    (score * 1000.0) as i64
+    let scaled = f64::from(score) * 1000.0;
+    if !scaled.is_finite() {
+        0
+    } else if scaled > i64::MAX as f64 {
+        i64::MAX
+    } else if scaled < i64::MIN as f64 {
+        i64::MIN
+    } else {
+        scaled as i64
+    }
 }
 
 fn apply_sort_direction(ordering: std::cmp::Ordering, descending: bool) -> std::cmp::Ordering {
@@ -381,6 +449,19 @@ impl Default for Pagination {
             limit: 20,
             after: None,
         }
+    }
+}
+
+impl Pagination {
+    /// Validate page sizing before collection.
+    pub fn validate(&self) -> Result<(), SearchError> {
+        if self.limit == 0 {
+            return invalid_query("pagination limit must be at least 1");
+        }
+        if self.limit > MAX_SEARCH_LIMIT {
+            return invalid_query(format!("pagination limit must be <= {MAX_SEARCH_LIMIT}"));
+        }
+        Ok(())
     }
 }
 
@@ -455,6 +536,36 @@ impl Default for SnippetConfig {
             highlight_post: "»".to_string(),
             enabled: true,
         }
+    }
+}
+
+impl SnippetConfig {
+    /// Validate snippet sizing before extraction.
+    pub fn validate(&self) -> Result<(), SearchError> {
+        if self.max_fragment_len == 0 {
+            return invalid_query("snippet max_fragment_len must be at least 1");
+        }
+        if self.max_fragment_len > MAX_SNIPPET_FRAGMENT_LEN {
+            return invalid_query(format!(
+                "snippet max_fragment_len must be <= {MAX_SNIPPET_FRAGMENT_LEN}"
+            ));
+        }
+        if self.max_fragments == 0 {
+            return invalid_query("snippet max_fragments must be at least 1");
+        }
+        if self.max_fragments > MAX_SNIPPET_FRAGMENTS {
+            return invalid_query(format!(
+                "snippet max_fragments must be <= {MAX_SNIPPET_FRAGMENTS}"
+            ));
+        }
+        if self.highlight_pre.len() > MAX_HIGHLIGHT_TAG_BYTES
+            || self.highlight_post.len() > MAX_HIGHLIGHT_TAG_BYTES
+        {
+            return invalid_query(format!(
+                "snippet highlight tags must be <= {MAX_HIGHLIGHT_TAG_BYTES} bytes"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -671,6 +782,12 @@ impl std::fmt::Display for SearchError {
 
 impl std::error::Error for SearchError {}
 
+fn invalid_query<T>(reason: impl Into<String>) -> Result<T, SearchError> {
+    Err(SearchError::InvalidQuery {
+        reason: reason.into(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // LexicalSearchService trait
 // ---------------------------------------------------------------------------
@@ -792,11 +909,7 @@ impl LexicalSearchService for InMemorySearchService {
     fn search(&self, query: &SearchQuery) -> Result<SearchResults, SearchError> {
         let start = std::time::Instant::now();
 
-        if query.text.is_empty() && query.filters.is_empty() {
-            return Err(SearchError::InvalidQuery {
-                reason: "query must have text or at least one filter".to_string(),
-            });
-        }
+        query.validate()?;
 
         let terms = tokenize_query(&query.text);
         let text_boost = query.text_boost();
@@ -873,6 +986,8 @@ impl LexicalSearchService for InMemorySearchService {
     }
 
     fn count(&self, query: &SearchQuery) -> Result<u64, SearchError> {
+        query.validate()?;
+
         let terms = tokenize_query(&query.text);
 
         let count = self
@@ -1172,11 +1287,7 @@ impl LexicalSearchService for TantivySearchService {
 
         let start = std::time::Instant::now();
 
-        if query.text.is_empty() && query.filters.is_empty() {
-            return Err(SearchError::InvalidQuery {
-                reason: "query must have text or at least one filter".to_string(),
-            });
-        }
+        query.validate()?;
 
         let searcher = self.reader.searcher();
 
@@ -1194,7 +1305,7 @@ impl LexicalSearchService for TantivySearchService {
         };
 
         // Fetch more than limit to account for post-filters
-        let fetch_limit = (query.pagination.limit + 1) * 2;
+        let fetch_limit = query.pagination.limit.saturating_add(1).saturating_mul(2);
         let top_docs = searcher
             .search(
                 &final_query,
@@ -1286,6 +1397,8 @@ impl LexicalSearchService for TantivySearchService {
 
     fn count(&self, query: &SearchQuery) -> Result<u64, SearchError> {
         use tantivy::query::{BooleanQuery, Occur};
+
+        query.validate()?;
 
         let searcher = self.reader.searcher();
 
@@ -1532,6 +1645,71 @@ mod tests {
         };
         let err = svc.search(&q).unwrap_err();
         assert!(matches!(err, SearchError::InvalidQuery { .. }));
+    }
+
+    #[test]
+    fn query_validate_rejects_unbounded_and_non_finite_knobs() {
+        let invalid_queries = [
+            SearchQuery::simple("hello").with_limit(0),
+            SearchQuery::simple("hello").with_limit(MAX_SEARCH_LIMIT + 1),
+            SearchQuery::simple(
+                (0..=MAX_QUERY_TERMS)
+                    .map(|idx| format!("t{idx}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            SearchQuery::simple("a".repeat(MAX_QUERY_TERM_BYTES + 1)),
+            SearchQuery::simple("hello").with_snippet_config(SnippetConfig {
+                max_fragment_len: MAX_SNIPPET_FRAGMENT_LEN + 1,
+                ..Default::default()
+            }),
+            SearchQuery::simple("hello").with_snippet_config(SnippetConfig {
+                max_fragments: 0,
+                ..Default::default()
+            }),
+            SearchQuery::simple("hello").with_snippet_config(SnippetConfig {
+                max_fragments: MAX_SNIPPET_FRAGMENTS + 1,
+                ..Default::default()
+            }),
+            SearchQuery::simple("hello").with_snippet_config(SnippetConfig {
+                highlight_pre: "x".repeat(MAX_HIGHLIGHT_TAG_BYTES + 1),
+                ..Default::default()
+            }),
+            SearchQuery {
+                field_boosts: HashMap::from([("text".to_string(), f32::NAN)]),
+                ..SearchQuery::simple("hello")
+            },
+            SearchQuery {
+                field_boosts: HashMap::from([("text".to_string(), -0.1)]),
+                ..SearchQuery::simple("hello")
+            },
+            SearchQuery {
+                field_boosts: HashMap::from([("text".to_string(), MAX_FIELD_BOOST + 0.1)]),
+                ..SearchQuery::simple("hello")
+            },
+        ];
+
+        for query in invalid_queries {
+            assert!(matches!(
+                query.validate(),
+                Err(SearchError::InvalidQuery { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn in_memory_search_and_count_reject_invalid_query_knobs() {
+        let svc = test_service();
+        let q = SearchQuery::simple("hello").with_limit(0);
+
+        assert!(matches!(
+            svc.search(&q),
+            Err(SearchError::InvalidQuery { .. })
+        ));
+        assert!(matches!(
+            svc.count(&q),
+            Err(SearchError::InvalidQuery { .. })
+        ));
     }
 
     // =========================================================================
@@ -2714,6 +2892,21 @@ mod tests {
         };
         let err = svc.search(&q).unwrap_err();
         assert!(matches!(err, SearchError::InvalidQuery { .. }));
+    }
+
+    #[test]
+    fn tantivy_search_and_count_reject_invalid_query_knobs() {
+        let (svc, _tmp) = tantivy_service();
+        let q = SearchQuery::simple("hello").with_limit(MAX_SEARCH_LIMIT + 1);
+
+        assert!(matches!(
+            svc.search(&q),
+            Err(SearchError::InvalidQuery { .. })
+        ));
+        assert!(matches!(
+            svc.count(&q),
+            Err(SearchError::InvalidQuery { .. })
+        ));
     }
 
     #[test]
