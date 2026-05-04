@@ -768,7 +768,10 @@ mod tests {
             let diff = eval.evaluate_cycle(1, 1000, &recs, log.events());
 
             prop_assert_eq!(diff.emissions_count, 1);
-            prop_assert_eq!(diff.missing_executions, vec![("b2".to_string(), "a2".to_string())]);
+            prop_assert_eq!(
+                &diff.missing_executions,
+                &vec![("b2".to_string(), "a2".to_string())]
+            );
             prop_assert!((diff.dispatch_rate - 0.5).abs() < f64::EPSILON);
             prop_assert!(diff.fidelity_score < 0.8);
             prop_assert!(!diff.is_healthy());
@@ -817,8 +820,8 @@ mod tests {
                 prop_assert!(diff.is_healthy());
             } else {
                 prop_assert_eq!(
-                    diff.missing_executions,
-                    vec![("b-current".to_string(), "a-current".to_string())]
+                    &diff.missing_executions,
+                    &vec![("b-current".to_string(), "a-current".to_string())]
                 );
                 prop_assert!((diff.dispatch_rate - 0.0).abs() < f64::EPSILON);
                 prop_assert!(!diff.is_healthy());
@@ -873,8 +876,8 @@ mod tests {
             let diff = eval.evaluate_cycle(1, 1000, &recs, log.events());
 
             prop_assert_eq!(diff.agent_divergences.len(), 1);
-            prop_assert_eq!(diff.agent_divergences[0].recommended_agent, "a1");
-            prop_assert_eq!(diff.agent_divergences[0].actual_agent, "a_other");
+            prop_assert_eq!(&diff.agent_divergences[0].recommended_agent, "a1");
+            prop_assert_eq!(&diff.agent_divergences[0].actual_agent, "a_other");
             prop_assert_eq!(&diff.agent_divergences[0].reason_code, &reason_code);
         }
     }

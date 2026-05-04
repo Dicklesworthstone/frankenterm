@@ -138,7 +138,7 @@ pub(super) fn record_workflows_serde_drop() {
 static WORKFLOWS_PARSE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// br-ft-zhnaw: cumulative count of workflow-decision payloads
-/// that could not be parsed back into a `WorkflowDecision` since
+/// that could not be parsed back into a `WorkflowStepPolicySummary` since
 /// process load. > 0 means investigate consumer schema drift
 /// against the persisted-decision JSON shape.
 #[must_use]
@@ -11927,21 +11927,20 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn workflows_parse_drop_counter_bumps_on_malformed_decision_ft_zhnaw() {
-        // br-ft-zhnaw: a malformed serialized WorkflowDecision
+        // br-ft-zhnaw: a malformed serialized WorkflowStepPolicySummary
         // payload bumps the parse counter exactly once.
         let _guard = workflows_serde_drop_test_lock();
         super::reset_workflows_parse_drop_count_for_test();
 
-        let bad = r#"{"definitely":"not","a":"WorkflowDecision"}"#;
-        let parsed = crate::workflows::engine::WorkflowDecision::parse(bad);
+        let bad = r#"{"definitely":"not","a":"WorkflowStepPolicySummary"}"#;
+        let parsed = crate::workflows::engine::WorkflowStepPolicySummary::parse(bad);
         assert!(parsed.is_none());
         assert_eq!(super::workflows_parse_drop_count(), 1);
 
         // A second malformed parse bumps again.
-        let _ = crate::workflows::engine::WorkflowDecision::parse("{not json");
+        let _ = crate::workflows::engine::WorkflowStepPolicySummary::parse("{not json");
         assert_eq!(super::workflows_parse_drop_count(), 2);
     }
-
 
     #[test]
     fn workflows_parse_drop_counter_independent_of_serde_drop_counter_ft_zhnaw() {
@@ -11951,7 +11950,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
         super::reset_workflows_parse_drop_count_for_test();
         super::reset_workflows_serde_drop_count_for_test();
 
-        let _ = crate::workflows::engine::WorkflowDecision::parse("{bad");
+        let _ = crate::workflows::engine::WorkflowStepPolicySummary::parse("{bad");
         assert_eq!(super::workflows_parse_drop_count(), 1);
         assert_eq!(
             super::workflows_serde_drop_count(),

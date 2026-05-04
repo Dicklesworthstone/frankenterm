@@ -23,7 +23,6 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::byte_compression::{ByteCompressor, CompressionLevel, CompressionStats};
 use crate::pattern_trigger::{
@@ -967,12 +966,14 @@ mod tests {
             TriggerPattern::new("good", TriggerCategory::Custom),
             TriggerPattern::new("   ", TriggerCategory::Custom),
         ];
-        let err = ScanPipeline::try_with_custom_triggers(
+        let err = match ScanPipeline::try_with_custom_triggers(
             ScanPipelineConfig::default(),
             patterns,
             DEFAULT_MAX_TRIGGER_PATTERN_LEN,
-        )
-        .expect_err("empty pattern must reject");
+        ) {
+            Ok(_) => panic!("empty pattern must reject"),
+            Err(err) => err,
+        };
         assert_eq!(err, TriggerScannerError::EmptyPattern { index: 1 });
         assert!(err.to_string().contains("br-ft-djjnj"));
     }
@@ -982,12 +983,14 @@ mod tests {
         use crate::pattern_trigger::TriggerScannerError;
         let big = "a".repeat(2048);
         let patterns = vec![TriggerPattern::new(&big, TriggerCategory::Custom)];
-        let err = ScanPipeline::try_with_custom_triggers(
+        let err = match ScanPipeline::try_with_custom_triggers(
             ScanPipelineConfig::default(),
             patterns,
             1024, // cap below the pattern length
-        )
-        .expect_err("oversized pattern must reject");
+        ) {
+            Ok(_) => panic!("oversized pattern must reject"),
+            Err(err) => err,
+        };
         match err {
             TriggerScannerError::PatternTooLong {
                 index: 0,
@@ -1413,7 +1416,7 @@ mod tests {
             compression_threshold: 16,
             ..Default::default()
         };
-        let pipeline = ScanPipeline::with_config(config);
+        let pipeline = ScanPipeline::new(config);
         let buffer = vec![b'x'; 1024]; // exceeds the 16-byte threshold
         let output = pipeline.process(&buffer);
 
@@ -1454,7 +1457,7 @@ mod tests {
             enable_compression: false,
             ..Default::default()
         };
-        let pipeline = ScanPipeline::with_config(config);
+        let pipeline = ScanPipeline::new(config);
         let output = pipeline.process(b"hello");
 
         assert!(output.compressed.is_none());

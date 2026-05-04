@@ -959,7 +959,10 @@ pub(super) fn handle_stream_deltas(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventStreamChannel, SseEvent, parse_event_stream_channel};
+    use super::{
+        EventStreamChannel, STREAM_MAX_CONSECUTIVE_DROPS, SseEvent, mpsc,
+        parse_event_stream_channel,
+    };
     use crate::web_framework::QueryString;
 
     fn default_limits() -> super::super::WebRuntimeLimits {
@@ -1215,9 +1218,10 @@ mod tests {
 
         // Capacity-1 channel + a pre-filled slot → next send is Full.
         let (tx, _rx) = mpsc::channel::<super::SseEvent>(1);
-        tx.send(super::SseEvent::new("filler"))
-            .await
-            .expect("first send fits in cap=1 channel");
+        assert!(
+            tx.try_send(super::SseEvent::new("filler")).is_ok(),
+            "first send fits in cap=1 channel"
+        );
 
         let mut next_emit_at = std::time::Instant::now();
         let mut consecutive_drops: u64 = 0;
@@ -1266,9 +1270,10 @@ mod tests {
         super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
 
         let (tx, _rx) = mpsc::channel::<super::SseEvent>(1);
-        tx.send(super::SseEvent::new("filler"))
-            .await
-            .expect("first send fits in cap=1 channel");
+        assert!(
+            tx.try_send(super::SseEvent::new("filler")).is_ok(),
+            "first send fits in cap=1 channel"
+        );
 
         let mut next_emit_at = std::time::Instant::now();
         // Pre-load consecutive_drops to 1 below the cap so the next
@@ -1343,8 +1348,7 @@ mod tests {
         super::reset_epoch_clock_anomaly_count_for_test();
 
         // ~2024-01-01 in seconds since epoch.
-        let post_epoch = std::time::UNIX_EPOCH
-            + std::time::Duration::from_secs(1_704_067_200);
+        let post_epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
         let ms = super::epoch_ms_from(post_epoch);
         assert!(ms > 0, "post-epoch ms must be positive, got {ms}");
         assert_eq!(
@@ -1364,8 +1368,7 @@ mod tests {
         let _guard = drop_counter_test_lock();
         super::reset_epoch_clock_anomaly_count_for_test();
 
-        let pre_epoch = std::time::UNIX_EPOCH
-            - std::time::Duration::from_secs(100);
+        let pre_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(100);
         let ms = super::epoch_ms_from(pre_epoch);
         assert_eq!(ms, 0, "pre-epoch must fall back to 0");
         assert_eq!(
@@ -1389,8 +1392,7 @@ mod tests {
         super::reset_sse_events_dropped_count_for_test();
         super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
 
-        let pre_epoch = std::time::UNIX_EPOCH
-            - std::time::Duration::from_secs(50);
+        let pre_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(50);
         let _ = super::epoch_ms_from(pre_epoch);
 
         assert_eq!(super::epoch_clock_anomaly_count(), 1);

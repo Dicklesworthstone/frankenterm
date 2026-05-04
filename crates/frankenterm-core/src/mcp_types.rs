@@ -3079,51 +3079,44 @@ mod tests {
 
     #[test]
     fn validate_event_mutation_string_accepts_normal_input_ft_wztvw() {
-        crate::mcp_types::validate_event_mutation_string("Investigating", "note", 8192)
+        validate_event_mutation_string("Investigating", "note", 8192)
             .expect("normal note must validate");
-        crate::mcp_types::validate_event_mutation_string("ack", "state", 128)
-            .expect("normal state must validate");
-        crate::mcp_types::validate_event_mutation_string("agent-7", "by", 256)
-            .expect("normal actor must validate");
+        validate_event_mutation_string("ack", "state", 128).expect("normal state must validate");
+        validate_event_mutation_string("agent-7", "by", 256).expect("normal actor must validate");
     }
 
     #[test]
     fn validate_event_mutation_string_rejects_empty_ft_wztvw() {
-        let err = crate::mcp_types::validate_event_mutation_string("", "note", 8192)
-            .expect_err("empty must reject");
+        let err = validate_event_mutation_string("", "note", 8192).expect_err("empty must reject");
         assert!(matches!(
             err,
-            crate::mcp_types::EventMutationStringError::EmptyOrWhitespace { field: "note" }
+            EventMutationStringError::EmptyOrWhitespace { field: "note" }
         ));
         assert!(err.to_string().contains("br-ft-wztvw"));
     }
 
     #[test]
     fn validate_event_mutation_string_rejects_whitespace_only_ft_wztvw() {
-        let err = crate::mcp_types::validate_event_mutation_string("   \t\n", "label", 128)
+        let err = validate_event_mutation_string("   \t\n", "label", 128)
             .expect_err("whitespace-only must reject");
         assert!(matches!(
             err,
-            crate::mcp_types::EventMutationStringError::EmptyOrWhitespace { field: "label" }
+            EventMutationStringError::EmptyOrWhitespace { field: "label" }
         ));
     }
 
     #[test]
     fn validate_event_mutation_string_rejects_oversize_ft_wztvw() {
         let big = "a".repeat(9000);
-        let err = crate::mcp_types::validate_event_mutation_string(
-            &big,
-            "note",
-            crate::mcp_types::MAX_EVENT_NOTE_BYTES,
-        )
-        .expect_err("oversize must reject");
+        let err = validate_event_mutation_string(&big, "note", MAX_EVENT_NOTE_BYTES)
+            .expect_err("oversize must reject");
         match err {
-            crate::mcp_types::EventMutationStringError::TooLong {
+            EventMutationStringError::TooLong {
                 field: "note",
                 len: 9000,
                 max,
             } => {
-                assert_eq!(max, crate::mcp_types::MAX_EVENT_NOTE_BYTES);
+                assert_eq!(max, MAX_EVENT_NOTE_BYTES);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -3132,12 +3125,8 @@ mod tests {
     #[test]
     fn validate_event_mutation_string_accepts_at_cap_boundary_ft_wztvw() {
         // Boundary: exactly `max_bytes` is accepted (no off-by-one).
-        let exactly = "a".repeat(crate::mcp_types::MAX_EVENT_LABEL_BYTES);
-        crate::mcp_types::validate_event_mutation_string(
-            &exactly,
-            "add",
-            crate::mcp_types::MAX_EVENT_LABEL_BYTES,
-        )
-        .expect("exact-cap must validate");
+        let exactly = "a".repeat(MAX_EVENT_LABEL_BYTES);
+        validate_event_mutation_string(&exactly, "add", MAX_EVENT_LABEL_BYTES)
+            .expect("exact-cap must validate");
     }
 }

@@ -655,7 +655,8 @@ mod tests {
                 Err(QoEGuardrailConfigError::NonFinitePercentile | QoEGuardrailConfigError::PercentileOutOfRange)
             ));
             prop_assert!(QoEGuardrail::try_new(config.clone()).is_err());
-            prop_assert_eq!(QoEGuardrail::new(config).config(), &QoEGuardrailConfig::default());
+            let guardrail = QoEGuardrail::new(config);
+            prop_assert_eq!(guardrail.config(), &QoEGuardrailConfig::default());
         }
 
         #[test]

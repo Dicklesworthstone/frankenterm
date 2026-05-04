@@ -3693,7 +3693,6 @@ mod tests {
         let params: WorkflowRunParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.name, "handle_compaction");
         assert_eq!(params.pane_id, 42);
-        assert!(!params.force);
         assert!(!params.dry_run);
     }
 

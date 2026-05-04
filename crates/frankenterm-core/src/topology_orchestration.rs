@@ -2105,7 +2105,7 @@ mod tests {
             let first = orch.plan_swarm_lane_placement(&requests, &groups);
             let second = orch.plan_swarm_lane_placement(&reversed, &groups);
 
-            prop_assert_eq!(first, second);
+            prop_assert_eq!(&first, &second);
         }
 
         #[test]
@@ -2166,7 +2166,7 @@ mod tests {
             let first = orch.plan_swarm_lane_placement(&requests, &[]);
             let second = orch.plan_swarm_lane_placement(&requests, &[]);
 
-            prop_assert_eq!(first, second);
+            prop_assert_eq!(&first, &second);
             prop_assert_eq!(first.mode, TopologyPlacementMode::DeterministicShard);
             prop_assert!(first.assignments.iter().all(|assignment| assignment.degraded));
         }

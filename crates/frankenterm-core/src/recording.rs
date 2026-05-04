@@ -2260,8 +2260,7 @@ mod tests {
         // Sanity: a valid post-epoch SystemTime returns positive
         // ms and does NOT bump the anomaly counter.
         super::reset_recording_clock_anomaly_count_for_test();
-        let post = std::time::UNIX_EPOCH
-            + std::time::Duration::from_secs(1_704_067_200);
+        let post = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
         let ms = super::epoch_ms_now_from(post);
         assert!(ms > 0);
         assert_eq!(
@@ -2277,8 +2276,7 @@ mod tests {
         // branch. Returns 0 (preserves scalar contract) and bumps
         // the process-global counter.
         super::reset_recording_clock_anomaly_count_for_test();
-        let pre = std::time::UNIX_EPOCH
-            - std::time::Duration::from_secs(100);
+        let pre = std::time::UNIX_EPOCH - std::time::Duration::from_secs(100);
         let ms = super::epoch_ms_now_from(pre);
         assert_eq!(ms, 0);
         assert_eq!(super::recording_clock_anomaly_count(), 1);
@@ -3428,13 +3426,8 @@ mod tests {
     fn recorder_stop_state_transition_gated_on_finalize_ft_ye2gs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("stop.war");
-        let writer = FrameWriter::new(&path, 16).expect("writer");
-        let mut rec = Recorder {
-            writer,
-            state: RecorderState::Recording,
-            options: RecordingOptions::default(),
-            redactor: Redactor::new(),
-        };
+        let mut rec = Recorder::new(0, &path, 16).expect("recorder");
+        rec.start(0);
         assert_eq!(rec.state, RecorderState::Recording);
         rec.stop().expect("stop on a healthy writer must succeed");
         assert_eq!(
@@ -3491,7 +3484,7 @@ mod tests {
                 writer
                     .write_frame(RecordingFrame {
                         header: FrameHeader {
-                            timestamp_ms: i as i64,
+                            timestamp_ms: i as u64,
                             frame_type: FrameType::Output,
                             flags: 0,
                             payload_len: 1,

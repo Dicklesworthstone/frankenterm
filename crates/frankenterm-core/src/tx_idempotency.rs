@@ -2651,12 +2651,13 @@ mod tests {
 
             for idx in max_active_ledgers..max_active_ledgers + extra_attempts {
                 let result = store.create_ledger(&format!("exec-{idx}"), &plan);
-                prop_assert!(matches!(
-                    result,
+                let observed_limit = match result {
                     Err(IdempotencyError::ActiveLedgerLimitExceeded {
                         max_active_ledgers: observed
-                    }) if observed == max_active_ledgers
-                ));
+                    }) => Some(observed),
+                    _ => None,
+                };
+                prop_assert_eq!(observed_limit, Some(max_active_ledgers));
                 prop_assert_eq!(store.active_count(), max_active_ledgers);
             }
         }

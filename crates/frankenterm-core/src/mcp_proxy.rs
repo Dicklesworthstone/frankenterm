@@ -223,12 +223,12 @@ use crate::mcp_framework::{
 };
 
 use super::mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
+use crate::Result;
 use crate::config::{Config, McpClientConfig};
 use crate::mcp_client::{
-    discover_servers, ExternalServerConfig, FtMcpClient, McpClientContentItem,
-    McpClientToolDefinition,
+    ExternalServerConfig, FtMcpClient, McpClientContentItem, McpClientToolDefinition,
+    discover_servers,
 };
-use crate::Result;
 
 const LOG_TARGET: &str = "ft::mcp_proxy";
 
@@ -983,10 +983,10 @@ impl ToolHandler for RemoteProxyToolHandler {
 #[cfg(test)]
 mod tests {
     use super::{
+        Config, ExternalServerConfig, McpClientConfig, McpClientToolDefinition, Server,
         compose_proxy_tools, filter_remote_tools, insert_route_prefix,
         mcp_proxy_destructive_filtered_count, reset_mcp_proxy_destructive_filtered_count_for_test,
-        sanitize_prefix_segment, select_proxy_servers, Config, ExternalServerConfig,
-        McpClientConfig, McpClientToolDefinition, Server,
+        sanitize_prefix_segment, select_proxy_servers,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;

@@ -434,7 +434,7 @@ fn redact_timeline_summaries(timeline: &mut [TxTimelineEntry], policy: &Redactio
         .filter(|entry| !entry.summary.is_empty())
     {
         if entry.summary != policy.redaction_marker {
-            entry.summary = policy.redaction_marker.clone();
+            entry.summary.clone_from(&policy.redaction_marker);
             fields_redacted += 1;
         }
     }
@@ -947,6 +947,7 @@ mod tests {
                 overall_risk: StepRisk::High,
             },
             rejected_edges: Vec::new(),
+            rejected_assignments: Vec::new(),
         }
     }
 
@@ -1565,10 +1566,14 @@ mod tests {
             let serialized = serde_json::to_string(&bundle).unwrap();
 
             prop_assert!(!serialized.contains(&sensitive_summary));
-            prop_assert!(bundle.timeline.iter().any(|entry| {
+            let has_redacted_prepare_summary = bundle.timeline.iter().any(|entry| {
                 entry.kind == TxEventKind::PrepareStarted
                     && entry.summary == config.redaction_policy.redaction_marker
-            }));
+            });
+            prop_assert!(
+                has_redacted_prepare_summary,
+                "timeline should contain a redacted prepare summary"
+            );
             prop_assert!(
                 bundle
                     .redaction

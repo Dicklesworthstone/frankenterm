@@ -5689,11 +5689,15 @@ mod tests {
                 .assignment_set
                 .get_rejection("b1")
                 .expect("invalid pin target should become a solver rejection");
-            prop_assert!(rejection.reasons.iter().any(|reason| matches!(
+            let rejected_by_expected_gate = rejection.reasons.iter().any(|reason| matches!(
                 reason,
                 RejectionReason::SafetyGateDenied { gate_name }
                     if gate_name == expected_reason.safety_gate_name().unwrap()
-            )));
+            ));
+            prop_assert!(
+                rejected_by_expected_gate,
+                "invalid pin target rejection should include the expected safety gate"
+            );
 
             let summary = ml.state.last_override_summary.as_ref().unwrap();
             prop_assert!(summary.pinned_assignments.is_empty());
@@ -6207,7 +6211,7 @@ mod tests {
         let issues = vec![sample_detail("b1", BeadStatus::Open, 0, &[])];
         let mut paused_agent = ready_agent("a-paused");
         paused_agent.availability = crate::plan::MissionAgentAvailability::Paused {
-            reason: "operator-pause".to_string(),
+            reason_code: "operator-pause".to_string(),
         };
         let agents = vec![paused_agent, ready_agent("a-ready")];
         let ctx = PlannerExtractionContext::default();

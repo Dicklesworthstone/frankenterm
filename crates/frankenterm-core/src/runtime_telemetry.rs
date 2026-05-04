@@ -1348,9 +1348,7 @@ impl UnifiedTelemetryRecord {
         };
         let health_tier = if stats.permanent_failures > 0 || failure_ratio >= 0.5 {
             HealthTier::Black
-        } else if counter_overflow_detected {
-            HealthTier::Red
-        } else if failure_ratio >= 0.2 || saturation >= 0.95 {
+        } else if counter_overflow_detected || failure_ratio >= 0.2 || saturation >= 0.95 {
             HealthTier::Red
         } else if failure_ratio >= 0.05 || saturation >= 0.80 {
             HealthTier::Yellow
@@ -4876,7 +4874,7 @@ fn swarm_capacity_scale_bucket_per_1000(pane_scale: u32) -> i32 {
     if pane_scale == 0 {
         return 0;
     }
-    i32::try_from(31 - pane_scale.leading_zeros()).unwrap_or(i32::MAX) * 100
+    i32::try_from(pane_scale.ilog2()).unwrap_or(i32::MAX) * 100
 }
 
 fn swarm_capacity_growth_likelihood(value: f64, mean: f64) -> f64 {
@@ -5311,7 +5309,6 @@ impl std::fmt::Display for FairnessBudgetError {
 impl std::error::Error for FairnessBudgetError {}
 
 impl SwarmCapacityFairnessPolicyConfig {
-
     /// Stable hash of the normalized policy table and enabled flag.
     #[must_use]
     pub fn policy_hash(&self) -> String {
@@ -9187,7 +9184,7 @@ fn expected_loss_capacity_decision(
 /// Stable, deterministic hash of any Serialize value, formatted as
 /// `"sha256:<64 hex chars>"`. Used in audit-record id derivation
 /// + evidence-record content hashes (~4-7 calls per
-/// SwarmCapacityAdmissionPolicy::plan round).
+///   SwarmCapacityAdmissionPolicy::plan round).
 ///
 /// br-ft-15x9a optimization: writes the final 71-byte
 /// `"sha256:..."` String into a pre-sized buffer with manual
@@ -15616,8 +15613,7 @@ mod tests {
         // fairness isn't doing anything anyway.
         let cfg = SwarmCapacityFairnessPolicyConfig::default();
         assert!(!cfg.enabled);
-        cfg.validate_budgets()
-            .expect("disabled policy must pass");
+        cfg.validate_budgets().expect("disabled policy must pass");
     }
 
     #[test]
@@ -15693,8 +15689,7 @@ mod tests {
             reduced_admission_budget_units: 500,
             ..SwarmCapacityFairnessPolicyConfig::default()
         };
-        cfg.validate_budgets()
-            .expect("finite budgets must pass");
+        cfg.validate_budgets().expect("finite budgets must pass");
     }
 
     // ── br-ft-66xn8: admission threshold ladder validation ──
@@ -15873,7 +15868,7 @@ mod tests {
         for i in 0..32u64 {
             log.emit(
                 RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
-                    .reason(format!("event-{i}")),
+                    .reason(&format!("event-{i}")),
             );
         }
         let snap = log.snapshot();
@@ -15895,7 +15890,7 @@ mod tests {
         for i in 0..5u64 {
             log.emit(
                 RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
-                    .reason(format!("event-{i}")),
+                    .reason(&format!("event-{i}")),
             );
         }
         let snap = log.snapshot();
@@ -16094,10 +16089,7 @@ mod tests {
                 Some(expected_failed)
             );
             prop_assert_eq!(record.attributes["total_work"].as_u64(), Some(expected_work));
-            prop_assert_eq!(
-                &record.attributes["counter_overflow_detected"],
-                serde_json::json!(true)
-            );
+            prop_assert_eq!(record.attributes["counter_overflow_detected"].as_bool(), Some(true));
             let rate = record.attributes["fleet_failure_rate"].as_f64().unwrap();
             prop_assert!(rate.is_finite());
             prop_assert!((0.0..=1.0).contains(&rate));
@@ -16378,8 +16370,8 @@ mod tests {
             let overflow = total_attempts > u128::from(u64::MAX);
 
             prop_assert_eq!(
-                record.attributes["counter_overflow_detected"],
-                serde_json::json!(overflow)
+                record.attributes["counter_overflow_detected"].as_bool(),
+                Some(overflow)
             );
             prop_assert_eq!(
                 record.attributes["total_connection_attempts_saturated"].as_u64(),
@@ -16640,16 +16632,16 @@ mod tests {
             let inconsistent = overflow || terminal_exceeds_total;
 
             prop_assert_eq!(
-                &record.attributes["counter_overflow_detected"],
-                serde_json::json!(overflow)
+                record.attributes["counter_overflow_detected"].as_bool(),
+                Some(overflow)
             );
             prop_assert_eq!(
-                &record.attributes["terminal_exceeds_total_items"],
-                serde_json::json!(terminal_exceeds_total)
+                record.attributes["terminal_exceeds_total_items"].as_bool(),
+                Some(terminal_exceeds_total)
             );
             prop_assert_eq!(
-                &record.attributes["inconsistent_counters"],
-                serde_json::json!(inconsistent)
+                record.attributes["inconsistent_counters"].as_bool(),
+                Some(inconsistent)
             );
             prop_assert!(record.attributes["failure_rate"].as_f64().unwrap().is_finite());
             prop_assert!(record.attributes["blocked_ratio"].as_f64().unwrap().is_finite());

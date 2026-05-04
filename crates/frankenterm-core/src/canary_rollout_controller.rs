@@ -888,6 +888,7 @@ impl CanaryRolloutController {
 mod tests {
     use super::*;
     use crate::planner_features::{Assignment, SolverConfig};
+    use crate::shadow_mode_evaluator::UnexpectedExecution;
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -911,6 +912,17 @@ mod tests {
             dispatch_rate: 1.0,
             agent_match_rate: 1.0,
             fidelity_score: 0.95,
+        }
+    }
+
+    fn unexpected_execution(
+        bead_id: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> UnexpectedExecution {
+        UnexpectedExecution {
+            bead_id: bead_id.into(),
+            agent_id: agent_id.into(),
+            reason_code: "test-fixture".to_string(),
         }
     }
 
@@ -2214,7 +2226,7 @@ mod tests {
         assert_eq!(controller.phase(), CanaryPhase::Shadow);
 
         let mut diff = make_healthy_diff(1);
-        diff.unexpected_executions = vec![("bead-x".to_string(), "agent-x".to_string())];
+        diff.unexpected_executions = vec![unexpected_execution("bead-x", "agent-x")];
         let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
         let check = controller.compute_health_check(1, 1000, &diff, &metrics);
         assert!(
@@ -2276,7 +2288,7 @@ mod tests {
         cfg.initial_phase = CanaryPhase::Canary;
         let controller = CanaryRolloutController::new(cfg);
         let mut diff = make_healthy_diff(1);
-        diff.unexpected_executions = vec![("bead-x".to_string(), "agent-x".to_string())];
+        diff.unexpected_executions = vec![unexpected_execution("bead-x", "agent-x")];
         let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
         let check = controller.compute_health_check(1, 1000, &diff, &metrics);
         assert!(
@@ -2306,8 +2318,8 @@ mod tests {
         /// alone never triggers it.
         #[test]
         fn shadow_dispatch_leak_fires_iff_execution_evidence_present_ft_q5sn3(
-            emissions in 0u64..=10,
-            execution_rejections in 0u64..=5,
+            emissions in 0usize..=10,
+            execution_rejections in 0usize..=5,
             missing_count in 0usize..=4,
             unexpected_count in 0usize..=4,
         ) {
@@ -2319,7 +2331,7 @@ mod tests {
                 .map(|i| (format!("b{i}"), format!("a{i}")))
                 .collect();
             diff.unexpected_executions = (0..unexpected_count)
-                .map(|i| (format!("ub{i}"), format!("ua{i}")))
+                .map(|i| unexpected_execution(format!("ub{i}"), format!("ua{i}")))
                 .collect();
             let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
             let check = controller.compute_health_check(1, 1000, &diff, &metrics);
