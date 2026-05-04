@@ -49,6 +49,20 @@ static SSE_EVENTS_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 /// sustained backpressure rather than transient bursts.
 static SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// br-ft-bn6qi: cumulative count of `SystemTime::now() <
+/// UNIX_EPOCH` events observed by [`epoch_ms_now`] since process
+/// load. Pre-fix the `unwrap_or_default()` fallback silently
+/// substituted `0` for every event during a clock anomaly window
+/// (NTP fail, container restart with un-synced clock, hostile CI
+/// fixture clock value). Operators trying to correlate event
+/// ordering then saw a flat line at epoch zero with no diagnostic.
+/// This counter bumps on every Err branch of `duration_since`, so
+/// a single observability scrape surfaces the misconfiguration.
+///
+/// Same observability defect family as the existing
+/// `mcp_clock_anomaly` counter (ft-rnpuc).
+static EPOCH_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Cumulative count of SSE events dropped because the per-stream
 /// channel was full. See [`SSE_EVENTS_DROPPED_COUNT`].
 #[must_use]
@@ -61,6 +75,13 @@ pub fn sse_events_dropped_count() -> u64 {
 #[must_use]
 pub fn sse_streams_terminated_by_drop_cap_count() -> u64 {
     SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT.load(Ordering::Relaxed)
+}
+
+/// br-ft-bn6qi: cumulative count of clock-before-1970 anomalies
+/// observed by [`epoch_ms_now`]. See [`EPOCH_CLOCK_ANOMALY_COUNT`].
+#[must_use]
+pub fn epoch_clock_anomaly_count() -> u64 {
+    EPOCH_CLOCK_ANOMALY_COUNT.load(Ordering::Relaxed)
 }
 
 /// Test helper: reset the drop counter so regression tests can
@@ -76,6 +97,12 @@ pub(crate) fn reset_sse_streams_terminated_by_drop_cap_count_for_test() {
     SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT.store(0, Ordering::Relaxed);
 }
 
+/// br-ft-bn6qi: test helper to reset the clock-anomaly counter.
+#[cfg(test)]
+pub(crate) fn reset_epoch_clock_anomaly_count_for_test() {
+    EPOCH_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
+}
+
 #[inline]
 fn record_sse_event_dropped() {
     SSE_EVENTS_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -84,6 +111,11 @@ fn record_sse_event_dropped() {
 #[inline]
 fn record_sse_stream_terminated_by_drop_cap() {
     SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_epoch_clock_anomaly() {
+    EPOCH_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,11 +174,47 @@ pub(super) fn parse_event_stream_channel(
     }
 }
 
+/// Wall-clock UNIX epoch in milliseconds for SSE event payloads.
+///
+/// br-ft-bn6qi: `SystemTime::now().duration_since(UNIX_EPOCH)` returns
+/// `Err(SystemTimeError)` when the system clock is BEFORE 1970-01-01
+/// (NTP fail, container restart with un-synced clock, hostile CI
+/// fixture). The pre-fix `unwrap_or_default()` silently substituted a
+/// zero `Duration` for every emitted event during the anomaly window,
+/// producing `ts_ms = 0` on every SSE frame with no operator-visible
+/// diagnostic. We now fail loud:
+///
+///   * Bump [`EPOCH_CLOCK_ANOMALY_COUNT`] on the Err branch so a
+///     single observability scrape surfaces the misconfiguration.
+///   * Emit a structured `tracing::warn` (target: ft.web.clock) so
+///     log-aggregating consumers see one record per anomaly window
+///     plus the by-how-much delta (the `SystemTimeError` carries the
+///     pre-epoch duration).
+///   * Still return `0` so callers downstream don't have to handle
+///     `Result` — the contract stays scalar — but the anomaly is now
+///     observable through the counter, not silent.
 fn epoch_ms_now() -> i64 {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    i64::try_from(ts.as_millis()).unwrap_or(0)
+    epoch_ms_from(SystemTime::now())
+}
+
+/// br-ft-bn6qi: testable inner helper. Takes a `SystemTime` so a
+/// regression test can inject `UNIX_EPOCH - 100s` (a valid
+/// pre-epoch SystemTime) to exercise the Err branch without
+/// depending on the host system clock.
+fn epoch_ms_from(now: SystemTime) -> i64 {
+    match now.duration_since(UNIX_EPOCH) {
+        Ok(ts) => i64::try_from(ts.as_millis()).unwrap_or(0),
+        Err(err) => {
+            record_epoch_clock_anomaly();
+            tracing::warn!(
+                target: "ft.web.clock",
+                event = "epoch_clock_anomaly",
+                pre_epoch_secs = err.duration().as_secs(),
+                "system clock is before UNIX_EPOCH; SSE event timestamp falling back to 0 (br-ft-bn6qi)"
+            );
+            0
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1263,5 +1331,70 @@ mod tests {
             "ft-95fd3: termination bump must NOT spill into event-drop counter"
         );
         assert_eq!(super::sse_streams_terminated_by_drop_cap_count(), 1);
+    }
+
+    // ── br-ft-bn6qi: clock-anomaly observability ──
+
+    #[test]
+    fn epoch_ms_from_post_epoch_returns_positive_no_anomaly_ft_bn6qi() {
+        // Sanity: a valid post-epoch timestamp returns a positive
+        // ms value and does NOT bump the anomaly counter.
+        let _guard = drop_counter_test_lock();
+        super::reset_epoch_clock_anomaly_count_for_test();
+
+        // ~2024-01-01 in seconds since epoch.
+        let post_epoch = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_704_067_200);
+        let ms = super::epoch_ms_from(post_epoch);
+        assert!(ms > 0, "post-epoch ms must be positive, got {ms}");
+        assert_eq!(
+            super::epoch_clock_anomaly_count(),
+            0,
+            "post-epoch path must NOT bump anomaly counter"
+        );
+    }
+
+    #[test]
+    fn epoch_ms_from_pre_epoch_bumps_counter_ft_bn6qi() {
+        // br-ft-bn6qi: a pre-epoch SystemTime triggers the Err
+        // branch. The function returns 0 (preserving the scalar
+        // contract callers depend on) and bumps the
+        // process-global anomaly counter so a single observability
+        // scrape surfaces the misconfiguration.
+        let _guard = drop_counter_test_lock();
+        super::reset_epoch_clock_anomaly_count_for_test();
+
+        let pre_epoch = std::time::UNIX_EPOCH
+            - std::time::Duration::from_secs(100);
+        let ms = super::epoch_ms_from(pre_epoch);
+        assert_eq!(ms, 0, "pre-epoch must fall back to 0");
+        assert_eq!(
+            super::epoch_clock_anomaly_count(),
+            1,
+            "pre-epoch must bump anomaly counter exactly once"
+        );
+
+        // A second call must bump the counter again (the contract
+        // counts every event, not just first-occurrence).
+        let _ = super::epoch_ms_from(pre_epoch);
+        assert_eq!(super::epoch_clock_anomaly_count(), 2);
+    }
+
+    #[test]
+    fn epoch_ms_anomaly_counter_independent_of_drop_counters_ft_bn6qi() {
+        // The clock-anomaly counter must not bleed into the SSE
+        // drop counters and vice versa.
+        let _guard = drop_counter_test_lock();
+        super::reset_epoch_clock_anomaly_count_for_test();
+        super::reset_sse_events_dropped_count_for_test();
+        super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
+
+        let pre_epoch = std::time::UNIX_EPOCH
+            - std::time::Duration::from_secs(50);
+        let _ = super::epoch_ms_from(pre_epoch);
+
+        assert_eq!(super::epoch_clock_anomaly_count(), 1);
+        assert_eq!(super::sse_events_dropped_count(), 0);
+        assert_eq!(super::sse_streams_terminated_by_drop_cap_count(), 0);
     }
 }

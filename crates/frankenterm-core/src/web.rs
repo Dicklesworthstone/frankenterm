@@ -321,12 +321,19 @@ fn parse_event_stream_channel(
     sse::parse_event_stream_channel(qs)
 }
 
+/// br-ft-bn6qi: cfg(test) helper used by web.rs unit tests. Now
+/// matches the production [`sse::epoch_ms_now`] semantics: an Err
+/// from `duration_since(UNIX_EPOCH)` returns 0 rather than panicking
+/// or silently misbehaving. The production path lives in
+/// `web/sse.rs` and bumps `EPOCH_CLOCK_ANOMALY_COUNT` + emits
+/// `tracing::warn` on the Err branch; this test stub preserves the
+/// scalar contract so existing tests don't need to change.
 #[cfg(test)]
 fn epoch_ms_now() -> i64 {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    i64::try_from(ts.as_millis()).unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(ts) => i64::try_from(ts.as_millis()).unwrap_or(0),
+        Err(_) => 0,
+    }
 }
 
 #[cfg(test)]
