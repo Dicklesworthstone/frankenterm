@@ -29,6 +29,88 @@ use crate::policy::Redactor;
 /// Global health snapshot for crash reporting
 static GLOBAL_HEALTH: OnceLock<RwLock<Option<HealthSnapshot>>> = OnceLock::new();
 
+// ============================================================================
+// br-ft-94cdu: crash-bundle parse-drop observability
+// ============================================================================
+
+/// br-ft-94cdu: cumulative count of crash-bundle file parse failures
+/// observed during bundle enumeration. Pre-fix the `.ok()` chain
+/// silently dropped corrupted bundles, so operators chasing a
+/// crash report saw "no bundles" rather than "bundle present but
+/// corrupted, here's why".
+///
+/// File-not-found is NOT counted (the file just doesn't exist);
+/// only file-present-but-fails-to-{read,parse} bumps the counter.
+/// Each phase tag (`manifest_read_fail` | `manifest_parse_fail` |
+/// `report_read_fail` | `report_parse_fail`) is structured into the
+/// `tracing::warn` record so operators can discriminate filesystem
+/// permission issues from schema drift.
+///
+/// Same observability shape as ft-bn6qi epoch_clock_anomaly_count,
+/// ft-yygus policy_decision_context_serde_drop_count, ft-zkthg
+/// workflows_serde_drop_count.
+static CRASH_BUNDLE_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// br-ft-94cdu: cumulative count of crash-bundle parse failures.
+#[must_use]
+pub fn crash_bundle_parse_drop_count() -> u64 {
+    CRASH_BUNDLE_PARSE_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// br-ft-94cdu: test helper to reset the parse-drop counter.
+#[cfg(test)]
+pub(crate) fn reset_crash_bundle_parse_drop_count_for_test() {
+    CRASH_BUNDLE_PARSE_DROP_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn record_crash_bundle_parse_drop(
+    bundle_path: &Path,
+    phase: &'static str,
+    error: &dyn std::fmt::Display,
+) {
+    CRASH_BUNDLE_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        target: "ft.crash.bundle",
+        event = "crash_bundle_parse_drop",
+        bundle_path = %bundle_path.display(),
+        phase = phase,
+        error = %error,
+        "crash bundle file present but could not be parsed (br-ft-94cdu)"
+    );
+}
+
+/// br-ft-94cdu: read+parse a JSON file, treating file-not-found as
+/// `Ok(None)` (legitimate absence) and read/parse failures as
+/// counter bumps with discriminating phase tags. Returns
+/// `Ok(Some(T))` on success, `Ok(None)` if the file is missing,
+/// and `Ok(None)` on read/parse error after recording the drop.
+fn read_optional_json_bundle_file<T: serde::de::DeserializeOwned>(
+    bundle_path: &Path,
+    file_path: &Path,
+    read_fail_phase: &'static str,
+    parse_fail_phase: &'static str,
+) -> Option<T> {
+    if !file_path.exists() {
+        return None;
+    }
+    let raw = match fs::read_to_string(file_path) {
+        Ok(s) => s,
+        Err(err) => {
+            record_crash_bundle_parse_drop(bundle_path, read_fail_phase, &err);
+            return None;
+        }
+    };
+    match serde_json::from_str::<T>(&raw) {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            record_crash_bundle_parse_drop(bundle_path, parse_fail_phase, &err);
+            None
+        }
+    }
+}
+
 /// Maximum backtrace string length included in crash bundles (64 KiB).
 const MAX_BACKTRACE_LEN: usize = 64 * 1024;
 
@@ -620,12 +702,24 @@ pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSumm
         })
         .filter_map(|e| {
             let path = e.path();
-            let manifest = fs::read_to_string(path.join("manifest.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<CrashManifest>(&s).ok());
-            let report = fs::read_to_string(path.join("crash_report.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<CrashReport>(&s).ok());
+            // br-ft-94cdu: route through the parse-drop helper so a
+            // corrupted bundle (file present but malformed) is
+            // visible via crash_bundle_parse_drop_count() rather
+            // than silently filtered.
+            let manifest_path = path.join("manifest.json");
+            let manifest = read_optional_json_bundle_file::<CrashManifest>(
+                &path,
+                &manifest_path,
+                "manifest_read_fail",
+                "manifest_parse_fail",
+            );
+            let report_path = path.join("crash_report.json");
+            let report = read_optional_json_bundle_file::<CrashReport>(
+                &path,
+                &report_path,
+                "report_read_fail",
+                "report_parse_fail",
+            );
 
             // Skip bundles without at least a manifest or report
             if manifest.is_none() && report.is_none() {
@@ -4649,5 +4743,79 @@ mod e2e_crash_recovery {
 
         // Should be exactly at cap after enough crashes
         assert_eq!(det.next_delay_ms(), 5_000);
+    }
+
+    // ── br-ft-94cdu: crash bundle parse-drop counter ──
+
+    #[test]
+    fn read_optional_json_bundle_file_returns_none_when_absent_ft_94cdu() {
+        // File-not-found is NOT a drop — it's legitimate absence.
+        // The counter must NOT bump.
+        super::reset_crash_bundle_parse_drop_count_for_test();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle_path = dir.path().to_path_buf();
+        let missing = bundle_path.join("does_not_exist.json");
+        let result = super::read_optional_json_bundle_file::<super::CrashManifest>(
+            &bundle_path,
+            &missing,
+            "manifest_read_fail",
+            "manifest_parse_fail",
+        );
+        assert!(result.is_none());
+        assert_eq!(
+            super::crash_bundle_parse_drop_count(),
+            0,
+            "missing file must not bump parse-drop counter"
+        );
+    }
+
+    #[test]
+    fn read_optional_json_bundle_file_bumps_on_parse_fail_ft_94cdu() {
+        // br-ft-94cdu: file present but malformed JSON triggers
+        // the parse_fail phase. Counter bumps once.
+        super::reset_crash_bundle_parse_drop_count_for_test();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle_path = dir.path().to_path_buf();
+        let path = bundle_path.join("manifest.json");
+        std::fs::write(&path, b"{this is not valid json").unwrap();
+        let result = super::read_optional_json_bundle_file::<super::CrashManifest>(
+            &bundle_path,
+            &path,
+            "manifest_read_fail",
+            "manifest_parse_fail",
+        );
+        assert!(result.is_none());
+        assert_eq!(
+            super::crash_bundle_parse_drop_count(),
+            1,
+            "malformed JSON must bump the parse-drop counter exactly once"
+        );
+    }
+
+    #[test]
+    fn read_optional_json_bundle_file_no_bump_on_well_formed_ft_94cdu() {
+        // Sanity: a well-formed JSON file parses cleanly and does
+        // NOT bump the counter.
+        super::reset_crash_bundle_parse_drop_count_for_test();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle_path = dir.path().to_path_buf();
+        let path = bundle_path.join("manifest.json");
+        let manifest = super::CrashManifest {
+            wa_version: "test".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            files: vec!["crash_report.json".to_string()],
+            has_health_snapshot: false,
+            has_resize_forensics: false,
+            bundle_size_bytes: 0,
+        };
+        std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+        let result = super::read_optional_json_bundle_file::<super::CrashManifest>(
+            &bundle_path,
+            &path,
+            "manifest_read_fail",
+            "manifest_parse_fail",
+        );
+        assert!(result.is_some());
+        assert_eq!(super::crash_bundle_parse_drop_count(), 0);
     }
 }
