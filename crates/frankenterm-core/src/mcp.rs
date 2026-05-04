@@ -847,7 +847,15 @@ pub(crate) fn reset_mcp_audit_failure_count_for_test() {
 
 /// Internal helper invoked at every silent-failure call site
 /// listed in the static doc comment above.
-fn record_mcp_audit_failure() {
+///
+/// br-ft-pgjat: promoted to `pub(crate)` so mcp_tools.rs's 4
+/// silent `record_audit_action_redacted_with_cx` swallow sites
+/// (wa.events_annotate / triage / label) can route through the
+/// same counter as the ft-luav8 sites in mcp_helpers.rs. The
+/// audit-failure metric is intended to be the single observable
+/// signal across ALL silent MCP audit-write paths; siblings of
+/// the ft-luav8 sites should use the same counter.
+pub(crate) fn record_mcp_audit_failure() {
     MCP_AUDIT_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 

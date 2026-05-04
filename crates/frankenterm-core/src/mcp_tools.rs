@@ -72,6 +72,44 @@ use super::{
     resolve_pane_capabilities,
 };
 
+/// br-ft-pgjat: route silent `record_audit_action_redacted_with_cx`
+/// failures through the same observability counter as ft-luav8's
+/// `record_mcp_audit*` helpers in mcp_helpers.rs.
+///
+/// 4 callers in this file
+/// (wa.events_annotate / wa.events_triage / wa.events_label×2)
+/// previously did `let _ = storage.record_audit_action_redacted_with_cx(...).await`
+/// — silently swallowing both the audit row id (Ok) and the
+/// failure (Err). The audit row was missing AND operators had no
+/// signal — no tracing::warn, no counter bump.
+///
+/// This helper preserves the fire-and-forget contract (audit
+/// failures must NOT propagate to the MCP client per the ft-luav8
+/// design — the client succeeded; the audit fidelity gap is
+/// surfaced via the counter + log) while making the failure
+/// observable.
+async fn record_event_mutation_audit_or_log(
+    storage: &crate::storage::StorageHandle,
+    audit_cx: &crate::cx::Cx,
+    audit: crate::storage::AuditActionRecord,
+    tool_name: &'static str,
+) {
+    if let Err(err) = storage
+        .record_audit_action_redacted_with_cx(audit_cx, audit)
+        .await
+    {
+        crate::mcp::record_mcp_audit_failure();
+        tracing::warn!(
+            target: "ft.security.audit",
+            tool = tool_name,
+            error = %err,
+            "br-ft-pgjat: silent record_audit_action_redacted_with_cx failure; audit row \
+             missing for this MCP event-mutation call (client still got success per the \
+             ft-luav8 fire-and-forget contract). MCP_AUDIT_FAILURE_COUNT bumped."
+        );
+    }
+}
+
 fn mcp_get_text_policy_input(
     pane_id: u64,
     domain: impl Into<String>,
@@ -5970,8 +6008,8 @@ impl ToolHandler for WaEventsAnnotateTool {
             };
             // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
             let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            let _ = storage
-                .record_audit_action_redacted_with_cx(&audit_cx, audit)
+            // br-ft-pgjat: route silent failure through observability counter.
+            record_event_mutation_audit_or_log(&storage, &audit_cx, audit, "wa.events_annotate")
                 .await;
 
             let annotations = storage
@@ -6196,8 +6234,8 @@ impl ToolHandler for WaEventsTriageTool {
             };
             // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
             let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            let _ = storage
-                .record_audit_action_redacted_with_cx(&audit_cx, audit)
+            // br-ft-pgjat: route silent failure through observability counter.
+            record_event_mutation_audit_or_log(&storage, &audit_cx, audit, "wa.events_triage")
                 .await;
 
             let annotations = storage
@@ -6424,8 +6462,8 @@ impl ToolHandler for WaEventsLabelTool {
                 };
                 // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
                 let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                let _ = storage
-                    .record_audit_action_redacted_with_cx(&audit_cx, audit)
+                // br-ft-pgjat: route silent failure through observability counter.
+                record_event_mutation_audit_or_log(&storage, &audit_cx, audit, "wa.events_label")
                     .await;
 
                 Some(inserted)
@@ -6472,8 +6510,8 @@ impl ToolHandler for WaEventsLabelTool {
                 };
                 // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
                 let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                let _ = storage
-                    .record_audit_action_redacted_with_cx(&audit_cx, audit)
+                // br-ft-pgjat: route silent failure through observability counter.
+                record_event_mutation_audit_or_log(&storage, &audit_cx, audit, "wa.events_label")
                     .await;
 
                 Some(removed)
