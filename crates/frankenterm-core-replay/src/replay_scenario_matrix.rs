@@ -413,9 +413,7 @@ impl ScenarioMatrixRunner {
     ) {
         drop(thread::spawn(move || {
             let result = Self::run_scenario_with_timeout(art, ovr, generator, timeout);
-            if tx.send((index, result)).is_err() {
-                return;
-            }
+            let _ = tx.send((index, result));
         }));
     }
 
@@ -435,9 +433,7 @@ impl ScenarioMatrixRunner {
         drop(thread::spawn(move || {
             let baseline_result = generator(&artifact_path, None);
             let candidate_result = generator(&artifact_path, override_path.as_deref());
-            if work_tx.send((baseline_result, candidate_result)).is_err() {
-                return;
-            }
+            let _ = work_tx.send((baseline_result, candidate_result));
         }));
 
         match work_rx.recv_timeout(timeout) {

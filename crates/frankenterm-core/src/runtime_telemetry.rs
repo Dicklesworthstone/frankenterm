@@ -587,9 +587,66 @@ pub struct UnifiedTelemetryRecord {
 }
 
 impl UnifiedTelemetryRecord {
-    /// Normalize a runtime telemetry event into the shared record shape.
+    /// br-ft-7cqhu: redaction policy for the top-level identity
+    /// fields when normalizing into a [`UnifiedTelemetryRecord`].
+    ///
+    /// `from_runtime_event` and the existing `From<&RuntimeTelemetryEvent>`
+    /// impl preserve the legacy contract (`Passthrough`) — they
+    /// copy `scope_id`, `correlation_id`, and the embedded
+    /// correlation/component segments of `record_id` directly from
+    /// the source event. The unified record is described as a
+    /// redacted normalized contract for correlation, triage, and
+    /// severity routing, but the identity fields can carry raw
+    /// pane/session/user/secret-bearing identifiers (e.g.
+    /// `scope_id = "daemon:capture:pane_42"`,
+    /// `correlation_id = "session-secret-123"`).
+    ///
+    /// Operators that want redaction opt in via
+    /// [`UnifiedTelemetryRecord::from_runtime_event_with_id_redaction`]
+    /// with `IdRedactionPolicy::Hash`. The hash is a deterministic
+    /// FNV-1a digest, so cross-record correlation is preserved
+    /// without leaking the raw value.
     #[must_use]
     pub fn from_runtime_event(event: &RuntimeTelemetryEvent) -> Self {
+        Self::from_runtime_event_with_id_redaction(event, IdRedactionPolicy::Passthrough)
+    }
+
+    /// br-ft-7cqhu: same as [`Self::from_runtime_event`] but with
+    /// an explicit redaction policy applied to the top-level
+    /// identity fields. With `IdRedactionPolicy::Hash`:
+    ///
+    ///   * `scope_id` becomes `"hash:<u64-hex>"` (16-hex digits).
+    ///   * `correlation_id` becomes `"hash:<u64-hex>"`.
+    ///   * The `record_id` embedding correlation_id is built from
+    ///     the redacted form, so neither the raw correlation nor
+    ///     the raw scope leaks into the record_id.
+    ///
+    /// The hash is a deterministic FNV-1a digest of the original
+    /// string, so two records sharing a correlation_id still
+    /// share the same hashed value — preserving the cross-record
+    /// correlation property the unified record contract relies on.
+    #[must_use]
+    pub fn from_runtime_event_with_id_redaction(
+        event: &RuntimeTelemetryEvent,
+        policy: IdRedactionPolicy,
+    ) -> Self {
+        let mut record = Self::from_runtime_event_inner(event);
+        if matches!(policy, IdRedactionPolicy::Hash) {
+            if let Some(scope) = record.scope_id.take() {
+                record.scope_id = Some(hash_identity_field(&scope));
+            }
+            if let Some(corr) = record.correlation_id.take() {
+                let hashed = hash_identity_field(&corr);
+                record.record_id = record.record_id.replace(&corr, &hashed);
+                record.correlation_id = Some(hashed);
+            }
+        }
+        record
+    }
+
+    /// Internal: original (passthrough) construction logic.
+    #[must_use]
+    fn from_runtime_event_inner(event: &RuntimeTelemetryEvent) -> Self {
         let mut attributes = BTreeMap::new();
         let (sanitized_details, sensitivity, redaction_strategy, redacted_detail_count) =
             sanitize_runtime_details(&event.details);
