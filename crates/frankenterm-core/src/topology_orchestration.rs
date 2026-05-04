@@ -294,6 +294,115 @@ impl std::fmt::Display for TopologyError {
 }
 
 // =============================================================================
+// Swarm lane placement
+// =============================================================================
+
+/// Swarm lane category used to keep related work close to the same locality group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmLaneKind {
+    /// Interactive pane cohort traffic.
+    PaneCohort,
+    /// Capture worker lane.
+    CaptureWorker,
+    /// Search worker lane.
+    SearchWorker,
+    /// Storage writer lane.
+    StorageWriter,
+    /// Mission-loop worker lane.
+    MissionWorker,
+    /// MCP/robot surface lane.
+    McpSurface,
+}
+
+impl SwarmLaneKind {
+    const fn locality_rank(self) -> u8 {
+        match self {
+            Self::PaneCohort => 0,
+            Self::CaptureWorker => 1,
+            Self::StorageWriter => 2,
+            Self::SearchWorker => 3,
+            Self::MissionWorker => 4,
+            Self::McpSurface => 5,
+        }
+    }
+}
+
+/// A lane that needs topology-aware placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmLaneRequest {
+    /// Stable lane identifier.
+    pub lane_id: String,
+    /// Lane category.
+    pub kind: SwarmLaneKind,
+    /// Approximate churn pressure in the lane, 0..=255.
+    #[serde(default)]
+    pub churn: u8,
+    /// Approximate retained state for the lane.
+    #[serde(default)]
+    pub state_bytes: u64,
+}
+
+/// Operator-supplied locality bucket for topology-aware placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyLocalityGroup {
+    /// Stable group identifier.
+    pub group_id: String,
+    /// Optional NUMA node identifier.
+    #[serde(default)]
+    pub numa_node: Option<u32>,
+    /// CPU cores associated with this group.
+    #[serde(default)]
+    pub cpu_cores: Vec<u32>,
+    /// Optional memory budget associated with this group.
+    #[serde(default)]
+    pub memory_bytes: Option<u64>,
+}
+
+/// Placement mode used to build a swarm lane plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyPlacementMode {
+    /// Real topology locality groups were provided.
+    TopologyAware,
+    /// No topology data was available; deterministic synthetic shards were used.
+    DeterministicShard,
+}
+
+/// Assignment of one swarm lane to one locality group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmLaneAssignment {
+    /// Stable lane identifier.
+    pub lane_id: String,
+    /// Lane category.
+    pub kind: SwarmLaneKind,
+    /// Selected locality group identifier.
+    pub locality_group_id: String,
+    /// Stable shard index within the selected plan.
+    pub shard_index: usize,
+    /// True when assignment used degraded synthetic topology.
+    pub degraded: bool,
+}
+
+/// Deterministic swarm lane placement plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmLanePlacementPlan {
+    /// Placement mode used by this plan.
+    pub mode: TopologyPlacementMode,
+    /// Stable, lane-id ordered assignments.
+    pub assignments: Vec<SwarmLaneAssignment>,
+    /// Human-readable fallback reason when topology data was unavailable.
+    #[serde(default)]
+    pub degraded_reason: Option<String>,
+    /// Existing assignments preserved from the previous plan.
+    pub preserved_assignments: usize,
+    /// New lanes assigned in this plan.
+    pub new_assignments: usize,
+    /// Previous assignments that had to move because their old group vanished.
+    pub migrated_assignments: usize,
+}
+
+// =============================================================================
 // Layout template registry
 // =============================================================================
 
@@ -837,6 +946,106 @@ impl TopologyOrchestrator {
     }
 
     // -------------------------------------------------------------------------
+    // Swarm lane placement
+    // -------------------------------------------------------------------------
+
+    /// Build a deterministic topology-aware placement plan for swarm lanes.
+    #[allow(clippy::unused_self)]
+    pub fn plan_swarm_lane_placement(
+        &self,
+        requests: &[SwarmLaneRequest],
+        locality_groups: &[TopologyLocalityGroup],
+    ) -> SwarmLanePlacementPlan {
+        self.plan_swarm_lane_placement_with_previous(requests, locality_groups, &[])
+    }
+
+    /// Build a placement plan while preserving valid assignments from a previous plan.
+    #[allow(clippy::unused_self)]
+    pub fn plan_swarm_lane_placement_with_previous(
+        &self,
+        requests: &[SwarmLaneRequest],
+        locality_groups: &[TopologyLocalityGroup],
+        previous_assignments: &[SwarmLaneAssignment],
+    ) -> SwarmLanePlacementPlan {
+        let degraded = locality_groups.is_empty();
+        let groups = if degraded {
+            synthetic_locality_groups(requests.len())
+        } else {
+            normalized_locality_groups(locality_groups)
+        };
+        let mode = if degraded {
+            TopologyPlacementMode::DeterministicShard
+        } else {
+            TopologyPlacementMode::TopologyAware
+        };
+        let degraded_reason = degraded.then(|| {
+            "no topology locality groups supplied; using deterministic synthetic shards".to_string()
+        });
+
+        let previous_by_lane: HashMap<&str, &SwarmLaneAssignment> = previous_assignments
+            .iter()
+            .map(|assignment| (assignment.lane_id.as_str(), assignment))
+            .collect();
+        let mut sorted_requests = requests.to_vec();
+        sorted_requests.sort_by(|left, right| {
+            lane_placement_sort_key(left).cmp(&lane_placement_sort_key(right))
+        });
+
+        let mut group_loads = vec![0_u64; groups.len()];
+        let mut assignments = Vec::with_capacity(sorted_requests.len());
+        let mut preserved_assignments = 0;
+        let mut new_assignments = 0;
+        let mut migrated_assignments = 0;
+
+        for request in sorted_requests {
+            let previous = previous_by_lane.get(request.lane_id.as_str()).copied();
+            if let Some(previous) = previous {
+                if let Some(group_index) = groups
+                    .iter()
+                    .position(|group| group.group_id == previous.locality_group_id)
+                {
+                    group_loads[group_index] =
+                        group_loads[group_index].saturating_add(lane_load_units(&request));
+                    preserved_assignments += 1;
+                    assignments.push(SwarmLaneAssignment {
+                        lane_id: request.lane_id,
+                        kind: request.kind,
+                        locality_group_id: previous.locality_group_id.clone(),
+                        shard_index: group_index,
+                        degraded,
+                    });
+                    continue;
+                }
+                migrated_assignments += 1;
+            } else {
+                new_assignments += 1;
+            }
+
+            let group_index = choose_lane_group_index(&request, groups.len(), &group_loads);
+            group_loads[group_index] =
+                group_loads[group_index].saturating_add(lane_load_units(&request));
+            assignments.push(SwarmLaneAssignment {
+                lane_id: request.lane_id,
+                kind: request.kind,
+                locality_group_id: groups[group_index].group_id.clone(),
+                shard_index: group_index,
+                degraded,
+            });
+        }
+
+        assignments.sort_by(|left, right| left.lane_id.cmp(&right.lane_id));
+
+        SwarmLanePlacementPlan {
+            mode,
+            assignments,
+            degraded_reason,
+            preserved_assignments,
+            new_assignments,
+            migrated_assignments,
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Lifecycle-aware helpers
     // -------------------------------------------------------------------------
 
@@ -938,6 +1147,103 @@ fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn normalized_locality_groups(groups: &[TopologyLocalityGroup]) -> Vec<TopologyLocalityGroup> {
+    let mut normalized: Vec<TopologyLocalityGroup> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| {
+            let mut normalized = group.clone();
+            if normalized.group_id.is_empty() {
+                normalized.group_id = format!("locality-{index:02}");
+            }
+            normalized.cpu_cores.sort_unstable();
+            normalized.cpu_cores.dedup();
+            normalized
+        })
+        .collect();
+    normalized.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+    normalized.dedup_by(|left, right| left.group_id == right.group_id);
+    normalized
+}
+
+fn synthetic_locality_groups(request_count: usize) -> Vec<TopologyLocalityGroup> {
+    let group_count = request_count.clamp(1, 4);
+    (0..group_count)
+        .map(|index| TopologyLocalityGroup {
+            group_id: format!("synthetic-shard-{index:02}"),
+            numa_node: None,
+            cpu_cores: vec![u32::try_from(index).unwrap_or(u32::MAX)],
+            memory_bytes: None,
+        })
+        .collect()
+}
+
+fn lane_placement_sort_key(request: &SwarmLaneRequest) -> (u8, std::cmp::Reverse<u8>, &str) {
+    (
+        request.kind.locality_rank(),
+        std::cmp::Reverse(request.churn),
+        request.lane_id.as_str(),
+    )
+}
+
+fn choose_lane_group_index(
+    request: &SwarmLaneRequest,
+    group_count: usize,
+    group_loads: &[u64],
+) -> usize {
+    if group_count == 0 {
+        return 0;
+    }
+
+    let preferred = stable_lane_group_index(request, group_count);
+    (0..group_count)
+        .min_by_key(|index| {
+            (
+                group_loads.get(*index).copied().unwrap_or(u64::MAX),
+                topology_ring_distance(preferred, *index, group_count),
+                *index,
+            )
+        })
+        .unwrap_or(preferred)
+}
+
+fn topology_ring_distance(left: usize, right: usize, group_count: usize) -> usize {
+    if group_count == 0 {
+        return 0;
+    }
+    let direct = left.abs_diff(right);
+    direct.min(group_count - direct)
+}
+
+fn stable_lane_group_index(request: &SwarmLaneRequest, group_count: usize) -> usize {
+    if group_count == 0 {
+        return 0;
+    }
+    let group_count_u64 = u64::try_from(group_count).unwrap_or(u64::MAX);
+    let index = stable_lane_hash(request) % group_count_u64;
+    usize::try_from(index).unwrap_or(0)
+}
+
+fn stable_lane_hash(request: &SwarmLaneRequest) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    stable_hash_bytes(&mut hash, request.lane_id.as_bytes());
+    stable_hash_bytes(&mut hash, &[request.kind.locality_rank()]);
+    hash
+}
+
+fn stable_hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+fn lane_load_units(request: &SwarmLaneRequest) -> u64 {
+    1_u64
+        .saturating_add(u64::from(request.churn / 50))
+        .saturating_add(request.state_bytes / (64 * 1024 * 1024))
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -946,6 +1252,7 @@ fn epoch_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::session_topology::LifecycleEntityKind;
+    use proptest::prelude::*;
 
     // Helper: build a registry with some panes
     fn make_registry_with_panes(pane_ids: &[u64]) -> LifecycleRegistry {
@@ -969,6 +1276,48 @@ mod tests {
 
     fn window_identity(id: u64) -> LifecycleIdentity {
         LifecycleIdentity::new(LifecycleEntityKind::Window, "default", "local", id, 1)
+    }
+
+    fn lane_kind_for_index(index: usize) -> SwarmLaneKind {
+        match index % 6 {
+            0 => SwarmLaneKind::PaneCohort,
+            1 => SwarmLaneKind::CaptureWorker,
+            2 => SwarmLaneKind::StorageWriter,
+            3 => SwarmLaneKind::SearchWorker,
+            4 => SwarmLaneKind::MissionWorker,
+            _ => SwarmLaneKind::McpSurface,
+        }
+    }
+
+    fn lane_request(id: String, index: usize) -> SwarmLaneRequest {
+        SwarmLaneRequest {
+            lane_id: id,
+            kind: lane_kind_for_index(index),
+            churn: u8::try_from((index * 17) % 255).unwrap_or(0),
+            state_bytes: u64::try_from(index).unwrap_or(0) * 4 * 1024 * 1024,
+        }
+    }
+
+    fn lane_requests_strategy() -> impl Strategy<Value = Vec<SwarmLaneRequest>> {
+        prop::collection::hash_set("[a-z][a-z0-9_]{0,10}", 0..40).prop_map(|ids| {
+            let mut ids: Vec<String> = ids.into_iter().collect();
+            ids.sort();
+            ids.into_iter()
+                .enumerate()
+                .map(|(index, id)| lane_request(id, index))
+                .collect()
+        })
+    }
+
+    fn locality_groups(count: usize) -> Vec<TopologyLocalityGroup> {
+        (0..count)
+            .map(|index| TopologyLocalityGroup {
+                group_id: format!("numa-{index:02}"),
+                numa_node: Some(u32::try_from(index).unwrap_or(u32::MAX)),
+                cpu_cores: vec![u32::try_from(index * 2).unwrap_or(u32::MAX)],
+                memory_bytes: Some(16 * 1024 * 1024 * 1024),
+            })
+            .collect()
     }
 
     // -------------------------------------------------------------------------
@@ -1684,6 +2033,142 @@ mod tests {
                 }
             }
             _ => panic!("expected HSplit"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Swarm lane placement tests (ft-h2q3x)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn swarm_lane_placement_uses_topology_groups() {
+        let orch = TopologyOrchestrator::new();
+        let requests = vec![
+            lane_request("pane-alpha".into(), 0),
+            lane_request("capture-alpha".into(), 1),
+            lane_request("storage-alpha".into(), 2),
+        ];
+        let groups = locality_groups(2);
+
+        let plan = orch.plan_swarm_lane_placement(&requests, &groups);
+
+        assert_eq!(plan.mode, TopologyPlacementMode::TopologyAware);
+        assert_eq!(plan.assignments.len(), requests.len());
+        assert!(plan.degraded_reason.is_none());
+        assert!(
+            plan.assignments
+                .iter()
+                .all(|assignment| !assignment.degraded)
+        );
+        assert!(plan.assignments.iter().all(|assignment| {
+            groups
+                .iter()
+                .any(|group| group.group_id == assignment.locality_group_id)
+        }));
+    }
+
+    #[test]
+    fn swarm_lane_placement_degrades_without_topology_groups() {
+        let orch = TopologyOrchestrator::new();
+        let requests = vec![
+            lane_request("pane-alpha".into(), 0),
+            lane_request("capture-alpha".into(), 1),
+        ];
+
+        let plan = orch.plan_swarm_lane_placement(&requests, &[]);
+
+        assert_eq!(plan.mode, TopologyPlacementMode::DeterministicShard);
+        assert!(plan.degraded_reason.is_some());
+        assert!(
+            plan.assignments
+                .iter()
+                .all(|assignment| assignment.degraded)
+        );
+        assert!(
+            plan.assignments
+                .iter()
+                .all(|assignment| assignment.locality_group_id.starts_with("synthetic-shard-"))
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn swarm_lane_placement_is_order_independent(
+            requests in lane_requests_strategy(),
+            group_count in 1_usize..8,
+        ) {
+            let orch = TopologyOrchestrator::new();
+            let groups = locality_groups(group_count);
+            let mut reversed = requests.clone();
+            reversed.reverse();
+
+            let first = orch.plan_swarm_lane_placement(&requests, &groups);
+            let second = orch.plan_swarm_lane_placement(&reversed, &groups);
+
+            prop_assert_eq!(first, second);
+        }
+
+        #[test]
+        fn swarm_lane_placement_preserves_existing_lanes_under_append_churn(
+            mut requests in lane_requests_strategy(),
+            extra_lane in "[a-z][a-z0-9_]{0,10}",
+            group_count in 1_usize..8,
+        ) {
+            prop_assume!(!requests.iter().any(|request| request.lane_id == extra_lane));
+
+            let orch = TopologyOrchestrator::new();
+            let groups = locality_groups(group_count);
+            let initial = orch.plan_swarm_lane_placement(&requests, &groups);
+            let previous_assignments = initial.assignments.clone();
+            let initial_by_lane: HashMap<String, String> = initial
+                .assignments
+                .iter()
+                .map(|assignment| {
+                    (
+                        assignment.lane_id.clone(),
+                        assignment.locality_group_id.clone(),
+                    )
+                })
+                .collect();
+
+            requests.push(lane_request(extra_lane, 99));
+            let next = orch.plan_swarm_lane_placement_with_previous(
+                &requests,
+                &groups,
+                &previous_assignments,
+            );
+            let next_by_lane: HashMap<String, String> = next
+                .assignments
+                .iter()
+                .map(|assignment| {
+                    (
+                        assignment.lane_id.clone(),
+                        assignment.locality_group_id.clone(),
+                    )
+                })
+                .collect();
+
+            for (lane_id, locality_group_id) in initial_by_lane {
+                prop_assert_eq!(
+                    next_by_lane.get(&lane_id),
+                    Some(&locality_group_id),
+                    "existing lane moved despite unchanged locality groups",
+                );
+            }
+        }
+
+        #[test]
+        fn swarm_lane_placement_fallback_is_repeatable(
+            requests in lane_requests_strategy(),
+        ) {
+            let orch = TopologyOrchestrator::new();
+
+            let first = orch.plan_swarm_lane_placement(&requests, &[]);
+            let second = orch.plan_swarm_lane_placement(&requests, &[]);
+
+            prop_assert_eq!(first, second);
+            prop_assert_eq!(first.mode, TopologyPlacementMode::DeterministicShard);
+            prop_assert!(first.assignments.iter().all(|assignment| assignment.degraded));
         }
     }
 
