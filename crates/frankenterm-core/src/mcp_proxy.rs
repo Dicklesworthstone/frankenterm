@@ -642,32 +642,52 @@ fn proxy_tool_safety_block_reason(
     None
 }
 
+/// br-ft-gmt1c: a block reason is "explicit" iff the tool's
+/// annotations object is well-formed and self-classifies as
+/// destructive or mutating. Missing or malformed annotations are
+/// NOT explicit — the operator opting into mutating tools cannot
+/// know what they're admitting if the safety metadata is absent
+/// or shape-broken.
+fn proxy_block_reason_is_explicit(reason: ProxyToolSafetyBlockReason) -> bool {
+    matches!(
+        reason,
+        ProxyToolSafetyBlockReason::DestructiveToolBlocked
+            | ProxyToolSafetyBlockReason::MutatingToolBlocked
+    )
+}
+
 fn filter_remote_tools(
     settings: &McpClientConfig,
     tools: Vec<McpClientToolDefinition>,
 ) -> Vec<McpClientToolDefinition> {
-    if settings.proxy_allow_mutating_tools {
-        return tools;
-    }
-
     let mut filtered = Vec::with_capacity(tools.len());
     for tool in tools {
-        if let Some(reason) = proxy_tool_safety_block_reason(&tool) {
-            // br-ft-153dy: bump the cumulative counter alongside
-            // the per-event tracing::warn so operators can
-            // quantify the policy-driven removal blast radius
-            // without scraping logs.
-            record_mcp_proxy_destructive_filtered();
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "mcp_proxy_tool_filtered",
-                tool = %tool.name,
-                reason = reason.as_str(),
-                "Skipping unsafe remote tool due to proxy safety policy"
-            );
+        let Some(reason) = proxy_tool_safety_block_reason(&tool) else {
+            // No block reason — tool is safe by annotation.
+            filtered.push(tool);
+            continue;
+        };
+        // br-ft-gmt1c: `proxy_allow_mutating_tools` only bypasses
+        // EXPLICIT destructive/mutating annotations. Tools with
+        // missing or malformed annotations remain blocked
+        // regardless of the opt-in, because the operator cannot
+        // consent to admit unsafe metadata they can't see.
+        if settings.proxy_allow_mutating_tools && proxy_block_reason_is_explicit(reason) {
+            filtered.push(tool);
             continue;
         }
-        filtered.push(tool);
+        // br-ft-153dy: bump the cumulative counter alongside
+        // the per-event tracing::warn so operators can
+        // quantify the policy-driven removal blast radius
+        // without scraping logs.
+        record_mcp_proxy_destructive_filtered();
+        tracing::warn!(
+            target: LOG_TARGET,
+            event = "mcp_proxy_tool_filtered",
+            tool = %tool.name,
+            reason = reason.as_str(),
+            "Skipping unsafe remote tool due to proxy safety policy"
+        );
     }
     filtered
 }
@@ -1458,20 +1478,16 @@ mod tests {
 
     #[test]
     fn filter_remote_tools_allows_mutating_when_configured() {
+        // br-ft-gmt1c: `proxy_allow_mutating_tools` admits tools
+        // with EXPLICIT destructive/mutating annotations, but NOT
+        // tools with missing/malformed annotation metadata. The
+        // operator can't consent to admit unsafe metadata they
+        // can't see.
         let mut settings = McpClientConfig::default();
         settings.proxy_allow_mutating_tools = true;
 
         let tools = vec![
-            McpClientToolDefinition {
-                name: "safe_tool".to_string(),
-                description: None,
-                input_schema: serde_json::json!({"type": "object"}),
-                output_schema: None,
-                icon: None,
-                version: None,
-                tags: Vec::new(),
-                annotations: None,
-            },
+            // Explicit destructive: admitted under the opt-in.
             McpClientToolDefinition {
                 name: "drop_db".to_string(),
                 description: None,
@@ -1482,13 +1498,88 @@ mod tests {
                 tags: Vec::new(),
                 annotations: Some(serde_json::json!({"destructive": true})),
             },
+            // Explicit mutating: admitted under the opt-in.
+            McpClientToolDefinition {
+                name: "write_file".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: Some(serde_json::json!({"readOnly": false})),
+            },
+            // Tool with no safety problem (readOnly:true) — passes.
+            McpClientToolDefinition {
+                name: "list_tables".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: Some(serde_json::json!({"readOnly": true})),
+            },
         ];
 
         let filtered = filter_remote_tools(&settings, tools);
-        assert_eq!(
-            filtered.len(),
-            2,
-            "all tools should pass when mutating allowed"
+        let names: Vec<&str> = filtered.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"drop_db"), "explicit destructive admitted");
+        assert!(names.contains(&"write_file"), "explicit mutating admitted");
+        assert!(names.contains(&"list_tables"), "safe tool admitted");
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn filter_remote_tools_still_blocks_missing_annotations_under_opt_in_ft_gmt1c() {
+        // br-ft-gmt1c: even with proxy_allow_mutating_tools=true,
+        // a tool with annotations=None must remain blocked. The
+        // operator cannot consent to admit unsafe metadata they
+        // can't see.
+        let mut settings = McpClientConfig::default();
+        settings.proxy_allow_mutating_tools = true;
+
+        let tools = vec![McpClientToolDefinition {
+            name: "no_annotations".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }];
+
+        let filtered = filter_remote_tools(&settings, tools);
+        assert!(
+            filtered.is_empty(),
+            "missing-annotations tools must remain blocked even with opt-in"
+        );
+    }
+
+    #[test]
+    fn filter_remote_tools_still_blocks_malformed_annotations_under_opt_in_ft_gmt1c() {
+        // br-ft-gmt1c: a tool with annotations that are not a JSON
+        // object (e.g. an array, a string, a number) must remain
+        // blocked even when the operator opted into mutating tools.
+        let mut settings = McpClientConfig::default();
+        settings.proxy_allow_mutating_tools = true;
+
+        let tools = vec![McpClientToolDefinition {
+            name: "weird_shape".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!(["not", "an", "object"])),
+        }];
+
+        let filtered = filter_remote_tools(&settings, tools);
+        assert!(
+            filtered.is_empty(),
+            "malformed-annotations tools must remain blocked even with opt-in"
         );
     }
 
