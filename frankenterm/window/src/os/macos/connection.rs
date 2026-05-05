@@ -5,17 +5,17 @@
 
 use super::nsstring_to_str;
 use super::window::WindowInner;
+use crate::Appearance;
 use crate::connection::{
-    fail_window_op_for_destroyed_window, new_window_op_promise, ConnectionOps,
+    ConnectionOps, fail_window_op_for_destroyed_window, new_window_op_promise,
 };
 use crate::os::macos::app::create_app_delegate;
 use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
-use crate::Appearance;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyRegular, NSScreen};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSArray, NSInteger};
-use objc::runtime::{Object, BOOL, YES};
+use objc::runtime::{BOOL, Object, YES};
 use objc::*;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -107,6 +107,15 @@ impl SoftwareVersion {
     }
 }
 
+fn stop_app_message_loop() {
+    unsafe {
+        let () = msg_send![NSApp(), stop: nil];
+        // Generate a UI event so that the run loop breaks out after receiving
+        // the stop request. This also unwinds an active modal confirmation.
+        let () = msg_send![NSApp(), abortModal];
+    }
+}
+
 impl ConnectionOps for Connection {
     fn name(&self) -> String {
         if let Ok(vers) = SoftwareVersion::load() {
@@ -129,15 +138,17 @@ impl ConnectionOps for Connection {
 
     fn terminate_message_loop(&self) {
         unsafe {
-            // bounce via an event callback to encourage stop to apply
-            // to the correct level of run loop
-            promise::spawn::spawn_into_main_thread(async move {
-                let () = msg_send![NSApp(), stop: nil];
-                // Generate a UI event so that the run loop breaks out
-                // after receiving the stop
-                let () = msg_send![NSApp(), abortModal];
-            })
-            .detach();
+            let is_main_thread: BOOL = msg_send![class!(NSThread), isMainThread];
+            if is_main_thread == YES {
+                stop_app_message_loop();
+            } else {
+                // Bounce through the AppKit thread so stop applies to the
+                // active NSApplication run loop level.
+                promise::spawn::spawn_into_main_thread(async move {
+                    stop_app_message_loop();
+                })
+                .detach();
+            }
         }
     }
 
