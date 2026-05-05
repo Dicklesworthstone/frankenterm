@@ -1,11 +1,12 @@
 # Robot Family Contract: `context`
 
 **Bead:** [BR-RC-ROBOT-CONTRACT.3] / `ft-hac7w.4`
-**Status:** Foundation slice shipped. Schema-DSL contract +
-state-space proof + 10-test conformance harness extension all
-live; production handler wiring (cass-types + session-resume
-infrastructure) is the integration follow-on. **This is the
-last open child of the `ft-hac7w` epic.**
+**Status:** Native Robot Mode handler shipped under `ft-bs9uh.3`.
+Schema-DSL contract + state-space proof + 10-test conformance
+harness extension remain live, and the CLI now writes durable
+`pane_contexts` / `context_rotations` rows for status, rotate,
+and history. The native adapter records metadata and receipts;
+it does not persist raw conversation content.
 
 ## Family overview
 
@@ -52,8 +53,12 @@ always-on regression net for **4 named safety invariants**:
 **Request:** `{ "action": "status", "params": { "pane_id":
 "<required>" } }`
 
-**Response `data`:** `pane_id`, `active_context_id`, `depth`
-(rotation count), `last_rotated_at_ms` (optional).
+**Response `data`:** `panes`, `fleet_pressure`, and per-pane
+fields including `pane_id`, `active_context_id`, `depth`
+(rotation count), `last_rotated_at_ms` (optional),
+`pressure_tier`, token estimates, and
+`raw_context_content_stored: false`. Omitting `pane_id` returns
+the tracked context registry across panes.
 
 ### `rotate`
 

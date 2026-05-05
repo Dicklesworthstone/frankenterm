@@ -3492,6 +3492,14 @@ enum RobotContextCommands {
         /// Rotation strategy (agent_default, aggressive, gentle)
         #[arg(long, default_value = "agent_default")]
         strategy: String,
+
+        /// Optional rationale stored with the rotation receipt
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Caller-supplied replay key; repeated calls with the same key return the same receipt
+        #[arg(long, alias = "caller-idempotency-key")]
+        idempotency_key: Option<String>,
     },
     /// Get compaction history for a pane
     History {
@@ -9525,6 +9533,834 @@ fn robot_work_command_response(
     match result {
         Ok(data) => RobotResponse::<serde_json::Value>::success(data, elapsed_ms),
         Err(response) => response,
+    }
+}
+
+const ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET: i64 = 200_000;
+
+#[derive(Debug, Clone)]
+struct RobotContextActiveRow {
+    context_id: String,
+    depth: i64,
+    token_budget: i64,
+    tokens_consumed: i64,
+    pressure_tier: String,
+}
+
+#[derive(Debug, Clone)]
+struct RobotContextRotationRow {
+    rotation_id: String,
+    pane_id: i64,
+    previous_context_id: Option<String>,
+    new_context_id: String,
+    strategy: String,
+    reason: Option<String>,
+    caller_idempotency_key: Option<String>,
+    rotated_at_ms: i64,
+    tokens_before: i64,
+    tokens_after: i64,
+    tokens_freed: i64,
+}
+
+fn robot_context_error_response(
+    code: &str,
+    message: impl Into<String>,
+    hint: Option<String>,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    RobotResponse::<serde_json::Value>::error_with_code(code, message, hint, elapsed_ms)
+}
+
+fn robot_context_backend_error(
+    err: impl std::fmt::Display,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    robot_context_error_response(
+        ROBOT_ERR_STORAGE,
+        format!("Failed to update native context registry: {err}"),
+        Some("Check the workspace database path and permissions.".to_string()),
+        elapsed_ms,
+    )
+}
+
+fn robot_context_validate_text(
+    field: &str,
+    value: Option<&str>,
+    elapsed_ms: u64,
+) -> Result<(), RobotResponse<serde_json::Value>> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        return Err(robot_context_error_response(
+            ROBOT_ERR_INVALID_ARGS,
+            format!("{field} must not be empty when supplied."),
+            None,
+            elapsed_ms,
+        ));
+    }
+    if value.len() > 256 {
+        return Err(robot_context_error_response(
+            ROBOT_ERR_INVALID_ARGS,
+            format!("{field} is too long; maximum is 256 bytes."),
+            None,
+            elapsed_ms,
+        ));
+    }
+    Ok(())
+}
+
+fn robot_context_open_conn(db_path: &str) -> anyhow::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    robot_context_ensure_schema(&conn)?;
+    Ok(conn)
+}
+
+fn robot_context_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS pane_contexts (
+            context_id TEXT PRIMARY KEY NOT NULL,
+            pane_id INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('active', 'archived')),
+            depth INTEGER NOT NULL CHECK (depth >= 0),
+            created_at_ms INTEGER NOT NULL,
+            archived_at_ms INTEGER,
+            token_budget INTEGER NOT NULL DEFAULT 200000,
+            tokens_consumed INTEGER NOT NULL DEFAULT 0,
+            pressure_tier TEXT NOT NULL DEFAULT 'green',
+            source TEXT NOT NULL DEFAULT 'robot_context'
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pane_contexts_one_active
+            ON pane_contexts(pane_id)
+            WHERE state = 'active';
+        CREATE INDEX IF NOT EXISTS idx_pane_contexts_pane_state
+            ON pane_contexts(pane_id, state);
+
+        CREATE TABLE IF NOT EXISTS context_rotations (
+            rotation_id TEXT PRIMARY KEY NOT NULL,
+            pane_id INTEGER NOT NULL,
+            previous_context_id TEXT,
+            new_context_id TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            reason TEXT,
+            caller_idempotency_key TEXT,
+            rotated_at_ms INTEGER NOT NULL,
+            tokens_before INTEGER NOT NULL DEFAULT 0,
+            tokens_after INTEGER NOT NULL DEFAULT 0,
+            tokens_freed INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY(previous_context_id) REFERENCES pane_contexts(context_id),
+            FOREIGN KEY(new_context_id) REFERENCES pane_contexts(context_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_context_rotations_pane_time
+            ON context_rotations(pane_id, rotated_at_ms DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_context_rotations_idempotency
+            ON context_rotations(pane_id, caller_idempotency_key)
+            WHERE caller_idempotency_key IS NOT NULL;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn robot_context_active_row_from_sql(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RobotContextActiveRow> {
+    Ok(RobotContextActiveRow {
+        context_id: row.get(0)?,
+        depth: row.get(1)?,
+        token_budget: row.get(2)?,
+        tokens_consumed: row.get(3)?,
+        pressure_tier: row.get(4)?,
+    })
+}
+
+fn robot_context_rotation_row_from_sql(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RobotContextRotationRow> {
+    Ok(RobotContextRotationRow {
+        rotation_id: row.get(0)?,
+        pane_id: row.get(1)?,
+        previous_context_id: row.get(2)?,
+        new_context_id: row.get(3)?,
+        strategy: row.get(4)?,
+        reason: row.get(5)?,
+        caller_idempotency_key: row.get(6)?,
+        rotated_at_ms: row.get(7)?,
+        tokens_before: row.get(8)?,
+        tokens_after: row.get(9)?,
+        tokens_freed: row.get(10)?,
+    })
+}
+
+const ROBOT_CONTEXT_SELECT_ACTIVE: &str = r#"
+    SELECT context_id, depth, token_budget, tokens_consumed, pressure_tier
+    FROM pane_contexts
+    WHERE pane_id = ?1 AND state = 'active'
+"#;
+
+const ROBOT_CONTEXT_SELECT_ROTATION: &str = r#"
+    SELECT rotation_id, pane_id, previous_context_id, new_context_id, strategy, reason,
+           caller_idempotency_key, rotated_at_ms, tokens_before, tokens_after, tokens_freed
+    FROM context_rotations
+"#;
+
+fn robot_context_fetch_active_tx(
+    tx: &rusqlite::Transaction<'_>,
+    pane_id: u64,
+) -> anyhow::Result<Option<RobotContextActiveRow>> {
+    use rusqlite::OptionalExtension;
+
+    tx.query_row(
+        ROBOT_CONTEXT_SELECT_ACTIVE,
+        [pane_id as i64],
+        robot_context_active_row_from_sql,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn robot_context_fetch_active(
+    conn: &rusqlite::Connection,
+    pane_id: u64,
+) -> anyhow::Result<Option<RobotContextActiveRow>> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        ROBOT_CONTEXT_SELECT_ACTIVE,
+        [pane_id as i64],
+        robot_context_active_row_from_sql,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn robot_context_fetch_rotation_by_key_tx(
+    tx: &rusqlite::Transaction<'_>,
+    pane_id: u64,
+    idempotency_key: &str,
+) -> anyhow::Result<Option<RobotContextRotationRow>> {
+    use rusqlite::OptionalExtension;
+
+    let sql = format!(
+        "{ROBOT_CONTEXT_SELECT_ROTATION}
+         WHERE pane_id = ?1 AND caller_idempotency_key = ?2
+         ORDER BY rotated_at_ms DESC
+         LIMIT 1"
+    );
+    tx.query_row(
+        &sql,
+        rusqlite::params![pane_id as i64, idempotency_key],
+        robot_context_rotation_row_from_sql,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn robot_context_normalize_strategy(
+    strategy: &str,
+    elapsed_ms: u64,
+) -> Result<&'static str, RobotResponse<serde_json::Value>> {
+    match strategy.trim().to_ascii_lowercase().as_str() {
+        "agent_default" | "default" | "agent-default" => Ok("agent_default"),
+        "aggressive" => Ok("aggressive"),
+        "gentle" => Ok("gentle"),
+        other => Err(robot_context_error_response(
+            ROBOT_ERR_INVALID_ARGS,
+            format!("Unknown context rotation strategy `{other}`."),
+            Some("Use one of: agent_default, aggressive, gentle.".to_string()),
+            elapsed_ms,
+        )),
+    }
+}
+
+fn robot_context_hash(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn robot_context_make_id(prefix: &str, parts: &[&str]) -> String {
+    let hash = robot_context_hash(parts);
+    format!("{prefix}-{}", &hash[..32])
+}
+
+fn robot_context_limit(limit: usize) -> usize {
+    limit.clamp(1, 200)
+}
+
+fn robot_context_utilization(tokens_consumed: i64, token_budget: i64) -> f64 {
+    if token_budget <= 0 {
+        return if tokens_consumed <= 0 { 0.0 } else { 1.0 };
+    }
+    ((tokens_consumed.max(0) as f64) / (token_budget as f64)).min(1.0)
+}
+
+fn robot_context_status_for_pane(
+    conn: &rusqlite::Connection,
+    pane_id: u64,
+    now_ms: i64,
+) -> anyhow::Result<serde_json::Value> {
+    use rusqlite::OptionalExtension;
+
+    let active = robot_context_fetch_active(conn, pane_id)?;
+    let depth: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM context_rotations WHERE pane_id = ?1",
+        [pane_id as i64],
+        |row| row.get(0),
+    )?;
+    let last_rotated_at_ms: Option<i64> = conn
+        .query_row(
+            "SELECT rotated_at_ms FROM context_rotations
+             WHERE pane_id = ?1
+             ORDER BY rotated_at_ms DESC
+             LIMIT 1",
+            [pane_id as i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let (active_context_id, token_budget, tokens_consumed, pressure_tier, active_depth) = active
+        .map_or_else(
+            || {
+                (
+                    String::new(),
+                    ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET,
+                    0,
+                    "green".to_string(),
+                    depth,
+                )
+            },
+            |row| {
+                (
+                    row.context_id,
+                    row.token_budget,
+                    row.tokens_consumed,
+                    row.pressure_tier,
+                    row.depth,
+                )
+            },
+        );
+    let utilization = robot_context_utilization(tokens_consumed, token_budget);
+    let ms_since_last_compaction =
+        last_rotated_at_ms.map(|last| now_ms.saturating_sub(last).max(0) as u64);
+    let active_context_present = !active_context_id.is_empty();
+
+    Ok(serde_json::json!({
+        "pane_id": pane_id,
+        "active_context_id": active_context_id,
+        "active_context_present": active_context_present,
+        "depth": depth.max(active_depth),
+        "last_rotated_at_ms": last_rotated_at_ms,
+        "pressure_tier": pressure_tier,
+        "utilization": utilization,
+        "tokens_consumed": tokens_consumed.max(0) as u64,
+        "token_budget": token_budget.max(0) as u64,
+        "compaction_count": depth.max(0) as u64,
+        "ms_since_last_compaction": ms_since_last_compaction,
+        "raw_context_content_stored": false,
+    }))
+}
+
+fn robot_context_fleet_pressure(panes: &[serde_json::Value]) -> serde_json::Value {
+    let mut green_count = 0usize;
+    let mut yellow_count = 0usize;
+    let mut red_count = 0usize;
+    let mut black_count = 0usize;
+
+    for pane in panes {
+        match pane["pressure_tier"].as_str().unwrap_or("green") {
+            "black" => black_count += 1,
+            "red" => red_count += 1,
+            "yellow" => yellow_count += 1,
+            _ => green_count += 1,
+        }
+    }
+
+    serde_json::json!({
+        "total_panes": panes.len(),
+        "green_count": green_count,
+        "yellow_count": yellow_count,
+        "red_count": red_count,
+        "black_count": black_count,
+    })
+}
+
+fn robot_context_status_data(
+    db_path: &str,
+    pane_id: Option<u64>,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    let conn = robot_context_open_conn(db_path)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    let now_ms = now_ms_i64();
+    let panes = if let Some(pane_id) = pane_id {
+        vec![
+            robot_context_status_for_pane(&conn, pane_id, now_ms)
+                .map_err(|err| robot_context_backend_error(err, elapsed_ms))?,
+        ]
+    } else {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT pane_id FROM pane_contexts ORDER BY pane_id")
+            .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+        let pane_ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+        let mut panes = Vec::new();
+        for pane_id in pane_ids {
+            let pane_id = pane_id.map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+            panes.push(
+                robot_context_status_for_pane(&conn, pane_id.max(0) as u64, now_ms)
+                    .map_err(|err| robot_context_backend_error(err, elapsed_ms))?,
+            );
+        }
+        panes
+    };
+    let fleet_pressure = robot_context_fleet_pressure(&panes);
+
+    Ok(serde_json::json!({
+        "family": "context",
+        "action": "status",
+        "backend": "native_sqlite_context",
+        "storage_tables": ["pane_contexts", "context_rotations"],
+        "scope": if pane_id.is_some() { "pane" } else { "tracked_panes" },
+        "panes": panes,
+        "fleet_pressure": fleet_pressure,
+        "raw_context_content_stored": false,
+    }))
+}
+
+fn robot_context_rotation_response(
+    row: &RobotContextRotationRow,
+    is_replay: bool,
+) -> serde_json::Value {
+    let utilization_before =
+        robot_context_utilization(row.tokens_before, ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET);
+    let utilization_after =
+        robot_context_utilization(row.tokens_after, ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET);
+
+    serde_json::json!({
+        "family": "context",
+        "action": "rotate",
+        "backend": "native_sqlite_context",
+        "storage_tables": ["pane_contexts", "context_rotations"],
+        "pane_id": row.pane_id.max(0) as u64,
+        "accepted": true,
+        "reason": row.reason.clone(),
+        "rotation_id": row.rotation_id.clone(),
+        "previous_context_id": row.previous_context_id.clone(),
+        "new_context_id": row.new_context_id.clone(),
+        "rotated_at_ms": row.rotated_at_ms.max(0) as u64,
+        "is_replay": is_replay,
+        "strategy": row.strategy.clone(),
+        "caller_idempotency_key_present": row.caller_idempotency_key.is_some(),
+        "tokens_before": row.tokens_before.max(0) as u64,
+        "tokens_after": row.tokens_after.max(0) as u64,
+        "tokens_freed": row.tokens_freed.max(0) as u64,
+        "utilization_before": utilization_before,
+        "utilization_after": utilization_after,
+        "raw_context_content_stored": false,
+        "audit": {
+            "event": if is_replay { "context.rotated.replay" } else { "context.rotated" },
+            "serializable_key": format!("pane:{}", row.pane_id.max(0)),
+        },
+    })
+}
+
+fn robot_context_rotate_data(
+    db_path: &str,
+    pane_id: u64,
+    strategy: &str,
+    reason: Option<&str>,
+    idempotency_key: Option<&str>,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    robot_context_validate_text("reason", reason, elapsed_ms)?;
+    robot_context_validate_text("idempotency_key", idempotency_key, elapsed_ms)?;
+    let strategy = robot_context_normalize_strategy(strategy, elapsed_ms)?;
+
+    let mut conn = robot_context_open_conn(db_path)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+
+    if let Some(key) = idempotency_key {
+        if let Some(existing) = robot_context_fetch_rotation_by_key_tx(&tx, pane_id, key)
+            .map_err(|err| robot_context_backend_error(err, elapsed_ms))?
+        {
+            tx.commit()
+                .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+            return Ok(robot_context_rotation_response(&existing, true));
+        }
+    }
+
+    let now_ms = now_ms_i64();
+    let active = robot_context_fetch_active_tx(&tx, pane_id)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    let previous_context_id = active.as_ref().map(|row| row.context_id.clone());
+    let previous_depth = active.as_ref().map_or(0, |row| row.depth);
+    let tokens_before = active.as_ref().map_or(0, |row| row.tokens_consumed.max(0));
+    let new_depth = previous_depth.saturating_add(1);
+
+    let pane_s = pane_id.to_string();
+    let now_s = now_ms.to_string();
+    let depth_s = new_depth.to_string();
+    let previous_s = previous_context_id.as_deref().unwrap_or("");
+    let key_s = idempotency_key.unwrap_or("");
+    let strategy_s = strategy;
+    let new_context_id =
+        robot_context_make_id("ctx", &[&pane_s, &now_s, &depth_s, previous_s, strategy_s]);
+    let rotation_id = robot_context_make_id(
+        "rot",
+        &[
+            &pane_s,
+            &now_s,
+            &depth_s,
+            previous_s,
+            &new_context_id,
+            key_s,
+        ],
+    );
+
+    if let Some(previous) = previous_context_id.as_deref() {
+        tx.execute(
+            "UPDATE pane_contexts
+             SET state = 'archived', archived_at_ms = ?2
+             WHERE context_id = ?1 AND state = 'active'",
+            rusqlite::params![previous, now_ms],
+        )
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    }
+
+    tx.execute(
+        "INSERT INTO pane_contexts
+         (context_id, pane_id, state, depth, created_at_ms, token_budget, tokens_consumed,
+          pressure_tier, source)
+         VALUES (?1, ?2, 'active', ?3, ?4, ?5, 0, 'green', 'robot_context')",
+        rusqlite::params![
+            &new_context_id,
+            pane_id as i64,
+            new_depth,
+            now_ms,
+            ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET,
+        ],
+    )
+    .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+
+    tx.execute(
+        "INSERT INTO context_rotations
+         (rotation_id, pane_id, previous_context_id, new_context_id, strategy, reason,
+         caller_idempotency_key, rotated_at_ms, tokens_before, tokens_after, tokens_freed,
+          created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?9, ?8)",
+        rusqlite::params![
+            &rotation_id,
+            pane_id as i64,
+            previous_context_id.as_deref(),
+            &new_context_id,
+            strategy,
+            reason,
+            idempotency_key,
+            now_ms,
+            tokens_before,
+        ],
+    )
+    .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+
+    let row = tx
+        .query_row(
+            &format!("{ROBOT_CONTEXT_SELECT_ROTATION} WHERE rotation_id = ?1"),
+            rusqlite::params![&rotation_id],
+            robot_context_rotation_row_from_sql,
+        )
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    tx.commit()
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+
+    Ok(robot_context_rotation_response(&row, false))
+}
+
+fn robot_context_history_data(
+    db_path: &str,
+    pane_id: u64,
+    limit: usize,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    let conn = robot_context_open_conn(db_path)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    let limit = robot_context_limit(limit);
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM context_rotations WHERE pane_id = ?1",
+            [pane_id as i64],
+            |row| row.get(0),
+        )
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+
+    let sql = format!(
+        "{ROBOT_CONTEXT_SELECT_ROTATION}
+         WHERE pane_id = ?1
+         ORDER BY rotated_at_ms DESC, rotation_id DESC
+         LIMIT ?2"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![pane_id as i64, limit as i64],
+            robot_context_rotation_row_from_sql,
+        )
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    let mut rotations = Vec::new();
+    let mut events = Vec::new();
+    for row in rows {
+        let row = row.map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+        let utilization_before =
+            robot_context_utilization(row.tokens_before, ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET);
+        let utilization_after =
+            robot_context_utilization(row.tokens_after, ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET);
+        events.push(serde_json::json!({
+            "timestamp_ms": row.rotated_at_ms.max(0) as u64,
+            "utilization_before": utilization_before,
+            "utilization_after": utilization_after,
+            "tokens_freed": row.tokens_freed.max(0) as u64,
+            "trigger": row.strategy.clone(),
+        }));
+        rotations.push(serde_json::json!({
+            "rotation_id": row.rotation_id,
+            "pane_id": row.pane_id.max(0) as u64,
+            "previous_context_id": row.previous_context_id,
+            "new_context_id": row.new_context_id,
+            "rotated_at_ms": row.rotated_at_ms.max(0) as u64,
+            "strategy": row.strategy,
+            "reason": row.reason,
+            "caller_idempotency_key_present": row.caller_idempotency_key.is_some(),
+            "tokens_before": row.tokens_before.max(0) as u64,
+            "tokens_after": row.tokens_after.max(0) as u64,
+            "tokens_freed": row.tokens_freed.max(0) as u64,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "family": "context",
+        "action": "history",
+        "backend": "native_sqlite_context",
+        "storage_tables": ["pane_contexts", "context_rotations"],
+        "pane_id": pane_id,
+        "limit": limit,
+        "total": total.max(0) as u64,
+        "truncated": total > limit as i64,
+        "rotations": rotations,
+        "events": events,
+        "raw_context_content_stored": false,
+    }))
+}
+
+fn robot_context_command_response(
+    db_path: &str,
+    command: &RobotContextCommands,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    let result = match command {
+        RobotContextCommands::Status { pane_id } => {
+            robot_context_status_data(db_path, *pane_id, elapsed_ms)
+        }
+        RobotContextCommands::Rotate {
+            pane_id,
+            strategy,
+            reason,
+            idempotency_key,
+        } => robot_context_rotate_data(
+            db_path,
+            *pane_id,
+            strategy,
+            reason.as_deref(),
+            idempotency_key.as_deref(),
+            elapsed_ms,
+        ),
+        RobotContextCommands::History { pane_id, limit } => {
+            robot_context_history_data(db_path, *pane_id, *limit, elapsed_ms)
+        }
+    };
+
+    match result {
+        Ok(data) => RobotResponse::<serde_json::Value>::success(data, elapsed_ms),
+        Err(response) => response,
+    }
+}
+
+#[cfg(test)]
+mod robot_context_backend_tests {
+    use super::*;
+
+    fn setup_robot_context_test_db() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create robot context tempdir");
+        let db_path = dir.path().join("robot-context.db");
+        (dir, db_path.to_string_lossy().to_string())
+    }
+
+    fn context_rotation_count(db_path: &str, pane_id: u64) -> i64 {
+        let conn = robot_context_open_conn(db_path).expect("open context db");
+        conn.query_row(
+            "SELECT COUNT(*) FROM context_rotations WHERE pane_id = ?1",
+            [pane_id as i64],
+            |row| row.get(0),
+        )
+        .expect("count context rotations")
+    }
+
+    fn expect_context_ok(
+        result: Result<serde_json::Value, RobotResponse<serde_json::Value>>,
+    ) -> serde_json::Value {
+        match result {
+            Ok(value) => value,
+            Err(response) => panic!(
+                "expected context success, got {}",
+                serde_json::to_string(&response).expect("serialize context response")
+            ),
+        }
+    }
+
+    fn expect_context_error(
+        result: Result<serde_json::Value, RobotResponse<serde_json::Value>>,
+    ) -> RobotResponse<serde_json::Value> {
+        match result {
+            Ok(value) => panic!("expected context error, got success {value}"),
+            Err(response) => response,
+        }
+    }
+
+    #[test]
+    fn robot_context_status_history_empty_and_populated() {
+        let (_dir, db_path) = setup_robot_context_test_db();
+
+        let empty_status = expect_context_ok(robot_context_status_data(&db_path, Some(7), 5));
+        assert_eq!(empty_status["family"].as_str(), Some("context"));
+        assert_eq!(empty_status["action"].as_str(), Some("status"));
+        assert_eq!(empty_status["panes"][0]["pane_id"].as_u64(), Some(7));
+        assert_eq!(empty_status["panes"][0]["depth"].as_u64(), Some(0));
+        assert_eq!(
+            empty_status["panes"][0]["active_context_present"].as_bool(),
+            Some(false)
+        );
+
+        let empty_history = expect_context_ok(robot_context_history_data(&db_path, 7, 10, 5));
+        assert_eq!(empty_history["total"].as_u64(), Some(0));
+        assert_eq!(empty_history["events"].as_array().unwrap().len(), 0);
+
+        let rotate = expect_context_ok(robot_context_rotate_data(
+            &db_path,
+            7,
+            "gentle",
+            Some("manual compaction"),
+            None,
+            5,
+        ));
+        assert_eq!(rotate["family"].as_str(), Some("context"));
+        assert_eq!(rotate["action"].as_str(), Some("rotate"));
+        assert_eq!(rotate["accepted"].as_bool(), Some(true));
+        assert_eq!(rotate["strategy"].as_str(), Some("gentle"));
+        assert_eq!(rotate["is_replay"].as_bool(), Some(false));
+        assert!(
+            rotate["rotation_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("rot-"))
+        );
+        assert!(
+            rotate["new_context_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("ctx-"))
+        );
+
+        let status = expect_context_ok(robot_context_status_data(&db_path, Some(7), 5));
+        assert_eq!(status["panes"][0]["depth"].as_u64(), Some(1));
+        assert_eq!(
+            status["panes"][0]["active_context_present"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(status["fleet_pressure"]["total_panes"].as_u64(), Some(1));
+
+        let fleet = expect_context_ok(robot_context_status_data(&db_path, None, 5));
+        assert_eq!(fleet["scope"].as_str(), Some("tracked_panes"));
+        assert_eq!(fleet["panes"].as_array().unwrap().len(), 1);
+
+        let history = expect_context_ok(robot_context_history_data(&db_path, 7, 10, 5));
+        assert_eq!(history["total"].as_u64(), Some(1));
+        assert_eq!(history["truncated"].as_bool(), Some(false));
+        assert_eq!(history["rotations"][0]["strategy"].as_str(), Some("gentle"));
+        assert_eq!(history["events"][0]["trigger"].as_str(), Some("gentle"));
+    }
+
+    #[test]
+    fn robot_context_rotate_idempotency_key_replays_without_second_row() {
+        let (_dir, db_path) = setup_robot_context_test_db();
+
+        let first = expect_context_ok(robot_context_rotate_data(
+            &db_path,
+            42,
+            "agent_default",
+            Some("first"),
+            Some("caller-key-1"),
+            9,
+        ));
+        let second = expect_context_ok(robot_context_rotate_data(
+            &db_path,
+            42,
+            "aggressive",
+            Some("retry"),
+            Some("caller-key-1"),
+            9,
+        ));
+
+        assert_eq!(first["rotation_id"], second["rotation_id"]);
+        assert_eq!(second["is_replay"].as_bool(), Some(true));
+        assert_eq!(
+            second["caller_idempotency_key_present"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(context_rotation_count(&db_path, 42), 1);
+
+        let third = expect_context_ok(robot_context_rotate_data(
+            &db_path,
+            42,
+            "aggressive",
+            None,
+            Some("caller-key-2"),
+            9,
+        ));
+        assert_ne!(first["rotation_id"], third["rotation_id"]);
+        assert_eq!(third["is_replay"].as_bool(), Some(false));
+        assert_eq!(context_rotation_count(&db_path, 42), 2);
+    }
+
+    #[test]
+    fn robot_context_history_is_bounded_and_strategy_is_validated() {
+        let (_dir, db_path) = setup_robot_context_test_db();
+
+        for strategy in ["agent_default", "gentle", "aggressive"] {
+            expect_context_ok(robot_context_rotate_data(
+                &db_path, 3, strategy, None, None, 11,
+            ));
+        }
+
+        let history = expect_context_ok(robot_context_history_data(&db_path, 3, 2, 11));
+        assert_eq!(history["total"].as_u64(), Some(3));
+        assert_eq!(history["limit"].as_u64(), Some(2));
+        assert_eq!(history["truncated"].as_bool(), Some(true));
+        assert_eq!(history["rotations"].as_array().unwrap().len(), 2);
+
+        let invalid = expect_context_error(robot_context_rotate_data(
+            &db_path, 3, "surprise", None, None, 11,
+        ));
+        assert_eq!(invalid.error_code.as_deref(), Some(ROBOT_ERR_INVALID_ARGS));
     }
 }
 
@@ -25201,50 +26037,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Context { command } => {
-                            let ntm_cmd = match &command {
-                                RobotContextCommands::Status { pane_id } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Context(
-                                        frankenterm_core::robot_ntm_surface::ContextCommand::Status(
-                                            frankenterm_core::robot_ntm_surface::ContextStatusRequest {
-                                                pane_id: *pane_id,
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotContextCommands::Rotate { pane_id, strategy } => {
-                                    let strat = match strategy.as_str() {
-                                        "aggressive" => {
-                                            frankenterm_core::robot_ntm_surface::RotationStrategy::Aggressive
-                                        }
-                                        "gentle" => {
-                                            frankenterm_core::robot_ntm_surface::RotationStrategy::Gentle
-                                        }
-                                        _ => {
-                                            frankenterm_core::robot_ntm_surface::RotationStrategy::AgentDefault
-                                        }
-                                    };
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Context(
-                                        frankenterm_core::robot_ntm_surface::ContextCommand::Rotate(
-                                            frankenterm_core::robot_ntm_surface::ContextRotateRequest {
-                                                pane_id: *pane_id,
-                                                strategy: strat,
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotContextCommands::History { pane_id, limit } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Context(
-                                        frankenterm_core::robot_ntm_surface::ContextCommand::History(
-                                            frankenterm_core::robot_ntm_surface::ContextHistoryRequest {
-                                                pane_id: *pane_id,
-                                                limit: *limit,
-                                            },
-                                        ),
-                                    )
-                                }
-                            };
-                            let response =
-                                build_ntm_not_implemented_response(&ntm_cmd, elapsed_ms(start));
+                            let response = robot_context_command_response(
+                                &ctx.effective.paths.db_path,
+                                &command,
+                                elapsed_ms(start),
+                            );
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Work { command } => {
