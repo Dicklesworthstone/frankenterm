@@ -1396,6 +1396,21 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 - **Phase 1 (instant):** degree, topo sort, density
 - **Phase 2 (async, 500ms timeout):** PageRank, betweenness, HITS, eigenvector, cycles
 
+**Cycle-check truthfulness:** `bv --robot-triage` is a prioritization
+surface, not the authoritative all-history cycle detector. On large Beads
+graphs, `bv --robot-insights` may report `status.Cycles.state = "skipped"`
+while triage still displays `graph.has_cycles = false`; do not treat that as
+proof that the full dependency graph is acyclic. For dependency-editing or
+idea-wizard refinement passes, run:
+
+```bash
+br dep cycles --json
+```
+
+If `br dep cycles --json` reports only closed/legacy `wa-*` cycles and no
+active `ft-*` cycles, say that explicitly instead of claiming the whole graph
+is cycle-free.
+
 ### jq Quick Reference
 
 ```bash
