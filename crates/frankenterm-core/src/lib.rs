@@ -102,7 +102,9 @@ pub mod auto_tune;
 // `frankenterm-core-fleet` can read `BackpressureTier` without a `core → fleet`
 // edge. Re-export here so existing `crate::backpressure::*` and
 // `frankenterm_core::backpressure::*` paths keep resolving unchanged.
-pub use frankenterm_core_resource_types::{backpressure, backpressure_severity};
+pub use frankenterm_core_resource_types::{
+    backpressure, backpressure_severity, resource_admission,
+};
 // ft-yf2am / ft-y0loj.3.2: 5 leaf-clean telemetry primitives
 // (context_snapshot, count_min_sketch, ewma, exp_histogram, hyperloglog)
 // extracted to `frankenterm-core-telemetry-types`. Re-exported so existing

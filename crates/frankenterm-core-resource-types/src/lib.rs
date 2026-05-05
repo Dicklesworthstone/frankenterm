@@ -13,6 +13,7 @@
 //! Modules:
 //! - [`backpressure`] — capture/storage queue-depth FSM (Green / Yellow / Red / Black).
 //! - [`backpressure_severity`] — continuous-severity throttling function (sigmoid).
+//! - [`resource_admission`] — high-core resource admission and placement DTOs/planner.
 //!
 //! ## Modules NOT extracted in this pass (and why)
 //!
@@ -31,3 +32,4 @@
 
 pub mod backpressure;
 pub mod backpressure_severity;
+pub mod resource_admission;
