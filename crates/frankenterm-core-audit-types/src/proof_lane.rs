@@ -7,13 +7,24 @@
 //! closeout explicit enough that sync logs, worker selection, local fallbacks,
 //! and real remote Cargo results cannot be collapsed into the same operator
 //! claim.
+//!
+//! Proof-doctor verdicts may be attached as compact snapshots, but they do not
+//! replace the ledger's pass/fail invariants. The snapshot lets release reports
+//! explain why an attempt is dirty-tree blocked or inconclusive using the same
+//! taxonomy operators saw at runtime, while `PASS` still requires retained
+//! remote Cargo/rustc/test evidence on the ledger record itself.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::proof_doctor::{
+    ProofDoctorBlockerKind, ProofDoctorPhase, ProofDoctorStatus, ProofDoctorToolVersionState,
+    ProofDoctorVerdict,
+};
+
 /// Proof-lane ledger schema version implemented by this module.
-pub const PROOF_LANE_SCHEMA_VERSION: u32 = 1;
+pub const PROOF_LANE_SCHEMA_VERSION: u32 = 2;
 
 /// Terminal and intermediate proof states from the `ft-tn6cw.2` contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -70,9 +81,8 @@ impl ProofState {
             Self::InfraBlockedPostCargo => ProofReportBucket::PostCargoInfrastructureBlocker,
             Self::LocalInvalid => ProofReportBucket::InvalidLocalProof,
             Self::SkippedNotProven => ProofReportBucket::SkippedNotProven,
-            Self::NotRun | Self::ReachedRemoteCargo | Self::Inconclusive => {
-                ProofReportBucket::MissingEvidence
-            }
+            Self::Inconclusive => ProofReportBucket::InconclusiveEvidence,
+            Self::NotRun | Self::ReachedRemoteCargo => ProofReportBucket::MissingEvidence,
         }
     }
 }
@@ -175,10 +185,14 @@ pub enum ProofReportBucket {
     PreCargoInfrastructureBlocker,
     /// Infrastructure blocked proof after Cargo started.
     PostCargoInfrastructureBlocker,
+    /// Dirty tree or active ownership blocked the proof lane.
+    DirtyTreeBlocked,
     /// Local/off-policy proof attempt.
     InvalidLocalProof,
     /// Intentional skip that must not be promoted to proven.
     SkippedNotProven,
+    /// Retained evidence cannot support a stronger classification.
+    InconclusiveEvidence,
     /// Not run, in-flight, or inconclusive evidence.
     MissingEvidence,
 }
@@ -192,9 +206,96 @@ impl ProofReportBucket {
             Self::RemoteProofPassed => "remote_proof_passed",
             Self::PreCargoInfrastructureBlocker => "pre_cargo_infra_blocked",
             Self::PostCargoInfrastructureBlocker => "post_cargo_infra_blocked",
+            Self::DirtyTreeBlocked => "dirty_tree_blocked",
             Self::InvalidLocalProof => "local_invalid",
             Self::SkippedNotProven => "skipped_not_proven",
+            Self::InconclusiveEvidence => "inconclusive",
             Self::MissingEvidence => "missing_evidence",
+        }
+    }
+}
+
+/// Compact proof-doctor snapshot retained by a proof ledger record.
+///
+/// Release and closeout surfaces use this as a reference to the runtime
+/// proof-doctor verdict instead of reclassifying the same evidence locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorLedgerSnapshot {
+    /// Source proof-doctor verdict id.
+    pub verdict_id: String,
+    /// Source proof-doctor status.
+    pub status: ProofDoctorStatus,
+    /// Proof-doctor phase that produced the verdict.
+    pub phase: ProofDoctorPhase,
+    /// Primary proof-doctor reason code.
+    pub reason_code: String,
+    /// Primary blocker kind, when the verdict had a blocker.
+    pub blocker_kind: Option<ProofDoctorBlockerKind>,
+    /// Installed/patched/stale tool state seen by proof-doctor.
+    pub tool_version_state: ProofDoctorToolVersionState,
+    /// Whether proof-doctor evidence reached remote Cargo.
+    pub remote_cargo_reached: bool,
+    /// Redaction-safe affected paths from the primary blocker.
+    pub affected_paths: Vec<String>,
+    /// Operator-facing proof-doctor summary.
+    pub operator_summary: String,
+    /// Operator-facing next action selected by proof-doctor.
+    pub next_action: String,
+}
+
+impl ProofDoctorLedgerSnapshot {
+    /// Copy the release-report-safe fields from a proof-doctor verdict.
+    #[must_use]
+    pub fn from_verdict(verdict: &ProofDoctorVerdict) -> Self {
+        let primary_blocker = verdict.blockers.first();
+        let reason_code = primary_blocker.map_or_else(
+            || {
+                verdict.ledger_projection.as_ref().map_or_else(
+                    || "proof.no_blocker".to_string(),
+                    |projection| projection.reason_code.clone(),
+                )
+            },
+            |blocker| blocker.reason_code.clone(),
+        );
+
+        Self {
+            verdict_id: verdict.verdict_id.clone(),
+            status: verdict.status,
+            phase: verdict.phase,
+            reason_code,
+            blocker_kind: primary_blocker.map(|blocker| blocker.blocker_kind),
+            tool_version_state: verdict.evidence.tool_version_state,
+            remote_cargo_reached: verdict.evidence.remote_cargo_reached,
+            affected_paths: primary_blocker
+                .map_or_else(Vec::new, |blocker| blocker.affected_paths.clone()),
+            operator_summary: verdict.operator_summary.clone(),
+            next_action: verdict.next_action.message.clone(),
+        }
+    }
+
+    /// Report bucket implied by proof-doctor, falling back to the ledger state
+    /// for advisory runnable verdicts.
+    #[must_use]
+    pub const fn report_bucket(&self, fallback: ProofReportBucket) -> ProofReportBucket {
+        match self.status {
+            ProofDoctorStatus::Runnable => fallback,
+            ProofDoctorStatus::Passed => ProofReportBucket::RemoteProofPassed,
+            ProofDoctorStatus::SourceBlocked | ProofDoctorStatus::TestBlocked => {
+                ProofReportBucket::SourceRed
+            }
+            ProofDoctorStatus::InfraBlocked => {
+                if self.remote_cargo_reached {
+                    ProofReportBucket::PostCargoInfrastructureBlocker
+                } else {
+                    ProofReportBucket::PreCargoInfrastructureBlocker
+                }
+            }
+            ProofDoctorStatus::DirtyTreeBlocked | ProofDoctorStatus::OwnershipBlocked => {
+                ProofReportBucket::DirtyTreeBlocked
+            }
+            ProofDoctorStatus::Invalid => ProofReportBucket::InvalidLocalProof,
+            ProofDoctorStatus::SkippedNotProven => ProofReportBucket::SkippedNotProven,
+            ProofDoctorStatus::Inconclusive => ProofReportBucket::InconclusiveEvidence,
         }
     }
 }
@@ -270,6 +371,8 @@ pub struct ProofAttemptRecord {
     pub next_action: String,
     /// Redaction status for referenced artifacts.
     pub redaction_status: ProofRedactionStatus,
+    /// Optional proof-doctor verdict snapshot that justified the handoff.
+    pub proof_doctor: Option<ProofDoctorLedgerSnapshot>,
 }
 
 impl ProofAttemptRecord {
@@ -317,13 +420,24 @@ impl ProofAttemptRecord {
             claims_allowed: Vec::new(),
             next_action: String::new(),
             redaction_status: ProofRedactionStatus::Unknown,
+            proof_doctor: None,
         }
+    }
+
+    /// Attach a compact proof-doctor verdict snapshot to this record.
+    #[must_use]
+    pub fn with_proof_doctor_verdict(mut self, verdict: &ProofDoctorVerdict) -> Self {
+        self.proof_doctor = Some(ProofDoctorLedgerSnapshot::from_verdict(verdict));
+        self
     }
 
     /// Return the report bucket for this record.
     #[must_use]
-    pub const fn report_bucket(&self) -> ProofReportBucket {
-        self.state.report_bucket()
+    pub fn report_bucket(&self) -> ProofReportBucket {
+        let fallback = self.state.report_bucket();
+        self.proof_doctor
+            .as_ref()
+            .map_or(fallback, |snapshot| snapshot.report_bucket(fallback))
     }
 
     /// Whether this record can support closing a source implementation bead.
@@ -599,7 +713,62 @@ pub fn validate_proof_record(record: &ProofAttemptRecord) -> Vec<ProofLedgerFind
         ));
     }
 
+    validate_proof_doctor_snapshot(record, &mut findings);
+
     findings
+}
+
+fn validate_proof_doctor_snapshot(
+    record: &ProofAttemptRecord,
+    findings: &mut Vec<ProofLedgerFinding>,
+) {
+    let Some(snapshot) = &record.proof_doctor else {
+        return;
+    };
+
+    if snapshot.verdict_id.trim().is_empty() {
+        findings.push(ProofLedgerFinding::error(
+            record,
+            "missing_proof_doctor_verdict_id",
+            "proof-doctor snapshots must retain the source verdict id",
+        ));
+    }
+
+    if snapshot.reason_code.trim().is_empty() {
+        findings.push(ProofLedgerFinding::error(
+            record,
+            "missing_proof_doctor_reason_code",
+            "proof-doctor snapshots must retain the source reason code",
+        ));
+    }
+
+    if !proof_doctor_status_matches_state(snapshot.status, record.state) {
+        findings.push(ProofLedgerFinding::error(
+            record,
+            "proof_doctor_status_state_mismatch",
+            "proof-doctor snapshot status does not match the ledger proof state",
+        ));
+    }
+}
+
+fn proof_doctor_status_matches_state(status: ProofDoctorStatus, state: ProofState) -> bool {
+    match status {
+        ProofDoctorStatus::Runnable => {
+            matches!(state, ProofState::NotRun | ProofState::ReachedRemoteCargo)
+        }
+        ProofDoctorStatus::Passed => state == ProofState::Pass,
+        ProofDoctorStatus::SourceBlocked => state == ProofState::SourceCompileFail,
+        ProofDoctorStatus::TestBlocked => state == ProofState::TestFail,
+        ProofDoctorStatus::InfraBlocked => matches!(
+            state,
+            ProofState::InfraBlockedPreCargo | ProofState::InfraBlockedPostCargo
+        ),
+        ProofDoctorStatus::DirtyTreeBlocked
+        | ProofDoctorStatus::OwnershipBlocked
+        | ProofDoctorStatus::Inconclusive => state == ProofState::Inconclusive,
+        ProofDoctorStatus::Invalid => state == ProofState::LocalInvalid,
+        ProofDoctorStatus::SkippedNotProven => state == ProofState::SkippedNotProven,
+    }
 }
 
 fn is_proven_claim(claim: &String) -> bool {
@@ -653,6 +822,8 @@ pub struct ProofBeadSummary {
     pub summary: String,
     /// Next action from the selected record.
     pub next_action: String,
+    /// Proof-doctor snapshot for operator-facing blocker display.
+    pub proof_doctor: Option<ProofDoctorLedgerSnapshot>,
 }
 
 /// Aggregate proof-lane report for operator and Beads closeout surfaces.
@@ -668,6 +839,8 @@ pub struct ProofLaneReport {
     pub by_state: BTreeMap<ProofState, u64>,
     /// Counts by reason code.
     pub by_reason_code: BTreeMap<String, u64>,
+    /// Counts by attached proof-doctor status.
+    pub by_proof_doctor_status: BTreeMap<ProofDoctorStatus, u64>,
     /// Per-bead selected summaries.
     pub beads: Vec<ProofBeadSummary>,
     /// Validation findings.
@@ -683,6 +856,7 @@ impl ProofLaneReport {
         let mut by_bucket = BTreeMap::new();
         let mut by_state = BTreeMap::new();
         let mut by_reason_code = BTreeMap::new();
+        let mut by_proof_doctor_status = BTreeMap::new();
         let mut by_bead = BTreeMap::<String, &ProofAttemptRecord>::new();
         let mut findings = Vec::new();
 
@@ -694,12 +868,15 @@ impl ProofLaneReport {
             *by_reason_code
                 .entry(record.reason_code.clone())
                 .or_insert(0) += 1;
+            if let Some(snapshot) = &record.proof_doctor {
+                *by_proof_doctor_status.entry(snapshot.status).or_insert(0) += 1;
+            }
             findings.extend(validate_proof_record(record));
 
             by_bead
                 .entry(record.bead_id.clone())
                 .and_modify(|selected| {
-                    if proof_state_rank(record.state) > proof_state_rank(selected.state) {
+                    if proof_record_rank(record) > proof_record_rank(selected) {
                         *selected = record;
                     }
                 })
@@ -715,6 +892,7 @@ impl ProofLaneReport {
                 reason_code: record.reason_code.clone(),
                 summary: record.summary.clone(),
                 next_action: record.next_action.clone(),
+                proof_doctor: record.proof_doctor.clone(),
             })
             .collect::<Vec<_>>();
 
@@ -726,6 +904,7 @@ impl ProofLaneReport {
             by_bucket,
             by_state,
             by_reason_code,
+            by_proof_doctor_status,
             beads,
             findings,
             operator_summary,
@@ -761,6 +940,20 @@ fn proof_state_rank(state: ProofState) -> u8 {
     }
 }
 
+fn proof_record_rank(record: &ProofAttemptRecord) -> u8 {
+    match record.report_bucket() {
+        ProofReportBucket::InvalidLocalProof => 90,
+        ProofReportBucket::DirtyTreeBlocked => 85,
+        ProofReportBucket::PreCargoInfrastructureBlocker => 80,
+        ProofReportBucket::PostCargoInfrastructureBlocker => 70,
+        ProofReportBucket::SourceRed => 60,
+        ProofReportBucket::RemoteProofPassed => 50,
+        ProofReportBucket::SkippedNotProven => 40,
+        ProofReportBucket::InconclusiveEvidence => 30,
+        ProofReportBucket::MissingEvidence => proof_state_rank(record.state),
+    }
+}
+
 fn operator_summary(
     total_records: usize,
     by_bucket: &BTreeMap<String, u64>,
@@ -782,6 +975,10 @@ fn operator_summary(
         .get(ProofReportBucket::PostCargoInfrastructureBlocker.as_str())
         .copied()
         .unwrap_or(0);
+    let dirty_tree = by_bucket
+        .get(ProofReportBucket::DirtyTreeBlocked.as_str())
+        .copied()
+        .unwrap_or(0);
     let local_invalid = by_bucket
         .get(ProofReportBucket::InvalidLocalProof.as_str())
         .copied()
@@ -794,11 +991,16 @@ fn operator_summary(
         .get(ProofReportBucket::MissingEvidence.as_str())
         .copied()
         .unwrap_or(0);
+    let inconclusive = by_bucket
+        .get(ProofReportBucket::InconclusiveEvidence.as_str())
+        .copied()
+        .unwrap_or(0);
 
     format!(
         "records={total_records}; pass={pass}; source_red={source_red}; \
          pre_cargo_blocked={pre_cargo}; post_cargo_blocked={post_cargo}; \
-         local_invalid={local_invalid}; skipped_not_proven={skipped}; \
+         dirty_tree_blocked={dirty_tree}; local_invalid={local_invalid}; \
+         skipped_not_proven={skipped}; inconclusive={inconclusive}; \
          missing_evidence={missing}; findings={finding_count}"
     )
 }
@@ -806,6 +1008,11 @@ fn operator_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::proof_doctor::{
+        ProofDoctorDirtyPath, ProofDoctorEvidence, ProofDoctorOwner, ProofDoctorPreflightInput,
+        classify_proof_doctor,
+    };
 
     fn base_record(state: ProofState) -> ProofAttemptRecord {
         let mut record = ProofAttemptRecord::new("proof-1", "ft-test", state, "reason", "summary");
@@ -827,6 +1034,58 @@ mod tests {
         record.artifact_paths = vec!["tests/e2e/artifacts/proof/ft-test/summary.json".into()];
         record.next_action = "review report".into();
         record.redaction_status = ProofRedactionStatus::NoneNeeded;
+        record
+    }
+
+    fn base_doctor_input() -> ProofDoctorPreflightInput {
+        ProofDoctorPreflightInput {
+            bead_id: Some("ft-wik9p.4".to_string()),
+            parent_bead_id: Some("ft-wik9p".to_string()),
+            agent_name: "OliveChapel".to_string(),
+            repo_path: "/Users/jemanuel/projects/frankenterm".to_string(),
+            git_head: "4840b84d7".to_string(),
+            branch: "main".to_string(),
+            generated_at_utc: "2026-05-05T14:00:00Z".to_string(),
+            intended_command: vec![
+                "rch".to_string(),
+                "exec".to_string(),
+                "--".to_string(),
+                "env".to_string(),
+                "CARGO_TARGET_DIR=/tmp/ft-wik9p4-target".to_string(),
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "frankenterm-core-audit-types".to_string(),
+                "proof_lane".to_string(),
+            ],
+            intended_target_dir: Some("/tmp/ft-wik9p4-target".to_string()),
+            intended_scope: ProofScope::CargoTest,
+            required_backend: ProofBackend::Rch,
+            phase: ProofDoctorPhase::TerminalClassified,
+            proof_path_prefixes: vec!["crates/frankenterm-core-audit-types/src".to_string()],
+            evidence: ProofDoctorEvidence::default(),
+        }
+    }
+
+    fn record_from_doctor(input: &ProofDoctorPreflightInput) -> ProofAttemptRecord {
+        let verdict = classify_proof_doctor(input);
+        let projection = verdict
+            .ledger_projection
+            .as_ref()
+            .expect("proof doctor always projects into proof-lane vocabulary");
+        let mut record = base_record(projection.state);
+        record.proof_id = verdict.verdict_id.clone();
+        record.bead_id = verdict.bead_id.clone().expect("test input has bead");
+        record.parent_bead_id = verdict.parent_bead_id.clone();
+        record.reason_code = projection.reason_code.clone();
+        record.summary = projection.summary.clone();
+        record.remote_cargo_reached = verdict.evidence.remote_cargo_reached;
+        record.rustc_reached = verdict.evidence.rustc_reached;
+        record.test_binary_started = verdict.evidence.test_binary_started;
+        record.remote_exit_code = verdict.evidence.remote_exit_code;
+        record.wrapper_exit_code = verdict.evidence.wrapper_exit_code;
+        record.artifact_retrieval_status = verdict.evidence.artifact_retrieval_status;
+        record = record.with_proof_doctor_verdict(&verdict);
         record
     }
 
@@ -866,7 +1125,10 @@ mod tests {
                 ProofState::SkippedNotProven,
                 ProofReportBucket::SkippedNotProven,
             ),
-            (ProofState::Inconclusive, ProofReportBucket::MissingEvidence),
+            (
+                ProofState::Inconclusive,
+                ProofReportBucket::InconclusiveEvidence,
+            ),
         ];
 
         for (state, bucket) in cases {
@@ -1004,6 +1266,154 @@ mod tests {
         assert_eq!(report.bucket_count(ProofReportBucket::InvalidLocalProof), 1);
         assert_eq!(report.bucket_count(ProofReportBucket::SourceRed), 1);
         assert!(report.operator_summary.contains("local_invalid=1"));
+    }
+
+    #[test]
+    fn proof_doctor_snapshots_surface_release_report_buckets() {
+        let mut pass_input = base_doctor_input();
+        pass_input.evidence.remote_cargo_reached = true;
+        pass_input.evidence.rustc_reached = true;
+        pass_input.evidence.test_binary_started = true;
+        pass_input.evidence.remote_exit_code = Some(0);
+        pass_input.evidence.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        let mut pass = record_from_doctor(&pass_input);
+        pass.proof_id = "doctor-pass".into();
+        pass.bead_id = "ft-pass".into();
+
+        let mut source_input = base_doctor_input();
+        source_input.evidence.remote_cargo_reached = true;
+        source_input.evidence.rustc_reached = true;
+        source_input.evidence.remote_exit_code = Some(101);
+        source_input.evidence.diagnostic_paths =
+            vec!["crates/frankenterm-core/src/storage.rs".into()];
+        source_input.evidence.diagnostic_summary =
+            Some("remote rustc reported a first-party compile error".into());
+        let mut source = record_from_doctor(&source_input);
+        source.proof_id = "doctor-source".into();
+        source.bead_id = "ft-source".into();
+
+        let mut infra_input = base_doctor_input();
+        infra_input.evidence.selected_worker = Some("vmi1152480".into());
+        infra_input.evidence.sync_duration_ms = Some(164_000);
+        infra_input.evidence.wrapper_exit_code = Some(127);
+        let mut infra = record_from_doctor(&infra_input);
+        infra.proof_id = "doctor-infra".into();
+        infra.bead_id = "ft-infra".into();
+
+        let mut dirty_input = base_doctor_input();
+        dirty_input.evidence.dirty_paths.push(ProofDoctorDirtyPath {
+            path: "crates/frankenterm-core-audit-types/src/proof_lane.rs".into(),
+            status: "M".into(),
+            affects_proof: true,
+            owner: Some(ProofDoctorOwner::Bead {
+                bead_id: "ft-wik9p.5".into(),
+                assignee: Some("MagentaFalcon".into()),
+            }),
+        });
+        let mut dirty = record_from_doctor(&dirty_input);
+        dirty.proof_id = "doctor-dirty".into();
+        dirty.bead_id = "ft-dirty".into();
+
+        let mut inconclusive_input = base_doctor_input();
+        inconclusive_input.phase = ProofDoctorPhase::LaunchObserved;
+        inconclusive_input.evidence.selected_worker = Some("vmi1153651".into());
+        inconclusive_input.evidence.sync_duration_ms = Some(139_000);
+        let mut inconclusive = record_from_doctor(&inconclusive_input);
+        inconclusive.proof_id = "doctor-inconclusive".into();
+        inconclusive.bead_id = "ft-inconclusive".into();
+
+        let report = ProofLaneReport::from_records(&[
+            pass,
+            source,
+            infra,
+            dirty.clone(),
+            inconclusive.clone(),
+        ]);
+
+        assert_eq!(report.bucket_count(ProofReportBucket::RemoteProofPassed), 1);
+        assert_eq!(report.bucket_count(ProofReportBucket::SourceRed), 1);
+        assert_eq!(
+            report.bucket_count(ProofReportBucket::PreCargoInfrastructureBlocker),
+            1
+        );
+        assert_eq!(report.bucket_count(ProofReportBucket::DirtyTreeBlocked), 1);
+        assert_eq!(
+            report.bucket_count(ProofReportBucket::InconclusiveEvidence),
+            1
+        );
+        assert_eq!(
+            report
+                .by_proof_doctor_status
+                .get(&ProofDoctorStatus::DirtyTreeBlocked),
+            Some(&1)
+        );
+        assert!(report.operator_summary.contains("dirty_tree_blocked=1"));
+        assert!(report.operator_summary.contains("inconclusive=1"));
+        assert!(
+            dirty
+                .proof_doctor
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.verdict_id.contains("proof-doctor:"))
+        );
+        assert_eq!(
+            inconclusive.report_bucket(),
+            ProofReportBucket::InconclusiveEvidence
+        );
+    }
+
+    #[test]
+    fn proof_doctor_dirty_tree_beats_older_pass_for_bead_summary() {
+        let mut pass = base_record(ProofState::Pass);
+        pass.proof_id = "older-pass".into();
+        pass.bead_id = "ft-wik9p.4".into();
+        pass.remote_cargo_reached = true;
+        pass.rustc_reached = true;
+        pass.test_binary_started = true;
+        pass.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+
+        let mut dirty_input = base_doctor_input();
+        dirty_input.evidence.dirty_paths.push(ProofDoctorDirtyPath {
+            path: "crates/frankenterm-core-audit-types/src/proof_lane.rs".into(),
+            status: "M".into(),
+            affects_proof: true,
+            owner: Some(ProofDoctorOwner::Reservation {
+                agent_name: "MagentaFalcon".into(),
+                path_pattern: "crates/frankenterm-core-audit-types/src/proof_handoff.rs".into(),
+            }),
+        });
+        let dirty = record_from_doctor(&dirty_input);
+
+        let report = ProofLaneReport::from_records(&[pass, dirty]);
+
+        assert_eq!(report.beads.len(), 1);
+        assert_eq!(report.beads[0].bucket, ProofReportBucket::DirtyTreeBlocked);
+        assert_eq!(
+            report.beads[0]
+                .proof_doctor
+                .as_ref()
+                .map(|snapshot| snapshot.status),
+            Some(ProofDoctorStatus::DirtyTreeBlocked)
+        );
+    }
+
+    #[test]
+    fn proof_doctor_pass_snapshot_does_not_bypass_ledger_validation() {
+        let mut pass_input = base_doctor_input();
+        pass_input.evidence.remote_cargo_reached = true;
+        pass_input.evidence.rustc_reached = true;
+        pass_input.evidence.test_binary_started = true;
+        pass_input.evidence.remote_exit_code = Some(0);
+        pass_input.evidence.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        let mut record = record_from_doctor(&pass_input);
+        record.remote_cargo_reached = false;
+
+        let findings = validate_proof_record(&record);
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.reason_code == "pass_without_remote_cargo")
+        );
     }
 
     #[test]
