@@ -26,8 +26,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Source the E2E artifacts library
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
-# Build the wa binary first
-FT_BIN=""
+# Binary path. Set FT_BIN or CARGO_TARGET_DIR to use an rch-built binary.
+FT_BIN="${FT_BIN:-}"
 
 # Colors for output (only when TTY)
 if [[ -t 1 ]]; then
@@ -104,25 +104,31 @@ has_ansi() {
 check_prerequisites() {
     log_test "Checking Prerequisites"
 
-    # Build wa
-    log_info "Building wa binary..."
-    if ! cargo build -p frankenterm --quiet 2>/dev/null; then
-        log_fail "Failed to build wa binary"
+    # Find wa binary. This script intentionally does not build it:
+    # Cargo lanes must be run through rch by the caller.
+    local explicit_ft_bin="$FT_BIN"
+    if [[ -n "$explicit_ft_bin" ]]; then
+        if [[ ! -x "$explicit_ft_bin" ]]; then
+            log_fail "FT_BIN is set but not executable: $explicit_ft_bin"
+            exit 2
+        fi
+    else
+        # Try cargo target directory first, then project target.
+        FT_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
+        if [[ ! -x "$FT_BIN" ]]; then
+            FT_BIN="$PROJECT_ROOT/target/debug/wa"
+        fi
+    fi
+
+    if [[ ! -x "$FT_BIN" ]]; then
+        log_fail "wa binary not found"
+        echo "[INFO] Build via rch first, for example:" >&2
+        echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cli-polish-target cargo build -p frankenterm" >&2
+        echo "[INFO] Then rerun with FT_BIN=/tmp/ft-cli-polish-target/debug/wa or CARGO_TARGET_DIR=/tmp/ft-cli-polish-target" >&2
         exit 2
     fi
 
-    # Try cargo target directory first (used by cargo run), then project target
-    FT_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
-    if [[ ! -x "$FT_BIN" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/debug/wa"
-    fi
-
-    if [[ ! -x "$FT_BIN" ]]; then
-        log_fail "wa binary not found after build"
-        exit 2
-    fi
-
-    log_pass "wa binary built: $FT_BIN"
+    log_pass "wa binary found: $FT_BIN"
 
     # Check jq for JSON validation
     if command -v jq &>/dev/null; then
