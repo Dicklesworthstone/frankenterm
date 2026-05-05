@@ -625,6 +625,339 @@ impl ResourcePressureMemoryTierObservation {
     }
 }
 
+/// External dependency covered by an external-service stall scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourcePressureExternalDependencyKind {
+    /// MCP proxy discovery, mount, or per-call dispatch path.
+    McpProxy,
+    /// Search daemon query or health-check path.
+    SearchDaemon,
+    /// Policy/audit persistence dependency required before unsafe actions.
+    PolicyAuditStore,
+    /// Control-plane service dependency outside the local scheduler.
+    ControlPlane,
+}
+
+impl ResourcePressureExternalDependencyKind {
+    /// Stable machine string for this dependency kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::McpProxy => "mcp_proxy",
+            Self::SearchDaemon => "search_daemon",
+            Self::PolicyAuditStore => "policy_audit_store",
+            Self::ControlPlane => "control_plane",
+        }
+    }
+}
+
+impl fmt::Display for ResourcePressureExternalDependencyKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Retry/backoff decision recorded by an external-service stall scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureRetryBackoffDecision {
+    /// Attempts made before the system chose the final mitigation.
+    pub attempts_before_decision: u32,
+    /// Scenario-declared maximum attempts.
+    pub max_attempts: u32,
+    /// Backoff delay used between retry attempts.
+    pub backoff_delay_ms: u64,
+    /// Total retry budget before fail-closed/degrade must happen.
+    pub retry_budget_ms: u64,
+    /// Whether the injected dependency call timed out.
+    pub timed_out: bool,
+    /// Whether the retry budget was exhausted before recovery.
+    pub retry_budget_exhausted: bool,
+    /// Stable final decision code reported to operators.
+    pub final_decision_code: String,
+}
+
+impl ResourcePressureRetryBackoffDecision {
+    fn validate(
+        &self,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+        field_prefix: &str,
+    ) {
+        if self.max_attempts == 0 {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                format!("{field_prefix}.max_attempts"),
+                "must be greater than zero",
+            ));
+        }
+        if self.attempts_before_decision == 0 {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                format!("{field_prefix}.attempts_before_decision"),
+                "must be greater than zero",
+            ));
+        }
+        if self.attempts_before_decision > self.max_attempts {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                format!("{field_prefix}.attempts_before_decision"),
+                "must not exceed max_attempts",
+            ));
+        }
+        push_blank_violation(
+            violations,
+            &format!("{field_prefix}.final_decision_code"),
+            &self.final_decision_code,
+        );
+    }
+}
+
+/// Policy/audit decision recorded at an external-service boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressurePolicyAuditOutcome {
+    /// Whether the action required policy/audit persistence before proceeding.
+    pub audit_required: bool,
+    /// Whether the policy/audit dependency was available.
+    pub audit_available: bool,
+    /// Whether the system failed closed when the dependency was unavailable.
+    pub fail_closed: bool,
+    /// Whether a remote action was allowed to proceed.
+    pub remote_action_allowed: bool,
+    /// Whether stale or cached read-only data was explicitly allowed.
+    pub stale_cached_response_allowed: bool,
+    /// Whether a mutating action was blocked.
+    pub blocked_mutating_action: bool,
+    /// Stable policy/audit reason code.
+    pub reason_code: String,
+}
+
+impl ResourcePressurePolicyAuditOutcome {
+    fn validate(
+        &self,
+        status: ResourcePressureChaosStatus,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+        field_prefix: &str,
+    ) {
+        push_blank_violation(
+            violations,
+            &format!("{field_prefix}.reason_code"),
+            &self.reason_code,
+        );
+
+        if status == ResourcePressureChaosStatus::Pass
+            && self.audit_required
+            && !self.audit_available
+        {
+            if !self.fail_closed {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    format!("{field_prefix}.fail_closed"),
+                    "pass verdicts requiring unavailable audit storage must fail closed",
+                ));
+            }
+            if self.remote_action_allowed {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    format!("{field_prefix}.remote_action_allowed"),
+                    "pass verdicts must block remote actions when required audit storage is unavailable",
+                ));
+            }
+            if !self.stale_cached_response_allowed && !self.blocked_mutating_action {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    field_prefix,
+                    "pass verdicts must record an explicit cached degrade or blocked mutating action",
+                ));
+            }
+        }
+    }
+}
+
+/// Queue and fanout evidence for external dependency calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureExternalCallQueueObservation {
+    /// In-flight external calls before the injected fault.
+    pub in_flight_before: u32,
+    /// In-flight external calls after mitigation.
+    pub in_flight_after: u32,
+    /// Maximum allowed in-flight calls for the scenario.
+    pub in_flight_bound: u32,
+    /// Queued external calls before the injected fault.
+    pub queued_before: u32,
+    /// Queued external calls after mitigation.
+    pub queued_after: u32,
+    /// Maximum allowed queued calls for the scenario.
+    pub queued_bound: u32,
+    /// Concurrent-agent fanout represented by the scenario, when known.
+    pub concurrent_agent_fanout: Option<u32>,
+}
+
+impl ResourcePressureExternalCallQueueObservation {
+    /// Whether in-flight and queued calls stayed within the declared bounds.
+    #[must_use]
+    pub const fn bounded_after_injection(&self) -> bool {
+        self.in_flight_after <= self.in_flight_bound && self.queued_after <= self.queued_bound
+    }
+
+    fn validate(
+        &self,
+        status: ResourcePressureChaosStatus,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+        field_prefix: &str,
+    ) {
+        if self.in_flight_bound == 0 {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                format!("{field_prefix}.in_flight_bound"),
+                "must be greater than zero",
+            ));
+        }
+        if self.queued_bound == 0 {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                format!("{field_prefix}.queued_bound"),
+                "must be greater than zero",
+            ));
+        }
+        if status == ResourcePressureChaosStatus::Pass && !self.bounded_after_injection() {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                field_prefix,
+                "pass verdicts must keep external-call fanout and queued work within declared bounds",
+            ));
+        }
+    }
+}
+
+/// External-service/MCP/search-daemon stall evidence for a chaos verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureExternalServiceObservation {
+    /// Human-readable dependency path, such as `mcp_proxy.remote_call`.
+    pub dependency_name: String,
+    /// Kind of external dependency represented by this observation.
+    pub dependency_kind: ResourcePressureExternalDependencyKind,
+    /// Injected deterministic latency.
+    pub injected_latency_ms: u64,
+    /// Timeout threshold enforced by the boundary.
+    pub timeout_threshold_ms: u64,
+    /// Injected error code, if the script returned an error instead of only latency.
+    pub injected_error_code: Option<String>,
+    /// Total bounded wait observed before fail-closed/degrade/recovery.
+    pub bounded_wait_ms: u64,
+    /// Retry/backoff decision emitted by the boundary.
+    pub retry_backoff: ResourcePressureRetryBackoffDecision,
+    /// Policy/audit outcome for the dependency boundary.
+    pub policy_audit_outcome: ResourcePressurePolicyAuditOutcome,
+    /// External-call queue and fanout evidence.
+    pub call_queue: ResourcePressureExternalCallQueueObservation,
+    /// MCP proxy failure counter before injection, if the scenario covers MCP.
+    pub mcp_proxy_failure_counter_before: Option<u64>,
+    /// MCP proxy failure counter after mitigation, if the scenario covers MCP.
+    pub mcp_proxy_failure_counter_after: Option<u64>,
+    /// Whether stale/cached/local-only degraded behavior was used.
+    pub degraded_to_stale_or_cached: bool,
+    /// Whether recovery was observed after the injected dependency recovered.
+    pub recovered_after_fault_clear: bool,
+    /// Operator diagnostic code paired with this observation.
+    pub operator_diagnostic_code: String,
+}
+
+impl ResourcePressureExternalServiceObservation {
+    /// Declared upper bound for wait time before mitigation must decide.
+    #[must_use]
+    pub fn declared_wait_bound_ms(&self) -> u64 {
+        let attempt_window = self
+            .timeout_threshold_ms
+            .saturating_mul(u64::from(self.retry_backoff.attempts_before_decision));
+        attempt_window.saturating_add(self.retry_backoff.retry_budget_ms)
+    }
+
+    /// Whether the observed wait stayed within the declared retry/timeout budget.
+    #[must_use]
+    pub fn bounded_wait_observed(&self) -> bool {
+        self.bounded_wait_ms <= self.declared_wait_bound_ms()
+    }
+
+    /// Whether the MCP proxy failure counter moved for an MCP dependency.
+    #[must_use]
+    pub fn records_mcp_proxy_failure(&self) -> bool {
+        self.dependency_kind != ResourcePressureExternalDependencyKind::McpProxy
+            || matches!(
+                (
+                    self.mcp_proxy_failure_counter_before,
+                    self.mcp_proxy_failure_counter_after,
+                ),
+                (Some(before), Some(after)) if after > before
+            )
+    }
+
+    fn validate(
+        &self,
+        status: ResourcePressureChaosStatus,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+    ) {
+        push_blank_violation(
+            violations,
+            "external_service_observation.dependency_name",
+            &self.dependency_name,
+        );
+        push_blank_violation(
+            violations,
+            "external_service_observation.operator_diagnostic_code",
+            &self.operator_diagnostic_code,
+        );
+        if self.timeout_threshold_ms == 0 {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "external_service_observation.timeout_threshold_ms",
+                "must be greater than zero",
+            ));
+        }
+        if self.injected_latency_ms == 0 && self.injected_error_code.is_none() {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "external_service_observation",
+                "must inject latency or an error code",
+            ));
+        }
+        if self
+            .injected_error_code
+            .as_deref()
+            .is_some_and(|code| code.trim().is_empty())
+        {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "external_service_observation.injected_error_code",
+                "must not be blank when present",
+            ));
+        }
+
+        self.retry_backoff
+            .validate(violations, "external_service_observation.retry_backoff");
+        self.policy_audit_outcome.validate(
+            status,
+            violations,
+            "external_service_observation.policy_audit_outcome",
+        );
+        self.call_queue.validate(
+            status,
+            violations,
+            "external_service_observation.call_queue",
+        );
+
+        if status == ResourcePressureChaosStatus::Pass {
+            if !self.bounded_wait_observed() {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "external_service_observation.bounded_wait_ms",
+                    "pass verdicts must resolve within the declared retry/timeout budget",
+                ));
+            }
+            if !self.records_mcp_proxy_failure() {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "external_service_observation.mcp_proxy_failure_counter_after",
+                    "MCP proxy pass verdicts must record the proxy failure counter movement",
+                ));
+            }
+            if !self.degraded_to_stale_or_cached
+                && !self.policy_audit_outcome.blocked_mutating_action
+                && !self.recovered_after_fault_clear
+            {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "external_service_observation",
+                    "pass verdicts must record cached degrade, fail-closed block, or recovery",
+                ));
+            }
+        }
+    }
+}
+
 /// Hardware predicate evidence for real high-scale proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HighScaleHardwareEvidence {
@@ -720,6 +1053,9 @@ pub struct ResourcePressureChaosVerdict {
     /// Memory-tier observation, required for executed memory/tiering scenarios.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_observation: Option<ResourcePressureMemoryTierObservation>,
+    /// External-service/MCP/search-daemon observation, required for executed external stalls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_service_observation: Option<ResourcePressureExternalServiceObservation>,
 }
 
 impl ResourcePressureChaosVerdict {
@@ -856,6 +1192,10 @@ impl ResourcePressureChaosVerdict {
             self.validate_memory_tiering_observation(&mut violations);
         }
 
+        if self.pressure_class == ResourcePressureClass::ExternalServiceMcpSearchDaemonStall {
+            self.validate_external_service_observation(&mut violations);
+        }
+
         if violations.is_empty() {
             Ok(())
         } else {
@@ -935,6 +1275,44 @@ impl ResourcePressureChaosVerdict {
                 "diagnostics",
                 "memory pass diagnostics must identify memory/tiering pressure",
             ));
+        }
+    }
+
+    fn validate_external_service_observation(
+        &self,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+    ) {
+        let Some(observation) = self.external_service_observation.as_ref() else {
+            if matches!(
+                self.status,
+                ResourcePressureChaosStatus::Pass | ResourcePressureChaosStatus::Fail
+            ) {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "external_service_observation",
+                    "executed external-service/MCP/search-daemon stall verdicts require dependency observation evidence",
+                ));
+            }
+            return;
+        };
+
+        observation.validate(self.status, violations);
+
+        if self.status == ResourcePressureChaosStatus::Pass {
+            if !self.fail_closed_decision.fail_closed {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "fail_closed_decision.fail_closed",
+                    "external-service pass verdicts require fail-closed or explicit degrade",
+                ));
+            }
+            if !self.diagnostics.iter().any(|diagnostic| {
+                diagnostic_matches_pressure_class(diagnostic, self.pressure_class)
+                    && diagnostic.code == observation.operator_diagnostic_code
+            }) {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "diagnostics",
+                    "external-service pass diagnostics must identify the dependency pressure and match the observation diagnostic code",
+                ));
+            }
         }
     }
 }
@@ -1171,6 +1549,7 @@ pub fn sample_pass_verdict() -> ResourcePressureChaosVerdict {
         )),
         admission_observation: Some(cpu_admission_observation()),
         memory_observation: None,
+        external_service_observation: None,
     }
 }
 
@@ -1207,6 +1586,7 @@ pub fn sample_fail_verdict() -> ResourcePressureChaosVerdict {
         hardware_evidence: None,
         admission_observation: None,
         memory_observation: Some(memory_tiering_unbounded_fail_observation()),
+        external_service_observation: None,
     }
 }
 
@@ -1244,6 +1624,7 @@ pub fn sample_skipped_not_proven_verdict() -> ResourcePressureChaosVerdict {
         )),
         admission_observation: None,
         memory_observation: None,
+        external_service_observation: None,
     }
 }
 
@@ -1281,6 +1662,7 @@ pub fn sample_expected_blocked_by_infra_verdict() -> ResourcePressureChaosVerdic
         hardware_evidence: None,
         admission_observation: None,
         memory_observation: None,
+        external_service_observation: None,
     }
 }
 
@@ -1333,6 +1715,7 @@ pub fn cpu_admission_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
             ),
         ),
         memory_observation: None,
+        external_service_observation: None,
     }
 }
 
@@ -1382,6 +1765,7 @@ pub fn queue_saturation_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
             ),
         ),
         memory_observation: None,
+        external_service_observation: None,
     }
 }
 
@@ -1437,6 +1821,7 @@ pub fn queue_saturation_unbounded_fail_verdict() -> ResourcePressureChaosVerdict
             },
         }),
         memory_observation: None,
+        external_service_observation: None,
     }
 }
 
@@ -1501,6 +1886,7 @@ pub fn memory_tiering_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
         hardware_evidence: None,
         admission_observation: None,
         memory_observation: Some(memory_tiering_reduced_observation()),
+        external_service_observation: None,
     }
 }
 
@@ -1541,6 +1927,7 @@ pub fn memory_tiering_unbounded_fail_verdict() -> ResourcePressureChaosVerdict {
         hardware_evidence: None,
         admission_observation: None,
         memory_observation: Some(memory_tiering_unbounded_fail_observation()),
+        external_service_observation: None,
     }
 }
 
@@ -1558,6 +1945,177 @@ pub fn memory_tiering_high_scale_skipped_not_proven_verdict() -> ResourcePressur
         "256 GiB memory predicate absent",
     ));
     verdict.memory_observation = None;
+    verdict
+}
+
+/// Reduced external-service fixture for recoverable MCP proxy stalls.
+pub fn external_service_mcp_recoverable_stall_reduced_pass_verdict() -> ResourcePressureChaosVerdict
+{
+    ResourcePressureChaosVerdict {
+        schema_version: RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION,
+        scenario_id: "ft-lmg3g.5.external_service.mcp_recoverable_stall.reduced".into(),
+        pressure_class: ResourcePressureClass::ExternalServiceMcpSearchDaemonStall,
+        mode: ResourcePressureChaosMode::Reduced,
+        preconditions: vec![
+            "in-process MCP proxy fake has deterministic delay and error scripting".into(),
+            "read-only stale response fallback is explicitly policy-allowed".into(),
+            "MCP proxy failure counters are captured before and after injection".into(),
+        ],
+        injected_fault:
+            "MCP proxy remote_call sleeps past the timeout twice and returns a timeout error"
+                .into(),
+        observed_mitigation:
+            "remote mutation stayed blocked, read-only cached response was served, and the proxy recovered after the scripted delay cleared"
+                .into(),
+        fail_closed_decision: ResourcePressureFailClosedDecision {
+            fail_closed: true,
+            reason:
+                "remote MCP mutation was blocked while stale cached read-only data was allowed by policy"
+                    .into(),
+        },
+        diagnostics: vec![ResourcePressureDiagnostic {
+            code: "resource.external_service.mcp_proxy.cached_degrade_recovered".into(),
+            message:
+                "MCP proxy stall used bounded retry/backoff, emitted diagnostics, and recovered"
+                    .into(),
+            severity: ResourcePressureDiagnosticSeverity::Warn,
+        }],
+        logs_path: Some("artifacts/resource-pressure/external-service/mcp-recoverable.jsonl".into()),
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        skip_reason: None,
+        status: ResourcePressureChaosStatus::Pass,
+        assertions: vec![
+            ResourcePressureAssertion::FailClosed,
+            ResourcePressureAssertion::BoundedQueueGrowth,
+            ResourcePressureAssertion::DiagnosticEmitted,
+            ResourcePressureAssertion::MitigationLogged,
+            ResourcePressureAssertion::RecoveryObserved,
+        ],
+        hardware_evidence: None,
+        admission_observation: None,
+        memory_observation: None,
+        external_service_observation: Some(external_service_mcp_recoverable_observation()),
+    }
+}
+
+/// Reduced external-service fixture for required audit storage fail-closed behavior.
+pub fn external_service_policy_audit_fail_closed_reduced_pass_verdict()
+-> ResourcePressureChaosVerdict {
+    ResourcePressureChaosVerdict {
+        schema_version: RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION,
+        scenario_id: "ft-lmg3g.5.external_service.policy_audit_fail_closed.reduced".into(),
+        pressure_class: ResourcePressureClass::ExternalServiceMcpSearchDaemonStall,
+        mode: ResourcePressureChaosMode::Reduced,
+        preconditions: vec![
+            "in-process policy/audit fake denies persistence after a deterministic delay".into(),
+            "remote MCP write requires durable policy/audit evidence before dispatch".into(),
+        ],
+        injected_fault:
+            "policy/audit dependency times out while a mutating MCP proxy action is pending".into(),
+        observed_mitigation:
+            "mutating MCP proxy action was denied until audit storage recovered and the denial was diagnosed"
+                .into(),
+        fail_closed_decision: ResourcePressureFailClosedDecision {
+            fail_closed: true,
+            reason: "required audit persistence was unavailable, so the remote action was denied"
+                .into(),
+        },
+        diagnostics: vec![ResourcePressureDiagnostic {
+            code: "resource.external_service.policy_audit.fail_closed".into(),
+            message: "required policy/audit dependency timed out and remote action was blocked"
+                .into(),
+            severity: ResourcePressureDiagnosticSeverity::Warn,
+        }],
+        logs_path: Some(
+            "artifacts/resource-pressure/external-service/policy-audit-fail-closed.jsonl".into(),
+        ),
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        skip_reason: None,
+        status: ResourcePressureChaosStatus::Pass,
+        assertions: vec![
+            ResourcePressureAssertion::FailClosed,
+            ResourcePressureAssertion::BoundedQueueGrowth,
+            ResourcePressureAssertion::DiagnosticEmitted,
+            ResourcePressureAssertion::MitigationLogged,
+            ResourcePressureAssertion::RecoveryObserved,
+        ],
+        hardware_evidence: None,
+        admission_observation: None,
+        memory_observation: None,
+        external_service_observation: Some(external_service_policy_audit_fail_closed_observation()),
+    }
+}
+
+/// Negative reduced fixture: external dependency waits escaped the declared budget.
+pub fn external_service_unbounded_wait_fail_verdict() -> ResourcePressureChaosVerdict {
+    ResourcePressureChaosVerdict {
+        schema_version: RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION,
+        scenario_id: "ft-lmg3g.5.external_service.unbounded_wait_fail".into(),
+        pressure_class: ResourcePressureClass::ExternalServiceMcpSearchDaemonStall,
+        mode: ResourcePressureChaosMode::Reduced,
+        preconditions: vec![
+            "external dependency timeout guard intentionally disabled".into(),
+            "policy/audit dependency is required for the pending remote action".into(),
+        ],
+        injected_fault:
+            "search-daemon query stalls past the declared timeout while audit storage is unavailable"
+                .into(),
+        observed_mitigation:
+            "remote action was allowed after an unbounded wait and no fail-closed denial occurred"
+                .into(),
+        fail_closed_decision: ResourcePressureFailClosedDecision {
+            fail_closed: false,
+            reason: "required policy/audit storage was unavailable but the remote action proceeded"
+                .into(),
+        },
+        diagnostics: vec![ResourcePressureDiagnostic {
+            code: "resource.search_daemon.unbounded_wait_fail_open".into(),
+            message:
+                "external search-daemon stall exceeded timeout/backoff budget and failed open".into(),
+            severity: ResourcePressureDiagnosticSeverity::Error,
+        }],
+        logs_path: Some("artifacts/resource-pressure/external-service/unbounded-fail.jsonl".into()),
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        skip_reason: None,
+        status: ResourcePressureChaosStatus::Fail,
+        assertions: vec![
+            ResourcePressureAssertion::FailClosed,
+            ResourcePressureAssertion::BoundedQueueGrowth,
+            ResourcePressureAssertion::DiagnosticEmitted,
+            ResourcePressureAssertion::MitigationLogged,
+            ResourcePressureAssertion::RecoveryObserved,
+        ],
+        hardware_evidence: None,
+        admission_observation: None,
+        memory_observation: None,
+        external_service_observation: Some(external_service_unbounded_wait_observation()),
+    }
+}
+
+/// High-scale external-service fixture that cannot claim proof without scale evidence.
+pub fn external_service_high_scale_skipped_not_proven_verdict() -> ResourcePressureChaosVerdict {
+    let mut verdict = external_service_mcp_recoverable_stall_reduced_pass_verdict();
+    verdict.scenario_id = "ft-lmg3g.5.external_service.high_scale.skipped".into();
+    verdict.mode = ResourcePressureChaosMode::HighScale;
+    verdict.proof_level = ResourcePressureProofLevel::SimulatedHighScale;
+    verdict.logs_path = None;
+    verdict.status = ResourcePressureChaosStatus::SkippedNotProven;
+    verdict.skip_reason = Some(
+        "concurrent-agent fanout plus 64-core/256 GiB predicates absent; high-scale external-service proof not claimed"
+            .into(),
+    );
+    verdict.hardware_evidence = Some(HighScaleHardwareEvidence::skipped(
+        "concurrent-agent fanout and 64-core/256 GiB predicates absent",
+    ));
+    if let Some(observation) = verdict.external_service_observation.as_mut() {
+        observation.call_queue.in_flight_before = 512;
+        observation.call_queue.in_flight_after = 1_024;
+        observation.call_queue.in_flight_bound = 2_048;
+        observation.call_queue.queued_before = 1_024;
+        observation.call_queue.queued_after = 1_536;
+        observation.call_queue.queued_bound = 2_048;
+        observation.call_queue.concurrent_agent_fanout = Some(4_096);
+    }
     verdict
 }
 
@@ -1690,6 +2248,137 @@ fn memory_tiering_pressure_budget() -> FleetMemoryTierBudgetSnapshot {
     ])
 }
 
+fn external_service_mcp_recoverable_observation() -> ResourcePressureExternalServiceObservation {
+    ResourcePressureExternalServiceObservation {
+        dependency_name: "mcp_proxy.remote_call".into(),
+        dependency_kind: ResourcePressureExternalDependencyKind::McpProxy,
+        injected_latency_ms: 750,
+        timeout_threshold_ms: 250,
+        injected_error_code: Some("mcp_proxy.remote_timeout".into()),
+        bounded_wait_ms: 820,
+        retry_backoff: ResourcePressureRetryBackoffDecision {
+            attempts_before_decision: 3,
+            max_attempts: 3,
+            backoff_delay_ms: 35,
+            retry_budget_ms: 100,
+            timed_out: true,
+            retry_budget_exhausted: false,
+            final_decision_code: "mcp_proxy.cached_degrade_recover".into(),
+        },
+        policy_audit_outcome: ResourcePressurePolicyAuditOutcome {
+            audit_required: true,
+            audit_available: true,
+            fail_closed: true,
+            remote_action_allowed: false,
+            stale_cached_response_allowed: true,
+            blocked_mutating_action: true,
+            reason_code: "external_service.mcp_proxy.cached_read_only_degrade".into(),
+        },
+        call_queue: ResourcePressureExternalCallQueueObservation {
+            in_flight_before: 4,
+            in_flight_after: 5,
+            in_flight_bound: 8,
+            queued_before: 6,
+            queued_after: 6,
+            queued_bound: 8,
+            concurrent_agent_fanout: Some(128),
+        },
+        mcp_proxy_failure_counter_before: Some(7),
+        mcp_proxy_failure_counter_after: Some(8),
+        degraded_to_stale_or_cached: true,
+        recovered_after_fault_clear: true,
+        operator_diagnostic_code: "resource.external_service.mcp_proxy.cached_degrade_recovered"
+            .into(),
+    }
+}
+
+fn external_service_policy_audit_fail_closed_observation()
+-> ResourcePressureExternalServiceObservation {
+    ResourcePressureExternalServiceObservation {
+        dependency_name: "policy_audit_store.persist_mcp_decision".into(),
+        dependency_kind: ResourcePressureExternalDependencyKind::PolicyAuditStore,
+        injected_latency_ms: 500,
+        timeout_threshold_ms: 200,
+        injected_error_code: Some("policy_audit_store.timeout".into()),
+        bounded_wait_ms: 420,
+        retry_backoff: ResourcePressureRetryBackoffDecision {
+            attempts_before_decision: 2,
+            max_attempts: 2,
+            backoff_delay_ms: 20,
+            retry_budget_ms: 50,
+            timed_out: true,
+            retry_budget_exhausted: true,
+            final_decision_code: "policy_audit.fail_closed_deny_remote_action".into(),
+        },
+        policy_audit_outcome: ResourcePressurePolicyAuditOutcome {
+            audit_required: true,
+            audit_available: false,
+            fail_closed: true,
+            remote_action_allowed: false,
+            stale_cached_response_allowed: false,
+            blocked_mutating_action: true,
+            reason_code: "policy_audit.required_store_unavailable".into(),
+        },
+        call_queue: ResourcePressureExternalCallQueueObservation {
+            in_flight_before: 2,
+            in_flight_after: 2,
+            in_flight_bound: 4,
+            queued_before: 3,
+            queued_after: 3,
+            queued_bound: 4,
+            concurrent_agent_fanout: Some(64),
+        },
+        mcp_proxy_failure_counter_before: None,
+        mcp_proxy_failure_counter_after: None,
+        degraded_to_stale_or_cached: false,
+        recovered_after_fault_clear: true,
+        operator_diagnostic_code: "resource.external_service.policy_audit.fail_closed".into(),
+    }
+}
+
+fn external_service_unbounded_wait_observation() -> ResourcePressureExternalServiceObservation {
+    ResourcePressureExternalServiceObservation {
+        dependency_name: "search_daemon.query".into(),
+        dependency_kind: ResourcePressureExternalDependencyKind::SearchDaemon,
+        injected_latency_ms: 1_500,
+        timeout_threshold_ms: 250,
+        injected_error_code: Some("search_daemon.timeout".into()),
+        bounded_wait_ms: 1_400,
+        retry_backoff: ResourcePressureRetryBackoffDecision {
+            attempts_before_decision: 2,
+            max_attempts: 2,
+            backoff_delay_ms: 50,
+            retry_budget_ms: 100,
+            timed_out: true,
+            retry_budget_exhausted: true,
+            final_decision_code: "search_daemon.fail_open_after_unbounded_wait".into(),
+        },
+        policy_audit_outcome: ResourcePressurePolicyAuditOutcome {
+            audit_required: true,
+            audit_available: false,
+            fail_closed: false,
+            remote_action_allowed: true,
+            stale_cached_response_allowed: false,
+            blocked_mutating_action: false,
+            reason_code: "policy_audit.required_store_unavailable_but_allowed".into(),
+        },
+        call_queue: ResourcePressureExternalCallQueueObservation {
+            in_flight_before: 8,
+            in_flight_after: 12,
+            in_flight_bound: 8,
+            queued_before: 16,
+            queued_after: 24,
+            queued_bound: 16,
+            concurrent_agent_fanout: Some(256),
+        },
+        mcp_proxy_failure_counter_before: None,
+        mcp_proxy_failure_counter_after: None,
+        degraded_to_stale_or_cached: false,
+        recovered_after_fault_clear: false,
+        operator_diagnostic_code: "resource.search_daemon.unbounded_wait_fail_open".into(),
+    }
+}
+
 fn row(
     pressure_class: ResourcePressureClass,
     label: &str,
@@ -1817,6 +2506,11 @@ fn diagnostic_matches_pressure_class(
     match pressure_class {
         ResourcePressureClass::CpuAdmission => diagnostic.code.contains("cpu"),
         ResourcePressureClass::QueueSaturation => diagnostic.code.contains("queue"),
+        ResourcePressureClass::ExternalServiceMcpSearchDaemonStall => {
+            diagnostic.code.contains("external_service")
+                || diagnostic.code.contains("mcp_proxy")
+                || diagnostic.code.contains("search_daemon")
+        }
         _ => diagnostic.code.contains(pressure_class.as_str()),
     }
 }
@@ -1849,6 +2543,10 @@ mod tests {
         ResourcePressureChaosVerdict, ResourcePressureClass, ResourcePressureCoverageMatrix,
         ResourcePressureCoverageRow, ResourcePressureProofLevel,
         cpu_admission_high_scale_skipped_not_proven_verdict, cpu_admission_reduced_pass_verdict,
+        external_service_high_scale_skipped_not_proven_verdict,
+        external_service_mcp_recoverable_stall_reduced_pass_verdict,
+        external_service_policy_audit_fail_closed_reduced_pass_verdict,
+        external_service_unbounded_wait_fail_verdict,
         memory_tiering_high_scale_skipped_not_proven_verdict, memory_tiering_reduced_pass_verdict,
         memory_tiering_unbounded_fail_verdict, queue_saturation_reduced_pass_verdict,
         queue_saturation_unbounded_fail_verdict, sample_expected_blocked_by_infra_verdict,
@@ -2335,6 +3033,168 @@ mod tests {
     }
 
     #[test]
+    fn external_service_recoverable_fixture_records_cached_degrade_and_recovery() {
+        let verdict = external_service_mcp_recoverable_stall_reduced_pass_verdict();
+        verdict
+            .validate()
+            .expect("external MCP stall fixture validates");
+
+        let observation = verdict
+            .external_service_observation
+            .as_ref()
+            .expect("external fixture records dependency observation");
+        assert_eq!(observation.dependency_name, "mcp_proxy.remote_call");
+        assert!(observation.bounded_wait_observed());
+        assert!(observation.records_mcp_proxy_failure());
+        assert!(observation.call_queue.bounded_after_injection());
+        assert!(observation.degraded_to_stale_or_cached);
+        assert!(observation.recovered_after_fault_clear);
+        assert!(!observation.policy_audit_outcome.remote_action_allowed);
+    }
+
+    #[test]
+    fn external_service_policy_audit_fixture_blocks_required_remote_action() {
+        let verdict = external_service_policy_audit_fail_closed_reduced_pass_verdict();
+        verdict
+            .validate()
+            .expect("policy/audit external fixture validates");
+
+        let observation = verdict
+            .external_service_observation
+            .as_ref()
+            .expect("policy fixture records dependency observation");
+        assert!(observation.policy_audit_outcome.audit_required);
+        assert!(!observation.policy_audit_outcome.audit_available);
+        assert!(observation.policy_audit_outcome.fail_closed);
+        assert!(observation.policy_audit_outcome.blocked_mutating_action);
+        assert!(!observation.policy_audit_outcome.remote_action_allowed);
+    }
+
+    #[test]
+    fn negative_external_service_fixture_is_valid_fail_not_coverage() {
+        let verdict = external_service_unbounded_wait_fail_verdict();
+        verdict
+            .validate()
+            .expect("negative external-service fixture validates");
+
+        let observation = verdict
+            .external_service_observation
+            .as_ref()
+            .expect("negative fixture records dependency observation");
+        assert!(!observation.bounded_wait_observed());
+        assert!(!observation.call_queue.bounded_after_injection());
+        assert!(observation.policy_audit_outcome.remote_action_allowed);
+
+        let assessment =
+            ResourcePressureCoverageMatrix::default().assess_parent_completion(&[verdict]);
+        let external_status = assessment
+            .row_statuses
+            .iter()
+            .find(|status| {
+                status.pressure_class == ResourcePressureClass::ExternalServiceMcpSearchDaemonStall
+            })
+            .expect("external row status");
+        assert!(!external_status.satisfied);
+        assert!(external_status.reason.contains("FAIL"));
+    }
+
+    #[test]
+    fn high_scale_external_service_fixture_skips_without_fanout_hardware_proof() {
+        let verdict = external_service_high_scale_skipped_not_proven_verdict();
+        verdict
+            .validate()
+            .expect("high-scale skipped external fixture validates");
+        assert_eq!(
+            verdict.status,
+            ResourcePressureChaosStatus::SkippedNotProven
+        );
+        assert_eq!(
+            verdict.proof_level,
+            ResourcePressureProofLevel::SimulatedHighScale
+        );
+        assert!(
+            verdict
+                .skip_reason
+                .as_deref()
+                .expect("skip reason")
+                .contains("concurrent-agent fanout")
+        );
+        assert_eq!(
+            verdict
+                .external_service_observation
+                .as_ref()
+                .and_then(|observation| observation.call_queue.concurrent_agent_fanout),
+            Some(4_096)
+        );
+
+        let assessment =
+            ResourcePressureCoverageMatrix::default().assess_parent_completion(&[verdict]);
+        let external_status = assessment
+            .row_statuses
+            .iter()
+            .find(|status| {
+                status.pressure_class == ResourcePressureClass::ExternalServiceMcpSearchDaemonStall
+            })
+            .expect("external row status");
+        assert!(!external_status.satisfied);
+        assert!(external_status.reason.contains("SKIPPED_NOT_PROVEN"));
+    }
+
+    #[test]
+    fn skipped_external_service_verdicts_do_not_require_dependency_observation() {
+        let mut verdict = external_service_high_scale_skipped_not_proven_verdict();
+        verdict.external_service_observation = None;
+
+        verdict
+            .validate()
+            .expect("skipped external proof without execution evidence should validate");
+    }
+
+    #[test]
+    fn external_service_pass_verdicts_require_dependency_observation() {
+        let mut verdict = external_service_mcp_recoverable_stall_reduced_pass_verdict();
+        verdict.external_service_observation = None;
+
+        let error = verdict
+            .validate()
+            .expect_err("missing external-service observation must be rejected");
+        assert!(error.to_string().contains("external_service_observation"));
+    }
+
+    #[test]
+    fn external_service_pass_verdicts_reject_unbounded_wait_or_audit_fail_open() {
+        let mut unbounded = external_service_mcp_recoverable_stall_reduced_pass_verdict();
+        let observation = unbounded
+            .external_service_observation
+            .as_mut()
+            .expect("external fixture has observation");
+        observation.bounded_wait_ms = observation.declared_wait_bound_ms() + 1;
+
+        let unbounded_error = unbounded
+            .validate()
+            .expect_err("unbounded external wait must be rejected");
+        assert!(unbounded_error.to_string().contains("bounded_wait_ms"));
+
+        let mut fail_open = external_service_policy_audit_fail_closed_reduced_pass_verdict();
+        let observation = fail_open
+            .external_service_observation
+            .as_mut()
+            .expect("policy fixture has observation");
+        observation.policy_audit_outcome.fail_closed = false;
+        observation.policy_audit_outcome.remote_action_allowed = true;
+        observation.policy_audit_outcome.blocked_mutating_action = false;
+
+        let fail_open_error = fail_open
+            .validate()
+            .expect_err("required audit storage fail-open must be rejected");
+        assert!(
+            fail_open_error
+                .to_string()
+                .contains("remote_action_allowed")
+        );
+    }
+
+    #[test]
     fn high_scale_hardware_evidence_checks_core_and_memory_predicates() {
         let satisfied = HighScaleHardwareEvidence::satisfied("met");
         assert!(satisfied.predicates_met());
@@ -2375,10 +3235,20 @@ mod tests {
             }
             _ => None,
         };
+        verdict.external_service_observation = match row.pressure_class {
+            ResourcePressureClass::ExternalServiceMcpSearchDaemonStall => {
+                external_service_mcp_recoverable_stall_reduced_pass_verdict()
+                    .external_service_observation
+            }
+            _ => None,
+        };
         verdict.diagnostics = match row.pressure_class {
             ResourcePressureClass::CpuAdmission => cpu_admission_reduced_pass_verdict().diagnostics,
             ResourcePressureClass::MemoryTiering => {
                 memory_tiering_reduced_pass_verdict().diagnostics
+            }
+            ResourcePressureClass::ExternalServiceMcpSearchDaemonStall => {
+                external_service_mcp_recoverable_stall_reduced_pass_verdict().diagnostics
             }
             ResourcePressureClass::QueueSaturation => {
                 queue_saturation_reduced_pass_verdict().diagnostics
