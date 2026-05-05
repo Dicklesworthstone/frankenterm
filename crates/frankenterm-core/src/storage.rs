@@ -3479,8 +3479,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            get_pane_indexing_stats_sync(&conn)
+            pooled_backend(db_path.as_str(), get_pane_indexing_stats_backend)
         })
         .await
     }
@@ -3501,10 +3500,11 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            let stats = get_pane_indexing_stats_sync(&conn)?;
-            let fts_ok = check_fts_integrity_sync(&conn)?;
-            Ok(build_indexing_health_report(stats, fts_ok))
+            pooled_backend(db_path.as_str(), |backend| {
+                let stats = get_pane_indexing_stats_backend(backend)?;
+                let fts_ok = check_fts_integrity_backend(backend)?;
+                Ok(build_indexing_health_report(stats, fts_ok))
+            })
         })
         .await
     }
@@ -14331,14 +14331,44 @@ fn hybrid_search_with_results_sync(
 // Indexing Progress Tracking (wa-upg.5.2)
 // =============================================================================
 
-/// Get per-pane indexing statistics.
-///
-/// Since FTS5 indexing is trigger-driven (same transaction as INSERT), the
-/// segment count *is* the FTS row count under normal operation.  We separately
-/// check FTS integrity to detect corruption.
-fn get_pane_indexing_stats_sync(conn: &Connection) -> Result<Vec<PaneIndexingStats>> {
-    let mut stmt = conn
-        .prepare(
+fn pane_indexing_stats_from_backend_cells(row: &[SqlCell]) -> Result<PaneIndexingStats> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .i64(0)
+        .and_then(|value| backend_i64_to_u64(value, "panes.pane_id"))
+        .map_err(|err| storage_backend_error("FTS indexing stats pane_id", err))?;
+    let segment_count = reader
+        .i64(1)
+        .and_then(|value| backend_i64_to_u64(value, "output_segments.count"))
+        .map_err(|err| storage_backend_error("FTS indexing stats segment_count", err))?;
+    let total_bytes = reader
+        .i64(2)
+        .and_then(|value| backend_i64_to_u64(value, "output_segments.bytes"))
+        .map_err(|err| storage_backend_error("FTS indexing stats total_bytes", err))?;
+    let max_seq = reader
+        .optional_i64(3)
+        .map_err(|err| storage_backend_error("FTS indexing stats max_seq", err))?
+        .map(|value| backend_i64_to_u64(value, "output_segments.max_seq"))
+        .transpose()
+        .map_err(|err| storage_backend_error("FTS indexing stats max_seq", err))?;
+    let last_segment_at = reader
+        .optional_i64(4)
+        .map_err(|err| storage_backend_error("FTS indexing stats last_segment_at", err))?;
+
+    Ok(PaneIndexingStats {
+        pane_id,
+        segment_count,
+        total_bytes,
+        max_seq,
+        last_segment_at,
+        fts_row_count: segment_count,
+        fts_consistent: true,
+    })
+}
+
+fn get_pane_indexing_stats_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneIndexingStats>> {
+    let rows = backend
+        .query_map_cells(
             "SELECT p.pane_id,
                     COALESCE(seg.cnt, 0),
                     COALESCE(seg.bytes, 0),
@@ -14356,43 +14386,13 @@ fn get_pane_indexing_stats_sync(conn: &Connection) -> Result<Vec<PaneIndexingSta
              ) seg ON seg.pane_id = p.pane_id
              WHERE p.observed = 1
              ORDER BY p.pane_id",
+            &[],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare indexing stats: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to query indexing stats", err))?;
 
-    let rows = stmt
-        .query_map([], |row| {
-            let pane_id: u64 = {
-                let v: i64 = row.get(0)?;
-                v as u64
-            };
-            let segment_count: u64 = {
-                let v: i64 = row.get(1)?;
-                v as u64
-            };
-            let total_bytes: u64 = {
-                let v: i64 = row.get(2)?;
-                v as u64
-            };
-            let max_seq: Option<u64> = row.get::<_, Option<i64>>(3)?.map(|v| v as u64);
-            let last_segment_at: Option<i64> = row.get(4)?;
-            // Trigger-driven FTS: segment_count == fts_row_count by construction
-            Ok(PaneIndexingStats {
-                pane_id,
-                segment_count,
-                total_bytes,
-                max_seq,
-                last_segment_at,
-                fts_row_count: segment_count,
-                fts_consistent: true,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Failed to query indexing stats: {e}")))?;
-
-    let mut stats = Vec::new();
-    for row in rows {
-        stats.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-    Ok(stats)
+    rows.iter()
+        .map(|row| pane_indexing_stats_from_backend_cells(row))
+        .collect()
 }
 
 /// Run the FTS5 integrity-check command.
