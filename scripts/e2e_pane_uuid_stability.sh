@@ -13,7 +13,7 @@
 #   - Pane records persist correct UUID through storage roundtrip
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - rch (remote Cargo execution)
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -46,6 +46,8 @@ TESTS_SKIPPED=0
 
 # Configuration
 VERBOSE=false
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-/tmp/ft-e2e-pane-uuid-target}"
 
 # ==============================================================================
 # Argument parsing
@@ -103,17 +105,28 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
+    if ! command -v "$RCH_BIN" &>/dev/null; then
+        echo -e "${RED}ERROR:${NC} rch not found. Cargo test lanes must be run through RCH." >&2
         exit 5
     fi
-    log_pass "cargo available"
+    log_pass "rch available ($RCH_BIN)"
+    log_info "Remote Cargo target dir: $RCH_CARGO_TARGET_DIR"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
         exit 5
     fi
     log_pass "jq available"
+}
+
+run_rch_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
+}
+
+run_rch_cargo_timeout() {
+    local timeout_secs="$1"
+    shift
+    timeout "$timeout_secs" "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
 }
 
 # ==============================================================================
@@ -128,7 +141,7 @@ scenario_uuid_assignment() {
     exit_code=0
 
     # Run UUID format + assignment tests (pane_uuid matches both format and entropy tests)
-    cargo test -p frankenterm-core 'pane_uuid' \
+    run_rch_cargo test -p frankenterm-core 'pane_uuid' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -167,7 +180,7 @@ scenario_uuid_stability_metadata() {
     exit_code=0
 
     # Run all registry_uuid_stable tests
-    cargo test -p frankenterm-core 'registry_uuid_stable' \
+    run_rch_cargo test -p frankenterm-core 'registry_uuid_stable' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -212,7 +225,7 @@ scenario_multi_pane_churn() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'registry_multi_pane_churn_stability' \
+    run_rch_cargo test -p frankenterm-core 'registry_multi_pane_churn_stability' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -226,7 +239,7 @@ scenario_multi_pane_churn() {
 
     # Test pane close/reappearance handling
     exit_code=0
-    cargo test -p frankenterm-core 'registry_new_uuid_on_reappearance' \
+    run_rch_cargo test -p frankenterm-core 'registry_new_uuid_on_reappearance' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -238,7 +251,7 @@ scenario_multi_pane_churn() {
 
     # UUID removed on close
     exit_code=0
-    cargo test -p frankenterm-core 'registry_uuid_removed_on_close' \
+    run_rch_cargo test -p frankenterm-core 'registry_uuid_removed_on_close' \
         -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -262,7 +275,7 @@ scenario_fingerprint_generation() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'ingest::tests::fingerprint' \
+    run_rch_cargo test -p frankenterm-core 'ingest::tests::fingerprint' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -314,7 +327,7 @@ scenario_registry_lifecycle() {
     exit_code=0
 
     # Run all registry tests
-    cargo test -p frankenterm-core 'ingest::tests::registry' \
+    run_rch_cargo test -p frankenterm-core 'ingest::tests::registry' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -359,7 +372,7 @@ scenario_discovery_tick() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'ingest::tests::discovery_tick' \
+    run_rch_cargo test -p frankenterm-core 'ingest::tests::discovery_tick' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -404,7 +417,7 @@ scenario_pane_storage_persistence() {
     exit_code=0
 
     # Run pane entry conversion and persistence tests
-    cargo test -p frankenterm-core 'ingest::tests::pane_entry' \
+    run_rch_cargo test -p frankenterm-core 'ingest::tests::pane_entry' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -418,7 +431,7 @@ scenario_pane_storage_persistence() {
 
     # Also check persist_captured tests
     exit_code=0
-    cargo test -p frankenterm-core 'ingest::tests::persist_captured' \
+    run_rch_cargo test -p frankenterm-core 'ingest::tests::persist_captured' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -444,7 +457,7 @@ scenario_bounded_execution() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 60 cargo test -p frankenterm-core 'ingest::tests' \
+    run_rch_cargo_timeout 60 test -p frankenterm-core 'ingest::tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
