@@ -59289,6 +59289,80 @@ log_level = "debug"
     }
 
     #[test]
+    fn test_robot_fleet_status_and_error_toon_roundtrip() {
+        use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("fleet.sqlite3");
+        let db_path = db_path.to_str().expect("utf-8 temp path");
+        let mut running_agents = BTreeMap::new();
+        running_agents.insert(
+            9,
+            RunningAgentInventoryEntry {
+                slug: "codex".to_string(),
+                state: "idle".to_string(),
+                session_id: None,
+                source: DetectionSource::PaneTitle,
+            },
+        );
+
+        let status_resp = RobotResponse::success(
+            robot_fleet_status_data(db_path, false, Vec::new(), None, running_agents, None),
+            11,
+        );
+        let status_json = serde_json::to_value(&status_resp).expect("fleet status json");
+        let status_toon = toon_rust::encode(status_json, None);
+        let decoded_status =
+            toon_rust::try_decode(&status_toon, None).expect("decode fleet status toon");
+        let decoded_status_json =
+            toon_rust::cli::json_stringify::json_stringify_lines(&decoded_status, 0).join("\n");
+        let status_roundtrip: serde_json::Value =
+            serde_json::from_str(&decoded_status_json).expect("fleet status json parse");
+        assert_eq!(status_roundtrip["ok"].as_bool(), Some(true));
+        assert_eq!(status_roundtrip["data"]["family"], "fleet");
+        assert_eq!(status_roundtrip["data"]["action"], "status");
+        assert_eq!(
+            status_roundtrip["data"]["backend"],
+            "native_agent_inventory"
+        );
+        assert_eq!(
+            status_roundtrip["data"]["by_program"]["codex"]["idle"].as_f64(),
+            Some(1.0)
+        );
+
+        let unavailable_resp = robot_fleet_capability_unavailable(
+            "scale",
+            serde_json::json!({
+                "program": "codex",
+                "target_count": 2,
+                "dry_run": true,
+            }),
+            12,
+        );
+        let unavailable_json =
+            serde_json::to_value(&unavailable_resp).expect("fleet unavailable json");
+        let unavailable_toon = toon_rust::encode(unavailable_json, None);
+        let decoded_unavailable =
+            toon_rust::try_decode(&unavailable_toon, None).expect("decode fleet error toon");
+        let decoded_unavailable_json =
+            toon_rust::cli::json_stringify::json_stringify_lines(&decoded_unavailable, 0)
+                .join("\n");
+        let unavailable_roundtrip: serde_json::Value =
+            serde_json::from_str(&decoded_unavailable_json).expect("fleet error json parse");
+        assert_eq!(unavailable_roundtrip["ok"].as_bool(), Some(false));
+        assert_eq!(
+            unavailable_roundtrip["error_code"],
+            "robot.fleet.capability_unavailable"
+        );
+        assert_eq!(unavailable_roundtrip["data"]["family"], "fleet");
+        assert_eq!(unavailable_roundtrip["data"]["action"], "scale");
+        assert_eq!(
+            unavailable_roundtrip["data"]["capability_available"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn test_robot_agents_detect_refresh() {
         let cli = Cli::try_parse_from(["ft", "robot", "agents", "detect", "--refresh"])
             .expect("robot agents detect --refresh should parse");
