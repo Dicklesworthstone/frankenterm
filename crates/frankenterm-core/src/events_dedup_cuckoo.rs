@@ -12,32 +12,33 @@
 //!   events where a false-positive (silently dropping a true-new event)
 //!   is unacceptable.
 //!
-//! - **EventCuckooDedup** (this module): approximate dedup with bounded
-//!   false-positive rate (~3% at default config). Memory ~1.5 bytes/key
-//!   → ~3KB at default 2000 cap. **~93× memory reduction**. Use for
-//!   high-volume analytics/UI/telemetry events where dropping ~3% of
-//!   true-new events is acceptable in exchange for the memory + speed.
+//! - **EventCuckooDedup** (this module): approximate dedup with a bounded
+//!   false-positive rate from the underlying 32-bit fingerprints. The default
+//!   2000-event configuration is currently roughly tens of KB excluding allocator
+//!   bookkeeping, still far smaller than the HashMap-backed exact dedup path.
+//!   Use for high-volume analytics/UI/telemetry events where a small
+//!   false-positive risk is acceptable in exchange for bounded memory + speed.
 //!
 //! # False-positive direction
 //!
 //! `check()` returns `New` when the cuckoo filter says NOT in set
 //! (always correct — no false negatives for membership). Returns
 //! `PossibleDuplicate` when the filter says IN set (correct in true-
-//! positive case + ~3% false positive case where the filter's
-//! fingerprint table accidentally contains a colliding fingerprint
-//! for an unrelated event).
+//! positive case + false-positive case where the filter's fingerprint table
+//! accidentally contains a colliding fingerprint for an unrelated event).
 //!
 //! For dedup semantics: PossibleDuplicate means "we'd suppress this
 //! event"; the false-positive direction is **dropping a true-new
-//! event** (~3% of the time), NEVER firing twice on a true duplicate.
+//! event**, NEVER firing twice on a true duplicate.
 //!
 //! # Coverage guarantee (Fan et al. 2014)
 //!
 //! For a Cuckoo filter at load factor α with f-bit fingerprints and
 //! b-slot buckets, the false-positive rate is bounded by `2b / 2^f`
-//! per query. At default config (b=4, f=8), that's `2·4/256 = 3.1%`.
-//! Higher precision (f=16) drops FPR to `8/65536 ≈ 0.012%` at the
-//! cost of 2× memory.
+//! per query. FrankenTerm's current `CuckooFilter` stores 32-bit
+//! fingerprints, so the default b=4 configuration has a bound of
+//! `8 / 2^32` per query, excluding non-uniformity in the non-cryptographic
+//! hash.
 //!
 //! # What ships in this slice
 //!
@@ -56,7 +57,7 @@
 //! - Wiring into events.rs callsites where the EventDeduplicator is
 //!   used today (the operator opt-in).
 
-use crate::cuckoo_filter::{CuckooConfig, CuckooFilter, InsertResult};
+use crate::cuckoo_filter::{CuckooConfig, CuckooFilter};
 use serde::{Deserialize, Serialize};
 
 /// br-ft-events-dedup-cuckoo: dedup verdict for a [`EventCuckooDedup::check`]
@@ -66,15 +67,15 @@ pub enum CuckooDedupVerdict {
     /// Filter says key is NOT in set — definitely new (no false negatives).
     New,
     /// Filter says key IS in set — probably duplicate (true positive
-    /// with ~3% false-positive rate at default config).
+    /// with bounded false-positive risk from 32-bit fingerprints).
     PossibleDuplicate,
 }
 
 /// br-ft-events-dedup-cuckoo: high-volume event deduplicator backed by
 /// a Cuckoo filter. Drop-in alternative to
-/// [`crate::events::EventDeduplicator`] for events where ~3% false-
-/// positive (true-new event silently dropped) is acceptable in
-/// exchange for ~93× memory reduction.
+/// [`crate::events::EventDeduplicator`] for events where low false-
+/// positive risk (true-new event silently dropped) is acceptable in
+/// exchange for bounded memory.
 ///
 /// See module docstring for the full trade-off analysis + when to
 /// choose this over the exact EventDeduplicator.
@@ -103,8 +104,9 @@ impl EventCuckooDedup {
     /// failing with `InsertResult::Full`.
     #[must_use]
     pub fn with_capacity(expected_items: usize) -> Self {
+        let expected_items = expected_items.max(16);
         Self {
-            filter: CuckooFilter::with_capacity(expected_items.max(16)),
+            filter: CuckooFilter::with_capacity(expected_items),
             expected_items,
         }
     }
@@ -112,12 +114,10 @@ impl EventCuckooDedup {
     /// Create a new dedup with explicit CuckooConfig.
     #[must_use]
     pub fn with_config(config: CuckooConfig) -> Self {
-        let expected = config
-            .num_buckets
-            .saturating_mul(config.bucket_size)
-            .max(16);
+        let filter = CuckooFilter::with_config(config);
+        let expected = filter.capacity();
         Self {
-            filter: CuckooFilter::with_config(config),
+            filter,
             expected_items: expected,
         }
     }
@@ -126,8 +126,7 @@ impl EventCuckooDedup {
     ///
     /// Returns `New` if the filter has no record of the key (definitely
     /// new — no false negatives) or `PossibleDuplicate` if the filter
-    /// matches (true positive with ~3% false-positive rate at default
-    /// config).
+    /// matches (true positive or fingerprint false-positive).
     ///
     /// On `New`, the key is inserted into the filter so subsequent
     /// `check()` calls for the same key return `PossibleDuplicate`.
@@ -161,7 +160,7 @@ impl EventCuckooDedup {
     ///
     /// Cuckoo filter `delete()` is exact for true-positive entries
     /// + may incorrectly delete a different entry whose fingerprint
-    /// collides with the requested key (~3% rate at default config).
+    /// collides with the requested key.
     /// In dedup terms: forgetting key A may also forget unrelated
     /// key B that shares A's fingerprint. This is acceptable for
     /// high-volume events (B's next observation is treated as `New`
@@ -190,15 +189,12 @@ impl EventCuckooDedup {
     }
 
     /// Memory used by the underlying filter in bytes (approximate).
-    /// Cuckoo filter at default config: ~1.5 bytes per recorded key
-    /// at 95% load factor.
+    ///
+    /// Includes the top-level filter struct, bucket array, and fingerprint
+    /// storage, but not allocator bookkeeping.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        // CuckooFilter doesn't expose memory_bytes() directly; estimate
-        // from bucket configuration: num_buckets × bucket_size ×
-        // fingerprint_bits ÷ 8.
-        let bits = self.filter.num_buckets() * self.filter.bucket_size() * 8;
-        bits.div_ceil(8)
+        self.filter.memory_bytes()
     }
 
     /// Snapshot for inclusion in events / telemetry reports.
@@ -286,8 +282,9 @@ mod tests {
         // br-ft-events-dedup-cuckoo coverage test: insert 500 distinct
         // keys, then query 1000 brand-new keys. PossibleDuplicate
         // verdicts on the brand-new queries are false positives.
-        // At default config (b=4, f=8), FPR is bounded by 2b/2^f =
-        // 3.1%. Sampling slack covers ~3× — assert FPR < 10%.
+        // At default config (b=4, f=32), FPR is bounded by 2b/2^f.
+        // Keep a generous sampling bound because this uses the same
+        // non-cryptographic hash as production.
         let mut d = EventCuckooDedup::with_capacity(2000);
         for i in 0..500 {
             d.check(&format!("recorded-{i}"));
@@ -304,7 +301,7 @@ mod tests {
         assert!(
             fpr < 0.10,
             "br-ft-events-dedup-cuckoo bounded-FPR: must be < 0.10 \
-             (got {fpr:.4}); cuckoo filter FPR is ~3% at default config",
+             (got {fpr:.4}); cuckoo filter FPR is bounded by 32-bit fingerprints",
         );
     }
 
@@ -322,6 +319,17 @@ mod tests {
     }
 
     #[test]
+    fn custom_config_snapshot_uses_normalized_filter_capacity() {
+        let d = EventCuckooDedup::with_config(CuckooConfig {
+            num_buckets: 3,
+            bucket_size: 0,
+            max_kicks: 10,
+        });
+        let s = d.snapshot();
+        assert_eq!(s.expected_items, 4);
+    }
+
+    #[test]
     fn snapshot_serde_roundtrips() {
         let mut d = EventCuckooDedup::default();
         for i in 0..50 {
@@ -336,15 +344,19 @@ mod tests {
 
     #[test]
     fn memory_bytes_far_smaller_than_hashmap_dedup() {
-        // br-ft-events-dedup-cuckoo memory advantage: ~1.5 bytes/key
-        // for cuckoo vs ~140 bytes/key for HashMap-backed
-        // EventDeduplicator. For 2000 keys, cuckoo should fit in
-        // < 10KB; the equivalent HashMap dedup would need ~280KB.
+        // br-ft-events-dedup-cuckoo memory advantage: the default
+        // filter is much smaller than the approximate 280KB
+        // HashMap-backed EventDeduplicator at 2000 keys, but the
+        // estimate must include u32 fingerprints and bucket metadata.
         let d = EventCuckooDedup::with_capacity(2000);
         let bytes = d.memory_bytes();
         assert!(
-            bytes < 10 * 1024,
-            "cuckoo dedup must fit in < 10KB at 2000-key capacity; got {bytes} bytes"
+            bytes >= 16 * 1024,
+            "default cuckoo dedup estimate must include u32 fingerprint slots; got {bytes} bytes"
+        );
+        assert!(
+            bytes < 96 * 1024,
+            "cuckoo dedup should stay well below HashMap-backed dedup; got {bytes} bytes"
         );
     }
 }

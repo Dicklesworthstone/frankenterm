@@ -28,6 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
+use std::mem;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -396,6 +397,31 @@ impl CuckooFilter {
     pub fn bucket_size(&self) -> usize {
         self.bucket_size
     }
+
+    /// Estimated heap + struct memory used by the filter in bytes.
+    ///
+    /// This includes the top-level filter struct, the bucket array, and the
+    /// per-bucket fingerprint storage. Allocator bookkeeping is intentionally
+    /// not included because it is platform dependent.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        let bucket_array_bytes = self
+            .buckets
+            .capacity()
+            .saturating_mul(mem::size_of::<Bucket>());
+        let fingerprint_bytes = self.buckets.iter().fold(0usize, |acc, bucket| {
+            acc.saturating_add(
+                bucket
+                    .entries
+                    .capacity()
+                    .saturating_mul(mem::size_of::<Fingerprint>()),
+            )
+        });
+
+        mem::size_of::<Self>()
+            .saturating_add(bucket_array_bytes)
+            .saturating_add(fingerprint_bytes)
+    }
 }
 
 impl Default for CuckooFilter {
@@ -494,6 +520,18 @@ mod tests {
         assert_eq!(stats.count, 2);
         assert_eq!(stats.capacity, 64); // 16 * 4
         assert!(stats.occupied_buckets > 0);
+    }
+
+    #[test]
+    fn memory_bytes_includes_bucket_metadata_and_fingerprints() {
+        let filter = CuckooFilter::with_config(CuckooConfig {
+            num_buckets: 16,
+            bucket_size: 4,
+            max_kicks: 100,
+        });
+        let slot_floor =
+            filter.num_buckets() * filter.bucket_size() * std::mem::size_of::<Fingerprint>();
+        assert!(filter.memory_bytes() > slot_floor);
     }
 
     #[test]
