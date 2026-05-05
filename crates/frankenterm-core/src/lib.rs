@@ -633,6 +633,7 @@ pub mod suffix_array;
 pub mod suggestions;
 pub mod survival;
 pub mod swarm_command_center;
+pub mod swarm_failure_conformance;
 pub mod swarm_pipeline;
 pub mod swarm_scheduler;
 pub mod swarm_tail_risk_conformal;
