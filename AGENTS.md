@@ -73,6 +73,54 @@ native FrankenTerm GUI debugging on Apple Silicon.
 
 ---
 
+## RULE NUMBER 1.5: FIX EVERY ISSUE YOU FIND — NO MATTER THE ORIGIN
+
+When you are reviewing, auditing, or otherwise touching code in this
+repo and you discover a problem — a bug, a panic-on-edge-case, a
+resource leak, a race, a security gap, a silent-failure path, a
+missing observability counter, an unbounded operation, a deprecated
+API, an unhandled error, a clippy warning, anything that a careful
+reviewer would call a defect — **you MUST optimally investigate,
+diagnose, and fix it in the best, smartest, most correct way you
+can.** You may not punt on the basis of:
+
+- "Pre-existing — predates my work."
+- "Not introduced by my commit."
+- "Owned by another agent / bead."
+- "Out of scope for this pass."
+- "Tracked elsewhere in a bead."
+- "Style only / hygiene only."
+- "Will be addressed by some future refactor."
+- "Probably never happens in practice."
+
+None of these are valid reasons to leave a defect in place. If a fix
+would meaningfully change the architecture or break a public API,
+you should still do it — quality and correctness override
+backwards-compatibility (we are pre-1.0; see "Backwards
+Compatibility" below).
+
+**The only acceptable reasons to defer a fix are:**
+
+1. The fix is genuinely outside the scope of what you can do safely
+   in the current session (e.g., it requires running a long
+   migration, coordinating with a human stakeholder, or rewriting a
+   subsystem larger than a single coherent commit). In that case,
+   file a bead with a precise reproduction + proposed fix + the
+   diagnosis you already did, then keep working.
+2. Fixing it would produce demonstrably wrong behavior (e.g., the
+   "fix" papers over a deeper root cause). In that case, document
+   the deeper root cause and file the bead.
+
+**Diagnose first, then fix.** Never patch a symptom without
+understanding the root cause via first-principles analysis. A fix
+that hides the symptom but leaves the cause is worse than no fix.
+
+If you find ten issues, fix ten. If you find one hundred, fix one
+hundred. The size of the backlog is not an excuse to leave
+individual defects unaddressed.
+
+---
+
 ## RULE NUMBER 2: ABSOLUTELY NO GIT WORKTREES
 
 **GIT WORKTREES ARE STRICTLY FORBIDDEN IN THIS REPO. DO NOT USE THEM.**

@@ -4188,9 +4188,16 @@ impl RuntimeHandle {
     /// This is the bounded shutdown primitive used by the default shutdown
     /// paths. A stubborn background task can make the returned summary
     /// unclean, but it must not hold operator shutdown forever.
+    ///
+    /// `shutdown_timeout` bounds *both* the task-join phase and the
+    /// subsequent storage flush. A stubborn writer task that misses the
+    /// join window — and is therefore still running concurrently with the
+    /// flush — cannot wedge the flush either: each phase has its own
+    /// independent timeout budget of `shutdown_timeout`.
     pub async fn shutdown_with_timeout(self, shutdown_timeout: Duration) -> ShutdownSummary {
         let elapsed_secs = self.start_time.elapsed().as_secs();
         let mut warnings = Vec::new();
+        let mut clean = true;
 
         // Signal shutdown
         self.shutdown_flag.store(true, Ordering::SeqCst);
@@ -4223,12 +4230,10 @@ impl RuntimeHandle {
         })
         .await;
 
-        let clean = if join_result.is_err() {
+        if join_result.is_err() {
             warnings.push("Tasks did not complete within timeout".to_string());
-            false
-        } else {
-            true
-        };
+            clean = false;
+        }
 
         // Get final metrics
         let segments_persisted = self.metrics.segments_persisted.get();
@@ -4243,10 +4248,25 @@ impl RuntimeHandle {
                 .collect()
         };
 
-        // Flush storage
-        {
-            if let Err(e) = self.storage.shutdown().await {
+        // Flush storage under the same bounded timeout. A storage backend
+        // that wedges (e.g. a SQLite checkpoint blocked on a held lock, a
+        // filesystem hang, or a still-running persistence writer racing
+        // the flush after a join timeout) must not stall operator
+        // shutdown indefinitely.
+        let storage = self.storage;
+        let flush_result = runtime_timeout(&shutdown_cx, shutdown_timeout, async {
+            storage.shutdown().await
+        })
+        .await;
+        match flush_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
                 warnings.push(format!("Storage shutdown error: {e}"));
+                clean = false;
+            }
+            Err(_) => {
+                warnings.push("Storage flush did not complete within timeout".to_string());
+                clean = false;
             }
         }
 

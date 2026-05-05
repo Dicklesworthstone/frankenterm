@@ -1779,6 +1779,28 @@ mod tests {
     }
 
     #[test]
+    fn test_correlation_context_recording_past_end_breaks_propagation() {
+        // Run the full pipeline cleanly so `next_expected` becomes None.
+        let mut ctx = CorrelationContext::new("run-past-end", 0);
+        let mut t = 1000_u64;
+        for &stage in LatencyStage::PIPELINE_STAGES {
+            let probe = ctx.begin_stage(stage, t);
+            t += 100;
+            ctx.end_stage(probe, t);
+            t += 10;
+        }
+        assert!(ctx.propagation_intact);
+        assert_eq!(ctx.next_expected, None);
+
+        // A further begin_stage past the end of the pipeline must flag
+        // the context as no longer intact — recording past the end is
+        // just as much a propagation violation as starting in the middle.
+        let probe = ctx.begin_stage(LatencyStage::PtyCapture, t);
+        ctx.end_stage(probe, t + 100);
+        assert!(!ctx.propagation_intact);
+    }
+
+    #[test]
     fn test_correlation_context_clock_regression() {
         let mut ctx = CorrelationContext::new("run-clock", 0);
         let probe = ctx.begin_stage(LatencyStage::PtyCapture, 2000);

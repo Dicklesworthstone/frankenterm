@@ -969,6 +969,45 @@ mod tests {
         super::super::resolve_runtime_limits(None)
     }
 
+    /// Per ft-22x4r: every async test in supported paths must drive the
+    /// project asupersync runtime instead of `#[tokio::test]`. This
+    /// helper builds a thread-isolated current-thread runtime, runs the
+    /// future to completion, and absorbs the asupersync TLS destructor
+    /// panics that fire when the runtime is dropped after the future
+    /// has spawned `Sleep`/`Cx` cleanup tasks. Mirrors the helper used
+    /// in `runtime.rs` and `snapshot_engine.rs` test modules.
+    fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let result = std::thread::Builder::new()
+            .name("sse-test-isolated".into())
+            .spawn(move || {
+                let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("failed to build runtime for sse tests");
+
+                let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(f());
+                }));
+
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(runtime);
+                }));
+                crate::runtime_async::clear_runtime_handle();
+
+                if let Err(payload) = test_result {
+                    std::panic::resume_unwind(payload);
+                }
+            })
+            .expect("failed to spawn isolated test thread")
+            .join();
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     fn parse_stream_max_hz(qs: &QueryString<'_>) -> u64 {
         super::parse_stream_max_hz(qs, default_limits())
     }
@@ -1168,94 +1207,98 @@ mod tests {
     /// br-ft-95fd3: a successful send does NOT bump either drop
     /// counter. Vacuous-regression guard against the bumpers
     /// false-positiving on the happy path.
-    #[tokio::test]
-    async fn send_rate_limited_sse_ok_path_does_not_bump_drop_counter_ft_95fd3() {
-        let _guard = drop_counter_test_lock();
-        super::reset_sse_events_dropped_count_for_test();
-        super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
+    #[test]
+    fn send_rate_limited_sse_ok_path_does_not_bump_drop_counter_ft_95fd3() {
+        run_async_test_isolated(|| async {
+            let _guard = drop_counter_test_lock();
+            super::reset_sse_events_dropped_count_for_test();
+            super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
 
-        // Generous channel capacity so every send succeeds.
-        let (tx, _rx) = mpsc::channel::<super::SseEvent>(16);
-        let mut next_emit_at = std::time::Instant::now();
-        let mut consecutive_drops: u64 = 0;
-        let still_alive = super::send_rate_limited_sse(
-            &tx,
-            super::SseEvent::new("ok-payload"),
-            &mut next_emit_at,
-            std::time::Duration::ZERO,
-            &mut consecutive_drops,
-        )
-        .await;
+            // Generous channel capacity so every send succeeds.
+            let (tx, _rx) = mpsc::channel::<super::SseEvent>(16);
+            let mut next_emit_at = std::time::Instant::now();
+            let mut consecutive_drops: u64 = 0;
+            let still_alive = super::send_rate_limited_sse(
+                &tx,
+                super::SseEvent::new("ok-payload"),
+                &mut next_emit_at,
+                std::time::Duration::ZERO,
+                &mut consecutive_drops,
+            )
+            .await;
 
-        assert!(still_alive, "ft-95fd3: ok-path must keep stream alive");
-        assert_eq!(
-            consecutive_drops, 0,
-            "ft-95fd3: ok-path must not bump local"
-        );
-        assert_eq!(
-            super::sse_events_dropped_count(),
-            0,
-            "ft-95fd3: ok-path must NOT bump the global event-drop counter"
-        );
-        assert_eq!(
-            super::sse_streams_terminated_by_drop_cap_count(),
-            0,
-            "ft-95fd3: ok-path must NOT bump the global stream-termination counter"
-        );
+            assert!(still_alive, "ft-95fd3: ok-path must keep stream alive");
+            assert_eq!(
+                consecutive_drops, 0,
+                "ft-95fd3: ok-path must not bump local"
+            );
+            assert_eq!(
+                super::sse_events_dropped_count(),
+                0,
+                "ft-95fd3: ok-path must NOT bump the global event-drop counter"
+            );
+            assert_eq!(
+                super::sse_streams_terminated_by_drop_cap_count(),
+                0,
+                "ft-95fd3: ok-path must NOT bump the global stream-termination counter"
+            );
+        });
     }
 
     /// br-ft-95fd3: a Full send DOES bump the global event-drop
     /// counter. Pre-fix the only signal was the per-stream local
     /// `consecutive_drops`, never aggregated across streams; this
     /// test pins that the global counter now reflects the drop.
-    #[tokio::test]
-    async fn send_rate_limited_sse_full_path_bumps_event_drop_counter_ft_95fd3() {
-        let _guard = drop_counter_test_lock();
-        super::reset_sse_events_dropped_count_for_test();
-        super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
-        let before_events = super::sse_events_dropped_count();
-        let before_streams = super::sse_streams_terminated_by_drop_cap_count();
+    #[test]
+    fn send_rate_limited_sse_full_path_bumps_event_drop_counter_ft_95fd3() {
+        run_async_test_isolated(|| async {
+            let _guard = drop_counter_test_lock();
+            super::reset_sse_events_dropped_count_for_test();
+            super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
+            let before_events = super::sse_events_dropped_count();
+            let before_streams = super::sse_streams_terminated_by_drop_cap_count();
 
-        // Capacity-1 channel + a pre-filled slot → next send is Full.
-        let (tx, _rx) = mpsc::channel::<super::SseEvent>(1);
-        assert!(
-            tx.try_send(super::SseEvent::new("filler")).is_ok(),
-            "first send fits in cap=1 channel"
-        );
+            // Capacity-1 channel + a pre-filled slot → next send is Full.
+            let (tx, _rx) = mpsc::channel::<super::SseEvent>(1);
+            assert!(
+                tx.try_send(super::SseEvent::new("filler")).is_ok(),
+                "first send fits in cap=1 channel"
+            );
 
-        let mut next_emit_at = std::time::Instant::now();
-        let mut consecutive_drops: u64 = 0;
-        let still_alive = super::send_rate_limited_sse(
-            &tx,
-            super::SseEvent::new("dropped-payload"),
-            &mut next_emit_at,
-            std::time::Duration::ZERO,
-            &mut consecutive_drops,
-        )
-        .await;
+            let mut next_emit_at = std::time::Instant::now();
+            let mut consecutive_drops: u64 = 0;
+            let still_alive = super::send_rate_limited_sse(
+                &tx,
+                super::SseEvent::new("dropped-payload"),
+                &mut next_emit_at,
+                std::time::Duration::ZERO,
+                &mut consecutive_drops,
+            )
+            .await;
 
-        // Per-stream local incremented; stream still alive (1 < 64).
-        assert!(
-            still_alive,
-            "ft-95fd3: 1 drop is well below STREAM_MAX_CONSECUTIVE_DROPS"
-        );
-        assert_eq!(
-            consecutive_drops, 1,
-            "ft-95fd3: per-stream local must increment on Full"
-        );
+            // Per-stream local incremented; stream still alive (1 < 64).
+            assert!(
+                still_alive,
+                "ft-95fd3: 1 drop is well below STREAM_MAX_CONSECUTIVE_DROPS"
+            );
+            assert_eq!(
+                consecutive_drops, 1,
+                "ft-95fd3: per-stream local must increment on Full"
+            );
 
-        // Global event-drop counter MUST bump.
-        assert_eq!(
-            super::sse_events_dropped_count() - before_events,
-            1,
-            "ft-95fd3: Full send must bump the global event-drop counter exactly once"
-        );
-        // Stream-termination counter MUST NOT bump (still under cap).
-        assert_eq!(
-            super::sse_streams_terminated_by_drop_cap_count() - before_streams,
-            0,
-            "ft-95fd3: still-alive stream must NOT bump the termination counter"
-        );
+            // Global event-drop counter MUST bump.
+            assert_eq!(
+                super::sse_events_dropped_count() - before_events,
+                1,
+                "ft-95fd3: Full send must bump the global event-drop counter exactly once"
+            );
+            // Stream-termination counter MUST NOT bump (still under cap).
+            assert_eq!(
+                super::sse_streams_terminated_by_drop_cap_count() - before_streams,
+                0,
+                "ft-95fd3: still-alive stream must NOT bump the termination counter"
+            );
+        });
     }
 
     /// br-ft-95fd3: hitting the consecutive-drops cap bumps the
@@ -1263,50 +1306,52 @@ mod tests {
     /// invariant — a high stream-termination rate is page-worthy
     /// (sustained backpressure) while individual event drops are
     /// the common burst case.
-    #[tokio::test]
-    async fn send_rate_limited_sse_drop_cap_bumps_termination_counter_ft_95fd3() {
-        let _guard = drop_counter_test_lock();
-        super::reset_sse_events_dropped_count_for_test();
-        super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
+    #[test]
+    fn send_rate_limited_sse_drop_cap_bumps_termination_counter_ft_95fd3() {
+        run_async_test_isolated(|| async {
+            let _guard = drop_counter_test_lock();
+            super::reset_sse_events_dropped_count_for_test();
+            super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
 
-        let (tx, _rx) = mpsc::channel::<super::SseEvent>(1);
-        assert!(
-            tx.try_send(super::SseEvent::new("filler")).is_ok(),
-            "first send fits in cap=1 channel"
-        );
+            let (tx, _rx) = mpsc::channel::<super::SseEvent>(1);
+            assert!(
+                tx.try_send(super::SseEvent::new("filler")).is_ok(),
+                "first send fits in cap=1 channel"
+            );
 
-        let mut next_emit_at = std::time::Instant::now();
-        // Pre-load consecutive_drops to 1 below the cap so the next
-        // Full send pushes us OVER and triggers termination.
-        let mut consecutive_drops: u64 = STREAM_MAX_CONSECUTIVE_DROPS - 1;
+            let mut next_emit_at = std::time::Instant::now();
+            // Pre-load consecutive_drops to 1 below the cap so the next
+            // Full send pushes us OVER and triggers termination.
+            let mut consecutive_drops: u64 = STREAM_MAX_CONSECUTIVE_DROPS - 1;
 
-        let still_alive = super::send_rate_limited_sse(
-            &tx,
-            super::SseEvent::new("cap-trigger"),
-            &mut next_emit_at,
-            std::time::Duration::ZERO,
-            &mut consecutive_drops,
-        )
-        .await;
+            let still_alive = super::send_rate_limited_sse(
+                &tx,
+                super::SseEvent::new("cap-trigger"),
+                &mut next_emit_at,
+                std::time::Duration::ZERO,
+                &mut consecutive_drops,
+            )
+            .await;
 
-        assert!(
-            !still_alive,
-            "ft-95fd3: hitting STREAM_MAX_CONSECUTIVE_DROPS must terminate the stream"
-        );
-        assert_eq!(
-            consecutive_drops, STREAM_MAX_CONSECUTIVE_DROPS,
-            "ft-95fd3: per-stream local must reflect the cap"
-        );
-        assert_eq!(
-            super::sse_events_dropped_count(),
-            1,
-            "ft-95fd3: the cap-triggering drop must also bump the event-drop counter"
-        );
-        assert_eq!(
-            super::sse_streams_terminated_by_drop_cap_count(),
-            1,
-            "ft-95fd3: hitting the cap must bump the stream-termination counter exactly once"
-        );
+            assert!(
+                !still_alive,
+                "ft-95fd3: hitting STREAM_MAX_CONSECUTIVE_DROPS must terminate the stream"
+            );
+            assert_eq!(
+                consecutive_drops, STREAM_MAX_CONSECUTIVE_DROPS,
+                "ft-95fd3: per-stream local must reflect the cap"
+            );
+            assert_eq!(
+                super::sse_events_dropped_count(),
+                1,
+                "ft-95fd3: the cap-triggering drop must also bump the event-drop counter"
+            );
+            assert_eq!(
+                super::sse_streams_terminated_by_drop_cap_count(),
+                1,
+                "ft-95fd3: hitting the cap must bump the stream-termination counter exactly once"
+            );
+        });
     }
 
     /// br-ft-95fd3: the two counters are distinct atomics — a bump

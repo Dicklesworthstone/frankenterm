@@ -8,6 +8,14 @@ use super::{
     ObservationResult, PipelineRun, StageObservation,
 };
 
+/// Maximum overflow rate (overflow_runs / completed_runs) at which the
+/// `InstrumentedEnforcer` is still considered healthy. Above this the
+/// `is_healthy()` check returns false. Operators that need stricter
+/// SLO bands can compose their own predicate against
+/// `overflow_rate()` and `current_degradation()`; the default tracks
+/// the historic 10% acceptance band.
+pub const HEALTHY_OVERFLOW_RATE_THRESHOLD: f64 = 0.10;
+
 /// A correlation context that propagates across async boundaries.
 ///
 /// Created at the start of a pipeline run and threaded through all
@@ -64,13 +72,18 @@ impl CorrelationContext {
     ///
     /// # Propagation Check
     /// If the stage doesn't match `next_expected`, a gap is recorded
-    /// and `propagation_intact` is set to false.
+    /// and `propagation_intact` is set to false. If the pipeline has
+    /// already completed (i.e. `next_expected == None` because every
+    /// `PIPELINE_STAGES` entry has been observed), any further stage
+    /// is also a propagation violation — recording past the end of
+    /// the pipeline is just as much a gap as starting in the middle.
     pub fn begin_stage(&mut self, stage: LatencyStage, start_us: u64) -> StageProbe {
-        // Check propagation integrity.
-        if let Some(expected) = self.next_expected {
-            if stage != expected {
-                self.propagation_intact = false;
-            }
+        match self.next_expected {
+            Some(expected) if stage == expected => {}
+            // Either the wrong stage was begun, or the pipeline already
+            // ran to completion and a stage was begun anyway. Both are
+            // out-of-order recordings.
+            Some(_) | None => self.propagation_intact = false,
         }
 
         StageProbe {
@@ -551,11 +564,12 @@ impl InstrumentedEnforcer {
     /// Health check: returns true if instrumentation is healthy.
     ///
     /// Healthy means: overhead within budget, degradation is Full,
-    /// and overflow rate is below 10%.
+    /// and overflow rate is below
+    /// [`HEALTHY_OVERFLOW_RATE_THRESHOLD`] (10%).
     pub fn is_healthy(&self) -> bool {
         self.overhead.within_budget
             && self.current_degradation() == InstrumentationDegradation::Full
-            && self.overflow_rate() < 0.10
+            && self.overflow_rate() < HEALTHY_OVERFLOW_RATE_THRESHOLD
     }
 
     /// Get a compact status string for operator dashboards.

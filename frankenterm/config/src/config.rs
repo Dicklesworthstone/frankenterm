@@ -2346,7 +2346,20 @@ fn bundled_app_font_dirs() -> Vec<PathBuf> {
     }
 
     dirs.retain(|dir| dir.is_dir());
-    dirs.dedup();
+
+    // Canonicalize each directory before deduplicating so logically
+    // equivalent paths that differ only in symlink resolution
+    // (e.g. `FRANKENTERM_EXECUTABLE_DIR` set to an unresolved path while
+    // `current_exe()` reports the resolved path) collapse to a single
+    // entry. `Vec::dedup` only removes consecutive duplicates, so a
+    // non-canonicalizing dedup left order-dependent doubles in the
+    // returned list and we'd then prepend the same directory twice into
+    // `font_dirs`.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    dirs.retain(|dir| {
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        seen.insert(key)
+    });
     dirs
 }
 
