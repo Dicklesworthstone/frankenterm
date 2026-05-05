@@ -6034,6 +6034,40 @@ impl PolicyEngine {
         // Command safety gate for actions that carry executable command text.
         if matches!(input.action, ActionKind::SendText | ActionKind::ExecCommand) {
             if let Some(text) = input.command_text.as_deref() {
+                if input.actor != ActorKind::Human {
+                    let rch_proof_safety =
+                        crate::build_coord::classify_rch_proof_command_shape(text);
+                    if matches!(
+                        rch_proof_safety,
+                        crate::build_coord::RchProofCommandSafety::ShellWrappedRemoteCargo
+                    ) {
+                        let prefix = crate::build_coord::recommended_rch_prefix();
+                        let reason = format!(
+                            "Heavy cargo proof commands from {} actions must pass Cargo directly to `{prefix}`; shell payloads under `rch exec --` are diagnostic-only because they can fall out of the remote compilation path",
+                            input.actor.as_str()
+                        );
+                        context.record_rule(
+                            RCH_HEAVY_COMPUTE_RULE_ID,
+                            true,
+                            Some("require_approval"),
+                            Some(reason.clone()),
+                        );
+                        context.set_determining_rule(RCH_HEAVY_COMPUTE_RULE_ID);
+                        context.add_evidence(
+                            "rch_proof_command_safety",
+                            format!("{rch_proof_safety:?}"),
+                        );
+                        context
+                            .add_evidence("rch_proof_reason_code", rch_proof_safety.reason_code());
+                        context.add_evidence("rch_recommended_prefix", prefix);
+                        return PolicyDecision::require_approval_with_rule(
+                            reason,
+                            RCH_HEAVY_COMPUTE_RULE_ID,
+                        )
+                        .with_context(context);
+                    }
+                }
+
                 if input.actor != ActorKind::Human && crate::build_coord::requires_rch_offload(text)
                 {
                     let prefix = crate::build_coord::recommended_rch_prefix();
@@ -8775,6 +8809,38 @@ mod tests {
 
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn robot_shell_payload_under_rch_requires_approval() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text(
+                "rch exec -- bash -lc 'cargo test -p frankenterm-core -- --nocapture'",
+            );
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
+        assert!(decision.reason().is_some_and(|reason| {
+            reason.contains("shell payloads") && reason.contains("rch exec")
+        }));
+    }
+
+    #[test]
+    fn mcp_shell_payload_under_rch_requires_approval() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+            .with_surface(PolicySurface::Mcp)
+            .with_command_text(
+                "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof bash -lc 'cargo check --workspace'",
+            );
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
     }
 
     #[test]

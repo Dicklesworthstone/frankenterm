@@ -435,6 +435,52 @@ pub fn requires_rch_offload(command: &str) -> bool {
     analyze_command(command, false).requires_rch_offload
 }
 
+/// Safety classification for using a command as FrankenTerm remote Cargo proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RchProofCommandSafety {
+    /// The command does not contain a heavy Cargo workload.
+    NoCargoWork,
+    /// Heavy Cargo work is directly routed through `rch exec --`.
+    ValidRemoteCargo,
+    /// Heavy Cargo work appears without an `rch exec --` wrapper.
+    MissingRch,
+    /// `rch exec --` delegates to a shell that then runs heavy Cargo.
+    ShellWrappedRemoteCargo,
+}
+
+impl RchProofCommandSafety {
+    /// Returns true when this command shape is eligible as remote proof.
+    #[must_use]
+    pub const fn is_valid_remote_proof_shape(self) -> bool {
+        matches!(self, Self::ValidRemoteCargo)
+    }
+
+    /// Stable reason code for reports and proof-ledger records.
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::NoCargoWork => "proof.skipped.no_heavy_cargo",
+            Self::ValidRemoteCargo => "proof.command_shape.valid_remote_cargo",
+            Self::MissingRch => "proof.local_invalid.missing_rch_exec",
+            Self::ShellWrappedRemoteCargo => "proof.local_invalid.shell_wrapped_cargo",
+        }
+    }
+}
+
+/// Classify whether a command is an acceptable remote Cargo proof shape.
+///
+/// This is stricter than [`command_uses_rch`]. A command such as
+/// `rch exec -- bash -lc 'cargo test ...'` contains an RCH prefix, but RCH
+/// treats the payload as a shell command rather than a first-class Cargo job.
+/// That shape is diagnostic-only for FrankenTerm proof closeout because it can
+/// fall out of the remote compilation path and start local Cargo.
+#[must_use]
+pub fn classify_rch_proof_command_shape(command: &str) -> RchProofCommandSafety {
+    let tokens = command_tokens(command);
+    classify_rch_proof_tokens(&tokens, false)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct CommandAnalysis {
     first_cargo_subcommand: Option<&'static str>,
@@ -462,6 +508,69 @@ fn analyze_tokens(tokens: &[String], inherited_uses_rch: bool) -> CommandAnalysi
     }
 
     analysis
+}
+
+fn classify_rch_proof_tokens(tokens: &[String], inherited_uses_rch: bool) -> RchProofCommandSafety {
+    let mut segment_start = 0;
+    let mut aggregate = RchProofCommandSafety::NoCargoWork;
+
+    while segment_start < tokens.len() {
+        let segment = classify_rch_proof_segment(tokens, segment_start, inherited_uses_rch);
+        aggregate = combine_rch_proof_safety(aggregate, segment);
+        segment_start = next_command_segment_start(tokens, segment_start);
+    }
+
+    aggregate
+}
+
+fn classify_rch_proof_segment(
+    tokens: &[String],
+    segment_start: usize,
+    inherited_uses_rch: bool,
+) -> RchProofCommandSafety {
+    let (idx, uses_rch) = segment_command_start(tokens, segment_start, inherited_uses_rch);
+
+    if let Some(shell_command) = shell_command_payload(tokens, idx) {
+        let nested = classify_rch_proof_command_shape(shell_command);
+        if uses_rch && nested_mentions_heavy_cargo(nested) {
+            return RchProofCommandSafety::ShellWrappedRemoteCargo;
+        }
+        return nested;
+    }
+
+    let Some(subcommand) = cargo_subcommand_at(tokens, idx) else {
+        return RchProofCommandSafety::NoCargoWork;
+    };
+
+    if !HEAVY_CARGO_SUBCOMMANDS.contains(&subcommand) {
+        return RchProofCommandSafety::NoCargoWork;
+    }
+
+    if uses_rch {
+        RchProofCommandSafety::ValidRemoteCargo
+    } else {
+        RchProofCommandSafety::MissingRch
+    }
+}
+
+fn combine_rch_proof_safety(
+    current: RchProofCommandSafety,
+    next: RchProofCommandSafety,
+) -> RchProofCommandSafety {
+    use RchProofCommandSafety::{
+        MissingRch, NoCargoWork, ShellWrappedRemoteCargo, ValidRemoteCargo,
+    };
+
+    match (current, next) {
+        (ShellWrappedRemoteCargo, _) | (_, ShellWrappedRemoteCargo) => ShellWrappedRemoteCargo,
+        (MissingRch, _) | (_, MissingRch) => MissingRch,
+        (ValidRemoteCargo, _) | (_, ValidRemoteCargo) => ValidRemoteCargo,
+        (NoCargoWork, NoCargoWork) => NoCargoWork,
+    }
+}
+
+fn nested_mentions_heavy_cargo(safety: RchProofCommandSafety) -> bool {
+    !matches!(safety, RchProofCommandSafety::NoCargoWork)
 }
 
 /// Recommended `rch` prefix for the current platform.
@@ -1368,6 +1477,66 @@ mod tests {
         assert!(!requires_rch_offload(
             "TMPDIR=/tmp rch exec -- /bin/bash -lc 'cargo clippy --workspace'"
         ));
+    }
+
+    #[test]
+    fn rch_proof_command_shape_accepts_direct_remote_cargo() {
+        for command in [
+            "rch exec -- cargo test --workspace",
+            "TMPDIR=/tmp rch exec -- cargo check -p frankenterm-core",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo clippy --all-targets",
+            "bash -lc 'TMPDIR=/tmp rch exec -- cargo test -p frankenterm-core'",
+        ] {
+            let safety = classify_rch_proof_command_shape(command);
+            assert_eq!(safety, RchProofCommandSafety::ValidRemoteCargo, "{command}");
+            assert!(safety.is_valid_remote_proof_shape(), "{command}");
+            assert_eq!(
+                safety.reason_code(),
+                "proof.command_shape.valid_remote_cargo"
+            );
+        }
+    }
+
+    #[test]
+    fn rch_proof_command_shape_rejects_shell_payload_under_rch() {
+        for command in [
+            "rch exec -- bash -lc 'cargo test -p frankenterm-core -- --nocapture'",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof bash -lc 'cargo check --workspace'",
+            "TMPDIR=/tmp rch exec -- sh -c 'cargo clippy --all-targets -- -D warnings'",
+        ] {
+            let safety = classify_rch_proof_command_shape(command);
+            assert_eq!(
+                safety,
+                RchProofCommandSafety::ShellWrappedRemoteCargo,
+                "{command}"
+            );
+            assert!(!safety.is_valid_remote_proof_shape(), "{command}");
+            assert_eq!(
+                safety.reason_code(),
+                "proof.local_invalid.shell_wrapped_cargo"
+            );
+        }
+    }
+
+    #[test]
+    fn rch_proof_command_shape_flags_missing_rch_and_light_cargo() {
+        let missing = classify_rch_proof_command_shape(
+            "env CARGO_TARGET_DIR=/tmp/ft-proof cargo test -p frankenterm-core",
+        );
+        assert_eq!(missing, RchProofCommandSafety::MissingRch);
+        assert_eq!(
+            missing.reason_code(),
+            "proof.local_invalid.missing_rch_exec"
+        );
+
+        let mixed = classify_rch_proof_command_shape(
+            "rch exec -- cargo check --help && cargo test -p frankenterm-core",
+        );
+        assert_eq!(mixed, RchProofCommandSafety::MissingRch);
+
+        let light = classify_rch_proof_command_shape("cargo fmt --check");
+        assert_eq!(light, RchProofCommandSafety::NoCargoWork);
+        assert_eq!(light.reason_code(), "proof.skipped.no_heavy_cargo");
     }
 
     // ====================================================================
