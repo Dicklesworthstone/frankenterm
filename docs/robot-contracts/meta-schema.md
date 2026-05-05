@@ -4,8 +4,10 @@
 **Audience:** Anyone closing one of the schema-driven robot families.
 The original contract set covered `profile`, `checkpoint`, `context`,
 `work`, and `fleet`. `profile` now has native read paths and dry-run
-apply; the current NTM-gap implementation set is `checkpoint`,
-`context`, `work`, and `fleet`.
+apply; `checkpoint` now routes through the native snapshot/session adapter
+with mutating rollback approval-blocked outside `--dry-run`; `work` now
+routes through the native SQLite `work_claims` queue. The current NTM-gap
+implementation set is `context` and `fleet`.
 
 This document is the **single source of truth** for what a "complete"
 robot-family contract looks like. Each family is described by a

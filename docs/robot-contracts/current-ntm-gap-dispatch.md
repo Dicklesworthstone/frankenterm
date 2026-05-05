@@ -3,7 +3,8 @@
 **Bead:** `ft-bs9uh.1`
 
 This file records the live CLI dispatch shape for the remaining Robot Mode
-families that still route through `build_ntm_not_implemented_response`.
+families that still route through `build_ntm_not_implemented_response`, plus
+families that have graduated to a native backend under the same harness.
 It complements the per-family contract docs, which describe the target
 native semantics and state-machine proofs.
 
@@ -17,10 +18,15 @@ The current NTM-gap families are:
 
 | Family | CLI actions currently parsed | Current backend |
 |---|---|---|
-| `checkpoint` | `save`, `list`, `show`, `delete`, `rollback` | structured `robot.not_implemented` fallback |
 | `context` | `status`, `rotate`, `history` | structured `robot.not_implemented` fallback |
-| `work` | `claim`, `release`, `complete`, `list`, `ready`, `assign` | structured `robot.not_implemented` fallback |
 | `fleet` | `status`, `scale`, `rebalance`, `agents` | structured `robot.not_implemented` fallback |
+
+The checkpoint and work families have graduated from the NTM-gap fallback:
+
+| Family | CLI actions currently parsed | Current backend |
+|---|---|---|
+| `checkpoint` | `save`, `list`, `show`, `delete`, `rollback` | native snapshot/session adapter; rollback mutating execution is approval-blocked unless `--dry-run` is used |
+| `work` | `claim`, `release`, `complete`, `list`, `ready`, `assign` | native SQLite `work_claims` queue; claims/assignments are serialized per item and completion is durable |
 
 ## Harness Contract
 

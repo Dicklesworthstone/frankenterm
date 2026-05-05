@@ -4868,6 +4868,9 @@ const ROBOT_ERR_WORKFLOW_ABORTED: &str = "robot.workflow_aborted";
 const ROBOT_ERR_WORKFLOW_ERROR: &str = "robot.workflow_error";
 const ROBOT_ERR_WORKFLOW_NOT_FOUND: &str = "robot.workflow_not_found";
 const ROBOT_ERR_NOT_IMPLEMENTED: &str = "robot.not_implemented";
+const ROBOT_ERR_CHECKPOINT_NOT_FOUND: &str = "robot.checkpoint_not_found";
+const ROBOT_ERR_WORK_ITEM_NOT_FOUND: &str = "robot.work_item_not_found";
+const ROBOT_ERR_WORK_ITEM_CONFLICT: &str = "robot.work_item_conflict";
 const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
 const ROBOT_APPROVAL_RECOVERY_HINT: &str = "Run `ft watch` so approvals can be issued, then validate any issued token with `ft approve <CODE>` before retrying.";
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE: &str =
@@ -8856,6 +8859,834 @@ fn now_ms_i64() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+#[derive(Debug, Clone)]
+struct RobotWorkRow {
+    claim_id: String,
+    state: String,
+    owner: Option<String>,
+    priority: i64,
+    labels_json: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    claimed_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+    summary: Option<String>,
+    evidence_json: String,
+    blocked_by_count: i64,
+    unblocks_count: i64,
+    last_reason: Option<String>,
+}
+
+fn robot_work_error_response(
+    code: &str,
+    message: impl Into<String>,
+    hint: Option<String>,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    RobotResponse::<serde_json::Value>::error_with_code(code, message, hint, elapsed_ms)
+}
+
+fn robot_work_backend_error(
+    err: impl std::fmt::Display,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    robot_work_error_response(
+        ROBOT_ERR_STORAGE,
+        format!("Failed to update native work queue: {err}"),
+        Some("Check the workspace database path and permissions.".to_string()),
+        elapsed_ms,
+    )
+}
+
+fn robot_work_not_found(item_id: &str, elapsed_ms: u64) -> RobotResponse<serde_json::Value> {
+    robot_work_error_response(
+        ROBOT_ERR_WORK_ITEM_NOT_FOUND,
+        format!("Work item `{item_id}` was not found."),
+        Some(
+            "Use `ft robot work list` or `ft robot work ready` to inspect native work items."
+                .to_string(),
+        ),
+        elapsed_ms,
+    )
+}
+
+fn robot_work_conflict(
+    item_id: &str,
+    reason: &str,
+    current_owner: Option<&str>,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    let mut message = format!("Work item `{item_id}` cannot transition: {reason}.");
+    if let Some(owner) = current_owner {
+        message.push_str(&format!(" Current owner: {owner}."));
+    }
+    robot_work_error_response(
+        ROBOT_ERR_WORK_ITEM_CONFLICT,
+        message,
+        Some(
+            "Inspect the item with `ft robot work list --status claimed` before retrying."
+                .to_string(),
+        ),
+        elapsed_ms,
+    )
+}
+
+fn robot_work_validate_id(
+    kind: &str,
+    value: &str,
+    elapsed_ms: u64,
+) -> Result<(), RobotResponse<serde_json::Value>> {
+    if value.trim().is_empty() {
+        return Err(robot_work_error_response(
+            ROBOT_ERR_INVALID_ARGS,
+            format!("{kind} must not be empty."),
+            None,
+            elapsed_ms,
+        ));
+    }
+    if value.len() > 256 {
+        return Err(robot_work_error_response(
+            ROBOT_ERR_INVALID_ARGS,
+            format!("{kind} is too long; maximum is 256 bytes."),
+            None,
+            elapsed_ms,
+        ));
+    }
+    Ok(())
+}
+
+fn robot_work_open_conn(db_path: &str) -> anyhow::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    robot_work_ensure_schema(&conn)?;
+    Ok(conn)
+}
+
+fn robot_work_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS work_claims (
+            claim_id TEXT PRIMARY KEY NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('unclaimed', 'claimed', 'completed')),
+            owner TEXT,
+            priority INTEGER NOT NULL DEFAULT 3,
+            labels_json TEXT NOT NULL DEFAULT '[]',
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            claimed_at_ms INTEGER,
+            released_at_ms INTEGER,
+            completed_at_ms INTEGER,
+            summary TEXT,
+            evidence_json TEXT NOT NULL DEFAULT '[]',
+            blocked_by_count INTEGER NOT NULL DEFAULT 0,
+            unblocks_count INTEGER NOT NULL DEFAULT 0,
+            last_reason TEXT,
+            assign_strategy TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_claims_state ON work_claims(state);
+        CREATE INDEX IF NOT EXISTS idx_work_claims_owner ON work_claims(owner);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn robot_work_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<RobotWorkRow> {
+    Ok(RobotWorkRow {
+        claim_id: row.get(0)?,
+        state: row.get(1)?,
+        owner: row.get(2)?,
+        priority: row.get(3)?,
+        labels_json: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+        claimed_at_ms: row.get(7)?,
+        completed_at_ms: row.get(8)?,
+        summary: row.get(9)?,
+        evidence_json: row.get(10)?,
+        blocked_by_count: row.get(11)?,
+        unblocks_count: row.get(12)?,
+        last_reason: row.get(13)?,
+    })
+}
+
+const ROBOT_WORK_SELECT_ROW: &str = r#"
+    SELECT claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
+           claimed_at_ms, completed_at_ms, summary, evidence_json, blocked_by_count,
+           unblocks_count, last_reason
+    FROM work_claims
+    WHERE claim_id = ?1
+"#;
+
+fn robot_work_fetch_row(
+    conn: &rusqlite::Connection,
+    item_id: &str,
+) -> anyhow::Result<Option<RobotWorkRow>> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(ROBOT_WORK_SELECT_ROW, [item_id], robot_work_row_from_sql)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn robot_work_fetch_row_tx(
+    tx: &rusqlite::Transaction<'_>,
+    item_id: &str,
+) -> anyhow::Result<Option<RobotWorkRow>> {
+    use rusqlite::OptionalExtension;
+
+    tx.query_row(ROBOT_WORK_SELECT_ROW, [item_id], robot_work_row_from_sql)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn robot_work_parse_string_array(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+fn robot_work_priority(priority: i64) -> u32 {
+    u32::try_from(priority).unwrap_or(3)
+}
+
+fn robot_work_count(count: i64) -> usize {
+    usize::try_from(count).unwrap_or(0)
+}
+
+fn robot_work_summary(row: &RobotWorkRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.claim_id,
+        "claim_id": row.claim_id,
+        "title": row.claim_id,
+        "priority": robot_work_priority(row.priority),
+        "status": row.state,
+        "state": row.state,
+        "assigned_to": row.owner,
+        "labels": robot_work_parse_string_array(&row.labels_json),
+        "blocked_by_count": robot_work_count(row.blocked_by_count),
+        "unblocks_count": robot_work_count(row.unblocks_count),
+        "created_at_ms": row.created_at_ms,
+        "updated_at_ms": row.updated_at_ms,
+        "claimed_at_ms": row.claimed_at_ms,
+        "completed_at_ms": row.completed_at_ms,
+        "summary": row.summary,
+        "evidence": robot_work_parse_string_array(&row.evidence_json),
+        "last_reason": row.last_reason,
+    })
+}
+
+fn robot_work_normalize_status_filter(status: Option<&str>) -> Option<String> {
+    status.map(|s| match s.trim().to_ascii_lowercase().as_str() {
+        "open" | "ready" | "unclaimed" => "unclaimed".to_string(),
+        "in_progress" | "claimed" | "assigned" => "claimed".to_string(),
+        "closed" | "done" | "completed" => "completed".to_string(),
+        other => other.to_string(),
+    })
+}
+
+fn robot_work_limit(limit: usize) -> usize {
+    limit.clamp(1, 200)
+}
+
+fn robot_work_seed_unclaimed_if_missing(
+    tx: &rusqlite::Transaction<'_>,
+    item_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO work_claims
+         (claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
+          evidence_json, blocked_by_count, unblocks_count)
+         VALUES (?1, 'unclaimed', NULL, 3, '[]', ?2, ?2, '[]', 0, 0)",
+        rusqlite::params![item_id, now_ms],
+    )?;
+    Ok(())
+}
+
+fn robot_work_claim_data(
+    db_path: &str,
+    item_id: &str,
+    agent_id: &str,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    robot_work_validate_id("item_id", item_id, elapsed_ms)?;
+    robot_work_validate_id("agent_id", agent_id, elapsed_ms)?;
+
+    let mut conn =
+        robot_work_open_conn(db_path).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    let now_ms = now_ms_i64();
+    robot_work_seed_unclaimed_if_missing(&tx, item_id, now_ms)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let row = robot_work_fetch_row_tx(&tx, item_id)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
+        .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
+
+    match (row.state.as_str(), row.owner.as_deref()) {
+        ("unclaimed", _) => {
+            tx.execute(
+                "UPDATE work_claims
+                 SET state = 'claimed', owner = ?2, claimed_at_ms = ?3, updated_at_ms = ?3,
+                     last_reason = NULL
+                 WHERE claim_id = ?1",
+                rusqlite::params![item_id, agent_id, now_ms],
+            )
+            .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+        }
+        ("claimed", Some(owner)) if owner == agent_id => {}
+        ("claimed", owner) => {
+            return Err(robot_work_conflict(
+                item_id,
+                "already_claimed",
+                owner,
+                elapsed_ms,
+            ));
+        }
+        ("completed", owner) => {
+            return Err(robot_work_conflict(
+                item_id,
+                "already_completed",
+                owner,
+                elapsed_ms,
+            ));
+        }
+        _ => {
+            return Err(robot_work_conflict(
+                item_id,
+                "invalid_state",
+                row.owner.as_deref(),
+                elapsed_ms,
+            ));
+        }
+    }
+
+    let row = robot_work_fetch_row_tx(&tx, item_id)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
+        .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
+    tx.commit()
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    Ok(serde_json::json!({
+        "family": "work",
+        "action": "claim",
+        "backend": "native_sqlite_work_claims",
+        "storage_table": "work_claims",
+        "item_id": row.claim_id,
+        "claim_id": row.claim_id,
+        "agent_id": agent_id,
+        "state": row.state,
+        "title": row.claim_id,
+        "priority": robot_work_priority(row.priority),
+        "claimed_at": row.claimed_at_ms.unwrap_or(now_ms),
+        "claimed_at_ms": row.claimed_at_ms.unwrap_or(now_ms),
+        "audit": {
+            "event": "work.claimed",
+            "serializable_key": item_id,
+        },
+    }))
+}
+
+fn robot_work_release_data(
+    db_path: &str,
+    item_id: &str,
+    reason: Option<&str>,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    robot_work_validate_id("item_id", item_id, elapsed_ms)?;
+
+    let mut conn =
+        robot_work_open_conn(db_path).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    let row = robot_work_fetch_row_tx(&tx, item_id)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
+        .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
+    if row.state == "completed" {
+        return Err(robot_work_conflict(
+            item_id,
+            "already_completed",
+            row.owner.as_deref(),
+            elapsed_ms,
+        ));
+    }
+
+    let now_ms = now_ms_i64();
+    tx.execute(
+        "UPDATE work_claims
+         SET state = 'unclaimed', owner = NULL, released_at_ms = ?2, updated_at_ms = ?2,
+             last_reason = ?3
+         WHERE claim_id = ?1",
+        rusqlite::params![item_id, now_ms, reason],
+    )
+    .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    tx.commit()
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    Ok(serde_json::json!({
+        "family": "work",
+        "action": "release",
+        "backend": "native_sqlite_work_claims",
+        "storage_table": "work_claims",
+        "item_id": item_id,
+        "claim_id": item_id,
+        "new_status": "unclaimed",
+        "released_at_ms": now_ms,
+        "reason": reason,
+        "audit": {
+            "event": "work.released",
+            "serializable_key": item_id,
+        },
+    }))
+}
+
+fn robot_work_complete_data(
+    db_path: &str,
+    item_id: &str,
+    summary: Option<&str>,
+    evidence: &[String],
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    robot_work_validate_id("item_id", item_id, elapsed_ms)?;
+
+    let mut conn =
+        robot_work_open_conn(db_path).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    let row = robot_work_fetch_row_tx(&tx, item_id)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
+        .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
+    let already_completed = row.state == "completed";
+    let now_ms = row.completed_at_ms.unwrap_or_else(now_ms_i64);
+    let evidence_json =
+        serde_json::to_string(evidence).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    if !already_completed {
+        tx.execute(
+            "UPDATE work_claims
+             SET state = 'completed', completed_at_ms = ?2, updated_at_ms = ?2,
+                 summary = COALESCE(?3, summary), evidence_json = ?4
+             WHERE claim_id = ?1",
+            rusqlite::params![item_id, now_ms, summary, evidence_json],
+        )
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    }
+    tx.commit()
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    Ok(serde_json::json!({
+        "family": "work",
+        "action": "complete",
+        "backend": "native_sqlite_work_claims",
+        "storage_table": "work_claims",
+        "item_id": item_id,
+        "claim_id": item_id,
+        "completed_at_ms": now_ms,
+        "idempotent_replay": already_completed,
+        "unblocked": [],
+        "summary": summary,
+        "evidence": evidence,
+        "audit": {
+            "event": if already_completed { "work.completed.replay" } else { "work.completed" },
+            "serializable_key": item_id,
+        },
+    }))
+}
+
+fn robot_work_assign_data(
+    db_path: &str,
+    item_id: &str,
+    agent_id: &str,
+    strategy: Option<&str>,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    robot_work_validate_id("item_id", item_id, elapsed_ms)?;
+    robot_work_validate_id("agent_id", agent_id, elapsed_ms)?;
+
+    let strategy_used = strategy.unwrap_or("direct");
+    let force = strategy_used.eq_ignore_ascii_case("force");
+    let mut conn =
+        robot_work_open_conn(db_path).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    let now_ms = now_ms_i64();
+    robot_work_seed_unclaimed_if_missing(&tx, item_id, now_ms)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let row = robot_work_fetch_row_tx(&tx, item_id)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
+        .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
+
+    if row.state == "completed" {
+        return Err(robot_work_conflict(
+            item_id,
+            "already_completed",
+            row.owner.as_deref(),
+            elapsed_ms,
+        ));
+    }
+    if row.state == "claimed" && row.owner.as_deref() != Some(agent_id) && !force {
+        return Err(robot_work_conflict(
+            item_id,
+            "already_claimed",
+            row.owner.as_deref(),
+            elapsed_ms,
+        ));
+    }
+
+    tx.execute(
+        "UPDATE work_claims
+         SET state = 'claimed', owner = ?2, claimed_at_ms = COALESCE(claimed_at_ms, ?3),
+             updated_at_ms = ?3, assign_strategy = ?4, last_reason = NULL
+         WHERE claim_id = ?1",
+        rusqlite::params![item_id, agent_id, now_ms, strategy_used],
+    )
+    .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    tx.commit()
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    Ok(serde_json::json!({
+        "family": "work",
+        "action": "assign",
+        "backend": "native_sqlite_work_claims",
+        "storage_table": "work_claims",
+        "item_id": item_id,
+        "claim_id": item_id,
+        "agent_id": agent_id,
+        "strategy_used": strategy_used,
+        "audit": {
+            "event": "work.assigned",
+            "serializable_key": item_id,
+        },
+    }))
+}
+
+fn robot_work_list_rows(
+    db_path: &str,
+    status: Option<&str>,
+    agent: Option<&str>,
+    label: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<(Vec<serde_json::Value>, usize)> {
+    let conn = robot_work_open_conn(db_path)?;
+    let normalized_status = robot_work_normalize_status_filter(status);
+    let limit = robot_work_limit(limit);
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
+               claimed_at_ms, completed_at_ms, summary, evidence_json, blocked_by_count,
+               unblocks_count, last_reason
+        FROM work_claims
+        ORDER BY priority ASC, updated_at_ms DESC, claim_id ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([], robot_work_row_from_sql)?;
+
+    let mut total = 0usize;
+    let mut items = Vec::new();
+    for row in rows {
+        let row = row?;
+        if normalized_status
+            .as_deref()
+            .is_some_and(|status| row.state != status)
+        {
+            continue;
+        }
+        if agent.is_some_and(|agent| row.owner.as_deref() != Some(agent)) {
+            continue;
+        }
+        let labels = robot_work_parse_string_array(&row.labels_json);
+        if label.is_some_and(|label| !labels.iter().any(|candidate| candidate == label)) {
+            continue;
+        }
+        total += 1;
+        if items.len() < limit {
+            items.push(robot_work_summary(&row));
+        }
+    }
+
+    Ok((items, total))
+}
+
+fn robot_work_list_data(
+    db_path: &str,
+    status: Option<&str>,
+    agent: Option<&str>,
+    label: Option<&str>,
+    limit: usize,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    let (items, total) = robot_work_list_rows(db_path, status, agent, label, limit)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    Ok(serde_json::json!({
+        "family": "work",
+        "action": "list",
+        "backend": "native_sqlite_work_claims",
+        "storage_table": "work_claims",
+        "items": items,
+        "total": total,
+        "limit": robot_work_limit(limit),
+        "filters": {
+            "status": robot_work_normalize_status_filter(status),
+            "agent": agent,
+            "label": label,
+        },
+    }))
+}
+
+fn robot_work_ready_data(
+    db_path: &str,
+    agent_id: Option<&str>,
+    limit: usize,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    let conn =
+        robot_work_open_conn(db_path).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let total_ready: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM work_claims WHERE state = 'unclaimed' AND blocked_by_count = 0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let total_blocked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM work_claims WHERE state = 'unclaimed' AND blocked_by_count > 0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    drop(conn);
+
+    let (items, _) = robot_work_list_rows(db_path, Some("unclaimed"), None, None, limit)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let items: Vec<_> = items
+        .into_iter()
+        .filter(|item| {
+            item["blocked_by_count"]
+                .as_u64()
+                .is_some_and(|count| count == 0)
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "family": "work",
+        "action": "ready",
+        "backend": "native_sqlite_work_claims",
+        "storage_table": "work_claims",
+        "items": items,
+        "total_ready": robot_work_count(total_ready),
+        "total_blocked": robot_work_count(total_blocked),
+        "agent_id": agent_id,
+        "limit": robot_work_limit(limit),
+    }))
+}
+
+fn robot_work_command_response(
+    db_path: &str,
+    command: &RobotWorkCommands,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    let result = match command {
+        RobotWorkCommands::Claim { item_id, agent_id } => {
+            robot_work_claim_data(db_path, item_id, agent_id, elapsed_ms)
+        }
+        RobotWorkCommands::Release { item_id, reason } => {
+            robot_work_release_data(db_path, item_id, reason.as_deref(), elapsed_ms)
+        }
+        RobotWorkCommands::Complete {
+            item_id,
+            summary,
+            evidence,
+        } => robot_work_complete_data(
+            db_path,
+            item_id,
+            summary.as_deref(),
+            evidence.as_deref().unwrap_or(&[]),
+            elapsed_ms,
+        ),
+        RobotWorkCommands::List {
+            status,
+            agent,
+            label,
+            limit,
+        } => robot_work_list_data(
+            db_path,
+            status.as_deref(),
+            agent.as_deref(),
+            label.as_deref(),
+            *limit,
+            elapsed_ms,
+        ),
+        RobotWorkCommands::Ready { agent_id, limit } => {
+            robot_work_ready_data(db_path, agent_id.as_deref(), *limit, elapsed_ms)
+        }
+        RobotWorkCommands::Assign {
+            item_id,
+            agent_id,
+            strategy,
+        } => robot_work_assign_data(db_path, item_id, agent_id, strategy.as_deref(), elapsed_ms),
+    };
+
+    match result {
+        Ok(data) => RobotResponse::<serde_json::Value>::success(data, elapsed_ms),
+        Err(response) => response,
+    }
+}
+
+#[cfg(test)]
+mod robot_work_backend_tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    fn temp_work_db() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create work backend tempdir");
+        let db_path = dir.path().join("ft.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let conn = robot_work_open_conn(&db_path).expect("initialize work backend schema");
+        drop(conn);
+        (dir, db_path)
+    }
+
+    fn expect_ok(
+        result: Result<serde_json::Value, RobotResponse<serde_json::Value>>,
+    ) -> serde_json::Value {
+        match result {
+            Ok(value) => value,
+            Err(response) => panic!(
+                "expected success, got {}",
+                serde_json::to_string(&response).expect("serialize response")
+            ),
+        }
+    }
+
+    fn expect_error_code(
+        result: Result<serde_json::Value, RobotResponse<serde_json::Value>>,
+        expected_code: &str,
+    ) {
+        match result {
+            Ok(value) => panic!("expected {expected_code}, got success {value}"),
+            Err(response) => {
+                let value = serde_json::to_value(response).expect("serialize response");
+                assert_eq!(value["error_code"].as_str(), Some(expected_code));
+            }
+        }
+    }
+
+    #[test]
+    fn work_claim_rejects_competing_owner_and_preserves_original_claim() {
+        let (_dir, db_path) = temp_work_db();
+
+        let first = expect_ok(robot_work_claim_data(&db_path, "ft-work-a", "agent-a", 0));
+        assert_eq!(first["state"], "claimed");
+        assert_eq!(first["agent_id"], "agent-a");
+
+        expect_error_code(
+            robot_work_claim_data(&db_path, "ft-work-a", "agent-b", 0),
+            ROBOT_ERR_WORK_ITEM_CONFLICT,
+        );
+
+        let list = expect_ok(robot_work_list_data(
+            &db_path,
+            Some("claimed"),
+            Some("agent-a"),
+            None,
+            10,
+            0,
+        ));
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["items"][0]["claim_id"], "ft-work-a");
+        assert_eq!(list["items"][0]["assigned_to"], "agent-a");
+    }
+
+    #[test]
+    fn work_release_complete_and_ready_use_durable_states() {
+        let (_dir, db_path) = temp_work_db();
+
+        expect_ok(robot_work_assign_data(
+            &db_path,
+            "ft-ready-a",
+            "agent-a",
+            Some("direct"),
+            0,
+        ));
+        expect_ok(robot_work_release_data(
+            &db_path,
+            "ft-ready-a",
+            Some("handoff"),
+            0,
+        ));
+        let ready = expect_ok(robot_work_ready_data(&db_path, Some("agent-b"), 10, 0));
+        assert_eq!(ready["total_ready"], 1);
+        assert_eq!(ready["items"][0]["state"], "unclaimed");
+
+        expect_ok(robot_work_claim_data(&db_path, "ft-ready-a", "agent-b", 0));
+        let completed = expect_ok(robot_work_complete_data(
+            &db_path,
+            "ft-ready-a",
+            Some("shipped"),
+            &["abc123".to_string()],
+            0,
+        ));
+        assert_eq!(completed["action"], "complete");
+        assert_eq!(completed["idempotent_replay"], false);
+
+        let replay = expect_ok(robot_work_complete_data(
+            &db_path,
+            "ft-ready-a",
+            Some("shipped again"),
+            &[],
+            0,
+        ));
+        assert_eq!(replay["idempotent_replay"], true);
+        expect_error_code(
+            robot_work_release_data(&db_path, "ft-ready-a", None, 0),
+            ROBOT_ERR_WORK_ITEM_CONFLICT,
+        );
+    }
+
+    #[test]
+    fn work_claim_is_serialized_for_concurrent_callers() {
+        let (_dir, db_path) = temp_work_db();
+        let db_path = Arc::new(db_path);
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+
+        for agent in ["agent-a", "agent-b"] {
+            let db_path = Arc::clone(&db_path);
+            let barrier = Arc::clone(&barrier);
+            let agent = agent.to_string();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                robot_work_claim_data(db_path.as_str(), "ft-race", &agent, 0).is_ok()
+            }));
+        }
+
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread joins"))
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+
+        let claimed = expect_ok(robot_work_list_data(
+            db_path.as_str(),
+            Some("claimed"),
+            None,
+            None,
+            10,
+            0,
+        ));
+        assert_eq!(claimed["total"], 1);
+    }
+}
+
 fn parse_accounts_caut_service(service: &str) -> Option<frankenterm_core::caut::CautService> {
     frankenterm_core::caut::CautService::from_cli_input(service)
 }
@@ -9010,6 +9841,525 @@ fn resolve_checkpoint_id(db_path: &str, snapshot_id: &str) -> anyhow::Result<i64
     snapshot_id
         .parse::<i64>()
         .map_err(|_| anyhow::anyhow!("Invalid snapshot ID: {snapshot_id}"))
+}
+
+fn robot_checkpoint_error_response(
+    code: &str,
+    message: impl Into<String>,
+    hint: Option<String>,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    RobotResponse::<serde_json::Value>::error_with_code(code, message, hint, elapsed_ms)
+}
+
+fn robot_checkpoint_not_found(
+    checkpoint_id: &str,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    robot_checkpoint_error_response(
+        ROBOT_ERR_CHECKPOINT_NOT_FOUND,
+        format!("Checkpoint `{checkpoint_id}` was not found."),
+        Some("Use `ft robot checkpoint list` to find available checkpoint IDs.".to_string()),
+        elapsed_ms,
+    )
+}
+
+fn robot_checkpoint_resolve_id(
+    db_path: &str,
+    checkpoint_id: &str,
+    elapsed_ms: u64,
+) -> Result<i64, RobotResponse<serde_json::Value>> {
+    resolve_checkpoint_id(db_path, checkpoint_id).map_err(|err| {
+        let message = err.to_string();
+        let code = if message.contains("No snapshots found") {
+            ROBOT_ERR_CHECKPOINT_NOT_FOUND
+        } else {
+            ROBOT_ERR_INVALID_ARGS
+        };
+        robot_checkpoint_error_response(code, message, None, elapsed_ms)
+    })
+}
+
+fn robot_checkpoint_nonnegative_u64(field: &str, value: i64) -> anyhow::Result<u64> {
+    u64::try_from(value).map_err(|_| anyhow::anyhow!("{field} was negative: {value}"))
+}
+
+fn robot_checkpoint_nonnegative_usize(field: &str, value: i64) -> anyhow::Result<usize> {
+    usize::try_from(value).map_err(|_| anyhow::anyhow!("{field} was negative: {value}"))
+}
+
+fn robot_checkpoint_label_from_metadata(metadata_json: Option<&str>) -> Option<String> {
+    let metadata = serde_json::from_str::<serde_json::Value>(metadata_json?).ok()?;
+    metadata
+        .get("robot_checkpoint")?
+        .get("label")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn persist_robot_checkpoint_metadata(
+    db_path: &str,
+    checkpoint_id: i64,
+    label: &Option<String>,
+    include_scrollback: bool,
+    pane_ids: &[u64],
+) -> anyhow::Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let existing_metadata = match conn.query_row(
+        "SELECT metadata_json FROM session_checkpoints WHERE id = ?1",
+        [checkpoint_id],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        Ok(metadata) => metadata,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(anyhow::anyhow!("checkpoint {checkpoint_id} disappeared"));
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut metadata = existing_metadata
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "robot_checkpoint".to_string(),
+            serde_json::json!({
+                "label": label,
+                "include_scrollback": include_scrollback,
+                "pane_ids": pane_ids,
+                "created_by": "ft robot checkpoint save",
+            }),
+        );
+    }
+
+    conn.execute(
+        "UPDATE session_checkpoints SET metadata_json = ?1 WHERE id = ?2",
+        rusqlite::params![metadata.to_string(), checkpoint_id],
+    )?;
+
+    Ok(())
+}
+
+fn robot_checkpoint_list_data(
+    db_path: &str,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<serde_json::Value> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let total = conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let total = robot_checkpoint_nonnegative_usize("session_checkpoints.count", total)?;
+
+    let limit_i64 = i64::try_from(limit).map_err(|_| anyhow::anyhow!("limit is too large"))?;
+    let offset_i64 = i64::try_from(offset).map_err(|_| anyhow::anyhow!("offset is too large"))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, checkpoint_at, checkpoint_type, pane_count, total_bytes,
+                state_hash, metadata_json
+         FROM session_checkpoints
+         ORDER BY checkpoint_at DESC, id DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![limit_i64, offset_i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
+        ))
+    })?;
+
+    let mut checkpoints = Vec::new();
+    for row in rows {
+        let (
+            id,
+            session_id,
+            checkpoint_at,
+            checkpoint_type,
+            pane_count,
+            total_bytes,
+            state_hash,
+            metadata_json,
+        ) = row?;
+        checkpoints.push(serde_json::json!({
+            "checkpoint_id": id.to_string(),
+            "numeric_checkpoint_id": id,
+            "session_id": session_id,
+            "label": robot_checkpoint_label_from_metadata(metadata_json.as_deref()),
+            "pane_count": robot_checkpoint_nonnegative_usize("session_checkpoints.pane_count", pane_count)?,
+            "size_bytes": robot_checkpoint_nonnegative_u64("session_checkpoints.total_bytes", total_bytes)?,
+            "created_at": robot_checkpoint_nonnegative_u64("session_checkpoints.checkpoint_at", checkpoint_at)?,
+            "checkpoint_type": checkpoint_type,
+            "content_hash": state_hash,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "family": "checkpoint",
+        "action": "list",
+        "checkpoints": checkpoints,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }))
+}
+
+fn robot_checkpoint_show_data(
+    db_path: &str,
+    checkpoint_id: i64,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let checkpoint = match conn.query_row(
+        "SELECT id, session_id, checkpoint_at, checkpoint_type, pane_count, total_bytes,
+                state_hash, metadata_json
+         FROM session_checkpoints
+         WHERE id = ?1",
+        [checkpoint_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        },
+    ) {
+        Ok(checkpoint) => checkpoint,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    let (
+        id,
+        session_id,
+        checkpoint_at,
+        checkpoint_type,
+        pane_count,
+        total_bytes,
+        state_hash,
+        metadata_json,
+    ) = checkpoint;
+
+    let mut stmt = conn.prepare(
+        "SELECT pane_id, cwd, command, scrollback_checkpoint_seq
+         FROM mux_pane_state
+         WHERE checkpoint_id = ?1
+         ORDER BY pane_id",
+    )?;
+    let rows = stmt.query_map([id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+
+    let mut panes = Vec::new();
+    for row in rows {
+        let (pane_id, cwd, command, scrollback_checkpoint_seq) = row?;
+        let pane_id = robot_checkpoint_nonnegative_u64("mux_pane_state.pane_id", pane_id)?;
+        panes.push(serde_json::json!({
+            "pane_id": pane_id,
+            "title": command.clone().unwrap_or_else(|| format!("pane-{pane_id}")),
+            "working_dir": cwd,
+            "command": command,
+            "has_scrollback": scrollback_checkpoint_seq.is_some(),
+            "scrollback_lines": 0,
+        }));
+    }
+
+    Ok(Some(serde_json::json!({
+        "family": "checkpoint",
+        "action": "show",
+        "checkpoint_id": id.to_string(),
+        "numeric_checkpoint_id": id,
+        "session_id": session_id,
+        "label": robot_checkpoint_label_from_metadata(metadata_json.as_deref()),
+        "pane_count": robot_checkpoint_nonnegative_usize("session_checkpoints.pane_count", pane_count)?,
+        "size_bytes": robot_checkpoint_nonnegative_u64("session_checkpoints.total_bytes", total_bytes)?,
+        "created_at": robot_checkpoint_nonnegative_u64("session_checkpoints.checkpoint_at", checkpoint_at)?,
+        "checkpoint_type": checkpoint_type,
+        "content_hash": state_hash,
+        "panes": panes,
+    })))
+}
+
+fn robot_checkpoint_delete_data(
+    db_path: &str,
+    checkpoint_id: i64,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let total_bytes = match conn.query_row(
+        "SELECT total_bytes FROM session_checkpoints WHERE id = ?1",
+        [checkpoint_id],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(total_bytes) => total_bytes,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    conn.execute(
+        "DELETE FROM session_checkpoints WHERE id = ?1",
+        [checkpoint_id],
+    )?;
+
+    Ok(Some(serde_json::json!({
+        "family": "checkpoint",
+        "action": "delete",
+        "checkpoint_id": checkpoint_id.to_string(),
+        "numeric_checkpoint_id": checkpoint_id,
+        "bytes_freed": robot_checkpoint_nonnegative_u64("session_checkpoints.total_bytes", total_bytes)?,
+        "audit_receipt": {
+            "operation": "robot.checkpoint.delete",
+            "target": checkpoint_id.to_string(),
+        },
+    })))
+}
+
+async fn robot_checkpoint_save_data(
+    label: &Option<String>,
+    include_scrollback: bool,
+    pane_ids: &Option<Vec<u64>>,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+    elapsed_ms: u64,
+) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+    use frankenterm_core::snapshot_engine::SnapshotEngine;
+    use std::sync::Arc;
+
+    let db_path = layout.db_path.to_string_lossy().to_string();
+    let wezterm =
+        frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
+    let mut panes = wezterm.list_panes().await.map_err(|err| {
+        robot_checkpoint_error_response(
+            ROBOT_ERR_CONFIG,
+            format!("Failed to list panes for checkpoint capture: {err}"),
+            Some(
+                "Ensure the active mux backend is running before saving a checkpoint.".to_string(),
+            ),
+            elapsed_ms,
+        )
+    })?;
+
+    if let Some(requested_panes) = pane_ids.as_ref().filter(|ids| !ids.is_empty()) {
+        let requested: std::collections::HashSet<u64> = requested_panes.iter().copied().collect();
+        panes.retain(|pane| requested.contains(&pane.pane_id));
+    }
+
+    if panes.is_empty() {
+        return Err(robot_checkpoint_error_response(
+            ROBOT_ERR_PANE_NOT_FOUND,
+            "No panes matched the checkpoint request.",
+            Some(
+                "Use `ft robot state` to inspect live pane IDs before saving a checkpoint."
+                    .to_string(),
+            ),
+            elapsed_ms,
+        ));
+    }
+
+    let engine = SnapshotEngine::new(Arc::new(db_path.clone()), config.snapshots.clone());
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let result = engine
+        .capture_with_cx(
+            &cx,
+            &panes,
+            frankenterm_core::snapshot_engine::SnapshotTrigger::Manual,
+        )
+        .await
+        .map_err(|err| {
+            robot_checkpoint_error_response(
+                ROBOT_ERR_STORAGE,
+                format!("Checkpoint save failed: {err}"),
+                None,
+                elapsed_ms,
+            )
+        })?;
+
+    let requested_pane_ids = pane_ids.clone().unwrap_or_default();
+    persist_robot_checkpoint_metadata(
+        &db_path,
+        result.checkpoint_id,
+        label,
+        include_scrollback,
+        &requested_pane_ids,
+    )
+    .map_err(|err| {
+        robot_checkpoint_error_response(
+            ROBOT_ERR_STORAGE,
+            format!("Checkpoint metadata update failed: {err}"),
+            None,
+            elapsed_ms,
+        )
+    })?;
+
+    Ok(serde_json::json!({
+        "family": "checkpoint",
+        "action": "save",
+        "checkpoint_id": result.checkpoint_id.to_string(),
+        "numeric_checkpoint_id": result.checkpoint_id,
+        "session_id": result.session_id,
+        "label": label,
+        "pane_count": result.pane_count,
+        "bytes_persisted": u64::try_from(result.total_bytes).unwrap_or(u64::MAX),
+        "scrollback_included": include_scrollback,
+        "created_at": now_ms(),
+        "trigger": format!("{:?}", result.trigger),
+        "audit_receipt": {
+            "operation": "robot.checkpoint.save",
+            "target": result.checkpoint_id.to_string(),
+        },
+    }))
+}
+
+async fn handle_robot_checkpoint_command(
+    command: &RobotCheckpointCommands,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    let db_path = layout.db_path.to_string_lossy().to_string();
+
+    match command {
+        RobotCheckpointCommands::Save {
+            label,
+            include_scrollback,
+            pane_ids,
+        } => match robot_checkpoint_save_data(
+            label,
+            *include_scrollback,
+            pane_ids,
+            layout,
+            config,
+            elapsed_ms,
+        )
+        .await
+        {
+            Ok(data) => RobotResponse::success(data, elapsed_ms),
+            Err(response) => response,
+        },
+        RobotCheckpointCommands::List { limit, offset } => {
+            match robot_checkpoint_list_data(&db_path, *limit, *offset) {
+                Ok(data) => RobotResponse::success(data, elapsed_ms),
+                Err(err) => robot_checkpoint_error_response(
+                    ROBOT_ERR_STORAGE,
+                    format!("Checkpoint list failed: {err}"),
+                    None,
+                    elapsed_ms,
+                ),
+            }
+        }
+        RobotCheckpointCommands::Show { checkpoint_id } => {
+            let checkpoint_id_i64 =
+                match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
+                    Ok(id) => id,
+                    Err(response) => return response,
+                };
+            match robot_checkpoint_show_data(&db_path, checkpoint_id_i64) {
+                Ok(Some(data)) => RobotResponse::success(data, elapsed_ms),
+                Ok(None) => robot_checkpoint_not_found(checkpoint_id, elapsed_ms),
+                Err(err) => robot_checkpoint_error_response(
+                    ROBOT_ERR_STORAGE,
+                    format!("Checkpoint show failed: {err}"),
+                    None,
+                    elapsed_ms,
+                ),
+            }
+        }
+        RobotCheckpointCommands::Delete { checkpoint_id } => {
+            let checkpoint_id_i64 =
+                match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
+                    Ok(id) => id,
+                    Err(response) => return response,
+                };
+            match robot_checkpoint_delete_data(&db_path, checkpoint_id_i64) {
+                Ok(Some(data)) => RobotResponse::success(data, elapsed_ms),
+                Ok(None) => robot_checkpoint_not_found(checkpoint_id, elapsed_ms),
+                Err(err) => robot_checkpoint_error_response(
+                    ROBOT_ERR_STORAGE,
+                    format!("Checkpoint delete failed: {err}"),
+                    None,
+                    elapsed_ms,
+                ),
+            }
+        }
+        RobotCheckpointCommands::Rollback {
+            checkpoint_id,
+            dry_run,
+        } => {
+            let checkpoint_id_i64 =
+                match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
+                    Ok(id) => id,
+                    Err(response) => return response,
+                };
+            let checkpoint = match frankenterm_core::session_restore::load_checkpoint_by_id(
+                &db_path,
+                checkpoint_id_i64,
+            ) {
+                Ok(Some(checkpoint)) => checkpoint,
+                Ok(None) => return robot_checkpoint_not_found(checkpoint_id, elapsed_ms),
+                Err(err) => {
+                    return robot_checkpoint_error_response(
+                        ROBOT_ERR_STORAGE,
+                        format!("Checkpoint rollback preflight failed: {err}"),
+                        None,
+                        elapsed_ms,
+                    );
+                }
+            };
+
+            let restore_options = SnapshotRestoreWorkflowOptions {
+                layout_only: false,
+                launch_agents: false,
+                wezterm_timeout_secs: config.cli.timeout_seconds,
+            };
+
+            if *dry_run {
+                return RobotResponse::success(
+                    serde_json::json!({
+                        "family": "checkpoint",
+                        "action": "rollback",
+                        "checkpoint_id": checkpoint_id_i64.to_string(),
+                        "dry_run": true,
+                        "plan": snapshot_restore_dry_run_json(&checkpoint, restore_options),
+                    }),
+                    elapsed_ms,
+                );
+            }
+
+            let mut response = robot_checkpoint_error_response(
+                ROBOT_ERR_APPROVAL,
+                "Checkpoint rollback requires an explicit policy approval flow.",
+                Some(
+                    "Use `ft robot checkpoint rollback <id> --dry-run` for a plan, or `ft snapshot restore <id>` from a human-approved session.".to_string(),
+                ),
+                elapsed_ms,
+            );
+            response.data = Some(serde_json::json!({
+                "family": "checkpoint",
+                "action": "rollback",
+                "checkpoint_id": checkpoint_id_i64.to_string(),
+                "dry_run": false,
+                "approval_required": true,
+                "pane_count": checkpoint.pane_count,
+            }));
+            response
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -23852,62 +25202,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Checkpoint { command } => {
-                            let ntm_cmd = match &command {
-                                RobotCheckpointCommands::Save {
-                                    label,
-                                    include_scrollback,
-                                    pane_ids,
-                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
-                                    frankenterm_core::robot_ntm_surface::CheckpointCommand::Save(
-                                        frankenterm_core::robot_ntm_surface::CheckpointSaveRequest {
-                                            label: label.clone(),
-                                            include_scrollback: *include_scrollback,
-                                            pane_ids: pane_ids.clone().unwrap_or_default(),
-                                        },
-                                    ),
-                                ),
-                                RobotCheckpointCommands::List { limit, offset } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
-                                        frankenterm_core::robot_ntm_surface::CheckpointCommand::List(
-                                            frankenterm_core::robot_ntm_surface::CheckpointListRequest {
-                                                limit: *limit,
-                                                offset: *offset,
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotCheckpointCommands::Show { checkpoint_id } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
-                                        frankenterm_core::robot_ntm_surface::CheckpointCommand::Show(
-                                            frankenterm_core::robot_ntm_surface::CheckpointShowRequest {
-                                                checkpoint_id: checkpoint_id.clone(),
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotCheckpointCommands::Delete { checkpoint_id } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
-                                        frankenterm_core::robot_ntm_surface::CheckpointCommand::Delete(
-                                            frankenterm_core::robot_ntm_surface::CheckpointDeleteRequest {
-                                                checkpoint_id: checkpoint_id.clone(),
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotCheckpointCommands::Rollback {
-                                    checkpoint_id,
-                                    dry_run,
-                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
-                                    frankenterm_core::robot_ntm_surface::CheckpointCommand::Rollback(
-                                        frankenterm_core::robot_ntm_surface::CheckpointRollbackRequest {
-                                            checkpoint_id: checkpoint_id.clone(),
-                                            dry_run: *dry_run,
-                                        },
-                                    ),
-                                ),
-                            };
-                            let response =
-                                build_ntm_not_implemented_response(&ntm_cmd, elapsed_ms(start));
+                            let response = handle_robot_checkpoint_command(
+                                &command,
+                                &layout,
+                                &config,
+                                elapsed_ms(start),
+                            )
+                            .await;
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Context { command } => {
@@ -23958,81 +25259,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Work { command } => {
-                            let ntm_cmd = match &command {
-                                RobotWorkCommands::Claim { item_id, agent_id } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
-                                        frankenterm_core::robot_ntm_surface::WorkCommand::Claim(
-                                            frankenterm_core::robot_ntm_surface::WorkClaimRequest {
-                                                item_id: item_id.clone(),
-                                                agent_id: agent_id.clone(),
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotWorkCommands::Release { item_id, reason } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
-                                        frankenterm_core::robot_ntm_surface::WorkCommand::Release(
-                                            frankenterm_core::robot_ntm_surface::WorkReleaseRequest {
-                                                item_id: item_id.clone(),
-                                                reason: reason.clone(),
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotWorkCommands::Complete {
-                                    item_id,
-                                    summary,
-                                    evidence,
-                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
-                                    frankenterm_core::robot_ntm_surface::WorkCommand::Complete(
-                                        frankenterm_core::robot_ntm_surface::WorkCompleteRequest {
-                                            item_id: item_id.clone(),
-                                            summary: summary.clone(),
-                                            evidence: evidence.clone().unwrap_or_default(),
-                                        },
-                                    ),
-                                ),
-                                RobotWorkCommands::List {
-                                    status,
-                                    agent,
-                                    label,
-                                    limit,
-                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
-                                    frankenterm_core::robot_ntm_surface::WorkCommand::List(
-                                        frankenterm_core::robot_ntm_surface::WorkListRequest {
-                                            status_filter: status.clone(),
-                                            agent_filter: agent.clone(),
-                                            label_filter: label.clone(),
-                                            limit: *limit,
-                                        },
-                                    ),
-                                ),
-                                RobotWorkCommands::Ready { agent_id, limit } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
-                                        frankenterm_core::robot_ntm_surface::WorkCommand::Ready(
-                                            frankenterm_core::robot_ntm_surface::WorkReadyRequest {
-                                                agent_id: agent_id.clone(),
-                                                limit: *limit,
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotWorkCommands::Assign {
-                                    item_id,
-                                    agent_id,
-                                    strategy,
-                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
-                                    frankenterm_core::robot_ntm_surface::WorkCommand::Assign(
-                                        frankenterm_core::robot_ntm_surface::WorkAssignRequest {
-                                            item_id: item_id.clone(),
-                                            agent_id: agent_id.clone(),
-                                            strategy: strategy.clone(),
-                                        },
-                                    ),
-                                ),
-                            };
-                            let response =
-                                build_ntm_not_implemented_response(&ntm_cmd, elapsed_ms(start));
+                            let response = robot_work_command_response(
+                                &ctx.effective.paths.db_path,
+                                &command,
+                                elapsed_ms(start),
+                            );
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Fleet { command } => {
@@ -45221,6 +46452,243 @@ mod tests {
         .expect("insert session show test pane state");
     }
 
+    fn setup_robot_checkpoint_test_workspace() -> (
+        tempfile::TempDir,
+        frankenterm_core::config::WorkspaceLayout,
+        rusqlite::Connection,
+    ) {
+        let dir = tempfile::tempdir().expect("create robot checkpoint tempdir");
+        let layout = make_test_layout(dir.path());
+        std::fs::create_dir_all(&layout.ft_dir).expect("create robot checkpoint .ft dir");
+        let conn =
+            rusqlite::Connection::open(&layout.db_path).expect("open robot checkpoint sqlite db");
+        frankenterm_core::storage::initialize_schema(&conn)
+            .expect("initialize robot checkpoint schema");
+
+        (dir, layout, conn)
+    }
+
+    fn insert_robot_checkpoint_for_test(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        checkpoint_at: i64,
+        label: Option<&str>,
+        total_bytes: i64,
+    ) -> i64 {
+        let metadata_json = serde_json::json!({
+            "robot_checkpoint": {
+                "label": label,
+                "include_scrollback": true,
+                "pane_ids": [],
+                "created_by": "test",
+            }
+        })
+        .to_string();
+
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
+             VALUES (?1, ?2, 'event', 'hash123', 1, ?3, ?4)",
+            rusqlite::params![session_id, checkpoint_at, total_bytes, metadata_json],
+        )
+        .expect("insert robot checkpoint test checkpoint");
+        conn.last_insert_rowid()
+    }
+
+    fn insert_robot_checkpoint_pane_for_test(
+        conn: &rusqlite::Connection,
+        checkpoint_id: i64,
+        pane_id: u64,
+        cwd: Option<&str>,
+        command: Option<&str>,
+        scrollback_checkpoint_seq: Option<i64>,
+    ) {
+        let terminal_json = r#"{"rows":24,"cols":80,"cursor_row":0,"cursor_col":0,"is_alt_screen":false,"title":"test"}"#;
+        conn.execute(
+            "INSERT INTO mux_pane_state
+             (checkpoint_id, pane_id, cwd, command, terminal_state_json, scrollback_checkpoint_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                checkpoint_id,
+                pane_id as i64,
+                cwd,
+                command,
+                terminal_json,
+                scrollback_checkpoint_seq,
+            ],
+        )
+        .expect("insert robot checkpoint test pane state");
+    }
+
+    #[test]
+    fn robot_checkpoint_table_adapter_lists_shows_and_deletes() {
+        let (_dir, layout, conn) = setup_robot_checkpoint_test_workspace();
+        let db_path = layout.db_path.to_string_lossy().to_string();
+
+        insert_session_for_session_show_test(&conn, "sess-robot-checkpoint", false);
+        let older =
+            insert_robot_checkpoint_for_test(&conn, "sess-robot-checkpoint", 1000, None, 128);
+        insert_robot_checkpoint_pane_for_test(&conn, older, 7, Some("/old"), Some("bash"), None);
+        let newer = insert_robot_checkpoint_for_test(
+            &conn,
+            "sess-robot-checkpoint",
+            2000,
+            Some("manual save"),
+            2048,
+        );
+        insert_robot_checkpoint_pane_for_test(
+            &conn,
+            newer,
+            42,
+            Some("/workspace"),
+            Some("codex"),
+            Some(12),
+        );
+
+        let list = robot_checkpoint_list_data(&db_path, 10, 0).expect("list checkpoints");
+        assert_eq!(list["family"].as_str(), Some("checkpoint"));
+        assert_eq!(list["action"].as_str(), Some("list"));
+        assert_eq!(list["total"].as_u64(), Some(2));
+        let newer_id = newer.to_string();
+        assert_eq!(
+            list["checkpoints"][0]["checkpoint_id"].as_str(),
+            Some(newer_id.as_str())
+        );
+        assert_eq!(
+            list["checkpoints"][0]["label"].as_str(),
+            Some("manual save")
+        );
+        assert_eq!(list["checkpoints"][0]["size_bytes"].as_u64(), Some(2048));
+
+        let shown = robot_checkpoint_show_data(&db_path, newer)
+            .expect("show checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(shown["family"].as_str(), Some("checkpoint"));
+        assert_eq!(shown["action"].as_str(), Some("show"));
+        assert_eq!(shown["checkpoint_id"].as_str(), Some(newer_id.as_str()));
+        assert_eq!(shown["label"].as_str(), Some("manual save"));
+        assert_eq!(shown["panes"][0]["pane_id"].as_u64(), Some(42));
+        assert_eq!(
+            shown["panes"][0]["working_dir"].as_str(),
+            Some("/workspace")
+        );
+        assert_eq!(shown["panes"][0]["command"].as_str(), Some("codex"));
+        assert_eq!(shown["panes"][0]["has_scrollback"].as_bool(), Some(true));
+
+        let deleted = robot_checkpoint_delete_data(&db_path, newer)
+            .expect("delete checkpoint")
+            .expect("checkpoint deleted");
+        assert_eq!(deleted["family"].as_str(), Some("checkpoint"));
+        assert_eq!(deleted["action"].as_str(), Some("delete"));
+        assert_eq!(deleted["bytes_freed"].as_u64(), Some(2048));
+        assert!(
+            robot_checkpoint_show_data(&db_path, newer)
+                .expect("show after delete")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn robot_checkpoint_resolve_id_errors_are_structured() {
+        let (_dir, layout, _conn) = setup_robot_checkpoint_test_workspace();
+        let db_path = layout.db_path.to_string_lossy().to_string();
+
+        let latest_error =
+            robot_checkpoint_resolve_id(&db_path, "latest", 5).expect_err("latest is absent");
+        assert_eq!(
+            latest_error.error_code.as_deref(),
+            Some(ROBOT_ERR_CHECKPOINT_NOT_FOUND)
+        );
+
+        let invalid_error =
+            robot_checkpoint_resolve_id(&db_path, "not-a-number", 5).expect_err("invalid id");
+        assert_eq!(
+            invalid_error.error_code.as_deref(),
+            Some(ROBOT_ERR_INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn robot_checkpoint_rollback_dry_run_and_approval_envelopes() {
+        run_async_test(async {
+            let (_dir, layout, conn) = setup_robot_checkpoint_test_workspace();
+            let db_path = layout.db_path.to_string_lossy().to_string();
+
+            insert_session_for_session_show_test(&conn, "sess-robot-rollback", false);
+            let checkpoint_id = insert_robot_checkpoint_for_test(
+                &conn,
+                "sess-robot-rollback",
+                3000,
+                Some("rollback target"),
+                512,
+            );
+            insert_robot_checkpoint_pane_for_test(
+                &conn,
+                checkpoint_id,
+                99,
+                Some("/rollback"),
+                Some("zsh"),
+                None,
+            );
+
+            let config = frankenterm_core::config::Config::default();
+            let dry_run = handle_robot_checkpoint_command(
+                &RobotCheckpointCommands::Rollback {
+                    checkpoint_id: checkpoint_id.to_string(),
+                    dry_run: true,
+                },
+                &layout,
+                &config,
+                7,
+            )
+            .await;
+            assert!(dry_run.ok);
+            let dry_run_data = dry_run.data.expect("dry-run response data");
+            assert_eq!(dry_run_data["family"].as_str(), Some("checkpoint"));
+            assert_eq!(dry_run_data["action"].as_str(), Some("rollback"));
+            assert_eq!(dry_run_data["dry_run"].as_bool(), Some(true));
+            assert_eq!(
+                dry_run_data["plan"]["snapshot"]["checkpoint_id"].as_i64(),
+                Some(checkpoint_id)
+            );
+
+            let apply = handle_robot_checkpoint_command(
+                &RobotCheckpointCommands::Rollback {
+                    checkpoint_id: checkpoint_id.to_string(),
+                    dry_run: false,
+                },
+                &layout,
+                &config,
+                9,
+            )
+            .await;
+            assert!(!apply.ok);
+            assert_eq!(apply.error_code.as_deref(), Some(ROBOT_ERR_APPROVAL));
+            let apply_data = apply.data.expect("approval response data");
+            assert_eq!(apply_data["family"].as_str(), Some("checkpoint"));
+            assert_eq!(apply_data["action"].as_str(), Some("rollback"));
+            assert_eq!(apply_data["approval_required"].as_bool(), Some(true));
+
+            let missing = handle_robot_checkpoint_command(
+                &RobotCheckpointCommands::Show {
+                    checkpoint_id: (checkpoint_id + 1).to_string(),
+                },
+                &layout,
+                &config,
+                11,
+            )
+            .await;
+            assert!(!missing.ok);
+            assert_eq!(
+                missing.error_code.as_deref(),
+                Some(ROBOT_ERR_CHECKPOINT_NOT_FOUND)
+            );
+
+            drop(conn);
+            assert!(std::path::Path::new(&db_path).exists());
+        });
+    }
+
     #[test]
     fn session_show_pane_lookup_uses_selected_checkpoint_metadata() {
         let (db_path, conn, _dir) = setup_session_show_test_db();
@@ -56225,6 +57693,7 @@ log_level = "debug"
         assert_eq!(ROBOT_ERR_STORAGE, "robot.storage_error");
         assert_eq!(ROBOT_ERR_TIMEOUT, "robot.timeout");
         assert_eq!(ROBOT_ERR_NOT_IMPLEMENTED, "robot.not_implemented");
+        assert_eq!(ROBOT_ERR_CHECKPOINT_NOT_FOUND, "robot.checkpoint_not_found");
     }
 
     #[test]

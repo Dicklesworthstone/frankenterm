@@ -33,35 +33,35 @@ const NTM_GAP_ACTIONS: &[RobotActionContract] = &[
         family: "checkpoint",
         action: "save",
         args: &["checkpoint", "save", "--label", "contract-smoke"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
         family: "checkpoint",
         action: "list",
         args: &["checkpoint", "list", "--limit", "1"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: false,
     },
     RobotActionContract {
         family: "checkpoint",
         action: "show",
         args: &["checkpoint", "show", "checkpoint-smoke"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: false,
     },
     RobotActionContract {
         family: "checkpoint",
         action: "delete",
         args: &["checkpoint", "delete", "checkpoint-smoke"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
         family: "checkpoint",
         action: "rollback",
         args: &["checkpoint", "rollback", "checkpoint-smoke", "--dry-run"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
@@ -89,14 +89,14 @@ const NTM_GAP_ACTIONS: &[RobotActionContract] = &[
         family: "work",
         action: "claim",
         args: &["work", "claim", "ft-smoke", "--agent-id", "agent-a"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
         family: "work",
         action: "release",
         args: &["work", "release", "ft-smoke", "--reason", "contract-smoke"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
@@ -111,21 +111,21 @@ const NTM_GAP_ACTIONS: &[RobotActionContract] = &[
             "--evidence",
             "abc123",
         ],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
         family: "work",
         action: "list",
         args: &["work", "list", "--limit", "1"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: false,
     },
     RobotActionContract {
         family: "work",
         action: "ready",
         args: &["work", "ready", "--agent-id", "agent-a", "--limit", "1"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: false,
     },
     RobotActionContract {
@@ -140,7 +140,7 @@ const NTM_GAP_ACTIONS: &[RobotActionContract] = &[
             "--strategy",
             "manual",
         ],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
@@ -277,7 +277,7 @@ fn assert_native_not_ntm_fallback(contract: &RobotActionContract, payload: &Valu
 }
 
 #[test]
-fn robot_ntm_gap_dispatch_matches_manifest() {
+fn robot_checkpoint_work_and_remaining_ntm_gap_dispatch_matches_manifest() {
     let (_dir, workspace) = setup_workspace();
 
     for contract in NTM_GAP_ACTIONS {

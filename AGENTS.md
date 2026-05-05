@@ -629,7 +629,7 @@ pointing back at this section.
 
 ### Not Yet Implemented
 
-Four `ft robot` command families are wired into the CLI surface but currently
+Three `ft robot` command families are wired into the CLI surface but currently
 dispatch through `build_ntm_not_implemented_response` and return the
 `robot.not_implemented` error envelope. An agent reading this document in
 isolation should NOT plan workflows around them; use `ntm` directly for these
@@ -637,10 +637,14 @@ capabilities until the NTM-gap epic lands.
 
 | Command family | Dispatch anchor | Use instead |
 |----------------|-----------------|-------------|
-| `ft robot checkpoint` | `RobotCommands::Checkpoint` -> `build_ntm_not_implemented_response` | `ntm` checkpoint primitives |
 | `ft robot context`    | `RobotCommands::Context` -> `build_ntm_not_implemented_response` | `ntm` context rotation |
 | `ft robot work`       | `RobotCommands::Work` -> `build_ntm_not_implemented_response` | `ntm` work-queue commands |
 | `ft robot fleet`      | `RobotCommands::Fleet` -> `build_ntm_not_implemented_response` | `ntm` fleet commands |
+
+`ft robot checkpoint` shipped a native snapshot/session adapter under
+ft-bs9uh.2. `save`, `list`, `show`, and `delete` use the existing
+session checkpoint tables. `rollback --dry-run` returns the restore plan;
+non-dry-run rollback is approval-blocked until the robot policy gate lands.
 
 `ft robot profile` shipped under ft-b0g7g and is no longer in this table:
 read paths (`List` / `Show` / `Validate`) and dry-run `Apply` route through
@@ -650,7 +654,8 @@ state, tracked under ft-b0g7g.cont.apply_spawn.
 
 See README.md's supported-surface table for the user-facing status. The envelope returned
 from each family includes an `ntm_equivalent` pointer whenever one exists.
-The epic tracking the implementation is `wa-rsaf` (session state persistence).
+The epic tracking the remaining implementation is `ft-bs9uh` (Robot NTM-gap
+implementation).
 
 ### Session Persistence
 
