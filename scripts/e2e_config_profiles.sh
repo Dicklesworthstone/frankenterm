@@ -7,7 +7,7 @@
 #   Validate CLI-driven profile management and rollback safety.
 #
 # Requirements:
-#   - wa binary built (cargo build -p frankenterm)
+#   - wa/ft binary present (build via rch; script checks target/release/ft or target/debug/wa)
 #   - jq for JSON validation
 # =============================================================================
 
@@ -33,7 +33,7 @@ find_ft_binary() {
         fi
     done
 
-    echo "Error: wa binary not found. Run 'cargo build -p frankenterm' first." >&2
+    echo "Error: wa binary not found. Build via rch first; this script checks target/release/ft or target/debug/wa." >&2
     exit 1
 }
 

@@ -11,7 +11,7 @@
 #   - Output schemas are stable and parseable
 #
 # Requirements:
-#   - wa binary built (cargo build -p frankenterm)
+#   - wa/ft binary present (build via rch; script checks target/debug/wa or target/release/ft)
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -171,7 +171,7 @@ check_prerequisites() {
     elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
         FT_BIN="$PROJECT_ROOT/target/release/ft"
     else
-        echo -e "${RED}ERROR:${NC} wa binary not found. Run: cargo build -p frankenterm" >&2
+        echo -e "${RED}ERROR:${NC} wa binary not found. Build via rch first; this script checks target/debug/wa or target/release/ft." >&2
         exit 5
     fi
     log_pass "wa binary found: $FT_BIN"

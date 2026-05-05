@@ -10,7 +10,7 @@
 #   4. Round-trip: profile apply + bookmark add, list --json, remove --json
 #
 # Requirements:
-#   - wa binary built (cargo build -p frankenterm)
+#   - wa/ft binary present (build via rch; script checks target/release/ft or target/debug/wa)
 #   - jq for JSON validation
 #
 # No WezTerm runtime required — all operations are CLI-only against temp dirs.
@@ -36,7 +36,7 @@ find_ft_binary() {
             return 0
         fi
     done
-    echo "Error: wa binary not found. Run 'cargo build -p frankenterm' first." >&2
+    echo "Error: wa binary not found. Build via rch first; this script checks target/release/ft or target/debug/wa." >&2
     exit 1
 }
 

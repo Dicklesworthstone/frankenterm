@@ -13,7 +13,7 @@
 #   - CLI commands (ft session list/show/delete/doctor) work correctly
 #
 # Requirements:
-#   - ft binary built (cargo build -p frankenterm)
+#   - ft binary present (build via rch; script checks target/debug/ft or target/release/ft)
 #   - jq for JSON parsing
 #   - sqlite3 for database inspection
 #   - WezTerm mux server (optional; tests requiring it are skipped if unavailable)
@@ -266,7 +266,7 @@ check_prerequisites() {
     elif [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
         FT_BIN="$PROJECT_ROOT/target/release/ft"
     else
-        echo -e "${RED}ERROR:${NC} ft binary not found. Run: cargo build -p frankenterm" >&2
+        echo -e "${RED}ERROR:${NC} ft binary not found. Build via rch first; this script checks target/debug/ft or target/release/ft." >&2
         exit 5
     fi
     log_pass "P.1: ft binary found: $FT_BIN"

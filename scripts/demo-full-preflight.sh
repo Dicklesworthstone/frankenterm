@@ -74,7 +74,7 @@ while [ $# -gt 0 ]; do
 done
 
 if ! command -v ft >/dev/null 2>&1; then
-    echo "error: ft not on PATH; build with cargo build --release --bin ft and re-run" >&2
+    echo "error: ft not on PATH; add an rch-built ft binary to PATH and re-run" >&2
     exit 1
 fi
 
