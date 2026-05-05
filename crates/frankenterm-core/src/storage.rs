@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     time::Instant,
 };
@@ -57,6 +57,10 @@ use crate::redactor::{RedactionResult, StreamingRedactor};
 use crate::runtime_async::mpsc;
 use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
+use crate::storage::io_scheduler::{
+    StorageIoAdmissionDecision, StorageIoClass, StorageIoScheduler, StorageIoSchedulerConfig,
+    StorageIoWorkItem,
+};
 use crate::storage_backend_helpers::{count_table_where, execute_typed, row_exists_where};
 use crate::storage_backend_row_helpers::RowReader;
 use crate::storage_backend_trait::{
@@ -7126,27 +7130,362 @@ fn mirror_segment_into_mmap(
     }
 }
 
+#[derive(Debug)]
+struct StorageIoWriterGate {
+    scheduler: StorageIoScheduler,
+    next_work_id: u64,
+    next_ordering_sequence_by_stream: HashMap<String, u64>,
+}
+
+impl Default for StorageIoWriterGate {
+    fn default() -> Self {
+        Self::new(StorageIoSchedulerConfig::default())
+    }
+}
+
+impl StorageIoWriterGate {
+    fn new(config: StorageIoSchedulerConfig) -> Self {
+        Self {
+            scheduler: StorageIoScheduler::new(config),
+            next_work_id: 1,
+            next_ordering_sequence_by_stream: HashMap::new(),
+        }
+    }
+
+    fn admit_command(&mut self, cmd: &WriteCommand) -> Option<(u64, StorageIoAdmissionDecision)> {
+        let item = self.work_item_for_command(cmd)?;
+        let work_id = item.id;
+        let decision = self.scheduler.admit(item, storage_io_now_ms());
+        Some((work_id, decision))
+    }
+
+    fn pop_next(&mut self) -> Option<crate::storage::io_scheduler::StorageIoDispatchedWork> {
+        self.scheduler.pop_next(storage_io_now_ms())
+    }
+
+    fn work_item_for_command(&mut self, cmd: &WriteCommand) -> Option<StorageIoWorkItem> {
+        match cmd {
+            WriteCommand::AppendSegment {
+                pane_id, content, ..
+            } => Some(self.ordered_pane_work_item(
+                StorageIoClass::PaneSegmentDurable,
+                *pane_id,
+                storage_io_str_bytes(content),
+            )),
+            WriteCommand::RecordGap {
+                pane_id, reason, ..
+            } => Some(self.ordered_pane_work_item(
+                StorageIoClass::GapAndContinuity,
+                *pane_id,
+                storage_io_str_bytes(reason),
+            )),
+            WriteCommand::RecordEvent { event, .. } => Some(StorageIoWorkItem::new(
+                self.next_work_id(),
+                StorageIoClass::WorkflowEvent,
+                storage_io_stored_event_bytes(event),
+            )),
+            WriteCommand::RecordAuditAction { action, .. } => Some(StorageIoWorkItem::new(
+                self.next_work_id(),
+                StorageIoClass::PolicyAudit,
+                storage_io_audit_action_bytes(action),
+            )),
+            WriteCommand::RecordPolicyDenialAudit { record, .. } => Some(StorageIoWorkItem::new(
+                self.next_work_id(),
+                StorageIoClass::PolicyAudit,
+                storage_io_policy_denial_bytes(record),
+            )),
+            _ => None,
+        }
+    }
+
+    fn ordered_pane_work_item(
+        &mut self,
+        class: StorageIoClass,
+        pane_id: u64,
+        estimated_bytes: u64,
+    ) -> StorageIoWorkItem {
+        let stream = format!("pane:{pane_id}");
+        let sequence = self.next_ordering_sequence(&stream);
+        StorageIoWorkItem::new(self.next_work_id(), class, estimated_bytes)
+            .with_ordering(stream, sequence)
+    }
+
+    fn next_ordering_sequence(&mut self, stream: &str) -> u64 {
+        let next = self
+            .next_ordering_sequence_by_stream
+            .entry(stream.to_string())
+            .or_insert(0);
+        let sequence = *next;
+        *next = next.saturating_add(1);
+        sequence
+    }
+
+    fn next_work_id(&mut self) -> u64 {
+        let work_id = self.next_work_id;
+        self.next_work_id = self.next_work_id.saturating_add(1);
+        work_id
+    }
+}
+
+fn dispatch_write_command_batch(
+    conn: &mut Connection,
+    batch: VecDeque<WriteCommand>,
+    should_break: &mut bool,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    io_gate: &mut StorageIoWriterGate,
+) {
+    let mut pending_io = HashMap::<u64, WriteCommand>::new();
+
+    for cmd in batch {
+        if *should_break {
+            break;
+        }
+
+        if let Some((work_id, decision)) = io_gate.admit_command(&cmd) {
+            if decision.outcome.accepted() && decision.queued {
+                tracing::debug!(
+                    command = storage_io_command_name(&cmd),
+                    io_class = decision.class.as_str(),
+                    outcome = decision.outcome.as_str(),
+                    reason_code = %decision.reason_code(),
+                    queue_depth = decision.queue_depth,
+                    bytes_pending = decision.bytes_pending,
+                    "storage IO scheduler admitted writer command"
+                );
+                pending_io.insert(work_id, cmd);
+            } else {
+                let message = storage_io_admission_failure_message(&cmd, &decision);
+                tracing::warn!(
+                    command = storage_io_command_name(&cmd),
+                    io_class = decision.class.as_str(),
+                    outcome = decision.outcome.as_str(),
+                    reason_code = %decision.reason_code(),
+                    queue_depth = decision.queue_depth,
+                    bytes_pending = decision.bytes_pending,
+                    retry_after_ms = decision.retry_after_ms,
+                    "storage IO scheduler rejected writer command before persistence"
+                );
+                respond_storage_io_rejection(cmd, message);
+            }
+            continue;
+        }
+
+        flush_storage_io_pending_commands(
+            conn,
+            &mut pending_io,
+            should_break,
+            mmap_mirror,
+            segment_redactors,
+            io_gate,
+        );
+        if !*should_break {
+            dispatch_write_command_raw(conn, cmd, should_break, mmap_mirror, segment_redactors);
+        }
+    }
+
+    flush_storage_io_pending_commands(
+        conn,
+        &mut pending_io,
+        should_break,
+        mmap_mirror,
+        segment_redactors,
+        io_gate,
+    );
+}
+
+fn flush_storage_io_pending_commands(
+    conn: &mut Connection,
+    pending_io: &mut HashMap<u64, WriteCommand>,
+    should_break: &mut bool,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    io_gate: &mut StorageIoWriterGate,
+) {
+    while !pending_io.is_empty() && !*should_break {
+        let Some(dispatched) = io_gate.pop_next() else {
+            let message =
+                "storage IO scheduler lost queued writer commands before dispatch".to_string();
+            tracing::error!(
+                pending = pending_io.len(),
+                "storage IO scheduler returned no dispatchable work for queued commands"
+            );
+            fail_pending_storage_io_commands(std::mem::take(pending_io), message);
+            break;
+        };
+
+        let work_id = dispatched.item.id;
+        let Some(cmd) = pending_io.remove(&work_id) else {
+            tracing::error!(
+                work_id,
+                io_class = dispatched.item.class.as_str(),
+                "storage IO scheduler dispatched unknown writer work item"
+            );
+            continue;
+        };
+
+        tracing::debug!(
+            command = storage_io_command_name(&cmd),
+            work_id,
+            io_class = dispatched.item.class.as_str(),
+            queued_for_ms = dispatched.queued_for_ms,
+            "storage IO scheduler dispatching writer command"
+        );
+        dispatch_write_command_raw(conn, cmd, should_break, mmap_mirror, segment_redactors);
+    }
+}
+
+fn fail_pending_storage_io_commands(commands: HashMap<u64, WriteCommand>, message: String) {
+    for (_, cmd) in commands {
+        respond_storage_io_rejection(cmd, message.clone());
+    }
+}
+
+fn storage_io_now_ms() -> u64 {
+    u64::try_from(now_epoch_ms()).unwrap_or(0)
+}
+
+fn storage_io_admission_failure_message(
+    cmd: &WriteCommand,
+    decision: &StorageIoAdmissionDecision,
+) -> String {
+    format!(
+        "storage IO scheduler rejected {} before durable persistence: reason_code={} class={} outcome={} queue_depth={} bytes_pending={} retry_after_ms={:?}",
+        storage_io_command_name(cmd),
+        decision.reason_code(),
+        decision.class.as_str(),
+        decision.outcome.as_str(),
+        decision.queue_depth,
+        decision.bytes_pending,
+        decision.retry_after_ms
+    )
+}
+
+fn storage_io_command_name(cmd: &WriteCommand) -> &'static str {
+    match cmd {
+        WriteCommand::AppendSegment { .. } => "AppendSegment",
+        WriteCommand::RecordGap { .. } => "RecordGap",
+        WriteCommand::RecordEvent { .. } => "RecordEvent",
+        WriteCommand::RecordAuditAction { .. } => "RecordAuditAction",
+        WriteCommand::RecordPolicyDenialAudit { .. } => "RecordPolicyDenialAudit",
+        _ => "WriteCommand",
+    }
+}
+
+fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
+    match cmd {
+        WriteCommand::AppendSegment { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+        }
+        WriteCommand::RecordGap { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+        }
+        WriteCommand::RecordEvent { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+        }
+        WriteCommand::RecordAuditAction { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+        }
+        WriteCommand::RecordPolicyDenialAudit { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+        }
+        other => {
+            tracing::error!(
+                command = ?other,
+                "storage IO scheduler rejection reached non-routed writer command"
+            );
+        }
+    }
+}
+
+fn storage_io_str_bytes(value: &str) -> u64 {
+    u64::try_from(value.len()).unwrap_or(u64::MAX).max(1)
+}
+
+fn storage_io_option_str_bytes(value: Option<&str>) -> u64 {
+    value.map_or(0, storage_io_str_bytes)
+}
+
+fn storage_io_json_bytes(value: Option<&serde_json::Value>) -> u64 {
+    value.map_or(0, |json| storage_io_str_bytes(&json.to_string()))
+}
+
+fn storage_io_stored_event_bytes(event: &StoredEvent) -> u64 {
+    128_u64
+        .saturating_add(storage_io_str_bytes(&event.rule_id))
+        .saturating_add(storage_io_str_bytes(&event.agent_type))
+        .saturating_add(storage_io_str_bytes(&event.event_type))
+        .saturating_add(storage_io_str_bytes(&event.severity))
+        .saturating_add(storage_io_option_str_bytes(event.matched_text.as_deref()))
+        .saturating_add(storage_io_option_str_bytes(event.dedupe_key.as_deref()))
+        .saturating_add(storage_io_option_str_bytes(
+            event.handled_by_workflow_id.as_deref(),
+        ))
+        .saturating_add(storage_io_option_str_bytes(event.handled_status.as_deref()))
+        .saturating_add(storage_io_json_bytes(event.extracted.as_ref()))
+        .max(1)
+}
+
+fn storage_io_audit_action_bytes(action: &AuditActionRecord) -> u64 {
+    128_u64
+        .saturating_add(storage_io_str_bytes(&action.actor_kind))
+        .saturating_add(storage_io_option_str_bytes(action.actor_id.as_deref()))
+        .saturating_add(storage_io_option_str_bytes(
+            action.correlation_id.as_deref(),
+        ))
+        .saturating_add(storage_io_option_str_bytes(action.domain.as_deref()))
+        .saturating_add(storage_io_str_bytes(&action.action_kind))
+        .saturating_add(storage_io_str_bytes(&action.policy_decision))
+        .saturating_add(storage_io_option_str_bytes(
+            action.decision_reason.as_deref(),
+        ))
+        .saturating_add(storage_io_option_str_bytes(action.rule_id.as_deref()))
+        .saturating_add(storage_io_option_str_bytes(action.input_summary.as_deref()))
+        .saturating_add(storage_io_option_str_bytes(
+            action.verification_summary.as_deref(),
+        ))
+        .saturating_add(storage_io_option_str_bytes(
+            action.decision_context.as_deref(),
+        ))
+        .saturating_add(storage_io_str_bytes(&action.result))
+        .max(1)
+}
+
+fn storage_io_policy_denial_bytes(record: &PolicyDeniedAuditRecord) -> u64 {
+    128_u64
+        .saturating_add(storage_io_option_str_bytes(record.agent_id.as_deref()))
+        .saturating_add(storage_io_str_bytes(&record.tool_name))
+        .saturating_add(storage_io_option_str_bytes(record.intent_hash.as_deref()))
+        .saturating_add(storage_io_str_bytes(&record.reason))
+        .saturating_add(storage_io_str_bytes(&record.reason_code))
+        .saturating_add(storage_io_option_str_bytes(record.rule_id.as_deref()))
+        .saturating_add(storage_io_str_bytes(&record.decision))
+        .max(1)
+}
+
 /// Main loop for the writer thread.
 ///
 /// Opportunistically processes burst traffic while preserving immediate
 /// per-command dispatch semantics.
 ///
 /// Every `WriteCommand` resolves a caller-facing oneshot from
-/// `dispatch_write_command()`. Wrapping multiple commands in an explicit
+/// `dispatch_write_command_raw()`. Wrapping multiple commands in an explicit
 /// transaction would let individual commands report success before a later
 /// `COMMIT` could still fail, turning a durability failure into a false `Ok`.
 /// Until the response path can defer replies until the transaction outcome is
 /// known, the writer must stay in SQLite's per-statement autocommit mode.
 ///
-/// Additional queued commands are still drained opportunistically after the
-/// first wakeup, but each one is dispatched immediately after receipt rather
-/// than being staged in an undispatched in-memory batch.
+/// Additional queued commands are still drained opportunistically after the first
+/// wakeup. Segment, gap, event, and audit commands first pass through the
+/// storage IO scheduler; non-routed commands act as barriers and every routed
+/// command is executed before its caller receives `Ok`.
 fn writer_loop(
     conn: &mut Connection,
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
 ) {
     let mut segment_redactors = HashMap::<u64, StreamingRedactor>::new();
+    let mut io_gate = StorageIoWriterGate::default();
 
     // ft-ixgqo: removed the per-thread asupersync runtime + `block_on`
     // bridge that ft-3tvvt's audit flagged. The writer runs on a
@@ -7167,28 +7506,24 @@ fn writer_loop(
         match rx.try_recv() {
             Ok(first_cmd) => {
                 let mut should_break = false;
-                dispatch_write_command(
-                    conn,
-                    first_cmd,
-                    &mut should_break,
-                    mmap_mirror,
-                    &mut segment_redactors,
-                );
+                let mut batch = VecDeque::with_capacity(WRITER_BATCH_CAP);
+                batch.push_back(first_cmd);
 
-                let mut drained = 1;
-                while drained < WRITER_BATCH_CAP && !should_break {
+                while batch.len() < WRITER_BATCH_CAP {
                     let Ok(cmd) = rx.try_recv() else {
                         break;
                     };
-                    dispatch_write_command(
-                        conn,
-                        cmd,
-                        &mut should_break,
-                        mmap_mirror,
-                        &mut segment_redactors,
-                    );
-                    drained += 1;
+                    batch.push_back(cmd);
                 }
+
+                dispatch_write_command_batch(
+                    conn,
+                    batch,
+                    &mut should_break,
+                    mmap_mirror,
+                    &mut segment_redactors,
+                    &mut io_gate,
+                );
 
                 if should_break {
                     break 'main;
@@ -7411,25 +7746,191 @@ mod writer_bridge_tests {
     }
 }
 
+#[cfg(test)]
+mod writer_io_scheduler_tests {
+    use super::io_scheduler::{StorageIoAdmissionOutcome, StorageIoClassBudget};
+    use super::*;
+
+    fn tiny_writer_gate() -> StorageIoWriterGate {
+        let mut cfg = StorageIoSchedulerConfig {
+            aggregate_max_items: 8,
+            aggregate_max_bytes: 8192,
+            max_consecutive_per_class: 1,
+            ..StorageIoSchedulerConfig::default()
+        };
+        cfg.class_budgets.insert(
+            StorageIoClass::PaneSegmentDurable,
+            StorageIoClassBudget::deferrable(4, 4096, 1),
+        );
+        cfg.class_budgets.insert(
+            StorageIoClass::GapAndContinuity,
+            StorageIoClassBudget::strict(4, 4096, 0),
+        );
+        cfg.class_budgets.insert(
+            StorageIoClass::PolicyAudit,
+            StorageIoClassBudget::strict(1, 4096, 0),
+        );
+        cfg.class_budgets.insert(
+            StorageIoClass::WorkflowEvent,
+            StorageIoClassBudget::deferrable(1, 4096, 3),
+        );
+        StorageIoWriterGate::new(cfg)
+    }
+
+    fn segment_command(pane_id: u64, content: &str) -> WriteCommand {
+        let (tx, _rx) = oneshot::channel();
+        WriteCommand::AppendSegment {
+            pane_id,
+            content: content.to_string(),
+            content_hash: None,
+            respond: tx,
+        }
+    }
+
+    fn gap_command(pane_id: u64, reason: &str) -> WriteCommand {
+        let (tx, _rx) = oneshot::channel();
+        WriteCommand::RecordGap {
+            pane_id,
+            reason: reason.to_string(),
+            respond: tx,
+        }
+    }
+
+    fn event_command(pane_id: u64, rule_id: &str) -> WriteCommand {
+        let (tx, _rx) = oneshot::channel();
+        WriteCommand::RecordEvent {
+            event: StoredEvent {
+                id: 0,
+                pane_id,
+                rule_id: rule_id.to_string(),
+                agent_type: "codex".to_string(),
+                event_type: "state_transition".to_string(),
+                severity: "info".to_string(),
+                confidence: 1.0,
+                extracted: None,
+                matched_text: Some("done".to_string()),
+                segment_id: None,
+                detected_at: 1,
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            },
+            respond: tx,
+        }
+    }
+
+    fn policy_denial_command(tool_name: &str) -> WriteCommand {
+        let (tx, _rx) = oneshot::channel();
+        WriteCommand::RecordPolicyDenialAudit {
+            record: PolicyDeniedAuditRecord {
+                id: 0,
+                ts_ms: 1,
+                agent_id: Some("agent".to_string()),
+                tool_name: tool_name.to_string(),
+                intent_hash: Some("intent".to_string()),
+                reason: "denied by test policy".to_string(),
+                reason_code: PolicyDeniedAuditRecord::REASON_CODE_DENIED.to_string(),
+                rule_id: Some("rule".to_string()),
+                decision: PolicyDeniedAuditRecord::DECISION_DENIED.to_string(),
+            },
+            respond: tx,
+        }
+    }
+
+    #[test]
+    fn writer_io_gate_preserves_segment_gap_order_inside_batch() {
+        let mut gate = tiny_writer_gate();
+        let segment = segment_command(7, "first durable segment");
+        let gap = gap_command(7, "capture gap after segment");
+        let event = event_command(7, "state-ready");
+
+        let (segment_id, segment_decision) = gate.admit_command(&segment).unwrap();
+        let (gap_id, gap_decision) = gate.admit_command(&gap).unwrap();
+        let (event_id, event_decision) = gate.admit_command(&event).unwrap();
+
+        assert_eq!(segment_decision.class, StorageIoClass::PaneSegmentDurable);
+        assert_eq!(gap_decision.class, StorageIoClass::GapAndContinuity);
+        assert_eq!(event_decision.class, StorageIoClass::WorkflowEvent);
+        assert!(segment_decision.outcome.accepted());
+        assert!(gap_decision.outcome.accepted());
+        assert!(event_decision.outcome.accepted());
+
+        let first = gate.pop_next().unwrap();
+        let second = gate.pop_next().unwrap();
+        let third = gate.pop_next().unwrap();
+
+        assert_eq!(first.item.id, segment_id);
+        assert_eq!(second.item.id, gap_id);
+        assert_eq!(third.item.id, event_id);
+    }
+
+    #[test]
+    fn writer_io_gate_policy_audit_fail_closed_has_reason_code() {
+        let mut gate = tiny_writer_gate();
+        let first = policy_denial_command("ft.first");
+        let second = policy_denial_command("ft.second");
+
+        let (_, first_decision) = gate.admit_command(&first).unwrap();
+        let (_, second_decision) = gate.admit_command(&second).unwrap();
+
+        assert!(first_decision.outcome.accepted());
+        assert_eq!(
+            second_decision.outcome,
+            StorageIoAdmissionOutcome::FailClosed
+        );
+        assert_eq!(
+            second_decision.reason_code(),
+            "storage_io.fail_closed.audit_required"
+        );
+
+        let message = storage_io_admission_failure_message(&second, &second_decision);
+        assert!(message.contains("RecordPolicyDenialAudit"));
+        assert!(message.contains("storage_io.fail_closed.audit_required"));
+    }
+
+    #[test]
+    fn writer_io_gate_event_defer_has_explicit_diagnostic() {
+        let mut gate = tiny_writer_gate();
+        let first = event_command(9, "first-event");
+        let second = event_command(9, "second-event");
+
+        let (_, first_decision) = gate.admit_command(&first).unwrap();
+        let (_, second_decision) = gate.admit_command(&second).unwrap();
+
+        assert!(first_decision.outcome.accepted());
+        assert_eq!(second_decision.outcome, StorageIoAdmissionOutcome::Defer);
+        assert_eq!(
+            second_decision.reason_code(),
+            "storage_io.defer.class_budget_exhausted"
+        );
+
+        let message = storage_io_admission_failure_message(&second, &second_decision);
+        assert!(message.contains("RecordEvent"));
+        assert!(message.contains("storage_io.defer.class_budget_exhausted"));
+        assert!(message.contains("before durable persistence"));
+    }
+}
+
 /// br-ft-x2oyy: ship `value` back through the
 /// `WriteCommand::respond` oneshot channel under the
 /// receiver-dropped-is-fine contract documented on
-/// [`dispatch_write_command`]. The
+/// [`dispatch_write_command_raw`]. The
 /// `Result<(), oneshot::SendError<T>>` is intentionally
 /// discarded — see the dispatcher's rustdoc for the design
 /// rationale (oneshot send fails iff Receiver dropped → caller
 /// cancelled → no longer cares about the result; the SQLite
 /// write itself has already happened by this point and is
-/// folded into `WriterTelemetry` regardless of the return path).
+/// folded into writer-side telemetry regardless of the return path).
 ///
 /// Replaces the 62 inline `let _ = respond.send(value);`
-/// sites in `dispatch_write_command`'s match arms — the helper
+/// sites in `dispatch_write_command_raw`'s match arms — the helper
 /// name makes the contract self-documenting at every callsite.
 fn respond_oneshot_best_effort<T>(tx: oneshot::Sender<T>, value: T) {
     let _ = tx.send(value);
 }
 
-/// Dispatch a single write command to the appropriate sync handler.
+/// Dispatch a single already-admitted write command to the appropriate sync handler.
 ///
 /// br-ft-x2oyy: every `WriteCommand` variant carries a `respond:
 /// oneshot::Sender<Result<...>>` channel; the dispatcher computes
@@ -7452,7 +7953,7 @@ fn respond_oneshot_best_effort<T>(tx: oneshot::Sender<T>, value: T) {
 /// 3. **Forensics are preserved**: the `result` itself, including
 ///    any `Err` from `append_segment_sync` / `record_gap_backend`
 ///    / `record_event_backend` / etc., is still folded into the
-///    `WriterTelemetry` counters via the worker-loop wrapper.
+///    writer-side telemetry counters via the worker-loop wrapper.
 ///    Operators see write-side failures via that telemetry, not
 ///    via the per-command `respond.send`.
 ///
@@ -7462,7 +7963,7 @@ fn respond_oneshot_best_effort<T>(tx: oneshot::Sender<T>, value: T) {
 /// self-documenting at every callsite. The original inline
 /// `let _ = respond.send(...)` pattern is no longer present in
 /// the dispatch arms.
-fn dispatch_write_command(
+fn dispatch_write_command_raw(
     conn: &mut Connection,
     cmd: WriteCommand,
     should_break: &mut bool,
