@@ -446,6 +446,7 @@ pub mod redraw_predicate_telemetry;
 pub mod reduce_motion_probe;
 pub mod release_readiness_gates;
 pub mod resource_pressure_chaos;
+pub mod resource_pressure_clock_timer_chaos;
 // ft-y0loj.4 / ft-j1qjt: replay extraction ATTEMPTED but REVERTED — the
 // replay cluster is not a tier-1 leaf. policy.rs / runtime.rs /
 // workflows/runner.rs / workflows/mod.rs hold ~16 inline references to
