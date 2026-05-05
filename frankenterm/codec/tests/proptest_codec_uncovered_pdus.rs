@@ -634,7 +634,7 @@ proptest! {
         let (tagged_len, _) = tagged_len_prefix(&encoded)?;
         let compressed_bit = tagged_len & COMPRESSED_MASK;
         let raw_len = tagged_len & !COMPRESSED_MASK;
-        let delta_abs = i64::from(raw_len_delta).abs() as u64;
+        let delta_abs = i64::from(raw_len_delta).unsigned_abs();
         let mutated_raw_len = if raw_len_delta < 0 {
             raw_len.saturating_sub(delta_abs)
         } else {

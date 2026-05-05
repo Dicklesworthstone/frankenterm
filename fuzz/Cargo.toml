@@ -183,6 +183,15 @@ path = "fuzz_targets/snapshot_deserialize.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
+# ft-lb9yi: byte-compression frame decoder fuzz target. Drives
+# ByteCompressor::decompress and decompress_batch with raw adversarial
+# frames plus structured compressed payloads and corrupted batch headers.
+[[bin]]
+name = "byte_compression_frames"
+path = "fuzz_targets/byte_compression_frames.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
 [[bin]]
 name = "pdu_stream_decode"
 path = "fuzz_targets/pdu_stream_decode.rs"

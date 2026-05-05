@@ -45,7 +45,8 @@ impl<'a> Arbitrary<'a> for Segment {
             6 => (256u64 * 1024 * 1024) + 1,
             _ => u64::arbitrary(u)?,
         };
-        let bytes = u.bytes(u.int_in_range(0..=1024usize)?)?.to_vec();
+        let byte_len = u.int_in_range(0..=1024usize)?;
+        let bytes = u.bytes(byte_len)?.to_vec();
         Ok(Self { len_prefix, bytes })
     }
 }
@@ -74,7 +75,8 @@ impl<'a> Arbitrary<'a> for FuzzCase {
         for _ in 0..segment_count {
             segments.push(Segment::arbitrary(u)?);
         }
-        let trailing = u.bytes(u.int_in_range(0..=256usize)?)?.to_vec();
+        let trailing_len = u.int_in_range(0..=256usize)?;
+        let trailing = u.bytes(trailing_len)?.to_vec();
         Ok(Self {
             target,
             container_len,

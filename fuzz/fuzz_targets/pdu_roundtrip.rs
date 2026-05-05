@@ -37,6 +37,7 @@ enum FuzzPdu {
     GetCodecVersion,
     GetCodecVersionResponse {
         codec_vers: u16,
+        min_supported: u16,
         version_string: String,
         executable_path: String,
         config_file_path: Option<String>,
@@ -103,16 +104,16 @@ enum FuzzPdu {
 #[derive(Debug, Clone, Copy)]
 enum CompressionChoice {
     Auto,
-    None,
-    Compressed,
+    Never,
+    Always,
 }
 
 impl<'a> Arbitrary<'a> for CompressionChoice {
     fn arbitrary(u: &mut Unstructured<'a>) -> libfuzzer_sys::arbitrary::Result<Self> {
         Ok(match u.int_in_range(0..=2u8)? {
             0 => Self::Auto,
-            1 => Self::None,
-            _ => Self::Compressed,
+            1 => Self::Never,
+            _ => Self::Always,
         })
     }
 }
@@ -121,8 +122,8 @@ impl CompressionChoice {
     fn to_mode(self) -> codec::CompressionMode {
         match self {
             Self::Auto => codec::CompressionMode::Auto,
-            Self::None => codec::CompressionMode::None,
-            Self::Compressed => codec::CompressionMode::Compressed,
+            Self::Never => codec::CompressionMode::Never,
+            Self::Always => codec::CompressionMode::Always,
         }
     }
 }
@@ -157,6 +158,7 @@ impl<'a> Arbitrary<'a> for FuzzPdu {
             3 => Self::GetCodecVersion,
             4 => Self::GetCodecVersionResponse {
                 codec_vers: u16::arbitrary(u)?,
+                min_supported: u16::arbitrary(u)?,
                 version_string: bounded_string(u)?,
                 executable_path: bounded_string(u)?,
                 config_file_path: Option::<String>::arbitrary(u)?.map(|s| bound_str(&s)),
@@ -245,6 +247,7 @@ fn build_pdu(fp: &FuzzPdu) -> Pdu {
         FuzzPdu::GetCodecVersion => Pdu::GetCodecVersion(GetCodecVersion {}),
         FuzzPdu::GetCodecVersionResponse {
             codec_vers,
+            min_supported,
             version_string,
             executable_path,
             config_file_path,
@@ -253,6 +256,7 @@ fn build_pdu(fp: &FuzzPdu) -> Pdu {
             version_string: version_string.clone(),
             executable_path: PathBuf::from(executable_path),
             config_file_path: config_file_path.as_ref().map(PathBuf::from),
+            min_supported: *min_supported as usize,
         }),
         FuzzPdu::ErrorResponse(reason) => Pdu::ErrorResponse(ErrorResponse {
             reason: reason.clone(),

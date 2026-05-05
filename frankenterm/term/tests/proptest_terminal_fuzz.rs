@@ -799,7 +799,7 @@ proptest! {
 
         let (mut chunked, chunked_capture) = make_term_with_capture(rows, cols);
         for byte in &payload {
-            chunked.advance_bytes(&[*byte]);
+            chunked.advance_bytes([*byte]);
         }
         assert_terminal_invariants(&chunked, rows, cols, &payload);
 
