@@ -102,8 +102,6 @@
 //!
 //! # AARSP Bead: ft-2p9cb.1.1.1
 
-use serde::{Deserialize, Serialize};
-
 // br-ft-l8s7v slice 1: first sibling-module decomposition. Percentile
 // is a self-contained primitive (no latency_stages deps) — extracted
 // to `latency_stages/percentile.rs`. Re-exported here so existing
@@ -166,6 +164,12 @@ pub use instrumentation::*;
 // latency_stages::MitigationLevel and StageEnforcementState paths stay unchanged.
 mod runtime_policy;
 pub use runtime_policy::*;
+
+// br-ft-l8s7v slice 37: runtime enforcer wrapper extracted from the core
+// latency-stage monolith. Re-exported here so existing
+// latency_stages::RuntimeEnforcer and EnforcementDecision paths stay unchanged.
+mod runtime_enforcer;
+pub use runtime_enforcer::*;
 
 // br-ft-l8s7v slice 2: QoE/SLO guardrail lane extracted from the
 // SLO + validation cluster. Re-exported here so existing
@@ -383,334 +387,9 @@ pub use policy_controller::*;
 /// Mitigation policy, recovery protocol, and per-stage enforcement state are
 /// extracted to `latency_stages/runtime_policy.rs` under br-ft-l8s7v slice 36.
 /// Re-exported above via `pub use`.
-
-/// Enforcement decision emitted for each stage observation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EnforcementDecision {
-    /// Stage evaluated.
-    pub stage: LatencyStage,
-    /// Observed latency.
-    pub latency_us: f64,
-    /// Whether budget was exceeded.
-    pub overflow: bool,
-    /// Raw mitigation from the enforcer (before policy clamping).
-    pub raw_mitigation: MitigationLevel,
-    /// Clamped mitigation (after policy constraint).
-    pub applied_mitigation: MitigationLevel,
-    /// Whether this was a recovery (de-escalation).
-    pub recovery: bool,
-    /// Reason code.
-    pub reason: Option<ReasonCode>,
-    /// Whether warmup period is still active (enforcement suppressed).
-    pub warmup_active: bool,
-}
-
-/// Configuration for the runtime enforcer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeEnforcerConfig {
-    /// Base enforcer configuration.
-    pub enforcer_config: BudgetEnforcerConfig,
-    /// Per-stage policy constraints.
-    pub policy_constraints: Vec<PolicyConstraint>,
-    /// Recovery protocol.
-    pub recovery: RecoveryProtocol,
-    /// Whether to emit structured decision logs.
-    pub log_decisions: bool,
-}
-
-impl Default for RuntimeEnforcerConfig {
-    fn default() -> Self {
-        Self {
-            enforcer_config: BudgetEnforcerConfig::default(),
-            policy_constraints: default_policy_constraints(),
-            recovery: RecoveryProtocol::default(),
-            log_decisions: true,
-        }
-    }
-}
-
-/// The runtime budget enforcer with policy constraints and recovery.
-///
-/// Wraps BudgetEnforcer with:
-/// - Policy-safe mitigation clamping
-/// - Warmup suppression
-/// - Recovery protocol (gradual de-escalation)
-/// - Structured decision logging
-///
-/// # Determinism
-/// All decisions are deterministic given the same sequence of observations.
-/// No randomness, no system time — caller provides all timestamps.
-#[derive(Debug, Clone)]
-pub struct RuntimeEnforcer {
-    enforcer: BudgetEnforcer,
-    config: RuntimeEnforcerConfig,
-    states: Vec<(LatencyStage, StageEnforcementState)>,
-    decisions: Vec<EnforcementDecision>,
-    observation_count: u64,
-}
-
-impl RuntimeEnforcer {
-    /// Create a new runtime enforcer with the given configuration.
-    pub fn new(config: RuntimeEnforcerConfig) -> Self {
-        let enforcer = BudgetEnforcer::new(config.enforcer_config.clone());
-        let states = LatencyStage::PIPELINE_STAGES
-            .iter()
-            .map(|&s| (s, StageEnforcementState::new()))
-            .collect();
-        Self {
-            enforcer,
-            config,
-            states,
-            decisions: Vec::new(),
-            observation_count: 0,
-        }
-    }
-
-    /// Create with default configuration.
-    pub fn with_defaults() -> Self {
-        Self::new(RuntimeEnforcerConfig::default())
-    }
-
-    /// Record an observation and produce an enforcement decision.
-    ///
-    /// This is the main entry point for the critical path. It:
-    /// 1. Records the observation in the base enforcer
-    /// 2. Determines raw mitigation from overflow severity
-    /// 3. Applies policy constraints (clamping)
-    /// 4. Checks recovery conditions
-    /// 5. Updates enforcement state
-    /// 6. Emits a structured decision
-    #[allow(clippy::similar_names)]
-    pub fn enforce(
-        &mut self,
-        stage: LatencyStage,
-        latency_us: f64,
-        correlation_id: &str,
-        now_us: u64,
-    ) -> EnforcementDecision {
-        self.observation_count += 1;
-
-        // Step 1: Record in base enforcer.
-        let obs = self.enforcer.record(stage, latency_us, correlation_id);
-
-        // Find enforcement state for this stage.
-        let state = self
-            .states
-            .iter_mut()
-            .find(|(s, _)| *s == stage)
-            .map(|(_, st)| st);
-
-        let state = match state {
-            Some(s) => s,
-            None => {
-                // Unknown stage — pass through.
-                return EnforcementDecision {
-                    stage,
-                    latency_us,
-                    overflow: false,
-                    raw_mitigation: MitigationLevel::None,
-                    applied_mitigation: MitigationLevel::None,
-                    recovery: false,
-                    reason: None,
-                    warmup_active: true,
-                };
-            }
-        };
-
-        // Find policy constraint.
-        let constraint = self
-            .config
-            .policy_constraints
-            .iter()
-            .find(|c| c.stage == stage);
-
-        // Step 2: Check warmup.
-        let warmup_active = constraint
-            .map(|c| self.observation_count <= c.warmup_count)
-            .unwrap_or(false);
-
-        // Step 3: Determine raw mitigation level.
-        let raw_level = MitigationLevel::from_mitigation(obs.recommended_mitigation);
-
-        // Step 4: Apply policy constraint.
-        let clamped_level = if warmup_active {
-            MitigationLevel::None
-        } else {
-            constraint.map(|c| c.clamp(raw_level)).unwrap_or(raw_level)
-        };
-
-        // Step 5: Recovery check.
-        let mut recovery = false;
-        if obs.overflow {
-            state.consecutive_ok = 0;
-            if clamped_level > state.current_level {
-                state.current_level = clamped_level;
-                state.last_escalation_us = now_us;
-                state.escalation_count += 1;
-            }
-        } else {
-            state.consecutive_ok += 1;
-
-            // Check recovery conditions.
-            let cooldown_met = state.consecutive_ok >= self.config.recovery.cooldown_observations;
-            let timeout_met = now_us.saturating_sub(state.last_escalation_us)
-                >= self.config.recovery.max_degraded_duration_us;
-
-            if state.current_level > MitigationLevel::None && (cooldown_met || timeout_met) {
-                recovery = true;
-                state.recovery_count += 1;
-                if self.config.recovery.gradual && state.current_level > MitigationLevel::None {
-                    // Step down one level.
-                    let severity = state.current_level.severity();
-                    state.current_level = if severity > 0 {
-                        MitigationLevel::ALL[severity as usize - 1]
-                    } else {
-                        MitigationLevel::None
-                    };
-                } else {
-                    state.current_level = MitigationLevel::None;
-                }
-                state.consecutive_ok = 0;
-            }
-        }
-
-        let decision = EnforcementDecision {
-            stage,
-            latency_us,
-            overflow: obs.overflow,
-            raw_mitigation: raw_level,
-            applied_mitigation: state.current_level,
-            recovery,
-            reason: obs.reason,
-            warmup_active,
-        };
-
-        if self.config.log_decisions {
-            self.decisions.push(decision.clone());
-        }
-
-        decision
-    }
-
-    /// Get the current mitigation level for a stage.
-    pub fn current_level(&self, stage: LatencyStage) -> MitigationLevel {
-        self.states
-            .iter()
-            .find(|(s, _)| *s == stage)
-            .map(|(_, st)| st.current_level)
-            .unwrap_or(MitigationLevel::None)
-    }
-
-    /// Get the enforcement state for a stage.
-    pub fn stage_state(&self, stage: LatencyStage) -> Option<&StageEnforcementState> {
-        self.states
-            .iter()
-            .find(|(s, _)| *s == stage)
-            .map(|(_, st)| st)
-    }
-
-    /// Get the underlying enforcer.
-    pub fn base_enforcer(&self) -> &BudgetEnforcer {
-        &self.enforcer
-    }
-
-    /// Get accumulated decisions and clear.
-    pub fn drain_decisions(&mut self) -> Vec<EnforcementDecision> {
-        std::mem::take(&mut self.decisions)
-    }
-
-    /// Total observations processed.
-    pub fn total_observations(&self) -> u64 {
-        self.observation_count
-    }
-
-    /// Total escalations across all stages.
-    pub fn total_escalations(&self) -> u64 {
-        self.states.iter().map(|(_, s)| s.escalation_count).sum()
-    }
-
-    /// Total recoveries across all stages.
-    pub fn total_recoveries(&self) -> u64 {
-        self.states.iter().map(|(_, s)| s.recovery_count).sum()
-    }
-
-    /// Whether all stages are at MitigationLevel::None.
-    pub fn is_fully_recovered(&self) -> bool {
-        self.states
-            .iter()
-            .all(|(_, s)| s.current_level == MitigationLevel::None)
-    }
-
-    /// Compact status string.
-    pub fn status_line(&self) -> String {
-        let degraded: Vec<String> = self
-            .states
-            .iter()
-            .filter(|(_, s)| s.current_level > MitigationLevel::None)
-            .map(|(stage, s)| format!("{}={}", stage, s.current_level))
-            .collect();
-        if degraded.is_empty() {
-            format!(
-                "enforcement=NOMINAL obs={} esc={} rec={}",
-                self.observation_count,
-                self.total_escalations(),
-                self.total_recoveries()
-            )
-        } else {
-            format!(
-                "enforcement=DEGRADED [{}] obs={} esc={} rec={}",
-                degraded.join(", "),
-                self.observation_count,
-                self.total_escalations(),
-                self.total_recoveries()
-            )
-        }
-    }
-
-    /// Process a complete CorrelationContext through the enforcer.
-    ///
-    /// Returns per-stage enforcement decisions.
-    pub fn enforce_run(
-        &mut self,
-        ctx: &CorrelationContext,
-        base_time_us: u64,
-    ) -> Vec<EnforcementDecision> {
-        let mut decisions = Vec::with_capacity(ctx.timings.len());
-        for timing in &ctx.timings {
-            let d = self.enforce(
-                timing.stage,
-                timing.latency_us,
-                &ctx.correlation_id,
-                base_time_us + timing.end_us,
-            );
-            decisions.push(d);
-        }
-        decisions
-    }
-
-    /// Get a full diagnostic snapshot.
-    pub fn diagnostic_snapshot(&self) -> RuntimeEnforcerSnapshot {
-        RuntimeEnforcerSnapshot {
-            observation_count: self.observation_count,
-            total_escalations: self.total_escalations(),
-            total_recoveries: self.total_recoveries(),
-            fully_recovered: self.is_fully_recovered(),
-            stage_states: self.states.iter().map(|(s, st)| (*s, st.clone())).collect(),
-            base_snapshot: self.enforcer.snapshot(),
-        }
-    }
-}
-
-/// Full diagnostic snapshot of the runtime enforcer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeEnforcerSnapshot {
-    pub observation_count: u64,
-    pub total_escalations: u64,
-    pub total_recoveries: u64,
-    pub fully_recovered: bool,
-    pub stage_states: Vec<(LatencyStage, StageEnforcementState)>,
-    pub base_snapshot: EnforcerSnapshot,
-}
+/// Runtime enforcer decision/config/snapshot types are extracted to
+/// `latency_stages/runtime_enforcer.rs` under br-ft-l8s7v slice 37.
+/// Re-exported above via `pub use`.
 
 // ── A4: Adaptive Budget Allocator ─────────────────────────────────
 // Extracted to `latency_stages/adaptive_allocator.rs` under br-ft-l8s7v slice 21.
@@ -2467,6 +2146,42 @@ mod tests {
             assert!(d.warmup_active);
             assert_eq!(d.applied_mitigation, MitigationLevel::None);
         }
+    }
+
+    #[test]
+    fn test_runtime_enforcer_warmup_is_per_stage() {
+        let config = RuntimeEnforcerConfig {
+            policy_constraints: vec![
+                PolicyConstraint {
+                    stage: LatencyStage::PtyCapture,
+                    max_level: MitigationLevel::Skip,
+                    critical: false,
+                    warmup_count: 0,
+                },
+                PolicyConstraint {
+                    stage: LatencyStage::DeltaExtraction,
+                    max_level: MitigationLevel::Skip,
+                    critical: false,
+                    warmup_count: 2,
+                },
+            ],
+            ..RuntimeEnforcerConfig::default()
+        };
+        let mut re = RuntimeEnforcer::new(config);
+
+        for i in 0..5 {
+            re.enforce(LatencyStage::PtyCapture, 10.0, "other-stage", i * 1000);
+        }
+
+        let decision = re.enforce(
+            LatencyStage::DeltaExtraction,
+            100_000.0,
+            "target-stage",
+            10_000,
+        );
+        assert!(decision.overflow);
+        assert!(decision.warmup_active);
+        assert_eq!(decision.applied_mitigation, MitigationLevel::None);
     }
 
     #[test]
