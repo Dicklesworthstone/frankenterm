@@ -285,6 +285,9 @@ pub mod forbidden_dep_guards;
 // only `std` + `serde`). Re-exported so `crate::forensic_export::*` and
 // `frankenterm_core::forensic_export::*` paths continue to resolve unchanged.
 pub use frankenterm_core_audit_types::forensic_export;
+// `proof_lane` extracted to `frankenterm-core-audit-types` (ft-tn6cw.3).
+// Leaf-clean proof attempt DTOs and operator report summaries.
+pub use frankenterm_core_audit_types::proof_lane;
 pub mod gc;
 pub mod gpu_pipeline_cache;
 pub mod gpu_regression_fuzz_report;
