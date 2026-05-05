@@ -23,7 +23,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::Error;
 use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
@@ -3669,6 +3669,7 @@ const SNAPSHOT_IDLE_WINDOW_SECS: u64 =
     crate::tuning_config::SnapshotTuning::DEFAULT_IDLE_WINDOW_SECS;
 const SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS: u64 =
     crate::tuning_config::SnapshotTuning::DEFAULT_MEMORY_TRIGGER_COOLDOWN_SECS;
+const DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneActivityState {
     last_seq: i64,
@@ -4178,6 +4179,16 @@ impl RuntimeHandle {
     /// 3. Flushes storage
     /// 4. Collects and returns a shutdown summary
     pub async fn shutdown_with_summary(self) -> ShutdownSummary {
+        self.shutdown_with_timeout(DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    /// Request graceful shutdown with an explicit task-join timeout.
+    ///
+    /// This is the bounded shutdown primitive used by the default shutdown
+    /// paths. A stubborn background task can make the returned summary
+    /// unclean, but it must not hold operator shutdown forever.
+    pub async fn shutdown_with_timeout(self, shutdown_timeout: Duration) -> ShutdownSummary {
         let elapsed_secs = self.start_time.elapsed().as_secs();
         let mut warnings = Vec::new();
 
@@ -4191,7 +4202,6 @@ impl RuntimeHandle {
         info!("Shutdown signal sent");
 
         // Wait for tasks with timeout
-        let shutdown_timeout = Duration::from_secs(5);
         let shutdown_cx = runtime_loop_cx();
         let join_result = runtime_timeout(&shutdown_cx, shutdown_timeout, async {
             let _ = self.discovery.await;
@@ -4254,15 +4264,19 @@ impl RuntimeHandle {
 
     /// Request graceful shutdown.
     ///
-    /// Sets the shutdown flag and waits for tasks to complete.
+    /// Sets the shutdown flag, waits for tasks with the default bounded
+    /// timeout, and flushes storage. Use [`Self::shutdown_with_summary`] when
+    /// the caller needs to inspect warnings or distinguish clean from timed-out
+    /// shutdown.
     pub async fn shutdown(self) {
-        self.shutdown_flag.store(true, Ordering::SeqCst);
-        if let Some(ref tx) = self.snapshot_shutdown {
-            // br-ft-x2oyy: intentional best-effort shutdown signal; send
-            // only fails when the snapshot trigger task has already exited.
-            let _ = tx.send(true);
+        let summary = self.shutdown_with_summary().await;
+        if !summary.clean || !summary.warnings.is_empty() {
+            warn!(
+                clean = summary.clean,
+                warnings = ?summary.warnings,
+                "runtime shutdown completed with warnings"
+            );
         }
-        self.join().await;
     }
 
     /// ft-tr5a0 Cx-first sibling of [`Self::shutdown`]. Pre-flight
@@ -4943,6 +4957,52 @@ mod tests {
         (dir, path)
     }
 
+    fn stubborn_runtime_task(duration: Duration) -> JoinHandle<()> {
+        let loop_cx = runtime_loop_cx();
+        spawn_runtime_task(&loop_cx, move |_task_cx| async move {
+            sleep(duration).await;
+        })
+    }
+
+    async fn runtime_handle_with_stubborn_tasks(duration: Duration) -> (TempDir, RuntimeHandle) {
+        let (dir, db_path) = temp_db_path();
+        let storage = StorageHandle::new(&db_path).await.unwrap();
+        let engine = PatternEngine::new();
+        let runtime = ObservationRuntime::new(
+            RuntimeConfig::default(),
+            storage,
+            Arc::new(RwLock::new(engine)),
+        );
+        let (capture_tx, _capture_rx) = mpsc::channel(1);
+
+        let handle = RuntimeHandle {
+            discovery: stubborn_runtime_task(duration),
+            capture: stubborn_runtime_task(duration),
+            relay: stubborn_runtime_task(duration),
+            native_events: None,
+            persistence: stubborn_runtime_task(duration),
+            maintenance: None,
+            snapshot: None,
+            snapshot_triggers: None,
+            snapshot_shutdown: None,
+            shutdown_flag: Arc::clone(&runtime.shutdown_flag),
+            storage: runtime.storage.clone(),
+            metrics: Arc::clone(&runtime.metrics),
+            registry: Arc::clone(&runtime.registry),
+            cursors: Arc::clone(&runtime.cursors),
+            pane_activity_tracker: Arc::clone(&runtime.pane_activity_tracker),
+            start_time: Instant::now(),
+            config_tx: Arc::clone(&runtime.config_tx),
+            event_bus: None,
+            heartbeats: Arc::clone(&runtime.heartbeats),
+            capture_tx,
+            wezterm_handle: runtime.wezterm_handle.clone(),
+            scheduler_snapshot: Arc::clone(&runtime.scheduler_snapshot),
+        };
+
+        (dir, handle)
+    }
+
     #[allow(dead_code)]
     fn test_pane_record(pane_id: u64) -> PaneRecord {
         PaneRecord {
@@ -5205,6 +5265,42 @@ mod tests {
                 "shutdown should not emit warnings for mock lifecycle: {:?}",
                 summary.warnings
             );
+        });
+    }
+
+    #[test]
+    fn runtime_shutdown_timeout_reports_stubborn_tasks_without_hanging() {
+        run_async_test_isolated(|| async {
+            let (_dir, handle) =
+                runtime_handle_with_stubborn_tasks(Duration::from_millis(300)).await;
+
+            let started = Instant::now();
+            let summary = handle
+                .shutdown_with_timeout(Duration::from_millis(50))
+                .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                !summary.clean,
+                "stubborn tasks should make shutdown summary unclean"
+            );
+            assert!(
+                summary
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("timeout")),
+                "shutdown summary should report timeout warning: {:?}",
+                summary.warnings
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "bounded shutdown should return promptly, took {elapsed:?}"
+            );
+
+            // Let detached stubborn tasks finish before the isolated runtime is
+            // dropped so the test does not leave intentionally sleeping tasks
+            // behind.
+            sleep(Duration::from_millis(350)).await;
         });
     }
 
