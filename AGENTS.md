@@ -45,6 +45,26 @@ The `am serve-http` process is a **shared singleton** that all agents depend on.
 
 ---
 
+## macOS Debugging: Prefer LLDB for Native FrankenTerm Processes
+
+On Apple Silicon macOS, Homebrew `gdb` may install successfully, but GNU GDB is
+not a reliable local debugger for native `aarch64-darwin` FrankenTerm processes.
+Codesigning with `com.apple.security.cs.debugger` is required for Mach task-port
+access in cases where GDB can attach, but it does not fix the common Apple
+Silicon failure mode where GDB reports `Don't know how to attach` or `Don't know
+how to run`.
+
+For local live-process diagnosis on this Mac, use Apple-native tools first:
+- `lldb -b -p <pid> -o 'thread backtrace all' -o detach -o quit`
+- `/usr/bin/sample <pid> 5 -file /tmp/frankenterm-<pid>.sample.txt`
+- `spindump <pid>` for longer UI hangs or beach-ball investigations
+
+Keep GNU `gdb` installed only as a remote-protocol frontend or for non-native
+targets. Do not waste incident time trying to make Homebrew GDB replace LLDB for
+native FrankenTerm GUI debugging on Apple Silicon.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -98,6 +118,58 @@ This installs a pre-commit guard that blocks mass deletions and any deletion of 
 **If you see `master` referenced anywhere:**
 1. Update it to `main`
 2. Ensure `master` is synchronized: `git push origin main:master`
+
+---
+
+## Weekly WezTerm Upstream Backport Workflow
+
+We should periodically harvest fixes from upstream WezTerm, but **never** by
+blindly pulling or merging upstream into this repo. FrankenTerm is an owned fork
+with rebrand, asupersync/runtime policy, bundled defaults, and swarm-specific
+architecture. Treat upstream as a read-only patch source and backport
+deliberately.
+
+**Hard rules:**
+- Do NOT run `git pull` from `wez/wezterm` in this checkout.
+- Do NOT merge upstream `main` into FrankenTerm.
+- Do NOT create a git worktree or parallel checkout.
+- Do NOT bulk-copy upstream directories over `frankenterm/` or
+  `crates/frankenterm-gui/`.
+- Do NOT accept upstream deletions without explicit written user permission.
+- Preserve FrankenTerm naming, bundle IDs, icons, default Pragmasevka font,
+  `runtime_async`/asupersync policy, and side-by-side WezTerm installation.
+
+**Weekly process:**
+1. Start only from a clean or fully understood worktree. If unrelated files are
+   dirty, record them and do not mix them into the upstream-backport batch.
+2. Find the upstream baseline from `frankenterm/PROVENANCE.json`
+   (`divergence_point.subject` records the imported WezTerm commit).
+3. Fetch upstream into a read-only tracking ref:
+   ```bash
+   git fetch https://github.com/wez/wezterm.git main:refs/remotes/wezterm-upstream/main
+   ```
+4. Build an inventory of upstream commits since the baseline, grouped by
+   subsystem: `term`, `termwiz`, `window`, `config`, `mux`, `pty`, `font`,
+   `ssh`, `codec`, GUI, and mux-server surfaces.
+5. Prioritize security, crash, data-loss, terminal-correctness, macOS/windowing,
+   PTY, SSH, and font fixes before cosmetic changes or features.
+6. For each accepted upstream commit, inspect the patch with `git show` and
+   manually port the smallest coherent slice into the renamed FrankenTerm paths.
+   Avoid regex/script-based code rewrites.
+7. Keep one upstream topic per FrankenTerm commit when practical. Include the
+   upstream SHA(s) in the commit body as `Upstream-WezTerm: <sha>`.
+8. If an upstream change conflicts with FrankenTerm architecture, do not force
+   it in. Record it as skipped/deferred with the reason.
+9. Validate with the narrowest relevant proof first, usually package-scoped for
+   vendored crates (for example `cargo check -p mux --lib` and
+   `cargo test -p mux --lib` for mux-only changes). Then run broader workspace
+   checks when feasible. Report unrelated workspace or system-package blockers
+   separately from the backport result.
+10. Update provenance/backport notes at the end of the batch so the next weekly
+    pass knows which upstream SHAs were accepted, skipped, or deferred.
+
+Good backports should feel like FrankenTerm-native fixes with traceable upstream
+provenance, not like a partial re-import of WezTerm.
 
 ---
 
