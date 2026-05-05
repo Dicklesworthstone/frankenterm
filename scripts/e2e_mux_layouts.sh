@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 RCH_BIN="${RCH_BIN:-rch}"
-TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-/tmp/ft-e2e-mux-layouts-target}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/target/e2e/mux-layouts}"
 DRY_RUN=0
 
@@ -37,8 +37,8 @@ Options:
   -h, --help      Show help
 
 Environment:
-  RCH_BIN              rch executable (default: rch)
-  CARGO_TARGET_DIR     Cargo target dir
+  RCH_BIN               rch executable (default: rch)
+  RCH_CARGO_TARGET_DIR  Remote Cargo target dir (default: /tmp/ft-e2e-mux-layouts-target)
 EOF
 }
 
@@ -118,7 +118,7 @@ run_step() {
   fi
 }
 
-# --- Helper: run cargo test via rch or local fallback ---
+# --- Helper: run cargo test via rch only ---
 run_tests() {
   local package="$1"
   shift
@@ -129,11 +129,13 @@ run_tests() {
     test_args+=("--" "$filter")
   fi
 
-  if command -v "$RCH_BIN" >/dev/null 2>&1; then
-    run_cmd "$RCH_BIN" exec -- cargo test "${test_args[@]}" 2>&1 | tee "$LOG_DIR/${package}-${filter:-all}.log"
-  else
-    run_cmd cargo test "${test_args[@]}" 2>&1 | tee "$LOG_DIR/${package}-${filter:-all}.log"
+  if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+    mark_skip "rch not found; cargo test lanes must be run through RCH"
+    return 125
   fi
+
+  run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" \
+    cargo test "${test_args[@]}" 2>&1 | tee "$LOG_DIR/${package}-${filter:-all}.log"
 }
 
 # ======================================================================
@@ -219,6 +221,7 @@ step_session_handler_tests() {
 log "=== FrankenTerm Mux Layouts E2E Suite ==="
 log "Project root: $PROJECT_ROOT"
 log "Log dir:      $LOG_DIR"
+log "RCH target:   $RCH_CARGO_TARGET_DIR"
 log ""
 
 run_step "Layout cycle unit tests"         step_layout_unit_tests      || true
