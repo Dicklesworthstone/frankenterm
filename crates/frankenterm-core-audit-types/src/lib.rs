@@ -55,6 +55,8 @@
 //! Phase 5 (ft-wik9p.3):
 //! - [`proof_doctor`] — pure proof-doctor preflight verdict DTOs and
 //!   classifier substrate for RCH/git/Beads/reservation snapshots.
+//! - [`proof_handoff`] — Beads and Agent Mail handoff templates derived
+//!   from proof-doctor verdicts without creating a second taxonomy.
 //!
 //! ## Re-export contract
 //!
@@ -74,6 +76,7 @@ pub mod migration_rehearsal;
 pub mod mdl_extraction;
 pub mod policy_decision_log_engine;
 pub mod proof_doctor;
+pub mod proof_handoff;
 pub mod proof_lane;
 pub mod recorder_audit_engine;
 // [ft-xcsm0 / ft-8nqx0 Phase 4] Recorder + session retention POLICY DTOs.
