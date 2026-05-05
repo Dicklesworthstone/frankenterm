@@ -21,6 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 DEFAULT_TIMEOUT=120
 DEFAULT_ARTIFACTS_BASE="$PROJECT_ROOT/e2e-artifacts"
 
@@ -543,7 +544,7 @@ SCENARIO_REGISTRY=(
     "reliability_hardening|Validate circuit breaker, retry, degradation, chaos, watchdog|true|cargo,jq|Protects resilience and fault tolerance"
     "perf_regression|Perf regression smoke: patterns, delta, cache, benchmarks with budget validation|true|cargo,jq|Protects performance budgets"
     "input_latency_resize_storm|Validate typing/mouse/paste interaction latency during resize/font churn|true|cargo,jq|Protects user-perceived responsiveness under resize storms"
-    "distributed_streaming|Validate distributed agent->aggregator streaming, persistence, and query/auth robustness|false|cargo,jq|Protects optional distributed mode end-to-end"
+    "distributed_streaming|Validate distributed agent->aggregator streaming, persistence, and query/auth robustness|false|jq,rch|Protects optional distributed mode end-to-end"
     "timeline_correlation|Validate timeline cross-pane correlation (aggregation, failover, temporal)|true|cargo,jq,sqlite3|Protects event correlation determinism"
     "replay_capture_pipeline|Validate replay capture extraction/redaction/artifact/decision roundtrip with structured logs|false|cargo,jq,rch|Protects deterministic replay capture data plane"
 )
@@ -10712,25 +10713,31 @@ EOF
         return 0
     fi
 
-    log_info "[$case_name] Step 2: running distributed streaming cargo test suite"
+    log_info "[$case_name] Step 2: running distributed streaming cargo test suite through RCH"
     local test_started
     test_started=$(date +%s)
+    local rch_run_id="${RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
+    local rch_target_dir="${FT_E2E_DISTRIBUTED_RCH_TARGET_DIR:-/tmp/ft-e2e-distributed-streaming-${rch_run_id}}"
     local cargo_status=0
+    rch_init "$scenario_dir" "$rch_run_id" "distributed_streaming" "$PROJECT_ROOT"
+    ensure_rch_ready
     set +e
-    timeout "$TIMEOUT" cargo test -p frankenterm-core --features distributed \
-        --test distributed_streaming_e2e -- --nocapture >"$test_log" 2>&1
+    run_rch_cargo_logged_with_timeout "$TIMEOUT" "$test_log" \
+        env CARGO_TARGET_DIR="$rch_target_dir" \
+        cargo test -p frankenterm-core --features distributed \
+            --test distributed_streaming_e2e -- --nocapture
     cargo_status=$?
     set -e
     local test_duration=$(( $(date +%s) - test_started ))
 
     if [[ "$cargo_status" -eq 124 ]]; then
-        log_fail "[$case_name] timeout after ${test_duration}s running cargo test"
+        log_fail "[$case_name] timeout after ${test_duration}s running remote cargo test"
         result=4
     elif [[ "$cargo_status" -ne 0 ]]; then
-        log_fail "[$case_name] cargo test failed (exit=$cargo_status, duration=${test_duration}s)"
+        log_fail "[$case_name] remote cargo test failed (exit=$cargo_status, duration=${test_duration}s)"
         result=1
     else
-        log_pass "[$case_name] cargo test passed (${test_duration}s)"
+        log_pass "[$case_name] remote cargo test passed (${test_duration}s)"
     fi
 
     log_info "[$case_name] Step 3: extracting required artifacts from test output"

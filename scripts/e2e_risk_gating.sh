@@ -11,8 +11,8 @@
 #   - Risk metadata is visible in policy decision outputs
 #
 # Requirements:
-#   - wa binary built
 #   - jq for JSON manipulation
+#   - rch for remote Cargo test execution
 # =============================================================================
 
 set -euo pipefail
@@ -21,6 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -44,6 +45,11 @@ TESTS_FAILED=0
 
 # Binary path
 FT_BIN=""
+
+# RCH cargo offload state
+E2E_RCH_RUN_ID="${E2E_RCH_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
+E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-/tmp/ft-e2e-risk-gating-${E2E_RCH_RUN_ID}}"
+E2E_RCH_READY=0
 
 # Logging functions
 log_test() {
@@ -80,7 +86,7 @@ find_ft_binary() {
         fi
     done
 
-    echo "Error: wa binary not found. Run 'cargo build' first."
+    echo "Error: ft binary not found. Build ft before running this harness."
     exit 1
 }
 
@@ -100,6 +106,39 @@ run_wa_timeout() {
         /^{/ { found=1 }
         found { print }
     '
+}
+
+ensure_rch_for_cargo_tests() {
+    if [[ "$E2E_RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-${E2E_RCH_RUN_ID}}"
+    mkdir -p "$rch_log_dir"
+    rch_init "$rch_log_dir" "$E2E_RCH_RUN_ID" "risk_gating" "$PROJECT_ROOT"
+    ensure_rch_ready
+    E2E_RCH_READY=1
+}
+
+run_core_cargo_test() {
+    local output_name="$1"
+    shift
+
+    ensure_rch_for_cargo_tests
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-${E2E_RCH_RUN_ID}}"
+    local output_file="${rch_log_dir}/${output_name}.rch.log"
+    mkdir -p "$rch_log_dir"
+
+    set +e
+    run_rch_cargo_logged "$output_file" \
+        env CARGO_TARGET_DIR="$E2E_RCH_TARGET_DIR" \
+        cargo test -p frankenterm-core "$@"
+    local rc=$?
+    set -e
+
+    cat "$output_file"
+    return "$rc"
 }
 
 # =============================================================================
@@ -193,7 +232,7 @@ test_risk_scoring_unit_tests() {
 
     # Run the comprehensive risk scoring tests
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk 2>&1 || true)
+    output=$(run_core_cargo_test risk_scoring_unit_tests risk 2>&1 || true)
 
     e2e_add_file "risk_scoring_unit_tests" "cargo_test_output.txt" "$output"
 
@@ -218,7 +257,7 @@ test_risk_determinism() {
 
     # Run the determinism test specifically
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_score_deterministic -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test risk_determinism risk_score_deterministic -- --nocapture 2>&1 || true)
 
     e2e_add_file "risk_determinism" "determinism_test.txt" "$output"
 
@@ -238,7 +277,7 @@ test_risk_factor_ordering() {
     log_test "Risk Factor Ordering Stability"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_factors_have_stable_ordering -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test risk_factor_ordering risk_factors_have_stable_ordering -- --nocapture 2>&1 || true)
 
     e2e_add_file "risk_factor_ordering" "ordering_test.txt" "$output"
 
@@ -259,7 +298,7 @@ test_risk_decision_mapping() {
 
     # Run all three decision mapping tests
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_to_decision -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test risk_decision_mapping risk_to_decision -- --nocapture 2>&1 || true)
 
     e2e_add_file "risk_decision_mapping" "decision_tests.txt" "$output"
 
@@ -296,11 +335,11 @@ test_risk_decision_mapping() {
 test_risk_json_schema() {
     log_test "Risk JSON Schema Validation"
 
-    # Run each test separately since cargo test only accepts one filter
+    # Run each filter separately.
     local output1 output2 output3 output
-    output1=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_score_json_schema -- --nocapture 2>&1 || true)
-    output2=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_factor_json_schema -- --nocapture 2>&1 || true)
-    output3=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core decision_context_risk -- --nocapture 2>&1 || true)
+    output1=$(run_core_cargo_test risk_score_json_schema risk_score_json_schema -- --nocapture 2>&1 || true)
+    output2=$(run_core_cargo_test risk_factor_json_schema risk_factor_json_schema -- --nocapture 2>&1 || true)
+    output3=$(run_core_cargo_test decision_context_risk decision_context_risk -- --nocapture 2>&1 || true)
     output="$output1"$'\n'"$output2"$'\n'"$output3"
 
     e2e_add_file "risk_json_schema" "schema_tests.txt" "$output"
@@ -339,7 +378,7 @@ test_risk_matrix() {
     log_test "Risk Scoring Matrix Coverage"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core risk_matrix -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test risk_matrix risk_matrix -- --nocapture 2>&1 || true)
 
     e2e_add_file "risk_matrix" "matrix_tests.txt" "$output"
 

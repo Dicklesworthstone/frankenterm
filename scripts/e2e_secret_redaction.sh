@@ -14,9 +14,8 @@
 #   - No raw secrets appear in any E2E artifacts
 #
 # Requirements:
-#   - wa binary built
 #   - jq for JSON manipulation
-#   - cargo for running unit tests
+#   - rch for remote Cargo test execution
 # =============================================================================
 
 set -euo pipefail
@@ -24,6 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -47,6 +47,11 @@ TESTS_FAILED=0
 
 # Binary path
 FT_BIN=""
+
+# RCH cargo offload state
+E2E_RCH_RUN_ID="${E2E_RCH_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
+E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-/tmp/ft-e2e-secret-redaction-${E2E_RCH_RUN_ID}}"
+E2E_RCH_READY=0
 
 # Fake secrets used throughout the tests.  These MUST NOT appear in any artifact.
 FAKE_OPENAI_KEY="sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"
@@ -92,7 +97,7 @@ find_ft_binary() {
         fi
     done
 
-    echo "Error: wa binary not found. Run 'cargo build' first."
+    echo "Error: ft binary not found. Build ft before running this harness."
     exit 1
 }
 
@@ -112,6 +117,39 @@ run_wa_timeout() {
     '
 }
 
+ensure_rch_for_cargo_tests() {
+    if [[ "$E2E_RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-${E2E_RCH_RUN_ID}}"
+    mkdir -p "$rch_log_dir"
+    rch_init "$rch_log_dir" "$E2E_RCH_RUN_ID" "secret_redaction" "$PROJECT_ROOT"
+    ensure_rch_ready
+    E2E_RCH_READY=1
+}
+
+run_core_cargo_test() {
+    local output_name="$1"
+    shift
+
+    ensure_rch_for_cargo_tests
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-${E2E_RCH_RUN_ID}}"
+    local output_file="${rch_log_dir}/${output_name}.rch.log"
+    mkdir -p "$rch_log_dir"
+
+    set +e
+    run_rch_cargo_logged "$output_file" \
+        env CARGO_TARGET_DIR="$E2E_RCH_TARGET_DIR" \
+        cargo test -p frankenterm-core "$@"
+    local rc=$?
+    set -e
+
+    cat "$output_file"
+    return "$rc"
+}
+
 # =============================================================================
 # Test: Redactor true positives — all 15 patterns detected
 # =============================================================================
@@ -120,7 +158,7 @@ test_redactor_true_positives() {
     log_test "Redactor True Positives (All Secret Patterns)"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test redactor_true_positives redactor_redacts -- --nocapture 2>&1 || true)
 
     e2e_add_file "redactor_true_positives.txt" "$output"
 
@@ -183,7 +221,7 @@ test_redactor_false_positives() {
     log_test "Redactor False Positive Avoidance"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_does_not_redact -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test redactor_false_positives redactor_does_not_redact -- --nocapture 2>&1 || true)
 
     e2e_add_file "redactor_false_positives.txt" "$output"
 
@@ -235,15 +273,15 @@ test_redactor_helpers() {
     log_test "Redactor Helper Functions"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_contains_secrets -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test redactor_contains_secrets redactor_contains_secrets -- --nocapture 2>&1 || true)
     local output2
-    output2=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_detect -- --nocapture 2>&1 || true)
+    output2=$(run_core_cargo_test redactor_detect redactor_detect -- --nocapture 2>&1 || true)
     local output3
-    output3=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_debug_markers -- --nocapture 2>&1 || true)
+    output3=$(run_core_cargo_test redactor_debug_markers redactor_debug_markers -- --nocapture 2>&1 || true)
     local output4
-    output4=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_handles_multiple -- --nocapture 2>&1 || true)
+    output4=$(run_core_cargo_test redactor_handles_multiple redactor_handles_multiple -- --nocapture 2>&1 || true)
     local output5
-    output5=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_preserves_surrounding -- --nocapture 2>&1 || true)
+    output5=$(run_core_cargo_test redactor_preserves_surrounding redactor_preserves_surrounding -- --nocapture 2>&1 || true)
 
     local combined="$output"$'\n'"$output2"$'\n'"$output3"$'\n'"$output4"$'\n'"$output5"
     e2e_add_file "redactor_helpers.txt" "$combined"
@@ -303,7 +341,7 @@ test_redactor_policy_integration() {
     log_test "Redactor PolicyEngine Integration"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_policy_engine_integration -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test redactor_policy_integration redactor_policy_engine_integration -- --nocapture 2>&1 || true)
 
     e2e_add_file "redactor_policy_integration.txt" "$output"
 
@@ -323,7 +361,7 @@ test_audit_summary_redaction() {
 
     # Run the audit-related tests to verify summary building redacts content
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core send_text_audit -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test audit_summary_redaction send_text_audit -- --nocapture 2>&1 || true)
 
     e2e_add_file "audit_summary_redaction.txt" "$output"
 
@@ -354,10 +392,10 @@ test_audit_record_redact_fields() {
     log_test "AuditActionRecord redact_fields"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core audit_action_record -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test audit_action_record audit_action_record -- --nocapture 2>&1 || true)
     # Also try alternate test name patterns
     local output2
-    output2=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redact_fields -- --nocapture 2>&1 || true)
+    output2=$(run_core_cargo_test redact_fields redact_fields -- --nocapture 2>&1 || true)
 
     local combined="$output"$'\n'"$output2"
     e2e_add_file "audit_record_redact_fields.txt" "$combined"
@@ -396,7 +434,7 @@ test_dryrun_redacts_openai_key() {
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
             log_info "Compatibility backend bridge not running -- checking redaction via unit tests"
             local fallback_output
-            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_openai -- --nocapture 2>&1 || true)
+            fallback_output=$(run_core_cargo_test redactor_redacts_openai redactor_redacts_openai -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then
                 log_pass "OpenAI key redacted (validated via unit test)"
             else
@@ -436,7 +474,7 @@ test_dryrun_redacts_github_pat() {
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
             log_info "Compatibility backend bridge not running -- checking redaction via unit test"
             local fallback_output
-            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_github -- --nocapture 2>&1 || true)
+            fallback_output=$(run_core_cargo_test redactor_redacts_github redactor_redacts_github -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then
                 log_pass "GitHub PAT redacted (validated via unit test)"
             else
@@ -476,7 +514,7 @@ test_dryrun_redacts_db_url() {
         if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
             log_info "Compatibility backend bridge not running -- checking redaction via unit test"
             local fallback_output
-            fallback_output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor_redacts_database -- --nocapture 2>&1 || true)
+            fallback_output=$(run_core_cargo_test redactor_redacts_database redactor_redacts_database -- --nocapture 2>&1 || true)
             if echo "$fallback_output" | grep -q "ok"; then
                 log_pass "Database URL password redacted (validated via unit test)"
             else
@@ -557,7 +595,7 @@ test_redaction_test_coverage() {
     log_test "Redaction Test Coverage Count"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core redactor -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test redaction_test_coverage redactor -- --nocapture 2>&1 || true)
 
     e2e_add_file "redaction_test_coverage.txt" "$output"
 

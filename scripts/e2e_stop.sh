@@ -18,9 +18,8 @@
 #   - Config/layout resolution (workspace lock path exists)
 #
 # Requirements:
-#   - wa binary built
 #   - jq for JSON manipulation
-#   - cargo for running unit tests
+#   - rch for remote Cargo test execution
 # =============================================================================
 
 set -euo pipefail
@@ -28,6 +27,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -51,6 +51,11 @@ TESTS_FAILED=0
 
 # Binary path
 FT_BIN=""
+
+# RCH cargo offload state
+E2E_RCH_RUN_ID="${E2E_RCH_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
+E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-/tmp/ft-e2e-stop-${E2E_RCH_RUN_ID}}"
+E2E_RCH_READY=0
 
 # Temp workspace for isolation
 TEMP_WORKSPACE=""
@@ -90,8 +95,41 @@ find_ft_binary() {
         fi
     done
 
-    echo "Error: wa binary not found. Run 'cargo build' first."
+    echo "Error: ft binary not found. Build ft before running this harness."
     exit 1
+}
+
+ensure_rch_for_cargo_tests() {
+    if [[ "$E2E_RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-${E2E_RCH_RUN_ID}}"
+    mkdir -p "$rch_log_dir"
+    rch_init "$rch_log_dir" "$E2E_RCH_RUN_ID" "stop_shutdown" "$PROJECT_ROOT"
+    ensure_rch_ready
+    E2E_RCH_READY=1
+}
+
+run_core_cargo_test() {
+    local output_name="$1"
+    shift
+
+    ensure_rch_for_cargo_tests
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-${E2E_RCH_RUN_ID}}"
+    local output_file="${rch_log_dir}/${output_name}.rch.log"
+    mkdir -p "$rch_log_dir"
+
+    set +e
+    run_rch_cargo_logged "$output_file" \
+        env CARGO_TARGET_DIR="$E2E_RCH_TARGET_DIR" \
+        cargo test -p frankenterm-core "$@"
+    local rc=$?
+    set -e
+
+    cat "$output_file"
+    return "$rc"
 }
 
 # Setup temp workspace
@@ -199,7 +237,7 @@ test_lock_acquire_release() {
     log_test "Lock: Acquire and Release Lifecycle"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core lock::tests -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test lock_tests lock::tests -- --nocapture 2>&1 || true)
 
     e2e_add_file "lock_tests.txt" "$output"
 
@@ -220,7 +258,7 @@ test_check_running_no_lock() {
     log_test "Lock: check_running Returns None Without Lock File"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core check_running_returns_none -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test check_running_no_lock check_running_returns_none -- --nocapture 2>&1 || true)
 
     e2e_add_file "check_running_no_lock.txt" "$output"
 
@@ -241,7 +279,7 @@ test_stale_lock_detection() {
     log_test "Lock: Stale Lock Detection"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core stale_lock -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test stale_lock_detection stale_lock -- --nocapture 2>&1 || true)
 
     e2e_add_file "stale_lock_detection.txt" "$output"
 
@@ -262,7 +300,7 @@ test_lock_metadata() {
     log_test "Lock: Metadata Written Correctly"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core lock_metadata -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test lock_metadata lock_metadata -- --nocapture 2>&1 || true)
 
     e2e_add_file "lock_metadata.txt" "$output"
 
@@ -287,7 +325,7 @@ test_workspace_lock_path() {
     log_test "Workspace: Lock Path Resolution"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core workspace_layout -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test workspace_layout workspace_layout -- --nocapture 2>&1 || true)
 
     e2e_add_file "workspace_layout.txt" "$output"
 
@@ -306,7 +344,7 @@ test_watcher_signal_handling() {
     log_test "Watcher: Signal Handling Tests"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core signal -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test signal_handling signal -- --nocapture 2>&1 || true)
 
     e2e_add_file "signal_handling.txt" "$output"
 
@@ -328,7 +366,7 @@ test_watchdog_shutdown() {
     log_test "Watchdog: Shutdown on Signal"
 
     local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p frankenterm-core watchdog_shuts_down_on_signal -- --nocapture 2>&1 || true)
+    output=$(run_core_cargo_test watchdog_shutdown watchdog_shuts_down_on_signal -- --nocapture 2>&1 || true)
 
     e2e_add_file "watchdog_shutdown.txt" "$output"
 
