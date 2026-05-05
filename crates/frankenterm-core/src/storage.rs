@@ -62,7 +62,7 @@ use crate::storage::io_scheduler::{
     StorageIoWorkItem,
 };
 use crate::storage_backend_helpers::{count_table_where, execute_typed, row_exists_where};
-use crate::storage_backend_row_helpers::RowReader;
+use crate::storage_backend_row_helpers::{CellRowReader, RowReader};
 use crate::storage_backend_trait::{
     BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
 };
@@ -8642,31 +8642,29 @@ fn dispatch_write_command_raw(
             });
             respond_oneshot_best_effort(respond, result);
         }
-        // br-ft-dngp2: agent_profiles CRUD wraps the slice-1
-        // sync primitives. AgentProfileSqlError → StorageError
-        // is handled by `agent_profile_sql_to_error` so the
-        // four arms read uniform.
         WriteCommand::InsertAgentProfile { profile, respond } => {
-            let result = agent_profiles_sql::insert_agent_profile(conn, &profile)
-                .map_err(agent_profile_sql_to_error);
+            let result = with_writer_backend(conn, |backend| {
+                insert_agent_profile_backend(backend, &profile)
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::GetAgentProfile { name, respond } => {
-            let result = agent_profiles_sql::get_agent_profile(conn, &name)
-                .map_err(agent_profile_sql_to_error);
+            let result =
+                with_writer_backend(conn, |backend| get_agent_profile_backend(backend, &name));
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ListAgentProfiles {
             role_filter,
             respond,
         } => {
-            let result = agent_profiles_sql::list_agent_profiles(conn, role_filter.as_deref())
-                .map_err(agent_profile_sql_to_error);
+            let result = with_writer_backend(conn, |backend| {
+                list_agent_profiles_backend(backend, role_filter.as_deref())
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteAgentProfile { name, respond } => {
-            let result = agent_profiles_sql::delete_agent_profile(conn, &name)
-                .map_err(agent_profile_sql_to_error);
+            let result =
+                with_writer_backend(conn, |backend| delete_agent_profile_backend(backend, &name));
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertMuxSession {
@@ -11327,6 +11325,154 @@ fn agent_profile_sql_to_error(
     err: agent_profiles_sql::AgentProfileSqlError,
 ) -> crate::error::Error {
     crate::error::Error::Storage(StorageError::Database(format!("agent_profiles: {err}")))
+}
+
+/// br-ft-l1jgo writer-thread migration: insert agent profiles through
+/// [`StorageBackend`] while preserving the existing
+/// [`crate::agent_profiles::AgentProfile::validate`] preflight.
+fn insert_agent_profile_backend(
+    backend: &dyn StorageBackend,
+    profile: &crate::agent_profiles::AgentProfile,
+) -> Result<String> {
+    profile.validate().map_err(|err| {
+        agent_profile_sql_to_error(agent_profiles_sql::AgentProfileSqlError::Invalid(err))
+    })?;
+    let tags_json = serde_json::to_string(&profile.tags).expect("tags serialize");
+    let env_json = serde_json::to_string(&profile.env).expect("env serialize");
+    let metadata_json = serde_json::to_string(&profile.metadata).expect("metadata serialize");
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO agent_profiles
+             (name, role, tags, shell, command, env, metadata, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             RETURNING name",
+            &[
+                ToSqlValue::Text(profile.name.as_str()),
+                ToSqlValue::Text(profile.role.as_str()),
+                ToSqlValue::Text(tags_json.as_str()),
+                ToSqlValue::Text(profile.shell.as_str()),
+                ToSqlValue::optional_text(profile.command.as_deref()),
+                ToSqlValue::Text(env_json.as_str()),
+                ToSqlValue::Text(metadata_json.as_str()),
+                ToSqlValue::Integer(profile.created_at_ms),
+                ToSqlValue::Integer(profile.updated_at_ms),
+            ],
+        )
+        .map_err(|err| storage_backend_error("agent_profiles insert", err))?
+        .ok_or_else(|| {
+            StorageError::Database("agent_profiles insert returned no name".to_string())
+        })?;
+    RowReader::new(&row)
+        .string(0)
+        .map_err(|err| storage_backend_error("agent_profiles inserted name", err).into())
+}
+
+fn get_agent_profile_backend(
+    backend: &dyn StorageBackend,
+    name: &str,
+) -> Result<Option<crate::agent_profiles::AgentProfile>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT name, role, tags, shell, command, env, metadata,
+                    created_at_ms, updated_at_ms
+             FROM agent_profiles
+             WHERE name = ?1",
+            &[ToSqlValue::Text(name)],
+        )
+        .map_err(|err| storage_backend_error("agent_profiles get", err))?;
+    row.as_deref()
+        .map(agent_profile_from_backend_cells)
+        .transpose()
+}
+
+fn list_agent_profiles_backend(
+    backend: &dyn StorageBackend,
+    role_filter: Option<&str>,
+) -> Result<Vec<crate::agent_profiles::AgentProfile>> {
+    let rows = match role_filter {
+        Some(role) => backend.query_map_cells(
+            "SELECT name, role, tags, shell, command, env, metadata,
+                    created_at_ms, updated_at_ms
+             FROM agent_profiles
+             WHERE role = ?1
+             ORDER BY name ASC",
+            &[ToSqlValue::Text(role)],
+        ),
+        None => backend.query_map_cells(
+            "SELECT name, role, tags, shell, command, env, metadata,
+                    created_at_ms, updated_at_ms
+             FROM agent_profiles
+             ORDER BY name ASC",
+            &[],
+        ),
+    }
+    .map_err(|err| storage_backend_error("agent_profiles list", err))?;
+    rows.iter()
+        .map(|row| agent_profile_from_backend_cells(row))
+        .collect()
+}
+
+fn delete_agent_profile_backend(backend: &dyn StorageBackend, name: &str) -> Result<bool> {
+    let deleted = backend
+        .query_row_typed(
+            "DELETE FROM agent_profiles WHERE name = ?1 RETURNING 1",
+            &[ToSqlValue::Text(name)],
+        )
+        .map_err(|err| storage_backend_error("agent_profiles delete", err))?;
+    Ok(deleted.is_some())
+}
+
+fn agent_profile_from_backend_cells(
+    row: &[SqlCell],
+) -> Result<crate::agent_profiles::AgentProfile> {
+    let reader = CellRowReader::new(row);
+    let tags_json = reader
+        .string(2)
+        .map_err(|err| storage_backend_error("agent_profiles tags", err))?;
+    let env_json = reader
+        .string(5)
+        .map_err(|err| storage_backend_error("agent_profiles env", err))?;
+    let metadata_json = reader
+        .string(6)
+        .map_err(|err| storage_backend_error("agent_profiles metadata", err))?;
+    Ok(crate::agent_profiles::AgentProfile {
+        name: reader
+            .string(0)
+            .map_err(|err| storage_backend_error("agent_profiles name", err))?,
+        role: reader
+            .string(1)
+            .map_err(|err| storage_backend_error("agent_profiles role", err))?,
+        tags: serde_json::from_str(&tags_json).map_err(|err| {
+            agent_profile_sql_to_error(agent_profiles_sql::AgentProfileSqlError::Decode {
+                column: "tags",
+                msg: err.to_string(),
+            })
+        })?,
+        shell: reader
+            .string(3)
+            .map_err(|err| storage_backend_error("agent_profiles shell", err))?,
+        command: reader
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("agent_profiles command", err))?,
+        env: serde_json::from_str(&env_json).map_err(|err| {
+            agent_profile_sql_to_error(agent_profiles_sql::AgentProfileSqlError::Decode {
+                column: "env",
+                msg: err.to_string(),
+            })
+        })?,
+        metadata: serde_json::from_str(&metadata_json).map_err(|err| {
+            agent_profile_sql_to_error(agent_profiles_sql::AgentProfileSqlError::Decode {
+                column: "metadata",
+                msg: err.to_string(),
+            })
+        })?,
+        created_at_ms: reader
+            .i64(7)
+            .map_err(|err| storage_backend_error("agent_profiles created_at_ms", err))?,
+        updated_at_ms: reader
+            .i64(8)
+            .map_err(|err| storage_backend_error("agent_profiles updated_at_ms", err))?,
+    })
 }
 
 // =============================================================================
