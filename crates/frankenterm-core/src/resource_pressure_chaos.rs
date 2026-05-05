@@ -10,7 +10,15 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fleet_memory_controller::{
+    FleetMemoryTier, FleetMemoryTierBudgetRecord, FleetMemoryTierBudgetSnapshot, FleetPressureTier,
+};
 use crate::hardware_profile::HardwareProofStatus;
+use crate::latency_stages::{LatencyStage, StagePressure};
+use crate::swarm_scheduler::{
+    AdmissionAction, AdmissionReasonCode, AdmissionRequest, QueuePressure,
+    ResourceAdmissionDecisionSummary, SwarmAdmissionController, SwarmAdmissionTelemetry,
+};
 
 /// Current resource-pressure chaos verdict schema version.
 pub const RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION: u32 = 1;
@@ -144,10 +152,7 @@ impl ResourcePressureChaosStatus {
 
     /// Whether this status can satisfy a coverage row.
     pub const fn counts_as_covered(self) -> bool {
-        matches!(
-            self,
-            Self::Pass | Self::SkippedNotProven | Self::ExpectedBlockedByInfra
-        )
+        matches!(self, Self::Pass)
     }
 }
 
@@ -228,6 +233,162 @@ pub struct ResourcePressureFailClosedDecision {
     pub fail_closed: bool,
     /// Decision rationale or denial/degrade reason.
     pub reason: String,
+}
+
+/// Queue-depth evidence captured before and after a CPU/queue pressure scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureQueueObservation {
+    /// Queue depth before injecting the pressure event.
+    pub queue_depth_before: u32,
+    /// Queue depth after the admission mitigation ran.
+    pub queue_depth_after: u32,
+    /// Scenario-declared bound for acceptable queue growth.
+    pub queue_depth_bound: u32,
+    /// Admission-controller queue utilization in basis points (10_000 = 100%).
+    pub queue_utilization_basis_points: u32,
+    /// Pending items observed by the resource cockpit/admission controller.
+    pub pending_items: u32,
+    /// Total schedulable capacity observed by the admission controller.
+    pub total_capacity: u32,
+}
+
+impl ResourcePressureQueueObservation {
+    /// Whether post-injection queue depth stayed within the declared bound.
+    #[must_use]
+    pub const fn bounded_after_injection(&self) -> bool {
+        self.queue_depth_after <= self.queue_depth_bound
+    }
+}
+
+/// Resource-cockpit fields that explain a CPU/queue admission decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureCockpitTelemetry {
+    /// Queue utilization in basis points (10_000 = 100%).
+    pub queue_utilization_basis_points: u32,
+    /// Pending items reported to the cockpit.
+    pub pending_items: u32,
+    /// Total schedulable capacity reported to the cockpit.
+    pub total_capacity: u32,
+    /// Raw pressure severity before priority protection.
+    pub raw_pressure_severity: u8,
+    /// Effective pressure severity after priority protection/fail-closed gates.
+    pub effective_pressure_severity: u8,
+    /// Final admission action reported to operators.
+    pub admission_action: AdmissionAction,
+    /// Primary mitigation reason reported to operators.
+    pub mitigation_reason_code: AdmissionReasonCode,
+}
+
+/// Admission-controller observation required for CPU and queue chaos verdicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureAdmissionObservation {
+    /// Bounded queue evidence for the scenario.
+    pub queue: ResourcePressureQueueObservation,
+    /// Final admission action.
+    pub admission_action: AdmissionAction,
+    /// Stable reason codes emitted by the admission controller.
+    pub admission_reason_codes: Vec<AdmissionReasonCode>,
+    /// Reason code that identifies the observed mitigation path.
+    pub mitigation_reason_code: AdmissionReasonCode,
+    /// Resource-cockpit telemetry surfaced with the decision.
+    pub resource_cockpit: ResourcePressureCockpitTelemetry,
+}
+
+impl ResourcePressureAdmissionObservation {
+    /// Build a CPU/queue observation from the real swarm admission decision summary.
+    #[must_use]
+    pub fn from_admission_decision(
+        queue_depth_before: u32,
+        queue_depth_after: u32,
+        queue_depth_bound: u32,
+        total_capacity: u32,
+        decision: &ResourceAdmissionDecisionSummary,
+        mitigation_reason_code: AdmissionReasonCode,
+    ) -> Self {
+        let queue_utilization_basis_points =
+            utilization_to_basis_points(decision.queue_utilization);
+        let pending_items = decision.pending_items.unwrap_or(queue_depth_after);
+        Self {
+            queue: ResourcePressureQueueObservation {
+                queue_depth_before,
+                queue_depth_after,
+                queue_depth_bound,
+                queue_utilization_basis_points,
+                pending_items,
+                total_capacity,
+            },
+            admission_action: decision.action,
+            admission_reason_codes: decision.reason_codes.clone(),
+            mitigation_reason_code,
+            resource_cockpit: ResourcePressureCockpitTelemetry {
+                queue_utilization_basis_points,
+                pending_items,
+                total_capacity,
+                raw_pressure_severity: decision.raw_pressure_severity,
+                effective_pressure_severity: decision.effective_pressure_severity,
+                admission_action: decision.action,
+                mitigation_reason_code,
+            },
+        }
+    }
+
+    fn validate(
+        &self,
+        status: ResourcePressureChaosStatus,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+    ) {
+        if self.queue.queue_depth_bound == 0 {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "admission_observation.queue.queue_depth_bound",
+                "must be greater than zero",
+            ));
+        }
+
+        if self.admission_reason_codes.is_empty() {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "admission_observation.admission_reason_codes",
+                "must not be empty",
+            ));
+        }
+
+        if !self
+            .admission_reason_codes
+            .contains(&self.mitigation_reason_code)
+        {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "admission_observation.mitigation_reason_code",
+                "must be present in admission_reason_codes",
+            ));
+        }
+
+        if self.resource_cockpit.queue_utilization_basis_points
+            != self.queue.queue_utilization_basis_points
+            || self.resource_cockpit.pending_items != self.queue.pending_items
+            || self.resource_cockpit.total_capacity != self.queue.total_capacity
+            || self.resource_cockpit.admission_action != self.admission_action
+            || self.resource_cockpit.mitigation_reason_code != self.mitigation_reason_code
+        {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "admission_observation.resource_cockpit",
+                "must mirror the queue and admission decision fields",
+            ));
+        }
+
+        if status == ResourcePressureChaosStatus::Pass {
+            if self.admission_action == AdmissionAction::Admit {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "admission_observation.admission_action",
+                    "pass verdicts under CPU/queue pressure require defer, degrade, or shed",
+                ));
+            }
+            if !self.queue.bounded_after_injection() {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "admission_observation.queue.queue_depth_after",
+                    "pass verdicts must keep queue depth within the declared bound",
+                ));
+            }
+        }
+    }
 }
 
 /// Hardware predicate evidence for real high-scale proof.
@@ -319,6 +480,9 @@ pub struct ResourcePressureChaosVerdict {
     pub assertions: Vec<ResourcePressureAssertion>,
     /// Hardware predicate evidence for real high-scale proof.
     pub hardware_evidence: Option<HighScaleHardwareEvidence>,
+    /// CPU/queue admission observation, required for CPU and queue scenarios.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_observation: Option<ResourcePressureAdmissionObservation>,
 }
 
 impl ResourcePressureChaosVerdict {
@@ -444,6 +608,13 @@ impl ResourcePressureChaosVerdict {
             push_blank_violation(&mut violations, "diagnostics.message", &diagnostic.message);
         }
 
+        if matches!(
+            self.pressure_class,
+            ResourcePressureClass::CpuAdmission | ResourcePressureClass::QueueSaturation
+        ) {
+            self.validate_cpu_queue_observation(&mut violations);
+        }
+
         if violations.is_empty() {
             Ok(())
         } else {
@@ -462,6 +633,37 @@ impl ResourcePressureChaosVerdict {
         row.required_assertions
             .iter()
             .all(|assertion| present.contains(assertion))
+    }
+
+    fn validate_cpu_queue_observation(
+        &self,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+    ) {
+        let Some(observation) = self.admission_observation.as_ref() else {
+            if matches!(
+                self.status,
+                ResourcePressureChaosStatus::Pass | ResourcePressureChaosStatus::Fail
+            ) {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "admission_observation",
+                    "executed CPU admission and queue saturation verdicts require admission observation evidence",
+                ));
+            }
+            return;
+        };
+
+        observation.validate(self.status, violations);
+
+        if self.status == ResourcePressureChaosStatus::Pass
+            && !self.diagnostics.iter().any(|diagnostic| {
+                diagnostic_matches_pressure_class(diagnostic, self.pressure_class)
+            })
+        {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "diagnostics",
+                "CPU/queue pass diagnostics must identify the pressure class",
+            ));
+        }
     }
 }
 
@@ -511,7 +713,7 @@ pub struct ResourcePressureCoverageRow {
     pub pressure_class: ResourcePressureClass,
     /// Human-facing row label.
     pub label: String,
-    /// Whether this row must be pass/skipped before parent completion.
+    /// Whether this row must have a valid pass verdict before parent completion.
     pub required_for_parent_completion: bool,
     /// Assertion vocabulary required for this row to count as covered.
     pub required_assertions: Vec<ResourcePressureAssertion>,
@@ -636,7 +838,7 @@ pub struct ResourcePressureCoverageRowStatus {
     pub pressure_class: ResourcePressureClass,
     /// Whether this row is required for parent completion.
     pub required_for_parent_completion: bool,
-    /// Whether a valid pass/skipped verdict satisfied the row.
+    /// Whether a valid pass verdict satisfied the row.
     pub satisfied: bool,
     /// Scenario that satisfied the row, when available.
     pub satisfying_scenario_id: Option<String>,
@@ -651,7 +853,7 @@ pub struct ResourcePressureCoverageRowStatus {
 pub struct ResourcePressureCoverageAssessment {
     /// Schema version for the assessment.
     pub schema_version: u32,
-    /// Whether every required row has a pass/skipped verdict.
+    /// Whether every required row has a valid pass verdict.
     pub parent_completion_ready: bool,
     /// Per-row accounting.
     pub row_statuses: Vec<ResourcePressureCoverageRowStatus>,
@@ -695,6 +897,7 @@ pub fn sample_pass_verdict() -> ResourcePressureChaosVerdict {
         hardware_evidence: Some(HighScaleHardwareEvidence::satisfied(
             "hardware predicates met for sample high-scale pass",
         )),
+        admission_observation: Some(cpu_admission_observation()),
     }
 }
 
@@ -729,6 +932,7 @@ pub fn sample_fail_verdict() -> ResourcePressureChaosVerdict {
             ResourcePressureAssertion::RecoveryObserved,
         ],
         hardware_evidence: None,
+        admission_observation: None,
     }
 }
 
@@ -764,6 +968,7 @@ pub fn sample_skipped_not_proven_verdict() -> ResourcePressureChaosVerdict {
         hardware_evidence: Some(HighScaleHardwareEvidence::skipped(
             "hardware predicates not met",
         )),
+        admission_observation: None,
     }
 }
 
@@ -799,7 +1004,241 @@ pub fn sample_expected_blocked_by_infra_verdict() -> ResourcePressureChaosVerdic
             ResourcePressureAssertion::RecoveryObserved,
         ],
         hardware_evidence: None,
+        admission_observation: None,
     }
+}
+
+/// Reduced CPU-admission fixture derived from the real swarm admission path.
+pub fn cpu_admission_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
+    let decision = admission_decision_for_queue(cpu_admission_queue_pressure());
+    ResourcePressureChaosVerdict {
+        schema_version: RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION,
+        scenario_id: "ft-lmg3g.2.cpu_admission.reduced".into(),
+        pressure_class: ResourcePressureClass::CpuAdmission,
+        mode: ResourcePressureChaosMode::Reduced,
+        preconditions: vec![
+            "bounded CPU-admission fixture uses scheduler telemetry, not host-wide load".into(),
+            "resource cockpit reports queue utilization and pending work".into(),
+        ],
+        injected_fault:
+            "scheduler CPU scarcity represented as sustained high admission utilization".into(),
+        observed_mitigation:
+            "admission controller degraded non-critical work before queue growth escaped the bound"
+                .into(),
+        fail_closed_decision: ResourcePressureFailClosedDecision {
+            fail_closed: true,
+            reason: "non-critical CPU-bound work was degraded instead of admitted at full quality"
+                .into(),
+        },
+        diagnostics: vec![ResourcePressureDiagnostic {
+            code: "resource.cpu_admission.degrade_queue_saturated".into(),
+            message: "CPU-driven admission pressure degraded non-critical work".into(),
+            severity: ResourcePressureDiagnosticSeverity::Warn,
+        }],
+        logs_path: Some("artifacts/resource-pressure/cpu-admission/reduced.jsonl".into()),
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        skip_reason: None,
+        status: ResourcePressureChaosStatus::Pass,
+        assertions: vec![
+            ResourcePressureAssertion::FailClosed,
+            ResourcePressureAssertion::BoundedQueueGrowth,
+            ResourcePressureAssertion::DiagnosticEmitted,
+            ResourcePressureAssertion::MitigationLogged,
+        ],
+        hardware_evidence: None,
+        admission_observation: Some(
+            ResourcePressureAdmissionObservation::from_admission_decision(
+                10,
+                10,
+                12,
+                12,
+                &decision,
+                AdmissionReasonCode::QueueSaturated,
+            ),
+        ),
+    }
+}
+
+/// Reduced queue-saturation fixture derived from the real swarm admission path.
+pub fn queue_saturation_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
+    let decision = admission_decision_for_queue(queue_saturation_pressure());
+    ResourcePressureChaosVerdict {
+        schema_version: RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION,
+        scenario_id: "ft-lmg3g.2.queue_saturation.reduced".into(),
+        pressure_class: ResourcePressureClass::QueueSaturation,
+        mode: ResourcePressureChaosMode::Reduced,
+        preconditions: vec![
+            "bounded internal queue capacity declared by the scenario".into(),
+            "admission controller receives complete non-memory telemetry".into(),
+        ],
+        injected_fault: "ready queue is held at saturation while admission requests continue"
+            .into(),
+        observed_mitigation:
+            "admission controller shed low-priority work and held queue depth at the bound".into(),
+        fail_closed_decision: ResourcePressureFailClosedDecision {
+            fail_closed: true,
+            reason: "queue saturation produced a shed decision instead of unbounded backlog".into(),
+        },
+        diagnostics: vec![ResourcePressureDiagnostic {
+            code: "resource.queue_saturation.shed_over_capacity".into(),
+            message: "queue saturation produced explicit shed mitigation".into(),
+            severity: ResourcePressureDiagnosticSeverity::Warn,
+        }],
+        logs_path: Some("artifacts/resource-pressure/queue-saturation/reduced.jsonl".into()),
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        skip_reason: None,
+        status: ResourcePressureChaosStatus::Pass,
+        assertions: vec![
+            ResourcePressureAssertion::BoundedQueueGrowth,
+            ResourcePressureAssertion::NoPanic,
+            ResourcePressureAssertion::DiagnosticEmitted,
+        ],
+        hardware_evidence: None,
+        admission_observation: Some(
+            ResourcePressureAdmissionObservation::from_admission_decision(
+                16,
+                16,
+                16,
+                4,
+                &decision,
+                AdmissionReasonCode::QueueOverCapacity,
+            ),
+        ),
+    }
+}
+
+/// Negative reduced fixture: queue growth escaped the bound and must stay FAIL.
+pub fn queue_saturation_unbounded_fail_verdict() -> ResourcePressureChaosVerdict {
+    ResourcePressureChaosVerdict {
+        schema_version: RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION,
+        scenario_id: "ft-lmg3g.2.queue_saturation.unbounded_fail".into(),
+        pressure_class: ResourcePressureClass::QueueSaturation,
+        mode: ResourcePressureChaosMode::Reduced,
+        preconditions: vec!["misconfigured queue bound intentionally disabled".into()],
+        injected_fault: "queue saturation continued after admission telemetry was ignored".into(),
+        observed_mitigation: "no mitigation held queue depth inside the configured bound".into(),
+        fail_closed_decision: ResourcePressureFailClosedDecision {
+            fail_closed: false,
+            reason: "admission remained open while queue depth exceeded the bound".into(),
+        },
+        diagnostics: vec![ResourcePressureDiagnostic {
+            code: "resource.queue_saturation.unbounded_backlog".into(),
+            message: "queue depth exceeded the declared bound without a shed/degrade decision"
+                .into(),
+            severity: ResourcePressureDiagnosticSeverity::Error,
+        }],
+        logs_path: Some("artifacts/resource-pressure/queue-saturation/unbounded-fail.jsonl".into()),
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        skip_reason: None,
+        status: ResourcePressureChaosStatus::Fail,
+        assertions: vec![
+            ResourcePressureAssertion::BoundedQueueGrowth,
+            ResourcePressureAssertion::DiagnosticEmitted,
+        ],
+        hardware_evidence: None,
+        admission_observation: Some(ResourcePressureAdmissionObservation {
+            queue: ResourcePressureQueueObservation {
+                queue_depth_before: 16,
+                queue_depth_after: 24,
+                queue_depth_bound: 16,
+                queue_utilization_basis_points: 2_500,
+                pending_items: 24,
+                total_capacity: 16,
+            },
+            admission_action: AdmissionAction::Admit,
+            admission_reason_codes: vec![AdmissionReasonCode::Healthy],
+            mitigation_reason_code: AdmissionReasonCode::Healthy,
+            resource_cockpit: ResourcePressureCockpitTelemetry {
+                queue_utilization_basis_points: 2_500,
+                pending_items: 24,
+                total_capacity: 16,
+                raw_pressure_severity: 0,
+                effective_pressure_severity: 0,
+                admission_action: AdmissionAction::Admit,
+                mitigation_reason_code: AdmissionReasonCode::Healthy,
+            },
+        }),
+    }
+}
+
+/// High-scale CPU fixture that cannot claim proof without CPU topology evidence.
+pub fn cpu_admission_high_scale_skipped_not_proven_verdict() -> ResourcePressureChaosVerdict {
+    let mut verdict = cpu_admission_reduced_pass_verdict();
+    verdict.scenario_id = "ft-lmg3g.2.cpu_admission.high_scale.skipped".into();
+    verdict.mode = ResourcePressureChaosMode::HighScale;
+    verdict.proof_level = ResourcePressureProofLevel::SimulatedHighScale;
+    verdict.logs_path = None;
+    verdict.status = ResourcePressureChaosStatus::SkippedNotProven;
+    verdict.skip_reason =
+        Some("64+ logical CPU topology predicate absent; high-scale CPU proof not claimed".into());
+    verdict.hardware_evidence = Some(HighScaleHardwareEvidence::skipped(
+        "64+ logical CPU topology predicate absent",
+    ));
+    verdict
+}
+
+fn cpu_admission_observation() -> ResourcePressureAdmissionObservation {
+    let decision = admission_decision_for_queue(cpu_admission_queue_pressure());
+    ResourcePressureAdmissionObservation::from_admission_decision(
+        10,
+        10,
+        12,
+        12,
+        &decision,
+        AdmissionReasonCode::QueueSaturated,
+    )
+}
+
+fn admission_decision_for_queue(queue_pressure: QueuePressure) -> ResourceAdmissionDecisionSummary {
+    SwarmAdmissionController::default().evaluate(
+        &AdmissionRequest::standard(9, 1),
+        &SwarmAdmissionTelemetry::new(
+            queue_pressure,
+            FleetPressureTier::Normal,
+            healthy_memory_tier_budget(),
+            healthy_latency_stage_pressure(),
+        ),
+    )
+}
+
+fn cpu_admission_queue_pressure() -> QueuePressure {
+    QueuePressure {
+        ready_ratio: 0.20,
+        utilization: 0.93,
+        starvation_count: 0,
+        failure_rate: 0.0,
+        pending_items: 10,
+        active_agents: 4,
+        total_capacity: 12,
+    }
+}
+
+fn queue_saturation_pressure() -> QueuePressure {
+    QueuePressure {
+        ready_ratio: 0.30,
+        utilization: 1.0,
+        starvation_count: 0,
+        failure_rate: 0.0,
+        pending_items: 16,
+        active_agents: 4,
+        total_capacity: 4,
+    }
+}
+
+fn healthy_memory_tier_budget() -> FleetMemoryTierBudgetSnapshot {
+    FleetMemoryTierBudgetSnapshot::from_tiers([FleetMemoryTierBudgetRecord::new(
+        FleetMemoryTier::HotResident,
+        1_000,
+        900,
+    )])
+}
+
+fn healthy_latency_stage_pressure() -> Vec<StagePressure> {
+    vec![StagePressure::compute(
+        LatencyStage::PtyCapture,
+        500.0,
+        1_000.0,
+    )]
 }
 
 fn row(
@@ -834,6 +1273,10 @@ fn assess_row(
             validation_error = Some(error.to_string());
             continue;
         }
+        if !verdict.status.counts_as_covered() {
+            non_covering_status = Some(verdict.status);
+            continue;
+        }
         if !verdict.has_required_assertions(row) {
             let present: BTreeSet<_> = verdict.assertions.iter().copied().collect();
             let missing = row
@@ -847,17 +1290,14 @@ fn assess_row(
             missing_assertions = Some(missing);
             continue;
         }
-        if verdict.status.counts_as_covered() {
-            return ResourcePressureCoverageRowStatus {
-                pressure_class: row.pressure_class,
-                required_for_parent_completion: row.required_for_parent_completion,
-                satisfied: true,
-                satisfying_scenario_id: Some(verdict.scenario_id.clone()),
-                observed_status,
-                reason: format!("covered by {} ({})", verdict.scenario_id, verdict.status),
-            };
-        }
-        non_covering_status = Some(verdict.status);
+        return ResourcePressureCoverageRowStatus {
+            pressure_class: row.pressure_class,
+            required_for_parent_completion: row.required_for_parent_completion,
+            satisfied: true,
+            satisfying_scenario_id: Some(verdict.scenario_id.clone()),
+            observed_status,
+            reason: format!("covered by {} ({})", verdict.scenario_id, verdict.status),
+        };
     }
 
     let reason = if matching.is_empty() {
@@ -921,9 +1361,32 @@ fn push_blank_entry_violation(
     }
 }
 
+fn diagnostic_matches_pressure_class(
+    diagnostic: &ResourcePressureDiagnostic,
+    pressure_class: ResourcePressureClass,
+) -> bool {
+    match pressure_class {
+        ResourcePressureClass::CpuAdmission => diagnostic.code.contains("cpu"),
+        ResourcePressureClass::QueueSaturation => diagnostic.code.contains("queue"),
+        _ => diagnostic.code.contains(pressure_class.as_str()),
+    }
+}
+
+fn utilization_to_basis_points(utilization: Option<f64>) -> u32 {
+    let Some(utilization) = utilization else {
+        return 0;
+    };
+    if !utilization.is_finite() || utilization <= 0.0 {
+        return 0;
+    }
+    (utilization * 10_000.0).round().min(u32::MAX as f64) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use crate::swarm_scheduler::{AdmissionAction, AdmissionReasonCode};
 
     use super::{
         HIGH_SCALE_REQUIRED_LOGICAL_CORES, HIGH_SCALE_REQUIRED_MEMORY_BYTES,
@@ -931,6 +1394,8 @@ mod tests {
         ResourcePressureAssertion, ResourcePressureChaosMode, ResourcePressureChaosStatus,
         ResourcePressureChaosVerdict, ResourcePressureClass, ResourcePressureCoverageMatrix,
         ResourcePressureCoverageRow, ResourcePressureProofLevel,
+        cpu_admission_high_scale_skipped_not_proven_verdict, cpu_admission_reduced_pass_verdict,
+        queue_saturation_reduced_pass_verdict, queue_saturation_unbounded_fail_verdict,
         sample_expected_blocked_by_infra_verdict, sample_fail_verdict, sample_pass_verdict,
         sample_skipped_not_proven_verdict,
     };
@@ -1042,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_completion_blocks_until_all_matrix_rows_are_passed_or_skipped() {
+    fn parent_completion_requires_pass_for_all_matrix_rows() {
         let matrix = ResourcePressureCoverageMatrix::default();
         let mut verdicts = matrix
             .rows
@@ -1065,7 +1530,24 @@ mod tests {
         );
 
         verdicts.extend(matrix.rows.iter().skip(4).map(skipped_for_row));
-        let complete = matrix.assess_parent_completion(&verdicts);
+        let skipped_is_still_incomplete = matrix.assess_parent_completion(&verdicts);
+        assert!(
+            !skipped_is_still_incomplete.parent_completion_ready,
+            "{skipped_is_still_incomplete:?}"
+        );
+        assert!(
+            skipped_is_still_incomplete
+                .blocking_pressure_classes
+                .contains(&ResourcePressureClass::QueueSaturation)
+        );
+        assert!(
+            skipped_is_still_incomplete
+                .blocking_pressure_classes
+                .contains(&ResourcePressureClass::ClockTimerAnomaly)
+        );
+
+        let all_passed = matrix.rows.iter().map(pass_for_row).collect::<Vec<_>>();
+        let complete = matrix.assess_parent_completion(&all_passed);
         assert!(complete.parent_completion_ready, "{complete:?}");
         assert!(complete.blocking_pressure_classes.is_empty());
     }
@@ -1090,6 +1572,140 @@ mod tests {
 
         assert!(!cpu_status.satisfied);
         assert!(cpu_status.reason.contains("missing required assertions"));
+    }
+
+    #[test]
+    fn cpu_admission_reduced_fixture_records_degrade_decision() {
+        let verdict = cpu_admission_reduced_pass_verdict();
+        verdict.validate().expect("CPU admission fixture validates");
+
+        let observation = verdict
+            .admission_observation
+            .as_ref()
+            .expect("CPU fixture records admission observation");
+        assert_eq!(observation.admission_action, AdmissionAction::Degrade);
+        assert_eq!(
+            observation.mitigation_reason_code,
+            AdmissionReasonCode::QueueSaturated
+        );
+        assert!(
+            observation
+                .admission_reason_codes
+                .contains(&AdmissionReasonCode::QueueSaturated)
+        );
+        assert!(observation.queue.bounded_after_injection());
+    }
+
+    #[test]
+    fn queue_saturation_reduced_fixture_records_shed_decision() {
+        let verdict = queue_saturation_reduced_pass_verdict();
+        verdict
+            .validate()
+            .expect("queue saturation fixture validates");
+
+        let observation = verdict
+            .admission_observation
+            .as_ref()
+            .expect("queue fixture records admission observation");
+        assert_eq!(observation.admission_action, AdmissionAction::Shed);
+        assert_eq!(
+            observation.mitigation_reason_code,
+            AdmissionReasonCode::QueueOverCapacity
+        );
+        assert_eq!(observation.queue.queue_depth_after, 16);
+        assert_eq!(observation.queue.queue_depth_bound, 16);
+    }
+
+    #[test]
+    fn negative_unbounded_queue_fixture_is_valid_fail_not_coverage() {
+        let verdict = queue_saturation_unbounded_fail_verdict();
+        verdict.validate().expect("negative fail fixture validates");
+
+        let observation = verdict
+            .admission_observation
+            .as_ref()
+            .expect("negative fixture records admission observation");
+        assert!(!observation.queue.bounded_after_injection());
+
+        let assessment =
+            ResourcePressureCoverageMatrix::default().assess_parent_completion(&[verdict]);
+        let queue_status = assessment
+            .row_statuses
+            .iter()
+            .find(|status| status.pressure_class == ResourcePressureClass::QueueSaturation)
+            .expect("queue row status");
+        assert!(!queue_status.satisfied);
+        assert!(queue_status.reason.contains("FAIL"));
+    }
+
+    #[test]
+    fn high_scale_cpu_fixture_skips_without_topology_evidence() {
+        let verdict = cpu_admission_high_scale_skipped_not_proven_verdict();
+        verdict
+            .validate()
+            .expect("high-scale skipped CPU fixture validates");
+        assert_eq!(
+            verdict.status,
+            ResourcePressureChaosStatus::SkippedNotProven
+        );
+        assert_eq!(
+            verdict.proof_level,
+            ResourcePressureProofLevel::SimulatedHighScale
+        );
+        assert!(
+            verdict
+                .hardware_evidence
+                .as_ref()
+                .expect("hardware evidence")
+                .observed_logical_cores
+                .is_none()
+        );
+
+        let matrix = ResourcePressureCoverageMatrix::default();
+        let assessment = matrix.assess_parent_completion(&[verdict]);
+        let cpu_status = assessment
+            .row_statuses
+            .iter()
+            .find(|status| status.pressure_class == ResourcePressureClass::CpuAdmission)
+            .expect("CPU row status");
+        assert!(!cpu_status.satisfied);
+        assert!(cpu_status.reason.contains("SKIPPED_NOT_PROVEN"));
+    }
+
+    #[test]
+    fn skipped_cpu_and_queue_verdicts_do_not_require_admission_observation() {
+        let mut verdict = cpu_admission_high_scale_skipped_not_proven_verdict();
+        verdict.admission_observation = None;
+
+        verdict
+            .validate()
+            .expect("skipped CPU proof without execution evidence should validate");
+    }
+
+    #[test]
+    fn cpu_and_queue_pass_verdicts_require_admission_observation() {
+        let mut verdict = cpu_admission_reduced_pass_verdict();
+        verdict.admission_observation = None;
+
+        let error = verdict
+            .validate()
+            .expect_err("missing CPU observation must be rejected");
+        assert!(error.to_string().contains("admission_observation"));
+    }
+
+    #[test]
+    fn cpu_and_queue_pass_verdicts_reject_unbounded_growth() {
+        let mut verdict = queue_saturation_reduced_pass_verdict();
+        let observation = verdict
+            .admission_observation
+            .as_mut()
+            .expect("queue fixture has observation");
+        observation.queue.queue_depth_after = observation.queue.queue_depth_bound + 1;
+
+        let error = verdict
+            .validate()
+            .expect_err("unbounded pass verdict must be rejected");
+        assert!(error.to_string().contains("queue_depth_after"));
     }
 
     #[test]
@@ -1118,6 +1734,22 @@ mod tests {
         verdict.proof_level = ResourcePressureProofLevel::ReducedLocal;
         verdict.hardware_evidence = None;
         verdict.assertions = row.required_assertions.clone();
+        verdict.admission_observation = match row.pressure_class {
+            ResourcePressureClass::CpuAdmission => {
+                cpu_admission_reduced_pass_verdict().admission_observation
+            }
+            ResourcePressureClass::QueueSaturation => {
+                queue_saturation_reduced_pass_verdict().admission_observation
+            }
+            _ => None,
+        };
+        verdict.diagnostics = match row.pressure_class {
+            ResourcePressureClass::CpuAdmission => cpu_admission_reduced_pass_verdict().diagnostics,
+            ResourcePressureClass::QueueSaturation => {
+                queue_saturation_reduced_pass_verdict().diagnostics
+            }
+            _ => verdict.diagnostics,
+        };
         verdict
     }
 
