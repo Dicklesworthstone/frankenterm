@@ -12,7 +12,7 @@
 #   - Perf artifacts are captured for regression tracking
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - rch (remote Cargo execution)
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -45,6 +45,8 @@ TESTS_SKIPPED=0
 
 # Configuration
 VERBOSE=false
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-/tmp/ft-e2e-search-perf-target}"
 
 # ==============================================================================
 # Argument parsing
@@ -102,17 +104,28 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
+    if ! command -v "$RCH_BIN" &>/dev/null; then
+        echo -e "${RED}ERROR:${NC} rch not found. Cargo test/bench lanes must be run through RCH." >&2
         exit 5
     fi
-    log_pass "cargo available"
+    log_pass "rch available ($RCH_BIN)"
+    log_info "Remote Cargo target dir: $RCH_CARGO_TARGET_DIR"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
         exit 5
     fi
     log_pass "jq available"
+}
+
+run_rch_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
+}
+
+run_rch_cargo_timeout() {
+    local timeout_secs="$1"
+    shift
+    timeout "$timeout_secs" "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
 }
 
 # ==============================================================================
@@ -126,7 +139,7 @@ scenario_fts_search_correctness() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'storage::fts_search' \
+    run_rch_cargo test -p frankenterm-core 'storage::fts_search' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -161,7 +174,7 @@ scenario_fts_sync_pipeline() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'storage::fts_sync_tests' \
+    run_rch_cargo test -p frankenterm-core 'storage::fts_sync_tests' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -203,7 +216,7 @@ scenario_fts_benchmark_scales() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p frankenterm-core --bench fts_query \
+    run_rch_cargo_timeout 120 test -p frankenterm-core --bench fts_query \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -262,7 +275,7 @@ scenario_storage_regression_benchmarks() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p frankenterm-core --bench storage_regression \
+    run_rch_cargo_timeout 120 test -p frankenterm-core --bench storage_regression \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -309,7 +322,7 @@ scenario_db_sizing_benchmarks() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 180 cargo test -p frankenterm-core --bench sizing_benchmark \
+    run_rch_cargo_timeout 180 test -p frankenterm-core --bench sizing_benchmark \
         -- --test --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -349,7 +362,7 @@ scenario_search_linting() {
     exit_code=0
 
     # Run search linting tests if they exist
-    cargo test -p frankenterm-core 'search' \
+    run_rch_cargo test -p frankenterm-core 'search' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
@@ -391,7 +404,7 @@ scenario_bounded_execution() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 60 cargo test -p frankenterm-core 'storage::fts' \
+    run_rch_cargo_timeout 60 test -p frankenterm-core 'storage::fts' \
         --no-fail-fast -- --nocapture \
         >"$test_output" 2>&1 || exit_code=$?
 
