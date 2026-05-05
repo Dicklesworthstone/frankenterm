@@ -8160,7 +8160,9 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordAuditAction { action, respond } => {
-            let result = record_audit_action_sync(conn, &action);
+            let result = with_writer_backend(conn, |backend| {
+                record_audit_action_backend(backend, &action)
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordPolicyDenialAudit { record, respond } => {
@@ -10637,42 +10639,51 @@ pub fn record_policy_denial_audit_blocking(
     record_policy_denial_audit_backend(&backend, record)
 }
 
-/// Record an audit action (synchronous)
-fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Result<i64> {
+/// Record an audit action through the writer-thread backend bridge.
+fn record_audit_action_backend(
+    backend: &dyn StorageBackend,
+    action: &AuditActionRecord,
+) -> Result<i64> {
     let pane_id_i64 = action
         .pane_id
         .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
         .transpose()?;
     let ts = if action.ts == 0 { now_ms() } else { action.ts };
 
-    conn.execute(
+    let row = backend
+        .query_row_typed(
         "INSERT INTO audit_actions (ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
          policy_decision, decision_reason, rule_id, input_summary, verification_summary,
          decision_context, result)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            ts,
-            action.actor_kind.as_str(),
-            action.actor_id.as_deref(),
-            action.correlation_id.as_deref(),
-            pane_id_i64,
-            action.domain.as_deref(),
-            action.action_kind.as_str(),
-            action.policy_decision.as_str(),
-            action.decision_reason.as_deref(),
-            action.rule_id.as_deref(),
-            action.input_summary.as_deref(),
-            action.verification_summary.as_deref(),
-            action.decision_context.as_deref(),
-            action.result.as_str(),
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         RETURNING id",
+        &[
+            ToSqlValue::Integer(ts),
+            ToSqlValue::Text(action.actor_kind.as_str()),
+            ToSqlValue::optional_text(action.actor_id.as_deref()),
+            ToSqlValue::optional_text(action.correlation_id.as_deref()),
+            ToSqlValue::optional_i64(pane_id_i64),
+            ToSqlValue::optional_text(action.domain.as_deref()),
+            ToSqlValue::Text(action.action_kind.as_str()),
+            ToSqlValue::Text(action.policy_decision.as_str()),
+            ToSqlValue::optional_text(action.decision_reason.as_deref()),
+            ToSqlValue::optional_text(action.rule_id.as_deref()),
+            ToSqlValue::optional_text(action.input_summary.as_deref()),
+            ToSqlValue::optional_text(action.verification_summary.as_deref()),
+            ToSqlValue::optional_text(action.decision_context.as_deref()),
+            ToSqlValue::Text(action.result.as_str()),
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to insert audit action: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to insert audit action", err))?
+    .ok_or_else(|| {
+        StorageError::Database("insert audit action returned no id".to_string())
+    })?;
 
-    Ok(conn.last_insert_rowid())
+    RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Audit action id", err).into())
 }
 
-/// Upsert undo metadata for an audit action (synchronous)
 /// Upsert an action_undo record (writer-thread, backend-trait path).
 ///
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
