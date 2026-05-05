@@ -1458,10 +1458,10 @@ impl ObservationRuntime {
         info!("Observation runtime started");
 
         Ok(RuntimeHandle {
-            discovery: discovery_handle,
-            capture: capture_handle,
-            relay: relay_handle,
-            persistence: persistence_handle,
+            discovery: Some(discovery_handle),
+            capture: Some(capture_handle),
+            relay: Some(relay_handle),
+            persistence: Some(persistence_handle),
             maintenance: Some(maintenance_handle),
             snapshot: snapshot_handle,
             snapshot_triggers,
@@ -3594,16 +3594,25 @@ async fn run_vendored_streaming_capture(
 
 /// Handle to the running observation runtime.
 pub struct RuntimeHandle {
-    /// Discovery task handle
-    pub discovery: JoinHandle<()>,
-    /// Capture task handle
-    pub capture: JoinHandle<()>,
-    /// Relay task handle (capture ingress -> SPSC persistence queue)
-    pub relay: JoinHandle<()>,
-    /// Native events listener task handle (optional)
+    /// Discovery task handle. Wrapped in `Option` so the consumer
+    /// shutdown methods (`join`, `shutdown_with_timeout`,
+    /// `shutdown_with_summary`) can `.take()` the handle and
+    /// `.await` it, without conflicting with the defensive
+    /// [`Drop`] impl that aborts any handle still in place when
+    /// the runtime exits abnormally.
+    pub discovery: Option<JoinHandle<()>>,
+    /// Capture task handle. See [`Self::discovery`] for the
+    /// `Option` rationale.
+    pub capture: Option<JoinHandle<()>>,
+    /// Relay task handle (capture ingress -> SPSC persistence
+    /// queue). See [`Self::discovery`] for the `Option` rationale.
+    pub relay: Option<JoinHandle<()>>,
+    /// Native events listener task handle (optional by design,
+    /// not by the orphan-on-drop pattern).
     pub native_events: Option<JoinHandle<()>>,
-    /// Persistence task handle
-    pub persistence: JoinHandle<()>,
+    /// Persistence task handle. See [`Self::discovery`] for the
+    /// `Option` rationale.
+    pub persistence: Option<JoinHandle<()>>,
     /// Maintenance task handle (retention, checkpointing)
     pub maintenance: Option<JoinHandle<()>>,
     /// Snapshot engine task handle (session persistence)
@@ -4143,21 +4152,34 @@ impl RuntimeHandle {
     }
 
     /// Wait for all tasks to complete.
-    pub async fn join(self) {
-        let _ = self.discovery.await;
-        let _ = self.capture.await;
-        let _ = self.relay.await;
-        if let Some(native) = self.native_events {
+    ///
+    /// Each `.take()` empties the corresponding field so the
+    /// defensive [`Drop`] impl on [`RuntimeHandle`] sees `None`
+    /// and skips the redundant `abort()` once the join has
+    /// completed cleanly.
+    pub async fn join(mut self) {
+        if let Some(h) = self.discovery.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.capture.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.relay.take() {
+            let _ = h.await;
+        }
+        if let Some(native) = self.native_events.take() {
             let _ = native.await;
         }
-        let _ = self.persistence.await;
-        if let Some(maintenance) = self.maintenance {
+        if let Some(h) = self.persistence.take() {
+            let _ = h.await;
+        }
+        if let Some(maintenance) = self.maintenance.take() {
             let _ = maintenance.await;
         }
-        if let Some(snapshot) = self.snapshot {
+        if let Some(snapshot) = self.snapshot.take() {
             let _ = snapshot.await;
         }
-        if let Some(snapshot_triggers) = self.snapshot_triggers {
+        if let Some(snapshot_triggers) = self.snapshot_triggers.take() {
             let _ = snapshot_triggers.await;
         }
     }
@@ -4194,7 +4216,7 @@ impl RuntimeHandle {
     /// join window — and is therefore still running concurrently with the
     /// flush — cannot wedge the flush either: each phase has its own
     /// independent timeout budget of `shutdown_timeout`.
-    pub async fn shutdown_with_timeout(self, shutdown_timeout: Duration) -> ShutdownSummary {
+    pub async fn shutdown_with_timeout(mut self, shutdown_timeout: Duration) -> ShutdownSummary {
         let elapsed_secs = self.start_time.elapsed().as_secs();
         let mut warnings = Vec::new();
         let mut clean = true;
@@ -4208,24 +4230,45 @@ impl RuntimeHandle {
         }
         info!("Shutdown signal sent");
 
-        // Wait for tasks with timeout
+        // Wait for tasks with timeout. Each `.take()` empties the
+        // corresponding field so the defensive `Drop` impl on
+        // RuntimeHandle sees `None` for already-joined handles and
+        // skips the redundant `abort()`. Handles still in-place when
+        // the timeout fires (stubborn tasks) get aborted by `Drop`,
+        // not leaked.
+        let discovery = self.discovery.take();
+        let capture = self.capture.take();
+        let relay = self.relay.take();
+        let native_events = self.native_events.take();
+        let persistence = self.persistence.take();
+        let maintenance = self.maintenance.take();
+        let snapshot = self.snapshot.take();
+        let snapshot_triggers = self.snapshot_triggers.take();
         let shutdown_cx = runtime_loop_cx();
         let join_result = runtime_timeout(&shutdown_cx, shutdown_timeout, async {
-            let _ = self.discovery.await;
-            let _ = self.capture.await;
-            let _ = self.relay.await;
-            if let Some(native) = self.native_events {
-                let _ = native.await;
+            if let Some(h) = discovery {
+                let _ = h.await;
             }
-            let _ = self.persistence.await;
-            if let Some(maintenance) = self.maintenance {
-                let _ = maintenance.await;
+            if let Some(h) = capture {
+                let _ = h.await;
             }
-            if let Some(snapshot) = self.snapshot {
-                let _ = snapshot.await;
+            if let Some(h) = relay {
+                let _ = h.await;
             }
-            if let Some(snapshot_triggers) = self.snapshot_triggers {
-                let _ = snapshot_triggers.await;
+            if let Some(h) = native_events {
+                let _ = h.await;
+            }
+            if let Some(h) = persistence {
+                let _ = h.await;
+            }
+            if let Some(h) = maintenance {
+                let _ = h.await;
+            }
+            if let Some(h) = snapshot {
+                let _ = h.await;
+            }
+            if let Some(h) = snapshot_triggers {
+                let _ = h.await;
             }
         })
         .await;
@@ -4253,7 +4296,13 @@ impl RuntimeHandle {
         // filesystem hang, or a still-running persistence writer racing
         // the flush after a join timeout) must not stall operator
         // shutdown indefinitely.
-        let storage = self.storage;
+        //
+        // Cloning the StorageHandle (an `Arc`-backed clone, no real
+        // copy) instead of moving keeps `self.storage` in place so the
+        // defensive `Drop for RuntimeHandle` impl can run on a fully
+        // intact struct. The Drop only aborts task handles; it does
+        // not touch storage.
+        let storage = self.storage.clone();
         let flush_result = runtime_timeout(&shutdown_cx, shutdown_timeout, async {
             storage.shutdown().await
         })
@@ -4509,6 +4558,65 @@ impl RuntimeHandle {
     #[must_use]
     pub fn current_config(&self) -> HotReloadableConfig {
         self.config_tx.borrow().clone()
+    }
+}
+
+impl Drop for RuntimeHandle {
+    /// Defensive drop for callers that forget to invoke
+    /// [`Self::shutdown_with_summary`] / [`Self::shutdown_with_timeout`].
+    ///
+    /// This Drop fires only on abnormal exit paths — early return,
+    /// panic, or end-of-scope without an explicit shutdown call. We
+    /// cannot `.await` here, so we cannot drain channels or flush
+    /// storage; operators who need a clean summary MUST still call
+    /// the explicit shutdown methods. What we *can* do, defensively:
+    ///
+    ///   - Flip `shutdown_flag` so any background task that is
+    ///     still polling it observes cancellation on its next tick.
+    ///   - Send the snapshot-shutdown wake-up so the snapshot task
+    ///     breaks out of any pending `watch` / `select` wait.
+    ///   - Call `JoinHandle::abort` on every task handle so the
+    ///     handle resource is freed immediately and any future
+    ///     poll observes `JoinError`. Abort is cooperative — the
+    ///     underlying asupersync task only exits when its body next
+    ///     observes the cancel signal — but at minimum the handle
+    ///     itself stops pinning the runtime.
+    ///
+    /// A `tracing::warn` records the unclean exit so the leak shows
+    /// up in operator logs instead of failing silently.
+    fn drop(&mut self) {
+        let already_signalled = self.shutdown_flag.swap(true, Ordering::SeqCst);
+        if !already_signalled {
+            tracing::warn!(
+                target: "ft.runtime",
+                event = "runtime_handle_dropped_without_shutdown",
+                "RuntimeHandle dropped without explicit shutdown — \
+                 background tasks aborted; storage may not be flushed; \
+                 call shutdown_with_summary or shutdown_with_timeout for a \
+                 clean exit"
+            );
+        }
+        if let Some(ref tx) = self.snapshot_shutdown {
+            // Same intentional best-effort send as the explicit shutdown
+            // paths: failure here just means the snapshot task already
+            // exited.
+            let _ = tx.send(true);
+        }
+        for handle in [
+            self.discovery.as_ref(),
+            self.capture.as_ref(),
+            self.relay.as_ref(),
+            self.persistence.as_ref(),
+            self.native_events.as_ref(),
+            self.maintenance.as_ref(),
+            self.snapshot.as_ref(),
+            self.snapshot_triggers.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -4996,11 +5104,11 @@ mod tests {
         let (capture_tx, _capture_rx) = mpsc::channel(1);
 
         let handle = RuntimeHandle {
-            discovery: stubborn_runtime_task(duration),
-            capture: stubborn_runtime_task(duration),
-            relay: stubborn_runtime_task(duration),
+            discovery: Some(stubborn_runtime_task(duration)),
+            capture: Some(stubborn_runtime_task(duration)),
+            relay: Some(stubborn_runtime_task(duration)),
             native_events: None,
-            persistence: stubborn_runtime_task(duration),
+            persistence: Some(stubborn_runtime_task(duration)),
             maintenance: None,
             snapshot: None,
             snapshot_triggers: None,

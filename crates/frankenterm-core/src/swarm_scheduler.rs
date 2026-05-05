@@ -860,10 +860,18 @@ impl SwarmScheduler {
         let excess = pressure.utilization - self.config.scale_up_threshold;
         let scale_factor = (excess / (1.0 - self.config.scale_up_threshold)).clamp(0.0, 1.0);
         let raw_step = (scale_factor * self.config.max_scale_step as f64).ceil() as u32;
+        // The `>= max_fleet_size` guard at the top of `try_scale_up`
+        // makes this subtraction safe today, but `saturating_sub` keeps
+        // the math correct if a future caller weakens or moves the
+        // guard.
         let step = raw_step
             .max(1)
             .min(self.config.max_scale_step)
-            .min(self.config.max_fleet_size - pressure.active_agents);
+            .min(
+                self.config
+                    .max_fleet_size
+                    .saturating_sub(pressure.active_agents),
+            );
 
         let reason = format!(
             "queue pressure {:.2} exceeds threshold {:.2} (ready={}, capacity={})",
@@ -948,9 +956,14 @@ impl SwarmScheduler {
             a_completed.cmp(&b_completed)
         });
 
-        // Only remove enough to stay above min and not remove too many at once
-        let max_remove =
-            (pressure.active_agents - self.config.min_fleet_size).min(self.config.max_scale_step);
+        // Only remove enough to stay above min and not remove too many at once.
+        // The `<= min_fleet_size` early-return at the top of `try_scale_down`
+        // makes the subtraction safe today, but `saturating_sub` keeps the
+        // math correct if a future caller weakens or moves the guard.
+        let max_remove = pressure
+            .active_agents
+            .saturating_sub(self.config.min_fleet_size)
+            .min(self.config.max_scale_step);
         removable.truncate(max_remove as usize);
 
         if removable.is_empty() {

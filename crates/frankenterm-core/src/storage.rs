@@ -13667,8 +13667,15 @@ fn get_fts_index_state_sync(conn: &Connection) -> Result<Option<FtsIndexState>> 
         |row| {
             Ok(FtsIndexState {
                 index_version: {
+                    // SQLite stores `index_version` as INTEGER. A
+                    // bare `as u32` silently wraps if the column is
+                    // corrupted to negative or outside the u32
+                    // range; clamp instead so a corrupted row can
+                    // still be observed without producing a
+                    // gargantuan version number that confuses
+                    // downstream comparisons.
                     let v: i64 = row.get(0)?;
-                    v as u32
+                    v.clamp(0, i64::from(u32::MAX)) as u32
                 },
                 last_full_rebuild_at: row.get(1)?,
                 created_at: row.get(2)?,
