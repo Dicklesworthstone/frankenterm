@@ -16,7 +16,7 @@
 //!
 //! See bead `wa-ssm4` for the full design.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// Hard minimum and maximum for each tunable parameter.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ParamRange {
     pub min: f64,
     pub max: f64,
@@ -36,6 +36,12 @@ impl ParamRange {
     #[must_use]
     pub fn clamp(&self, v: f64) -> f64 {
         v.clamp(self.min, self.max)
+    }
+
+    /// Return true when a value is finite and inside this range.
+    #[must_use]
+    pub fn contains(&self, v: f64) -> bool {
+        v.is_finite() && v >= self.min && v <= self.max
     }
 }
 
@@ -163,6 +169,1300 @@ pub struct TunerMetrics {
     pub mux_latency_ms: f64,
     /// CPU utilization fraction (0.0–1.0).
     pub cpu_fraction: f64,
+}
+
+// =============================================================================
+// Bounded candidate evaluation
+// =============================================================================
+
+/// Registry key for knobs that the bounded candidate engine is allowed to explore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum TunableKnobId {
+    /// Runtime ingest/capture output coalescing window.
+    #[serde(rename = "runtime.output_coalesce_window_ms")]
+    RuntimeOutputCoalesceWindowMs,
+    /// Runtime ingest/capture maximum output coalescing delay.
+    #[serde(rename = "runtime.output_coalesce_max_delay_ms")]
+    RuntimeOutputCoalesceMaxDelayMs,
+    /// Runtime ingest/storage maximum coalesced output bytes.
+    #[serde(rename = "runtime.output_coalesce_max_bytes")]
+    RuntimeOutputCoalesceMaxBytes,
+    /// Runtime telemetry percentile sample window.
+    #[serde(rename = "runtime.telemetry_percentile_window")]
+    RuntimeTelemetryPercentileWindow,
+    /// Runtime memory-tier cursor snapshot warning threshold.
+    #[serde(rename = "runtime.cursor_snapshot_memory_warn_bytes")]
+    RuntimeCursorSnapshotMemoryWarnBytes,
+    /// Backpressure warning ratio.
+    #[serde(rename = "backpressure.warn_ratio")]
+    BackpressureWarnRatio,
+    /// Snapshot bridge trigger tick interval.
+    #[serde(rename = "snapshot.trigger_bridge_tick_secs")]
+    SnapshotTriggerBridgeTickSecs,
+    /// Snapshot memory-trigger cooldown.
+    #[serde(rename = "snapshot.memory_trigger_cooldown_secs")]
+    SnapshotMemoryTriggerCooldownSecs,
+    /// Ingest maximum persisted segment size.
+    #[serde(rename = "ingest.max_persist_segment_bytes")]
+    IngestMaxPersistSegmentBytes,
+    /// Pattern dedupe maximum seen-key budget.
+    #[serde(rename = "patterns.max_seen_keys")]
+    PatternsMaxSeenKeys,
+    /// Pattern matching retained tail size.
+    #[serde(rename = "patterns.max_tail_size_bytes")]
+    PatternsMaxTailSizeBytes,
+    /// Pattern Bloom filter false-positive rate.
+    #[serde(rename = "patterns.bloom_false_positive_rate")]
+    PatternsBloomFalsePositiveRate,
+    /// Policy rate-limiter maximum tracked pane count.
+    #[serde(rename = "policy.max_tracked_panes")]
+    PolicyMaxTrackedPanes,
+    /// Policy rate-limiter maximum events retained per pane.
+    #[serde(rename = "policy.max_events_per_pane")]
+    PolicyMaxEventsPerPane,
+    /// Policy cost-tracker maximum pane count.
+    #[serde(rename = "policy.cost_tracker_max_panes")]
+    PolicyCostTrackerMaxPanes,
+    /// Web/API default streaming frequency.
+    #[serde(rename = "web.stream_default_max_hz")]
+    WebStreamDefaultMaxHz,
+    /// Web/API stream catch-up scan limit.
+    #[serde(rename = "web.stream_scan_limit")]
+    WebStreamScanLimit,
+    /// Workflow/CASS handler timeout.
+    #[serde(rename = "workflows.cass_*_timeout_secs")]
+    WorkflowsCassTimeoutSecs,
+    /// Workflow handler cooldown.
+    #[serde(rename = "workflows.*_cooldown_ms")]
+    WorkflowsCooldownMs,
+    /// Search Tantivy writer memory budget.
+    #[serde(rename = "search.tantivy_writer_memory_bytes")]
+    SearchTantivyWriterMemoryBytes,
+    /// IPC accept polling interval.
+    #[serde(rename = "ipc.accept_poll_interval_ms")]
+    IpcAcceptPollIntervalMs,
+    /// Capacity admission queue defer threshold.
+    #[serde(rename = "capacity.queue_defer_threshold")]
+    CapacityQueueDeferThreshold,
+    /// Capacity admission backlog defer threshold.
+    #[serde(rename = "capacity.backlog_defer_threshold")]
+    CapacityBacklogDeferThreshold,
+    /// Capacity admission queue throttle threshold.
+    #[serde(rename = "capacity.throttle_queue_depth")]
+    CapacityThrottleQueueDepth,
+    /// Capacity admission backlog throttle threshold.
+    #[serde(rename = "capacity.throttle_backlog_depth")]
+    CapacityThrottleBacklogDepth,
+    /// Capacity admission queue shed threshold.
+    #[serde(rename = "capacity.shed_queue_depth")]
+    CapacityShedQueueDepth,
+    /// Capacity admission backlog shed threshold.
+    #[serde(rename = "capacity.shed_backlog_depth")]
+    CapacityShedBacklogDepth,
+    /// Capacity admission default retry-after seconds.
+    #[serde(rename = "capacity.default_retry_after_secs")]
+    CapacityDefaultRetryAfterSecs,
+    /// Capacity admission cooldown seconds.
+    #[serde(rename = "capacity.cooldown_secs")]
+    CapacityCooldownSecs,
+}
+
+impl TunableKnobId {
+    /// Stable registry id used in decision records.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeOutputCoalesceWindowMs => "runtime.output_coalesce_window_ms",
+            Self::RuntimeOutputCoalesceMaxDelayMs => "runtime.output_coalesce_max_delay_ms",
+            Self::RuntimeOutputCoalesceMaxBytes => "runtime.output_coalesce_max_bytes",
+            Self::RuntimeTelemetryPercentileWindow => "runtime.telemetry_percentile_window",
+            Self::RuntimeCursorSnapshotMemoryWarnBytes => {
+                "runtime.cursor_snapshot_memory_warn_bytes"
+            }
+            Self::BackpressureWarnRatio => "backpressure.warn_ratio",
+            Self::SnapshotTriggerBridgeTickSecs => "snapshot.trigger_bridge_tick_secs",
+            Self::SnapshotMemoryTriggerCooldownSecs => "snapshot.memory_trigger_cooldown_secs",
+            Self::IngestMaxPersistSegmentBytes => "ingest.max_persist_segment_bytes",
+            Self::PatternsMaxSeenKeys => "patterns.max_seen_keys",
+            Self::PatternsMaxTailSizeBytes => "patterns.max_tail_size_bytes",
+            Self::PatternsBloomFalsePositiveRate => "patterns.bloom_false_positive_rate",
+            Self::PolicyMaxTrackedPanes => "policy.max_tracked_panes",
+            Self::PolicyMaxEventsPerPane => "policy.max_events_per_pane",
+            Self::PolicyCostTrackerMaxPanes => "policy.cost_tracker_max_panes",
+            Self::WebStreamDefaultMaxHz => "web.stream_default_max_hz",
+            Self::WebStreamScanLimit => "web.stream_scan_limit",
+            Self::WorkflowsCassTimeoutSecs => "workflows.cass_*_timeout_secs",
+            Self::WorkflowsCooldownMs => "workflows.*_cooldown_ms",
+            Self::SearchTantivyWriterMemoryBytes => "search.tantivy_writer_memory_bytes",
+            Self::IpcAcceptPollIntervalMs => "ipc.accept_poll_interval_ms",
+            Self::CapacityQueueDeferThreshold => "capacity.queue_defer_threshold",
+            Self::CapacityBacklogDeferThreshold => "capacity.backlog_defer_threshold",
+            Self::CapacityThrottleQueueDepth => "capacity.throttle_queue_depth",
+            Self::CapacityThrottleBacklogDepth => "capacity.throttle_backlog_depth",
+            Self::CapacityShedQueueDepth => "capacity.shed_queue_depth",
+            Self::CapacityShedBacklogDepth => "capacity.shed_backlog_depth",
+            Self::CapacityDefaultRetryAfterSecs => "capacity.default_retry_after_secs",
+            Self::CapacityCooldownSecs => "capacity.cooldown_secs",
+        }
+    }
+
+    /// Parse a stable registry id.
+    #[must_use]
+    pub fn from_registry_id(id: &str) -> Option<Self> {
+        match id {
+            "runtime.output_coalesce_window_ms" => Some(Self::RuntimeOutputCoalesceWindowMs),
+            "runtime.output_coalesce_max_delay_ms" => Some(Self::RuntimeOutputCoalesceMaxDelayMs),
+            "runtime.output_coalesce_max_bytes" => Some(Self::RuntimeOutputCoalesceMaxBytes),
+            "runtime.telemetry_percentile_window" => Some(Self::RuntimeTelemetryPercentileWindow),
+            "runtime.cursor_snapshot_memory_warn_bytes" => {
+                Some(Self::RuntimeCursorSnapshotMemoryWarnBytes)
+            }
+            "backpressure.warn_ratio" => Some(Self::BackpressureWarnRatio),
+            "snapshot.trigger_bridge_tick_secs" => Some(Self::SnapshotTriggerBridgeTickSecs),
+            "snapshot.memory_trigger_cooldown_secs" => {
+                Some(Self::SnapshotMemoryTriggerCooldownSecs)
+            }
+            "ingest.max_persist_segment_bytes" => Some(Self::IngestMaxPersistSegmentBytes),
+            "patterns.max_seen_keys" => Some(Self::PatternsMaxSeenKeys),
+            "patterns.max_tail_size_bytes" => Some(Self::PatternsMaxTailSizeBytes),
+            "patterns.bloom_false_positive_rate" => Some(Self::PatternsBloomFalsePositiveRate),
+            "policy.max_tracked_panes" => Some(Self::PolicyMaxTrackedPanes),
+            "policy.max_events_per_pane" => Some(Self::PolicyMaxEventsPerPane),
+            "policy.cost_tracker_max_panes" => Some(Self::PolicyCostTrackerMaxPanes),
+            "web.stream_default_max_hz" => Some(Self::WebStreamDefaultMaxHz),
+            "web.stream_scan_limit" => Some(Self::WebStreamScanLimit),
+            "workflows.cass_*_timeout_secs" => Some(Self::WorkflowsCassTimeoutSecs),
+            "workflows.*_cooldown_ms" => Some(Self::WorkflowsCooldownMs),
+            "search.tantivy_writer_memory_bytes" => Some(Self::SearchTantivyWriterMemoryBytes),
+            "ipc.accept_poll_interval_ms" => Some(Self::IpcAcceptPollIntervalMs),
+            "capacity.queue_defer_threshold" => Some(Self::CapacityQueueDeferThreshold),
+            "capacity.backlog_defer_threshold" => Some(Self::CapacityBacklogDeferThreshold),
+            "capacity.throttle_queue_depth" => Some(Self::CapacityThrottleQueueDepth),
+            "capacity.throttle_backlog_depth" => Some(Self::CapacityThrottleBacklogDepth),
+            "capacity.shed_queue_depth" => Some(Self::CapacityShedQueueDepth),
+            "capacity.shed_backlog_depth" => Some(Self::CapacityShedBacklogDepth),
+            "capacity.default_retry_after_secs" => Some(Self::CapacityDefaultRetryAfterSecs),
+            "capacity.cooldown_secs" => Some(Self::CapacityCooldownSecs),
+            _ => None,
+        }
+    }
+}
+
+/// Controller mode for bounded candidate evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningMode {
+    /// Compile-time and runtime off state.
+    Disabled,
+    /// Collect telemetry and emit would-have-tuned decisions.
+    Observe,
+    /// Evaluate a bounded candidate against a small canary scope.
+    Canary,
+    /// Try one registry-approved step while tracking regression metrics.
+    Exploration,
+    /// Keep a previously proven setting inside a narrow range.
+    SteadyState,
+    /// Restore the last safe value after regression.
+    Rollback,
+    /// Pause adaptation after rollback, drift, or missing telemetry.
+    Cooldown,
+}
+
+impl TuningMode {
+    /// Whether a candidate in this mode may be applied somewhere.
+    #[must_use]
+    pub const fn would_apply_candidate(self) -> bool {
+        matches!(
+            self,
+            Self::Canary | Self::Exploration | Self::SteadyState | Self::Rollback
+        )
+    }
+
+    /// Whether this mode is allowed to mutate live knobs.
+    #[must_use]
+    pub const fn may_mutate_live_knobs(self) -> bool {
+        matches!(self, Self::SteadyState | Self::Rollback)
+    }
+
+    /// Whether this mode consumes the concurrent exploration budget.
+    #[must_use]
+    pub const fn consumes_exploration_budget(self) -> bool {
+        matches!(self, Self::Canary | Self::Exploration)
+    }
+
+    /// Whether the transition is allowed by the ft-luq3w.1 controller contract.
+    #[must_use]
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        match (self, next) {
+            (_, Self::Disabled) => true,
+            (Self::Disabled, Self::Observe) => true,
+            (Self::Disabled, _) => false,
+            (Self::Observe, _) => matches!(next, Self::Observe | Self::Canary),
+            (Self::Canary, _) => matches!(
+                next,
+                Self::Canary | Self::Exploration | Self::Rollback | Self::Cooldown
+            ),
+            (Self::Exploration, _) => matches!(
+                next,
+                Self::Exploration | Self::SteadyState | Self::Rollback | Self::Cooldown
+            ),
+            (Self::SteadyState, _) => {
+                matches!(next, Self::SteadyState | Self::Rollback | Self::Cooldown)
+            }
+            (Self::Rollback, _) => matches!(next, Self::Rollback | Self::Cooldown),
+            (Self::Cooldown, _) => matches!(next, Self::Cooldown | Self::Observe | Self::Rollback),
+        }
+    }
+}
+
+/// Trust state for the telemetry window used to evaluate candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryTrust {
+    /// Telemetry is fresh enough for the current evaluation window.
+    Fresh,
+    /// Required telemetry is absent.
+    Missing,
+    /// Telemetry exists but is too old for the current window.
+    Stale,
+    /// Telemetry exists but failed a trust or provenance check.
+    Untrusted,
+}
+
+/// Direction for one bounded knob step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateDirection {
+    /// Move the value upward.
+    Increase,
+    /// Move the value downward.
+    Decrease,
+}
+
+/// Step policy for one bounded candidate move.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateStep {
+    /// Add or subtract a fixed amount.
+    Fixed { amount: f64 },
+    /// Add or subtract a fraction of the current value.
+    Fraction { fraction: f64 },
+    /// Multiply by this factor when increasing, divide by it when decreasing.
+    Multiplier { factor: f64 },
+    /// Move by one documented profile tier.
+    Tier { amount: f64 },
+}
+
+/// Registry gate required before a candidate can leave observe mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnobGate {
+    /// Requires an explicit operator profile gate.
+    ProfileGated,
+    /// Must emit observe decisions before any applied candidate.
+    ObserveFirst,
+    /// Must start in a canary scope.
+    CanaryFirst,
+}
+
+/// Static registry row for one safe tunable knob.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct KnobSpec {
+    /// Stable registry id.
+    pub id: TunableKnobId,
+    /// Owning subsystem.
+    pub owner: &'static str,
+    /// Current configuration source.
+    pub source: &'static str,
+    /// Default value from the safe tuning contract.
+    pub default_value: f64,
+    /// Hard range for generated candidates.
+    pub range: ParamRange,
+    /// Initial bounded step policy.
+    pub step: CandidateStep,
+    /// Primary safety metric for this knob.
+    pub safety_metric: &'static str,
+    /// Primary rollback metric for this knob.
+    pub rollback_metric: &'static str,
+    /// Dynamic or cross-field constraint that cannot be represented by min/max alone.
+    pub constraint: &'static str,
+    /// Gate required by the registry.
+    pub gate: KnobGate,
+}
+
+/// Bounded candidate generator configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateEvaluationConfig {
+    /// Current controller mode.
+    pub mode: TuningMode,
+    /// Maximum number of concurrent exploration candidates.
+    pub max_concurrent_explorations: usize,
+    /// Freshness and trust state for the telemetry window.
+    pub telemetry_trust: TelemetryTrust,
+}
+
+impl Default for CandidateEvaluationConfig {
+    fn default() -> Self {
+        Self {
+            mode: TuningMode::Observe,
+            max_concurrent_explorations: 1,
+            telemetry_trust: TelemetryTrust::Fresh,
+        }
+    }
+}
+
+/// Telemetry window evaluated for one candidate pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateTelemetryWindow {
+    /// Whether the warmup portion of the window has completed.
+    pub warmup_complete: bool,
+    /// Number of measurements in the current window.
+    pub measurement_count: usize,
+    /// Minimum required measurements for this window.
+    pub minimum_measurements: usize,
+    /// Confidence score for the measured pressure signal.
+    pub confidence: f64,
+    /// Minimum confidence required before a candidate may be emitted.
+    pub minimum_confidence: f64,
+    /// Direction recommended by trusted telemetry for this candidate window.
+    pub direction: Option<CandidateDirection>,
+}
+
+impl Default for CandidateTelemetryWindow {
+    fn default() -> Self {
+        Self {
+            warmup_complete: true,
+            measurement_count: 30,
+            minimum_measurements: 10,
+            confidence: 0.95,
+            minimum_confidence: 0.80,
+            direction: None,
+        }
+    }
+}
+
+/// Why a candidate was not generated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateSkipReason {
+    /// The controller is disabled.
+    Disabled,
+    /// The controller is in cooldown.
+    Cooldown,
+    /// Required telemetry is missing.
+    MissingTelemetry,
+    /// Required telemetry is stale.
+    StaleTelemetry,
+    /// Required telemetry failed a trust check.
+    UntrustedTelemetry,
+    /// Telemetry warmup has not completed.
+    WarmupIncomplete,
+    /// Telemetry window has too few measurements.
+    InsufficientMeasurements,
+    /// Telemetry confidence is below threshold.
+    InsufficientConfidence,
+    /// The concurrent exploration budget is exhausted.
+    ExplorationBudgetExhausted,
+    /// The requested knob is not in the safe registry.
+    UnknownKnob,
+    /// The first implementation forbids multi-knob candidates.
+    MultipleKnobsForbidden,
+    /// Requested knobs violate an explicit combination guardrail.
+    UnsafeCombination,
+    /// The requested knob is pinned by the operator.
+    PinnedKnob,
+    /// Current value for the requested knob was not available.
+    MissingCurrentValue,
+    /// Current value is outside hard bounds or is not finite.
+    InvalidCurrentValue,
+    /// There is no pressure signal for any unpinned safe knob.
+    NoPressureSignal,
+}
+
+/// Candidate for one bounded registry-approved knob step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningCandidate {
+    /// Registry id.
+    pub knob_id: TunableKnobId,
+    /// Owning subsystem.
+    pub owner: String,
+    /// Previous value.
+    pub old_value: f64,
+    /// Bounded candidate value.
+    pub candidate_value: f64,
+    /// Step direction.
+    pub direction: CandidateDirection,
+    /// Step policy from the registry.
+    pub step: CandidateStep,
+    /// Whether the current mode permits application somewhere.
+    pub would_apply: bool,
+    /// Whether the current mode may mutate live knobs.
+    pub live_mutation_allowed: bool,
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+    /// Primary safety metric from the registry.
+    pub safety_metric: String,
+    /// Primary rollback metric from the registry.
+    pub rollback_metric: String,
+    /// Registry gate that must be satisfied before widening.
+    pub gate: KnobGate,
+}
+
+/// Result of one bounded candidate evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateDecision {
+    /// Mode used for this evaluation.
+    pub mode: TuningMode,
+    /// Candidate, when one was safely generated.
+    pub candidate: Option<TuningCandidate>,
+    /// Reasons candidate generation was skipped.
+    pub skip_reasons: Vec<CandidateSkipReason>,
+    /// Current active exploration count.
+    pub active_explorations: usize,
+    /// Configured maximum active exploration count.
+    pub max_concurrent_explorations: usize,
+}
+
+/// Registry-only, single-knob candidate engine for ft-luq3w.2.
+#[derive(Debug, Clone)]
+pub struct BoundedCandidateEngine {
+    registry: BTreeMap<TunableKnobId, KnobSpec>,
+    config: CandidateEvaluationConfig,
+    active_explorations: usize,
+}
+
+impl BoundedCandidateEngine {
+    /// Build an engine with the default safe registry.
+    #[must_use]
+    pub fn new(config: CandidateEvaluationConfig) -> Self {
+        Self {
+            registry: default_candidate_registry(),
+            config,
+            active_explorations: 0,
+        }
+    }
+
+    /// Return the safe registry.
+    #[must_use]
+    pub fn registry(&self) -> &BTreeMap<TunableKnobId, KnobSpec> {
+        &self.registry
+    }
+
+    /// Return the engine config.
+    #[must_use]
+    pub fn config(&self) -> &CandidateEvaluationConfig {
+        &self.config
+    }
+
+    /// Set the active exploration count reported by the caller.
+    pub fn set_active_explorations(&mut self, active: usize) {
+        self.active_explorations = active;
+    }
+
+    /// Validate that a textual knob id belongs to the safe registry.
+    #[must_use]
+    pub fn validate_knob_id(&self, knob_id: &str) -> Result<TunableKnobId, CandidateSkipReason> {
+        let Some(id) = TunableKnobId::from_registry_id(knob_id) else {
+            return Err(CandidateSkipReason::UnknownKnob);
+        };
+
+        if self.registry.contains_key(&id) {
+            Ok(id)
+        } else {
+            Err(CandidateSkipReason::UnknownKnob)
+        }
+    }
+
+    /// Validate a requested candidate knob set against the initial guardrails.
+    pub fn validate_requested_knobs(
+        &self,
+        knob_ids: &[&str],
+    ) -> Result<Vec<TunableKnobId>, Vec<CandidateSkipReason>> {
+        let mut skip_reasons = Vec::new();
+        let mut ids = Vec::with_capacity(knob_ids.len());
+
+        for knob_id in knob_ids {
+            match self.validate_knob_id(knob_id) {
+                Ok(id) => ids.push(id),
+                Err(reason) => skip_reasons.push(reason),
+            }
+        }
+
+        if ids.len() > 1 {
+            skip_reasons.push(CandidateSkipReason::MultipleKnobsForbidden);
+            skip_reasons.push(CandidateSkipReason::UnsafeCombination);
+        }
+
+        if skip_reasons.is_empty() {
+            Ok(ids)
+        } else {
+            Err(skip_reasons)
+        }
+    }
+
+    /// Evaluate the current metrics and return at most one bounded candidate.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        current_values: &BTreeMap<TunableKnobId, f64>,
+        telemetry: &CandidateTelemetryWindow,
+        pinned: &[TunableKnobId],
+    ) -> CandidateDecision {
+        let skip_reasons = self.preflight_skip_reasons(telemetry);
+
+        if !skip_reasons.is_empty() {
+            return self.skipped(skip_reasons);
+        }
+
+        let Some(direction) = telemetry.direction else {
+            return self.skipped(vec![CandidateSkipReason::NoPressureSignal]);
+        };
+
+        for spec in self.registry.values() {
+            if pinned.contains(&spec.id) {
+                continue;
+            }
+
+            let Some(old_value) = current_values.get(&spec.id).copied() else {
+                continue;
+            };
+
+            match self.build_candidate(spec, old_value, direction) {
+                Ok(candidate) => {
+                    return CandidateDecision {
+                        mode: self.config.mode,
+                        candidate: Some(candidate),
+                        skip_reasons,
+                        active_explorations: self.active_explorations,
+                        max_concurrent_explorations: self.config.max_concurrent_explorations,
+                    };
+                }
+                Err(CandidateSkipReason::NoPressureSignal) => continue,
+                Err(reason) => return self.skipped(vec![reason]),
+            }
+        }
+
+        self.skipped(vec![CandidateSkipReason::NoPressureSignal])
+    }
+
+    /// Evaluate a caller-requested knob set after validating registry and combination guards.
+    #[must_use]
+    pub fn evaluate_requested(
+        &self,
+        knob_ids: &[&str],
+        current_values: &BTreeMap<TunableKnobId, f64>,
+        telemetry: &CandidateTelemetryWindow,
+        pinned: &[TunableKnobId],
+    ) -> CandidateDecision {
+        let mut skip_reasons = self.preflight_skip_reasons(telemetry);
+
+        let requested = match self.validate_requested_knobs(knob_ids) {
+            Ok(requested) => requested,
+            Err(mut reasons) => {
+                skip_reasons.append(&mut reasons);
+                return self.skipped(skip_reasons);
+            }
+        };
+
+        if !skip_reasons.is_empty() {
+            return self.skipped(skip_reasons);
+        }
+
+        if requested.is_empty() {
+            return self.evaluate(current_values, telemetry, pinned);
+        }
+
+        let knob_id = requested[0];
+        let Some(spec) = self.registry.get(&knob_id) else {
+            return self.skipped(vec![CandidateSkipReason::UnknownKnob]);
+        };
+
+        if pinned.contains(&knob_id) {
+            return self.skipped(vec![CandidateSkipReason::PinnedKnob]);
+        }
+
+        let Some(old_value) = current_values.get(&knob_id).copied() else {
+            return self.skipped(vec![CandidateSkipReason::MissingCurrentValue]);
+        };
+
+        let Some(direction) = telemetry.direction else {
+            return self.skipped(vec![CandidateSkipReason::NoPressureSignal]);
+        };
+
+        match self.build_candidate(spec, old_value, direction) {
+            Ok(candidate) => CandidateDecision {
+                mode: self.config.mode,
+                candidate: Some(candidate),
+                skip_reasons,
+                active_explorations: self.active_explorations,
+                max_concurrent_explorations: self.config.max_concurrent_explorations,
+            },
+            Err(reason) => self.skipped(vec![reason]),
+        }
+    }
+
+    fn preflight_skip_reasons(
+        &self,
+        telemetry: &CandidateTelemetryWindow,
+    ) -> Vec<CandidateSkipReason> {
+        let mut skip_reasons = Vec::new();
+
+        match self.config.mode {
+            TuningMode::Disabled => skip_reasons.push(CandidateSkipReason::Disabled),
+            TuningMode::Cooldown => skip_reasons.push(CandidateSkipReason::Cooldown),
+            _ => {}
+        }
+
+        match self.config.telemetry_trust {
+            TelemetryTrust::Fresh => {}
+            TelemetryTrust::Missing => skip_reasons.push(CandidateSkipReason::MissingTelemetry),
+            TelemetryTrust::Stale => skip_reasons.push(CandidateSkipReason::StaleTelemetry),
+            TelemetryTrust::Untrusted => skip_reasons.push(CandidateSkipReason::UntrustedTelemetry),
+        }
+
+        if !telemetry.warmup_complete {
+            skip_reasons.push(CandidateSkipReason::WarmupIncomplete);
+        }
+        if telemetry.measurement_count < telemetry.minimum_measurements {
+            skip_reasons.push(CandidateSkipReason::InsufficientMeasurements);
+        }
+        if telemetry.confidence < telemetry.minimum_confidence {
+            skip_reasons.push(CandidateSkipReason::InsufficientConfidence);
+        }
+        if self.config.mode.consumes_exploration_budget()
+            && self.active_explorations >= self.config.max_concurrent_explorations
+        {
+            skip_reasons.push(CandidateSkipReason::ExplorationBudgetExhausted);
+        }
+
+        skip_reasons
+    }
+
+    fn build_candidate(
+        &self,
+        spec: &KnobSpec,
+        old_value: f64,
+        direction: CandidateDirection,
+    ) -> Result<TuningCandidate, CandidateSkipReason> {
+        if !spec.range.contains(old_value) {
+            return Err(CandidateSkipReason::InvalidCurrentValue);
+        }
+
+        let Some(candidate_value) = bounded_step(old_value, spec.range, spec.step, direction)
+        else {
+            return Err(CandidateSkipReason::InvalidCurrentValue);
+        };
+
+        if (candidate_value - old_value).abs() <= f64::EPSILON {
+            return Err(CandidateSkipReason::NoPressureSignal);
+        }
+
+        Ok(TuningCandidate {
+            knob_id: spec.id,
+            owner: spec.owner.to_string(),
+            old_value,
+            candidate_value,
+            direction,
+            step: spec.step,
+            would_apply: self.config.mode.would_apply_candidate(),
+            live_mutation_allowed: self.config.mode.may_mutate_live_knobs(),
+            reason_code: format!("auto_tune.candidate.{}", spec.id.as_str()),
+            safety_metric: spec.safety_metric.to_string(),
+            rollback_metric: spec.rollback_metric.to_string(),
+            gate: spec.gate,
+        })
+    }
+
+    fn skipped(&self, skip_reasons: Vec<CandidateSkipReason>) -> CandidateDecision {
+        CandidateDecision {
+            mode: self.config.mode,
+            candidate: None,
+            skip_reasons,
+            active_explorations: self.active_explorations,
+            max_concurrent_explorations: self.config.max_concurrent_explorations,
+        }
+    }
+}
+
+fn default_candidate_registry() -> BTreeMap<TunableKnobId, KnobSpec> {
+    use CandidateStep::{Fixed, Multiplier, Tier};
+    use KnobGate::{CanaryFirst, ObserveFirst, ProfileGated};
+
+    BTreeMap::from([
+        (
+            TunableKnobId::RuntimeOutputCoalesceWindowMs,
+            KnobSpec {
+                id: TunableKnobId::RuntimeOutputCoalesceWindowMs,
+                owner: "runtime",
+                source: "RuntimeTuning::output_coalesce_window_ms",
+                default_value: 50.0,
+                range: ParamRange {
+                    min: 5.0,
+                    max: 200.0,
+                },
+                step: Fixed { amount: 25.0 },
+                safety_metric: "ingest_p95_latency",
+                rollback_metric: "p99_ingest_latency",
+                constraint: "segment_flush_count and buffered memory must remain in budget",
+                gate: ProfileGated,
+            },
+        ),
+        (
+            TunableKnobId::RuntimeOutputCoalesceMaxDelayMs,
+            KnobSpec {
+                id: TunableKnobId::RuntimeOutputCoalesceMaxDelayMs,
+                owner: "runtime",
+                source: "RuntimeTuning::output_coalesce_max_delay_ms",
+                default_value: 200.0,
+                range: ParamRange {
+                    min: 5.0,
+                    max: 750.0,
+                },
+                step: Fixed { amount: 50.0 },
+                safety_metric: "flush_boundedness",
+                rollback_metric: "pane_freshness_p99",
+                constraint: "candidate must remain >= runtime.output_coalesce_window_ms",
+                gate: ProfileGated,
+            },
+        ),
+        (
+            TunableKnobId::RuntimeOutputCoalesceMaxBytes,
+            KnobSpec {
+                id: TunableKnobId::RuntimeOutputCoalesceMaxBytes,
+                owner: "runtime",
+                source: "RuntimeTuning::output_coalesce_max_bytes",
+                default_value: 262_144.0,
+                range: ParamRange {
+                    min: 4096.0,
+                    max: 1_048_576.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "storage_write_service_p95",
+                rollback_metric: "storage_queue_depth",
+                constraint: "one x2 or /2 step only",
+                gate: ProfileGated,
+            },
+        ),
+        (
+            TunableKnobId::RuntimeTelemetryPercentileWindow,
+            KnobSpec {
+                id: TunableKnobId::RuntimeTelemetryPercentileWindow,
+                owner: "runtime",
+                source: "RuntimeTuning::telemetry_percentile_window",
+                default_value: 1024.0,
+                range: ParamRange {
+                    min: 256.0,
+                    max: 4096.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "telemetry_memory_cap",
+                rollback_metric: "stage_sample_contention",
+                constraint: "sample sufficiency must remain in budget",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::RuntimeCursorSnapshotMemoryWarnBytes,
+            KnobSpec {
+                id: TunableKnobId::RuntimeCursorSnapshotMemoryWarnBytes,
+                owner: "runtime",
+                source: "RuntimeTuning::cursor_snapshot_memory_warn_bytes",
+                default_value: 67_108_864.0,
+                range: ParamRange {
+                    min: 33_554_432.0,
+                    max: 536_870_912.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "memory_pressure_tier",
+                rollback_metric: "hot_resident_bytes",
+                constraint: "retained cursor bytes must remain in budget",
+                gate: ProfileGated,
+            },
+        ),
+        (
+            TunableKnobId::BackpressureWarnRatio,
+            KnobSpec {
+                id: TunableKnobId::BackpressureWarnRatio,
+                owner: "backpressure",
+                source: "BackpressureTuning::warn_ratio",
+                default_value: 0.75,
+                range: ParamRange {
+                    min: 0.10,
+                    max: 0.99,
+                },
+                step: Fixed { amount: 0.05 },
+                safety_metric: "false_positive_warning_rate",
+                rollback_metric: "queue_saturation_rate",
+                constraint: "warning timing must precede capacity action",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::SnapshotTriggerBridgeTickSecs,
+            KnobSpec {
+                id: TunableKnobId::SnapshotTriggerBridgeTickSecs,
+                owner: "snapshot",
+                source: "SnapshotTuning::trigger_bridge_tick_secs",
+                default_value: 30.0,
+                range: ParamRange {
+                    min: 5.0,
+                    max: 120.0,
+                },
+                step: Fixed { amount: 15.0 },
+                safety_metric: "snapshot_trigger_latency",
+                rollback_metric: "idle_cpu",
+                constraint: "must not miss trigger SLA",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::SnapshotMemoryTriggerCooldownSecs,
+            KnobSpec {
+                id: TunableKnobId::SnapshotMemoryTriggerCooldownSecs,
+                owner: "snapshot",
+                source: "SnapshotTuning::memory_trigger_cooldown_secs",
+                default_value: 120.0,
+                range: ParamRange {
+                    min: 60.0,
+                    max: 600.0,
+                },
+                step: Fixed { amount: 60.0 },
+                safety_metric: "repeated_memory_trigger_rate",
+                rollback_metric: "snapshot_io_pressure",
+                constraint: "memory recovery must stay inside budget",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::IngestMaxPersistSegmentBytes,
+            KnobSpec {
+                id: TunableKnobId::IngestMaxPersistSegmentBytes,
+                owner: "ingest",
+                source: "IngestTuning::max_persist_segment_bytes",
+                default_value: 65_536.0,
+                range: ParamRange {
+                    min: 32_768.0,
+                    max: 262_144.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "storage_write_p95",
+                rollback_metric: "search_freshness_lag",
+                constraint: "memory queue must not exceed baseline budget",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::PatternsMaxSeenKeys,
+            KnobSpec {
+                id: TunableKnobId::PatternsMaxSeenKeys,
+                owner: "patterns",
+                source: "PatternsTuning::max_seen_keys",
+                default_value: 1000.0,
+                range: ParamRange {
+                    min: 100.0,
+                    max: 64_000.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "dedupe_hit_rate",
+                rollback_metric: "pattern_cpu",
+                constraint: "memory footprint must remain in budget",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::PatternsMaxTailSizeBytes,
+            KnobSpec {
+                id: TunableKnobId::PatternsMaxTailSizeBytes,
+                owner: "patterns",
+                source: "PatternsTuning::max_tail_size_bytes",
+                default_value: 2048.0,
+                range: ParamRange {
+                    min: 256.0,
+                    max: 16_384.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "detection_recall_proxy",
+                rollback_metric: "regex_cpu",
+                constraint: "retained tail bytes must remain in budget",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::PatternsBloomFalsePositiveRate,
+            KnobSpec {
+                id: TunableKnobId::PatternsBloomFalsePositiveRate,
+                owner: "patterns",
+                source: "PatternsTuning::bloom_false_positive_rate",
+                default_value: 0.01,
+                range: ParamRange {
+                    min: 0.001,
+                    max: 0.2,
+                },
+                step: Tier { amount: 0.009 },
+                safety_metric: "regex_evaluations",
+                rollback_metric: "false_positive_work",
+                constraint: "one documented tier only",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::PolicyMaxTrackedPanes,
+            KnobSpec {
+                id: TunableKnobId::PolicyMaxTrackedPanes,
+                owner: "policy",
+                source: "PolicyTuning::max_tracked_panes",
+                default_value: 256.0,
+                range: ParamRange {
+                    min: 32.0,
+                    max: 8192.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "rate_limit_amnesia_count",
+                rollback_metric: "policy_memory",
+                constraint: "evictions must not remain high",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::PolicyMaxEventsPerPane,
+            KnobSpec {
+                id: TunableKnobId::PolicyMaxEventsPerPane,
+                owner: "policy",
+                source: "PolicyTuning::max_events_per_pane",
+                default_value: 64.0,
+                range: ParamRange {
+                    min: 8.0,
+                    max: 512.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "rate_limit_accuracy",
+                rollback_metric: "enforcement_churn",
+                constraint: "policy memory must remain in budget",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::PolicyCostTrackerMaxPanes,
+            KnobSpec {
+                id: TunableKnobId::PolicyCostTrackerMaxPanes,
+                owner: "policy",
+                source: "PolicyTuning::cost_tracker_max_panes",
+                default_value: 512.0,
+                range: ParamRange {
+                    min: 128.0,
+                    max: 8192.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "cost_tracker_eviction_count",
+                rollback_metric: "cost_tracker_memory",
+                constraint: "cost tracker must stop evicting after increase",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::WebStreamDefaultMaxHz,
+            KnobSpec {
+                id: TunableKnobId::WebStreamDefaultMaxHz,
+                owner: "web",
+                source: "WebTuning::stream_default_max_hz",
+                default_value: 50.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 250.0,
+                },
+                step: Tier { amount: 25.0 },
+                safety_metric: "sse_lag",
+                rollback_metric: "client_backlog",
+                constraint: "CPU fanout must remain inside baseline",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::WebStreamScanLimit,
+            KnobSpec {
+                id: TunableKnobId::WebStreamScanLimit,
+                owner: "web",
+                source: "WebTuning::stream_scan_limit",
+                default_value: 256.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 1024.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "catch_up_latency",
+                rollback_metric: "request_latency",
+                constraint: "scan CPU must not regress",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::WorkflowsCassTimeoutSecs,
+            KnobSpec {
+                id: TunableKnobId::WorkflowsCassTimeoutSecs,
+                owner: "workflows",
+                source: "CassQueryConfig::timeout_secs",
+                default_value: 6.0,
+                range: ParamRange {
+                    min: 4.0,
+                    max: 15.0,
+                },
+                step: Fixed { amount: 2.0 },
+                safety_metric: "cass_success_rate",
+                rollback_metric: "workflow_p99",
+                constraint: "cancellation rate must not regress",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::WorkflowsCooldownMs,
+            KnobSpec {
+                id: TunableKnobId::WorkflowsCooldownMs,
+                owner: "workflows",
+                source: "WorkflowsTuning::*_cooldown_ms",
+                default_value: 180_000.0,
+                range: ParamRange {
+                    min: 60_000.0,
+                    max: 1_800_000.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "duplicate_automation_rate",
+                rollback_metric: "recovery_latency",
+                constraint: "repeated intervention must not regress",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::SearchTantivyWriterMemoryBytes,
+            KnobSpec {
+                id: TunableKnobId::SearchTantivyWriterMemoryBytes,
+                owner: "search",
+                source: "SearchTuning::tantivy_writer_memory_bytes",
+                default_value: 50_000_000.0,
+                range: ParamRange {
+                    min: 10_485_760.0,
+                    max: 268_435_456.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "indexing_throughput",
+                rollback_metric: "search_lag",
+                constraint: "memory pressure must not regress",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::IpcAcceptPollIntervalMs,
+            KnobSpec {
+                id: TunableKnobId::IpcAcceptPollIntervalMs,
+                owner: "ipc",
+                source: "IpcTuning::accept_poll_interval_ms",
+                default_value: 100.0,
+                range: ParamRange {
+                    min: 10.0,
+                    max: 250.0,
+                },
+                step: Fixed { amount: 25.0 },
+                safety_metric: "accept_latency",
+                rollback_metric: "idle_cpu",
+                constraint: "accept p99 must not regress",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::CapacityQueueDeferThreshold,
+            KnobSpec {
+                id: TunableKnobId::CapacityQueueDeferThreshold,
+                owner: "capacity",
+                source: "SwarmCapacityAdmissionControllerConfig::queue_defer_threshold",
+                default_value: 16.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 1024.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "admission_queue_pressure",
+                rollback_metric: "defer_count",
+                constraint: "defer <= throttle <= shed",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::CapacityBacklogDeferThreshold,
+            KnobSpec {
+                id: TunableKnobId::CapacityBacklogDeferThreshold,
+                owner: "capacity",
+                source: "SwarmCapacityAdmissionControllerConfig::backlog_defer_threshold",
+                default_value: 64.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 4096.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "admission_backlog_pressure",
+                rollback_metric: "backlog_defer_count",
+                constraint: "defer <= throttle <= shed",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::CapacityThrottleQueueDepth,
+            KnobSpec {
+                id: TunableKnobId::CapacityThrottleQueueDepth,
+                owner: "capacity",
+                source: "SwarmCapacityAdmissionControllerConfig::throttle_queue_depth",
+                default_value: 64.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 4096.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "queue_throttle_rate",
+                rollback_metric: "capture_freshness",
+                constraint: "queue_defer_threshold <= candidate <= shed_queue_depth",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::CapacityThrottleBacklogDepth,
+            KnobSpec {
+                id: TunableKnobId::CapacityThrottleBacklogDepth,
+                owner: "capacity",
+                source: "SwarmCapacityAdmissionControllerConfig::throttle_backlog_depth",
+                default_value: 256.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 16_384.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "backlog_throttle_rate",
+                rollback_metric: "backlog_drain_time",
+                constraint: "backlog_defer_threshold <= candidate <= shed_backlog_depth",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::CapacityShedQueueDepth,
+            KnobSpec {
+                id: TunableKnobId::CapacityShedQueueDepth,
+                owner: "capacity",
+                source: "SwarmCapacityAdmissionControllerConfig::shed_queue_depth",
+                default_value: 256.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 4096.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "optional_shed_count",
+                rollback_metric: "queue_saturation",
+                constraint: "candidate >= throttle_queue_depth",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::CapacityShedBacklogDepth,
+            KnobSpec {
+                id: TunableKnobId::CapacityShedBacklogDepth,
+                owner: "capacity",
+                source: "SwarmCapacityAdmissionControllerConfig::shed_backlog_depth",
+                default_value: 1024.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 16_384.0,
+                },
+                step: Multiplier { factor: 2.0 },
+                safety_metric: "optional_backlog_shed_count",
+                rollback_metric: "backlog_saturation",
+                constraint: "candidate >= throttle_backlog_depth",
+                gate: CanaryFirst,
+            },
+        ),
+        (
+            TunableKnobId::CapacityDefaultRetryAfterSecs,
+            KnobSpec {
+                id: TunableKnobId::CapacityDefaultRetryAfterSecs,
+                owner: "capacity",
+                source: "SwarmCapacityAdmissionControllerConfig::default_retry_after_secs",
+                default_value: 5.0,
+                range: ParamRange {
+                    min: 1.0,
+                    max: 3600.0,
+                },
+                step: Fixed { amount: 5.0 },
+                safety_metric: "retry_storm_rate",
+                rollback_metric: "completion_latency",
+                constraint: "candidate <= max_retry_after_secs",
+                gate: ObserveFirst,
+            },
+        ),
+        (
+            TunableKnobId::CapacityCooldownSecs,
+            KnobSpec {
+                id: TunableKnobId::CapacityCooldownSecs,
+                owner: "capacity",
+                source: "SwarmCapacityAdmissionControllerConfig::cooldown_secs",
+                default_value: 30.0,
+                range: ParamRange {
+                    min: 0.0,
+                    max: 3600.0,
+                },
+                step: Fixed { amount: 30.0 },
+                safety_metric: "oscillation_count",
+                rollback_metric: "recovery_time",
+                constraint: "cooldown semantics must match capacity admission",
+                gate: ObserveFirst,
+            },
+        ),
+    ])
+}
+
+fn bounded_step(
+    current: f64,
+    range: ParamRange,
+    step: CandidateStep,
+    direction: CandidateDirection,
+) -> Option<f64> {
+    if !current.is_finite() || !range.min.is_finite() || !range.max.is_finite() {
+        return None;
+    }
+
+    let candidate = match (step, direction) {
+        (CandidateStep::Fixed { amount } | CandidateStep::Tier { amount }, _) => {
+            if !amount.is_finite() || amount <= 0.0 {
+                return None;
+            }
+            match direction {
+                CandidateDirection::Increase => current + amount,
+                CandidateDirection::Decrease => current - amount,
+            }
+        }
+        (CandidateStep::Fraction { fraction }, _) => {
+            if !fraction.is_finite() || fraction <= 0.0 {
+                return None;
+            }
+            let amount = (current.abs() * fraction).max(f64::EPSILON);
+            match direction {
+                CandidateDirection::Increase => current + amount,
+                CandidateDirection::Decrease => current - amount,
+            }
+        }
+        (CandidateStep::Multiplier { factor }, CandidateDirection::Increase) => {
+            if !factor.is_finite() || factor <= 1.0 {
+                return None;
+            }
+            current * factor
+        }
+        (CandidateStep::Multiplier { factor }, CandidateDirection::Decrease) => {
+            if !factor.is_finite() || factor <= 1.0 {
+                return None;
+            }
+            current / factor
+        }
+    };
+
+    if candidate.is_finite() {
+        Some(range.clamp(candidate))
+    } else {
+        None
+    }
 }
 
 // =============================================================================
@@ -567,6 +1867,7 @@ impl AutoTuner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn default_config() -> AutoTuneConfig {
         AutoTuneConfig::default()
@@ -686,6 +1987,287 @@ mod tests {
         assert_eq!(params.scrollback_lines_usize(), 5000);
         assert_eq!(params.snapshot_interval_secs_u64(), 300);
         assert_eq!(params.pool_size_usize(), 4);
+    }
+
+    // ---- Bounded candidate engine tests ----
+
+    fn fresh_observe_candidate_engine() -> BoundedCandidateEngine {
+        BoundedCandidateEngine::new(CandidateEvaluationConfig::default())
+    }
+
+    fn pressure_window(direction: CandidateDirection) -> CandidateTelemetryWindow {
+        CandidateTelemetryWindow {
+            direction: Some(direction),
+            ..CandidateTelemetryWindow::default()
+        }
+    }
+
+    fn default_current_values(engine: &BoundedCandidateEngine) -> BTreeMap<TunableKnobId, f64> {
+        engine
+            .registry()
+            .iter()
+            .map(|(id, spec)| (*id, spec.default_value))
+            .collect()
+    }
+
+    #[test]
+    fn candidate_registry_rejects_unknown_knob() {
+        let engine = fresh_observe_candidate_engine();
+        assert_eq!(
+            engine.validate_knob_id("not_a_real_knob"),
+            Err(CandidateSkipReason::UnknownKnob)
+        );
+        assert_eq!(
+            engine.validate_knob_id("runtime.output_coalesce_window_ms"),
+            Ok(TunableKnobId::RuntimeOutputCoalesceWindowMs)
+        );
+    }
+
+    #[test]
+    fn candidate_engine_generates_single_registry_candidate() {
+        let engine = fresh_observe_candidate_engine();
+        let decision = engine.evaluate(
+            &default_current_values(&engine),
+            &pressure_window(CandidateDirection::Increase),
+            &[],
+        );
+        let candidate = decision.candidate.expect("registry candidate");
+
+        assert_eq!(
+            candidate.knob_id,
+            TunableKnobId::RuntimeOutputCoalesceWindowMs
+        );
+        assert_eq!(candidate.owner, "runtime");
+        assert_eq!(candidate.direction, CandidateDirection::Increase);
+        assert!(!candidate.would_apply);
+        assert!(!candidate.live_mutation_allowed);
+        assert_eq!(candidate.candidate_value, 75.0);
+        assert_eq!(
+            candidate.reason_code,
+            "auto_tune.candidate.runtime.output_coalesce_window_ms"
+        );
+        assert!(decision.skip_reasons.is_empty());
+    }
+
+    #[test]
+    fn candidate_engine_respects_pinned_knobs() {
+        let engine = fresh_observe_candidate_engine();
+        let decision = engine.evaluate(
+            &default_current_values(&engine),
+            &pressure_window(CandidateDirection::Increase),
+            &[TunableKnobId::RuntimeOutputCoalesceWindowMs],
+        );
+        let candidate = decision.candidate.expect("next registry candidate");
+
+        assert_eq!(
+            candidate.knob_id,
+            TunableKnobId::RuntimeOutputCoalesceMaxDelayMs
+        );
+        assert_eq!(candidate.direction, CandidateDirection::Increase);
+    }
+
+    #[test]
+    fn candidate_engine_skips_stale_telemetry() {
+        let engine = BoundedCandidateEngine::new(CandidateEvaluationConfig {
+            telemetry_trust: TelemetryTrust::Stale,
+            ..CandidateEvaluationConfig::default()
+        });
+        let decision = engine.evaluate(
+            &default_current_values(&engine),
+            &pressure_window(CandidateDirection::Increase),
+            &[],
+        );
+
+        assert!(decision.candidate.is_none());
+        assert_eq!(
+            decision.skip_reasons,
+            vec![CandidateSkipReason::StaleTelemetry]
+        );
+    }
+
+    #[test]
+    fn candidate_engine_enforces_exploration_budget() {
+        let mut engine = BoundedCandidateEngine::new(CandidateEvaluationConfig {
+            mode: TuningMode::Exploration,
+            max_concurrent_explorations: 1,
+            telemetry_trust: TelemetryTrust::Fresh,
+        });
+        engine.set_active_explorations(1);
+        let decision = engine.evaluate(
+            &default_current_values(&engine),
+            &pressure_window(CandidateDirection::Increase),
+            &[],
+        );
+
+        assert!(decision.candidate.is_none());
+        assert_eq!(
+            decision.skip_reasons,
+            vec![CandidateSkipReason::ExplorationBudgetExhausted]
+        );
+    }
+
+    #[test]
+    fn candidate_engine_marks_apply_scope_by_mode() {
+        let engine = fresh_observe_candidate_engine();
+        let observe = fresh_observe_candidate_engine().evaluate(
+            &default_current_values(&engine),
+            &pressure_window(CandidateDirection::Increase),
+            &[],
+        );
+        assert!(
+            !observe
+                .candidate
+                .as_ref()
+                .expect("observe candidate")
+                .would_apply
+        );
+        assert!(
+            !observe
+                .candidate
+                .as_ref()
+                .expect("observe candidate")
+                .live_mutation_allowed
+        );
+
+        let canary_engine = BoundedCandidateEngine::new(CandidateEvaluationConfig {
+            mode: TuningMode::Canary,
+            ..CandidateEvaluationConfig::default()
+        });
+        let canary = canary_engine.evaluate(
+            &default_current_values(&canary_engine),
+            &pressure_window(CandidateDirection::Increase),
+            &[],
+        );
+        assert!(
+            canary
+                .candidate
+                .as_ref()
+                .expect("canary candidate")
+                .would_apply
+        );
+        assert!(
+            !canary
+                .candidate
+                .as_ref()
+                .expect("canary candidate")
+                .live_mutation_allowed
+        );
+
+        let steady_engine = BoundedCandidateEngine::new(CandidateEvaluationConfig {
+            mode: TuningMode::SteadyState,
+            ..CandidateEvaluationConfig::default()
+        });
+        let steady = steady_engine.evaluate(
+            &default_current_values(&steady_engine),
+            &pressure_window(CandidateDirection::Increase),
+            &[],
+        );
+        assert!(
+            steady
+                .candidate
+                .as_ref()
+                .expect("steady candidate")
+                .live_mutation_allowed
+        );
+    }
+
+    #[test]
+    fn candidate_engine_rejects_unsafe_multiple_knob_request() {
+        let engine = fresh_observe_candidate_engine();
+        let decision = engine.evaluate_requested(
+            &[
+                "runtime.output_coalesce_window_ms",
+                "backpressure.warn_ratio",
+            ],
+            &default_current_values(&engine),
+            &pressure_window(CandidateDirection::Increase),
+            &[],
+        );
+
+        assert!(decision.candidate.is_none());
+        assert!(
+            decision
+                .skip_reasons
+                .contains(&CandidateSkipReason::MultipleKnobsForbidden)
+        );
+        assert!(
+            decision
+                .skip_reasons
+                .contains(&CandidateSkipReason::UnsafeCombination)
+        );
+    }
+
+    #[test]
+    fn candidate_engine_refuses_low_confidence_telemetry() {
+        let engine = fresh_observe_candidate_engine();
+        let decision = engine.evaluate(
+            &default_current_values(&engine),
+            &CandidateTelemetryWindow {
+                confidence: 0.40,
+                minimum_confidence: 0.80,
+                direction: Some(CandidateDirection::Increase),
+                ..CandidateTelemetryWindow::default()
+            },
+            &[],
+        );
+
+        assert!(decision.candidate.is_none());
+        assert_eq!(
+            decision.skip_reasons,
+            vec![CandidateSkipReason::InsufficientConfidence]
+        );
+    }
+
+    #[test]
+    fn candidate_engine_requires_requested_current_value() {
+        let engine = fresh_observe_candidate_engine();
+        let decision = engine.evaluate_requested(
+            &["runtime.output_coalesce_window_ms"],
+            &BTreeMap::new(),
+            &pressure_window(CandidateDirection::Increase),
+            &[],
+        );
+
+        assert!(decision.candidate.is_none());
+        assert_eq!(
+            decision.skip_reasons,
+            vec![CandidateSkipReason::MissingCurrentValue]
+        );
+    }
+
+    #[test]
+    fn registry_steps_stay_inside_hard_bounds() {
+        let engine = fresh_observe_candidate_engine();
+
+        for spec in engine.registry().values() {
+            assert!(
+                spec.range.contains(spec.default_value),
+                "{}",
+                spec.id.as_str()
+            );
+            assert_eq!(
+                TunableKnobId::from_registry_id(spec.id.as_str()),
+                Some(spec.id)
+            );
+
+            for direction in [CandidateDirection::Increase, CandidateDirection::Decrease] {
+                let value = bounded_step(spec.default_value, spec.range, spec.step, direction)
+                    .expect("bounded step");
+                assert!(spec.range.contains(value), "{}", spec.id.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn tuning_mode_contract_rejects_invalid_transition() {
+        assert!(TuningMode::Disabled.can_transition_to(TuningMode::Observe));
+        assert!(TuningMode::Observe.can_transition_to(TuningMode::Canary));
+        assert!(TuningMode::Rollback.can_transition_to(TuningMode::Cooldown));
+        assert!(TuningMode::Cooldown.can_transition_to(TuningMode::Observe));
+
+        assert!(!TuningMode::Observe.can_transition_to(TuningMode::SteadyState));
+        assert!(!TuningMode::Cooldown.can_transition_to(TuningMode::Exploration));
+        assert!(!TuningMode::Rollback.can_transition_to(TuningMode::SteadyState));
     }
 
     // ---- Hysteresis tests ----
