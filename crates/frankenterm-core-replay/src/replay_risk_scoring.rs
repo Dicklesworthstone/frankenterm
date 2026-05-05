@@ -892,7 +892,7 @@ mod tests {
         let scorer = RiskScorer::new();
         let div = make_divergence(DivergenceType::Modified, "rule_a", RootCause::Unknown);
 
-        let zero_radius = scorer.aggregate(&[div.clone()]);
+        let zero_radius = scorer.aggregate(std::slice::from_ref(&div));
         let caller_radius = scorer.aggregate_with_impact_radii(&[(div, 4)]);
 
         assert_eq!(

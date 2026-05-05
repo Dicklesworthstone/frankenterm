@@ -133,18 +133,12 @@ pub enum CheckpointResumeError {
     /// constant compiled into this engine. Indicates a stale
     /// persisted checkpoint from a prior schema or a forged
     /// payload claiming a different version.
-    SchemaMismatch {
-        expected: String,
-        actual: String,
-    },
+    SchemaMismatch { expected: String, actual: String },
     /// Checkpoint's `replay_run_id` does not match the
     /// checkpointer's current run id. Indicates a checkpoint
     /// from a different replay run was supplied — accepting it
     /// would resume one run with another's deterministic state.
-    RunIdMismatch {
-        expected: String,
-        actual: String,
-    },
+    RunIdMismatch { expected: String, actual: String },
 }
 
 impl std::fmt::Display for CheckpointResumeError {
@@ -699,7 +693,9 @@ mod tests {
 
         // Resume from checkpoint
         let ckpt2 = ReplayCheckpointer::new("run_res".into(), config, FailureMode::Default);
-        ckpt2.resume_from(&cp).expect("matching run id + version must succeed");
+        ckpt2
+            .resume_from(&cp)
+            .expect("matching run id + version must succeed");
         assert_eq!(ckpt2.current_state().event_position, 3);
         ckpt2.advance(300, 3000);
         assert_eq!(ckpt2.current_state().event_position, 4);
@@ -736,7 +732,8 @@ mod tests {
         // So cp.decisions_made = 5.
 
         let run2 = ReplayCheckpointer::new("run_r1".into(), config, FailureMode::Default);
-        run2.resume_from(&cp).expect("matching run id + version must succeed");
+        run2.resume_from(&cp)
+            .expect("matching run id + version must succeed");
         // Record the decision for event 5 that was lost in the checkpoint boundary.
         run2.record_decision();
         for i in 6..10 {
@@ -1002,7 +999,9 @@ mod tests {
                 assert_eq!(expected, "run-A");
                 assert_eq!(actual, "run-B");
             }
-            other => panic!("expected RunIdMismatch; got {other:?}"),
+            other @ CheckpointResumeError::SchemaMismatch { .. } => {
+                panic!("expected RunIdMismatch; got {other:?}");
+            }
         }
         // Pre-existing live state must be untouched.
         let state = ckpt.current_state();
@@ -1025,7 +1024,9 @@ mod tests {
                 assert_eq!(expected, CHECKPOINT_VERSION);
                 assert_eq!(actual, "ft.replay.checkpoint.v0");
             }
-            other => panic!("expected SchemaMismatch; got {other:?}"),
+            other @ CheckpointResumeError::RunIdMismatch { .. } => {
+                panic!("expected SchemaMismatch; got {other:?}");
+            }
         }
     }
 
@@ -1061,7 +1062,10 @@ mod tests {
             },
             0,
         );
-        assert!(ckpt.is_halted(), "preconditions: handle_error should halt under Strict");
+        assert!(
+            ckpt.is_halted(),
+            "preconditions: handle_error should halt under Strict"
+        );
         let foreign = CheckpointState::new("run-OTHER".into());
         let _ = ckpt.resume_from(&foreign).expect_err("must reject");
         // Halt state preserved across rejection.

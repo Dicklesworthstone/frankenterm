@@ -5,6 +5,15 @@
 //! - [`ScenarioMatrixRunner`] — Executes all (artifact, override) pairs.
 //! - [`MatrixResult`] — Aggregate results with diff summaries.
 //! - [`ScenarioResult`] — Per-scenario outcome with decision diffs.
+//! - [`ScaleScenarioManifest`] — Checked-in massive-swarm scenario tiers.
+//! - [`ScaleProofMatrix`] — Machine-readable proof coverage for scale claims.
+//!
+//! Massive-swarm scale proof starts from
+//! [`ScaleScenarioManifest::massive_swarm_defaults`]. Add new scenarios there
+//! with deterministic seeds and expected counters, then attach bounded,
+//! replay-backed, or live-hardware proof rows through [`ScaleProofMatrix`].
+//! Hardware claims such as 64-core / 256 GiB hosts are only proven by passed
+//! [`ScaleScenarioClass::LiveHardware`] rows with complete execution evidence.
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, mpsc};
@@ -290,6 +299,356 @@ impl MatrixConfig {
             }
         }
         pairs
+    }
+}
+
+// ============================================================================
+// ScaleScenarioManifest — deterministic massive-swarm scenario inventory
+// ============================================================================
+
+/// Scenario origin class for scale-lab proof rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleScenarioClass {
+    /// Deterministic synthetic generation; useful for bounded correctness.
+    Synthetic,
+    /// Replay artifact derived from real captured runs.
+    ReplayBacked,
+    /// Live execution on a measured hardware worker.
+    LiveHardware,
+}
+
+/// Coverage dimension exercised by a scenario proof row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofDimension {
+    /// Decision and event correctness.
+    Correctness,
+    /// Throughput and scheduling capacity.
+    Throughput,
+    /// Memory pressure and retention behavior.
+    Memory,
+    /// Live hardware capacity evidence.
+    Hardware,
+}
+
+/// Proof row status for machine-readable scale evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProofStatus {
+    /// The proof completed and satisfied its expected counters.
+    Passed,
+    /// The proof ran and failed.
+    Failed,
+    /// The proof gap is intentional and must not be marketed as proven.
+    SkippedNotProven,
+}
+
+/// Expected traffic counters for one scale scenario fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleScenarioCounters {
+    /// Logical pane count simulated or replayed by the scenario.
+    pub logical_panes: u64,
+    /// Logical agent count simulated or replayed by the scenario.
+    pub logical_agents: u64,
+    /// Pane/agent churn events.
+    pub churn_events: u64,
+    /// Alternate-screen enter/exit transitions.
+    pub alt_screen_flips: u64,
+    /// Burst event storms.
+    pub event_storms: u64,
+    /// Output burst volume in bytes.
+    pub output_burst_bytes: u64,
+    /// Storage writes expected from capture/index/audit paths.
+    pub storage_writes: u64,
+    /// Policy-denial or require-approval audit records.
+    pub policy_denials: u64,
+}
+
+/// One deterministic massive-swarm scenario fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleScenarioManifestEntry {
+    /// Stable scenario identifier.
+    pub id: String,
+    /// Human-readable scenario label.
+    pub label: String,
+    /// Scenario origin class.
+    pub class: ScaleScenarioClass,
+    /// Deterministic generation seed.
+    pub deterministic_seed: u64,
+    /// Expected traffic counters.
+    pub counters: ScaleScenarioCounters,
+    /// Proof dimensions this scenario is intended to cover.
+    pub dimensions: Vec<ProofDimension>,
+}
+
+/// Checked-in deterministic scale scenario manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleScenarioManifest {
+    /// Scenario fixtures available to the scale lab.
+    pub scenarios: Vec<ScaleScenarioManifestEntry>,
+}
+
+impl ScaleScenarioManifest {
+    /// Standard massive-swarm tiers for bounded proof runs.
+    #[must_use]
+    pub fn massive_swarm_defaults() -> Self {
+        Self {
+            scenarios: vec![
+                ScaleScenarioManifestEntry {
+                    id: "synthetic_1k_churn".to_string(),
+                    label: "1k logical panes with churn and output bursts".to_string(),
+                    class: ScaleScenarioClass::Synthetic,
+                    deterministic_seed: 1_001_001,
+                    counters: ScaleScenarioCounters {
+                        logical_panes: 1_024,
+                        logical_agents: 1_024,
+                        churn_events: 6_144,
+                        alt_screen_flips: 2_048,
+                        event_storms: 32,
+                        output_burst_bytes: 268_435_456,
+                        storage_writes: 65_536,
+                        policy_denials: 512,
+                    },
+                    dimensions: vec![
+                        ProofDimension::Correctness,
+                        ProofDimension::Throughput,
+                        ProofDimension::Memory,
+                    ],
+                },
+                ScaleScenarioManifestEntry {
+                    id: "synthetic_5k_event_storm".to_string(),
+                    label: "5k logical panes under event storms".to_string(),
+                    class: ScaleScenarioClass::Synthetic,
+                    deterministic_seed: 5_005_005,
+                    counters: ScaleScenarioCounters {
+                        logical_panes: 5_120,
+                        logical_agents: 5_120,
+                        churn_events: 40_960,
+                        alt_screen_flips: 12_288,
+                        event_storms: 128,
+                        output_burst_bytes: 1_610_612_736,
+                        storage_writes: 327_680,
+                        policy_denials: 2_560,
+                    },
+                    dimensions: vec![
+                        ProofDimension::Correctness,
+                        ProofDimension::Throughput,
+                        ProofDimension::Memory,
+                    ],
+                },
+                ScaleScenarioManifestEntry {
+                    id: "synthetic_10k_policy_audit".to_string(),
+                    label: "10k logical panes with policy audit traffic".to_string(),
+                    class: ScaleScenarioClass::Synthetic,
+                    deterministic_seed: 10_010_010,
+                    counters: ScaleScenarioCounters {
+                        logical_panes: 10_240,
+                        logical_agents: 10_240,
+                        churn_events: 102_400,
+                        alt_screen_flips: 24_576,
+                        event_storms: 256,
+                        output_burst_bytes: 4_294_967_296,
+                        storage_writes: 786_432,
+                        policy_denials: 10_240,
+                    },
+                    dimensions: vec![
+                        ProofDimension::Correctness,
+                        ProofDimension::Throughput,
+                        ProofDimension::Memory,
+                    ],
+                },
+            ],
+        }
+    }
+
+    /// Look up a scenario by stable id.
+    #[must_use]
+    pub fn scenario(&self, id: &str) -> Option<&ScaleScenarioManifestEntry> {
+        self.scenarios.iter().find(|scenario| scenario.id == id)
+    }
+}
+
+/// Execution evidence attached to a proof row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofExecutionEvidence {
+    /// Logical CPU count reported by the worker.
+    pub cpu_count: u32,
+    /// Worker RAM in bytes.
+    pub memory_bytes: u64,
+    /// Storage capacity or scratch budget in bytes.
+    pub storage_bytes: u64,
+    /// Operating system identifier.
+    pub os: String,
+    /// Worker identifier.
+    pub worker_id: String,
+    /// Exact command that produced the evidence.
+    pub command: String,
+    /// Command elapsed time in milliseconds.
+    pub elapsed_ms: u64,
+    /// Git commit tested by the command.
+    pub git_commit: String,
+}
+
+impl ProofExecutionEvidence {
+    /// Whether all evidence fields needed for hardware claims are present.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.cpu_count > 0
+            && self.memory_bytes > 0
+            && self.storage_bytes > 0
+            && !self.os.is_empty()
+            && !self.worker_id.is_empty()
+            && !self.command.is_empty()
+            && self.elapsed_ms > 0
+            && !self.git_commit.is_empty()
+    }
+}
+
+/// One row in the scale proof matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleScenarioProof {
+    /// Scenario id from [`ScaleScenarioManifest`].
+    pub scenario_id: String,
+    /// Proof origin class.
+    pub class: ScaleScenarioClass,
+    /// Dimensions this proof row covers.
+    pub dimensions: Vec<ProofDimension>,
+    /// Proof result.
+    pub status: ProofStatus,
+    /// Execution evidence, required for live hardware claims.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ProofExecutionEvidence>,
+    /// Short operator note for failures or skipped gaps.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl ScaleScenarioProof {
+    /// Whether this row proves a live hardware capacity claim.
+    #[must_use]
+    pub fn proves_hardware_claim(&self, min_cpu_count: u32, min_memory_bytes: u64) -> bool {
+        self.status == ProofStatus::Passed
+            && self.class == ScaleScenarioClass::LiveHardware
+            && self.dimensions.contains(&ProofDimension::Hardware)
+            && self.evidence.as_ref().is_some_and(|evidence| {
+                evidence.is_complete()
+                    && evidence.cpu_count >= min_cpu_count
+                    && evidence.memory_bytes >= min_memory_bytes
+            })
+    }
+}
+
+/// Machine-readable scale proof matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleProofMatrix {
+    /// Deterministic scenario inventory.
+    pub manifest: ScaleScenarioManifest,
+    /// Proof rows attached to scenarios.
+    pub proofs: Vec<ScaleScenarioProof>,
+}
+
+impl ScaleProofMatrix {
+    /// Build a matrix from a manifest and proof rows.
+    #[must_use]
+    pub fn new(manifest: ScaleScenarioManifest, proofs: Vec<ScaleScenarioProof>) -> Self {
+        Self { manifest, proofs }
+    }
+
+    /// Whether at least one live hardware proof satisfies the requested host claim.
+    #[must_use]
+    pub fn hardware_claims_proven(&self, min_cpu_count: u32, min_memory_bytes: u64) -> bool {
+        self.proofs
+            .iter()
+            .any(|proof| proof.proves_hardware_claim(min_cpu_count, min_memory_bytes))
+    }
+
+    /// Hardware-dimension rows that do not prove the requested host claim.
+    #[must_use]
+    pub fn unproven_hardware_claims(
+        &self,
+        min_cpu_count: u32,
+        min_memory_bytes: u64,
+    ) -> Vec<String> {
+        self.proofs
+            .iter()
+            .filter(|proof| proof.dimensions.contains(&ProofDimension::Hardware))
+            .filter(|proof| !proof.proves_hardware_claim(min_cpu_count, min_memory_bytes))
+            .map(|proof| proof.scenario_id.clone())
+            .collect()
+    }
+
+    /// Summarize proof status and dimension coverage.
+    #[must_use]
+    pub fn coverage_summary(&self) -> ScaleProofCoverageSummary {
+        ScaleProofCoverageSummary::from_proofs(&self.proofs)
+    }
+}
+
+/// Aggregated coverage counters for a scale proof matrix.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleProofCoverageSummary {
+    /// Total proof rows.
+    pub total_rows: usize,
+    /// Passed proof rows.
+    pub passed_rows: usize,
+    /// Failed proof rows.
+    pub failed_rows: usize,
+    /// Intentionally skipped proof gaps.
+    pub skipped_not_proven_rows: usize,
+    /// Synthetic proof rows.
+    pub synthetic_rows: usize,
+    /// Replay-backed proof rows.
+    pub replay_backed_rows: usize,
+    /// Live-hardware proof rows.
+    pub live_hardware_rows: usize,
+    /// Passed correctness coverage rows.
+    pub correctness_passed: usize,
+    /// Passed throughput coverage rows.
+    pub throughput_passed: usize,
+    /// Passed memory coverage rows.
+    pub memory_passed: usize,
+    /// Passed live-hardware coverage rows.
+    pub hardware_passed: usize,
+}
+
+impl ScaleProofCoverageSummary {
+    fn from_proofs(proofs: &[ScaleScenarioProof]) -> Self {
+        let mut summary = Self::default();
+
+        for proof in proofs {
+            summary.total_rows += 1;
+            match proof.status {
+                ProofStatus::Passed => summary.passed_rows += 1,
+                ProofStatus::Failed => summary.failed_rows += 1,
+                ProofStatus::SkippedNotProven => summary.skipped_not_proven_rows += 1,
+            }
+
+            match proof.class {
+                ScaleScenarioClass::Synthetic => summary.synthetic_rows += 1,
+                ScaleScenarioClass::ReplayBacked => summary.replay_backed_rows += 1,
+                ScaleScenarioClass::LiveHardware => summary.live_hardware_rows += 1,
+            }
+
+            if proof.status != ProofStatus::Passed {
+                continue;
+            }
+
+            for dimension in &proof.dimensions {
+                match dimension {
+                    ProofDimension::Correctness => summary.correctness_passed += 1,
+                    ProofDimension::Throughput => summary.throughput_passed += 1,
+                    ProofDimension::Memory => summary.memory_passed += 1,
+                    ProofDimension::Hardware => {
+                        if proof.class == ScaleScenarioClass::LiveHardware {
+                            summary.hardware_passed += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        summary
     }
 }
 
@@ -1086,5 +1445,166 @@ label = "b"
         assert_eq!(config.concurrency, 2);
         assert_eq!(config.timeout_per_scenario_ms, 300_000);
         assert!(!config.fail_fast);
+    }
+
+    // ── Massive-swarm proof matrix ─────────────────────────────────────
+
+    fn complete_evidence(cpu_count: u32, memory_bytes: u64) -> ProofExecutionEvidence {
+        ProofExecutionEvidence {
+            cpu_count,
+            memory_bytes,
+            storage_bytes: 1_099_511_627_776,
+            os: "linux-x86_64".to_string(),
+            worker_id: "rch-scale-worker-01".to_string(),
+            command: "cargo test -p frankenterm-core-replay scale_proof_matrix".to_string(),
+            elapsed_ms: 42_000,
+            git_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        }
+    }
+
+    #[test]
+    fn massive_swarm_manifest_has_required_tiers_and_counters() {
+        let manifest = ScaleScenarioManifest::massive_swarm_defaults();
+
+        assert_eq!(manifest.scenarios.len(), 3);
+        for minimum in [1_000, 5_000, 10_000] {
+            assert!(
+                manifest.scenarios.iter().any(|scenario| {
+                    scenario.counters.logical_panes >= minimum
+                        && scenario.counters.logical_agents >= minimum
+                        && scenario.deterministic_seed > 0
+                        && scenario.counters.churn_events > 0
+                        && scenario.counters.alt_screen_flips > 0
+                        && scenario.counters.event_storms > 0
+                        && scenario.counters.output_burst_bytes > 0
+                        && scenario.counters.storage_writes > 0
+                        && scenario.counters.policy_denials > 0
+                }),
+                "missing required {minimum}-tier scale scenario"
+            );
+        }
+
+        let ten_k = manifest.scenario("synthetic_10k_policy_audit").unwrap();
+        assert_eq!(ten_k.class, ScaleScenarioClass::Synthetic);
+        assert!(ten_k.dimensions.contains(&ProofDimension::Correctness));
+        assert!(ten_k.dimensions.contains(&ProofDimension::Throughput));
+        assert!(ten_k.dimensions.contains(&ProofDimension::Memory));
+    }
+
+    #[test]
+    fn synthetic_proof_cannot_satisfy_live_hardware_claim() {
+        let proof = ScaleScenarioProof {
+            scenario_id: "synthetic_10k_policy_audit".to_string(),
+            class: ScaleScenarioClass::Synthetic,
+            dimensions: vec![ProofDimension::Hardware],
+            status: ProofStatus::SkippedNotProven,
+            evidence: Some(complete_evidence(128, 549_755_813_888)),
+            note: "synthetic proof does not prove live 64-core/256GiB capacity".to_string(),
+        };
+        let matrix =
+            ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), vec![proof]);
+
+        assert!(!matrix.hardware_claims_proven(64, 274_877_906_944));
+        assert_eq!(
+            matrix.unproven_hardware_claims(64, 274_877_906_944),
+            vec!["synthetic_10k_policy_audit".to_string()]
+        );
+
+        let summary = matrix.coverage_summary();
+        assert_eq!(summary.synthetic_rows, 1);
+        assert_eq!(summary.skipped_not_proven_rows, 1);
+        assert_eq!(summary.hardware_passed, 0);
+    }
+
+    #[test]
+    fn live_hardware_proof_satisfies_host_claim_when_evidence_is_complete() {
+        let proof = ScaleScenarioProof {
+            scenario_id: "live_10k_64core_256gib".to_string(),
+            class: ScaleScenarioClass::LiveHardware,
+            dimensions: vec![ProofDimension::Hardware],
+            status: ProofStatus::Passed,
+            evidence: Some(complete_evidence(96, 549_755_813_888)),
+            note: String::new(),
+        };
+        let matrix =
+            ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), vec![proof]);
+
+        assert!(matrix.hardware_claims_proven(64, 274_877_906_944));
+        assert!(
+            matrix
+                .unproven_hardware_claims(64, 274_877_906_944)
+                .is_empty()
+        );
+
+        let summary = matrix.coverage_summary();
+        assert_eq!(summary.live_hardware_rows, 1);
+        assert_eq!(summary.hardware_passed, 1);
+    }
+
+    #[test]
+    fn proof_coverage_summary_distinguishes_dimensions() {
+        let proofs = vec![
+            ScaleScenarioProof {
+                scenario_id: "synthetic_1k_churn".to_string(),
+                class: ScaleScenarioClass::Synthetic,
+                dimensions: vec![
+                    ProofDimension::Correctness,
+                    ProofDimension::Throughput,
+                    ProofDimension::Memory,
+                ],
+                status: ProofStatus::Passed,
+                evidence: Some(complete_evidence(16, 68_719_476_736)),
+                note: String::new(),
+            },
+            ScaleScenarioProof {
+                scenario_id: "synthetic_10k_policy_audit".to_string(),
+                class: ScaleScenarioClass::Synthetic,
+                dimensions: vec![ProofDimension::Hardware],
+                status: ProofStatus::SkippedNotProven,
+                evidence: None,
+                note: "waiting for live high-core worker".to_string(),
+            },
+        ];
+        let matrix = ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), proofs);
+
+        let summary = matrix.coverage_summary();
+        assert_eq!(summary.total_rows, 2);
+        assert_eq!(summary.passed_rows, 1);
+        assert_eq!(summary.skipped_not_proven_rows, 1);
+        assert_eq!(summary.correctness_passed, 1);
+        assert_eq!(summary.throughput_passed, 1);
+        assert_eq!(summary.memory_passed, 1);
+        assert_eq!(summary.hardware_passed, 0);
+    }
+
+    #[test]
+    fn scale_proof_matrix_serde_preserves_machine_readable_status() {
+        let proofs = vec![
+            ScaleScenarioProof {
+                scenario_id: "synthetic_1k_churn".to_string(),
+                class: ScaleScenarioClass::Synthetic,
+                dimensions: vec![ProofDimension::Correctness],
+                status: ProofStatus::Passed,
+                evidence: Some(complete_evidence(16, 68_719_476_736)),
+                note: String::new(),
+            },
+            ScaleScenarioProof {
+                scenario_id: "synthetic_10k_policy_audit".to_string(),
+                class: ScaleScenarioClass::Synthetic,
+                dimensions: vec![ProofDimension::Hardware],
+                status: ProofStatus::SkippedNotProven,
+                evidence: None,
+                note: "hardware proof gap".to_string(),
+            },
+        ];
+        let matrix = ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), proofs);
+
+        let json = serde_json::to_string_pretty(&matrix).unwrap();
+        assert!(json.contains("\"PASSED\""));
+        assert!(json.contains("\"SKIPPED_NOT_PROVEN\""));
+
+        let restored: ScaleProofMatrix = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.manifest.scenarios.len(), 3);
+        assert_eq!(restored.proofs[1].status, ProofStatus::SkippedNotProven);
     }
 }
