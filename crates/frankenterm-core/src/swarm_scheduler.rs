@@ -475,10 +475,12 @@ impl SwarmScheduler {
             0.0
         };
 
-        let active = stats.active_agents as u32;
+        let active = saturating_usize_to_u32(stats.active_agents);
         let capacity = active.saturating_mul(max_concurrent_per_agent);
-        let utilization = if capacity > 0 {
-            stats.in_progress as f64 / capacity as f64
+        let utilization_capacity =
+            (stats.active_agents as f64) * f64::from(max_concurrent_per_agent);
+        let utilization = if utilization_capacity > 0.0 {
+            stats.in_progress as f64 / utilization_capacity
         } else if stats.ready > 0 || stats.in_progress > 0 {
             // No schedulable capacity while work is waiting/running: treat as
             // saturated so autoscaling can recover from zero-capacity stalls.
@@ -499,7 +501,7 @@ impl SwarmScheduler {
             utilization,
             starvation_count: 0, // computed externally from queue internals
             failure_rate,
-            pending_items: non_terminal as u32,
+            pending_items: saturating_usize_to_u32(non_terminal),
             active_agents: active,
             total_capacity: capacity,
         }
@@ -1092,6 +1094,8 @@ pub enum AdmissionReasonCode {
     MissingLatencyTelemetry,
     /// Telemetry contained non-finite values and was treated as unsafe.
     NonFiniteTelemetry,
+    /// Latency telemetry contained impossible numeric values.
+    InvalidLatencyTelemetry,
     /// Pane/work priority reduced the requested disruption severity.
     PriorityProtected,
     /// Operator priority override expanded protection beyond normal caps.
@@ -1398,10 +1402,17 @@ impl SwarmAdmissionController {
                 severity = severity.max(2);
                 continue;
             }
+            if pressure.observed_p95_us < 0.0 || pressure.budget_p95_us < 0.0 {
+                push_reason(reasons, AdmissionReasonCode::InvalidLatencyTelemetry);
+                severity = severity.max(2);
+                continue;
+            }
 
             let ratio = if pressure.budget_p95_us <= 0.0 {
                 if pressure.observed_p95_us > 0.0 {
-                    f64::INFINITY
+                    push_reason(reasons, AdmissionReasonCode::InvalidLatencyTelemetry);
+                    severity = severity.max(2);
+                    self.config.shed_stage_over_budget_ratio
                 } else {
                     0.0
                 }
@@ -1490,6 +1501,10 @@ fn push_reason(reasons: &mut Vec<AdmissionReasonCode>, reason: AdmissionReasonCo
     if !reasons.contains(&reason) {
         reasons.push(reason);
     }
+}
+
+fn saturating_usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 // =============================================================================
@@ -1811,6 +1826,40 @@ mod tests {
         assert!(json.contains("memory_tier_pressure"));
     }
 
+    #[test]
+    fn admission_zero_latency_budget_keeps_summary_ratio_finite() {
+        let controller = SwarmAdmissionController::default();
+        let request = background_admission_request();
+        let telemetry = SwarmAdmissionTelemetry::new(
+            admission_queue_pressure(0.10),
+            FleetPressureTier::Normal,
+            healthy_tier_budget(),
+            vec![StagePressure::compute(LatencyStage::StorageWrite, 1.0, 0.0)],
+        );
+
+        let summary = controller.evaluate(&request, &telemetry);
+        let ratio = summary
+            .max_latency_over_budget_ratio
+            .expect("latency telemetry should produce a ratio");
+
+        assert!(ratio.is_finite());
+        assert_eq!(ratio, controller.config().shed_stage_over_budget_ratio);
+        assert!(
+            summary
+                .reason_codes
+                .contains(&AdmissionReasonCode::InvalidLatencyTelemetry)
+        );
+        assert!(
+            summary
+                .reason_codes
+                .contains(&AdmissionReasonCode::LatencyStageOverBudget)
+        );
+
+        let json = serde_json::to_string(&summary).expect("serialize admission summary");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse summary");
+        assert!(value["max_latency_over_budget_ratio"].is_number());
+    }
+
     // =========================================================================
     // Config tests
     // =========================================================================
@@ -1911,6 +1960,31 @@ mod tests {
         };
         let pressure = scheduler.compute_pressure(&stats, 3);
         assert!((pressure.utilization - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn pressure_saturates_large_queue_counts_without_wrapping() {
+        let scheduler = SwarmScheduler::with_defaults();
+        let above_u32 = usize::try_from(u64::from(u32::MAX) + 5).unwrap();
+        let stats = QueueStats {
+            total_items: above_u32,
+            blocked: 0,
+            ready: above_u32,
+            in_progress: above_u32,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+            active_agents: above_u32,
+            completion_log_size: 0,
+        };
+
+        let pressure = scheduler.compute_pressure(&stats, 2);
+
+        assert_eq!(pressure.pending_items, u32::MAX);
+        assert_eq!(pressure.active_agents, u32::MAX);
+        assert_eq!(pressure.total_capacity, u32::MAX);
+        assert!(pressure.utilization.is_finite());
     }
 
     // =========================================================================
