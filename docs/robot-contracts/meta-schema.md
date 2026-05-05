@@ -1,8 +1,11 @@
 # Robot Family Contract Meta-Schema
 
 **Bead:** [BR-RC-ROBOT-CONTRACT.0] / `ft-hac7w.1`
-**Audience:** Anyone closing one of the 5 not-yet-implemented robot families
-(`profile`, `checkpoint`, `context`, `work`, `fleet`).
+**Audience:** Anyone closing one of the schema-driven robot families.
+The original contract set covered `profile`, `checkpoint`, `context`,
+`work`, and `fleet`. `profile` now has native read paths and dry-run
+apply; the current NTM-gap implementation set is `checkpoint`,
+`context`, `work`, and `fleet`.
 
 This document is the **single source of truth** for what a "complete"
 robot-family contract looks like. Each family is described by a
@@ -19,6 +22,14 @@ that emits four things from one declaration:
 4. **Conformance-harness invariants** — named, machine-runnable predicates
    that the harness in `tests/robot_family_conformance/` enumerates and
    asserts against a real handler.
+
+The live CLI dispatch status for the remaining NTM-gap families is tracked
+in `docs/robot-contracts/current-ntm-gap-dispatch.md` and guarded by
+`crates/frankenterm/tests/robot_ntm_gap_contract_tests.rs`. That harness is
+separate from the schema/state-machine conformance suite: it verifies that
+actions documented as fallback still return the structured
+`robot.not_implemented` envelope, and gives implementation beads a single
+manifest entry to flip when an action becomes native.
 
 Everything below describes the *shape* of that declaration. New families
 SHOULD NOT add ad-hoc proptest strategies, hand-rolled JSON schemas, or
