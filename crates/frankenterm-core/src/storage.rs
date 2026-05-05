@@ -606,6 +606,16 @@ enum WriteCommand {
         name: String,
         respond: oneshot::Sender<Result<usize>>,
     },
+    /// Run deferred incremental FTS catch-up on the writer connection.
+    SyncFts {
+        config: FtsSyncConfig,
+        respond: oneshot::Sender<Result<FtsSyncResult>>,
+    },
+    /// Run a full FTS rebuild on the writer connection.
+    RebuildFts {
+        config: FtsSyncConfig,
+        respond: oneshot::Sender<Result<FtsSyncResult>>,
+    },
     /// Prune output segments older than a cutoff
     PruneSegments {
         before_ts: i64,
@@ -825,6 +835,8 @@ impl std::fmt::Debug for WriteCommand {
             Self::UpdateSavedSearchRun { .. } => "UpdateSavedSearchRun",
             Self::UpdateSavedSearchSchedule { .. } => "UpdateSavedSearchSchedule",
             Self::DeleteSavedSearch { .. } => "DeleteSavedSearch",
+            Self::SyncFts { .. } => "SyncFts",
+            Self::RebuildFts { .. } => "RebuildFts",
             Self::PruneSegments { .. } => "PruneSegments",
             Self::Vacuum { .. } => "Vacuum",
             Self::UpsertAccount { .. } => "UpsertAccount",
@@ -3518,12 +3530,18 @@ impl StorageHandle {
     ) -> Result<FtsSyncResult> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("sync_fts cancelled: {err}")))?;
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            sync_fts_on_startup(&conn, &config)
-        })
-        .await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::SyncFts {
+                    config,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Perform a full FTS rebuild regardless of current state.
@@ -3543,12 +3561,18 @@ impl StorageHandle {
     ) -> Result<FtsSyncResult> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("rebuild_fts cancelled: {err}")))?;
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            full_fts_rebuild_sync(&conn, &config)
-        })
-        .await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RebuildFts {
+                    config,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Get the current FTS index state (version, last rebuild time).
@@ -7194,6 +7218,16 @@ impl StorageIoWriterGate {
                 StorageIoClass::PolicyAudit,
                 storage_io_policy_denial_bytes(record),
             )),
+            WriteCommand::SyncFts { config, .. } => Some(StorageIoWorkItem::new(
+                self.next_work_id(),
+                StorageIoClass::FtsIncremental,
+                storage_io_fts_sync_bytes(config),
+            )),
+            WriteCommand::RebuildFts { config, .. } => Some(StorageIoWorkItem::new(
+                self.next_work_id(),
+                StorageIoClass::FtsRebuild,
+                storage_io_fts_rebuild_bytes(config),
+            )),
             _ => None,
         }
     }
@@ -7368,6 +7402,8 @@ fn storage_io_command_name(cmd: &WriteCommand) -> &'static str {
         WriteCommand::RecordEvent { .. } => "RecordEvent",
         WriteCommand::RecordAuditAction { .. } => "RecordAuditAction",
         WriteCommand::RecordPolicyDenialAudit { .. } => "RecordPolicyDenialAudit",
+        WriteCommand::SyncFts { .. } => "SyncFts",
+        WriteCommand::RebuildFts { .. } => "RebuildFts",
         _ => "WriteCommand",
     }
 }
@@ -7389,6 +7425,12 @@ fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
         WriteCommand::RecordPolicyDenialAudit { respond, .. } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
         }
+        WriteCommand::SyncFts { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+        }
+        WriteCommand::RebuildFts { respond, .. } => {
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+        }
         other => {
             tracing::error!(
                 command = ?other,
@@ -7400,6 +7442,10 @@ fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
 
 fn storage_io_str_bytes(value: &str) -> u64 {
     u64::try_from(value.len()).unwrap_or(u64::MAX).max(1)
+}
+
+fn storage_io_usize_bytes(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX).max(1)
 }
 
 fn storage_io_option_str_bytes(value: Option<&str>) -> u64 {
@@ -7461,6 +7507,16 @@ fn storage_io_policy_denial_bytes(record: &PolicyDeniedAuditRecord) -> u64 {
         .saturating_add(storage_io_option_str_bytes(record.rule_id.as_deref()))
         .saturating_add(storage_io_str_bytes(&record.decision))
         .max(1)
+}
+
+fn storage_io_fts_sync_bytes(config: &FtsSyncConfig) -> u64 {
+    storage_io_usize_bytes(config.batch_size)
+        .saturating_mul(storage_io_usize_bytes(config.max_batch_bytes))
+        .max(1)
+}
+
+fn storage_io_fts_rebuild_bytes(config: &FtsSyncConfig) -> u64 {
+    storage_io_fts_sync_bytes(config).saturating_mul(4).max(1)
 }
 
 /// Main loop for the writer thread.
@@ -7774,6 +7830,14 @@ mod writer_io_scheduler_tests {
             StorageIoClass::WorkflowEvent,
             StorageIoClassBudget::deferrable(1, 4096, 3),
         );
+        cfg.class_budgets.insert(
+            StorageIoClass::FtsIncremental,
+            StorageIoClassBudget::deferrable(2, 4096, 4),
+        );
+        cfg.class_budgets.insert(
+            StorageIoClass::FtsRebuild,
+            StorageIoClassBudget::deferrable(1, 8192, 5),
+        );
         StorageIoWriterGate::new(cfg)
     }
 
@@ -7833,6 +7897,30 @@ mod writer_io_scheduler_tests {
                 reason_code: PolicyDeniedAuditRecord::REASON_CODE_DENIED.to_string(),
                 rule_id: Some("rule".to_string()),
                 decision: PolicyDeniedAuditRecord::DECISION_DENIED.to_string(),
+            },
+            respond: tx,
+        }
+    }
+
+    fn fts_sync_command(batch_size: usize, max_batch_bytes: usize) -> WriteCommand {
+        let (tx, _rx) = oneshot::channel();
+        WriteCommand::SyncFts {
+            config: FtsSyncConfig {
+                batch_size,
+                max_batch_bytes,
+                commit_progress: true,
+            },
+            respond: tx,
+        }
+    }
+
+    fn fts_rebuild_command(batch_size: usize, max_batch_bytes: usize) -> WriteCommand {
+        let (tx, _rx) = oneshot::channel();
+        WriteCommand::RebuildFts {
+            config: FtsSyncConfig {
+                batch_size,
+                max_batch_bytes,
+                commit_progress: true,
             },
             respond: tx,
         }
@@ -7909,6 +7997,77 @@ mod writer_io_scheduler_tests {
         assert!(message.contains("RecordEvent"));
         assert!(message.contains("storage_io.defer.class_budget_exhausted"));
         assert!(message.contains("before durable persistence"));
+    }
+
+    #[test]
+    fn writer_io_gate_keeps_segment_ahead_of_fts_catchup() {
+        let mut gate = tiny_writer_gate();
+        let fts = fts_sync_command(2, 512);
+        let segment = segment_command(42, "fresh pane output must stay durable first");
+
+        let (fts_id, fts_decision) = gate.admit_command(&fts).unwrap();
+        let (segment_id, segment_decision) = gate.admit_command(&segment).unwrap();
+
+        assert_eq!(fts_decision.class, StorageIoClass::FtsIncremental);
+        assert_eq!(segment_decision.class, StorageIoClass::PaneSegmentDurable);
+        assert!(fts_decision.outcome.accepted());
+        assert!(segment_decision.outcome.accepted());
+
+        let first = gate.pop_next().unwrap();
+        let second = gate.pop_next().unwrap();
+
+        assert_eq!(first.item.id, segment_id);
+        assert_eq!(first.item.class, StorageIoClass::PaneSegmentDurable);
+        assert_eq!(second.item.id, fts_id);
+        assert_eq!(second.item.class, StorageIoClass::FtsIncremental);
+    }
+
+    #[test]
+    fn writer_io_gate_fts_budget_defer_has_search_reason_code() {
+        let mut gate = tiny_writer_gate();
+        let first = fts_sync_command(2, 512);
+        let second = fts_sync_command(2, 512);
+        let third = fts_sync_command(2, 512);
+
+        let (_, first_decision) = gate.admit_command(&first).unwrap();
+        let (_, second_decision) = gate.admit_command(&second).unwrap();
+        let (_, third_decision) = gate.admit_command(&third).unwrap();
+
+        assert!(first_decision.outcome.accepted());
+        assert!(second_decision.outcome.accepted());
+        assert_eq!(third_decision.outcome, StorageIoAdmissionOutcome::Defer);
+        assert_eq!(
+            third_decision.reason_code(),
+            "storage_io.defer.class_budget_exhausted"
+        );
+
+        let message = storage_io_admission_failure_message(&third, &third_decision);
+        assert!(message.contains("SyncFts"));
+        assert!(message.contains("fts_incremental"));
+        assert!(message.contains("storage_io.defer.class_budget_exhausted"));
+    }
+
+    #[test]
+    fn writer_io_gate_routes_full_rebuild_as_lower_priority_index_work() {
+        let mut gate = tiny_writer_gate();
+        let incremental = fts_sync_command(1, 256);
+        let rebuild = fts_rebuild_command(1, 256);
+
+        let (incremental_id, incremental_decision) = gate.admit_command(&incremental).unwrap();
+        let (rebuild_id, rebuild_decision) = gate.admit_command(&rebuild).unwrap();
+
+        assert_eq!(incremental_decision.class, StorageIoClass::FtsIncremental);
+        assert_eq!(rebuild_decision.class, StorageIoClass::FtsRebuild);
+        assert!(incremental_decision.outcome.accepted());
+        assert!(rebuild_decision.outcome.accepted());
+
+        let first = gate.pop_next().unwrap();
+        let second = gate.pop_next().unwrap();
+
+        assert_eq!(first.item.id, incremental_id);
+        assert_eq!(first.item.class, StorageIoClass::FtsIncremental);
+        assert_eq!(second.item.id, rebuild_id);
+        assert_eq!(second.item.class, StorageIoClass::FtsRebuild);
     }
 }
 
@@ -8282,6 +8441,14 @@ fn dispatch_write_command_raw(
         WriteCommand::DeleteSavedSearch { name, respond } => {
             let result =
                 with_writer_backend(conn, |backend| delete_saved_search_backend(backend, &name));
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::SyncFts { config, respond } => {
+            let result = sync_fts_on_startup(conn, &config);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::RebuildFts { config, respond } => {
+            let result = full_fts_rebuild_sync(conn, &config);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSegments { before_ts, respond } => {

@@ -9,6 +9,12 @@ use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+const SEARCH_LAG_CLASSES: [StorageIoClass; 3] = [
+    StorageIoClass::FtsIncremental,
+    StorageIoClass::FtsRebuild,
+    StorageIoClass::SearchIndexState,
+];
+
 /// Stable storage IO work classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -652,9 +658,9 @@ impl StorageIoScheduler {
             aggregate_bytes_pending: self.aggregate_bytes_pending_saturating(),
             io_pressure_tier: pressure,
             io_pressure_reason: pressure_reason(pressure).to_string(),
-            search_lag_segments: 0,
-            search_lag_oldest_age_ms: None,
-            hydration_lag_pages: 0,
+            search_lag_segments: self.search_lag_segments(),
+            search_lag_oldest_age_ms: self.search_lag_oldest_age_ms(now_ms),
+            hydration_lag_pages: self.hydration_lag_pages(),
             audit_fail_closed_total: self
                 .counters
                 .get(&StorageIoClass::PolicyAudit)
@@ -867,6 +873,23 @@ impl StorageIoScheduler {
             .saturating_add(self.class_queue_depth(StorageIoClass::PolicyAudit))
     }
 
+    fn search_lag_segments(&self) -> u64 {
+        SEARCH_LAG_CLASSES.iter().fold(0, |total, class| {
+            total.saturating_add(self.class_queue_depth(*class))
+        })
+    }
+
+    fn search_lag_oldest_age_ms(&self, now_ms: u64) -> Option<u64> {
+        SEARCH_LAG_CLASSES
+            .iter()
+            .filter_map(|class| self.oldest_queued_age_ms(*class, now_ms))
+            .max()
+    }
+
+    fn hydration_lag_pages(&self) -> u64 {
+        self.class_queue_depth(StorageIoClass::ColdTierRead)
+    }
+
     fn aggregate_bytes_pending_saturating(&self) -> u64 {
         self.queues.values().fold(0, |total, queue| {
             total.saturating_add(queue_estimated_bytes_saturating(queue))
@@ -968,6 +991,18 @@ mod tests {
         cfg.class_budgets.insert(
             StorageIoClass::FtsIncremental,
             StorageIoClassBudget::deferrable(4, 4096, 4),
+        );
+        cfg.class_budgets.insert(
+            StorageIoClass::FtsRebuild,
+            StorageIoClassBudget::deferrable(4, 4096, 5),
+        );
+        cfg.class_budgets.insert(
+            StorageIoClass::SearchIndexState,
+            StorageIoClassBudget::deferrable(4, 4096, 5),
+        );
+        cfg.class_budgets.insert(
+            StorageIoClass::ColdTierRead,
+            StorageIoClassBudget::deferrable(1, 1024, 2),
         );
         cfg.class_budgets.insert(
             StorageIoClass::StorageMaintenance,
@@ -1197,6 +1232,116 @@ mod tests {
         assert_eq!(
             scheduler.pop_next(22).unwrap().item.class,
             StorageIoClass::PolicyAudit
+        );
+    }
+
+    #[test]
+    fn durability_classes_dispatch_before_hydration_and_indexing() {
+        let mut scheduler = StorageIoScheduler::new(tiny_config());
+        scheduler.admit(
+            StorageIoWorkItem::new(1, StorageIoClass::ColdTierRead, 100),
+            10,
+        );
+        scheduler.admit(
+            StorageIoWorkItem::new(2, StorageIoClass::FtsIncremental, 100),
+            11,
+        );
+        scheduler.admit(
+            StorageIoWorkItem::new(3, StorageIoClass::PaneSegmentDurable, 100),
+            12,
+        );
+        scheduler.admit(
+            StorageIoWorkItem::new(4, StorageIoClass::PolicyAudit, 100),
+            13,
+        );
+
+        assert_eq!(
+            scheduler.pop_next(20).unwrap().item.class,
+            StorageIoClass::PolicyAudit
+        );
+        assert_eq!(
+            scheduler.pop_next(21).unwrap().item.class,
+            StorageIoClass::PaneSegmentDurable
+        );
+    }
+
+    #[test]
+    fn search_lag_is_observable_and_drains_after_dispatch() {
+        let mut scheduler = StorageIoScheduler::new(tiny_config());
+        scheduler.admit(
+            StorageIoWorkItem::new(1, StorageIoClass::FtsIncremental, 100),
+            10,
+        );
+        scheduler.admit(
+            StorageIoWorkItem::new(2, StorageIoClass::SearchIndexState, 100),
+            20,
+        );
+
+        let lagged = scheduler.snapshot(70);
+        assert_eq!(lagged.search_lag_segments, 2);
+        assert_eq!(lagged.search_lag_oldest_age_ms, Some(60));
+        let lagged_summary = lagged.operator_summary();
+        assert_eq!(lagged_summary.search_lag_segments, 2);
+
+        assert_eq!(
+            scheduler.pop_next(80).unwrap().item.class,
+            StorageIoClass::FtsIncremental
+        );
+        let partial = scheduler.snapshot(80);
+        assert_eq!(partial.search_lag_segments, 1);
+        assert_eq!(partial.search_lag_oldest_age_ms, Some(60));
+
+        assert_eq!(
+            scheduler.pop_next(90).unwrap().item.class,
+            StorageIoClass::SearchIndexState
+        );
+        let drained = scheduler.snapshot(90);
+        assert_eq!(drained.search_lag_segments, 0);
+        assert_eq!(drained.search_lag_oldest_age_ms, None);
+        assert_eq!(drained.operator_summary().search_lag_segments, 0);
+    }
+
+    #[test]
+    fn cold_tier_hydration_defers_with_visible_lag() {
+        let mut scheduler = StorageIoScheduler::new(tiny_config());
+        let admitted = scheduler.admit(
+            StorageIoWorkItem::new(1, StorageIoClass::ColdTierRead, 512),
+            10,
+        );
+        let deferred = scheduler.admit(
+            StorageIoWorkItem::new(2, StorageIoClass::ColdTierRead, 512),
+            11,
+        );
+
+        assert_eq!(admitted.outcome, StorageIoAdmissionOutcome::Admit);
+        assert_eq!(deferred.outcome, StorageIoAdmissionOutcome::Defer);
+        assert_eq!(
+            deferred.reason_code(),
+            "storage_io.defer.class_budget_exhausted"
+        );
+        assert!(!deferred.queued);
+        assert_eq!(scheduler.class_queue_depth(StorageIoClass::ColdTierRead), 1);
+
+        let snapshot = scheduler.snapshot(70);
+        assert_eq!(snapshot.hydration_lag_pages, 1);
+        assert_eq!(snapshot.search_lag_segments, 0);
+        let cold_tier = snapshot
+            .classes
+            .iter()
+            .find(|row| row.class == StorageIoClass::ColdTierRead)
+            .unwrap();
+        assert_eq!(cold_tier.queue_depth, 1);
+        assert_eq!(cold_tier.deferred_total, 1);
+        assert_eq!(
+            cold_tier.last_reason_code.as_deref(),
+            Some("storage_io.defer.class_budget_exhausted")
+        );
+
+        let summary = snapshot.operator_summary();
+        assert_eq!(summary.hydration_lag_pages, 1);
+        assert_eq!(
+            summary.dominant_class.as_ref().map(|row| row.class),
+            Some(StorageIoClass::ColdTierRead)
         );
     }
 
