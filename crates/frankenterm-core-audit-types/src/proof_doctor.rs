@@ -697,6 +697,11 @@ fn diagnostic_blocker(
 ) -> ProofDoctorBlocker {
     let mut blocker = ProofDoctorBlocker::block(blocker_kind, reason_code, message, next_action);
     for path in &evidence.diagnostic_paths {
+        if blocker.owner.is_none() {
+            if let Some(owner) = diagnostic_owner_for_path(evidence, path) {
+                blocker = blocker.with_owner(owner).with_evidence("diagnostic_owner");
+            }
+        }
         blocker = blocker.with_path(path.clone());
     }
     if !evidence.diagnostic_paths.is_empty() {
@@ -706,6 +711,39 @@ fn diagnostic_blocker(
         blocker = blocker.with_evidence("diagnostic_summary");
     }
     blocker
+}
+
+fn diagnostic_owner_for_path(
+    evidence: &ProofDoctorEvidence,
+    path: &str,
+) -> Option<ProofDoctorOwner> {
+    evidence
+        .dirty_paths
+        .iter()
+        .find(|dirty_path| dirty_path.path == path)
+        .and_then(|dirty_path| dirty_path.owner.clone())
+        .or_else(|| {
+            evidence
+                .reservations
+                .iter()
+                .find(|reservation| path_overlaps_pattern(path, &reservation.path_pattern))
+                .map(|reservation| ProofDoctorOwner::Reservation {
+                    agent_name: reservation.agent_name.clone(),
+                    path_pattern: reservation.path_pattern.clone(),
+                })
+        })
+}
+
+fn path_overlaps_pattern(path: &str, pattern: &str) -> bool {
+    path == pattern
+        || pattern == "*"
+        || pattern == "**/*"
+        || pattern
+            .strip_suffix("/*")
+            .is_some_and(|prefix| path.starts_with(&format!("{prefix}/")))
+        || pattern
+            .strip_suffix("/**")
+            .is_some_and(|prefix| path.starts_with(&format!("{prefix}/")))
 }
 
 fn classify_dirty_paths(input: &ProofDoctorPreflightInput, blockers: &mut Vec<ProofDoctorBlocker>) {
@@ -939,6 +977,81 @@ mod tests {
         verdict: &'a ProofDoctorVerdict,
     }
 
+    fn owner_source_value(owner: Option<&ProofDoctorOwner>) -> serde_json::Value {
+        match owner {
+            Some(ProofDoctorOwner::CurrentAgent {
+                agent_name,
+                bead_id,
+            }) => serde_json::json!({
+                "type": "current_agent",
+                "agent_name": agent_name,
+                "bead_id": bead_id,
+            }),
+            Some(ProofDoctorOwner::OtherAgent {
+                agent_name,
+                bead_id,
+            }) => serde_json::json!({
+                "type": "other_agent",
+                "agent_name": agent_name,
+                "bead_id": bead_id,
+            }),
+            Some(ProofDoctorOwner::Bead { bead_id, assignee }) => serde_json::json!({
+                "type": "bead",
+                "bead_id": bead_id,
+                "assignee": assignee,
+            }),
+            Some(ProofDoctorOwner::Reservation {
+                agent_name,
+                path_pattern,
+            }) => serde_json::json!({
+                "type": "reservation",
+                "agent_name": agent_name,
+                "path_pattern": path_pattern,
+            }),
+            Some(ProofDoctorOwner::Unknown) => serde_json::json!({
+                "type": "unknown",
+            }),
+            None => serde_json::Value::Null,
+        }
+    }
+
+    fn dirty_paths_value(input: &ProofDoctorPreflightInput) -> serde_json::Value {
+        serde_json::Value::Array(
+            input
+                .evidence
+                .dirty_paths
+                .iter()
+                .map(|dirty_path| {
+                    serde_json::json!({
+                        "path": dirty_path.path,
+                        "status": dirty_path.status,
+                        "owner": owner_source_value(dirty_path.owner.as_ref()),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn e2e_fixture_log(
+        scenario: &str,
+        input: &ProofDoctorPreflightInput,
+        verdict: &ProofDoctorVerdict,
+    ) -> serde_json::Value {
+        let primary = verdict.blockers.first();
+        serde_json::json!({
+            "scenario": scenario,
+            "command": input.intended_command,
+            "worker_id": input.evidence.selected_worker,
+            "sync_completed": input.evidence.sync_duration_ms.is_some(),
+            "cargo_started": input.evidence.remote_cargo_reached,
+            "first_error": input.evidence.diagnostic_summary,
+            "dirty_files": dirty_paths_value(input),
+            "ownership_source": owner_source_value(primary.and_then(|blocker| blocker.owner.as_ref())),
+            "status": verdict.status,
+            "reason_code": primary.map(|blocker| blocker.reason_code.as_str()),
+        })
+    }
+
     fn base_input() -> ProofDoctorPreflightInput {
         ProofDoctorPreflightInput {
             bead_id: Some("ft-wik9p.3".to_string()),
@@ -1055,6 +1168,166 @@ mod tests {
         let inconclusive = classify_proof_doctor(&inconclusive);
 
         vec![runnable, infra, source, dirty, inconclusive]
+    }
+
+    #[test]
+    fn e2e_fixture_scenarios_capture_required_proof_doctor_logs() {
+        let mut stale_timeout = base_input();
+        stale_timeout.bead_id = Some("ft-wik9p.7.installed-stale".to_string());
+        stale_timeout.phase = ProofDoctorPhase::TerminalClassified;
+        stale_timeout.evidence.rch_binary_path = Some("/Users/jemanuel/.local/bin/rch".to_string());
+        stale_timeout.evidence.rch_version = Some("1.0.24+32a0ea5".to_string());
+        stale_timeout.evidence.tool_version_state = ProofDoctorToolVersionState::InstalledStale;
+        stale_timeout.evidence.rch_external_timeout_enabled = Some(false);
+        stale_timeout.evidence.stale_external_timeout_observed = true;
+        stale_timeout
+            .evidence
+            .rch_config_sources
+            .push(ProofDoctorConfigSource {
+                key: "compilation.external_timeout_enabled".to_string(),
+                value: "false".to_string(),
+                source: "user".to_string(),
+                effective: true,
+            });
+        stale_timeout.evidence.selected_worker = Some("vmi1152480".to_string());
+        stale_timeout.evidence.sync_duration_ms = Some(176_008);
+        stale_timeout.evidence.wrapper_exit_code = Some(127);
+        let stale_timeout_verdict = classify_proof_doctor(&stale_timeout);
+
+        let mut source_fail = base_input();
+        source_fail.bead_id = Some("ft-wik9p.7.patched-source".to_string());
+        source_fail.phase = ProofDoctorPhase::TerminalClassified;
+        source_fail.evidence.tool_version_state = ProofDoctorToolVersionState::PatchedLocal;
+        source_fail.evidence.selected_worker = Some("vmi1153651".to_string());
+        source_fail.evidence.sync_duration_ms = Some(164_000);
+        source_fail.evidence.remote_command_duration_ms = Some(88_000);
+        source_fail.evidence.remote_cargo_reached = true;
+        source_fail.evidence.rustc_reached = true;
+        source_fail.evidence.remote_exit_code = Some(101);
+        source_fail.evidence.diagnostic_paths =
+            vec!["crates/frankenterm-core/src/resource_pressure_clock_timer_chaos.rs".to_string()];
+        source_fail.evidence.diagnostic_summary =
+            Some("remote rustc reported missing field `external_service_observation`".to_string());
+        source_fail.evidence.dirty_paths.push(ProofDoctorDirtyPath {
+            path: "crates/frankenterm-core/src/resource_pressure_clock_timer_chaos.rs".to_string(),
+            status: "M".to_string(),
+            affects_proof: false,
+            owner: Some(ProofDoctorOwner::Bead {
+                bead_id: "ft-1grhq.5".to_string(),
+                assignee: Some("CoralBeaver".to_string()),
+            }),
+        });
+        let source_fail_verdict = classify_proof_doctor(&source_fail);
+
+        let mut dirty_active = base_input();
+        dirty_active.bead_id = Some("ft-wik9p.7.dirty-active".to_string());
+        dirty_active.proof_path_prefixes =
+            vec!["crates/frankenterm-core-audit-types/src/proof_handoff.rs".to_string()];
+        dirty_active
+            .evidence
+            .dirty_paths
+            .push(ProofDoctorDirtyPath {
+                path: "crates/frankenterm-core-audit-types/src/proof_handoff.rs".to_string(),
+                status: "M".to_string(),
+                affects_proof: true,
+                owner: Some(ProofDoctorOwner::Reservation {
+                    agent_name: "MagentaFalcon".to_string(),
+                    path_pattern: "crates/frankenterm-core-audit-types/src/proof_handoff.rs"
+                        .to_string(),
+                }),
+            });
+        let dirty_active_verdict = classify_proof_doctor(&dirty_active);
+
+        let mut clean_pass = base_input();
+        clean_pass.bead_id = Some("ft-wik9p.7.clean-pass".to_string());
+        clean_pass.phase = ProofDoctorPhase::TerminalClassified;
+        clean_pass.evidence.tool_version_state = ProofDoctorToolVersionState::PatchedLocal;
+        clean_pass.evidence.selected_worker = Some("vmi1152480".to_string());
+        clean_pass.evidence.sync_duration_ms = Some(140_000);
+        clean_pass.evidence.remote_cargo_reached = true;
+        clean_pass.evidence.rustc_reached = true;
+        clean_pass.evidence.test_binary_started = true;
+        clean_pass.evidence.remote_exit_code = Some(0);
+        clean_pass.evidence.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        clean_pass.evidence.artifact_paths =
+            vec!["tests/e2e/artifacts/proof/ft-wik9p.7/pass.json".to_string()];
+        let clean_plan_verdict = classify_proof_doctor(&base_input());
+        let clean_pass_verdict = classify_proof_doctor(&clean_pass);
+
+        assert_eq!(
+            stale_timeout_verdict.status,
+            ProofDoctorStatus::InfraBlocked
+        );
+        assert_eq!(
+            stale_timeout_verdict.blockers[0].reason_code,
+            "proof.rch.stale_external_timeout_config"
+        );
+        assert!(stale_timeout_verdict.blockers.iter().any(|blocker| {
+            blocker.reason_code == "proof.rch.pre_cargo_timeout_exec_missing"
+                && blocker
+                    .evidence_keys
+                    .iter()
+                    .any(|key| key == "wrapper_exit_code")
+        }));
+
+        assert_eq!(source_fail_verdict.status, ProofDoctorStatus::SourceBlocked);
+        assert_eq!(
+            source_fail_verdict.blockers[0].affected_paths,
+            vec!["crates/frankenterm-core/src/resource_pressure_clock_timer_chaos.rs"]
+        );
+        assert!(matches!(
+            source_fail_verdict.blockers[0].owner.as_ref(),
+            Some(ProofDoctorOwner::Bead {
+                bead_id,
+                assignee: Some(assignee),
+            }) if bead_id == "ft-1grhq.5" && assignee == "CoralBeaver"
+        ));
+
+        assert_eq!(
+            dirty_active_verdict.status,
+            ProofDoctorStatus::DirtyTreeBlocked
+        );
+        assert_ne!(
+            dirty_active_verdict.status,
+            ProofDoctorStatus::SourceBlocked
+        );
+        assert_eq!(clean_plan_verdict.status, ProofDoctorStatus::Runnable);
+        assert_eq!(clean_pass_verdict.status, ProofDoctorStatus::Passed);
+        assert_eq!(
+            clean_pass_verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| (projection.state, projection.safe_to_close)),
+            Some((ProofState::Pass, true))
+        );
+
+        let logs = serde_json::Value::Array(vec![
+            e2e_fixture_log(
+                "installed_stale_timeout",
+                &stale_timeout,
+                &stale_timeout_verdict,
+            ),
+            e2e_fixture_log("patched_source_failure", &source_fail, &source_fail_verdict),
+            e2e_fixture_log("dirty_active_owner", &dirty_active, &dirty_active_verdict),
+            e2e_fixture_log("clean_pass", &clean_pass, &clean_pass_verdict),
+        ]);
+
+        assert_eq!(logs[0]["worker_id"].as_str(), Some("vmi1152480"));
+        assert_eq!(logs[0]["sync_completed"].as_bool(), Some(true));
+        assert_eq!(logs[0]["cargo_started"].as_bool(), Some(false));
+        assert_eq!(
+            logs[1]["first_error"].as_str(),
+            source_fail.evidence.diagnostic_summary.as_deref()
+        );
+        assert_eq!(
+            logs[1]["ownership_source"]["bead_id"].as_str(),
+            Some("ft-1grhq.5")
+        );
+        assert_eq!(
+            logs[2]["dirty_files"][0]["owner"]["agent_name"].as_str(),
+            Some("MagentaFalcon")
+        );
+        assert_eq!(logs[3]["cargo_started"].as_bool(), Some(true));
     }
 
     #[test]
