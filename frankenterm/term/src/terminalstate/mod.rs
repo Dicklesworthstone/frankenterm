@@ -2099,14 +2099,16 @@ impl TerminalState {
                 right,
                 ..
             } => {
-                let checksum = self.checksum_rectangle(
-                    left.as_zero_based(),
-                    top.as_zero_based(),
-                    right.as_zero_based(),
-                    bottom.as_zero_based(),
-                );
-                write!(self.writer, "\x1bP{}!~{:04x}\x1b\\", request_id, checksum).ok();
-                self.writer.flush().ok();
+                if self.config.enable_checksum_rectangular_area() {
+                    let checksum = self.checksum_rectangle(
+                        left.as_zero_based(),
+                        top.as_zero_based(),
+                        right.as_zero_based(),
+                        bottom.as_zero_based(),
+                    );
+                    write!(self.writer, "\x1bP{}!~{:04x}\x1b\\", request_id, checksum).ok();
+                    self.writer.flush().ok();
+                }
             }
             Window::ResizeWindowCells { .. } => {
                 // We don't allow the application to change the window size; that's
@@ -2818,6 +2820,7 @@ mod tests {
         kitty_budget: usize,
         unicode_version: UnicodeVersion,
         scorecard_enabled: bool,
+        checksum_rectangular_area: bool,
     }
 
     impl TerminalConfiguration for TestTermConfig {
@@ -2836,6 +2839,10 @@ mod tests {
         fn resize_wrap_scorecard_enabled(&self) -> bool {
             self.scorecard_enabled
         }
+
+        fn enable_checksum_rectangular_area(&self) -> bool {
+            self.checksum_rectangular_area
+        }
     }
 
     fn test_terminal_state(config: Arc<dyn TerminalConfiguration>) -> TerminalState {
@@ -2852,6 +2859,90 @@ mod tests {
             "1.0",
             Box::new(std::io::sink()),
         )
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CaptureWriter {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.data.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn terminal_state_with_capture(
+        checksum_rectangular_area: bool,
+    ) -> (TerminalState, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area,
+        });
+        let capture = CaptureWriter::default();
+        let data = capture.data.clone();
+        let terminal = TerminalState::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            config,
+            "test-program",
+            "1.0",
+            Box::new(capture),
+        );
+        (terminal, data)
+    }
+
+    #[test]
+    fn checksum_rectangular_area_suppressed_by_default() {
+        let (mut terminal, output) = terminal_state_with_capture(false);
+
+        terminal.perform_csi_window(Window::ChecksumRectangularArea {
+            request_id: 42,
+            page_number: 0,
+            top: OneBased::new(1),
+            left: OneBased::new(1),
+            bottom: OneBased::new(1),
+            right: OneBased::new(1),
+        });
+
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "DECRQCRA must not write a screen checksum unless explicitly enabled",
+        );
+    }
+
+    #[test]
+    fn checksum_rectangular_area_can_be_enabled() {
+        let (mut terminal, output) = terminal_state_with_capture(true);
+
+        terminal.perform_csi_window(Window::ChecksumRectangularArea {
+            request_id: 42,
+            page_number: 0,
+            top: OneBased::new(1),
+            left: OneBased::new(1),
+            bottom: OneBased::new(1),
+            right: OneBased::new(1),
+        });
+
+        let output = output.lock().unwrap().clone();
+        assert!(
+            output.starts_with(b"\x1bP42!~"),
+            "DECRQCRA opt-in should emit a checksum response, got {:?}",
+            String::from_utf8_lossy(&output),
+        );
+        assert!(output.ends_with(b"\x1b\\"));
     }
 
     /// Per ft-mv27v (cont of ft-d1pv3): TerminalConfiguration test
@@ -3151,11 +3242,13 @@ mod tests {
             kitty_budget: 1024,
             unicode_version: UnicodeVersion::new(9),
             scorecard_enabled: false,
+            checksum_rectangular_area: false,
         });
         let updated: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
             kitty_budget: 2048,
             unicode_version: UnicodeVersion::new(14),
             scorecard_enabled: true,
+            checksum_rectangular_area: false,
         });
 
         let mut terminal = test_terminal_state(initial);
@@ -3187,11 +3280,13 @@ mod tests {
             kitty_budget: 1024,
             unicode_version: UnicodeVersion::new(9),
             scorecard_enabled: false,
+            checksum_rectangular_area: false,
         });
         let updated: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
             kitty_budget: 2048,
             unicode_version: UnicodeVersion::new(14),
             scorecard_enabled: true,
+            checksum_rectangular_area: false,
         });
 
         let mut terminal = test_terminal_state(initial);

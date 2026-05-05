@@ -194,6 +194,10 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
         self.configuration().enable_title_reporting
     }
 
+    fn enable_checksum_rectangular_area(&self) -> bool {
+        self.configuration().enable_checksum_rectangular_area
+    }
+
     fn enable_kitty_keyboard(&self) -> bool {
         self.configuration().enable_kitty_keyboard
     }

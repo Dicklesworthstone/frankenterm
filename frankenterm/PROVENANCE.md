@@ -1,7 +1,8 @@
 # FrankenTerm Provenance
 
 Source: <https://github.com/wezterm/wezterm>
-Reference commit: `05343b387085842b434d267f91b6b0ec157e4331`
+Reference commit: `577474d89ee61aef4a48145cdec82a638d874751`
+Initial import reference: `05343b387085842b434d267f91b6b0ec157e4331`
 Date imported: 2026-02-10
 License: MIT (see `../LICENSE`)
 
@@ -18,6 +19,12 @@ to the wezterm-fork identity — these vendored crates are first-class
 workspace members and are NOT tracking upstream wezterm for sync.
 Modifications are owned by the FrankenTerm project; upstream
 compatibility is explicitly not maintained.
+
+## Upstream Backport Ledger
+
+| Upstream SHA | Date | Disposition | Local proof | Notes |
+| ------------ | ---- | ----------- | ----------- | ----- |
+| `577474d89ee61aef4a48145cdec82a638d874751` | 2026-03-31 | accepted | `scripts/cargo-local.sh test -p frankenterm-term checksum_rectangular_area --lib`; `scripts/cargo-local.sh check -p config --lib` | Disabled DECRQCRA checksum replies by default to prevent silent screen scraping; preserved opt-in config behavior. |
 
 ## Per-crate classification (ft-zoxxq.5)
 
