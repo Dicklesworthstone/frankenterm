@@ -3,8 +3,9 @@ set -euo pipefail
 
 # create-macos-bundle.sh — Build FrankenTerm.app bundle from source
 #
-# Builds frankenterm-gui and ft binaries, then packages them into a macOS
-# .app bundle with the FrankenTerm icon and Info.plist.
+# Builds frankenterm-gui, frankenterm-mux-server, and ft binaries, then
+# packages them into a macOS .app bundle with the FrankenTerm icon and
+# Info.plist.
 #
 # No dependency on a pre-installed WezTerm.app.
 #
@@ -108,6 +109,7 @@ run_rch_bundle_build() {
         cd "$PROJECT_ROOT"
         run_rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR_REL" cargo build --release \
             --bin frankenterm-gui \
+            --bin frankenterm-mux-server \
             --bin ft \
             --manifest-path Cargo.toml
     )
@@ -209,16 +211,22 @@ if [ "$SKIP_BUILD" = false ]; then
     if ! ensure_remote_gui_prereqs; then
         exit 1
     fi
-    echo "Building frankenterm-gui and ft via rch (release)..."
+    echo "Building frankenterm-gui, frankenterm-mux-server, and ft via rch (release)..."
     run_rch_bundle_build
 fi
 
 # --- Locate binaries ---
 GUI_BINARY="$CARGO_TARGET_DIR/release/frankenterm-gui"
+MUX_SERVER_BINARY="$CARGO_TARGET_DIR/release/frankenterm-mux-server"
 FT_BINARY="$CARGO_TARGET_DIR/release/ft"
 
 if [ ! -f "$GUI_BINARY" ]; then
     echo "Error: frankenterm-gui binary not found at $GUI_BINARY"
+    echo "Run without --skip-build, or set CARGO_TARGET_DIR."
+    exit 1
+fi
+if [ ! -f "$MUX_SERVER_BINARY" ]; then
+    echo "Error: frankenterm-mux-server binary not found at $MUX_SERVER_BINARY"
     echo "Run without --skip-build, or set CARGO_TARGET_DIR."
     exit 1
 fi
@@ -248,6 +256,9 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 echo "Installing frankenterm-gui..."
 cp "$GUI_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-gui"
 
+echo "Installing frankenterm-mux-server..."
+cp "$MUX_SERVER_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-mux-server"
+
 echo "Installing ft CLI..."
 cp "$FT_BINARY" "$APP_BUNDLE/Contents/MacOS/ft"
 
@@ -255,6 +266,34 @@ cp "$FT_BINARY" "$APP_BUNDLE/Contents/MacOS/ft"
 DEFAULT_CONFIG="$PROJECT_ROOT/crates/frankenterm-gui/frankenterm.toml"
 if [ -f "$DEFAULT_CONFIG" ]; then
     cp "$DEFAULT_CONFIG" "$APP_BUNDLE/Contents/Resources/frankenterm.toml"
+fi
+
+# --- Bundle the default Pragmasevka Nerd Font ---
+FONT_PAYLOAD="$PROJECT_ROOT/crates/frankenterm/assets/Pragmasevka_NF.zip.zst"
+FONT_DIR="$APP_BUNDLE/Contents/Resources/fonts"
+if [ ! -f "$FONT_PAYLOAD" ]; then
+    echo "Error: bundled Pragmasevka font payload not found at $FONT_PAYLOAD"
+    exit 1
+fi
+mkdir -p "$FONT_DIR"
+if ! command -v zstd >/dev/null 2>&1; then
+    echo "Error: zstd is required to unpack the bundled Pragmasevka font payload"
+    exit 1
+fi
+zstd -dc "$FONT_PAYLOAD" | /usr/bin/tar -xf - -C "$FONT_DIR"
+
+# The mandatory source payload carries the regular face. If this machine already
+# has the matching Pragmasevka style faces installed, include them in the local
+# app bundle too so bold/italic text doesn't fall back through CoreText.
+if [ -d "$HOME/Library/Fonts" ]; then
+    for font_face in "$HOME"/Library/Fonts/pragmasevka-nf-*.ttf; do
+        if [ -f "$font_face" ]; then
+            dest="$FONT_DIR/$(basename "$font_face")"
+            if [ ! -e "$dest" ]; then
+                cp "$font_face" "$dest"
+            fi
+        fi
+    done
 fi
 
 # --- Copy FrankenTerm icon ---
