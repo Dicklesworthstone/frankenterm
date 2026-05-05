@@ -1466,6 +1466,580 @@ fn bounded_step(
 }
 
 // =============================================================================
+// Rollback safety controller
+// =============================================================================
+
+/// Safety metric families enforced before an auto-tuned candidate can persist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyMetricKind {
+    /// Latency percentiles or service times.
+    Latency,
+    /// Queue or backlog depth.
+    QueueDepth,
+    /// Resident memory, pressure tier, or memory budget utilization.
+    MemoryPressure,
+    /// Dropped, shed, or otherwise abandoned work.
+    DroppedWork,
+    /// Error or failure rate.
+    ErrorRate,
+    /// Policy denials, approval failures, or rate-limit misses.
+    PolicyApprovalFailures,
+}
+
+impl SafetyMetricKind {
+    /// Stable metric id used in rollback reason codes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Latency => "latency",
+            Self::QueueDepth => "queue_depth",
+            Self::MemoryPressure => "memory_pressure",
+            Self::DroppedWork => "dropped_work",
+            Self::ErrorRate => "error_rate",
+            Self::PolicyApprovalFailures => "policy_approval_failures",
+        }
+    }
+}
+
+/// Monotonic direction for a safety metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyMetricGoal {
+    /// Observed value must remain below or equal to the baseline plus tolerance.
+    LowerOrEqual,
+    /// Observed value must remain above or equal to the baseline minus tolerance.
+    HigherOrEqual,
+}
+
+impl SafetyMetricGoal {
+    fn limit(self, baseline: f64, max_regression_fraction: f64) -> Option<f64> {
+        if !baseline.is_finite()
+            || !max_regression_fraction.is_finite()
+            || max_regression_fraction < 0.0
+        {
+            return None;
+        }
+
+        match self {
+            Self::LowerOrEqual => Some(baseline * (1.0 + max_regression_fraction)),
+            Self::HigherOrEqual => Some(baseline * (1.0 - max_regression_fraction)),
+        }
+    }
+
+    fn is_regressed(self, observed: f64, limit: f64) -> bool {
+        match self {
+            Self::LowerOrEqual => observed > limit,
+            Self::HigherOrEqual => observed < limit,
+        }
+    }
+}
+
+/// One safety metric observed for an active candidate window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SafetyMetricSample {
+    /// Metric family being checked.
+    pub metric: SafetyMetricKind,
+    /// Last known safe baseline.
+    pub baseline: Option<f64>,
+    /// Observed candidate-window value.
+    pub observed: Option<f64>,
+    /// Allowed fractional regression from the baseline.
+    pub max_regression_fraction: f64,
+    /// Whether absence or invalidity must fail the candidate closed.
+    pub required: bool,
+    /// Monotonic safety direction.
+    pub goal: SafetyMetricGoal,
+}
+
+/// Per-metric safety verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyMetricVerdict {
+    /// Metric is inside its monotonic safety bound.
+    Healthy,
+    /// Required telemetry was absent.
+    MissingTelemetry,
+    /// Telemetry existed but could not be trusted as a finite bound.
+    InvalidTelemetry,
+    /// Metric crossed the configured regression threshold.
+    Regressed,
+}
+
+/// Machine-readable result for one safety metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SafetyMetricCheck {
+    /// Metric family being checked.
+    pub metric: SafetyMetricKind,
+    /// Per-metric verdict.
+    pub verdict: SafetyMetricVerdict,
+    /// Last known safe baseline, when available.
+    pub baseline: Option<f64>,
+    /// Observed candidate-window value, when available.
+    pub observed: Option<f64>,
+    /// Calculated safety limit, when available.
+    pub limit: Option<f64>,
+    /// Whether this metric was required for the candidate.
+    pub required: bool,
+    /// Stable reason code for operator logs and robot/cockpit surfaces.
+    pub reason_code: String,
+}
+
+impl SafetyMetricCheck {
+    fn from_sample(sample: &SafetyMetricSample) -> Self {
+        let (Some(baseline), Some(observed)) = (sample.baseline, sample.observed) else {
+            let suffix = if sample.required {
+                "missing_telemetry"
+            } else {
+                "optional_missing_telemetry"
+            };
+            return Self {
+                metric: sample.metric,
+                verdict: SafetyMetricVerdict::MissingTelemetry,
+                baseline: sample.baseline,
+                observed: sample.observed,
+                limit: None,
+                required: sample.required,
+                reason_code: metric_reason_code(sample.metric, suffix),
+            };
+        };
+
+        let limit = sample.goal.limit(baseline, sample.max_regression_fraction);
+
+        let Some(limit) = limit else {
+            return Self {
+                metric: sample.metric,
+                verdict: SafetyMetricVerdict::InvalidTelemetry,
+                baseline: sample.baseline,
+                observed: sample.observed,
+                limit: None,
+                required: sample.required,
+                reason_code: metric_reason_code(sample.metric, "invalid_telemetry"),
+            };
+        };
+
+        if !observed.is_finite() {
+            return Self {
+                metric: sample.metric,
+                verdict: SafetyMetricVerdict::InvalidTelemetry,
+                baseline: sample.baseline,
+                observed: sample.observed,
+                limit: Some(limit),
+                required: sample.required,
+                reason_code: metric_reason_code(sample.metric, "invalid_telemetry"),
+            };
+        }
+
+        if sample.goal.is_regressed(observed, limit) {
+            return Self {
+                metric: sample.metric,
+                verdict: SafetyMetricVerdict::Regressed,
+                baseline: sample.baseline,
+                observed: sample.observed,
+                limit: Some(limit),
+                required: sample.required,
+                reason_code: metric_reason_code(sample.metric, "regressed"),
+            };
+        }
+
+        Self {
+            metric: sample.metric,
+            verdict: SafetyMetricVerdict::Healthy,
+            baseline: sample.baseline,
+            observed: sample.observed,
+            limit: Some(limit),
+            required: sample.required,
+            reason_code: metric_reason_code(sample.metric, "healthy"),
+        }
+    }
+
+    fn should_rollback(&self) -> bool {
+        self.required
+            && matches!(
+                self.verdict,
+                SafetyMetricVerdict::MissingTelemetry
+                    | SafetyMetricVerdict::InvalidTelemetry
+                    | SafetyMetricVerdict::Regressed
+            )
+    }
+}
+
+/// Safety telemetry for one active candidate evaluation window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SafetyTelemetryWindow {
+    /// Whether the warmup portion of the window has completed.
+    pub warmup_complete: bool,
+    /// Confidence score for the safety window.
+    pub confidence: f64,
+    /// Minimum confidence required before a candidate may persist.
+    pub minimum_confidence: f64,
+    /// Safety samples observed for this candidate.
+    pub samples: Vec<SafetyMetricSample>,
+}
+
+impl Default for SafetyTelemetryWindow {
+    fn default() -> Self {
+        Self {
+            warmup_complete: true,
+            confidence: 0.95,
+            minimum_confidence: 0.80,
+            samples: Vec::new(),
+        }
+    }
+}
+
+/// Configuration for rollback hysteresis and cooldown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackControllerConfig {
+    /// Whether rollback control is enabled.
+    pub enabled: bool,
+    /// Consecutive regressed windows required before rollback.
+    pub regression_hysteresis_windows: usize,
+    /// Candidate windows to pause after rollback.
+    pub cooldown_windows: usize,
+}
+
+impl Default for RollbackControllerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            regression_hysteresis_windows: 2,
+            cooldown_windows: 3,
+        }
+    }
+}
+
+impl RollbackControllerConfig {
+    fn effective_hysteresis_windows(&self) -> usize {
+        self.regression_hysteresis_windows.max(1)
+    }
+}
+
+/// Controller action selected for one safety window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackAction {
+    /// Controller is disabled and no candidate state remains active.
+    Disabled,
+    /// No active candidate exists.
+    Noop,
+    /// Active candidate remains under evaluation.
+    ContinueCandidate,
+    /// Candidate passed safety checks and can become the last safe value.
+    AcceptCandidate,
+    /// Candidate regressed and must be restored to the last safe value.
+    Rollback,
+    /// Controller is cooling down after rollback.
+    Cooldown,
+}
+
+/// Machine-readable rollback controller decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RollbackDecision {
+    /// Mode used for this decision.
+    pub mode: TuningMode,
+    /// Selected controller action.
+    pub action: RollbackAction,
+    /// Active candidate knob, when present.
+    pub knob_id: Option<TunableKnobId>,
+    /// Candidate value under evaluation, when present.
+    pub candidate_value: Option<f64>,
+    /// Last safe value to restore on rollback.
+    pub rollback_value: Option<f64>,
+    /// Stable reason codes for operator logs and robot/cockpit surfaces.
+    pub reason_codes: Vec<String>,
+    /// Per-metric safety checks.
+    pub checks: Vec<SafetyMetricCheck>,
+    /// Consecutive regressed windows observed for this candidate.
+    pub regression_windows: usize,
+    /// Cooldown windows remaining after this decision.
+    pub cooldown_remaining_windows: usize,
+}
+
+/// Fail-closed rollback controller for one active tuning candidate.
+#[derive(Debug, Clone)]
+pub struct RollbackController {
+    config: RollbackControllerConfig,
+    mode: TuningMode,
+    active_candidate: Option<TuningCandidate>,
+    last_safe_values: BTreeMap<TunableKnobId, f64>,
+    regression_windows: usize,
+    cooldown_remaining_windows: usize,
+}
+
+impl RollbackController {
+    /// Create a rollback controller with empty candidate state.
+    #[must_use]
+    pub fn new(config: RollbackControllerConfig) -> Self {
+        let mode = if config.enabled {
+            TuningMode::Observe
+        } else {
+            TuningMode::Disabled
+        };
+
+        Self {
+            config,
+            mode,
+            active_candidate: None,
+            last_safe_values: BTreeMap::new(),
+            regression_windows: 0,
+            cooldown_remaining_windows: 0,
+        }
+    }
+
+    /// Return the current rollback controller mode.
+    #[must_use]
+    pub const fn mode(&self) -> TuningMode {
+        self.mode
+    }
+
+    /// Return the active candidate, when one is under safety evaluation.
+    #[must_use]
+    pub const fn active_candidate(&self) -> Option<&TuningCandidate> {
+        self.active_candidate.as_ref()
+    }
+
+    /// Return the last known safe value for a knob.
+    #[must_use]
+    pub fn last_safe_value(&self, knob_id: TunableKnobId) -> Option<f64> {
+        self.last_safe_values.get(&knob_id).copied()
+    }
+
+    /// Start evaluating a candidate unless the controller is disabled or cooling down.
+    #[must_use]
+    pub fn start_candidate(&mut self, candidate: TuningCandidate) -> bool {
+        if !self.config.enabled || self.mode == TuningMode::Disabled {
+            self.disable();
+            return false;
+        }
+
+        if self.cooldown_remaining_windows > 0 || self.mode == TuningMode::Cooldown {
+            return false;
+        }
+
+        self.last_safe_values
+            .entry(candidate.knob_id)
+            .or_insert(candidate.old_value);
+        self.mode = if candidate.live_mutation_allowed {
+            TuningMode::SteadyState
+        } else if candidate.would_apply {
+            TuningMode::Exploration
+        } else {
+            TuningMode::Observe
+        };
+        self.regression_windows = 0;
+        self.active_candidate = Some(candidate);
+        true
+    }
+
+    /// Disable the controller and clear all partial candidate state.
+    pub fn disable(&mut self) {
+        self.config.enabled = false;
+        self.mode = TuningMode::Disabled;
+        self.active_candidate = None;
+        self.regression_windows = 0;
+        self.cooldown_remaining_windows = 0;
+    }
+
+    /// Evaluate one safety window and choose continue, accept, rollback, or cooldown.
+    pub fn evaluate(&mut self, telemetry: &SafetyTelemetryWindow) -> RollbackDecision {
+        if !self.config.enabled || self.mode == TuningMode::Disabled {
+            self.disable();
+            return self.decision_for(
+                TuningMode::Disabled,
+                RollbackAction::Disabled,
+                None,
+                None,
+                vec!["auto_tune.disabled".to_string()],
+                Vec::new(),
+            );
+        }
+
+        if self.mode == TuningMode::Cooldown {
+            if self.cooldown_remaining_windows > 0 {
+                self.cooldown_remaining_windows -= 1;
+                let decision = self.decision_for(
+                    TuningMode::Cooldown,
+                    RollbackAction::Cooldown,
+                    None,
+                    None,
+                    vec!["auto_tune.cooldown.active".to_string()],
+                    Vec::new(),
+                );
+                if self.cooldown_remaining_windows == 0 {
+                    self.mode = TuningMode::Observe;
+                }
+                return decision;
+            }
+            self.mode = TuningMode::Observe;
+        }
+
+        let Some(candidate) = self.active_candidate.clone() else {
+            return self.decision_for(
+                self.mode,
+                RollbackAction::Noop,
+                None,
+                None,
+                vec!["auto_tune.safety.no_active_candidate".to_string()],
+                Vec::new(),
+            );
+        };
+
+        if !telemetry.warmup_complete {
+            return self.decision_for(
+                self.mode,
+                RollbackAction::ContinueCandidate,
+                Some(&candidate),
+                None,
+                vec!["auto_tune.safety.warmup_incomplete".to_string()],
+                Vec::new(),
+            );
+        }
+
+        if !telemetry.confidence.is_finite()
+            || !telemetry.minimum_confidence.is_finite()
+            || telemetry.confidence < telemetry.minimum_confidence
+        {
+            return self.rollback_candidate(
+                &candidate,
+                vec!["auto_tune.rollback.insufficient_confidence".to_string()],
+                Vec::new(),
+            );
+        }
+
+        let checks = telemetry
+            .samples
+            .iter()
+            .map(SafetyMetricCheck::from_sample)
+            .collect::<Vec<_>>();
+
+        if checks.is_empty() {
+            return self.rollback_candidate(
+                &candidate,
+                vec!["auto_tune.rollback.missing_telemetry".to_string()],
+                checks,
+            );
+        }
+
+        let mut regression_codes = checks
+            .iter()
+            .filter(|check| check.should_rollback())
+            .map(|check| check.reason_code.clone())
+            .collect::<Vec<_>>();
+
+        if !regression_codes.is_empty() {
+            self.regression_windows += 1;
+            if self.regression_windows < self.config.effective_hysteresis_windows() {
+                regression_codes.push("auto_tune.safety.regression_hysteresis".to_string());
+                return self.decision_for(
+                    self.mode,
+                    RollbackAction::ContinueCandidate,
+                    Some(&candidate),
+                    None,
+                    regression_codes,
+                    checks,
+                );
+            }
+
+            regression_codes.push("auto_tune.rollback.metric_regression".to_string());
+            return self.rollback_candidate(&candidate, regression_codes, checks);
+        }
+
+        self.accept_candidate(&candidate, checks)
+    }
+
+    fn accept_candidate(
+        &mut self,
+        candidate: &TuningCandidate,
+        checks: Vec<SafetyMetricCheck>,
+    ) -> RollbackDecision {
+        self.regression_windows = 0;
+        let safe_value = if candidate.would_apply {
+            candidate.candidate_value
+        } else {
+            candidate.old_value
+        };
+        self.last_safe_values.insert(candidate.knob_id, safe_value);
+        self.active_candidate = None;
+        self.mode = if candidate.would_apply {
+            TuningMode::SteadyState
+        } else {
+            TuningMode::Observe
+        };
+        self.decision_for(
+            self.mode,
+            RollbackAction::AcceptCandidate,
+            Some(candidate),
+            None,
+            vec!["auto_tune.safety.accepted".to_string()],
+            checks,
+        )
+    }
+
+    fn rollback_candidate(
+        &mut self,
+        candidate: &TuningCandidate,
+        reason_codes: Vec<String>,
+        checks: Vec<SafetyMetricCheck>,
+    ) -> RollbackDecision {
+        let rollback_value = self
+            .last_safe_values
+            .get(&candidate.knob_id)
+            .copied()
+            .unwrap_or(candidate.old_value);
+        self.last_safe_values
+            .insert(candidate.knob_id, rollback_value);
+        self.mode = TuningMode::Rollback;
+        self.cooldown_remaining_windows = self.config.cooldown_windows;
+
+        let decision = self.decision_for(
+            TuningMode::Rollback,
+            RollbackAction::Rollback,
+            Some(candidate),
+            Some(rollback_value),
+            reason_codes,
+            checks,
+        );
+
+        self.active_candidate = None;
+        self.regression_windows = 0;
+        self.mode = if self.cooldown_remaining_windows > 0 {
+            TuningMode::Cooldown
+        } else {
+            TuningMode::Observe
+        };
+
+        decision
+    }
+
+    fn decision_for(
+        &self,
+        mode: TuningMode,
+        action: RollbackAction,
+        candidate: Option<&TuningCandidate>,
+        rollback_value: Option<f64>,
+        reason_codes: Vec<String>,
+        checks: Vec<SafetyMetricCheck>,
+    ) -> RollbackDecision {
+        RollbackDecision {
+            mode,
+            action,
+            knob_id: candidate.map(|candidate| candidate.knob_id),
+            candidate_value: candidate.map(|candidate| candidate.candidate_value),
+            rollback_value,
+            reason_codes,
+            checks,
+            regression_windows: self.regression_windows,
+            cooldown_remaining_windows: self.cooldown_remaining_windows,
+        }
+    }
+}
+
+fn metric_reason_code(metric: SafetyMetricKind, suffix: &str) -> String {
+    format!("auto_tune.safety.{}.{}", metric.as_str(), suffix)
+}
+
+// =============================================================================
 // Manual overrides
 // =============================================================================
 
@@ -2268,6 +2842,294 @@ mod tests {
         assert!(!TuningMode::Observe.can_transition_to(TuningMode::SteadyState));
         assert!(!TuningMode::Cooldown.can_transition_to(TuningMode::Exploration));
         assert!(!TuningMode::Rollback.can_transition_to(TuningMode::SteadyState));
+    }
+
+    // ---- Rollback controller tests ----
+
+    fn candidate_for_rollback_controller() -> TuningCandidate {
+        let engine = BoundedCandidateEngine::new(CandidateEvaluationConfig {
+            mode: TuningMode::Exploration,
+            ..CandidateEvaluationConfig::default()
+        });
+        engine
+            .evaluate(
+                &default_current_values(&engine),
+                &pressure_window(CandidateDirection::Increase),
+                &[],
+            )
+            .candidate
+            .expect("rollback controller candidate")
+    }
+
+    fn required_lower_sample(
+        metric: SafetyMetricKind,
+        baseline: Option<f64>,
+        observed: Option<f64>,
+    ) -> SafetyMetricSample {
+        SafetyMetricSample {
+            metric,
+            baseline,
+            observed,
+            max_regression_fraction: 0.10,
+            required: true,
+            goal: SafetyMetricGoal::LowerOrEqual,
+        }
+    }
+
+    fn optional_lower_sample(
+        metric: SafetyMetricKind,
+        baseline: Option<f64>,
+        observed: Option<f64>,
+    ) -> SafetyMetricSample {
+        SafetyMetricSample {
+            required: false,
+            ..required_lower_sample(metric, baseline, observed)
+        }
+    }
+
+    fn safety_window(samples: Vec<SafetyMetricSample>) -> SafetyTelemetryWindow {
+        SafetyTelemetryWindow {
+            samples,
+            ..SafetyTelemetryWindow::default()
+        }
+    }
+
+    #[test]
+    fn rollback_controller_accepts_safe_window_and_updates_last_safe() {
+        let mut controller = RollbackController::new(RollbackControllerConfig::default());
+        let candidate = candidate_for_rollback_controller();
+
+        assert!(controller.start_candidate(candidate.clone()));
+        let decision = controller.evaluate(&safety_window(vec![required_lower_sample(
+            SafetyMetricKind::Latency,
+            Some(100.0),
+            Some(105.0),
+        )]));
+
+        assert_eq!(decision.action, RollbackAction::AcceptCandidate);
+        assert_eq!(decision.mode, TuningMode::SteadyState);
+        assert_eq!(decision.knob_id, Some(candidate.knob_id));
+        assert_eq!(controller.active_candidate(), None);
+        assert_eq!(
+            controller.last_safe_value(candidate.knob_id),
+            Some(candidate.candidate_value)
+        );
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"auto_tune.safety.accepted".to_string())
+        );
+    }
+
+    #[test]
+    fn rollback_controller_table_driven_monotonic_constraints() {
+        let metrics = [
+            SafetyMetricKind::Latency,
+            SafetyMetricKind::QueueDepth,
+            SafetyMetricKind::MemoryPressure,
+            SafetyMetricKind::DroppedWork,
+            SafetyMetricKind::ErrorRate,
+            SafetyMetricKind::PolicyApprovalFailures,
+        ];
+
+        for metric in metrics {
+            let mut controller = RollbackController::new(RollbackControllerConfig {
+                regression_hysteresis_windows: 1,
+                cooldown_windows: 0,
+                ..RollbackControllerConfig::default()
+            });
+            let candidate = candidate_for_rollback_controller();
+
+            assert!(controller.start_candidate(candidate.clone()));
+            let decision = controller.evaluate(&safety_window(vec![required_lower_sample(
+                metric,
+                Some(100.0),
+                Some(111.0),
+            )]));
+
+            assert_eq!(
+                decision.action,
+                RollbackAction::Rollback,
+                "{}",
+                metric.as_str()
+            );
+            assert_eq!(decision.mode, TuningMode::Rollback);
+            assert_eq!(decision.rollback_value, Some(candidate.old_value));
+            assert!(
+                decision
+                    .reason_codes
+                    .contains(&metric_reason_code(metric, "regressed"))
+            );
+            assert!(
+                decision
+                    .reason_codes
+                    .contains(&"auto_tune.rollback.metric_regression".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_controller_uses_hysteresis_before_rollback() {
+        let mut controller = RollbackController::new(RollbackControllerConfig {
+            regression_hysteresis_windows: 2,
+            cooldown_windows: 2,
+            ..RollbackControllerConfig::default()
+        });
+        let candidate = candidate_for_rollback_controller();
+
+        assert!(controller.start_candidate(candidate.clone()));
+        let regressed = safety_window(vec![required_lower_sample(
+            SafetyMetricKind::QueueDepth,
+            Some(100.0),
+            Some(125.0),
+        )]);
+        let first = controller.evaluate(&regressed);
+
+        assert_eq!(first.action, RollbackAction::ContinueCandidate);
+        assert_eq!(first.regression_windows, 1);
+        assert_eq!(controller.active_candidate(), Some(&candidate));
+        assert!(
+            first
+                .reason_codes
+                .contains(&"auto_tune.safety.regression_hysteresis".to_string())
+        );
+
+        let second = controller.evaluate(&regressed);
+        assert_eq!(second.action, RollbackAction::Rollback);
+        assert_eq!(second.rollback_value, Some(candidate.old_value));
+        assert_eq!(second.cooldown_remaining_windows, 2);
+        assert_eq!(controller.mode(), TuningMode::Cooldown);
+    }
+
+    #[test]
+    fn rollback_controller_cooldown_blocks_immediate_reentry() {
+        let mut controller = RollbackController::new(RollbackControllerConfig {
+            regression_hysteresis_windows: 1,
+            cooldown_windows: 1,
+            ..RollbackControllerConfig::default()
+        });
+        let candidate = candidate_for_rollback_controller();
+
+        assert!(controller.start_candidate(candidate.clone()));
+        let rollback = controller.evaluate(&safety_window(vec![required_lower_sample(
+            SafetyMetricKind::MemoryPressure,
+            Some(100.0),
+            Some(150.0),
+        )]));
+        assert_eq!(rollback.action, RollbackAction::Rollback);
+
+        assert!(!controller.start_candidate(candidate));
+        assert_eq!(controller.active_candidate(), None);
+
+        let cooldown = controller.evaluate(&safety_window(vec![required_lower_sample(
+            SafetyMetricKind::MemoryPressure,
+            Some(100.0),
+            Some(100.0),
+        )]));
+        assert_eq!(cooldown.action, RollbackAction::Cooldown);
+        assert_eq!(cooldown.cooldown_remaining_windows, 0);
+        assert_eq!(controller.mode(), TuningMode::Observe);
+    }
+
+    #[test]
+    fn rollback_controller_missing_required_telemetry_fails_closed() {
+        let mut controller = RollbackController::new(RollbackControllerConfig {
+            regression_hysteresis_windows: 1,
+            cooldown_windows: 0,
+            ..RollbackControllerConfig::default()
+        });
+        let candidate = candidate_for_rollback_controller();
+
+        assert!(controller.start_candidate(candidate.clone()));
+        let empty = controller.evaluate(&safety_window(Vec::new()));
+        assert_eq!(empty.action, RollbackAction::Rollback);
+        assert_eq!(empty.rollback_value, Some(candidate.old_value));
+        assert!(
+            empty
+                .reason_codes
+                .contains(&"auto_tune.rollback.missing_telemetry".to_string())
+        );
+
+        assert!(controller.start_candidate(candidate));
+        let required_missing = controller.evaluate(&safety_window(vec![required_lower_sample(
+            SafetyMetricKind::DroppedWork,
+            Some(100.0),
+            None,
+        )]));
+        assert_eq!(required_missing.action, RollbackAction::Rollback);
+        assert!(required_missing.reason_codes.contains(&metric_reason_code(
+            SafetyMetricKind::DroppedWork,
+            "missing_telemetry"
+        )));
+    }
+
+    #[test]
+    fn rollback_controller_optional_missing_telemetry_does_not_rollback() {
+        let mut controller = RollbackController::new(RollbackControllerConfig::default());
+        let candidate = candidate_for_rollback_controller();
+
+        assert!(controller.start_candidate(candidate.clone()));
+        let decision = controller.evaluate(&safety_window(vec![
+            required_lower_sample(SafetyMetricKind::ErrorRate, Some(100.0), Some(100.0)),
+            optional_lower_sample(SafetyMetricKind::PolicyApprovalFailures, Some(100.0), None),
+        ]));
+
+        assert_eq!(decision.action, RollbackAction::AcceptCandidate);
+        assert_eq!(
+            controller.last_safe_value(candidate.knob_id),
+            Some(candidate.candidate_value)
+        );
+    }
+
+    #[test]
+    fn rollback_controller_insufficient_confidence_rolls_back() {
+        let mut controller = RollbackController::new(RollbackControllerConfig::default());
+        let candidate = candidate_for_rollback_controller();
+
+        assert!(controller.start_candidate(candidate.clone()));
+        let decision = controller.evaluate(&SafetyTelemetryWindow {
+            confidence: 0.25,
+            minimum_confidence: 0.80,
+            samples: vec![required_lower_sample(
+                SafetyMetricKind::Latency,
+                Some(100.0),
+                Some(100.0),
+            )],
+            ..SafetyTelemetryWindow::default()
+        });
+
+        assert_eq!(decision.action, RollbackAction::Rollback);
+        assert_eq!(decision.rollback_value, Some(candidate.old_value));
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"auto_tune.rollback.insufficient_confidence".to_string())
+        );
+    }
+
+    #[test]
+    fn rollback_controller_disable_clears_active_candidate() {
+        let mut controller = RollbackController::new(RollbackControllerConfig::default());
+        let candidate = candidate_for_rollback_controller();
+
+        assert!(controller.start_candidate(candidate));
+        assert!(controller.active_candidate().is_some());
+
+        controller.disable();
+        assert_eq!(controller.mode(), TuningMode::Disabled);
+        assert_eq!(controller.active_candidate(), None);
+
+        let decision = controller.evaluate(&safety_window(vec![required_lower_sample(
+            SafetyMetricKind::Latency,
+            Some(100.0),
+            Some(100.0),
+        )]));
+        assert_eq!(decision.action, RollbackAction::Disabled);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&"auto_tune.disabled".to_string())
+        );
     }
 
     // ---- Hysteresis tests ----
