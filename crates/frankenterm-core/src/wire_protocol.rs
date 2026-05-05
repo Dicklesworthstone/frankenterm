@@ -775,8 +775,7 @@ fn epoch_ms_now_from(now: std::time::SystemTime) -> i64 {
     match now.duration_since(std::time::UNIX_EPOCH) {
         Ok(ts) => i64::try_from(ts.as_millis()).unwrap_or(i64::MAX),
         Err(err) => {
-            WIRE_PROTOCOL_CLOCK_ANOMALY_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WIRE_PROTOCOL_CLOCK_ANOMALY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 target: "ft.wire_protocol.clock",
                 event = "wire_protocol_clock_anomaly",
@@ -2923,8 +2922,7 @@ mod tests {
     #[test]
     fn wire_protocol_epoch_ms_post_epoch_no_anomaly_ft_crpvd() {
         super::reset_wire_protocol_clock_anomaly_count_for_test();
-        let post = std::time::UNIX_EPOCH
-            + std::time::Duration::from_secs(1_704_067_200);
+        let post = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
         let ms = super::epoch_ms_now_from(post);
         assert!(ms > 0);
         assert_eq!(super::wire_protocol_clock_anomaly_count(), 0);
@@ -2933,8 +2931,7 @@ mod tests {
     #[test]
     fn wire_protocol_epoch_ms_pre_epoch_bumps_counter_ft_crpvd() {
         super::reset_wire_protocol_clock_anomaly_count_for_test();
-        let pre = std::time::UNIX_EPOCH
-            - std::time::Duration::from_secs(100);
+        let pre = std::time::UNIX_EPOCH - std::time::Duration::from_secs(100);
         let ms = super::epoch_ms_now_from(pre);
         assert_eq!(ms, 0);
         assert_eq!(super::wire_protocol_clock_anomaly_count(), 1);

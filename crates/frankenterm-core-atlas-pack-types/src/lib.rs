@@ -1285,7 +1285,7 @@ mod tests {
         let second = p.try_alloc(glyph(2, 1)).placed().unwrap();
         assert_eq!(second.x, 0);
         assert_eq!(second.y, 1);
-        assert!(second.right() <= u64::from(u32::MAX));
+        assert!(u32::try_from(second.right()).is_ok());
         assert!(non_overlapping(p.placements()));
     }
 

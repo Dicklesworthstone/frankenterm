@@ -242,8 +242,8 @@ fn impact_throughput_measurable_across_window() {
 
     let history = &ml.state().metrics_history;
     // First half vs second half
-    let first_half: Vec<&MissionCycleMetricsSample> = history[..5].iter().collect();
-    let second_half: Vec<&MissionCycleMetricsSample> = history[5..].iter().collect();
+    let first_half: Vec<&MissionCycleMetricsSample> = history.iter().take(5).collect();
+    let second_half: Vec<&MissionCycleMetricsSample> = history.iter().skip(5).collect();
 
     let baseline = compute_baseline(&first_half);
     let current = compute_baseline(&second_half);
@@ -282,8 +282,9 @@ fn impact_churn_decreases_with_stable_assignments() {
 
     let history = &ml.state().metrics_history;
     if history.len() >= 4 {
-        let late_churn: Vec<f64> = history[history.len() - 3..]
+        let late_churn: Vec<f64> = history
             .iter()
+            .skip(history.len() - 3)
             .map(|s| s.planner_churn_rate)
             .collect();
         let avg_late_churn = late_churn.iter().sum::<f64>() / late_churn.len() as f64;
@@ -476,7 +477,7 @@ fn confidence_variance_zero_for_constant_workload() {
 
     let history = &ml.state().metrics_history;
     if history.len() >= 3 {
-        let stable: Vec<&MissionCycleMetricsSample> = history[1..].iter().collect();
+        let stable: Vec<&MissionCycleMetricsSample> = history.iter().skip(1).collect();
         let stats = compute_baseline(&stable);
 
         assert!(
@@ -535,7 +536,7 @@ fn confidence_window_stability_over_many_cycles() {
     let history = &ml.state().metrics_history;
     let mut window_means: Vec<f64> = Vec::new();
     for start in 0..history.len().saturating_sub(4) {
-        let window: Vec<&MissionCycleMetricsSample> = history[start..start + 5].iter().collect();
+        let window: Vec<&MissionCycleMetricsSample> = history.iter().skip(start).take(5).collect();
         let stats = compute_baseline(&window);
         window_means.push(stats.mean_throughput);
     }

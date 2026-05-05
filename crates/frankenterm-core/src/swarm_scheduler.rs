@@ -864,14 +864,11 @@ impl SwarmScheduler {
         // makes this subtraction safe today, but `saturating_sub` keeps
         // the math correct if a future caller weakens or moves the
         // guard.
-        let step = raw_step
-            .max(1)
-            .min(self.config.max_scale_step)
-            .min(
-                self.config
-                    .max_fleet_size
-                    .saturating_sub(pressure.active_agents),
-            );
+        let step = raw_step.max(1).min(self.config.max_scale_step).min(
+            self.config
+                .max_fleet_size
+                .saturating_sub(pressure.active_agents),
+        );
 
         let reason = format!(
             "queue pressure {:.2} exceeds threshold {:.2} (ready={}, capacity={})",

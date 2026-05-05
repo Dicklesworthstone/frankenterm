@@ -183,11 +183,7 @@ pub(super) fn redact_json_value(value: &mut serde_json::Value, redactor: &Redact
     redact_json_value_with_depth(value, redactor, 0);
 }
 
-fn redact_json_value_with_depth(
-    value: &mut serde_json::Value,
-    redactor: &Redactor,
-    depth: usize,
-) {
+fn redact_json_value_with_depth(value: &mut serde_json::Value, redactor: &Redactor, depth: usize) {
     if depth >= MAX_REDACT_RECURSION_DEPTH {
         record_redact_depth_limit_hit();
         tracing::warn!(

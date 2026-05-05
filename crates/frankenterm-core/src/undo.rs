@@ -780,8 +780,7 @@ fn parse_undo_payload(undo: &ActionUndoRecord) -> Option<serde_json::Value> {
     match serde_json::from_str::<serde_json::Value>(payload) {
         Ok(value) => Some(value),
         Err(err) => {
-            UNDO_PAYLOAD_PARSE_DROP_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            UNDO_PAYLOAD_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 target: "ft.undo.parse",
                 event = "undo_payload_parse_drop",

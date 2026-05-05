@@ -983,9 +983,7 @@ fn allocate_weighted(total: u32, mix: &[AgentMixEntry]) -> Vec<u32> {
         return vec![0; mix.len()];
     }
 
-    let total_weight: u32 = mix
-        .iter()
-        .fold(0u32, |acc, e| acc.saturating_add(e.weight));
+    let total_weight: u32 = mix.iter().fold(0u32, |acc, e| acc.saturating_add(e.weight));
     if total_weight == 0 {
         return vec![0; mix.len()];
     }
@@ -1233,10 +1231,7 @@ mod tests {
         // small total_weight in release. The saturating_add path
         // clamps to u32::MAX and produces a finite (if grossly
         // proportional) allocation.
-        let mix = vec![
-            agent_mix("a", u32::MAX),
-            agent_mix("b", u32::MAX),
-        ];
+        let mix = vec![agent_mix("a", u32::MAX), agent_mix("b", u32::MAX)];
         let alloc = allocate_weighted(10, &mix);
         // Allocation must sum to exactly `total` (no slots lost or
         // duplicated) and contain no negative-weight artifacts.

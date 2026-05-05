@@ -204,10 +204,7 @@ pub enum AuditChainContinuityError {
     /// predecessor's `chain_hash` — the predecessor was
     /// modified after the entry was appended (tamper) or the
     /// entry's own hash field was overwritten.
-    HashLinkBroken {
-        sequence: u64,
-        reason: &'static str,
-    },
+    HashLinkBroken { sequence: u64, reason: &'static str },
     /// Two adjacent entries' sequences are non-contiguous —
     /// the chain has been spliced (an entry was removed
     /// without recording the eviction in the watermark).
@@ -223,7 +220,10 @@ impl fmt::Display for AuditChainContinuityError {
                  entries[0].sequence={actual}"
             ),
             Self::HashLinkBroken { sequence, reason } => {
-                write!(f, "audit chain hash-link broken at seq={sequence}: {reason}")
+                write!(
+                    f,
+                    "audit chain hash-link broken at seq={sequence}: {reason}"
+                )
             }
             Self::SequenceGap { after, before } => write!(
                 f,
@@ -1175,11 +1175,15 @@ mod tests {
         // break because previous_hash of seq=3 was the chain_hash
         // of seq=2; but seq=2 is gone. The hash-link check fires
         // first.
-        let err = chain.verify_chain_continuity().expect_err("tamper detected");
+        let err = chain
+            .verify_chain_continuity()
+            .expect_err("tamper detected");
         match err {
             AuditChainContinuityError::HashLinkBroken { .. }
             | AuditChainContinuityError::SequenceGap { .. } => {}
-            other => panic!("expected HashLinkBroken or SequenceGap, got {other:?}"),
+            other @ AuditChainContinuityError::AnchorMismatch { .. } => {
+                panic!("expected HashLinkBroken or SequenceGap, got {other:?}")
+            }
         }
     }
 
@@ -1405,7 +1409,10 @@ mod tests {
         );
 
         let jsonl = chain.export_jsonl();
-        assert!(!jsonl.is_empty(), "clean export must produce non-empty JSONL");
+        assert!(
+            !jsonl.is_empty(),
+            "clean export must produce non-empty JSONL"
+        );
         assert_eq!(
             super::audit_chain_export_dropped_count(),
             0,

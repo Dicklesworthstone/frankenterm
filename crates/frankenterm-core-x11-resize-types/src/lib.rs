@@ -577,7 +577,7 @@ mod tests {
                 assert_eq!(dimensions, WindowDimensions::new(820, 610));
                 assert_eq!(dropped_count, 2);
             }
-            other => panic!("expected Emit, got {other:?}"),
+            other @ CoalesceDecision::Buffer { .. } => panic!("expected Emit, got {other:?}"),
         }
         assert!(s.is_idle());
     }
@@ -659,7 +659,7 @@ mod tests {
                 assert_eq!(dimensions, WindowDimensions::new(810, 605));
                 assert_eq!(dropped_count, 1);
             }
-            other => panic!("expected Emit, got {other:?}"),
+            other @ CoalesceDecision::Buffer { .. } => panic!("expected Emit, got {other:?}"),
         }
         assert!(s.is_idle());
     }

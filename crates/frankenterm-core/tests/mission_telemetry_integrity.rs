@@ -633,9 +633,9 @@ fn trust_cycle_ids_monotonic() {
     }
 
     let history = &ml.state().metrics_history;
-    for window in history.windows(2) {
+    for (previous, current) in history.iter().zip(history.iter().skip(1)) {
         assert!(
-            window[1].cycle_id > window[0].cycle_id,
+            current.cycle_id > previous.cycle_id,
             "Cycle IDs must be monotonically increasing"
         );
     }
@@ -659,9 +659,9 @@ fn trust_timestamps_non_decreasing() {
     }
 
     let history = &ml.state().metrics_history;
-    for window in history.windows(2) {
+    for (previous, current) in history.iter().zip(history.iter().skip(1)) {
         assert!(
-            window[1].timestamp_ms >= window[0].timestamp_ms,
+            current.timestamp_ms >= previous.timestamp_ms,
             "Timestamps must be non-decreasing"
         );
     }
