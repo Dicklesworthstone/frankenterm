@@ -369,6 +369,20 @@ pub enum TuningMode {
 }
 
 impl TuningMode {
+    /// Stable mode label for decision logs and cockpit rows.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Observe => "observe",
+            Self::Canary => "canary",
+            Self::Exploration => "exploration",
+            Self::SteadyState => "steady_state",
+            Self::Rollback => "rollback",
+            Self::Cooldown => "cooldown",
+        }
+    }
+
     /// Whether a candidate in this mode may be applied somewhere.
     #[must_use]
     pub const fn would_apply_candidate(self) -> bool {
@@ -577,6 +591,31 @@ pub enum CandidateSkipReason {
     InvalidCurrentValue,
     /// There is no pressure signal for any unpinned safe knob.
     NoPressureSignal,
+}
+
+impl CandidateSkipReason {
+    /// Stable reason code for decision logs and cockpit rows.
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Disabled => "auto_tune.skipped.disabled",
+            Self::Cooldown => "auto_tune.skipped.cooldown",
+            Self::MissingTelemetry => "auto_tune.skipped.missing_telemetry",
+            Self::StaleTelemetry => "auto_tune.skipped.stale_telemetry",
+            Self::UntrustedTelemetry => "auto_tune.skipped.untrusted_telemetry",
+            Self::WarmupIncomplete => "auto_tune.skipped.warmup_incomplete",
+            Self::InsufficientMeasurements => "auto_tune.skipped.insufficient_measurements",
+            Self::InsufficientConfidence => "auto_tune.skipped.insufficient_confidence",
+            Self::ExplorationBudgetExhausted => "auto_tune.skipped.exploration_budget_exhausted",
+            Self::UnknownKnob => "auto_tune.skipped.unknown_knob",
+            Self::MultipleKnobsForbidden => "auto_tune.skipped.multiple_knobs_forbidden",
+            Self::UnsafeCombination => "auto_tune.skipped.unsafe_combination",
+            Self::PinnedKnob => "auto_tune.skipped.pinned_knob",
+            Self::MissingCurrentValue => "auto_tune.skipped.missing_current_value",
+            Self::InvalidCurrentValue => "auto_tune.skipped.invalid_current_value",
+            Self::NoPressureSignal => "auto_tune.skipped.no_pressure_signal",
+        }
+    }
 }
 
 /// Candidate for one bounded registry-approved knob step.
@@ -2040,6 +2079,514 @@ fn metric_reason_code(metric: SafetyMetricKind, suffix: &str) -> String {
 }
 
 // =============================================================================
+// Decision records and bounded operator log
+// =============================================================================
+
+/// Schema version for auto-tune decision records surfaced to operators.
+pub const AUTO_TUNE_DECISION_RECORD_SCHEMA_VERSION: u32 = 1;
+
+/// Default number of recent auto-tune decisions retained for operator surfaces.
+pub const DEFAULT_TUNING_DECISION_LOG_CAPACITY: usize = 64;
+
+const MAX_TUNING_DECISION_REASON_CODES: usize = 8;
+const MAX_TUNING_DECISION_SAFETY_CHECKS: usize = 8;
+
+/// Operator-visible decision family for the candidate and rollback controllers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningDecisionKind {
+    /// A bounded candidate was emitted and entered observation/exploration.
+    CandidateStarted,
+    /// A candidate passed safety checks.
+    CandidateAccepted,
+    /// A candidate failed safety checks before rollback action is reported.
+    CandidateRejected,
+    /// A rollback value should be restored.
+    Rollback,
+    /// The controller is intentionally cooling down.
+    Cooldown,
+    /// Auto-tuning is disabled.
+    Disabled,
+    /// Exploration was skipped before a candidate was produced.
+    ExplorationSkipped,
+    /// Controller is observing or waiting for more evidence.
+    Observing,
+    /// Controller is in steady state after an accepted candidate.
+    SteadyState,
+}
+
+impl TuningDecisionKind {
+    /// Stable label for compact cockpit rows.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateStarted => "candidate_started",
+            Self::CandidateAccepted => "candidate_accepted",
+            Self::CandidateRejected => "candidate_rejected",
+            Self::Rollback => "rollback",
+            Self::Cooldown => "cooldown",
+            Self::Disabled => "disabled",
+            Self::ExplorationSkipped => "exploration_skipped",
+            Self::Observing => "observing",
+            Self::SteadyState => "steady_state",
+        }
+    }
+}
+
+/// Confidence classification used by compact and JSON operator telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningConfidenceState {
+    /// Confidence telemetry was absent or invalid.
+    Missing,
+    /// Confidence telemetry existed but was below the configured floor.
+    Insufficient,
+    /// Confidence telemetry met the configured floor.
+    Acceptable,
+}
+
+impl TuningConfidenceState {
+    fn from_confidence(confidence: f64, minimum_confidence: f64) -> Self {
+        if !confidence.is_finite() || !minimum_confidence.is_finite() {
+            Self::Missing
+        } else if confidence < minimum_confidence {
+            Self::Insufficient
+        } else {
+            Self::Acceptable
+        }
+    }
+
+    /// Stable label for compact cockpit rows.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Insufficient => "insufficient",
+            Self::Acceptable => "acceptable",
+        }
+    }
+}
+
+/// Bounded summary of the telemetry window that produced a decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningMetricWindowSummary {
+    /// Whether the warmup portion of the window was complete.
+    pub warmup_complete: bool,
+    /// Number of measurements represented, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurement_count: Option<usize>,
+    /// Required measurement floor, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_measurements: Option<usize>,
+    /// Confidence score, when finite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Required confidence floor, when finite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_confidence: Option<f64>,
+    /// Stable confidence classification.
+    pub confidence_state: TuningConfidenceState,
+}
+
+impl TuningMetricWindowSummary {
+    /// Summarize a candidate-generation telemetry window.
+    #[must_use]
+    pub fn from_candidate_window(window: &CandidateTelemetryWindow) -> Self {
+        Self {
+            warmup_complete: window.warmup_complete,
+            measurement_count: Some(window.measurement_count),
+            minimum_measurements: Some(window.minimum_measurements),
+            confidence: finite_option(window.confidence),
+            minimum_confidence: finite_option(window.minimum_confidence),
+            confidence_state: TuningConfidenceState::from_confidence(
+                window.confidence,
+                window.minimum_confidence,
+            ),
+        }
+    }
+
+    /// Summarize a rollback safety telemetry window.
+    #[must_use]
+    pub fn from_safety_window(window: &SafetyTelemetryWindow) -> Self {
+        Self {
+            warmup_complete: window.warmup_complete,
+            measurement_count: Some(window.samples.len()),
+            minimum_measurements: None,
+            confidence: finite_option(window.confidence),
+            minimum_confidence: finite_option(window.minimum_confidence),
+            confidence_state: TuningConfidenceState::from_confidence(
+                window.confidence,
+                window.minimum_confidence,
+            ),
+        }
+    }
+}
+
+/// Bounded per-metric safety check exposed in a decision record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningSafetyCheckSummary {
+    /// Metric family checked.
+    pub metric: SafetyMetricKind,
+    /// Per-metric verdict.
+    pub verdict: SafetyMetricVerdict,
+    /// Stable reason code.
+    pub reason_code: String,
+    /// Last safe baseline, when finite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<f64>,
+    /// Candidate-window observation, when finite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<f64>,
+    /// Computed monotonic safety limit, when finite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    /// Whether this check can fail the candidate closed.
+    pub required: bool,
+}
+
+impl From<&SafetyMetricCheck> for TuningSafetyCheckSummary {
+    fn from(check: &SafetyMetricCheck) -> Self {
+        Self {
+            metric: check.metric,
+            verdict: check.verdict,
+            reason_code: check.reason_code.clone(),
+            baseline: check.baseline.and_then(finite_option),
+            observed: check.observed.and_then(finite_option),
+            limit: check.limit.and_then(finite_option),
+            required: check.required,
+        }
+    }
+}
+
+/// Machine-readable auto-tune decision record for logs, robot APIs, and cockpit rows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningDecisionRecord {
+    /// Record schema version.
+    pub schema_version: u32,
+    /// Decision timestamp in epoch milliseconds.
+    pub timestamp_ms: u64,
+    /// Operator profile or rollout scope that produced the decision.
+    pub profile: String,
+    /// Correlation id linking candidate and rollback records.
+    pub correlation_id: String,
+    /// Decision family.
+    pub kind: TuningDecisionKind,
+    /// Controller mode at decision time.
+    pub mode: TuningMode,
+    /// Tunable knob, when a decision targets one knob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knob_id: Option<TunableKnobId>,
+    /// Stable knob label for compact renderers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knob_name: Option<String>,
+    /// Prior knob value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_value: Option<f64>,
+    /// Candidate or accepted knob value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_value: Option<f64>,
+    /// Value to restore on rollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_value: Option<f64>,
+    /// Registry gate attached to this knob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<KnobGate>,
+    /// Whether the controller intended to apply this candidate.
+    pub would_apply: bool,
+    /// Whether live mutation was allowed for this decision.
+    pub live_mutation_allowed: bool,
+    /// Stable reason codes, bounded for high-scale runs.
+    pub reason_codes: Vec<String>,
+    /// Bounded telemetry-window summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric_window: Option<TuningMetricWindowSummary>,
+    /// Bounded safety-check summaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safety_checks: Vec<TuningSafetyCheckSummary>,
+    /// Active exploration count at decision time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_explorations: Option<usize>,
+    /// Configured active exploration limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_explorations: Option<usize>,
+}
+
+impl TuningDecisionRecord {
+    /// Build a record from candidate generation or a skipped exploration decision.
+    #[must_use]
+    pub fn from_candidate_decision(
+        timestamp_ms: u64,
+        profile: impl Into<String>,
+        correlation_id: impl Into<String>,
+        decision: &CandidateDecision,
+        telemetry: &CandidateTelemetryWindow,
+    ) -> Self {
+        match &decision.candidate {
+            Some(candidate) => Self::from_candidate(
+                timestamp_ms,
+                profile,
+                correlation_id,
+                TuningDecisionKind::CandidateStarted,
+                decision.mode,
+                candidate,
+                vec![candidate.reason_code.clone()],
+                Some(TuningMetricWindowSummary::from_candidate_window(telemetry)),
+                Some(decision.active_explorations),
+                Some(decision.max_concurrent_explorations),
+            ),
+            None => Self {
+                schema_version: AUTO_TUNE_DECISION_RECORD_SCHEMA_VERSION,
+                timestamp_ms,
+                profile: profile.into(),
+                correlation_id: correlation_id.into(),
+                kind: TuningDecisionKind::ExplorationSkipped,
+                mode: decision.mode,
+                knob_id: None,
+                knob_name: None,
+                old_value: None,
+                new_value: None,
+                rollback_value: None,
+                gate: None,
+                would_apply: decision.mode.would_apply_candidate(),
+                live_mutation_allowed: decision.mode.may_mutate_live_knobs(),
+                reason_codes: bounded_reason_codes(
+                    decision
+                        .skip_reasons
+                        .iter()
+                        .map(CandidateSkipReason::reason_code),
+                ),
+                metric_window: Some(TuningMetricWindowSummary::from_candidate_window(telemetry)),
+                safety_checks: Vec::new(),
+                active_explorations: Some(decision.active_explorations),
+                max_concurrent_explorations: Some(decision.max_concurrent_explorations),
+            },
+        }
+    }
+
+    /// Build one record from a rollback-controller decision.
+    #[must_use]
+    pub fn from_rollback_decision(
+        timestamp_ms: u64,
+        profile: impl Into<String>,
+        correlation_id: impl Into<String>,
+        decision: &RollbackDecision,
+        telemetry: Option<&SafetyTelemetryWindow>,
+    ) -> Self {
+        let kind = match decision.action {
+            RollbackAction::Disabled => TuningDecisionKind::Disabled,
+            RollbackAction::Noop | RollbackAction::ContinueCandidate => {
+                TuningDecisionKind::Observing
+            }
+            RollbackAction::AcceptCandidate => TuningDecisionKind::CandidateAccepted,
+            RollbackAction::Rollback => TuningDecisionKind::Rollback,
+            RollbackAction::Cooldown => TuningDecisionKind::Cooldown,
+        };
+
+        Self {
+            schema_version: AUTO_TUNE_DECISION_RECORD_SCHEMA_VERSION,
+            timestamp_ms,
+            profile: profile.into(),
+            correlation_id: correlation_id.into(),
+            kind,
+            mode: decision.mode,
+            knob_id: decision.knob_id,
+            knob_name: decision.knob_id.map(|knob_id| knob_id.as_str().to_string()),
+            old_value: None,
+            new_value: decision.candidate_value.and_then(finite_option),
+            rollback_value: decision.rollback_value.and_then(finite_option),
+            gate: None,
+            would_apply: decision.mode.would_apply_candidate(),
+            live_mutation_allowed: decision.mode.may_mutate_live_knobs(),
+            reason_codes: bounded_reason_codes(decision.reason_codes.iter().map(String::as_str)),
+            metric_window: telemetry.map(TuningMetricWindowSummary::from_safety_window),
+            safety_checks: decision
+                .checks
+                .iter()
+                .take(MAX_TUNING_DECISION_SAFETY_CHECKS)
+                .map(TuningSafetyCheckSummary::from)
+                .collect(),
+            active_explorations: None,
+            max_concurrent_explorations: None,
+        }
+    }
+
+    fn from_candidate(
+        timestamp_ms: u64,
+        profile: impl Into<String>,
+        correlation_id: impl Into<String>,
+        kind: TuningDecisionKind,
+        mode: TuningMode,
+        candidate: &TuningCandidate,
+        reason_codes: Vec<String>,
+        metric_window: Option<TuningMetricWindowSummary>,
+        active_explorations: Option<usize>,
+        max_concurrent_explorations: Option<usize>,
+    ) -> Self {
+        Self {
+            schema_version: AUTO_TUNE_DECISION_RECORD_SCHEMA_VERSION,
+            timestamp_ms,
+            profile: profile.into(),
+            correlation_id: correlation_id.into(),
+            kind,
+            mode,
+            knob_id: Some(candidate.knob_id),
+            knob_name: Some(candidate.knob_id.as_str().to_string()),
+            old_value: finite_option(candidate.old_value),
+            new_value: finite_option(candidate.candidate_value),
+            rollback_value: None,
+            gate: Some(candidate.gate),
+            would_apply: candidate.would_apply,
+            live_mutation_allowed: candidate.live_mutation_allowed,
+            reason_codes: reason_codes
+                .into_iter()
+                .take(MAX_TUNING_DECISION_REASON_CODES)
+                .collect(),
+            metric_window,
+            safety_checks: Vec::new(),
+            active_explorations,
+            max_concurrent_explorations,
+        }
+    }
+
+    fn candidate_rejected_from_rollback(
+        timestamp_ms: u64,
+        profile: &str,
+        correlation_id: &str,
+        decision: &RollbackDecision,
+        telemetry: Option<&SafetyTelemetryWindow>,
+    ) -> Self {
+        let mut record = Self::from_rollback_decision(
+            timestamp_ms,
+            profile,
+            correlation_id,
+            decision,
+            telemetry,
+        );
+        record.kind = TuningDecisionKind::CandidateRejected;
+        record
+            .reason_codes
+            .push("auto_tune.candidate.rejected".to_string());
+        record
+            .reason_codes
+            .truncate(MAX_TUNING_DECISION_REASON_CODES);
+        record
+    }
+}
+
+/// Bounded ring buffer for recent auto-tune decision records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningDecisionLog {
+    capacity: usize,
+    records: VecDeque<TuningDecisionRecord>,
+}
+
+impl Default for TuningDecisionLog {
+    fn default() -> Self {
+        Self::new(DEFAULT_TUNING_DECISION_LOG_CAPACITY)
+    }
+}
+
+impl TuningDecisionLog {
+    /// Create a bounded decision log.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            records: VecDeque::new(),
+        }
+    }
+
+    /// Return configured retention capacity.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Append one decision, evicting the oldest record when at capacity.
+    pub fn push(&mut self, record: TuningDecisionRecord) {
+        if self.records.len() >= self.capacity {
+            self.records.pop_front();
+        }
+        self.records.push_back(record);
+    }
+
+    /// Record candidate-generation or skipped-exploration output.
+    pub fn record_candidate_decision(
+        &mut self,
+        timestamp_ms: u64,
+        profile: &str,
+        correlation_id: &str,
+        decision: &CandidateDecision,
+        telemetry: &CandidateTelemetryWindow,
+    ) {
+        self.push(TuningDecisionRecord::from_candidate_decision(
+            timestamp_ms,
+            profile,
+            correlation_id,
+            decision,
+            telemetry,
+        ));
+    }
+
+    /// Record rollback output. Rollback emits both rejection and rollback rows.
+    pub fn record_rollback_decision(
+        &mut self,
+        timestamp_ms: u64,
+        profile: &str,
+        correlation_id: &str,
+        decision: &RollbackDecision,
+        telemetry: Option<&SafetyTelemetryWindow>,
+    ) {
+        if decision.action == RollbackAction::Rollback {
+            self.push(TuningDecisionRecord::candidate_rejected_from_rollback(
+                timestamp_ms,
+                profile,
+                correlation_id,
+                decision,
+                telemetry,
+            ));
+        }
+        self.push(TuningDecisionRecord::from_rollback_decision(
+            timestamp_ms,
+            profile,
+            correlation_id,
+            decision,
+            telemetry,
+        ));
+    }
+
+    /// Recent decisions in oldest-to-newest order.
+    #[must_use]
+    pub fn recent(&self) -> Vec<TuningDecisionRecord> {
+        self.records.iter().cloned().collect()
+    }
+
+    /// Number of retained decisions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the log is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+fn finite_option(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn bounded_reason_codes<'a>(codes: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    codes
+        .into_iter()
+        .take(MAX_TUNING_DECISION_REASON_CODES)
+        .map(str::to_string)
+        .collect()
+}
+
+// =============================================================================
 // Manual overrides
 // =============================================================================
 
@@ -3129,6 +3676,124 @@ mod tests {
             decision
                 .reason_codes
                 .contains(&"auto_tune.disabled".to_string())
+        );
+    }
+
+    #[test]
+    fn tuning_decision_records_cover_candidate_start_and_skipped_exploration_ft_luq3w_4() {
+        let engine = fresh_observe_candidate_engine();
+        let telemetry = pressure_window(CandidateDirection::Increase);
+        let decision = engine.evaluate(&default_current_values(&engine), &telemetry, &[]);
+        let record = TuningDecisionRecord::from_candidate_decision(
+            1_700_000_030_000,
+            "high-core-observe",
+            "corr-auto-1",
+            &decision,
+            &telemetry,
+        );
+
+        assert_eq!(record.kind, TuningDecisionKind::CandidateStarted);
+        assert_eq!(record.profile, "high-core-observe");
+        assert_eq!(record.correlation_id, "corr-auto-1");
+        assert_eq!(
+            record.knob_id,
+            Some(TunableKnobId::RuntimeOutputCoalesceWindowMs)
+        );
+        assert_eq!(
+            record.knob_name.as_deref(),
+            Some("runtime.output_coalesce_window_ms")
+        );
+        assert_eq!(record.old_value, Some(50.0));
+        assert_eq!(record.new_value, Some(75.0));
+        assert_eq!(
+            record
+                .metric_window
+                .as_ref()
+                .map(|window| window.confidence_state),
+            Some(TuningConfidenceState::Acceptable)
+        );
+        assert!(
+            record
+                .reason_codes
+                .contains(&"auto_tune.candidate.runtime.output_coalesce_window_ms".to_string())
+        );
+
+        let stale_engine = BoundedCandidateEngine::new(CandidateEvaluationConfig {
+            telemetry_trust: TelemetryTrust::Stale,
+            ..CandidateEvaluationConfig::default()
+        });
+        let skipped = stale_engine.evaluate(&default_current_values(&engine), &telemetry, &[]);
+        let skipped_record = TuningDecisionRecord::from_candidate_decision(
+            1_700_000_030_001,
+            "high-core-observe",
+            "corr-auto-2",
+            &skipped,
+            &telemetry,
+        );
+
+        assert_eq!(skipped_record.kind, TuningDecisionKind::ExplorationSkipped);
+        assert_eq!(skipped_record.knob_id, None);
+        assert_eq!(
+            skipped_record.reason_codes,
+            vec!["auto_tune.skipped.stale_telemetry".to_string()]
+        );
+    }
+
+    #[test]
+    fn tuning_decision_log_records_candidate_rejection_and_rollback_bounded_ft_luq3w_4() {
+        let mut controller = RollbackController::new(RollbackControllerConfig {
+            regression_hysteresis_windows: 1,
+            ..RollbackControllerConfig::default()
+        });
+        let candidate = candidate_for_rollback_controller();
+        assert!(controller.start_candidate(candidate.clone()));
+
+        let safety = safety_window(vec![required_lower_sample(
+            SafetyMetricKind::Latency,
+            Some(100.0),
+            Some(150.0),
+        )]);
+        let rollback = controller.evaluate(&safety);
+
+        let mut log = TuningDecisionLog::new(2);
+        let telemetry = pressure_window(CandidateDirection::Increase);
+        let candidate_decision = CandidateDecision {
+            mode: TuningMode::Observe,
+            candidate: Some(candidate),
+            skip_reasons: Vec::new(),
+            active_explorations: 0,
+            max_concurrent_explorations: 1,
+        };
+        log.record_candidate_decision(
+            1_700_000_030_000,
+            "high-core-canary",
+            "corr-auto-3",
+            &candidate_decision,
+            &telemetry,
+        );
+        log.record_rollback_decision(
+            1_700_000_030_010,
+            "high-core-canary",
+            "corr-auto-3",
+            &rollback,
+            Some(&safety),
+        );
+
+        let records = log.recent();
+        assert_eq!(log.capacity(), 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind, TuningDecisionKind::CandidateRejected);
+        assert_eq!(records[1].kind, TuningDecisionKind::Rollback);
+        assert_eq!(records[1].rollback_value, Some(50.0));
+        assert!(
+            records[1]
+                .reason_codes
+                .contains(&"auto_tune.rollback.metric_regression".to_string())
+        );
+        assert_eq!(records[1].safety_checks.len(), 1);
+        assert_eq!(
+            records[1].safety_checks[0].reason_code,
+            "auto_tune.safety.latency.regressed"
         );
     }
 

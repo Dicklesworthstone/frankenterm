@@ -93,6 +93,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Instant, SystemTime};
 
+use crate::auto_tune::TuningDecisionRecord;
 use crate::connector_credential_broker::{CredentialAuditEvent, CredentialAuditType};
 use crate::connector_data_classification::{DataSensitivity, RedactionStrategy};
 use crate::connector_event_model::{CanonicalConnectorEvent, CanonicalSeverity};
@@ -2613,6 +2614,9 @@ pub const MAX_SWARM_RESOURCE_COCKPIT_ADMISSION_DECISIONS: usize = 8;
 
 /// Maximum mitigation/drilldown rows surfaced in one resource cockpit snapshot.
 pub const MAX_SWARM_RESOURCE_COCKPIT_DRILLDOWNS: usize = 12;
+
+/// Maximum auto-tune decisions surfaced in one resource cockpit snapshot.
+pub const MAX_SWARM_RESOURCE_COCKPIT_AUTO_TUNE_DECISIONS: usize = 8;
 
 const SWARM_CAPACITY_HISTOGRAMS_PER_STAGE: usize = 4;
 const SWARM_CAPACITY_TELEMETRY_SHARDS: usize = 64;
@@ -6523,6 +6527,9 @@ pub struct SwarmResourceCockpitSnapshot {
     /// Storage IO scheduler pressure, separate from CPU and memory pressure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_io: Option<StorageIoOperatorSummary>,
+    /// Recent auto-tune decisions, bounded for high-scale operator surfaces.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_tune_decisions: Vec<TuningDecisionRecord>,
     /// Mitigation history distilled from memory and admission decisions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mitigation_history: Vec<SwarmResourceCockpitDrilldown>,
@@ -6603,9 +6610,20 @@ impl SwarmResourceCockpitSnapshot {
             capacity_admission_decisions,
             resource_admission_decisions,
             storage_io,
+            auto_tune_decisions: Vec::new(),
             mitigation_history,
             drilldowns,
         }
+    }
+
+    /// Return this cockpit with recent auto-tune decisions attached.
+    #[must_use]
+    pub fn with_auto_tune_decisions(mut self, decisions: &[TuningDecisionRecord]) -> Self {
+        let start = decisions
+            .len()
+            .saturating_sub(MAX_SWARM_RESOURCE_COCKPIT_AUTO_TUNE_DECISIONS);
+        self.auto_tune_decisions = decisions[start..].to_vec();
+        self
     }
 
     /// Concise stable rows for the human doctor surface.
@@ -6616,13 +6634,14 @@ impl SwarmResourceCockpitSnapshot {
             .map(fleet_pressure_tier_name)
             .unwrap_or("unknown");
         let mut rows = vec![format!(
-            "status={} proof_gate={} memory_pressure={} stages={} capacity_decisions={} resource_decisions={}",
+            "status={} proof_gate={} memory_pressure={} stages={} capacity_decisions={} resource_decisions={} auto_tune_decisions={}",
             self.status.as_str(),
             self.proof_gate.as_str(),
             memory_pressure,
             self.slowest_latency_cohorts.len(),
             self.capacity_admission_decisions.len(),
-            self.resource_admission_decisions.len()
+            self.resource_admission_decisions.len(),
+            self.auto_tune_decisions.len()
         )];
 
         for tier in self.memory_tiers.iter().take(3) {
@@ -6667,6 +6686,23 @@ impl SwarmResourceCockpitSnapshot {
                 storage_io.write_error_total,
                 storage_io.search_lag_segments,
                 storage_io.hydration_lag_pages
+            ));
+        }
+        for decision in self.auto_tune_decisions.iter().rev().take(3) {
+            rows.push(format!(
+                "auto_tune kind={} mode={} profile={} knob={} old={} new={} rollback={} confidence={} reasons={}",
+                decision.kind.as_str(),
+                decision.mode.as_str(),
+                decision.profile,
+                decision.knob_name.as_deref().unwrap_or("none"),
+                optional_f64_label(decision.old_value),
+                optional_f64_label(decision.new_value),
+                optional_f64_label(decision.rollback_value),
+                decision
+                    .metric_window
+                    .as_ref()
+                    .map_or("unknown", |window| window.confidence_state.as_str()),
+                auto_tune_reason_codes_label(&decision.reason_codes)
             ));
         }
         for decision in self.capacity_admission_decisions.iter().take(3) {
@@ -6921,6 +6957,18 @@ impl SwarmCapacityOperatorSummary {
                 storage_io,
             );
             self.resource_cockpit = Some(cockpit);
+        }
+        self
+    }
+
+    /// Return this summary with recent auto-tune decisions attached to the cockpit.
+    #[must_use]
+    pub fn with_auto_tune_decisions(mut self, decisions: &[TuningDecisionRecord]) -> Self {
+        if self.transparency_level >= 2 {
+            let cockpit = self.resource_cockpit.take().unwrap_or_else(|| {
+                SwarmResourceCockpitSnapshot::from_capacity_summary(&self, None, &[])
+            });
+            self.resource_cockpit = Some(cockpit.with_auto_tune_decisions(decisions));
         }
         self
     }
@@ -7278,6 +7326,17 @@ fn resource_admission_reason_codes_label(reasons: &[AdmissionReasonCode]) -> Str
         .iter()
         .copied()
         .map(resource_admission_reason_code_name)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn auto_tune_reason_codes_label(reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        return "none".to_string();
+    }
+    reasons
+        .iter()
+        .map(String::as_str)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -14562,19 +14621,19 @@ mod tests {
 
         assert_eq!(
             first_row(&healthy),
-            "status=ready proof_gate=healthy memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0"
+            "status=ready proof_gate=healthy memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0 auto_tune_decisions=0"
         );
         assert_eq!(
             first_row(&pressured),
-            "status=watch proof_gate=pressured memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0"
+            "status=watch proof_gate=pressured memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0 auto_tune_decisions=0"
         );
         assert_eq!(
             first_row(&degraded),
-            "status=violated proof_gate=degraded memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0"
+            "status=violated proof_gate=degraded memory_pressure=unknown stages=0 capacity_decisions=1 resource_decisions=0 auto_tune_decisions=0"
         );
         assert_eq!(
             first_row(&skipped),
-            "status=unavailable proof_gate=skipped_proof memory_pressure=unknown stages=0 capacity_decisions=0 resource_decisions=0"
+            "status=unavailable proof_gate=skipped_proof memory_pressure=unknown stages=0 capacity_decisions=0 resource_decisions=0 auto_tune_decisions=0"
         );
         assert!(
             skipped
@@ -14584,6 +14643,113 @@ mod tests {
                 .compact_table_rows()
                 .iter()
                 .any(|row| row.contains("resource.proof.skipped"))
+        );
+    }
+
+    #[test]
+    fn swarm_resource_cockpit_surfaces_bounded_auto_tune_decisions_ft_luq3w_4() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "auto-tune",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            0,
+        );
+        let plan = controller.plan(
+            1_700_000_031_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let base = TuningDecisionRecord {
+            schema_version: crate::auto_tune::AUTO_TUNE_DECISION_RECORD_SCHEMA_VERSION,
+            timestamp_ms: 1_700_000_031_001,
+            profile: "high-core-canary".to_string(),
+            correlation_id: "corr-auto-cockpit".to_string(),
+            kind: crate::auto_tune::TuningDecisionKind::CandidateStarted,
+            mode: crate::auto_tune::TuningMode::Exploration,
+            knob_id: Some(crate::auto_tune::TunableKnobId::RuntimeOutputCoalesceWindowMs),
+            knob_name: Some("runtime.output_coalesce_window_ms".to_string()),
+            old_value: Some(50.0),
+            new_value: Some(75.0),
+            rollback_value: None,
+            gate: Some(crate::auto_tune::KnobGate::ObserveFirst),
+            would_apply: true,
+            live_mutation_allowed: false,
+            reason_codes: vec!["auto_tune.candidate.runtime.output_coalesce_window_ms".to_string()],
+            metric_window: Some(crate::auto_tune::TuningMetricWindowSummary {
+                warmup_complete: true,
+                measurement_count: Some(30),
+                minimum_measurements: Some(10),
+                confidence: Some(0.95),
+                minimum_confidence: Some(0.80),
+                confidence_state: crate::auto_tune::TuningConfidenceState::Acceptable,
+            }),
+            safety_checks: Vec::new(),
+            active_explorations: Some(1),
+            max_concurrent_explorations: Some(1),
+        };
+        let decisions = (0..(MAX_SWARM_RESOURCE_COCKPIT_AUTO_TUNE_DECISIONS + 2))
+            .map(|idx| {
+                let mut record = base.clone();
+                record.timestamp_ms += idx as u64;
+                record.correlation_id = format!("corr-auto-cockpit-{idx}");
+                if idx % 2 == 1 {
+                    record.kind = crate::auto_tune::TuningDecisionKind::Rollback;
+                    record.mode = crate::auto_tune::TuningMode::Rollback;
+                    record.rollback_value = Some(50.0);
+                    record
+                        .reason_codes
+                        .push("auto_tune.rollback.metric_regression".to_string());
+                }
+                record
+            })
+            .collect::<Vec<_>>();
+
+        let summary = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_031_010,
+            2,
+            &certificate,
+            &report,
+            &plan,
+            None,
+        )
+        .with_auto_tune_decisions(&decisions);
+        let cockpit = summary.resource_cockpit.as_ref().expect("cockpit present");
+        let rows = cockpit.compact_table_rows();
+        let json = serde_json::to_value(&summary).expect("summary serializes");
+
+        assert_eq!(
+            cockpit.auto_tune_decisions.len(),
+            MAX_SWARM_RESOURCE_COCKPIT_AUTO_TUNE_DECISIONS
+        );
+        assert_eq!(
+            cockpit.auto_tune_decisions[0].timestamp_ms,
+            base.timestamp_ms + 2
+        );
+        assert!(rows[0].contains("auto_tune_decisions=8"));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("auto_tune kind=rollback mode=rollback")
+                    && row.contains("rollback=50.000")
+                    && row.contains("confidence=acceptable"))
+        );
+        assert_eq!(
+            json["resource_cockpit"]["auto_tune_decisions"][0]["profile"],
+            "high-core-canary"
+        );
+        assert_eq!(
+            json["resource_cockpit"]["auto_tune_decisions"][1]["kind"],
+            "rollback"
         );
     }
 
