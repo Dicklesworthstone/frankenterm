@@ -21,16 +21,16 @@ use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
+use crate::{
+    CONFIG_DIRS, CellWidth, GpuInfo, IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig,
+    MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop, WebGpuPowerPreference,
+    default_one_point_oh, default_one_point_oh_f64, default_true,
+    default_win32_acrylic_accent_color,
+};
 #[cfg(feature = "lua")]
 use crate::{
-    default_config_with_overrides_applied, CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP,
-    HOME_DIR,
-};
-use crate::{
-    default_one_point_oh, default_one_point_oh_f64, default_true,
-    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
-    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
-    WebGpuPowerPreference, CONFIG_DIRS,
+    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    default_config_with_overrides_applied,
 };
 use anyhow::Context;
 use frankenterm_bidi::ParagraphDirectionHint;
@@ -1146,6 +1146,15 @@ impl Config {
     }
 
     fn defaults_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+        let empty_overrides;
+        let overrides = match overrides {
+            frankenterm_dynamic::Value::Null => {
+                empty_overrides = frankenterm_dynamic::Value::Object(Default::default());
+                &empty_overrides
+            }
+            overrides => overrides,
+        };
+
         let (config, warnings) =
             frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
                 let cfg = Config::from_dynamic(
@@ -1194,7 +1203,7 @@ impl Config {
     pub fn update_ulimit(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (no_file_soft, no_file_hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
@@ -1223,7 +1232,7 @@ impl Config {
 
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (nproc_soft, nproc_hard) = getrlimit(Resource::RLIMIT_NPROC)?;
@@ -1628,6 +1637,8 @@ impl Config {
                 }
             }
         }
+
+        prepend_bundled_app_font_dirs(&mut cfg.font_dirs);
 
         // Add some reasonable default font rules
         let reduced = self.font.reduce_first_font_to_family();
@@ -2307,21 +2318,49 @@ fn default_tiling_desktop_environments() -> Vec<String> {
 }
 
 fn default_stateless_process_list() -> Vec<String> {
-    [
-        "bash",
-        "sh",
-        "zsh",
-        "fish",
-        "tmux",
-        "nu",
-        "nu.exe",
-        "cmd.exe",
-        "pwsh.exe",
-        "powershell.exe",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    // FrankenTerm panes often host long-running agent work behind ordinary
+    // shells, so the safe default is to prompt before closing any live pane.
+    Vec::new()
+}
+
+fn prepend_bundled_app_font_dirs(font_dirs: &mut Vec<PathBuf>) {
+    let mut bundled_dirs = bundled_app_font_dirs();
+    bundled_dirs.retain(|dir| !font_dirs.iter().any(|existing| existing == dir));
+
+    for dir in bundled_dirs.into_iter().rev() {
+        font_dirs.insert(0, dir);
+    }
+}
+
+fn bundled_app_font_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(exe_dir) = std::env::var_os("FRANKENTERM_EXECUTABLE_DIR").map(PathBuf::from) {
+        dirs.extend(bundled_app_font_dirs_from_executable_dir(&exe_dir));
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.extend(bundled_app_font_dirs_from_executable_dir(exe_dir));
+        }
+    }
+
+    dirs.retain(|dir| dir.is_dir());
+    dirs.dedup();
+    dirs
+}
+
+fn bundled_app_font_dirs_from_executable_dir(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
+        if let Some(contents_dir) = exe_dir.parent() {
+            dirs.push(contents_dir.join("Resources").join("fonts"));
+        }
+    }
+
+    dirs
 }
 
 fn default_status_update_interval() -> u64 {
@@ -2749,6 +2788,19 @@ mod tests {
     }
 
     #[test]
+    fn defaults_with_null_overrides_uses_empty_override_object() {
+        let loaded = Config::defaults_with_overrides(&Value::default());
+        let cfg = loaded
+            .config
+            .expect("null overrides should mean no overrides");
+        let defaults = Config::default_config();
+
+        assert_eq!(cfg.initial_rows, defaults.initial_rows);
+        assert_eq!(cfg.initial_cols, defaults.initial_cols);
+        assert_eq!(cfg.scrollback_lines, defaults.scrollback_lines);
+    }
+
+    #[test]
     fn dropped_file_quoting_windows_quotes_tab() {
         let result = DroppedFileQuoting::Windows.escape("has\ttab");
         assert_eq!(result, "\"has\ttab\"");
@@ -2995,7 +3047,7 @@ mod tests {
     #[test]
     fn default_cursor_style_is_steady_block() {
         let style = DefaultCursorStyle::default();
-        matches!(style, DefaultCursorStyle::SteadyBlock);
+        assert!(matches!(style, DefaultCursorStyle::SteadyBlock));
     }
 
     // ── ExitBehavior ───────────────────────────────────────────
@@ -3025,45 +3077,75 @@ mod tests {
 
     #[test]
     fn window_close_confirmation_default_is_always_prompt() {
-        matches!(
+        assert!(matches!(
             WindowCloseConfirmation::default(),
             WindowCloseConfirmation::AlwaysPrompt
+        ));
+    }
+
+    #[test]
+    fn close_confirmation_does_not_skip_shells_by_default() {
+        assert!(
+            Config::default_config()
+                .skip_close_confirmation_for_processes_named
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn macos_bundle_font_dir_is_derived_from_executable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let macos_dir = dir.path().join("FrankenTerm.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos_dir).unwrap();
+
+        let dirs = bundled_app_font_dirs_from_executable_dir(&macos_dir);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            dirs,
+            vec![dir.path().join("FrankenTerm.app/Contents/Resources/fonts")]
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        assert!(dirs.is_empty());
     }
 
     // ── BoldBrightening ────────────────────────────────────────
 
     #[test]
     fn bold_brightening_default_is_bright_and_bold() {
-        matches!(BoldBrightening::default(), BoldBrightening::BrightAndBold);
+        assert!(matches!(
+            BoldBrightening::default(),
+            BoldBrightening::BrightAndBold
+        ));
     }
 
     #[test]
     fn bold_brightening_from_dynamic_string_no() {
         let val = Value::String("No".into());
         let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
-        matches!(result, BoldBrightening::No);
+        assert!(matches!(result, BoldBrightening::No));
     }
 
     #[test]
     fn bold_brightening_from_dynamic_string_bright_only() {
         let val = Value::String("BrightOnly".into());
         let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
-        matches!(result, BoldBrightening::BrightOnly);
+        assert!(matches!(result, BoldBrightening::BrightOnly));
     }
 
     #[test]
     fn bold_brightening_from_dynamic_bool_true() {
         let val = Value::Bool(true);
         let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
-        matches!(result, BoldBrightening::BrightAndBold);
+        assert!(matches!(result, BoldBrightening::BrightAndBold));
     }
 
     #[test]
     fn bold_brightening_from_dynamic_bool_false() {
         let val = Value::Bool(false);
         let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
-        matches!(result, BoldBrightening::No);
+        assert!(matches!(result, BoldBrightening::No));
     }
 
     #[test]

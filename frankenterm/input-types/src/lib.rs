@@ -2145,7 +2145,11 @@ impl TryFrom<String> for WindowDecorations {
 
 impl Default for WindowDecorations {
     fn default() -> Self {
-        WindowDecorations::TITLE | WindowDecorations::RESIZE
+        if cfg!(target_os = "macos") {
+            WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE
+        } else {
+            WindowDecorations::TITLE | WindowDecorations::RESIZE
+        }
     }
 }
 
@@ -3825,10 +3829,16 @@ mod test {
     }
 
     #[test]
-    fn window_decorations_default_has_title_and_resize() {
+    fn window_decorations_default_matches_platform_chrome() {
         let wd = WindowDecorations::default();
-        assert!(wd.contains(WindowDecorations::TITLE));
         assert!(wd.contains(WindowDecorations::RESIZE));
+        if cfg!(target_os = "macos") {
+            assert!(wd.contains(WindowDecorations::INTEGRATED_BUTTONS));
+            assert!(!wd.contains(WindowDecorations::TITLE));
+        } else {
+            assert!(wd.contains(WindowDecorations::TITLE));
+            assert!(!wd.contains(WindowDecorations::INTEGRATED_BUTTONS));
+        }
     }
 
     #[test]

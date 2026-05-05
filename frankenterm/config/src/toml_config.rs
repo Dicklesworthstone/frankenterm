@@ -560,13 +560,15 @@ agent_auto_layout = "by_activity"
 scrollback_lines = 50000
 font_size = 16.0
 color_scheme = "Builtin Dark"
+font_dirs = ["fonts"]
 enable_scroll_bar = true
 enable_tab_bar = true
 hide_tab_bar_if_only_one_tab = true
 tab_bar_at_bottom = false
 initial_rows = 40
 initial_cols = 120
-window_close_confirmation = "NeverPrompt"
+window_close_confirmation = "AlwaysPrompt"
+skip_close_confirmation_for_processes_named = []
 check_for_updates = false
 automatically_reload_config = true
 max_fps = 60
@@ -579,6 +581,8 @@ bottom = 4
 
 [[font.font]]
 family = "JetBrains Mono"
+harfbuzz_features = ["calt=0", "clig=0", "liga=0"]
+
 "#;
         let toml_value: toml::Value = toml_str.parse().unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
@@ -593,9 +597,26 @@ family = "JetBrains Mono"
         assert_eq!(cfg.scrollback_lines, 50000);
         assert!((cfg.font_size - 16.0).abs() < 0.01);
         assert_eq!(cfg.color_scheme.as_deref(), Some("Builtin Dark"));
+        assert_eq!(cfg.font_dirs, vec![std::path::PathBuf::from("fonts")]);
         assert!(cfg.enable_scroll_bar);
         assert_eq!(cfg.initial_rows, 40);
         assert_eq!(cfg.initial_cols, 120);
+        assert!(matches!(
+            cfg.window_close_confirmation,
+            crate::WindowCloseConfirmation::AlwaysPrompt
+        ));
+        assert!(cfg.skip_close_confirmation_for_processes_named.is_empty());
+        assert_eq!(cfg.font.font[0].family, "JetBrains Mono");
+        assert_eq!(
+            cfg.font.font[0].harfbuzz_features.as_deref(),
+            Some(
+                &[
+                    "calt=0".to_string(),
+                    "clig=0".to_string(),
+                    "liga=0".to_string()
+                ][..]
+            )
+        );
     }
 
     #[test]

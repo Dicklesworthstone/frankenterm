@@ -1743,7 +1743,7 @@ impl TermWindow {
             window: None,
             window_background,
             config: config.clone(),
-            config_overrides: wezterm_dynamic::Value::default(),
+            config_overrides: wezterm_dynamic::Value::Object(Default::default()),
             palette: None,
             focused: None,
             mux_window_id,

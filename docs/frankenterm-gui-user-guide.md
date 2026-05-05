@@ -130,24 +130,25 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 |---|---|---|
 | `color_scheme` | `"Builtin Dark"` | `color_scheme = "Dracula"` |
 | `font_size` | `14.0` | `font_size = 12.0` |
-| `[[font.font]].family` | `"JetBrains Mono"` | add additional fallback `[[font.font]]` entries |
-| `harfbuzz_features` | `["calt=0","clig=0","liga=0"]` | tune ligatures per preference |
+| `font_dirs` | `["fonts"]` | bundled app fonts directory |
+| `[[font.font]].family` | `"Pragmasevka Nerd Font"` | add additional fallback `[[font.font]]` entries |
+| `[[font.font]].harfbuzz_features` | `["calt=0","clig=0","liga=0"]` | tune ligatures per preference |
 | `window_background_opacity` | `1.0` | `0.95` for transparency |
 | `text_background_opacity` | `1.0` | usually keep aligned with window opacity |
 | `scrollback_lines` | `100000` | lower for memory-constrained hosts |
 | `enable_scroll_bar` | `true` | `false` for minimal UI |
 | `initial_rows` | `40` | window startup rows |
 | `initial_cols` | `120` | window startup columns |
-| `window_decorations` | `"TITLE | RESIZE"` | OS-dependent behavior |
-| `window_close_confirmation` | `"NeverPrompt"` | set stricter confirmation if desired |
+| `window_decorations` | macOS: `"INTEGRATED_BUTTONS | RESIZE"`; other platforms: `"TITLE | RESIZE"` | OS-dependent behavior |
+| `window_close_confirmation` | `"AlwaysPrompt"` | controls tab/window/quit confirmation prompts |
+| `skip_close_confirmation_for_processes_named` | `[]` | keep empty to prompt for ordinary shell-backed tabs |
 | `click_interval_ms` | `500` | accessibility: raise to `1000`-`2000` for a slower double-click cadence |
 | `[window_padding].left/right/top/bottom` | `4` | pixel padding around terminal viewport |
 | `enable_tab_bar` | `true` | show/hide tab bar |
-| `hide_tab_bar_if_only_one_tab` | `true` | keeps single-tab window clean |
+| `hide_tab_bar_if_only_one_tab` | `false` | keeps the macOS integrated titlebar surface visible |
 | `tab_bar_at_bottom` | `false` | set `true` for bottom tab bar |
 | `[leader]` (optional) | unset | tmux-style leader key chord |
-| `[[unix_domains]].name` | `"local"` | add named local mux domains |
-| `[[unix_domains]].connect_automatically` | `false` | auto-connect on startup if `true` |
+| `unix_domains` | implicit `"unix"` domain | add custom domains only for non-default mux sockets |
 | `resize_wrap_scorecard_enabled` | `true` | emits resize wrap quality telemetry |
 | `resize_wrap_readability_gate_enabled` | `true` | fallback gate for unreadable wraps |
 | `resize_wrap_readability_max_line_badness_delta` | `500` | stricter = lower |

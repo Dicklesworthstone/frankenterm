@@ -435,7 +435,7 @@ impl FontAttributes {
 impl Default for FontAttributes {
     fn default() -> Self {
         Self {
-            family: "JetBrains Mono".into(),
+            family: "Pragmasevka Nerd Font".into(),
             weight: FontWeight::default(),
             stretch: FontStretch::default(),
             style: FontStyle::Normal,
@@ -590,14 +590,21 @@ impl TextStyle {
     pub fn font_with_fallback(&self) -> Vec<FontAttributes> {
         let mut font = self.font.clone();
 
-        let mut default_font = FontAttributes::default();
+        let mut bundled_default_font = FontAttributes::default();
 
-        // Insert our bundled default JetBrainsMono as a fallback
+        // Insert our bundled default Pragmasevka Nerd Font as a fallback
         // in case their preference doesn't match anything.
         // But don't add it if it is already their preference.
-        if !font.iter().any(|f| *f == default_font) {
-            default_font.is_fallback = true;
-            font.push(default_font);
+        if !font.iter().any(|f| *f == bundled_default_font) {
+            bundled_default_font.is_fallback = true;
+            font.push(bundled_default_font);
+        }
+
+        // Keep the legacy built-in JetBrains Mono as a second fallback in
+        // case Pragmasevka is unavailable in older or manually assembled
+        // bundles.
+        if !font.iter().any(|f| f.family == "JetBrains Mono") {
+            font.push(FontAttributes::new_fallback("JetBrains Mono"));
         }
 
         // We bundle this emoji font as an in-memory fallback
@@ -869,7 +876,7 @@ mod test {
     #[test]
     fn font_attributes_default_family() {
         let fa = FontAttributes::default();
-        assert_eq!(fa.family, "JetBrains Mono");
+        assert_eq!(fa.family, "Pragmasevka Nerd Font");
     }
 
     #[test]
@@ -900,7 +907,9 @@ mod test {
     fn text_style_font_with_fallback_includes_defaults() {
         let style = TextStyle::default();
         let fonts = style.font_with_fallback();
-        assert!(fonts.len() >= 3);
+        assert!(fonts.len() >= 4);
+        assert!(fonts.iter().any(|f| f.family == "Pragmasevka Nerd Font"));
+        assert!(fonts.iter().any(|f| f.family == "JetBrains Mono"));
         assert!(fonts.iter().any(|f| f.family == "Noto Color Emoji"));
         assert!(fonts.iter().any(|f| f.family == "Symbols Nerd Font Mono"));
     }

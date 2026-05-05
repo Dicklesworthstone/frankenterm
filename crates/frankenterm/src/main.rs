@@ -42181,7 +42181,7 @@ fn install_bundled_pragmasevka(font_dir: &Path) -> anyhow::Result<Vec<PathBuf>> 
 
     let marker_path = font_dir.join(PRAGMASEVKA_MARKER_FILE);
     let marker = format!(
-        "font=Pragmasevka NF\nversion={}\nsource={}\nzip_sha256={}\nzst_sha256={}\ninstalled_at_utc={}\n",
+        "font=Pragmasevka Nerd Font\nversion={}\nsource={}\nzip_sha256={}\nzst_sha256={}\ninstalled_at_utc={}\n",
         PRAGMASEVKA_BUNDLED_VERSION,
         PRAGMASEVKA_BUNDLED_SOURCE_URL,
         PRAGMASEVKA_BUNDLED_ZIP_SHA256,
@@ -60540,7 +60540,7 @@ log_level = "debug"
         let marker_path = temp_dir.join(PRAGMASEVKA_MARKER_FILE);
         let marker =
             std::fs::read_to_string(&marker_path).expect("font install marker should be readable");
-        assert!(marker.contains("font=Pragmasevka NF"));
+        assert!(marker.contains("font=Pragmasevka Nerd Font"));
         assert!(marker.contains(&format!("version={}", PRAGMASEVKA_BUNDLED_VERSION)));
         assert!(marker.contains(&format!("source={}", PRAGMASEVKA_BUNDLED_SOURCE_URL)));
         assert!(marker.contains(&format!("zip_sha256={}", PRAGMASEVKA_BUNDLED_ZIP_SHA256)));
