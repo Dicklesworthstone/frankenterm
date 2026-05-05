@@ -52,6 +52,10 @@
 //! - [`proof_lane`] — proof attempt records, truthfulness validation, and
 //!   operator report summaries for RCH/source/infra proof closeout.
 //!
+//! Phase 5 (ft-wik9p.3):
+//! - [`proof_doctor`] — pure proof-doctor preflight verdict DTOs and
+//!   classifier substrate for RCH/git/Beads/reservation snapshots.
+//!
 //! ## Re-export contract
 //!
 //! `frankenterm-core` re-exports each module via `pub use` so the
@@ -69,6 +73,7 @@ pub mod migration_rehearsal;
 // Both are leaf-clean (zero `crate::*` deps in their source).
 pub mod mdl_extraction;
 pub mod policy_decision_log_engine;
+pub mod proof_doctor;
 pub mod proof_lane;
 pub mod recorder_audit_engine;
 // [ft-xcsm0 / ft-8nqx0 Phase 4] Recorder + session retention POLICY DTOs.

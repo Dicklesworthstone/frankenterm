@@ -1,0 +1,1073 @@
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::struct_excessive_bools)]
+
+//! Proof-doctor preflight DTOs and classifier substrate for `ft-wik9p.3`.
+//!
+//! This module is intentionally pure. It does not run `git`, `br`, Agent Mail,
+//! RCH, or Cargo. Callers collect those observations and pass them here so the
+//! resulting verdict can be reused by CLI, robot-mode, Beads comments, Agent
+//! Mail handoffs, and proof-lane ledger projections.
+
+use serde::{Deserialize, Serialize};
+
+use crate::proof_lane::{ArtifactRetrievalStatus, ProofBackend, ProofScope, ProofState};
+
+/// Proof-doctor schema version implemented by this module.
+pub const PROOF_DOCTOR_SCHEMA_VERSION: u32 = 1;
+
+/// Preflight or post-launch phase inspected by proof-doctor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofDoctorPhase {
+    /// No material proof command has run.
+    Preflight,
+    /// Backend launch began, but only early evidence exists.
+    LaunchObserved,
+    /// Retained logs prove remote Cargo or rustc started.
+    RemoteCargoObserved,
+    /// A terminal proof state or blocker has enough evidence for handoff.
+    TerminalClassified,
+    /// Required logs or metadata are missing.
+    EvidenceGap,
+}
+
+/// Top-level operator decision for a proof-doctor verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofDoctorStatus {
+    /// No known preflight blocker.
+    Runnable,
+    /// Existing evidence proves the required lane passed.
+    Passed,
+    /// Remote Cargo/rustc found code-owned failure.
+    SourceBlocked,
+    /// Tests, benches, or E2E assertions failed.
+    TestBlocked,
+    /// RCH, worker, shell, timeout, substrate, or artifact retrieval blocked proof.
+    InfraBlocked,
+    /// Dirty files make the proof unsafe or unattributable.
+    DirtyTreeBlocked,
+    /// A different active owner owns the blocker.
+    OwnershipBlocked,
+    /// Command shape or backend is off-policy for the claimed proof.
+    Invalid,
+    /// Required predicate is absent and the claim is skipped, not proven.
+    SkippedNotProven,
+    /// Evidence is incomplete or contradictory.
+    Inconclusive,
+}
+
+/// Category for one proof-doctor blocker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofDoctorBlockerKind {
+    /// Installed or selected RCH cannot satisfy required behavior.
+    RchTooling,
+    /// Worker capacity, health, hardware, or admission is insufficient.
+    WorkerCapacity,
+    /// Repo sync or transfer failed before Cargo.
+    RemoteSync,
+    /// Remote wrapper or shell failed before Cargo.
+    RemoteLaunch,
+    /// Cargo started, but remote substrate prevented complete evidence.
+    RemoteSubstrate,
+    /// First-party compile, feature, lint, or build-script error.
+    SourceCompile,
+    /// Test, bench, E2E, or harness assertion failure.
+    TestAssertion,
+    /// Dirty tracked or untracked path affects the lane.
+    DirtyTree,
+    /// Another Bead, reservation, or agent owns the blocker.
+    BeadOwnership,
+    /// Local Cargo, shell-wrapped RCH, or fail-open fallback.
+    CommandShape,
+    /// Required log, manifest, sidecar, or redaction evidence is missing.
+    ArtifactGap,
+    /// Repo policy forbids the attempted proof path.
+    Policy,
+}
+
+/// Severity for one blocker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofDoctorSeverity {
+    /// Advisory but proof may proceed.
+    Warn,
+    /// Proof should not proceed or cannot be claimed.
+    Block,
+}
+
+/// Owner signal attached to a proof-doctor blocker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProofDoctorOwner {
+    /// The current agent owns the path or blocker.
+    CurrentAgent {
+        /// Agent name.
+        agent_name: String,
+        /// Optional Bead id.
+        bead_id: Option<String>,
+    },
+    /// Another active agent owns the path or blocker.
+    OtherAgent {
+        /// Agent name.
+        agent_name: String,
+        /// Optional Bead id.
+        bead_id: Option<String>,
+    },
+    /// Beads identifies an owner.
+    Bead {
+        /// Bead id.
+        bead_id: String,
+        /// Optional assignee.
+        assignee: Option<String>,
+    },
+    /// Agent Mail reservation identifies an owner.
+    Reservation {
+        /// Agent name.
+        agent_name: String,
+        /// Reserved path pattern.
+        path_pattern: String,
+    },
+    /// No owner could be identified.
+    Unknown,
+}
+
+/// One blocker in a proof-doctor verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorBlocker {
+    /// Blocker category.
+    pub blocker_kind: ProofDoctorBlockerKind,
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+    /// Blocker severity.
+    pub severity: ProofDoctorSeverity,
+    /// Best owner signal, when known.
+    pub owner: Option<ProofDoctorOwner>,
+    /// Paths affected by this blocker.
+    pub affected_paths: Vec<String>,
+    /// Evidence keys that justify the classifier decision.
+    pub evidence_keys: Vec<String>,
+    /// Operator-facing message.
+    pub message: String,
+    /// Next action for the operator or agent.
+    pub next_action: String,
+}
+
+impl ProofDoctorBlocker {
+    #[must_use]
+    fn block(
+        blocker_kind: ProofDoctorBlockerKind,
+        reason_code: &str,
+        message: &str,
+        next_action: &str,
+    ) -> Self {
+        Self {
+            blocker_kind,
+            reason_code: reason_code.to_string(),
+            severity: ProofDoctorSeverity::Block,
+            owner: None,
+            affected_paths: Vec::new(),
+            evidence_keys: Vec::new(),
+            message: message.to_string(),
+            next_action: next_action.to_string(),
+        }
+    }
+
+    #[must_use]
+    fn with_owner(mut self, owner: ProofDoctorOwner) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    #[must_use]
+    fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.affected_paths.push(path.into());
+        self
+    }
+
+    #[must_use]
+    fn with_evidence(mut self, key: &str) -> Self {
+        self.evidence_keys.push(key.to_string());
+        self
+    }
+}
+
+/// RCH config value and source observed by the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorConfigSource {
+    /// Config key, for example `compilation.external_timeout_enabled`.
+    pub key: String,
+    /// Effective value as display-safe text.
+    pub value: String,
+    /// Source label, for example `user`, `project`, or `env`.
+    pub source: String,
+    /// Whether this source produced the effective value.
+    pub effective: bool,
+}
+
+/// Active Bead reference observed during preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorBeadRef {
+    /// Bead id.
+    pub bead_id: String,
+    /// Bead title.
+    pub title: String,
+    /// Optional assignee.
+    pub assignee: Option<String>,
+    /// Bead status.
+    pub status: String,
+}
+
+/// File reservation reference observed during preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorReservationRef {
+    /// Agent holding the reservation.
+    pub agent_name: String,
+    /// Reserved path or glob pattern.
+    pub path_pattern: String,
+    /// Owning Bead when known.
+    pub bead_id: Option<String>,
+}
+
+/// Dirty path metadata observed during preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorDirtyPath {
+    /// Repository-relative path.
+    pub path: String,
+    /// Git status marker, for example `M`, `??`, or `AM`.
+    pub status: String,
+    /// Whether the caller already knows this path affects the proof lane.
+    pub affects_proof: bool,
+    /// Best owner signal for this path.
+    pub owner: Option<ProofDoctorOwner>,
+}
+
+/// Evidence snapshot consumed by the proof-doctor classifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorEvidence {
+    /// RCH binary path.
+    pub rch_binary_path: Option<String>,
+    /// RCH version.
+    pub rch_version: Option<String>,
+    /// Config source rows.
+    pub rch_config_sources: Vec<ProofDoctorConfigSource>,
+    /// Effective external-timeout setting.
+    pub rch_external_timeout_enabled: Option<bool>,
+    /// Whether stale external-timeout behavior was observed.
+    pub stale_external_timeout_observed: bool,
+    /// Selected worker id.
+    pub selected_worker: Option<String>,
+    /// Worker probe artifact path.
+    pub worker_probe_artifact: Option<String>,
+    /// Healthy worker count reported by RCH status.
+    pub healthy_worker_count: Option<u32>,
+    /// Rust-capable worker count reported by RCH status or worker capabilities.
+    pub rust_worker_count: Option<u32>,
+    /// Available remote execution slots reported by RCH status.
+    pub available_worker_slots: Option<u32>,
+    /// RCH sync duration.
+    pub sync_duration_ms: Option<u64>,
+    /// Remote command duration.
+    pub remote_command_duration_ms: Option<u64>,
+    /// Wrapper exit code.
+    pub wrapper_exit_code: Option<i32>,
+    /// Remote exit code.
+    pub remote_exit_code: Option<i32>,
+    /// True when remote Cargo started.
+    pub remote_cargo_reached: bool,
+    /// True when rustc or build execution started.
+    pub rustc_reached: bool,
+    /// True when assertions started.
+    pub test_binary_started: bool,
+    /// True when local Cargo or fail-open execution was detected.
+    pub local_cargo_detected: bool,
+    /// Artifact retrieval state.
+    pub artifact_retrieval_status: ArtifactRetrievalStatus,
+    /// Dirty path observations.
+    pub dirty_paths: Vec<ProofDoctorDirtyPath>,
+    /// Active Beads observed by preflight.
+    pub active_beads: Vec<ProofDoctorBeadRef>,
+    /// File reservations observed by preflight.
+    pub reservations: Vec<ProofDoctorReservationRef>,
+    /// Retained artifact paths.
+    pub artifact_paths: Vec<String>,
+    /// High-scale predicate status, when relevant.
+    pub high_scale_predicate_met: Option<bool>,
+}
+
+impl Default for ProofDoctorEvidence {
+    fn default() -> Self {
+        Self {
+            rch_binary_path: None,
+            rch_version: None,
+            rch_config_sources: Vec::new(),
+            rch_external_timeout_enabled: None,
+            stale_external_timeout_observed: false,
+            selected_worker: None,
+            worker_probe_artifact: None,
+            healthy_worker_count: None,
+            rust_worker_count: None,
+            available_worker_slots: None,
+            sync_duration_ms: None,
+            remote_command_duration_ms: None,
+            wrapper_exit_code: None,
+            remote_exit_code: None,
+            remote_cargo_reached: false,
+            rustc_reached: false,
+            test_binary_started: false,
+            local_cargo_detected: false,
+            artifact_retrieval_status: ArtifactRetrievalStatus::NotStarted,
+            dirty_paths: Vec::new(),
+            active_beads: Vec::new(),
+            reservations: Vec::new(),
+            artifact_paths: Vec::new(),
+            high_scale_predicate_met: None,
+        }
+    }
+}
+
+/// Durable projection into the existing proof-lane ledger vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofAttemptProjection {
+    /// Projected proof state.
+    pub state: ProofState,
+    /// Primary reason code.
+    pub reason_code: String,
+    /// Operator-facing summary.
+    pub summary: String,
+    /// Whether this projection can support source-bead closeout.
+    pub safe_to_close: bool,
+}
+
+/// Next action selected by proof-doctor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorNextAction {
+    /// Stable action code.
+    pub action_code: String,
+    /// Human-readable instruction.
+    pub message: String,
+}
+
+/// Input to the pure proof-doctor classifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorPreflightInput {
+    /// Optional owning Bead id.
+    pub bead_id: Option<String>,
+    /// Optional parent Bead id.
+    pub parent_bead_id: Option<String>,
+    /// Agent or operator name.
+    pub agent_name: String,
+    /// Absolute repo path.
+    pub repo_path: String,
+    /// Git head used by the observation.
+    pub git_head: String,
+    /// Branch name.
+    pub branch: String,
+    /// RFC3339 timestamp from the caller.
+    pub generated_at_utc: String,
+    /// Intended proof command argv.
+    pub intended_command: Vec<String>,
+    /// Intended target dir.
+    pub intended_target_dir: Option<String>,
+    /// Scope being proven.
+    pub intended_scope: ProofScope,
+    /// Required backend.
+    pub required_backend: ProofBackend,
+    /// Phase being classified.
+    pub phase: ProofDoctorPhase,
+    /// Repo-relative paths or prefixes that define the lane scope.
+    pub proof_path_prefixes: Vec<String>,
+    /// Evidence snapshot.
+    pub evidence: ProofDoctorEvidence,
+}
+
+impl Default for ProofDoctorPreflightInput {
+    fn default() -> Self {
+        Self {
+            bead_id: None,
+            parent_bead_id: None,
+            agent_name: String::new(),
+            repo_path: String::new(),
+            git_head: String::new(),
+            branch: String::new(),
+            generated_at_utc: String::new(),
+            intended_command: Vec::new(),
+            intended_target_dir: None,
+            intended_scope: ProofScope::CargoTest,
+            required_backend: ProofBackend::Rch,
+            phase: ProofDoctorPhase::Preflight,
+            proof_path_prefixes: Vec::new(),
+            evidence: ProofDoctorEvidence::default(),
+        }
+    }
+}
+
+/// Machine-readable proof-doctor verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorVerdict {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Stable verdict id.
+    pub verdict_id: String,
+    /// Optional owning Bead id.
+    pub bead_id: Option<String>,
+    /// Optional parent Bead id.
+    pub parent_bead_id: Option<String>,
+    /// RFC3339 timestamp from the caller.
+    pub generated_at_utc: String,
+    /// Agent or operator name.
+    pub agent_name: String,
+    /// Absolute repo path.
+    pub repo_path: String,
+    /// Git head used by the observation.
+    pub git_head: String,
+    /// Branch name.
+    pub branch: String,
+    /// Intended proof command argv.
+    pub intended_command: Vec<String>,
+    /// Intended target dir.
+    pub intended_target_dir: Option<String>,
+    /// Scope being proven.
+    pub intended_scope: ProofScope,
+    /// Required backend.
+    pub required_backend: ProofBackend,
+    /// Phase inspected by proof-doctor.
+    pub phase: ProofDoctorPhase,
+    /// Top-level status.
+    pub status: ProofDoctorStatus,
+    /// Blockers found by proof-doctor.
+    pub blockers: Vec<ProofDoctorBlocker>,
+    /// Evidence consumed by the classifier.
+    pub evidence: ProofDoctorEvidence,
+    /// Existing proof-lane projection, when material evidence exists.
+    pub ledger_projection: Option<ProofAttemptProjection>,
+    /// Operator-facing summary.
+    pub operator_summary: String,
+    /// Next action.
+    pub next_action: ProofDoctorNextAction,
+}
+
+/// Classify one proof-doctor preflight or observed proof snapshot.
+#[must_use]
+pub fn classify_proof_doctor(input: &ProofDoctorPreflightInput) -> ProofDoctorVerdict {
+    let mut blockers = Vec::new();
+
+    classify_command_shape(input, &mut blockers);
+    classify_rch_tooling(input, &mut blockers);
+    classify_execution_evidence(input, &mut blockers);
+    classify_dirty_paths(input, &mut blockers);
+    classify_high_scale(input, &mut blockers);
+
+    let status = select_status(input, &blockers);
+    let primary = blockers.first();
+    let reason_code = primary.map_or_else(
+        || "proof.runnable".to_string(),
+        |blocker| blocker.reason_code.clone(),
+    );
+    let operator_summary = primary.map_or_else(
+        || runnable_operator_summary(input.phase),
+        |blocker| blocker.message.clone(),
+    );
+    let next_action = primary.map_or_else(
+        || ProofDoctorNextAction {
+            action_code: "run_remote_proof".to_string(),
+            message:
+                "Run the intended proof through the required backend and attach ledger evidence."
+                    .to_string(),
+        },
+        |blocker| ProofDoctorNextAction {
+            action_code: next_action_code(status).to_string(),
+            message: blocker.next_action.clone(),
+        },
+    );
+
+    ProofDoctorVerdict {
+        schema_version: PROOF_DOCTOR_SCHEMA_VERSION,
+        verdict_id: verdict_id(input, &reason_code),
+        bead_id: input.bead_id.clone(),
+        parent_bead_id: input.parent_bead_id.clone(),
+        generated_at_utc: input.generated_at_utc.clone(),
+        agent_name: input.agent_name.clone(),
+        repo_path: input.repo_path.clone(),
+        git_head: input.git_head.clone(),
+        branch: input.branch.clone(),
+        intended_command: input.intended_command.clone(),
+        intended_target_dir: input.intended_target_dir.clone(),
+        intended_scope: input.intended_scope,
+        required_backend: input.required_backend,
+        phase: input.phase,
+        status,
+        blockers,
+        evidence: input.evidence.clone(),
+        ledger_projection: projection_for(status, &reason_code, &operator_summary),
+        operator_summary,
+        next_action,
+    }
+}
+
+fn classify_command_shape(
+    input: &ProofDoctorPreflightInput,
+    blockers: &mut Vec<ProofDoctorBlocker>,
+) {
+    if input.required_backend != ProofBackend::Rch {
+        return;
+    }
+
+    if input.evidence.local_cargo_detected || is_local_cargo_command(&input.intended_command) {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::CommandShape,
+                "proof.command.local_cargo_invalid",
+                "Local Cargo was offered for an RCH-required proof lane.",
+                "Rerun through direct RCH remote Cargo or record this only as local smoke.",
+            )
+            .with_evidence("intended_command"),
+        );
+        return;
+    }
+
+    if is_shell_wrapped_cargo(&input.intended_command) {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::CommandShape,
+                "proof.command.shell_wrapped_rch_unclassified",
+                "Shell-wrapped RCH Cargo cannot be claimed as remote proof without positive remote-Cargo evidence.",
+                "Use direct `rch exec -- env CARGO_TARGET_DIR=... cargo ...` or retain metadata proving remote Cargo started.",
+            )
+            .with_evidence("intended_command"),
+        );
+    }
+}
+
+fn classify_rch_tooling(input: &ProofDoctorPreflightInput, blockers: &mut Vec<ProofDoctorBlocker>) {
+    let evidence = &input.evidence;
+    if input.required_backend != ProofBackend::Rch {
+        return;
+    }
+
+    if evidence.rch_external_timeout_enabled == Some(false)
+        && evidence.stale_external_timeout_observed
+    {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::RchTooling,
+                "proof.rch.stale_external_timeout_config",
+                "Effective RCH config disables the external timeout wrapper, but stale timeout behavior was observed.",
+                "Update or select an RCH binary that honors the effective config before rerunning proof.",
+            )
+            .with_evidence("rch_config_sources")
+            .with_evidence("rch_binary_path"),
+        );
+    }
+
+    if evidence.rust_worker_count == Some(0) {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::WorkerCapacity,
+                "proof.rch.no_rust_workers",
+                "RCH status found no Rust-capable workers for a required remote Cargo lane.",
+                "Restore worker capabilities or choose a Rust-capable RCH worker before rerunning proof.",
+            )
+            .with_evidence("rust_worker_count")
+            .with_evidence("healthy_worker_count")
+            .with_evidence("available_worker_slots"),
+        );
+    }
+}
+
+fn classify_execution_evidence(
+    input: &ProofDoctorPreflightInput,
+    blockers: &mut Vec<ProofDoctorBlocker>,
+) {
+    let evidence = &input.evidence;
+
+    if evidence.remote_cargo_reached
+        && evidence.rustc_reached
+        && evidence.remote_exit_code == Some(101)
+    {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::SourceCompile,
+                "proof.source.remote_compile_error",
+                "Remote rustc reached first-party code and reported a compile error.",
+                "Handoff to the owner of the first-party source failure; do not claim this proof lane green.",
+            )
+            .with_evidence("remote_exit_code")
+            .with_evidence("rustc_reached"),
+        );
+        return;
+    }
+
+    if evidence.remote_cargo_reached
+        && evidence.test_binary_started
+        && evidence.remote_exit_code.is_some_and(|code| code != 0)
+    {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::TestAssertion,
+                "proof.test.remote_assertion_failed",
+                "The remote proof command reached assertion execution and failed.",
+                "Fix the behavior or test harness before claiming this lane.",
+            )
+            .with_evidence("remote_exit_code")
+            .with_evidence("test_binary_started"),
+        );
+        return;
+    }
+
+    if !evidence.remote_cargo_reached
+        && evidence.wrapper_exit_code == Some(127)
+        && (evidence.selected_worker.is_some() || evidence.sync_duration_ms.is_some())
+    {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::RemoteLaunch,
+                "proof.rch.pre_cargo_timeout_exec_missing",
+                "RCH selected a worker or synced, then the remote launch failed before Cargo started.",
+                "Block on RCH tooling or worker launch; do not claim source pass or fail.",
+            )
+            .with_evidence("selected_worker")
+            .with_evidence("sync_duration_ms")
+            .with_evidence("wrapper_exit_code"),
+        );
+        return;
+    }
+
+    if !evidence.remote_cargo_reached
+        && (evidence.selected_worker.is_some() || evidence.sync_duration_ms.is_some())
+        && input.phase != ProofDoctorPhase::Preflight
+    {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::ArtifactGap,
+                "proof.rch.sync_not_proof",
+                "RCH worker or sync evidence exists, but no retained log proves remote Cargo started.",
+                "Rerun with fail-closed RCH logging or mark the attempt inconclusive.",
+            )
+            .with_evidence("selected_worker")
+            .with_evidence("sync_duration_ms"),
+        );
+    }
+}
+
+fn classify_dirty_paths(input: &ProofDoctorPreflightInput, blockers: &mut Vec<ProofDoctorBlocker>) {
+    for dirty_path in &input.evidence.dirty_paths {
+        if !dirty_path.affects_proof
+            && !path_overlaps_prefixes(&dirty_path.path, &input.proof_path_prefixes)
+        {
+            continue;
+        }
+
+        let owner = dirty_path
+            .owner
+            .clone()
+            .unwrap_or(ProofDoctorOwner::Unknown);
+        let reason_code = if matches!(owner, ProofDoctorOwner::Unknown) {
+            "proof.dirty.unowned_path_overlap"
+        } else {
+            "proof.dirty.active_owned_path_overlap"
+        };
+        let message = if matches!(owner, ProofDoctorOwner::Unknown) {
+            "A dirty path overlaps the proof lane, but no owner could be identified."
+        } else {
+            "A dirty path overlaps the proof lane and is owned by active work."
+        };
+
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::DirtyTree,
+                reason_code,
+                message,
+                "Resolve ownership or wait for the owning Bead before claiming proof.",
+            )
+            .with_owner(owner)
+            .with_path(dirty_path.path.clone())
+            .with_evidence("dirty_paths"),
+        );
+    }
+}
+
+fn classify_high_scale(input: &ProofDoctorPreflightInput, blockers: &mut Vec<ProofDoctorBlocker>) {
+    if input.intended_scope == ProofScope::HighScale
+        && input.evidence.high_scale_predicate_met == Some(false)
+    {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::WorkerCapacity,
+                "proof.high_scale.predicate_absent",
+                "The required high-scale worker predicate is absent.",
+                "Record the lane as skipped-not-proven or rerun on matching hardware.",
+            )
+            .with_evidence("high_scale_predicate_met"),
+        );
+    }
+}
+
+fn select_status(
+    input: &ProofDoctorPreflightInput,
+    blockers: &[ProofDoctorBlocker],
+) -> ProofDoctorStatus {
+    if blockers.iter().any(|blocker| {
+        blocker.blocker_kind == ProofDoctorBlockerKind::CommandShape
+            || blocker.blocker_kind == ProofDoctorBlockerKind::Policy
+    }) {
+        return ProofDoctorStatus::Invalid;
+    }
+
+    if blockers
+        .iter()
+        .any(|blocker| blocker.blocker_kind == ProofDoctorBlockerKind::SourceCompile)
+    {
+        return ProofDoctorStatus::SourceBlocked;
+    }
+
+    if blockers
+        .iter()
+        .any(|blocker| blocker.blocker_kind == ProofDoctorBlockerKind::TestAssertion)
+    {
+        return ProofDoctorStatus::TestBlocked;
+    }
+
+    if blockers
+        .iter()
+        .any(|blocker| blocker.blocker_kind == ProofDoctorBlockerKind::DirtyTree)
+    {
+        return ProofDoctorStatus::DirtyTreeBlocked;
+    }
+
+    if blockers
+        .iter()
+        .any(|blocker| blocker.blocker_kind == ProofDoctorBlockerKind::BeadOwnership)
+    {
+        return ProofDoctorStatus::OwnershipBlocked;
+    }
+
+    if blockers
+        .iter()
+        .any(|blocker| blocker.reason_code == "proof.high_scale.predicate_absent")
+    {
+        return ProofDoctorStatus::SkippedNotProven;
+    }
+
+    if blockers.iter().any(|blocker| {
+        matches!(
+            blocker.blocker_kind,
+            ProofDoctorBlockerKind::RchTooling
+                | ProofDoctorBlockerKind::WorkerCapacity
+                | ProofDoctorBlockerKind::RemoteSync
+                | ProofDoctorBlockerKind::RemoteLaunch
+                | ProofDoctorBlockerKind::RemoteSubstrate
+        )
+    }) {
+        return ProofDoctorStatus::InfraBlocked;
+    }
+
+    if blockers
+        .iter()
+        .any(|blocker| blocker.blocker_kind == ProofDoctorBlockerKind::ArtifactGap)
+    {
+        return ProofDoctorStatus::Inconclusive;
+    }
+
+    if input.evidence.remote_cargo_reached
+        && input.evidence.remote_exit_code == Some(0)
+        && input.evidence.artifact_retrieval_status == ArtifactRetrievalStatus::Complete
+    {
+        return ProofDoctorStatus::Passed;
+    }
+
+    ProofDoctorStatus::Runnable
+}
+
+fn projection_for(
+    status: ProofDoctorStatus,
+    reason_code: &str,
+    summary: &str,
+) -> Option<ProofAttemptProjection> {
+    let state = match status {
+        ProofDoctorStatus::Runnable => ProofState::NotRun,
+        ProofDoctorStatus::Passed => ProofState::Pass,
+        ProofDoctorStatus::SourceBlocked => ProofState::SourceCompileFail,
+        ProofDoctorStatus::TestBlocked => ProofState::TestFail,
+        ProofDoctorStatus::InfraBlocked => ProofState::InfraBlockedPreCargo,
+        ProofDoctorStatus::DirtyTreeBlocked
+        | ProofDoctorStatus::OwnershipBlocked
+        | ProofDoctorStatus::Inconclusive => ProofState::Inconclusive,
+        ProofDoctorStatus::Invalid => ProofState::LocalInvalid,
+        ProofDoctorStatus::SkippedNotProven => ProofState::SkippedNotProven,
+    };
+
+    Some(ProofAttemptProjection {
+        state,
+        reason_code: reason_code.to_string(),
+        summary: summary.to_string(),
+        safe_to_close: status == ProofDoctorStatus::Passed,
+    })
+}
+
+fn next_action_code(status: ProofDoctorStatus) -> &'static str {
+    match status {
+        ProofDoctorStatus::Runnable => "run_remote_proof",
+        ProofDoctorStatus::Passed => "attach_pass_evidence",
+        ProofDoctorStatus::SourceBlocked => "handoff_source_owner",
+        ProofDoctorStatus::TestBlocked => "fix_failing_assertion",
+        ProofDoctorStatus::InfraBlocked => "fix_infrastructure",
+        ProofDoctorStatus::DirtyTreeBlocked => "resolve_dirty_tree",
+        ProofDoctorStatus::OwnershipBlocked => "handoff_owner",
+        ProofDoctorStatus::Invalid => "fix_command_shape",
+        ProofDoctorStatus::SkippedNotProven => "supply_predicate_or_skip",
+        ProofDoctorStatus::Inconclusive => "rerun_with_artifacts",
+    }
+}
+
+fn runnable_operator_summary(phase: ProofDoctorPhase) -> String {
+    match phase {
+        ProofDoctorPhase::Preflight => {
+            "Advisory preflight verdict: proof lane is runnable; no known blocker was found before the proof command starts.".to_string()
+        }
+        _ => "Proof lane is runnable; no known blocker was found in the retained evidence.".to_string(),
+    }
+}
+
+fn verdict_id(input: &ProofDoctorPreflightInput, reason_code: &str) -> String {
+    let bead = input.bead_id.as_deref().unwrap_or("no-bead");
+    format!("proof-doctor:{bead}:{reason_code}")
+}
+
+fn is_local_cargo_command(command: &[String]) -> bool {
+    command
+        .first()
+        .is_some_and(|first| command_token_is(first, "cargo"))
+}
+
+fn is_shell_wrapped_cargo(command: &[String]) -> bool {
+    command.windows(3).any(|window| {
+        (command_token_is(&window[0], "bash")
+            || command_token_is(&window[0], "sh")
+            || command_token_is(&window[0], "zsh"))
+            && window[1] == "-lc"
+            && window[2].contains("cargo")
+    }) || command
+        .windows(2)
+        .any(|window| window[0] == "-lc" && window[1].contains("cargo"))
+}
+
+fn command_token_is(token: &str, expected: &str) -> bool {
+    token == expected || token.ends_with(&format!("/{expected}"))
+}
+
+fn path_overlaps_prefixes(path: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_input() -> ProofDoctorPreflightInput {
+        ProofDoctorPreflightInput {
+            bead_id: Some("ft-wik9p.3".to_string()),
+            parent_bead_id: Some("ft-wik9p".to_string()),
+            agent_name: "OliveChapel".to_string(),
+            repo_path: "/Users/jemanuel/projects/frankenterm".to_string(),
+            git_head: "HEAD".to_string(),
+            branch: "main".to_string(),
+            generated_at_utc: "2026-05-05T12:00:00Z".to_string(),
+            intended_command: vec![
+                "rch".to_string(),
+                "exec".to_string(),
+                "--".to_string(),
+                "env".to_string(),
+                "CARGO_TARGET_DIR=/tmp/ft-wik9p3-target".to_string(),
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "frankenterm-core-audit-types".to_string(),
+            ],
+            intended_target_dir: Some("/tmp/ft-wik9p3-target".to_string()),
+            intended_scope: ProofScope::CargoTest,
+            required_backend: ProofBackend::Rch,
+            phase: ProofDoctorPhase::Preflight,
+            proof_path_prefixes: vec!["crates/frankenterm-core-audit-types".to_string()],
+            evidence: ProofDoctorEvidence::default(),
+        }
+    }
+
+    #[test]
+    fn clean_direct_rch_lane_is_runnable() {
+        let verdict = classify_proof_doctor(&base_input());
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
+        assert!(verdict.blockers.is_empty());
+        assert_eq!(verdict.generated_at_utc, "2026-05-05T12:00:00Z");
+        assert!(
+            verdict
+                .operator_summary
+                .contains("Advisory preflight verdict")
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::NotRun)
+        );
+    }
+
+    #[test]
+    fn stale_external_timeout_config_blocks_preflight() {
+        let mut input = base_input();
+        input.evidence.rch_binary_path = Some("/Users/jemanuel/.local/bin/rch".to_string());
+        input.evidence.rch_external_timeout_enabled = Some(false);
+        input.evidence.stale_external_timeout_observed = true;
+        input
+            .evidence
+            .rch_config_sources
+            .push(ProofDoctorConfigSource {
+                key: "compilation.external_timeout_enabled".to_string(),
+                value: "false".to_string(),
+                source: "user".to_string(),
+                effective: true,
+            });
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::InfraBlocked);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.rch.stale_external_timeout_config"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::InfraBlockedPreCargo)
+        );
+    }
+
+    #[test]
+    fn no_rust_workers_blocks_remote_cargo_preflight() {
+        let mut input = base_input();
+        input.evidence.healthy_worker_count = Some(8);
+        input.evidence.rust_worker_count = Some(0);
+        input.evidence.available_worker_slots = Some(54);
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::InfraBlocked);
+        assert_eq!(verdict.blockers[0].reason_code, "proof.rch.no_rust_workers");
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::InfraBlockedPreCargo)
+        );
+    }
+
+    #[test]
+    fn local_cargo_is_invalid_for_rch_required_lane() {
+        let mut input = base_input();
+        input.intended_command = vec!["cargo".to_string(), "test".to_string()];
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Invalid);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.command.local_cargo_invalid"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::LocalInvalid)
+        );
+    }
+
+    #[test]
+    fn bare_shell_token_does_not_invalidate_direct_rch_lane() {
+        let mut input = base_input();
+        input.intended_command.push("bash".to_string());
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
+        assert!(verdict.blockers.is_empty());
+    }
+
+    #[test]
+    fn dirty_active_owned_path_overlap_blocks_with_owner() {
+        let mut input = base_input();
+        input.evidence.dirty_paths.push(ProofDoctorDirtyPath {
+            path: "crates/frankenterm-core-audit-types/src/lib.rs".to_string(),
+            status: "M".to_string(),
+            affects_proof: false,
+            owner: Some(ProofDoctorOwner::Bead {
+                bead_id: "ft-wik9p.3".to_string(),
+                assignee: Some("OliveChapel".to_string()),
+            }),
+        });
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::DirtyTreeBlocked);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.dirty.active_owned_path_overlap"
+        );
+        assert_eq!(
+            verdict.blockers[0].affected_paths,
+            vec!["crates/frankenterm-core-audit-types/src/lib.rs"]
+        );
+    }
+
+    #[test]
+    fn sync_without_remote_cargo_is_inconclusive_not_green() {
+        let mut input = base_input();
+        input.phase = ProofDoctorPhase::LaunchObserved;
+        input.evidence.selected_worker = Some("vmi1152480".to_string());
+        input.evidence.sync_duration_ms = Some(176_008);
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Inconclusive);
+        assert_eq!(verdict.blockers[0].reason_code, "proof.rch.sync_not_proof");
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::Inconclusive)
+        );
+    }
+
+    #[test]
+    fn remote_compile_failure_maps_to_source_blocked() {
+        let mut input = base_input();
+        input.phase = ProofDoctorPhase::TerminalClassified;
+        input.evidence.remote_cargo_reached = true;
+        input.evidence.rustc_reached = true;
+        input.evidence.remote_exit_code = Some(101);
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::SourceBlocked);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.source.remote_compile_error"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::SourceCompileFail)
+        );
+    }
+}
