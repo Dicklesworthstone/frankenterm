@@ -1840,9 +1840,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_event_identity_key(&conn, event_id)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_event_identity_key_backend(backend, event_id)
+            })
         })
         .await
     }
@@ -9695,39 +9695,37 @@ fn list_active_mutes_backend(
 }
 
 /// Compute the event identity key for a stored event.
-fn query_event_identity_key(conn: &Connection, event_id: i64) -> Result<Option<String>> {
-    let mut stmt = conn
-        .prepare(
+fn query_event_identity_key_backend(
+    backend: &dyn StorageBackend,
+    event_id: i64,
+) -> Result<Option<String>> {
+    let row = backend
+        .query_row_cells(
             "SELECT e.rule_id, e.event_type, e.extracted, e.pane_id, p.pane_uuid
              FROM events e
              LEFT JOIN panes p ON p.pane_id = e.pane_id
              WHERE e.id = ?1",
+            &[ToSqlValue::Integer(event_id)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare identity query: {e}")))?;
+        .map_err(|err| storage_backend_error("Identity query failed", err))?;
 
-    let mut rows = stmt
-        .query(params![event_id])
-        .map_err(|e| StorageError::Database(format!("Identity query failed: {e}")))?;
-
-    if let Some(row) = rows
-        .next()
-        .map_err(|e| StorageError::Database(format!("Identity query row error: {e}")))?
-    {
-        let rule_id: String = row
-            .get(0)
-            .map_err(|e| StorageError::Database(format!("Failed to read rule_id: {e}")))?;
-        let event_type: String = row
-            .get(1)
-            .map_err(|e| StorageError::Database(format!("Failed to read event_type: {e}")))?;
-        let extracted_str: Option<String> = row
-            .get(2)
-            .map_err(|e| StorageError::Database(format!("Failed to read extracted: {e}")))?;
-        let pane_id_i64: i64 = row
-            .get(3)
-            .map_err(|e| StorageError::Database(format!("Failed to read pane_id: {e}")))?;
-        let pane_uuid: Option<String> = row
-            .get(4)
-            .map_err(|e| StorageError::Database(format!("Failed to read pane_uuid: {e}")))?;
+    if let Some(row) = row {
+        let row = CellRowReader::new(&row);
+        let rule_id = row
+            .string(0)
+            .map_err(|err| storage_backend_error("Failed to read rule_id", err))?;
+        let event_type = row
+            .string(1)
+            .map_err(|err| storage_backend_error("Failed to read event_type", err))?;
+        let extracted_str = row
+            .optional_string(2)
+            .map_err(|err| storage_backend_error("Failed to read extracted", err))?;
+        let pane_id_i64 = row
+            .i64(3)
+            .map_err(|err| storage_backend_error("Failed to read pane_id", err))?;
+        let pane_uuid = row
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("Failed to read pane_uuid", err))?;
         // br-ft-4d6ic: route silent serde failure through observability counter.
         let extracted = parse_storage_json_col::<serde_json::Value>(
             extracted_str.as_deref(),
