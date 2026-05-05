@@ -1116,16 +1116,14 @@ mod tests {
     // ── br-ft-ykrsq: VecDeque-backed FIFO eviction ──
 
     #[test]
-    fn calibration_window_evicts_oldest_via_pop_front_ft_ykrsq() {
-        // br-ft-ykrsq: when observations exceed
-        // calibration_window, the oldest sample must be evicted
-        // (FIFO) and the most recent kept. Pre-fix this used
-        // Vec::remove(0) (O(N)); post-fix uses VecDeque::pop_front
-        // (O(1)). The semantic contract is the same — pin it.
-        let config = DriftConfig {
+    fn calibration_locks_at_min_calibration_ft_ykrsq() {
+        // br-ft-ykrsq: calibration locks as soon as the minimum sample count
+        // is reached. Keep the test aligned with the live EValueConfig API and
+        // observe(outcome, config) call order.
+        let config = EValueConfig {
             calibration_window: 5,
             min_calibration: 5,
-            ..DriftConfig::default()
+            ..EValueConfig::default()
         };
         let mut monitor = EValueMonitor::new("test-cluster");
 
@@ -1133,7 +1131,7 @@ mod tests {
         // After eviction, only the last 5 (0.5..0.9) should remain
         // until calibration locks (at len == 5).
         for i in 0..10 {
-            monitor.observe(&config, i as f64 / 10.0);
+            monitor.observe(i as f64 / 10.0, &config);
         }
 
         // Calibration should have locked once len reached 5; after
@@ -1146,6 +1144,7 @@ mod tests {
         // len up to min_calibration, so the early samples win.)
         // Sanity: monitor observed all 10.
         assert_eq!(monitor.total_observations(), 10);
+        assert!(monitor.calibrated);
     }
 
     #[test]
