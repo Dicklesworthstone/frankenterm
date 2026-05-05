@@ -1592,6 +1592,56 @@ mod tests {
 
             prop_assert_eq!(config.validate(), Ok(()));
         }
+
+        #[test]
+        fn proptest_config_validation_rejects_misordered_thresholds(
+            warn_units in 1u16..=10_000,
+            gap_units in 1u16..=10_000,
+        ) {
+            let warn_threshold = f64::from(warn_units) / 10_000.0;
+            let refuse_units = warn_units.saturating_sub(gap_units).min(warn_units - 1);
+            let refuse_threshold = f64::from(refuse_units) / 10_000.0;
+            let config = FdBudgetConfig {
+                warn_threshold,
+                refuse_threshold,
+                ..test_config()
+            };
+
+            prop_assert_eq!(
+                config.validate(),
+                Err(FdBudgetConfigError::MisorderedThresholds)
+            );
+        }
+
+        #[test]
+        fn proptest_zero_leak_window_is_rejected_and_fails_closed(
+            warn_units in 0u16..=10_000,
+            extra_units in 0u16..=10_000,
+            fds_per_pane in 1u64..=10_000,
+            min_nofile_limit in 1u64..=100_000,
+        ) {
+            let warn_threshold = f64::from(warn_units) / 10_000.0;
+            let remaining = 10_000u32.saturating_sub(u32::from(warn_units));
+            let refuse_threshold = warn_threshold
+                + f64::from(u32::from(extra_units).min(remaining)) / 10_000.0;
+            let config = FdBudgetConfig {
+                warn_threshold,
+                refuse_threshold,
+                fds_per_pane,
+                min_nofile_limit,
+                audit_interval_secs: 1,
+                leak_detection_count: 0,
+            };
+
+            prop_assert_eq!(
+                config.validate(),
+                Err(FdBudgetConfigError::ZeroLeakDetectionCount)
+            );
+
+            let budget = FdBudget::with_limit(config, 1_000);
+            prop_assert!(!budget.can_admit_pane().is_allowed());
+            prop_assert_eq!(budget.audit().audit_count, 1);
+        }
     }
 
     // ── Budget boundary cases ──
