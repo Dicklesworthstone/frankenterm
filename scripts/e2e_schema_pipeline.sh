@@ -41,7 +41,7 @@ TESTS_FAILED=0
 TESTS_SKIPPED=0
 
 # Binary and schema paths
-FT_BIN=""
+FT_BIN="${FT_BIN:-}"
 SCHEMA_DIR="$PROJECT_ROOT/docs/json-schema"
 ENVELOPE_SCHEMA="$SCHEMA_DIR/wa-robot-envelope.json"
 
@@ -141,21 +141,28 @@ check_prerequisites() {
 
     log_test "Checking Prerequisites"
 
-    # Find wa binary
-    FT_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
-    if [[ ! -x "$FT_BIN" ]]; then
-        FT_BIN="$PROJECT_ROOT/target/debug/wa"
-    fi
-
-    if [[ ! -x "$FT_BIN" ]]; then
-        echo "[INFO] Building wa binary..."
-        cargo build -p frankenterm 2>&1 | tail -5
+    # Find wa binary. This script intentionally does not build it:
+    # Cargo lanes must be run through rch by the caller.
+    local explicit_ft_bin="$FT_BIN"
+    if [[ -n "$explicit_ft_bin" ]]; then
+        if [[ ! -x "$explicit_ft_bin" ]]; then
+            log_fail "FT_BIN is set but not executable: $explicit_ft_bin"
+            exit 1
+        fi
+    else
+        FT_BIN="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}/debug/wa"
+        if [[ ! -x "$FT_BIN" ]]; then
+            FT_BIN="$PROJECT_ROOT/target/debug/wa"
+        fi
     fi
 
     if [[ -x "$FT_BIN" ]]; then
         log_pass "wa binary found: $FT_BIN"
     else
         log_fail "wa binary not found"
+        echo "[INFO] Build via rch first, for example:" >&2
+        echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-schema-pipeline-target cargo build -p frankenterm" >&2
+        echo "[INFO] Then rerun with FT_BIN=/tmp/ft-schema-pipeline-target/debug/wa or CARGO_TARGET_DIR=/tmp/ft-schema-pipeline-target" >&2
         exit 1
     fi
 
