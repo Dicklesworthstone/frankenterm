@@ -9,6 +9,10 @@
 use super::*;
 use rusqlite::Connection;
 
+fn record_audit_action_for_conn(conn: &mut Connection, action: &AuditActionRecord) -> Result<i64> {
+    with_writer_backend(conn, |backend| record_audit_action_backend(backend, action))
+}
+
 fn typed_decision_context_json(
     action: crate::policy::ActionKind,
     actor: crate::policy::ActorKind,
@@ -1535,7 +1539,7 @@ fn audit_stream_record_redacts_sensitive_fields() {
 
 #[test]
 fn can_insert_and_query_audit_actions() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now_ms = 1_700_000_000_000i64;
@@ -1564,7 +1568,7 @@ fn can_insert_and_query_audit_actions() {
         result: "success".to_string(),
     };
 
-    let id = record_audit_action_sync(&conn, &action).unwrap();
+    let id = record_audit_action_for_conn(&mut conn, &action).unwrap();
     assert!(id > 0);
 
     let query = AuditQuery {
@@ -1612,7 +1616,7 @@ fn action_history_includes_undo_metadata() {
         result: "success".to_string(),
     };
 
-    let action_id = record_audit_action_sync(&conn, &action).unwrap();
+    let action_id = record_audit_action_for_conn(&mut conn, &action).unwrap();
 
     let undo = ActionUndoRecord {
         audit_action_id: action_id,
@@ -1658,7 +1662,7 @@ fn action_undo_index_exists_after_init() {
 
 #[test]
 fn action_history_orders_by_ts_and_id() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now_ms = 1_700_000_000_000i64;
@@ -1687,9 +1691,9 @@ fn action_history_orders_by_ts_and_id() {
         result: "success".to_string(),
     };
 
-    let id1 = record_audit_action_sync(&conn, &base).unwrap();
-    let id2 = record_audit_action_sync(
-        &conn,
+    let id1 = record_audit_action_for_conn(&mut conn, &base).unwrap();
+    let id2 = record_audit_action_for_conn(
+        &mut conn,
         &AuditActionRecord {
             ts: 2_000,
             input_summary: Some("second".to_string()),
@@ -1697,8 +1701,8 @@ fn action_history_orders_by_ts_and_id() {
         },
     )
     .unwrap();
-    let id3 = record_audit_action_sync(
-        &conn,
+    let id3 = record_audit_action_for_conn(
+        &mut conn,
         &AuditActionRecord {
             ts: 2_000,
             input_summary: Some("third".to_string()),
@@ -1753,9 +1757,9 @@ fn action_history_filters_undoable() {
         result: "success".to_string(),
     };
 
-    let undoable_id = record_audit_action_sync(&conn, &base).unwrap();
-    let non_undoable_id = record_audit_action_sync(
-        &conn,
+    let undoable_id = record_audit_action_for_conn(&mut conn, &base).unwrap();
+    let non_undoable_id = record_audit_action_for_conn(
+        &mut conn,
         &AuditActionRecord {
             ts: 2_000,
             input_summary: Some("second".to_string()),
@@ -1819,7 +1823,7 @@ fn action_history_filters_undoable() {
 
 #[test]
 fn action_history_includes_workflow_step_info() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now_ms = 1_700_000_000_000i64;
@@ -1847,7 +1851,7 @@ fn action_history_includes_workflow_step_info() {
         decision_context: None,
         result: "success".to_string(),
     };
-    let action_id = record_audit_action_sync(&conn, &action).unwrap();
+    let action_id = record_audit_action_for_conn(&mut conn, &action).unwrap();
 
     conn.execute(
             "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
@@ -1899,7 +1903,7 @@ fn action_undo_redaction_applied() {
         decision_context: None,
         result: "success".to_string(),
     };
-    let action_id = record_audit_action_sync(&conn, &action).unwrap();
+    let action_id = record_audit_action_for_conn(&mut conn, &action).unwrap();
 
     let secret = "sk-abc123456789012345678901234567890123456789012345678901";
     let mut undo = ActionUndoRecord {
@@ -1936,7 +1940,7 @@ fn action_undo_redaction_applied() {
 
 #[test]
 fn purge_audit_actions_removes_old_entries() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     conn.execute(
@@ -1968,8 +1972,8 @@ fn purge_audit_actions_removes_old_entries() {
         ..older.clone()
     };
 
-    record_audit_action_sync(&conn, &older).unwrap();
-    record_audit_action_sync(&conn, &newer).unwrap();
+    record_audit_action_for_conn(&mut conn, &older).unwrap();
+    record_audit_action_for_conn(&mut conn, &newer).unwrap();
 
     // br-ft-l1jgo: purge_audit_actions_sync was migrated to
     // purge_audit_actions_backend at c64527d9c. Wrap the test
@@ -1986,7 +1990,7 @@ fn purge_audit_actions_removes_old_entries() {
 
 #[test]
 fn audit_query_filters_and_limits() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     conn.execute(
@@ -2023,8 +2027,8 @@ fn audit_query_filters_and_limits() {
         ..allow.clone()
     };
 
-    record_audit_action_sync(&conn, &allow).unwrap();
-    record_audit_action_sync(&conn, &deny).unwrap();
+    record_audit_action_for_conn(&mut conn, &allow).unwrap();
+    record_audit_action_for_conn(&mut conn, &deny).unwrap();
 
     let last_one = query_audit_actions(
         &conn,
@@ -2072,7 +2076,7 @@ fn audit_query_filters_and_limits() {
 
 #[test]
 fn audit_stream_query_pages_with_cursor() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     conn.execute(
@@ -2099,9 +2103,9 @@ fn audit_stream_query_pages_with_cursor() {
         result: "success".to_string(),
     };
 
-    let id1 = record_audit_action_sync(&conn, &base).unwrap();
-    let id2 = record_audit_action_sync(
-        &conn,
+    let id1 = record_audit_action_for_conn(&mut conn, &base).unwrap();
+    let id2 = record_audit_action_for_conn(
+        &mut conn,
         &AuditActionRecord {
             ts: 2_000,
             input_summary: Some("second".to_string()),
@@ -2109,8 +2113,8 @@ fn audit_stream_query_pages_with_cursor() {
         },
     )
     .unwrap();
-    let id3 = record_audit_action_sync(
-        &conn,
+    let id3 = record_audit_action_for_conn(
+        &mut conn,
         &AuditActionRecord {
             ts: 3_000,
             input_summary: Some("third".to_string()),
@@ -2158,7 +2162,7 @@ fn audit_stream_query_empty_returns_none_cursor() {
 
 #[test]
 fn audit_stream_query_respects_limit() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     conn.execute(
@@ -2185,9 +2189,9 @@ fn audit_stream_query_respects_limit() {
         result: "success".to_string(),
     };
 
-    record_audit_action_sync(&conn, &action).unwrap();
-    record_audit_action_sync(
-        &conn,
+    record_audit_action_for_conn(&mut conn, &action).unwrap();
+    record_audit_action_for_conn(
+        &mut conn,
         &AuditActionRecord {
             ts: 2_000,
             input_summary: Some("second".to_string()),

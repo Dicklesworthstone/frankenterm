@@ -2007,9 +2007,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_action_undo_sync(&conn, audit_action_id)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_action_undo_backend(backend, audit_action_id)
+            })
         })
         .await
     }
@@ -10930,31 +10930,47 @@ fn upsert_action_undo_backend(
     Ok(())
 }
 
-fn query_action_undo_sync(
-    conn: &Connection,
+fn action_undo_from_backend_cells(row: &[SqlCell]) -> Result<ActionUndoRecord> {
+    let row = CellRowReader::new(row);
+    Ok(ActionUndoRecord {
+        audit_action_id: row
+            .i64(0)
+            .map_err(|err| storage_backend_error("action undo audit_action_id", err))?,
+        undoable: row
+            .bool(1)
+            .map_err(|err| storage_backend_error("action undo undoable", err))?,
+        undo_strategy: row
+            .string(2)
+            .map_err(|err| storage_backend_error("action undo undo_strategy", err))?,
+        undo_hint: row
+            .optional_string(3)
+            .map_err(|err| storage_backend_error("action undo undo_hint", err))?,
+        undo_payload: row
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("action undo undo_payload", err))?,
+        undone_at: row
+            .optional_i64(5)
+            .map_err(|err| storage_backend_error("action undo undone_at", err))?,
+        undone_by: row
+            .optional_string(6)
+            .map_err(|err| storage_backend_error("action undo undone_by", err))?,
+    })
+}
+
+fn query_action_undo_backend(
+    backend: &dyn StorageBackend,
     audit_action_id: i64,
 ) -> Result<Option<ActionUndoRecord>> {
-    conn.query_row(
-        "SELECT audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by
+    let row = backend
+        .query_row_cells(
+            "SELECT audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by
          FROM action_undo WHERE audit_action_id = ?1",
-        params![audit_action_id],
-        |row| {
-            Ok(ActionUndoRecord {
-                audit_action_id: row.get(0)?,
-                undoable: {
-                    let value: i64 = row.get(1)?;
-                    value != 0
-                },
-                undo_strategy: row.get(2)?,
-                undo_hint: row.get(3)?,
-                undo_payload: row.get(4)?,
-                undone_at: row.get(5)?,
-                undone_by: row.get(6)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Failed to query action_undo: {e}")).into())
+            &[ToSqlValue::Integer(audit_action_id)],
+        )
+        .map_err(|err| storage_backend_error("Failed to query action_undo", err))?;
+    row.as_deref()
+        .map(action_undo_from_backend_cells)
+        .transpose()
 }
 
 fn mark_action_undone_backend(
