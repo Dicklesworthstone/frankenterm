@@ -1,4 +1,4 @@
-//! `frankenterm-core-replay` — 24-module replay sub-crate extracted from
+//! `frankenterm-core-replay` — replay sub-crate extracted from
 //! `frankenterm-core` (ft-y0loj.4 / ft-j1qjt.2).
 //!
 //! See `Cargo.toml` for the precise scope. Only modules with **zero
@@ -10,6 +10,7 @@
 //! extracted to leaves first.
 
 pub mod replay_artifact_registry;
+pub mod replay_capture_tiering;
 pub mod replay_checkpoint;
 pub mod replay_ci_gate;
 pub mod replay_cli;

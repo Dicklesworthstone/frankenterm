@@ -1,6 +1,6 @@
 [package]
 name = "frankenterm-core-replay"
-description = "Replay sub-crate (24 modules) extracted from frankenterm-core (ft-y0loj.4 / ft-j1qjt.2)"
+description = "Replay sub-crate extracted from frankenterm-core (ft-y0loj.4 / ft-j1qjt.2)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,13 +15,14 @@ categories = ["development-tools"]
 workspace = true
 
 # Sub-crate carved out of frankenterm-core under ft-y0loj.4 / ft-j1qjt.2.
-# Holds the 24 replay_* modules that have ZERO inbound references from
+# Holds replay_* modules that have ZERO inbound references from
 # non-replay core (audited via grep -rln "crate::replay_<module>" outside
 # the replay cluster). Each of these is reachable only from other replay
 # modules, the replay tests, or external consumers.
 #
 # Modules in this crate:
 #   replay_artifact_registry
+#   replay_capture_tiering
 #   replay_checkpoint
 #   replay_ci_gate
 #   replay_cli

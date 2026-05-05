@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "total_panes": 6,
+  "hot": 1,
+  "warm": 2,
+  "cold": 1,
+  "deferred": 2,
+  "degraded_receipts": 2,
+  "search_full_realtime": 1,
+  "search_buffered_catchup": 2,
+  "search_summary_only": 1,
+  "search_deferred_with_gap": 2,
+  "operator_summary": "adaptive_capture_indexing: 1 hot, 2 warm, 1 cold, 2 deferred; 2 explicit degraded-fidelity receipts"
+}
