@@ -2723,26 +2723,30 @@ fn can_insert_and_consume_approval_token() {
     })
     .unwrap();
 
-    let consumed = consume_approval_token_sync(
-        &mut conn,
-        "sha256:tokenhash",
-        "ws",
-        "send_text",
-        Some(1),
-        "sha256:fp",
-    )
+    let consumed = with_writer_backend(&mut conn, |backend| {
+        consume_approval_token_backend(
+            backend,
+            "sha256:tokenhash",
+            "ws",
+            "send_text",
+            Some(1),
+            "sha256:fp",
+        )
+    })
     .unwrap();
     assert!(consumed.is_some());
     assert!(consumed.unwrap().used_at.is_some());
 
-    let second = consume_approval_token_sync(
-        &mut conn,
-        "sha256:tokenhash",
-        "ws",
-        "send_text",
-        Some(1),
-        "sha256:fp",
-    )
+    let second = with_writer_backend(&mut conn, |backend| {
+        consume_approval_token_backend(
+            backend,
+            "sha256:tokenhash",
+            "ws",
+            "send_text",
+            Some(1),
+            "sha256:fp",
+        )
+    })
     .unwrap();
     assert!(second.is_none());
 }

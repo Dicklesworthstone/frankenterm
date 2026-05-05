@@ -8376,14 +8376,16 @@ fn dispatch_write_command_raw(
             action_fingerprint,
             respond,
         } => {
-            let result = consume_approval_token_sync(
-                conn,
-                &code_hash,
-                &workspace_id,
-                &action_kind,
-                pane_id,
-                &action_fingerprint,
-            );
+            let result = with_writer_backend(conn, |backend| {
+                consume_approval_token_backend(
+                    backend,
+                    &code_hash,
+                    &workspace_id,
+                    &action_kind,
+                    pane_id,
+                    &action_fingerprint,
+                )
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ConsumeApprovalTokenByCode {
@@ -13099,10 +13101,10 @@ fn consume_prepared_plan_backend(
         .transpose()
 }
 
-/// Consume an approval token if it matches scope and is valid (synchronous)
+/// Consume an approval token if it matches scope and is valid through the storage backend.
 #[allow(clippy::too_many_arguments)]
-fn consume_approval_token_sync(
-    conn: &mut Connection,
+fn consume_approval_token_backend(
+    backend: &dyn StorageBackend,
     code_hash: &str,
     workspace_id: &str,
     action_kind: &str,
@@ -13110,73 +13112,48 @@ fn consume_approval_token_sync(
     action_fingerprint: &str,
 ) -> Result<Option<ApprovalTokenRecord>> {
     let now = now_ms();
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
+    let pane_id_i64 = pane_id
+        .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
+        .transpose()?;
 
     let mut sql = String::from(
-        "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-         pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
-         FROM approval_tokens
-         WHERE code_hash = ?
-           AND workspace_id = ?
-           AND action_kind = ?
-           AND action_fingerprint = ?
-           AND used_at IS NULL
-           AND expires_at >= ?",
+        "UPDATE approval_tokens
+         SET used_at = ?5
+         WHERE id = (
+             SELECT id FROM approval_tokens
+             WHERE code_hash = ?1
+               AND workspace_id = ?2
+               AND action_kind = ?3
+               AND action_fingerprint = ?4
+               AND used_at IS NULL
+               AND expires_at >= ?5",
     );
     let mut params = vec![
-        SqlValue::Text(code_hash.to_string()),
-        SqlValue::Text(workspace_id.to_string()),
-        SqlValue::Text(action_kind.to_string()),
-        SqlValue::Text(action_fingerprint.to_string()),
-        SqlValue::Integer(now),
+        ToSqlValue::Text(code_hash),
+        ToSqlValue::Text(workspace_id),
+        ToSqlValue::Text(action_kind),
+        ToSqlValue::Text(action_fingerprint),
+        ToSqlValue::Integer(now),
     ];
-
-    // Add pane_id constraint if specified
-    if let Some(pid) = pane_id {
-        sql.push_str(" AND pane_id = ?");
-        #[allow(clippy::cast_possible_wrap)]
-        params.push(SqlValue::Integer(pid as i64));
+    if let Some(pid) = pane_id_i64 {
+        sql.push_str(" AND pane_id = ?6");
+        params.push(ToSqlValue::Integer(pid));
     }
-    sql.push_str(" LIMIT 1");
+    sql.push_str(
+        " LIMIT 1
+         )
+           AND used_at IS NULL
+         RETURNING id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+                   pane_id, action_fingerprint, plan_hash, plan_version, risk_summary",
+    );
 
-    let record = {
-        let mut stmt = tx.prepare(&sql).map_err(|e| {
-            StorageError::Database(format!("Failed to prepare approval query: {e}"))
-        })?;
+    let row = backend
+        .query_row_typed(&sql, &params)
+        .map_err(|err| storage_backend_error("Failed to consume approval token", err))?;
 
-        stmt.query_row(rusqlite::params_from_iter(params), approval_token_from_row)
-            .optional()
-            .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")))?
-    };
-
-    if let Some(mut record) = record {
-        let updated = tx
-            .execute(
-                "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
-                params![now, record.id],
-            )
-            .map_err(|e| {
-                StorageError::Database(format!("Failed to consume approval token: {e}"))
-            })?;
-
-        if updated == 0 {
-            tx.commit().map_err(|e| {
-                StorageError::Database(format!("Failed to commit approval token: {e}"))
-            })?;
-            return Ok(None);
-        }
-
-        record.used_at = Some(now);
-        tx.commit()
-            .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
-        return Ok(Some(record));
-    }
-
-    tx.commit()
-        .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
-    Ok(None)
+    row.as_deref()
+        .map(approval_token_from_backend_row)
+        .transpose()
 }
 
 /// Consume an approval token by code hash only, without fingerprint validation (synchronous).
@@ -18986,6 +18963,70 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
                     1_700_000_000_600,
                 )
                 .unwrap()
+        );
+
+        let scoped_token = ApprovalTokenRecord {
+            id: 0,
+            code_hash: "scoped-code-hash-tick142".to_string(),
+            created_at: 1_700_000_000_000,
+            expires_at: 4_100_000_000_000,
+            used_at: None,
+            workspace_id: "ws-tick142".to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id: Some(9),
+            action_fingerprint: "fp-scoped-tick142".to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
+        };
+        let scoped_token_id = storage
+            .insert_approval_token_with_cx(&cx, scoped_token)
+            .await
+            .unwrap();
+        assert!(scoped_token_id > 0);
+        let wrong_scope = storage
+            .consume_approval_token_with_cx(
+                &cx,
+                "scoped-code-hash-tick142",
+                "ws-tick142",
+                "send_text",
+                Some(9),
+                "wrong-fingerprint",
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_scope.is_none(),
+            "scope mismatch must not consume approval token"
+        );
+        let scoped_consumed = storage
+            .consume_approval_token_with_cx(
+                &cx,
+                "scoped-code-hash-tick142",
+                "ws-tick142",
+                "send_text",
+                Some(9),
+                "fp-scoped-tick142",
+            )
+            .await
+            .unwrap()
+            .expect("scoped approval token should be consumable once");
+        assert_eq!(scoped_consumed.id, scoped_token_id);
+        assert!(scoped_consumed.used_at.is_some());
+        let scoped_after = storage
+            .consume_approval_token_with_cx(
+                &cx,
+                "scoped-code-hash-tick142",
+                "ws-tick142",
+                "send_text",
+                Some(9),
+                "fp-scoped-tick142",
+            )
+            .await
+            .unwrap();
+        assert!(
+            scoped_after.is_none(),
+            "scoped approval token can only be consumed once"
         );
 
         // ---- prepared-plan cluster ----
