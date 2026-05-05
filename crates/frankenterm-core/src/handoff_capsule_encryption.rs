@@ -6,15 +6,15 @@
 //! computed, so a stolen capsule blob remains opaque without the
 //! operator-supplied key.
 //!
-//! # Why a hook trait, not a baked-in cipher?
+//! # Why a hook trait and a built-in AEAD?
 //!
-//! `frankenterm-core` declares `#![forbid(unsafe_code)]`. Real AES
-//! implementations rely on `unsafe` for SIMD/AESNI fast paths;
-//! ring-based wrappers pull in C dependencies (aws-lc-sys etc.) that
-//! conflict with the cross-platform constraint. The hook trait lets
-//! operators bring their own cipher (libsodium via FFI in a sibling
-//! crate, age, GPG-via-subprocess, kernel keyring) without forcing
-//! frankenterm-core to depend on any of them.
+//! `frankenterm-core` declares `#![forbid(unsafe_code)]`. The built-in
+//! [`XChaCha20Poly1305Hook`] uses the RustCrypto pure-Rust AEAD
+//! implementation so the default production path does not need
+//! operator FFI, C libraries, or a test-only cipher. The hook trait
+//! remains the extension point for deployments that need an external
+//! keyring, age recipient encryption, GPG-via-subprocess, or a
+//! platform security module.
 //!
 //! # Layered with integrity
 //!
@@ -39,14 +39,19 @@
 //!
 //! # XorPlaceholderHook is for tests only
 //!
-//! The included [`XorPlaceholderHook`] applies a repeating-key XOR
+//! Test builds include [`XorPlaceholderHook`], which applies a repeating-key XOR
 //! to plaintext. **DO NOT USE THIS FOR REAL SECRETS** — repeating-
 //! key XOR is broken under known-plaintext attack. Its only purpose
 //! is to let the test suite exercise the seal/open ordering
 //! contract + verify that wrong-key rejects + that integrity fires
-//! before decrypt, without depending on a real cipher.
+//! before decrypt. It is not compiled into normal production builds.
 
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::capability_passport::RedactedProof;
 use crate::handoff_capsule::{CapsuleIntegrity, CapsuleSection, HandoffCapsule};
@@ -250,6 +255,167 @@ fn compute_ciphertext_integrity(ciphertext: &[u8]) -> CapsuleIntegrity {
 }
 
 // =============================================================================
+// XChaCha20Poly1305Hook — production AEAD hook
+// =============================================================================
+
+const XCHACHA20_POLY1305_MAGIC: &[u8] = b"FT-XCHACHA20POLY1305-V1\0";
+const XCHACHA20_POLY1305_KEY_ID_LEN: usize = 8;
+const XCHACHA20_POLY1305_NONCE_LEN: usize = 24;
+
+/// Production handoff-capsule encryption hook backed by
+/// XChaCha20-Poly1305.
+///
+/// The sealed byte format is:
+///
+/// ```text
+/// magic || key_id(8) || nonce(24) || aead_ciphertext_and_tag
+/// ```
+///
+/// `key_id` is the first 8 bytes of SHA-256(key). It is not a secret; it
+/// lets operators detect key-rotation mismatches before attempting AEAD
+/// decrypt, while the AEAD tag remains the authoritative authenticity
+/// check.
+#[derive(Clone)]
+pub struct XChaCha20Poly1305Hook {
+    cipher: XChaCha20Poly1305,
+    key_id: [u8; XCHACHA20_POLY1305_KEY_ID_LEN],
+}
+
+impl std::fmt::Debug for XChaCha20Poly1305Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XChaCha20Poly1305Hook")
+            .field("hook_id", &Self::HOOK_ID)
+            .field("key_id", &self.key_id_hex())
+            .finish_non_exhaustive()
+    }
+}
+
+impl XChaCha20Poly1305Hook {
+    /// Stable hook identifier stored in encrypted capsule envelopes.
+    pub const HOOK_ID: &'static str = "xchacha20poly1305-ietf-v1";
+
+    /// Required key length in bytes.
+    pub const KEY_LEN: usize = 32;
+
+    /// Construct the hook from a 32-byte symmetric key.
+    ///
+    /// Empty, wrong-length, and all-zero keys fail closed so production
+    /// callers cannot accidentally select an inert placeholder.
+    pub fn try_from_key_slice(key: &[u8]) -> Result<Self, EncryptionError> {
+        if key.len() != Self::KEY_LEN {
+            return Err(EncryptionError::Unsupported {
+                reason: "XChaCha20Poly1305 key must be exactly 32 bytes".into(),
+            });
+        }
+        if key.iter().all(|byte| *byte == 0) {
+            return Err(EncryptionError::Unsupported {
+                reason: "all-zero XChaCha20Poly1305 key is not allowed".into(),
+            });
+        }
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(key).map_err(|_| EncryptionError::Unsupported {
+                reason: "XChaCha20Poly1305 key initialization failed".into(),
+            })?;
+        Ok(Self {
+            cipher,
+            key_id: xchacha20poly1305_key_id(key),
+        })
+    }
+
+    /// Construct the hook from a 64-character hex-encoded key.
+    pub fn from_hex_key(key_hex: &str) -> Result<Self, EncryptionError> {
+        let trimmed = key_hex.trim();
+        if trimmed.is_empty() {
+            return Err(EncryptionError::Unsupported {
+                reason: "missing XChaCha20Poly1305 key".into(),
+            });
+        }
+        let key = hex::decode(trimmed).map_err(|_| EncryptionError::Unsupported {
+            reason: "XChaCha20Poly1305 key must be 64 hex characters".into(),
+        })?;
+        Self::try_from_key_slice(&key)
+    }
+
+    /// Hex fingerprint of the configured key, safe for diagnostics.
+    #[must_use]
+    pub fn key_id_hex(&self) -> String {
+        hex::encode(self.key_id)
+    }
+
+    /// Extract the key-id fingerprint from a sealed hook payload.
+    #[must_use]
+    pub fn envelope_key_id_hex(ciphertext: &[u8]) -> Option<String> {
+        let body = ciphertext.strip_prefix(XCHACHA20_POLY1305_MAGIC)?;
+        let (key_id, _) = body.split_at_checked(XCHACHA20_POLY1305_KEY_ID_LEN)?;
+        Some(hex::encode(key_id))
+    }
+}
+
+impl CapsuleEncryptionHook for XChaCha20Poly1305Hook {
+    fn hook_id(&self) -> &'static str {
+        Self::HOOK_ID
+    }
+
+    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let encrypted = self.cipher.encrypt(&nonce, plaintext).map_err(|_| {
+            EncryptionError::EncryptionFailed {
+                reason: "XChaCha20Poly1305 seal failed".into(),
+            }
+        })?;
+
+        let mut sealed = Vec::with_capacity(
+            XCHACHA20_POLY1305_MAGIC.len()
+                + XCHACHA20_POLY1305_KEY_ID_LEN
+                + XCHACHA20_POLY1305_NONCE_LEN
+                + encrypted.len(),
+        );
+        sealed.extend_from_slice(XCHACHA20_POLY1305_MAGIC);
+        sealed.extend_from_slice(&self.key_id);
+        sealed.extend_from_slice(nonce.as_ref());
+        sealed.extend_from_slice(&encrypted);
+        Ok(sealed)
+    }
+
+    fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+        let body = ciphertext
+            .strip_prefix(XCHACHA20_POLY1305_MAGIC)
+            .ok_or_else(|| EncryptionError::DecryptionFailed {
+                reason: "missing XChaCha20Poly1305 envelope header".into(),
+            })?;
+        let Some((key_id, body)) = body.split_at_checked(XCHACHA20_POLY1305_KEY_ID_LEN) else {
+            return Err(EncryptionError::DecryptionFailed {
+                reason: "truncated XChaCha20Poly1305 key id".into(),
+            });
+        };
+        if key_id != self.key_id.as_slice() {
+            return Err(EncryptionError::DecryptionFailed {
+                reason: "XChaCha20Poly1305 key id mismatch".into(),
+            });
+        }
+        let Some((nonce_bytes, encrypted)) = body.split_at_checked(XCHACHA20_POLY1305_NONCE_LEN)
+        else {
+            return Err(EncryptionError::DecryptionFailed {
+                reason: "truncated XChaCha20Poly1305 nonce".into(),
+            });
+        };
+        let nonce = XNonce::from_slice(nonce_bytes);
+        self.cipher
+            .decrypt(nonce, encrypted)
+            .map_err(|_| EncryptionError::DecryptionFailed {
+                reason: "XChaCha20Poly1305 authentication failed".into(),
+            })
+    }
+}
+
+fn xchacha20poly1305_key_id(key: &[u8]) -> [u8; XCHACHA20_POLY1305_KEY_ID_LEN] {
+    let digest = Sha256::digest(key);
+    let mut key_id = [0; XCHACHA20_POLY1305_KEY_ID_LEN];
+    key_id.copy_from_slice(&digest[..XCHACHA20_POLY1305_KEY_ID_LEN]);
+    key_id
+}
+
+// =============================================================================
 // XorPlaceholderHook — TEST USE ONLY
 // =============================================================================
 
@@ -258,16 +424,16 @@ fn compute_ciphertext_integrity(ciphertext: &[u8]) -> CapsuleIntegrity {
 /// SOLELY to let the test suite exercise the seal/open ordering
 /// contract without depending on a real cipher crate.
 ///
-/// Production deployments MUST replace this with a real
-/// [`CapsuleEncryptionHook`] backed by a vetted AEAD primitive
-/// (libsodium secretbox via FFI, age-x25519, or a kernel keyring
-/// API). This crate's `#![forbid(unsafe_code)]` declaration
-/// precludes vendoring a real AES implementation here.
+/// Normal production builds do not compile this type; use
+/// [`XChaCha20Poly1305Hook`] or a deployment-specific
+/// [`CapsuleEncryptionHook`] instead.
+#[cfg(any(test, doc))]
 #[derive(Debug, Clone)]
 pub struct XorPlaceholderHook {
     key: Vec<u8>,
 }
 
+#[cfg(any(test, doc))]
 impl XorPlaceholderHook {
     /// Construct with the supplied key bytes. Caller is responsible
     /// for the key — this hook does NOT generate, store, or rotate
@@ -278,6 +444,7 @@ impl XorPlaceholderHook {
     }
 }
 
+#[cfg(any(test, doc))]
 impl CapsuleEncryptionHook for XorPlaceholderHook {
     fn hook_id(&self) -> &'static str {
         "xor-placeholder-test-only"
@@ -289,7 +456,10 @@ impl CapsuleEncryptionHook for XorPlaceholderHook {
                 reason: "empty key".into(),
             });
         }
-        Ok(xor_with_key(plaintext, &self.key))
+        let mut buffer = Vec::with_capacity(XOR_MAGIC_PREFIX.len() + plaintext.len());
+        buffer.extend_from_slice(XOR_MAGIC_PREFIX);
+        buffer.extend_from_slice(plaintext);
+        Ok(xor_with_key(&buffer, &self.key))
     }
 
     fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
@@ -298,12 +468,12 @@ impl CapsuleEncryptionHook for XorPlaceholderHook {
                 reason: "empty key".into(),
             });
         }
-        // Wrong-key detection: the operator wraps ciphertext with a
-        // fixed magic prefix at seal-time so open can reject early
-        // when the prefix doesn't reappear post-decrypt. Without the
-        // prefix, repeating-key XOR with a wrong key would silently
-        // produce garbage plaintext. This is a pedagogical pattern;
-        // real AEADs detect this via authentication tag.
+        // Wrong-key detection: seal() wraps plaintext with a fixed
+        // magic prefix so open can reject when the prefix doesn't
+        // reappear post-decrypt. Without the prefix, repeating-key XOR
+        // with a wrong key would silently produce garbage plaintext.
+        // This is a pedagogical pattern; real AEADs detect this via
+        // authentication tag.
         let candidate = xor_with_key(ciphertext, &self.key);
         if candidate.starts_with(XOR_MAGIC_PREFIX) {
             Ok(candidate[XOR_MAGIC_PREFIX.len()..].to_vec())
@@ -315,21 +485,12 @@ impl CapsuleEncryptionHook for XorPlaceholderHook {
     }
 }
 
+#[cfg(any(test, doc))]
 const XOR_MAGIC_PREFIX: &[u8] = b"FT-XOR\xfe\xed";
 
+#[cfg(any(test, doc))]
 fn xor_with_key(input: &[u8], key: &[u8]) -> Vec<u8> {
-    // For seal we PREPEND the magic prefix to the plaintext, then
-    // XOR the whole thing. open() XORs back, checks the prefix, and
-    // strips it. This way wrong-key produces a candidate that
-    // doesn't start with the magic and gets rejected.
-    //
-    // Implementation detail: seal() doesn't see the magic; we add
-    // it as a wrapper here so XorPlaceholderHook::seal can produce
-    // ciphertext from arbitrary plaintext without the caller
-    // knowing about the magic.
-    let mut buffer = Vec::with_capacity(XOR_MAGIC_PREFIX.len() + input.len());
-    buffer.extend_from_slice(XOR_MAGIC_PREFIX);
-    buffer.extend_from_slice(input);
+    let mut buffer = input.to_vec();
     for (i, byte) in buffer.iter_mut().enumerate() {
         *byte ^= key[i % key.len()];
     }
@@ -377,6 +538,96 @@ mod tests {
             ],
             1_500_000,
         )
+    }
+
+    // ── XChaCha20-Poly1305 seal/open roundtrip ─────────────────────────
+
+    #[test]
+    fn xchacha20poly1305_hook_seal_open_roundtrip_recovers_capsule() {
+        let hook = XChaCha20Poly1305Hook::try_from_key_slice(&[0x11; 32]).expect("valid key");
+        let capsule = sample_capsule();
+        let envelope = EncryptedCapsuleEnvelope::seal(&capsule, &hook).expect("seal ok");
+        let plain = serde_json::to_vec(&capsule.sections).unwrap();
+
+        assert_eq!(envelope.hook_id, XChaCha20Poly1305Hook::HOOK_ID);
+        assert_ne!(envelope.ciphertext, plain);
+        assert_eq!(
+            XChaCha20Poly1305Hook::envelope_key_id_hex(&envelope.ciphertext),
+            Some(hook.key_id_hex())
+        );
+
+        let envelope2 = EncryptedCapsuleEnvelope::seal(&capsule, &hook).expect("seal ok");
+        assert_ne!(envelope.ciphertext, envelope2.ciphertext);
+
+        let recovered = envelope
+            .open(&hook, capsule.source.clone(), capsule.destination.clone())
+            .expect("open ok");
+        assert_eq!(recovered.sections, capsule.sections);
+        recovered.verify_integrity().expect("integrity preserved");
+    }
+
+    #[test]
+    fn xchacha20poly1305_hook_wrong_key_rejects_without_plaintext_leakage() {
+        let seal_hook = XChaCha20Poly1305Hook::try_from_key_slice(&[0x11; 32]).expect("seal key");
+        let open_hook = XChaCha20Poly1305Hook::try_from_key_slice(&[0x22; 32]).expect("open key");
+        let capsule = sample_capsule();
+        let envelope = EncryptedCapsuleEnvelope::seal(&capsule, &seal_hook).expect("seal");
+        let err = envelope
+            .open(
+                &open_hook,
+                capsule.source.clone(),
+                capsule.destination.clone(),
+            )
+            .unwrap_err();
+        let EnvelopeOpenError::Decryption(EncryptionError::DecryptionFailed { reason }) = err
+        else {
+            panic!("expected DecryptionFailed for wrong key, got {err:?}");
+        };
+        assert!(reason.contains("key id mismatch"));
+        assert!(!reason.contains("context"));
+        assert!(!reason.contains("proof"));
+    }
+
+    #[test]
+    fn xchacha20poly1305_hook_tamper_rejects_at_aead_layer() {
+        let hook = XChaCha20Poly1305Hook::try_from_key_slice(&[0x11; 32]).expect("valid key");
+        let mut sealed = hook
+            .seal(b"context proof should stay sealed")
+            .expect("seal");
+        *sealed.last_mut().expect("ciphertext byte") ^= 0x01;
+        let err = hook.open(&sealed).unwrap_err();
+        let EncryptionError::DecryptionFailed { reason } = err else {
+            panic!("expected DecryptionFailed");
+        };
+        assert!(reason.contains("authentication failed"));
+        assert!(!reason.contains("context"));
+        assert!(!reason.contains("proof"));
+    }
+
+    #[test]
+    fn xchacha20poly1305_hook_rejects_missing_and_weak_keys() {
+        let missing = XChaCha20Poly1305Hook::from_hex_key("").unwrap_err();
+        assert!(matches!(missing, EncryptionError::Unsupported { .. }));
+
+        let short = XChaCha20Poly1305Hook::try_from_key_slice(&[0x11; 31]).unwrap_err();
+        let EncryptionError::Unsupported { reason } = short else {
+            panic!("expected Unsupported");
+        };
+        assert!(reason.contains("32 bytes"));
+
+        let zero = XChaCha20Poly1305Hook::try_from_key_slice(&[0; 32]).unwrap_err();
+        let EncryptionError::Unsupported { reason } = zero else {
+            panic!("expected Unsupported");
+        };
+        assert!(reason.contains("all-zero"));
+    }
+
+    #[test]
+    fn xchacha20poly1305_hook_accepts_hex_key() {
+        let key_hex = "11".repeat(32);
+        let hook = XChaCha20Poly1305Hook::from_hex_key(&key_hex).expect("hex key");
+        let sealed = hook.seal(b"plaintext").expect("seal");
+        assert_eq!(hook.open(&sealed).expect("open"), b"plaintext");
     }
 
     // ── XOR seal/open roundtrip ─────────────────────────────────────────

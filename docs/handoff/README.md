@@ -15,6 +15,26 @@ next agent can resume without re-deriving context.
   calculator, operator playbooks, demo-full preflight verifier,
   per-PR diff helper). 7 closed + 8 with substrate progress.
 
+## Encrypted Capsules
+
+Production handoff capsule encryption should use
+`XChaCha20Poly1305Hook` from
+`crates/frankenterm-core/src/handoff_capsule_encryption.rs` or a
+deployment-specific `CapsuleEncryptionHook`. The built-in hook requires a
+32-byte symmetric key, or a 64-character hex string via `from_hex_key`.
+Missing, wrong-length, and all-zero keys fail closed.
+
+The sealed hook payload is `magic || key_id || nonce || ciphertext+tag`.
+The outer `EncryptedCapsuleEnvelope` hashes that payload before decrypt,
+so envelope tampering is rejected before the AEAD open path runs.
+
+`XorPlaceholderHook` is compiled only for tests/docs and is not available
+to production builds. It exists only to exercise failure ordering in unit
+tests. For key rotation, keep the old 32-byte key available until existing
+capsules expire or provide a custom hook with deployment-specific
+multi-key routing; a key-id mismatch is reported without logging key
+material or plaintext.
+
 ## Conventions
 
 - File name: `<agent_id>-session-<YYYY-MM-DD>.md`. When an agent
