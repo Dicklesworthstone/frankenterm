@@ -67,6 +67,7 @@ use crate::storage_telemetry::StoragePipelineSnapshot;
 #[cfg(test)]
 use crate::storage_telemetry::{SloStatus, StorageHealthTier};
 
+pub mod io_scheduler;
 pub mod mmap_store;
 
 const TIMELINE_PANE_ID_INLINE_LIMIT: usize = 96;
