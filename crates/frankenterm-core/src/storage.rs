@@ -8701,16 +8701,22 @@ fn dispatch_write_command_raw(
             pane_states,
             respond,
         } => {
-            let result = insert_session_checkpoint_sync(
-                conn,
-                &session_id,
-                &checkpoint_type,
-                &state_hash,
-                pane_count,
-                total_bytes,
-                metadata_json.as_deref(),
-                &pane_states,
-            );
+            // br-ft-l1jgo: routes through the trait via the writer-
+            // thread wrap-unwrap bridge. Replaces the legacy
+            // `insert_session_checkpoint_sync(&mut Connection, ...)`
+            // direct-rusqlite transaction path.
+            let result = with_writer_backend(conn, |backend| {
+                insert_session_checkpoint_backend(
+                    backend,
+                    &session_id,
+                    &checkpoint_type,
+                    &state_hash,
+                    pane_count,
+                    total_bytes,
+                    metadata_json.as_deref(),
+                    &pane_states,
+                )
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSessionCheckpoints {
@@ -11365,8 +11371,15 @@ fn insert_mux_session_backend(
     Ok(())
 }
 
-fn insert_session_checkpoint_sync(
-    conn: &mut Connection,
+/// br-ft-l1jgo writer-thread migration: replaces the legacy
+/// `insert_session_checkpoint_sync(&mut Connection, ...)` direct-
+/// rusqlite helper. Preserves the original IMMEDIATE transaction
+/// semantics while inserting the checkpoint row, pane-state batch,
+/// and mux-session timestamp update through [`StorageBackend`].
+/// Called from the writer-thread dispatcher inside
+/// `with_writer_backend(...)`.
+fn insert_session_checkpoint_backend(
+    backend: &dyn StorageBackend,
     session_id: &str,
     checkpoint_type: &str,
     state_hash: &str,
@@ -11376,70 +11389,100 @@ fn insert_session_checkpoint_sync(
     pane_states: &[SessionPaneStateRow],
 ) -> Result<i64> {
     let now = now_ms();
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| StorageError::Database(format!("Failed to begin checkpoint txn: {e}")))?;
+    let pane_count_i64 = usize_to_i64(pane_count, "session_checkpoints.pane_count")?;
+    let total_bytes_i64 = usize_to_i64(total_bytes, "session_checkpoints.total_bytes")?;
+    let pane_state_rows: Vec<Vec<ToSqlValue<'_>>> = pane_states
+        .iter()
+        .map(|ps| {
+            Ok(vec![
+                ToSqlValue::Integer(u64_to_i64(ps.pane_id, "mux_pane_state.pane_id")?),
+                ToSqlValue::optional_text(ps.cwd.as_deref()),
+                ToSqlValue::optional_text(ps.command.as_deref()),
+                ToSqlValue::optional_text(ps.env_json.as_deref()),
+                ToSqlValue::Text(ps.terminal_state_json.as_str()),
+                ToSqlValue::optional_text(ps.agent_metadata_json.as_deref()),
+                ToSqlValue::optional_i64(ps.scrollback_checkpoint_seq),
+                ToSqlValue::optional_i64(ps.last_output_at),
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    tx.execute(
-        "INSERT INTO session_checkpoints
+    backend
+        .execute("BEGIN IMMEDIATE")
+        .map_err(|err| storage_backend_error("Failed to begin checkpoint txn", err))?;
+
+    let tx_result = (|| -> Result<i64> {
+        let row = backend
+            .query_row_typed(
+                "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            session_id,
-            now,
-            checkpoint_type,
-            state_hash,
-            pane_count as i64,
-            total_bytes as i64,
-            metadata_json,
-        ],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to insert session checkpoint: {e}")))?;
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         RETURNING id",
+                &[
+                    ToSqlValue::Text(session_id),
+                    ToSqlValue::Integer(now),
+                    ToSqlValue::Text(checkpoint_type),
+                    ToSqlValue::Text(state_hash),
+                    ToSqlValue::Integer(pane_count_i64),
+                    ToSqlValue::Integer(total_bytes_i64),
+                    ToSqlValue::optional_text(metadata_json),
+                ],
+            )
+            .map_err(|err| storage_backend_error("Failed to insert session checkpoint", err))?
+            .ok_or_else(|| {
+                StorageError::Database(
+                    "Failed to insert session checkpoint: no id returned".to_string(),
+                )
+            })?;
+        let checkpoint_id = RowReader::new(&row)
+            .i64(0)
+            .map_err(|err| storage_backend_error("Failed to parse session checkpoint id", err))?;
 
-    let checkpoint_id = tx.last_insert_rowid();
+        let pane_state_param_rows: Vec<Vec<ToSqlValue<'_>>> = pane_state_rows
+            .iter()
+            .map(|row| {
+                let mut params = Vec::with_capacity(9);
+                params.push(ToSqlValue::Integer(checkpoint_id));
+                params.extend(row.iter().cloned());
+                params
+            })
+            .collect();
 
-    {
-        let mut stmt = tx
-            .prepare_cached(
+        backend
+            .execute_many(
                 "INSERT INTO mux_pane_state
                  (checkpoint_id, pane_id, cwd, command, env_json, terminal_state_json,
                   agent_metadata_json, scrollback_checkpoint_seq, last_output_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                &pane_state_param_rows,
             )
-            .map_err(|e| {
-                StorageError::Database(format!("Failed to prepare pane state insert: {e}"))
-            })?;
+            .map_err(|err| storage_backend_error("Failed to insert pane state", err))?;
 
-        for ps in pane_states {
-            stmt.execute(params![
-                checkpoint_id,
-                ps.pane_id as i64,
-                ps.cwd,
-                ps.command,
-                ps.env_json,
-                ps.terminal_state_json,
-                ps.agent_metadata_json,
-                ps.scrollback_checkpoint_seq,
-                ps.last_output_at,
-            ])
-            .map_err(|e| StorageError::Database(format!("Failed to insert pane state: {e}")))?;
+        execute_typed(
+            backend,
+            "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
+            &[ToSqlValue::Integer(now), ToSqlValue::Text(session_id)],
+        )
+        .map_err(|err| {
+            storage_backend_error("Failed to update session checkpoint timestamp", err)
+        })?;
+
+        Ok(checkpoint_id)
+    })();
+
+    match tx_result {
+        Ok(checkpoint_id) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(checkpoint_id),
+            Err(commit_err) => {
+                let _ = backend.execute("ROLLBACK");
+                Err(storage_backend_error("Failed to commit checkpoint", commit_err).into())
+            }
+        },
+        Err(err) => {
+            let _ = backend.execute("ROLLBACK");
+            Err(err)
         }
-    } // drop stmt before further tx operations
-
-    tx.execute(
-        "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
-        params![now, session_id],
-    )
-    .map_err(|e| {
-        StorageError::Database(format!(
-            "Failed to update session checkpoint timestamp: {e}"
-        ))
-    })?;
-
-    tx.commit()
-        .map_err(|e| StorageError::Database(format!("Failed to commit checkpoint: {e}")))?;
-
-    Ok(checkpoint_id)
+    }
 }
 
 /// Prune session_checkpoints down to the most-recent `retention`
@@ -18799,16 +18842,36 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
         // 2. insert_session_checkpoint_with_cx — three checkpoints so prune
         //    below has something to remove.
         for i in 0..3 {
+            let pane_states = if i == 0 {
+                vec![SessionPaneStateRow {
+                    pane_id: 143,
+                    cwd: Some("/tmp/tick143".to_string()),
+                    command: Some("ft-test-shell".to_string()),
+                    env_json: Some("{\"TERM\":\"xterm-256color\"}".to_string()),
+                    terminal_state_json: "{\"cursor\":[0,0]}".to_string(),
+                    agent_metadata_json: Some("{\"agent\":\"tick143\"}".to_string()),
+                    scrollback_checkpoint_seq: Some(7),
+                    last_output_at: Some(143_000),
+                }]
+            } else {
+                Vec::new()
+            };
+            let pane_count = pane_states.len();
+            let total_bytes = pane_states
+                .iter()
+                .map(|ps| ps.terminal_state_json.len())
+                .sum();
+            let metadata_json = (i == 0).then(|| "{\"source\":\"tick143\"}".to_string());
             let checkpoint_id = storage
                 .insert_session_checkpoint_with_cx(
                     &cx,
                     session_id.clone(),
                     "periodic".to_string(),
                     format!("state-hash-{i}"),
-                    0,
-                    0,
-                    None,
-                    Vec::<SessionPaneStateRow>::new(),
+                    pane_count,
+                    total_bytes,
+                    metadata_json,
+                    pane_states,
                 )
                 .await
                 .unwrap();
