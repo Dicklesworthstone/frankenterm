@@ -12,7 +12,7 @@
 #   - Completes within acceptable performance bounds
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - prebuilt ft binary (set FT_BINARY or CARGO_TARGET_DIR)
 #   - jq for JSON manipulation
 #   - sqlite3 for direct DB seeding
 # =============================================================================
@@ -103,12 +103,6 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
-        exit 5
-    fi
-    log_pass "cargo available"
-
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
         exit 5
@@ -126,17 +120,35 @@ check_prerequisites() {
 # Binary discovery
 # ==============================================================================
 
-FT_BINARY=""
+FT_BINARY="${FT_BINARY:-}"
 
 find_ft_binary() {
-    if [[ -n "${FT_BINARY:-}" ]] && [[ -x "${FT_BINARY:-}" ]]; then
-        return 0
+    local explicit_ft_binary="$FT_BINARY"
+    if [[ -n "$explicit_ft_binary" ]]; then
+        if [[ -x "$explicit_ft_binary" ]]; then
+            log_pass "ft binary: $explicit_ft_binary"
+            return 0
+        fi
+
+        echo -e "${RED}ERROR:${NC} FT_BINARY is set but not executable: $explicit_ft_binary" >&2
+        exit 5
     fi
 
-    # Try release build first, then debug
-    for candidate in \
-        "$PROJECT_ROOT/target/release/ft" \
-        "$PROJECT_ROOT/target/debug/ft"; do
+    # Try release build first, then debug. This script intentionally does not
+    # build the binary: Cargo lanes must be run through rch by the caller.
+    local target_dir="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+    local candidates=(
+        "$target_dir/release/ft"
+        "$target_dir/debug/ft"
+    )
+    if [[ "$target_dir" != "$PROJECT_ROOT/target" ]]; then
+        candidates+=(
+            "$PROJECT_ROOT/target/release/ft"
+            "$PROJECT_ROOT/target/debug/ft"
+        )
+    fi
+
+    for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
             FT_BINARY="$candidate"
             log_pass "ft binary: $FT_BINARY"
@@ -144,17 +156,10 @@ find_ft_binary() {
         fi
     done
 
-    # Build if not found
-    log_info "Building ft binary..."
-    if cargo build -p frankenterm --quiet 2>/dev/null; then
-        FT_BINARY="$PROJECT_ROOT/target/debug/ft"
-        if [[ -x "$FT_BINARY" ]]; then
-            log_pass "ft binary built: $FT_BINARY"
-            return 0
-        fi
-    fi
-
-    echo -e "${RED}ERROR:${NC} Cannot find or build ft binary" >&2
+    echo -e "${RED}ERROR:${NC} Cannot find ft binary" >&2
+    echo "[INFO] Build via rch first, for example:" >&2
+    echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-timeline-target cargo build -p frankenterm" >&2
+    echo "[INFO] Then rerun with FT_BINARY=/tmp/ft-timeline-target/debug/ft or CARGO_TARGET_DIR=/tmp/ft-timeline-target" >&2
     exit 5
 }
 
