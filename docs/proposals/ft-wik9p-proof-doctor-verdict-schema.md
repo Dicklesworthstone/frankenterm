@@ -183,6 +183,7 @@ Implementations must cover these v1 reason codes before adding broader ones:
 | `proof.test.remote_assertion_failed` | `test_blocked` | Test/bench/E2E assertion failed after the intended command started. |
 | `proof.command.local_cargo_invalid` | `invalid` | Local Cargo or local fail-open execution is used for an RCH-required lane. |
 | `proof.command.shell_wrapped_rch_unclassified` | `invalid` | `rch exec -- bash -lc 'cargo ...'` or equivalent was not positively classified as remote Cargo. |
+| `proof.command.rch_cargo_shape_required` | `invalid` | The command is neither a direct RCH Cargo argv nor a recognized local/shell-wrapped invalid shape. |
 | `proof.dirty.active_owned_path_overlap` | `dirty_tree_blocked` | Dirty path overlaps lane and maps to an active Bead, reservation, or agent. |
 | `proof.dirty.unowned_path_overlap` | `dirty_tree_blocked` | Dirty path overlaps lane but no owner can be identified. |
 | `proof.ownership.other_agent_blocker` | `ownership_blocked` | Beads or Agent Mail identifies a different active owner for the blocker. |
