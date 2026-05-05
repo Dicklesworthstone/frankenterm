@@ -259,6 +259,9 @@ impl FtsConsistencyThresholds {
     /// `ratio` is `fts_rows / segment_count` (1.0 = perfectly consistent).
     #[must_use]
     pub fn classify(&self, ratio: f64) -> HealthTier {
+        if !ratio.is_finite() {
+            return HealthTier::Red;
+        }
         if ratio < self.red_ratio {
             HealthTier::Red
         } else if ratio < self.yellow_ratio {
@@ -601,6 +604,14 @@ mod tests {
         let th = FtsConsistencyThresholds::default();
         assert_eq!(th.classify(0.89), HealthTier::Red);
         assert_eq!(th.classify(0.0), HealthTier::Red);
+    }
+
+    #[test]
+    fn fts_consistency_non_finite_is_red() {
+        let th = FtsConsistencyThresholds::default();
+        assert_eq!(th.classify(f64::NAN), HealthTier::Red);
+        assert_eq!(th.classify(f64::INFINITY), HealthTier::Red);
+        assert_eq!(th.classify(f64::NEG_INFINITY), HealthTier::Red);
     }
 
     // --- Indexing lag health ---
