@@ -692,6 +692,30 @@ limits instead of the generic `robot.not_implemented` fallback.
 | `ft robot fleet`         | status / scale / rebalance / agents       | ✅ native read paths for status/agents; scale/rebalance parse natively and return typed `robot.fleet.capability_unavailable` until daemon-side mutation is wired |
 | `ft robot profile`       | list / show / validate / dry-run apply    | ✅ shipped for read paths and dry-run apply; non-dry-run apply returns typed `robot.profile.spawn_failed` until daemon spawn RPC lands |
 
+Examples for the graduated NTM-gap families:
+
+```bash
+# Checkpoint lifecycle. Non-dry-run rollback stays approval-blocked.
+ft robot --format json checkpoint save --label smoke
+ft robot --format json checkpoint list --limit 5
+ft robot --format json checkpoint rollback <checkpoint-id> --dry-run
+
+# Context registry. Rotation records a receipt and never stores raw context text.
+ft robot --format json context status --pane-id 1
+ft robot --format json context rotate 1 --strategy gentle --idempotency-key smoke-rotate-1
+ft robot --format json context history 1 --limit 5
+
+# Native work queue backed by work_claims.
+ft robot --format json work claim ft-smoke --agent-id agent-a
+ft robot --format json work list --status claimed --limit 5
+ft robot --format json work complete ft-smoke --summary done --evidence commit:abc123
+
+# Fleet read paths are native; mutating controls return typed capability limits.
+ft robot --format json fleet status --detailed
+ft robot --format json fleet agents --program codex --state idle
+ft robot --format json fleet scale codex 1 --dry-run
+```
+
 Remaining fleet mutation work is tracked under `ft-bs9uh` (Robot NTM-gap
 implementation epic). File an issue if a typed capability-unavailable envelope
 for your use case does not identify the missing native control-plane

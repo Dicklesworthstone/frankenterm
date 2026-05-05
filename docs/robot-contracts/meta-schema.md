@@ -5,9 +5,12 @@
 The original contract set covered `profile`, `checkpoint`, `context`,
 `work`, and `fleet`. `profile` now has native read paths and dry-run
 apply; `checkpoint` now routes through the native snapshot/session adapter
-with mutating rollback approval-blocked outside `--dry-run`; `work` now
-routes through the native SQLite `work_claims` queue. The current NTM-gap
-implementation set is `context` and `fleet`.
+with mutating rollback approval-blocked outside `--dry-run`; `context` now
+routes through the native SQLite `pane_contexts` / `context_rotations`
+registry; `work` now routes through the native SQLite `work_claims` queue.
+`fleet` now routes through native read paths and typed fleet capability errors
+for unavailable mutating controls. The current generic NTM-gap fallback set is
+empty.
 
 This document is the **single source of truth** for what a "complete"
 robot-family contract looks like. Each family is described by a
@@ -25,13 +28,12 @@ that emits four things from one declaration:
    that the harness in `tests/robot_family_conformance/` enumerates and
    asserts against a real handler.
 
-The live CLI dispatch status for the remaining NTM-gap families is tracked
-in `docs/robot-contracts/current-ntm-gap-dispatch.md` and guarded by
+The live CLI dispatch status for the retired NTM-gap families is tracked in
+`docs/robot-contracts/current-ntm-gap-dispatch.md` and guarded by
 `crates/frankenterm/tests/robot_ntm_gap_contract_tests.rs`. That harness is
 separate from the schema/state-machine conformance suite: it verifies that
-actions documented as fallback still return the structured
-`robot.not_implemented` envelope, and gives implementation beads a single
-manifest entry to flip when an action becomes native.
+graduated actions no longer return the structured `robot.not_implemented`
+fallback while still allowing honest typed runtime errors.
 
 Everything below describes the *shape* of that declaration. New families
 SHOULD NOT add ad-hoc proptest strategies, hand-rolled JSON schemas, or

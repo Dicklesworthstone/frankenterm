@@ -34,3 +34,11 @@ JSON robot envelope, and does not return the retired
 `robot.not_implemented` fallback. The native assertion intentionally does not
 require success, because a real backend can still return typed errors for
 missing state, unavailable daemons, or denied policy.
+
+Re-run the live dispatch proof through RCH:
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
+  cargo test -p frankenterm --test robot_ntm_gap_contract_tests \
+  robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture
+```

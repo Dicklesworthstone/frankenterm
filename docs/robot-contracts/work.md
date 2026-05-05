@@ -1,13 +1,12 @@
 # Robot Family Contract: `work`
 
 **Bead:** [BR-RC-ROBOT-CONTRACT.4] / `ft-hac7w.5`
-**Status:** Foundation slice shipped. Schema-DSL contract +
-multi-agent state-space proof + TLA+ spec + 12-test conformance
-harness extension all live; wiring `RobotCommands::Work` to a
-real `work_claims` storage table is the integration follow-on.
-Differential test against `bv` work-queue commands (action #5)
-plugs into the `crate::robot_ntm_differential::DifferentialHarness`
-from `ft-hac7w.1.1`.
+**Status:** Native work backend shipped under `ft-bs9uh.4`. The Schema-DSL
+contract, multi-agent state-space proof, TLA+ spec, and conformance harness
+remain the proof substrate; live `RobotCommands::Work` dispatches to
+`robot_work_command_response`, backed by the native SQLite `work_claims` table.
+Differential test work against `bv` remains separate from the live Robot
+dispatch contract.
 
 ## Family overview
 
@@ -17,10 +16,11 @@ ownership model.
 | Action | Idempotency | Failure semantics | Side effects |
 |---|---|---|---|
 | `claim` | Sequential (non-idempotent across agents) | MustNotPartiallyMutate | events: `work.claimed`; tables: `work_claims` |
-| `complete` | Idempotent on owned claim | MustNotPartiallyMutate | events: `work.completed`; tables: `work_claims` |
 | `release` | Idempotent | MustNotPartiallyMutate | events: `work.released`; tables: `work_claims` |
-| `status` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `complete` | Idempotent on owned claim | MustNotPartiallyMutate | events: `work.completed`; tables: `work_claims` |
 | `list` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `ready` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `assign` | Sequential | MustNotPartiallyMutate | events: `work.assigned`; tables: `work_claims` |
 
 Concurrency: **PerPaneSerial** — serializable per `claim_id`,
 parallel across distinct claim ids.
@@ -222,20 +222,30 @@ Total conformance harness: **31 always-on tests** (7 profile +
 ## Re-running
 
 ```bash
+# Live dispatch smoke harness (checkpoint + context + work + fleet):
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
+  cargo test -p frankenterm --test robot_ntm_gap_contract_tests \
+  robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture
+
+# Focused native work backend tests:
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-backend \
+  cargo test -p frankenterm --bin ft robot_work_backend_tests -- --nocapture
+
 # State-machine model:
-CARGO_TARGET_DIR=/tmp/ft-pane3-target \
-CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-cargo test -p frankenterm-core --lib robot_work_state_machine:: \
-    --features asupersync-runtime --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-core \
+  cargo test -p frankenterm-core --lib robot_work_state_machine:: \
+  --features asupersync-runtime --no-default-features
 # → 18 passed (incl. exhaustive BFS + 1024-trial random sweep)
 
 # Contract DSL (profile + checkpoint + work):
-cargo test -p frankenterm-core --lib robot_family_contract:: \
-    --features asupersync-runtime --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-contract \
+  cargo test -p frankenterm-core --lib robot_family_contract:: \
+  --features asupersync-runtime --no-default-features
 
 # Conformance harness (all three families):
-cargo test -p frankenterm-core --test robot_family_conformance \
-    --features asupersync-runtime --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-conformance \
+  cargo test -p frankenterm-core --test robot_family_conformance \
+  --features asupersync-runtime --no-default-features
 # → 31 passed
 ```
 
@@ -244,13 +254,13 @@ cargo test -p frankenterm-core --test robot_family_conformance \
 | Item | Status |
 |---|---|
 | Contract at docs/robot-contracts/work.md | ✓ |
-| Schema migration for work_claims | ⏳ integration follow-on |
-| Handler with claim/release atomicity | ⏳ integration follow-on |
+| Schema migration for work_claims | ✓ native SQLite `work_claims` table is created by the Robot work adapter |
+| Handler with claim/release atomicity | ✓ focused `robot_work_backend_tests` cover conflict and serialization behavior |
 | Stateright model proving 3 invariants | ✓ (Rust always-on regression net + TLA+ spec) |
 | Differential test against bv | ⏳ uses ft-hac7w.1.1 DifferentialHarness |
-| README E2E example | ⏳ depends on handler wiring |
+| README E2E example | ✓ README implementation-status examples include claim/list/complete |
 | Stateright passes ≥1M random schedules | ✓ (12k always-on; ≥1M with CI multiplier) |
-| ntm fallback removed | ⏳ depends on handler wiring |
+| ntm fallback removed | ✓ live dispatch harness asserts no `robot.not_implemented` fallback |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |
 
 ## Cross-references
@@ -268,7 +278,7 @@ cargo test -p frankenterm-core --test robot_family_conformance \
 - **TLA+ spec:** `docs/specs/robot-work.tla`.
 - **Sibling family contracts:** `profile` (proof-of-concept,
   shipped at `ft-hac7w.1`); `checkpoint` (`ft-hac7w.3`);
-  `context`, `fleet` (open).
+  `context` and `fleet` have graduated from the generic NTM-gap fallback.
 - **Sibling state-space proofs** (same Rust+TLA+ shape):
   `tx_killswitch_model` (`ft-x0666.4`),
   `wire_dedup_model` (`ft-x0666.3`),

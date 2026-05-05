@@ -1,22 +1,22 @@
 # Robot Family Contract: `checkpoint`
 
 **Bead:** [BR-RC-ROBOT-CONTRACT.2] / `ft-hac7w.3`
-**Status:** Foundation slice shipped. Schema-DSL contract +
-state-space proof + TLA+ spec + 9-test conformance harness all
-live; wiring `RobotCommands::Checkpoint` to the existing
-`ft snapshot` + `session_restore` machinery is the integration
-follow-on. ntm differential test (action #5) consumes the
-state-machine model + the
-`crate::robot_ntm_differential::DifferentialHarness` from
-`ft-hac7w.1.1`.
+**Status:** Native adapter shipped under `ft-bs9uh.2`. The Schema-DSL
+contract, state-space proof, TLA+ spec, and conformance harness remain the
+proof substrate; live `RobotCommands::Checkpoint` dispatches to
+`handle_robot_checkpoint_command`, backed by the snapshot/session storage
+surface. `rollback --dry-run` emits a restore plan; non-dry-run rollback is
+approval-blocked until the robot policy gate lands.
 
 ## Family overview
 
 | Action | Idempotency | Failure semantics | Side effects |
 |---|---|---|---|
 | `save` | Idempotent | MustNotPartiallyMutate | events: `checkpoint.saved`; tables: `snapshots` |
-| `rollback` | Sequential (approval-gated) | MustNotPartiallyMutate | events: `checkpoint.rolled_back`; tables: `snapshots`, `session_state`; ipc: `session_restore` |
 | `list` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `show` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `delete` | Sequential | MustNotPartiallyMutate | tables: `snapshots` |
+| `rollback` | Sequential (approval-gated) | MustNotPartiallyMutate | events: `checkpoint.rolled_back`; tables: `snapshots`, `session_state`; ipc: `session_restore` |
 
 Concurrency: **Serializable** per session.
 
@@ -228,20 +228,26 @@ conformance harness has 19 tests, 19 passing.
 ## Re-running
 
 ```bash
+# Live dispatch smoke harness (checkpoint + context + work + fleet):
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
+  cargo test -p frankenterm --test robot_ntm_gap_contract_tests \
+  robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture
+
 # Library tests (state machine + family contract):
-CARGO_TARGET_DIR=/tmp/ft-pane3-target \
-CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-cargo test -p frankenterm-core --lib robot_checkpoint_state_machine:: \
-    --features asupersync-runtime --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-core \
+  cargo test -p frankenterm-core --lib robot_checkpoint_state_machine:: \
+  --features asupersync-runtime --no-default-features
 # → 16 passed
 
-cargo test -p frankenterm-core --lib robot_family_contract:: \
-    --features asupersync-runtime --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-contract \
+  cargo test -p frankenterm-core --lib robot_family_contract:: \
+  --features asupersync-runtime --no-default-features
 # → 13 passed
 
 # Conformance harness (profile + checkpoint families):
-cargo test -p frankenterm-core --test robot_family_conformance \
-    --features asupersync-runtime --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-checkpoint-conformance \
+  cargo test -p frankenterm-core --test robot_family_conformance \
+  --features asupersync-runtime --no-default-features
 # → 19 passed (7 profile + 9 checkpoint contract + 3 state machine)
 ```
 
@@ -253,11 +259,11 @@ cargo test -p frankenterm-core --test robot_family_conformance \
 | TLA+ spec at docs/specs/robot-checkpoint.tla | ✓ |
 | Conformance harness at tests/robot_family_conformance | ✓ (extends existing harness with 9 checkpoint tests + 3 state-machine tests) |
 | State-space proof | ✓ (16 unit tests + 256-trial random schedule sweep) |
-| Wire RobotCommands::Checkpoint to handler | ⏳ integration follow-on (depends on ft snapshot subsystem wiring) |
+| Wire RobotCommands::Checkpoint to handler | ✓ dispatches to `handle_robot_checkpoint_command` |
 | Differential test against ntm checkpoint | ⏳ uses ft-hac7w.1.1 DifferentialHarness; consumes contract's proptest_seeds() |
 | TLC verification passes safety + liveness | ⏳ TLA+ spec shipped; operator runs TLC |
-| ntm fallback removed | ⏳ depends on handler wiring |
-| README E2E example | ⏳ depends on handler wiring |
+| ntm fallback removed | ✓ live dispatch harness asserts no `robot.not_implemented` fallback |
+| README E2E example | ✓ README implementation-status examples include checkpoint save/list/rollback dry-run |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` schema bead |
 
 ## Cross-references
@@ -274,7 +280,8 @@ cargo test -p frankenterm-core --test robot_family_conformance \
   `crates/frankenterm-core/tests/robot_family_conformance.rs`.
 - **TLA+ spec:** `docs/specs/robot-checkpoint.tla`.
 - **Sibling family contracts:** `profile` (proof-of-concept,
-  shipped at `ft-hac7w.1`); `context`, `work`, `fleet` (open).
+  shipped at `ft-hac7w.1`); `context`, `work`, and `fleet`
+  have graduated from the generic NTM-gap fallback.
 - **Sibling state-space proofs** (same Rust+TLA+ shape):
   `tx_killswitch_model` (`ft-x0666.4`),
   `wire_dedup_model` (`ft-x0666.3`).

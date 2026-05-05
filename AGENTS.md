@@ -627,7 +627,7 @@ Calls gated out by the feature return the FT-MCP-style envelope with
 `ok: false`, `error_code: "robot.feature_not_available"`, and a hint
 pointing back at this section.
 
-### Not Yet Implemented
+### Graduated Robot NTM-Gap Families
 
 The original NTM-gap family fallback has been retired for the checkpoint,
 context, work, and live fleet CLI shapes. `ft robot fleet status` and

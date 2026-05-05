@@ -164,16 +164,16 @@ cargo test -p frankenterm-core --test robot_family_conformance \
 # → 53 passed (all 5 families)
 ```
 
-## Bead acceptance status
+## Native handler status
 
 | Item | Status |
 |---|---|
 | Contract at docs/robot-contracts/context.md | ✓ |
-| Schema migrations for pane_contexts + context_rotations | ⏳ integration follow-on |
-| Handler with TX-receipt emission for rotate | ⏳ integration follow-on (state machine is the contract; handler wires to cass-types + session-resume) |
+| Schema for pane_contexts + context_rotations | ✓ native adapter creates the contract tables in the workspace SQLite DB |
+| Handler with TX-receipt emission for rotate | ✓ `ft robot context rotate` records durable receipts and supports `--idempotency-key` replay |
 | Conformance harness with rotation-atomicity focus | ✓ (10 tests + 1024 × 12 random sweep) |
-| ntm fallback removed | ⏳ depends on handler wiring |
-| README E2E example | ⏳ depends on handler wiring |
+| ntm fallback removed | ✓ `RobotCommands::Context` dispatches to the native adapter |
+| README implementation status | ✓ context marked native with scoped storage semantics |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |
 
 ## Cross-references

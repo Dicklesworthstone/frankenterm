@@ -1,12 +1,13 @@
 # Robot Family Contract: `fleet`
 
 **Bead:** [BR-RC-ROBOT-CONTRACT.5] / `ft-hac7w.6`
-**Status:** Foundation slice shipped. Schema-DSL contract +
-TX-engine-integrated state-space proof + TLA+ spec + 12-test
-conformance harness extension all live; wiring
-`RobotCommands::Fleet` to the existing `frankenterm-core-fleet`
-sub-crate + the production TX engine is the integration
-follow-on. **Cross-link to `ft-x0666.4`
+**Status:** Native read adapter shipped under `ft-bs9uh.5`. Live
+`RobotCommands::Fleet` dispatches to `robot_fleet_command_response`: `status`
+and `agents` use native agent-inventory/work-queue read paths, while `scale`
+and `rebalance` parse natively and return typed
+`robot.fleet.capability_unavailable` until daemon-side fleet mutation lands.
+The TX-engine-integrated state-space proof remains the mutation substrate.
+**Cross-link to `ft-x0666.4`
 (`tx_killswitch_model`):** the kill-switch invariant
 `stop_completes_under_kill_switch_hardstop` reuses that proof's
 "HardStop disables forward progress, leaves recovery enabled"
@@ -17,9 +18,9 @@ pattern.
 | Action | Idempotency | Failure semantics | Side effects |
 |---|---|---|---|
 | `status` | Idempotent | MustNotPartiallyMutate | (read-only) |
-| `launch` | Sequential (TX-engine-atomic) | MustNotPartiallyMutate | events: launching/launched/launch_failed/launch_compensated; tables: `fleets`; ipc: `mux`, `tx_engine` |
-| `stop` | Idempotent (TX-engine-atomic) | MustNotPartiallyMutate | events: stopping/stopped/stop_failed; tables: `fleets`; ipc: `mux`, `tx_engine` |
-| `describe` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `agents` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `scale` | Sequential (daemon mutation unavailable) | Typed `robot.fleet.capability_unavailable`; MustNotPartiallyMutate | (none until daemon mutation is wired) |
+| `rebalance` | Sequential (daemon mutation unavailable) | Typed `robot.fleet.capability_unavailable`; MustNotPartiallyMutate | (none until daemon mutation is wired) |
 
 Concurrency: **PerPaneSerial** — serializable per `fleet_id`,
 parallel across distinct fleets.
@@ -150,16 +151,25 @@ Total conformance harness: **43 always-on tests** (7 profile +
 ## Re-running
 
 ```bash
+# Live dispatch smoke harness (checkpoint + context + work + fleet):
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
+  cargo test -p frankenterm --test robot_ntm_gap_contract_tests \
+  robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture
+
+# Focused native fleet response tests:
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-fleet-backend \
+  cargo test -p frankenterm --bin ft robot_fleet -- --nocapture
+
 # State-machine model:
-CARGO_TARGET_DIR=/tmp/ft-pane3-target \
-CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-cargo test -p frankenterm-core --lib robot_fleet_state_machine:: \
-    --features asupersync-runtime --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-fleet-core \
+  cargo test -p frankenterm-core --lib robot_fleet_state_machine:: \
+  --features asupersync-runtime --no-default-features
 # → 12 passed (incl. random schedule sweep with kill-switch flips)
 
 # Conformance harness (all four families):
-cargo test -p frankenterm-core --test robot_family_conformance \
-    --features asupersync-runtime --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-fleet-conformance \
+  cargo test -p frankenterm-core --test robot_family_conformance \
+  --features asupersync-runtime --no-default-features
 # → 43 passed
 ```
 
@@ -168,10 +178,11 @@ cargo test -p frankenterm-core --test robot_family_conformance \
 | Item | Status |
 |---|---|
 | Contract at docs/robot-contracts/fleet.md | ✓ |
-| Status/describe wired to fleet_dashboard | ⏳ integration follow-on |
-| Launch/stop wired through TX engine | ⏳ integration follow-on (state-machine model is ready; tx_execution.rs wiring is the substrate) |
+| Status/agents wired to native reads | ✓ `status` and `agents` use native inventory/work-queue summaries |
+| Scale/rebalance parse natively | ✓ return typed `robot.fleet.capability_unavailable` until daemon-side mutation is wired |
+| Launch/stop wired through TX engine | ⏳ deferred daemon mutation path; state-machine model is ready and tx_execution.rs is the substrate |
 | Conformance harness with TX kill-switch interleavings | ✓ (cross-links to ft-x0666.4 via stop_completes_under_kill_switch_hardstop invariant + harness test) |
-| E2E example | ⏳ depends on handler wiring |
+| E2E example | ✓ README implementation-status examples include status/agents/scale dry-run |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |
 
 ## Cross-references
@@ -193,4 +204,5 @@ cargo test -p frankenterm-core --test robot_family_conformance \
 - **TLA+ spec:** `docs/specs/robot-fleet.tla`.
 - **Sibling family contracts:** `profile` (`ft-hac7w.1`);
   `checkpoint` (`ft-hac7w.3`); `work` (`ft-hac7w.5`);
-  `context` (`ft-hac7w.4`, open).
+  `context` (`ft-hac7w.4`), now graduated from the generic
+  NTM-gap fallback.
