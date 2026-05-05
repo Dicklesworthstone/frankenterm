@@ -15,13 +15,21 @@
 
 use std::collections::HashMap;
 
+use frankenterm_core::fleet_memory_controller::{
+    FleetMemoryTier, FleetMemoryTierBudgetRecord, FleetMemoryTierBudgetSnapshot, FleetPressureTier,
+};
+use frankenterm_core::latency_stages::{LatencyStage, StagePressure};
+use frankenterm_core::priority::PanePriority;
 use frankenterm_core::swarm_pipeline::{
     BackoffStrategy, CompensatingAction, CompensationKind, HookHandler, HookPhase,
     HookRegistration, HookRegistry, PipelineDefinition, PipelineExecutor, PipelineStatus,
     PipelineStep, RecoveryPolicy, StepAction, StepStatus,
 };
 use frankenterm_core::swarm_scheduler::{
-    SchedulerConfig, SchedulerDecision, SwarmScheduler, compute_queue_pressure,
+    AdmissionAction, AdmissionReasonCode, AdmissionRequest, HerdWaveDetectionConfig,
+    HerdWaveEventKind, HerdWaveSignal, MissionCriticality, QueuePressure, SchedulerConfig,
+    SchedulerDecision, SwarmAdmissionController, SwarmAdmissionTelemetry, SwarmScheduler,
+    compute_queue_pressure, plan_herd_wave_staggered_actions,
 };
 use frankenterm_core::swarm_work_queue::{
     SwarmWorkQueue, WorkItem, WorkItemStatus, WorkQueueConfig,
@@ -89,6 +97,22 @@ fn noop_pipeline_step(label: &str) -> PipelineStep {
     }
 }
 
+fn sim_healthy_tier_budget() -> FleetMemoryTierBudgetSnapshot {
+    FleetMemoryTierBudgetSnapshot::from_tiers([FleetMemoryTierBudgetRecord::new(
+        FleetMemoryTier::HotResident,
+        1_000,
+        500,
+    )])
+}
+
+fn sim_healthy_stage_pressure() -> Vec<StagePressure> {
+    vec![StagePressure::compute(
+        LatencyStage::PtyCapture,
+        400.0,
+        1_000.0,
+    )]
+}
+
 /// Structured log emitter for simulation events.
 fn emit_sim_log(scenario_id: &str, correlation_id: &str, metric: &str, value: &str, outcome: &str) {
     let payload = serde_json::json!({
@@ -121,6 +145,132 @@ fn gini_coefficient(values: &[u32]) -> f64 {
         numerator += (2.0f64.mul_add(i as f64 + 1.0, -n) - 1.0) * val;
     }
     numerator / (n * sum)
+}
+
+#[test]
+fn sim_herd_wave_replay_staggers_synchronized_actions_with_diagnostics_ft_wks87() {
+    let scenario = "sim.herd_wave_replay_stagger";
+    let config = HerdWaveDetectionConfig {
+        detection_window_ms: 250,
+        min_distinct_panes: 3,
+        elevated_distinct_panes: 3,
+        critical_distinct_panes: 4,
+        emergency_distinct_panes: 8,
+        base_stagger_ms: 500,
+        max_stagger_ms: 2_000,
+    };
+    let synchronized = vec![
+        HerdWaveSignal::pane(90, HerdWaveEventKind::Compaction, 9_700),
+        HerdWaveSignal::pane(10, HerdWaveEventKind::Compaction, 10_000),
+        HerdWaveSignal::pane(11, HerdWaveEventKind::Compaction, 10_030),
+        HerdWaveSignal::pane(12, HerdWaveEventKind::Retry, 10_060),
+        HerdWaveSignal::pane(13, HerdWaveEventKind::WorkflowFanout, 10_090),
+        HerdWaveSignal::pane(10, HerdWaveEventKind::Retry, 10_100),
+    ];
+
+    let plan = plan_herd_wave_staggered_actions(&synchronized, &config);
+
+    assert!(plan.summary.detected);
+    assert_eq!(plan.summary.pressure_tier, FleetPressureTier::Critical);
+    assert_eq!(plan.summary.distinct_panes, 4);
+    assert_eq!(plan.summary.event_count, 5);
+    assert_eq!(plan.actions.len(), 4);
+    assert_eq!(plan.actions[0].pane_id, 10);
+    assert_eq!(plan.actions[0].delay_ms, 0);
+    assert_eq!(plan.actions[1].delay_ms, 500);
+    assert_eq!(plan.actions[2].delay_ms, 1_000);
+    assert_eq!(plan.actions[3].delay_ms, 1_500);
+    assert_eq!(plan.actions[3].delay_ms, plan.summary.cohort_max_stagger_ms);
+
+    let latest = plan
+        .summary
+        .last_seen_ms
+        .expect("detected plan has last timestamp");
+    for window in plan.actions.windows(2) {
+        assert!(
+            window[0].scheduled_at_ms < window[1].scheduled_at_ms,
+            "stagger plan must smooth synchronized actions into increasing schedule slots"
+        );
+    }
+    assert!(
+        plan.actions
+            .iter()
+            .all(|action| action.scheduled_at_ms >= latest)
+    );
+
+    let controller = SwarmAdmissionController::default();
+    let telemetry = SwarmAdmissionTelemetry::new(
+        QueuePressure {
+            ready_ratio: 0.10,
+            utilization: 0.10,
+            starvation_count: 0,
+            failure_rate: 0.0,
+            pending_items: 4,
+            active_agents: 4,
+            total_capacity: 12,
+        },
+        FleetPressureTier::Normal,
+        sim_healthy_tier_budget(),
+        sim_healthy_stage_pressure(),
+    )
+    .with_herd_wave_pressure(plan.summary.clone());
+
+    let decisions: Vec<_> = plan
+        .actions
+        .iter()
+        .map(|action| {
+            let request = AdmissionRequest {
+                pane_id: Some(action.pane_id),
+                pane_priority: PanePriority::Background,
+                mission_criticality: MissionCriticality::Background,
+                work_priority: 9,
+                estimated_effort: 1,
+                operator_priority_override: false,
+            };
+            controller.evaluate(&request, &telemetry)
+        })
+        .collect();
+
+    assert_eq!(decisions.len(), plan.actions.len());
+    assert!(decisions.iter().all(|decision| {
+        decision.action == AdmissionAction::Degrade
+            && decision
+                .reason_codes
+                .contains(&AdmissionReasonCode::HerdWavePressure)
+            && decision.herd_wave_recommended_stagger_ms == Some(config.base_stagger_ms)
+            && decision.herd_wave_cohort_max_stagger_ms == Some(1_500)
+    }));
+
+    let diagnostics = serde_json::json!({
+        "scenario_id": scenario,
+        "plan": plan,
+        "decisions": decisions,
+    });
+    let diagnostic_json =
+        serde_json::to_string(&diagnostics).expect("serialize herd-wave replay diagnostics");
+    assert!(diagnostic_json.contains("\"scheduled_at_ms\""));
+    assert!(diagnostic_json.contains("\"herd_wave_pressure\":\"critical\""));
+    assert!(diagnostic_json.contains("\"herd_wave_recommended_stagger_ms\":500"));
+    assert!(diagnostic_json.contains("\"action\":\"degrade\""));
+
+    emit_sim_log(
+        scenario,
+        "herd-wave-001",
+        "staggered_actions",
+        &diagnostics["plan"]["actions"]
+            .as_array()
+            .unwrap()
+            .len()
+            .to_string(),
+        "pass",
+    );
+    emit_sim_log(
+        scenario,
+        "herd-wave-001",
+        "diagnostics_bytes",
+        &diagnostic_json.len().to_string(),
+        "pass",
+    );
 }
 
 // =============================================================================

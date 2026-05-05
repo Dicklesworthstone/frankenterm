@@ -215,6 +215,32 @@ pub struct HerdWavePressureSummary {
     pub cohort_max_stagger_ms: u64,
 }
 
+/// One pane action scheduled after smoothing a synchronized herd wave.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveStaggeredAction {
+    /// Pane whose synchronized signal is being staggered.
+    pub pane_id: u64,
+    /// Event family that put this pane into the active cohort.
+    pub kind: HerdWaveEventKind,
+    /// Original signal timestamp in epoch milliseconds.
+    pub observed_at_ms: u64,
+    /// Deterministic cohort order used for delay computation.
+    pub cohort_rank: u32,
+    /// Delay applied before this pane's follow-up action may run.
+    pub delay_ms: u64,
+    /// Absolute scheduled timestamp after smoothing.
+    pub scheduled_at_ms: u64,
+}
+
+/// Replayable herd-wave smoothing plan with operator-facing diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveStaggerPlan {
+    /// Detection summary that produced this plan.
+    pub summary: HerdWavePressureSummary,
+    /// Deterministically staggered pane actions for the detected cohort.
+    pub actions: Vec<HerdWaveStaggeredAction>,
+}
+
 /// Compute a bounded per-rank stagger delay for a herd-wave cohort.
 #[must_use]
 pub fn herd_wave_stagger_delay_ms(cohort_rank: u32, config: &HerdWaveDetectionConfig) -> u64 {
@@ -1725,6 +1751,72 @@ fn push_reason(reasons: &mut Vec<AdmissionReasonCode>, reason: AdmissionReasonCo
     if !reasons.contains(&reason) {
         reasons.push(reason);
     }
+}
+
+/// Build a deterministic smoothing plan for the active herd-wave cohort.
+///
+/// The plan intentionally keeps one action per distinct pane in the active
+/// window. Repeated signals from the same pane are diagnostic evidence for the
+/// wave but must not duplicate follow-up work for that pane.
+#[must_use]
+pub fn plan_herd_wave_staggered_actions(
+    signals: &[HerdWaveSignal],
+    config: &HerdWaveDetectionConfig,
+) -> HerdWaveStaggerPlan {
+    let summary = detect_herd_wave_pressure(signals, config);
+    if !summary.detected {
+        return HerdWaveStaggerPlan {
+            summary,
+            actions: Vec::new(),
+        };
+    }
+
+    let latest_ms = summary.last_seen_ms.unwrap_or(0);
+    let window_start_ms = latest_ms.saturating_sub(config.detection_window_ms);
+    let mut earliest_by_pane: BTreeMap<u64, (u64, HerdWaveEventKind)> = BTreeMap::new();
+
+    for signal in signals
+        .iter()
+        .filter(|signal| signal.timestamp_ms >= window_start_ms && signal.timestamp_ms <= latest_ms)
+    {
+        let Some(pane_id) = signal.pane_id else {
+            continue;
+        };
+        let candidate = (signal.timestamp_ms, signal.kind);
+        earliest_by_pane
+            .entry(pane_id)
+            .and_modify(|existing| {
+                if candidate < *existing {
+                    *existing = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+
+    let mut cohort: Vec<_> = earliest_by_pane
+        .into_iter()
+        .map(|(pane_id, (observed_at_ms, kind))| (observed_at_ms, pane_id, kind))
+        .collect();
+    cohort.sort_unstable();
+
+    let actions = cohort
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (observed_at_ms, pane_id, kind))| {
+            let cohort_rank = saturating_usize_to_u32(rank);
+            let delay_ms = herd_wave_stagger_delay_ms(cohort_rank, config);
+            HerdWaveStaggeredAction {
+                pane_id,
+                kind,
+                observed_at_ms,
+                cohort_rank,
+                delay_ms,
+                scheduled_at_ms: latest_ms.saturating_add(delay_ms),
+            }
+        })
+        .collect();
+
+    HerdWaveStaggerPlan { summary, actions }
 }
 
 fn herd_wave_pressure_tier(
