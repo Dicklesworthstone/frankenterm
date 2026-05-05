@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -830,6 +830,8 @@ pub struct RuntimeMetrics {
     cursor_snapshot_bytes_last: ShardedGauge,
     /// Recent cursor snapshot bytes for percentile telemetry.
     cursor_snapshot_recent_bytes: StdMutex<VecDeque<u64>>,
+    /// Last observed capture pipeline queue depth.
+    capture_queue_depth: AtomicUsize,
     /// Total native pane output events received (pre-coalesce).
     native_output_input_events: ShardedCounter,
     /// Total native pane output batches emitted (post-coalesce).
@@ -881,6 +883,7 @@ impl Default for RuntimeMetrics {
             cursor_snapshot_recent_bytes: StdMutex::new(VecDeque::with_capacity(
                 TELEMETRY_PERCENTILE_WINDOW_CAPACITY,
             )),
+            capture_queue_depth: AtomicUsize::new(0),
             native_output_input_events: ShardedCounter::new(),
             native_output_batches_emitted: ShardedCounter::new(),
             native_output_input_bytes: ShardedCounter::new(),
@@ -933,6 +936,17 @@ impl RuntimeMetrics {
         self.cursor_snapshot_bytes_max.observe(total_bytes);
         self.cursor_snapshot_bytes_last.set(total_bytes);
         record_bounded_sample(&self.cursor_snapshot_recent_bytes, total_bytes);
+    }
+
+    /// Record the latest capture pipeline depth observed by the relay task.
+    pub fn record_capture_queue_depth(&self, depth: usize) {
+        self.capture_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Last capture pipeline depth observed by the relay task.
+    #[must_use]
+    pub fn capture_queue_depth(&self) -> usize {
+        self.capture_queue_depth.load(Ordering::Relaxed)
     }
 
     pub fn record_native_output_input(&self, bytes: usize) {
@@ -1357,6 +1371,10 @@ impl ObservationRuntime {
 
         // Clone ingress sender for queue depth instrumentation before moving it.
         let capture_tx_probe = capture_ingress_tx.clone();
+        let capture_queue_capacity = capture_ingress_tx
+            .capacity()
+            .saturating_add(capture_ring_tx.capacity())
+            .saturating_add(1);
 
         // Spawn discovery task
         let discovery_handle = self.spawn_discovery_task();
@@ -1401,7 +1419,7 @@ impl ObservationRuntime {
         );
 
         // Spawn maintenance task
-        let maintenance_handle = self.spawn_maintenance_task(capture_tx_probe.clone());
+        let maintenance_handle = self.spawn_maintenance_task(capture_queue_capacity);
 
         // Spawn snapshot engine task (session persistence) if configured
         let (snapshot_handle, snapshot_shutdown_tx, snapshot_triggers) =
@@ -1477,6 +1495,7 @@ impl ObservationRuntime {
             event_bus: self.event_bus.clone(),
             heartbeats: Arc::clone(&self.heartbeats),
             capture_tx: capture_tx_probe,
+            capture_queue_capacity,
             wezterm_handle: Arc::clone(&self.wezterm_handle),
             native_events: native_handle,
             scheduler_snapshot: Arc::clone(&self.scheduler_snapshot),
@@ -1609,7 +1628,7 @@ impl ObservationRuntime {
     }
 
     /// Spawn the maintenance task.
-    fn spawn_maintenance_task(&self, capture_tx: mpsc::Sender<CaptureEvent>) -> JoinHandle<()> {
+    fn spawn_maintenance_task(&self, capture_queue_capacity: usize) -> JoinHandle<()> {
         let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let wezterm_handle = self.wezterm_handle.clone();
@@ -1916,8 +1935,8 @@ impl ObservationRuntime {
                     let cursor_snapshot_bytes = health_panes.cursor_snapshot_bytes;
                     metrics.record_cursor_snapshot_memory(cursor_snapshot_bytes);
 
-                    let capture_cap = mpsc_max_capacity(&capture_tx);
-                    let capture_depth = capture_cap.saturating_sub(capture_tx.capacity());
+                    let capture_cap = capture_queue_capacity;
+                    let capture_depth = metrics.capture_queue_depth();
 
                     let (write_depth, write_cap, db_writable) = {
                         let wd = storage.write_queue_depth();
@@ -3009,10 +3028,12 @@ impl ObservationRuntime {
         capture_ring_tx: SpscProducer<CaptureEvent>,
     ) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let metrics = Arc::clone(&self.metrics);
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             loop {
+                record_capture_pipeline_depth(&metrics, &capture_ingress_rx, &capture_ring_tx, 0);
                 match runtime_timeout(
                     &loop_cx,
                     Duration::from_millis(25),
@@ -3021,6 +3042,12 @@ impl ObservationRuntime {
                 .await
                 {
                     Ok(RecvEvent::Item(event)) => {
+                        record_capture_pipeline_depth(
+                            &metrics,
+                            &capture_ingress_rx,
+                            &capture_ring_tx,
+                            1,
+                        );
                         if shutdown_flag.load(Ordering::SeqCst) {
                             debug!(
                                 "Capture relay: shutdown signal received, draining remaining events"
@@ -3029,9 +3056,16 @@ impl ObservationRuntime {
 
                         // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
                         if capture_ring_tx.send_with_cx(&loop_cx, event).await.is_err() {
+                            metrics.record_capture_queue_depth(0);
                             debug!("Capture relay: persistence ring closed");
                             return;
                         }
+                        record_capture_pipeline_depth(
+                            &metrics,
+                            &capture_ingress_rx,
+                            &capture_ring_tx,
+                            0,
+                        );
                     }
                     Ok(RecvEvent::Closed) => break,
                     Ok(RecvEvent::Cancelled) => {
@@ -3046,6 +3080,7 @@ impl ObservationRuntime {
                 }
             }
 
+            metrics.record_capture_queue_depth(capture_ring_tx.depth());
             capture_ring_tx.close();
             debug!("Capture relay exited");
         })
@@ -3078,6 +3113,7 @@ impl ObservationRuntime {
 
             // Process events until producer is closed and the ring is drained.
             while let Some(event) = capture_rx.recv().await {
+                metrics.record_capture_queue_depth(capture_rx.depth());
                 heartbeats.record_persistence();
                 // Check shutdown flag - if set, drain remaining events quickly
                 if shutdown_flag.load(Ordering::SeqCst) {
@@ -3306,6 +3342,8 @@ impl ObservationRuntime {
                     }
                 }
             }
+
+            metrics.record_capture_queue_depth(0);
         })
     }
 
@@ -3654,8 +3692,10 @@ pub struct RuntimeHandle {
     pub event_bus: Option<Arc<EventBus>>,
     /// Heartbeat registry for watchdog monitoring
     pub heartbeats: Arc<HeartbeatRegistry>,
-    /// Capture channel sender (cloned for queue depth instrumentation)
+    /// Capture ingress sender retained for runtime-handle lifetime and capacity checks.
     capture_tx: mpsc::Sender<CaptureEvent>,
+    /// Combined capacity of the capture ingress queue, relay slot, and persistence ring.
+    capture_queue_capacity: usize,
     /// WezTerm interface handle for health/warning probes.
     wezterm_handle: WeztermHandle,
     /// Shared scheduler snapshot for health reporting (written by capture task).
@@ -4120,17 +4160,31 @@ fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
     tx.capacity()
 }
 
+fn record_capture_pipeline_depth(
+    metrics: &RuntimeMetrics,
+    capture_ingress_rx: &mpsc::Receiver<CaptureEvent>,
+    capture_ring_tx: &SpscProducer<CaptureEvent>,
+    relay_in_flight: usize,
+) {
+    let depth = capture_ingress_rx
+        .len()
+        .saturating_add(capture_ring_tx.depth())
+        .saturating_add(relay_in_flight);
+    metrics.record_capture_queue_depth(depth);
+}
+
 impl RuntimeHandle {
     /// Current capture channel queue depth (pending items waiting for persistence).
     #[must_use]
     pub fn capture_queue_depth(&self) -> usize {
-        mpsc_max_capacity(&self.capture_tx).saturating_sub(self.capture_tx.capacity())
+        self.metrics.capture_queue_depth()
     }
 
     /// Maximum capture channel capacity.
     #[must_use]
     pub fn capture_queue_capacity(&self) -> usize {
-        mpsc_max_capacity(&self.capture_tx)
+        debug_assert!(self.capture_queue_capacity >= mpsc_max_capacity(&self.capture_tx));
+        self.capture_queue_capacity
     }
 
     /// Current write queue depth (pending commands for the storage writer thread).
@@ -4530,12 +4584,15 @@ impl RuntimeHandle {
         RuntimeLockMemoryTelemetrySnapshot::update_global(self.metrics.lock_memory_snapshot());
     }
 
-    /// Take ownership of the storage handle for external shutdown.
+    /// Clone the storage handle for external shutdown coordination.
     ///
-    /// The caller is responsible for shutdown. This invalidates the runtime.
+    /// `RuntimeHandle` has a defensive `Drop` impl, so this method cannot move
+    /// the field out directly. Consuming `self` still drops the runtime handle
+    /// and aborts any task handles left in place; the returned `StorageHandle`
+    /// is the caller's handle for any follow-up storage shutdown work.
     #[must_use]
     pub fn take_storage(self) -> StorageHandle {
-        self.storage
+        self.storage.clone()
     }
 
     /// Apply a hot-reloadable config update.
@@ -5079,6 +5136,18 @@ mod tests {
         rx.recv(&cx).await.expect("test mpsc recv should succeed")
     }
 
+    fn test_capture_event(seq: u64) -> CaptureEvent {
+        CaptureEvent {
+            segment: CapturedSegment {
+                pane_id: 1,
+                seq,
+                content: "test".to_string(),
+                kind: crate::ingest::CapturedSegmentKind::Delta,
+                captured_at: epoch_ms(),
+            },
+        }
+    }
+
     fn temp_db_path() -> (TempDir, String) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.db").to_string_lossy().to_string();
@@ -5124,6 +5193,7 @@ mod tests {
             event_bus: None,
             heartbeats: Arc::clone(&runtime.heartbeats),
             capture_tx,
+            capture_queue_capacity: 1,
             wezterm_handle: runtime.wezterm_handle.clone(),
             scheduler_snapshot: Arc::clone(&runtime.scheduler_snapshot),
         };
@@ -6548,16 +6618,38 @@ mod tests {
     }
 
     #[test]
-    fn mpsc_queue_depth_computation_is_correct() {
-        // Validates queue depth accounting for a fixed-capacity channel.
+    fn mpsc_sender_capacity_is_not_queue_depth() {
+        // asupersync Sender::capacity reports fixed channel capacity, not
+        // remaining capacity. Runtime queue depth must come from receiver-side
+        // observation published through RuntimeMetrics.
         let (tx, _rx) = mpsc::channel::<u8>(16);
-        #[allow(unused_variables)]
-        let max_cap = 16usize;
-        assert_eq!(max_cap, 16);
+        assert_eq!(mpsc_max_capacity(&tx), 16);
+        assert_eq!(tx.capacity(), 16);
+    }
 
-        // Empty queue: depth should be 0
-        let depth = max_cap - tx.capacity();
-        assert_eq!(depth, 0);
+    #[test]
+    fn runtime_metrics_records_capture_queue_depth() {
+        let metrics = RuntimeMetrics::default();
+
+        assert_eq!(metrics.capture_queue_depth(), 0);
+        metrics.record_capture_queue_depth(3);
+        assert_eq!(metrics.capture_queue_depth(), 3);
+        metrics.record_capture_queue_depth(1);
+        assert_eq!(metrics.capture_queue_depth(), 1);
+    }
+
+    #[test]
+    fn capture_pipeline_depth_includes_ingress_ring_and_relay_slot() {
+        let metrics = RuntimeMetrics::default();
+        let (ingress_tx, ingress_rx) = mpsc::channel(4);
+        let (ring_tx, _ring_rx) = spsc_channel(4);
+
+        ingress_tx.try_send(test_capture_event(1)).unwrap();
+        ring_tx.try_send(test_capture_event(2)).unwrap();
+
+        record_capture_pipeline_depth(&metrics, &ingress_rx, &ring_tx, 1);
+
+        assert_eq!(metrics.capture_queue_depth(), 3);
     }
 
     #[test]

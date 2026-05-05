@@ -963,6 +963,7 @@ mod tests {
         EventStreamChannel, STREAM_MAX_CONSECUTIVE_DROPS, SseEvent, mpsc,
         parse_event_stream_channel,
     };
+    use crate::runtime_async::CompatRuntime;
     use crate::web_framework::QueryString;
 
     fn default_limits() -> super::super::WebRuntimeLimits {
