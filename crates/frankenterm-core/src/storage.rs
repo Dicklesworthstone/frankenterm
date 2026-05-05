@@ -8389,7 +8389,9 @@ fn dispatch_write_command_raw(
             workspace_id,
             respond,
         } => {
-            let result = consume_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
+            let result = with_writer_backend(conn, |backend| {
+                consume_approval_token_by_code_backend(backend, &code_hash, &workspace_id)
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordMaintenance { record, respond } => {
@@ -13223,57 +13225,38 @@ fn consume_approval_token_sync(
 /// This code-only variant exists for the CLI `ft approve` path where the user
 /// provides a short approval code and the full action context is not available
 /// at consumption time.
-fn consume_approval_token_by_code_sync(
-    conn: &mut Connection,
+fn consume_approval_token_by_code_backend(
+    backend: &dyn StorageBackend,
     code_hash: &str,
     workspace_id: &str,
 ) -> Result<Option<ApprovalTokenRecord>> {
     let now = now_ms();
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
 
-    let sql = "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-               pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
-               FROM approval_tokens
-               WHERE code_hash = ?
-                 AND workspace_id = ?
-                 AND used_at IS NULL
-                 AND expires_at >= ?
-               LIMIT 1";
-
-    let record = {
-        let mut stmt = tx.prepare(sql).map_err(|e| {
-            StorageError::Database(format!("Failed to prepare approval query: {e}"))
-        })?;
-
-        stmt.query_row(
-            params![code_hash, workspace_id, now],
-            approval_token_from_row,
+    let row = backend
+        .query_row_typed(
+            "UPDATE approval_tokens
+             SET used_at = ?3
+             WHERE id = (
+                 SELECT id FROM approval_tokens
+                 WHERE code_hash = ?1
+                   AND workspace_id = ?2
+                   AND used_at IS NULL
+                   AND expires_at >= ?3
+                 LIMIT 1
+             )
+             AND used_at IS NULL
+             RETURNING id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+                       pane_id, action_fingerprint, plan_hash, plan_version, risk_summary",
+            &[
+                ToSqlValue::Text(code_hash),
+                ToSqlValue::Text(workspace_id),
+                ToSqlValue::Integer(now),
+            ],
         )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")))?
-    };
+        .map_err(|err| storage_backend_error("Failed to consume approval token", err))?;
 
-    if let Some(mut record) = record {
-        let updated = tx
-            .execute(
-                "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
-                params![now, record.id],
-            )
-            .map_err(|e| {
-                StorageError::Database(format!("Failed to consume approval token: {e}"))
-            })?;
-
-        if updated == 0 {
-            tx.commit().map_err(|e| {
-                StorageError::Database(format!("Failed to commit approval token: {e}"))
-            })?;
-            return Ok(None);
-        }
-
-        record.used_at = Some(now);
-
+    if let Some(row) = row {
+        let record = approval_token_from_backend_row(&row)?;
         // Warn that this token was consumed without scope validation — the
         // token's action_kind/pane_id may not match what the caller intends
         // to approve. This is expected for the CLI `ft approve` path but
@@ -13287,14 +13270,9 @@ fn consume_approval_token_by_code_sync(
              validation; token's action_kind/pane_id were not checked against \
              the current approval context"
         );
-
-        tx.commit()
-            .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
         return Ok(Some(record));
     }
 
-    tx.commit()
-        .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
     Ok(None)
 }
 
