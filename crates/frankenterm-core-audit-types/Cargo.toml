@@ -23,3 +23,6 @@ tracing.workspace = true
 # crate alongside the rest of recorder metadata (replay-types is itself
 # leaf-tier so the dep is leaf→leaf, no cycles).
 frankenterm-core-replay-types = { path = "../frankenterm-core-replay-types" }
+
+[dev-dependencies]
+toon_rust.workspace = true

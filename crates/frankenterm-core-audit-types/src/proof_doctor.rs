@@ -206,6 +206,22 @@ pub struct ProofDoctorConfigSource {
     pub effective: bool,
 }
 
+/// Observed relationship between the selected RCH binary and required behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofDoctorToolVersionState {
+    /// No version comparison or behavior check was available.
+    Unknown,
+    /// Installed RCH appears to honor the required behavior.
+    InstalledCurrent,
+    /// Installed RCH is stale or contradicts effective configuration.
+    InstalledStale,
+    /// A local patched RCH binary is being used instead of the installed one.
+    PatchedLocal,
+    /// Evidence includes both installed and patched RCH surfaces.
+    Mixed,
+}
+
 /// Active Bead reference observed during preflight.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofDoctorBeadRef {
@@ -250,6 +266,8 @@ pub struct ProofDoctorEvidence {
     pub rch_binary_path: Option<String>,
     /// RCH version.
     pub rch_version: Option<String>,
+    /// Machine-readable installed-vs-patched RCH state.
+    pub tool_version_state: ProofDoctorToolVersionState,
     /// Config source rows.
     pub rch_config_sources: Vec<ProofDoctorConfigSource>,
     /// Effective external-timeout setting.
@@ -292,6 +310,10 @@ pub struct ProofDoctorEvidence {
     pub reservations: Vec<ProofDoctorReservationRef>,
     /// Retained artifact paths.
     pub artifact_paths: Vec<String>,
+    /// First-party paths named by compile/test diagnostics.
+    pub diagnostic_paths: Vec<String>,
+    /// Short redaction-safe compile/test diagnostic summary.
+    pub diagnostic_summary: Option<String>,
     /// High-scale predicate status, when relevant.
     pub high_scale_predicate_met: Option<bool>,
 }
@@ -301,6 +323,7 @@ impl Default for ProofDoctorEvidence {
         Self {
             rch_binary_path: None,
             rch_version: None,
+            tool_version_state: ProofDoctorToolVersionState::Unknown,
             rch_config_sources: Vec::new(),
             rch_external_timeout_enabled: None,
             stale_external_timeout_observed: false,
@@ -322,6 +345,8 @@ impl Default for ProofDoctorEvidence {
             active_beads: Vec::new(),
             reservations: Vec::new(),
             artifact_paths: Vec::new(),
+            diagnostic_paths: Vec::new(),
+            diagnostic_summary: None,
             high_scale_predicate_met: None,
         }
     }
@@ -583,35 +608,47 @@ fn classify_execution_evidence(
     let evidence = &input.evidence;
 
     if evidence.remote_cargo_reached
-        && evidence.rustc_reached
-        && evidence.remote_exit_code == Some(101)
+        && evidence.test_binary_started
+        && evidence.remote_exit_code.is_some_and(|code| code != 0)
     {
+        let message = evidence
+            .diagnostic_summary
+            .as_deref()
+            .unwrap_or("The remote proof command reached assertion execution and failed.");
+        let blocker = diagnostic_blocker(
+            ProofDoctorBlockerKind::TestAssertion,
+            "proof.test.remote_assertion_failed",
+            message,
+            "Fix the behavior or test harness before claiming this lane.",
+            evidence,
+        );
         blockers.push(
-            ProofDoctorBlocker::block(
-                ProofDoctorBlockerKind::SourceCompile,
-                "proof.source.remote_compile_error",
-                "Remote rustc reached first-party code and reported a compile error.",
-                "Handoff to the owner of the first-party source failure; do not claim this proof lane green.",
-            )
-            .with_evidence("remote_exit_code")
-            .with_evidence("rustc_reached"),
+            blocker
+                .with_evidence("remote_exit_code")
+                .with_evidence("test_binary_started"),
         );
         return;
     }
 
     if evidence.remote_cargo_reached
-        && evidence.test_binary_started
-        && evidence.remote_exit_code.is_some_and(|code| code != 0)
+        && evidence.rustc_reached
+        && evidence.remote_exit_code == Some(101)
     {
+        let message = evidence
+            .diagnostic_summary
+            .as_deref()
+            .unwrap_or("Remote rustc reached first-party code and reported a compile error.");
+        let blocker = diagnostic_blocker(
+            ProofDoctorBlockerKind::SourceCompile,
+            "proof.source.remote_compile_error",
+            message,
+            "Handoff to the owner of the first-party source failure; do not claim this proof lane green.",
+            evidence,
+        );
         blockers.push(
-            ProofDoctorBlocker::block(
-                ProofDoctorBlockerKind::TestAssertion,
-                "proof.test.remote_assertion_failed",
-                "The remote proof command reached assertion execution and failed.",
-                "Fix the behavior or test harness before claiming this lane.",
-            )
-            .with_evidence("remote_exit_code")
-            .with_evidence("test_binary_started"),
+            blocker
+                .with_evidence("remote_exit_code")
+                .with_evidence("rustc_reached"),
         );
         return;
     }
@@ -649,6 +686,26 @@ fn classify_execution_evidence(
             .with_evidence("sync_duration_ms"),
         );
     }
+}
+
+fn diagnostic_blocker(
+    blocker_kind: ProofDoctorBlockerKind,
+    reason_code: &str,
+    message: &str,
+    next_action: &str,
+    evidence: &ProofDoctorEvidence,
+) -> ProofDoctorBlocker {
+    let mut blocker = ProofDoctorBlocker::block(blocker_kind, reason_code, message, next_action);
+    for path in &evidence.diagnostic_paths {
+        blocker = blocker.with_path(path.clone());
+    }
+    if !evidence.diagnostic_paths.is_empty() {
+        blocker = blocker.with_evidence("diagnostic_paths");
+    }
+    if evidence.diagnostic_summary.is_some() {
+        blocker = blocker.with_evidence("diagnostic_summary");
+    }
+    blocker
 }
 
 fn classify_dirty_paths(input: &ProofDoctorPreflightInput, blockers: &mut Vec<ProofDoctorBlocker>) {
@@ -867,6 +924,21 @@ fn path_overlaps_prefixes(path: &str, prefixes: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    #[derive(serde::Serialize)]
+    struct TestRobotEnvelope<'a> {
+        ok: bool,
+        data: TestRobotData<'a>,
+        elapsed_ms: u64,
+        version: &'static str,
+        now: u64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestRobotData<'a> {
+        schema_version: u32,
+        verdict: &'a ProofDoctorVerdict,
+    }
+
     fn base_input() -> ProofDoctorPreflightInput {
         ProofDoctorPreflightInput {
             bead_id: Some("ft-wik9p.3".to_string()),
@@ -896,6 +968,95 @@ mod tests {
         }
     }
 
+    fn robot_envelope_value(verdict: &ProofDoctorVerdict) -> serde_json::Value {
+        serde_json::to_value(TestRobotEnvelope {
+            ok: true,
+            data: TestRobotData {
+                schema_version: PROOF_DOCTOR_SCHEMA_VERSION,
+                verdict,
+            },
+            elapsed_ms: 12,
+            version: "0.1.0-test",
+            now: 1_777_960_000,
+        })
+        .expect("serialize proof-doctor test robot envelope")
+    }
+
+    fn status_snapshot(verdict: &ProofDoctorVerdict) -> serde_json::Value {
+        let envelope = robot_envelope_value(verdict);
+        let first_blocker = envelope["data"]["verdict"]["blockers"]
+            .as_array()
+            .and_then(|blockers| blockers.first());
+        let reason_code = first_blocker.map_or(serde_json::Value::Null, |blocker| {
+            blocker["reason_code"].clone()
+        });
+        let blocker_kind = first_blocker.map_or(serde_json::Value::Null, |blocker| {
+            blocker["blocker_kind"].clone()
+        });
+        let affected_path = first_blocker.map_or(serde_json::Value::Null, |blocker| {
+            blocker["affected_paths"][0].clone()
+        });
+
+        serde_json::json!({
+            "ok": envelope["ok"],
+            "schema_version": envelope["data"]["schema_version"],
+            "verdict_schema_version": envelope["data"]["verdict"]["schema_version"],
+            "verdict_id": envelope["data"]["verdict"]["verdict_id"],
+            "status": envelope["data"]["verdict"]["status"],
+            "phase": envelope["data"]["verdict"]["phase"],
+            "reason_code": reason_code,
+            "blocker_kind": blocker_kind,
+            "affected_path": affected_path,
+            "ledger_state": envelope["data"]["verdict"]["ledger_projection"]["state"],
+            "safe_to_close": envelope["data"]["verdict"]["ledger_projection"]["safe_to_close"],
+            "tool_version_state": envelope["data"]["verdict"]["evidence"]["tool_version_state"],
+        })
+    }
+
+    fn core_status_verdicts() -> Vec<ProofDoctorVerdict> {
+        let runnable = classify_proof_doctor(&base_input());
+
+        let mut infra = base_input();
+        infra.phase = ProofDoctorPhase::TerminalClassified;
+        infra.evidence.tool_version_state = ProofDoctorToolVersionState::InstalledStale;
+        infra.evidence.selected_worker = Some("vmi1152480".to_string());
+        infra.evidence.sync_duration_ms = Some(176_008);
+        infra.evidence.wrapper_exit_code = Some(127);
+        let infra = classify_proof_doctor(&infra);
+
+        let mut source = base_input();
+        source.phase = ProofDoctorPhase::TerminalClassified;
+        source.evidence.tool_version_state = ProofDoctorToolVersionState::PatchedLocal;
+        source.evidence.remote_cargo_reached = true;
+        source.evidence.rustc_reached = true;
+        source.evidence.remote_exit_code = Some(101);
+        source.evidence.diagnostic_paths =
+            vec!["crates/frankenterm-core/src/resource_pressure_clock_timer_chaos.rs".to_string()];
+        source.evidence.diagnostic_summary =
+            Some("Remote rustc reported a missing field initializer.".to_string());
+        let source = classify_proof_doctor(&source);
+
+        let mut dirty = base_input();
+        dirty.evidence.dirty_paths.push(ProofDoctorDirtyPath {
+            path: "crates/frankenterm-core-audit-types/src/proof_doctor.rs".to_string(),
+            status: "M".to_string(),
+            affects_proof: false,
+            owner: Some(ProofDoctorOwner::Bead {
+                bead_id: "ft-wik9p.6".to_string(),
+                assignee: Some("OliveChapel".to_string()),
+            }),
+        });
+        let dirty = classify_proof_doctor(&dirty);
+
+        let mut inconclusive = base_input();
+        inconclusive.phase = ProofDoctorPhase::LaunchObserved;
+        inconclusive.evidence.selected_worker = Some("vmi1156319".to_string());
+        inconclusive.evidence.sync_duration_ms = Some(225_197);
+        let inconclusive = classify_proof_doctor(&inconclusive);
+
+        vec![runnable, infra, source, dirty, inconclusive]
+    }
+
     #[test]
     fn clean_direct_rch_lane_is_runnable() {
         let verdict = classify_proof_doctor(&base_input());
@@ -918,11 +1079,41 @@ mod tests {
     }
 
     #[test]
+    fn pre_cargo_timeout_wrapper_is_infra_blocked_not_source_blocked() {
+        let mut input = base_input();
+        input.phase = ProofDoctorPhase::TerminalClassified;
+        input.evidence.selected_worker = Some("vmi1149989".to_string());
+        input.evidence.sync_duration_ms = Some(180_611);
+        input.evidence.wrapper_exit_code = Some(127);
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::InfraBlocked);
+        assert_ne!(verdict.status, ProofDoctorStatus::SourceBlocked);
+        assert_eq!(
+            verdict.blockers[0].blocker_kind,
+            ProofDoctorBlockerKind::RemoteLaunch
+        );
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.rch.pre_cargo_timeout_exec_missing"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::InfraBlockedPreCargo)
+        );
+    }
+
+    #[test]
     fn stale_external_timeout_config_blocks_preflight() {
         let mut input = base_input();
         input.evidence.rch_binary_path = Some("/Users/jemanuel/.local/bin/rch".to_string());
         input.evidence.rch_external_timeout_enabled = Some(false);
         input.evidence.stale_external_timeout_observed = true;
+        input.evidence.tool_version_state = ProofDoctorToolVersionState::InstalledStale;
         input
             .evidence
             .rch_config_sources
@@ -946,6 +1137,28 @@ mod tests {
                 .as_ref()
                 .map(|projection| projection.state),
             Some(ProofState::InfraBlockedPreCargo)
+        );
+    }
+
+    #[test]
+    fn patched_local_rch_tool_state_is_visible_without_blocking() {
+        let mut input = base_input();
+        input.evidence.rch_binary_path = Some("/tmp/rch-config-patch-target/debug/rch".to_string());
+        input.evidence.rch_version = Some("1.0.24+32a0ea5".to_string());
+        input.evidence.rch_external_timeout_enabled = Some(false);
+        input.evidence.tool_version_state = ProofDoctorToolVersionState::PatchedLocal;
+
+        let verdict = classify_proof_doctor(&input);
+        let json = serde_json::to_value(&verdict).expect("serialize verdict");
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
+        assert_eq!(
+            json["evidence"]["tool_version_state"].as_str(),
+            Some("patched_local")
+        );
+        assert_eq!(
+            json["evidence"]["rch_binary_path"].as_str(),
+            Some("/tmp/rch-config-patch-target/debug/rch")
         );
     }
 
@@ -1028,6 +1241,55 @@ mod tests {
     }
 
     #[test]
+    fn dirty_untracked_reservation_owner_blocks_with_owner() {
+        let mut input = base_input();
+        input.evidence.dirty_paths.push(ProofDoctorDirtyPath {
+            path: "crates/frankenterm-core-audit-types/src/proof_doctor.rs".to_string(),
+            status: "??".to_string(),
+            affects_proof: true,
+            owner: Some(ProofDoctorOwner::Reservation {
+                agent_name: "CoralBeaver".to_string(),
+                path_pattern: "crates/frankenterm-core-audit-types/src/proof_doctor.rs".to_string(),
+            }),
+        });
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::DirtyTreeBlocked);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.dirty.active_owned_path_overlap"
+        );
+        assert!(matches!(
+            verdict.blockers[0].owner.as_ref(),
+            Some(ProofDoctorOwner::Reservation { .. })
+        ));
+    }
+
+    #[test]
+    fn dirty_untracked_unowned_path_overlap_blocks_without_owner() {
+        let mut input = base_input();
+        input.evidence.dirty_paths.push(ProofDoctorDirtyPath {
+            path: "crates/frankenterm-core-audit-types/src/proof_doctor.rs".to_string(),
+            status: "??".to_string(),
+            affects_proof: false,
+            owner: None,
+        });
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::DirtyTreeBlocked);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.dirty.unowned_path_overlap"
+        );
+        assert!(matches!(
+            verdict.blockers[0].owner.as_ref(),
+            Some(ProofDoctorOwner::Unknown)
+        ));
+    }
+
+    #[test]
     fn sync_without_remote_cargo_is_inconclusive_not_green() {
         let mut input = base_input();
         input.phase = ProofDoctorPhase::LaunchObserved;
@@ -1054,6 +1316,10 @@ mod tests {
         input.evidence.remote_cargo_reached = true;
         input.evidence.rustc_reached = true;
         input.evidence.remote_exit_code = Some(101);
+        input.evidence.diagnostic_paths =
+            vec!["crates/frankenterm-core/src/resource_pressure_clock_timer_chaos.rs".to_string()];
+        input.evidence.diagnostic_summary =
+            Some("Remote rustc reported missing field `external_service_observation`.".to_string());
 
         let verdict = classify_proof_doctor(&input);
 
@@ -1069,5 +1335,178 @@ mod tests {
                 .map(|projection| projection.state),
             Some(ProofState::SourceCompileFail)
         );
+        assert_eq!(
+            verdict.blockers[0].affected_paths,
+            vec!["crates/frankenterm-core/src/resource_pressure_clock_timer_chaos.rs"]
+        );
+        assert!(
+            verdict.blockers[0]
+                .evidence_keys
+                .iter()
+                .any(|key| key == "diagnostic_summary")
+        );
+    }
+
+    #[test]
+    fn remote_test_assertion_failure_maps_to_test_blocked() {
+        let mut input = base_input();
+        input.phase = ProofDoctorPhase::TerminalClassified;
+        input.evidence.remote_cargo_reached = true;
+        input.evidence.rustc_reached = true;
+        input.evidence.test_binary_started = true;
+        input.evidence.remote_exit_code = Some(101);
+        input.evidence.diagnostic_paths =
+            vec!["crates/frankenterm-core-audit-types/src/proof_doctor.rs".to_string()];
+        input.evidence.diagnostic_summary =
+            Some("Remote test assertion failed for stale installed RCH wording.".to_string());
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::TestBlocked);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.test.remote_assertion_failed"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::TestFail)
+        );
+        assert_eq!(
+            verdict.blockers[0].affected_paths,
+            vec!["crates/frankenterm-core-audit-types/src/proof_doctor.rs"]
+        );
+    }
+
+    #[test]
+    fn robot_json_golden_snapshots_cover_core_statuses() {
+        let snapshots = core_status_verdicts()
+            .iter()
+            .map(status_snapshot)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            serde_json::Value::Array(snapshots),
+            serde_json::json!([
+                {
+                    "ok": true,
+                    "schema_version": 1,
+                    "verdict_schema_version": 1,
+                    "verdict_id": "proof-doctor:ft-wik9p.3:proof.runnable",
+                    "status": "runnable",
+                    "phase": "preflight",
+                    "reason_code": null,
+                    "blocker_kind": null,
+                    "affected_path": null,
+                    "ledger_state": "NOT_RUN",
+                    "safe_to_close": false,
+                    "tool_version_state": "unknown",
+                },
+                {
+                    "ok": true,
+                    "schema_version": 1,
+                    "verdict_schema_version": 1,
+                    "verdict_id": "proof-doctor:ft-wik9p.3:proof.rch.pre_cargo_timeout_exec_missing",
+                    "status": "infra_blocked",
+                    "phase": "terminal_classified",
+                    "reason_code": "proof.rch.pre_cargo_timeout_exec_missing",
+                    "blocker_kind": "remote_launch",
+                    "affected_path": null,
+                    "ledger_state": "INFRA_BLOCKED_PRE_CARGO",
+                    "safe_to_close": false,
+                    "tool_version_state": "installed_stale",
+                },
+                {
+                    "ok": true,
+                    "schema_version": 1,
+                    "verdict_schema_version": 1,
+                    "verdict_id": "proof-doctor:ft-wik9p.3:proof.source.remote_compile_error",
+                    "status": "source_blocked",
+                    "phase": "terminal_classified",
+                    "reason_code": "proof.source.remote_compile_error",
+                    "blocker_kind": "source_compile",
+                    "affected_path": "crates/frankenterm-core/src/resource_pressure_clock_timer_chaos.rs",
+                    "ledger_state": "SOURCE_COMPILE_FAIL",
+                    "safe_to_close": false,
+                    "tool_version_state": "patched_local",
+                },
+                {
+                    "ok": true,
+                    "schema_version": 1,
+                    "verdict_schema_version": 1,
+                    "verdict_id": "proof-doctor:ft-wik9p.3:proof.dirty.active_owned_path_overlap",
+                    "status": "dirty_tree_blocked",
+                    "phase": "preflight",
+                    "reason_code": "proof.dirty.active_owned_path_overlap",
+                    "blocker_kind": "dirty_tree",
+                    "affected_path": "crates/frankenterm-core-audit-types/src/proof_doctor.rs",
+                    "ledger_state": "INCONCLUSIVE",
+                    "safe_to_close": false,
+                    "tool_version_state": "unknown",
+                },
+                {
+                    "ok": true,
+                    "schema_version": 1,
+                    "verdict_schema_version": 1,
+                    "verdict_id": "proof-doctor:ft-wik9p.3:proof.rch.sync_not_proof",
+                    "status": "inconclusive",
+                    "phase": "launch_observed",
+                    "reason_code": "proof.rch.sync_not_proof",
+                    "blocker_kind": "artifact_gap",
+                    "affected_path": null,
+                    "ledger_state": "INCONCLUSIVE",
+                    "safe_to_close": false,
+                    "tool_version_state": "unknown",
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn robot_toon_roundtrip_preserves_core_statuses() {
+        for verdict in core_status_verdicts() {
+            let envelope = robot_envelope_value(&verdict);
+            let toon = toon_rust::encode(envelope.clone(), None);
+            let decoded = toon_rust::try_decode(&toon, None).expect("decode proof-doctor toon");
+            let json_str =
+                toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+            let roundtripped: serde_json::Value =
+                serde_json::from_str(&json_str).expect("parse roundtripped toon json");
+
+            assert_eq!(roundtripped["ok"], envelope["ok"]);
+            assert_eq!(
+                roundtripped["data"]["verdict"]["status"],
+                envelope["data"]["verdict"]["status"]
+            );
+            assert_eq!(
+                roundtripped["data"]["verdict"]["phase"],
+                envelope["data"]["verdict"]["phase"]
+            );
+            assert_eq!(
+                roundtripped["data"]["verdict"]["evidence"]["tool_version_state"],
+                envelope["data"]["verdict"]["evidence"]["tool_version_state"]
+            );
+        }
+    }
+
+    #[test]
+    fn human_summaries_stay_concise_and_do_not_overclaim_non_passes() {
+        for verdict in core_status_verdicts() {
+            assert!(
+                verdict.operator_summary.len() <= 120,
+                "summary too long for {:?}: {}",
+                verdict.status,
+                verdict.operator_summary
+            );
+
+            if verdict.status != ProofDoctorStatus::Passed {
+                let summary = verdict.operator_summary.to_ascii_lowercase();
+                assert!(!summary.contains("green"));
+                assert!(!summary.contains("passed"));
+                assert!(!summary.contains("safe to close"));
+            }
+        }
     }
 }
