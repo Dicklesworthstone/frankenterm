@@ -46,14 +46,120 @@ Before sending the first marching order, verify the environment.
 | Agent panes responding | `ntm --robot-snapshot -t frankenterm` | All panes named (cc_1, cc_2, cod_1...) |
 
 **If any pre-flight check fails:**
-- rch unhealthy → fall back to `scripts/cargo-local.sh` per AGENTS.md `RCH — Remote Compilation Helper`.
+- rch unhealthy → for RCH-required proof lanes, record an infra-blocked
+  proof-doctor verdict; use `scripts/cargo-local.sh` only as explicitly
+  labeled local smoke when the Bead allows non-proof diagnostics.
 - Disk >90% → run `scripts/clean-stale-targets.sh` *before* dispatching work, not after.
 - Beads DB locked → wait 10s; if persistent, `lsof .beads/beads.db` to find writer; if no writer, the DB is corrupted (use `bv` for triage instead, per MEMORY.md note `br-db-corruption`).
 - ntm pane missing → relaunch via the project's spawn script before the swarm tick begins.
 
+## 2. Proof-Doctor Gate For Proof Lanes
+
+Use proof-doctor for every Bead whose closeout depends on RCH, Cargo, clippy,
+tests, benches, E2E, high-scale worker predicates, or proof-lane evidence. It
+is the operator vocabulary for separating RCH/tooling blockers, source
+failures, dirty-tree ownership, invalid command shapes, and inconclusive logs.
+
+Primary anchors:
+
+- `docs/proposals/ft-wik9p-proof-doctor-verdict-schema.md` for the status,
+  reason-code, handoff, and robot-mode envelope contract.
+- `docs/proposals/ft-tn6cw-proof-lane-evidence-taxonomy.md` for proof-state
+  truthfulness rules and invalid command-shape examples.
+- `crates/frankenterm-core-audit-types/src/proof_doctor.rs` for the classifier
+  DTOs, JSON/TOON golden coverage, and the E2E fixture scenarios.
+- `crates/frankenterm-core-audit-types/src/proof_handoff.rs` and
+  `crates/frankenterm-core-audit-types/src/proof_lane.rs` for Beads/Agent Mail
+  handoff text and durable ledger projections.
+
+### 2.1 Pre-proof checklist
+
+Before launching or claiming a proof lane:
+
+1. Read the Bead and dependency state with `br show <id> --json`.
+2. Confirm the exact proof backend, command, package/test filter, and
+   `CARGO_TARGET_DIR`. RCH-required lanes use direct remote Cargo argv, for
+   example:
+   ```bash
+   rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target cargo test -p <crate> <filter> -- --nocapture
+   ```
+3. Inspect `git status --short` and active ownership. If a dirty path overlaps
+   the proof scope and belongs to another Bead, agent, or reservation, classify
+   `dirty_tree_blocked` instead of running over it.
+4. Record the RCH binary/tool state, effective timeout setting, selected worker
+   if any, and worker predicate if the proof depends on hardware capacity.
+5. Keep the intended command as argv in the verdict. Do not translate a shell
+   string into proof after the fact.
+
+Invalid for an RCH-required closeout unless retained metadata proves remote
+Cargo started:
+
+```bash
+cargo test ...
+scripts/cargo-local.sh test ...
+rch exec -- bash -lc 'cargo test ...'
+rch exec -- env CARGO_TARGET_DIR=/tmp/foo bash -lc 'cargo test ...'
+```
+
+Local Cargo can be cited only as local smoke or docs-static validation, never
+as remote proof for a Bead whose proof lane requires RCH.
+
+### 2.2 Classify the evidence before claiming it
+
+RCH transfer logs are transfer evidence only:
+
+- "Selected worker" means worker selection happened.
+- "Sync completed" means workspace transfer happened.
+- "Remote Cargo reached" requires retained logs proving Cargo or rustc started
+  on the remote worker.
+- "Tests passed" requires a terminal pass for the intended test or E2E scope
+  plus retained artifacts.
+
+Current scenario mapping:
+
+| Evidence | Proof-doctor status | Required wording |
+| --- | --- | --- |
+| Installed RCH still emits the stale external-timeout wrapper and fails before Cargo | `infra_blocked` | "RCH wrapper/tooling blocked before Cargo; no source verdict." |
+| Patched RCH reaches remote Cargo/rustc, then first-party code fails to compile | `source_blocked` | "Remote Cargo/rustc reached first-party source; source is blocked in `<path>` and owned by `<bead-or-agent>`." |
+| Dirty active file overlaps the proof path and another Bead/agent owns it | `dirty_tree_blocked` | "Dirty owned path blocks attribution; do not run or close this proof without owner release." |
+| RCH selected a worker or synced but there is no retained Cargo/rustc/test evidence | `inconclusive` | "RCH sync completed, but no remote Cargo proof was retained; rerun with fail-closed logging." |
+| Direct RCH Cargo lane exits 0 with complete artifacts and ledger validation | `passed` | "Remote proof passed with retained RCH/Cargo evidence and complete artifacts." |
+
+For `source_blocked`, include the first compiler/test diagnostic path and the
+owner source. For `infra_blocked` before Cargo, do not file source findings
+against the package under test. For `dirty_tree_blocked`, do not edit the
+overlapping file unless the owner releases it or the user explicitly assigns
+the conflict.
+
+### 2.3 Closeout adoption gate
+
+Every future proof-lane Bead closeout must include either:
+
+```text
+Proof-doctor: <status>; phase <phase>; reason <reason_code>; verdict <verdict_id or artifact>; remote Cargo <reached|not reached>; owner <owner or none>; closeout <safe|blocked>.
+```
+
+or an explicit non-applicability sentence:
+
+```text
+Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.
+```
+
+Closeout rules:
+
+- A green claim requires `passed` plus proof-lane ledger validation or equivalent
+  retained artifact evidence.
+- `runnable` is only a preflight result; it is not a pass.
+- `infra_blocked`, `dirty_tree_blocked`, `invalid`, `skipped_not_proven`, and
+  `inconclusive` do not prove source health.
+- `source_blocked` and `test_blocked` are real red results only after remote
+  Cargo/rustc/test execution is positively observed.
+- Beads comments and Agent Mail handoffs should carry the same status,
+  reason code, command, worker/sync/Cargo evidence, owner, and next action.
+
 ---
 
-## 2. Tick #1 — establish baseline
+## 3. Tick #1 — establish baseline
 
 The first tick sets the contract for the session. Skip steps and you
 will pay 30+ minutes recovering shared context later.
@@ -86,11 +192,11 @@ will pay 30+ minutes recovering shared context later.
 
 ---
 
-## 3. Steady-state tick (the 4-minute loop)
+## 4. Steady-state tick (the 4-minute loop)
 
 Every 4 minutes, run this loop. Each step in order; the order matters.
 
-### 3.1 — Run swarm-tick.sh
+### 4.1 — Run swarm-tick.sh
 
 ```bash
 scripts/swarm-tick.sh frankenterm > /tmp/swarm-tick.json
@@ -101,13 +207,13 @@ attribution, ready/in_progress bead counts, disk/usb-nvme percentages.
 It acquires an operator lock so two concurrent operator scripts can't
 corrupt shared state.
 
-### 3.2 — Tail each pane
+### 4.2 — Tail each pane
 
 Read the last ~30 lines from each pane via `tmux capture-pane -p
 -t S:0.N`. Don't skip this — `--robot-is-working` alone won't catch
 the case where a pane is staring at a confirm prompt.
 
-### 3.3 — Classify each pane
+### 4.3 — Classify each pane
 
 | State | Signal | Operator action |
 |-------|--------|-----------------|
@@ -121,7 +227,7 @@ the case where a pane is staring at a confirm prompt.
 in @", "Explain this codebase", etc.). That is **not** stuck. See
 AGENTS.md Rule SO-3.
 
-### 3.4 — Dispatch nudges to idle/stuck panes
+### 4.4 — Dispatch nudges to idle/stuck panes
 
 ```bash
 ntm --robot-send -t frankenterm:0.N "your message here"
@@ -135,7 +241,7 @@ Why two Enters for codex: see AGENTS.md Rule SO-2.
 **Do not** use `ntm --robot-interrupt --interrupt-msg` for cooperative
 nudges; it can crash codex panes (Rule SO-1).
 
-### 3.5 — Reset stalled in_progress beads
+### 4.5 — Reset stalled in_progress beads
 
 Beads in_progress >2h with no commit linkage in the last 30 min are
 candidates for force-release. Per AGENTS.md Rule SO-8:
@@ -151,7 +257,7 @@ candidates for force-release. Per AGENTS.md Rule SO-8:
 Preserving agent autonomy first is what makes the broadcast work.
 Force-releasing immediately erodes trust and wastes work-in-progress.
 
-### 3.6 — Disk pressure check
+### 4.6 — Disk pressure check
 
 If `swarm-tick.json` reports `disk_used_pct >= 96`:
 
@@ -167,7 +273,7 @@ keep the `debug` subdirectory for incremental rebuilds.
 
 ---
 
-## 4. Mode transitions
+## 5. Mode transitions
 
 A swarm session has four modes. The trigger for each transition is
 listed below. Do not skip modes; each one prepares the swarm for the
@@ -186,11 +292,11 @@ monotonically.
 
 ---
 
-## 5. Recovery recipes
+## 6. Recovery recipes
 
 When a pane shows non-steady-state, match the symptom to the recipe.
 
-### 5.1 — Pane shows bare zsh prompt
+### 6.1 — Pane shows bare zsh prompt
 
 The agent process exited (typically codex after a bad
 `--robot-interrupt`). Recover:
@@ -203,13 +309,13 @@ ntm --robot-send -t frankenterm:0.N "Re-dispatching: <original prompt>"
 tmux send-keys -t frankenterm:0.N Enter
 ```
 
-### 5.2 — Pane is rate-limited
+### 6.2 — Pane is rate-limited
 
 The pane's tail shows "rate limited" or similar. Rotate via caam
 (`caam list`, `caam switch <profile>`) and re-dispatch. Save the
 rate-limited account for a future session.
 
-### 5.3 — Context saturation
+### 6.3 — Context saturation
 
 Pane's tail shows the agent referring to early-session context
 ambiguously, or repeats the same approach despite explicit corrections.
@@ -222,12 +328,12 @@ tmux send-keys -t frankenterm:0.N "cc" Enter     # relaunch
 ntm --robot-send -t frankenterm:0.N "<setup prompt + current bead context>"
 ```
 
-### 5.4 — Abandoned in_progress bead
+### 6.4 — Abandoned in_progress bead
 
-Apply the broadcast-first protocol from §3.5. Do not reset the bead's
+Apply the broadcast-first protocol from §4.5. Do not reset the bead's
 assignee until you have given the agent one full tick to respond.
 
-### 5.5 — Beads DB busy / corrupted
+### 6.5 — Beads DB busy / corrupted
 
 `br` returns `database is busy` or `database disk image is malformed`:
 
@@ -237,7 +343,7 @@ assignee until you have given the agent one full tick to respond.
 
 ---
 
-## 6. Convergence detection
+## 7. Convergence detection
 
 Stop when *all four* hold for one full tick:
 
@@ -258,7 +364,7 @@ last 30 minutes of commits include at least one bead-closure commit
 
 ---
 
-## 7. Wind-down — generating the SESSION SUMMARY
+## 8. Wind-down — generating the SESSION SUMMARY
 
 Once convergence is detected:
 
@@ -277,7 +383,7 @@ Once convergence is detected:
 
 ---
 
-## 8. Anti-patterns
+## 9. Anti-patterns
 
 These are the failure modes most often observed. Avoid each one.
 
