@@ -9017,17 +9017,6 @@ const ROBOT_WORK_SELECT_ROW: &str = r#"
     WHERE claim_id = ?1
 "#;
 
-fn robot_work_fetch_row(
-    conn: &rusqlite::Connection,
-    item_id: &str,
-) -> anyhow::Result<Option<RobotWorkRow>> {
-    use rusqlite::OptionalExtension;
-
-    conn.query_row(ROBOT_WORK_SELECT_ROW, [item_id], robot_work_row_from_sql)
-        .optional()
-        .map_err(Into::into)
-}
-
 fn robot_work_fetch_row_tx(
     tx: &rusqlite::Transaction<'_>,
     item_id: &str,
