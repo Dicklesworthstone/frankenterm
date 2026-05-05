@@ -2925,7 +2925,10 @@ pub struct PinnedParams {
 /// Configuration for the auto-tuner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoTuneConfig {
-    /// Whether auto-tuning is enabled.
+    /// Whether auto-tuning may mutate tunable parameters.
+    ///
+    /// Defaults to `false`; operators must opt in before the legacy
+    /// proportional tuner changes live parameters.
     pub enabled: bool,
     /// Tick interval (seconds).
     pub tick_interval_secs: u64,
@@ -2942,7 +2945,7 @@ pub struct AutoTuneConfig {
 impl Default for AutoTuneConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             tick_interval_secs: 30,
             targets: TuningTargets::default(),
             max_change_per_tick: 0.1,
@@ -3120,6 +3123,10 @@ impl AutoTuner {
         self.history.push_back(metrics.clone());
         if self.history.len() > self.config.history_limit {
             self.history.pop_front();
+        }
+
+        if !self.config.enabled {
+            return self.params.clone();
         }
 
         let threshold = self.config.hysteresis_ticks;
@@ -3307,7 +3314,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn default_config() -> AutoTuneConfig {
-        AutoTuneConfig::default()
+        AutoTuneConfig {
+            enabled: true,
+            ..AutoTuneConfig::default()
+        }
     }
 
     fn calm_metrics() -> TunerMetrics {
@@ -4701,11 +4711,34 @@ mod tests {
     #[test]
     fn auto_tune_config_default_values() {
         let cfg = AutoTuneConfig::default();
-        assert!(cfg.enabled);
+        assert!(
+            !cfg.enabled,
+            "auto-tuning must stay disabled unless an operator explicitly enables it"
+        );
         assert_eq!(cfg.tick_interval_secs, 30);
         assert!((cfg.max_change_per_tick - 0.1).abs() < f64::EPSILON);
         assert_eq!(cfg.hysteresis_ticks, 3);
         assert_eq!(cfg.history_limit, 100);
+    }
+
+    #[test]
+    fn disabled_config_observes_history_without_mutating_params_ft_luq3w_6() {
+        let mut tuner = AutoTuner::new(AutoTuneConfig {
+            hysteresis_ticks: 1,
+            ..AutoTuneConfig::default()
+        });
+        let initial = tuner.params().clone();
+
+        for _ in 0..5 {
+            tuner.tick(&high_memory_metrics());
+            tuner.tick(&high_latency_metrics());
+            tuner.tick(&high_cpu_metrics());
+        }
+
+        assert_eq!(tuner.tick_count(), 15);
+        assert_eq!(tuner.history.len(), 15);
+        assert!(tuner.adjustments().is_empty());
+        assert_eq!(tuner.params(), &initial);
     }
 
     #[test]
@@ -5165,7 +5198,7 @@ mod tests {
             ) {
                 let config = AutoTuneConfig {
                     hysteresis_ticks: 1,
-                    ..AutoTuneConfig::default()
+                    ..default_config()
                 };
                 let mut tuner = AutoTuner::new(config);
 
@@ -5198,7 +5231,7 @@ mod tests {
             ) {
                 let config = AutoTuneConfig {
                     hysteresis_ticks: 1,
-                    ..AutoTuneConfig::default()
+                    ..default_config()
                 };
                 let mut tuner = AutoTuner::new(config);
                 let metrics = TunerMetrics {
@@ -5232,7 +5265,7 @@ mod tests {
                 let config = AutoTuneConfig {
                     hysteresis_ticks: 1,
                     max_change_per_tick: 0.1,
-                    ..AutoTuneConfig::default()
+                    ..default_config()
                 };
                 let mut tuner = AutoTuner::new(config);
 
@@ -5262,7 +5295,7 @@ mod tests {
             ) {
                 let config = AutoTuneConfig {
                     hysteresis_ticks: 1,
-                    ..AutoTuneConfig::default()
+                    ..default_config()
                 };
                 let mut tuner = AutoTuner::new(config);
                 tuner.set_pinned(PinnedParams {

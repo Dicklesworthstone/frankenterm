@@ -9,7 +9,73 @@ Before you tune a live deployment:
 - For blessed 10, 50, and 200+ pane starting profiles with exact commands, evidence citations, and escalation rules, start with `docs/ft-xbnl0-5-3-blessed-tuning-playbook.md`.
 - For current rollout posture, hardware-tier defaults, and fallback guidance, use `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`.
 - For incident triage and rollback flow, use `docs/operator-playbook.md`.
+- For telemetry-driven auto-tuning modes, proof labels, and rollback requirements, use `docs/proposals/ft-luq3w-safe-auto-tuning-contract.md`.
 - Treat this file as the knob-level reference, not the release-posture document.
+
+## Auto-Tuning Enablement Gate
+
+Telemetry-driven auto-tuning is not active by default. The library-level
+`AutoTuneConfig::default()` keeps `enabled = false`, and the bounded candidate
+engine starts in `observe` mode. That means a default process may record
+telemetry and decision-shape proof, but it must not mutate live tuning knobs
+unless an operator deliberately opts into a stronger mode.
+
+Operator modes:
+
+| Mode | Live mutation | Use |
+| --- | --- | --- |
+| `disabled` | No | Emergency off switch or normal default. Existing values stay pinned and no candidates are evaluated. |
+| `observe` | No | Collect telemetry and emit would-have-tuned decision records with `would_apply=false`. |
+| `canary` | Canary scope only | Try one registry-approved candidate on a bounded scope with explicit rollback metrics. |
+| `exploration` | Temporary bounded scope | Evaluate one candidate while safety telemetry remains fresh and confidence thresholds pass. |
+| `steady_state` | Yes | Keep a previously proven setting inside a narrow range. Do not enter from `observe` without canary/exploration evidence. |
+| `rollback` | Yes, toward previous safe value only | Restore the last known safe value after regression, stale telemetry, or operator disable. |
+| `cooldown` | No | Pause after rollback or missing telemetry until the unsafe reason clears. |
+
+Enablement rules:
+
+1. Start with `disabled` or `observe`.
+2. Move to `canary` only after the decision log shows fresh telemetry, bounded
+   candidate values, and a rollback metric for the selected knob.
+3. Move to `exploration` or `steady_state` only after remote proof artifacts
+   and retained decision records support the exact profile being enabled.
+4. Pause by switching back to `observe` or `cooldown`; disable by setting the
+   profile to `disabled` or `enabled = false`.
+5. Roll back by entering `rollback`; the controller must restore the previous
+   safe value and then enter `cooldown` before another candidate on that knob.
+
+Reduced replay proof verifies logic, schemas, decision records, and rollback
+behavior. It does not prove high-core/high-memory benefit. When RCH is healthy,
+use this remote-reduced proof shape for the auto-tuning library slice:
+
+```bash
+RCH_NO_UPDATE_CHECK=1 \
+RCH_EXTERNAL_TIMEOUT_ENABLED=false \
+RCH_BUILD_TIMEOUT_SEC=3600 \
+RCH_TEST_TIMEOUT_SEC=3600 \
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-luq3w-auto-tune-target \
+  cargo test -p frankenterm-core --lib --no-default-features auto_tune -- --nocapture
+```
+
+If the local RCH wrapper recovery from `ft-tn6cw.1` is still required, replace
+`rch` with the patched wrapper path and record that exact path in the Beads
+comment and proof artifact. If RCH fails before Cargo starts, classify the
+attempt as an infrastructure blocker, not as a source result.
+
+High-scale proof requires all of the following:
+
+- the same focused auto-tuning test path runs through remote Cargo on a
+  target-class worker or host,
+- retained `ft doctor --json` or equivalent hardware evidence proves the
+  64-core / 256 GiB predicate for that run,
+- replay or live artifacts include before/after latency, memory pressure,
+  queue depth, dropped-work, and decision-log summaries,
+- the proof report records `target_hardware`; otherwise use
+  `skipped_not_proven`.
+
+No README, Beads comment, release note, or operator runbook should claim
+production or high-scale benefit from `local_reduced`, `remote_reduced`, or
+`skipped_not_proven` evidence.
 
 ## Sizing Profiles
 

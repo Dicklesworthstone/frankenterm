@@ -29,9 +29,9 @@ Important existing behavior:
 - `AutoTuner` adjusts five parameters in isolation:
   `poll_interval_ms`, `scrollback_lines`, `snapshot_interval_secs`,
   `pool_size`, and `backpressure_threshold`.
-- `AutoTuneConfig::default()` currently has `enabled: true`; future live
-  fleet wiring must not treat that library default as permission to mutate
-  runtime behavior.
+- `AutoTuneConfig::default()` now has `enabled: false`; live fleet wiring must
+  preserve that operator gate and refuse to mutate runtime behavior unless a
+  profile explicitly opts into a non-default mode.
 - The capacity controller already has opt-in and dry-run fields through
   `SwarmCapacityAdmissionControllerConfig`.
 - High-scale proof claims must stay distinct from local or reduced-mode
@@ -220,6 +220,92 @@ Use these labels consistently in decision records, Beads comments, and docs:
 
 Any future README or operator doc wording must distinguish "supported by local
 reduced proof" from "proven on target-class hardware."
+
+## Operator Enablement and Proof Runbook (ft-luq3w.6)
+
+### Default posture
+
+Auto-tuning is opt-in. A default process may keep static `[tuning]` values,
+retain bounded telemetry, and emit decision-shaped records for reduced replay
+proof, but it must not mutate live knobs. The default operator posture is:
+
+```toml
+[auto_tuning]
+enabled = false
+mode = "disabled"
+```
+
+The current code surface represents the library gate as
+`AutoTuneConfig { enabled: false, .. }` and the candidate-controller gate as
+`TuningMode::Observe` unless a caller explicitly chooses another mode. A future
+profile/config loader may expose these as TOML, but it must keep equivalent
+defaults and transition checks.
+
+### Operator mode actions
+
+| Operator action | Required mode/config | Expected decision record |
+| --- | --- | --- |
+| Keep tuning off | `enabled=false`, `mode=disabled` | No live candidate; if a tick runs, parameters stay unchanged. |
+| Watch without changing values | `enabled=true`, `mode=observe` | `would_apply=false`, `live_mutation_allowed=false`, fresh telemetry summary. |
+| Try a bounded candidate | `mode=canary` or `mode=exploration` | Candidate id, old/new value, safety metric, rollback metric, correlation id. |
+| Persist a proven setting | `mode=steady_state` | Evidence level, current profile, retained artifact paths, drift checks. |
+| Emergency pause | `mode=cooldown` or `mode=observe` | Last unsafe reason and cooldown/observe reason code. |
+| Emergency disable | `enabled=false`, `mode=disabled` | Existing safe values retained; new candidates rejected with `auto_tune.skipped.disabled`. |
+| Roll back | `mode=rollback` | Restored value, regression metric, trigger reason, then `cooldown`. |
+
+Mode changes must follow the transition table above. In particular,
+`observe -> steady_state` is invalid without canary/exploration evidence, and
+`rollback -> steady_state` is invalid without a fresh cooldown-cleared
+evaluation.
+
+### Reduced replay proof
+
+Reduced replay proof is the closeout lane for logic, schema, candidate,
+decision-log, rollback, and missing/stale telemetry behavior. It is not a
+high-scale performance claim. When RCH is healthy, use this command shape:
+
+```bash
+RCH_NO_UPDATE_CHECK=1 \
+RCH_EXTERNAL_TIMEOUT_ENABLED=false \
+RCH_BUILD_TIMEOUT_SEC=3600 \
+RCH_TEST_TIMEOUT_SEC=3600 \
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-luq3w-auto-tune-target \
+  cargo test -p frankenterm-core --lib --no-default-features auto_tune -- --nocapture
+```
+
+Closeout comments must include the selected worker, exit status, test count,
+and whether Cargo/rustc actually ran remotely. If the `ft-tn6cw.1` wrapper
+recovery path is still required, replace `rch` with the patched wrapper path
+used for the run and record that exact path.
+
+Classify failures with the proof-lane evidence contract:
+
+| Observation | Classification |
+| --- | --- |
+| Remote Cargo starts and tests pass | `PASS`, usually `remote_reduced`. |
+| Remote Cargo starts and source/tests fail | source/test failure; fix code before closeout. |
+| RCH fails before Cargo starts | infrastructure blocker; do not close the bead on this proof. |
+| Cargo may have run locally | `LOCAL_INVALID`; useful for diagnosis only. |
+| Target hardware predicate is absent | `SKIPPED_NOT_PROVEN` for high-scale claims. |
+
+### High-scale hardware proof
+
+A high-scale benefit claim requires `target_hardware` evidence, not just a
+passing replay test. Required artifacts:
+
+1. Exact RCH or target-host command and full argv.
+2. Worker/host identity.
+3. `ft doctor --json` or equivalent retained hardware evidence showing the
+   64-core / 256 GiB predicate for that run.
+4. Before/after summaries for latency, memory pressure, queue depth, dropped
+   work, and auto-tune decision records.
+5. Replay or live-run artifact paths retained in the proof report.
+6. `AutoTuneReplayProofReport.high_scale_claim_allowed=true`.
+
+If any item is missing, record `high_scale_evidence_level=skipped_not_proven`
+and `high_scale_claim_allowed=false`. The operator-facing summary may say that
+reduced replay proof passed, but it must not claim the setting is proven for
+high-core/high-memory operation.
 
 ## Required Implementation Beads
 
