@@ -1,0 +1,6 @@
+schema_version: 1
+total_workloads: 5
+heat_levels: cool=1 warm=0 hot=3 saturated=1
+admissions: run_now=1 defer=1 throttle=1 shard=1 mark_coverage_degraded=1
+max_estimated_freshness_lag_ms: 25000
+operator_summary: storage_index_heatmap: 1 cool, 0 warm, 3 hot, 1 saturated; admissions run_now=1 defer=1 throttle=1 shard=1 degraded=1; max_lag=25000ms

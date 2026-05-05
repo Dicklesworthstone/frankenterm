@@ -20,6 +20,7 @@ pub mod replay_fault_injection;
 pub mod replay_guardrails;
 pub mod replay_guardrails_gate;
 pub mod replay_guide;
+pub mod replay_io_heatmap;
 pub mod replay_mcp;
 pub mod replay_merge;
 pub mod replay_performance;
