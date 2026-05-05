@@ -13,18 +13,21 @@ use std::time::Duration;
 use std::{mem, ptr};
 use winapi::shared::winerror::WAIT_TIMEOUT;
 use winapi::um::consoleapi;
+use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::synchapi::{CreateEventW, SetEvent, WaitForMultipleObjects};
 use winapi::um::winbase::{INFINITE, WAIT_FAILED, WAIT_OBJECT_0};
 use winapi::um::wincon::{
-    FillConsoleOutputAttribute, FillConsoleOutputCharacterW, GetConsoleScreenBufferInfo,
-    ReadConsoleOutputW, ScrollConsoleScreenBufferW, SetConsoleCP, SetConsoleCursorPosition,
-    SetConsoleOutputCP, SetConsoleScreenBufferSize, SetConsoleTextAttribute, SetConsoleWindowInfo,
-    WriteConsoleOutputW, CHAR_INFO, CONSOLE_SCREEN_BUFFER_INFO, COORD, DISABLE_NEWLINE_AUTO_RETURN,
-    ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
-    INPUT_RECORD, SMALL_RECT,
+    CreateConsoleScreenBuffer, FillConsoleOutputAttribute, FillConsoleOutputCharacterW,
+    GetConsoleScreenBufferInfo, ReadConsoleOutputW, ScrollConsoleScreenBufferW,
+    SetConsoleActiveScreenBuffer, SetConsoleCP, SetConsoleCursorPosition, SetConsoleOutputCP,
+    SetConsoleScreenBufferSize, SetConsoleTextAttribute, SetConsoleWindowInfo, WriteConsoleOutputW,
+    CHAR_INFO, CONSOLE_SCREEN_BUFFER_INFO, CONSOLE_TEXTMODE_BUFFER, COORD,
+    DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
+    ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    ENABLE_WINDOW_INPUT, INPUT_RECORD, SMALL_RECT,
 };
 use winapi::um::winnls::CP_UTF8;
+use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
 
 use crate::caps::Capabilities;
 use crate::input::{InputEvent, InputParser};
@@ -167,12 +170,70 @@ impl OutputHandle {
             write_buffer: Vec::with_capacity(BUF_SIZE),
         }
     }
+
+    fn new_screen_buffer() -> Result<Self> {
+        let handle = unsafe {
+            CreateConsoleScreenBuffer(
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                CONSOLE_TEXTMODE_BUFFER,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            bail!(
+                "CreateConsoleScreenBuffer failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(Self::new(unsafe {
+            FileDescriptor::from_raw_handle(handle as _)
+        }))
+    }
+
+    fn set_active_screen_buffer(&mut self) -> Result<()> {
+        self.flush()?;
+        if unsafe { SetConsoleActiveScreenBuffer(self.handle.as_raw_handle() as *mut _) } == 0 {
+            bail!(
+                "SetConsoleActiveScreenBuffer failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    fn set_screen_buffer_size(&mut self, size: COORD) -> Result<()> {
+        if unsafe { SetConsoleScreenBufferSize(self.handle.as_raw_handle() as *mut _, size) } != 1 {
+            bail!(
+                "SetConsoleScreenBufferSize failed: {}",
+                IoError::last_os_error()
+            );
+        }
+        Ok(())
+    }
 }
 
 fn dimensions_from_buffer_info(info: CONSOLE_SCREEN_BUFFER_INFO) -> (usize, usize) {
     let cols = 1 + (info.srWindow.Right - info.srWindow.Left);
     let rows = 1 + (info.srWindow.Bottom - info.srWindow.Top);
     (cols as usize, rows as usize)
+}
+
+fn alternate_screen_buffer_geometry(info: CONSOLE_SCREEN_BUFFER_INFO) -> (COORD, SMALL_RECT) {
+    let visible_cols = 1 + (info.srWindow.Right - info.srWindow.Left);
+    let visible_rows = 1 + (info.srWindow.Bottom - info.srWindow.Top);
+    let cols = max(info.dwSize.X, visible_cols).max(1);
+    let rows = max(info.dwSize.Y, visible_rows).max(1);
+    (
+        COORD { X: cols, Y: rows },
+        SMALL_RECT {
+            Left: 0,
+            Top: 0,
+            Right: visible_cols.saturating_sub(1),
+            Bottom: visible_rows.saturating_sub(1),
+        },
+    )
 }
 
 impl RenderTty for OutputHandle {
@@ -491,6 +552,7 @@ pub struct WindowsTerminal {
     saved_input_cp: u32,
     saved_output_cp: u32,
     in_alternate_screen: bool,
+    alternate_main_output: Option<OutputHandle>,
     caps: Capabilities,
 }
 
@@ -620,6 +682,7 @@ impl WindowsTerminal {
             input_parser,
             input_queue: VecDeque::new(),
             in_alternate_screen: false,
+            alternate_main_output: None,
             caps,
         };
 
@@ -752,17 +815,30 @@ impl Terminal for WindowsTerminal {
             }
             Ok(())
         } else {
-            // ft-uic0x: native WindowsConsoleRenderer does NOT yet drive
-            // CreateConsoleScreenBuffer / SetConsoleActiveScreenBuffer.
-            // Returning a silent Ok here lets full-screen TUIs assume
-            // they captured the screen and then corrupt main-buffer
-            // scrollback. Refuse loudly until the native plumbing lands.
-            bail!(
-                "alternate screen buffer is not implemented for the native \
-                 WindowsConsoleRenderer (ft-uic0x); use the Terminfo renderer \
-                 (set TERM/use ConPTY) until \
-                 CreateConsoleScreenBuffer/SetConsoleActiveScreenBuffer plumbing lands"
-            )
+            if self.in_alternate_screen {
+                return Ok(());
+            }
+
+            let current_info = self.output_handle.get_buffer_info()?;
+            let current_mode = self.output_handle.get_output_mode()?;
+            let (buffer_size, window_rect) = alternate_screen_buffer_geometry(current_info);
+
+            let mut alternate = OutputHandle::new_screen_buffer()?;
+            alternate.set_output_mode(current_mode)?;
+            alternate.set_screen_buffer_size(buffer_size)?;
+            alternate.set_viewport(
+                window_rect.Left,
+                window_rect.Top,
+                window_rect.Right,
+                window_rect.Bottom,
+            )?;
+            alternate.set_cursor_position(0, 0)?;
+            alternate.set_active_screen_buffer()?;
+
+            let main = mem::replace(&mut self.output_handle, alternate);
+            self.alternate_main_output = Some(main);
+            self.in_alternate_screen = true;
+            Ok(())
         }
     }
 
@@ -779,21 +855,21 @@ impl Terminal for WindowsTerminal {
                 self.in_alternate_screen = false;
             }
             Ok(())
-        } else if self.in_alternate_screen {
-            // ft-uic0x: caller managed to set in_alternate_screen=true
-            // against the native renderer (unreachable through the public
-            // API now that enter_alternate_screen bails first; defensive
-            // for direct field manipulation). Refuse loudly rather than
-            // pretend we restored the main buffer.
-            bail!(
-                "alternate screen buffer is not implemented for the native \
-                 WindowsConsoleRenderer (ft-uic0x); use the Terminfo renderer \
-                 until CreateConsoleScreenBuffer/SetConsoleActiveScreenBuffer plumbing lands"
-            )
+        } else if !self.in_alternate_screen {
+            Ok(())
         } else {
-            // Never entered an alternate screen — the standard Drop path
-            // calls this unconditionally; staying quiet here keeps every
-            // Windows-native shutdown out of the warning log.
+            let Some(main_output) = self.alternate_main_output.as_mut() else {
+                bail!("native Windows alternate screen is marked active but main buffer handle is missing");
+            };
+            main_output.set_active_screen_buffer()?;
+
+            let main = self
+                .alternate_main_output
+                .take()
+                .expect("checked alternate main output above");
+            let alternate = mem::replace(&mut self.output_handle, main);
+            drop(alternate);
+            self.in_alternate_screen = false;
             Ok(())
         }
     }
@@ -896,5 +972,64 @@ impl Terminal for WindowsTerminal {
         WindowsTerminalWaker {
             handle: Some(self.waker_handle.clone()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffer_info(
+        buffer_cols: i16,
+        buffer_rows: i16,
+        window_left: i16,
+        window_top: i16,
+        window_right: i16,
+        window_bottom: i16,
+    ) -> CONSOLE_SCREEN_BUFFER_INFO {
+        CONSOLE_SCREEN_BUFFER_INFO {
+            dwSize: COORD {
+                X: buffer_cols,
+                Y: buffer_rows,
+            },
+            dwCursorPosition: COORD { X: 0, Y: 0 },
+            wAttributes: 0,
+            srWindow: SMALL_RECT {
+                Left: window_left,
+                Top: window_top,
+                Right: window_right,
+                Bottom: window_bottom,
+            },
+            dwMaximumWindowSize: COORD {
+                X: buffer_cols,
+                Y: buffer_rows,
+            },
+        }
+    }
+
+    #[test]
+    fn alternate_screen_geometry_preserves_main_buffer_scrollback_rows() {
+        let info = buffer_info(120, 9_000, 0, 8_950, 119, 8_999);
+
+        let (size, rect) = alternate_screen_buffer_geometry(info);
+
+        assert_eq!((size.X, size.Y), (120, 9_000));
+        assert_eq!(
+            (rect.Left, rect.Top, rect.Right, rect.Bottom),
+            (0, 0, 119, 49)
+        );
+    }
+
+    #[test]
+    fn alternate_screen_geometry_expands_buffer_to_visible_window() {
+        let info = buffer_info(40, 10, 10, 5, 89, 29);
+
+        let (size, rect) = alternate_screen_buffer_geometry(info);
+
+        assert_eq!((size.X, size.Y), (80, 25));
+        assert_eq!(
+            (rect.Left, rect.Top, rect.Right, rect.Bottom),
+            (0, 0, 79, 24)
+        );
     }
 }

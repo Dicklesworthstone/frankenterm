@@ -271,7 +271,7 @@ impl ScreenBuffer {
 
             // We're only doing vertical scrolling
             let dx = 0;
-            let dy = scroll_count.min(i16::MAX as usize) as i16;
+            let dy = scroll_count.clamp(i16::MIN as isize, i16::MAX as isize) as i16;
 
             if first_row == 0 && region_size == self.rows {
                 // We're scrolling the whole screen, so let it scroll
