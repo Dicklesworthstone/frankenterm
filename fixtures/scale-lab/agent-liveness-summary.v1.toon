@@ -1,0 +1,7 @@
+schema_version: 1
+total_agents: 5
+classes: alive=1 quiet_but_active=1 unreachable=0 stale_claim=1 conflicting_claim=1 recovery_needed=1
+actions: wait=2 ping=1 reopen=1 reassign=0 escalate_human=1
+policy_gated_receipts: 3
+automatic_reopen_allowed: 0
+operator_summary: agent_liveness: 1 alive, 1 quiet, 0 unreachable, 1 stale, 1 conflicting, 1 recovery_needed; actions wait=2 ping=1 reopen=1 reassign=0 escalate=1; policy_gated=3; auto_reopen=0

@@ -33,6 +33,7 @@ workspace = true
 #   replay_guardrails_gate
 #   replay_guide
 #   replay_io_heatmap
+#   replay_liveness_receipts
 #   replay_mcp
 #   replay_merge
 #   replay_performance
