@@ -2587,6 +2587,322 @@ fn bounded_reason_codes<'a>(codes: impl IntoIterator<Item = &'a str>) -> Vec<Str
 }
 
 // =============================================================================
+// Deterministic replay proof reports
+// =============================================================================
+
+/// Schema version for deterministic auto-tune replay proof reports.
+pub const AUTO_TUNE_REPLAY_PROOF_SCHEMA_VERSION: u32 = 1;
+
+/// Evidence level attached to auto-tune proof artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoTuneEvidenceLevel {
+    /// Local or small-worker proof of logic, schemas, and rollback behavior.
+    LocalReduced,
+    /// Remote `rch` proof reached Cargo/tests, but the worker is not target-class hardware.
+    RemoteReduced,
+    /// The proof ran on a worker satisfying the target high-scale predicate.
+    TargetHardware,
+    /// The required high-scale predicate or artifact was absent.
+    SkippedNotProven,
+}
+
+impl AutoTuneEvidenceLevel {
+    /// Stable evidence label for proof logs and Beads comments.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalReduced => "local_reduced",
+            Self::RemoteReduced => "remote_reduced",
+            Self::TargetHardware => "target_hardware",
+            Self::SkippedNotProven => "skipped_not_proven",
+        }
+    }
+}
+
+/// One deterministic candidate-generation and safety-evaluation replay step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoTuneReplayStep {
+    /// Candidate decision timestamp in epoch milliseconds.
+    pub timestamp_ms: u64,
+    /// Operator profile or replay scope.
+    pub profile: String,
+    /// Correlation id shared by candidate and rollback rows.
+    pub correlation_id: String,
+    /// Candidate engine configuration for this step.
+    pub engine_config: CandidateEvaluationConfig,
+    /// Active exploration count reported to the candidate engine.
+    pub active_explorations: usize,
+    /// Telemetry window used to produce or skip a candidate.
+    pub candidate_telemetry: CandidateTelemetryWindow,
+    /// Optional requested knobs. Empty means registry-order candidate selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_knobs: Vec<String>,
+    /// Knobs pinned for this replay step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_knobs: Vec<TunableKnobId>,
+    /// Rollback controller configuration for this replay step.
+    pub rollback_config: RollbackControllerConfig,
+    /// Safety windows observed after a candidate starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safety_windows: Vec<SafetyTelemetryWindow>,
+}
+
+/// Deterministic fixed-trace replay input for the auto-tune controllers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoTuneReplayTrace {
+    /// Trace schema version.
+    pub schema_version: u32,
+    /// Stable trace identifier.
+    pub trace_id: String,
+    /// Evidence level for the replay itself.
+    pub evidence_level: AutoTuneEvidenceLevel,
+    /// Whether this trace was collected on 64-core / 256 GiB target-class hardware.
+    pub target_hardware_predicate_met: bool,
+    /// Current knob values before the replay begins.
+    pub initial_values: BTreeMap<TunableKnobId, f64>,
+    /// Ordered candidate/safety replay steps.
+    pub steps: Vec<AutoTuneReplayStep>,
+    /// Retained proof artifacts backing this trace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_paths: Vec<String>,
+}
+
+/// Aggregate counters and safety assertions for a replay proof report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoTuneReplaySummary {
+    /// Number of replay steps processed.
+    pub steps: usize,
+    /// Number of candidate-start decisions.
+    pub candidates_started: usize,
+    /// Number of accepted candidates.
+    pub candidates_accepted: usize,
+    /// Number of rejected candidates.
+    pub candidates_rejected: usize,
+    /// Number of rollback actions.
+    pub rollbacks: usize,
+    /// Number of skipped explorations before a candidate started.
+    pub explorations_skipped: usize,
+    /// Skips caused specifically by missing or stale candidate telemetry.
+    pub missing_or_stale_telemetry_noops: usize,
+    /// Controller windows that continued observation without accepting or rolling back.
+    pub observing_windows: usize,
+    /// Whether every accepted candidate preserved or improved required safety metrics.
+    pub accepted_candidates_preserved_or_improved: bool,
+    /// Whether every rejected candidate produced a rollback action.
+    pub regressed_candidates_rolled_back: bool,
+}
+
+impl AutoTuneReplaySummary {
+    fn new(steps: usize) -> Self {
+        Self {
+            steps,
+            candidates_started: 0,
+            candidates_accepted: 0,
+            candidates_rejected: 0,
+            rollbacks: 0,
+            explorations_skipped: 0,
+            missing_or_stale_telemetry_noops: 0,
+            observing_windows: 0,
+            accepted_candidates_preserved_or_improved: true,
+            regressed_candidates_rolled_back: true,
+        }
+    }
+}
+
+/// Deterministic fixed-trace replay report for auto-tune proof artifacts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoTuneReplayProofReport {
+    /// Report schema version.
+    pub schema_version: u32,
+    /// Stable trace identifier.
+    pub trace_id: String,
+    /// Evidence level for the replay itself.
+    pub evidence_level: AutoTuneEvidenceLevel,
+    /// High-scale claim status after applying the hardware predicate.
+    pub high_scale_evidence_level: AutoTuneEvidenceLevel,
+    /// Whether this report may support a high-scale benefit claim.
+    pub high_scale_claim_allowed: bool,
+    /// Stable reason code for the high-scale evidence decision.
+    pub high_scale_reason_code: String,
+    /// Current knob values before replay.
+    pub before_values: BTreeMap<TunableKnobId, f64>,
+    /// Simulated knob values after accepted candidates and rollbacks.
+    pub after_values: BTreeMap<TunableKnobId, f64>,
+    /// Aggregate replay counters and assertions.
+    pub summary: AutoTuneReplaySummary,
+    /// Structured decision rows emitted by the replay.
+    pub decisions: Vec<TuningDecisionRecord>,
+    /// Retained proof artifacts backing this report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_paths: Vec<String>,
+}
+
+/// Run a deterministic auto-tune trace through the candidate and rollback controllers.
+#[must_use]
+pub fn run_auto_tune_replay_trace(trace: &AutoTuneReplayTrace) -> AutoTuneReplayProofReport {
+    let mut current_values = trace.initial_values.clone();
+    let mut summary = AutoTuneReplaySummary::new(trace.steps.len());
+    let mut log = TuningDecisionLog::new(replay_decision_capacity(trace));
+
+    for step in &trace.steps {
+        let mut engine = BoundedCandidateEngine::new(step.engine_config.clone());
+        engine.set_active_explorations(step.active_explorations);
+        let requested_knobs = step
+            .requested_knobs
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let candidate_decision = if requested_knobs.is_empty() {
+            engine.evaluate(
+                &current_values,
+                &step.candidate_telemetry,
+                &step.pinned_knobs,
+            )
+        } else {
+            engine.evaluate_requested(
+                &requested_knobs,
+                &current_values,
+                &step.candidate_telemetry,
+                &step.pinned_knobs,
+            )
+        };
+
+        log.record_candidate_decision(
+            step.timestamp_ms,
+            &step.profile,
+            &step.correlation_id,
+            &candidate_decision,
+            &step.candidate_telemetry,
+        );
+
+        let Some(candidate) = candidate_decision.candidate.clone() else {
+            summary.explorations_skipped += 1;
+            if candidate_decision
+                .skip_reasons
+                .iter()
+                .any(is_missing_or_stale_candidate_telemetry)
+            {
+                summary.missing_or_stale_telemetry_noops += 1;
+            }
+            continue;
+        };
+
+        summary.candidates_started += 1;
+
+        let mut rollback = RollbackController::new(step.rollback_config.clone());
+        if !rollback.start_candidate(candidate.clone()) {
+            summary.observing_windows += 1;
+            continue;
+        }
+
+        for (window_index, safety_window) in step.safety_windows.iter().enumerate() {
+            let decision = rollback.evaluate(safety_window);
+            let safety_timestamp_ms = step
+                .timestamp_ms
+                .saturating_add(u64::try_from(window_index).unwrap_or(u64::MAX))
+                .saturating_add(1);
+            log.record_rollback_decision(
+                safety_timestamp_ms,
+                &step.profile,
+                &step.correlation_id,
+                &decision,
+                Some(safety_window),
+            );
+
+            match decision.action {
+                RollbackAction::AcceptCandidate => {
+                    summary.candidates_accepted += 1;
+                    if !required_checks_preserved_or_improved(&decision.checks) {
+                        summary.accepted_candidates_preserved_or_improved = false;
+                    }
+                    if candidate.would_apply {
+                        current_values.insert(candidate.knob_id, candidate.candidate_value);
+                    }
+                    break;
+                }
+                RollbackAction::Rollback => {
+                    summary.candidates_rejected += 1;
+                    summary.rollbacks += 1;
+                    let rollback_value = decision.rollback_value.unwrap_or(candidate.old_value);
+                    current_values.insert(candidate.knob_id, rollback_value);
+                    break;
+                }
+                RollbackAction::ContinueCandidate => {
+                    summary.observing_windows += 1;
+                }
+                RollbackAction::Disabled | RollbackAction::Noop | RollbackAction::Cooldown => {
+                    summary.observing_windows += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    summary.regressed_candidates_rolled_back = summary.candidates_rejected == summary.rollbacks;
+    let high_scale_evidence_level = high_scale_evidence_level(trace);
+
+    AutoTuneReplayProofReport {
+        schema_version: AUTO_TUNE_REPLAY_PROOF_SCHEMA_VERSION,
+        trace_id: trace.trace_id.clone(),
+        evidence_level: trace.evidence_level,
+        high_scale_evidence_level,
+        high_scale_claim_allowed: high_scale_evidence_level
+            == AutoTuneEvidenceLevel::TargetHardware,
+        high_scale_reason_code: high_scale_reason_code(high_scale_evidence_level).to_string(),
+        before_values: trace.initial_values.clone(),
+        after_values: current_values,
+        summary,
+        decisions: log.recent(),
+        artifact_paths: trace.artifact_paths.clone(),
+    }
+}
+
+fn replay_decision_capacity(trace: &AutoTuneReplayTrace) -> usize {
+    trace
+        .steps
+        .iter()
+        .map(|step| 1usize.saturating_add(step.safety_windows.len().saturating_mul(2)))
+        .sum::<usize>()
+        .max(1)
+}
+
+fn is_missing_or_stale_candidate_telemetry(reason: &CandidateSkipReason) -> bool {
+    matches!(
+        reason,
+        CandidateSkipReason::MissingTelemetry | CandidateSkipReason::StaleTelemetry
+    )
+}
+
+fn required_checks_preserved_or_improved(checks: &[SafetyMetricCheck]) -> bool {
+    checks
+        .iter()
+        .filter(|check| check.required)
+        .all(|check| check.verdict == SafetyMetricVerdict::Healthy)
+}
+
+fn high_scale_evidence_level(trace: &AutoTuneReplayTrace) -> AutoTuneEvidenceLevel {
+    if trace.evidence_level == AutoTuneEvidenceLevel::TargetHardware
+        && trace.target_hardware_predicate_met
+    {
+        AutoTuneEvidenceLevel::TargetHardware
+    } else {
+        AutoTuneEvidenceLevel::SkippedNotProven
+    }
+}
+
+fn high_scale_reason_code(level: AutoTuneEvidenceLevel) -> &'static str {
+    match level {
+        AutoTuneEvidenceLevel::TargetHardware => "auto_tune.proof.high_scale.target_hardware",
+        AutoTuneEvidenceLevel::LocalReduced
+        | AutoTuneEvidenceLevel::RemoteReduced
+        | AutoTuneEvidenceLevel::SkippedNotProven => {
+            "auto_tune.proof.high_scale.skipped_not_proven"
+        }
+    }
+}
+
+// =============================================================================
 // Manual overrides
 // =============================================================================
 
@@ -3441,6 +3757,53 @@ mod tests {
         }
     }
 
+    fn default_replay_values() -> BTreeMap<TunableKnobId, f64> {
+        let engine = BoundedCandidateEngine::new(CandidateEvaluationConfig {
+            mode: TuningMode::Exploration,
+            ..CandidateEvaluationConfig::default()
+        });
+        default_current_values(&engine)
+    }
+
+    fn replay_step(
+        correlation_id: &str,
+        telemetry_trust: TelemetryTrust,
+        safety_windows: Vec<SafetyTelemetryWindow>,
+    ) -> AutoTuneReplayStep {
+        AutoTuneReplayStep {
+            timestamp_ms: 1_700_000_040_000,
+            profile: "fixed-trace-replay".to_string(),
+            correlation_id: correlation_id.to_string(),
+            engine_config: CandidateEvaluationConfig {
+                mode: TuningMode::Exploration,
+                telemetry_trust,
+                ..CandidateEvaluationConfig::default()
+            },
+            active_explorations: 0,
+            candidate_telemetry: pressure_window(CandidateDirection::Increase),
+            requested_knobs: Vec::new(),
+            pinned_knobs: Vec::new(),
+            rollback_config: RollbackControllerConfig {
+                regression_hysteresis_windows: 1,
+                cooldown_windows: 0,
+                ..RollbackControllerConfig::default()
+            },
+            safety_windows,
+        }
+    }
+
+    fn replay_trace(trace_id: &str, steps: Vec<AutoTuneReplayStep>) -> AutoTuneReplayTrace {
+        AutoTuneReplayTrace {
+            schema_version: AUTO_TUNE_REPLAY_PROOF_SCHEMA_VERSION,
+            trace_id: trace_id.to_string(),
+            evidence_level: AutoTuneEvidenceLevel::LocalReduced,
+            target_hardware_predicate_met: false,
+            initial_values: default_replay_values(),
+            steps,
+            artifact_paths: vec!["inline-fixed-trace".to_string()],
+        }
+    }
+
     #[test]
     fn rollback_controller_accepts_safe_window_and_updates_last_safe() {
         let mut controller = RollbackController::new(RollbackControllerConfig::default());
@@ -3795,6 +4158,167 @@ mod tests {
             records[1].safety_checks[0].reason_code,
             "auto_tune.safety.latency.regressed"
         );
+    }
+
+    #[test]
+    fn auto_tune_replay_fixed_trace_accepts_candidate_ft_luq3w_5() {
+        let trace = replay_trace(
+            "ft-luq3w.5.accept",
+            vec![replay_step(
+                "corr-replay-accept",
+                TelemetryTrust::Fresh,
+                vec![safety_window(vec![required_lower_sample(
+                    SafetyMetricKind::Latency,
+                    Some(100.0),
+                    Some(101.0),
+                )])],
+            )],
+        );
+
+        let report = run_auto_tune_replay_trace(&trace);
+        let knob = TunableKnobId::RuntimeOutputCoalesceWindowMs;
+
+        assert_eq!(report.schema_version, AUTO_TUNE_REPLAY_PROOF_SCHEMA_VERSION);
+        assert_eq!(report.summary.steps, 1);
+        assert_eq!(report.summary.candidates_started, 1);
+        assert_eq!(report.summary.candidates_accepted, 1);
+        assert_eq!(report.summary.candidates_rejected, 0);
+        assert_eq!(report.summary.rollbacks, 0);
+        assert!(report.summary.accepted_candidates_preserved_or_improved);
+        assert!(report.summary.regressed_candidates_rolled_back);
+        assert_eq!(report.before_values.get(&knob).copied(), Some(50.0));
+        assert_eq!(report.after_values.get(&knob).copied(), Some(75.0));
+        assert_eq!(
+            report
+                .decisions
+                .iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                TuningDecisionKind::CandidateStarted,
+                TuningDecisionKind::CandidateAccepted,
+            ]
+        );
+        assert_eq!(report.decisions[1].safety_checks.len(), 1);
+        assert_eq!(
+            report.decisions[1].safety_checks[0].reason_code,
+            "auto_tune.safety.latency.healthy"
+        );
+    }
+
+    #[test]
+    fn auto_tune_replay_fixed_trace_rejects_and_rolls_back_ft_luq3w_5() {
+        let trace = replay_trace(
+            "ft-luq3w.5.rollback",
+            vec![replay_step(
+                "corr-replay-rollback",
+                TelemetryTrust::Fresh,
+                vec![safety_window(vec![required_lower_sample(
+                    SafetyMetricKind::Latency,
+                    Some(100.0),
+                    Some(150.0),
+                )])],
+            )],
+        );
+
+        let report = run_auto_tune_replay_trace(&trace);
+        let knob = TunableKnobId::RuntimeOutputCoalesceWindowMs;
+
+        assert_eq!(report.summary.candidates_started, 1);
+        assert_eq!(report.summary.candidates_accepted, 0);
+        assert_eq!(report.summary.candidates_rejected, 1);
+        assert_eq!(report.summary.rollbacks, 1);
+        assert!(report.summary.regressed_candidates_rolled_back);
+        assert_eq!(report.before_values.get(&knob).copied(), Some(50.0));
+        assert_eq!(report.after_values.get(&knob).copied(), Some(50.0));
+        assert_eq!(
+            report
+                .decisions
+                .iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                TuningDecisionKind::CandidateStarted,
+                TuningDecisionKind::CandidateRejected,
+                TuningDecisionKind::Rollback,
+            ]
+        );
+        assert!(
+            report.decisions[2]
+                .reason_codes
+                .contains(&"auto_tune.rollback.metric_regression".to_string())
+        );
+        assert_eq!(report.decisions[2].rollback_value, Some(50.0));
+    }
+
+    #[test]
+    fn auto_tune_replay_fixed_trace_skips_missing_and_stale_telemetry_ft_luq3w_5() {
+        let trace = replay_trace(
+            "ft-luq3w.5.noop",
+            vec![
+                replay_step("corr-replay-missing", TelemetryTrust::Missing, Vec::new()),
+                replay_step("corr-replay-stale", TelemetryTrust::Stale, Vec::new()),
+            ],
+        );
+
+        let report = run_auto_tune_replay_trace(&trace);
+
+        assert_eq!(report.summary.steps, 2);
+        assert_eq!(report.summary.candidates_started, 0);
+        assert_eq!(report.summary.explorations_skipped, 2);
+        assert_eq!(report.summary.missing_or_stale_telemetry_noops, 2);
+        assert_eq!(report.before_values, report.after_values);
+        assert_eq!(
+            report
+                .decisions
+                .iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                TuningDecisionKind::ExplorationSkipped,
+                TuningDecisionKind::ExplorationSkipped,
+            ]
+        );
+        assert_eq!(
+            report.decisions[0].reason_codes,
+            vec!["auto_tune.skipped.missing_telemetry".to_string()]
+        );
+        assert_eq!(
+            report.decisions[1].reason_codes,
+            vec!["auto_tune.skipped.stale_telemetry".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_tune_replay_report_is_deterministic_and_high_scale_unproven_ft_luq3w_5() {
+        let trace = replay_trace(
+            "ft-luq3w.5.deterministic",
+            vec![replay_step(
+                "corr-replay-deterministic",
+                TelemetryTrust::Fresh,
+                vec![safety_window(vec![required_lower_sample(
+                    SafetyMetricKind::Latency,
+                    Some(100.0),
+                    Some(100.0),
+                )])],
+            )],
+        );
+
+        let first = run_auto_tune_replay_trace(&trace);
+        let second = run_auto_tune_replay_trace(&trace);
+
+        assert_eq!(first, second);
+        assert_eq!(first.evidence_level, AutoTuneEvidenceLevel::LocalReduced);
+        assert_eq!(
+            first.high_scale_evidence_level,
+            AutoTuneEvidenceLevel::SkippedNotProven
+        );
+        assert!(!first.high_scale_claim_allowed);
+        assert_eq!(
+            first.high_scale_reason_code,
+            "auto_tune.proof.high_scale.skipped_not_proven"
+        );
+        assert_eq!(first.artifact_paths, vec!["inline-fixed-trace".to_string()]);
     }
 
     // ---- Hysteresis tests ----
