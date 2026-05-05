@@ -1370,8 +1370,8 @@ impl StorageHandle {
             // [ft-wk5fo] Deferred FTS indexing: drop the three
             // per-INSERT/DELETE/UPDATE triggers on output_segments so new
             // segment writes no longer synchronously rebuild the FTS
-            // inverted-index pages inside `append_segment_sync`'s
-            // transaction. Callers are responsible for invoking
+            // inverted-index pages inside the append-segment writer
+            // path. Callers are responsible for invoking
             // `StorageHandle::sync_fts` periodically to catch the index
             // up — the `fts_pane_progress` table + `sync_fts_on_startup`
             // engine already support resumable batched indexing.
@@ -8110,7 +8110,7 @@ fn respond_oneshot_best_effort<T>(tx: oneshot::Sender<T>, value: T) {
 ///    binding. A failed `send` does not roll the write back; it
 ///    just means the return path was severed.
 /// 3. **Forensics are preserved**: the `result` itself, including
-///    any `Err` from `append_segment_sync` / `record_gap_backend`
+///    any `Err` from `append_segment_backend` / `record_gap_backend`
 ///    / `record_event_backend` / etc., is still folded into the
 ///    writer-side telemetry counters via the worker-loop wrapper.
 ///    Operators see write-side failures via that telemetry, not
@@ -8143,7 +8143,9 @@ fn dispatch_write_command_raw(
             } else {
                 None
             };
-            let result = append_segment_sync(conn, pane_id, &redacted_content, persisted_hash);
+            let result = with_writer_backend(conn, |backend| {
+                append_segment_backend(backend, pane_id, &redacted_content, persisted_hash)
+            });
             if let Ok(segment) = &result {
                 mirror_segment_into_mmap(mmap_mirror, segment);
             }
@@ -8780,7 +8782,9 @@ fn flush_segment_redactor_for_pane(
         return Ok(());
     }
 
-    let segment = append_segment_sync(conn, pane_id, &content, None)?;
+    let segment = with_writer_backend(conn, |backend| {
+        append_segment_backend(backend, pane_id, &content, None)
+    })?;
     mirror_segment_into_mmap(mmap_mirror, &segment);
     Ok(())
 }
@@ -9168,27 +9172,32 @@ fn query_active_approval_for_scope_backend(
     Ok(exists)
 }
 
-/// Append a segment (synchronous, called from writer thread)
-fn append_segment_sync(
-    conn: &Connection,
+/// Append a segment through the storage backend (called from writer thread).
+fn append_segment_backend(
+    backend: &dyn StorageBackend,
     pane_id: u64,
     content: &str,
     content_hash: Option<&str>,
 ) -> Result<Segment> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
 
-    // Get next sequence number for this pane
-    let next_seq: u64 = conn
-        .query_row(
+    let next_seq_i64 = backend
+        .query_row_typed(
             "SELECT COALESCE(MAX(seq) + 1, 0) FROM output_segments WHERE pane_id = ?1",
-            [pane_id_i64],
-            |row| {
-                let val: i64 = row.get(0)?;
-                #[allow(clippy::cast_sign_loss)]
-                Ok(val as u64)
-            },
+            &[ToSqlValue::Integer(pane_id_i64)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to get next seq: {e}")))?;
+        .map_err(|e| storage_backend_error("Failed to get next seq", e))?
+        .ok_or_else(|| StorageError::Database("Failed to get next seq: no row".to_string()))
+        .and_then(|row| {
+            RowReader::new(&row)
+                .i64(0)
+                .map_err(|e| storage_backend_error("Failed to parse next seq", e))
+        })?;
+    let next_seq = u64::try_from(next_seq_i64).map_err(|_| {
+        StorageError::Database(format!(
+            "output_segments.next_seq out of range: {next_seq_i64}"
+        ))
+    })?;
 
     let now = now_ms();
     let content_len = content.len();
@@ -9196,21 +9205,25 @@ fn append_segment_sync(
     let next_seq_i64 = u64_to_i64(next_seq, "seq")?;
     let content_len_i64 = usize_to_i64(content_len, "content_len")?;
 
-    conn.execute(
+    let row = backend
+        .query_row_typed(
         "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            pane_id_i64,
-            next_seq_i64,
-            content,
-            content_len_i64,
-            content_hash,
-            now
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         RETURNING id",
+        &[
+            ToSqlValue::Integer(pane_id_i64),
+            ToSqlValue::Integer(next_seq_i64),
+            ToSqlValue::Text(content),
+            ToSqlValue::Integer(content_len_i64),
+            ToSqlValue::optional_text(content_hash),
+            ToSqlValue::Integer(now),
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to insert segment: {e}")))?;
-
-    let id = conn.last_insert_rowid();
+    .map_err(|e| storage_backend_error("Failed to insert segment", e))?
+    .ok_or_else(|| StorageError::Database("Failed to insert segment: no id returned".to_string()))?;
+    let id = RowReader::new(&row)
+        .i64(0)
+        .map_err(|e| storage_backend_error("Failed to parse inserted segment id", e))?;
 
     Ok(Segment {
         id,
@@ -11627,8 +11640,8 @@ fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Resul
 
     // [ft-znu6v] Rewind stranded FTS progress after pruning.
     //
-    // `append_segment_sync` assigns `seq = COALESCE(MAX(seq) + 1, 0)`
-    // (storage.rs:12371-12382), so after a full prune a live pane's
+    // `append_segment_backend` assigns `seq = COALESCE(MAX(seq) + 1, 0)`,
+    // so after a full prune a live pane's
     // next append restarts at seq=0. If a progress row still carries
     // the pre-prune high-water mark, the strict `seq > last_indexed_seq`
     // branch in `get_unindexed_segments_sync` (15949-15953) would never
@@ -14390,7 +14403,7 @@ fn clear_fts_pane_progress_sync(conn: &Connection) -> Result<()> {
 /// with no seq filter — used on the very first batch of the very first
 /// sync for a pane, where `last_indexed_seq = 0` is the default-zero
 /// sentinel meaning "never indexed", not a claim that seq=0 has been
-/// indexed. See [ft-7do6c] for the full rationale: `append_segment_sync`
+/// indexed. See [ft-7do6c] for the full rationale: `append_segment_backend`
 /// assigns `seq = COALESCE(MAX(seq) + 1, 0)`, so the pane's first-ever
 /// segment is seq=0, and a strict `seq > 0` filter would silently skip
 /// it forever under deferred-FTS mode.
@@ -14483,8 +14496,8 @@ fn sync_fts_for_pane(
     // [ft-7do6c] "Never indexed" sentinel: the absence of a progress
     // row is distinct from "indexed up to seq=0". Without tracking
     // this, the strict `seq > 0` filter would skip the pane's first
-    // segment forever — COALESCE(MAX(seq)+1, 0) at append_segment_sync:
-    // 12355 assigns seq=0 to every pane's very first segment.
+    // segment forever — COALESCE(MAX(seq)+1, 0) in append_segment_backend
+    // assigns seq=0 to every pane's very first segment.
     let had_prior_progress = progress.is_some();
 
     let mut total_indexed = 0u64;
@@ -19835,10 +19848,24 @@ fn storage_tick118_hot_path_siblings_roundtrip() {
 
         // 2. append_segment_with_cx (hot write path)
         let segment = storage
-            .append_segment_with_cx(&cx, 11, "tick118-content", None)
+            .append_segment_with_cx(
+                &cx,
+                11,
+                "tick118-content.",
+                Some("hash-tick118-a".to_string()),
+            )
             .await
             .unwrap();
         assert_eq!(segment.pane_id, 11);
+        assert_eq!(segment.seq, 0);
+        assert_eq!(segment.content_hash.as_deref(), Some("hash-tick118-a"));
+        let second_segment = storage
+            .append_segment_with_cx(&cx, 11, "tick118-content-2", None)
+            .await
+            .unwrap();
+        assert_eq!(second_segment.pane_id, 11);
+        assert_eq!(second_segment.seq, 1);
+        assert!(second_segment.content_hash.is_none());
 
         // 3. record_gap_with_cx
         let gap = storage
