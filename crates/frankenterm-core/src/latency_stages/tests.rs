@@ -1097,6 +1097,23 @@ fn test_overhead_record_within_budget() {
 }
 
 #[test]
+fn test_overhead_record_negative_clamps_to_zero() {
+    let mut oh = InstrumentationOverhead::new();
+    oh.record(-5.0);
+    assert_eq!(oh.total_overhead_us, 0.0);
+    assert_eq!(oh.max_overhead_us, 0.0);
+    assert!(oh.within_budget);
+}
+
+#[test]
+fn test_overhead_record_non_finite_fails_closed() {
+    let mut oh = InstrumentationOverhead::new();
+    oh.record(f64::NAN);
+    assert!(!oh.within_budget);
+    assert!(oh.max_overhead_us > oh.budget_per_probe_us);
+}
+
+#[test]
 fn test_overhead_record_exceeds_budget() {
     let mut oh = InstrumentationOverhead::new();
     oh.record(0.5);
@@ -1400,6 +1417,12 @@ fn test_enforcer_is_healthy_nominal() {
     ctx.end_stage(probe, 10);
     ie.process_run(&ctx);
     assert!(ie.is_healthy());
+}
+
+#[test]
+fn test_enforcer_is_unhealthy_before_any_runs() {
+    let ie = InstrumentedEnforcer::new();
+    assert!(!ie.is_healthy());
 }
 
 #[test]

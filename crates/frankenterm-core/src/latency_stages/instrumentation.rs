@@ -235,13 +235,26 @@ impl InstrumentationOverhead {
 
     /// Record a probe's overhead.
     pub fn record(&mut self, overhead_us: f64) {
+        let budget_is_valid =
+            self.budget_per_probe_us.is_finite() && self.budget_per_probe_us >= 0.0;
+        let budget_per_probe_us = if budget_is_valid {
+            self.budget_per_probe_us
+        } else {
+            0.0
+        };
+        let overhead_us = if overhead_us.is_finite() {
+            overhead_us.max(0.0)
+        } else {
+            budget_per_probe_us + 1.0
+        };
+
         self.total_overhead_us += overhead_us;
         self.probe_count += 1;
         self.mean_overhead_us = self.total_overhead_us / self.probe_count as f64;
         if overhead_us > self.max_overhead_us {
             self.max_overhead_us = overhead_us;
         }
-        self.within_budget = self.max_overhead_us <= self.budget_per_probe_us;
+        self.within_budget = budget_is_valid && self.max_overhead_us <= budget_per_probe_us;
     }
 
     /// Get the overhead as a fraction of total pipeline time.
@@ -563,11 +576,12 @@ impl InstrumentedEnforcer {
 
     /// Health check: returns true if instrumentation is healthy.
     ///
-    /// Healthy means: overhead within budget, degradation is Full,
-    /// and overflow rate is below
+    /// Healthy means: at least one completed run, overhead within
+    /// budget, degradation is Full, and overflow rate is below
     /// [`HEALTHY_OVERFLOW_RATE_THRESHOLD`] (10%).
     pub fn is_healthy(&self) -> bool {
-        self.overhead.within_budget
+        self.completed_runs > 0
+            && self.overhead.within_budget
             && self.current_degradation() == InstrumentationDegradation::Full
             && self.overflow_rate() < HEALTHY_OVERFLOW_RATE_THRESHOLD
     }
