@@ -113,16 +113,11 @@ pub fn reset_storage_export_json_parse_drop_count_for_test() {
 /// counter contract without constructing a `RowReader` over a
 /// real storage backend. Returns `Some(Value)` on Ok,
 /// `None` on Err (the calling helper turns that into `Ok(None)`).
-fn parse_export_json_column(
-    raw: &str,
-    label: &str,
-    column: usize,
-) -> Option<serde_json::Value> {
+fn parse_export_json_column(raw: &str, label: &str, column: usize) -> Option<serde_json::Value> {
     match serde_json::from_str(raw) {
         Ok(value) => Some(value),
         Err(err) => {
-            STORAGE_EXPORT_JSON_PARSE_DROP_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            STORAGE_EXPORT_JSON_PARSE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 target: "ft.storage.export",
                 event = "storage_export_json_parse_drop",
