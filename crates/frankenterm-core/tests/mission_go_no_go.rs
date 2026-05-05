@@ -115,6 +115,7 @@ fn sample_plan() -> TxPlan {
             overall_risk: StepRisk::Low,
         },
         rejected_edges: Vec::new(),
+        rejected_assignments: Vec::new(),
     }
 }
 

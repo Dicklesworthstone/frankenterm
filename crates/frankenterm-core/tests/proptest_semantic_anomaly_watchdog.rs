@@ -119,6 +119,7 @@ fn arb_metrics_snapshot() -> impl Strategy<Value = WatchdogMetricsSnapshot> {
                     segments_entropy_skipped: entropy_skipped,
                     segments_embedded: embedded,
                     anomalies_detected: anomalies,
+                    anomaly_publish_failures: 0,
                     batches_processed: batches,
                     avg_batch_fill: avg_fill,
                     segments_too_short: too_short,

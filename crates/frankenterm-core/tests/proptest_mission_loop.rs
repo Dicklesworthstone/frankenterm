@@ -988,6 +988,7 @@ proptest! {
                 bead_id: "b2".to_string(), agent_id: "a2".to_string(),
                 override_id: "ov-1".to_string(),
             }],
+            rejected_pinned_assignments: Vec::new(),
             reprioritized_beads: vec![],
             expired_overrides: expired,
         };

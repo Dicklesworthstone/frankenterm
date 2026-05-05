@@ -50,6 +50,7 @@ fn robot_success<T: Serialize>(data: T, elapsed_ms: u64, now: u64) -> RobotRespo
         elapsed_ms,
         version: VERSION.to_string(),
         now,
+        schema_version: RobotResponse::<T>::SCHEMA_VERSION,
     }
 }
 

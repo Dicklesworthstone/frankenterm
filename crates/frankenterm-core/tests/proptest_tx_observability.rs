@@ -798,6 +798,8 @@ proptest! {
             generator: generator_name.clone(), incident_id: incident.clone(),
             classification: cls, workspace: "ws-1".to_string(),
             track: "track-1".to_string(),
+            original_timeline_len: 0, retained_timeline_len: 0,
+            truncated_count: 0, retention_strategy: TimelineRetentionStrategy::Full,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: BundleMetadata = serde_json::from_str(&json).unwrap();

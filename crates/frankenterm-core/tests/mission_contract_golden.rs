@@ -384,6 +384,7 @@ fn contract_override_application_summary_serde() {
             agent_id: "a2".to_string(),
             override_id: "ovr-1".to_string(),
         }],
+        rejected_pinned_assignments: Vec::new(),
         reprioritized_beads: vec![ReprioritizedBeadRecord {
             bead_id: "b3".to_string(),
             original_score: 0.5,

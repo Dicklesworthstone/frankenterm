@@ -237,6 +237,7 @@ proptest! {
             metric: SloMetric::GovernorAllowRate,
             threshold,
             actual,
+            measured: true,
             passed,
         };
         prop_assert_eq!(slo_result.passed, actual >= threshold);
@@ -253,6 +254,7 @@ proptest! {
             metric: SloMetric::GovernorBlockRate,
             threshold,
             actual,
+            measured: true,
             passed,
         };
         prop_assert_eq!(slo_result.passed, actual <= threshold);

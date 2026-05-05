@@ -395,6 +395,7 @@ proptest! {
             elapsed_ms: 42,
             version: "0.1.0".to_string(),
             now: 1_700_000_000_000,
+            schema_version: RobotResponse::<GetTextData>::SCHEMA_VERSION,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: RobotResponse<GetTextData> = serde_json::from_str(&json).unwrap();
@@ -420,6 +421,7 @@ proptest! {
             elapsed_ms: 1,
             version: "0.1.0".to_string(),
             now: 0,
+            schema_version: RobotResponse::<GetTextData>::SCHEMA_VERSION,
         };
         let result = resp.into_result();
         prop_assert!(result.is_ok(), "into_result should be Ok for ok=true+data");
@@ -441,6 +443,7 @@ proptest! {
             elapsed_ms: 1,
             version: "0.1.0".to_string(),
             now: 0,
+            schema_version: RobotResponse::<GetTextData>::SCHEMA_VERSION,
         };
         let result = resp.into_result();
         prop_assert!(result.is_err(), "into_result should be Err for ok=false");
@@ -459,6 +462,7 @@ proptest! {
             elapsed_ms: 1,
             version: "0.1.0".to_string(),
             now: 0,
+            schema_version: RobotResponse::<GetTextData>::SCHEMA_VERSION,
         };
         let result = resp.into_result();
         prop_assert!(result.is_err(), "into_result should be Err for null data");
@@ -479,6 +483,7 @@ proptest! {
             elapsed_ms: 1,
             version: "0.1.0".to_string(),
             now: 0,
+            schema_version: RobotResponse::<GetTextData>::SCHEMA_VERSION,
         };
         let parsed = resp.parsed_error_code();
         prop_assert!(parsed.is_some(), "parsed_error_code should return Some");

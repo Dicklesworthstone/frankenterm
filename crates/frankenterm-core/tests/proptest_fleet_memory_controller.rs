@@ -114,6 +114,7 @@ fn arb_fleet_memory_snapshot() -> impl Strategy<Value = FleetMemorySnapshot> {
                     total_transitions,
                     consecutive_at_tier,
                     last_actions,
+                    tier_budget: None,
                 }
             },
         )
@@ -132,6 +133,7 @@ fn arb_decision_record() -> impl Strategy<Value = DecisionRecord> {
                 signals,
                 compound_tier,
                 actions,
+                tier_budget: None,
             },
         )
 }
