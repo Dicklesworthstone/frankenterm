@@ -650,7 +650,7 @@ impl SwarmScheduler {
     ) -> Vec<AgentLoadSnapshot> {
         let mut snapshots = Vec::new();
         for (agent_id, &first_seen) in &self.agent_first_seen {
-            let active = queue.agent_items(agent_id).len() as u32;
+            let active = saturating_usize_to_u32(queue.agent_items(agent_id).len());
             let completed = self.agent_completed.get(agent_id).copied().unwrap_or(0);
             let failed = self.agent_failed.get(agent_id).copied().unwrap_or(0);
             snapshots.push(AgentLoadSnapshot {
@@ -968,7 +968,13 @@ impl SwarmScheduler {
         self.consecutive_scale_ops += 1;
         self.check_circuit_breaker(now_ms);
 
-        let new_size = pressure.active_agents - removable.len() as u32;
+        // `removable` was truncated to `max_remove`, which is bounded by
+        // `pressure.active_agents - min_fleet_size`, so the subtraction below
+        // cannot underflow. The saturating helpers harden the path against
+        // any future regression in the truncation ceiling.
+        let new_size = pressure
+            .active_agents
+            .saturating_sub(saturating_usize_to_u32(removable.len()));
         let decision = SchedulerDecision::ScaleDown {
             remove_agents: removable,
             reason: reason.clone(),

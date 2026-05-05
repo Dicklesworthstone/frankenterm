@@ -209,6 +209,13 @@ ubs_*.txt
 /dump_sender.rs
 /test_*.rs
 
+# Stray zero-byte files created by accidental shell redirection
+# (e.g. `cmd > 0` or piping to a literal fd number). These are never
+# legitimate repo content; if they appear, they're shell mishaps.
+/0
+/1
+/2
+
 # Loose SQLite databases at repo root (runtime artifacts, backups,
 # corrupt-snapshot files). Actual workspace databases live in
 # ~/.local/share/frankenterm/ via workspace_layout().
