@@ -27,7 +27,7 @@
 // ```
 // =============================================================================
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,189 @@ pub struct QueuePressure {
     pub active_agents: u32,
     /// Total agent capacity (active_agents * max_concurrent_per_agent).
     pub total_capacity: u32,
+}
+
+/// Synchronized event family that can create a fleet-wide herd wave.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdWaveEventKind {
+    /// Many agents compact/context-rotate together.
+    Compaction,
+    /// Many agents retry a failed operation together.
+    Retry,
+    /// Many agents recover from a rate limit or quota window together.
+    RateLimitRecovery,
+    /// Many agents issue search/index work together.
+    SearchBurst,
+    /// Workflow fanout produced many near-simultaneous actions.
+    WorkflowFanout,
+    /// Many idle agents woke up at nearly the same time.
+    Wake,
+    /// Known herd signal that does not fit a narrower family yet.
+    Other,
+}
+
+/// One timestamped signal used for herd-wave detection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveSignal {
+    /// Pane that emitted the signal, when pane-scoped.
+    pub pane_id: Option<u64>,
+    /// Synchronized event family.
+    pub kind: HerdWaveEventKind,
+    /// Event timestamp in epoch milliseconds.
+    pub timestamp_ms: u64,
+}
+
+impl HerdWaveSignal {
+    /// Build a pane-scoped signal.
+    #[must_use]
+    pub const fn pane(pane_id: u64, kind: HerdWaveEventKind, timestamp_ms: u64) -> Self {
+        Self {
+            pane_id: Some(pane_id),
+            kind,
+            timestamp_ms,
+        }
+    }
+}
+
+/// Deterministic policy for detecting and staggering herd waves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveDetectionConfig {
+    /// Sliding window used to group synchronized signals.
+    pub detection_window_ms: u64,
+    /// Minimum distinct pane count before a burst is treated as a herd wave.
+    pub min_distinct_panes: u32,
+    /// Distinct pane count that maps to elevated pressure.
+    pub elevated_distinct_panes: u32,
+    /// Distinct pane count that maps to critical pressure.
+    pub critical_distinct_panes: u32,
+    /// Distinct pane count that maps to emergency pressure.
+    pub emergency_distinct_panes: u32,
+    /// Delay between adjacent actions when staggering a detected cohort.
+    pub base_stagger_ms: u64,
+    /// Maximum delay assigned to the tail of a staggered cohort.
+    pub max_stagger_ms: u64,
+}
+
+impl Default for HerdWaveDetectionConfig {
+    fn default() -> Self {
+        Self {
+            detection_window_ms: 30_000,
+            min_distinct_panes: 3,
+            elevated_distinct_panes: 3,
+            critical_distinct_panes: 8,
+            emergency_distinct_panes: 16,
+            base_stagger_ms: 750,
+            max_stagger_ms: 30_000,
+        }
+    }
+}
+
+/// Operator-facing summary for a synchronized herd-wave cohort.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWavePressureSummary {
+    /// Synthesized pressure tier contributed by the herd wave.
+    pub pressure_tier: FleetPressureTier,
+    /// Whether the configured distinct-pane threshold was reached.
+    pub detected: bool,
+    /// Signals considered inside the active window.
+    pub event_count: u32,
+    /// Distinct pane count inside the active window.
+    pub distinct_panes: u32,
+    /// Detection window used for this summary.
+    pub window_ms: u64,
+    /// First signal timestamp in the active window.
+    pub first_seen_ms: Option<u64>,
+    /// Last signal timestamp in the active window.
+    pub last_seen_ms: Option<u64>,
+    /// Most common event family in the active window.
+    pub dominant_kind: Option<HerdWaveEventKind>,
+    /// Count of the dominant family.
+    pub dominant_kind_count: u32,
+    /// Recommended delay between adjacent cohort actions.
+    pub recommended_stagger_ms: u64,
+    /// Maximum delay assigned to the final action in this cohort.
+    pub cohort_max_stagger_ms: u64,
+}
+
+/// Compute a bounded per-rank stagger delay for a herd-wave cohort.
+#[must_use]
+pub fn herd_wave_stagger_delay_ms(cohort_rank: u32, config: &HerdWaveDetectionConfig) -> u64 {
+    u64::from(cohort_rank)
+        .saturating_mul(config.base_stagger_ms.max(1))
+        .min(config.max_stagger_ms)
+}
+
+/// Detect synchronized herd-wave pressure from timestamped pane signals.
+#[must_use]
+pub fn detect_herd_wave_pressure(
+    signals: &[HerdWaveSignal],
+    config: &HerdWaveDetectionConfig,
+) -> HerdWavePressureSummary {
+    let Some(latest_ms) = signals.iter().map(|signal| signal.timestamp_ms).max() else {
+        return HerdWavePressureSummary {
+            pressure_tier: FleetPressureTier::Normal,
+            detected: false,
+            event_count: 0,
+            distinct_panes: 0,
+            window_ms: config.detection_window_ms,
+            first_seen_ms: None,
+            last_seen_ms: None,
+            dominant_kind: None,
+            dominant_kind_count: 0,
+            recommended_stagger_ms: 0,
+            cohort_max_stagger_ms: 0,
+        };
+    };
+
+    let window_start_ms = latest_ms.saturating_sub(config.detection_window_ms);
+    let mut event_count = 0_usize;
+    let mut distinct_panes = BTreeSet::new();
+    let mut kind_counts: BTreeMap<HerdWaveEventKind, u32> = BTreeMap::new();
+    let mut first_seen_ms: Option<u64> = None;
+
+    for signal in signals
+        .iter()
+        .filter(|signal| signal.timestamp_ms >= window_start_ms && signal.timestamp_ms <= latest_ms)
+    {
+        event_count = event_count.saturating_add(1);
+        if let Some(pane_id) = signal.pane_id {
+            distinct_panes.insert(pane_id);
+        }
+        *kind_counts.entry(signal.kind).or_insert(0) += 1;
+        first_seen_ms =
+            Some(first_seen_ms.map_or(signal.timestamp_ms, |first| first.min(signal.timestamp_ms)));
+    }
+
+    let distinct_panes = saturating_usize_to_u32(distinct_panes.len());
+    let event_count = saturating_usize_to_u32(event_count);
+    let (dominant_kind, dominant_kind_count) = dominant_herd_wave_kind(&kind_counts);
+    let pressure_tier = herd_wave_pressure_tier(distinct_panes, config);
+    let detected = pressure_tier > FleetPressureTier::Normal;
+    let recommended_stagger_ms = if detected {
+        config.base_stagger_ms.max(1)
+    } else {
+        0
+    };
+    let cohort_max_stagger_ms = if detected && distinct_panes > 0 {
+        herd_wave_stagger_delay_ms(distinct_panes.saturating_sub(1), config)
+    } else {
+        0
+    };
+
+    HerdWavePressureSummary {
+        pressure_tier,
+        detected,
+        event_count,
+        distinct_panes,
+        window_ms: config.detection_window_ms,
+        first_seen_ms,
+        last_seen_ms: Some(latest_ms),
+        dominant_kind,
+        dominant_kind_count,
+        recommended_stagger_ms,
+        cohort_max_stagger_ms,
+    }
 }
 
 /// Per-agent load snapshot for rebalancing decisions.
@@ -1017,6 +1200,8 @@ pub struct SwarmAdmissionTelemetry {
     pub memory_tier_budget: Option<FleetMemoryTierBudgetSnapshot>,
     /// Per-latency-stage budget pressure.
     pub latency_stage_pressures: Option<Vec<StagePressure>>,
+    /// Optional herd-wave pressure from synchronized agent actions.
+    pub herd_wave_pressure: Option<HerdWavePressureSummary>,
 }
 
 impl SwarmAdmissionTelemetry {
@@ -1033,7 +1218,15 @@ impl SwarmAdmissionTelemetry {
             fleet_pressure: Some(fleet_pressure),
             memory_tier_budget: Some(memory_tier_budget),
             latency_stage_pressures: Some(latency_stage_pressures),
+            herd_wave_pressure: None,
         }
+    }
+
+    /// Attach a herd-wave pressure summary to this telemetry bundle.
+    #[must_use]
+    pub fn with_herd_wave_pressure(mut self, summary: HerdWavePressureSummary) -> Self {
+        self.herd_wave_pressure = Some(summary);
+        self
     }
 }
 
@@ -1084,6 +1277,8 @@ pub enum AdmissionReasonCode {
     MemoryTierPressure,
     /// At least one latency stage is over its current budget.
     LatencyStageOverBudget,
+    /// Synchronized agent activity is likely to amplify pressure.
+    HerdWavePressure,
     /// Queue telemetry was missing.
     MissingQueueTelemetry,
     /// Fleet-pressure telemetry was missing.
@@ -1173,6 +1368,12 @@ pub struct ResourceAdmissionDecisionSummary {
     pub memory_tier_pressure: Option<FleetPressureTier>,
     /// Maximum latency-stage over-budget ratio, if latency telemetry was available.
     pub max_latency_over_budget_ratio: Option<f64>,
+    /// Herd-wave pressure tier from synchronized agent activity, if available.
+    pub herd_wave_pressure: Option<FleetPressureTier>,
+    /// Recommended adjacent-action stagger for the active herd-wave cohort.
+    pub herd_wave_recommended_stagger_ms: Option<u64>,
+    /// Maximum cohort delay implied by the active herd-wave cohort.
+    pub herd_wave_cohort_max_stagger_ms: Option<u64>,
 }
 
 /// Deterministic threshold policy for global admission.
@@ -1310,6 +1511,25 @@ impl SwarmAdmissionController {
             }
         };
 
+        let (herd_wave_pressure, herd_wave_recommended_stagger_ms, herd_wave_cohort_max_stagger_ms) =
+            match telemetry.herd_wave_pressure.as_ref() {
+                Some(summary) => {
+                    let severity = summary.pressure_tier.as_u8();
+                    if severity > 0 {
+                        raw_severity = raw_severity.max(severity);
+                        push_reason(&mut reasons, AdmissionReasonCode::HerdWavePressure);
+                    }
+                    (
+                        Some(summary.pressure_tier),
+                        (summary.recommended_stagger_ms > 0)
+                            .then_some(summary.recommended_stagger_ms),
+                        (summary.cohort_max_stagger_ms > 0)
+                            .then_some(summary.cohort_max_stagger_ms),
+                    )
+                }
+                None => (None, None, None),
+            };
+
         if raw_severity == 0 {
             push_reason(&mut reasons, AdmissionReasonCode::Healthy);
         }
@@ -1345,6 +1565,9 @@ impl SwarmAdmissionController {
             fleet_pressure: telemetry.fleet_pressure,
             memory_tier_pressure,
             max_latency_over_budget_ratio,
+            herd_wave_pressure,
+            herd_wave_recommended_stagger_ms,
+            herd_wave_cohort_max_stagger_ms,
         }
     }
 
@@ -1503,6 +1726,46 @@ fn push_reason(reasons: &mut Vec<AdmissionReasonCode>, reason: AdmissionReasonCo
     }
 }
 
+fn herd_wave_pressure_tier(
+    distinct_panes: u32,
+    config: &HerdWaveDetectionConfig,
+) -> FleetPressureTier {
+    let min = config.min_distinct_panes.max(2);
+    if distinct_panes < min {
+        return FleetPressureTier::Normal;
+    }
+
+    let elevated = config.elevated_distinct_panes.max(min);
+    let critical = config
+        .critical_distinct_panes
+        .max(elevated.saturating_add(1));
+    let emergency = config
+        .emergency_distinct_panes
+        .max(critical.saturating_add(1));
+
+    if distinct_panes >= emergency {
+        FleetPressureTier::Emergency
+    } else if distinct_panes >= critical {
+        FleetPressureTier::Critical
+    } else {
+        FleetPressureTier::Elevated
+    }
+}
+
+fn dominant_herd_wave_kind(
+    kind_counts: &BTreeMap<HerdWaveEventKind, u32>,
+) -> (Option<HerdWaveEventKind>, u32) {
+    let mut best_kind = None;
+    let mut best_count = 0;
+    for (&kind, &count) in kind_counts {
+        if count > best_count {
+            best_kind = Some(kind);
+            best_count = count;
+        }
+    }
+    (best_kind, best_count)
+}
+
 fn saturating_usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -1517,6 +1780,7 @@ mod tests {
     use crate::fleet_memory_controller::{FleetMemoryTier, FleetMemoryTierBudgetRecord};
     use crate::latency_stages::LatencyStage;
     use crate::swarm_work_queue::{WorkItem, WorkQueueConfig};
+    use proptest::prelude::*;
 
     fn test_config() -> SchedulerConfig {
         SchedulerConfig {
@@ -1709,6 +1973,7 @@ mod tests {
             fleet_pressure: Some(FleetPressureTier::Normal),
             memory_tier_budget: None,
             latency_stage_pressures: Some(healthy_stage_pressure()),
+            herd_wave_pressure: None,
         };
         let request = mission_critical_admission_request();
 
@@ -1858,6 +2123,139 @@ mod tests {
         let json = serde_json::to_string(&summary).expect("serialize admission summary");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parse summary");
         assert!(value["max_latency_over_budget_ratio"].is_number());
+    }
+
+    #[test]
+    fn herd_wave_detection_requires_distinct_panes_not_repeated_single_pane_ft_wks87() {
+        let config = HerdWaveDetectionConfig::default();
+        let repeated_single_pane = vec![
+            HerdWaveSignal::pane(7, HerdWaveEventKind::Retry, 1_000),
+            HerdWaveSignal::pane(7, HerdWaveEventKind::Retry, 1_100),
+            HerdWaveSignal::pane(7, HerdWaveEventKind::Retry, 1_200),
+            HerdWaveSignal::pane(7, HerdWaveEventKind::Retry, 1_300),
+        ];
+
+        let false_positive = detect_herd_wave_pressure(&repeated_single_pane, &config);
+
+        assert!(!false_positive.detected);
+        assert_eq!(false_positive.pressure_tier, FleetPressureTier::Normal);
+        assert_eq!(false_positive.distinct_panes, 1);
+        assert_eq!(false_positive.event_count, 4);
+        assert_eq!(false_positive.recommended_stagger_ms, 0);
+
+        let synchronized_cohort = vec![
+            HerdWaveSignal::pane(1, HerdWaveEventKind::Retry, 2_000),
+            HerdWaveSignal::pane(2, HerdWaveEventKind::Retry, 2_100),
+            HerdWaveSignal::pane(3, HerdWaveEventKind::Retry, 2_200),
+        ];
+        let detected = detect_herd_wave_pressure(&synchronized_cohort, &config);
+
+        assert!(detected.detected);
+        assert_eq!(detected.pressure_tier, FleetPressureTier::Elevated);
+        assert_eq!(detected.distinct_panes, 3);
+        assert_eq!(detected.dominant_kind, Some(HerdWaveEventKind::Retry));
+        assert_eq!(detected.dominant_kind_count, 3);
+        assert_eq!(detected.recommended_stagger_ms, config.base_stagger_ms);
+        assert_eq!(detected.cohort_max_stagger_ms, config.base_stagger_ms * 2);
+    }
+
+    #[test]
+    fn herd_wave_detection_respects_sliding_window_boundaries_ft_wks87() {
+        let config = HerdWaveDetectionConfig {
+            detection_window_ms: 100,
+            ..HerdWaveDetectionConfig::default()
+        };
+        let below_threshold = vec![
+            HerdWaveSignal::pane(1, HerdWaveEventKind::Compaction, 0),
+            HerdWaveSignal::pane(2, HerdWaveEventKind::Compaction, 50),
+            HerdWaveSignal::pane(3, HerdWaveEventKind::Compaction, 101),
+        ];
+
+        let summary = detect_herd_wave_pressure(&below_threshold, &config);
+
+        assert!(!summary.detected);
+        assert_eq!(summary.distinct_panes, 2);
+        assert_eq!(summary.event_count, 2);
+        assert_eq!(summary.first_seen_ms, Some(50));
+        assert_eq!(summary.last_seen_ms, Some(101));
+
+        let inside_window = vec![
+            HerdWaveSignal::pane(1, HerdWaveEventKind::Compaction, 0),
+            HerdWaveSignal::pane(2, HerdWaveEventKind::Compaction, 50),
+            HerdWaveSignal::pane(3, HerdWaveEventKind::Compaction, 100),
+            HerdWaveSignal::pane(4, HerdWaveEventKind::WorkflowFanout, 101),
+        ];
+        let detected = detect_herd_wave_pressure(&inside_window, &config);
+
+        assert!(detected.detected);
+        assert_eq!(detected.distinct_panes, 3);
+        assert_eq!(detected.event_count, 3);
+        assert_eq!(detected.dominant_kind, Some(HerdWaveEventKind::Compaction));
+    }
+
+    #[test]
+    fn admission_uses_herd_wave_pressure_and_surfaces_stagger_guidance_ft_wks87() {
+        let controller = SwarmAdmissionController::default();
+        let wave_signals: Vec<_> = (0..8)
+            .map(|pane| {
+                HerdWaveSignal::pane(pane, HerdWaveEventKind::RateLimitRecovery, 10_000 + pane)
+            })
+            .collect();
+        let wave = detect_herd_wave_pressure(&wave_signals, &HerdWaveDetectionConfig::default());
+        let telemetry =
+            admission_telemetry(0.10, FleetPressureTier::Normal).with_herd_wave_pressure(wave);
+
+        let summary = controller.evaluate(&background_admission_request(), &telemetry);
+
+        assert_eq!(summary.action, AdmissionAction::Degrade);
+        assert_eq!(
+            summary.herd_wave_pressure,
+            Some(FleetPressureTier::Critical)
+        );
+        assert_eq!(
+            summary.herd_wave_recommended_stagger_ms,
+            Some(HerdWaveDetectionConfig::default().base_stagger_ms)
+        );
+        assert!(
+            summary
+                .reason_codes
+                .contains(&AdmissionReasonCode::HerdWavePressure)
+        );
+        assert!(summary.herd_wave_cohort_max_stagger_ms.is_some());
+
+        let json = serde_json::to_string(&summary).expect("serialize summary");
+        assert!(json.contains("herd_wave_pressure"));
+        assert!(json.contains("herd_wave_recommended_stagger_ms"));
+    }
+
+    proptest! {
+        #[test]
+        fn herd_wave_stagger_delay_is_bounded_and_monotonic_ft_wks87(rank in 0_u32..100_000) {
+            let config = HerdWaveDetectionConfig::default();
+            let delay = herd_wave_stagger_delay_ms(rank, &config);
+
+            prop_assert!(delay <= config.max_stagger_ms);
+            if rank > 0 {
+                let previous = herd_wave_stagger_delay_ms(rank - 1, &config);
+                prop_assert!(delay >= previous);
+            }
+        }
+
+        #[test]
+        fn detected_herd_wave_cohort_never_gets_unbounded_tail_delay_ft_wks87(
+            distinct_panes in 3_u32..512,
+        ) {
+            let config = HerdWaveDetectionConfig::default();
+            let signals: Vec<_> = (0..distinct_panes)
+                .map(|pane| HerdWaveSignal::pane(pane as u64, HerdWaveEventKind::Wake, 20_000 + u64::from(pane)))
+                .collect();
+
+            let summary = detect_herd_wave_pressure(&signals, &config);
+
+            prop_assert!(summary.detected);
+            prop_assert!(summary.cohort_max_stagger_ms <= config.max_stagger_ms);
+            prop_assert!(summary.recommended_stagger_ms <= config.max_stagger_ms);
+        }
     }
 
     // =========================================================================
