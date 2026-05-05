@@ -429,8 +429,16 @@ test_docs_generation() {
     # Check for schema-to-docs generation tooling
     if [[ -f "$PROJECT_ROOT/scripts/generate_schema_docs.sh" ]]; then
         log_pass "Schema docs generator found"
-        # Would run: ./scripts/generate_schema_docs.sh --dry-run
-        log_skip "Docs generation: not implemented yet"
+        local docs_output
+        local docs_result=0
+        docs_output=$("$PROJECT_ROOT/scripts/generate_schema_docs.sh" --dry-run 2>&1) || docs_result=$?
+        if [[ $docs_result -eq 0 ]]; then
+            log_pass "Docs generation: dry-run succeeded"
+            e2e_add_file "schema_docs_dry_run.md" "$docs_output"
+        else
+            log_fail "Docs generation: dry-run failed"
+            e2e_add_file "schema_docs_generation_error.txt" "$docs_output"
+        fi
     else
         log_skip "Docs generation: no generator script found (wa-upg.10.2 not implemented)"
     fi
