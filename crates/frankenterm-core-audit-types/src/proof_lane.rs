@@ -215,6 +215,39 @@ impl ProofReportBucket {
     }
 }
 
+/// Release/closeout evidence class for operator-facing performance claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofEvidenceClass {
+    /// High-scale hardware predicate and proof invariants both passed.
+    HighScaleProven,
+    /// High-scale hardware predicate was observed, but proof cannot support it.
+    HighScaleNotProven,
+    /// High-scale lane was explicitly skipped and must not be promoted.
+    HighScaleSkippedNotProven,
+    /// Reduced remote proof only.
+    RemoteReduced,
+    /// Reduced local proof only.
+    LocalReduced,
+    /// No explicit hardware/evidence class was retained.
+    Unknown,
+}
+
+impl ProofEvidenceClass {
+    /// Stable key for release and closeout summaries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HighScaleProven => "high_scale_proven",
+            Self::HighScaleNotProven => "high_scale_not_proven",
+            Self::HighScaleSkippedNotProven => "high_scale_skipped_not_proven",
+            Self::RemoteReduced => "remote_reduced",
+            Self::LocalReduced => "local_reduced",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Compact proof-doctor snapshot retained by a proof ledger record.
 ///
 /// Release and closeout surfaces use this as a reference to the runtime
@@ -849,6 +882,42 @@ pub struct ProofLaneReport {
     pub operator_summary: String,
 }
 
+/// Blocker group for release and swarm closeout reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofCloseoutBlockerGroup {
+    /// Stable report bucket for the blocker.
+    pub bucket: ProofReportBucket,
+    /// Number of proof records in this blocker bucket.
+    pub count: u64,
+    /// Affected Beads, deduplicated in first-seen order.
+    pub bead_ids: Vec<String>,
+    /// Stable reason codes contributing to this blocker.
+    pub reason_codes: Vec<String>,
+    /// Operator-facing next actions from the selected records.
+    pub next_actions: Vec<String>,
+}
+
+/// Release/swarm closeout report derived from proof-lane records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofCloseoutReport {
+    /// Report schema version.
+    pub schema_version: u32,
+    /// Number of records summarized.
+    pub total_records: u64,
+    /// Counts by evidence class key.
+    pub by_evidence_class: BTreeMap<String, u64>,
+    /// Beads with enough evidence to support normal source closeout.
+    pub closeable_source_beads: Vec<String>,
+    /// Beads with enough evidence to support high-scale claims.
+    pub high_scale_claim_beads: Vec<String>,
+    /// Actionable non-pass blocker groups.
+    pub blocker_groups: Vec<ProofCloseoutBlockerGroup>,
+    /// Validation findings inherited from proof-lane validation.
+    pub findings: Vec<ProofLedgerFinding>,
+    /// Concise operator summary for release notes and Beads comments.
+    pub operator_summary: String,
+}
+
 impl ProofLaneReport {
     /// Build an aggregate report from proof records.
     #[must_use]
@@ -923,6 +992,112 @@ impl ProofLaneReport {
         self.findings
             .iter()
             .any(|finding| finding.severity == ProofFindingSeverity::Error)
+    }
+}
+
+impl ProofCloseoutReport {
+    /// Build a release/swarm closeout report from proof records.
+    #[must_use]
+    pub fn from_records(records: &[ProofAttemptRecord]) -> Self {
+        let mut by_evidence_class = BTreeMap::new();
+        let mut closeable_source_beads = Vec::new();
+        let mut high_scale_claim_beads = Vec::new();
+        let mut blocker_groups = BTreeMap::<ProofReportBucket, ProofCloseoutBlockerGroup>::new();
+        let mut findings = Vec::new();
+
+        for record in records {
+            let evidence_class = record.evidence_class();
+            *by_evidence_class
+                .entry(evidence_class.as_str().to_string())
+                .or_insert(0) += 1;
+
+            if record.safe_to_close_source_bead() {
+                push_unique_non_empty(&mut closeable_source_beads, &record.bead_id);
+            }
+            if record.allows_high_scale_claim() {
+                push_unique_non_empty(&mut high_scale_claim_beads, &record.bead_id);
+            }
+
+            let bucket = record.report_bucket();
+            if bucket != ProofReportBucket::RemoteProofPassed {
+                let group =
+                    blocker_groups
+                        .entry(bucket)
+                        .or_insert_with(|| ProofCloseoutBlockerGroup {
+                            bucket,
+                            count: 0,
+                            bead_ids: Vec::new(),
+                            reason_codes: Vec::new(),
+                            next_actions: Vec::new(),
+                        });
+                group.count += 1;
+                push_unique_non_empty(&mut group.bead_ids, &record.bead_id);
+                push_unique_non_empty(&mut group.reason_codes, &record.reason_code);
+                push_unique_non_empty(&mut group.next_actions, &record.next_action);
+            }
+
+            findings.extend(validate_proof_record(record));
+        }
+
+        let blocker_groups = blocker_groups.into_values().collect::<Vec<_>>();
+        let operator_summary = closeout_operator_summary(
+            records.len(),
+            closeable_source_beads.len(),
+            high_scale_claim_beads.len(),
+            blocker_groups.len(),
+            &by_evidence_class,
+            findings.len(),
+        );
+
+        Self {
+            schema_version: PROOF_LANE_SCHEMA_VERSION,
+            total_records: records.len() as u64,
+            by_evidence_class,
+            closeable_source_beads,
+            high_scale_claim_beads,
+            blocker_groups,
+            findings,
+            operator_summary,
+        }
+    }
+
+    /// Count records in an evidence class.
+    #[must_use]
+    pub fn evidence_count(&self, evidence_class: ProofEvidenceClass) -> u64 {
+        self.by_evidence_class
+            .get(evidence_class.as_str())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether any validation finding is an error.
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| finding.severity == ProofFindingSeverity::Error)
+    }
+}
+
+impl ProofAttemptRecord {
+    /// Evidence class used by release and swarm closeout reports.
+    #[must_use]
+    pub fn evidence_class(&self) -> ProofEvidenceClass {
+        match self.hardware_predicate {
+            Some(ProofHardwarePredicate::ProvenPredicateMet) => {
+                if self.allows_high_scale_claim() {
+                    ProofEvidenceClass::HighScaleProven
+                } else {
+                    ProofEvidenceClass::HighScaleNotProven
+                }
+            }
+            Some(ProofHardwarePredicate::SkippedNotProven) => {
+                ProofEvidenceClass::HighScaleSkippedNotProven
+            }
+            Some(ProofHardwarePredicate::RemoteReduced) => ProofEvidenceClass::RemoteReduced,
+            Some(ProofHardwarePredicate::LocalReduced) => ProofEvidenceClass::LocalReduced,
+            Some(ProofHardwarePredicate::Unknown) | None => ProofEvidenceClass::Unknown,
+        }
     }
 }
 
@@ -1001,8 +1176,52 @@ fn operator_summary(
          pre_cargo_blocked={pre_cargo}; post_cargo_blocked={post_cargo}; \
          dirty_tree_blocked={dirty_tree}; local_invalid={local_invalid}; \
          skipped_not_proven={skipped}; inconclusive={inconclusive}; \
-         missing_evidence={missing}; findings={finding_count}"
+        missing_evidence={missing}; findings={finding_count}"
     )
+}
+
+fn closeout_operator_summary(
+    total_records: usize,
+    closeable_source_beads: usize,
+    high_scale_claim_beads: usize,
+    blocker_groups: usize,
+    by_evidence_class: &BTreeMap<String, u64>,
+    finding_count: usize,
+) -> String {
+    let high_scale_proven = by_evidence_class
+        .get(ProofEvidenceClass::HighScaleProven.as_str())
+        .copied()
+        .unwrap_or(0);
+    let high_scale_not_proven = by_evidence_class
+        .get(ProofEvidenceClass::HighScaleNotProven.as_str())
+        .copied()
+        .unwrap_or(0)
+        + by_evidence_class
+            .get(ProofEvidenceClass::HighScaleSkippedNotProven.as_str())
+            .copied()
+            .unwrap_or(0);
+    let remote_reduced = by_evidence_class
+        .get(ProofEvidenceClass::RemoteReduced.as_str())
+        .copied()
+        .unwrap_or(0);
+    let local_reduced = by_evidence_class
+        .get(ProofEvidenceClass::LocalReduced.as_str())
+        .copied()
+        .unwrap_or(0);
+
+    format!(
+        "records={total_records}; closeable_source_beads={closeable_source_beads}; \
+         high_scale_claim_beads={high_scale_claim_beads}; blocker_groups={blocker_groups}; \
+         high_scale_proven={high_scale_proven}; high_scale_not_proven={high_scale_not_proven}; \
+         remote_reduced={remote_reduced}; local_reduced={local_reduced}; \
+         findings={finding_count}"
+    )
+}
+
+fn push_unique_non_empty(values: &mut Vec<String>, value: &str) {
+    if !value.trim().is_empty() && !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -1266,6 +1485,122 @@ mod tests {
         assert_eq!(report.bucket_count(ProofReportBucket::InvalidLocalProof), 1);
         assert_eq!(report.bucket_count(ProofReportBucket::SourceRed), 1);
         assert!(report.operator_summary.contains("local_invalid=1"));
+    }
+
+    #[test]
+    fn closeout_report_groups_blockers_and_evidence_classes() {
+        let mut remote_reduced = base_record(ProofState::Pass);
+        remote_reduced.proof_id = "remote-reduced".into();
+        remote_reduced.bead_id = "ft-storage-reduced".into();
+        remote_reduced.remote_cargo_reached = true;
+        remote_reduced.rustc_reached = true;
+        remote_reduced.test_binary_started = true;
+        remote_reduced.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        remote_reduced.hardware_predicate = Some(ProofHardwarePredicate::RemoteReduced);
+
+        let mut high_scale = base_record(ProofState::Pass);
+        high_scale.proof_id = "high-scale-pass".into();
+        high_scale.bead_id = "ft-tn6cw-gauntlet".into();
+        high_scale.remote_cargo_reached = true;
+        high_scale.rustc_reached = true;
+        high_scale.test_binary_started = true;
+        high_scale.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        high_scale.hardware_predicate = Some(ProofHardwarePredicate::ProvenPredicateMet);
+
+        let mut infra = base_record(ProofState::InfraBlockedPreCargo);
+        infra.proof_id = "infra-blocked".into();
+        infra.bead_id = "ft-tn6cw.1".into();
+        infra.reason_code = "proof.infra.pre_cargo.rch_timeout_wrapper".into();
+        infra.summary = "installed RCH failed before Cargo".into();
+        infra.next_action = "fix RCH wrapper before rerunning release proof".into();
+
+        let mut local_invalid = base_record(ProofState::LocalInvalid);
+        local_invalid.proof_id = "local-invalid".into();
+        local_invalid.bead_id = "ft-luq3w.4".into();
+        local_invalid.observed_backend = ProofBackend::LocalShell;
+        local_invalid.local_cargo_detected = true;
+        local_invalid.artifact_retrieval_status = ArtifactRetrievalStatus::NotApplicable;
+        local_invalid.hardware_predicate = Some(ProofHardwarePredicate::LocalReduced);
+        local_invalid.reason_code = "proof.local_invalid.shell_wrapped_cargo".into();
+        local_invalid.next_action = "rerun through rch with a direct cargo argv".into();
+
+        let mut skipped = base_record(ProofState::SkippedNotProven);
+        skipped.proof_id = "high-scale-skipped".into();
+        skipped.bead_id = "ft-tn6cw.high-scale".into();
+        skipped.hardware_predicate = Some(ProofHardwarePredicate::SkippedNotProven);
+        skipped.reason_code = "proof.high_scale.skipped_not_proven".into();
+        skipped.next_action = "run on 64+ CPU / 256+ GiB hardware before claiming PROVEN".into();
+
+        let report = ProofCloseoutReport::from_records(&[
+            remote_reduced,
+            high_scale,
+            infra,
+            local_invalid,
+            skipped,
+        ]);
+
+        assert_eq!(report.total_records, 5);
+        assert_eq!(report.evidence_count(ProofEvidenceClass::RemoteReduced), 1);
+        assert_eq!(
+            report.evidence_count(ProofEvidenceClass::HighScaleProven),
+            1
+        );
+        assert_eq!(
+            report.evidence_count(ProofEvidenceClass::HighScaleSkippedNotProven),
+            1
+        );
+        assert_eq!(report.evidence_count(ProofEvidenceClass::LocalReduced), 1);
+        assert_eq!(
+            report.closeable_source_beads,
+            vec![
+                "ft-storage-reduced".to_string(),
+                "ft-tn6cw-gauntlet".to_string()
+            ]
+        );
+        assert_eq!(
+            report.high_scale_claim_beads,
+            vec!["ft-tn6cw-gauntlet".to_string()]
+        );
+
+        let infra_group = report
+            .blocker_groups
+            .iter()
+            .find(|group| group.bucket == ProofReportBucket::PreCargoInfrastructureBlocker)
+            .expect("pre-Cargo blocker group");
+        assert_eq!(infra_group.bead_ids, vec!["ft-tn6cw.1".to_string()]);
+        assert!(
+            infra_group
+                .next_actions
+                .contains(&"fix RCH wrapper before rerunning release proof".to_string())
+        );
+
+        let local_group = report
+            .blocker_groups
+            .iter()
+            .find(|group| group.bucket == ProofReportBucket::InvalidLocalProof)
+            .expect("local-invalid blocker group");
+        assert_eq!(
+            local_group.reason_codes,
+            vec!["proof.local_invalid.shell_wrapped_cargo".to_string()]
+        );
+
+        let skipped_group = report
+            .blocker_groups
+            .iter()
+            .find(|group| group.bucket == ProofReportBucket::SkippedNotProven)
+            .expect("skipped high-scale blocker group");
+        assert!(
+            skipped_group
+                .next_actions
+                .iter()
+                .any(|action| action.contains("64+ CPU / 256+ GiB"))
+        );
+
+        assert!(!report.has_errors());
+        assert!(report.operator_summary.contains("high_scale_proven=1"));
+        assert!(report.operator_summary.contains("high_scale_not_proven=1"));
+        assert!(report.operator_summary.contains("remote_reduced=1"));
+        assert!(report.operator_summary.contains("local_reduced=1"));
     }
 
     #[test]
