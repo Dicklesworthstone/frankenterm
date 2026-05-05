@@ -318,6 +318,23 @@ pub enum ScaleScenarioClass {
     LiveHardware,
 }
 
+/// Source class for evidence attached to a scale proof row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleProofEvidenceSource {
+    /// Deterministic synthetic fixture evidence.
+    Synthetic,
+    /// Replay artifact derived from captured or generated transcripts.
+    ReplayBacked,
+    /// Reduced proof produced by an RCH remote worker.
+    RchRemote,
+    /// Proof produced on target-class high-core/high-memory hardware.
+    LiveHardware,
+    /// Older or incomplete rows that did not record the source class.
+    #[default]
+    Unknown,
+}
+
 /// Coverage dimension exercised by a scenario proof row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -478,6 +495,9 @@ pub struct ProofExecutionEvidence {
     pub memory_bytes: u64,
     /// Storage capacity or scratch budget in bytes.
     pub storage_bytes: u64,
+    /// Storage class observed for the proof lane.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub storage_class: String,
     /// Operating system identifier.
     pub os: String,
     /// Worker identifier.
@@ -497,6 +517,7 @@ impl ProofExecutionEvidence {
         self.cpu_count > 0
             && self.memory_bytes > 0
             && self.storage_bytes > 0
+            && !self.storage_class.is_empty()
             && !self.os.is_empty()
             && !self.worker_id.is_empty()
             && !self.command.is_empty()
@@ -516,6 +537,9 @@ pub struct ScaleScenarioProof {
     pub dimensions: Vec<ProofDimension>,
     /// Proof result.
     pub status: ProofStatus,
+    /// Where this proof evidence came from.
+    #[serde(default)]
+    pub evidence_source: ScaleProofEvidenceSource,
     /// Execution evidence, required for live hardware claims.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<ProofExecutionEvidence>,
@@ -530,6 +554,7 @@ impl ScaleScenarioProof {
     pub fn proves_hardware_claim(&self, min_cpu_count: u32, min_memory_bytes: u64) -> bool {
         self.status == ProofStatus::Passed
             && self.class == ScaleScenarioClass::LiveHardware
+            && self.evidence_source == ScaleProofEvidenceSource::LiveHardware
             && self.dimensions.contains(&ProofDimension::Hardware)
             && self.evidence.as_ref().is_some_and(|evidence| {
                 evidence.is_complete()
@@ -583,6 +608,95 @@ impl ScaleProofMatrix {
     pub fn coverage_summary(&self) -> ScaleProofCoverageSummary {
         ScaleProofCoverageSummary::from_proofs(&self.proofs)
     }
+
+    /// Validate proof rows as a durable evidence index.
+    #[must_use]
+    pub fn validate_evidence_index(
+        &self,
+        min_cpu_count: u32,
+        min_memory_bytes: u64,
+    ) -> Vec<ScaleProofMatrixFinding> {
+        let mut findings = Vec::new();
+
+        for proof in &self.proofs {
+            if proof.scenario_id.trim().is_empty() {
+                findings.push(ScaleProofMatrixFinding::error(
+                    proof,
+                    "missing_scenario_id",
+                    "proof rows must link to a stable scale-lab scenario id",
+                ));
+            } else if self.manifest.scenario(&proof.scenario_id).is_none() {
+                findings.push(ScaleProofMatrixFinding::error(
+                    proof,
+                    "unknown_scenario_id",
+                    "proof row scenario_id is not present in the scale-lab manifest",
+                ));
+            }
+
+            if proof.status == ProofStatus::Passed
+                && proof.evidence_source == ScaleProofEvidenceSource::Unknown
+            {
+                findings.push(ScaleProofMatrixFinding::warning(
+                    proof,
+                    "unknown_evidence_source",
+                    "passed proof rows should record synthetic, replay, RCH, or live-hardware evidence source",
+                ));
+            }
+
+            if proof.status == ProofStatus::Passed
+                && proof.dimensions.contains(&ProofDimension::Hardware)
+            {
+                if proof.class != ScaleScenarioClass::LiveHardware
+                    || proof.evidence_source != ScaleProofEvidenceSource::LiveHardware
+                {
+                    findings.push(ScaleProofMatrixFinding::error(
+                        proof,
+                        "hardware_pass_not_live_hardware",
+                        "passed hardware claims must come from live-hardware rows, not synthetic or replay evidence",
+                    ));
+                    continue;
+                }
+
+                let Some(evidence) = &proof.evidence else {
+                    findings.push(ScaleProofMatrixFinding::error(
+                        proof,
+                        "hardware_pass_missing_execution_evidence",
+                        "passed hardware claims require CPU, RAM, storage, worker, command, elapsed time, and git evidence",
+                    ));
+                    continue;
+                };
+
+                if !evidence.is_complete() {
+                    findings.push(ScaleProofMatrixFinding::error(
+                        proof,
+                        "hardware_pass_incomplete_execution_evidence",
+                        "passed hardware claims cannot omit CPU, RAM, storage class, worker, command, elapsed time, or git evidence",
+                    ));
+                }
+
+                if evidence.cpu_count < min_cpu_count || evidence.memory_bytes < min_memory_bytes {
+                    findings.push(ScaleProofMatrixFinding::error(
+                        proof,
+                        "hardware_pass_predicate_not_met",
+                        "passed hardware claims must satisfy the requested CPU and RAM predicates",
+                    ));
+                }
+            }
+
+            if proof.status == ProofStatus::SkippedNotProven
+                && proof.dimensions.contains(&ProofDimension::Hardware)
+                && !proof.note.contains("SKIPPED_NOT_PROVEN")
+            {
+                findings.push(ScaleProofMatrixFinding::warning(
+                    proof,
+                    "hardware_gap_missing_skip_label",
+                    "hardware proof gaps should say SKIPPED_NOT_PROVEN so reports cannot promote them to proven",
+                ));
+            }
+        }
+
+        findings
+    }
 }
 
 /// Aggregated coverage counters for a scale proof matrix.
@@ -610,6 +724,49 @@ pub struct ScaleProofCoverageSummary {
     pub memory_passed: usize,
     /// Passed live-hardware coverage rows.
     pub hardware_passed: usize,
+}
+
+/// Severity for scale proof matrix validation findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleProofFindingSeverity {
+    /// The evidence index violates a truthfulness invariant.
+    Error,
+    /// The row is usable, but less explicit than operator surfaces expect.
+    Warning,
+}
+
+/// Validation finding for a scale proof evidence index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleProofMatrixFinding {
+    /// Scenario row that produced the finding.
+    pub scenario_id: String,
+    /// Finding severity.
+    pub severity: ScaleProofFindingSeverity,
+    /// Stable machine-readable reason.
+    pub reason_code: String,
+    /// Operator-facing finding text.
+    pub message: String,
+}
+
+impl ScaleProofMatrixFinding {
+    fn error(proof: &ScaleScenarioProof, reason_code: &str, message: &str) -> Self {
+        Self {
+            scenario_id: proof.scenario_id.clone(),
+            severity: ScaleProofFindingSeverity::Error,
+            reason_code: reason_code.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    fn warning(proof: &ScaleScenarioProof, reason_code: &str, message: &str) -> Self {
+        Self {
+            scenario_id: proof.scenario_id.clone(),
+            severity: ScaleProofFindingSeverity::Warning,
+            reason_code: reason_code.to_string(),
+            message: message.to_string(),
+        }
+    }
 }
 
 impl ScaleProofCoverageSummary {
@@ -1454,6 +1611,7 @@ label = "b"
             cpu_count,
             memory_bytes,
             storage_bytes: 1_099_511_627_776,
+            storage_class: "rch-ephemeral-nvme".to_string(),
             os: "linux-x86_64".to_string(),
             worker_id: "rch-scale-worker-01".to_string(),
             command: "cargo test -p frankenterm-core-replay scale_proof_matrix".to_string(),
@@ -1498,8 +1656,10 @@ label = "b"
             class: ScaleScenarioClass::Synthetic,
             dimensions: vec![ProofDimension::Hardware],
             status: ProofStatus::SkippedNotProven,
+            evidence_source: ScaleProofEvidenceSource::Synthetic,
             evidence: Some(complete_evidence(128, 549_755_813_888)),
-            note: "synthetic proof does not prove live 64-core/256GiB capacity".to_string(),
+            note: "SKIPPED_NOT_PROVEN: synthetic proof does not prove live 64-core/256GiB capacity"
+                .to_string(),
         };
         let matrix =
             ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), vec![proof]);
@@ -1523,6 +1683,7 @@ label = "b"
             class: ScaleScenarioClass::LiveHardware,
             dimensions: vec![ProofDimension::Hardware],
             status: ProofStatus::Passed,
+            evidence_source: ScaleProofEvidenceSource::LiveHardware,
             evidence: Some(complete_evidence(96, 549_755_813_888)),
             note: String::new(),
         };
@@ -1553,6 +1714,7 @@ label = "b"
                     ProofDimension::Memory,
                 ],
                 status: ProofStatus::Passed,
+                evidence_source: ScaleProofEvidenceSource::RchRemote,
                 evidence: Some(complete_evidence(16, 68_719_476_736)),
                 note: String::new(),
             },
@@ -1561,8 +1723,9 @@ label = "b"
                 class: ScaleScenarioClass::Synthetic,
                 dimensions: vec![ProofDimension::Hardware],
                 status: ProofStatus::SkippedNotProven,
+                evidence_source: ScaleProofEvidenceSource::Synthetic,
                 evidence: None,
-                note: "waiting for live high-core worker".to_string(),
+                note: "SKIPPED_NOT_PROVEN: waiting for live high-core worker".to_string(),
             },
         ];
         let matrix = ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), proofs);
@@ -1585,6 +1748,7 @@ label = "b"
                 class: ScaleScenarioClass::Synthetic,
                 dimensions: vec![ProofDimension::Correctness],
                 status: ProofStatus::Passed,
+                evidence_source: ScaleProofEvidenceSource::Synthetic,
                 evidence: Some(complete_evidence(16, 68_719_476_736)),
                 note: String::new(),
             },
@@ -1593,8 +1757,9 @@ label = "b"
                 class: ScaleScenarioClass::Synthetic,
                 dimensions: vec![ProofDimension::Hardware],
                 status: ProofStatus::SkippedNotProven,
+                evidence_source: ScaleProofEvidenceSource::Synthetic,
                 evidence: None,
-                note: "hardware proof gap".to_string(),
+                note: "SKIPPED_NOT_PROVEN: hardware proof gap".to_string(),
             },
         ];
         let matrix = ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), proofs);
@@ -1606,5 +1771,82 @@ label = "b"
         let restored: ScaleProofMatrix = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.manifest.scenarios.len(), 3);
         assert_eq!(restored.proofs[1].status, ProofStatus::SkippedNotProven);
+    }
+
+    #[test]
+    fn checked_in_scale_proof_evidence_index_fixture_validates() {
+        let json = include_str!("../../../fixtures/scale-lab/massive-swarm-evidence-index.v1.json");
+        let matrix: ScaleProofMatrix = serde_json::from_str(json).unwrap();
+
+        assert_eq!(matrix.proofs.len(), 3);
+        assert!(
+            matrix
+                .proofs
+                .iter()
+                .any(|proof| proof.evidence_source == ScaleProofEvidenceSource::Synthetic)
+        );
+        assert!(
+            matrix
+                .proofs
+                .iter()
+                .any(|proof| proof.evidence_source == ScaleProofEvidenceSource::RchRemote)
+        );
+        assert!(
+            matrix
+                .proofs
+                .iter()
+                .any(|proof| proof.status == ProofStatus::SkippedNotProven
+                    && proof.dimensions.contains(&ProofDimension::Hardware)
+                    && proof.note.contains("SKIPPED_NOT_PROVEN"))
+        );
+
+        let findings = matrix.validate_evidence_index(64, 274_877_906_944);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.severity != ScaleProofFindingSeverity::Error),
+            "unexpected evidence-index errors: {findings:?}"
+        );
+        assert!(!matrix.hardware_claims_proven(64, 274_877_906_944));
+
+        let summary = matrix.coverage_summary();
+        assert_eq!(summary.total_rows, 3);
+        assert_eq!(summary.passed_rows, 2);
+        assert_eq!(summary.skipped_not_proven_rows, 1);
+        assert_eq!(summary.hardware_passed, 0);
+    }
+
+    #[test]
+    fn green_hardware_claim_requires_complete_worker_command_and_capacity_evidence() {
+        let mut incomplete = complete_evidence(0, 0);
+        incomplete.worker_id.clear();
+        incomplete.command.clear();
+        incomplete.storage_class.clear();
+
+        let proof = ScaleScenarioProof {
+            scenario_id: "synthetic_10k_policy_audit".to_string(),
+            class: ScaleScenarioClass::LiveHardware,
+            dimensions: vec![ProofDimension::Hardware],
+            status: ProofStatus::Passed,
+            evidence_source: ScaleProofEvidenceSource::LiveHardware,
+            evidence: Some(incomplete),
+            note: String::new(),
+        };
+        let matrix =
+            ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), vec![proof]);
+
+        let findings = matrix.validate_evidence_index(64, 274_877_906_944);
+        assert!(
+            findings.iter().any(|finding| finding.reason_code
+                == "hardware_pass_incomplete_execution_evidence"),
+            "missing incomplete-evidence finding: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.reason_code == "hardware_pass_predicate_not_met"),
+            "missing capacity-predicate finding: {findings:?}"
+        );
+        assert!(!matrix.hardware_claims_proven(64, 274_877_906_944));
     }
 }

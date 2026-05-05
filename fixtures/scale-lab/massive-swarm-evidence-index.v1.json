@@ -1,0 +1,105 @@
+{
+  "manifest": {
+    "scenarios": [
+      {
+        "id": "synthetic_1k_churn",
+        "label": "1k logical panes with churn and output bursts",
+        "class": "synthetic",
+        "deterministic_seed": 1001001,
+        "counters": {
+          "logical_panes": 1024,
+          "logical_agents": 1024,
+          "churn_events": 6144,
+          "alt_screen_flips": 2048,
+          "event_storms": 32,
+          "output_burst_bytes": 268435456,
+          "storage_writes": 65536,
+          "policy_denials": 512
+        },
+        "dimensions": ["correctness", "throughput", "memory"]
+      },
+      {
+        "id": "synthetic_5k_event_storm",
+        "label": "5k logical panes under event storms",
+        "class": "synthetic",
+        "deterministic_seed": 5005005,
+        "counters": {
+          "logical_panes": 5120,
+          "logical_agents": 5120,
+          "churn_events": 40960,
+          "alt_screen_flips": 12288,
+          "event_storms": 128,
+          "output_burst_bytes": 1610612736,
+          "storage_writes": 327680,
+          "policy_denials": 2560
+        },
+        "dimensions": ["correctness", "throughput", "memory"]
+      },
+      {
+        "id": "synthetic_10k_policy_audit",
+        "label": "10k logical panes with policy audit traffic",
+        "class": "synthetic",
+        "deterministic_seed": 10010010,
+        "counters": {
+          "logical_panes": 10240,
+          "logical_agents": 10240,
+          "churn_events": 102400,
+          "alt_screen_flips": 24576,
+          "event_storms": 256,
+          "output_burst_bytes": 4294967296,
+          "storage_writes": 786432,
+          "policy_denials": 10240
+        },
+        "dimensions": ["correctness", "throughput", "memory"]
+      }
+    ]
+  },
+  "proofs": [
+    {
+      "scenario_id": "synthetic_1k_churn",
+      "class": "synthetic",
+      "dimensions": ["correctness", "memory"],
+      "status": "PASSED",
+      "evidence_source": "synthetic",
+      "evidence": {
+        "cpu_count": 8,
+        "memory_bytes": 34359738368,
+        "storage_bytes": 214748364800,
+        "storage_class": "local_fixture",
+        "os": "fixture-linux",
+        "worker_id": "synthetic-fixture",
+        "command": "cargo test -p frankenterm-core-replay --lib replay_scenario_matrix::tests::checked_in_scale_proof_evidence_index_fixture_validates",
+        "elapsed_ms": 1200,
+        "git_commit": "fixture-synthetic"
+      },
+      "note": "bounded synthetic fixture validates scenario counters and memory coverage"
+    },
+    {
+      "scenario_id": "synthetic_5k_event_storm",
+      "class": "synthetic",
+      "dimensions": ["correctness", "throughput"],
+      "status": "PASSED",
+      "evidence_source": "rch_remote",
+      "evidence": {
+        "cpu_count": 16,
+        "memory_bytes": 68719476736,
+        "storage_bytes": 549755813888,
+        "storage_class": "rch_ephemeral_ssd",
+        "os": "linux-x86_64",
+        "worker_id": "vmi-fixture-rch",
+        "command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-7-evidence-index cargo test -p frankenterm-core-replay --lib replay_scenario_matrix::tests::checked_in_scale_proof_evidence_index_fixture_validates -- --nocapture",
+        "elapsed_ms": 42000,
+        "git_commit": "fixture-rch"
+      },
+      "note": "RCH reduced proof row records worker, command, elapsed time, and storage class"
+    },
+    {
+      "scenario_id": "synthetic_10k_policy_audit",
+      "class": "live_hardware",
+      "dimensions": ["hardware"],
+      "status": "SKIPPED_NOT_PROVEN",
+      "evidence_source": "live_hardware",
+      "note": "SKIPPED_NOT_PROVEN: no retained 64-core / 256 GiB live-hardware worker evidence exists yet"
+    }
+  ]
+}
