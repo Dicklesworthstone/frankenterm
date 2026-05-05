@@ -7510,8 +7510,8 @@ fn storage_io_policy_denial_bytes(record: &PolicyDeniedAuditRecord) -> u64 {
 }
 
 fn storage_io_fts_sync_bytes(config: &FtsSyncConfig) -> u64 {
-    storage_io_usize_bytes(config.batch_size)
-        .saturating_mul(storage_io_usize_bytes(config.max_batch_bytes))
+    storage_io_usize_bytes(config.max_batch_bytes)
+        .max(storage_io_usize_bytes(config.batch_size))
         .max(1)
 }
 
@@ -8452,11 +8452,14 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::SyncFts { config, respond } => {
-            let result = sync_fts_on_startup(conn, &config);
+            let result = with_writer_backend(conn, |backend| {
+                sync_fts_on_startup_backend(backend, &config)
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RebuildFts { config, respond } => {
-            let result = full_fts_rebuild_sync(conn, &config);
+            let result =
+                with_writer_backend(conn, |backend| full_fts_rebuild_backend(backend, &config));
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSegments { before_ts, respond } => {
@@ -14967,6 +14970,515 @@ pub fn sync_fts_on_startup(conn: &Connection, config: &FtsSyncConfig) -> Result<
         match sync_fts_for_pane(conn, pane_id, config) {
             Ok((indexed, _)) => total_indexed += indexed,
             Err(e) => warnings.push(format!("Pane {pane_id} incremental sync failed: {e}")),
+        }
+    }
+
+    let duration = start.elapsed();
+    Ok(FtsSyncResult {
+        segments_indexed: total_indexed,
+        panes_processed,
+        full_rebuild: false,
+        duration_ms: duration.as_millis() as u64,
+        warnings,
+    })
+}
+
+fn fts_index_state_from_backend_cells(row: &[SqlCell]) -> Result<FtsIndexState> {
+    let reader = CellRowReader::new(row);
+    let index_version = reader
+        .i64(0)
+        .map(|value| value.clamp(0, i64::from(u32::MAX)) as u32)
+        .map_err(|err| storage_backend_error("FTS index state version", err))?;
+    Ok(FtsIndexState {
+        index_version,
+        last_full_rebuild_at: reader
+            .optional_i64(1)
+            .map_err(|err| storage_backend_error("FTS index state last_full_rebuild_at", err))?,
+        created_at: reader
+            .i64(2)
+            .map_err(|err| storage_backend_error("FTS index state created_at", err))?,
+        updated_at: reader
+            .i64(3)
+            .map_err(|err| storage_backend_error("FTS index state updated_at", err))?,
+    })
+}
+
+fn fts_pane_progress_from_backend_cells(row: &[SqlCell]) -> Result<FtsPaneProgress> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .i64(0)
+        .and_then(|value| backend_i64_to_u64(value, "fts_pane_progress.pane_id"))
+        .map_err(|err| storage_backend_error("FTS pane progress pane_id", err))?;
+    let last_indexed_seq = reader
+        .i64(1)
+        .and_then(|value| backend_i64_to_u64(value, "fts_pane_progress.last_indexed_seq"))
+        .map_err(|err| storage_backend_error("FTS pane progress last_indexed_seq", err))?;
+    let indexed_count = reader
+        .i64(2)
+        .and_then(|value| backend_i64_to_u64(value, "fts_pane_progress.indexed_count"))
+        .map_err(|err| storage_backend_error("FTS pane progress indexed_count", err))?;
+    Ok(FtsPaneProgress {
+        pane_id,
+        last_indexed_seq,
+        indexed_count,
+        last_indexed_at: reader
+            .i64(3)
+            .map_err(|err| storage_backend_error("FTS pane progress last_indexed_at", err))?,
+    })
+}
+
+fn segment_from_backend_cells(row: &[SqlCell]) -> Result<Segment> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .i64(1)
+        .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
+        .map_err(|err| storage_backend_error("FTS segment pane_id", err))?;
+    let seq = reader
+        .i64(2)
+        .and_then(|value| backend_i64_to_u64(value, "output_segments.seq"))
+        .map_err(|err| storage_backend_error("FTS segment seq", err))?;
+    let content_len = reader
+        .i64(4)
+        .and_then(|value| {
+            usize::try_from(value).map_err(|_| {
+                BackendError::Query(format!("output_segments.content_len out of range: {value}"))
+            })
+        })
+        .map_err(|err| storage_backend_error("FTS segment content_len", err))?;
+    Ok(Segment {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("FTS segment id", err))?,
+        pane_id,
+        seq,
+        content: reader
+            .string(3)
+            .map_err(|err| storage_backend_error("FTS segment content", err))?,
+        content_len,
+        content_hash: reader
+            .optional_string(5)
+            .map_err(|err| storage_backend_error("FTS segment content_hash", err))?,
+        captured_at: reader
+            .i64(6)
+            .map_err(|err| storage_backend_error("FTS segment captured_at", err))?,
+    })
+}
+
+fn check_fts_integrity_backend(backend: &dyn StorageBackend) -> Result<bool> {
+    match backend.execute_batch(
+        "INSERT INTO output_segments_fts(output_segments_fts) VALUES('integrity-check')",
+    ) {
+        Ok(()) => Ok(true),
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("database disk image is malformed") || msg.contains("fts5: ") {
+                Ok(false)
+            } else {
+                Err(StorageError::Database(format!("FTS integrity check failed: {err}")).into())
+            }
+        }
+    }
+}
+
+fn get_fts_index_state_backend(backend: &dyn StorageBackend) -> Result<Option<FtsIndexState>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT index_version, last_full_rebuild_at, created_at, updated_at
+             FROM fts_index_state WHERE id = 1",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Failed to get FTS index state", err))?;
+    row.as_deref()
+        .map(fts_index_state_from_backend_cells)
+        .transpose()
+}
+
+fn upsert_fts_index_state_backend(
+    backend: &dyn StorageBackend,
+    state: &FtsIndexState,
+) -> Result<()> {
+    execute_typed(
+        backend,
+        "INSERT INTO fts_index_state (id, index_version, last_full_rebuild_at, created_at, updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+             index_version = excluded.index_version,
+             last_full_rebuild_at = excluded.last_full_rebuild_at,
+             updated_at = excluded.updated_at",
+        &[
+            ToSqlValue::Integer(i64::from(state.index_version)),
+            ToSqlValue::optional_i64(state.last_full_rebuild_at),
+            ToSqlValue::Integer(state.created_at),
+            ToSqlValue::Integer(state.updated_at),
+        ],
+    )
+    .map_err(|err| storage_backend_error("Failed to upsert FTS index state", err))?;
+    Ok(())
+}
+
+fn mark_fts_rebuild_pending_backend(backend: &dyn StorageBackend, now: i64) -> Result<()> {
+    let created_at = get_fts_index_state_backend(backend)?
+        .map(|state| state.created_at)
+        .unwrap_or(now);
+    let pending_state = FtsIndexState {
+        index_version: FTS_INDEX_REBUILD_PENDING_VERSION,
+        last_full_rebuild_at: None,
+        created_at,
+        updated_at: now,
+    };
+    upsert_fts_index_state_backend(backend, &pending_state)
+}
+
+fn get_fts_pane_progress_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+) -> Result<Option<FtsPaneProgress>> {
+    let pane_id = u64_to_i64(pane_id, "fts_pane_progress.pane_id")?;
+    let row = backend
+        .query_row_cells(
+            "SELECT pane_id, last_indexed_seq, indexed_count, last_indexed_at
+             FROM fts_pane_progress WHERE pane_id = ?1",
+            &[ToSqlValue::Integer(pane_id)],
+        )
+        .map_err(|err| storage_backend_error("Failed to get FTS pane progress", err))?;
+    row.as_deref()
+        .map(fts_pane_progress_from_backend_cells)
+        .transpose()
+}
+
+fn upsert_fts_pane_progress_backend(
+    backend: &dyn StorageBackend,
+    progress: &FtsPaneProgress,
+) -> Result<()> {
+    let pane_id = u64_to_i64(progress.pane_id, "fts_pane_progress.pane_id")?;
+    let last_indexed_seq = u64_to_i64(
+        progress.last_indexed_seq,
+        "fts_pane_progress.last_indexed_seq",
+    )?;
+    let indexed_count = u64_to_i64(progress.indexed_count, "fts_pane_progress.indexed_count")?;
+    execute_typed(
+        backend,
+        "INSERT INTO fts_pane_progress (pane_id, last_indexed_seq, indexed_count, last_indexed_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(pane_id) DO UPDATE SET
+             last_indexed_seq = excluded.last_indexed_seq,
+             indexed_count = excluded.indexed_count,
+             last_indexed_at = excluded.last_indexed_at",
+        &[
+            ToSqlValue::Integer(pane_id),
+            ToSqlValue::Integer(last_indexed_seq),
+            ToSqlValue::Integer(indexed_count),
+            ToSqlValue::Integer(progress.last_indexed_at),
+        ],
+    )
+    .map_err(|err| storage_backend_error("Failed to upsert FTS pane progress", err))?;
+    Ok(())
+}
+
+fn clear_fts_pane_progress_backend(backend: &dyn StorageBackend) -> Result<()> {
+    backend
+        .execute("DELETE FROM fts_pane_progress")
+        .map_err(|err| storage_backend_error("Failed to clear FTS pane progress", err))?;
+    Ok(())
+}
+
+fn get_unindexed_segments_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    last_indexed_seq: u64,
+    limit: usize,
+    include_from_zero: bool,
+) -> Result<Vec<Segment>> {
+    let sql = if include_from_zero {
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+             FROM output_segments
+             WHERE pane_id = ?1
+             ORDER BY seq
+             LIMIT ?3"
+    } else {
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+             FROM output_segments
+             WHERE pane_id = ?1 AND seq > ?2
+             ORDER BY seq
+             LIMIT ?3"
+    };
+    let pane_id = u64_to_i64(pane_id, "output_segments.pane_id")?;
+    let last_indexed_seq = u64_to_i64(last_indexed_seq, "output_segments.seq")?;
+    let limit = usize_to_i64(limit, "FTS sync batch_size")?;
+    let rows = backend
+        .query_map_cells(
+            sql,
+            &[
+                ToSqlValue::Integer(pane_id),
+                ToSqlValue::Integer(last_indexed_seq),
+                ToSqlValue::Integer(limit),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to query unindexed segments", err))?;
+    rows.iter()
+        .map(|row| segment_from_backend_cells(row))
+        .collect()
+}
+
+fn insert_fts_entry_backend(backend: &dyn StorageBackend, segment: &Segment) -> Result<()> {
+    execute_typed(
+        backend,
+        "INSERT INTO output_segments_fts(rowid, content) VALUES (?1, ?2)",
+        &[
+            ToSqlValue::Integer(segment.id),
+            ToSqlValue::Text(&segment.content),
+        ],
+    )
+    .map_err(|err| storage_backend_error("Failed to insert FTS entry", err))?;
+    Ok(())
+}
+
+fn sync_fts_for_pane_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    config: &FtsSyncConfig,
+) -> Result<(u64, u64)> {
+    let now = now_ms();
+    let progress = get_fts_pane_progress_backend(backend, pane_id)?;
+    let last_seq = progress.as_ref().map_or(0, |p| p.last_indexed_seq);
+    let mut indexed_count = progress.as_ref().map_or(0, |p| p.indexed_count);
+    let had_prior_progress = progress.is_some();
+
+    let mut total_indexed = 0u64;
+    let mut max_seq = last_seq;
+
+    loop {
+        let include_from_zero = !had_prior_progress && total_indexed == 0;
+        let segments = get_unindexed_segments_backend(
+            backend,
+            pane_id,
+            max_seq,
+            config.batch_size,
+            include_from_zero,
+        )?;
+        if segments.is_empty() {
+            break;
+        }
+
+        let mut batch_bytes = 0usize;
+        for segment in &segments {
+            if batch_bytes > 0 && batch_bytes + segment.content_len > config.max_batch_bytes {
+                break;
+            }
+
+            insert_fts_entry_backend(backend, segment)?;
+            total_indexed = total_indexed.saturating_add(1);
+            indexed_count = indexed_count.saturating_add(1);
+            max_seq = segment.seq;
+            batch_bytes = batch_bytes.saturating_add(segment.content_len);
+        }
+
+        if config.commit_progress && total_indexed > 0 {
+            let new_progress = FtsPaneProgress {
+                pane_id,
+                last_indexed_seq: max_seq,
+                indexed_count,
+                last_indexed_at: now,
+            };
+            upsert_fts_pane_progress_backend(backend, &new_progress)?;
+        }
+
+        if segments.len() < config.batch_size {
+            break;
+        }
+    }
+
+    if total_indexed > 0 && !config.commit_progress {
+        let new_progress = FtsPaneProgress {
+            pane_id,
+            last_indexed_seq: max_seq,
+            indexed_count,
+            last_indexed_at: now,
+        };
+        upsert_fts_pane_progress_backend(backend, &new_progress)?;
+    }
+
+    Ok((total_indexed, max_seq))
+}
+
+fn panes_needing_fts_sync_backend(backend: &dyn StorageBackend) -> Result<Vec<u64>> {
+    let rows = backend
+        .query_map_cells(
+            "SELECT s.pane_id
+             FROM output_segments s
+             LEFT JOIN fts_pane_progress p ON p.pane_id = s.pane_id
+             GROUP BY s.pane_id
+             HAVING MAX(p.pane_id) IS NULL OR MAX(s.seq) > MAX(p.last_indexed_seq)
+             ORDER BY s.pane_id",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Failed to query panes needing FTS sync", err))?;
+
+    rows.iter()
+        .map(|row| {
+            CellRowReader::new(row)
+                .i64(0)
+                .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
+                .map_err(|err| {
+                    storage_backend_error("Failed to list panes needing FTS sync", err).into()
+                })
+        })
+        .collect()
+}
+
+fn full_fts_rebuild_backend(
+    backend: &dyn StorageBackend,
+    config: &FtsSyncConfig,
+) -> Result<FtsSyncResult> {
+    use std::time::Instant;
+    let start = Instant::now();
+    let now = now_ms();
+    let mut warnings = Vec::new();
+
+    if let Err(err) = backend
+        .execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')")
+    {
+        warnings.push(format!("FTS delete-all failed (may be empty): {err}"));
+    }
+
+    clear_fts_pane_progress_backend(backend)?;
+
+    let pane_ids = backend
+        .query_map_cells(
+            "SELECT DISTINCT pane_id FROM output_segments ORDER BY pane_id",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Failed to query panes", err))?
+        .iter()
+        .map(|row| {
+            CellRowReader::new(row)
+                .i64(0)
+                .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
+                .map_err(|err| storage_backend_error("Failed to list panes", err).into())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut total_indexed = 0u64;
+    let panes_processed = pane_ids.len() as u64;
+    let mut hard_failure_panes: Vec<(u64, String)> = Vec::new();
+
+    for pane_id in &pane_ids {
+        match sync_fts_for_pane_backend(backend, *pane_id, config) {
+            Ok((indexed, _)) => total_indexed = total_indexed.saturating_add(indexed),
+            Err(err) => {
+                let err_msg = format!("{err}");
+                let is_hard = matches!(
+                    &err,
+                    crate::Error::Storage(StorageError::Database(_)) | crate::Error::Io(_)
+                );
+                if is_hard {
+                    tracing::error!(
+                        pane_id = pane_id,
+                        error = %err,
+                        "FTS rebuild: pane completely failed to re-index (hard I/O error)"
+                    );
+                    hard_failure_panes.push((*pane_id, err_msg.clone()));
+                } else {
+                    tracing::warn!(
+                        pane_id = pane_id,
+                        error = %err,
+                        "FTS rebuild: pane sync produced non-fatal error"
+                    );
+                }
+                warnings.push(format!("Pane {pane_id} sync failed: {err_msg}"));
+            }
+        }
+    }
+
+    if !hard_failure_panes.is_empty() {
+        tracing::error!(
+            failed_count = hard_failure_panes.len(),
+            total_panes = pane_ids.len(),
+            "FTS rebuild had hard failures; marking index as rebuild-pending"
+        );
+        if let Err(cleanup_err) = backend.execute_batch(
+            "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
+        ) {
+            tracing::error!(
+                error = %cleanup_err,
+                "Failed to clear partially rebuilt FTS contents after hard rebuild failure"
+            );
+        }
+        clear_fts_pane_progress_backend(backend)?;
+        mark_fts_rebuild_pending_backend(backend, now)?;
+
+        let failed_panes = hard_failure_panes
+            .iter()
+            .map(|(pane_id, _)| pane_id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(StorageError::Database(format!(
+            "FTS rebuild incomplete after hard failures in panes [{failed_panes}]; index marked for full rebuild"
+        ))
+        .into());
+    }
+
+    let state = FtsIndexState {
+        index_version: FTS_INDEX_VERSION,
+        last_full_rebuild_at: Some(now),
+        created_at: now,
+        updated_at: now,
+    };
+    upsert_fts_index_state_backend(backend, &state)?;
+
+    let duration = start.elapsed();
+    Ok(FtsSyncResult {
+        segments_indexed: total_indexed,
+        panes_processed,
+        full_rebuild: true,
+        duration_ms: duration.as_millis() as u64,
+        warnings,
+    })
+}
+
+fn sync_fts_on_startup_backend(
+    backend: &dyn StorageBackend,
+    config: &FtsSyncConfig,
+) -> Result<FtsSyncResult> {
+    use std::time::Instant;
+    let start = Instant::now();
+    let mut warnings = Vec::new();
+
+    let fts_ok = check_fts_integrity_backend(backend)?;
+    if !fts_ok {
+        tracing::warn!("FTS index corruption detected, performing full rebuild");
+        return full_fts_rebuild_backend(backend, config);
+    }
+
+    let state = get_fts_index_state_backend(backend)?;
+    if let Some(ref s) = state {
+        if s.index_version != FTS_INDEX_VERSION {
+            tracing::info!(
+                old_version = s.index_version,
+                new_version = FTS_INDEX_VERSION,
+                "FTS index version mismatch or rebuild-pending marker detected, performing full rebuild"
+            );
+            return full_fts_rebuild_backend(backend, config);
+        }
+    } else {
+        let now = now_ms();
+        let new_state = FtsIndexState {
+            index_version: FTS_INDEX_VERSION,
+            last_full_rebuild_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        upsert_fts_index_state_backend(backend, &new_state)?;
+    }
+
+    let pane_ids = panes_needing_fts_sync_backend(backend)?;
+    let mut total_indexed = 0u64;
+    let panes_processed = pane_ids.len() as u64;
+
+    for pane_id in pane_ids {
+        match sync_fts_for_pane_backend(backend, pane_id, config) {
+            Ok((indexed, _)) => total_indexed = total_indexed.saturating_add(indexed),
+            Err(err) => warnings.push(format!("Pane {pane_id} incremental sync failed: {err}")),
         }
     }
 
