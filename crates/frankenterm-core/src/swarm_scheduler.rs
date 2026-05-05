@@ -259,7 +259,8 @@ pub fn detect_herd_wave_pressure(
         if let Some(pane_id) = signal.pane_id {
             distinct_panes.insert(pane_id);
         }
-        *kind_counts.entry(signal.kind).or_insert(0) += 1;
+        let count = kind_counts.entry(signal.kind).or_insert(0);
+        *count = count.saturating_add(1);
         first_seen_ms =
             Some(first_seen_ms.map_or(signal.timestamp_ms, |first| first.min(signal.timestamp_ms)));
     }
@@ -270,7 +271,7 @@ pub fn detect_herd_wave_pressure(
     let pressure_tier = herd_wave_pressure_tier(distinct_panes, config);
     let detected = pressure_tier > FleetPressureTier::Normal;
     let recommended_stagger_ms = if detected {
-        config.base_stagger_ms.max(1)
+        herd_wave_stagger_delay_ms(1, config)
     } else {
         0
     };
@@ -2247,7 +2248,7 @@ mod tests {
         ) {
             let config = HerdWaveDetectionConfig::default();
             let signals: Vec<_> = (0..distinct_panes)
-                .map(|pane| HerdWaveSignal::pane(pane as u64, HerdWaveEventKind::Wake, 20_000 + u64::from(pane)))
+                .map(|pane| HerdWaveSignal::pane(u64::from(pane), HerdWaveEventKind::Wake, 20_000 + u64::from(pane)))
                 .collect();
 
             let summary = detect_herd_wave_pressure(&signals, &config);

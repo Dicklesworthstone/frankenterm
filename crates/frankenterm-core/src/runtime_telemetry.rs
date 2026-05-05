@@ -7189,6 +7189,7 @@ const fn resource_admission_reason_code_name(reason: AdmissionReasonCode) -> &'s
         AdmissionReasonCode::FleetPressure => "fleet_pressure",
         AdmissionReasonCode::MemoryTierPressure => "memory_tier_pressure",
         AdmissionReasonCode::LatencyStageOverBudget => "latency_stage_over_budget",
+        AdmissionReasonCode::HerdWavePressure => "herd_wave_pressure",
         AdmissionReasonCode::MissingQueueTelemetry => "missing_queue_telemetry",
         AdmissionReasonCode::MissingFleetTelemetry => "missing_fleet_telemetry",
         AdmissionReasonCode::MissingMemoryTierTelemetry => "missing_memory_tier_telemetry",
@@ -14253,6 +14254,9 @@ mod tests {
                 crate::fleet_memory_controller::FleetPressureTier::Emergency,
             ),
             max_latency_over_budget_ratio: Some(1.75),
+            herd_wave_pressure: None,
+            herd_wave_recommended_stagger_ms: None,
+            herd_wave_cohort_max_stagger_ms: None,
         };
 
         let summary = SwarmCapacityOperatorSummary::from_components(
