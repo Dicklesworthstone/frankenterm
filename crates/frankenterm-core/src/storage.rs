@@ -4267,9 +4267,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_agent_session(&conn, session_id)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_agent_session_backend(backend, session_id)
+            })
         })
         .await
     }
@@ -4291,9 +4291,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_active_sessions(&conn)
+            pooled_backend(db_path.as_str(), query_active_sessions_backend)
         })
         .await
     }
@@ -4316,9 +4314,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_sessions_for_pane(&conn, pane_id)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_sessions_for_pane_backend(backend, pane_id)
+            })
         })
         .await
     }
@@ -15490,156 +15488,143 @@ fn sync_fts_on_startup_backend(
     })
 }
 
-/// Query an agent session by ID
-#[allow(clippy::cast_sign_loss)]
-fn query_agent_session(conn: &Connection, session_id: i64) -> Result<Option<AgentSessionRecord>> {
-    conn.query_row(
-        "SELECT id, pane_id, agent_type, session_id, external_id, external_meta,
+const AGENT_SESSION_SELECT_COLUMNS: &str =
+    "id, pane_id, agent_type, session_id, external_id, external_meta,
          started_at, ended_at, end_reason, total_tokens, input_tokens, output_tokens,
-         cached_tokens, reasoning_tokens, model_name, estimated_cost_usd
-         FROM agent_sessions WHERE id = ?1",
-        [session_id],
-        |row| {
-            let external_meta_str: Option<String> = row.get(5)?;
-            // br-ft-4d6ic: route silent serde failure through observability counter.
-            let external_meta = parse_storage_json_col::<serde_json::Value>(
-                external_meta_str.as_deref(),
-                "agent_sessions",
-                "external_meta",
-            );
-            Ok(AgentSessionRecord {
-                id: row.get(0)?,
-                pane_id: {
-                    let v: i64 = row.get(1)?;
-                    v as u64
-                },
-                agent_type: row.get(2)?,
-                session_id: row.get(3)?,
-                external_id: row.get(4)?,
-                external_meta,
-                started_at: row.get(6)?,
-                ended_at: row.get(7)?,
-                end_reason: row.get(8)?,
-                total_tokens: row.get(9)?,
-                input_tokens: row.get(10)?,
-                output_tokens: row.get(11)?,
-                cached_tokens: row.get(12)?,
-                reasoning_tokens: row.get(13)?,
-                model_name: row.get(14)?,
-                estimated_cost_usd: row.get(15)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+         cached_tokens, reasoning_tokens, model_name, estimated_cost_usd";
+
+fn optional_f64_from_backend_cells(
+    row: &CellRowReader<'_>,
+    idx: usize,
+    context: &str,
+) -> Result<Option<f64>> {
+    if row.is_null(idx) {
+        return Ok(None);
+    }
+    row.f64(idx)
+        .map(Some)
+        .map_err(|err| storage_backend_error(context, err).into())
+}
+
+fn agent_session_from_backend_cells(row: &[SqlCell]) -> Result<AgentSessionRecord> {
+    let row = CellRowReader::new(row);
+    let external_meta_str = row
+        .optional_string(5)
+        .map_err(|err| storage_backend_error("agent session external_meta", err))?;
+    // br-ft-4d6ic: route silent serde failure through observability counter.
+    let external_meta = parse_storage_json_col::<serde_json::Value>(
+        external_meta_str.as_deref(),
+        "agent_sessions",
+        "external_meta",
+    );
+    Ok(AgentSessionRecord {
+        id: row
+            .i64(0)
+            .map_err(|err| storage_backend_error("agent session id", err))?,
+        pane_id: row
+            .i64(1)
+            .and_then(|value| backend_i64_to_u64(value, "agent_sessions.pane_id"))
+            .map_err(|err| storage_backend_error("agent session pane_id", err))?,
+        agent_type: row
+            .string(2)
+            .map_err(|err| storage_backend_error("agent session agent_type", err))?,
+        session_id: row
+            .optional_string(3)
+            .map_err(|err| storage_backend_error("agent session session_id", err))?,
+        external_id: row
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("agent session external_id", err))?,
+        external_meta,
+        started_at: row
+            .i64(6)
+            .map_err(|err| storage_backend_error("agent session started_at", err))?,
+        ended_at: row
+            .optional_i64(7)
+            .map_err(|err| storage_backend_error("agent session ended_at", err))?,
+        end_reason: row
+            .optional_string(8)
+            .map_err(|err| storage_backend_error("agent session end_reason", err))?,
+        total_tokens: row
+            .optional_i64(9)
+            .map_err(|err| storage_backend_error("agent session total_tokens", err))?,
+        input_tokens: row
+            .optional_i64(10)
+            .map_err(|err| storage_backend_error("agent session input_tokens", err))?,
+        output_tokens: row
+            .optional_i64(11)
+            .map_err(|err| storage_backend_error("agent session output_tokens", err))?,
+        cached_tokens: row
+            .optional_i64(12)
+            .map_err(|err| storage_backend_error("agent session cached_tokens", err))?,
+        reasoning_tokens: row
+            .optional_i64(13)
+            .map_err(|err| storage_backend_error("agent session reasoning_tokens", err))?,
+        model_name: row
+            .optional_string(14)
+            .map_err(|err| storage_backend_error("agent session model_name", err))?,
+        estimated_cost_usd: optional_f64_from_backend_cells(
+            &row,
+            15,
+            "agent session estimated_cost_usd",
+        )?,
+    })
+}
+
+/// Query an agent session by ID
+fn query_agent_session_backend(
+    backend: &dyn StorageBackend,
+    session_id: i64,
+) -> Result<Option<AgentSessionRecord>> {
+    let row = backend
+        .query_row_cells(
+            &format!(
+                "SELECT {AGENT_SESSION_SELECT_COLUMNS}
+                 FROM agent_sessions WHERE id = ?1"
+            ),
+            &[ToSqlValue::Integer(session_id)],
+        )
+        .map_err(|err| storage_backend_error("Query agent session", err))?;
+    row.as_deref()
+        .map(agent_session_from_backend_cells)
+        .transpose()
 }
 
 /// Query active agent sessions (ended_at IS NULL)
-#[allow(clippy::cast_sign_loss)]
-fn query_active_sessions(conn: &Connection) -> Result<Vec<AgentSessionRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, agent_type, session_id, external_id, external_meta,
-             started_at, ended_at, end_reason, total_tokens, input_tokens, output_tokens,
-             cached_tokens, reasoning_tokens, model_name, estimated_cost_usd
-             FROM agent_sessions WHERE ended_at IS NULL
-             ORDER BY started_at DESC",
+fn query_active_sessions_backend(backend: &dyn StorageBackend) -> Result<Vec<AgentSessionRecord>> {
+    let rows = backend
+        .query_map_cells(
+            &format!(
+                "SELECT {AGENT_SESSION_SELECT_COLUMNS}
+                 FROM agent_sessions WHERE ended_at IS NULL
+                 ORDER BY started_at DESC"
+            ),
+            &[],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let external_meta_str: Option<String> = row.get(5)?;
-            // br-ft-4d6ic: route silent serde failure through observability counter.
-            let external_meta = parse_storage_json_col::<serde_json::Value>(
-                external_meta_str.as_deref(),
-                "agent_sessions",
-                "external_meta",
-            );
-            Ok(AgentSessionRecord {
-                id: row.get(0)?,
-                pane_id: {
-                    let v: i64 = row.get(1)?;
-                    v as u64
-                },
-                agent_type: row.get(2)?,
-                session_id: row.get(3)?,
-                external_id: row.get(4)?,
-                external_meta,
-                started_at: row.get(6)?,
-                ended_at: row.get(7)?,
-                end_reason: row.get(8)?,
-                total_tokens: row.get(9)?,
-                input_tokens: row.get(10)?,
-                output_tokens: row.get(11)?,
-                cached_tokens: row.get(12)?,
-                reasoning_tokens: row.get(13)?,
-                model_name: row.get(14)?,
-                estimated_cost_usd: row.get(15)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-    Ok(results)
+        .map_err(|err| storage_backend_error("Query active agent sessions", err))?;
+    rows.iter()
+        .map(|row| agent_session_from_backend_cells(row))
+        .collect()
 }
 
 /// Query agent sessions for a specific pane
-#[allow(clippy::cast_sign_loss)]
-fn query_sessions_for_pane(conn: &Connection, pane_id: u64) -> Result<Vec<AgentSessionRecord>> {
+fn query_sessions_for_pane_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+) -> Result<Vec<AgentSessionRecord>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, agent_type, session_id, external_id, external_meta,
-             started_at, ended_at, end_reason, total_tokens, input_tokens, output_tokens,
-             cached_tokens, reasoning_tokens, model_name, estimated_cost_usd
-             FROM agent_sessions WHERE pane_id = ?1
-             ORDER BY started_at DESC",
+    let rows = backend
+        .query_map_cells(
+            &format!(
+                "SELECT {AGENT_SESSION_SELECT_COLUMNS}
+                 FROM agent_sessions WHERE pane_id = ?1
+                 ORDER BY started_at DESC"
+            ),
+            &[ToSqlValue::Integer(pane_id_i64)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([pane_id_i64], |row| {
-            let external_meta_str: Option<String> = row.get(5)?;
-            // br-ft-4d6ic: route silent serde failure through observability counter.
-            let external_meta = parse_storage_json_col::<serde_json::Value>(
-                external_meta_str.as_deref(),
-                "agent_sessions",
-                "external_meta",
-            );
-            Ok(AgentSessionRecord {
-                id: row.get(0)?,
-                pane_id: {
-                    let v: i64 = row.get(1)?;
-                    v as u64
-                },
-                agent_type: row.get(2)?,
-                session_id: row.get(3)?,
-                external_id: row.get(4)?,
-                external_meta,
-                started_at: row.get(6)?,
-                ended_at: row.get(7)?,
-                end_reason: row.get(8)?,
-                total_tokens: row.get(9)?,
-                input_tokens: row.get(10)?,
-                output_tokens: row.get(11)?,
-                cached_tokens: row.get(12)?,
-                reasoning_tokens: row.get(13)?,
-                model_name: row.get(14)?,
-                estimated_cost_usd: row.get(15)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-    Ok(results)
+        .map_err(|err| storage_backend_error("Query sessions for pane", err))?;
+    rows.iter()
+        .map(|row| agent_session_from_backend_cells(row))
+        .collect()
 }
 
 /// Query unhandled events
@@ -19466,13 +19451,15 @@ fn storage_tick144_account_cluster_roundtrip() {
 }
 
 /// ft-xbnl0.2.3 Cx-first: tick 143 mux-session/checkpoint cluster —
-/// 6 new storage cx-first siblings exercised end-to-end:
+/// 8 storage cx-first siblings exercised end-to-end:
 /// `insert_mux_session_with_cx`,
 /// `insert_session_checkpoint_with_cx`,
 /// `prune_session_checkpoints_with_cx`,
 /// `mark_session_shutdown_clean_with_cx`,
 /// `get_latest_checkpoint_hash_with_cx`,
-/// `get_active_sessions_with_cx`.
+/// `get_agent_session_with_cx`,
+/// `get_active_sessions_with_cx`,
+/// `get_sessions_for_pane_with_cx`.
 #[test]
 fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
     run_storage_async_test(async {
@@ -19565,11 +19552,65 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
             .await
             .unwrap();
 
-        // 6. get_active_sessions_with_cx — AgentSession table is distinct
-        //    from mux_sessions; on a fresh DB with no agent sessions it
-        //    should be empty. The call just needs to roundtrip.
+        // 6. AgentSession read cluster — seed one session so the backend
+        //    cell decoder covers nullable text + optional float fields.
+        storage
+            .upsert_pane_with_cx(
+                &cx,
+                PaneRecord {
+                    pane_id: 143,
+                    pane_uuid: Some("pane-uuid-tick143".to_string()),
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("tick143-agent".to_string()),
+                    cwd: Some("/tmp/tick143".to_string()),
+                    tty_name: None,
+                    first_seen_at: 143_000,
+                    last_seen_at: 143_001,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut agent_session = AgentSessionRecord::new_start(143, "codex");
+        agent_session.session_id = Some("codex-session-tick143".to_string());
+        agent_session.external_id = Some(String::new());
+        agent_session.external_meta = Some(serde_json::json!({"source":"tick143"}));
+        agent_session.model_name = Some("gpt-test".to_string());
+        agent_session.total_tokens = Some(1430);
+        agent_session.estimated_cost_usd = Some(0.125);
+        let agent_session_id = storage
+            .upsert_agent_session_with_cx(&cx, agent_session)
+            .await
+            .unwrap();
+
+        let loaded = storage
+            .get_agent_session_with_cx(&cx, agent_session_id)
+            .await
+            .unwrap()
+            .expect("seeded agent session should load");
+        assert_eq!(loaded.pane_id, 143);
+        assert_eq!(loaded.session_id.as_deref(), Some("codex-session-tick143"));
+        assert_eq!(loaded.external_id.as_deref(), Some(""));
+        assert_eq!(loaded.total_tokens, Some(1430));
+        assert_eq!(loaded.estimated_cost_usd, Some(0.125));
+
+        // 7. get_active_sessions_with_cx.
         let active = storage.get_active_sessions_with_cx(&cx).await.unwrap();
-        assert!(active.is_empty());
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, agent_session_id);
+
+        // 8. get_sessions_for_pane_with_cx.
+        let pane_sessions = storage
+            .get_sessions_for_pane_with_cx(&cx, 143)
+            .await
+            .unwrap();
+        assert_eq!(pane_sessions.len(), 1);
+        assert_eq!(pane_sessions[0].id, agent_session_id);
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);

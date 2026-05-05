@@ -3093,8 +3093,9 @@ fn can_insert_agent_session() {
     let session_id = upsert_agent_session_backend(&backend, &session).unwrap();
     assert!(session_id > 0, "Session should have been assigned an ID");
 
-    let conn = backend.into_connection();
-    let retrieved = query_agent_session(&conn, session_id).unwrap().unwrap();
+    let retrieved = query_agent_session_backend(&backend, session_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(retrieved.pane_id, 1);
     assert_eq!(retrieved.agent_type, "claude_code");
 }
@@ -3122,8 +3123,9 @@ fn can_update_agent_session() {
 
     upsert_agent_session_backend(&backend, &updated).unwrap();
 
-    let conn = backend.into_connection();
-    let retrieved = query_agent_session(&conn, session_id).unwrap().unwrap();
+    let retrieved = query_agent_session_backend(&backend, session_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(retrieved.total_tokens, Some(5000));
 }
 
@@ -3149,8 +3151,7 @@ fn query_active_sessions_filters_ended() {
     ended.ended_at = Some(now_ms);
     upsert_agent_session_backend(&backend, &ended).unwrap();
 
-    let conn = backend.into_connection();
-    let results = query_active_sessions(&conn).unwrap();
+    let results = query_active_sessions_backend(&backend).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].agent_type, "claude");
 }
