@@ -10,11 +10,16 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::backpressure::BackpressureTier;
 use crate::fleet_memory_controller::{
-    FleetMemoryTier, FleetMemoryTierBudgetRecord, FleetMemoryTierBudgetSnapshot, FleetPressureTier,
+    FleetMemoryAction, FleetMemoryConfig, FleetMemoryController, FleetMemoryTier,
+    FleetMemoryTierBudgetRecord, FleetMemoryTierBudgetSnapshot, FleetMemoryTierReclamationTarget,
+    FleetPressureTier, PressureSignals,
 };
 use crate::hardware_profile::HardwareProofStatus;
 use crate::latency_stages::{LatencyStage, StagePressure};
+use crate::memory_budget::BudgetLevel;
+use crate::memory_pressure::MemoryPressureTier;
 use crate::swarm_scheduler::{
     AdmissionAction, AdmissionReasonCode, AdmissionRequest, QueuePressure,
     ResourceAdmissionDecisionSummary, SwarmAdmissionController, SwarmAdmissionTelemetry,
@@ -391,6 +396,235 @@ impl ResourcePressureAdmissionObservation {
     }
 }
 
+/// Memory-tier accounting before and after a memory-pressure mitigation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureMemoryBytesObservation {
+    /// Hot resident bytes before the injected memory pressure.
+    pub hot_resident_before_bytes: u64,
+    /// Hot resident bytes after the mitigation ran.
+    pub hot_resident_after_bytes: u64,
+    /// Warm compressed bytes before mitigation.
+    pub warm_compressed_before_bytes: u64,
+    /// Warm compressed bytes after mitigation.
+    pub warm_compressed_after_bytes: u64,
+    /// Cold disk-backed bytes before mitigation.
+    pub cold_disk_before_bytes: u64,
+    /// Cold disk-backed bytes after mitigation.
+    pub cold_disk_after_bytes: u64,
+    /// Maximum allowed cold-tier growth for the reduced fixture.
+    pub cold_disk_growth_bound_bytes: u64,
+    /// Search/index cache bytes before mitigation.
+    pub search_index_cache_before_bytes: u64,
+    /// Search/index cache bytes after mitigation.
+    pub search_index_cache_after_bytes: u64,
+    /// Allocator-pool bytes before mitigation.
+    pub allocator_pool_before_bytes: u64,
+    /// Allocator-pool bytes after mitigation.
+    pub allocator_pool_after_bytes: u64,
+    /// Resident bytes after mitigation, excluding cold disk.
+    pub resident_after_bytes: u64,
+}
+
+impl ResourcePressureMemoryBytesObservation {
+    /// Cold-tier byte growth caused by warm-to-cold eviction.
+    #[must_use]
+    pub const fn cold_disk_growth_bytes(&self) -> u64 {
+        self.cold_disk_after_bytes
+            .saturating_sub(self.cold_disk_before_bytes)
+    }
+
+    /// Whether cold-tier growth stayed within the scenario bound.
+    #[must_use]
+    pub const fn cold_disk_growth_bounded(&self) -> bool {
+        self.cold_disk_growth_bytes() <= self.cold_disk_growth_bound_bytes
+    }
+}
+
+/// Resource-cockpit memory telemetry captured for a memory-tier scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureMemoryCockpitTelemetry {
+    /// System memory pressure tier supplied to the fleet memory controller.
+    pub memory_pressure_tier: MemoryPressureTier,
+    /// Worst per-pane memory budget level supplied to the controller.
+    pub worst_budget_level: BudgetLevel,
+    /// Fleet tier derived from the tier-budget snapshot alone.
+    pub tier_budget_pressure_tier: FleetPressureTier,
+    /// Compound fleet pressure tier after the controller evaluated all signals.
+    pub compound_pressure_tier: FleetPressureTier,
+    /// Resident budget before mitigation.
+    pub resident_budget_bytes: u64,
+    /// Resident bytes before mitigation.
+    pub resident_before_bytes: u64,
+    /// Resident bytes after mitigation.
+    pub resident_after_bytes: u64,
+    /// Resident bytes over budget before mitigation.
+    pub resident_over_budget_before_bytes: u64,
+    /// Resident bytes still over budget after mitigation.
+    pub resident_over_budget_after_bytes: u64,
+    /// Refused bytes recorded in the tier-budget snapshot.
+    pub refused_bytes: u64,
+}
+
+/// Memory-tier and allocator-pressure observation required for memory chaos verdicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureMemoryTierObservation {
+    /// Operator-visible tier-budget snapshot consumed by the real memory governor.
+    pub tier_budget: FleetMemoryTierBudgetSnapshot,
+    /// Byte counters before and after mitigation.
+    pub bytes: ResourcePressureMemoryBytesObservation,
+    /// Reclamation targets computed by the tier-budget controller.
+    pub reclamation_targets: Vec<FleetMemoryTierReclamationTarget>,
+    /// Fleet memory actions returned by `FleetMemoryController`.
+    pub controller_actions: Vec<FleetMemoryAction>,
+    /// Resource-cockpit telemetry surfaced with the decision.
+    pub resource_cockpit: ResourcePressureMemoryCockpitTelemetry,
+    /// Stable memory-specific mitigation reason.
+    pub mitigation_reason_code: String,
+}
+
+impl ResourcePressureMemoryTierObservation {
+    /// Build an observation from the real fleet memory controller and tier-budget snapshot.
+    #[must_use]
+    pub fn from_tier_budget_decision(
+        tier_budget: FleetMemoryTierBudgetSnapshot,
+        bytes: ResourcePressureMemoryBytesObservation,
+        memory_pressure_tier: MemoryPressureTier,
+        worst_budget_level: BudgetLevel,
+        pane_count: usize,
+        mitigation_reason_code: impl Into<String>,
+    ) -> Self {
+        let mut controller = FleetMemoryController::new(FleetMemoryConfig {
+            escalation_threshold: 1,
+            deescalation_threshold: 1,
+            ..FleetMemoryConfig::default()
+        });
+        let signals = PressureSignals {
+            backpressure: BackpressureTier::Green,
+            memory_pressure: memory_pressure_tier,
+            worst_budget: worst_budget_level,
+            pane_count,
+            paused_pane_count: 0,
+        };
+        let controller_actions =
+            controller.evaluate_with_tier_budget(&signals, tier_budget.clone());
+        let snapshot = controller.snapshot();
+        let tier_budget_pressure_tier = tier_budget.pressure_tier();
+        let resident_budget_bytes = tier_budget.totals.resident_budget_bytes;
+        let resident_before_bytes = tier_budget.totals.resident_actual_bytes;
+        let resident_after_bytes = bytes.resident_after_bytes;
+        let resident_over_budget_after_bytes =
+            resident_after_bytes.saturating_sub(resident_budget_bytes);
+
+        Self {
+            reclamation_targets: tier_budget.reclamation_targets(),
+            tier_budget,
+            resource_cockpit: ResourcePressureMemoryCockpitTelemetry {
+                memory_pressure_tier,
+                worst_budget_level,
+                tier_budget_pressure_tier,
+                compound_pressure_tier: snapshot.compound_tier,
+                resident_budget_bytes,
+                resident_before_bytes,
+                resident_after_bytes,
+                resident_over_budget_before_bytes: resident_before_bytes
+                    .saturating_sub(resident_budget_bytes),
+                resident_over_budget_after_bytes,
+                refused_bytes: snapshot
+                    .tier_budget
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.totals.refused_bytes),
+            },
+            bytes,
+            controller_actions,
+            mitigation_reason_code: mitigation_reason_code.into(),
+        }
+    }
+
+    fn validate(
+        &self,
+        status: ResourcePressureChaosStatus,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+    ) {
+        if self.tier_budget.tiers.is_empty() {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "memory_observation.tier_budget.tiers",
+                "must not be empty",
+            ));
+        }
+        if self.controller_actions.is_empty() {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "memory_observation.controller_actions",
+                "must not be empty",
+            ));
+        }
+        if self.mitigation_reason_code.trim().is_empty() {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "memory_observation.mitigation_reason_code",
+                "must not be blank",
+            ));
+        }
+
+        if self.resource_cockpit.resident_budget_bytes
+            != self.tier_budget.totals.resident_budget_bytes
+            || self.resource_cockpit.resident_before_bytes
+                != self.tier_budget.totals.resident_actual_bytes
+            || self.resource_cockpit.resident_after_bytes != self.bytes.resident_after_bytes
+            || self.resource_cockpit.tier_budget_pressure_tier != self.tier_budget.pressure_tier()
+        {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "memory_observation.resource_cockpit",
+                "must mirror tier-budget and resident-byte evidence",
+            ));
+        }
+
+        if status == ResourcePressureChaosStatus::Pass {
+            if self.tier_budget.totals.resident_over_budget_bytes == 0 {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "memory_observation.tier_budget.totals.resident_over_budget_bytes",
+                    "pass verdicts require pre-mitigation resident memory pressure",
+                ));
+            }
+            if self.resource_cockpit.compound_pressure_tier == FleetPressureTier::Normal {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "memory_observation.resource_cockpit.compound_pressure_tier",
+                    "pass verdicts require a non-normal fleet memory pressure decision",
+                ));
+            }
+            if !self.controller_actions.iter().any(|action| {
+                matches!(
+                    action,
+                    FleetMemoryAction::EvictWarmScrollback
+                        | FleetMemoryAction::PauseIdlePanes
+                        | FleetMemoryAction::EmergencyCleanup
+                )
+            }) {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "memory_observation.controller_actions",
+                    "pass verdicts require an explicit memory mitigation action",
+                ));
+            }
+            if self.reclamation_targets.is_empty() {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "memory_observation.reclamation_targets",
+                    "pass verdicts require at least one memory reclamation target",
+                ));
+            }
+            if self.bytes.resident_after_bytes > self.tier_budget.totals.resident_budget_bytes {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "memory_observation.bytes.resident_after_bytes",
+                    "pass verdicts must bring resident bytes within the declared budget",
+                ));
+            }
+            if !self.bytes.cold_disk_growth_bounded() {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "memory_observation.bytes.cold_disk_after_bytes",
+                    "pass verdicts must bound cold-tier growth",
+                ));
+            }
+        }
+    }
+}
+
 /// Hardware predicate evidence for real high-scale proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HighScaleHardwareEvidence {
@@ -483,6 +717,9 @@ pub struct ResourcePressureChaosVerdict {
     /// CPU/queue admission observation, required for CPU and queue scenarios.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_observation: Option<ResourcePressureAdmissionObservation>,
+    /// Memory-tier observation, required for executed memory/tiering scenarios.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_observation: Option<ResourcePressureMemoryTierObservation>,
 }
 
 impl ResourcePressureChaosVerdict {
@@ -615,6 +852,10 @@ impl ResourcePressureChaosVerdict {
             self.validate_cpu_queue_observation(&mut violations);
         }
 
+        if self.pressure_class == ResourcePressureClass::MemoryTiering {
+            self.validate_memory_tiering_observation(&mut violations);
+        }
+
         if violations.is_empty() {
             Ok(())
         } else {
@@ -662,6 +903,37 @@ impl ResourcePressureChaosVerdict {
             violations.push(ResourcePressureChaosSchemaViolation::new(
                 "diagnostics",
                 "CPU/queue pass diagnostics must identify the pressure class",
+            ));
+        }
+    }
+
+    fn validate_memory_tiering_observation(
+        &self,
+        violations: &mut Vec<ResourcePressureChaosSchemaViolation>,
+    ) {
+        let Some(observation) = self.memory_observation.as_ref() else {
+            if matches!(
+                self.status,
+                ResourcePressureChaosStatus::Pass | ResourcePressureChaosStatus::Fail
+            ) {
+                violations.push(ResourcePressureChaosSchemaViolation::new(
+                    "memory_observation",
+                    "executed memory/tiering verdicts require tier-budget and mitigation evidence",
+                ));
+            }
+            return;
+        };
+
+        observation.validate(self.status, violations);
+
+        if self.status == ResourcePressureChaosStatus::Pass
+            && !self.diagnostics.iter().any(|diagnostic| {
+                diagnostic_matches_pressure_class(diagnostic, self.pressure_class)
+            })
+        {
+            violations.push(ResourcePressureChaosSchemaViolation::new(
+                "diagnostics",
+                "memory pass diagnostics must identify memory/tiering pressure",
             ));
         }
     }
@@ -898,6 +1170,7 @@ pub fn sample_pass_verdict() -> ResourcePressureChaosVerdict {
             "hardware predicates met for sample high-scale pass",
         )),
         admission_observation: Some(cpu_admission_observation()),
+        memory_observation: None,
     }
 }
 
@@ -933,6 +1206,7 @@ pub fn sample_fail_verdict() -> ResourcePressureChaosVerdict {
         ],
         hardware_evidence: None,
         admission_observation: None,
+        memory_observation: Some(memory_tiering_unbounded_fail_observation()),
     }
 }
 
@@ -969,6 +1243,7 @@ pub fn sample_skipped_not_proven_verdict() -> ResourcePressureChaosVerdict {
             "hardware predicates not met",
         )),
         admission_observation: None,
+        memory_observation: None,
     }
 }
 
@@ -1005,6 +1280,7 @@ pub fn sample_expected_blocked_by_infra_verdict() -> ResourcePressureChaosVerdic
         ],
         hardware_evidence: None,
         admission_observation: None,
+        memory_observation: None,
     }
 }
 
@@ -1056,6 +1332,7 @@ pub fn cpu_admission_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
                 AdmissionReasonCode::QueueSaturated,
             ),
         ),
+        memory_observation: None,
     }
 }
 
@@ -1104,6 +1381,7 @@ pub fn queue_saturation_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
                 AdmissionReasonCode::QueueOverCapacity,
             ),
         ),
+        memory_observation: None,
     }
 }
 
@@ -1158,6 +1436,7 @@ pub fn queue_saturation_unbounded_fail_verdict() -> ResourcePressureChaosVerdict
                 mitigation_reason_code: AdmissionReasonCode::Healthy,
             },
         }),
+        memory_observation: None,
     }
 }
 
@@ -1174,6 +1453,111 @@ pub fn cpu_admission_high_scale_skipped_not_proven_verdict() -> ResourcePressure
     verdict.hardware_evidence = Some(HighScaleHardwareEvidence::skipped(
         "64+ logical CPU topology predicate absent",
     ));
+    verdict
+}
+
+/// Reduced memory-tier fixture derived from the real fleet memory controller.
+pub fn memory_tiering_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
+    ResourcePressureChaosVerdict {
+        schema_version: RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION,
+        scenario_id: "ft-lmg3g.3.memory_tiering.reduced".into(),
+        pressure_class: ResourcePressureClass::MemoryTiering,
+        mode: ResourcePressureChaosMode::Reduced,
+        preconditions: vec![
+            "synthetic hot/warm/search/allocator tier budgets force memory pressure".into(),
+            "fleet memory controller evaluates the tier-budget snapshot".into(),
+            "cold disk tier remains queryable and bounded after warm eviction".into(),
+        ],
+        injected_fault:
+            "hot resident, warm compressed, search-cache, and allocator-pool tiers exceed budget"
+                .into(),
+        observed_mitigation:
+            "fleet memory controller throttled work, evicted warm scrollback, paused idle panes, and selected bounded reclamation targets"
+                .into(),
+        fail_closed_decision: ResourcePressureFailClosedDecision {
+            fail_closed: true,
+            reason:
+                "resident memory pressure degraded capture/search work until bytes returned to budget"
+                    .into(),
+        },
+        diagnostics: vec![ResourcePressureDiagnostic {
+            code: "resource.memory_tiering.reclaim_budget".into(),
+            message:
+                "memory/tiering pressure produced explicit reclaim, eviction, and pause mitigation"
+                    .into(),
+            severity: ResourcePressureDiagnosticSeverity::Warn,
+        }],
+        logs_path: Some("artifacts/resource-pressure/memory-tiering/reduced.jsonl".into()),
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        skip_reason: None,
+        status: ResourcePressureChaosStatus::Pass,
+        assertions: vec![
+            ResourcePressureAssertion::FailClosed,
+            ResourcePressureAssertion::BoundedQueueGrowth,
+            ResourcePressureAssertion::DiagnosticEmitted,
+            ResourcePressureAssertion::MitigationLogged,
+            ResourcePressureAssertion::RecoveryObserved,
+        ],
+        hardware_evidence: None,
+        admission_observation: None,
+        memory_observation: Some(memory_tiering_reduced_observation()),
+    }
+}
+
+/// Negative reduced fixture: memory pressure remained unbounded and must stay FAIL.
+pub fn memory_tiering_unbounded_fail_verdict() -> ResourcePressureChaosVerdict {
+    ResourcePressureChaosVerdict {
+        schema_version: RESOURCE_PRESSURE_CHAOS_SCHEMA_VERSION,
+        scenario_id: "ft-lmg3g.3.memory_tiering.unbounded_fail".into(),
+        pressure_class: ResourcePressureClass::MemoryTiering,
+        mode: ResourcePressureChaosMode::Reduced,
+        preconditions: vec!["misconfigured memory-tier mitigation intentionally disabled".into()],
+        injected_fault: "resident tiers exceed budget while warm eviction is disabled".into(),
+        observed_mitigation:
+            "memory pressure diagnostic was emitted but resident bytes and cold growth stayed unbounded"
+                .into(),
+        fail_closed_decision: ResourcePressureFailClosedDecision {
+            fail_closed: false,
+            reason: "capture/search admission continued while resident memory exceeded budget".into(),
+        },
+        diagnostics: vec![ResourcePressureDiagnostic {
+            code: "resource.memory_tiering.unbounded_resident_bytes".into(),
+            message:
+                "resident memory remained over budget and cold-tier growth exceeded the declared bound"
+                    .into(),
+            severity: ResourcePressureDiagnosticSeverity::Error,
+        }],
+        logs_path: Some("artifacts/resource-pressure/memory-tiering/unbounded-fail.jsonl".into()),
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        skip_reason: None,
+        status: ResourcePressureChaosStatus::Fail,
+        assertions: vec![
+            ResourcePressureAssertion::FailClosed,
+            ResourcePressureAssertion::BoundedQueueGrowth,
+            ResourcePressureAssertion::DiagnosticEmitted,
+            ResourcePressureAssertion::MitigationLogged,
+            ResourcePressureAssertion::RecoveryObserved,
+        ],
+        hardware_evidence: None,
+        admission_observation: None,
+        memory_observation: Some(memory_tiering_unbounded_fail_observation()),
+    }
+}
+
+/// High-scale memory fixture that cannot claim proof without 256 GiB evidence.
+pub fn memory_tiering_high_scale_skipped_not_proven_verdict() -> ResourcePressureChaosVerdict {
+    let mut verdict = memory_tiering_reduced_pass_verdict();
+    verdict.scenario_id = "ft-lmg3g.3.memory_tiering.high_scale.skipped".into();
+    verdict.mode = ResourcePressureChaosMode::HighScale;
+    verdict.proof_level = ResourcePressureProofLevel::SimulatedHighScale;
+    verdict.logs_path = None;
+    verdict.status = ResourcePressureChaosStatus::SkippedNotProven;
+    verdict.skip_reason =
+        Some("256 GiB memory predicate absent; high-scale memory proof not claimed".into());
+    verdict.hardware_evidence = Some(HighScaleHardwareEvidence::skipped(
+        "256 GiB memory predicate absent",
+    ));
+    verdict.memory_observation = None;
     verdict
 }
 
@@ -1239,6 +1623,71 @@ fn healthy_latency_stage_pressure() -> Vec<StagePressure> {
         500.0,
         1_000.0,
     )]
+}
+
+fn memory_tiering_reduced_observation() -> ResourcePressureMemoryTierObservation {
+    let tier_budget = memory_tiering_pressure_budget();
+    ResourcePressureMemoryTierObservation::from_tier_budget_decision(
+        tier_budget,
+        ResourcePressureMemoryBytesObservation {
+            hot_resident_before_bytes: 2_300,
+            hot_resident_after_bytes: 2_100,
+            warm_compressed_before_bytes: 2_400,
+            warm_compressed_after_bytes: 2_100,
+            cold_disk_before_bytes: 2_000,
+            cold_disk_after_bytes: 2_300,
+            cold_disk_growth_bound_bytes: 512,
+            search_index_cache_before_bytes: 1_300,
+            search_index_cache_after_bytes: 1_100,
+            allocator_pool_before_bytes: 1_100,
+            allocator_pool_after_bytes: 700,
+            resident_after_bytes: 6_000,
+        },
+        MemoryPressureTier::Orange,
+        BudgetLevel::OverBudget,
+        128,
+        "memory_tiering.reclaim_to_budget",
+    )
+}
+
+fn memory_tiering_unbounded_fail_observation() -> ResourcePressureMemoryTierObservation {
+    let tier_budget = memory_tiering_pressure_budget();
+    ResourcePressureMemoryTierObservation::from_tier_budget_decision(
+        tier_budget,
+        ResourcePressureMemoryBytesObservation {
+            hot_resident_before_bytes: 2_300,
+            hot_resident_after_bytes: 2_450,
+            warm_compressed_before_bytes: 2_400,
+            warm_compressed_after_bytes: 2_650,
+            cold_disk_before_bytes: 2_000,
+            cold_disk_after_bytes: 3_200,
+            cold_disk_growth_bound_bytes: 512,
+            search_index_cache_before_bytes: 1_300,
+            search_index_cache_after_bytes: 1_300,
+            allocator_pool_before_bytes: 1_100,
+            allocator_pool_after_bytes: 1_100,
+            resident_after_bytes: 7_500,
+        },
+        MemoryPressureTier::Orange,
+        BudgetLevel::OverBudget,
+        128,
+        "memory_tiering.mitigation_missing",
+    )
+}
+
+fn memory_tiering_pressure_budget() -> FleetMemoryTierBudgetSnapshot {
+    FleetMemoryTierBudgetSnapshot::from_tiers([
+        FleetMemoryTierBudgetRecord::new(FleetMemoryTier::HotResident, 2_000, 2_300)
+            .with_reclaimable_bytes(500),
+        FleetMemoryTierBudgetRecord::new(FleetMemoryTier::WarmCompressed, 2_000, 2_400)
+            .with_reclaimable_bytes(300),
+        FleetMemoryTierBudgetRecord::new(FleetMemoryTier::ColdDisk, 10_000, 2_000)
+            .with_reclaimable_bytes(0),
+        FleetMemoryTierBudgetRecord::new(FleetMemoryTier::SearchIndexCache, 1_000, 1_300)
+            .with_reclaimable_bytes(200),
+        FleetMemoryTierBudgetRecord::new(FleetMemoryTier::AllocatorPools, 1_000, 1_100)
+            .with_reclaimable_bytes(400),
+    ])
 }
 
 fn row(
@@ -1386,6 +1835,11 @@ fn utilization_to_basis_points(utilization: Option<f64>) -> u32 {
 mod tests {
     use serde_json::json;
 
+    use crate::fleet_memory_controller::{
+        FleetMemoryAction, FleetMemoryTier, FleetMemoryTierReclamationAction, FleetPressureTier,
+    };
+    use crate::memory_budget::BudgetLevel;
+    use crate::memory_pressure::MemoryPressureTier;
     use crate::swarm_scheduler::{AdmissionAction, AdmissionReasonCode};
 
     use super::{
@@ -1395,9 +1849,10 @@ mod tests {
         ResourcePressureChaosVerdict, ResourcePressureClass, ResourcePressureCoverageMatrix,
         ResourcePressureCoverageRow, ResourcePressureProofLevel,
         cpu_admission_high_scale_skipped_not_proven_verdict, cpu_admission_reduced_pass_verdict,
-        queue_saturation_reduced_pass_verdict, queue_saturation_unbounded_fail_verdict,
-        sample_expected_blocked_by_infra_verdict, sample_fail_verdict, sample_pass_verdict,
-        sample_skipped_not_proven_verdict,
+        memory_tiering_high_scale_skipped_not_proven_verdict, memory_tiering_reduced_pass_verdict,
+        memory_tiering_unbounded_fail_verdict, queue_saturation_reduced_pass_verdict,
+        queue_saturation_unbounded_fail_verdict, sample_expected_blocked_by_infra_verdict,
+        sample_fail_verdict, sample_pass_verdict, sample_skipped_not_proven_verdict,
     };
 
     #[test]
@@ -1673,6 +2128,122 @@ mod tests {
     }
 
     #[test]
+    fn memory_tiering_reduced_fixture_records_reclaiming_decision() {
+        let verdict = memory_tiering_reduced_pass_verdict();
+        verdict
+            .validate()
+            .expect("memory-tiering fixture validates");
+
+        let observation = verdict
+            .memory_observation
+            .as_ref()
+            .expect("memory fixture records memory observation");
+        assert_eq!(
+            observation.resource_cockpit.memory_pressure_tier,
+            MemoryPressureTier::Orange
+        );
+        assert_eq!(
+            observation.resource_cockpit.worst_budget_level,
+            BudgetLevel::OverBudget
+        );
+        assert_eq!(
+            observation.resource_cockpit.compound_pressure_tier,
+            FleetPressureTier::Critical
+        );
+        assert!(
+            observation
+                .controller_actions
+                .contains(&FleetMemoryAction::EvictWarmScrollback)
+        );
+        assert!(
+            observation
+                .controller_actions
+                .contains(&FleetMemoryAction::PauseIdlePanes)
+        );
+        assert!(
+            observation
+                .reclamation_targets
+                .iter()
+                .any(|target| target.tier == FleetMemoryTier::AllocatorPools
+                    && target.action == FleetMemoryTierReclamationAction::TrimAllocatorPools),
+            "allocator pressure should be represented by a real reclamation target"
+        );
+        assert_eq!(observation.bytes.resident_after_bytes, 6_000);
+        assert_eq!(
+            observation.bytes.resident_after_bytes,
+            observation.tier_budget.totals.resident_budget_bytes
+        );
+        assert!(observation.bytes.cold_disk_growth_bounded());
+    }
+
+    #[test]
+    fn negative_memory_tiering_fixture_is_valid_fail_not_coverage() {
+        let verdict = memory_tiering_unbounded_fail_verdict();
+        verdict
+            .validate()
+            .expect("negative memory fixture validates");
+
+        let observation = verdict
+            .memory_observation
+            .as_ref()
+            .expect("negative fixture records memory observation");
+        assert!(
+            observation.bytes.resident_after_bytes
+                > observation.tier_budget.totals.resident_budget_bytes
+        );
+        assert!(!observation.bytes.cold_disk_growth_bounded());
+
+        let assessment =
+            ResourcePressureCoverageMatrix::default().assess_parent_completion(&[verdict]);
+        let memory_status = assessment
+            .row_statuses
+            .iter()
+            .find(|status| status.pressure_class == ResourcePressureClass::MemoryTiering)
+            .expect("memory row status");
+        assert!(!memory_status.satisfied);
+        assert!(memory_status.reason.contains("FAIL"));
+    }
+
+    #[test]
+    fn high_scale_memory_fixture_skips_without_256gb_evidence() {
+        let verdict = memory_tiering_high_scale_skipped_not_proven_verdict();
+        verdict
+            .validate()
+            .expect("high-scale skipped memory fixture validates");
+        assert_eq!(
+            verdict.status,
+            ResourcePressureChaosStatus::SkippedNotProven
+        );
+        assert_eq!(
+            verdict.proof_level,
+            ResourcePressureProofLevel::SimulatedHighScale
+        );
+        let evidence = verdict
+            .hardware_evidence
+            .as_ref()
+            .expect("hardware evidence");
+        assert_eq!(
+            evidence.required_memory_bytes,
+            HIGH_SCALE_REQUIRED_MEMORY_BYTES
+        );
+        assert!(evidence.observed_memory_bytes.is_none());
+        assert!(
+            verdict.memory_observation.is_none(),
+            "simulated high-scale skips must not masquerade as executed memory evidence"
+        );
+
+        let matrix = ResourcePressureCoverageMatrix::default();
+        let assessment = matrix.assess_parent_completion(&[verdict]);
+        let memory_status = assessment
+            .row_statuses
+            .iter()
+            .find(|status| status.pressure_class == ResourcePressureClass::MemoryTiering)
+            .expect("memory row status");
+        assert!(!memory_status.satisfied);
+        assert!(memory_status.reason.contains("SKIPPED_NOT_PROVEN"));
+    }
+
+    #[test]
     fn skipped_cpu_and_queue_verdicts_do_not_require_admission_observation() {
         let mut verdict = cpu_admission_high_scale_skipped_not_proven_verdict();
         verdict.admission_observation = None;
@@ -1680,6 +2251,16 @@ mod tests {
         verdict
             .validate()
             .expect("skipped CPU proof without execution evidence should validate");
+    }
+
+    #[test]
+    fn skipped_memory_verdicts_do_not_require_memory_observation() {
+        let mut verdict = memory_tiering_high_scale_skipped_not_proven_verdict();
+        verdict.memory_observation = None;
+
+        verdict
+            .validate()
+            .expect("skipped memory proof without execution evidence should validate");
     }
 
     #[test]
@@ -1706,6 +2287,51 @@ mod tests {
             .validate()
             .expect_err("unbounded pass verdict must be rejected");
         assert!(error.to_string().contains("queue_depth_after"));
+    }
+
+    #[test]
+    fn memory_pass_verdicts_require_memory_observation() {
+        let mut verdict = memory_tiering_reduced_pass_verdict();
+        verdict.memory_observation = None;
+
+        let error = verdict
+            .validate()
+            .expect_err("missing memory observation must be rejected");
+        assert!(error.to_string().contains("memory_observation"));
+    }
+
+    #[test]
+    fn memory_pass_verdicts_reject_unbounded_resident_or_cold_growth() {
+        let mut resident = memory_tiering_reduced_pass_verdict();
+        let observation = resident
+            .memory_observation
+            .as_mut()
+            .expect("memory fixture has observation");
+        observation.bytes.resident_after_bytes =
+            observation.tier_budget.totals.resident_budget_bytes + 1;
+        observation.resource_cockpit.resident_after_bytes = observation.bytes.resident_after_bytes;
+        observation
+            .resource_cockpit
+            .resident_over_budget_after_bytes = 1;
+
+        let resident_error = resident
+            .validate()
+            .expect_err("over-budget resident memory must be rejected");
+        assert!(resident_error.to_string().contains("resident_after_bytes"));
+
+        let mut cold = memory_tiering_reduced_pass_verdict();
+        let observation = cold
+            .memory_observation
+            .as_mut()
+            .expect("memory fixture has observation");
+        observation.bytes.cold_disk_after_bytes = observation.bytes.cold_disk_before_bytes
+            + observation.bytes.cold_disk_growth_bound_bytes
+            + 1;
+
+        let cold_error = cold
+            .validate()
+            .expect_err("unbounded cold-tier growth must be rejected");
+        assert!(cold_error.to_string().contains("cold_disk_after_bytes"));
     }
 
     #[test]
@@ -1743,8 +2369,17 @@ mod tests {
             }
             _ => None,
         };
+        verdict.memory_observation = match row.pressure_class {
+            ResourcePressureClass::MemoryTiering => {
+                memory_tiering_reduced_pass_verdict().memory_observation
+            }
+            _ => None,
+        };
         verdict.diagnostics = match row.pressure_class {
             ResourcePressureClass::CpuAdmission => cpu_admission_reduced_pass_verdict().diagnostics,
+            ResourcePressureClass::MemoryTiering => {
+                memory_tiering_reduced_pass_verdict().diagnostics
+            }
             ResourcePressureClass::QueueSaturation => {
                 queue_saturation_reduced_pass_verdict().diagnostics
             }
