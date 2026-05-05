@@ -22,6 +22,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
+FT_BINARY="${FT_BINARY:-}"
+
 require_cmd() {
   local cmd="$1"
   if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -31,25 +33,42 @@ require_cmd() {
 }
 
 find_ft_binary() {
-  if [[ -n "${FT_BINARY:-}" ]] && [[ -x "${FT_BINARY:-}" ]]; then
-    return 0
-  fi
-  if [[ -x "$PROJECT_ROOT/target/debug/wa" ]]; then
-    FT_BINARY="$PROJECT_ROOT/target/debug/wa"
-    return 0
-  fi
-  if [[ -x "$PROJECT_ROOT/target/release/ft" ]]; then
-    FT_BINARY="$PROJECT_ROOT/target/release/ft"
-    return 0
-  fi
+  local explicit_ft_binary="$FT_BINARY"
+  if [[ -n "$explicit_ft_binary" ]]; then
+    if [[ -x "$explicit_ft_binary" ]]; then
+      return 0
+    fi
 
-  # Best-effort build (kept quiet; artifacts capture stdout/stderr per scenario).
-  cargo build -p frankenterm >/dev/null
-  FT_BINARY="$PROJECT_ROOT/target/debug/wa"
-  if [[ ! -x "$FT_BINARY" ]]; then
-    echo "Could not find wa binary at $FT_BINARY" >&2
+    echo "FT_BINARY is set but not executable: $explicit_ft_binary" >&2
     return 1
   fi
+
+  # This script intentionally does not build the binary: Cargo lanes must be
+  # run through rch by the caller.
+  local target_dir="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+  local candidates=(
+    "$target_dir/debug/wa"
+    "$target_dir/release/ft"
+  )
+  if [[ "$target_dir" != "$PROJECT_ROOT/target" ]]; then
+    candidates+=(
+      "$PROJECT_ROOT/target/debug/wa"
+      "$PROJECT_ROOT/target/release/ft"
+    )
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -x "$candidate" ]]; then
+      FT_BINARY="$candidate"
+      return 0
+    fi
+  done
+
+  echo "Could not find wa/ft binary" >&2
+  echo "[INFO] Build via rch first, for example:" >&2
+  echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-saved-searches-target cargo build -p frankenterm" >&2
+  echo "[INFO] Then rerun with FT_BINARY=/tmp/ft-saved-searches-target/debug/wa or CARGO_TARGET_DIR=/tmp/ft-saved-searches-target" >&2
+  return 1
 }
 
 wait_for_json_condition() {
@@ -206,4 +225,3 @@ main() {
 }
 
 main "$@"
-
