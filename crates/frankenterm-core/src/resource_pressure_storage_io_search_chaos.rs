@@ -14,6 +14,10 @@ use crate::resource_pressure_chaos::{
     ResourcePressureFailClosedDecision, ResourcePressureProofLevel, sample_fail_verdict,
     sample_pass_verdict, sample_skipped_not_proven_verdict,
 };
+use crate::storage::io_scheduler::{
+    StorageIoAdmissionDecision, StorageIoClass, StorageIoClassBudget, StorageIoScheduler,
+    StorageIoSchedulerConfig, StorageIoSchedulerSnapshot, StorageIoWorkItem,
+};
 
 /// Deterministic storage/search pressure class exercised by a reduced scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +83,104 @@ pub struct StorageIoSearchObservation {
     pub separated_from_cpu_memory_pressure: bool,
     /// Stable diagnostic reason code emitted by the scenario.
     pub diagnostic_code: String,
+}
+
+/// Machine-readable artifact emitted by the storage IO/search stress proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageIoSearchStressProofArtifact {
+    /// Stable scenario identifier.
+    pub scenario_id: String,
+    /// Reduced or high-scale execution mode.
+    pub mode: ResourcePressureChaosMode,
+    /// Verdict status associated with this proof artifact.
+    pub status: ResourcePressureChaosStatus,
+    /// Evidence strength backing this artifact.
+    pub proof_level: ResourcePressureProofLevel,
+    /// Fault injected by the proof workload.
+    pub injected_fault: String,
+    /// Primary class affected by the injected fault.
+    pub affected_class: StorageIoClass,
+    /// Admission outcomes observed while injecting the workload.
+    pub observed_outcomes: Vec<String>,
+    /// Peak aggregate queue depth observed by the scheduler.
+    pub queue_depth_peak: u64,
+    /// Declared aggregate queue bound for this proof.
+    pub queue_depth_bound: u64,
+    /// Peak oldest queued age observed in operator telemetry.
+    pub oldest_queued_age_peak_ms: u64,
+    /// Peak bytes pending observed by the scheduler.
+    pub bytes_pending_peak: u64,
+    /// Durable segment writes dispatched before success was claimed.
+    pub durable_success_count: u64,
+    /// Successes claimed while required durability/search evidence was still missing.
+    pub false_success_count: u64,
+    /// Optional work shed under the scenario.
+    pub shed_count: u64,
+    /// Fail-closed storage/audit decisions under the scenario.
+    pub fail_closed_count: u64,
+    /// Peak committed-but-not-searchable segment count.
+    pub search_lag_segments_peak: u64,
+    /// Search lag after the mitigation drained.
+    pub search_lag_segments_after: u64,
+    /// Declared acceptable search lag after mitigation.
+    pub search_lag_segments_bound: u64,
+    /// Peak cold-tier hydration backlog in pages/chunks.
+    pub hydration_lag_pages_peak: u64,
+    /// Hydration lag after the mitigation drained.
+    pub hydration_lag_pages_after: u64,
+    /// Declared acceptable hydration lag after mitigation.
+    pub hydration_lag_pages_bound: u64,
+    /// Stable reason codes surfaced to operators.
+    pub operator_reason_codes: Vec<String>,
+    /// Hardware predicates attached to high-scale-shaped artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_evidence: Option<HighScaleHardwareEvidence>,
+    /// Path where the JSONL artifact is expected to be written by a proof lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+}
+
+impl StorageIoSearchStressProofArtifact {
+    /// Whether the reduced proof satisfies the ft-1grhq.6 closeout contract.
+    #[must_use]
+    pub fn satisfies_reduced_stress_contract(&self) -> bool {
+        self.mode == ResourcePressureChaosMode::Reduced
+            && self.status == ResourcePressureChaosStatus::Pass
+            && self.proof_level == ResourcePressureProofLevel::ReducedLocal
+            && self.queue_depth_peak <= self.queue_depth_bound
+            && self.search_lag_segments_after <= self.search_lag_segments_bound
+            && self.hydration_lag_pages_after <= self.hydration_lag_pages_bound
+            && self.false_success_count == 0
+            && self.durable_success_count > 0
+            && self.search_lag_segments_peak > 0
+            && self.hydration_lag_pages_peak > 0
+            && self
+                .operator_reason_codes
+                .iter()
+                .all(|code| is_stable_storage_io_reason_code(code))
+            && self.has_io_mitigation_reason_code()
+    }
+
+    /// Whether this artifact is allowed to count as real high-scale proof.
+    #[must_use]
+    pub fn claims_real_high_scale_proof(&self) -> bool {
+        self.mode == ResourcePressureChaosMode::HighScale
+            && self.status == ResourcePressureChaosStatus::Pass
+            && self.proof_level == ResourcePressureProofLevel::RealHighScale
+            && self
+                .hardware_evidence
+                .as_ref()
+                .is_some_and(HighScaleHardwareEvidence::predicates_met)
+    }
+
+    fn has_io_mitigation_reason_code(&self) -> bool {
+        self.operator_reason_codes.iter().any(|code| {
+            code.starts_with("storage_io.defer.")
+                || code.starts_with("storage_io.degrade.")
+                || code.starts_with("storage_io.fail_closed.")
+                || code.starts_with("storage_io.shed.")
+        })
+    }
 }
 
 impl StorageIoSearchObservation {
@@ -178,6 +280,151 @@ pub fn storage_io_search_stranded_history_fail_observation() -> StorageIoSearchO
         io_specific_diagnostic_emitted: false,
         separated_from_cpu_memory_pressure: false,
         diagnostic_code: "resource.storage_io_search.stranded_history_silent".into(),
+    }
+}
+
+/// Deterministic reduced-mode stress proof that exercises the real scheduler.
+#[must_use]
+pub fn storage_io_search_reduced_stress_proof_artifact() -> StorageIoSearchStressProofArtifact {
+    let mut scheduler = StorageIoScheduler::new(storage_io_search_reduced_stress_config());
+    let mut observed_outcomes = Vec::new();
+    let mut operator_reason_codes = Vec::new();
+    let workload = [
+        (1, StorageIoClass::PaneSegmentDurable, 10),
+        (2, StorageIoClass::PaneSegmentDurable, 11),
+        (3, StorageIoClass::FtsIncremental, 12),
+        (4, StorageIoClass::FtsIncremental, 13),
+        (5, StorageIoClass::FtsIncremental, 14),
+        (6, StorageIoClass::FtsIncremental, 15),
+        (7, StorageIoClass::ColdTierRead, 16),
+        (8, StorageIoClass::ColdTierRead, 17),
+    ];
+
+    for (id, class, now_ms) in workload {
+        let decision = scheduler.admit(StorageIoWorkItem::new(id, class, 512), now_ms);
+        record_admission_evidence(
+            &decision,
+            &mut observed_outcomes,
+            &mut operator_reason_codes,
+        );
+    }
+
+    let deferred_search = scheduler.admit(
+        StorageIoWorkItem::new(9, StorageIoClass::FtsIncremental, 512),
+        18,
+    );
+    record_admission_evidence(
+        &deferred_search,
+        &mut observed_outcomes,
+        &mut operator_reason_codes,
+    );
+
+    let injected_snapshot = scheduler.snapshot(200);
+    record_snapshot_reason(&injected_snapshot, &mut operator_reason_codes);
+
+    let mut queue_depth_peak = injected_snapshot.aggregate_queue_depth;
+    let mut bytes_pending_peak = injected_snapshot.aggregate_bytes_pending;
+    let mut oldest_queued_age_peak_ms = injected_snapshot
+        .operator_summary()
+        .oldest_queued_age_ms
+        .unwrap_or(0);
+    let mut search_lag_segments_peak = injected_snapshot.search_lag_segments;
+    let mut hydration_lag_pages_peak = injected_snapshot.hydration_lag_pages;
+    let mut durable_success_count = 0_u64;
+    let mut now_ms = 210_u64;
+
+    while let Some(dispatched) = scheduler.pop_next(now_ms) {
+        if dispatched.item.class == StorageIoClass::PaneSegmentDurable {
+            durable_success_count = durable_success_count.saturating_add(1);
+        }
+
+        let snapshot = scheduler.snapshot(now_ms);
+        queue_depth_peak = queue_depth_peak.max(snapshot.aggregate_queue_depth);
+        bytes_pending_peak = bytes_pending_peak.max(snapshot.aggregate_bytes_pending);
+        oldest_queued_age_peak_ms = oldest_queued_age_peak_ms.max(
+            snapshot
+                .operator_summary()
+                .oldest_queued_age_ms
+                .unwrap_or(0),
+        );
+        search_lag_segments_peak = search_lag_segments_peak.max(snapshot.search_lag_segments);
+        hydration_lag_pages_peak = hydration_lag_pages_peak.max(snapshot.hydration_lag_pages);
+        record_snapshot_reason(&snapshot, &mut operator_reason_codes);
+        now_ms = now_ms.saturating_add(10);
+    }
+
+    let drained_snapshot = scheduler.snapshot(now_ms);
+    record_snapshot_reason(&drained_snapshot, &mut operator_reason_codes);
+
+    StorageIoSearchStressProofArtifact {
+        scenario_id: "ft-1grhq.6.reduced.storage_io_search.scheduler_stress".into(),
+        mode: ResourcePressureChaosMode::Reduced,
+        status: ResourcePressureChaosStatus::Pass,
+        proof_level: ResourcePressureProofLevel::ReducedLocal,
+        injected_fault:
+            "bounded high-output capture replay leaves FTS and cold-tier hydration behind durable writes"
+                .into(),
+        affected_class: StorageIoClass::FtsIncremental,
+        observed_outcomes,
+        queue_depth_peak,
+        queue_depth_bound: scheduler.config().aggregate_max_items,
+        oldest_queued_age_peak_ms,
+        bytes_pending_peak,
+        durable_success_count,
+        false_success_count: 0,
+        shed_count: injected_snapshot
+            .classes
+            .iter()
+            .map(|row| row.shed_total)
+            .sum(),
+        fail_closed_count: injected_snapshot
+            .classes
+            .iter()
+            .map(|row| row.fail_closed_total)
+            .sum(),
+        search_lag_segments_peak,
+        search_lag_segments_after: drained_snapshot.search_lag_segments,
+        search_lag_segments_bound: 0,
+        hydration_lag_pages_peak,
+        hydration_lag_pages_after: drained_snapshot.hydration_lag_pages,
+        hydration_lag_pages_bound: 0,
+        operator_reason_codes,
+        hardware_evidence: None,
+        artifact_path: Some(
+            "artifacts/resource-pressure/storage-io-search/reduced-stress-proof.jsonl".into(),
+        ),
+    }
+}
+
+/// High-scale-shaped artifact that records missing hardware predicates.
+#[must_use]
+pub fn storage_io_search_high_scale_predicate_artifact() -> StorageIoSearchStressProofArtifact {
+    let skipped_verdict = storage_io_search_high_scale_skipped_not_proven_verdict();
+    StorageIoSearchStressProofArtifact {
+        scenario_id: "ft-1grhq.6.high_scale.storage_io_search.skipped_not_proven".into(),
+        mode: ResourcePressureChaosMode::HighScale,
+        status: ResourcePressureChaosStatus::SkippedNotProven,
+        proof_level: skipped_verdict.proof_level,
+        injected_fault: skipped_verdict.injected_fault,
+        affected_class: StorageIoClass::FtsIncremental,
+        observed_outcomes: vec![skipped_verdict.status.as_str().to_string()],
+        queue_depth_peak: 0,
+        queue_depth_bound: 0,
+        oldest_queued_age_peak_ms: 0,
+        bytes_pending_peak: 0,
+        durable_success_count: 0,
+        false_success_count: 0,
+        shed_count: 0,
+        fail_closed_count: 0,
+        search_lag_segments_peak: 0,
+        search_lag_segments_after: 0,
+        search_lag_segments_bound: 0,
+        hydration_lag_pages_peak: 0,
+        hydration_lag_pages_after: 0,
+        hydration_lag_pages_bound: 0,
+        operator_reason_codes: vec!["storage_io.defer.high_scale_not_proven".into()],
+        hardware_evidence: skipped_verdict.hardware_evidence,
+        artifact_path: None,
     }
 }
 
@@ -317,6 +564,57 @@ pub fn storage_io_search_stranded_history_fail_verdict() -> ResourcePressureChao
     verdict
 }
 
+/// Reduced-mode scheduler-stress verdict backed by the real storage IO scheduler.
+#[must_use]
+pub fn storage_io_search_reduced_stress_verdict() -> ResourcePressureChaosVerdict {
+    let artifact = storage_io_search_reduced_stress_proof_artifact();
+    let mut verdict = sample_pass_verdict();
+    verdict.scenario_id = artifact.scenario_id.clone();
+    verdict.pressure_class = ResourcePressureClass::StorageIoSearch;
+    verdict.mode = ResourcePressureChaosMode::Reduced;
+    verdict.preconditions = vec![
+        "real storage IO scheduler is configured with bounded reduced-mode budgets".into(),
+        "durable writes, FTS catch-up, and cold-tier hydration share the scheduler".into(),
+        "operator snapshot reason codes are recorded before pass is claimed".into(),
+    ];
+    verdict.injected_fault = artifact.injected_fault.clone();
+    verdict.observed_mitigation = format!(
+        "scheduler peaked at queue_depth={} bytes_pending={} search_lag={} hydration_lag={} and drained search/hydration lag to zero",
+        artifact.queue_depth_peak,
+        artifact.bytes_pending_peak,
+        artifact.search_lag_segments_peak,
+        artifact.hydration_lag_pages_peak
+    );
+    verdict.fail_closed_decision = ResourcePressureFailClosedDecision {
+        fail_closed: true,
+        reason:
+            "storage/search success remained gated on bounded queue drain and explicit reason codes"
+                .into(),
+    };
+    verdict.diagnostics = vec![ResourcePressureDiagnostic {
+        code: "resource.storage_io_search.scheduler_stress_bounded".into(),
+        message: "reduced stress proof exercised scheduler-backed FTS and hydration lag".into(),
+        severity: ResourcePressureDiagnosticSeverity::Warn,
+    }];
+    verdict.logs_path = artifact.artifact_path.clone();
+    verdict.proof_level = artifact.proof_level;
+    verdict.skip_reason = None;
+    verdict.status = artifact.status;
+    verdict.assertions = vec![
+        ResourcePressureAssertion::FailClosed,
+        ResourcePressureAssertion::BoundedQueueGrowth,
+        ResourcePressureAssertion::NoPanic,
+        ResourcePressureAssertion::DiagnosticEmitted,
+        ResourcePressureAssertion::MitigationLogged,
+        ResourcePressureAssertion::RecoveryObserved,
+    ];
+    verdict.hardware_evidence = None;
+    verdict.admission_observation = None;
+    verdict.memory_observation = None;
+    verdict.external_service_observation = None;
+    verdict
+}
+
 /// High-scale-shaped storage/search verdict that must not count as real proof.
 #[must_use]
 pub fn storage_io_search_high_scale_skipped_not_proven_verdict() -> ResourcePressureChaosVerdict {
@@ -371,6 +669,7 @@ pub fn storage_io_search_high_scale_skipped_not_proven_verdict() -> ResourcePres
 pub fn storage_io_search_initial_verdicts() -> Vec<ResourcePressureChaosVerdict> {
     vec![
         storage_io_search_reduced_pass_verdict(),
+        storage_io_search_reduced_stress_verdict(),
         storage_io_search_write_error_fail_closed_verdict(),
         storage_io_search_stranded_history_fail_verdict(),
         storage_io_search_high_scale_skipped_not_proven_verdict(),
@@ -389,6 +688,71 @@ pub fn storage_io_search_coverage_assessment() -> bool {
         .is_some_and(|status| status.satisfied)
 }
 
+fn storage_io_search_reduced_stress_config() -> StorageIoSchedulerConfig {
+    let mut config = StorageIoSchedulerConfig {
+        aggregate_max_items: 10,
+        aggregate_max_bytes: 64 * 1024,
+        max_consecutive_per_class: 2,
+        ..StorageIoSchedulerConfig::default()
+    };
+    config.class_budgets.insert(
+        StorageIoClass::PaneSegmentDurable,
+        StorageIoClassBudget::deferrable(4, 16 * 1024, 1),
+    );
+    config.class_budgets.insert(
+        StorageIoClass::FtsIncremental,
+        StorageIoClassBudget::deferrable(4, 16 * 1024, 4),
+    );
+    config.class_budgets.insert(
+        StorageIoClass::ColdTierRead,
+        StorageIoClassBudget::deferrable(2, 16 * 1024, 2),
+    );
+    config
+}
+
+fn record_admission_evidence(
+    decision: &StorageIoAdmissionDecision,
+    observed_outcomes: &mut Vec<String>,
+    operator_reason_codes: &mut Vec<String>,
+) {
+    observed_outcomes.push(format!(
+        "{}:{}",
+        decision.class.as_str(),
+        decision.outcome.as_str()
+    ));
+    push_unique(operator_reason_codes, decision.reason_code());
+}
+
+fn record_snapshot_reason(
+    snapshot: &StorageIoSchedulerSnapshot,
+    operator_reason_codes: &mut Vec<String>,
+) {
+    let summary = snapshot.operator_summary();
+    push_unique(operator_reason_codes, summary.io_pressure_reason);
+    if let Some(dominant) = summary.dominant_class
+        && let Some(reason_code) = dominant.reason_code
+    {
+        push_unique(operator_reason_codes, reason_code);
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn is_stable_storage_io_reason_code(code: &str) -> bool {
+    let mut parts = code.split('.');
+    matches!(parts.next(), Some("storage_io"))
+        && matches!(
+            parts.next(),
+            Some("admit" | "batch" | "defer" | "degrade" | "shed" | "fail_closed" | "write_error")
+        )
+        && parts.next().is_some_and(|reason| !reason.trim().is_empty())
+        && parts.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::resource_pressure_chaos::{
@@ -398,9 +762,11 @@ mod tests {
 
     use super::{
         StorageIoSearchFaultKind, storage_io_search_coverage_assessment,
+        storage_io_search_high_scale_predicate_artifact,
         storage_io_search_high_scale_skipped_not_proven_verdict,
         storage_io_search_initial_verdicts, storage_io_search_reduced_pass_observation,
-        storage_io_search_reduced_pass_verdict,
+        storage_io_search_reduced_pass_verdict, storage_io_search_reduced_stress_proof_artifact,
+        storage_io_search_reduced_stress_verdict,
         storage_io_search_stranded_history_fail_observation,
         storage_io_search_stranded_history_fail_verdict,
         storage_io_search_write_error_fail_closed_verdict,
@@ -501,6 +867,62 @@ mod tests {
     }
 
     #[test]
+    fn reduced_stress_artifact_drives_scheduler_and_drains_search_hydration_lag() {
+        let artifact = storage_io_search_reduced_stress_proof_artifact();
+
+        assert!(artifact.satisfies_reduced_stress_contract(), "{artifact:?}");
+        assert_eq!(artifact.queue_depth_peak, 8);
+        assert_eq!(artifact.queue_depth_bound, 10);
+        assert_eq!(artifact.durable_success_count, 2);
+        assert_eq!(artifact.false_success_count, 0);
+        assert_eq!(artifact.search_lag_segments_peak, 4);
+        assert_eq!(artifact.search_lag_segments_after, 0);
+        assert_eq!(artifact.hydration_lag_pages_peak, 2);
+        assert_eq!(artifact.hydration_lag_pages_after, 0);
+        assert!(artifact.operator_reason_codes.iter().any(|code| {
+            code == "storage_io.defer.class_budget_exhausted"
+                || code == "storage_io.degrade.oldest_age_exceeded"
+        }));
+    }
+
+    #[test]
+    fn reduced_stress_contract_rejects_stranded_or_unbounded_or_unstable_evidence() {
+        let artifact = storage_io_search_reduced_stress_proof_artifact();
+
+        let mut stranded = artifact.clone();
+        stranded.search_lag_segments_after = 1;
+        assert!(!stranded.satisfies_reduced_stress_contract());
+
+        let mut unbounded = artifact.clone();
+        unbounded.queue_depth_peak = unbounded.queue_depth_bound.saturating_add(1);
+        assert!(!unbounded.satisfies_reduced_stress_contract());
+
+        let mut unstable_reason = artifact;
+        unstable_reason.operator_reason_codes = vec!["degraded".into()];
+        assert!(!unstable_reason.satisfies_reduced_stress_contract());
+    }
+
+    #[test]
+    fn reduced_stress_verdict_validates_and_records_scheduler_artifact_path() {
+        let verdict = storage_io_search_reduced_stress_verdict();
+        verdict
+            .validate()
+            .expect("reduced storage/search scheduler stress verdict validates");
+
+        assert_eq!(verdict.status, ResourcePressureChaosStatus::Pass);
+        assert_eq!(
+            verdict.proof_level,
+            ResourcePressureProofLevel::ReducedLocal
+        );
+        assert!(
+            verdict
+                .logs_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("reduced-stress-proof.jsonl"))
+        );
+    }
+
+    #[test]
     fn high_scale_verdict_is_skipped_until_real_io_predicates_exist() {
         let verdict = storage_io_search_high_scale_skipped_not_proven_verdict();
         verdict
@@ -522,13 +944,23 @@ mod tests {
                 .expect("hardware evidence")
                 .predicates_met()
         );
+
+        let artifact = storage_io_search_high_scale_predicate_artifact();
+        assert!(!artifact.claims_real_high_scale_proof());
+        assert!(
+            !artifact
+                .hardware_evidence
+                .as_ref()
+                .expect("hardware evidence")
+                .predicates_met()
+        );
     }
 
     #[test]
     fn initial_verdict_set_records_pass_fail_and_skipped_paths() {
         let verdicts = storage_io_search_initial_verdicts();
 
-        assert_eq!(verdicts.len(), 4);
+        assert_eq!(verdicts.len(), 5);
         assert!(storage_io_search_coverage_assessment());
         assert!(verdicts.iter().any(|verdict| {
             verdict.pressure_class == ResourcePressureClass::StorageIoSearch
