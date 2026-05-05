@@ -15,7 +15,7 @@
 #   - Capture channel backpressure detection
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - rch (remote cargo offload)
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -24,6 +24,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+RCH_LOG_DIR="$PROJECT_ROOT/tests/e2e/logs"
+RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-/tmp/ft-e2e-prioritized-capture-target}"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -105,17 +110,57 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
+    if ! command -v rch &>/dev/null; then
+        echo -e "${RED}ERROR:${NC} rch not found. Install/configure RCH for remote cargo execution." >&2
         exit 5
     fi
-    log_pass "cargo available"
+    log_pass "rch available"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
         exit 5
     fi
     log_pass "jq available"
+}
+
+run_rch_cargo_to_file() {
+    local output_file="$1"
+    shift
+
+    (
+        run_rch_cargo_logged "$output_file" \
+            env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
+    )
+}
+
+run_rch_cargo_to_file_with_timeout() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+
+    (
+        run_rch_cargo_logged_with_timeout "$timeout_secs" "$output_file" \
+            env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
+    )
+}
+
+record_rch_preflight_artifacts() {
+    if [[ -f "${_RCH_PROBE_LOG}" ]]; then
+        e2e_add_file "rch_probe.log" "$(cat "${_RCH_PROBE_LOG}")"
+    fi
+    if [[ -f "${_RCH_SMOKE_LOG}" ]]; then
+        e2e_add_file "rch_smoke.log" "$(cat "${_RCH_SMOKE_LOG}")"
+    fi
+}
+
+ensure_rch_ready_capture_artifacts() {
+    local rc=0
+    set +e
+    ( ensure_rch_ready )
+    rc=$?
+    set -e
+    record_rch_preflight_artifacts
+    return "$rc"
 }
 
 # ==============================================================================
@@ -129,9 +174,9 @@ scenario_scheduler_budget() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'tailer::tests::scheduler' \
+    run_rch_cargo_to_file "$test_output" test -p frankenterm-core 'tailer::tests::scheduler' \
         --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+        || exit_code=$?
 
     e2e_add_file "scheduler_budget.log" "$(cat "$test_output")"
 
@@ -206,9 +251,9 @@ scenario_scheduler_determinism() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'tailer::tests::scheduler' \
+    run_rch_cargo_to_file "$test_output" test -p frankenterm-core 'tailer::tests::scheduler' \
         --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+        || exit_code=$?
 
     e2e_add_file "scheduler_determinism.log" "$(cat "$test_output")"
 
@@ -267,9 +312,9 @@ scenario_supervisor_integration() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'tailer::tests::supervisor' \
+    run_rch_cargo_to_file "$test_output" test -p frankenterm-core 'tailer::tests::supervisor' \
         --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+        || exit_code=$?
 
     e2e_add_file "supervisor_integration.log" "$(cat "$test_output")"
 
@@ -328,9 +373,9 @@ scenario_overflow_gap() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'overflow' \
+    run_rch_cargo_to_file "$test_output" test -p frankenterm-core 'overflow' \
         --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+        || exit_code=$?
 
     e2e_add_file "overflow_gap.log" "$(cat "$test_output")"
 
@@ -391,9 +436,9 @@ scenario_priority_config() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'pane_priority' \
+    run_rch_cargo_to_file "$test_output" test -p frankenterm-core 'pane_priority' \
         --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+        || exit_code=$?
 
     e2e_add_file "priority_config.log" "$(cat "$test_output")"
 
@@ -431,9 +476,9 @@ scenario_capture_backpressure() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'capture_channel' \
+    run_rch_cargo_to_file "$test_output" test -p frankenterm-core 'capture_channel' \
         --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+        || exit_code=$?
 
     e2e_add_file "capture_backpressure.log" "$(cat "$test_output")"
 
@@ -471,9 +516,9 @@ scenario_health_scheduler() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'health_snapshot' \
+    run_rch_cargo_to_file "$test_output" test -p frankenterm-core 'health_snapshot' \
         --no-fail-fast -- --nocapture --skip health_json_schema \
-        >"$test_output" 2>&1 || exit_code=$?
+        || exit_code=$?
 
     e2e_add_file "health_scheduler.log" "$(cat "$test_output")"
 
@@ -514,9 +559,9 @@ scenario_bounded_execution() {
     exit_code=0
 
     # Run all scheduler, supervisor, overflow, priority, and capture tests
-    timeout 90 cargo test -p frankenterm-core 'tailer::tests' \
+    run_rch_cargo_to_file_with_timeout 90 "$test_output" test -p frankenterm-core 'tailer::tests' \
         --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+        || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
@@ -568,9 +613,15 @@ main() {
     echo -e "${BLUE}Bead: bd-3vo0${NC}"
     echo -e "${BLUE}================================================${NC}"
 
-    check_prerequisites
-
     e2e_init_artifacts "prioritized-capture" >/dev/null
+    mkdir -p "$RCH_LOG_DIR"
+    rch_init "$RCH_LOG_DIR" "$RUN_ID" "scripts_prioritized_capture" "$PROJECT_ROOT"
+    if ! e2e_capture_scenario "rch_preflight" ensure_rch_ready_capture_artifacts; then
+        log_fail "rch preflight failed; refusing local cargo fallback"
+        e2e_finalize 1 >/dev/null
+        return 1
+    fi
+    check_prerequisites
 
     local overall_exit=0
 
