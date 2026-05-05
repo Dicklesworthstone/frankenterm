@@ -629,33 +629,38 @@ pointing back at this section.
 
 ### Not Yet Implemented
 
-Three `ft robot` command families are wired into the CLI surface but currently
-dispatch through `build_ntm_not_implemented_response` and return the
-`robot.not_implemented` error envelope. An agent reading this document in
-isolation should NOT plan workflows around them; use `ntm` directly for these
-capabilities until the NTM-gap epic lands.
-
-| Command family | Dispatch anchor | Use instead |
-|----------------|-----------------|-------------|
-| `ft robot context`    | `RobotCommands::Context` -> `build_ntm_not_implemented_response` | `ntm` context rotation |
-| `ft robot work`       | `RobotCommands::Work` -> `build_ntm_not_implemented_response` | `ntm` work-queue commands |
-| `ft robot fleet`      | `RobotCommands::Fleet` -> `build_ntm_not_implemented_response` | `ntm` fleet commands |
+The original NTM-gap family fallback has been retired for the checkpoint,
+context, work, and live fleet CLI shapes. `ft robot fleet status` and
+`ft robot fleet agents` use native agent-inventory/work-queue read paths.
+`ft robot fleet scale` and `ft robot fleet rebalance` parse natively but return
+the typed `robot.fleet.capability_unavailable` envelope until daemon-side fleet
+mutation is wired. Agents should treat those mutating controls as unavailable
+instead of planning workflows around them.
 
 `ft robot checkpoint` shipped a native snapshot/session adapter under
 ft-bs9uh.2. `save`, `list`, `show`, and `delete` use the existing
 session checkpoint tables. `rollback --dry-run` returns the restore plan;
 non-dry-run rollback is approval-blocked until the robot policy gate lands.
 
+`ft robot context` shipped under ft-bs9uh.3 and is no longer in this table:
+`status`, `rotate`, and `history` use the native SQLite `pane_contexts` and
+`context_rotations` registry. `rotate` records a durable receipt with optional
+`--idempotency-key` replay semantics; the native registry stores metadata and
+does not persist raw conversation content.
+
+`ft robot work` shipped a native SQLite `work_claims` queue under ft-bs9uh.4:
+`claim`, `release`, `complete`, `list`, `ready`, and `assign` no longer route
+through the NTM-gap fallback.
+
 `ft robot profile` shipped under ft-b0g7g and is no longer in this table:
 read paths (`List` / `Show` / `Validate`) and dry-run `Apply` route through
 `crates/frankenterm-core/src/robot_profile_handler.rs`. Only non-dry-run
-`Apply` (which requires daemon-side pane spawning) is still in NTM-passthrough
-state, tracked under ft-b0g7g.cont.apply_spawn.
+`Apply` (which requires daemon-side pane spawning) still returns a typed
+`robot.profile.spawn_failed` envelope, tracked under ft-b0g7g.cont.apply_spawn.
 
-See README.md's supported-surface table for the user-facing status. The envelope returned
-from each family includes an `ntm_equivalent` pointer whenever one exists.
-The epic tracking the remaining implementation is `ft-bs9uh` (Robot NTM-gap
-implementation).
+See README.md's supported-surface table for the user-facing status. The epic
+tracking the remaining fleet mutation implementation is `ft-bs9uh` (Robot
+NTM-gap implementation).
 
 ### Session Persistence
 

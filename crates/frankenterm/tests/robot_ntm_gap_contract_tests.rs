@@ -1,10 +1,9 @@
-//! Contract harness for current `ft robot` NTM-gap dispatch.
+//! Contract harness for retired `ft robot` NTM-gap dispatch.
 //!
 //! The schema/state-machine suite in `frankenterm-core` describes target
 //! native semantics. This integration harness guards the live CLI boundary:
-//! fallback actions must keep returning the structured `robot.not_implemented`
-//! envelope, and implementation beads have a single manifest entry to flip
-//! once an action is natively wired.
+//! actions that have graduated to native dispatch must not regress to the
+//! structured `robot.not_implemented` envelope.
 
 #![allow(deprecated)]
 
@@ -147,14 +146,14 @@ const NTM_GAP_ACTIONS: &[RobotActionContract] = &[
         family: "fleet",
         action: "status",
         args: &["fleet", "status", "--detailed"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: false,
     },
     RobotActionContract {
         family: "fleet",
         action: "scale",
         args: &["fleet", "scale", "codex", "1", "--dry-run"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
@@ -167,14 +166,14 @@ const NTM_GAP_ACTIONS: &[RobotActionContract] = &[
             "round_robin",
             "--dry-run",
         ],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: true,
     },
     RobotActionContract {
         family: "fleet",
         action: "agents",
         args: &["fleet", "agents", "--program", "codex", "--state", "idle"],
-        expected_backend: ExpectedBackend::NtmFallback,
+        expected_backend: ExpectedBackend::Native,
         is_mutation: false,
     },
 ];
@@ -277,7 +276,7 @@ fn assert_native_not_ntm_fallback(contract: &RobotActionContract, payload: &Valu
 }
 
 #[test]
-fn robot_checkpoint_work_and_remaining_ntm_gap_dispatch_matches_manifest() {
+fn robot_checkpoint_context_work_fleet_dispatch_matches_manifest() {
     let (_dir, workspace) = setup_workspace();
 
     for contract in NTM_GAP_ACTIONS {

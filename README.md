@@ -672,7 +672,10 @@ ft robot help               # List all robot commands
 
 #### Implementation status
 
-Not every `ft robot` subcommand is wired to a real backend yet. The CLI surface is real, argument parsing is real, and unimplemented families return a structured `robot.not_implemented` envelope (not silent breakage) — but a caller reaching for the unshipped surfaces will get that envelope back instead of a side effect. The `code` is `robot.not_implemented`, and each response carries an `ntm_equivalent` pointer to the current out-of-band workaround (shell out to `ntm`).
+The original NTM-gap family fallback has been retired for the robot families
+below. The CLI surface is real, argument parsing is real, and remaining
+unavailable operations return typed robot envelopes for their own backend
+limits instead of the generic `robot.not_implemented` fallback.
 
 | Family                   | Actions                                   | Status                |
 |--------------------------|-------------------------------------------|-----------------------|
@@ -684,12 +687,15 @@ Not every `ft robot` subcommand is wired to a real backend yet. The CLI surface 
 | `ft robot events`        | recent detection events                   | ✅ shipped            |
 | `ft robot approve`       | approve gated action                      | ✅ shipped            |
 | `ft robot checkpoint`    | save / list / show / delete / rollback    | ✅ native snapshot/session adapter; rollback execution requires `--dry-run` until robot policy approval lands |
-| `ft robot context`       | status / rotate / history                 | ⏳ returns `robot.not_implemented` — use `ntm` |
-| `ft robot work`          | claim / complete / status / list          | ⏳ returns `robot.not_implemented` — use `ntm` |
-| `ft robot fleet`         | status / launch / stop / describe         | ⏳ returns `robot.not_implemented` — use `ntm` |
+| `ft robot context`       | status / rotate / history                 | ✅ native SQLite context registry; rotation receipts are durable and raw context content is not stored |
+| `ft robot work`          | claim / release / complete / list / ready / assign | ✅ native SQLite `work_claims` queue |
+| `ft robot fleet`         | status / scale / rebalance / agents       | ✅ native read paths for status/agents; scale/rebalance parse natively and return typed `robot.fleet.capability_unavailable` until daemon-side mutation is wired |
 | `ft robot profile`       | list / show / validate / dry-run apply    | ✅ shipped for read paths and dry-run apply; non-dry-run apply returns typed `robot.profile.spawn_failed` until daemon spawn RPC lands |
 
-The remaining unimplemented families are tracked under `ft-bs9uh` (Robot NTM-gap implementation epic). File an issue if the `robot.not_implemented` envelope for your use case does not include a usable `ntm_equivalent` pointer.
+Remaining fleet mutation work is tracked under `ft-bs9uh` (Robot NTM-gap
+implementation epic). File an issue if a typed capability-unavailable envelope
+for your use case does not identify the missing native control-plane
+capability.
 
 #### Profile management
 

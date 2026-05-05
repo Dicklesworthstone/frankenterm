@@ -4875,6 +4875,7 @@ const ROBOT_ERR_TIMEOUT: &str = "robot.timeout";
 const ROBOT_ERR_WORKFLOW_ABORTED: &str = "robot.workflow_aborted";
 const ROBOT_ERR_WORKFLOW_ERROR: &str = "robot.workflow_error";
 const ROBOT_ERR_WORKFLOW_NOT_FOUND: &str = "robot.workflow_not_found";
+#[cfg(test)]
 const ROBOT_ERR_NOT_IMPLEMENTED: &str = "robot.not_implemented";
 const ROBOT_ERR_CHECKPOINT_NOT_FOUND: &str = "robot.checkpoint_not_found";
 const ROBOT_ERR_WORK_ITEM_NOT_FOUND: &str = "robot.work_item_not_found";
@@ -7546,6 +7547,345 @@ fn infer_running_agents_from_panes(
     }
 
     correlator.inventory().running.into_iter().collect()
+}
+
+fn robot_fleet_state_bucket(state: &str) -> &'static str {
+    match state.trim().to_ascii_lowercase().as_str() {
+        "idle" => "idle",
+        "stalled" | "stuck" | "rate_limited" | "auth_error" | "waiting_approval" => "stalled",
+        _ => "active",
+    }
+}
+
+fn robot_fleet_state_matches_filter(
+    entry: &frankenterm_core::agent_correlator::RunningAgentInventoryEntry,
+    state_filter: Option<&str>,
+) -> bool {
+    let Some(filter) = state_filter else {
+        return true;
+    };
+    let normalized = filter.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "busy" | "active" | "working" => robot_fleet_state_bucket(&entry.state) == "active",
+        "idle" => robot_fleet_state_bucket(&entry.state) == "idle",
+        "stalled" | "stuck" | "blocked" => robot_fleet_state_bucket(&entry.state) == "stalled",
+        other => entry.state.eq_ignore_ascii_case(other),
+    }
+}
+
+fn robot_fleet_program_matches_filter(
+    entry: &frankenterm_core::agent_correlator::RunningAgentInventoryEntry,
+    program_filter: Option<&str>,
+) -> bool {
+    let Some(filter) = program_filter else {
+        return true;
+    };
+    let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(filter.trim());
+    entry.slug == provider.canonical_slug()
+}
+
+fn robot_fleet_program_summaries(
+    running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut counts: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    for entry in running_agents.values() {
+        let bucket = robot_fleet_state_bucket(&entry.state);
+        let slot = counts.entry(entry.slug.clone()).or_default();
+        match bucket {
+            "idle" => slot.1 += 1,
+            "stalled" => slot.2 += 1,
+            _ => slot.0 += 1,
+        }
+    }
+
+    counts
+        .into_iter()
+        .map(|(program, (active, idle, stalled))| {
+            (
+                program,
+                serde_json::json!({
+                    "count": active + idle + stalled,
+                    "active": active,
+                    "idle": idle,
+                    "stalled": stalled,
+                }),
+            )
+        })
+        .collect()
+}
+
+fn robot_fleet_agent_counts(
+    running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+) -> (usize, usize, usize) {
+    let mut active = 0usize;
+    let mut idle = 0usize;
+    let mut stalled = 0usize;
+
+    for entry in running_agents.values() {
+        match robot_fleet_state_bucket(&entry.state) {
+            "idle" => idle += 1,
+            "stalled" => stalled += 1,
+            _ => active += 1,
+        }
+    }
+
+    (active, idle, stalled)
+}
+
+fn robot_fleet_work_queue_summary(db_path: &str) -> serde_json::Value {
+    let conn = match robot_work_open_conn(db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "unavailable",
+                "error": err.to_string(),
+                "total_items": 0usize,
+                "ready": 0usize,
+                "blocked": 0usize,
+                "in_progress": 0usize,
+                "completed": 0usize,
+            });
+        }
+    };
+
+    let count = |sql: &str| -> usize {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .map(robot_work_count)
+            .unwrap_or(0)
+    };
+
+    serde_json::json!({
+        "status": "ok",
+        "storage_table": "work_claims",
+        "total_items": count("SELECT COUNT(*) FROM work_claims"),
+        "ready": count("SELECT COUNT(*) FROM work_claims WHERE state = 'unclaimed' AND blocked_by_count = 0"),
+        "blocked": count("SELECT COUNT(*) FROM work_claims WHERE state = 'unclaimed' AND blocked_by_count > 0"),
+        "in_progress": count("SELECT COUNT(*) FROM work_claims WHERE state = 'claimed'"),
+        "completed": count("SELECT COUNT(*) FROM work_claims WHERE state = 'completed'"),
+    })
+}
+
+async fn robot_fleet_load_running_agents(
+    config: &frankenterm_core::config::Config,
+) -> (
+    BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    Option<String>,
+) {
+    let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    match wezterm.list_panes_with_cx(&cx).await {
+        Ok(panes) => (infer_running_agents_from_panes(&panes), None),
+        Err(err) => (BTreeMap::new(), Some(err.to_string())),
+    }
+}
+
+fn robot_fleet_load_installed_agents() -> (
+    Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry>,
+    Option<String>,
+) {
+    match load_installed_agent_inventory(false) {
+        Ok(installed) => (installed, None),
+        Err(err) => (Vec::new(), Some(err)),
+    }
+}
+
+fn robot_fleet_status_data(
+    db_path: &str,
+    detailed: bool,
+    installed_agents: Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry>,
+    installed_error: Option<String>,
+    running_agents: BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    running_error: Option<String>,
+) -> serde_json::Value {
+    let summary = build_robot_agent_inventory_summary(&installed_agents, &running_agents);
+    let (active, idle, stalled) = robot_fleet_agent_counts(&running_agents);
+    let mut data = serde_json::json!({
+        "family": "fleet",
+        "action": "status",
+        "backend": "native_agent_inventory",
+        "live_cli_contract": "status_scale_rebalance_agents",
+        "detailed": detailed,
+        "filesystem_detection_available": frankenterm_core::agent_correlator::filesystem_detection_available(),
+        "installed_inventory": {
+            "ok": installed_error.is_none(),
+            "error": installed_error,
+            "count": installed_agents.len(),
+        },
+        "running_inventory": {
+            "ok": running_error.is_none(),
+            "error": running_error,
+            "count": running_agents.len(),
+        },
+        "summary": summary,
+        "total_agents": running_agents.len(),
+        "active_agents": active,
+        "idle_agents": idle,
+        "stalled_agents": stalled,
+        "by_program": robot_fleet_program_summaries(&running_agents),
+        "work_queue": robot_fleet_work_queue_summary(db_path),
+        "mutating_capabilities": {
+            "scale": "capability_unavailable",
+            "rebalance": "capability_unavailable",
+            "reason": "daemon-side fleet mutation is not wired to native Robot Mode yet",
+        },
+    });
+
+    if detailed {
+        data["installed_agents"] = serde_json::json!(installed_agents);
+        data["running_agents"] = serde_json::json!(running_agents);
+    }
+
+    data
+}
+
+fn robot_fleet_agents_data(
+    installed_agents: Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry>,
+    installed_error: Option<String>,
+    running_agents: BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    running_error: Option<String>,
+    program: Option<&str>,
+    state: Option<&str>,
+) -> serde_json::Value {
+    let filtered: BTreeMap<_, _> = running_agents
+        .iter()
+        .filter(|(_, entry)| robot_fleet_program_matches_filter(entry, program))
+        .filter(|(_, entry)| robot_fleet_state_matches_filter(entry, state))
+        .map(|(pane_id, entry)| (*pane_id, entry.clone()))
+        .collect();
+    let summary = build_robot_agent_inventory_summary(&installed_agents, &filtered);
+
+    serde_json::json!({
+        "family": "fleet",
+        "action": "agents",
+        "backend": "native_agent_inventory",
+        "live_cli_contract": "status_scale_rebalance_agents",
+        "filesystem_detection_available": frankenterm_core::agent_correlator::filesystem_detection_available(),
+        "filters": {
+            "program": program,
+            "state": state,
+        },
+        "installed_inventory": {
+            "ok": installed_error.is_none(),
+            "error": installed_error,
+            "count": installed_agents.len(),
+        },
+        "running_inventory": {
+            "ok": running_error.is_none(),
+            "error": running_error,
+            "unfiltered_count": running_agents.len(),
+            "count": filtered.len(),
+        },
+        "summary": summary,
+        "running_agents": filtered,
+    })
+}
+
+fn robot_fleet_error_with_data(
+    code: &str,
+    message: impl Into<String>,
+    hint: Option<String>,
+    data: serde_json::Value,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    RobotResponse {
+        ok: false,
+        data: Some(data),
+        error: Some(message.into()),
+        error_code: Some(code.to_string()),
+        hint,
+        elapsed_ms,
+        version: frankenterm_core::VERSION.to_string(),
+        now: now_ms(),
+    }
+}
+
+fn robot_fleet_capability_unavailable(
+    action: &str,
+    requested: serde_json::Value,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    robot_fleet_error_with_data(
+        "robot.fleet.capability_unavailable",
+        format!("ft robot fleet {action} is parsed natively but daemon-side fleet mutation is not available yet."),
+        Some(
+            "Use read-only `ft robot fleet status` / `ft robot fleet agents`, or use the existing NTM operator flow for mutating fleet control."
+                .to_string(),
+        ),
+        serde_json::json!({
+            "family": "fleet",
+            "action": action,
+            "backend": "native_agent_inventory",
+            "capability_available": false,
+            "capability": "daemon_side_fleet_mutation",
+            "requested": requested,
+            "audit": {
+                "event": format!("fleet.{action}.denied"),
+                "reason": "capability_unavailable",
+            },
+        }),
+        elapsed_ms,
+    )
+}
+
+async fn robot_fleet_command_response(
+    db_path: &str,
+    config: &frankenterm_core::config::Config,
+    command: &RobotFleetCommands,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    match command {
+        RobotFleetCommands::Status { detailed } => {
+            let (installed_agents, installed_error) = robot_fleet_load_installed_agents();
+            let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
+            RobotResponse::success(
+                robot_fleet_status_data(
+                    db_path,
+                    *detailed,
+                    installed_agents,
+                    installed_error,
+                    running_agents,
+                    running_error,
+                ),
+                elapsed_ms,
+            )
+        }
+        RobotFleetCommands::Agents { program, state } => {
+            let (installed_agents, installed_error) = robot_fleet_load_installed_agents();
+            let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
+            RobotResponse::success(
+                robot_fleet_agents_data(
+                    installed_agents,
+                    installed_error,
+                    running_agents,
+                    running_error,
+                    program.as_deref(),
+                    state.as_deref(),
+                ),
+                elapsed_ms,
+            )
+        }
+        RobotFleetCommands::Scale {
+            program,
+            target_count,
+            dry_run,
+        } => robot_fleet_capability_unavailable(
+            "scale",
+            serde_json::json!({
+                "program": program,
+                "target_count": target_count,
+                "dry_run": dry_run,
+            }),
+            elapsed_ms,
+        ),
+        RobotFleetCommands::Rebalance { strategy, dry_run } => robot_fleet_capability_unavailable(
+            "rebalance",
+            serde_json::json!({
+                "strategy": strategy,
+                "dry_run": dry_run,
+            }),
+            elapsed_ms,
+        ),
+    }
 }
 
 fn redact_for_output(text: &str) -> String {
@@ -13038,6 +13378,7 @@ fn build_robot_context(
 /// but whose handler backend is not yet connected. Returns an error envelope
 /// with `robot.not_implemented` error code so callers get an explicit signal
 /// that the command surface exists but has no backend wired yet.
+#[cfg(test)]
 fn build_ntm_not_implemented_response(
     cmd: &frankenterm_core::robot_ntm_surface::RobotNtmCommand,
     elapsed_ms: u64,
@@ -26053,63 +26394,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Fleet { command } => {
-                            let ntm_cmd = match &command {
-                                RobotFleetCommands::Status { detailed } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Fleet(
-                                        frankenterm_core::robot_ntm_surface::FleetCommand::Status(
-                                            frankenterm_core::robot_ntm_surface::FleetStatusRequest {
-                                                detailed: *detailed,
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotFleetCommands::Scale {
-                                    program,
-                                    target_count,
-                                    dry_run,
-                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Fleet(
-                                    frankenterm_core::robot_ntm_surface::FleetCommand::Scale(
-                                        frankenterm_core::robot_ntm_surface::FleetScaleRequest {
-                                            program: program.clone(),
-                                            target_count: *target_count,
-                                            dry_run: *dry_run,
-                                        },
-                                    ),
-                                ),
-                                RobotFleetCommands::Rebalance { strategy, dry_run } => {
-                                    let strat = match strategy.as_str() {
-                                        "capability_based" => {
-                                            frankenterm_core::robot_ntm_surface::RebalanceStrategy::CapabilityBased
-                                        }
-                                        "round_robin" => {
-                                            frankenterm_core::robot_ntm_surface::RebalanceStrategy::RoundRobin
-                                        }
-                                        _ => {
-                                            frankenterm_core::robot_ntm_surface::RebalanceStrategy::LoadBased
-                                        }
-                                    };
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Fleet(
-                                        frankenterm_core::robot_ntm_surface::FleetCommand::Rebalance(
-                                            frankenterm_core::robot_ntm_surface::FleetRebalanceRequest {
-                                                strategy: strat,
-                                                dry_run: *dry_run,
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotFleetCommands::Agents { program, state } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Fleet(
-                                        frankenterm_core::robot_ntm_surface::FleetCommand::Agents(
-                                            frankenterm_core::robot_ntm_surface::FleetAgentsRequest {
-                                                program_filter: program.clone(),
-                                                state_filter: state.clone(),
-                                            },
-                                        ),
-                                    )
-                                }
-                            };
-                            let response =
-                                build_ntm_not_implemented_response(&ntm_cmd, elapsed_ms(start));
+                            let response = robot_fleet_command_response(
+                                &ctx.effective.paths.db_path,
+                                &config,
+                                &command,
+                                elapsed_ms(start),
+                            )
+                            .await;
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Profile { command } => {
@@ -58921,6 +59212,80 @@ log_level = "debug"
             running.get(&8).map(|entry| entry.slug.as_str()),
             Some("gemini")
         );
+    }
+
+    #[test]
+    fn test_robot_fleet_program_summary_buckets_agent_states() {
+        use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
+
+        let mut running_agents = BTreeMap::new();
+        running_agents.insert(
+            1,
+            RunningAgentInventoryEntry {
+                slug: "codex".to_string(),
+                state: "active".to_string(),
+                session_id: None,
+                source: DetectionSource::PaneTitle,
+            },
+        );
+        running_agents.insert(
+            2,
+            RunningAgentInventoryEntry {
+                slug: "codex".to_string(),
+                state: "idle".to_string(),
+                session_id: None,
+                source: DetectionSource::PaneTitle,
+            },
+        );
+        running_agents.insert(
+            3,
+            RunningAgentInventoryEntry {
+                slug: "gemini".to_string(),
+                state: "rate_limited".to_string(),
+                session_id: None,
+                source: DetectionSource::ProcessName,
+            },
+        );
+
+        let summaries = robot_fleet_program_summaries(&running_agents);
+        assert_eq!(summaries["codex"]["count"].as_u64(), Some(2));
+        assert_eq!(summaries["codex"]["active"].as_u64(), Some(1));
+        assert_eq!(summaries["codex"]["idle"].as_u64(), Some(1));
+        assert_eq!(summaries["gemini"]["stalled"].as_u64(), Some(1));
+        assert_eq!(robot_fleet_agent_counts(&running_agents), (1, 1, 1));
+    }
+
+    #[test]
+    fn test_robot_fleet_filters_program_and_state_aliases() {
+        use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
+
+        let codex_busy = RunningAgentInventoryEntry {
+            slug: "codex".to_string(),
+            state: "working".to_string(),
+            session_id: None,
+            source: DetectionSource::PaneTitle,
+        };
+        let gemini_idle = RunningAgentInventoryEntry {
+            slug: "gemini".to_string(),
+            state: "idle".to_string(),
+            session_id: None,
+            source: DetectionSource::ProcessName,
+        };
+
+        assert!(robot_fleet_program_matches_filter(
+            &codex_busy,
+            Some("codex")
+        ));
+        assert!(!robot_fleet_program_matches_filter(
+            &gemini_idle,
+            Some("codex")
+        ));
+        assert!(robot_fleet_state_matches_filter(&codex_busy, Some("busy")));
+        assert!(robot_fleet_state_matches_filter(&gemini_idle, Some("idle")));
+        assert!(!robot_fleet_state_matches_filter(
+            &gemini_idle,
+            Some("stalled")
+        ));
     }
 
     #[test]

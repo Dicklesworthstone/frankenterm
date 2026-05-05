@@ -2,9 +2,10 @@
 
 **Bead:** `ft-bs9uh.1`
 
-This file records the live CLI dispatch shape for the remaining Robot Mode
-families that still route through `build_ntm_not_implemented_response`, plus
-families that have graduated to a native backend under the same harness.
+This file records the live CLI dispatch shape for Robot Mode families that
+were once part of the generic NTM-gap fallback. No live family currently routes
+through `build_ntm_not_implemented_response`; the table below records the
+native backends that replaced it.
 It complements the per-family contract docs, which describe the target
 native semantics and state-machine proofs.
 
@@ -14,36 +15,22 @@ native semantics and state-machine proofs.
 dispatch through `robot_profile_handler`; non-dry-run apply returns a typed
 profile spawn error until daemon-side pane spawning lands.
 
-The current NTM-gap families are:
-
-| Family | CLI actions currently parsed | Current backend |
-|---|---|---|
-| `context` | `status`, `rotate`, `history` | structured `robot.not_implemented` fallback |
-| `fleet` | `status`, `scale`, `rebalance`, `agents` | structured `robot.not_implemented` fallback |
-
-The checkpoint and work families have graduated from the NTM-gap fallback:
+The checkpoint, context, work, and live fleet CLI shapes have graduated from
+the NTM-gap fallback:
 
 | Family | CLI actions currently parsed | Current backend |
 |---|---|---|
 | `checkpoint` | `save`, `list`, `show`, `delete`, `rollback` | native snapshot/session adapter; rollback mutating execution is approval-blocked unless `--dry-run` is used |
+| `context` | `status`, `rotate`, `history` | native SQLite `pane_contexts` / `context_rotations` registry; rotation receipts are durable, support optional idempotency-key replay, and store metadata without raw conversation content |
 | `work` | `claim`, `release`, `complete`, `list`, `ready`, `assign` | native SQLite `work_claims` queue; claims/assignments are serialized per item and completion is durable |
+| `fleet` | `status`, `scale`, `rebalance`, `agents` | native agent-inventory/work-queue read paths for `status` and `agents`; mutating `scale`/`rebalance` parse natively and return typed `robot.fleet.capability_unavailable` until daemon-side mutation is wired |
 
 ## Harness Contract
 
 The integration harness at
 `crates/frankenterm/tests/robot_ntm_gap_contract_tests.rs` owns the current
-fallback/native manifest. For an action marked as fallback, it asserts:
-
-- the command parses and emits a JSON robot envelope;
-- `ok == false`;
-- `error_code == "robot.not_implemented"`;
-- `data.family` and `data.action` match the parsed CLI action;
-- `data.is_mutation` matches the NTM surface classification;
-- `data.ntm_equivalence.ntm_commands` is non-empty.
-
-When an implementation bead wires a native backend for an action, update the
-same harness entry from fallback to native in the implementation commit. The
-native assertion intentionally does not require success, because a real
-backend can still return typed errors for missing state, unavailable daemons,
-or denied policy. It only forbids `robot.not_implemented`, making the gap
-closure falsifiable without weakening runtime error honesty.
+native-dispatch manifest. It asserts that each listed action parses, emits a
+JSON robot envelope, and does not return the retired
+`robot.not_implemented` fallback. The native assertion intentionally does not
+require success, because a real backend can still return typed errors for
+missing state, unavailable daemons, or denied policy.
