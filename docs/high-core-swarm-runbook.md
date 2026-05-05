@@ -124,7 +124,8 @@ Inspect the compact cockpit fields:
 jq '.swarm_capacity.resource_cockpit |
     {schema_version, status, proof_gate, memory_pressure,
      memory_tiers, slowest_latency_cohorts,
-     resource_admission_decisions, mitigation_history, drilldowns}' \
+     resource_admission_decisions, storage_io,
+     mitigation_history, drilldowns}' \
   "$FT_HIGH_CORE_RUN_DIR/doctor.json"
 ```
 
@@ -137,6 +138,7 @@ Operator interpretation:
 | `memory_tiers` | Hot resident, warm compressed, and cold disk stay within budget | Over-budget hot or warm tiers mean demote, compress, or shed noncritical work. |
 | `slowest_latency_cohorts` | Known bottleneck stage with bounded p99 | Repeated p99 over budget means tune or pause fanout before adding panes. |
 | `resource_admission_decisions` | `admit` or planned `degrade` under controlled pressure | `defer`, `degrade`, or `shed` without a planned soak requires triage. |
+| `storage_io` | `io_pressure_tier=green` with bounded queues and zero write errors | `yellow`, `red`, `black`, growing lag, or write errors mean treat storage as its own pressure domain. |
 | `drilldowns` | One clear reason per mitigation | Missing or vague reasons mean collect support artifacts and stop tuning upward. |
 
 ## Troubleshooting Branches
@@ -180,6 +182,7 @@ Signals:
 ```bash
 ft status --health > "$FT_HIGH_CORE_RUN_DIR/status-health.txt"
 ft robot events --limit 20 > "$FT_HIGH_CORE_RUN_DIR/events.json"
+jq '.swarm_capacity.resource_cockpit.storage_io' "$FT_HIGH_CORE_RUN_DIR/doctor.json"
 ```
 
 Actions:

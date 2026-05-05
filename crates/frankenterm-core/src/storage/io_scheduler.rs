@@ -409,6 +409,101 @@ pub struct StorageIoSchedulerSnapshot {
     pub classes: Vec<StorageIoClassSnapshot>,
 }
 
+/// Dominant IO class surfaced in operator summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageIoDominantClassSummary {
+    pub class: StorageIoClass,
+    pub class_name: String,
+    pub queue_depth: u64,
+    pub bytes_pending: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_queued_age_ms: Option<u64>,
+    pub fail_closed_total: u64,
+    pub write_error_total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+/// Stable IO-pressure summary for resource cockpit and structured logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageIoOperatorSummary {
+    pub schema_version: u32,
+    pub pressure_domain: String,
+    pub io_pressure_tier: StorageIoPressureTier,
+    pub io_pressure_reason: String,
+    pub operator_action: String,
+    pub aggregate_queue_depth: u64,
+    pub aggregate_bytes_pending: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_queued_age_ms: Option<u64>,
+    pub durability_pending_total: u64,
+    pub search_lag_segments: u64,
+    pub hydration_lag_pages: u64,
+    pub audit_fail_closed_total: u64,
+    pub write_error_total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dominant_class: Option<StorageIoDominantClassSummary>,
+}
+
+impl StorageIoSchedulerSnapshot {
+    #[must_use]
+    pub fn operator_summary(&self) -> StorageIoOperatorSummary {
+        let write_error_total = self.classes.iter().fold(0_u64, |total, row| {
+            total.saturating_add(row.write_error_total)
+        });
+
+        StorageIoOperatorSummary {
+            schema_version: self.schema_version,
+            pressure_domain: "storage_io".to_string(),
+            io_pressure_tier: self.io_pressure_tier,
+            io_pressure_reason: self.io_pressure_reason.clone(),
+            operator_action: operator_action_for_summary(
+                self.io_pressure_tier,
+                self.audit_fail_closed_total,
+                write_error_total,
+            )
+            .to_string(),
+            aggregate_queue_depth: self.aggregate_queue_depth,
+            aggregate_bytes_pending: self.aggregate_bytes_pending,
+            oldest_queued_age_ms: self
+                .classes
+                .iter()
+                .filter_map(|row| row.oldest_queued_age_ms)
+                .max(),
+            durability_pending_total: self.durability_pending_total,
+            search_lag_segments: self.search_lag_segments,
+            hydration_lag_pages: self.hydration_lag_pages,
+            audit_fail_closed_total: self.audit_fail_closed_total,
+            write_error_total,
+            dominant_class: self.dominant_class_summary(),
+        }
+    }
+
+    fn dominant_class_summary(&self) -> Option<StorageIoDominantClassSummary> {
+        self.classes
+            .iter()
+            .filter(|row| class_has_operator_signal(row))
+            .max_by_key(|row| {
+                (
+                    class_operator_rank(row),
+                    row.oldest_queued_age_ms.unwrap_or(0),
+                    row.queue_depth,
+                    row.bytes_pending,
+                )
+            })
+            .map(|row| StorageIoDominantClassSummary {
+                class: row.class,
+                class_name: row.class_name.clone(),
+                queue_depth: row.queue_depth,
+                bytes_pending: row.bytes_pending,
+                oldest_queued_age_ms: row.oldest_queued_age_ms,
+                fail_closed_total: row.fail_closed_total,
+                write_error_total: row.write_error_total,
+                reason_code: row.last_reason_code.clone(),
+            })
+    }
+}
+
 /// Pure in-memory storage IO scheduler.
 #[derive(Debug, Clone)]
 pub struct StorageIoScheduler {
@@ -589,6 +684,12 @@ impl StorageIoScheduler {
             .get(&class)
             .and_then(|queue| queue.front())
             .map(|queued| now_ms.saturating_sub(queued.admitted_at_ms))
+    }
+
+    pub fn record_write_error(&mut self, class: StorageIoClass, reason: StorageIoReason) {
+        let counters = self.counters.entry(class).or_default();
+        counters.write_error_total = counters.write_error_total.saturating_add(1);
+        counters.last_reason_code = Some(format!("storage_io.write_error.{}", reason.as_str()));
     }
 
     fn reject(
@@ -800,6 +901,48 @@ fn pressure_reason(tier: StorageIoPressureTier) -> &'static str {
         StorageIoPressureTier::Yellow => "storage_io.defer.queue_full",
         StorageIoPressureTier::Red => "storage_io.degrade.oldest_age_exceeded",
         StorageIoPressureTier::Black => "storage_io.fail_closed.queue_full",
+    }
+}
+
+fn operator_action_for_summary(
+    tier: StorageIoPressureTier,
+    audit_fail_closed_total: u64,
+    write_error_total: u64,
+) -> &'static str {
+    if audit_fail_closed_total > 0 || write_error_total > 0 {
+        "investigate_io_fail_closed"
+    } else {
+        match tier {
+            StorageIoPressureTier::Green => "continue",
+            StorageIoPressureTier::Yellow => "watch_io_queue",
+            StorageIoPressureTier::Red => "throttle_or_defer_io",
+            StorageIoPressureTier::Black => "fail_closed_or_shed_optional_io",
+        }
+    }
+}
+
+fn class_has_operator_signal(row: &StorageIoClassSnapshot) -> bool {
+    row.queue_depth > 0
+        || row.deferred_total > 0
+        || row.degraded_total > 0
+        || row.shed_total > 0
+        || row.fail_closed_total > 0
+        || row.write_error_total > 0
+}
+
+fn class_operator_rank(row: &StorageIoClassSnapshot) -> u8 {
+    if row.write_error_total > 0 {
+        5
+    } else if row.fail_closed_total > 0 {
+        4
+    } else if row.shed_total > 0 {
+        3
+    } else if row.degraded_total > 0 {
+        2
+    } else if row.deferred_total > 0 {
+        1
+    } else {
+        0
     }
 }
 
@@ -1086,5 +1229,43 @@ mod tests {
         assert_eq!(segment.queue_depth, 1);
         assert_eq!(segment.bytes_pending, 512);
         assert_eq!(segment.oldest_queued_age_ms, Some(60));
+
+        let summary = snapshot.operator_summary();
+        assert_eq!(summary.pressure_domain, "storage_io");
+        assert_eq!(summary.operator_action, "fail_closed_or_shed_optional_io");
+        assert_eq!(summary.oldest_queued_age_ms, Some(60));
+        assert_eq!(
+            summary.dominant_class.as_ref().map(|row| row.class),
+            Some(StorageIoClass::PaneSegmentDurable)
+        );
+    }
+
+    #[test]
+    fn operator_summary_reports_no_dominant_class_when_idle() {
+        let scheduler = StorageIoScheduler::new(tiny_config());
+        let summary = scheduler.snapshot(10).operator_summary();
+
+        assert_eq!(summary.io_pressure_tier, StorageIoPressureTier::Green);
+        assert_eq!(summary.operator_action, "continue");
+        assert_eq!(summary.write_error_total, 0);
+        assert!(summary.dominant_class.is_none());
+    }
+
+    #[test]
+    fn write_error_updates_operator_summary_reason_code() {
+        let mut scheduler = StorageIoScheduler::new(tiny_config());
+        scheduler.record_write_error(StorageIoClass::SearchIndexState, StorageIoReason::IoError);
+
+        let summary = scheduler.snapshot(10).operator_summary();
+        let dominant = summary.dominant_class.unwrap();
+
+        assert_eq!(summary.write_error_total, 1);
+        assert_eq!(summary.operator_action, "investigate_io_fail_closed");
+        assert_eq!(dominant.class, StorageIoClass::SearchIndexState);
+        assert_eq!(dominant.write_error_total, 1);
+        assert_eq!(
+            dominant.reason_code.as_deref(),
+            Some("storage_io.write_error.io_error")
+        );
     }
 }

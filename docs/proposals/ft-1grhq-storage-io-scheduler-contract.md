@@ -232,6 +232,12 @@ drilldown from CPU and memory pressure. A storage defer/degrade decision
 must not be described as CPU or memory pressure unless those inputs
 actually caused the decision.
 
+`ft-1grhq.5` exposes this as `.swarm_capacity.resource_cockpit.storage_io`
+using the scheduler's `StorageIoOperatorSummary`. The compact cockpit rows and
+drilldowns key storage-specific pressure with `subject=storage_io` plus stable
+`storage_io.*` reason codes, so chaos/conformance tests do not need to parse
+operator prose.
+
 ## Chaos Harness Contract for ft-lmg3g.4
 
 `ft-lmg3g.4` should be able to inject and observe at least these faults:

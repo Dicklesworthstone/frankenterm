@@ -105,6 +105,7 @@ use crate::fleet_memory_controller::{
     FleetMemoryTierReclamationAction, FleetPressureTier,
 };
 use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
+use crate::storage::io_scheduler::{StorageIoOperatorSummary, StorageIoPressureTier};
 use crate::swarm_scheduler::{
     AdmissionAction, AdmissionReasonCode, ResourceAdmissionDecisionSummary, ScaleEventType,
     SchedulerSnapshot,
@@ -6519,6 +6520,9 @@ pub struct SwarmResourceCockpitSnapshot {
     /// Resource admission decisions from the global admission controller.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resource_admission_decisions: Vec<ResourceAdmissionDecisionSummary>,
+    /// Storage IO scheduler pressure, separate from CPU and memory pressure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_io: Option<StorageIoOperatorSummary>,
     /// Mitigation history distilled from memory and admission decisions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mitigation_history: Vec<SwarmResourceCockpitDrilldown>,
@@ -6534,6 +6538,22 @@ impl SwarmResourceCockpitSnapshot {
         summary: &SwarmCapacityOperatorSummary,
         memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
         resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
+    ) -> Self {
+        Self::from_capacity_summary_with_storage_io(
+            summary,
+            memory_budget,
+            resource_admission_decisions,
+            None,
+        )
+    }
+
+    /// Build a cockpit view with optional storage IO pressure attached.
+    #[must_use]
+    pub fn from_capacity_summary_with_storage_io(
+        summary: &SwarmCapacityOperatorSummary,
+        memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
+        resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
+        storage_io: Option<&StorageIoOperatorSummary>,
     ) -> Self {
         let memory_tiers = memory_budget
             .map(swarm_resource_cockpit_memory_tiers)
@@ -6553,17 +6573,20 @@ impl SwarmResourceCockpitSnapshot {
             .cloned()
             .collect::<Vec<_>>();
         let proof_gate = swarm_resource_cockpit_proof_gate(summary.status);
+        let storage_io = storage_io.cloned();
         let mitigation_history = swarm_resource_cockpit_mitigations(
             proof_gate,
             &memory_tiers,
             &capacity_admission_decisions,
             &resource_admission_decisions,
+            storage_io.as_ref(),
         );
         let drilldowns = swarm_resource_cockpit_drilldowns(
             proof_gate,
             &memory_tiers,
             &capacity_admission_decisions,
             &resource_admission_decisions,
+            storage_io.as_ref(),
         );
 
         Self {
@@ -6579,6 +6602,7 @@ impl SwarmResourceCockpitSnapshot {
             slowest_latency_cohorts,
             capacity_admission_decisions,
             resource_admission_decisions,
+            storage_io,
             mitigation_history,
             drilldowns,
         }
@@ -6630,6 +6654,19 @@ impl SwarmResourceCockpitSnapshot {
                 decision
                     .pending_items
                     .map_or_else(|| "unknown".to_string(), |items| items.to_string())
+            ));
+        }
+        if let Some(storage_io) = &self.storage_io {
+            rows.push(format!(
+                "storage_io tier={} reason={} action={} queue_depth={} bytes_pending={} write_errors={} search_lag={} hydration_lag={}",
+                storage_io_pressure_tier_name(storage_io.io_pressure_tier),
+                storage_io_cockpit_reason_code(storage_io),
+                storage_io.operator_action,
+                storage_io.aggregate_queue_depth,
+                storage_io.aggregate_bytes_pending,
+                storage_io.write_error_total,
+                storage_io.search_lag_segments,
+                storage_io.hydration_lag_pages
             ));
         }
         for decision in self.capacity_admission_decisions.iter().take(3) {
@@ -6857,15 +6894,31 @@ impl SwarmCapacityOperatorSummary {
     /// Return this summary with resource cockpit inputs attached.
     #[must_use]
     pub fn with_resource_cockpit_inputs(
-        mut self,
+        self,
         memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
         resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
     ) -> Self {
+        self.with_resource_cockpit_inputs_and_storage_io(
+            memory_budget,
+            resource_admission_decisions,
+            None,
+        )
+    }
+
+    /// Return this summary with resource cockpit inputs and storage IO pressure attached.
+    #[must_use]
+    pub fn with_resource_cockpit_inputs_and_storage_io(
+        mut self,
+        memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
+        resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
+        storage_io: Option<&StorageIoOperatorSummary>,
+    ) -> Self {
         if self.transparency_level >= 2 {
-            let cockpit = SwarmResourceCockpitSnapshot::from_capacity_summary(
+            let cockpit = SwarmResourceCockpitSnapshot::from_capacity_summary_with_storage_io(
                 &self,
                 memory_budget,
                 resource_admission_decisions,
+                storage_io,
             );
             self.resource_cockpit = Some(cockpit);
         }
@@ -7014,6 +7067,7 @@ fn swarm_resource_cockpit_mitigations(
     memory_tiers: &[SwarmResourceCockpitMemoryTierSummary],
     capacity_decisions: &[SwarmCapacityOperatorDecisionSummary],
     resource_decisions: &[ResourceAdmissionDecisionSummary],
+    storage_io: Option<&StorageIoOperatorSummary>,
 ) -> Vec<SwarmResourceCockpitDrilldown> {
     let mut rows = Vec::new();
     for tier in memory_tiers.iter().filter(|tier| tier.has_pressure) {
@@ -7074,6 +7128,26 @@ fn swarm_resource_cockpit_mitigations(
             ),
         );
     }
+    if let Some(storage_io) = storage_io.filter(|summary| storage_io_has_operator_signal(summary)) {
+        push_cockpit_row(
+            &mut rows,
+            "storage_io",
+            storage_io_cockpit_reason_code(storage_io),
+            format!(
+                "tier={} action={} queue_depth={} bytes_pending={} write_errors={} dominant_class={}",
+                storage_io_pressure_tier_name(storage_io.io_pressure_tier),
+                storage_io.operator_action,
+                storage_io.aggregate_queue_depth,
+                storage_io.aggregate_bytes_pending,
+                storage_io.write_error_total,
+                storage_io
+                    .dominant_class
+                    .as_ref()
+                    .map(|row| row.class_name.as_str())
+                    .unwrap_or("none")
+            ),
+        );
+    }
     if proof_gate == SwarmResourceCockpitProofGate::SkippedProof {
         push_cockpit_row(
             &mut rows,
@@ -7090,12 +7164,14 @@ fn swarm_resource_cockpit_drilldowns(
     memory_tiers: &[SwarmResourceCockpitMemoryTierSummary],
     capacity_decisions: &[SwarmCapacityOperatorDecisionSummary],
     resource_decisions: &[ResourceAdmissionDecisionSummary],
+    storage_io: Option<&StorageIoOperatorSummary>,
 ) -> Vec<SwarmResourceCockpitDrilldown> {
     let mut rows = swarm_resource_cockpit_mitigations(
         proof_gate,
         memory_tiers,
         capacity_decisions,
         resource_decisions,
+        storage_io,
     );
     if rows.is_empty() && proof_gate == SwarmResourceCockpitProofGate::Healthy {
         push_cockpit_row(
@@ -7122,6 +7198,33 @@ fn push_cockpit_row(
         reason_code: reason_code.into(),
         detail: detail.into(),
     });
+}
+
+fn storage_io_has_operator_signal(summary: &StorageIoOperatorSummary) -> bool {
+    summary.io_pressure_tier != StorageIoPressureTier::Green
+        || summary.aggregate_queue_depth > 0
+        || summary.aggregate_bytes_pending > 0
+        || summary.audit_fail_closed_total > 0
+        || summary.write_error_total > 0
+        || summary.search_lag_segments > 0
+        || summary.hydration_lag_pages > 0
+}
+
+fn storage_io_cockpit_reason_code(summary: &StorageIoOperatorSummary) -> &str {
+    summary
+        .dominant_class
+        .as_ref()
+        .and_then(|row| row.reason_code.as_deref())
+        .unwrap_or(summary.io_pressure_reason.as_str())
+}
+
+const fn storage_io_pressure_tier_name(tier: StorageIoPressureTier) -> &'static str {
+    match tier {
+        StorageIoPressureTier::Green => "green",
+        StorageIoPressureTier::Yellow => "yellow",
+        StorageIoPressureTier::Red => "red",
+        StorageIoPressureTier::Black => "black",
+    }
 }
 
 const fn fleet_pressure_tier_name(tier: FleetPressureTier) -> &'static str {
@@ -14258,6 +14361,33 @@ mod tests {
             herd_wave_recommended_stagger_ms: None,
             herd_wave_cohort_max_stagger_ms: None,
         };
+        let storage_io = crate::storage::io_scheduler::StorageIoOperatorSummary {
+            schema_version: 1,
+            pressure_domain: "storage_io".to_string(),
+            io_pressure_tier: crate::storage::io_scheduler::StorageIoPressureTier::Red,
+            io_pressure_reason: "storage_io.defer.search_freshness_lag".to_string(),
+            operator_action: "throttle_or_defer_io".to_string(),
+            aggregate_queue_depth: 8,
+            aggregate_bytes_pending: 4_096,
+            oldest_queued_age_ms: Some(250),
+            durability_pending_total: 2,
+            search_lag_segments: 7,
+            hydration_lag_pages: 1,
+            audit_fail_closed_total: 0,
+            write_error_total: 1,
+            dominant_class: Some(
+                crate::storage::io_scheduler::StorageIoDominantClassSummary {
+                    class: crate::storage::io_scheduler::StorageIoClass::FtsIncremental,
+                    class_name: "fts_incremental".to_string(),
+                    queue_depth: 8,
+                    bytes_pending: 4_096,
+                    oldest_queued_age_ms: Some(250),
+                    fail_closed_total: 0,
+                    write_error_total: 1,
+                    reason_code: Some("storage_io.write_error.io_error".to_string()),
+                },
+            ),
+        };
 
         let summary = SwarmCapacityOperatorSummary::from_components(
             1_700_000_010_001,
@@ -14267,7 +14397,11 @@ mod tests {
             &plan,
             None,
         )
-        .with_resource_cockpit_inputs(Some(&tier_budget), &[resource_decision]);
+        .with_resource_cockpit_inputs_and_storage_io(
+            Some(&tier_budget),
+            &[resource_decision],
+            Some(&storage_io),
+        );
         let cockpit = summary
             .resource_cockpit
             .as_ref()
@@ -14298,11 +14432,26 @@ mod tests {
         assert!(cockpit.drilldowns.iter().any(|row| {
             row.subject == "resource_admission" && row.reason_code == "memory_tier_pressure"
         }));
+        assert_eq!(
+            cockpit
+                .storage_io
+                .as_ref()
+                .expect("storage IO pressure is attached")
+                .pressure_domain,
+            "storage_io"
+        );
+        assert!(cockpit.drilldowns.iter().any(|row| {
+            row.subject == "storage_io" && row.reason_code == "storage_io.write_error.io_error"
+        }));
         assert_eq!(json["schema_version"], 2);
         assert_eq!(json["resource_cockpit"]["schema_version"], 1);
         assert_eq!(
             json["resource_cockpit"]["memory_tiers"][0]["tier"],
             "hot_resident"
+        );
+        assert_eq!(
+            json["resource_cockpit"]["storage_io"]["search_lag_segments"],
+            7
         );
         let smoke_log = cockpit
             .compact_table_rows()
@@ -14315,6 +14464,8 @@ mod tests {
         assert!(smoke_log.contains("memory_pressure=emergency"));
         assert!(smoke_log.contains("mem hot_resident"));
         assert!(smoke_log.contains("resource_admission action=degrade"));
+        assert!(smoke_log.contains("storage_io tier=red"));
+        assert!(smoke_log.contains("reason=storage_io.write_error.io_error"));
         assert!(
             cockpit
                 .compact_table_rows()
