@@ -368,7 +368,7 @@ impl MenuItem {
     }
 }
 
-const WRAPPER_CLS_NAME: &str = "WezTermNSMenuRepresentedItem";
+const WRAPPER_CLS_NAME: &str = "FrankenTermNSMenuRepresentedItem";
 const WRAPPER_FIELD_NAME: &str = "item";
 /// Wraps RepresentedItem in an NSObject so that we can associate
 /// it with a MenuItem

@@ -384,7 +384,7 @@ impl CommandDef {
 
         let mut candidates_for_removal = vec![];
         #[allow(unexpected_cfgs)] // <https://github.com/SSheldon/rust-objc/issues/125>
-        let wezterm_perform_key_assignment_sel = sel!(weztermPerformKeyAssignment:);
+        let frankenterm_perform_key_assignment_sel = sel!(frankentermPerformKeyAssignment:);
 
         /// Mark menu items as candidates for removal
         fn mark_candidates(menu: &Menu, candidates: &mut Vec<MenuItem>, action: SEL) {
@@ -404,7 +404,7 @@ impl CommandDef {
                 mark_candidates(
                     &existing,
                     &mut candidates_for_removal,
-                    wezterm_perform_key_assignment_sel,
+                    frankenterm_perform_key_assignment_sel,
                 );
 
                 existing
@@ -445,7 +445,7 @@ impl CommandDef {
 
                         let about_item = MenuItem::new_with(
                             &format!("FrankenTerm {}", config::wezterm_version()),
-                            Some(wezterm_perform_key_assignment_sel),
+                            Some(frankenterm_perform_key_assignment_sel),
                             "",
                         );
                         about_item.set_tool_tip("Click to copy version number");
@@ -527,7 +527,7 @@ impl CommandDef {
                     None => {
                         let item = MenuItem::new_with(
                             &cmd.brief,
-                            Some(wezterm_perform_key_assignment_sel),
+                            Some(frankenterm_perform_key_assignment_sel),
                             &short_cut,
                         );
                         submenu.add_item(&item);

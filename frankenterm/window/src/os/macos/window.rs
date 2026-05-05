@@ -1902,8 +1902,8 @@ impl Inner {
     }
 }
 
-const VIEW_CLS_NAME: &str = "WezTermWindowView";
-const WINDOW_CLS_NAME: &str = "WezTermWindow";
+const VIEW_CLS_NAME: &str = "FrankenTermWindowView";
+const WINDOW_CLS_NAME: &str = "FrankenTermWindow";
 const TITLEBAR_VIEW_NAME: &str = "NSTitlebarContainerView";
 
 struct WindowView {
@@ -2362,15 +2362,15 @@ impl WindowView {
         NO
     }
 
-    extern "C" fn wezterm_perform_key_assignment(
+    extern "C" fn frankenterm_perform_key_assignment(
         this: &mut Object,
         _sel: Sel,
         menu_item: *mut Object,
     ) {
         let menu_item = MenuItem::with_menu_item(menu_item);
-        // Safe because weztermPerformKeyAssignment: is only used with KeyAssignment
+        // Safe because frankentermPerformKeyAssignment: is only used with KeyAssignment
         let action = menu_item.get_represented_item();
-        log::debug!("wezterm_perform_key_assignment {action:?}",);
+        log::debug!("frankenterm_perform_key_assignment {action:?}",);
         match action {
             Some(RepresentedItem::KeyAssignment(action)) => {
                 if let Some(this) = Self::get_this(this) {
@@ -3273,8 +3273,8 @@ impl WindowView {
             );
 
             cls.add_method(
-                sel!(weztermPerformKeyAssignment:),
-                Self::wezterm_perform_key_assignment
+                sel!(frankentermPerformKeyAssignment:),
+                Self::frankenterm_perform_key_assignment
                     as extern "C" fn(&mut Object, Sel, *mut Object),
             );
 
