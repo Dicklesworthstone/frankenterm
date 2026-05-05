@@ -1809,8 +1809,9 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            conn.with_borrowed_backend(|backend| query_event_annotations_backend(backend, event_id))
+            pooled_backend(db_path.as_str(), |backend| {
+                query_event_annotations_backend(backend, event_id)
+            })
         })
         .await
     }
