@@ -8273,7 +8273,9 @@ fn dispatch_write_command_raw(
             now_ms,
             respond,
         } => {
-            let result = consume_prepared_plan_sync(conn, &plan_id, now_ms);
+            let result = with_writer_backend(conn, |backend| {
+                consume_prepared_plan_backend(backend, &plan_id, now_ms)
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertStepLog {
@@ -8907,6 +8909,7 @@ fn approval_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Approval
     })
 }
 
+#[cfg(test)]
 fn prepared_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreparedPlanRecord> {
     Ok(PreparedPlanRecord {
         plan_id: row.get(0)?,
@@ -13072,62 +13075,28 @@ fn insert_prepared_plan_backend(
     Ok(())
 }
 
-/// Consume a prepared plan by plan_id (synchronous)
-fn consume_prepared_plan_sync(
-    conn: &mut Connection,
+/// Consume a prepared plan by plan_id through the storage backend.
+fn consume_prepared_plan_backend(
+    backend: &dyn StorageBackend,
     plan_id: &str,
     now_ms: i64,
 ) -> Result<Option<PreparedPlanRecord>> {
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
+    let row = backend
+        .query_row_typed(
+            "UPDATE prepared_plans
+             SET consumed_at = ?2
+             WHERE plan_id = ?1
+               AND consumed_at IS NULL
+               AND expires_at >= ?2
+             RETURNING plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
+                       plan_json, requires_approval, created_at, expires_at, consumed_at",
+            &[ToSqlValue::Text(plan_id), ToSqlValue::Integer(now_ms)],
+        )
+        .map_err(|err| storage_backend_error("Failed to consume prepared plan", err))?;
 
-    let record = {
-        let mut stmt = tx
-            .prepare(
-                "SELECT plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
-                        plan_json, requires_approval, created_at, expires_at, consumed_at
-                 FROM prepared_plans
-                 WHERE plan_id = ?1
-                   AND consumed_at IS NULL
-                   AND expires_at >= ?2
-                 LIMIT 1",
-            )
-            .map_err(|e| {
-                StorageError::Database(format!("Failed to prepare prepared plan query: {e}"))
-            })?;
-
-        stmt.query_row(params![plan_id, now_ms], prepared_plan_from_row)
-            .optional()
-            .map_err(|e| StorageError::Database(format!("Prepared plan query failed: {e}")))?
-    };
-
-    if let Some(mut record) = record {
-        let updated = tx
-            .execute(
-                "UPDATE prepared_plans SET consumed_at = ?1 WHERE plan_id = ?2 AND consumed_at IS NULL",
-                params![now_ms, plan_id],
-            )
-            .map_err(|e| {
-                StorageError::Database(format!("Failed to consume prepared plan: {e}"))
-            })?;
-
-        if updated == 0 {
-            tx.commit().map_err(|e| {
-                StorageError::Database(format!("Failed to commit prepared plan: {e}"))
-            })?;
-            return Ok(None);
-        }
-
-        record.consumed_at = Some(now_ms);
-        tx.commit()
-            .map_err(|e| StorageError::Database(format!("Failed to commit prepared plan: {e}")))?;
-        return Ok(Some(record));
-    }
-
-    tx.commit()
-        .map_err(|e| StorageError::Database(format!("Failed to commit prepared plan: {e}")))?;
-    Ok(None)
+    row.as_deref()
+        .map(prepared_plan_from_backend_row)
+        .transpose()
 }
 
 /// Consume an approval token if it matches scope and is valid (synchronous)
@@ -17564,12 +17533,17 @@ fn can_insert_and_consume_prepared_plan() {
     assert_eq!(fetched.plan_id, record.plan_id);
     assert_eq!(fetched.action_kind, "send_text");
 
-    let consumed = consume_prepared_plan_sync(&mut conn, "plan:abcd1234", now_ms + 1)
+    let consumed = with_writer_backend(&mut conn, |backend| {
+        consume_prepared_plan_backend(backend, "plan:abcd1234", now_ms + 1)
+    })
         .unwrap()
         .unwrap();
     assert!(consumed.consumed_at.is_some());
 
-    let second = consume_prepared_plan_sync(&mut conn, "plan:abcd1234", now_ms + 2).unwrap();
+    let second = with_writer_backend(&mut conn, |backend| {
+        consume_prepared_plan_backend(backend, "plan:abcd1234", now_ms + 2)
+    })
+    .unwrap();
     assert!(second.is_none());
 }
 
