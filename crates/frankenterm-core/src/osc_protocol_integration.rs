@@ -384,8 +384,8 @@ impl Osc52PolicyGated {
     ) -> &'a crate::policy_audit_chain::AuditChainEntry {
         let (decoded_bytes, decision) = match self {
             Self::Allowed(response) => (response.decoded_len(), Osc52AuditDecision::Allowed),
-            Self::Denied(response) => (
-                response.decoded_len(),
+            Self::Denied(_) => (
+                Osc52ReadResponse::<Denied>::decoded_len(),
                 Osc52AuditDecision::Denied {
                     reason: Osc52DenyReason::ReadDefaultDeny,
                 },
@@ -509,7 +509,7 @@ pub fn sanitize_osc52_targets(targets: &str) -> String {
 
 impl Osc52ReadResponse<Denied> {
     #[must_use]
-    const fn decoded_len(&self) -> u64 {
+    const fn decoded_len() -> u64 {
         0
     }
 

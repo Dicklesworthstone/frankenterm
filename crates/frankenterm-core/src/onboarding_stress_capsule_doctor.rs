@@ -165,7 +165,7 @@ impl OnboardingDoctor {
                 .iter()
                 .map(|f| FailedCheckRendering::from_substrate(f, IssueClass::RepoCode))
                 .collect(),
-            passed: report.passed.iter().copied().collect(),
+            passed: report.passed.to_vec(),
             skipped: report
                 .skipped
                 .iter()
