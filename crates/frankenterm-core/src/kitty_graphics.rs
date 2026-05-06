@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn action_carries_payload_only_for_t_and_T() {
+    fn action_carries_payload_only_for_t_and_upper_t() {
         assert!(KittyAction::Transmit.carries_payload());
         assert!(KittyAction::TransmitDisplay.carries_payload());
         assert!(!KittyAction::Place.carries_payload());

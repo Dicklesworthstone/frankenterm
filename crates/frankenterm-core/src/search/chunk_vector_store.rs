@@ -1801,7 +1801,7 @@ mod tests {
     /// and then call ensure_semantic_store_metadata explicitly to observe
     /// its atomicity behaviour from the outside.
     fn open_schema_only(path: &Path) -> Connection {
-        let mut conn = Connection::open(path).unwrap();
+        let conn = Connection::open(path).unwrap();
         conn.pragma_update(None, "foreign_keys", 1).unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         conn
@@ -1840,7 +1840,7 @@ mod tests {
         // Stage 1: write the schema, insert an embedding and a generation,
         // and stamp metadata with a deliberately stale schema version.
         {
-            let mut conn = open_schema_only(&path);
+            let conn = open_schema_only(&path);
             conn.execute(
                 "INSERT INTO semantic_generations (
                     profile_id, generation_id, chunk_policy_version,
@@ -1949,7 +1949,7 @@ mod tests {
 
         // Stage embeddings + stale metadata exactly as in the prior test.
         {
-            let mut conn = open_schema_only(&path);
+            let conn = open_schema_only(&path);
             conn.execute(
                 "INSERT INTO semantic_generations (
                     profile_id, generation_id, chunk_policy_version,
