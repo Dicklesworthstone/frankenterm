@@ -446,7 +446,12 @@ fn detect_memory_mb() -> Option<u64> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn detect_memory_mb() -> Option<u64> {
+    macos_sysctl_stdout("hw.memsize").and_then(|text| parse_macos_memory_mb(&text))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn detect_memory_mb() -> Option<u64> {
     None
 }
@@ -458,9 +463,52 @@ fn detect_load_average() -> Option<f64> {
     first.parse::<f64>().ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn detect_load_average() -> Option<f64> {
+    macos_sysctl_stdout("vm.loadavg").and_then(|text| parse_macos_load_average(&text))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn detect_load_average() -> Option<f64> {
     None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl_stdout(name: &str) -> Option<String> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_memory_mb(text: &str) -> Option<u64> {
+    let bytes = text.trim().parse::<u64>().ok()?;
+    if bytes == 0 {
+        return None;
+    }
+    Some(bytes / 1024 / 1024)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_load_average(text: &str) -> Option<f64> {
+    let trimmed = text
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim();
+    let load = trimmed.split_whitespace().next()?.parse::<f64>().ok()?;
+    if load.is_finite() && load >= 0.0 {
+        Some(load)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,6 +1163,27 @@ mod tests {
     fn shell_info_from_path_sets_type() {
         let info = ShellInfo::from_shell_path(Some("/bin/bash"));
         assert_eq!(info.shell_type.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn macos_memory_parser_converts_bytes_to_mebibytes() {
+        assert_eq!(parse_macos_memory_mb("17179869184\n"), Some(16_384));
+        assert_eq!(parse_macos_memory_mb("0"), None);
+        assert_eq!(parse_macos_memory_mb("not-a-number"), None);
+    }
+
+    #[test]
+    fn macos_load_average_parser_accepts_sysctl_output() {
+        assert_eq!(parse_macos_load_average("{ 2.50 1.75 1.25 }"), Some(2.5));
+        assert_eq!(parse_macos_load_average("0.42 0.30 0.20"), Some(0.42));
+    }
+
+    #[test]
+    fn macos_load_average_parser_rejects_invalid_values() {
+        assert_eq!(parse_macos_load_average("{ }"), None);
+        assert_eq!(parse_macos_load_average("nan 1.0 1.0"), None);
+        assert_eq!(parse_macos_load_average("-1.0 1.0 1.0"), None);
+        assert_eq!(parse_macos_load_average("not-a-number"), None);
     }
 
     // --- AutoConfig tests ---
