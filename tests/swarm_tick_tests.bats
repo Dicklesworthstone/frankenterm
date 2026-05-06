@@ -231,10 +231,9 @@ EOF
         FIXTURE_DIR="$fixture" \
         REPO_ROOT="$REPO_ROOT" \
         bash "$SCRIPT" frankenterm > "${TMP_DIR}/raw.json" 2>"${TMP_DIR}/stderr.log"
-    # `br ready --json | jq 'length'` on the error shape yields 1 (object key
-    # count). The script's `|| echo 0` only kicks in if jq itself errors.
-    # Either way, the field must be a number; verify that.
+    # Error envelopes are not ready-item arrays; they must collapse to zero.
     [[ "$(jq -r '.beads.ready | type' "${TMP_DIR}/raw.json")" == "number" ]]
+    [[ "$(jq -r '.beads.ready' "${TMP_DIR}/raw.json")" == "0" ]]
 }
 
 @test "robustness: empty session (panes_json empty) uses fallback object" {

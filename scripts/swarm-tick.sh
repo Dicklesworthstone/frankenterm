@@ -83,7 +83,17 @@ beads_open=$(cd "$repo_root" && br list --status open --json 2>/dev/null | jq '.
 beads_in_progress=$(cd "$repo_root" && br list --status in_progress --json 2>/dev/null | jq '.issues|length' 2>/dev/null || echo 0)
 beads_blocked=$(cd "$repo_root" && br list --status blocked --json 2>/dev/null | jq '.issues|length' 2>/dev/null || echo 0)
 
-ready=$(cd "$repo_root" && br ready --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+json_array_count_or_zero() {
+  local output
+  output="$("$@" 2>/dev/null || true)"
+  if [ -n "$output" ]; then
+    printf '%s\n' "$output" | jq 'if type == "array" then length else 0 end' 2>/dev/null || echo 0
+  else
+    echo 0
+  fi
+}
+
+ready=$(cd "$repo_root" && json_array_count_or_zero br ready --json || echo 0)
 
 # Disk
 data_avail=$(df -h "$disk_vol" | awk 'NR==2{print $4}')
