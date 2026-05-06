@@ -104,6 +104,29 @@ external services. Golden contract cases live in
 `fixtures/scale-lab/resource-what-if-contracts.v1.json` and cover pass,
 warning, blocked, and missing-telemetry output shapes.
 
+### 3.2 Resource What-If Proof Fixtures
+
+Replay-backed proof fixtures live under
+`fixtures/scale-lab/resource-what-if-proof/`. The manifest
+`fixtures/scale-lab/resource-what-if-proof/manifest.v1.json` is the stable
+operator contract for this fixture family. Each case records:
+
+- a fixed `DigitalTwinTrace` artifact with a `trace_hash`;
+- a resource-control override package with an `override_hash`;
+- a golden what-if report summary with proof status, evidence source,
+  hardware predicate, high-scale gate, and required risk/apply reason codes;
+- the expected human JSON and Robot TOON command transcript.
+
+The fixed cases cover healthy live hardware, CPU/queue saturation,
+memory-tier pressure, topology degradation, MCP/search stall, policy-audit
+unavailability, and failure-oriented memory/topology/policy candidates.
+Replay-backed or synthetic evidence must remain `SKIPPED_NOT_PROVEN` for
+64-core / 256 GiB claims even when the candidate improves simulated queue or
+latency decisions. Only a live hardware trace with complete evidence,
+`proof_status = "PASSED"`, `evidence_source = "live_hardware"`, at least 64
+logical CPUs, and at least 274877906944 bytes of RAM may set
+`high_scale_claim_allowed = true`.
+
 ---
 
 ## 4. Equivalence Levels

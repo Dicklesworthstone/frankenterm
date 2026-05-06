@@ -112,6 +112,63 @@ Expected outcomes:
 - If `rch` fails before cargo starts, record the wrapper failure separately from
   test failure. Follow the repo fallback rules before claiming a code defect.
 
+## Resource What-If Proof
+
+Use this branch when evaluating resource-control override candidates through
+the replay-backed digital twin. The fixture manifest is
+`fixtures/scale-lab/resource-what-if-proof/manifest.v1.json`; it links each
+trace, override package, golden report summary, proof classification, and
+command transcript.
+
+The live high-scale predicate is exact:
+
+- `proof_status = "PASSED"`
+- `evidence_source = "live_hardware"`
+- `hardware_evidence_complete = true`
+- `hardware_cpu_count >= 64`
+- `hardware_memory_bytes >= 274877906944`
+
+Anything else, including replay-backed, synthetic, RCH-reduced, incomplete, or
+local smoke evidence, must stay `SKIPPED_NOT_PROVEN` and
+`high_scale_claim_allowed = false` for 64-core / 256 GiB claims.
+
+Run the fixed proof contract through `rch` with an isolated target directory:
+
+```bash
+export CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target
+RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false \
+  rch exec -- bash -lc \
+  'env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target cargo test -p frankenterm --bin ft resource_what_if_proof_manifest -- --nocapture'
+```
+
+Build the CLI and run the command-level smoke. The script emits a final JSON
+summary line with the trace, override package, command transcript, proof
+status, hardware predicate, and high-scale gate:
+
+```bash
+export CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target
+RCH_NO_UPDATE_CHECK=1 RCH_EXTERNAL_TIMEOUT_ENABLED=false \
+  rch exec -- bash -lc \
+  'env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-proof-target cargo build -p frankenterm --bin ft'
+
+FT_BIN=/tmp/ft-resource-what-if-proof-target/debug/ft \
+  bash tests/e2e/test_resource_what_if.sh \
+  | tee "$FT_HIGH_CORE_RUN_DIR/resource-what-if-summary.jsonl"
+```
+
+For a live high-scale run, keep these artifacts together:
+
+- `ft doctor --json` output showing the hardware predicate;
+- the source `DigitalTwinTrace` artifact and its `trace_hash`;
+- the resource-control override package and its `override_hash`;
+- the `ft resource what-if --format json` report;
+- the Robot TOON transcript for the same trace/package;
+- the command log from the `rch` proof lane above.
+
+Do not promote a candidate from replay fixtures alone. Replay fixtures are
+operator evidence for "what would the digital twin decide"; they are not proof
+that target-class hardware accepted the same resource settings.
+
 ## Resource Cockpit
 
 The resource cockpit lives under `.swarm_capacity.resource_cockpit` in

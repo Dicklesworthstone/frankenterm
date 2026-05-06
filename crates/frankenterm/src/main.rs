@@ -50255,6 +50255,294 @@ reason = "overly conservative pending threshold"
     }
 
     #[test]
+    fn resource_what_if_proof_manifest_validates_fixed_replay_fixtures() {
+        use frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace;
+        use std::collections::BTreeSet;
+
+        #[derive(Debug, serde::Deserialize)]
+        struct ProofManifest {
+            schema_version: String,
+            minimum_cpu_count: u32,
+            minimum_memory_bytes: u64,
+            runbook: String,
+            cases: Vec<ProofManifestCase>,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct ProofManifestCase {
+            case_id: String,
+            fixture_class: String,
+            proof_classification: String,
+            trace: String,
+            override_package: String,
+            trace_hash: String,
+            override_hash: String,
+            golden_report: ProofManifestGoldenReport,
+            command_transcript: ProofManifestCommandTranscript,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct ProofManifestGoldenReport {
+            schema_version: String,
+            dry_run: bool,
+            mutation_surface: Vec<String>,
+            proof_status: String,
+            proof_evidence_source: String,
+            hardware_predicate: String,
+            high_scale_claim_allowed: bool,
+            required_risk_codes: Vec<String>,
+            required_apply_reason_codes: Vec<String>,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct ProofManifestCommandTranscript {
+            human_json: String,
+            robot_toon: String,
+        }
+
+        let manifest: ProofManifest = serde_json::from_str(include_str!(
+            "../../../fixtures/scale-lab/resource-what-if-proof/manifest.v1.json"
+        ))
+        .expect("resource what-if proof manifest parses");
+        assert_eq!(
+            manifest.schema_version,
+            "ft.resource_what_if.proof_manifest.v1"
+        );
+        assert_eq!(manifest.minimum_cpu_count, 64);
+        assert_eq!(manifest.minimum_memory_bytes, 274_877_906_944);
+        assert!(
+            manifest.runbook.contains("docs/high-core-swarm-runbook.md"),
+            "manifest must point at the operator runbook"
+        );
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut fixture_classes = BTreeSet::new();
+        let mut skipped_not_proven_reports = 0usize;
+        let mut failure_oriented_cases = 0usize;
+
+        for case in &manifest.cases {
+            fixture_classes.insert(case.fixture_class.as_str());
+            assert!(
+                !case.proof_classification.trim().is_empty(),
+                "{}: proof classification must be explicit",
+                case.case_id
+            );
+            assert!(
+                case.command_transcript.human_json.contains(&case.trace)
+                    && case
+                        .command_transcript
+                        .human_json
+                        .contains(&case.override_package)
+                    && case.command_transcript.human_json.contains("--format json"),
+                "{}: human command transcript must be replayable",
+                case.case_id
+            );
+            assert!(
+                case.command_transcript
+                    .robot_toon
+                    .contains("ft robot --format toon")
+                    && case.command_transcript.robot_toon.contains(&case.trace)
+                    && case
+                        .command_transcript
+                        .robot_toon
+                        .contains(&case.override_package),
+                "{}: robot command transcript must be replayable",
+                case.case_id
+            );
+
+            let trace_path = repo_root.join(&case.trace);
+            let trace_json = fs::read_to_string(&trace_path)
+                .unwrap_or_else(|error| panic!("{}: failed to read trace: {error}", case.case_id));
+            let trace: DigitalTwinTrace = serde_json::from_str(&trace_json)
+                .unwrap_or_else(|error| panic!("{}: trace parses: {error}", case.case_id));
+            assert_eq!(
+                trace.schema_version, "ft.digital_twin_trace.v1",
+                "{}: trace schema drifted",
+                case.case_id
+            );
+            assert_eq!(
+                trace.trace_hash, case.trace_hash,
+                "{}: manifest trace hash drifted",
+                case.case_id
+            );
+            assert!(
+                !trace.source_artifact_hashes.is_empty(),
+                "{}: trace must link source artifacts",
+                case.case_id
+            );
+            assert!(
+                !trace.steps.is_empty(),
+                "{}: trace has no steps",
+                case.case_id
+            );
+            for step in &trace.steps {
+                assert!(
+                    !step.step_id.trim().is_empty() && !step.source_hash.trim().is_empty(),
+                    "{}: trace step must have stable ids and hashes",
+                    case.case_id
+                );
+                assert!(
+                    !step.source_artifact_hashes.is_empty(),
+                    "{}: step {} must link source artifacts",
+                    case.case_id,
+                    step.step_id
+                );
+            }
+
+            let package_path = repo_root.join(&case.override_package);
+            let package_toml = fs::read_to_string(&package_path).unwrap_or_else(|error| {
+                panic!("{}: failed to read override package: {error}", case.case_id)
+            });
+            assert_eq!(
+                resource_what_if_sha256_hex(package_toml.as_bytes()),
+                case.override_hash,
+                "{}: manifest override hash drifted",
+                case.case_id
+            );
+
+            let report = load_resource_what_if_report(
+                &trace_path,
+                &package_path,
+                &resource_what_if_options(
+                    Some(trace.generated_at_ms),
+                    None,
+                    Some(manifest.minimum_cpu_count),
+                    Some(manifest.minimum_memory_bytes),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("{}: report builds: {error}", case.case_id));
+            let expected = &case.golden_report;
+
+            assert_eq!(
+                report.schema_version, expected.schema_version,
+                "{}",
+                case.case_id
+            );
+            assert_eq!(report.dry_run, expected.dry_run, "{}", case.case_id);
+            let mutation_surface = report
+                .mutation_surface
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mutation_surface, expected.mutation_surface,
+                "{}: mutation surface drifted",
+                case.case_id
+            );
+            assert_eq!(report.trace_hash, case.trace_hash, "{}", case.case_id);
+            assert_eq!(
+                report.override_hash, case.override_hash,
+                "{}: report override hash drifted",
+                case.case_id
+            );
+            assert_eq!(
+                report.digital_twin_schema_version, "ft.resource_digital_twin.v1",
+                "{}: digital twin schema drifted",
+                case.case_id
+            );
+            assert_eq!(
+                resource_what_if_label(&report.proof_status),
+                expected.proof_status,
+                "{}: proof status drifted",
+                case.case_id
+            );
+            let proof_source = report
+                .proof_evidence_source
+                .as_ref()
+                .map(resource_what_if_label)
+                .unwrap_or_else(|| "none".to_string());
+            assert_eq!(
+                proof_source, expected.proof_evidence_source,
+                "{}: proof evidence source drifted",
+                case.case_id
+            );
+            assert_eq!(
+                resource_what_if_label(&report.hardware_predicate),
+                expected.hardware_predicate,
+                "{}: hardware predicate drifted",
+                case.case_id
+            );
+            assert_eq!(
+                report.high_scale_claim_allowed, expected.high_scale_claim_allowed,
+                "{}: high-scale gate drifted",
+                case.case_id
+            );
+
+            let risk_codes = report
+                .risk_items
+                .iter()
+                .map(|item| item.code.as_str())
+                .collect::<BTreeSet<_>>();
+            for code in &expected.required_risk_codes {
+                assert!(
+                    risk_codes.contains(code.as_str()),
+                    "{}: missing required risk code {code}; got {risk_codes:?}",
+                    case.case_id
+                );
+            }
+            let apply_reason_codes = report
+                .apply_reason_codes
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            for code in &expected.required_apply_reason_codes {
+                assert!(
+                    apply_reason_codes.contains(code.as_str()),
+                    "{}: missing required apply reason {code}; got {apply_reason_codes:?}",
+                    case.case_id
+                );
+            }
+
+            if expected.proof_status == "SKIPPED_NOT_PROVEN" {
+                skipped_not_proven_reports += 1;
+                assert!(
+                    !report.high_scale_claim_allowed,
+                    "{}: skipped proof must not allow high-scale claims",
+                    case.case_id
+                );
+                assert!(
+                    !report.next_proof_steps.is_empty(),
+                    "{}: skipped proof must include next proof steps",
+                    case.case_id
+                );
+            }
+            if case.fixture_class.starts_with("failure_oriented") {
+                failure_oriented_cases += 1;
+                assert!(
+                    !expected.required_risk_codes.is_empty(),
+                    "{}: failure-oriented fixtures must pin a risk code",
+                    case.case_id
+                );
+            }
+        }
+
+        for required_class in [
+            "healthy",
+            "cpu_queue_saturated",
+            "memory_tier_pressured",
+            "topology_degraded",
+            "mcp_search_stalled",
+            "policy_audit_unavailable",
+            "failure_oriented_memory",
+            "failure_oriented_topology",
+            "failure_oriented_policy",
+        ] {
+            assert!(
+                fixture_classes.contains(required_class),
+                "manifest missing fixture class {required_class}"
+            );
+        }
+        assert!(
+            skipped_not_proven_reports >= 1,
+            "golden reports must include SKIPPED_NOT_PROVEN when hardware evidence is absent"
+        );
+        assert_eq!(
+            failure_oriented_cases, 3,
+            "manifest should cover memory, topology, and policy failure candidates"
+        );
+    }
+
+    #[test]
     fn mission_cli_command_family_parses_all_subcommands() {
         let plan_cli = Cli::try_parse_from([
             "ft",

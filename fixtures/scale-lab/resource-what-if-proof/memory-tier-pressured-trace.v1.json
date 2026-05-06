@@ -1,0 +1,70 @@
+{
+  "schema_version": "ft.digital_twin_trace.v1",
+  "generated_at_ms": 44000,
+  "trace_hash": "resource-what-if-proof-memory-tier-pressured-v1",
+  "source_artifact_hashes": [
+    "proof-memory-tier-replay",
+    "admission-memory-tier-pressured",
+    "memory-tier-pressured"
+  ],
+  "steps": [
+    {
+      "step_id": "proof-memory-tier-replay",
+      "source": "scale_proof",
+      "monotonic_ms": 1,
+      "source_hash": "proof-memory-tier-replay",
+      "source_artifact_hashes": [
+        "proof-memory-tier-replay"
+      ],
+      "proof_status": "SKIPPED_NOT_PROVEN",
+      "evidence_source": "replay_backed",
+      "hardware_evidence_complete": false,
+      "pressure_score": 1,
+      "quality_flags": [
+        "simulated_evidence",
+        "incomplete_hardware_evidence"
+      ]
+    },
+    {
+      "step_id": "admission-memory-normal",
+      "source": "resource_admission",
+      "monotonic_ms": 100,
+      "source_hash": "admission-memory-tier-pressured",
+      "source_artifact_hashes": [
+        "admission-memory-tier-pressured"
+      ],
+      "queue_utilization": 0.5,
+      "pending_items": 24,
+      "admission_action": "admit",
+      "reason_codes": [
+        "memory_tier_watch"
+      ],
+      "raw_pressure_severity": 0,
+      "effective_pressure_severity": 0,
+      "fleet_pressure": "normal",
+      "max_latency_over_budget_ratio": 0.8,
+      "pressure_score": 0
+    },
+    {
+      "step_id": "memory-tier-pressured",
+      "source": "memory_tier_budget",
+      "monotonic_ms": 200,
+      "source_hash": "memory-tier-pressured",
+      "source_artifact_hashes": [
+        "memory-tier-pressured"
+      ],
+      "raw_pressure_severity": 2,
+      "effective_pressure_severity": 2,
+      "memory_tier_pressure": "critical",
+      "memory_budget_bytes": 134217728,
+      "memory_actual_bytes": 268435456,
+      "resident_over_budget_bytes": 134217728,
+      "reclaimable_bytes": 33554432,
+      "pressure_score": 2
+    }
+  ],
+  "quality_flags": [
+    "simulated_evidence",
+    "incomplete_hardware_evidence"
+  ]
+}

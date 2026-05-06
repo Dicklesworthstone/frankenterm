@@ -1,0 +1,25 @@
+[meta]
+schema_version = "ft.resource_control_override.v1"
+name = "resource what-if policy fail-open candidate"
+description = "Failure-oriented replay candidate that hides policy audit pressure"
+base_trace = "fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json"
+created_at = "2026-05-06T00:00:00Z"
+author = "fixture"
+
+[[admission]]
+knob_id = "admission.max_queue_utilization"
+domain = "admission"
+value = "0.99"
+reason = "failure fixture admits work despite missing policy audit evidence"
+
+[[admission]]
+knob_id = "admission.max_pending_items"
+domain = "admission"
+value = "256"
+reason = "failure fixture admits queued work despite audit unavailability"
+
+[[auto_tune]]
+knob_id = "autotune.exploration_budget_percent"
+domain = "auto_tune"
+value = "0.0"
+reason = "failure fixture disables exploration audit breadcrumbs"

@@ -1,0 +1,71 @@
+{
+  "schema_version": "ft.digital_twin_trace.v1",
+  "generated_at_ms": 43000,
+  "trace_hash": "resource-what-if-proof-cpu-queue-saturated-v1",
+  "source_artifact_hashes": [
+    "proof-cpu-queue-replay",
+    "admission-cpu-queue-saturated",
+    "memory-cpu-queue-saturated"
+  ],
+  "steps": [
+    {
+      "step_id": "proof-cpu-queue-replay",
+      "source": "scale_proof",
+      "monotonic_ms": 1,
+      "source_hash": "proof-cpu-queue-replay",
+      "source_artifact_hashes": [
+        "proof-cpu-queue-replay"
+      ],
+      "proof_status": "SKIPPED_NOT_PROVEN",
+      "evidence_source": "replay_backed",
+      "hardware_evidence_complete": false,
+      "pressure_score": 1,
+      "quality_flags": [
+        "simulated_evidence",
+        "incomplete_hardware_evidence"
+      ]
+    },
+    {
+      "step_id": "cpu-queue-saturated",
+      "source": "resource_admission",
+      "monotonic_ms": 100,
+      "source_hash": "admission-cpu-queue-saturated",
+      "source_artifact_hashes": [
+        "admission-cpu-queue-saturated"
+      ],
+      "queue_utilization": 0.98,
+      "pending_items": 180,
+      "admission_action": "shed",
+      "reason_codes": [
+        "cpu_saturated",
+        "queue_saturated"
+      ],
+      "raw_pressure_severity": 3,
+      "effective_pressure_severity": 3,
+      "fleet_pressure": "critical",
+      "max_latency_over_budget_ratio": 1.6,
+      "pressure_score": 3
+    },
+    {
+      "step_id": "memory-cpu-queue-normal",
+      "source": "memory_tier_budget",
+      "monotonic_ms": 200,
+      "source_hash": "memory-cpu-queue-saturated",
+      "source_artifact_hashes": [
+        "memory-cpu-queue-saturated"
+      ],
+      "raw_pressure_severity": 0,
+      "effective_pressure_severity": 0,
+      "memory_tier_pressure": "normal",
+      "memory_budget_bytes": 134217728,
+      "memory_actual_bytes": 104857600,
+      "resident_over_budget_bytes": 0,
+      "reclaimable_bytes": 4194304,
+      "pressure_score": 0
+    }
+  ],
+  "quality_flags": [
+    "simulated_evidence",
+    "incomplete_hardware_evidence"
+  ]
+}

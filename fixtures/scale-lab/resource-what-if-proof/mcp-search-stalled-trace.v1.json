@@ -1,0 +1,71 @@
+{
+  "schema_version": "ft.digital_twin_trace.v1",
+  "generated_at_ms": 46000,
+  "trace_hash": "resource-what-if-proof-mcp-search-stalled-v1",
+  "source_artifact_hashes": [
+    "proof-mcp-search-replay",
+    "admission-mcp-search-stalled",
+    "memory-mcp-search-stalled"
+  ],
+  "steps": [
+    {
+      "step_id": "proof-mcp-search-replay",
+      "source": "scale_proof",
+      "monotonic_ms": 1,
+      "source_hash": "proof-mcp-search-replay",
+      "source_artifact_hashes": [
+        "proof-mcp-search-replay"
+      ],
+      "proof_status": "SKIPPED_NOT_PROVEN",
+      "evidence_source": "replay_backed",
+      "hardware_evidence_complete": false,
+      "pressure_score": 1,
+      "quality_flags": [
+        "simulated_evidence",
+        "incomplete_hardware_evidence"
+      ]
+    },
+    {
+      "step_id": "mcp-search-stalled",
+      "source": "resource_admission",
+      "monotonic_ms": 100,
+      "source_hash": "admission-mcp-search-stalled",
+      "source_artifact_hashes": [
+        "admission-mcp-search-stalled"
+      ],
+      "queue_utilization": 0.91,
+      "pending_items": 96,
+      "admission_action": "degrade",
+      "reason_codes": [
+        "mcp_control_plane_stall",
+        "search_index_lag"
+      ],
+      "raw_pressure_severity": 2,
+      "effective_pressure_severity": 2,
+      "fleet_pressure": "degraded",
+      "max_latency_over_budget_ratio": 2.4,
+      "pressure_score": 2
+    },
+    {
+      "step_id": "memory-search-cache-pressured",
+      "source": "memory_tier_budget",
+      "monotonic_ms": 200,
+      "source_hash": "memory-mcp-search-stalled",
+      "source_artifact_hashes": [
+        "memory-mcp-search-stalled"
+      ],
+      "raw_pressure_severity": 1,
+      "effective_pressure_severity": 1,
+      "memory_tier_pressure": "elevated",
+      "memory_budget_bytes": 134217728,
+      "memory_actual_bytes": 167772160,
+      "resident_over_budget_bytes": 33554432,
+      "reclaimable_bytes": 16777216,
+      "pressure_score": 1
+    }
+  ],
+  "quality_flags": [
+    "simulated_evidence",
+    "incomplete_hardware_evidence"
+  ]
+}

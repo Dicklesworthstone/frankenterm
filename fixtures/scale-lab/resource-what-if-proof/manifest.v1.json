@@ -1,0 +1,258 @@
+{
+  "schema_version": "ft.resource_what_if.proof_manifest.v1",
+  "minimum_cpu_count": 64,
+  "minimum_memory_bytes": 274877906944,
+  "runbook": "docs/high-core-swarm-runbook.md#resource-what-if-proof",
+  "cases": [
+    {
+      "case_id": "healthy_live_hardware",
+      "fixture_class": "healthy",
+      "proof_classification": "live_hardware",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/healthy-live-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-healthy-live-v1",
+      "override_hash": "68a8e6a66f60666824add7621e96ae46cc75f63a392871fe3860d100ed17831b",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "PASSED",
+        "proof_evidence_source": "live_hardware",
+        "hardware_predicate": "proven_predicate_met",
+        "high_scale_claim_allowed": true,
+        "required_risk_codes": [],
+        "required_apply_reason_codes": []
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/healthy-live-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/healthy-live-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml"
+      }
+    },
+    {
+      "case_id": "cpu_queue_saturated_replay",
+      "fixture_class": "cpu_queue_saturated",
+      "proof_classification": "replay_backed_reduced",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/cpu-queue-saturated-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-cpu-queue-saturated-v1",
+      "override_hash": "68a8e6a66f60666824add7621e96ae46cc75f63a392871fe3860d100ed17831b",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "SKIPPED_NOT_PROVEN",
+        "proof_evidence_source": "replay_backed",
+        "hardware_predicate": "skipped_not_proven",
+        "high_scale_claim_allowed": false,
+        "required_risk_codes": [
+          "data_quality_apply_blocker"
+        ],
+        "required_apply_reason_codes": [
+          "proof_skipped_not_proven"
+        ]
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/cpu-queue-saturated-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/cpu-queue-saturated-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml"
+      }
+    },
+    {
+      "case_id": "memory_tier_pressured_replay",
+      "fixture_class": "memory_tier_pressured",
+      "proof_classification": "replay_backed_reduced",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/memory-tier-pressured-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-memory-tier-pressured-v1",
+      "override_hash": "68a8e6a66f60666824add7621e96ae46cc75f63a392871fe3860d100ed17831b",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "SKIPPED_NOT_PROVEN",
+        "proof_evidence_source": "replay_backed",
+        "hardware_predicate": "skipped_not_proven",
+        "high_scale_claim_allowed": false,
+        "required_risk_codes": [
+          "memory_oversubscription",
+          "data_quality_apply_blocker"
+        ],
+        "required_apply_reason_codes": [
+          "proof_skipped_not_proven"
+        ]
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/memory-tier-pressured-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/memory-tier-pressured-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml"
+      }
+    },
+    {
+      "case_id": "topology_degraded_replay",
+      "fixture_class": "topology_degraded",
+      "proof_classification": "replay_backed_reduced",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/topology-degraded-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/topology-churn-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-topology-degraded-v1",
+      "override_hash": "9b386d5d80793388149c542f2c09d09645bf498e40ec6c5d49dd0d42486de045",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "SKIPPED_NOT_PROVEN",
+        "proof_evidence_source": "replay_backed",
+        "hardware_predicate": "skipped_not_proven",
+        "high_scale_claim_allowed": false,
+        "required_risk_codes": [
+          "topology_churn"
+        ],
+        "required_apply_reason_codes": [
+          "proof_skipped_not_proven"
+        ]
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/topology-degraded-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/topology-churn-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/topology-degraded-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/topology-churn-candidate.v1.toml"
+      }
+    },
+    {
+      "case_id": "mcp_search_stalled_replay",
+      "fixture_class": "mcp_search_stalled",
+      "proof_classification": "replay_backed_reduced",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/mcp-search-stalled-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-mcp-search-stalled-v1",
+      "override_hash": "68a8e6a66f60666824add7621e96ae46cc75f63a392871fe3860d100ed17831b",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "SKIPPED_NOT_PROVEN",
+        "proof_evidence_source": "replay_backed",
+        "hardware_predicate": "skipped_not_proven",
+        "high_scale_claim_allowed": false,
+        "required_risk_codes": [
+          "memory_oversubscription",
+          "data_quality_apply_blocker"
+        ],
+        "required_apply_reason_codes": [
+          "proof_skipped_not_proven"
+        ]
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/mcp-search-stalled-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/mcp-search-stalled-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml"
+      }
+    },
+    {
+      "case_id": "policy_audit_unavailable_replay",
+      "fixture_class": "policy_audit_unavailable",
+      "proof_classification": "replay_backed_reduced",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/policy-fail-open-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-policy-audit-unavailable-v1",
+      "override_hash": "76b9d0137c9b74f82730c007e605939151e911601c9411fa1c7869e2ea42b52d",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "SKIPPED_NOT_PROVEN",
+        "proof_evidence_source": "replay_backed",
+        "hardware_predicate": "skipped_not_proven",
+        "high_scale_claim_allowed": false,
+        "required_risk_codes": [
+          "policy_audit_fail_open_risk"
+        ],
+        "required_apply_reason_codes": [
+          "proof_skipped_not_proven"
+        ]
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/policy-fail-open-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/policy-fail-open-candidate.v1.toml"
+      }
+    },
+    {
+      "case_id": "memory_oversubscription_candidate",
+      "fixture_class": "failure_oriented_memory",
+      "proof_classification": "live_hardware_failure_candidate",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/healthy-live-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/memory-oversubscription-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-healthy-live-v1",
+      "override_hash": "dced2c4e1fdd70412fca0bf260b0a6ba443da11f0aa14eec5af6f41ded8a6d52",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "PASSED",
+        "proof_evidence_source": "live_hardware",
+        "hardware_predicate": "proven_predicate_met",
+        "high_scale_claim_allowed": true,
+        "required_risk_codes": [
+          "memory_oversubscription"
+        ],
+        "required_apply_reason_codes": [
+          "candidate_risk_fail_closed"
+        ]
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/healthy-live-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/memory-oversubscription-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/healthy-live-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/memory-oversubscription-candidate.v1.toml"
+      }
+    },
+    {
+      "case_id": "topology_churn_candidate",
+      "fixture_class": "failure_oriented_topology",
+      "proof_classification": "replay_backed_failure_candidate",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/topology-degraded-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/topology-churn-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-topology-degraded-v1",
+      "override_hash": "9b386d5d80793388149c542f2c09d09645bf498e40ec6c5d49dd0d42486de045",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "SKIPPED_NOT_PROVEN",
+        "proof_evidence_source": "replay_backed",
+        "hardware_predicate": "skipped_not_proven",
+        "high_scale_claim_allowed": false,
+        "required_risk_codes": [
+          "topology_churn"
+        ],
+        "required_apply_reason_codes": [
+          "proof_skipped_not_proven"
+        ]
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/topology-degraded-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/topology-churn-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/topology-degraded-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/topology-churn-candidate.v1.toml"
+      }
+    },
+    {
+      "case_id": "policy_fail_open_candidate",
+      "fixture_class": "failure_oriented_policy",
+      "proof_classification": "replay_backed_failure_candidate",
+      "trace": "fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json",
+      "override_package": "fixtures/scale-lab/resource-what-if-proof/policy-fail-open-candidate.v1.toml",
+      "trace_hash": "resource-what-if-proof-policy-audit-unavailable-v1",
+      "override_hash": "76b9d0137c9b74f82730c007e605939151e911601c9411fa1c7869e2ea42b52d",
+      "golden_report": {
+        "schema_version": "ft.resource_what_if.v1",
+        "dry_run": true,
+        "mutation_surface": [],
+        "proof_status": "SKIPPED_NOT_PROVEN",
+        "proof_evidence_source": "replay_backed",
+        "hardware_predicate": "skipped_not_proven",
+        "high_scale_claim_allowed": false,
+        "required_risk_codes": [
+          "policy_audit_fail_open_risk"
+        ],
+        "required_apply_reason_codes": [
+          "proof_skipped_not_proven"
+        ]
+      },
+      "command_transcript": {
+        "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/policy-fail-open-candidate.v1.toml --format json",
+        "robot_toon": "ft robot --format toon resource what-if --trace fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/policy-fail-open-candidate.v1.toml"
+      }
+    }
+  ]
+}
