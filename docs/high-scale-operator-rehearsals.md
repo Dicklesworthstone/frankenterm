@@ -25,6 +25,18 @@ Optional live probes are non-mutating status checks only:
 scripts/high-scale-rehearsal.sh --live-probes
 ```
 
+Verify an existing artifact bundle without running probes or Cargo:
+
+```bash
+scripts/high-scale-rehearsal.sh --verify tests/e2e/artifacts/high-scale-rehearsal/<UTC_RUN_ID>
+```
+
+Verifier mode checks the documented artifact contract: required files,
+summary/event count agreement, required scenario rows, allowed receipts,
+zero failure rows, `local_cargo_used=false`, and
+`destructive_actions_used=false`. It requires `jq` and reads only the supplied
+artifact directory.
+
 The script writes a run directory under
 `tests/e2e/artifacts/high-scale-rehearsal/<UTC_RUN_ID>/` unless `--out-dir` or
 `FT_REHEARSAL_OUT_DIR` is set. Expected artifacts:
@@ -83,12 +95,13 @@ Closeout wording must distinguish:
 ## Operator Checklist
 
 1. Create a fresh run directory with `scripts/high-scale-rehearsal.sh`.
-2. Attach `rehearsal-summary.json` and `rehearsal-events.jsonl` to the Beads
+2. Verify the bundle with `scripts/high-scale-rehearsal.sh --verify <run-dir>`.
+3. Attach `rehearsal-summary.json` and `rehearsal-events.jsonl` to the Beads
    closeout or handoff.
-3. For every `SKIPPED_NOT_PROVEN` row, decide whether it is acceptable for this
+4. For every `SKIPPED_NOT_PROVEN` row, decide whether it is acceptable for this
    rehearsal or whether the owning bead must provide a real fixture/proof.
-4. If a Cargo proof is needed, switch to RCH and the exact command shape from
+5. If a Cargo proof is needed, switch to RCH and the exact command shape from
    the owning proof contract. Keep the bounded rehearsal artifacts separate from
    remote proof artifacts.
-5. Never promote a rehearsal pass into a high-scale performance claim unless
+6. Never promote a rehearsal pass into a high-scale performance claim unless
    the proof ledger has target-class hardware evidence.

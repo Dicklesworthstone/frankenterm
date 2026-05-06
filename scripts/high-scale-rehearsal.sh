@@ -5,10 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 RUN_ID="${FT_REHEARSAL_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${FT_REHEARSAL_OUT_DIR:-$ROOT_DIR/tests/e2e/artifacts/high-scale-rehearsal/$RUN_ID}"
 LIVE_PROBES=0
+VERIFY_DIR=""
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/high-scale-rehearsal.sh [--out-dir DIR] [--run-id ID] [--live-probes]
+       scripts/high-scale-rehearsal.sh --verify DIR
 
 Bounded high-scale operator rehearsal. Default mode is shell-only and does not
 run Cargo, touch live GUI state, restart shared services, or mutate processes.
@@ -20,14 +22,32 @@ Outputs:
 USAGE
 }
 
+require_arg_value() {
+  local flag="$1"
+  local value="${2:-}"
+
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "$flag requires a value" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out-dir)
+      require_arg_value "$1" "${2:-}"
       OUT_DIR="$2"
       shift 2
       ;;
     --run-id)
+      require_arg_value "$1" "${2:-}"
       RUN_ID="$2"
+      shift 2
+      ;;
+    --verify)
+      require_arg_value "$1" "${2:-}"
+      VERIFY_DIR="$2"
       shift 2
       ;;
     --live-probes)
@@ -45,6 +65,102 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+verify_fail() {
+  echo "high-scale rehearsal verify failed: $*" >&2
+  return 1
+}
+
+verify_file() {
+  local path="$1"
+  [[ -f "$path" ]] || verify_fail "missing file: $path"
+}
+
+verify_rehearsal_dir() {
+  local dir="$1"
+  local summary="$dir/rehearsal-summary.json"
+  local events="$dir/rehearsal-events.jsonl"
+  local scenario
+  local event_count
+  local pass_count
+  local skip_count
+  local fail_count
+  local summary_pass
+  local summary_skip
+  local summary_fail
+
+  if ! command -v jq >/dev/null 2>&1; then
+    verify_fail "jq is required for verifier mode"
+    return 1
+  fi
+
+  verify_file "$summary" || return 1
+  verify_file "$events" || return 1
+  verify_file "$dir/git-status-short.txt" || return 1
+  verify_file "$dir/git-head.txt" || return 1
+  verify_file "$dir/git-branch.txt" || return 1
+
+  jq -e '
+    .schema_version == 1
+    and (.run_id | type == "string" and length > 0)
+    and (.mode == "bounded" or .mode == "live_probes")
+    and (.artifact_dir | type == "string" and length > 0)
+    and (.events_jsonl | type == "string" and length > 0)
+    and (.pass_count | type == "number")
+    and (.skip_count | type == "number")
+    and (.fail_count | type == "number")
+    and .local_cargo_used == false
+    and .destructive_actions_used == false
+  ' "$summary" >/dev/null || return 1
+
+  jq -s -e '
+    length > 0
+    and all(.[]; .schema_version == 1)
+    and all(.[]; (.run_id | type == "string" and length > 0))
+    and all(.[]; (.scenario | type == "string" and length > 0))
+    and all(.[]; (.status == "PASS" or .status == "SKIP" or .status == "FAIL"))
+    and all(.[]; (.receipt == "READY" or .receipt == "SKIPPED_NOT_PROVEN"))
+    and all(.[]; (.artifact_path | type == "string" and length > 0))
+    and all(.[]; (.summary | type == "string" and length > 0))
+  ' "$events" >/dev/null || return 1
+
+  event_count="$(jq -s 'length' "$events")"
+  pass_count="$(jq -s 'map(select(.status == "PASS")) | length' "$events")"
+  skip_count="$(jq -s 'map(select(.status == "SKIP")) | length' "$events")"
+  fail_count="$(jq -s 'map(select(.status == "FAIL")) | length' "$events")"
+  summary_pass="$(jq -r '.pass_count' "$summary")"
+  summary_skip="$(jq -r '.skip_count' "$summary")"
+  summary_fail="$(jq -r '.fail_count' "$summary")"
+
+  [[ "$pass_count" == "$summary_pass" ]] || verify_fail "pass_count mismatch: events=$pass_count summary=$summary_pass" || return 1
+  [[ "$skip_count" == "$summary_skip" ]] || verify_fail "skip_count mismatch: events=$skip_count summary=$summary_skip" || return 1
+  [[ "$fail_count" == "$summary_fail" ]] || verify_fail "fail_count mismatch: events=$fail_count summary=$summary_fail" || return 1
+  [[ "$summary_fail" == 0 ]] || verify_fail "summary has fail_count=$summary_fail" || return 1
+
+  for scenario in \
+    synthetic_swarm_scale \
+    storage_indexing_pressure \
+    policy_approval_backlog \
+    robot_mcp_control_plane_smoke \
+    mission_chaos_recovery \
+    slo_cockpit_bottlenecks \
+    degraded_agent_mail \
+    rch_worker_loss; do
+    jq -s -e --arg scenario "$scenario" 'any(.[]; .scenario == $scenario)' "$events" >/dev/null \
+      || verify_fail "missing scenario: $scenario" || return 1
+  done
+
+  while IFS= read -r artifact; do
+    verify_file "$artifact" || return 1
+  done < <(jq -r 'select(.status == "PASS") | .artifact_path' "$events")
+
+  echo "high-scale rehearsal verified: $dir ($event_count events)"
+}
+
+if [[ -n "$VERIFY_DIR" ]]; then
+  verify_rehearsal_dir "$VERIFY_DIR"
+  exit $?
+fi
 
 json_string() {
   local value="${1//\\/\\\\}"
