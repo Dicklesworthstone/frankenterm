@@ -179,7 +179,7 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
         sorted[lo]
     } else {
         let frac = pos - lo as f64;
-        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+        (sorted[hi] - sorted[lo]).mul_add(frac, sorted[lo])
     }
 }
 
@@ -231,7 +231,7 @@ pub fn bootstrap_percentile_ci(
     let mut estimates = Vec::with_capacity(resamples);
     let mut buf: Vec<f64> = vec![0.0; n];
     for _ in 0..resamples {
-        for slot in buf.iter_mut() {
+        for slot in &mut buf {
             *slot = sorted_samples[rng.next_index(n)];
         }
         buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -282,17 +282,23 @@ pub fn mann_whitney_u(samples_a: &[f64], samples_b: &[f64]) -> Option<MannWhitne
     let mut i = 0;
     while i < combined.len() {
         let mut j = i + 1;
-        while j < combined.len() && combined[j].0 == combined[i].0 {
+        while j < combined.len()
+            && matches!(
+                combined[j].0.partial_cmp(&combined[i].0),
+                Some(std::cmp::Ordering::Equal)
+            )
+        {
             j += 1;
         }
         // Average rank for the tied block (1-indexed in stats convention).
         let avg_rank = (i + j + 1) as f64 / 2.0;
-        for k in i..j {
-            ranks[k] = avg_rank;
+        for rank in &mut ranks[i..j] {
+            *rank = avg_rank;
         }
         if j - i > 1 {
             let t = (j - i) as f64;
-            tie_correction += t * (t.powi(2) - 1.0);
+            let t_squared = t * t;
+            tie_correction = t_squared.mul_add(t, tie_correction - t);
         }
         i = j;
     }
@@ -303,16 +309,16 @@ pub fn mann_whitney_u(samples_a: &[f64], samples_b: &[f64]) -> Option<MannWhitne
         .filter_map(|(r, (_, side))| if *side == 0 { Some(*r) } else { None })
         .sum();
 
-    let n_a_f = n_a as f64;
-    let n_b_f = n_b as f64;
-    let u_a = r_a - n_a_f * (n_a_f + 1.0) / 2.0;
-    let u_b = n_a_f * n_b_f - u_a;
+    let left_count = n_a as f64;
+    let right_count = n_b as f64;
+    let u_a = r_a - left_count * (left_count + 1.0) / 2.0;
+    let u_b = left_count.mul_add(right_count, -u_a);
     let u_min = u_a.min(u_b);
 
-    let n_total = n_a_f + n_b_f;
-    let mu = n_a_f * n_b_f / 2.0;
-    let sigma_sq =
-        n_a_f * n_b_f / 12.0 * (n_total + 1.0 - tie_correction / (n_total * (n_total - 1.0)));
+    let n_total = left_count + right_count;
+    let mu = left_count * right_count / 2.0;
+    let sigma_sq = left_count * right_count / 12.0
+        * (n_total + 1.0 - tie_correction / (n_total * (n_total - 1.0)));
     let sigma = sigma_sq.sqrt();
 
     // Continuity-corrected z and two-sided p-value.
@@ -336,14 +342,17 @@ pub fn mann_whitney_u(samples_a: &[f64], samples_b: &[f64]) -> Option<MannWhitne
 fn normal_cdf(x: f64) -> f64 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
-    let t = 1.0 / (1.0 + 0.231_641_9 * x);
-    let y = 1.0
-        - (((((1.330_274_429 * t - 1.821_255_978) * t + 1.781_477_937) * t - 0.356_563_782) * t
-            + 0.319_381_530)
-            * t)
-            * (-x * x / 2.0).exp()
-            / (2.0 * std::f64::consts::PI).sqrt();
-    0.5 * (1.0 + sign * (2.0 * y - 1.0))
+    let t = 0.231_641_9_f64.mul_add(x, 1.0).recip();
+    let polynomial = 1.330_274_429_f64
+        .mul_add(t, -1.821_255_978)
+        .mul_add(t, 1.781_477_937)
+        .mul_add(t, -0.356_563_782)
+        .mul_add(t, 0.319_381_530)
+        * t;
+    let density = (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    let y = 1.0 - polynomial * density;
+    let erf_approx = 2.0_f64.mul_add(y, -1.0);
+    erf_approx.mul_add(sign, 1.0) * 0.5
 }
 
 /// Raw Criterion `<bench>/new/sample.json` shape (only the fields we read).
@@ -566,7 +575,7 @@ pub fn min_sample_size_bernstein(
     let max_var = range * range / 4.0;
     let var = var_bound.min(max_var);
     let log_term = (2.0_f64 / alpha).ln();
-    let numerator = (2.0 * var + (2.0 / 3.0) * range * threshold) * log_term;
+    let numerator = ((2.0 / 3.0) * range).mul_add(threshold, 2.0 * var) * log_term;
     let n = numerator / (threshold * threshold);
     if !n.is_finite() {
         return None;
@@ -645,7 +654,7 @@ pub fn conformal_band(samples: &[f64], alpha: f64) -> Option<ConformalBand> {
     if !samples.iter().all(|x| x.is_finite()) {
         return None;
     }
-    let mut sorted: Vec<f64> = samples.iter().copied().collect();
+    let mut sorted: Vec<f64> = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     // Two-tailed split: lower at α/2, upper at 1-α/2.
     let half = alpha / 2.0;
