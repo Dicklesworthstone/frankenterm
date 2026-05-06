@@ -4861,9 +4861,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_events_stream(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_events_stream_backend(backend, &query)
+            })
         })
         .await
     }
@@ -15999,6 +15999,9 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
 }
 
 /// Query events in deterministic ID order with cursor-based resume.
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_events_stream_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_events_stream(conn: &Connection, query: &EventStreamQuery) -> Result<Vec<StoredEvent>> {
     let mut sql = String::from(
         "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
@@ -16095,6 +16098,68 @@ fn query_events_stream(conn: &Connection, query: &EventStreamQuery) -> Result<Ve
     }
 
     Ok(results)
+}
+
+fn query_events_stream_backend(
+    backend: &dyn StorageBackend,
+    query: &EventStreamQuery,
+) -> Result<Vec<StoredEvent>> {
+    let mut sql = String::from(
+        "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+         extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
+         handled_by_workflow_id, handled_status
+         FROM events WHERE 1=1",
+    );
+    let mut params = Vec::new();
+
+    if let Some(after_id) = query.after_id {
+        sql.push_str(" AND id > ?");
+        params.push(ToSqlValue::Integer(after_id));
+    }
+    if query.unhandled_only {
+        sql.push_str(" AND handled_at IS NULL");
+    }
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(ToSqlValue::Integer(pane_id_i64));
+    }
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(ToSqlValue::Text(rule_id.as_str()));
+    }
+    if let Some(event_type) = &query.event_type {
+        sql.push_str(" AND event_type = ?");
+        params.push(ToSqlValue::Text(event_type.as_str()));
+    }
+    if let Some(triage_state) = &query.triage_state {
+        sql.push_str(" AND triage_state = ?");
+        params.push(ToSqlValue::Text(triage_state.as_str()));
+    }
+    if let Some(label) = &query.label {
+        sql.push_str(" AND id IN (SELECT event_id FROM event_labels WHERE label = ?)");
+        params.push(ToSqlValue::Text(label.as_str()));
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND detected_at >= ?");
+        params.push(ToSqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND detected_at <= ?");
+        params.push(ToSqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    params.push(ToSqlValue::Integer(limit_i64));
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query events stream", err))?;
+
+    rows.iter()
+        .map(|row| stored_event_from_backend_cells(row))
+        .collect()
 }
 
 // =============================================================================
