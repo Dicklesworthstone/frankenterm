@@ -1505,6 +1505,420 @@ fn bounded_step(
 }
 
 // =============================================================================
+// Operator tuning advisor
+// =============================================================================
+
+/// Pane-count class used by the operator tuning advisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningPaneScaleClass {
+    /// Small local swarm or single-operator setup.
+    TenPanes,
+    /// Medium fleet where defaults are usually appropriate.
+    FiftyPanes,
+    /// High-concurrency fleet where throughput and queue stability dominate.
+    TwoHundredPlusPanes,
+}
+
+impl TuningPaneScaleClass {
+    #[must_use]
+    fn from_pane_count(pane_count: usize) -> Self {
+        match pane_count {
+            0..=20 => Self::TenPanes,
+            21..=100 => Self::FiftyPanes,
+            _ => Self::TwoHundredPlusPanes,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TenPanes => "10_panes",
+            Self::FiftyPanes => "50_panes",
+            Self::TwoHundredPlusPanes => "200_plus_panes",
+        }
+    }
+}
+
+/// Confidence tier for one advisory report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningAdvisorConfidence {
+    /// The advisor has too little evidence for more than a starting profile.
+    Low,
+    /// The advisor has a useful profile but at least one important signal is absent.
+    Medium,
+    /// All required signals are present and no degraded condition was observed.
+    High,
+    /// Evidence shows overload, unavailable backends, or invalid telemetry.
+    Degraded,
+}
+
+/// How an operator may use the recommendation set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningAdvisorApplicationMode {
+    /// Keep the output as an observation or starting point only.
+    ObserveOnly,
+    /// A canary is still required before any live tuning change.
+    CanaryRequired,
+}
+
+/// Coarse memory-pressure tier observed by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningMemoryPressureTier {
+    /// Plenty of memory headroom remains.
+    Nominal,
+    /// Memory is elevated but not yet blocking.
+    Elevated,
+    /// Memory pressure is high enough that memory-expanding knobs should not grow.
+    High,
+    /// Memory pressure is critical; recommendations must stay observe-only.
+    Critical,
+}
+
+/// Availability of an advisory input backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningBackendAvailability {
+    /// Backend is healthy enough for this advisory pass.
+    Available,
+    /// Backend is present but degraded.
+    Degraded,
+    /// Backend is unavailable.
+    Unavailable,
+    /// Caller did not report backend state.
+    Unknown,
+}
+
+/// Observed workload shape used by the tuning advisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuningAdvisorInput {
+    /// Current tracked pane count.
+    pub pane_count: Option<usize>,
+    /// Recent output volume across the fleet, in bytes per second.
+    pub output_bytes_per_sec: Option<u64>,
+    /// Current queue depth for capture/admission work.
+    pub queue_depth: Option<u64>,
+    /// Queue capacity for the reported queue depth.
+    pub queue_capacity: Option<u64>,
+    /// Current memory-pressure tier.
+    pub memory_tier: Option<TuningMemoryPressureTier>,
+    /// Lexical search backend availability.
+    pub lexical_backend: TuningBackendAvailability,
+    /// Semantic search backend availability.
+    pub semantic_backend: TuningBackendAvailability,
+}
+
+/// One documented knob range selected by the advisor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningAdvisorRecommendation {
+    /// Registry knob id.
+    pub knob_id: TunableKnobId,
+    /// Minimum recommended value.
+    pub min_value: f64,
+    /// Maximum recommended value.
+    pub max_value: f64,
+    /// Display unit from the tuning reference.
+    pub unit: String,
+    /// Source document for this range.
+    pub source: String,
+    /// Stable reasons that selected or tightened the range.
+    pub reason_codes: Vec<String>,
+}
+
+impl TuningAdvisorRecommendation {
+    fn new(
+        knob_id: TunableKnobId,
+        min_value: f64,
+        max_value: f64,
+        unit: &str,
+        reason_codes: Vec<String>,
+    ) -> Self {
+        let registry = default_candidate_registry();
+        let spec = registry
+            .get(&knob_id)
+            .expect("advisor knob must exist in safe candidate registry");
+        let min_value = spec.range.clamp(min_value);
+        let max_value = spec.range.clamp(max_value).max(min_value);
+        Self {
+            knob_id,
+            min_value,
+            max_value,
+            unit: unit.to_string(),
+            source: "docs/tuning-reference.md".to_string(),
+            reason_codes,
+        }
+    }
+}
+
+/// Full advisory report for one workload shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningAdvisorReport {
+    /// Pane class selected from the observed pane count.
+    pub pane_class: Option<TuningPaneScaleClass>,
+    /// Confidence in the advisory result.
+    pub confidence: TuningAdvisorConfidence,
+    /// Whether recommendations are observe-only or may proceed to canary.
+    pub application_mode: TuningAdvisorApplicationMode,
+    /// Missing signals that reduced confidence.
+    pub evidence_gaps: Vec<String>,
+    /// Degraded signals that prevent canary use.
+    pub degraded_reason_codes: Vec<String>,
+    /// Documented range recommendations clamped to the safe registry.
+    pub recommendations: Vec<TuningAdvisorRecommendation>,
+}
+
+impl TuningAdvisorReport {
+    /// True when all emitted ranges still fit the safe tuning registry.
+    #[must_use]
+    pub fn recommendations_inside_registry(&self) -> bool {
+        let registry = default_candidate_registry();
+        self.recommendations.iter().all(|recommendation| {
+            registry.get(&recommendation.knob_id).is_some_and(|spec| {
+                spec.range.contains(recommendation.min_value)
+                    && spec.range.contains(recommendation.max_value)
+                    && recommendation.min_value <= recommendation.max_value
+            })
+        })
+    }
+}
+
+/// Build a cautious tuning advisory report from observed workload shape.
+#[must_use]
+pub fn advise_tuning(input: &TuningAdvisorInput) -> TuningAdvisorReport {
+    let pane_class = input.pane_count.map(TuningPaneScaleClass::from_pane_count);
+    let evidence_gaps = advisor_evidence_gaps(input);
+    let degraded_reason_codes = advisor_degraded_reason_codes(input);
+    let confidence = advisor_confidence(input, &evidence_gaps, &degraded_reason_codes);
+    let application_mode = if confidence == TuningAdvisorConfidence::High {
+        TuningAdvisorApplicationMode::CanaryRequired
+    } else {
+        TuningAdvisorApplicationMode::ObserveOnly
+    };
+    let recommendations = pane_class.map_or_else(Vec::new, |class| {
+        advisor_recommendations(class, input, confidence)
+    });
+
+    TuningAdvisorReport {
+        pane_class,
+        confidence,
+        application_mode,
+        evidence_gaps,
+        degraded_reason_codes,
+        recommendations,
+    }
+}
+
+fn advisor_evidence_gaps(input: &TuningAdvisorInput) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if input.pane_count.is_none() {
+        gaps.push("advisor.evidence.missing_pane_count".to_string());
+    }
+    if input.output_bytes_per_sec.is_none() {
+        gaps.push("advisor.evidence.missing_output_rate".to_string());
+    }
+    if input.queue_depth.is_none() || input.queue_capacity.is_none() {
+        gaps.push("advisor.evidence.missing_queue_depth".to_string());
+    }
+    if input.memory_tier.is_none() {
+        gaps.push("advisor.evidence.missing_memory_tier".to_string());
+    }
+    if input.lexical_backend == TuningBackendAvailability::Unknown {
+        gaps.push("advisor.evidence.unknown_lexical_backend".to_string());
+    }
+    if input.semantic_backend == TuningBackendAvailability::Unknown {
+        gaps.push("advisor.evidence.unknown_semantic_backend".to_string());
+    }
+    gaps
+}
+
+fn advisor_degraded_reason_codes(input: &TuningAdvisorInput) -> Vec<String> {
+    let mut reasons = Vec::new();
+    match input.memory_tier {
+        Some(TuningMemoryPressureTier::Critical) => {
+            reasons.push("advisor.degraded.memory_critical".to_string());
+        }
+        Some(TuningMemoryPressureTier::High) => {
+            reasons.push("advisor.degraded.memory_high".to_string());
+        }
+        Some(TuningMemoryPressureTier::Nominal | TuningMemoryPressureTier::Elevated) | None => {}
+    }
+
+    if queue_invalid(input) {
+        reasons.push("advisor.degraded.queue_invalid".to_string());
+    } else if queue_at_or_above(input, 90) {
+        reasons.push("advisor.degraded.queue_saturated".to_string());
+    }
+
+    if matches!(
+        input.lexical_backend,
+        TuningBackendAvailability::Degraded | TuningBackendAvailability::Unavailable
+    ) {
+        reasons.push("advisor.degraded.lexical_backend".to_string());
+    }
+    if matches!(
+        input.semantic_backend,
+        TuningBackendAvailability::Degraded | TuningBackendAvailability::Unavailable
+    ) {
+        reasons.push("advisor.degraded.semantic_backend".to_string());
+    }
+    reasons
+}
+
+fn advisor_confidence(
+    input: &TuningAdvisorInput,
+    evidence_gaps: &[String],
+    degraded_reason_codes: &[String],
+) -> TuningAdvisorConfidence {
+    if !degraded_reason_codes.is_empty() {
+        return TuningAdvisorConfidence::Degraded;
+    }
+    if evidence_gaps.is_empty() {
+        return TuningAdvisorConfidence::High;
+    }
+    if input.pane_count.is_some() && evidence_gaps.len() <= 2 {
+        return TuningAdvisorConfidence::Medium;
+    }
+    TuningAdvisorConfidence::Low
+}
+
+fn queue_invalid(input: &TuningAdvisorInput) -> bool {
+    matches!(
+        (input.queue_depth, input.queue_capacity),
+        (Some(_), Some(0))
+    ) || matches!(
+        (input.queue_depth, input.queue_capacity),
+        (Some(depth), Some(capacity)) if depth > capacity
+    )
+}
+
+fn queue_at_or_above(input: &TuningAdvisorInput, percent: u64) -> bool {
+    match (input.queue_depth, input.queue_capacity) {
+        (Some(depth), Some(capacity)) if capacity > 0 => {
+            depth.saturating_mul(100) >= capacity.saturating_mul(percent)
+        }
+        _ => false,
+    }
+}
+
+fn memory_constrained(input: &TuningAdvisorInput) -> bool {
+    matches!(
+        input.memory_tier,
+        Some(TuningMemoryPressureTier::High | TuningMemoryPressureTier::Critical)
+    )
+}
+
+fn advisor_recommendations(
+    pane_class: TuningPaneScaleClass,
+    input: &TuningAdvisorInput,
+    confidence: TuningAdvisorConfidence,
+) -> Vec<TuningAdvisorRecommendation> {
+    let profile_reason = format!("advisor.profile.{}", pane_class.as_str());
+    let output_high = input
+        .output_bytes_per_sec
+        .is_some_and(|rate| rate >= 1_048_576);
+    let queue_high = queue_at_or_above(input, 75);
+    let memory_constrained = memory_constrained(input);
+    let backend_constrained = input.lexical_backend != TuningBackendAvailability::Available
+        || input.semantic_backend != TuningBackendAvailability::Available;
+
+    let (coalesce_window, coalesce_bytes, mut backpressure, mut search_memory): (
+        (f64, f64),
+        (f64, f64),
+        (f64, f64),
+        (f64, f64),
+    ) = match pane_class {
+        TuningPaneScaleClass::TenPanes => (
+            (25.0, 50.0),
+            (131_072.0, 262_144.0),
+            (0.70, 0.80),
+            (16_000_000.0, 50_000_000.0),
+        ),
+        TuningPaneScaleClass::FiftyPanes => (
+            (50.0, 75.0),
+            (262_144.0, 524_288.0),
+            (0.70, 0.80),
+            (50_000_000.0, 100_000_000.0),
+        ),
+        TuningPaneScaleClass::TwoHundredPlusPanes => (
+            (75.0, 150.0),
+            (524_288.0, 1_048_576.0),
+            (0.60, 0.75),
+            (100_000_000.0, 256_000_000.0),
+        ),
+    };
+
+    if queue_high {
+        backpressure.1 =
+            backpressure
+                .1
+                .min(if pane_class == TuningPaneScaleClass::TwoHundredPlusPanes {
+                    0.70_f64
+                } else {
+                    0.75
+                });
+    }
+    if memory_constrained || backend_constrained || confidence != TuningAdvisorConfidence::High {
+        search_memory.1 = search_memory.0;
+    }
+
+    let mut coalesce_reasons = vec![profile_reason.clone()];
+    if output_high {
+        coalesce_reasons.push("advisor.signal.output_rate_high".to_string());
+    }
+    let coalesce_bytes_reasons = coalesce_reasons.clone();
+
+    let mut backpressure_reasons = vec![profile_reason.clone()];
+    if queue_high {
+        backpressure_reasons.push("advisor.signal.queue_depth_high".to_string());
+    }
+
+    let mut search_reasons = vec![profile_reason];
+    if memory_constrained {
+        search_reasons.push("advisor.signal.memory_constrained".to_string());
+    }
+    if backend_constrained {
+        search_reasons.push("advisor.signal.backend_constrained".to_string());
+    }
+    if confidence != TuningAdvisorConfidence::High {
+        search_reasons.push("advisor.signal.confidence_not_high".to_string());
+    }
+
+    vec![
+        TuningAdvisorRecommendation::new(
+            TunableKnobId::RuntimeOutputCoalesceWindowMs,
+            coalesce_window.0,
+            coalesce_window.1,
+            "ms",
+            coalesce_reasons,
+        ),
+        TuningAdvisorRecommendation::new(
+            TunableKnobId::RuntimeOutputCoalesceMaxBytes,
+            coalesce_bytes.0,
+            coalesce_bytes.1,
+            "bytes",
+            coalesce_bytes_reasons,
+        ),
+        TuningAdvisorRecommendation::new(
+            TunableKnobId::BackpressureWarnRatio,
+            backpressure.0,
+            backpressure.1,
+            "ratio",
+            backpressure_reasons,
+        ),
+        TuningAdvisorRecommendation::new(
+            TunableKnobId::SearchTantivyWriterMemoryBytes,
+            search_memory.0,
+            search_memory.1,
+            "bytes",
+            search_reasons,
+        ),
+    ]
+}
+
+// =============================================================================
 // Rollback safety controller
 // =============================================================================
 
@@ -3352,6 +3766,192 @@ mod tests {
             mux_latency_ms: 5.0,
             cpu_fraction: 0.6,
         }
+    }
+
+    fn advisor_input(
+        pane_count: Option<usize>,
+        output_bytes_per_sec: Option<u64>,
+        queue_depth: Option<u64>,
+        queue_capacity: Option<u64>,
+        memory_tier: Option<TuningMemoryPressureTier>,
+        lexical_backend: TuningBackendAvailability,
+        semantic_backend: TuningBackendAvailability,
+    ) -> TuningAdvisorInput {
+        TuningAdvisorInput {
+            pane_count,
+            output_bytes_per_sec,
+            queue_depth,
+            queue_capacity,
+            memory_tier,
+            lexical_backend,
+            semantic_backend,
+        }
+    }
+
+    fn recommendation(
+        report: &TuningAdvisorReport,
+        knob_id: TunableKnobId,
+    ) -> &TuningAdvisorRecommendation {
+        report
+            .recommendations
+            .iter()
+            .find(|recommendation| recommendation.knob_id == knob_id)
+            .expect("advisor recommendation exists")
+    }
+
+    #[test]
+    fn tuning_advisor_low_evidence_is_observe_only() {
+        let input = advisor_input(
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            TuningBackendAvailability::Unknown,
+            TuningBackendAvailability::Unknown,
+        );
+
+        let report = advise_tuning(&input);
+
+        assert_eq!(report.pane_class, Some(TuningPaneScaleClass::TenPanes));
+        assert_eq!(report.confidence, TuningAdvisorConfidence::Low);
+        assert_eq!(
+            report.application_mode,
+            TuningAdvisorApplicationMode::ObserveOnly
+        );
+        assert!(
+            report
+                .evidence_gaps
+                .iter()
+                .any(|gap| gap == "advisor.evidence.missing_output_rate")
+        );
+        assert!(report.recommendations_inside_registry());
+    }
+
+    #[test]
+    fn tuning_advisor_medium_50_pane_queue_pressure_tightens_backpressure() {
+        let input = advisor_input(
+            Some(50),
+            None,
+            Some(80),
+            Some(100),
+            Some(TuningMemoryPressureTier::Nominal),
+            TuningBackendAvailability::Available,
+            TuningBackendAvailability::Available,
+        );
+
+        let report = advise_tuning(&input);
+        let backpressure = recommendation(&report, TunableKnobId::BackpressureWarnRatio);
+
+        assert_eq!(report.pane_class, Some(TuningPaneScaleClass::FiftyPanes));
+        assert_eq!(report.confidence, TuningAdvisorConfidence::Medium);
+        assert_eq!(
+            report.application_mode,
+            TuningAdvisorApplicationMode::ObserveOnly
+        );
+        assert!((backpressure.min_value - 0.70).abs() < f64::EPSILON);
+        assert!((backpressure.max_value - 0.75).abs() < f64::EPSILON);
+        assert!(
+            backpressure
+                .reason_codes
+                .iter()
+                .any(|reason| reason == "advisor.signal.queue_depth_high")
+        );
+        assert!(report.recommendations_inside_registry());
+    }
+
+    #[test]
+    fn tuning_advisor_high_200_pane_outputs_documented_ranges() {
+        let input = advisor_input(
+            Some(220),
+            Some(2_500_000),
+            Some(300),
+            Some(1_000),
+            Some(TuningMemoryPressureTier::Nominal),
+            TuningBackendAvailability::Available,
+            TuningBackendAvailability::Available,
+        );
+
+        let report = advise_tuning(&input);
+        let coalesce = recommendation(&report, TunableKnobId::RuntimeOutputCoalesceWindowMs);
+        let max_bytes = recommendation(&report, TunableKnobId::RuntimeOutputCoalesceMaxBytes);
+        let search = recommendation(&report, TunableKnobId::SearchTantivyWriterMemoryBytes);
+
+        assert_eq!(
+            report.pane_class,
+            Some(TuningPaneScaleClass::TwoHundredPlusPanes)
+        );
+        assert_eq!(report.confidence, TuningAdvisorConfidence::High);
+        assert_eq!(
+            report.application_mode,
+            TuningAdvisorApplicationMode::CanaryRequired
+        );
+        assert!((coalesce.min_value - 75.0).abs() < f64::EPSILON);
+        assert!((coalesce.max_value - 150.0).abs() < f64::EPSILON);
+        assert!((max_bytes.min_value - 524_288.0).abs() < f64::EPSILON);
+        assert!((max_bytes.max_value - 1_048_576.0).abs() < f64::EPSILON);
+        assert!((search.min_value - 100_000_000.0).abs() < f64::EPSILON);
+        assert!((search.max_value - 256_000_000.0).abs() < f64::EPSILON);
+        assert!(report.recommendations_inside_registry());
+    }
+
+    #[test]
+    fn tuning_advisor_degraded_evidence_blocks_application_and_memory_increases() {
+        let input = advisor_input(
+            Some(220),
+            Some(3_000_000),
+            Some(95),
+            Some(100),
+            Some(TuningMemoryPressureTier::Critical),
+            TuningBackendAvailability::Available,
+            TuningBackendAvailability::Unavailable,
+        );
+
+        let report = advise_tuning(&input);
+        let search = recommendation(&report, TunableKnobId::SearchTantivyWriterMemoryBytes);
+
+        assert_eq!(report.confidence, TuningAdvisorConfidence::Degraded);
+        assert_eq!(
+            report.application_mode,
+            TuningAdvisorApplicationMode::ObserveOnly
+        );
+        assert!(
+            report
+                .degraded_reason_codes
+                .iter()
+                .any(|reason| reason == "advisor.degraded.memory_critical")
+        );
+        assert!(
+            report
+                .degraded_reason_codes
+                .iter()
+                .any(|reason| reason == "advisor.degraded.semantic_backend")
+        );
+        assert!((search.min_value - 100_000_000.0).abs() < f64::EPSILON);
+        assert!((search.max_value - 100_000_000.0).abs() < f64::EPSILON);
+        assert!(report.recommendations_inside_registry());
+    }
+
+    #[test]
+    fn tuning_advisor_report_serde_roundtrip_preserves_ranges() {
+        let input = advisor_input(
+            Some(50),
+            Some(800_000),
+            Some(25),
+            Some(100),
+            Some(TuningMemoryPressureTier::Elevated),
+            TuningBackendAvailability::Available,
+            TuningBackendAvailability::Available,
+        );
+        let report = advise_tuning(&input);
+
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: TuningAdvisorReport = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.confidence, report.confidence);
+        assert_eq!(restored.pane_class, report.pane_class);
+        assert_eq!(restored.recommendations.len(), report.recommendations.len());
+        assert!(restored.recommendations_inside_registry());
     }
 
     // ---- Basic tests ----
