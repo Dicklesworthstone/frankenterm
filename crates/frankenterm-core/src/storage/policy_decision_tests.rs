@@ -2520,14 +2520,19 @@ fn secret_scan_report_roundtrip() {
     let id = record_secret_scan_report_backend(&backend, &record).unwrap();
     assert!(id > 0);
 
-    let conn = backend.into_connection();
-    let fetched = query_latest_secret_scan_report(&conn, "scope-hash")
+    let fetched = query_latest_secret_scan_report_backend(&backend, "scope-hash")
         .unwrap()
         .expect("report should exist");
     assert_eq!(fetched.scope_hash, "scope-hash");
     assert_eq!(fetched.last_segment_id, Some(42));
     assert_eq!(fetched.report_version, 1);
     assert_eq!(fetched.report_json, "{\"report_version\":1}");
+
+    let conn = backend.into_connection();
+    let direct = query_latest_secret_scan_report(&conn, "scope-hash")
+        .unwrap()
+        .expect("direct fallback should still decode");
+    assert_eq!(direct.id, fetched.id);
 }
 
 #[test]

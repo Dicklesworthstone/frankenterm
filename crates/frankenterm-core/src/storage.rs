@@ -5270,9 +5270,11 @@ impl StorageHandle {
         let scope_hash = scope_hash.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_latest_secret_scan_report(&conn, &scope_hash)
+            // br-ft-l1jgo: route the secret-scan checkpoint read through
+            // the trait-typed pooled backend instead of a direct read conn.
+            pooled_backend(db_path.as_str(), |backend| {
+                query_latest_secret_scan_report_backend(backend, &scope_hash)
+            })
         })
         .await
     }
@@ -17566,6 +17568,57 @@ fn query_scan_segments(conn: &Connection, query: &SegmentScanQuery) -> Result<Ve
     Ok(results)
 }
 
+fn secret_scan_report_from_backend_cells(row: &[SqlCell]) -> Result<SecretScanReportRecord> {
+    let reader = CellRowReader::new(row);
+    Ok(SecretScanReportRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Secret scan report id", err))?,
+        scope_hash: reader
+            .string(1)
+            .map_err(|err| storage_backend_error("Secret scan report scope_hash", err))?,
+        scope_json: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Secret scan report scope_json", err))?,
+        report_version: reader
+            .i64(3)
+            .map_err(|err| storage_backend_error("Secret scan report version", err))?,
+        last_segment_id: reader
+            .optional_i64(4)
+            .map_err(|err| storage_backend_error("Secret scan report last_segment_id", err))?,
+        report_json: reader
+            .string(5)
+            .map_err(|err| storage_backend_error("Secret scan report report_json", err))?,
+        created_at: reader
+            .i64(6)
+            .map_err(|err| storage_backend_error("Secret scan report created_at", err))?,
+    })
+}
+
+fn query_latest_secret_scan_report_backend(
+    backend: &dyn StorageBackend,
+    scope_hash: &str,
+) -> Result<Option<SecretScanReportRecord>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT id, scope_hash, scope_json, report_version, last_segment_id, \
+             report_json, created_at
+             FROM secret_scan_reports
+             WHERE scope_hash = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            &[ToSqlValue::Text(scope_hash)],
+        )
+        .map_err(|err| storage_backend_error("Query latest secret scan report", err))?;
+
+    row.as_deref()
+        .map(secret_scan_report_from_backend_cells)
+        .transpose()
+}
+
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_latest_secret_scan_report_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_latest_secret_scan_report(
     conn: &Connection,
     scope_hash: &str,
