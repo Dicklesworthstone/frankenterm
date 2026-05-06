@@ -7,8 +7,8 @@ use frankenterm_core::distributed::validate_token;
 use frankenterm_core::patterns::{AgentType, Severity};
 use frankenterm_core::storage::{EventQuery, PaneRecord, StorageHandle, StoredEvent};
 use frankenterm_core::wire_protocol::{
-    Aggregator, DEFAULT_AGENT_STALE_AFTER_MS, DetectionNotice, IngestResult, PaneDelta, PaneMeta,
-    WireEnvelope, WirePayload,
+    Aggregator, DEFAULT_AGENT_STALE_AFTER_MS, DetectionNotice, GapNotice, IngestResult, PaneDelta,
+    PaneMeta, WireEnvelope, WirePayload, WireProtocolError,
 };
 
 fn run_async_test<F>(future: F)
@@ -289,6 +289,13 @@ fn pane_meta(pane_id: u64) -> PaneMeta {
     }
 }
 
+fn distributed_pane_meta(pane_id: u64, sender: &str) -> PaneMeta {
+    let mut meta = pane_meta(pane_id);
+    meta.domain = format!("distributed:{sender}:prod");
+    meta.title = Some(format!("{sender}-pane-{pane_id}"));
+    meta
+}
+
 fn pane_delta(pane_id: u64, seq: u64, content: &str) -> PaneDelta {
     PaneDelta {
         pane_id,
@@ -297,6 +304,46 @@ fn pane_delta(pane_id: u64, seq: u64, content: &str) -> PaneDelta {
         content_len: content.len(),
         captured_at_ms: now_ms(),
     }
+}
+
+fn wire_protocol_error_code(error: &WireProtocolError) -> &'static str {
+    match error {
+        WireProtocolError::InvalidJson(_) => "dist.invalid_json",
+        WireProtocolError::MessageTooLarge { .. } => "dist.message_too_large",
+        WireProtocolError::VersionMismatch { .. } => "dist.version_mismatch",
+        WireProtocolError::InvalidSender { .. } => "dist.invalid_sender",
+        WireProtocolError::TooManyAgents { .. } => "dist.too_many_agents",
+        WireProtocolError::InvalidSequence { .. } => "dist.invalid_sequence",
+    }
+}
+
+fn fault_receipt(
+    fault: &str,
+    sender: &str,
+    envelope_seq: u64,
+    pane_seq: Option<u64>,
+    received_at_ms: i64,
+    decision: &str,
+    error_code: Option<&str>,
+    stale_pruned_senders: &[&str],
+    bridge: &DistributedBridge,
+) -> serde_json::Value {
+    serde_json::json!({
+        "fault": fault,
+        "sender": sender,
+        "envelope_seq": envelope_seq,
+        "pane_seq": pane_seq,
+        "received_at_ms": received_at_ms,
+        "decision": decision,
+        "error_code": error_code,
+        "stale_pruned_senders": stale_pruned_senders,
+        "accepted_total": bridge.aggregator.total_accepted(),
+        "rejected_total": bridge.aggregator.total_rejected(),
+        "dedup_total": bridge.diagnostics.duplicates,
+        "pane_reorder_drops": bridge.diagnostics.pane_reorder_drops,
+        "pane_seq_gap_repairs": bridge.diagnostics.pane_seq_gap_repairs,
+        "tracked_agents": bridge.aggregator.agent_count(),
+    })
 }
 
 fn inferred_gap_bounds(expected: u64, actual: u64) -> (u64, u64) {
@@ -577,6 +624,324 @@ fn distributed_streaming_e2e_preserves_gap_and_handles_duplicate_out_of_order() 
                 "segments": segments.len(),
                 "gaps": gaps.len(),
                 "search_hits": search_hits.len()
+            }),
+        );
+    });
+}
+
+#[test]
+fn distributed_streaming_e2e_lossy_stale_session_drill_preserves_visibility() {
+    run_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("distributed_streaming_lossy_stale.db");
+        let mut bridge = DistributedBridge::new_with_capacity_and_stale(
+            db_path.to_str().expect("db path"),
+            1,
+            50,
+        )
+        .await
+        .expect("bridge");
+        let mut receipts = Vec::new();
+
+        let sender_a = "agent-loss-a";
+        let sender_b = "agent-loss-b";
+        let sender_c = "agent-loss-c";
+
+        let mut meta_a = WireEnvelope::new(
+            1,
+            sender_a,
+            WirePayload::PaneMeta(distributed_pane_meta(71, sender_a)),
+        );
+        meta_a.sent_at_ms = 10_000;
+        bridge
+            .ingest_envelope_at(meta_a, 100)
+            .await
+            .expect("agent a metadata should be accepted");
+        receipts.push(fault_receipt(
+            "initial_meta",
+            sender_a,
+            1,
+            None,
+            100,
+            "accepted",
+            None,
+            &[],
+            &bridge,
+        ));
+
+        let mut first_delta = WireEnvelope::new(
+            2,
+            sender_a,
+            WirePayload::PaneDelta(pane_delta(71, 0, "LOSSY_STALE_MARKER first")),
+        );
+        first_delta.sent_at_ms = 10_001;
+        bridge
+            .ingest_envelope_at(first_delta, 110)
+            .await
+            .expect("first delta should be accepted");
+        receipts.push(fault_receipt(
+            "first_delta",
+            sender_a,
+            2,
+            Some(0),
+            110,
+            "accepted",
+            None,
+            &[],
+            &bridge,
+        ));
+
+        let mut delayed_duplicate = WireEnvelope::new(
+            2,
+            sender_a,
+            WirePayload::PaneDelta(pane_delta(71, 0, "LOSSY_STALE_MARKER duplicate")),
+        );
+        delayed_duplicate.sent_at_ms = 1;
+        bridge
+            .ingest_envelope_at(delayed_duplicate, 130)
+            .await
+            .expect("duplicate should refresh liveness without persisting");
+        receipts.push(fault_receipt(
+            "delayed_duplicate",
+            sender_a,
+            2,
+            Some(0),
+            130,
+            "dedup",
+            None,
+            &[],
+            &bridge,
+        ));
+
+        let mut rejected_recent_sender = WireEnvelope::new(
+            1,
+            sender_b,
+            WirePayload::PaneMeta(distributed_pane_meta(72, sender_b)),
+        );
+        rejected_recent_sender.sent_at_ms = 2;
+        let err = bridge
+            .ingest_envelope_at(rejected_recent_sender, 160)
+            .await
+            .expect_err("recent refreshed sender should still occupy capacity");
+        let wire_err = err
+            .downcast_ref::<WireProtocolError>()
+            .expect("capacity rejection should be a wire protocol error");
+        assert!(matches!(
+            wire_err,
+            WireProtocolError::TooManyAgents { max: 1, sender: _ }
+        ));
+        receipts.push(fault_receipt(
+            "recent_sender_capacity_reject",
+            sender_b,
+            1,
+            None,
+            160,
+            "rejected",
+            Some(wire_protocol_error_code(wire_err)),
+            &[],
+            &bridge,
+        ));
+
+        let mut replayed_pane_seq = WireEnvelope::new(
+            3,
+            sender_a,
+            WirePayload::PaneDelta(pane_delta(71, 0, "LOSSY_STALE_MARKER replay")),
+        );
+        replayed_pane_seq.sent_at_ms = 10_002;
+        bridge
+            .ingest_envelope_at(replayed_pane_seq, 170)
+            .await
+            .expect("new sender sequence with replayed pane seq should be diagnosed");
+        receipts.push(fault_receipt(
+            "replayed_pane_seq",
+            sender_a,
+            3,
+            Some(0),
+            170,
+            "accepted_replay_dropped",
+            Some("dist.replay_detected"),
+            &[],
+            &bridge,
+        ));
+
+        let mut dropped_stream_gap = WireEnvelope::new(
+            4,
+            sender_a,
+            WirePayload::Gap(GapNotice {
+                pane_id: 71,
+                seq_before: 0,
+                seq_after: 3,
+                reason: "dropped_stream_reconnect".to_string(),
+                detected_at_ms: now_ms(),
+            }),
+        );
+        dropped_stream_gap.sent_at_ms = 10_003;
+        bridge
+            .ingest_envelope_at(dropped_stream_gap, 175)
+            .await
+            .expect("explicit dropped-stream gap should persist");
+        receipts.push(fault_receipt(
+            "dropped_stream_gap",
+            sender_a,
+            4,
+            None,
+            175,
+            "accepted",
+            None,
+            &[],
+            &bridge,
+        ));
+
+        let mut after_gap = WireEnvelope::new(
+            5,
+            sender_a,
+            WirePayload::PaneDelta(pane_delta(71, 3, "LOSSY_STALE_MARKER after gap")),
+        );
+        after_gap.sent_at_ms = 10_004;
+        bridge
+            .ingest_envelope_at(after_gap, 180)
+            .await
+            .expect("delta after explicit gap should persist");
+        receipts.push(fault_receipt(
+            "after_gap_delta",
+            sender_a,
+            5,
+            Some(3),
+            180,
+            "accepted",
+            None,
+            &[],
+            &bridge,
+        ));
+
+        assert_eq!(bridge.aggregator.agent_last_seq(sender_a), Some(5));
+        let mut stale_replacement = WireEnvelope::new(
+            1,
+            sender_c,
+            WirePayload::PaneMeta(distributed_pane_meta(73, sender_c)),
+        );
+        stale_replacement.sent_at_ms = 99_999;
+        bridge
+            .ingest_envelope_at(stale_replacement, 240)
+            .await
+            .expect("stale sender should be pruned before accepting replacement");
+        let stale_pruned = if bridge.aggregator.agent_last_seq(sender_a).is_none() {
+            vec![sender_a]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(stale_pruned, vec![sender_a]);
+        receipts.push(fault_receipt(
+            "stale_prune_replacement",
+            sender_c,
+            1,
+            None,
+            240,
+            "accepted",
+            None,
+            &stale_pruned,
+            &bridge,
+        ));
+
+        let mut panes = bridge.storage.get_panes().await.expect("panes");
+        panes.sort_by_key(|pane| pane.pane_id);
+        let segments = bridge.storage.get_segments(71, 20).await.expect("segments");
+        let gaps = bridge.storage.get_gaps().await.expect("gaps");
+        let search_hits = bridge
+            .storage
+            .search("LOSSY_STALE_MARKER")
+            .await
+            .expect("search");
+
+        assert_eq!(receipts.len(), 8);
+        assert_eq!(bridge.aggregator.total_accepted(), 6);
+        assert_eq!(bridge.aggregator.total_rejected(), 1);
+        assert_eq!(bridge.aggregator.agent_last_seq(sender_a), None);
+        assert_eq!(bridge.aggregator.agent_last_seq(sender_c), Some(1));
+        assert_eq!(bridge.diagnostics.duplicates, 1);
+        assert_eq!(bridge.diagnostics.pane_reorder_drops, 1);
+        assert_eq!(bridge.diagnostics.pane_seq_gap_repairs, 0);
+        assert_eq!(
+            bridge.diagnostics.replay_event_codes,
+            vec!["dist.replay_detected".to_string()]
+        );
+
+        assert!(
+            panes.iter().any(|pane| {
+                pane.pane_id == 71 && pane.domain == "distributed:agent-loss-a:prod"
+            }),
+            "accepted remote pane should remain visible in state"
+        );
+        assert!(
+            !panes.iter().any(|pane| pane.pane_id == 72),
+            "capacity-rejected sender metadata must not persist"
+        );
+        assert!(
+            panes.iter().any(|pane| {
+                pane.pane_id == 73 && pane.domain == "distributed:agent-loss-c:prod"
+            }),
+            "replacement remote pane should be visible after stale prune"
+        );
+        let segment_contents = segments
+            .iter()
+            .map(|segment| segment.content.as_str())
+            .collect::<Vec<_>>();
+        let combined_segments = segment_contents.join("");
+        assert!(
+            segment_contents
+                .iter()
+                .any(|content| content.contains("LOSSY_STALE_MARKER")),
+            "canonical marker should persist: {segment_contents:?}"
+        );
+        assert!(
+            segment_contents
+                .iter()
+                .any(|content| content.contains("first")),
+            "first canonical payload should persist: {segment_contents:?}"
+        );
+        assert!(
+            segment_contents
+                .iter()
+                .any(|content| content.contains("after")),
+            "after-gap canonical payload should persist: {segment_contents:?}"
+        );
+        assert!(
+            !combined_segments.contains("duplicate") && !combined_segments.contains("replay"),
+            "deduped and replay-dropped payloads must not be searchable"
+        );
+        assert_eq!(
+            search_hits.len(),
+            2,
+            "search should expose persisted output"
+        );
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.reason.contains("distributed_out_of_order")),
+            "replayed pane sequence should be recorded as a diagnostic gap"
+        );
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.reason.contains("dropped_stream_reconnect")),
+            "dropped stream should be recorded as an explicit gap"
+        );
+
+        emit_artifact(
+            "lossy_stale_fault_receipts",
+            serde_json::json!({
+                "receipts": receipts,
+                "state_panes": panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>(),
+                "search_hits": search_hits.len(),
+                "gaps": gaps.iter().map(|gap| serde_json::json!({
+                    "pane_id": gap.pane_id,
+                    "seq_before": gap.seq_before,
+                    "seq_after": gap.seq_after,
+                    "reason": gap.reason,
+                })).collect::<Vec<_>>(),
+                "remote_live_read_expectation": {
+                    "pane_id": 71,
+                    "error_code": "robot.remote_text_unavailable",
+                    "mcp_error_code": "mcp.remote_text_unavailable"
+                }
             }),
         );
     });
