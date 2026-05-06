@@ -219,10 +219,10 @@ impl Ucb1Bandit {
     /// shift periodically (a coarser-grained alternative to the
     /// proper sliding-window-UCB variant).
     pub fn reset(&mut self) {
-        for p in self.arm_pulls.iter_mut() {
+        for p in &mut self.arm_pulls {
             *p = 0;
         }
-        for r in self.arm_rewards.iter_mut() {
+        for r in &mut self.arm_rewards {
             *r = 0.0;
         }
         self.total_pulls = 0;
