@@ -32,40 +32,52 @@
 /// We therefore compute only cells in the band [j - k, j + k] for each
 /// row, and early-terminate when the minimum value in a row exceeds k.
 #[must_use]
-pub fn edit_distance_bounded(a: &[u8], b: &[u8], max_distance: usize) -> Option<usize> {
-    let m = a.len();
-    let n = b.len();
+pub fn edit_distance_bounded(left: &[u8], right: &[u8], max_distance: usize) -> Option<usize> {
+    let left_len = left.len();
+    let right_len = right.len();
 
     // The length difference is a lower bound on edit distance.
     // If the difference already exceeds k, the true distance is > k.
-    let len_diff = m.abs_diff(n);
+    let len_diff = left_len.abs_diff(right_len);
     if len_diff > max_distance {
         return None;
     }
 
-    if m == 0 {
-        return if n <= max_distance { Some(n) } else { None };
+    if left_len == 0 {
+        return if right_len <= max_distance {
+            Some(right_len)
+        } else {
+            None
+        };
     }
-    if n == 0 {
-        return if m <= max_distance { Some(m) } else { None };
+    if right_len == 0 {
+        return if left_len <= max_distance {
+            Some(left_len)
+        } else {
+            None
+        };
     }
 
     // Width-(2k+1) band around the main diagonal. We store the full
     // row to keep indexing simple but only update cells in the band.
     // Cells outside the band are conceptually `usize::MAX / 2` (infinity).
     let inf = max_distance + 1;
-    let mut prev = vec![inf; n + 1];
-    let mut curr = vec![inf; n + 1];
+    let mut prev = vec![inf; right_len + 1];
+    let mut curr = vec![inf; right_len + 1];
 
-    for j in 0..=max_distance.min(n) {
-        prev[j] = j;
+    for (column, cell) in prev
+        .iter_mut()
+        .enumerate()
+        .take(max_distance.min(right_len) + 1)
+    {
+        *cell = column;
     }
 
-    for i in 1..=m {
-        curr[0] = if i <= max_distance { i } else { inf };
+    for row in 1..=left_len {
+        curr[0] = if row <= max_distance { row } else { inf };
 
-        let band_start = i.saturating_sub(max_distance).max(1);
-        let band_end = (i + max_distance).min(n);
+        let band_start = row.saturating_sub(max_distance).max(1);
+        let band_end = (row + max_distance).min(right_len);
 
         // Cell at band_start - 1 is conceptually inf if outside band;
         // we already set curr[0] = inf when i > max_distance, but for
@@ -78,22 +90,22 @@ pub fn edit_distance_bounded(a: &[u8], b: &[u8], max_distance: usize) -> Option<
 
         let mut row_min = curr[0];
 
-        for j in band_start..=band_end {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            let del = prev[j].saturating_add(1);
-            let ins = curr[j - 1].saturating_add(1);
-            let sub = prev[j - 1].saturating_add(cost);
-            let v = del.min(ins).min(sub);
-            curr[j] = v;
-            if v < row_min {
-                row_min = v;
+        for column in band_start..=band_end {
+            let substitution_cost = usize::from(left[row - 1] != right[column - 1]);
+            let deletion = prev[column].saturating_add(1);
+            let insertion = curr[column - 1].saturating_add(1);
+            let substitution = prev[column - 1].saturating_add(substitution_cost);
+            let distance = deletion.min(insertion).min(substitution);
+            curr[column] = distance;
+            if distance < row_min {
+                row_min = distance;
             }
         }
 
         // Cells immediately right of the band must be reset too, since
         // the next row's band may extend further left and read prev[j+1]
         // where j+1 was outside this row's band.
-        if band_end < n {
+        if band_end < right_len {
             curr[band_end + 1] = inf;
         }
 
@@ -107,7 +119,7 @@ pub fn edit_distance_bounded(a: &[u8], b: &[u8], max_distance: usize) -> Option<
         std::mem::swap(&mut prev, &mut curr);
     }
 
-    let result = prev[n];
+    let result = prev[right_len];
     if result <= max_distance {
         Some(result)
     } else {
@@ -118,8 +130,8 @@ pub fn edit_distance_bounded(a: &[u8], b: &[u8], max_distance: usize) -> Option<
 /// Convenience: returns `true` iff `edit_distance(a, b) <= max_distance`.
 /// Cheaper than `edit_distance_bounded(...).is_some()` only by a name.
 #[must_use]
-pub fn within_edit_distance(a: &[u8], b: &[u8], max_distance: usize) -> bool {
-    edit_distance_bounded(a, b, max_distance).is_some()
+pub fn within_edit_distance(left: &[u8], right: &[u8], max_distance: usize) -> bool {
+    edit_distance_bounded(left, right, max_distance).is_some()
 }
 
 #[cfg(test)]
@@ -128,26 +140,28 @@ mod tests {
 
     /// Reference implementation from output_compression (full Wagner-
     /// Fischer DP). Used for equivalence testing.
-    fn edit_distance_reference(a: &[u8], b: &[u8]) -> usize {
-        let m = a.len();
-        let n = b.len();
-        if m == 0 {
-            return n;
+    fn edit_distance_reference(left: &[u8], right: &[u8]) -> usize {
+        let left_len = left.len();
+        let right_len = right.len();
+        if left_len == 0 {
+            return right_len;
         }
-        if n == 0 {
-            return m;
+        if right_len == 0 {
+            return left_len;
         }
-        let mut prev: Vec<usize> = (0..=n).collect();
-        let mut curr = vec![0; n + 1];
-        for i in 1..=m {
-            curr[0] = i;
-            for j in 1..=n {
-                let cost = usize::from(a[i - 1] != b[j - 1]);
-                curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        let mut prev: Vec<usize> = (0..=right_len).collect();
+        let mut curr = vec![0; right_len + 1];
+        for row in 1..=left_len {
+            curr[0] = row;
+            for column in 1..=right_len {
+                let substitution_cost = usize::from(left[row - 1] != right[column - 1]);
+                curr[column] = (prev[column] + 1)
+                    .min(curr[column - 1] + 1)
+                    .min(prev[column - 1] + substitution_cost);
             }
             std::mem::swap(&mut prev, &mut curr);
         }
-        prev[n]
+        prev[right_len]
     }
 
     #[test]
