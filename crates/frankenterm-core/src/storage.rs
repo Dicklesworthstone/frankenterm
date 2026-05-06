@@ -5297,9 +5297,9 @@ impl StorageHandle {
         let workflow_id = workflow_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_workflow(&conn, &workflow_id)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_workflow_backend(backend, &workflow_id)
+            })
         })
         .await
     }
@@ -5438,9 +5438,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_incomplete_workflows(&conn)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_incomplete_workflows_backend(backend)
+            })
         })
         .await
     }
@@ -17169,6 +17169,9 @@ fn query_segment_by_id(conn: &Connection, segment_id: i64) -> Result<Option<Segm
 }
 
 /// Query workflow by ID
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_workflow_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 #[allow(clippy::cast_sign_loss)]
 fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
     conn.query_row(
@@ -17224,6 +17227,81 @@ fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<Workflo
     )
     .optional()
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+}
+
+fn workflow_record_from_backend_cells(row: &[SqlCell]) -> Result<WorkflowRecord> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .i64(2)
+        .and_then(|value| backend_i64_to_u64(value, "workflow_executions.pane_id"))
+        .map_err(|err| storage_backend_error("Workflow row pane_id", err))?;
+    let current_step = reader
+        .i64(4)
+        .map_err(|err| storage_backend_error("Workflow row current_step", err))?;
+    let wait_condition_str = reader
+        .optional_string(6)
+        .map_err(|err| storage_backend_error("Workflow row wait_condition", err))?;
+    let context_str = reader
+        .optional_string(7)
+        .map_err(|err| storage_backend_error("Workflow row context", err))?;
+    let result_str = reader
+        .optional_string(8)
+        .map_err(|err| storage_backend_error("Workflow row result", err))?;
+
+    Ok(WorkflowRecord {
+        id: reader
+            .string(0)
+            .map_err(|err| storage_backend_error("Workflow row id", err))?,
+        workflow_name: reader
+            .string(1)
+            .map_err(|err| storage_backend_error("Workflow row workflow_name", err))?,
+        pane_id,
+        trigger_event_id: reader
+            .optional_i64(3)
+            .map_err(|err| storage_backend_error("Workflow row trigger_event_id", err))?,
+        current_step: i64_to_usize(current_step).map_err(|err| {
+            StorageError::Database(format!("Workflow row current_step decode failed: {err}"))
+        })?,
+        status: reader
+            .string(5)
+            .map_err(|err| storage_backend_error("Workflow row status", err))?,
+        wait_condition: parse_workflow_execution_column(
+            wait_condition_str.as_deref(),
+            "wait_condition",
+        ),
+        context: parse_workflow_execution_column(context_str.as_deref(), "context"),
+        result: parse_workflow_execution_column(result_str.as_deref(), "result"),
+        error: reader
+            .optional_string(9)
+            .map_err(|err| storage_backend_error("Workflow row error", err))?,
+        started_at: reader
+            .i64(10)
+            .map_err(|err| storage_backend_error("Workflow row started_at", err))?,
+        updated_at: reader
+            .i64(11)
+            .map_err(|err| storage_backend_error("Workflow row updated_at", err))?,
+        completed_at: reader
+            .optional_i64(12)
+            .map_err(|err| storage_backend_error("Workflow row completed_at", err))?,
+    })
+}
+
+fn query_workflow_backend(
+    backend: &dyn StorageBackend,
+    workflow_id: &str,
+) -> Result<Option<WorkflowRecord>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT id, workflow_name, pane_id, trigger_event_id, current_step, status,
+             wait_condition, context, result, error, started_at, updated_at, completed_at
+             FROM workflow_executions WHERE id = ?1",
+            &[ToSqlValue::Text(workflow_id)],
+        )
+        .map_err(|err| storage_backend_error("Query workflow", err))?;
+
+    row.as_deref()
+        .map(workflow_record_from_backend_cells)
+        .transpose()
 }
 
 /// Direct-rusqlite path. Kept for transitional fallback while
@@ -17494,6 +17572,9 @@ fn query_latest_step_log(
 }
 
 /// Query incomplete workflows for resume on restart
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_incomplete_workflows_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 #[allow(clippy::cast_sign_loss)]
 fn query_incomplete_workflows(conn: &Connection) -> Result<Vec<WorkflowRecord>> {
     let mut stmt = conn
@@ -17551,6 +17632,23 @@ fn query_incomplete_workflows(conn: &Connection) -> Result<Vec<WorkflowRecord>> 
     }
 
     Ok(results)
+}
+
+fn query_incomplete_workflows_backend(backend: &dyn StorageBackend) -> Result<Vec<WorkflowRecord>> {
+    let rows = backend
+        .query_map_cells(
+            "SELECT id, workflow_name, pane_id, trigger_event_id, current_step, status,
+             wait_condition, context, result, error, started_at, updated_at, completed_at
+             FROM workflow_executions
+             WHERE status IN ('running', 'waiting')
+             ORDER BY started_at ASC",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Query incomplete workflows", err))?;
+
+    rows.iter()
+        .map(|row| workflow_record_from_backend_cells(row))
+        .collect()
 }
 
 // =============================================================================
