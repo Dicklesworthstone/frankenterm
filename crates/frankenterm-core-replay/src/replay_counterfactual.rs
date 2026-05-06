@@ -584,6 +584,677 @@ impl OverrideManifest {
 }
 
 // ============================================================================
+// Resource-control override packages
+// ============================================================================
+
+/// Versioned schema for replay-backed resource-control what-if packages.
+pub const RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION: &str = "ft.resource_control_override.v1";
+
+const MAX_RESOURCE_KNOB_ID_LEN: usize = 128;
+
+fn default_resource_override_schema_version() -> String {
+    RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION.to_string()
+}
+
+fn default_resource_override_action() -> ResourceOverrideAction {
+    ResourceOverrideAction::Set
+}
+
+/// Resource-control domain targeted by a what-if override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceOverrideDomain {
+    /// Global admission/defer/degrade/shed thresholds.
+    Admission,
+    /// Lane and pane priority weights.
+    Qos,
+    /// Topology or locality-placement policy.
+    Topology,
+    /// Hot/warm/cold/search memory tier budgets.
+    MemoryTier,
+    /// Safe auto-tuning controls.
+    AutoTune,
+}
+
+impl ResourceOverrideDomain {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Qos => "qos",
+            Self::Topology => "topology",
+            Self::MemoryTier => "memory_tier",
+            Self::AutoTune => "auto_tune",
+        }
+    }
+}
+
+/// Primitive value shape accepted by a safe resource-control knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKnobValueKind {
+    Bool,
+    Integer,
+    Float,
+    Text,
+}
+
+/// Action to take for a resource-control knob in a what-if run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceOverrideAction {
+    /// Set the knob to a candidate value.
+    Set,
+    /// Disable the knob or policy, when explicitly allowed by the registry.
+    Disable,
+    /// Reset the knob to its baseline/default value.
+    ResetToDefault,
+}
+
+impl ResourceOverrideAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Disable => "disable",
+            Self::ResetToDefault => "reset_to_default",
+        }
+    }
+}
+
+/// Static safe-knob registry entry for resource-control what-if packages.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResourceKnobSpec {
+    pub knob_id: &'static str,
+    pub domain: ResourceOverrideDomain,
+    pub value_kind: ResourceKnobValueKind,
+    pub min_value: Option<f64>,
+    pub max_value: Option<f64>,
+    pub allow_disable: bool,
+    pub description: &'static str,
+}
+
+impl ResourceKnobSpec {
+    #[must_use]
+    pub fn validates_value(self, raw: &str) -> Result<(), ResourceOverrideError> {
+        match self.value_kind {
+            ResourceKnobValueKind::Bool => match raw {
+                "true" | "false" => Ok(()),
+                _ => Err(ResourceOverrideError::ValueTypeMismatch {
+                    knob_id: self.knob_id.to_string(),
+                    expected: self.value_kind,
+                    value: raw.to_string(),
+                }),
+            },
+            ResourceKnobValueKind::Integer => {
+                let value =
+                    raw.parse::<i64>()
+                        .map_err(|_| ResourceOverrideError::ValueTypeMismatch {
+                            knob_id: self.knob_id.to_string(),
+                            expected: self.value_kind,
+                            value: raw.to_string(),
+                        })?;
+                self.validate_numeric(value as f64, raw)
+            }
+            ResourceKnobValueKind::Float => {
+                let value =
+                    raw.parse::<f64>()
+                        .map_err(|_| ResourceOverrideError::ValueTypeMismatch {
+                            knob_id: self.knob_id.to_string(),
+                            expected: self.value_kind,
+                            value: raw.to_string(),
+                        })?;
+                if !value.is_finite() {
+                    return Err(ResourceOverrideError::ValueTypeMismatch {
+                        knob_id: self.knob_id.to_string(),
+                        expected: self.value_kind,
+                        value: raw.to_string(),
+                    });
+                }
+                self.validate_numeric(value, raw)
+            }
+            ResourceKnobValueKind::Text => {
+                if raw.trim().is_empty() {
+                    return Err(ResourceOverrideError::ValueTypeMismatch {
+                        knob_id: self.knob_id.to_string(),
+                        expected: self.value_kind,
+                        value: raw.to_string(),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_numeric(self, value: f64, raw: &str) -> Result<(), ResourceOverrideError> {
+        let below_min = self.min_value.is_some_and(|min| value < min);
+        let above_max = self.max_value.is_some_and(|max| value > max);
+        if below_min || above_max {
+            return Err(ResourceOverrideError::ValueOutOfRange {
+                knob_id: self.knob_id.to_string(),
+                min: self.min_value,
+                max: self.max_value,
+                value: raw.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Metadata for a resource-control what-if package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceControlOverrideMeta {
+    /// Schema version. Defaults to [`RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION`].
+    #[serde(default = "default_resource_override_schema_version")]
+    pub schema_version: String,
+    /// Human-readable experiment name.
+    pub name: String,
+    /// Description of what the candidate resource policy tests.
+    #[serde(default)]
+    pub description: String,
+    /// Path or label of the baseline trace artifact.
+    #[serde(default)]
+    pub base_trace: String,
+    /// ISO-8601 creation timestamp.
+    #[serde(default)]
+    pub created_at: String,
+    /// Author or agent identifier.
+    #[serde(default)]
+    pub author: String,
+}
+
+/// One safe resource-control knob override for a what-if run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceControlOverride {
+    /// Stable knob identifier from the safe-knob registry.
+    pub knob_id: String,
+    /// Expected domain for the knob. Must match the registry entry.
+    pub domain: ResourceOverrideDomain,
+    /// What to do with this knob.
+    #[serde(default = "default_resource_override_action")]
+    pub action: ResourceOverrideAction,
+    /// Candidate value, encoded as a stable string to avoid float/TOML drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Operator-facing reason for this override.
+    #[serde(default)]
+    pub reason: String,
+    /// Optional declared hash. The loader computes and verifies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_hash: Option<String>,
+}
+
+/// Complete resource-control what-if package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceControlOverridePackage {
+    pub meta: ResourceControlOverrideMeta,
+    /// Backward-compatible flat override list for compact packages.
+    #[serde(default)]
+    pub overrides: Vec<ResourceControlOverride>,
+    /// Admission threshold and pressure-control overrides.
+    #[serde(default)]
+    pub admission: Vec<ResourceControlOverride>,
+    /// QoS class and scheduling-weight overrides.
+    #[serde(default)]
+    pub qos: Vec<ResourceControlOverride>,
+    /// Topology placement and rebalance overrides.
+    #[serde(default)]
+    pub topology: Vec<ResourceControlOverride>,
+    /// Hot/warm/cold/search memory-tier budget overrides.
+    #[serde(default)]
+    pub memory_tier: Vec<ResourceControlOverride>,
+    /// Replay-only auto-tune candidate knob overrides.
+    #[serde(default)]
+    pub auto_tune: Vec<ResourceControlOverride>,
+}
+
+impl ResourceControlOverridePackage {
+    #[must_use]
+    pub fn override_count(&self) -> usize {
+        self.all_overrides().len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.override_count() == 0
+    }
+
+    #[must_use]
+    pub fn knob_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .all_overrides()
+            .into_iter()
+            .map(|override_| override_.knob_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    #[must_use]
+    pub fn all_overrides(&self) -> Vec<&ResourceControlOverride> {
+        self.overrides
+            .iter()
+            .chain(self.admission.iter())
+            .chain(self.qos.iter())
+            .chain(self.topology.iter())
+            .chain(self.memory_tier.iter())
+            .chain(self.auto_tune.iter())
+            .collect()
+    }
+}
+
+/// Error from loading or validating a resource-control what-if package.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ResourceOverrideError {
+    ParseError(String),
+    UnsupportedSchemaVersion {
+        expected: String,
+        actual: String,
+    },
+    MissingMeta(String),
+    UnknownKnob(String),
+    UnsafeWildcard(String),
+    DomainMismatch {
+        knob_id: String,
+        expected: ResourceOverrideDomain,
+        actual: ResourceOverrideDomain,
+    },
+    ConflictingKnobOverrides(String),
+    MissingValue(String),
+    DisableNotAllowed(String),
+    ValueTypeMismatch {
+        knob_id: String,
+        expected: ResourceKnobValueKind,
+        value: String,
+    },
+    ValueOutOfRange {
+        knob_id: String,
+        min: Option<f64>,
+        max: Option<f64>,
+        value: String,
+    },
+    HashMismatch {
+        knob_id: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+impl std::fmt::Display for ResourceOverrideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParseError(error) => write!(f, "TOML parse error: {error}"),
+            Self::UnsupportedSchemaVersion { expected, actual } => {
+                write!(
+                    f,
+                    "unsupported resource override schema {actual}; expected {expected}"
+                )
+            }
+            Self::MissingMeta(field) => write!(f, "missing resource override metadata: {field}"),
+            Self::UnknownKnob(knob_id) => write!(f, "unknown resource-control knob: {knob_id}"),
+            Self::UnsafeWildcard(knob_id) => {
+                write!(f, "resource-control knob wildcards are unsafe: {knob_id}")
+            }
+            Self::DomainMismatch {
+                knob_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "domain mismatch for {knob_id}: expected {}, got {}",
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::ConflictingKnobOverrides(knob_id) => {
+                write!(f, "conflicting resource-control override for {knob_id}")
+            }
+            Self::MissingValue(knob_id) => write!(f, "missing value for resource knob {knob_id}"),
+            Self::DisableNotAllowed(knob_id) => {
+                write!(f, "disable is not allowed for resource knob {knob_id}")
+            }
+            Self::ValueTypeMismatch {
+                knob_id,
+                expected,
+                value,
+            } => write!(
+                f,
+                "value {value:?} does not match {expected:?} for resource knob {knob_id}"
+            ),
+            Self::ValueOutOfRange {
+                knob_id,
+                min,
+                max,
+                value,
+            } => write!(
+                f,
+                "value {value:?} is outside range {min:?}..={max:?} for resource knob {knob_id}"
+            ),
+            Self::HashMismatch {
+                knob_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "hash mismatch for resource knob {knob_id}: expected {expected}, got {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResourceOverrideError {}
+
+/// Loader and validator for resource-control what-if packages.
+pub struct ResourceControlOverrideLoader;
+
+impl ResourceControlOverrideLoader {
+    /// Parse and validate a resource-control what-if package.
+    pub fn load(toml_str: &str) -> Result<ResourceControlOverridePackage, ResourceOverrideError> {
+        let mut pkg: ResourceControlOverridePackage = toml::from_str(toml_str)
+            .map_err(|error| ResourceOverrideError::ParseError(error.to_string()))?;
+        Self::validate_meta(&pkg.meta)?;
+        Self::validate_package_overrides(&mut pkg, &Self::safe_knob_map())?;
+        Ok(pkg)
+    }
+
+    /// Built-in safe-knob registry for replay-only resource-control experiments.
+    #[must_use]
+    pub fn builtin_safe_knobs() -> Vec<ResourceKnobSpec> {
+        vec![
+            ResourceKnobSpec {
+                knob_id: "admission.max_queue_utilization",
+                domain: ResourceOverrideDomain::Admission,
+                value_kind: ResourceKnobValueKind::Float,
+                min_value: Some(0.0),
+                max_value: Some(1.0),
+                allow_disable: false,
+                description: "maximum ready-queue utilization before degradation",
+            },
+            ResourceKnobSpec {
+                knob_id: "admission.max_pending_items",
+                domain: ResourceOverrideDomain::Admission,
+                value_kind: ResourceKnobValueKind::Integer,
+                min_value: Some(1.0),
+                max_value: Some(1_000_000.0),
+                allow_disable: false,
+                description: "maximum pending work items before shedding is considered",
+            },
+            ResourceKnobSpec {
+                knob_id: "qos.interactive_weight",
+                domain: ResourceOverrideDomain::Qos,
+                value_kind: ResourceKnobValueKind::Float,
+                min_value: Some(0.1),
+                max_value: Some(10.0),
+                allow_disable: false,
+                description: "relative weight for interactive pane work",
+            },
+            ResourceKnobSpec {
+                knob_id: "qos.bulk_search_weight",
+                domain: ResourceOverrideDomain::Qos,
+                value_kind: ResourceKnobValueKind::Float,
+                min_value: Some(0.1),
+                max_value: Some(10.0),
+                allow_disable: false,
+                description: "relative weight for bulk search/index work",
+            },
+            ResourceKnobSpec {
+                knob_id: "topology.max_migrations_per_epoch",
+                domain: ResourceOverrideDomain::Topology,
+                value_kind: ResourceKnobValueKind::Integer,
+                min_value: Some(0.0),
+                max_value: Some(10_000.0),
+                allow_disable: false,
+                description: "maximum topology rebalance moves per simulation epoch",
+            },
+            ResourceKnobSpec {
+                knob_id: "topology.locality_spread_factor",
+                domain: ResourceOverrideDomain::Topology,
+                value_kind: ResourceKnobValueKind::Float,
+                min_value: Some(0.0),
+                max_value: Some(1.0),
+                allow_disable: false,
+                description: "fractional preference for spreading work across locality groups",
+            },
+            ResourceKnobSpec {
+                knob_id: "memory.hot_resident_budget_bytes",
+                domain: ResourceOverrideDomain::MemoryTier,
+                value_kind: ResourceKnobValueKind::Integer,
+                min_value: Some(1_048_576.0),
+                max_value: Some(1_099_511_627_776.0),
+                allow_disable: false,
+                description: "hot resident memory budget in bytes",
+            },
+            ResourceKnobSpec {
+                knob_id: "memory.search_cache_budget_bytes",
+                domain: ResourceOverrideDomain::MemoryTier,
+                value_kind: ResourceKnobValueKind::Integer,
+                min_value: Some(1_048_576.0),
+                max_value: Some(1_099_511_627_776.0),
+                allow_disable: false,
+                description: "search/index cache memory budget in bytes",
+            },
+            ResourceKnobSpec {
+                knob_id: "autotune.enabled",
+                domain: ResourceOverrideDomain::AutoTune,
+                value_kind: ResourceKnobValueKind::Bool,
+                min_value: None,
+                max_value: None,
+                allow_disable: true,
+                description: "whether replay-only auto-tune candidates are considered",
+            },
+            ResourceKnobSpec {
+                knob_id: "autotune.exploration_budget_percent",
+                domain: ResourceOverrideDomain::AutoTune,
+                value_kind: ResourceKnobValueKind::Float,
+                min_value: Some(0.0),
+                max_value: Some(20.0),
+                allow_disable: false,
+                description: "maximum percent of budget spent on candidate exploration",
+            },
+        ]
+    }
+
+    fn safe_knob_map() -> BTreeMap<&'static str, ResourceKnobSpec> {
+        Self::builtin_safe_knobs()
+            .into_iter()
+            .map(|spec| (spec.knob_id, spec))
+            .collect()
+    }
+
+    fn validate_meta(meta: &ResourceControlOverrideMeta) -> Result<(), ResourceOverrideError> {
+        if meta.schema_version != RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION {
+            return Err(ResourceOverrideError::UnsupportedSchemaVersion {
+                expected: RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION.to_string(),
+                actual: meta.schema_version.clone(),
+            });
+        }
+        if meta.name.trim().is_empty() {
+            return Err(ResourceOverrideError::MissingMeta("name".to_string()));
+        }
+        Ok(())
+    }
+
+    fn validate_package_overrides(
+        pkg: &mut ResourceControlOverridePackage,
+        registry: &BTreeMap<&'static str, ResourceKnobSpec>,
+    ) -> Result<(), ResourceOverrideError> {
+        let mut seen = BTreeMap::<String, ()>::new();
+        Self::validate_override_group(&mut pkg.overrides, None, registry, &mut seen)?;
+        Self::validate_override_group(
+            &mut pkg.admission,
+            Some(ResourceOverrideDomain::Admission),
+            registry,
+            &mut seen,
+        )?;
+        Self::validate_override_group(
+            &mut pkg.qos,
+            Some(ResourceOverrideDomain::Qos),
+            registry,
+            &mut seen,
+        )?;
+        Self::validate_override_group(
+            &mut pkg.topology,
+            Some(ResourceOverrideDomain::Topology),
+            registry,
+            &mut seen,
+        )?;
+        Self::validate_override_group(
+            &mut pkg.memory_tier,
+            Some(ResourceOverrideDomain::MemoryTier),
+            registry,
+            &mut seen,
+        )?;
+        Self::validate_override_group(
+            &mut pkg.auto_tune,
+            Some(ResourceOverrideDomain::AutoTune),
+            registry,
+            &mut seen,
+        )
+    }
+
+    fn validate_override_group(
+        overrides: &mut [ResourceControlOverride],
+        section_domain: Option<ResourceOverrideDomain>,
+        registry: &BTreeMap<&'static str, ResourceKnobSpec>,
+        seen: &mut BTreeMap<String, ()>,
+    ) -> Result<(), ResourceOverrideError> {
+        for override_ in &mut *overrides {
+            Self::validate_knob_id(&override_.knob_id)?;
+            if seen.insert(override_.knob_id.clone(), ()).is_some() {
+                return Err(ResourceOverrideError::ConflictingKnobOverrides(
+                    override_.knob_id.clone(),
+                ));
+            }
+            if let Some(expected) = section_domain {
+                if override_.domain != expected {
+                    return Err(ResourceOverrideError::DomainMismatch {
+                        knob_id: override_.knob_id.clone(),
+                        expected,
+                        actual: override_.domain,
+                    });
+                }
+            }
+            let spec = registry
+                .get(override_.knob_id.as_str())
+                .copied()
+                .ok_or_else(|| ResourceOverrideError::UnknownKnob(override_.knob_id.clone()))?;
+            if override_.domain != spec.domain {
+                return Err(ResourceOverrideError::DomainMismatch {
+                    knob_id: override_.knob_id.clone(),
+                    expected: spec.domain,
+                    actual: override_.domain,
+                });
+            }
+            Self::validate_override_value(override_, spec)?;
+            let hash = resource_override_hash(override_);
+            if let Some(declared) = &override_.value_hash {
+                if *declared != hash {
+                    return Err(ResourceOverrideError::HashMismatch {
+                        knob_id: override_.knob_id.clone(),
+                        expected: declared.clone(),
+                        actual: hash,
+                    });
+                }
+            }
+            override_.value_hash = Some(hash);
+        }
+        overrides.sort_by(|left, right| left.knob_id.cmp(&right.knob_id));
+        Ok(())
+    }
+
+    fn validate_knob_id(knob_id: &str) -> Result<(), ResourceOverrideError> {
+        if knob_id.trim().is_empty() || knob_id.len() > MAX_RESOURCE_KNOB_ID_LEN {
+            return Err(ResourceOverrideError::UnknownKnob(knob_id.to_string()));
+        }
+        if knob_id.contains('*') {
+            return Err(ResourceOverrideError::UnsafeWildcard(knob_id.to_string()));
+        }
+        Ok(())
+    }
+
+    fn validate_override_value(
+        override_: &ResourceControlOverride,
+        spec: ResourceKnobSpec,
+    ) -> Result<(), ResourceOverrideError> {
+        match override_.action {
+            ResourceOverrideAction::Set => {
+                let value = override_.value.as_deref().ok_or_else(|| {
+                    ResourceOverrideError::MissingValue(override_.knob_id.clone())
+                })?;
+                spec.validates_value(value)
+            }
+            ResourceOverrideAction::Disable => {
+                if !spec.allow_disable {
+                    return Err(ResourceOverrideError::DisableNotAllowed(
+                        override_.knob_id.clone(),
+                    ));
+                }
+                Ok(())
+            }
+            ResourceOverrideAction::ResetToDefault => Ok(()),
+        }
+    }
+}
+
+/// Stable hash for a resource-control knob override.
+#[must_use]
+pub fn resource_override_hash(override_: &ResourceControlOverride) -> String {
+    let value = override_.value.as_deref().unwrap_or("");
+    definition_hash(&format!(
+        "{}|{}|{}|{}",
+        override_.domain.as_str(),
+        override_.knob_id,
+        override_.action.as_str(),
+        value
+    ))
+}
+
+/// Manifest entry for a resource-control what-if package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceManifestEntry {
+    pub knob_id: String,
+    pub domain: ResourceOverrideDomain,
+    pub action: ResourceOverrideAction,
+    pub baseline_hash: Option<String>,
+    pub override_hash: Option<String>,
+    pub reason: String,
+}
+
+/// Deterministic manifest for resource-control what-if package diffs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceControlOverrideManifest {
+    pub schema_version: String,
+    pub package_name: String,
+    pub entries: Vec<ResourceManifestEntry>,
+}
+
+impl ResourceControlOverrideManifest {
+    #[must_use]
+    pub fn build(
+        pkg: &ResourceControlOverridePackage,
+        baseline_hashes: &BTreeMap<String, String>,
+    ) -> Self {
+        let mut entries = pkg
+            .all_overrides()
+            .into_iter()
+            .map(|override_| ResourceManifestEntry {
+                knob_id: override_.knob_id.clone(),
+                domain: override_.domain,
+                action: override_.action,
+                baseline_hash: baseline_hashes.get(&override_.knob_id).cloned(),
+                override_hash: override_.value_hash.clone(),
+                reason: override_.reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.knob_id.cmp(&right.knob_id));
+        Self {
+            schema_version: RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION.to_string(),
+            package_name: pkg.meta.name.clone(),
+            entries,
+        }
+    }
+}
+
+// ============================================================================
 // OverrideApplicator — runtime lookup
 // ============================================================================
 
@@ -821,6 +1492,8 @@ impl OverrideApplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     fn sample_toml() -> &'static str {
         r#"
@@ -1321,5 +1994,410 @@ new_definition = "def"
         assert_eq!(ids.len(), 4);
         assert!(ids.contains(&"rate_limit_api".to_string()));
         assert!(ids.contains(&"deploy_canary".to_string()));
+    }
+
+    fn resource_override_toml() -> &'static str {
+        r#"
+[meta]
+schema_version = "ft.resource_control_override.v1"
+name = "resource-candidate"
+description = "tighten queue pressure while raising hot memory budget"
+base_trace = "baseline.fttrace"
+created_at = "2026-05-06T00:00:00Z"
+author = "SilverHarbor"
+
+[[overrides]]
+knob_id = "admission.max_queue_utilization"
+domain = "admission"
+value = "0.82"
+reason = "degrade before p99 latency spikes"
+
+[[overrides]]
+knob_id = "memory.hot_resident_budget_bytes"
+domain = "memory_tier"
+value = "268435456"
+reason = "give hot scrollback more room during replay"
+
+[[overrides]]
+knob_id = "autotune.enabled"
+domain = "auto_tune"
+action = "disable"
+reason = "hold auto-tune constant for baseline comparison"
+"#
+    }
+
+    fn sectioned_resource_override_toml() -> &'static str {
+        r#"
+[meta]
+schema_version = "ft.resource_control_override.v1"
+name = "sectioned-resource-candidate"
+
+[[admission]]
+knob_id = "admission.max_pending_items"
+domain = "admission"
+value = "2048"
+reason = "bound queue growth"
+
+[[qos]]
+knob_id = "qos.interactive_weight"
+domain = "qos"
+value = "2.5"
+reason = "favor live panes"
+
+[[topology]]
+knob_id = "topology.locality_spread_factor"
+domain = "topology"
+value = "0.75"
+reason = "spread pressure across hosts"
+
+[[memory_tier]]
+knob_id = "memory.search_cache_budget_bytes"
+domain = "memory_tier"
+value = "134217728"
+reason = "cap search cache footprint"
+
+[[auto_tune]]
+knob_id = "autotune.exploration_budget_percent"
+domain = "auto_tune"
+value = "5.0"
+reason = "limit replay candidate exploration"
+"#
+    }
+
+    const RESOURCE_TEST_KNOBS: [(&str, &str, &str); 5] = [
+        ("admission.max_queue_utilization", "admission", "0.80"),
+        ("qos.interactive_weight", "qos", "1.5"),
+        ("topology.max_migrations_per_epoch", "topology", "12"),
+        (
+            "memory.hot_resident_budget_bytes",
+            "memory_tier",
+            "67108864",
+        ),
+        ("autotune.enabled", "auto_tune", "true"),
+    ];
+
+    fn resource_override_toml_from_indices(indices: &[usize]) -> String {
+        let mut toml = String::from(
+            r#"
+[meta]
+name = "generated-resource-candidate"
+"#,
+        );
+        for index in indices {
+            let (knob_id, domain, value) = RESOURCE_TEST_KNOBS[*index];
+            toml.push_str(&format!(
+                r#"
+[[overrides]]
+knob_id = "{knob_id}"
+domain = "{domain}"
+value = "{value}"
+reason = "generated"
+"#
+            ));
+        }
+        toml
+    }
+
+    // ── Resource-control override packages ─────────────────────────────
+
+    #[test]
+    fn resource_override_package_parses_and_hashes() {
+        let pkg = ResourceControlOverrideLoader::load(resource_override_toml()).unwrap();
+        assert_eq!(pkg.meta.name, "resource-candidate");
+        assert_eq!(pkg.override_count(), 3);
+        assert!(
+            pkg.overrides
+                .iter()
+                .all(|override_| override_.value_hash.is_some())
+        );
+        let ids = pkg.knob_ids();
+        assert_eq!(
+            ids,
+            vec![
+                "admission.max_queue_utilization".to_string(),
+                "autotune.enabled".to_string(),
+                "memory.hot_resident_budget_bytes".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_override_sectioned_package_covers_domains() {
+        let pkg = ResourceControlOverrideLoader::load(sectioned_resource_override_toml()).unwrap();
+        assert_eq!(pkg.override_count(), 5);
+        assert_eq!(pkg.admission.len(), 1);
+        assert_eq!(pkg.qos.len(), 1);
+        assert_eq!(pkg.topology.len(), 1);
+        assert_eq!(pkg.memory_tier.len(), 1);
+        assert_eq!(pkg.auto_tune.len(), 1);
+        assert_eq!(
+            pkg.knob_ids(),
+            vec![
+                "admission.max_pending_items".to_string(),
+                "autotune.exploration_budget_percent".to_string(),
+                "memory.search_cache_budget_bytes".to_string(),
+                "qos.interactive_weight".to_string(),
+                "topology.locality_spread_factor".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_override_rejects_section_domain_mismatch() {
+        let toml = r#"
+[meta]
+name = "bad-section"
+
+[[memory_tier]]
+knob_id = "memory.hot_resident_budget_bytes"
+domain = "admission"
+value = "268435456"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(
+            error,
+            ResourceOverrideError::DomainMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn resource_override_rejects_unknown_knob() {
+        let toml = r#"
+[meta]
+name = "unknown"
+
+[[overrides]]
+knob_id = "scheduler.mystery_knob"
+domain = "admission"
+value = "1"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(error, ResourceOverrideError::UnknownKnob(_)));
+    }
+
+    #[test]
+    fn resource_override_rejects_wildcard_knob() {
+        let toml = r#"
+[meta]
+name = "wildcard"
+
+[[overrides]]
+knob_id = "admission.*"
+domain = "admission"
+value = "0.5"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(error, ResourceOverrideError::UnsafeWildcard(_)));
+    }
+
+    #[test]
+    fn resource_override_rejects_domain_mismatch() {
+        let toml = r#"
+[meta]
+name = "domain-mismatch"
+
+[[overrides]]
+knob_id = "memory.hot_resident_budget_bytes"
+domain = "admission"
+value = "268435456"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(
+            error,
+            ResourceOverrideError::DomainMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn resource_override_rejects_out_of_range_value() {
+        let toml = r#"
+[meta]
+name = "out-of-range"
+
+[[overrides]]
+knob_id = "admission.max_queue_utilization"
+domain = "admission"
+value = "1.5"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(
+            error,
+            ResourceOverrideError::ValueOutOfRange { .. }
+        ));
+    }
+
+    #[test]
+    fn resource_override_rejects_bad_value_type() {
+        let toml = r#"
+[meta]
+name = "bad-type"
+
+[[overrides]]
+knob_id = "autotune.enabled"
+domain = "auto_tune"
+value = "sometimes"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(
+            error,
+            ResourceOverrideError::ValueTypeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn resource_override_rejects_duplicate_knob() {
+        let toml = r#"
+[meta]
+name = "duplicate"
+
+[[overrides]]
+knob_id = "qos.interactive_weight"
+domain = "qos"
+value = "2.0"
+
+[[overrides]]
+knob_id = "qos.interactive_weight"
+domain = "qos"
+value = "3.0"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(
+            error,
+            ResourceOverrideError::ConflictingKnobOverrides(_)
+        ));
+    }
+
+    #[test]
+    fn resource_override_rejects_disable_when_not_allowed() {
+        let toml = r#"
+[meta]
+name = "unsafe-disable"
+
+[[overrides]]
+knob_id = "admission.max_pending_items"
+domain = "admission"
+action = "disable"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(error, ResourceOverrideError::DisableNotAllowed(_)));
+    }
+
+    #[test]
+    fn resource_override_allows_reset_without_value() {
+        let toml = r#"
+[meta]
+name = "reset"
+
+[[overrides]]
+knob_id = "topology.max_migrations_per_epoch"
+domain = "topology"
+action = "reset_to_default"
+"#;
+        let pkg = ResourceControlOverrideLoader::load(toml).unwrap();
+        assert_eq!(pkg.override_count(), 1);
+        assert_eq!(
+            pkg.overrides[0].action,
+            ResourceOverrideAction::ResetToDefault
+        );
+        assert!(pkg.overrides[0].value_hash.is_some());
+    }
+
+    #[test]
+    fn resource_override_hash_mismatch_rejected() {
+        let toml = r#"
+[meta]
+name = "hash-mismatch"
+
+[[overrides]]
+knob_id = "qos.bulk_search_weight"
+domain = "qos"
+value = "2.0"
+value_hash = "0000000000000000"
+"#;
+        let error = ResourceControlOverrideLoader::load(toml).unwrap_err();
+        assert!(matches!(error, ResourceOverrideError::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn resource_manifest_is_deterministic_and_sorted() {
+        let pkg = ResourceControlOverrideLoader::load(resource_override_toml()).unwrap();
+        let mut baseline = BTreeMap::new();
+        baseline.insert(
+            "memory.hot_resident_budget_bytes".to_string(),
+            "baseline-memory".to_string(),
+        );
+        baseline.insert(
+            "admission.max_queue_utilization".to_string(),
+            "baseline-admission".to_string(),
+        );
+
+        let manifest = ResourceControlOverrideManifest::build(&pkg, &baseline);
+        assert_eq!(
+            manifest.schema_version,
+            RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION
+        );
+        assert_eq!(manifest.entries.len(), 3);
+        assert_eq!(
+            manifest
+                .entries
+                .iter()
+                .map(|entry| entry.knob_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "admission.max_queue_utilization",
+                "autotune.enabled",
+                "memory.hot_resident_budget_bytes",
+            ]
+        );
+        assert_eq!(
+            manifest.entries[0].baseline_hash.as_deref(),
+            Some("baseline-admission")
+        );
+        assert!(manifest.entries[1].baseline_hash.is_none());
+    }
+
+    #[test]
+    fn resource_manifest_serde_roundtrip() {
+        let pkg = ResourceControlOverrideLoader::load(resource_override_toml()).unwrap();
+        let manifest = ResourceControlOverrideManifest::build(&pkg, &BTreeMap::new());
+        let json = serde_json::to_string(&manifest).unwrap();
+        let restored: ResourceControlOverrideManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, manifest);
+    }
+
+    proptest! {
+        #[test]
+        fn resource_manifest_order_is_deterministic_for_any_input_order(
+            raw_indices in proptest::collection::vec(0usize..RESOURCE_TEST_KNOBS.len(), 1..32)
+        ) {
+            let mut seen = BTreeSet::new();
+            let unique = raw_indices
+                .into_iter()
+                .filter(|index| seen.insert(*index))
+                .collect::<Vec<_>>();
+            let toml = resource_override_toml_from_indices(&unique);
+            let pkg = ResourceControlOverrideLoader::load(&toml).unwrap();
+            let manifest = ResourceControlOverrideManifest::build(&pkg, &BTreeMap::new());
+            let ids = manifest
+                .entries
+                .iter()
+                .map(|entry| entry.knob_id.as_str())
+                .collect::<Vec<_>>();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+
+            prop_assert_eq!(ids, sorted);
+        }
+
+        #[test]
+        fn resource_duplicate_knobs_fail_closed(knob_index in 0usize..RESOURCE_TEST_KNOBS.len()) {
+            let toml = resource_override_toml_from_indices(&[knob_index, knob_index]);
+            let error = ResourceControlOverrideLoader::load(&toml).unwrap_err();
+            prop_assert!(matches!(
+                error,
+                ResourceOverrideError::ConflictingKnobOverrides(_)
+            ));
+        }
     }
 }
