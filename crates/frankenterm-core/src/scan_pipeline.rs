@@ -795,6 +795,8 @@ pub fn quick_metrics(bytes: &[u8]) -> ScanMetricsSummary {
 mod tests {
     use super::*;
     use crate::pattern_trigger::TriggerPattern;
+    use crate::runtime_async::{self, CompatRuntime, RuntimeBuilder};
+    use std::time::{Duration, Instant};
 
     // -----------------------------------------------------------------------
     // Basic pipeline tests
@@ -1577,6 +1579,206 @@ mod tests {
             chunked_output.metrics.logical_lines,
             batch_output.metrics.logical_lines
         );
+    }
+
+    struct LivenessReceipt {
+        seed_name: &'static str,
+        input_bytes: usize,
+        buffer_limit: usize,
+        processed_bytes: usize,
+        flushed_bytes: u64,
+        flushes: usize,
+        retries: usize,
+        yields: usize,
+        elapsed_ms: u128,
+        parser_decisions: Vec<String>,
+    }
+
+    impl LivenessReceipt {
+        fn emit(&self) {
+            eprintln!(
+                "ft-aawoe scan-pipeline liveness receipt seed={} input_bytes={} buffer_limit={} processed_bytes={} flushed_bytes={} flushes={} retries={} yields={} elapsed_ms={} decisions={}",
+                self.seed_name,
+                self.input_bytes,
+                self.buffer_limit,
+                self.processed_bytes,
+                self.flushed_bytes,
+                self.flushes,
+                self.retries,
+                self.yields,
+                self.elapsed_ms,
+                self.parser_decisions.join("|")
+            );
+        }
+    }
+
+    async fn drive_terminal_seed_with_backpressure_receipt(
+        seed_name: &'static str,
+        seed: &[u8],
+        buffer_limit: usize,
+        chunk_pattern: &[usize],
+    ) -> LivenessReceipt {
+        let pipeline = ScanPipeline::new(ScanPipelineConfig {
+            enable_compression: false,
+            ..Default::default()
+        });
+        let mut state = ChunkedPipelineState::try_new(buffer_limit).expect("valid buffer limit");
+        let start = Instant::now();
+        let mut cursor = 0usize;
+        let mut chunk_index = 0usize;
+        let mut processed_bytes = 0usize;
+        let mut flushed_bytes = 0u64;
+        let mut flushes = 0usize;
+        let mut retries = 0usize;
+        let mut yields = 0usize;
+        let mut parser_decisions = Vec::new();
+        let max_attempts = seed.len().saturating_mul(4).saturating_add(64);
+        let mut attempts = 0usize;
+
+        while cursor < seed.len() {
+            attempts += 1;
+            assert!(
+                attempts <= max_attempts,
+                "ft-aawoe: scan pipeline made no forward progress seed={seed_name} cursor={cursor} len={} decisions={}",
+                seed.len(),
+                parser_decisions.join("|")
+            );
+
+            let requested = chunk_pattern[chunk_index % chunk_pattern.len()].max(1);
+            chunk_index += 1;
+            let end = cursor.saturating_add(requested).min(seed.len());
+            let chunk = &seed[cursor..end];
+
+            match pipeline.try_process_chunk(chunk, &mut state) {
+                Ok(summary) => {
+                    processed_bytes += chunk.len();
+                    cursor = end;
+                    parser_decisions.push(format!(
+                        "ok:{}:{}:{}",
+                        chunk.len(),
+                        summary.ansi_byte_count,
+                        state.should_flush()
+                    ));
+                }
+                Err(ChunkedPipelineError::FlushRequired) => {
+                    retries += 1;
+                    let output = pipeline.flush(&mut state);
+                    flushed_bytes = flushed_bytes.saturating_add(output.input_bytes);
+                    flushes += 1;
+                    parser_decisions.push(format!("retry_flush:{}", output.input_bytes));
+                    runtime_async::task::yield_now().await;
+                    yields += 1;
+                    continue;
+                }
+                Err(err) => panic!("unexpected scan-pipeline error for seed {seed_name}: {err}"),
+            }
+
+            if state.should_flush() {
+                let output = pipeline.flush(&mut state);
+                flushed_bytes = flushed_bytes.saturating_add(output.input_bytes);
+                flushes += 1;
+                parser_decisions.push(format!("flush:{}", output.input_bytes));
+            }
+
+            runtime_async::task::yield_now().await;
+            yields += 1;
+        }
+
+        let final_output = pipeline.flush(&mut state);
+        flushed_bytes = flushed_bytes.saturating_add(final_output.input_bytes);
+        if final_output.input_bytes > 0 {
+            flushes += 1;
+            parser_decisions.push(format!("final_flush:{}", final_output.input_bytes));
+        }
+
+        LivenessReceipt {
+            seed_name,
+            input_bytes: seed.len(),
+            buffer_limit,
+            processed_bytes,
+            flushed_bytes,
+            flushes,
+            retries,
+            yields,
+            elapsed_ms: start.elapsed().as_millis(),
+            parser_decisions,
+        }
+    }
+
+    #[test]
+    fn terminal_protocol_backpressure_liveness_receipts_ft_aawoe() {
+        let mut unterminated_csi = Vec::with_capacity(258);
+        unterminated_csi.extend_from_slice(b"\x1b[");
+        for _ in 0..128 {
+            unterminated_csi.extend_from_slice(b"0;");
+        }
+
+        let mut split_osc = Vec::new();
+        split_osc.extend_from_slice(b"\x1b]0;window-title");
+        split_osc.extend_from_slice(&[0xff, 0xfe, 0x80, b'\n']);
+        split_osc.extend_from_slice(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+
+        let seeds: &[(&str, &[u8], usize, &[usize])] = &[
+            (
+                "esc-flood",
+                b"\x1b\x1b\x1b\x1b\x1b\x1bERROR\x1b[31mwarning\x1b",
+                8,
+                &[1, 2, 3],
+            ),
+            (
+                "invalid-utf8-sgr",
+                b"\xc0\xaf\x1b[38;2;255;0;128mFAIL\x1b[0m\xf0\x9f\x1b[31m",
+                11,
+                &[5, 1, 8, 2],
+            ),
+            ("unterminated-csi", &unterminated_csi, 13, &[7, 1, 16, 3]),
+            ("split-osc", &split_osc, 17, &[4, 9, 2, 11]),
+        ];
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime_async current-thread runtime");
+
+        for (seed_name, seed, buffer_limit, chunk_pattern) in seeds {
+            let receipt = runtime.block_on(async {
+                runtime_async::timeout(
+                    Duration::from_millis(250),
+                    drive_terminal_seed_with_backpressure_receipt(
+                        seed_name,
+                        seed,
+                        *buffer_limit,
+                        chunk_pattern,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "ft-aawoe: runtime_async timeout while scanning seed={seed_name} len={} err={err}",
+                        seed.len()
+                    )
+                })
+            });
+            receipt.emit();
+            assert_eq!(
+                receipt.processed_bytes, receipt.input_bytes,
+                "ft-aawoe: liveness driver must consume every byte for seed {}",
+                receipt.seed_name
+            );
+            assert_eq!(
+                receipt.flushed_bytes, receipt.input_bytes as u64,
+                "ft-aawoe: flush accounting must equal consumed bytes for seed {}",
+                receipt.seed_name
+            );
+            assert!(
+                receipt.flushes > 0,
+                "ft-aawoe: seed {} should exercise backpressure flush path",
+                receipt.seed_name
+            );
+            assert!(
+                receipt.yields >= receipt.flushes,
+                "ft-aawoe: runtime_async yield checkpoints should accompany scan progress"
+            );
+        }
     }
 
     /// Validate all fuzz corpus seeds don't panic and produce sane output.
