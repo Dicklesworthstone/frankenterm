@@ -2,9 +2,11 @@
 # Clean stale build artifact dirs older than N hours.
 #
 # Usage:
-#   clean-stale-targets.sh [hours]            (default: 12)
-#   clean-stale-targets.sh --dry-run [hours]  (no deletions; reports would-remove)
-#   DRY_RUN=1 clean-stale-targets.sh [hours]  (env-var form of --dry-run)
+#   clean-stale-targets.sh [hours]                                  (default: 12)
+#   clean-stale-targets.sh --dry-run [hours]                        (no deletions; reports would-remove)
+#   clean-stale-targets.sh --dry-run --threshold-hours <hours>      (documented runbook form)
+#   clean-stale-targets.sh --dry-run --threshold-hours=<hours>      (equals form)
+#   DRY_RUN=1 clean-stale-targets.sh [hours]                        (env-var form of --dry-run)
 #
 # Override target glob for tests:
 #   TARGET_GLOB='/tmp/clean-stale-test-XXXX/ft-*-target' clean-stale-targets.sh ...
@@ -130,9 +132,32 @@ active_usage() {
 
 dry_run=0
 hours=""
-for arg in "$@"; do
+set_hours() {
+  local value="$1"
+  local source="$2"
+  if [ -n "$hours" ]; then
+    echo "threshold hours specified more than once: $source" >&2
+    exit 2
+  fi
+  hours="$value"
+}
+
+while [ "$#" -gt 0 ]; do
+  arg="$1"
+  shift
   case "$arg" in
     --dry-run) dry_run=1 ;;
+    --threshold-hours)
+      if [ "$#" -eq 0 ] || [[ "$1" == --* ]]; then
+        echo "missing value for --threshold-hours" >&2
+        exit 2
+      fi
+      set_hours "$1" "--threshold-hours"
+      shift
+      ;;
+    --threshold-hours=*)
+      set_hours "${arg#--threshold-hours=}" "--threshold-hours"
+      ;;
     -h|--help)
       sed -n '2,/^$/p' "$0"
       exit 0
@@ -142,11 +167,7 @@ for arg in "$@"; do
       exit 2
       ;;
     *)
-      if [ -n "$hours" ]; then
-        echo "unexpected extra arg: $arg" >&2
-        exit 2
-      fi
-      hours="$arg"
+      set_hours "$arg" "positional hours"
       ;;
   esac
 done

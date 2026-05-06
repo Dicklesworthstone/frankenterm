@@ -247,6 +247,54 @@ count_remaining() {
     [[ "$output" == *"would have cleaned 1"* ]]
 }
 
+@test "--threshold-hours accepts documented runbook dry-run form" {
+    make_target "ft-stale-target" 1500 >/dev/null
+    make_target "ft-fresh-target" 30 >/dev/null
+
+    run "$SCRIPT" --dry-run --threshold-hours 12
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[dry-run] would-remove"*"ft-stale-target"* ]]
+    [[ "$output" != *"ft-fresh-target"* ]]
+    [[ "$output" == *"cleaned 0 dirs (would have cleaned 1, skipped 0)"* ]]
+    [ "$(count_remaining)" -eq 2 ]
+}
+
+@test "--threshold-hours accepts equals form" {
+    make_target "ft-stale-target" 1500 >/dev/null
+
+    run "$SCRIPT" --dry-run --threshold-hours=12
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[dry-run] would-remove"*"ft-stale-target"* ]]
+    [[ "$output" == *"would have cleaned 1"* ]]
+    [ "$(count_remaining)" -eq 1 ]
+}
+
+@test "--threshold-hours missing value rejects" {
+    run "$SCRIPT" --dry-run --threshold-hours
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"missing value for --threshold-hours"* ]]
+
+    run "$SCRIPT" --threshold-hours --dry-run
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"missing value for --threshold-hours"* ]]
+}
+
+@test "--threshold-hours non-numeric value rejects" {
+    run "$SCRIPT" --threshold-hours abc
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"hours must be a non-negative integer"* ]]
+}
+
+@test "--threshold-hours rejects duplicate threshold values" {
+    run "$SCRIPT" --threshold-hours 12 24
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"threshold hours specified more than once"* ]]
+
+    run "$SCRIPT" 12 --threshold-hours 24
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"threshold hours specified more than once"* ]]
+}
+
 @test "race: dir disappears between scan and remove → script still exits 0" {
     d="$(make_target "ft-race-target" 1500)"
 
