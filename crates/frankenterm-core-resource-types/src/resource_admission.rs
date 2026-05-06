@@ -49,6 +49,8 @@ pub enum ResourcePlacementReasonCode {
     MissingHostCapacity,
     /// A workload request has no usable CPU or memory requirement.
     MissingRequestCapacity,
+    /// Planner configuration is invalid, so admission fails closed.
+    InvalidPlannerConfig,
     /// Numeric telemetry was non-finite and was treated as unsafe.
     NonFiniteTelemetry,
     /// CPU lane utilization would exceed the admission limit.
@@ -268,6 +270,23 @@ pub struct ResourcePlacementPlan {
     pub counters: ResourcePlacementCounters,
 }
 
+/// Operator-facing aggregate summary for a placement plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePlacementPlanSummary {
+    /// Planner policy version.
+    pub planner_version: u32,
+    /// Number of requests considered.
+    pub total_requests: u64,
+    /// Most restrictive action in the plan.
+    pub highest_action: ResourcePlacementAction,
+    /// Unique reason codes across all decisions, in first-observed order.
+    pub reason_codes: Vec<ResourcePlacementReasonCode>,
+    /// Aggregate action counters.
+    pub counters: ResourcePlacementCounters,
+    /// Compact operator-facing summary, suitable for Robot/MCP output.
+    pub operator_summary: String,
+}
+
 impl ResourcePlacementPlan {
     /// Find a decision by request id.
     #[must_use]
@@ -275,6 +294,34 @@ impl ResourcePlacementPlan {
         self.decisions
             .iter()
             .find(|decision| decision.request_id == request_id)
+    }
+
+    /// Summarize the plan without requiring operators to inspect every decision.
+    #[must_use]
+    pub fn summary(&self) -> ResourcePlacementPlanSummary {
+        let mut highest_action = ResourcePlacementAction::Admit;
+        let mut reason_codes = Vec::new();
+
+        for decision in &self.decisions {
+            highest_action = highest_action.max(decision.action);
+            for reason in &decision.reason_codes {
+                push_reason(&mut reason_codes, *reason);
+            }
+        }
+
+        if reason_codes.is_empty() {
+            push_reason(&mut reason_codes, ResourcePlacementReasonCode::Healthy);
+        }
+
+        let operator_summary = operator_summary(highest_action, &reason_codes);
+        ResourcePlacementPlanSummary {
+            planner_version: self.planner_version,
+            total_requests: saturating_usize_to_u64(self.decisions.len()),
+            highest_action,
+            reason_codes,
+            counters: self.counters,
+            operator_summary,
+        }
     }
 }
 
@@ -386,6 +433,10 @@ impl ResourceAwarePlacementPlanner {
         host: &HighCoreHostResourceSnapshot,
         requests: &[SwarmWorkloadRequest],
     ) -> ResourcePlacementPlan {
+        if let Err(error) = self.config.validate() {
+            return invalid_config_plan(host, requests, &error);
+        }
+
         let mut ordered = requests.to_vec();
         ordered.sort_by(|left, right| {
             left.work_priority
@@ -400,7 +451,8 @@ impl ResourceAwarePlacementPlanner {
         let mut decisions = Vec::with_capacity(ordered.len());
 
         for (rank, request) in ordered.iter().enumerate() {
-            let decision = self.evaluate_one(host, request, rank + 1, cpu_lanes_used, memory_reserved);
+            let decision =
+                self.evaluate_one(host, request, rank + 1, cpu_lanes_used, memory_reserved);
             if matches!(
                 decision.action,
                 ResourcePlacementAction::Admit | ResourcePlacementAction::DegradeCaptureTier
@@ -432,7 +484,10 @@ impl ResourceAwarePlacementPlanner {
         let mut action = ResourcePlacementAction::Admit;
 
         if host.logical_cpu_count == 0 || host.total_memory_bytes == 0 {
-            push_reason(&mut reasons, ResourcePlacementReasonCode::MissingHostCapacity);
+            push_reason(
+                &mut reasons,
+                ResourcePlacementReasonCode::MissingHostCapacity,
+            );
             action = action.max(ResourcePlacementAction::Shed);
         }
         if request.requested_cpu_lanes == 0 || request.requested_memory_bytes == 0 {
@@ -443,8 +498,10 @@ impl ResourceAwarePlacementPlanner {
             action = action.max(ResourcePlacementAction::Shed);
         }
 
-        let predicted_cpu_utilization =
-            utilization(cpu_lanes_used.saturating_add(request.requested_cpu_lanes), host.logical_cpu_count);
+        let predicted_cpu_utilization = utilization(
+            cpu_lanes_used.saturating_add(request.requested_cpu_lanes),
+            host.logical_cpu_count,
+        );
         let predicted_memory_utilization = utilization_u64(
             memory_reserved.saturating_add(request.requested_memory_bytes),
             host.total_memory_bytes,
@@ -471,7 +528,7 @@ impl ResourceAwarePlacementPlanner {
             });
         }
 
-        action = self.apply_pressure_ratio(
+        action = Self::apply_pressure_ratio(
             action,
             &mut reasons,
             host.storage_io_utilization,
@@ -479,7 +536,7 @@ impl ResourceAwarePlacementPlanner {
             ResourcePlacementReasonCode::StorageIoPressure,
             ResourcePlacementAction::Delay,
         );
-        action = self.apply_pressure_ratio(
+        action = Self::apply_pressure_ratio(
             action,
             &mut reasons,
             host.capture_backlog_ratio,
@@ -487,7 +544,7 @@ impl ResourceAwarePlacementPlanner {
             ResourcePlacementReasonCode::CaptureBacklogPressure,
             degraded_or_delayed(request),
         );
-        action = self.apply_pressure_ratio(
+        action = Self::apply_pressure_ratio(
             action,
             &mut reasons,
             host.indexing_backlog_ratio,
@@ -495,7 +552,7 @@ impl ResourceAwarePlacementPlanner {
             ResourcePlacementReasonCode::IndexingSaturation,
             degraded_or_delayed(request),
         );
-        action = self.apply_pressure_ratio(
+        action = Self::apply_pressure_ratio(
             action,
             &mut reasons,
             host.event_fanout_utilization,
@@ -503,7 +560,7 @@ impl ResourceAwarePlacementPlanner {
             ResourcePlacementReasonCode::EventFanoutSaturation,
             degraded_or_delayed(request),
         );
-        action = self.apply_pressure_ratio(
+        action = Self::apply_pressure_ratio(
             action,
             &mut reasons,
             host.workflow_queue_utilization,
@@ -511,7 +568,7 @@ impl ResourceAwarePlacementPlanner {
             ResourcePlacementReasonCode::WorkflowQueuePressure,
             ResourcePlacementAction::Delay,
         );
-        action = self.apply_pressure_ratio(
+        action = Self::apply_pressure_ratio(
             action,
             &mut reasons,
             host.policy_queue_utilization,
@@ -578,7 +635,6 @@ impl ResourceAwarePlacementPlanner {
     }
 
     fn apply_pressure_ratio(
-        &self,
         action: ResourcePlacementAction,
         reasons: &mut Vec<ResourcePlacementReasonCode>,
         observed: f64,
@@ -613,6 +669,60 @@ fn utilization_u64(used: u64, total: u64) -> Option<f64> {
     (total > 0).then(|| used as f64 / total as f64)
 }
 
+fn saturating_usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn invalid_config_plan(
+    host: &HighCoreHostResourceSnapshot,
+    requests: &[SwarmWorkloadRequest],
+    error: &str,
+) -> ResourcePlacementPlan {
+    let mut ordered = requests.to_vec();
+    ordered.sort_by(|left, right| {
+        left.work_priority
+            .cmp(&right.work_priority)
+            .then_with(|| right.mission_critical.cmp(&left.mission_critical))
+            .then_with(|| left.stable_id.cmp(&right.stable_id))
+    });
+
+    let mut counters = ResourcePlacementCounters::default();
+    let mut decisions = Vec::with_capacity(ordered.len());
+    let reason_codes = vec![ResourcePlacementReasonCode::InvalidPlannerConfig];
+
+    for (rank, request) in ordered.iter().enumerate() {
+        counters.record(ResourcePlacementAction::Shed);
+        let mut summary = operator_summary(ResourcePlacementAction::Shed, &reason_codes);
+        summary.push_str(";config_error=");
+        summary.push_str(error);
+        decisions.push(ResourcePlacementDecision {
+            request_id: request.stable_id.clone(),
+            rank: rank + 1,
+            action: ResourcePlacementAction::Shed,
+            reason_codes: reason_codes.clone(),
+            placement: None,
+            predicted_cpu_utilization: utilization(
+                host.cpu_lanes_in_use
+                    .saturating_add(request.requested_cpu_lanes),
+                host.logical_cpu_count,
+            ),
+            predicted_memory_utilization: utilization_u64(
+                host.reserved_memory_bytes
+                    .saturating_add(request.requested_memory_bytes),
+                host.total_memory_bytes,
+            ),
+            operator_summary: summary,
+        });
+    }
+
+    ResourcePlacementPlan {
+        planner_version: 1,
+        host: host.clone(),
+        decisions,
+        counters,
+    }
+}
+
 fn degraded_or_delayed(request: &SwarmWorkloadRequest) -> ResourcePlacementAction {
     if request.can_degrade_capture {
         ResourcePlacementAction::DegradeCaptureTier
@@ -630,7 +740,8 @@ fn placement_for(
     let capture_tier = match action {
         ResourcePlacementAction::Admit => CapturePlacementTier::Hot,
         ResourcePlacementAction::DegradeCaptureTier => {
-            if host.backpressure_tier >= BackpressureTier::Red || host.capture_backlog_ratio >= 0.95 {
+            if host.backpressure_tier >= BackpressureTier::Red || host.capture_backlog_ratio >= 0.95
+            {
                 CapturePlacementTier::Deferred
             } else {
                 CapturePlacementTier::WarmCompressed
@@ -699,9 +810,18 @@ mod tests {
         assert_eq!(plan.decisions[0].request_id, "critical");
         assert_eq!(plan.decisions[1].request_id, "important");
         assert_eq!(plan.decisions[2].request_id, "medium");
-        assert_eq!(plan.decisions[0].placement.as_ref().unwrap().cpu_lane_start, 0);
-        assert_eq!(plan.decisions[1].placement.as_ref().unwrap().cpu_lane_start, 8);
-        assert_eq!(plan.decisions[2].placement.as_ref().unwrap().cpu_lane_start, 10);
+        assert_eq!(
+            plan.decisions[0].placement.as_ref().unwrap().cpu_lane_start,
+            0
+        );
+        assert_eq!(
+            plan.decisions[1].placement.as_ref().unwrap().cpu_lane_start,
+            8
+        );
+        assert_eq!(
+            plan.decisions[2].placement.as_ref().unwrap().cpu_lane_start,
+            10
+        );
     }
 
     #[test]
@@ -799,6 +919,41 @@ mod tests {
     }
 
     #[test]
+    fn plan_summary_folds_highest_action_counters_and_unique_reasons() {
+        let planner = ResourceAwarePlacementPlanner::default();
+        let mut host = host_64c_256gib();
+        host.capture_backlog_ratio = 0.90;
+
+        let plan = planner.plan(
+            &host,
+            &[
+                request("capture", 2, 4),
+                request("approval", 2, 4).requires_approval(),
+            ],
+        );
+        let summary = plan.summary();
+
+        assert_eq!(summary.total_requests, 2);
+        assert_eq!(
+            summary.highest_action,
+            ResourcePlacementAction::RequireApproval
+        );
+        assert_eq!(summary.counters.degraded, 1);
+        assert_eq!(summary.counters.approval_required, 1);
+        assert!(
+            summary
+                .reason_codes
+                .contains(&ResourcePlacementReasonCode::CaptureBacklogPressure)
+        );
+        assert!(
+            summary
+                .reason_codes
+                .contains(&ResourcePlacementReasonCode::PolicyApprovalRequired)
+        );
+        assert!(summary.operator_summary.contains("RequireApproval"));
+    }
+
+    #[test]
     fn mission_critical_work_is_delayed_not_shed_under_black_backpressure() {
         let planner = ResourceAwarePlacementPlanner::default();
         let mut host = host_64c_256gib();
@@ -850,6 +1005,45 @@ mod tests {
                 .reason_codes
                 .contains(&ResourcePlacementReasonCode::NonFiniteTelemetry)
         );
+    }
+
+    #[test]
+    fn invalid_planner_config_fails_closed_for_all_requests() {
+        let config = ResourcePlacementPlannerConfig {
+            max_cpu_utilization: f64::NAN,
+            ..ResourcePlacementPlannerConfig::default()
+        };
+        let planner = ResourceAwarePlacementPlanner::new(config);
+
+        let plan = planner.plan(
+            &host_64c_256gib(),
+            &[
+                request("background", 2, 4),
+                request("mission", 2, 4).mission_critical(),
+            ],
+        );
+        let summary = plan.summary();
+
+        assert_eq!(plan.counters.shed, 2);
+        assert_eq!(summary.highest_action, ResourcePlacementAction::Shed);
+        assert_eq!(summary.counters.shed, 2);
+        assert!(
+            summary
+                .reason_codes
+                .contains(&ResourcePlacementReasonCode::InvalidPlannerConfig)
+        );
+
+        for decision in &plan.decisions {
+            assert_eq!(decision.action, ResourcePlacementAction::Shed);
+            assert!(decision.placement.is_none());
+            assert!(
+                decision
+                    .reason_codes
+                    .contains(&ResourcePlacementReasonCode::InvalidPlannerConfig)
+            );
+            assert!(decision.operator_summary.contains("InvalidPlannerConfig"));
+            assert!(decision.operator_summary.contains("max_cpu_utilization"));
+        }
     }
 
     #[test]
