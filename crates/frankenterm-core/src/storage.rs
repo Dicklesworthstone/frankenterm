@@ -4834,9 +4834,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_events(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_events_backend(backend, &query)
+            })
         })
         .await
     }
@@ -15890,7 +15890,10 @@ fn query_last_activity_by_pane_backend(
     Ok(result)
 }
 
-/// Query events with optional filters
+/// Query events with optional filters.
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_events_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent>> {
     let mut sql = String::from(
         "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
@@ -15996,6 +15999,71 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
     }
 
     Ok(results)
+}
+
+fn query_events_backend(
+    backend: &dyn StorageBackend,
+    query: &EventQuery,
+) -> Result<Vec<StoredEvent>> {
+    let mut sql = String::from(
+        "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+         extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
+         handled_by_workflow_id, handled_status
+         FROM events WHERE 1=1",
+    );
+    let mut params = Vec::new();
+
+    if query.unhandled_only {
+        sql.push_str(" AND handled_at IS NULL");
+    }
+
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(ToSqlValue::Integer(pane_id_i64));
+    }
+
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(ToSqlValue::Text(rule_id.as_str()));
+    }
+
+    if let Some(event_type) = &query.event_type {
+        sql.push_str(" AND event_type = ?");
+        params.push(ToSqlValue::Text(event_type.as_str()));
+    }
+
+    if let Some(triage_state) = &query.triage_state {
+        sql.push_str(" AND triage_state = ?");
+        params.push(ToSqlValue::Text(triage_state.as_str()));
+    }
+
+    if let Some(label) = &query.label {
+        sql.push_str(" AND id IN (SELECT event_id FROM event_labels WHERE label = ?)");
+        params.push(ToSqlValue::Text(label.as_str()));
+    }
+
+    if let Some(since) = query.since {
+        sql.push_str(" AND detected_at >= ?");
+        params.push(ToSqlValue::Integer(since));
+    }
+
+    if let Some(until) = query.until {
+        sql.push_str(" AND detected_at <= ?");
+        params.push(ToSqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY detected_at DESC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(20), "limit")?;
+    params.push(ToSqlValue::Integer(limit_i64));
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query events", err))?;
+
+    rows.iter()
+        .map(|row| stored_event_from_backend_cells(row))
+        .collect()
 }
 
 /// Query events in deterministic ID order with cursor-based resume.
@@ -19824,8 +19892,9 @@ fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
 }
 
 /// ft-xbnl0.2.3 Cx-first: tick 146 event-reads cluster —
-/// 5 new storage cx-first siblings exercised end-to-end:
-/// `get_unhandled_events_with_cx`, `get_events_stream_with_cx`,
+/// 6 storage cx-first siblings exercised end-to-end:
+/// `get_unhandled_events_with_cx`, `get_events_with_cx`,
+/// `get_events_stream_with_cx`,
 /// `get_timeline_with_cx`, `count_unhandled_events_by_pane_with_cx`,
 /// `get_last_activity_by_pane_with_cx`.
 #[test]
@@ -19883,7 +19952,56 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
             "seeded event should show up in unhandled list"
         );
 
-        // 2. get_events_stream_with_cx — ID-cursor ordering, no filter.
+        assert!(
+            storage
+                .set_event_triage_state_with_cx(
+                    &cx,
+                    event_id,
+                    Some("investigating".to_string()),
+                    Some("tick146".to_string()),
+                )
+                .await
+                .unwrap(),
+            "seeded event should accept a triage state"
+        );
+        assert!(
+            storage
+                .add_event_label_with_cx(
+                    &cx,
+                    event_id,
+                    "tick146-label".to_string(),
+                    Some("tick146".to_string()),
+                )
+                .await
+                .unwrap(),
+            "seeded event should accept a label"
+        );
+
+        // 2. get_events_with_cx — filtered event query path.
+        let filtered_events = storage
+            .get_events_with_cx(
+                &cx,
+                EventQuery {
+                    limit: Some(10),
+                    pane_id: Some(41),
+                    rule_id: Some("rule-tick146".to_string()),
+                    event_type: Some("pattern".to_string()),
+                    triage_state: Some("investigating".to_string()),
+                    label: Some("tick146-label".to_string()),
+                    unhandled_only: true,
+                    since: Some(1_699_999_999_999),
+                    until: Some(1_700_000_000_001),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered_events.iter().filter(|e| e.id == event_id).count(),
+            1,
+            "filtered event query should return the seeded event exactly once"
+        );
+
+        // 3. get_events_stream_with_cx — ID-cursor ordering, no filter.
         let streamed = storage
             .get_events_stream_with_cx(
                 &cx,
@@ -19904,7 +20022,7 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
             .unwrap();
         assert!(streamed.iter().any(|e| e.id == event_id));
 
-        // 3. get_timeline_with_cx — lenient query, should include our event.
+        // 4. get_timeline_with_cx — lenient query, should include our event.
         let timeline = storage
             .get_timeline_with_cx(
                 &cx,
@@ -19958,14 +20076,14 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
             "large pane-id filter should include the staged pane id"
         );
 
-        // 4. count_unhandled_events_by_pane_with_cx
+        // 5. count_unhandled_events_by_pane_with_cx
         let counts = storage
             .count_unhandled_events_by_pane_with_cx(&cx)
             .await
             .unwrap();
         assert_eq!(counts.get(&41), Some(&1));
 
-        // 5. count_events_by_tier_with_cx
+        // 6. count_events_by_tier_with_cx
         let severities = vec!["info".to_string()];
         let event_types = vec!["pattern".to_string()];
         let tier_count = storage
@@ -19980,7 +20098,7 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
             .unwrap();
         assert_eq!(tier_count, 1);
 
-        // 6. get_last_activity_by_pane_with_cx — no segments recorded, so
+        // 7. get_last_activity_by_pane_with_cx — no segments recorded, so
         //    the map may not include pane 41. Just assert the call succeeds.
         let _activity = storage
             .get_last_activity_by_pane_with_cx(&cx)
