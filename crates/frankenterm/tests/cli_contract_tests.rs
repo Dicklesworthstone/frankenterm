@@ -20,6 +20,8 @@ use frankenterm_core::scrollback_mmap_format::{FormatVersion, HeaderFlags, Scrol
 use predicates::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
@@ -33,12 +35,28 @@ fn setup_workspace() -> (TempDir, String) {
     let dir = TempDir::new().expect("create temp dir");
     let ft_dir = dir.path().join(".ft");
     std::fs::create_dir_all(&ft_dir).expect("create .ft dir");
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&ft_dir)
+            .expect("read .ft dir metadata")
+            .permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&ft_dir, perms).expect("harden .ft dir permissions");
+    }
 
     // Initialize database with schema
     let db_path = ft_dir.join("ft.db");
     let conn = rusqlite::Connection::open(&db_path).expect("open DB");
     frankenterm_core::storage::initialize_schema(&conn).expect("init schema");
     drop(conn);
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&db_path)
+            .expect("read ft.db metadata")
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&db_path, perms).expect("harden ft.db permissions");
+    }
 
     let ws = dir.path().to_string_lossy().to_string();
     (dir, ws)
@@ -337,6 +355,95 @@ fn run_wa_json(workspace: &str, args: &[&str]) -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON")
+}
+
+struct ControlPlaneReceipt {
+    args: Vec<String>,
+    workspace: String,
+    data_dir: String,
+    fixture_seed: String,
+    cleanup_expectation: &'static str,
+    status_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl ControlPlaneReceipt {
+    fn command(&self) -> String {
+        format!("ft {}", self.args.join(" "))
+    }
+
+    fn diagnostic(&self) -> String {
+        format!(
+            "command: {}\nstatus: {:?}\nworkspace: {}\ndata_dir: {}\nfixture_seed: {}\ncleanup: {}\nstdout:\n{}\nstderr:\n{}",
+            self.command(),
+            self.status_code,
+            self.workspace,
+            self.data_dir,
+            self.fixture_seed,
+            self.cleanup_expectation,
+            self.stdout,
+            self.stderr
+        )
+    }
+
+    fn emit(&self, normalized_response: &serde_json::Value) {
+        eprintln!(
+            "control-plane receipt\n{}\nnormalized_response:\n{}",
+            self.diagnostic(),
+            serde_json::to_string_pretty(normalized_response)
+                .expect("normalized response should serialize")
+        );
+    }
+
+    fn stdout_json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.stdout).unwrap_or_else(|err| {
+            panic!("stdout should be JSON: {err}\n{}", self.diagnostic());
+        })
+    }
+
+    fn assert_success(&self) {
+        assert_eq!(self.status_code, Some(0), "{}", self.diagnostic());
+    }
+}
+
+fn run_control_plane_receipt(
+    workspace: &str,
+    args: &[&str],
+    fixture_seed: &str,
+    cleanup_expectation: &'static str,
+) -> ControlPlaneReceipt {
+    let output = wa_cmd_for(workspace)
+        .args(args)
+        .output()
+        .expect("ft command should execute");
+    ControlPlaneReceipt {
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        workspace: workspace.to_string(),
+        data_dir: std::path::Path::new(workspace)
+            .join(".ft")
+            .display()
+            .to_string(),
+        fixture_seed: fixture_seed.to_string(),
+        cleanup_expectation,
+        status_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn assert_receipt_json_eq(
+    receipt: &ControlPlaneReceipt,
+    label: &str,
+    actual: serde_json::Value,
+    expected: serde_json::Value,
+) {
+    assert_eq!(
+        actual,
+        expected,
+        "{label} mismatch\nexpected: {expected}\nactual: {actual}\n{}",
+        receipt.diagnostic()
+    );
 }
 
 fn resize_baseline_fixture_path(file_name: &str) -> std::path::PathBuf {
@@ -2166,6 +2273,115 @@ fn contract_robot_tx_plan_json_envelope() {
     assert_eq!(data["precondition_count"].as_u64(), Some(1));
     assert_eq!(data["compensation_count"].as_u64(), Some(3));
     assert_tx_transition_contract_shape(&data["legal_transitions"]);
+}
+
+#[test]
+fn contract_no_mock_control_plane_receipts_cover_read_and_policy_gated_robot_paths() {
+    let (dir, ws) = setup_workspace();
+    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let cleanup_expectation =
+        "TempDir guard owns isolated workspace cleanup; no repository files are removed.";
+
+    let read_receipt = run_control_plane_receipt(
+        &ws,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "show",
+            "--include-contract",
+        ],
+        "ft-m5y5u:tx-contract-read:v1",
+        cleanup_expectation,
+    );
+    read_receipt.assert_success();
+    let read_payload = read_receipt.stdout_json();
+    read_receipt.emit(&read_payload);
+    assert_receipt_json_eq(
+        &read_receipt,
+        "robot tx show ok",
+        read_payload["ok"].clone(),
+        serde_json::json!(true),
+    );
+
+    let read_data = &read_payload["data"];
+    assert_receipt_json_eq(
+        &read_receipt,
+        "robot tx show contract_file",
+        read_data["contract_file"].clone(),
+        serde_json::json!(contract_path.to_string_lossy()),
+    );
+    assert_receipt_json_eq(
+        &read_receipt,
+        "robot tx show tx_id",
+        read_data["tx_id"].clone(),
+        serde_json::json!("tx:test"),
+    );
+    assert!(
+        read_data["contract"].is_object(),
+        "read path should include the real serialized tx contract\n{}",
+        read_receipt.diagnostic()
+    );
+
+    let send_receipt = run_control_plane_receipt(
+        &ws,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "send",
+            "5252",
+            "conformance-ok",
+            "--dry-run",
+        ],
+        "ft-m5y5u:robot-send-dry-run:v1",
+        cleanup_expectation,
+    );
+    send_receipt.assert_success();
+    let send_payload = send_receipt.stdout_json();
+    send_receipt.emit(&send_payload);
+    assert_receipt_json_eq(
+        &send_receipt,
+        "robot send dry-run ok",
+        send_payload["ok"].clone(),
+        serde_json::json!(true),
+    );
+
+    let send_data = &send_payload["data"];
+    let expected_actions = send_data["expected_actions"].as_array().unwrap_or_else(|| {
+        panic!(
+            "expected_actions should be an array\n{}",
+            send_receipt.diagnostic()
+        )
+    });
+    assert!(
+        expected_actions
+            .iter()
+            .any(|action| action["action_type"] == "send_text"),
+        "dry-run send must expose the policy-gated SendText action\n{}",
+        send_receipt.diagnostic()
+    );
+
+    let checks = send_data["policy_evaluation"]["checks"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "policy checks should be an array\n{}",
+                send_receipt.diagnostic()
+            )
+        });
+    assert!(
+        checks.iter().any(|check| check["name"] == "policy_surface"),
+        "dry-run send must log policy surface evaluation\n{}",
+        send_receipt.diagnostic()
+    );
+    assert_receipt_json_eq(
+        &send_receipt,
+        "robot send dry-run target pane",
+        send_data["target_resolution"]["pane_id"].clone(),
+        serde_json::json!(5252),
+    );
 }
 
 #[test]
