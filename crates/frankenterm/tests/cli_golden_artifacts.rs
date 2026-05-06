@@ -11,10 +11,15 @@
 //! ```
 
 use assert_cmd::Command;
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::storage::{FtsSyncConfig, PaneRecord, StorageHandle};
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+const INCIDENT_SECRET: &str = "sk-abc123456789012345678901234567890123456789012345678901";
+const INCIDENT_PANE_ID: u64 = 4_242;
 
 fn setup_workspace() -> (TempDir, String) {
     let dir = TempDir::new().expect("create temp dir");
@@ -118,6 +123,12 @@ fn pretty_canonical_json(value: &Value) -> String {
     serde_json::to_string_pretty(&canonicalize(value)).expect("serialize canonical JSON")
 }
 
+fn canonical_response_value(value: &Value) -> Value {
+    let mut scrubbed = value.clone();
+    scrub_dynamic(&mut scrubbed, None);
+    canonicalize(&scrubbed)
+}
+
 fn canonical_toon(value: &Value) -> String {
     toon_rust::encode(canonicalize(value), None)
 }
@@ -173,6 +184,32 @@ if [ "${1:-}" = "cli" ] && [ "${2:-}" = "list" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "cli" ] && [ "${2:-}" = "get-text" ]; then
+  pane_id=""
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --pane-id)
+        pane_id="${2:-}"
+        shift 2
+        ;;
+      --escapes)
+        shift
+        ;;
+      *)
+        echo "unsupported get-text args: $*" >&2
+        exit 64
+        ;;
+    esac
+  done
+  if [ -z "$pane_id" ]; then
+    echo "missing --pane-id" >&2
+    exit 64
+  fi
+  cat "$FT_TEST_WEZTERM_TEXT_DIR/$pane_id.txt"
+  exit 0
+fi
+
 echo "unsupported wezterm stub invocation: $*" >&2
 exit 64
 "#;
@@ -185,6 +222,83 @@ exit 64
         fs::set_permissions(&path, perms).expect("chmod stub");
     }
     path
+}
+
+fn runtime() -> frankenterm_core::runtime_async::Runtime {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime")
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |dur| i64::try_from(dur.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn pane_record(pane_id: u64, ts: i64) -> PaneRecord {
+    PaneRecord {
+        pane_id,
+        pane_uuid: None,
+        domain: "local".to_string(),
+        window_id: Some(3),
+        tab_id: Some(7),
+        title: Some("incident-robot".to_string()),
+        cwd: Some("file:///tmp/ft-incident-robot".to_string()),
+        tty_name: None,
+        first_seen_at: ts,
+        last_seen_at: ts,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    }
+}
+
+fn seed_robot_search_segment(workspace: &str, pane_id: u64, text: &str) {
+    let db_path = Path::new(workspace).join(".ft").join("ft.db");
+    let db_path_string = db_path.to_string_lossy().to_string();
+    let text = text.to_string();
+    runtime().block_on(async move {
+        let storage = StorageHandle::new(&db_path_string)
+            .await
+            .expect("open robot search storage");
+        storage
+            .upsert_pane(pane_record(pane_id, now_ms()))
+            .await
+            .expect("upsert robot incident pane");
+        storage
+            .append_segment(pane_id, &text, None)
+            .await
+            .expect("append robot incident segment");
+        storage
+            .rebuild_fts(FtsSyncConfig::default())
+            .await
+            .expect("rebuild robot incident FTS fixture");
+        storage.shutdown().await.expect("shutdown robot storage");
+    });
+}
+
+fn log_incident_drill_case(case: Value) {
+    eprintln!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema": "ft.hp70k.incident_drill.v1",
+            "case": case,
+        }))
+        .expect("serialize incident drill log")
+    );
+}
+
+fn assert_robot_response_redacted(case_id: &str, response: &Value) {
+    let rendered = serde_json::to_string(response).expect("serialize robot response");
+    assert!(
+        !rendered.contains(INCIDENT_SECRET),
+        "{case_id} leaked raw secret in response: {rendered}"
+    );
+    assert!(
+        rendered.contains("[REDACTED"),
+        "{case_id} should include a redaction marker: {rendered}"
+    );
 }
 
 fn run_robot_state_toon(case_name: &str, fixture_name: &str) -> String {
@@ -384,6 +498,105 @@ fn robot_state_redacts_title_and_cwd_secrets() {
         actual.contains("[REDACTED]"),
         "robot state output should include redaction marker: {actual}"
     );
+}
+
+#[test]
+fn robot_get_text_and_search_redact_incident_secrets() {
+    let (dir, workspace) = setup_workspace();
+    let stub_path = write_wezterm_stub(&dir);
+    let text_dir = dir.path().join("texts");
+    fs::create_dir_all(&text_dir).expect("create robot incident text dir");
+    fs::write(
+        text_dir.join(format!("{INCIDENT_PANE_ID}.txt")),
+        format!("incident alpha\nOPENAI_API_KEY={INCIDENT_SECRET}\nomega\n"),
+    )
+    .expect("write robot incident pane text");
+
+    let panes = serde_json::json!([
+        {
+            "pane_id": INCIDENT_PANE_ID,
+            "tab_id": 7,
+            "window_id": 3,
+            "domain_name": "local",
+            "title": "incident-robot",
+            "cwd": "file:///tmp/ft-incident-robot"
+        }
+    ]);
+    let wezterm_json = dir.path().join("incident_panes.json");
+    fs::write(
+        &wezterm_json,
+        serde_json::to_string_pretty(&panes).expect("serialize incident panes"),
+    )
+    .expect("write incident panes fixture");
+    seed_robot_search_segment(
+        &workspace,
+        INCIDENT_PANE_ID,
+        &format!("incident search OPENAI_API_KEY={INCIDENT_SECRET} stable"),
+    );
+
+    let get_text_command = [
+        "robot", "--format", "json", "get-text", "4242", "--tail", "10",
+    ];
+    let get_text_stdout = Command::cargo_bin("ft")
+        .expect("locate ft binary")
+        .env("FT_WORKSPACE", &workspace)
+        .env("FT_WEZTERM_CLI", &stub_path)
+        .env("FT_TEST_WEZTERM_LIST_JSON", &wezterm_json)
+        .env("FT_TEST_WEZTERM_TEXT_DIR", &text_dir)
+        .args(get_text_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let get_text_response: Value =
+        serde_json::from_slice(&get_text_stdout).expect("parse robot get-text JSON");
+    assert_eq!(get_text_response["ok"], true);
+    assert_robot_response_redacted("robot.get_text.redaction", &get_text_response);
+    log_incident_drill_case(serde_json::json!({
+        "id": "robot.get_text.redaction",
+        "command": get_text_command,
+        "redaction_tier": "secret-redactor",
+        "policy_decision": "allow",
+        "audit_row_id": Value::Null,
+        "normalized_response": canonical_response_value(&get_text_response),
+    }));
+
+    let search_command = [
+        "robot",
+        "--format",
+        "json",
+        "search",
+        "incident",
+        "--pane",
+        "4242",
+        "--limit",
+        "5",
+        "--snippets=false",
+        "--mode",
+        "lexical",
+    ];
+    let search_stdout = Command::cargo_bin("ft")
+        .expect("locate ft binary")
+        .env("FT_WORKSPACE", &workspace)
+        .args(search_command)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let search_response: Value =
+        serde_json::from_slice(&search_stdout).expect("parse robot search JSON");
+    assert_eq!(search_response["ok"], true);
+    assert_robot_response_redacted("robot.search.redaction", &search_response);
+    log_incident_drill_case(serde_json::json!({
+        "id": "robot.search.redaction",
+        "command": search_command,
+        "redaction_tier": "secret-redactor",
+        "policy_decision": "allow",
+        "audit_row_id": Value::Null,
+        "normalized_response": canonical_response_value(&search_response),
+    }));
 }
 
 #[test]

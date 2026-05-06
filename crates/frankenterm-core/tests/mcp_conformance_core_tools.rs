@@ -1,13 +1,15 @@
 #![cfg(feature = "mcp")]
 
-use frankenterm_core::config::Config;
+use frankenterm_core::config::{
+    Config, PolicyRule, PolicyRuleDecision, PolicyRuleMatch, PolicyRulesConfig,
+};
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
     framework_create_memory_transport_pair,
 };
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
-use frankenterm_core::storage::{PaneRecord, StorageHandle};
+use frankenterm_core::storage::{FtsSyncConfig, PaneRecord, SearchOptions, StorageHandle};
 use frankenterm_core::wezterm::set_wezterm_cli_override;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -20,6 +22,7 @@ use tempfile::TempDir;
 
 struct TestHarness {
     client: FrameworkTestClient,
+    db_path: PathBuf,
     // Struct fields drop in declaration order: reset the global override before
     // removing its fake CLI tempdir, then release the process-wide env lock last.
     _override_guard: WeztermCliOverrideGuard,
@@ -27,6 +30,20 @@ struct TestHarness {
     _workspace: TempDir,
     _env_lock: MutexGuard<'static, ()>,
 }
+
+#[derive(Debug)]
+struct PolicyDeniedAuditRow {
+    id: i64,
+    tool_name: String,
+    decision: String,
+    reason_code: String,
+    reason: String,
+    rule_id: Option<String>,
+}
+
+const INCIDENT_SECRET: &str = "sk-abc123456789012345678901234567890123456789012345678901";
+const INCIDENT_GET_TEXT_PANE_ID: u64 = 7_373;
+const INCIDENT_SEARCH_PANE_ID: u64 = 8_484;
 
 #[derive(Serialize)]
 struct ToolGoldenCapture {
@@ -71,6 +88,11 @@ impl FakeWezterm {
             .expect("write fake get_text pane");
         fs::write(text_dir.join("5252.txt"), "prompt> ").expect("write fake send pane");
         fs::write(text_dir.join("6262.txt"), "build ready").expect("write fake wait_for pane");
+        fs::write(
+            text_dir.join(format!("{INCIDENT_GET_TEXT_PANE_ID}.txt")),
+            format!("incident alpha\nOPENAI_API_KEY={INCIDENT_SECRET}\nomega\n"),
+        )
+        .expect("write incident get_text pane");
 
         let cli_path = workspace.path().join("fake-wezterm.py");
         fs::write(&cli_path, fake_wezterm_script(&state_dir)).expect("write fake wezterm cli");
@@ -97,15 +119,20 @@ impl FakeWezterm {
 
 impl TestHarness {
     fn new() -> Self {
+        Self::new_with_config(default_mcp_test_config())
+    }
+
+    fn new_with_config(config: Config) -> Self {
         let env_lock = wezterm_env_lock();
         let fake_wezterm = FakeWezterm::new();
         let override_guard = fake_wezterm.install();
         let workspace = tempfile::tempdir().expect("create conformance workspace");
         let db_path = workspace.path().join("mcp.sqlite3");
         seed_search_db(&db_path);
-        let client = spawn_client(Some(db_path));
+        let client = spawn_client_with_config(config, Some(db_path.clone()));
         Self {
             client,
+            db_path,
             _override_guard: override_guard,
             _fake_wezterm: fake_wezterm,
             _workspace: workspace,
@@ -147,6 +174,22 @@ fn fake_panes() -> Value {
             "domain_name": "local",
             "title": "codex-wait",
             "cwd": "file:///tmp/ft-wait"
+        },
+        {
+            "pane_id": INCIDENT_GET_TEXT_PANE_ID,
+            "tab_id": 1,
+            "window_id": 1,
+            "domain_name": "local",
+            "title": "incident-get-text",
+            "cwd": "file:///tmp/ft-incident-get-text"
+        },
+        {
+            "pane_id": INCIDENT_SEARCH_PANE_ID,
+            "tab_id": 1,
+            "window_id": 1,
+            "domain_name": "local",
+            "title": "incident-search",
+            "cwd": "file:///tmp/ft-incident-search"
         }
     ])
 }
@@ -241,9 +284,44 @@ sys.exit(2)
     )
 }
 
-fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
+fn default_mcp_test_config() -> Config {
     let mut config = Config::default();
     config.safety.require_prompt_active = false;
+    config
+}
+
+fn mcp_policy_test_config(
+    rule_id: &str,
+    action: &str,
+    pane_id: Option<u64>,
+    decision: PolicyRuleDecision,
+    message: &str,
+) -> Config {
+    let mut config = default_mcp_test_config();
+    let mut match_on = PolicyRuleMatch {
+        actions: vec![action.to_string()],
+        actors: vec!["mcp".to_string()],
+        surfaces: vec!["mux".to_string()],
+        ..PolicyRuleMatch::default()
+    };
+    if let Some(pane_id) = pane_id {
+        match_on.pane_ids.push(pane_id);
+    }
+    config.safety.rules = PolicyRulesConfig {
+        enabled: true,
+        rules: vec![PolicyRule {
+            id: rule_id.to_string(),
+            description: Some("ft-hp70k incident drill".to_string()),
+            priority: 0,
+            match_on,
+            decision,
+            message: Some(message.to_string()),
+        }],
+    };
+    config
+}
+
+fn spawn_client_with_config(config: Config, db_path: Option<PathBuf>) -> FrameworkTestClient {
     let server = build_server_with_db(&config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
@@ -298,11 +376,105 @@ fn seed_search_db(db_path: &Path) {
             .await
             .expect("upsert pane");
         storage
+            .upsert_pane(pane(INCIDENT_SEARCH_PANE_ID, now_ms()))
+            .await
+            .expect("upsert incident search pane");
+        storage
             .append_segment(1, "conformance needle stable", None)
             .await
             .expect("append search segment");
+        storage
+            .append_segment(
+                INCIDENT_SEARCH_PANE_ID,
+                &format!("incident search OPENAI_API_KEY={INCIDENT_SECRET} stable"),
+                None,
+            )
+            .await
+            .expect("append incident search segment");
+        storage
+            .rebuild_fts(FtsSyncConfig::default())
+            .await
+            .expect("rebuild incident search FTS fixture");
+        let seeded_segments = storage
+            .get_segments(INCIDENT_SEARCH_PANE_ID, 10)
+            .await
+            .expect("read incident search fixture segments");
+        let seeded_hits = storage
+            .search_with_results(
+                "incident",
+                SearchOptions {
+                    pane_id: Some(INCIDENT_SEARCH_PANE_ID),
+                    include_snippets: Some(false),
+                    include_highlights: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("query incident search FTS fixture");
+        assert!(
+            !seeded_hits.is_empty(),
+            "incident search fixture must be indexed before MCP server starts; segments={seeded_segments:?}"
+        );
         storage.shutdown().await.expect("shutdown storage");
     });
+}
+
+fn policy_denied_audit_rows(db_path: &Path, tool_name: &str) -> Vec<PolicyDeniedAuditRow> {
+    let conn = rusqlite::Connection::open(db_path).expect("open db for policy audit rows");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, tool_name, decision, reason_code, reason, rule_id \
+             FROM policy_denied_audit \
+             WHERE tool_name = ?1 \
+             ORDER BY id",
+        )
+        .expect("prepare policy_denied_audit query");
+    stmt.query_map([tool_name], |row| {
+        Ok(PolicyDeniedAuditRow {
+            id: row.get(0)?,
+            tool_name: row.get(1)?,
+            decision: row.get(2)?,
+            reason_code: row.get(3)?,
+            reason: row.get(4)?,
+            rule_id: row.get(5)?,
+        })
+    })
+    .expect("query policy_denied_audit rows")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("collect policy_denied_audit rows")
+}
+
+fn log_incident_drill_case(case: Value) {
+    eprintln!(
+        "{}",
+        serde_json::to_string(&json!({
+            "schema": "ft.hp70k.incident_drill.v1",
+            "case": case,
+        }))
+        .expect("serialize incident drill log")
+    );
+}
+
+fn assert_response_does_not_leak_secret(case_id: &str, envelope: &Value) {
+    let rendered = serde_json::to_string(envelope).expect("serialize envelope for leak check");
+    assert!(
+        !rendered.contains(INCIDENT_SECRET),
+        "{case_id} leaked raw secret in response: {rendered}"
+    );
+}
+
+fn assert_contains_redaction_marker(case_id: &str, text: &str) {
+    assert!(
+        text.contains("[REDACTED"),
+        "{case_id} should include a redaction marker, got {text:?}"
+    );
+}
+
+fn assert_mcp_policy_error(envelope: &Value, expected_error: &str) {
+    assert_common_envelope_fields(envelope, false);
+    assert!(envelope.get("data").is_none());
+    assert_eq!(envelope["error_code"], "FT-MCP-0006");
+    assert_eq!(envelope["error"], expected_error);
 }
 
 fn tool_input_schema(client: &mut FrameworkTestClient, tool_name: &str) -> Value {
@@ -560,6 +732,179 @@ fn assert_send_success_data(envelope: &Value) {
     );
     assert!(data.get("wait_for").is_none());
     assert!(data.get("verification_error").is_none());
+}
+
+#[test]
+fn mcp_policy_redaction_incident_drill_matrix_covers_core_read_surfaces() {
+    let mut harness = TestHarness::new();
+
+    let get_text_args = json!({
+        "pane_id": INCIDENT_GET_TEXT_PANE_ID,
+        "tail": 10,
+        "format": "json"
+    });
+    let get_text_envelope = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool("wa.get_text", get_text_args.clone())
+            .expect("call wa.get_text incident redaction case"),
+    );
+    assert_success_envelope_shape(&get_text_envelope);
+    assert_response_does_not_leak_secret("mcp.wa_get_text.redaction", &get_text_envelope);
+    let get_text = get_text_envelope["data"]["text"]
+        .as_str()
+        .expect("wa.get_text response text");
+    assert_contains_redaction_marker("mcp.wa_get_text.redaction", get_text);
+    log_incident_drill_case(json!({
+        "id": "mcp.wa_get_text.redaction",
+        "tool": "wa.get_text",
+        "input": get_text_args,
+        "redaction_tier": "secret-redactor",
+        "policy_decision": "allow",
+        "audit_row_id": Value::Null,
+        "normalized_response": canonical_value(&get_text_envelope),
+    }));
+
+    let search_args = json!({
+        "query": "incident",
+        "limit": 5,
+        "pane": INCIDENT_SEARCH_PANE_ID,
+        "since": 0,
+        "until": 4_102_444_800_000_i64,
+        "snippets": false,
+        "mode": "lexical",
+        "format": "json"
+    });
+    let search_envelope = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool("wa.search", search_args.clone())
+            .expect("call wa.search incident redaction case"),
+    );
+    assert_success_envelope_shape(&search_envelope);
+    assert_response_does_not_leak_secret("mcp.wa_search.redaction", &search_envelope);
+    let hits = search_envelope["data"]["results"]
+        .as_array()
+        .expect("wa.search incident results array");
+    assert!(
+        !hits.is_empty(),
+        "wa.search incident query should return at least one hit: {search_envelope}"
+    );
+    let rendered_hits = serde_json::to_string(hits).expect("serialize incident search hits");
+    assert_contains_redaction_marker("mcp.wa_search.redaction", &rendered_hits);
+    log_incident_drill_case(json!({
+        "id": "mcp.wa_search.redaction",
+        "tool": "wa.search",
+        "input": search_args,
+        "redaction_tier": "secret-redactor",
+        "policy_decision": "allow",
+        "audit_row_id": Value::Null,
+        "normalized_response": canonical_value(&search_envelope),
+    }));
+}
+
+#[test]
+fn mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits() {
+    let deny_message = "ft-hp70k denied get-text drill";
+    let mut deny_harness = TestHarness::new_with_config(mcp_policy_test_config(
+        "ft_hp70k_deny_get_text",
+        "read_output",
+        Some(INCIDENT_GET_TEXT_PANE_ID),
+        PolicyRuleDecision::Deny,
+        deny_message,
+    ));
+    let deny_args = json!({
+        "pane_id": INCIDENT_GET_TEXT_PANE_ID,
+        "tail": 10,
+        "format": "json"
+    });
+    let deny_envelope = parse_tool_envelope(
+        &deny_harness
+            .client
+            .call_tool("wa.get_text", deny_args.clone())
+            .expect("call wa.get_text denied incident case"),
+    );
+    assert_mcp_policy_error(&deny_envelope, deny_message);
+    assert_response_does_not_leak_secret("mcp.wa_get_text.policy_denied", &deny_envelope);
+    let deny_rows = policy_denied_audit_rows(&deny_harness.db_path, "wa.get_text");
+    assert_eq!(
+        deny_rows.len(),
+        1,
+        "wa.get_text denial should persist one typed policy audit row"
+    );
+    let deny_row = deny_rows.first().expect("wa.get_text denial row");
+    assert_eq!(deny_row.tool_name, "wa.get_text");
+    assert_eq!(deny_row.decision, "denied");
+    assert_eq!(deny_row.reason_code, "denied");
+    assert_eq!(deny_row.reason, deny_message);
+    assert_eq!(
+        deny_row.rule_id.as_deref(),
+        Some("config.rule.ft_hp70k_deny_get_text")
+    );
+    log_incident_drill_case(json!({
+        "id": "mcp.wa_get_text.policy_denied",
+        "tool": "wa.get_text",
+        "input": deny_args,
+        "redaction_tier": "not-applicable-policy-denied-before-read",
+        "policy_decision": "denied",
+        "audit_row_id": deny_row.id,
+        "normalized_response": canonical_value(&deny_envelope),
+    }));
+
+    let require_message = "ft-hp70k require approval search drill";
+    let mut approval_harness = TestHarness::new_with_config(mcp_policy_test_config(
+        "ft_hp70k_require_search",
+        "search_output",
+        Some(INCIDENT_SEARCH_PANE_ID),
+        PolicyRuleDecision::RequireApproval,
+        require_message,
+    ));
+    let approval_args = json!({
+        "query": "incident",
+        "limit": 5,
+        "pane": INCIDENT_SEARCH_PANE_ID,
+        "snippets": false,
+        "mode": "lexical",
+        "format": "json"
+    });
+    let approval_envelope = parse_tool_envelope(
+        &approval_harness
+            .client
+            .call_tool("wa.search", approval_args.clone())
+            .expect("call wa.search require-approval incident case"),
+    );
+    assert_mcp_policy_error(&approval_envelope, require_message);
+    assert_response_does_not_leak_secret("mcp.wa_search.require_approval", &approval_envelope);
+    assert!(
+        approval_envelope["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("approve")),
+        "require-approval envelope should include an approval hint: {approval_envelope}"
+    );
+    let approval_rows = policy_denied_audit_rows(&approval_harness.db_path, "wa.search");
+    assert_eq!(
+        approval_rows.len(),
+        1,
+        "wa.search require-approval should persist one typed policy audit row"
+    );
+    let approval_row = approval_rows.first().expect("wa.search approval row");
+    assert_eq!(approval_row.tool_name, "wa.search");
+    assert_eq!(approval_row.decision, "require_approval");
+    assert_eq!(approval_row.reason_code, "require_approval");
+    assert_eq!(approval_row.reason, require_message);
+    assert_eq!(
+        approval_row.rule_id.as_deref(),
+        Some("config.rule.ft_hp70k_require_search")
+    );
+    log_incident_drill_case(json!({
+        "id": "mcp.wa_search.require_approval",
+        "tool": "wa.search",
+        "input": approval_args,
+        "redaction_tier": "not-applicable-policy-gated-before-search",
+        "policy_decision": "require_approval",
+        "audit_row_id": approval_row.id,
+        "normalized_response": canonical_value(&approval_envelope),
+    }));
 }
 
 fn assert_wait_for_success_data(envelope: &Value) {
