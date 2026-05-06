@@ -17898,31 +17898,6 @@ fn query_workflow_backend(
         .transpose()
 }
 
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_action_plan_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_action_plan(
-    conn: &Connection,
-    workflow_id: &str,
-) -> Result<Option<WorkflowActionPlanRecord>> {
-    conn.query_row(
-        "SELECT workflow_id, plan_id, plan_hash, plan_json, created_at \
-         FROM workflow_action_plans WHERE workflow_id = ?1",
-        [workflow_id],
-        |row| {
-            Ok(WorkflowActionPlanRecord {
-                workflow_id: row.get(0)?,
-                plan_id: row.get(1)?,
-                plan_hash: row.get(2)?,
-                plan_json: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
-}
-
 fn workflow_action_plan_from_backend_cells(row: &[SqlCell]) -> Result<WorkflowActionPlanRecord> {
     let reader = CellRowReader::new(row);
 
@@ -17974,54 +17949,6 @@ fn query_prepared_plan(conn: &Connection, plan_id: &str) -> Result<Option<Prepar
     )
     .optional()
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
-}
-
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_step_logs_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, workflow_id, audit_action_id, step_index, step_name, step_id, step_kind,
-             result_type, result_data, policy_summary, verification_refs, error_code,
-             started_at, completed_at, duration_ms
-             FROM workflow_step_logs
-             WHERE workflow_id = ?1
-             ORDER BY step_index ASC",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([workflow_id], |row| {
-            Ok(WorkflowStepLogRecord {
-                id: row.get(0)?,
-                workflow_id: row.get(1)?,
-                audit_action_id: row.get(2)?,
-                step_index: {
-                    let val: i64 = row.get(3)?;
-                    i64_to_usize(val)?
-                },
-                step_name: row.get(4)?,
-                step_id: row.get(5)?,
-                step_kind: row.get(6)?,
-                result_type: row.get(7)?,
-                result_data: row.get(8)?,
-                policy_summary: row.get(9)?,
-                verification_refs: row.get(10)?,
-                error_code: row.get(11)?,
-                started_at: row.get(12)?,
-                completed_at: row.get(13)?,
-                duration_ms: row.get(14)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-
-    Ok(results)
 }
 
 fn workflow_step_log_from_backend_cells(row: &[SqlCell]) -> Result<WorkflowStepLogRecord> {
@@ -18120,49 +18047,6 @@ fn query_latest_step_log_backend(
     row.as_deref()
         .map(workflow_step_log_from_backend_cells)
         .transpose()
-}
-
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_latest_step_log_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_latest_step_log(
-    conn: &Connection,
-    workflow_id: &str,
-) -> Result<Option<WorkflowStepLogRecord>> {
-    conn.query_row(
-        "SELECT id, workflow_id, audit_action_id, step_index, step_name, step_id, step_kind,
-             result_type, result_data, policy_summary, verification_refs, error_code,
-             started_at, completed_at, duration_ms
-         FROM workflow_step_logs
-         WHERE workflow_id = ?1
-         ORDER BY step_index DESC
-         LIMIT 1",
-        [workflow_id],
-        |row| {
-            Ok(WorkflowStepLogRecord {
-                id: row.get(0)?,
-                workflow_id: row.get(1)?,
-                audit_action_id: row.get(2)?,
-                step_index: {
-                    let val: i64 = row.get(3)?;
-                    i64_to_usize(val)?
-                },
-                step_name: row.get(4)?,
-                step_id: row.get(5)?,
-                step_kind: row.get(6)?,
-                result_type: row.get(7)?,
-                result_data: row.get(8)?,
-                policy_summary: row.get(9)?,
-                verification_refs: row.get(10)?,
-                error_code: row.get(11)?,
-                started_at: row.get(12)?,
-                completed_at: row.get(13)?,
-                duration_ms: row.get(14)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
 }
 
 fn query_incomplete_workflows_backend(backend: &dyn StorageBackend) -> Result<Vec<WorkflowRecord>> {
@@ -19032,12 +18916,6 @@ fn can_insert_and_query_workflow_step_logs() {
     assert_eq!(logs[1].step_name, "step_two");
     assert_eq!(logs[1].result_type, "done");
     assert_eq!(logs[1].duration_ms, 200);
-
-    let conn = backend.into_connection();
-    let direct_logs = query_step_logs(&conn, "wf-test-001").unwrap();
-    assert_eq!(direct_logs.len(), logs.len());
-    assert_eq!(direct_logs[0].id, logs[0].id);
-    assert_eq!(direct_logs[1].id, logs[1].id);
 }
 
 #[test]
@@ -19051,13 +18929,6 @@ fn query_step_logs_returns_empty_for_unknown_workflow() {
     assert!(
         logs.is_empty(),
         "Should return empty vec for unknown workflow"
-    );
-
-    let conn = backend.into_connection();
-    let direct_logs = query_step_logs(&conn, "nonexistent-workflow").unwrap();
-    assert!(
-        direct_logs.is_empty(),
-        "direct fallback should return empty vec for unknown workflow"
     );
 }
 
@@ -19142,13 +19013,6 @@ fn query_latest_step_log_returns_last_step() {
     assert_eq!(latest.step_index, 2);
     assert_eq!(latest.step_name, "step_three");
     assert_eq!(latest.result_type, "done");
-
-    let conn = backend.into_connection();
-    let direct_latest = query_latest_step_log(&conn, "wf-test-latest")
-        .unwrap()
-        .unwrap();
-    assert_eq!(direct_latest.id, latest.id);
-    assert_eq!(direct_latest.step_index, latest.step_index);
 }
 
 #[test]
@@ -19159,10 +19023,6 @@ fn query_latest_step_log_returns_none_for_unknown_workflow() {
     let backend = RusqliteBackend::new(conn);
     let latest = query_latest_step_log_backend(&backend, "unknown-workflow").unwrap();
     assert!(latest.is_none());
-
-    let conn = backend.into_connection();
-    let direct_latest = query_latest_step_log(&conn, "unknown-workflow").unwrap();
-    assert!(direct_latest.is_none());
 }
 
 #[test]
@@ -19205,8 +19065,7 @@ fn workflow_step_log_result_data_is_optional() {
     )
     .unwrap();
 
-    let conn = backend.into_connection();
-    let logs = query_step_logs(&conn, "wf-test-002").unwrap();
+    let logs = query_step_logs_backend(&backend, "wf-test-002").unwrap();
 
     assert_eq!(logs.len(), 1);
     assert!(logs[0].result_data.is_none(), "result_data should be None");
@@ -19280,11 +19139,6 @@ fn can_insert_and_query_workflow_action_plan() {
     assert_eq!(fetched.plan_id, plan.plan_id.to_string());
     assert_eq!(fetched.plan_hash, plan.compute_hash());
 
-    let conn = backend.into_connection();
-    let direct_fetched = query_action_plan(&conn, "wf-plan-001").unwrap().unwrap();
-    assert_eq!(direct_fetched.plan_id, fetched.plan_id);
-    assert_eq!(direct_fetched.plan_hash, fetched.plan_hash);
-
     let parsed: crate::plan::ActionPlan = serde_json::from_str(&fetched.plan_json).unwrap();
     assert_eq!(parsed.plan_id, plan.plan_id);
 }
@@ -19297,10 +19151,6 @@ fn query_action_plan_returns_none_for_unknown_workflow() {
     let backend = RusqliteBackend::new(conn);
     let fetched = query_action_plan_backend(&backend, "missing-workflow").unwrap();
     assert!(fetched.is_none());
-
-    let conn = backend.into_connection();
-    let direct_fetched = query_action_plan(&conn, "missing-workflow").unwrap();
-    assert!(direct_fetched.is_none());
 }
 
 #[test]
