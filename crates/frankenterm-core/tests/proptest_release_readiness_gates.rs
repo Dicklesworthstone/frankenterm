@@ -4,8 +4,10 @@ use proptest::prelude::*;
 
 use frankenterm_core::release_readiness_gates::{
     LeakEvidenceStatus, ReleaseDecision, ReleaseGateCheck, ReleaseGateInputs, ReleaseGatePolicy,
-    ReleaseGateReport, SoakEvidenceStatus,
+    ReleaseGateReport, ScaleLabEvidenceStatus, SoakEvidenceStatus,
 };
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Strategies
@@ -59,14 +61,38 @@ fn gate_policy_strategy() -> impl Strategy<Value = ReleaseGatePolicy> {
         0usize..10,
         positive_f64(),
         positive_f64(),
+        prop::collection::vec(0u64..2000, 0..8),
+        0u64..128,
+        1u64..=(512 * GIB),
+        "[a-zA-Z0-9_-]{1,40}",
+        "[a-zA-Z0-9_-]{1,40}",
+        "[a-zA-Z0-9_-]{1,40}",
     )
         .prop_map(
-            |(scales, metric_count, min_cycles, max_rss, max_dur)| ReleaseGatePolicy {
-                required_pane_scales: scales,
+            |(
+                soak_scales,
+                metric_count,
+                min_cycles,
+                max_rss,
+                max_dur,
+                scale_lab_scales,
+                min_cores,
+                min_memory,
+                required_claim_status,
+                required_manifest_status,
+                required_evidence_mode,
+            )| ReleaseGatePolicy {
+                required_pane_scales: soak_scales,
                 required_metric_count: metric_count,
                 min_release_cycles: min_cycles,
                 max_peak_rss_mb: max_rss,
                 max_duration_s: max_dur,
+                required_scale_lab_pane_scales: scale_lab_scales,
+                min_scale_lab_logical_cores: min_cores,
+                min_scale_lab_memory_bytes: min_memory,
+                required_scale_lab_release_claim_status: required_claim_status,
+                required_scale_lab_manifest_status: required_manifest_status,
+                required_scale_lab_evidence_mode: required_evidence_mode,
             },
         )
 }
@@ -123,15 +149,63 @@ fn soak_evidence_strategy() -> impl Strategy<Value = SoakEvidenceStatus> {
         )
 }
 
+fn scale_lab_evidence_strategy() -> impl Strategy<Value = ScaleLabEvidenceStatus> {
+    (
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        "[a-zA-Z0-9/_.-]{0,100}",
+        "[a-zA-Z0-9._-]{0,50}",
+        "[a-zA-Z0-9_-]{0,40}",
+        "[a-zA-Z0-9_-]{0,40}",
+        "[a-zA-Z0-9_-]{0,40}",
+        prop::collection::vec(0u64..2000, 0..8),
+        0u64..128,
+        0u64..=(512 * GIB),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(
+                present,
+                valid,
+                stale,
+                path,
+                schema,
+                claim_status,
+                manifest_status,
+                evidence_mode,
+                pane_scales,
+                max_cores,
+                max_memory,
+                live_mux,
+            )| ScaleLabEvidenceStatus {
+                artifact_present: present,
+                artifact_valid: valid,
+                artifact_stale: stale,
+                artifact_path: path,
+                schema_version: schema,
+                release_claim_status: claim_status,
+                manifest_status,
+                evidence_mode,
+                pane_scales,
+                max_requested_logical_cores: max_cores,
+                max_requested_memory_bytes: max_memory,
+                live_mux_available: live_mux,
+            },
+        )
+}
+
 fn gate_inputs_strategy() -> impl Strategy<Value = ReleaseGateInputs> {
     (
         leak_evidence_strategy(),
         soak_evidence_strategy(),
+        scale_lab_evidence_strategy(),
         any::<bool>(),
     )
-        .prop_map(|(leak, soak, guard)| ReleaseGateInputs {
+        .prop_map(|(leak, soak, scale_lab, guard)| ReleaseGateInputs {
             leak,
             soak,
+            scale_lab,
             guard_contract_passed: guard,
         })
 }
@@ -185,6 +259,10 @@ proptest! {
         prop_assert_eq!(&policy.required_pane_scales, &back.required_pane_scales);
         prop_assert_eq!(policy.required_metric_count, back.required_metric_count);
         prop_assert_eq!(policy.min_release_cycles, back.min_release_cycles);
+        prop_assert_eq!(&policy.required_scale_lab_pane_scales, &back.required_scale_lab_pane_scales);
+        prop_assert_eq!(policy.min_scale_lab_logical_cores, back.min_scale_lab_logical_cores);
+        prop_assert_eq!(policy.min_scale_lab_memory_bytes, back.min_scale_lab_memory_bytes);
+        prop_assert_eq!(&policy.required_scale_lab_release_claim_status, &back.required_scale_lab_release_claim_status);
         let close_rss = f64_close(policy.max_peak_rss_mb, back.max_peak_rss_mb);
         prop_assert!(close_rss, "max_peak_rss_mb mismatch");
         let close_dur = f64_close(policy.max_duration_s, back.max_duration_s);
@@ -217,6 +295,13 @@ proptest! {
     }
 
     #[test]
+    fn scale_lab_evidence_serde_roundtrip(se in scale_lab_evidence_strategy()) {
+        let json = serde_json::to_string(&se).unwrap();
+        let back: ScaleLabEvidenceStatus = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(se, back);
+    }
+
+    #[test]
     fn gate_inputs_serde_roundtrip(gi in gate_inputs_strategy()) {
         let json = serde_json::to_string(&gi).unwrap();
         let back: ReleaseGateInputs = serde_json::from_str(&json).unwrap();
@@ -224,6 +309,7 @@ proptest! {
         prop_assert_eq!(gi.guard_contract_passed, back.guard_contract_passed);
         prop_assert_eq!(gi.soak.wrapper_present, back.soak.wrapper_present);
         prop_assert_eq!(gi.soak.smoke_cycles, back.soak.smoke_cycles);
+        prop_assert_eq!(gi.scale_lab, back.scale_lab);
     }
 }
 
@@ -233,12 +319,12 @@ proptest! {
 
 proptest! {
     #[test]
-    fn evaluate_always_produces_four_checks(
+    fn evaluate_always_produces_five_checks(
         policy in gate_policy_strategy(),
         inputs in gate_inputs_strategy(),
     ) {
         let report = policy.evaluate(&inputs);
-        prop_assert_eq!(report.checks.len(), 4, "should always produce 4 gate checks");
+        prop_assert_eq!(report.checks.len(), 5, "should always produce 5 gate checks");
     }
 
     #[test]
@@ -299,6 +385,7 @@ proptest! {
             "REL-02-guard-surface",
             "REL-03-soak-confidence",
             "REL-04-performance-budget",
+            "REL-05-scale-lab-evidence",
         ]);
     }
 

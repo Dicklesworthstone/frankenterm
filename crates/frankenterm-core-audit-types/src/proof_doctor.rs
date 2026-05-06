@@ -14,6 +14,12 @@ use crate::proof_lane::{ArtifactRetrievalStatus, ProofBackend, ProofScope, Proof
 
 /// Proof-doctor schema version implemented by this module.
 pub const PROOF_DOCTOR_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_SCALE_LAB_REQUIRED_RELEASE_CLAIM_STATUS: &str = "real-hardware-proven";
+const DEFAULT_SCALE_LAB_REQUIRED_MANIFEST_STATUS: &str = "proven";
+const DEFAULT_SCALE_LAB_REQUIRED_EVIDENCE_MODE: &str = "real_hardware_run";
+const DEFAULT_SCALE_LAB_REQUIRED_PANE_SCALES: &[u64] = &[50, 200, 1_000];
+const DEFAULT_SCALE_LAB_MIN_LOGICAL_CORES: u64 = 64;
+const DEFAULT_SCALE_LAB_MIN_MEMORY_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 
 /// Preflight or post-launch phase inspected by proof-doctor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -259,6 +265,67 @@ pub struct ProofDoctorDirtyPath {
     pub owner: Option<ProofDoctorOwner>,
 }
 
+/// Scale-lab artifact evidence consumed by high-scale proof-doctor checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofDoctorScaleLabArtifactEvidence {
+    /// Whether this proof lane requires a scale-lab artifact.
+    pub required: bool,
+    /// Retained scale-lab artifact path.
+    pub artifact_path: Option<String>,
+    /// Artifact schema version.
+    pub schema_version: Option<String>,
+    /// Whether the artifact is too old for the claim being made.
+    pub artifact_stale: bool,
+    /// Whether the artifact failed schema or semantic validation.
+    pub artifact_malformed: bool,
+    /// Release claim status reported by the artifact.
+    pub release_claim_status: Option<String>,
+    /// Required release claim status for this lane.
+    pub required_release_claim_status: String,
+    /// Proof manifest status reported by the artifact.
+    pub manifest_status: Option<String>,
+    /// Evidence mode reported by the artifact.
+    pub evidence_mode: Option<String>,
+    /// Whether the artifact reports a live mux substrate.
+    pub live_mux_available: Option<bool>,
+    /// Pane scales represented by the artifact.
+    pub pane_scales: Vec<u64>,
+    /// Pane scales required by this lane.
+    pub required_pane_scales: Vec<u64>,
+    /// Maximum requested logical cores represented by the artifact.
+    pub max_requested_logical_cores: Option<u64>,
+    /// Minimum logical cores required by this lane.
+    pub min_required_logical_cores: u64,
+    /// Maximum requested memory represented by the artifact.
+    pub max_requested_memory_bytes: Option<u64>,
+    /// Minimum memory required by this lane.
+    pub min_required_memory_bytes: u64,
+}
+
+impl Default for ProofDoctorScaleLabArtifactEvidence {
+    fn default() -> Self {
+        Self {
+            required: false,
+            artifact_path: None,
+            schema_version: None,
+            artifact_stale: false,
+            artifact_malformed: false,
+            release_claim_status: None,
+            required_release_claim_status: DEFAULT_SCALE_LAB_REQUIRED_RELEASE_CLAIM_STATUS
+                .to_string(),
+            manifest_status: None,
+            evidence_mode: None,
+            live_mux_available: None,
+            pane_scales: Vec::new(),
+            required_pane_scales: DEFAULT_SCALE_LAB_REQUIRED_PANE_SCALES.to_vec(),
+            max_requested_logical_cores: None,
+            min_required_logical_cores: DEFAULT_SCALE_LAB_MIN_LOGICAL_CORES,
+            max_requested_memory_bytes: None,
+            min_required_memory_bytes: DEFAULT_SCALE_LAB_MIN_MEMORY_BYTES,
+        }
+    }
+}
+
 /// Evidence snapshot consumed by the proof-doctor classifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofDoctorEvidence {
@@ -316,6 +383,9 @@ pub struct ProofDoctorEvidence {
     pub diagnostic_summary: Option<String>,
     /// High-scale predicate status, when relevant.
     pub high_scale_predicate_met: Option<bool>,
+    /// Scale-lab artifact evidence, when the lane needs high-scale claim evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_lab_artifact: Option<ProofDoctorScaleLabArtifactEvidence>,
 }
 
 impl Default for ProofDoctorEvidence {
@@ -348,6 +418,7 @@ impl Default for ProofDoctorEvidence {
             diagnostic_paths: Vec::new(),
             diagnostic_summary: None,
             high_scale_predicate_met: None,
+            scale_lab_artifact: None,
         }
     }
 }
@@ -483,6 +554,7 @@ pub fn classify_proof_doctor(input: &ProofDoctorPreflightInput) -> ProofDoctorVe
     classify_execution_evidence(input, &mut blockers);
     classify_dirty_paths(input, &mut blockers);
     classify_high_scale(input, &mut blockers);
+    classify_scale_lab_artifact(input, &mut blockers);
 
     let status = select_status(input, &blockers);
     let primary = blockers.first();
@@ -799,6 +871,178 @@ fn classify_high_scale(input: &ProofDoctorPreflightInput, blockers: &mut Vec<Pro
     }
 }
 
+fn classify_scale_lab_artifact(
+    input: &ProofDoctorPreflightInput,
+    blockers: &mut Vec<ProofDoctorBlocker>,
+) {
+    if !requires_scale_lab_artifact(input) {
+        return;
+    }
+
+    let Some(artifact) = input.evidence.scale_lab_artifact.as_ref() else {
+        blockers.push(
+            scale_lab_blocker(
+                ProofDoctorBlockerKind::ArtifactGap,
+                "proof.scale_lab.artifact_missing",
+                "A scale-lab proof lane requires a retained scale-lab artifact.",
+                "Attach the scale-lab staged proof artifact before graduating the claim.",
+                None,
+            )
+            .with_evidence("intended_command"),
+        );
+        return;
+    };
+
+    if artifact.artifact_path.as_deref().is_none_or(str::is_empty) {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.artifact_missing",
+            "A scale-lab proof lane requires a retained scale-lab artifact.",
+            "Attach the scale-lab staged proof artifact before graduating the claim.",
+            Some(artifact),
+        ));
+        return;
+    }
+
+    let structural_blocker_count = blockers.len();
+
+    if artifact.artifact_stale {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.artifact_stale",
+            "The retained scale-lab artifact is stale for this release claim.",
+            "Rerun the scale-lab lane and attach a fresh artifact.",
+            Some(artifact),
+        ));
+    }
+
+    if artifact.artifact_malformed {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.artifact_malformed",
+            "The retained scale-lab artifact failed schema or semantic validation.",
+            "Regenerate the scale-lab artifact and keep the malformed file out of release evidence.",
+            Some(artifact),
+        ));
+    }
+
+    if !artifact_contains_required_pane_scales(artifact) {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.pane_scales_incomplete",
+            "The scale-lab artifact is missing one or more required pane-scale lanes.",
+            "Rerun the missing 50/200/500+ scale-lab stages before graduating the claim.",
+            Some(artifact),
+        ));
+    }
+
+    if blockers.len() > structural_blocker_count {
+        return;
+    }
+
+    if artifact.release_claim_status.as_deref()
+        != Some(artifact.required_release_claim_status.as_str())
+    {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.release_claim_not_proven",
+            "Scale-lab artifact does not meet the required release claim truth tier.",
+            "Record this lane as skipped-not-proven or rerun on live matching hardware.",
+            Some(artifact),
+        ));
+        return;
+    }
+
+    if artifact.manifest_status.as_deref() != Some(DEFAULT_SCALE_LAB_REQUIRED_MANIFEST_STATUS) {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.manifest_not_proven",
+            "Scale-lab artifact proof manifest is not proven.",
+            "Record this lane as skipped-not-proven or attach a proven proof-manifest artifact.",
+            Some(artifact),
+        ));
+        return;
+    }
+
+    if artifact.evidence_mode.as_deref() != Some(DEFAULT_SCALE_LAB_REQUIRED_EVIDENCE_MODE) {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.evidence_mode_not_real_hardware",
+            "Scale-lab artifact evidence mode is not a real hardware run.",
+            "Record this lane as skipped-not-proven or rerun on live matching hardware.",
+            Some(artifact),
+        ));
+        return;
+    }
+
+    if artifact.live_mux_available != Some(true) {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.live_mux_absent",
+            "Scale-lab artifact did not come from a live mux substrate.",
+            "Rerun with live panes before using this artifact for release claim graduation.",
+            Some(artifact),
+        ));
+    }
+
+    let cores_missing = artifact
+        .max_requested_logical_cores
+        .is_none_or(|cores| cores < artifact.min_required_logical_cores);
+    let memory_missing = artifact
+        .max_requested_memory_bytes
+        .is_none_or(|memory| memory < artifact.min_required_memory_bytes);
+    if cores_missing || memory_missing {
+        blockers.push(scale_lab_blocker(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.scale_lab.hardware_shape_mismatch",
+            "Scale-lab artifact does not represent the required high-scale host shape.",
+            "Rerun on hardware matching the requested core and memory predicate.",
+            Some(artifact),
+        ));
+    }
+}
+
+fn requires_scale_lab_artifact(input: &ProofDoctorPreflightInput) -> bool {
+    input
+        .evidence
+        .scale_lab_artifact
+        .as_ref()
+        .is_some_and(|artifact| artifact.required)
+        || input.intended_scope == ProofScope::HighScale
+        || command_mentions_scale_lab(&input.intended_command)
+}
+
+fn command_mentions_scale_lab(command: &[String]) -> bool {
+    command.iter().any(|token| {
+        let token = token.to_ascii_lowercase();
+        token.contains("scale_lab") || token.contains("scale-lab")
+    })
+}
+
+fn artifact_contains_required_pane_scales(artifact: &ProofDoctorScaleLabArtifactEvidence) -> bool {
+    artifact
+        .required_pane_scales
+        .iter()
+        .all(|required| artifact.pane_scales.contains(required))
+}
+
+fn scale_lab_blocker(
+    blocker_kind: ProofDoctorBlockerKind,
+    reason_code: &str,
+    message: &str,
+    next_action: &str,
+    artifact: Option<&ProofDoctorScaleLabArtifactEvidence>,
+) -> ProofDoctorBlocker {
+    let mut blocker = ProofDoctorBlocker::block(blocker_kind, reason_code, message, next_action)
+        .with_evidence("scale_lab_artifact");
+    if let Some(path) = artifact.and_then(|artifact| artifact.artifact_path.as_deref()) {
+        if !path.is_empty() {
+            blocker = blocker.with_path(path.to_string());
+        }
+    }
+    blocker
+}
+
 fn select_status(
     input: &ProofDoctorPreflightInput,
     blockers: &[ProofDoctorBlocker],
@@ -840,7 +1084,7 @@ fn select_status(
 
     if blockers
         .iter()
-        .any(|blocker| blocker.reason_code == "proof.high_scale.predicate_absent")
+        .any(|blocker| skipped_not_proven_reason(&blocker.reason_code))
     {
         return ProofDoctorStatus::SkippedNotProven;
     }
@@ -873,6 +1117,18 @@ fn select_status(
     }
 
     ProofDoctorStatus::Runnable
+}
+
+fn skipped_not_proven_reason(reason_code: &str) -> bool {
+    matches!(
+        reason_code,
+        "proof.high_scale.predicate_absent"
+            | "proof.scale_lab.release_claim_not_proven"
+            | "proof.scale_lab.manifest_not_proven"
+            | "proof.scale_lab.evidence_mode_not_real_hardware"
+            | "proof.scale_lab.live_mux_absent"
+            | "proof.scale_lab.hardware_shape_mismatch"
+    )
 }
 
 fn projection_for(
@@ -1078,6 +1334,25 @@ mod tests {
             phase: ProofDoctorPhase::Preflight,
             proof_path_prefixes: vec!["crates/frankenterm-core-audit-types".to_string()],
             evidence: ProofDoctorEvidence::default(),
+        }
+    }
+
+    fn scale_lab_artifact() -> ProofDoctorScaleLabArtifactEvidence {
+        ProofDoctorScaleLabArtifactEvidence {
+            required: true,
+            artifact_path: Some(
+                "/tmp/ft-5kt3d-target/scale-lab-smoke/run/scale-lab-staged-proof.v1.json"
+                    .to_string(),
+            ),
+            schema_version: Some("ft.scale_lab.staged_proof.v1".to_string()),
+            release_claim_status: Some(DEFAULT_SCALE_LAB_REQUIRED_RELEASE_CLAIM_STATUS.to_string()),
+            manifest_status: Some("proven".to_string()),
+            evidence_mode: Some("real_hardware_run".to_string()),
+            live_mux_available: Some(true),
+            pane_scales: DEFAULT_SCALE_LAB_REQUIRED_PANE_SCALES.to_vec(),
+            max_requested_logical_cores: Some(DEFAULT_SCALE_LAB_MIN_LOGICAL_CORES),
+            max_requested_memory_bytes: Some(DEFAULT_SCALE_LAB_MIN_MEMORY_BYTES),
+            ..ProofDoctorScaleLabArtifactEvidence::default()
         }
     }
 
@@ -1348,6 +1623,146 @@ mod tests {
                 .as_ref()
                 .map(|projection| projection.state),
             Some(ProofState::NotRun)
+        );
+    }
+
+    #[test]
+    fn scale_lab_command_without_artifact_is_inconclusive() {
+        let mut input = base_input();
+        input.intended_scope = ProofScope::HighScale;
+        input
+            .intended_command
+            .push("scale_lab_staged_lanes_mark_replay_unproven_without_live_hardware".to_string());
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Inconclusive);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.scale_lab.artifact_missing"
+        );
+        assert_eq!(
+            verdict.blockers[0].blocker_kind,
+            ProofDoctorBlockerKind::ArtifactGap
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::Inconclusive)
+        );
+    }
+
+    #[test]
+    fn scale_lab_local_smoke_cannot_graduate_high_scale_claim() {
+        let mut input = base_input();
+        input.intended_scope = ProofScope::HighScale;
+        input.evidence.high_scale_predicate_met = Some(true);
+        let mut artifact = scale_lab_artifact();
+        artifact.release_claim_status = Some("local-smoke".to_string());
+        artifact.manifest_status = Some("skipped_not_proven".to_string());
+        artifact.evidence_mode = Some("synthetic_smoke".to_string());
+        artifact.live_mux_available = Some(false);
+        input.evidence.scale_lab_artifact = Some(artifact);
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::SkippedNotProven);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.scale_lab.release_claim_not_proven"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::SkippedNotProven)
+        );
+        assert!(
+            !verdict
+                .ledger_projection
+                .as_ref()
+                .is_some_and(|projection| projection.safe_to_close),
+            "skipped scale-lab evidence must not be safe to close as proven"
+        );
+    }
+
+    #[test]
+    fn scale_lab_malformed_artifact_is_inconclusive() {
+        let mut input = base_input();
+        input.intended_scope = ProofScope::HighScale;
+        input.evidence.high_scale_predicate_met = Some(true);
+        let mut artifact = scale_lab_artifact();
+        artifact.artifact_malformed = true;
+        input.evidence.scale_lab_artifact = Some(artifact);
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Inconclusive);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.scale_lab.artifact_malformed"
+        );
+    }
+
+    #[test]
+    fn scale_lab_manifest_and_mode_mismatch_cannot_graduate_high_scale_claim() {
+        let mut input = base_input();
+        input.intended_scope = ProofScope::HighScale;
+        input.evidence.high_scale_predicate_met = Some(true);
+        let mut artifact = scale_lab_artifact();
+        artifact.manifest_status = Some("skipped_not_proven".to_string());
+        artifact.evidence_mode = Some("synthetic_smoke".to_string());
+        input.evidence.scale_lab_artifact = Some(artifact);
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::SkippedNotProven);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.scale_lab.manifest_not_proven"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::SkippedNotProven)
+        );
+
+        let mut input = base_input();
+        input.intended_scope = ProofScope::HighScale;
+        input.evidence.high_scale_predicate_met = Some(true);
+        let mut artifact = scale_lab_artifact();
+        artifact.evidence_mode = Some("synthetic_smoke".to_string());
+        input.evidence.scale_lab_artifact = Some(artifact);
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::SkippedNotProven);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.scale_lab.evidence_mode_not_real_hardware"
+        );
+    }
+
+    #[test]
+    fn scale_lab_real_hardware_artifact_keeps_high_scale_lane_runnable() {
+        let mut input = base_input();
+        input.intended_scope = ProofScope::HighScale;
+        input.evidence.high_scale_predicate_met = Some(true);
+        input.evidence.scale_lab_artifact = Some(scale_lab_artifact());
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
+        assert!(verdict.blockers.is_empty());
+        let json = serde_json::to_value(&verdict).expect("serialize verdict");
+        assert_eq!(
+            json["evidence"]["scale_lab_artifact"]["release_claim_status"].as_str(),
+            Some(DEFAULT_SCALE_LAB_REQUIRED_RELEASE_CLAIM_STATUS)
         );
     }
 

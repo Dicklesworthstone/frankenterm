@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+const GIB: u64 = 1024 * 1024 * 1024;
+
 /// Explicit release decision produced from the gate set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReleaseDecision {
@@ -83,6 +85,18 @@ pub struct ReleaseGatePolicy {
     pub max_peak_rss_mb: f64,
     /// Maximum allowed aggregate max-duration across validated soak summaries.
     pub max_duration_s: f64,
+    /// Pane scales that must appear in scale-lab artifact evidence.
+    pub required_scale_lab_pane_scales: Vec<u64>,
+    /// Minimum logical cores for high-scale release evidence.
+    pub min_scale_lab_logical_cores: u64,
+    /// Minimum memory bytes for high-scale release evidence.
+    pub min_scale_lab_memory_bytes: u64,
+    /// Required release-claim truth tier for graduating high-scale claims.
+    pub required_scale_lab_release_claim_status: String,
+    /// Required proof-manifest truth status for graduating high-scale claims.
+    pub required_scale_lab_manifest_status: String,
+    /// Required evidence mode for high-scale release evidence.
+    pub required_scale_lab_evidence_mode: String,
 }
 
 impl ReleaseGatePolicy {
@@ -95,6 +109,12 @@ impl ReleaseGatePolicy {
             min_release_cycles: 3,
             max_peak_rss_mb: 32.0,
             max_duration_s: 3.0,
+            required_scale_lab_pane_scales: vec![50, 200, 1_000],
+            min_scale_lab_logical_cores: 64,
+            min_scale_lab_memory_bytes: 256 * GIB,
+            required_scale_lab_release_claim_status: "real-hardware-proven".into(),
+            required_scale_lab_manifest_status: "proven".into(),
+            required_scale_lab_evidence_mode: "real_hardware_run".into(),
         }
     }
 
@@ -178,6 +198,23 @@ impl ReleaseGatePolicy {
                 ),
                 action: "Tighten the workload implementation or tune the runtime until the 4.5 soak matrix stays within the declared RSS/duration budgets.".into(),
             },
+            ReleaseGateCheck {
+                gate_id: "REL-05-scale-lab-evidence".into(),
+                description: "Scale-lab artifact evidence supports high-scale release claims".into(),
+                passed: inputs.scale_lab.satisfies_policy(self),
+                blocking: true,
+                observed: inputs.scale_lab.render_observed(),
+                required: format!(
+                    "fresh valid artifact with status={} manifest_status={} evidence_mode={} live_mux=true panes {:?} and host >= {} cores / {} GiB",
+                    self.required_scale_lab_release_claim_status,
+                    self.required_scale_lab_manifest_status,
+                    self.required_scale_lab_evidence_mode,
+                    self.required_scale_lab_pane_scales,
+                    self.min_scale_lab_logical_cores,
+                    self.min_scale_lab_memory_bytes / GIB,
+                ),
+                action: "Attach a fresh scale-lab staged proof artifact from live 64-core / 256 GiB hardware, or keep the high-scale claim ungraduated.".into(),
+            },
         ];
 
         let decision = if checks.iter().any(|check| check.blocking && !check.passed) {
@@ -226,6 +263,80 @@ pub struct SoakEvidenceStatus {
     pub backpressure_exercised: bool,
 }
 
+/// Scale-lab artifact evidence status for high-scale release claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleLabEvidenceStatus {
+    /// Whether the expected scale-lab artifact was found.
+    pub artifact_present: bool,
+    /// Whether the artifact parsed and validated against its schema.
+    pub artifact_valid: bool,
+    /// Whether the artifact is too old for release claim graduation.
+    pub artifact_stale: bool,
+    /// Path used for the evaluation.
+    pub artifact_path: String,
+    /// Artifact schema version.
+    pub schema_version: String,
+    /// Release claim status reported by the artifact.
+    pub release_claim_status: String,
+    /// Proof-manifest status reported by the artifact.
+    pub manifest_status: String,
+    /// Evidence mode reported by the artifact.
+    pub evidence_mode: String,
+    /// Pane scales represented by the artifact.
+    pub pane_scales: Vec<u64>,
+    /// Maximum requested logical cores represented by the artifact.
+    pub max_requested_logical_cores: u64,
+    /// Maximum requested memory represented by the artifact.
+    pub max_requested_memory_bytes: u64,
+    /// Whether the artifact came from a live mux substrate.
+    pub live_mux_available: bool,
+}
+
+impl ScaleLabEvidenceStatus {
+    #[must_use]
+    fn satisfies_policy(&self, policy: &ReleaseGatePolicy) -> bool {
+        self.artifact_present
+            && self.artifact_valid
+            && !self.artifact_stale
+            && self.release_claim_status == policy.required_scale_lab_release_claim_status
+            && self.manifest_status == policy.required_scale_lab_manifest_status
+            && self.evidence_mode == policy.required_scale_lab_evidence_mode
+            && self.live_mux_available
+            && self.max_requested_logical_cores >= policy.min_scale_lab_logical_cores
+            && self.max_requested_memory_bytes >= policy.min_scale_lab_memory_bytes
+            && self.contains_required_pane_scales(&policy.required_scale_lab_pane_scales)
+    }
+
+    #[must_use]
+    fn contains_required_pane_scales(&self, required_scales: &[u64]) -> bool {
+        required_scales
+            .iter()
+            .all(|required| self.pane_scales.contains(required))
+    }
+
+    #[must_use]
+    fn render_observed(&self) -> String {
+        if !self.artifact_present {
+            return "no scale-lab artifact".into();
+        }
+
+        format!(
+            "valid={} stale={} path={} schema={} release_claim_status={} manifest_status={} evidence_mode={} live_mux={} pane_scales={:?} max_cores={} max_memory_gib={}",
+            self.artifact_valid,
+            self.artifact_stale,
+            self.artifact_path,
+            self.schema_version,
+            self.release_claim_status,
+            self.manifest_status,
+            self.evidence_mode,
+            self.live_mux_available,
+            self.pane_scales,
+            self.max_requested_logical_cores,
+            self.max_requested_memory_bytes / GIB,
+        )
+    }
+}
+
 /// Inputs needed for a release readiness evaluation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseGateInputs {
@@ -233,6 +344,8 @@ pub struct ReleaseGateInputs {
     pub leak: LeakEvidenceStatus,
     /// Soak confidence and performance evidence.
     pub soak: SoakEvidenceStatus,
+    /// Scale-lab evidence for high-scale swarm claims.
+    pub scale_lab: ScaleLabEvidenceStatus,
     /// Whether the permanent finish-line guard surface is green.
     pub guard_contract_passed: bool,
 }
@@ -259,6 +372,21 @@ mod tests {
                 peak_rss_mb: 16.61,
                 max_duration_s: 2.23,
                 backpressure_exercised: true,
+            },
+            scale_lab: ScaleLabEvidenceStatus {
+                artifact_present: true,
+                artifact_valid: true,
+                artifact_stale: false,
+                artifact_path: "tests/e2e/artifacts/scale-lab/scale-lab-staged-proof.v1.json"
+                    .into(),
+                schema_version: "ft.scale_lab.staged_proof.v1".into(),
+                release_claim_status: "real-hardware-proven".into(),
+                manifest_status: "proven".into(),
+                evidence_mode: "real_hardware_run".into(),
+                pane_scales: vec![50, 200, 1_000],
+                max_requested_logical_cores: 64,
+                max_requested_memory_bytes: 256 * GIB,
+                live_mux_available: true,
             },
             guard_contract_passed: true,
         }
@@ -421,6 +549,10 @@ mod tests {
         let restored: ReleaseGateInputs = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.leak.summary_present, inputs.leak.summary_present);
         assert_eq!(restored.soak.release_cycles, inputs.soak.release_cycles);
+        assert_eq!(
+            restored.scale_lab.release_claim_status,
+            inputs.scale_lab.release_claim_status
+        );
         assert_eq!(restored.guard_contract_passed, inputs.guard_contract_passed);
     }
 
@@ -437,15 +569,16 @@ mod tests {
     #[test]
     fn failed_count_matches_actual_failures() {
         let mut inputs = passing_inputs();
-        // Fail all 4 gates
+        // Fail all five gates.
         inputs.leak.summary_present = false;
         inputs.guard_contract_passed = false;
         inputs.soak.release_cycles = 0;
         inputs.soak.metric_count = 0;
+        inputs.scale_lab.artifact_present = false;
         let report = ReleaseGatePolicy::finish_line().evaluate(&inputs);
         assert_eq!(report.decision, ReleaseDecision::Blocked);
-        assert_eq!(report.failed_count(), 4);
-        assert_eq!(report.checks.len(), 4);
+        assert_eq!(report.failed_count(), 5);
+        assert_eq!(report.checks.len(), 5);
     }
 
     #[test]
@@ -456,5 +589,45 @@ mod tests {
         assert_eq!(policy.min_release_cycles, 3);
         assert!((policy.max_peak_rss_mb - 32.0).abs() < f64::EPSILON);
         assert!((policy.max_duration_s - 3.0).abs() < f64::EPSILON);
+        assert_eq!(policy.required_scale_lab_pane_scales, vec![50, 200, 1_000]);
+        assert_eq!(policy.min_scale_lab_logical_cores, 64);
+        assert_eq!(policy.min_scale_lab_memory_bytes, 256 * GIB);
+    }
+
+    #[test]
+    fn scale_lab_local_smoke_blocks_release_claim_graduation() {
+        let mut inputs = passing_inputs();
+        inputs.scale_lab.release_claim_status = "local-smoke".into();
+        inputs.scale_lab.manifest_status = "skipped_not_proven".into();
+        inputs.scale_lab.evidence_mode = "synthetic_smoke".into();
+        inputs.scale_lab.live_mux_available = false;
+
+        let report = ReleaseGatePolicy::finish_line().evaluate(&inputs);
+        assert_eq!(report.decision, ReleaseDecision::Blocked);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.gate_id == "REL-05-scale-lab-evidence")
+            .expect("scale-lab gate exists");
+        assert!(!check.passed);
+        assert!(
+            check.observed.contains("release_claim_status=local-smoke"),
+            "observed summary must expose the non-proven truth tier"
+        );
+    }
+
+    #[test]
+    fn scale_lab_missing_artifact_blocks_release_gate() {
+        let mut inputs = passing_inputs();
+        inputs.scale_lab.artifact_present = false;
+        inputs.scale_lab.artifact_path.clear();
+
+        let report = ReleaseGatePolicy::finish_line().evaluate(&inputs);
+        assert_eq!(report.decision, ReleaseDecision::Blocked);
+        assert!(report.checks.iter().any(|check| {
+            check.gate_id == "REL-05-scale-lab-evidence"
+                && !check.passed
+                && check.observed == "no scale-lab artifact"
+        }));
     }
 }
