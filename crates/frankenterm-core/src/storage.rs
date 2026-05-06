@@ -5131,9 +5131,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_panes(&conn)
+            // br-ft-l1jgo: trait-typed pooled_backend pane-list
+            // read path (was direct PooledReadConn::acquire + query_panes).
+            pooled_backend(db_path.as_str(), query_panes_backend)
         })
         .await
     }
@@ -5155,9 +5155,11 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_pane(&conn, pane_id)
+            // br-ft-l1jgo: trait-typed pooled_backend pane lookup
+            // (was direct PooledReadConn::acquire + query_pane).
+            pooled_backend(db_path.as_str(), |backend| {
+                query_pane_backend(backend, pane_id)
+            })
         })
         .await
     }
@@ -5167,8 +5169,11 @@ impl StorageHandle {
     /// This is intended for prepare-phase policy evaluation, where the caller
     /// is already on a synchronous execution path.
     pub fn get_pane_blocking(&self, pane_id: u64) -> Result<Option<PaneRecord>> {
-        let conn = PooledReadConn::acquire(self.db_path.as_str())?;
-        query_pane(&conn, pane_id)
+        // br-ft-l1jgo: keep the blocking path on the same trait-typed
+        // pooled backend as the async sibling.
+        pooled_backend(self.db_path.as_str(), |backend| {
+            query_pane_backend(backend, pane_id)
+        })
     }
 
     /// Get recent segments for a pane
@@ -16843,7 +16848,102 @@ fn query_max_seq_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<O
     Ok(max.map(|v| v as u64))
 }
 
+fn pane_record_from_backend_cells(row: &[SqlCell]) -> Result<PaneRecord> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .i64(0)
+        .and_then(|value| backend_i64_to_u64(value, "panes.pane_id"))
+        .map_err(|err| storage_backend_error("Pane row pane_id", err))?;
+    let window_id = reader
+        .optional_i64(3)
+        .map_err(|err| storage_backend_error("Pane row window_id", err))?
+        .map(|value| backend_i64_to_u64(value, "panes.window_id"))
+        .transpose()
+        .map_err(|err| storage_backend_error("Pane row window_id", err))?;
+    let tab_id = reader
+        .optional_i64(4)
+        .map_err(|err| storage_backend_error("Pane row tab_id", err))?
+        .map(|value| backend_i64_to_u64(value, "panes.tab_id"))
+        .transpose()
+        .map_err(|err| storage_backend_error("Pane row tab_id", err))?;
+    let observed = reader
+        .i64(10)
+        .and_then(|value| backend_i64_to_bool(value, "panes.observed"))
+        .map_err(|err| storage_backend_error("Pane row observed", err))?;
+
+    Ok(PaneRecord {
+        pane_id,
+        pane_uuid: reader
+            .optional_string(1)
+            .map_err(|err| storage_backend_error("Pane row pane_uuid", err))?,
+        domain: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Pane row domain", err))?,
+        window_id,
+        tab_id,
+        title: reader
+            .optional_string(5)
+            .map_err(|err| storage_backend_error("Pane row title", err))?,
+        cwd: reader
+            .optional_string(6)
+            .map_err(|err| storage_backend_error("Pane row cwd", err))?,
+        tty_name: reader
+            .optional_string(7)
+            .map_err(|err| storage_backend_error("Pane row tty_name", err))?,
+        first_seen_at: reader
+            .i64(8)
+            .map_err(|err| storage_backend_error("Pane row first_seen_at", err))?,
+        last_seen_at: reader
+            .i64(9)
+            .map_err(|err| storage_backend_error("Pane row last_seen_at", err))?,
+        observed,
+        ignore_reason: reader
+            .optional_string(11)
+            .map_err(|err| storage_backend_error("Pane row ignore_reason", err))?,
+        last_decision_at: reader
+            .optional_i64(12)
+            .map_err(|err| storage_backend_error("Pane row last_decision_at", err))?,
+    })
+}
+
+/// br-ft-l1jgo: trait-typed sibling of [`query_panes`].
+fn query_panes_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneRecord>> {
+    let rows = backend
+        .query_map_cells(
+            "SELECT pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
+             first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
+             FROM panes
+             ORDER BY last_seen_at DESC",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Query panes", err))?;
+
+    rows.iter()
+        .map(|row| pane_record_from_backend_cells(row))
+        .collect()
+}
+
+/// br-ft-l1jgo: trait-typed sibling of [`query_pane`].
+fn query_pane_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<Option<PaneRecord>> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let row = backend
+        .query_row_cells(
+            "SELECT pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
+             first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
+             FROM panes WHERE pane_id = ?1",
+            &[ToSqlValue::Integer(pane_id_i64)],
+        )
+        .map_err(|err| storage_backend_error("Query pane", err))?;
+    row.as_deref()
+        .map(pane_record_from_backend_cells)
+        .transpose()
+}
+
 /// Query all panes
+///
+/// Direct-rusqlite path. Kept as a fallback while
+/// [`query_panes_backend`] migration target settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
     let mut stmt = conn
         .prepare(
@@ -16867,6 +16967,11 @@ fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
 }
 
 /// Query a specific pane
+///
+/// Direct-rusqlite path. Kept for transitional fallback and direct
+/// row-shape tests while [`query_pane_backend`] settles in
+/// (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_pane(conn: &Connection, pane_id: u64) -> Result<Option<PaneRecord>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
 
@@ -20747,6 +20852,11 @@ fn storage_tick117_hot_path_siblings_roundtrip() {
             .unwrap()
             .expect("pane 7 should exist");
         assert_eq!(fetched.pane_id, 7);
+        let blocking_fetched = storage
+            .get_pane_blocking(7)
+            .unwrap()
+            .expect("pane 7 should exist through blocking path");
+        assert_eq!(blocking_fetched.pane_id, 7);
 
         // 2. get_events_with_cx (empty on fresh DB)
         let events = storage
