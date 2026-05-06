@@ -30,6 +30,7 @@ impl ErrorRenderer {
     }
 
     /// Map an Error to its error code
+    #[allow(deprecated)]
     #[must_use]
     pub fn error_code(error: &Error) -> &'static str {
         match error {
