@@ -18,6 +18,7 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+emojis.workspace = true
 # ft-i2eni.3: production `tokio` dependency removed (the line
 # previously read `tokio.workspace = true`). frankenterm-core's
 # canonical async runtime is asupersync via `runtime_async`; direct

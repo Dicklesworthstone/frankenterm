@@ -10,7 +10,7 @@
 //! - Variable-axis classification (weight / width / slant / etc.)
 //!   with bead-cited bounds.
 //! - Reduce-motion gate (A11Y.5 cross-link).
-//! - A11Y emoji-name lookup schema (CLDR).
+//! - A11Y emoji-name lookup schema + CLDR-backed scalar lookup.
 //! - Atlas-key derivation that includes the variable-axis vector
 //!   so a glyph at weight=400 caches separately from weight=700.
 //! - Telemetry counters per the bead's structured-logging schema.
@@ -36,9 +36,8 @@
 //!   instead of animating.
 //! - `EmojiName` — `{ codepoint, name, source }` payload the
 //!   integration emits via accessibility tree.
-//! - `lookup_emoji_name` — substrate's CLDR-name fallback
-//!   (no full DB; returns `None` and the integration consults
-//!   the real CLDR table).
+//! - `lookup_emoji_name` — CLDR-name lookup for a single Unicode
+//!   scalar, backed by the workspace emoji metadata table.
 //! - `FontFeaturesTelemetry` — bead's structured-logging
 //!   counters (per-format render counts + atlas-key reuse +
 //!   a11y emit count).
@@ -52,7 +51,7 @@
 //!   ICC-profile colour management.
 //! - Bitmap-strike support per format (CBLC/CBDT, sbix, EBLC/EBDT).
 //! - Atlas integration: extend existing atlas-key with axis vector.
-//! - Real CLDR name DB (`unic-cldr` or vendored JSON).
+//! - Multi-scalar emoji grapheme names in the accessibility tree.
 //! - JSON-line emission at `tests/variable_fonts/logs/<scenario>.jsonl`.
 
 #![allow(dead_code)]
@@ -403,12 +402,22 @@ pub struct EmojiName {
     pub source: EmojiNameSource,
 }
 
-/// Substrate's stub: returns `None` for any codepoint. The
-/// integration's CLDR-name DB plugs in here. Substrate
-/// exposes the schema so the integration can build to it.
+/// Look up the CLDR short name for a single Unicode scalar emoji.
+///
+/// Multi-scalar emoji graphemes remain an integration responsibility:
+/// this substrate accepts one codepoint and returns `None` for invalid
+/// scalars or scalars that are not emoji.
 #[must_use]
-pub fn lookup_emoji_name(_codepoint: u32) -> Option<EmojiName> {
-    None
+pub fn lookup_emoji_name(codepoint: u32) -> Option<EmojiName> {
+    let scalar = char::from_u32(codepoint)?;
+    let mut utf8 = [0_u8; 4];
+    let emoji = emojis::get(scalar.encode_utf8(&mut utf8))?;
+
+    Some(EmojiName {
+        codepoint,
+        name: emoji.name().to_owned(),
+        source: EmojiNameSource::Cldr,
+    })
 }
 
 // ============================================================================
@@ -742,9 +751,22 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn emoji_lookup_substrate_returns_none() {
-        // Substrate is a stub — integration plugs in real CLDR DB.
-        assert!(lookup_emoji_name(0x1F600).is_none());
+    fn emoji_lookup_uses_cldr_metadata() {
+        let name = lookup_emoji_name(0x1F600).unwrap();
+
+        assert_eq!(name.codepoint, 0x1F600);
+        assert_eq!(name.name, "grinning face");
+        assert_eq!(name.source, EmojiNameSource::Cldr);
+    }
+
+    #[test]
+    fn emoji_lookup_returns_none_for_non_emoji_scalar() {
+        assert!(lookup_emoji_name(u32::from('A')).is_none());
+    }
+
+    #[test]
+    fn emoji_lookup_returns_none_for_invalid_scalar() {
+        assert!(lookup_emoji_name(0x11_0000).is_none());
     }
 
     // ----------------------------------------------------------------
