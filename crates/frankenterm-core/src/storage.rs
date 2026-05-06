@@ -4888,9 +4888,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_timeline(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_timeline_backend(backend, &query)
+            })
         })
         .await
     }
@@ -16234,29 +16234,31 @@ fn query_events_stream_backend(
 // Timeline Query Implementation (wa-6sk.1)
 // =============================================================================
 
-/// Query timeline with unified event view across panes
+/// Query timeline with unified event view across panes.
+///
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_timeline_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> {
-    // Build the SQL query with joins for pane info
-    let mut sql = String::from(
+    let select_sql = String::from(
         "SELECT e.id, e.pane_id, e.rule_id, e.agent_type, e.event_type, e.severity,
                 e.confidence, e.detected_at, e.handled_at, e.handled_by_workflow_id,
                 e.handled_status, e.matched_text,
-                p.pane_uuid, p.domain, p.cwd, p.title
-         FROM events e
-         JOIN panes p ON p.pane_id = e.pane_id
-         WHERE 1=1",
+                p.pane_uuid, p.domain, p.cwd, p.title",
     );
+    let from_sql = String::from(" FROM events e JOIN panes p ON p.pane_id = e.pane_id");
+    let mut where_sql = String::from(" WHERE 1=1");
 
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     // Time range filters
     if let Some(start) = query.start {
-        sql.push_str(" AND e.detected_at >= ?");
+        where_sql.push_str(" AND e.detected_at >= ?");
         params.push(Box::new(start));
     }
 
     if let Some(end) = query.end {
-        sql.push_str(" AND e.detected_at <= ?");
+        where_sql.push_str(" AND e.detected_at <= ?");
         params.push(Box::new(end));
     }
 
@@ -16267,11 +16269,11 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
             if let Some(predicate) =
                 pane_id_set.as_sql_in_clause_for_column("e.pane_id", TIMELINE_PANE_ID_INLINE_LIMIT)
             {
-                sql.push_str(" AND ");
-                sql.push_str(&predicate);
+                where_sql.push_str(" AND ");
+                where_sql.push_str(&predicate);
             } else {
                 stage_timeline_pane_id_temp_table(conn, &pane_id_set)?;
-                sql.push_str(
+                where_sql.push_str(
                     " AND EXISTS (
                         SELECT 1 FROM temp_pane_id_set staged_pane_ids
                         WHERE staged_pane_ids.pane_id = e.pane_id
@@ -16285,7 +16287,7 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
     if let Some(ref severities) = query.severities {
         if !severities.is_empty() {
             let placeholders: Vec<&str> = severities.iter().map(|_| "?").collect();
-            sql.push_str(&format!(" AND e.severity IN ({})", placeholders.join(",")));
+            where_sql.push_str(&format!(" AND e.severity IN ({})", placeholders.join(",")));
             for s in severities {
                 params.push(Box::new(s.clone()));
             }
@@ -16296,7 +16298,7 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
     if let Some(ref event_types) = query.event_types {
         if !event_types.is_empty() {
             let placeholders: Vec<&str> = event_types.iter().map(|_| "?").collect();
-            sql.push_str(&format!(
+            where_sql.push_str(&format!(
                 " AND e.event_type IN ({})",
                 placeholders.join(",")
             ));
@@ -16310,7 +16312,7 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
     if let Some(ref agent_types) = query.agent_types {
         if !agent_types.is_empty() {
             let placeholders: Vec<&str> = agent_types.iter().map(|_| "?").collect();
-            sql.push_str(&format!(
+            where_sql.push_str(&format!(
                 " AND e.agent_type IN ({})",
                 placeholders.join(",")
             ));
@@ -16322,25 +16324,20 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
 
     // Unhandled filter
     if query.unhandled_only {
-        sql.push_str(" AND e.handled_at IS NULL");
+        where_sql.push_str(" AND e.handled_at IS NULL");
     }
 
     // Count total before pagination
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM events e JOIN panes p ON p.pane_id = e.pane_id WHERE {}",
-        sql.split("WHERE").nth(1).unwrap_or("1=1")
-    );
+    let count_sql = format!("SELECT COUNT(*){from_sql}{where_sql}");
 
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(AsRef::as_ref).collect();
     let total_count: i64 = conn
         .query_row(&count_sql, param_refs.as_slice(), |row| row.get(0))
         .unwrap_or(0);
 
-    // Add ordering and pagination
-    sql.push_str(" ORDER BY e.detected_at ASC");
-
-    let limit_i64 = query.limit as i64;
-    let offset_i64 = query.offset as i64;
+    let mut sql = format!("{select_sql}{from_sql}{where_sql} ORDER BY e.detected_at ASC");
+    let limit_i64 = usize_to_i64(query.limit, "limit")?;
+    let offset_i64 = usize_to_i64(query.offset, "offset")?;
     sql.push_str(" LIMIT ? OFFSET ?");
     params.push(Box::new(limit_i64));
     params.push(Box::new(offset_i64));
@@ -16398,7 +16395,15 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
         events.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
     }
 
-    // Calculate time range from results
+    let total_count_u64 = u64::try_from(total_count).unwrap_or(0);
+    Ok(assemble_timeline(query, events, total_count_u64))
+}
+
+fn assemble_timeline(
+    query: &TimelineQuery,
+    events: Vec<TimelineEvent>,
+    total_count: u64,
+) -> Timeline {
     let (start, end) = if events.is_empty() {
         let now = now_ms();
         (query.start.unwrap_or(now), query.end.unwrap_or(now))
@@ -16429,16 +16434,200 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
             .collect();
     }
 
-    let has_more = (query.offset + events_with_refs.len()) < total_count as usize;
+    let total_count_usize = usize::try_from(total_count).unwrap_or(usize::MAX);
+    let has_more = query.offset.saturating_add(events_with_refs.len()) < total_count_usize;
 
-    Ok(Timeline {
+    Timeline {
         start,
         end,
         events: events_with_refs,
         correlations,
-        total_count: total_count as u64,
+        total_count,
         has_more,
+    }
+}
+
+fn timeline_event_from_backend_cells(row: &[SqlCell]) -> Result<TimelineEvent> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .i64(1)
+        .and_then(|value| backend_i64_to_u64(value, "timeline.pane_id"))
+        .map_err(|err| storage_backend_error("Timeline row pane_id", err))?;
+    let agent_type = reader
+        .string(3)
+        .map_err(|err| storage_backend_error("Timeline row agent_type", err))?;
+    let handled_at = reader
+        .optional_i64(8)
+        .map_err(|err| storage_backend_error("Timeline row handled_at", err))?;
+    let handled = if let Some(handled_at) = handled_at {
+        let status = reader
+            .optional_string(10)
+            .map_err(|err| storage_backend_error("Timeline row handled_status", err))?
+            .unwrap_or_else(|| "unknown".to_string());
+        Some(HandledInfo {
+            handled_at,
+            workflow_id: reader
+                .optional_string(9)
+                .map_err(|err| storage_backend_error("Timeline row handled_by_workflow_id", err))?,
+            status,
+        })
+    } else {
+        None
+    };
+
+    Ok(TimelineEvent {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Timeline row id", err))?,
+        timestamp: reader
+            .i64(7)
+            .map_err(|err| storage_backend_error("Timeline row detected_at", err))?,
+        pane_info: PaneInfo {
+            pane_id,
+            pane_uuid: reader
+                .optional_string(12)
+                .map_err(|err| storage_backend_error("Timeline row pane_uuid", err))?,
+            agent_type: if agent_type == "unknown" {
+                None
+            } else {
+                Some(agent_type)
+            },
+            domain: reader
+                .string(13)
+                .map_err(|err| storage_backend_error("Timeline row domain", err))?,
+            cwd: reader
+                .optional_string(14)
+                .map_err(|err| storage_backend_error("Timeline row cwd", err))?,
+            title: reader
+                .optional_string(15)
+                .map_err(|err| storage_backend_error("Timeline row title", err))?,
+        },
+        rule_id: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Timeline row rule_id", err))?,
+        event_type: reader
+            .string(4)
+            .map_err(|err| storage_backend_error("Timeline row event_type", err))?,
+        severity: reader
+            .string(5)
+            .map_err(|err| storage_backend_error("Timeline row severity", err))?,
+        confidence: reader
+            .f64(6)
+            .map_err(|err| storage_backend_error("Timeline row confidence", err))?,
+        handled,
+        correlations: Vec::new(),
+        summary: reader
+            .optional_string(11)
+            .map_err(|err| storage_backend_error("Timeline row matched_text", err))?,
     })
+}
+
+fn query_timeline_backend(backend: &dyn StorageBackend, query: &TimelineQuery) -> Result<Timeline> {
+    let select_sql = String::from(
+        "SELECT e.id, e.pane_id, e.rule_id, e.agent_type, e.event_type, e.severity,
+                e.confidence, e.detected_at, e.handled_at, e.handled_by_workflow_id,
+                e.handled_status, e.matched_text,
+                p.pane_uuid, p.domain, p.cwd, p.title",
+    );
+    let from_sql = String::from(" FROM events e JOIN panes p ON p.pane_id = e.pane_id");
+    let mut where_sql = String::from(" WHERE 1=1");
+    let mut params = Vec::new();
+
+    if let Some(start) = query.start {
+        where_sql.push_str(" AND e.detected_at >= ?");
+        params.push(ToSqlValue::Integer(start));
+    }
+    if let Some(end) = query.end {
+        where_sql.push_str(" AND e.detected_at <= ?");
+        params.push(ToSqlValue::Integer(end));
+    }
+    if let Some(ref pane_ids) = query.pane_ids {
+        if !pane_ids.is_empty() {
+            let pane_id_set = PaneIdSet::from_pane_ids(pane_ids.iter().copied());
+            if let Some(predicate) =
+                pane_id_set.as_sql_in_clause_for_column("e.pane_id", TIMELINE_PANE_ID_INLINE_LIMIT)
+            {
+                where_sql.push_str(" AND ");
+                where_sql.push_str(&predicate);
+            } else {
+                stage_timeline_pane_id_temp_table_backend(backend, &pane_id_set)?;
+                where_sql.push_str(
+                    " AND EXISTS (
+                        SELECT 1 FROM temp_pane_id_set staged_pane_ids
+                        WHERE staged_pane_ids.pane_id = e.pane_id
+                    )",
+                );
+            }
+        }
+    }
+    if let Some(ref severities) = query.severities {
+        if !severities.is_empty() {
+            let placeholders: Vec<&str> = severities.iter().map(|_| "?").collect();
+            where_sql.push_str(&format!(" AND e.severity IN ({})", placeholders.join(",")));
+            for severity in severities {
+                params.push(ToSqlValue::Text(severity.as_str()));
+            }
+        }
+    }
+    if let Some(ref event_types) = query.event_types {
+        if !event_types.is_empty() {
+            let placeholders: Vec<&str> = event_types.iter().map(|_| "?").collect();
+            where_sql.push_str(&format!(
+                " AND e.event_type IN ({})",
+                placeholders.join(",")
+            ));
+            for event_type in event_types {
+                params.push(ToSqlValue::Text(event_type.as_str()));
+            }
+        }
+    }
+    if let Some(ref agent_types) = query.agent_types {
+        if !agent_types.is_empty() {
+            let placeholders: Vec<&str> = agent_types.iter().map(|_| "?").collect();
+            where_sql.push_str(&format!(
+                " AND e.agent_type IN ({})",
+                placeholders.join(",")
+            ));
+            for agent_type in agent_types {
+                params.push(ToSqlValue::Text(agent_type.as_str()));
+            }
+        }
+    }
+    if query.unhandled_only {
+        where_sql.push_str(" AND e.handled_at IS NULL");
+    }
+
+    let count_sql = format!("SELECT COUNT(*){from_sql}{where_sql}");
+    let total_count = backend
+        .query_row_cells(&count_sql, &params)
+        .map_err(|err| storage_backend_error("Timeline count query", err))?
+        .map(|row| {
+            let reader = CellRowReader::new(&row);
+            reader
+                .i64(0)
+                .and_then(|value| backend_i64_to_u64(value, "timeline.total_count"))
+        })
+        .transpose()
+        .map_err(|err| storage_backend_error("Timeline count row", err))?
+        .unwrap_or(0);
+
+    let mut sql = format!("{select_sql}{from_sql}{where_sql} ORDER BY e.detected_at ASC");
+    let limit_i64 = usize_to_i64(query.limit, "limit")?;
+    let offset_i64 = usize_to_i64(query.offset, "offset")?;
+    sql.push_str(" LIMIT ? OFFSET ?");
+    params.push(ToSqlValue::Integer(limit_i64));
+    params.push(ToSqlValue::Integer(offset_i64));
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Timeline query", err))?;
+    let events = rows
+        .iter()
+        .map(Vec::as_slice)
+        .map(timeline_event_from_backend_cells)
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(assemble_timeline(query, events, total_count))
 }
 
 fn stage_timeline_pane_id_temp_table(conn: &Connection, pane_id_set: &PaneIdSet) -> Result<()> {
@@ -16462,6 +16651,41 @@ fn create_and_fill_pane_id_temp_table(conn: &Connection, plan: &PaneIdTempTableP
         stmt.execute([pane_id])
             .map_err(|err| StorageError::Database(format!("Failed to stage pane id: {err}")))?;
     }
+
+    Ok(())
+}
+
+fn stage_timeline_pane_id_temp_table_backend(
+    backend: &dyn StorageBackend,
+    pane_id_set: &PaneIdSet,
+) -> Result<()> {
+    let plan = pane_id_set.temp_table_plan();
+    create_and_fill_pane_id_temp_table_backend(backend, &plan)
+}
+
+fn create_and_fill_pane_id_temp_table_backend(
+    backend: &dyn StorageBackend,
+    plan: &PaneIdTempTablePlan,
+) -> Result<()> {
+    backend
+        .execute_batch(plan.create_sql)
+        .map_err(|err| storage_backend_error("Create pane id temp table", err))?;
+    backend
+        .execute_batch(plan.clear_sql)
+        .map_err(|err| storage_backend_error("Clear pane id temp table", err))?;
+
+    let param_rows = plan
+        .pane_ids
+        .iter()
+        .map(|&pane_id| {
+            u64_to_i64(pane_id, "temp_pane_id_set.pane_id")
+                .map(|pane_id| vec![ToSqlValue::Integer(pane_id)])
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    backend
+        .execute_many(plan.insert_sql, &param_rows)
+        .map_err(|err| storage_backend_error("Stage pane id", err))?;
 
     Ok(())
 }
@@ -20574,6 +20798,10 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
                 .iter()
                 .any(|event| event.pane_info.pane_id == 41),
             "large pane-id filter should include the staged pane id"
+        );
+        assert_eq!(
+            large_filter_timeline.total_count, 1,
+            "large pane-id temp-table count should keep the subquery predicate intact"
         );
 
         // 5. count_unhandled_events_by_pane_with_cx
