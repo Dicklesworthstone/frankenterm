@@ -226,7 +226,8 @@ fn synthetic_envelope_missing_required_field_must_fail() {
     );
 }
 
-/// Negative case: malformed `error_code` (must match `^robot\.[a-z_]+$`).
+/// Negative case: malformed `error_code` (must match the namespaced `robot.*`
+/// wire-code grammar).
 #[test]
 fn synthetic_envelope_with_malformed_error_code_must_fail() {
     let schema = load_envelope_schema();
@@ -243,8 +244,32 @@ fn synthetic_envelope_with_malformed_error_code_must_fail() {
     let result = schema.validate(&broken);
     assert!(
         result.is_err(),
-        "validator MUST reject error_code that doesn't match ^robot\\.[a-z_]+$"
+        "validator MUST reject error_code that doesn't match the robot.* grammar"
     );
+}
+
+#[test]
+fn synthetic_namespaced_robot_error_code_validates() {
+    let schema = load_envelope_schema();
+
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": "fleet mutation is unavailable",
+        "error_code": "robot.fleet.capability_unavailable",
+        "hint": "Use read-only fleet commands until daemon-side mutation is wired.",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "data": {
+            "family": "fleet",
+            "action": "scale",
+            "capability_available": false
+        }
+    });
+
+    schema
+        .validate(&envelope)
+        .unwrap_or_else(|errors| panic_validation_errors("namespaced robot error", errors));
 }
 
 #[test]

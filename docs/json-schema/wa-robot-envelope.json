@@ -19,8 +19,8 @@
     },
     "error_code": {
       "type": "string",
-      "description": "Machine-readable error code for programmatic handling. Present when ok=false. Format: 'robot.<code>' (e.g., 'robot.require_approval', 'robot.wezterm_not_running').",
-      "pattern": "^robot\\.[a-z_]+$"
+      "description": "Machine-readable error code for programmatic handling. Present when ok=false. Format: 'robot.<code>' or 'robot.<family>.<code>' (e.g., 'robot.require_approval', 'robot.wezterm_not_running', 'robot.fleet.capability_unavailable').",
+      "pattern": "^robot\\.[a-z0-9_]+(?:\\.[a-z0-9_]+)*$"
     },
     "hint": {
       "type": "string",
@@ -103,7 +103,13 @@
         "robot.tx_execution_failed",
         "robot.tx_error",
         "robot.internal_error",
-        "robot.timeout"
+        "robot.timeout",
+        "robot.profile.unknown_action",
+        "robot.profile.bad_params",
+        "robot.profile.not_found",
+        "robot.profile.storage",
+        "robot.profile.spawn_failed",
+        "robot.fleet.capability_unavailable"
       ]
     }
   }
