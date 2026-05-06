@@ -8555,8 +8555,7 @@ fn dispatch_write_command_raw(
         }
         WriteCommand::RecordUsageMetricsBatch { records, respond } => {
             // br-ft-l1jgo: trait-typed bulk insert via execute_many
-            // (was direct rusqlite Transaction + prepare + loop in
-            // record_usage_metrics_batch_sync).
+            // (was a direct rusqlite Transaction + prepare + loop).
             let result = with_writer_backend(conn, |backend| {
                 record_usage_metrics_batch_backend(backend, &records)
             });
@@ -11681,30 +11680,6 @@ fn mark_session_shutdown_clean_backend(
     Ok(())
 }
 
-/// Get the state_hash of the latest checkpoint for a session (read-only).
-///
-/// Direct-rusqlite path. Kept as a fallback while the
-/// [`get_latest_checkpoint_hash_backend`] migration target settles
-/// in (br-ft-l1jgo); will be removed once no callers remain.
-#[allow(dead_code)]
-pub fn get_latest_checkpoint_hash(conn: &Connection, session_id: &str) -> Result<Option<String>> {
-    let result = conn
-        .query_row(
-            "SELECT state_hash FROM session_checkpoints
-             WHERE session_id = ?1
-             ORDER BY checkpoint_at DESC LIMIT 1",
-            params![session_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to get latest checkpoint hash: {e}"))
-        })?;
-    Ok(result)
-}
-
-/// br-ft-l1jgo: trait-typed sibling of [`get_latest_checkpoint_hash`].
-///
 /// `state_hash` is a content hash (SHA-derived) and the column is
 /// NOT NULL by schema, so `query_row_typed`'s string-substrate path
 /// — which can't distinguish NULL from empty TEXT — is sound here.
@@ -11959,69 +11934,6 @@ fn record_usage_metric_backend(
         .map_err(|err| storage_backend_error("Usage metric insert id", err))?)
 }
 
-/// Direct-rusqlite path. Kept as a fallback while the
-/// [`record_usage_metrics_batch_backend`] migration target settles
-/// in (br-ft-l1jgo); will be removed once no callers remain.
-#[allow(dead_code)]
-fn record_usage_metrics_batch_sync(
-    conn: &mut Connection,
-    records: &[UsageMetricRecord],
-) -> Result<usize> {
-    if records.is_empty() {
-        return Ok(0);
-    }
-
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| StorageError::Database(format!("Failed to start metrics batch tx: {e}")))?;
-
-    {
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO usage_metrics (timestamp, metric_type, pane_id, agent_type, account_id, workflow_id, count, amount, tokens, metadata, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )
-            .map_err(|e| {
-                StorageError::Database(format!("Failed to prepare metrics batch insert: {e}"))
-            })?;
-
-        for record in records {
-            let ts = if record.timestamp == 0 {
-                now_ms()
-            } else {
-                record.timestamp
-            };
-            let created = if record.created_at == 0 {
-                now_ms()
-            } else {
-                record.created_at
-            };
-            let pane_id = record.pane_id.map(|id| id as i64);
-
-            stmt.execute(params![
-                ts,
-                record.metric_type.as_str(),
-                pane_id,
-                record.agent_type,
-                record.account_id,
-                record.workflow_id,
-                record.count,
-                record.amount,
-                record.tokens,
-                record.metadata,
-                created,
-            ])
-            .map_err(|e| StorageError::Database(format!("Failed to insert usage metric: {e}")))?;
-        }
-    }
-
-    tx.commit()
-        .map_err(|e| StorageError::Database(format!("Failed to commit metrics batch tx: {e}")))?;
-
-    Ok(records.len())
-}
-
-/// br-ft-l1jgo: trait-typed sibling of [`record_usage_metrics_batch_sync`].
 /// Uses [`StorageBackend::execute_many`] (ft-qgj81 slice 5) to batch the
 /// inserts through the backend's prepare-cached path, wrapped in an
 /// explicit BEGIN/COMMIT for one fsync per batch instead of one per row
