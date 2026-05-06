@@ -962,6 +962,12 @@ pub struct DigitalTwinTraceStep {
     /// Whether hardware evidence is complete for live proof claims.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hardware_evidence_complete: Option<bool>,
+    /// Observed logical CPU count for high-scale hardware predicates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_cpu_count: Option<u32>,
+    /// Observed RAM bytes for high-scale hardware predicates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_memory_bytes: Option<u64>,
     /// Normalized pressure score used by compaction and risk ordering.
     pub pressure_score: u8,
     /// Step-local data quality flags.
@@ -1153,6 +1159,8 @@ impl DigitalTwinTraceAdapter {
             proof_status: None,
             evidence_source: None,
             hardware_evidence_complete: None,
+            hardware_cpu_count: None,
+            hardware_memory_bytes: None,
             pressure_score: 0,
             quality_flags,
         }
@@ -1225,6 +1233,8 @@ impl DigitalTwinTraceAdapter {
             proof_status: None,
             evidence_source: None,
             hardware_evidence_complete: None,
+            hardware_cpu_count: None,
+            hardware_memory_bytes: None,
             pressure_score: decision.effective_pressure_severity,
             quality_flags,
         }
@@ -1279,6 +1289,8 @@ impl DigitalTwinTraceAdapter {
             proof_status: None,
             evidence_source: None,
             hardware_evidence_complete: None,
+            hardware_cpu_count: None,
+            hardware_memory_bytes: None,
             pressure_score: pressure.as_u8(),
             quality_flags,
         }
@@ -1316,6 +1328,11 @@ impl DigitalTwinTraceAdapter {
                     ProofStatus::SkippedNotProven => 1,
                     ProofStatus::Failed => 3,
                 };
+                let hardware_cpu_count = proof.evidence.as_ref().map(|evidence| evidence.cpu_count);
+                let hardware_memory_bytes = proof
+                    .evidence
+                    .as_ref()
+                    .map(|evidence| evidence.memory_bytes);
 
                 DigitalTwinTraceStep {
                     step_id: format!("scale_proof:{idx:04}"),
@@ -1349,6 +1366,8 @@ impl DigitalTwinTraceAdapter {
                     proof_status: Some(proof.status),
                     evidence_source: Some(proof.evidence_source),
                     hardware_evidence_complete: Some(evidence_complete),
+                    hardware_cpu_count,
+                    hardware_memory_bytes,
                     pressure_score,
                     quality_flags,
                 }
@@ -1456,6 +1475,15 @@ impl DigitalTwinTraceAdapter {
             proof_status: None,
             evidence_source: None,
             hardware_evidence_complete: Some(verdict.hardware_evidence.is_some()),
+            hardware_cpu_count: verdict.hardware_evidence.as_ref().and_then(|evidence| {
+                evidence
+                    .observed_logical_cores
+                    .and_then(|cores| u32::try_from(cores).ok())
+            }),
+            hardware_memory_bytes: verdict
+                .hardware_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.observed_memory_bytes),
             pressure_score,
             quality_flags,
         }
@@ -1968,6 +1996,8 @@ mod tests {
             proof_status: None,
             evidence_source: None,
             hardware_evidence_complete: None,
+            hardware_cpu_count: None,
+            hardware_memory_bytes: None,
             pressure_score,
             quality_flags: Vec::new(),
         }

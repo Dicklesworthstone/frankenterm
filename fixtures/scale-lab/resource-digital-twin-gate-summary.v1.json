@@ -1,0 +1,71 @@
+{
+  "schema_version": "ft.resource_digital_twin.gate_summary.v1",
+  "cases": [
+    {
+      "case_id": "pass",
+      "recommendation": "apply",
+      "confidence_verdict": "pass",
+      "confidence_score": 100,
+      "risk_verdict": "pass",
+      "risk_score": 0,
+      "proof_status": "PASSED",
+      "hardware_predicate": "proven_predicate_met",
+      "high_scale_claim_allowed": true,
+      "blocker_codes": []
+    },
+    {
+      "case_id": "warning",
+      "recommendation": "review_only",
+      "confidence_verdict": "warning",
+      "confidence_score": 97,
+      "risk_verdict": "warning",
+      "risk_score": 10,
+      "proof_status": "PASSED",
+      "hardware_predicate": "proven_predicate_met",
+      "high_scale_claim_allowed": true,
+      "blocker_codes": [
+        "candidate_risk_requires_review",
+        "confidence_requires_review",
+        "data_quality_apply_blocker"
+      ]
+    },
+    {
+      "case_id": "blocked",
+      "recommendation": "blocked",
+      "confidence_verdict": "pass",
+      "confidence_score": 100,
+      "risk_verdict": "blocked",
+      "risk_score": 100,
+      "proof_status": "PASSED",
+      "hardware_predicate": "proven_predicate_met",
+      "high_scale_claim_allowed": true,
+      "blocker_codes": [
+        "candidate_risk_fail_closed",
+        "harmful_candidate_rejection",
+        "policy_audit_fail_closed",
+        "predicted_queue_growth",
+        "topology_churn"
+      ]
+    },
+    {
+      "case_id": "skipped_not_proven",
+      "recommendation": "blocked",
+      "confidence_verdict": "blocked",
+      "confidence_score": 68,
+      "risk_verdict": "blocked",
+      "risk_score": 80,
+      "proof_status": "SKIPPED_NOT_PROVEN",
+      "hardware_predicate": "skipped_not_proven",
+      "high_scale_claim_allowed": false,
+      "blocker_codes": [
+        "candidate_risk_fail_closed",
+        "confidence_below_apply_threshold",
+        "data_quality_apply_blocker",
+        "missing_hardware_predicate",
+        "policy_audit_fail_open_risk",
+        "proof_skipped_not_proven",
+        "simulated_evidence_skipped_not_proven"
+      ]
+    }
+  ]
+}
