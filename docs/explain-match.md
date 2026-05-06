@@ -30,7 +30,8 @@ ft robot rules test "Usage limit" --trace
 Notes:
 - `ft robot rules test --trace` currently returns a minimal trace
   (`anchors_checked`, `regex_matched`). Full trace output is planned.
-- `--pack` is accepted for robot rules test, but filtering is not yet implemented.
+- `--pack` filters robot rules test detections to rules provided by the named
+  pack.
 
 ## Mental model (phases)
 
