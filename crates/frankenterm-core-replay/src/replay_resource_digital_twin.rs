@@ -544,7 +544,7 @@ pub struct ResourceDecisionChange {
 }
 
 /// Aggregate baseline-vs-candidate diff summary.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceDigitalTwinDiff {
     /// Total trace steps compared.
     pub total_steps: u64,
@@ -580,7 +580,7 @@ pub struct ResourceDigitalTwinDiff {
 }
 
 /// Complete digital-twin simulation output.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceDigitalTwinSimulation {
     /// Schema version.
     pub schema_version: String,

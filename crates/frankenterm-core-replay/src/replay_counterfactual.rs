@@ -7,7 +7,7 @@
 //! - [`OverrideManifest`] — Hash-pair list for diff detection.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 // ============================================================================
@@ -675,7 +675,6 @@ pub struct ResourceKnobSpec {
 }
 
 impl ResourceKnobSpec {
-    #[must_use]
     pub fn validates_value(self, raw: &str) -> Result<(), ResourceOverrideError> {
         match self.value_kind {
             ResourceKnobValueKind::Bool => match raw {
@@ -1077,7 +1076,7 @@ impl ResourceControlOverrideLoader {
         pkg: &mut ResourceControlOverridePackage,
         registry: &BTreeMap<&'static str, ResourceKnobSpec>,
     ) -> Result<(), ResourceOverrideError> {
-        let mut seen = BTreeMap::<String, ()>::new();
+        let mut seen = BTreeSet::<String>::new();
         Self::validate_override_group(&mut pkg.overrides, None, registry, &mut seen)?;
         Self::validate_override_group(
             &mut pkg.admission,
@@ -1115,11 +1114,11 @@ impl ResourceControlOverrideLoader {
         overrides: &mut [ResourceControlOverride],
         section_domain: Option<ResourceOverrideDomain>,
         registry: &BTreeMap<&'static str, ResourceKnobSpec>,
-        seen: &mut BTreeMap<String, ()>,
+        seen: &mut BTreeSet<String>,
     ) -> Result<(), ResourceOverrideError> {
         for override_ in &mut *overrides {
             Self::validate_knob_id(&override_.knob_id)?;
-            if seen.insert(override_.knob_id.clone(), ()).is_some() {
+            if !seen.insert(override_.knob_id.clone()) {
                 return Err(ResourceOverrideError::ConflictingKnobOverrides(
                     override_.knob_id.clone(),
                 ));

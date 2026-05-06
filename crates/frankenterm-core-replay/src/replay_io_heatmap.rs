@@ -383,26 +383,19 @@ fn decide_storage_index_cell(
         && workload.pending_index_segments <= policy.recovery_index_segments
         && workload.compaction_debt_bytes < policy.compaction_debt_bytes
         && !upstream_deferred;
-
-    let heat_level = classify_heat(
+    let signals = IoHeatSignals {
         write_hot,
         write_saturated,
         indexing_saturated,
-        search_burst,
-        replay_hot,
-        compaction_debt,
-        recovering,
-        workload,
-    );
-    let (admission_action, reasons, freshness_impact) = decide_admission(
-        indexing_saturated,
         upstream_deferred,
-        write_hot,
         search_burst,
         replay_hot,
         compaction_debt,
         recovering,
-    );
+    };
+
+    let heat_level = classify_heat(signals, workload);
+    let (admission_action, reasons, freshness_impact) = decide_admission(signals);
     let estimated_freshness_lag_ms = estimate_freshness_lag_ms(policy, workload, admission_action);
     let operator_note = format!(
         "{} -> {} ({})",
@@ -424,23 +417,26 @@ fn decide_storage_index_cell(
     }
 }
 
-fn classify_heat(
+#[derive(Debug, Clone, Copy)]
+struct IoHeatSignals {
     write_hot: bool,
     write_saturated: bool,
     indexing_saturated: bool,
+    upstream_deferred: bool,
     search_burst: bool,
     replay_hot: bool,
     compaction_debt: bool,
     recovering: bool,
-    workload: &StorageIndexWorkloadInput,
-) -> IoHeatLevel {
-    if write_saturated || indexing_saturated {
+}
+
+fn classify_heat(signals: IoHeatSignals, workload: &StorageIndexWorkloadInput) -> IoHeatLevel {
+    if signals.write_saturated || signals.indexing_saturated {
         return IoHeatLevel::Saturated;
     }
-    if write_hot || search_burst || replay_hot || compaction_debt {
+    if signals.write_hot || signals.search_burst || signals.replay_hot || signals.compaction_debt {
         return IoHeatLevel::Hot;
     }
-    if recovering {
+    if signals.recovering {
         return IoHeatLevel::Cool;
     }
     if workload.write_bytes_per_sec > 0
@@ -454,20 +450,14 @@ fn classify_heat(
 }
 
 fn decide_admission(
-    indexing_saturated: bool,
-    upstream_deferred: bool,
-    write_hot: bool,
-    search_burst: bool,
-    replay_hot: bool,
-    compaction_debt: bool,
-    recovering: bool,
+    signals: IoHeatSignals,
 ) -> (StorageAdmissionAction, Vec<String>, CoverageFreshnessImpact) {
-    if indexing_saturated || upstream_deferred {
+    if signals.indexing_saturated || signals.upstream_deferred {
         let mut reasons = Vec::new();
-        if indexing_saturated {
+        if signals.indexing_saturated {
             reasons.push(StorageAdmissionReason::IndexingBacklog.as_str().to_string());
         }
-        if upstream_deferred {
+        if signals.upstream_deferred {
             reasons.push(
                 StorageAdmissionReason::CoverageAlreadyDeferred
                     .as_str()
@@ -481,7 +471,7 @@ fn decide_admission(
         );
     }
 
-    if write_hot {
+    if signals.write_hot {
         return (
             StorageAdmissionAction::Throttle,
             vec![
@@ -493,12 +483,12 @@ fn decide_admission(
         );
     }
 
-    if search_burst || replay_hot {
+    if signals.search_burst || signals.replay_hot {
         let mut reasons = Vec::new();
-        if search_burst {
+        if signals.search_burst {
             reasons.push(StorageAdmissionReason::SearchBurst.as_str().to_string());
         }
-        if replay_hot {
+        if signals.replay_hot {
             reasons.push(
                 StorageAdmissionReason::ReplayArtifactIo
                     .as_str()
@@ -512,7 +502,7 @@ fn decide_admission(
         );
     }
 
-    if compaction_debt {
+    if signals.compaction_debt {
         return (
             StorageAdmissionAction::Defer,
             vec![StorageAdmissionReason::CompactionDebt.as_str().to_string()],
@@ -520,7 +510,7 @@ fn decide_admission(
         );
     }
 
-    if recovering {
+    if signals.recovering {
         return (
             StorageAdmissionAction::RunNow,
             vec![
