@@ -5358,9 +5358,9 @@ impl StorageHandle {
         let workflow_id = workflow_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_latest_step_log(&conn, &workflow_id)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_latest_step_log_backend(backend, &workflow_id)
+            })
         })
         .await
     }
@@ -17308,6 +17308,86 @@ fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowS
     Ok(results)
 }
 
+fn workflow_step_log_from_backend_cells(row: &[SqlCell]) -> Result<WorkflowStepLogRecord> {
+    let reader = CellRowReader::new(row);
+    let step_index = reader
+        .i64(3)
+        .map_err(|err| storage_backend_error("Workflow step log step_index", err))?;
+
+    Ok(WorkflowStepLogRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Workflow step log id", err))?,
+        workflow_id: reader
+            .string(1)
+            .map_err(|err| storage_backend_error("Workflow step log workflow_id", err))?,
+        audit_action_id: reader
+            .optional_i64(2)
+            .map_err(|err| storage_backend_error("Workflow step log audit_action_id", err))?,
+        step_index: i64_to_usize(step_index).map_err(|err| {
+            StorageError::Database(format!("Workflow step log step_index decode failed: {err}"))
+        })?,
+        step_name: reader
+            .string(4)
+            .map_err(|err| storage_backend_error("Workflow step log step_name", err))?,
+        step_id: reader
+            .optional_string(5)
+            .map_err(|err| storage_backend_error("Workflow step log step_id", err))?,
+        step_kind: reader
+            .optional_string(6)
+            .map_err(|err| storage_backend_error("Workflow step log step_kind", err))?,
+        result_type: reader
+            .string(7)
+            .map_err(|err| storage_backend_error("Workflow step log result_type", err))?,
+        result_data: reader
+            .optional_string(8)
+            .map_err(|err| storage_backend_error("Workflow step log result_data", err))?,
+        policy_summary: reader
+            .optional_string(9)
+            .map_err(|err| storage_backend_error("Workflow step log policy_summary", err))?,
+        verification_refs: reader
+            .optional_string(10)
+            .map_err(|err| storage_backend_error("Workflow step log verification_refs", err))?,
+        error_code: reader
+            .optional_string(11)
+            .map_err(|err| storage_backend_error("Workflow step log error_code", err))?,
+        started_at: reader
+            .i64(12)
+            .map_err(|err| storage_backend_error("Workflow step log started_at", err))?,
+        completed_at: reader
+            .i64(13)
+            .map_err(|err| storage_backend_error("Workflow step log completed_at", err))?,
+        duration_ms: reader
+            .i64(14)
+            .map_err(|err| storage_backend_error("Workflow step log duration_ms", err))?,
+    })
+}
+
+fn query_latest_step_log_backend(
+    backend: &dyn StorageBackend,
+    workflow_id: &str,
+) -> Result<Option<WorkflowStepLogRecord>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT id, workflow_id, audit_action_id, step_index, step_name, step_id, step_kind,
+             result_type, result_data, policy_summary, verification_refs, error_code,
+             started_at, completed_at, duration_ms
+         FROM workflow_step_logs
+         WHERE workflow_id = ?1
+         ORDER BY step_index DESC
+         LIMIT 1",
+            &[ToSqlValue::Text(workflow_id)],
+        )
+        .map_err(|err| storage_backend_error("Query latest step log", err))?;
+
+    row.as_deref()
+        .map(workflow_step_log_from_backend_cells)
+        .transpose()
+}
+
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_latest_step_log_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_latest_step_log(
     conn: &Connection,
     workflow_id: &str,
@@ -18308,13 +18388,19 @@ fn query_latest_step_log_returns_last_step() {
     )
     .unwrap();
 
-    let conn = backend.into_connection();
-    let latest = query_latest_step_log(&conn, "wf-test-latest")
+    let latest = query_latest_step_log_backend(&backend, "wf-test-latest")
         .unwrap()
         .unwrap();
     assert_eq!(latest.step_index, 2);
     assert_eq!(latest.step_name, "step_three");
     assert_eq!(latest.result_type, "done");
+
+    let conn = backend.into_connection();
+    let direct_latest = query_latest_step_log(&conn, "wf-test-latest")
+        .unwrap()
+        .unwrap();
+    assert_eq!(direct_latest.id, latest.id);
+    assert_eq!(direct_latest.step_index, latest.step_index);
 }
 
 #[test]
@@ -18322,8 +18408,13 @@ fn query_latest_step_log_returns_none_for_unknown_workflow() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
-    let latest = query_latest_step_log(&conn, "unknown-workflow").unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let latest = query_latest_step_log_backend(&backend, "unknown-workflow").unwrap();
     assert!(latest.is_none());
+
+    let conn = backend.into_connection();
+    let direct_latest = query_latest_step_log(&conn, "unknown-workflow").unwrap();
+    assert!(direct_latest.is_none());
 }
 
 #[test]
