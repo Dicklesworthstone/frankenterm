@@ -388,6 +388,313 @@ impl RuntimeDoctorReport {
     }
 }
 
+/// Schema version for the operator SLO cockpit.
+pub const SLO_COCKPIT_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum bottleneck rows exposed in one SLO cockpit snapshot.
+pub const MAX_SLO_COCKPIT_BOTTLENECKS: usize = 12;
+
+/// Stable SLO domain bucket for operator and robot-facing bottleneck summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloCockpitDomain {
+    /// Pane capture, ingest, or scan lag.
+    Capture,
+    /// Event fanout, broadcast, signal, or subscriber lag.
+    EventFanout,
+    /// Deduplication or coalescing saturation.
+    DedupSaturation,
+    /// Storage, indexing, WAL, search, or IO pressure.
+    Storage,
+    /// Policy gates, approval queues, or safety denials.
+    Policy,
+    /// Capacity, resource, backpressure, or scheduler pressure.
+    Capacity,
+    /// Proof-lane, RCH, hardware-evidence, or capacity-certificate gaps.
+    ProofLane,
+    /// Agent Mail availability or coordination health.
+    AgentMail,
+    /// Runtime lifecycle or generic runtime health.
+    Runtime,
+    /// Health check did not match a known domain.
+    Unknown,
+}
+
+impl SloCockpitDomain {
+    /// Stable domain label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::EventFanout => "event_fanout",
+            Self::DedupSaturation => "dedup_saturation",
+            Self::Storage => "storage",
+            Self::Policy => "policy",
+            Self::Capacity => "capacity",
+            Self::ProofLane => "proof_lane",
+            Self::AgentMail => "agent_mail",
+            Self::Runtime => "runtime",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A single bottleneck or degraded SLO explanation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SloCockpitBottleneck {
+    /// Stable domain bucket.
+    pub domain: SloCockpitDomain,
+    /// Source health check id.
+    pub check_id: String,
+    /// Source health check status.
+    pub status: CheckStatus,
+    /// SLO severity after cockpit-specific skip handling.
+    pub tier: HealthTier,
+    /// Stable reason code for automation.
+    pub reason_code: String,
+    /// Human-facing summary.
+    pub summary: String,
+    /// Evidence copied from the source check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// Actionable next steps distilled from remediation hints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_steps: Vec<String>,
+}
+
+/// Operator-facing and robot-readable SLO cockpit snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SloCockpitSnapshot {
+    /// SLO cockpit schema version.
+    pub schema_version: u32,
+    /// Runtime timestamp from the source doctor report.
+    pub generated_at_ms: u64,
+    /// Worst SLO tier after cockpit-specific aggregation.
+    pub overall_tier: HealthTier,
+    /// Runtime phase from the source doctor report.
+    pub phase: RuntimePhase,
+    /// Primary bottleneck domain, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_bottleneck: Option<String>,
+    /// Stable one-line operator summary.
+    pub summary: String,
+    /// Aggregated next steps, ordered by bottleneck severity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_steps: Vec<String>,
+    /// Bounded bottleneck rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bottlenecks: Vec<SloCockpitBottleneck>,
+}
+
+impl SloCockpitSnapshot {
+    /// Build an SLO cockpit from a doctor report.
+    #[must_use]
+    pub fn from_doctor_report(report: &RuntimeDoctorReport) -> Self {
+        let mut bottlenecks = report
+            .checks
+            .iter()
+            .filter_map(slo_bottleneck_from_check)
+            .collect::<Vec<_>>();
+        bottlenecks.sort_by(|left, right| {
+            right
+                .tier
+                .cmp(&left.tier)
+                .then_with(|| left.domain.as_str().cmp(right.domain.as_str()))
+                .then_with(|| left.check_id.cmp(&right.check_id))
+        });
+        bottlenecks.truncate(MAX_SLO_COCKPIT_BOTTLENECKS);
+
+        let overall_tier = bottlenecks.first().map_or(report.overall_tier, |first| {
+            report.overall_tier.max(first.tier)
+        });
+        let primary_bottleneck = bottlenecks
+            .first()
+            .map(|bottleneck| bottleneck.domain.as_str().to_string());
+        let next_steps = slo_next_steps(&bottlenecks);
+        let summary = slo_summary(
+            overall_tier,
+            primary_bottleneck.as_deref(),
+            bottlenecks.len(),
+        );
+
+        Self {
+            schema_version: SLO_COCKPIT_SCHEMA_VERSION,
+            generated_at_ms: report.timestamp_ms,
+            overall_tier,
+            phase: report.phase,
+            primary_bottleneck,
+            summary,
+            next_steps,
+            bottlenecks,
+        }
+    }
+
+    /// Whether the cockpit has no degraded SLO domains.
+    #[must_use]
+    pub fn is_green(&self) -> bool {
+        self.overall_tier == HealthTier::Green && self.bottlenecks.is_empty()
+    }
+}
+
+fn slo_bottleneck_from_check(check: &RuntimeHealthCheck) -> Option<SloCockpitBottleneck> {
+    let tier = slo_tier_for_check(check);
+    if tier == HealthTier::Green {
+        return None;
+    }
+
+    let domain = slo_domain_for_check(check, tier);
+    Some(SloCockpitBottleneck {
+        domain,
+        check_id: check.check_id.clone(),
+        status: check.status,
+        tier,
+        reason_code: slo_reason_code(domain, &check.check_id),
+        summary: check.summary.clone(),
+        evidence: check.evidence.clone(),
+        next_steps: slo_remediation_steps(check, tier),
+    })
+}
+
+fn slo_tier_for_check(check: &RuntimeHealthCheck) -> HealthTier {
+    match check.status {
+        CheckStatus::Pass => HealthTier::Green,
+        CheckStatus::Warn => check.tier.max(HealthTier::Yellow),
+        CheckStatus::Fail => check.tier.max(HealthTier::Red),
+        CheckStatus::Skip if check.check_id == "swarm_capacity" => HealthTier::Yellow,
+        CheckStatus::Skip => HealthTier::Green,
+    }
+}
+
+fn slo_domain_for_check(check: &RuntimeHealthCheck, tier: HealthTier) -> SloCockpitDomain {
+    if check.check_id == "swarm_capacity" && check.status == CheckStatus::Skip {
+        return SloCockpitDomain::ProofLane;
+    }
+
+    let haystack = format!(
+        "{} {} {}",
+        check.check_id, check.display_name, check.summary
+    )
+    .to_ascii_lowercase();
+
+    if contains_any(&haystack, &["agent_mail", "agent mail"]) {
+        SloCockpitDomain::AgentMail
+    } else if contains_any(&haystack, &["proof", "rch", "hardware", "certificate"]) {
+        SloCockpitDomain::ProofLane
+    } else if contains_any(&haystack, &["policy", "approval", "deny", "denial"]) {
+        SloCockpitDomain::Policy
+    } else if contains_any(
+        &haystack,
+        &[
+            "storage",
+            "index",
+            "indexing",
+            "fts",
+            "wal",
+            "search",
+            "hydration",
+            "i/o",
+            " io ",
+            ".io",
+            "_io",
+            "io_",
+        ],
+    ) {
+        SloCockpitDomain::Storage
+    } else if contains_any(&haystack, &["capture", "ingest", "scan"]) {
+        SloCockpitDomain::Capture
+    } else if contains_any(&haystack, &["event", "fanout", "broadcast", "signal"]) {
+        SloCockpitDomain::EventFanout
+    } else if contains_any(&haystack, &["dedup", "coalesce"]) {
+        SloCockpitDomain::DedupSaturation
+    } else if contains_any(
+        &haystack,
+        &[
+            "capacity",
+            "resource",
+            "backpressure",
+            "scheduler",
+            "memory",
+        ],
+    ) {
+        SloCockpitDomain::Capacity
+    } else if tier.requires_attention() {
+        SloCockpitDomain::Runtime
+    } else {
+        SloCockpitDomain::Unknown
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn slo_reason_code(domain: SloCockpitDomain, check_id: &str) -> String {
+    let mut sanitized = String::with_capacity(check_id.len());
+    for ch in check_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else {
+            sanitized.push('_');
+        }
+    }
+    let trimmed = sanitized.trim_matches('_');
+    let check = if trimmed.is_empty() {
+        "unknown"
+    } else {
+        trimmed
+    };
+    format!("slo.{}.{}", domain.as_str(), check)
+}
+
+fn slo_remediation_steps(check: &RuntimeHealthCheck, tier: HealthTier) -> Vec<String> {
+    let mut steps = Vec::new();
+    for hint in &check.remediation {
+        push_unique_step(&mut steps, hint.description.clone());
+        if let Some(command) = &hint.command {
+            push_unique_step(&mut steps, format!("run {command}"));
+        }
+    }
+    if steps.is_empty() && tier.requires_attention() {
+        push_unique_step(
+            &mut steps,
+            format!("inspect {} evidence before restarting work", check.check_id),
+        );
+    }
+    steps
+}
+
+fn slo_next_steps(bottlenecks: &[SloCockpitBottleneck]) -> Vec<String> {
+    let mut steps = Vec::new();
+    for bottleneck in bottlenecks {
+        for step in &bottleneck.next_steps {
+            push_unique_step(&mut steps, step.clone());
+        }
+    }
+    steps
+}
+
+fn push_unique_step(steps: &mut Vec<String>, step: String) {
+    if !step.is_empty() && !steps.iter().any(|existing| existing == &step) {
+        steps.push(step);
+    }
+}
+
+fn slo_summary(tier: HealthTier, primary: Option<&str>, bottleneck_count: usize) -> String {
+    if bottleneck_count == 0 {
+        return "all monitored swarm SLO domains are green".to_string();
+    }
+
+    let state = match tier {
+        HealthTier::Green => "has advisory signals",
+        HealthTier::Yellow => "is degraded",
+        HealthTier::Red | HealthTier::Black => "requires attention",
+    };
+    format!(
+        "{bottleneck_count} swarm SLO bottleneck(s) {state}; primary={}",
+        primary.unwrap_or("unknown")
+    )
+}
+
 // =============================================================================
 // Health check registry
 // =============================================================================
@@ -1975,6 +2282,240 @@ mod tests {
         let rt: HealthCheckData = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.overall_tier, "green");
         assert!(rt.healthy);
+    }
+
+    fn slo_cockpit_for_checks(checks: Vec<RuntimeHealthCheck>) -> SloCockpitSnapshot {
+        let mut reg = HealthCheckRegistry::new();
+        for check in checks {
+            reg.register(check);
+        }
+        let mut report = reg.build_report();
+        report.timestamp_ms = 42;
+        SloCockpitSnapshot::from_doctor_report(&report)
+    }
+
+    #[test]
+    fn slo_cockpit_from_doctor_report_is_green_without_bottlenecks() {
+        let mut reg = HealthCheckRegistry::new();
+        reg.register(RuntimeHealthCheck::pass(
+            "capture.tail",
+            "Capture Tail",
+            "capture tail is within budget",
+        ));
+        let report = reg.build_report();
+
+        let cockpit = SloCockpitSnapshot::from_doctor_report(&report);
+        let json = serde_json::to_value(&cockpit).unwrap();
+
+        assert_eq!(cockpit.schema_version, SLO_COCKPIT_SCHEMA_VERSION);
+        assert!(cockpit.is_green());
+        assert_eq!(cockpit.primary_bottleneck, None);
+        assert!(cockpit.next_steps.is_empty());
+        assert_eq!(json["overall_tier"], "green");
+        assert_eq!(json["summary"], "all monitored swarm SLO domains are green");
+    }
+
+    #[test]
+    fn slo_cockpit_classifies_storage_policy_agent_mail_and_proof_lane() {
+        let mut reg = HealthCheckRegistry::new();
+        reg.register(
+            RuntimeHealthCheck::fail(
+                "storage.indexing_lag",
+                "Storage Indexing",
+                "FTS indexing is behind capture",
+            )
+            .with_tier(HealthTier::Red)
+            .with_evidence("indexing_lag_ms=900")
+            .with_remediation(RemediationHint::with_command(
+                "throttle search fanout until indexing catches up",
+                "ft robot search --limit 5",
+            )),
+        );
+        reg.register(
+            RuntimeHealthCheck::warn(
+                "policy.approval_queue",
+                "Policy Approval Queue",
+                "approval queue is delaying work",
+            )
+            .with_remediation(RemediationHint::text("review pending approvals")),
+        );
+        reg.register(
+            RuntimeHealthCheck::warn(
+                "agent_mail.degraded",
+                "Agent Mail",
+                "Agent Mail is read-only",
+            )
+            .with_remediation(RemediationHint::text("coordinate through Beads")),
+        );
+        reg.register(
+            RuntimeHealthCheck::skip(
+                "swarm_capacity",
+                "Swarm capacity",
+                "no live swarm capacity certificate attached",
+            )
+            .with_remediation(RemediationHint::with_command(
+                "collect a capacity proof snapshot",
+                "ft robot capacity --level 2",
+            )),
+        );
+
+        let report = reg.build_report();
+        let cockpit = SloCockpitSnapshot::from_doctor_report(&report);
+        let domains = cockpit
+            .bottlenecks
+            .iter()
+            .map(|bottleneck| bottleneck.domain)
+            .collect::<Vec<_>>();
+        let json = serde_json::to_value(&cockpit).unwrap();
+
+        assert_eq!(cockpit.overall_tier, HealthTier::Red);
+        assert_eq!(cockpit.primary_bottleneck.as_deref(), Some("storage"));
+        assert_eq!(
+            domains,
+            vec![
+                SloCockpitDomain::Storage,
+                SloCockpitDomain::AgentMail,
+                SloCockpitDomain::Policy,
+                SloCockpitDomain::ProofLane,
+            ]
+        );
+        assert_eq!(
+            json["bottlenecks"][0]["reason_code"],
+            "slo.storage.storage_indexing_lag"
+        );
+        assert!(
+            cockpit
+                .next_steps
+                .iter()
+                .any(|step| step == "collect a capacity proof snapshot")
+        );
+        assert!(
+            cockpit
+                .next_steps
+                .iter()
+                .any(|step| step == "run ft robot capacity --level 2")
+        );
+    }
+
+    #[test]
+    fn slo_cockpit_has_stable_synthetic_bound_scenario_outputs() {
+        let healthy = slo_cockpit_for_checks(vec![RuntimeHealthCheck::pass(
+            "capture.tail",
+            "Capture Tail",
+            "capture tail is within budget",
+        )]);
+        let cpu_bound = slo_cockpit_for_checks(vec![
+            RuntimeHealthCheck::fail(
+                "capacity.cpu_saturation",
+                "CPU Capacity",
+                "CPU worker lanes are saturated",
+            )
+            .with_tier(HealthTier::Red)
+            .with_remediation(RemediationHint::with_command(
+                "move proof work to a remote RCH lane",
+                "rch status",
+            )),
+        ]);
+        let memory_bound = slo_cockpit_for_checks(vec![RuntimeHealthCheck::warn(
+            "capacity.memory_pressure",
+            "Memory Capacity",
+            "memory backpressure is approaching throttle",
+        )]);
+        let io_bound = slo_cockpit_for_checks(vec![RuntimeHealthCheck::warn(
+            "storage.io_wal_pressure",
+            "IO WAL Pressure",
+            "IO WAL pressure is delaying storage commits",
+        )]);
+        let policy_blocked = slo_cockpit_for_checks(vec![RuntimeHealthCheck::warn(
+            "policy.approval_queue",
+            "Policy Approval Queue",
+            "policy approval queue is blocking automation",
+        )]);
+        let mail_and_proof = slo_cockpit_for_checks(vec![
+            RuntimeHealthCheck::warn(
+                "agent_mail.degraded",
+                "Agent Mail",
+                "Agent Mail is read-only",
+            )
+            .with_remediation(RemediationHint::text(
+                "coordinate through Beads while Agent Mail is degraded",
+            )),
+            RuntimeHealthCheck::skip(
+                "swarm_capacity",
+                "Swarm capacity",
+                "no live high-core capacity proof available",
+            )
+            .with_remediation(RemediationHint::with_command(
+                "collect a capacity proof before calling the lane proven",
+                "ft robot capacity --level 2",
+            )),
+        ]);
+
+        assert!(healthy.is_green());
+        assert_eq!(
+            cpu_bound.bottlenecks[0].reason_code,
+            "slo.capacity.capacity_cpu_saturation"
+        );
+        assert_eq!(cpu_bound.primary_bottleneck.as_deref(), Some("capacity"));
+        assert_eq!(
+            memory_bound.bottlenecks[0].domain,
+            SloCockpitDomain::Capacity
+        );
+        assert_eq!(io_bound.bottlenecks[0].domain, SloCockpitDomain::Storage);
+        assert_eq!(
+            policy_blocked.bottlenecks[0].domain,
+            SloCockpitDomain::Policy
+        );
+        assert_eq!(
+            mail_and_proof
+                .bottlenecks
+                .iter()
+                .map(|bottleneck| bottleneck.domain)
+                .collect::<Vec<_>>(),
+            vec![SloCockpitDomain::AgentMail, SloCockpitDomain::ProofLane]
+        );
+        assert!(
+            mail_and_proof
+                .next_steps
+                .iter()
+                .any(|step| step == "collect a capacity proof before calling the lane proven")
+        );
+
+        let cpu_json = serde_json::to_string(&cpu_bound).unwrap();
+        let expected_cpu_json = concat!(
+            "{\"schema_version\":1,\"generated_at_ms\":42,\"overall_tier\":\"red\",",
+            "\"phase\":\"running\",\"primary_bottleneck\":\"capacity\",",
+            "\"summary\":\"1 swarm SLO bottleneck(s) requires attention; primary=capacity\",",
+            "\"next_steps\":[\"move proof work to a remote RCH lane\",\"run rch status\"],",
+            "\"bottlenecks\":[{\"domain\":\"capacity\",\"check_id\":\"capacity.cpu_saturation\",",
+            "\"status\":\"fail\",\"tier\":\"red\",",
+            "\"reason_code\":\"slo.capacity.capacity_cpu_saturation\",",
+            "\"summary\":\"CPU worker lanes are saturated\",",
+            "\"next_steps\":[\"move proof work to a remote RCH lane\",\"run rch status\"]}]}"
+        );
+        assert_eq!(cpu_json, expected_cpu_json);
+    }
+
+    #[test]
+    fn slo_cockpit_surfaces_skipped_capacity_proof_as_yellow() {
+        let mut reg = HealthCheckRegistry::new();
+        reg.register(RuntimeHealthCheck::skip(
+            "swarm_capacity",
+            "Swarm capacity",
+            "no live capacity proof available",
+        ));
+        let report = reg.build_report();
+
+        let cockpit = SloCockpitSnapshot::from_doctor_report(&report);
+
+        assert_eq!(report.overall_tier, HealthTier::Green);
+        assert_eq!(cockpit.overall_tier, HealthTier::Yellow);
+        assert_eq!(cockpit.primary_bottleneck.as_deref(), Some("proof_lane"));
+        assert_eq!(cockpit.bottlenecks[0].domain, SloCockpitDomain::ProofLane);
+        assert_eq!(
+            cockpit.bottlenecks[0].reason_code,
+            "slo.proof_lane.swarm_capacity"
+        );
     }
 
     #[test]
