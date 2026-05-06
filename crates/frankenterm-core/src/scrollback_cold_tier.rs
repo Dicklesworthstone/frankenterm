@@ -116,7 +116,7 @@ impl ScrollbackTier {
 /// have lower ids.
 ///
 /// Inner field is `pub(crate)` so external code can't forge ids
-/// outside the [`Self::next`] allocator (which would risk
+/// outside the [`Self::allocate`] allocator (which would risk
 /// collisions in the metadata index). Use [`Self::raw`] for
 /// read access (e.g., serialization) and [`Self::from_raw`]
 /// for round-tripping deserialized ids.
@@ -124,7 +124,8 @@ impl ScrollbackTier {
 pub struct ChunkId(pub(crate) u64);
 
 impl ChunkId {
-    pub fn next(&mut self) -> Self {
+    #[must_use]
+    pub fn allocate(&mut self) -> Self {
         let curr = *self;
         self.0 = self.0.saturating_add(1);
         curr
@@ -137,7 +138,7 @@ impl ChunkId {
     }
 
     /// Reconstruct from a raw u64 (for deserialization round-
-    /// trip). New code should use the [`Self::next`] allocator;
+    /// trip). New code should use the [`Self::allocate`] allocator;
     /// this is the deserialization-only entry point.
     #[must_use]
     pub const fn from_raw(raw: u64) -> Self {
@@ -477,11 +478,11 @@ pub fn should_purge_by_retention(
 /// one with the largest `idle_ms`. Filters by tier first; ties
 /// broken by `id` for deterministic telemetry.
 #[must_use]
-pub fn select_eviction_target<'a>(
-    candidates: &'a [ChunkMetadata],
+pub fn select_eviction_target(
+    candidates: &[ChunkMetadata],
     tier: ScrollbackTier,
     now_ms: u64,
-) -> Option<&'a ChunkMetadata> {
+) -> Option<&ChunkMetadata> {
     candidates.iter().filter(|c| c.tier == tier).max_by(|a, b| {
         a.idle_ms(now_ms)
             .cmp(&b.idle_ms(now_ms))
@@ -658,11 +659,11 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn chunk_id_next_monotonic() {
+    fn chunk_id_allocate_monotonic() {
         let mut id = ChunkId::default();
-        assert_eq!(id.next(), ChunkId(0));
-        assert_eq!(id.next(), ChunkId(1));
-        assert_eq!(id.next(), ChunkId(2));
+        assert_eq!(id.allocate(), ChunkId(0));
+        assert_eq!(id.allocate(), ChunkId(1));
+        assert_eq!(id.allocate(), ChunkId(2));
     }
 
     // ----------------------------------------------------------------
@@ -875,8 +876,8 @@ mod tests {
     #[test]
     fn chunk_id_round_trip_via_raw_and_from_raw() {
         let mut counter = ChunkId::default();
-        let a = counter.next();
-        let b = counter.next();
+        let a = counter.allocate();
+        let b = counter.allocate();
         assert_eq!(a.raw(), 0);
         assert_eq!(b.raw(), 1);
         // Deserialization round-trip via from_raw.
