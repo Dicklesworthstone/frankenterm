@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 /// Stable schema version identifier for test artifact manifests.
 pub const TEST_ARTIFACT_SCHEMA_VERSION: &str = "wa.test_artifacts.v1";
 
+/// Stable schema version identifier for scale-lab workload catalog artifacts.
+pub const SCALE_LAB_WORKLOAD_CATALOG_SCHEMA_VERSION: &str = "ft.scale_lab.workload_catalog.v1";
+
 /// Result category for a test run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -275,6 +278,462 @@ impl std::fmt::Display for TestArtifactSchemaError {
 
 impl std::error::Error for TestArtifactSchemaError {}
 
+/// Execution substrate used by a scale-lab workload artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleLabEvidenceMode {
+    SimulatedReplay,
+    LocalReplay,
+    RchReplay,
+    LiveMux,
+}
+
+/// Workload personas used by scale-lab runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleLabWorkloadPersona {
+    IdleAgents,
+    ActiveAgents,
+    NoisyAgents,
+    RateLimitedAgents,
+    TuiHeavy,
+    SearchHeavy,
+    WorkflowHeavy,
+    DistributedPanes,
+}
+
+/// Hardware and runtime substrate metadata for a scale-lab run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaleLabHostShape {
+    pub host_class: String,
+    pub os: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_gib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gib: Option<u32>,
+    pub live_mux_available: bool,
+}
+
+/// Cargo feature evidence attached to the command line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleLabFeatureFlags {
+    pub default_features: bool,
+    #[serde(default)]
+    pub enabled: Vec<String>,
+    #[serde(default)]
+    pub disabled: Vec<String>,
+}
+
+/// Command receipt fields required for reproducible scale-lab artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleLabCommandEvidence {
+    pub command_line: String,
+    pub target_dir: String,
+    pub feature_flags: ScaleLabFeatureFlags,
+}
+
+/// One workload component in a mixed scale-lab run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaleLabWorkloadMixEntry {
+    pub persona: ScaleLabWorkloadPersona,
+    pub pane_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes_per_sec: Option<f64>,
+    #[serde(default)]
+    pub operations: Vec<String>,
+}
+
+/// Timing evidence for a scale-lab artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaleLabTimingEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_api_latency_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_api_latency_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99_api_latency_ms: Option<f64>,
+}
+
+/// Memory evidence for a scale-lab artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleLabMemoryEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_tier_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_tier_bytes: Option<u64>,
+}
+
+/// Disk evidence for a scale-lab artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleLabDiskEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes_after_run: Option<u64>,
+}
+
+/// Event/drop/gap counters required for scale-lab proof artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaleLabEventEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_gaps: Option<u64>,
+}
+
+/// Self-contained workload catalog and proof artifact skeleton for scale-lab runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaleLabWorkloadCatalog {
+    pub schema_version: String,
+    pub catalog_id: String,
+    pub generated_at_ms: u64,
+    #[serde(default)]
+    pub field_notes: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_mode: Option<ScaleLabEvidenceMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pane_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<ScaleLabHostShape>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<ScaleLabCommandEvidence>,
+    #[serde(default)]
+    pub workload_mix: Vec<ScaleLabWorkloadMixEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<ScaleLabTimingEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<ScaleLabMemoryEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<ScaleLabDiskEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<ScaleLabEventEvidence>,
+    #[serde(default)]
+    pub limitations: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactEntry>,
+}
+
+impl ScaleLabWorkloadCatalog {
+    /// Validate that a scale-lab catalog carries enough evidence for later claims.
+    pub fn validate(&self) -> Result<(), ScaleLabWorkloadSchemaError> {
+        if self.schema_version != SCALE_LAB_WORKLOAD_CATALOG_SCHEMA_VERSION {
+            return Err(ScaleLabWorkloadSchemaError::InvalidSchemaVersion {
+                found: self.schema_version.clone(),
+            });
+        }
+        require_non_empty("catalog_id", &self.catalog_id)?;
+        if self.generated_at_ms == 0 {
+            return Err(ScaleLabWorkloadSchemaError::NonPositiveField {
+                field: "generated_at_ms",
+                value: 0,
+            });
+        }
+
+        let mode = require_some("evidence_mode", self.evidence_mode)?;
+        let target_panes = require_some("target_pane_count", self.target_pane_count)?;
+        if target_panes == 0 {
+            return Err(ScaleLabWorkloadSchemaError::NonPositiveField {
+                field: "target_pane_count",
+                value: 0,
+            });
+        }
+
+        let host = require_some_ref("host", &self.host)?;
+        validate_host_shape(host, mode)?;
+        validate_command(require_some_ref("command", &self.command)?)?;
+        validate_workload_mix(&self.workload_mix, target_panes)?;
+        validate_timings(require_some_ref("timings", &self.timings)?)?;
+        validate_memory(require_some_ref("memory", &self.memory)?)?;
+        validate_disk(require_some_ref("disk", &self.disk)?)?;
+        validate_events(require_some_ref("events", &self.events)?)?;
+        validate_non_empty_strings("limitations", &self.limitations)?;
+        validate_scale_lab_artifacts(&self.artifacts)?;
+
+        Ok(())
+    }
+}
+
+/// Validation errors for [`ScaleLabWorkloadCatalog`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScaleLabWorkloadSchemaError {
+    InvalidSchemaVersion { found: String },
+    MissingField { field: &'static str },
+    EmptyField { field: &'static str },
+    NonPositiveField { field: &'static str, value: u64 },
+    InvalidNumber { field: &'static str, value: f64 },
+    InvalidPercentileOrder { p50: f64, p95: f64, p99: f64 },
+    PaneCountMismatch { expected: u32, actual: u32 },
+    MissingArtifactPath { index: usize },
+    InvalidSha256 { index: usize, value: String },
+    MissingWorkloadOperations { persona: ScaleLabWorkloadPersona },
+    LiveMuxUnavailable,
+}
+
+impl std::fmt::Display for ScaleLabWorkloadSchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSchemaVersion { found } => {
+                write!(f, "invalid scale-lab schema version: {found}")
+            }
+            Self::MissingField { field } => write!(f, "scale-lab field {field} is required"),
+            Self::EmptyField { field } => write!(f, "scale-lab field {field} must not be empty"),
+            Self::NonPositiveField { field, value } => {
+                write!(f, "scale-lab field {field} must be positive (got {value})")
+            }
+            Self::InvalidNumber { field, value } => {
+                write!(
+                    f,
+                    "scale-lab numeric field {field} must be finite and non-negative (got {value})"
+                )
+            }
+            Self::InvalidPercentileOrder { p50, p95, p99 } => write!(
+                f,
+                "invalid scale-lab latency percentile order: expected p50 <= p95 <= p99, got {p50}, {p95}, {p99}"
+            ),
+            Self::PaneCountMismatch { expected, actual } => write!(
+                f,
+                "scale-lab workload_mix pane count mismatch: expected {expected}, got {actual}"
+            ),
+            Self::MissingArtifactPath { index } => {
+                write!(f, "scale-lab artifact at index {index} has empty path")
+            }
+            Self::InvalidSha256 { index, value } => write!(
+                f,
+                "scale-lab artifact at index {index} has invalid sha256 '{value}'"
+            ),
+            Self::MissingWorkloadOperations { persona } => {
+                write!(f, "scale-lab workload persona {persona:?} needs operations")
+            }
+            Self::LiveMuxUnavailable => write!(
+                f,
+                "scale-lab live_mux evidence requires host.live_mux_available=true"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScaleLabWorkloadSchemaError {}
+
+fn require_some<T>(
+    field: &'static str,
+    value: Option<T>,
+) -> Result<T, ScaleLabWorkloadSchemaError> {
+    value.ok_or(ScaleLabWorkloadSchemaError::MissingField { field })
+}
+
+fn require_some_ref<'a, T>(
+    field: &'static str,
+    value: &'a Option<T>,
+) -> Result<&'a T, ScaleLabWorkloadSchemaError> {
+    value
+        .as_ref()
+        .ok_or(ScaleLabWorkloadSchemaError::MissingField { field })
+}
+
+fn require_non_empty(field: &'static str, value: &str) -> Result<(), ScaleLabWorkloadSchemaError> {
+    if value.trim().is_empty() {
+        return Err(ScaleLabWorkloadSchemaError::EmptyField { field });
+    }
+    Ok(())
+}
+
+fn validate_non_empty_strings(
+    field: &'static str,
+    values: &[String],
+) -> Result<(), ScaleLabWorkloadSchemaError> {
+    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+        return Err(ScaleLabWorkloadSchemaError::EmptyField { field });
+    }
+    Ok(())
+}
+
+fn validate_positive_option(
+    field: &'static str,
+    value: Option<u32>,
+) -> Result<(), ScaleLabWorkloadSchemaError> {
+    match value {
+        Some(positive) if positive > 0 => Ok(()),
+        Some(value) => Err(ScaleLabWorkloadSchemaError::NonPositiveField {
+            field,
+            value: u64::from(value),
+        }),
+        None => Err(ScaleLabWorkloadSchemaError::MissingField { field }),
+    }
+}
+
+fn validate_non_negative_number(
+    field: &'static str,
+    value: Option<f64>,
+) -> Result<f64, ScaleLabWorkloadSchemaError> {
+    let value = require_some(field, value)?;
+    if !value.is_finite() || value.is_sign_negative() {
+        return Err(ScaleLabWorkloadSchemaError::InvalidNumber { field, value });
+    }
+    Ok(value)
+}
+
+fn validate_non_negative_u64(
+    field: &'static str,
+    value: Option<u64>,
+) -> Result<(), ScaleLabWorkloadSchemaError> {
+    require_some(field, value)?;
+    Ok(())
+}
+
+fn validate_host_shape(
+    host: &ScaleLabHostShape,
+    mode: ScaleLabEvidenceMode,
+) -> Result<(), ScaleLabWorkloadSchemaError> {
+    require_non_empty("host.host_class", &host.host_class)?;
+    require_non_empty("host.os", &host.os)?;
+    validate_positive_option("host.cpu_cores", host.cpu_cores)?;
+    validate_positive_option("host.memory_gib", host.memory_gib)?;
+    validate_positive_option("host.storage_gib", host.storage_gib)?;
+    if mode == ScaleLabEvidenceMode::LiveMux && !host.live_mux_available {
+        return Err(ScaleLabWorkloadSchemaError::LiveMuxUnavailable);
+    }
+    Ok(())
+}
+
+fn validate_command(command: &ScaleLabCommandEvidence) -> Result<(), ScaleLabWorkloadSchemaError> {
+    require_non_empty("command.command_line", &command.command_line)?;
+    require_non_empty("command.target_dir", &command.target_dir)?;
+    if !command.feature_flags.default_features
+        && command.feature_flags.enabled.is_empty()
+        && command.feature_flags.disabled.is_empty()
+    {
+        return Err(ScaleLabWorkloadSchemaError::EmptyField {
+            field: "command.feature_flags",
+        });
+    }
+    if command
+        .feature_flags
+        .enabled
+        .iter()
+        .chain(command.feature_flags.disabled.iter())
+        .any(|flag| flag.trim().is_empty())
+    {
+        return Err(ScaleLabWorkloadSchemaError::EmptyField {
+            field: "command.feature_flags",
+        });
+    }
+    Ok(())
+}
+
+fn validate_workload_mix(
+    workload_mix: &[ScaleLabWorkloadMixEntry],
+    target_pane_count: u32,
+) -> Result<(), ScaleLabWorkloadSchemaError> {
+    if workload_mix.is_empty() {
+        return Err(ScaleLabWorkloadSchemaError::MissingField {
+            field: "workload_mix",
+        });
+    }
+
+    let mut actual_panes = 0_u32;
+    for entry in workload_mix {
+        if entry.pane_count == 0 {
+            return Err(ScaleLabWorkloadSchemaError::NonPositiveField {
+                field: "workload_mix.pane_count",
+                value: 0,
+            });
+        }
+        validate_non_negative_number(
+            "workload_mix.output_bytes_per_sec",
+            entry.output_bytes_per_sec,
+        )?;
+        if entry.operations.is_empty() {
+            return Err(ScaleLabWorkloadSchemaError::MissingWorkloadOperations {
+                persona: entry.persona,
+            });
+        }
+        validate_non_empty_strings("workload_mix.operations", &entry.operations)?;
+        actual_panes = actual_panes.saturating_add(entry.pane_count);
+    }
+
+    if actual_panes != target_pane_count {
+        return Err(ScaleLabWorkloadSchemaError::PaneCountMismatch {
+            expected: target_pane_count,
+            actual: actual_panes,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_timings(timings: &ScaleLabTimingEvidence) -> Result<(), ScaleLabWorkloadSchemaError> {
+    validate_non_negative_number("timings.elapsed_ms", timings.elapsed_ms)?;
+    let p50 =
+        validate_non_negative_number("timings.p50_api_latency_ms", timings.p50_api_latency_ms)?;
+    let p95 =
+        validate_non_negative_number("timings.p95_api_latency_ms", timings.p95_api_latency_ms)?;
+    let p99 =
+        validate_non_negative_number("timings.p99_api_latency_ms", timings.p99_api_latency_ms)?;
+
+    if !(p50 <= p95 && p95 <= p99) {
+        return Err(ScaleLabWorkloadSchemaError::InvalidPercentileOrder { p50, p95, p99 });
+    }
+
+    Ok(())
+}
+
+fn validate_memory(memory: &ScaleLabMemoryEvidence) -> Result<(), ScaleLabWorkloadSchemaError> {
+    validate_non_negative_u64("memory.peak_rss_bytes", memory.peak_rss_bytes)?;
+    validate_non_negative_u64("memory.memory_limit_bytes", memory.memory_limit_bytes)?;
+    validate_non_negative_u64("memory.warm_tier_bytes", memory.warm_tier_bytes)?;
+    validate_non_negative_u64("memory.cold_tier_bytes", memory.cold_tier_bytes)?;
+    Ok(())
+}
+
+fn validate_disk(disk: &ScaleLabDiskEvidence) -> Result<(), ScaleLabWorkloadSchemaError> {
+    validate_non_negative_u64("disk.bytes_written", disk.bytes_written)?;
+    validate_non_negative_u64("disk.free_bytes_after_run", disk.free_bytes_after_run)?;
+    Ok(())
+}
+
+fn validate_events(events: &ScaleLabEventEvidence) -> Result<(), ScaleLabWorkloadSchemaError> {
+    validate_non_negative_u64("events.detection_events", events.detection_events)?;
+    validate_non_negative_u64("events.workflow_events", events.workflow_events)?;
+    validate_non_negative_u64("events.dropped_events", events.dropped_events)?;
+    validate_non_negative_u64("events.capture_gaps", events.capture_gaps)?;
+    Ok(())
+}
+
+fn validate_scale_lab_artifacts(
+    artifacts: &[ArtifactEntry],
+) -> Result<(), ScaleLabWorkloadSchemaError> {
+    if artifacts.is_empty() {
+        return Err(ScaleLabWorkloadSchemaError::MissingField { field: "artifacts" });
+    }
+    for (index, artifact) in artifacts.iter().enumerate() {
+        if artifact.path.trim().is_empty() {
+            return Err(ScaleLabWorkloadSchemaError::MissingArtifactPath { index });
+        }
+        if let Some(hash) = &artifact.sha256 {
+            let valid = hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit());
+            if !valid {
+                return Err(ScaleLabWorkloadSchemaError::InvalidSha256 {
+                    index,
+                    value: hash.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +799,140 @@ mod tests {
                 p99_ms: Some(5.0),
             },
             artifacts,
+        }
+    }
+
+    fn valid_scale_lab_catalog() -> ScaleLabWorkloadCatalog {
+        let mut field_notes = std::collections::BTreeMap::new();
+        field_notes.insert(
+            "target_pane_count".to_string(),
+            "Total pane-equivalent workload covered by workload_mix.".to_string(),
+        );
+        field_notes.insert(
+            "evidence_mode".to_string(),
+            "Declares whether evidence is simulated, replayed, rch-offloaded, or live mux."
+                .to_string(),
+        );
+
+        ScaleLabWorkloadCatalog {
+            schema_version: SCALE_LAB_WORKLOAD_CATALOG_SCHEMA_VERSION.to_string(),
+            catalog_id: "ft-s6h49.scale-lab-smoke".to_string(),
+            generated_at_ms: 1_778_087_760_000,
+            field_notes,
+            evidence_mode: Some(ScaleLabEvidenceMode::RchReplay),
+            target_pane_count: Some(10),
+            host: Some(ScaleLabHostShape {
+                host_class: "rch-worker-smoke".to_string(),
+                os: "linux".to_string(),
+                cpu_cores: Some(8),
+                memory_gib: Some(32),
+                storage_gib: Some(256),
+                live_mux_available: false,
+            }),
+            command: Some(ScaleLabCommandEvidence {
+                command_line: "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-s6h49-silverharbor-target cargo test -p frankenterm-core scale_lab_workload_catalog --lib --no-default-features".to_string(),
+                target_dir: "/tmp/ft-s6h49-silverharbor-target".to_string(),
+                feature_flags: ScaleLabFeatureFlags {
+                    default_features: false,
+                    enabled: vec!["no-default-features".to_string()],
+                    disabled: Vec::new(),
+                },
+            }),
+            workload_mix: vec![
+                ScaleLabWorkloadMixEntry {
+                    persona: ScaleLabWorkloadPersona::IdleAgents,
+                    pane_count: 1,
+                    output_bytes_per_sec: Some(0.0),
+                    operations: vec!["state_snapshot".to_string()],
+                },
+                ScaleLabWorkloadMixEntry {
+                    persona: ScaleLabWorkloadPersona::ActiveAgents,
+                    pane_count: 2,
+                    output_bytes_per_sec: Some(256.0),
+                    operations: vec!["capture_delta".to_string(), "detect_prompt".to_string()],
+                },
+                ScaleLabWorkloadMixEntry {
+                    persona: ScaleLabWorkloadPersona::NoisyAgents,
+                    pane_count: 1,
+                    output_bytes_per_sec: Some(4096.0),
+                    operations: vec!["scan_pipeline".to_string()],
+                },
+                ScaleLabWorkloadMixEntry {
+                    persona: ScaleLabWorkloadPersona::RateLimitedAgents,
+                    pane_count: 1,
+                    output_bytes_per_sec: Some(128.0),
+                    operations: vec!["pattern_detection".to_string()],
+                },
+                ScaleLabWorkloadMixEntry {
+                    persona: ScaleLabWorkloadPersona::TuiHeavy,
+                    pane_count: 1,
+                    output_bytes_per_sec: Some(2048.0),
+                    operations: vec!["ansi_density_scan".to_string()],
+                },
+                ScaleLabWorkloadMixEntry {
+                    persona: ScaleLabWorkloadPersona::SearchHeavy,
+                    pane_count: 2,
+                    output_bytes_per_sec: Some(512.0),
+                    operations: vec!["fts_query".to_string(), "hybrid_query".to_string()],
+                },
+                ScaleLabWorkloadMixEntry {
+                    persona: ScaleLabWorkloadPersona::WorkflowHeavy,
+                    pane_count: 1,
+                    output_bytes_per_sec: Some(384.0),
+                    operations: vec!["workflow_trigger".to_string()],
+                },
+                ScaleLabWorkloadMixEntry {
+                    persona: ScaleLabWorkloadPersona::DistributedPanes,
+                    pane_count: 1,
+                    output_bytes_per_sec: Some(256.0),
+                    operations: vec!["stale_session_prune".to_string()],
+                },
+            ],
+            timings: Some(ScaleLabTimingEvidence {
+                elapsed_ms: Some(12_000.0),
+                p50_api_latency_ms: Some(3.0),
+                p95_api_latency_ms: Some(8.0),
+                p99_api_latency_ms: Some(13.0),
+            }),
+            memory: Some(ScaleLabMemoryEvidence {
+                peak_rss_bytes: Some(320 * 1024 * 1024),
+                memory_limit_bytes: Some(32 * 1024 * 1024 * 1024),
+                warm_tier_bytes: Some(12 * 1024 * 1024),
+                cold_tier_bytes: Some(0),
+            }),
+            disk: Some(ScaleLabDiskEvidence {
+                bytes_written: Some(4 * 1024 * 1024),
+                free_bytes_after_run: Some(180 * 1024 * 1024 * 1024),
+            }),
+            events: Some(ScaleLabEventEvidence {
+                detection_events: Some(7),
+                workflow_events: Some(2),
+                dropped_events: Some(0),
+                capture_gaps: Some(0),
+            }),
+            limitations: vec![
+                "rch replay smoke artifact; not a live mux or 64-core/256GB proof".to_string(),
+                "pane count is 10 pane-equivalents and cannot graduate larger support claims"
+                    .to_string(),
+            ],
+            artifacts: vec![
+                ArtifactEntry {
+                    kind: ArtifactKind::StructuredLog,
+                    format: ArtifactFormat::JsonLines,
+                    path: "artifacts/scale-lab-smoke/events.jsonl".to_string(),
+                    bytes: Some(1024),
+                    sha256: Some("0".repeat(64)),
+                    redacted: true,
+                },
+                ArtifactEntry {
+                    kind: ArtifactKind::TraceBundle,
+                    format: ArtifactFormat::Json,
+                    path: "artifacts/scale-lab-smoke/trace.json".to_string(),
+                    bytes: Some(2048),
+                    sha256: Some("1".repeat(64)),
+                    redacted: true,
+                },
+            ],
         }
     }
 
@@ -899,6 +1492,131 @@ mod tests {
     #[test]
     fn schema_version_constant_is_stable() {
         assert_eq!(TEST_ARTIFACT_SCHEMA_VERSION, "wa.test_artifacts.v1");
+    }
+
+    #[test]
+    fn scale_lab_schema_version_constant_is_stable() {
+        assert_eq!(
+            SCALE_LAB_WORKLOAD_CATALOG_SCHEMA_VERSION,
+            "ft.scale_lab.workload_catalog.v1"
+        );
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_validates_required_evidence() {
+        let catalog = valid_scale_lab_catalog();
+        assert!(catalog.validate().is_ok());
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_requires_host_shape() {
+        let mut catalog = valid_scale_lab_catalog();
+        catalog.host = None;
+
+        let err = catalog.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ScaleLabWorkloadSchemaError::MissingField { field: "host" }
+        ));
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_rejects_pane_count_mismatch() {
+        let mut catalog = valid_scale_lab_catalog();
+        catalog.target_pane_count = Some(11);
+
+        let err = catalog.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ScaleLabWorkloadSchemaError::PaneCountMismatch {
+                expected: 11,
+                actual: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_requires_drop_and_gap_counter_group() {
+        let mut catalog = valid_scale_lab_catalog();
+        catalog.events = None;
+
+        let err = catalog.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ScaleLabWorkloadSchemaError::MissingField { field: "events" }
+        ));
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_requires_dropped_event_counter() {
+        let mut catalog = valid_scale_lab_catalog();
+        catalog.events.as_mut().unwrap().dropped_events = None;
+
+        let err = catalog.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ScaleLabWorkloadSchemaError::MissingField {
+                field: "events.dropped_events"
+            }
+        ));
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_rejects_invalid_timing_number() {
+        let mut catalog = valid_scale_lab_catalog();
+        catalog.timings.as_mut().unwrap().p95_api_latency_ms = Some(f64::NAN);
+
+        let err = catalog.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ScaleLabWorkloadSchemaError::InvalidNumber {
+                field: "timings.p95_api_latency_ms",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_rejects_live_mux_without_live_mux_host() {
+        let mut catalog = valid_scale_lab_catalog();
+        catalog.evidence_mode = Some(ScaleLabEvidenceMode::LiveMux);
+
+        let err = catalog.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ScaleLabWorkloadSchemaError::LiveMuxUnavailable
+        ));
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_rejects_empty_limitations() {
+        let mut catalog = valid_scale_lab_catalog();
+        catalog.limitations.clear();
+
+        let err = catalog.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ScaleLabWorkloadSchemaError::EmptyField {
+                field: "limitations"
+            }
+        ));
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_fixture_validates() {
+        let fixture = include_str!("../../../fixtures/scale-lab/workload-catalog-smoke.v1.json");
+        let catalog: ScaleLabWorkloadCatalog = serde_json::from_str(fixture).unwrap();
+        assert!(catalog.validate().is_ok());
+        assert_eq!(catalog.target_pane_count, Some(10));
+        assert_eq!(catalog.workload_mix.len(), 8);
+    }
+
+    #[test]
+    fn scale_lab_workload_catalog_serde_roundtrip() {
+        let catalog = valid_scale_lab_catalog();
+        let json = serde_json::to_string(&catalog).unwrap();
+        let deserialized: ScaleLabWorkloadCatalog = serde_json::from_str(&json).unwrap();
+        assert_eq!(catalog, deserialized);
     }
 
     // =====================================================================

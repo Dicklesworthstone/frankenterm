@@ -1,0 +1,153 @@
+{
+  "schema_version": "ft.scale_lab.workload_catalog.v1",
+  "catalog_id": "ft-s6h49.scale-lab-smoke",
+  "generated_at_ms": 1778087760000,
+  "field_notes": {
+    "schema_version": "Stable schema contract for scale-lab workload catalog and proof artifacts.",
+    "catalog_id": "Stable identifier for this workload catalog fixture.",
+    "evidence_mode": "Declares whether evidence is simulated, replayed locally, rch-offloaded, or from a live mux run.",
+    "target_pane_count": "Total pane-equivalent count; must equal the sum of workload_mix pane_count values.",
+    "host": "Host shape captured with enough detail to prevent unsupported hardware claims.",
+    "command": "Reproduction command, target dir, and feature flags used for this proof lane.",
+    "workload_mix": "Persona-weighted workload taxonomy for idle, active, noisy, rate-limited, TUI-heavy, search-heavy, workflow-heavy, and distributed panes.",
+    "timings": "Elapsed time and API latency percentiles from the proof run.",
+    "memory": "Peak RSS plus hot/warm/cold memory envelope evidence.",
+    "disk": "Bytes written and post-run free-space evidence.",
+    "events": "Detection, workflow, dropped-event, and capture-gap counters.",
+    "limitations": "Truth labels that say what this artifact does not prove.",
+    "artifacts": "Machine-readable logs and traces emitted by the proof lane."
+  },
+  "evidence_mode": "rch_replay",
+  "target_pane_count": 10,
+  "host": {
+    "host_class": "rch-worker-smoke",
+    "os": "linux",
+    "cpu_cores": 8,
+    "memory_gib": 32,
+    "storage_gib": 256,
+    "live_mux_available": false
+  },
+  "command": {
+    "command_line": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-s6h49-silverharbor-target cargo test -p frankenterm-core scale_lab_workload_catalog --lib --no-default-features",
+    "target_dir": "/tmp/ft-s6h49-silverharbor-target",
+    "feature_flags": {
+      "default_features": false,
+      "enabled": [
+        "no-default-features"
+      ],
+      "disabled": []
+    }
+  },
+  "workload_mix": [
+    {
+      "persona": "idle_agents",
+      "pane_count": 1,
+      "output_bytes_per_sec": 0.0,
+      "operations": [
+        "state_snapshot"
+      ]
+    },
+    {
+      "persona": "active_agents",
+      "pane_count": 2,
+      "output_bytes_per_sec": 256.0,
+      "operations": [
+        "capture_delta",
+        "detect_prompt"
+      ]
+    },
+    {
+      "persona": "noisy_agents",
+      "pane_count": 1,
+      "output_bytes_per_sec": 4096.0,
+      "operations": [
+        "scan_pipeline"
+      ]
+    },
+    {
+      "persona": "rate_limited_agents",
+      "pane_count": 1,
+      "output_bytes_per_sec": 128.0,
+      "operations": [
+        "pattern_detection"
+      ]
+    },
+    {
+      "persona": "tui_heavy",
+      "pane_count": 1,
+      "output_bytes_per_sec": 2048.0,
+      "operations": [
+        "ansi_density_scan"
+      ]
+    },
+    {
+      "persona": "search_heavy",
+      "pane_count": 2,
+      "output_bytes_per_sec": 512.0,
+      "operations": [
+        "fts_query",
+        "hybrid_query"
+      ]
+    },
+    {
+      "persona": "workflow_heavy",
+      "pane_count": 1,
+      "output_bytes_per_sec": 384.0,
+      "operations": [
+        "workflow_trigger"
+      ]
+    },
+    {
+      "persona": "distributed_panes",
+      "pane_count": 1,
+      "output_bytes_per_sec": 256.0,
+      "operations": [
+        "stale_session_prune"
+      ]
+    }
+  ],
+  "timings": {
+    "elapsed_ms": 12000.0,
+    "p50_api_latency_ms": 3.0,
+    "p95_api_latency_ms": 8.0,
+    "p99_api_latency_ms": 13.0
+  },
+  "memory": {
+    "peak_rss_bytes": 335544320,
+    "memory_limit_bytes": 34359738368,
+    "warm_tier_bytes": 12582912,
+    "cold_tier_bytes": 0
+  },
+  "disk": {
+    "bytes_written": 4194304,
+    "free_bytes_after_run": 193273528320
+  },
+  "events": {
+    "detection_events": 7,
+    "workflow_events": 2,
+    "dropped_events": 0,
+    "capture_gaps": 0
+  },
+  "limitations": [
+    "rch replay smoke artifact; not a live mux or 64-core/256GB proof",
+    "pane count is 10 pane-equivalents and cannot graduate larger support claims"
+  ],
+  "artifacts": [
+    {
+      "kind": "structured_log",
+      "format": "json_lines",
+      "path": "artifacts/scale-lab-smoke/events.jsonl",
+      "bytes": 1024,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "redacted": true
+    },
+    {
+      "kind": "trace_bundle",
+      "format": "json",
+      "path": "artifacts/scale-lab-smoke/trace.json",
+      "bytes": 2048,
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "redacted": true
+    }
+  ]
+}
