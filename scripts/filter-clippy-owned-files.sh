@@ -18,6 +18,7 @@ Options:
   --owned-files FILE    Newline-delimited file containing owned paths.
   --input FILE          Cargo JSONL input. Defaults to stdin.
   --format json|text    Output format. Defaults to json.
+  --repo-root PATH      Repo root used to normalize absolute diagnostics.
 
 The output is attribution evidence only. An owned-files-clean verdict is not a
 workspace-green clippy claim when cargo_status is non-zero.
@@ -27,6 +28,7 @@ EOF
 cargo_status=""
 input_file="-"
 output_format="json"
+repo_root="${REPO_ROOT:-$(pwd -P)}"
 owned_files=()
 
 while [ "$#" -gt 0 ]; do
@@ -59,6 +61,11 @@ while [ "$#" -gt 0 ]; do
     --format)
       [ "$#" -ge 2 ] || { echo "--format requires a value" >&2; exit 64; }
       output_format="$2"
+      shift 2
+      ;;
+    --repo-root)
+      [ "$#" -ge 2 ] || { echo "--repo-root requires a value" >&2; exit 64; }
+      repo_root="$2"
       shift 2
       ;;
     --help|-h)
@@ -98,13 +105,42 @@ if [ "$input_file" != "-" ] && [ ! -f "$input_file" ]; then
   exit 66
 fi
 
-owned_json=$(printf '%s\n' "${owned_files[@]}" | jq -R 'select(length > 0)' | jq -s .)
+repo_root="${repo_root%/}"
+
+owned_json=$(
+  printf '%s\n' "${owned_files[@]}" |
+    jq -R --arg repo_root "$repo_root" '
+      def normalize_path:
+        gsub("\\\\"; "/")
+        | sub("^\\./"; "")
+        | if ($repo_root | length) > 0 and startswith($repo_root + "/") then
+            .[($repo_root | length + 1):]
+          else
+            .
+          end
+        | sub("^\\./"; "");
+
+      select(length > 0) | normalize_path
+    ' |
+    jq -s 'unique'
+)
 
 run_filter() {
   jq -Rs \
     --argjson cargo_status "$cargo_status" \
     --argjson owned "$owned_json" \
+    --arg repo_root "$repo_root" \
     '
+    def normalize_path:
+      gsub("\\\\"; "/")
+      | sub("^\\./"; "")
+      | if ($repo_root | length) > 0 and startswith($repo_root + "/") then
+          .[($repo_root | length + 1):]
+        else
+          .
+        end
+      | sub("^\\./"; "");
+
     def parse_jsonl:
       split("\n")
       | map(select(length > 0) | (fromjson? // empty));
@@ -116,7 +152,7 @@ run_filter() {
       (($message.spans // []) + child_spans($message));
 
     def diagnostic_files($message):
-      [message_spans($message)[]? | .file_name | select(. != null)] | unique;
+      [message_spans($message)[]? | .file_name | select(. != null) | normalize_path] | unique;
 
     def owned_hit($files):
       any($files[]; . as $file | any($owned[]; . == $file));

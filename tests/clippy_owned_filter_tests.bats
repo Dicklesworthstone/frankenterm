@@ -57,6 +57,26 @@ setup() {
     [[ "$output" == *"attribution_verdict=owned_files_clean"* ]]
 }
 
+@test "normalizes dot-prefixed and repo-root absolute diagnostic paths" {
+    fixture="${BATS_TEST_TMPDIR}/absolute-and-dot.jsonl"
+    printf '{"reason":"compiler-message","message":{"level":"error","message":"dot path","spans":[{"file_name":"./crates/frankenterm-core/src/color_management.rs"}],"children":[]}}\n' > "$fixture"
+    printf '{"reason":"compiler-message","message":{"level":"warning","message":"absolute repo path","spans":[{"file_name":"%s/crates/frankenterm-core/src/replay_fixture_harvest.rs"}],"children":[]}}\n' "$REPO_ROOT" >> "$fixture"
+    printf '{"reason":"compiler-message","message":{"level":"error","message":"unrelated absolute path","spans":[{"file_name":"/tmp/not-the-repo/crates/frankenterm-core/src/color_management.rs"}],"children":[]}}\n' >> "$fixture"
+
+    run bash "$SCRIPT" \
+        --cargo-status 101 \
+        --repo-root "$REPO_ROOT" \
+        --owned-file crates/frankenterm-core/src/color_management.rs \
+        --owned-file crates/frankenterm-core/src/replay_fixture_harvest.rs \
+        --input "$fixture"
+
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.owned_diagnostic_count' <<<"$output")" = "2" ]
+    [ "$(jq -r '.owned_error_count' <<<"$output")" = "1" ]
+    [ "$(jq -r '.owned_warning_count' <<<"$output")" = "1" ]
+    [ "$(jq -r '.owned_diagnostics[].message' <<<"$output" | grep -c '^unrelated absolute path$')" -eq 0 ]
+}
+
 @test "requires explicit cargo status" {
     run bash "$SCRIPT" \
         --owned-file crates/frankenterm-core/src/color_management.rs \
