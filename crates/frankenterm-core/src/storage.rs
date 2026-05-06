@@ -18322,7 +18322,7 @@ fn query_segments_from_mmap(
     }
 
     // tail_lines() returns oldest->newest within the requested window;
-    // query_segments() returns newest->oldest, so align ordering.
+    // query_segments_backend() returns newest->oldest, so align ordering.
     segments.reverse();
     Ok(Some(segments))
 }
@@ -18381,67 +18381,6 @@ fn query_segment_by_id(conn: &Connection, segment_id: i64) -> Result<Option<Segm
     )
     .optional()
     .map_err(|e| StorageError::Database(format!("query_segment_by_id failed: {e}")).into())
-}
-
-/// Query workflow by ID
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_workflow_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-#[allow(clippy::cast_sign_loss)]
-fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
-    conn.query_row(
-        "SELECT id, workflow_name, pane_id, trigger_event_id, current_step, status,
-         wait_condition, context, result, error, started_at, updated_at, completed_at
-         FROM workflow_executions WHERE id = ?1",
-        [workflow_id],
-        |row| {
-            // br-ft-lqj5g: route through the parse-drop helper so a
-            // schema-skewed row column bumps the observability
-            // counter instead of silently turning into None.
-            let wait_condition_str: Option<String> = row.get(6)?;
-            let wait_condition =
-                parse_workflow_execution_column(wait_condition_str.as_deref(), "wait_condition");
-
-            let context_str: Option<String> = row.get(7)?;
-            let context = parse_workflow_execution_column(context_str.as_deref(), "context");
-
-            let result_str: Option<String> = row.get(8)?;
-            let result = parse_workflow_execution_column(result_str.as_deref(), "result");
-
-            Ok(WorkflowRecord {
-                id: row.get(0)?,
-                workflow_name: row.get(1)?,
-                pane_id: {
-                    let val: i64 = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                trigger_event_id: row.get(3)?,
-                current_step: {
-                    let val: i64 = row.get(4)?;
-                    usize::try_from(val).map_err(|_| {
-                        rusqlite::Error::InvalidColumnType(
-                            4,
-                            "current_step".to_string(),
-                            rusqlite::types::Type::Integer,
-                        )
-                    })?
-                },
-                status: row.get(5)?,
-                wait_condition,
-                context,
-                result,
-                error: row.get(9)?,
-                started_at: row.get(10)?,
-                updated_at: row.get(11)?,
-                completed_at: row.get(12)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
 }
 
 fn workflow_record_from_backend_cells(row: &[SqlCell]) -> Result<WorkflowRecord> {
@@ -18786,69 +18725,6 @@ fn query_latest_step_log(
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
 }
 
-/// Query incomplete workflows for resume on restart
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_incomplete_workflows_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-#[allow(clippy::cast_sign_loss)]
-fn query_incomplete_workflows(conn: &Connection) -> Result<Vec<WorkflowRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, workflow_name, pane_id, trigger_event_id, current_step, status,
-             wait_condition, context, result, error, started_at, updated_at, completed_at
-             FROM workflow_executions
-             WHERE status IN ('running', 'waiting')
-             ORDER BY started_at ASC",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            // br-ft-lqj5g: route through the parse-drop helper so a
-            // schema-skewed row column bumps the observability
-            // counter instead of silently turning into None.
-            let wait_condition_str: Option<String> = row.get(6)?;
-            let wait_condition =
-                parse_workflow_execution_column(wait_condition_str.as_deref(), "wait_condition");
-
-            let context_str: Option<String> = row.get(7)?;
-            let context = parse_workflow_execution_column(context_str.as_deref(), "context");
-
-            let result_str: Option<String> = row.get(8)?;
-            let result = parse_workflow_execution_column(result_str.as_deref(), "result");
-
-            Ok(WorkflowRecord {
-                id: row.get(0)?,
-                workflow_name: row.get(1)?,
-                pane_id: {
-                    let val: i64 = row.get(2)?;
-                    val as u64
-                },
-                trigger_event_id: row.get(3)?,
-                current_step: {
-                    let val: i64 = row.get(4)?;
-                    i64_to_usize(val)?
-                },
-                status: row.get(5)?,
-                wait_condition,
-                context,
-                result,
-                error: row.get(9)?,
-                started_at: row.get(10)?,
-                updated_at: row.get(11)?,
-                completed_at: row.get(12)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-
-    Ok(results)
-}
-
 fn query_incomplete_workflows_backend(backend: &dyn StorageBackend) -> Result<Vec<WorkflowRecord>> {
     let rows = backend
         .query_map_cells(
@@ -18869,41 +18745,6 @@ fn query_incomplete_workflows_backend(backend: &dyn StorageBackend) -> Result<Ve
 // =============================================================================
 // Segment Scan Query Functions
 // =============================================================================
-
-/// Build a dynamic WHERE clause and params from a SegmentScanQuery.
-/// `time_column` is the column name used for since/until filtering.
-fn build_segment_scan_where(
-    query: &SegmentScanQuery,
-    time_column: &str,
-) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-    if let Some(after_id) = query.after_id {
-        clauses.push(format!("id > ?{}", params.len() + 1));
-        params.push(Box::new(after_id));
-    }
-    if let Some(pane_id) = query.pane_id {
-        clauses.push(format!("pane_id = ?{}", params.len() + 1));
-        params.push(Box::new(u64_to_i64_unchecked(pane_id)));
-    }
-    if let Some(since) = query.since {
-        clauses.push(format!("{time_column} >= ?{}", params.len() + 1));
-        params.push(Box::new(since));
-    }
-    if let Some(until) = query.until {
-        clauses.push(format!("{time_column} <= ?{}", params.len() + 1));
-        params.push(Box::new(until));
-    }
-
-    let where_clause = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", clauses.join(" AND "))
-    };
-
-    (where_clause, params)
-}
 
 fn build_segment_scan_backend_where(
     query: &SegmentScanQuery,
@@ -18961,69 +18802,6 @@ fn query_scan_segments_backend(
     rows.iter()
         .map(|row| segment_from_backend_cells(row))
         .collect()
-}
-
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_scan_segments_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_scan_segments(conn: &Connection, query: &SegmentScanQuery) -> Result<Vec<Segment>> {
-    let (where_clause, params) = build_segment_scan_where(query, "captured_at");
-    let limit = if query.limit == 0 { 1_000 } else { query.limit };
-    let sql = format!(
-        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
-         FROM output_segments{where_clause}
-         ORDER BY id ASC
-         LIMIT ?{}",
-        params.len() + 1
-    );
-
-    let mut all_params = params;
-    all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(Segment {
-                id: row.get(0)?,
-                pane_id: {
-                    let val: i64 = row.get(1)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                seq: {
-                    let val: i64 = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                content: row.get(3)?,
-                content_len: {
-                    let val: i64 = row.get(4)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as usize
-                    }
-                },
-                content_hash: row.get(5)?,
-                captured_at: row.get(6)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-
-    Ok(results)
 }
 
 fn secret_scan_report_from_backend_cells(row: &[SqlCell]) -> Result<SecretScanReportRecord> {
