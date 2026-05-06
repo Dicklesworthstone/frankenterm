@@ -142,13 +142,14 @@ the conflict.
 Every future proof-lane Bead closeout must include either:
 
 ```text
-Proof-doctor: <status>; phase <phase>; reason <reason_code>; verdict <verdict_id or artifact>; remote Cargo <reached|not reached>; owner <owner or none>; closeout <safe|blocked>.
+Proof-doctor: <status>; phase <phase>; reason <reason_code>; verdict <verdict_id or artifact>; remote Cargo <reached|not reached>; owner <owner or none>; target_dir <path|none>; target_lifecycle <kept|cleanup_requested|deletion_authorized|cleaned|not_applicable>; target_size <size|unknown>; closeout <safe|blocked>.
 ```
 
 or an explicit non-applicability sentence:
 
 ```text
 Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.
+Target-dir lifecycle: not applicable; no Cargo/RCH target dir created.
 ```
 
 Closeout rules:
@@ -162,6 +163,44 @@ Closeout rules:
   Cargo/rustc/test execution is positively observed.
 - Beads comments and Agent Mail handoffs should carry the same status,
   reason code, command, worker/sync/Cargo evidence, owner, and next action.
+- RCH-heavy closeouts without target-dir lifecycle fields are incomplete even
+  when the proof itself passed. Disk pressure is a shared resource issue, not
+  cleanup trivia.
+
+### 2.4 RCH target-dir lifecycle fields
+
+Every RCH-heavy proof comment must account for the target directory it used.
+Use these fields verbatim so later operators can grep for them:
+
+```text
+Target-dir lifecycle: CARGO_TARGET_DIR=/tmp/ft-<bead>-<purpose>-target; lifecycle=<kept|cleanup_requested|deletion_authorized|cleaned>; approx_size=<size|unknown>; deletion_authorized=<yes|no>; cleanup_note=<why it remains or what was removed>.
+```
+
+Allowed lifecycle values:
+
+| Value | Meaning |
+| --- | --- |
+| `kept` | Target dir remains intentionally for incremental reuse. Include `approx_size` when known. |
+| `cleanup_requested` | Operator should review inventory/dry-run output and decide whether deletion is authorized. |
+| `deletion_authorized` | A human explicitly authorized deletion, but the agent has not performed it yet. Quote the authorization in the Beads comment. |
+| `cleaned` | Cleanup already ran under explicit authorization. Include the command, time, and affected path. |
+| `not_applicable` | No Cargo/RCH target dir was created by this bead. Use only for docs/static/non-Cargo work. |
+
+Examples:
+
+```text
+Proof-doctor: passed; phase cargo-test; reason none; verdict /tmp/ft-abcd-test.log; remote Cargo reached; owner none; target_dir /tmp/ft-abcd-test-target; target_lifecycle kept; target_size 6.2G; closeout safe.
+Target-dir lifecycle: CARGO_TARGET_DIR=/tmp/ft-abcd-test-target; lifecycle=kept; approx_size=6.2G; deletion_authorized=no; cleanup_note=kept for follow-up clippy reuse.
+```
+
+```text
+Proof-doctor: infra_blocked; phase rch-wrapper; reason RCH-E127; verdict /tmp/ft-abcd-rch.log; remote Cargo not reached; owner none; target_dir /tmp/ft-abcd-test-target; target_lifecycle cleanup_requested; target_size unknown; closeout blocked.
+Target-dir lifecycle: CARGO_TARGET_DIR=/tmp/ft-abcd-test-target; lifecycle=cleanup_requested; approx_size=unknown; deletion_authorized=no; cleanup_note=run scripts/clean-stale-targets.sh --inventory before requesting deletion.
+```
+
+Do not turn a lifecycle note into implicit deletion permission. The AGENTS.md
+no-file-deletion rule still applies to `/tmp` target directories and `release`
+subdirectories unless the user gives explicit written authorization.
 
 ---
 

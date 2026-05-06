@@ -965,9 +965,14 @@ Each agent uses a unique `/tmp/ft-swarm-<slug>-target` (or
 session peaked at 96% disk with 7 active 98 GB targets and self-cleaned
 to 33 GB by session end.
 
-Operator dispatch nudges should always include `rm -rf /tmp/ft-<slug>-
-target/release` (keep debug for incremental) once the assigned bead is
-done — and *especially* once disk crosses 95%.
+Operator dispatch nudges should always include target-dir lifecycle reporting
+once the assigned bead is done — and especially once disk crosses 95%. Ask the
+agent to report `CARGO_TARGET_DIR`, whether it is kept for incremental reuse,
+approximate size if known, and whether cleanup is requested. Do not tell agents
+to delete `/tmp/ft-<slug>-target/release` directly unless the user has given
+explicit written deletion authorization for that exact path. Prefer
+`scripts/clean-stale-targets.sh --inventory --threshold-hours 12` and a
+reviewed dry-run before any cleanup request.
 
 ### Rule SO-7: Use `ntm --robot-send` for repeated nudges; `ntm send` is CASS-deduped
 
