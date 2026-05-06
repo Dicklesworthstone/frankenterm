@@ -2803,7 +2803,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     query_usage_metrics_backend(backend, &query)
                 })
             },
@@ -2831,7 +2831,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     aggregate_daily_backend(backend, since_ts)
                 })
             },
@@ -2859,7 +2859,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     aggregate_by_agent_backend(backend, since_ts)
                 })
             },
@@ -3061,7 +3061,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     count_segments_before_backend(backend, before_ts)
                 })
             },
@@ -3089,7 +3089,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     count_events_before_backend(backend, before_ts)
                 })
             },
@@ -3129,7 +3129,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     count_events_by_tier_backend(
                         backend,
                         before_ts,
@@ -3164,7 +3164,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     count_audit_actions_before_backend(backend, before_ts)
                 })
             },
@@ -3193,7 +3193,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     count_usage_metrics_before_backend(backend, before_ts)
                 })
             },
@@ -3224,7 +3224,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     count_notification_history_before_backend(backend, before_ts)
                 })
             },
@@ -3341,7 +3341,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     query_notification_history_backend(backend, &query)
                 })
             },
@@ -3368,7 +3368,7 @@ impl StorageHandle {
             cx,
             "Spawn blocking failed",
             move || {
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     get_notification_backend(backend, id)
                 })
             },
@@ -3701,7 +3701,7 @@ impl StorageHandle {
         let workspace_id = workspace_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 query_approval_token_by_code_backend(backend, &code_hash, &workspace_id)
             })
         })
@@ -5059,7 +5059,7 @@ impl StorageHandle {
         let workspace_id = workspace_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 query_active_approvals_count_backend(backend, &workspace_id, now_ms)
             })
         })
@@ -5088,7 +5088,7 @@ impl StorageHandle {
         let code_hash = code_hash.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 query_approval_token_by_hash_backend(backend, &code_hash)
             })
         })
@@ -5823,7 +5823,7 @@ impl StorageHandle {
         action_fingerprint: &str,
         now_ms: i64,
     ) -> Result<bool> {
-        pooled_rusqlite_backend(self.db_path.as_str(), |backend| {
+        pooled_backend(self.db_path.as_str(), |backend| {
             query_active_approval_for_scope_backend(
                 backend,
                 workspace_id,
@@ -22344,6 +22344,7 @@ fn storage_tick140_fts_cluster_roundtrip() {
 /// `acknowledge_notification_with_cx`,
 /// `increment_notification_retry_with_cx`,
 /// `query_notification_history_with_cx`,
+/// `count_notification_history_before_with_cx`,
 /// `get_notification_with_cx`.
 #[test]
 fn storage_tick139_notification_cluster_roundtrip() {
@@ -22424,6 +22425,13 @@ fn storage_tick139_notification_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(listed.iter().any(|n| n.id == id));
+
+        // 7. count_notification_history_before_with_cx — includes the seeded row.
+        let count = storage
+            .count_notification_history_before_with_cx(&cx, 1_800_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
