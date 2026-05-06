@@ -568,7 +568,7 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
         .iter()
         .map(|(key, value)| (key.as_str(), value))
         .collect();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(left, _)| *left);
 
     for (key, value) in entries {
         let mut rendered = match value {
@@ -643,7 +643,7 @@ fn canonicalize_json_value(value: &mut serde_json::Value) {
             // canonicalized before their parent is rebuilt.
             let mut entries: Vec<(String, serde_json::Value)> =
                 obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            for (_, v) in entries.iter_mut() {
+            for (_, v) in &mut entries {
                 canonicalize_json_value(v);
             }
             entries.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -5350,12 +5350,12 @@ mod tests {
         // window_id/tab_id/generation — only pane_id, domain, title.
         let bus = EventBus::new(8);
         let _sub = bus.subscribe();
-        bus.publish(Event::PaneDiscovered {
+        let _ = bus.publish(Event::PaneDiscovered {
             pane_id: 1,
             domain: "local".to_string(),
             title: "shell".to_string(),
         });
-        bus.publish(Event::PaneDiscovered {
+        let _ = bus.publish(Event::PaneDiscovered {
             pane_id: 1,
             domain: "local".to_string(),
             title: "shell".to_string(),
@@ -5422,7 +5422,7 @@ mod tests {
         let bus = EventBus::new(8);
         let _sub = bus.subscribe(); // 1 all-subscriber
 
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 1,
             seq: 1,
             content_len: 10,
@@ -5443,7 +5443,7 @@ mod tests {
     fn events_delivered_unchanged_when_zero_subscribers() {
         let bus = EventBus::new(8);
         // No subscribers — every publish hits the no-subscribers path.
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 1,
             seq: 1,
             content_len: 10,
@@ -5468,9 +5468,9 @@ mod tests {
             content_len: 100,
         };
         // First publish reaches the subscriber.
-        bus.publish(evt.clone());
+        let _ = bus.publish(evt.clone());
         // Second publish is dedup-dropped before fanout.
-        bus.publish(evt);
+        let _ = bus.publish(evt);
 
         let snap = bus.metrics.snapshot();
         assert_eq!(snap.events_published, 2);
@@ -5521,12 +5521,12 @@ mod tests {
         let bus = EventBus::new(16);
 
         // Phase 1: publish two events with no subscribers.
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 1,
             seq: 1,
             content_len: 10,
         });
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 2,
             seq: 1,
             content_len: 20,
@@ -5534,17 +5534,17 @@ mod tests {
 
         // Phase 2: subscribe; publish three deliverable events.
         let _sub = bus.subscribe();
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 3,
             seq: 1,
             content_len: 30,
         });
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 4,
             seq: 1,
             content_len: 40,
         });
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 5,
             seq: 1,
             content_len: 50,
@@ -5552,7 +5552,7 @@ mod tests {
 
         // Phase 3: republish one of the deliverable events to
         // trigger the dedup gate.
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 3,
             seq: 1,
             content_len: 30,
@@ -5598,7 +5598,7 @@ mod tests {
         let bus = EventBus::new(8);
         let _sub = bus.subscribe();
         for seq in 0..10 {
-            bus.publish(Event::SegmentCaptured {
+            let _ = bus.publish(Event::SegmentCaptured {
                 pane_id: 1,
                 seq,
                 content_len: 10,
@@ -5625,7 +5625,7 @@ mod tests {
         let bus = EventBus::new(8);
         let _sub = bus.subscribe();
         for seq in 0..2200 {
-            bus.publish(Event::SegmentCaptured {
+            let _ = bus.publish(Event::SegmentCaptured {
                 pane_id: 1,
                 seq,
                 content_len: 10,

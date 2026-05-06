@@ -82,7 +82,7 @@ impl PSquaredEstimator {
         let q_target = quantile.clamp(0.001, 0.999);
         // Desired positions: 0, q/2, q, (1+q)/2, 1.
         // Per-observation increments: 0, q/2, q, (1+q)/2, 1.
-        let dn = [0.0, q_target / 2.0, q_target, (1.0 + q_target) / 2.0, 1.0];
+        let dn = [0.0, q_target / 2.0, q_target, q_target.midpoint(1.0), 1.0];
         Self {
             quantile: q_target,
             q: [0.0; MARKER_COUNT],
@@ -107,11 +107,9 @@ impl PSquaredEstimator {
                 // Warmup done — sort + initialize markers.
                 let mut sorted = std::mem::take(buf);
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                for i in 0..MARKER_COUNT {
-                    self.q[i] = sorted[i];
+                for (i, value) in sorted.into_iter().enumerate() {
+                    self.q[i] = value;
                     self.n[i] = i as f64;
-                    self.n_desired[i] =
-                        (i as f64) * (MARKER_COUNT as f64 - 1.0) / (MARKER_COUNT as f64 - 1.0); // 0,1,2,3,4 initially
                 }
                 // n_desired refines based on quantile after the first record.
                 self.n_desired[0] = 0.0;
@@ -225,8 +223,9 @@ fn parabolic(d: f64, q: &[f64; MARKER_COUNT], n: &[f64; MARKER_COUNT], i: usize)
     let ni = n[i];
     let nm = n[i - 1];
     let np = n[i + 1];
-    qi + d / (np - nm)
-        * ((ni - nm + d) * (qp - qi) / (np - ni) + (np - ni - d) * (qi - qm) / (ni - nm))
+    let left = (ni - nm + d) * (qp - qi) / (np - ni);
+    let right = (np - ni - d) * (qi - qm) / (ni - nm);
+    (d / (np - nm)).mul_add(left + right, qi)
 }
 
 fn linear(d: f64, q: &[f64; MARKER_COUNT], n: &[f64; MARKER_COUNT], i: usize) -> f64 {
@@ -234,7 +233,7 @@ fn linear(d: f64, q: &[f64; MARKER_COUNT], n: &[f64; MARKER_COUNT], i: usize) ->
     let qd = q[(i as isize + d as isize) as usize];
     let ni = n[i];
     let nd = n[(i as isize + d as isize) as usize];
-    qi + d * (qd - qi) / (nd - ni)
+    (d / (nd - ni)).mul_add(qd - qi, qi)
 }
 
 /// br-ft-p-squared: serde snapshot for telemetry.
