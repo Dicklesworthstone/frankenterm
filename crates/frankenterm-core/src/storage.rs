@@ -18107,7 +18107,7 @@ fn pane_record_from_backend_cells(row: &[SqlCell]) -> Result<PaneRecord> {
     })
 }
 
-/// br-ft-l1jgo: trait-typed sibling of [`query_panes`].
+/// Query all panes through the trait-typed backend path.
 fn query_panes_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneRecord>> {
     let rows = backend
         .query_map_cells(
@@ -18138,33 +18138,6 @@ fn query_pane_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<Opti
     row.as_deref()
         .map(pane_record_from_backend_cells)
         .transpose()
-}
-
-/// Query all panes
-///
-/// Direct-rusqlite path. Kept as a fallback while
-/// [`query_panes_backend`] migration target settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
-             first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
-             FROM panes
-             ORDER BY last_seen_at DESC",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([], pane_record_from_row)
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-
-    Ok(results)
 }
 
 /// Query a specific pane
