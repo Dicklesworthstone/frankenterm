@@ -5329,9 +5329,9 @@ impl StorageHandle {
         let workflow_id = workflow_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_step_logs(&conn, &workflow_id)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_step_logs_backend(backend, &workflow_id)
+            })
         })
         .await
     }
@@ -17263,6 +17263,9 @@ fn query_prepared_plan(conn: &Connection, plan_id: &str) -> Result<Option<Prepar
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
 }
 
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_step_logs_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
     let mut stmt = conn
         .prepare(
@@ -17361,6 +17364,27 @@ fn workflow_step_log_from_backend_cells(row: &[SqlCell]) -> Result<WorkflowStepL
             .i64(14)
             .map_err(|err| storage_backend_error("Workflow step log duration_ms", err))?,
     })
+}
+
+fn query_step_logs_backend(
+    backend: &dyn StorageBackend,
+    workflow_id: &str,
+) -> Result<Vec<WorkflowStepLogRecord>> {
+    let rows = backend
+        .query_map_cells(
+            "SELECT id, workflow_id, audit_action_id, step_index, step_name, step_id, step_kind,
+             result_type, result_data, policy_summary, verification_refs, error_code,
+             started_at, completed_at, duration_ms
+             FROM workflow_step_logs
+             WHERE workflow_id = ?1
+             ORDER BY step_index ASC",
+            &[ToSqlValue::Text(workflow_id)],
+        )
+        .map_err(|err| storage_backend_error("Query step logs", err))?;
+
+    rows.iter()
+        .map(|row| workflow_step_log_from_backend_cells(row))
+        .collect()
 }
 
 fn query_latest_step_log_backend(
@@ -18282,9 +18306,7 @@ fn can_insert_and_query_workflow_step_logs() {
     )
     .unwrap();
 
-    // Query step logs
-    let conn = backend.into_connection();
-    let logs = query_step_logs(&conn, "wf-test-001").unwrap();
+    let logs = query_step_logs_backend(&backend, "wf-test-001").unwrap();
 
     assert_eq!(logs.len(), 2, "Should have 2 step logs");
 
@@ -18298,6 +18320,12 @@ fn can_insert_and_query_workflow_step_logs() {
     assert_eq!(logs[1].step_name, "step_two");
     assert_eq!(logs[1].result_type, "done");
     assert_eq!(logs[1].duration_ms, 200);
+
+    let conn = backend.into_connection();
+    let direct_logs = query_step_logs(&conn, "wf-test-001").unwrap();
+    assert_eq!(direct_logs.len(), logs.len());
+    assert_eq!(direct_logs[0].id, logs[0].id);
+    assert_eq!(direct_logs[1].id, logs[1].id);
 }
 
 #[test]
@@ -18305,11 +18333,19 @@ fn query_step_logs_returns_empty_for_unknown_workflow() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
-    let logs = query_step_logs(&conn, "nonexistent-workflow").unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let logs = query_step_logs_backend(&backend, "nonexistent-workflow").unwrap();
 
     assert!(
         logs.is_empty(),
         "Should return empty vec for unknown workflow"
+    );
+
+    let conn = backend.into_connection();
+    let direct_logs = query_step_logs(&conn, "nonexistent-workflow").unwrap();
+    assert!(
+        direct_logs.is_empty(),
+        "direct fallback should return empty vec for unknown workflow"
     );
 }
 
