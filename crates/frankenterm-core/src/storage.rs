@@ -2306,7 +2306,7 @@ impl StorageHandle {
             // br-ft-3twzm: use the pooled backend so the
             // br-ft-l1jgo migration doesn't bypass ft-bhyxz's
             // read-connection pool.
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 query_saved_search_by_name_backend(backend, &name)
             })
         })
@@ -4452,7 +4452,7 @@ impl StorageHandle {
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 execute_typed(
                     backend,
                     "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
@@ -4500,7 +4500,7 @@ impl StorageHandle {
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 let rows = backend
                     .query_map_typed(
                         "SELECT s.id FROM output_segments s
@@ -4552,7 +4552,7 @@ impl StorageHandle {
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 let result = backend
                     .query_row_cells(
                         "SELECT vector FROM segment_embeddings WHERE segment_id = ?1 AND embedder_id = ?2",
@@ -4590,7 +4590,7 @@ impl StorageHandle {
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 let rows = backend
                     .query_map_typed(
                         "SELECT embedder_id, dimension, COUNT(*) as count,
@@ -4919,7 +4919,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 query_unhandled_event_counts(backend)
             })
         })
@@ -5414,7 +5414,7 @@ impl StorageHandle {
         let plan_id = plan_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 query_prepared_plan_backend(backend, &plan_id)
             })
         })
@@ -5901,7 +5901,7 @@ impl StorageHandle {
             "Task join error",
             move || -> Result<Vec<Gap>> {
                 // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     let rows = backend
                         .query_map_typed(
                             "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
@@ -5955,7 +5955,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || -> Result<u64> {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+            pooled_backend(db_path.as_str(), |backend| {
                 let row = backend
                     .query_row_typed(
                         "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
@@ -6001,7 +6001,7 @@ impl StorageHandle {
             "Task join error",
             move || -> Result<(Option<i64>, Option<i64>)> {
                 // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
-                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                pooled_backend(db_path.as_str(), |backend| {
                     let row = backend
                         .query_row_typed(
                             "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
@@ -10113,6 +10113,11 @@ fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
 /// wrapping via `storage_backend_error(context, err)` so the helper
 /// stays a thin lend wrapper that doesn't impose a single error
 /// context on the whole closure body.
+///
+/// Current read migrations should prefer [`pooled_backend`]. This
+/// concrete sibling is kept for future FTS5/PRAGMA/prepared-statement
+/// loops that need `RusqliteBackend` specifically.
+#[allow(dead_code)]
 fn pooled_rusqlite_backend<F, R>(db_path: &str, f: F) -> Result<R>
 where
     F: FnOnce(&RusqliteBackend) -> Result<R>,
