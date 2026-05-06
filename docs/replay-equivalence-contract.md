@@ -35,15 +35,58 @@ would have no objective way to determine whether they agree.
 | **Equivalence class** | A group of events that share the same `(pane_id, stream_kind, sequence)` tuple. |
 | **Merge key** | The 5-field `RecorderMergeKey` that defines total event ordering. |
 | **Drift domain** | A field or field group where controlled variation between runs is expected and tolerated. |
+| **Resource-control what-if package** | Replay-only resource override package using schema `ft.resource_control_override.v1`; it is separate from the rule/workflow/policy `.ftoverride` package. |
 
 ---
 
-## 3. Equivalence Levels
+## 3. Resource-Control What-If Packages
+
+Rule, workflow, and policy counterfactuals use the existing `.ftoverride`
+shape. Resource-control experiments use a separate schema so simulated
+admission, QoS, topology, memory-tier, and auto-tune changes are not confused
+with production rule replacement.
+
+Resource-control packages must declare metadata and then place each safe knob
+in either the compact `[[overrides]]` list or an explicit domain section:
+`[[admission]]`, `[[qos]]`, `[[topology]]`, `[[memory_tier]]`, or
+`[[auto_tune]]`. Every entry names a registry-backed `knob_id`, a matching
+`domain`, an action, and operator-facing `reason` text.
+
+```toml
+[meta]
+schema_version = "ft.resource_control_override.v1"
+name = "queue-pressure-candidate"
+base_trace = "baseline.fttrace"
+
+[[admission]]
+knob_id = "admission.max_queue_utilization"
+domain = "admission"
+value = "0.82"
+reason = "degrade before p99 latency spikes"
+
+[[memory_tier]]
+knob_id = "memory.hot_resident_budget_bytes"
+domain = "memory_tier"
+value = "268435456"
+reason = "give hot scrollback more replay budget"
+```
+
+Validation is fail-closed: unknown knobs, wildcard knob IDs, domain/section
+mismatches, duplicate knob entries, unsafe disable actions, out-of-range values,
+and declared hash mismatches reject the package. The loader produces a
+deterministic manifest sorted by knob ID with baseline hash, candidate hash,
+changed knob ID, action, and reason. Candidate runs must label decisions that
+derive from these packages as simulated output; they are replay evidence, not
+proof that the live runtime would accept the same resource settings.
+
+---
+
+## 4. Equivalence Levels
 
 Three levels of equivalence are defined, from strictest to most permissive.
 Each higher level includes all requirements of the levels below it.
 
-### 3.1 Level 0 — Structural Equivalence (required for all replay)
+### 4.1 Level 0 — Structural Equivalence (required for all replay)
 
 Two runs are **structurally equivalent** if and only if:
 
@@ -61,12 +104,12 @@ Two runs are **structurally equivalent** if and only if:
 Structural equivalence is the minimum bar. A replay that fails structural
 equivalence has a bug in the replay kernel, not a difference in rules.
 
-### 3.2 Level 1 — Decision Equivalence (required for regression pass)
+### 4.2 Level 1 — Decision Equivalence (required for regression pass)
 
 Two runs are **decision-equivalent** if they are structurally equivalent AND:
 
 1. **Identical decision payloads**: For each decision-bearing event (see
-   Section 4), the decision-relevant fields are byte-identical.
+   Section 5), the decision-relevant fields are byte-identical.
 2. **Identical merge ordering**: Events sorted by `RecorderMergeKey` appear
    in the same order. Specifically, for events at positions `i` and `j`
    where `i < j`, `merge_key(event_i) < merge_key(event_j)` in both runs.
@@ -78,12 +121,12 @@ Decision equivalence is the regression gate. If a code change causes
 decision non-equivalence on any regression artifact, that change is a
 regression.
 
-### 3.3 Level 2 — Full Equivalence (gold standard)
+### 4.3 Level 2 — Full Equivalence (gold standard)
 
 Two runs are **fully equivalent** if they are decision-equivalent AND:
 
-1. **All non-excluded fields match** (see Section 5 for the exclusion list).
-2. **Timestamp drift within tolerance** (see Section 6).
+1. **All non-excluded fields match** (see Section 6 for the exclusion list).
+2. **Timestamp drift within tolerance** (see Section 7).
 3. **Payload details JSON structurally equal** (key order ignored, float
    precision within tolerance).
 
@@ -93,13 +136,13 @@ equivalence and full equivalence must be explainable.
 
 ---
 
-## 4. Decision-Bearing Events
+## 5. Decision-Bearing Events
 
 Not every event carries a decision. The equivalence contract distinguishes
 **decision-bearing events** (whose outputs matter for correctness) from
 **observational events** (which provide context but do not affect outcomes).
 
-### 4.1 Decision-Bearing Event Types
+### 5.1 Decision-Bearing Event Types
 
 | Source | Event/Field | Decision Content | Exact Match Required |
 |--------|------------|-----------------|---------------------|
@@ -109,7 +152,7 @@ Not every event carries a decision. The equivalence contract distinguishes
 | **Control markers** | `ControlMarker` with `PolicyDecision` type | `details.decision`, `details.rule_id` | Yes |
 | **Lifecycle markers** | `LifecycleMarker` | `lifecycle_phase`, `reason` | Yes |
 
-### 4.2 Observational (Non-Decision) Event Types
+### 5.2 Observational (Non-Decision) Event Types
 
 | Source | Event/Field | Role | Comparison |
 |--------|------------|------|-----------|
@@ -119,12 +162,12 @@ Not every event carries a decision. The equivalence contract distinguishes
 
 ---
 
-## 5. Field Classification
+## 6. Field Classification
 
 Every field of `RecorderEvent` is classified into one of four comparison
 categories.
 
-### 5.1 Exact Match (E)
+### 6.1 Exact Match (E)
 
 These fields must be byte-identical between baseline and replay for the
 same event position in merge order.
@@ -141,18 +184,18 @@ same event position in merge order.
 | `causality.trigger_event_id` | Cross-stream causality |
 | `causality.root_event_id` | Chain root identity |
 
-### 5.2 Tolerance Match (T)
+### 6.2 Tolerance Match (T)
 
 These fields are compared with a configurable tolerance window.
 
 | Field | Default Tolerance | Rationale |
 |-------|------------------|----------|
-| `occurred_at_ms` | (excluded — see 5.4) | Wall-clock source time; non-deterministic |
-| `recorded_at_ms` | (excluded — see 5.4) | Wall-clock record time; non-deterministic |
+| `occurred_at_ms` | (excluded — see 6.4) | Wall-clock source time; non-deterministic |
+| `recorded_at_ms` | (excluded — see 6.4) | Wall-clock record time; non-deterministic |
 | `confidence` (in Detection) | Absolute delta < 1e-9 | Float precision across platforms |
 | `details` JSON floats | Absolute delta < 1e-6 | JSON serde float precision loss |
 
-### 5.3 Structural Match (S)
+### 6.3 Structural Match (S)
 
 These fields are compared for structural equality (same keys, same types)
 but not byte-identical values.
@@ -163,7 +206,7 @@ but not byte-identical values.
 | `details` (LifecycleMarker) | JSON deep-equal with float tolerance, key-order-independent |
 | `extracted` (Detection) | JSON deep-equal with float tolerance |
 
-### 5.4 Excluded from Comparison (X)
+### 6.4 Excluded from Comparison (X)
 
 These fields are explicitly excluded from equivalence checking.
 
@@ -182,9 +225,9 @@ is what matters, not the absolute timestamp values.
 
 ---
 
-## 6. Tolerance Model
+## 7. Tolerance Model
 
-### 6.1 Configuration
+### 7.1 Configuration
 
 ```
 [replay.equivalence]
@@ -205,7 +248,7 @@ timestamp_drift_warn_ms = 100
 timestamp_drift_fail_ms = 5000
 ```
 
-### 6.2 Tolerance Application Rules
+### 7.2 Tolerance Application Rules
 
 1. **Exact fields never tolerate drift.** If `event_id` differs, the events
    are non-equivalent regardless of tolerance settings.
@@ -226,9 +269,9 @@ timestamp_drift_fail_ms = 5000
 
 ---
 
-## 7. Ordering Contract
+## 8. Ordering Contract
 
-### 7.1 RecorderMergeKey Total Order
+### 8.1 RecorderMergeKey Total Order
 
 The canonical ordering for all replay comparison uses `RecorderMergeKey`:
 
@@ -244,7 +287,7 @@ This is a **total order** — no two distinct events share the same merge key
 (guaranteed by the event_id tiebreaker). Event ordering is therefore
 deterministic regardless of input permutation.
 
-### 7.2 Ordering Classes
+### 8.2 Ordering Classes
 
 Events fall into ordering classes based on how strictly their position
 is constrained:
@@ -261,7 +304,7 @@ panes), the merge key imposes a deterministic order (by `pane_id` then
 causal order in the original system. This is acceptable: the charter
 (ft-og6q6.1.1, Principle 5.1) explicitly chooses determinism over fidelity.
 
-### 7.3 Merge Order Verification
+### 8.3 Merge Order Verification
 
 Given two event sequences `A` and `B`, merge order equivalence holds if
 and only if:
@@ -281,9 +324,9 @@ diverged at position `i`. The divergence report must include:
 
 ---
 
-## 8. Comparison Procedure
+## 9. Comparison Procedure
 
-### 8.1 Inputs
+### 9.1 Inputs
 
 - **Baseline**: An ordered sequence of `RecorderEvent` values, sorted by
   `RecorderMergeKey`.
@@ -291,7 +334,7 @@ diverged at position `i`. The divergence report must include:
   sorted by `RecorderMergeKey`.
 - **Config**: Equivalence level and tolerance parameters.
 
-### 8.2 Algorithm
+### 9.2 Algorithm
 
 ```
 function compare(baseline, replay, config) -> EquivalenceReport:
@@ -331,7 +374,7 @@ function compare(baseline, replay, config) -> EquivalenceReport:
     return EquivalenceReport(divergences)
 ```
 
-### 8.3 Output: EquivalenceReport
+### 9.3 Output: EquivalenceReport
 
 ```
 EquivalenceReport {
@@ -365,13 +408,13 @@ RootCause {
 
 ---
 
-## 9. Counterfactual Comparison Extension
+## 10. Counterfactual Comparison Extension
 
 When comparing a **baseline** against a **candidate** (modified rules),
 decision equivalence is NOT expected. Instead, the comparison produces a
 **decision-diff** that identifies each divergence with its root cause.
 
-### 9.1 Expected vs Unexpected Divergences
+### 10.1 Expected vs Unexpected Divergences
 
 | Category | Definition | Action |
 |----------|-----------|--------|
@@ -379,7 +422,7 @@ decision equivalence is NOT expected. Instead, the comparison produces a
 | **Unexpected** | Divergence NOT traceable to any intentional change | Flag as potential regression |
 | **Cascading** | Divergence caused by a prior divergence (e.g., workflow step changed, so downstream steps differ) | Include with cascade chain |
 
-### 9.2 Root Cause Attribution
+### 10.2 Root Cause Attribution
 
 For each divergence, the diff engine must identify which change caused it:
 
@@ -396,7 +439,7 @@ For each divergence, the diff engine must identify which change caused it:
 
 ---
 
-## 10. Gap Handling
+## 11. Gap Handling
 
 The charter (ft-og6q6.1.1, Non-Goal 3.5) states that gaps in capture
 persist in replay. The equivalence contract handles gaps as follows:
@@ -413,7 +456,7 @@ persist in replay. The equivalence contract handles gaps as follows:
 
 ---
 
-## 11. Clock Anomaly Handling
+## 12. Clock Anomaly Handling
 
 Clock anomalies (`details.clock_anomaly = true`) are expected in both
 baseline and replay. The equivalence contract:
@@ -428,7 +471,7 @@ baseline and replay. The equivalence contract:
 
 ---
 
-## 12. Invariant Summary
+## 13. Invariant Summary
 
 These invariants must hold for any compliant replay implementation:
 
@@ -452,7 +495,7 @@ These invariants must hold for any compliant replay implementation:
 
 ---
 
-## 13. Acceptance Criteria for This Document (ft-og6q6.1.2)
+## 14. Acceptance Criteria for This Document (ft-og6q6.1.2)
 
 - [x] Three equivalence levels defined (structural, decision, full)
 - [x] Decision-bearing events enumerated with exact fields

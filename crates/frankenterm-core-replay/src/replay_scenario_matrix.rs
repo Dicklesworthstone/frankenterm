@@ -15,7 +15,13 @@
 //! Hardware claims such as 64-core / 256 GiB hosts are only proven by passed
 //! [`ScaleScenarioClass::LiveHardware`] rows with complete execution evidence.
 
+use frankenterm_core::fleet_memory_controller::FleetMemoryTierBudgetSnapshot;
+use frankenterm_core::resource_pressure_chaos::{
+    ResourcePressureChaosStatus, ResourcePressureChaosVerdict,
+};
+use frankenterm_core::swarm_scheduler::{ResourceAdmissionDecisionSummary, SchedulerSnapshot};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -810,6 +816,814 @@ impl ScaleProofCoverageSummary {
 }
 
 // ============================================================================
+// DigitalTwinTrace — deterministic resource-control what-if trace adapter
+// ============================================================================
+
+/// Schema version for replay-backed digital-twin trace artifacts.
+pub const DIGITAL_TWIN_TRACE_SCHEMA_VERSION: &str = "ft.digital_twin_trace.v1";
+
+/// Source family represented by one digital-twin trace step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigitalTwinTraceSource {
+    /// Scheduler checkpoint or autoscaler snapshot.
+    SchedulerSnapshot,
+    /// Resource admission controller decision.
+    ResourceAdmission,
+    /// Fleet memory-tier budget snapshot.
+    MemoryTierBudget,
+    /// Resource-pressure chaos verdict row.
+    ResourcePressureChaos,
+    /// Scale-lab proof matrix row.
+    ScaleProof,
+}
+
+impl DigitalTwinTraceSource {
+    /// Stable source label for machine-facing trace output and tests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SchedulerSnapshot => "scheduler_snapshot",
+            Self::ResourceAdmission => "resource_admission",
+            Self::MemoryTierBudget => "memory_tier_budget",
+            Self::ResourcePressureChaos => "resource_pressure_chaos",
+            Self::ScaleProof => "scale_proof",
+        }
+    }
+}
+
+/// Data quality markers attached to trace steps and aggregate traces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigitalTwinTraceQualityFlag {
+    /// A source timestamp was zero or stale enough to be unsafe for sequencing.
+    StaleTimestamp,
+    /// Queue utilization or backlog data was absent.
+    MissingQueueTelemetry,
+    /// Fleet pressure data was absent.
+    MissingFleetTelemetry,
+    /// Memory-tier budget data was absent.
+    MissingMemoryTierTelemetry,
+    /// Latency-stage data was absent.
+    MissingLatencyTelemetry,
+    /// Hardware proof evidence was absent or incomplete.
+    IncompleteHardwareEvidence,
+    /// Evidence came from synthetic or replay data, not live target hardware.
+    SimulatedEvidence,
+    /// A source timestamp regressed and was clamped to preserve monotonic order.
+    NonMonotonicTimestampAdjusted,
+    /// Raw pane, agent, scenario, or correlation identifiers were hashed.
+    RedactedIdentity,
+    /// Low-value samples were dropped by phase/extrema compaction.
+    CompactedSamples,
+    /// A source artifact hash was absent and had to be derived from the source row.
+    DerivedSourceHash,
+    /// Non-finite numeric telemetry was dropped from the trace.
+    NonFiniteTelemetry,
+}
+
+/// One deterministic step consumed by the replay-backed resource digital twin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DigitalTwinTraceStep {
+    /// Stable step id inside the trace.
+    pub step_id: String,
+    /// Source family for this step.
+    pub source: DigitalTwinTraceSource,
+    /// Monotonic timestamp used by the simulator.
+    pub monotonic_ms: u64,
+    /// Deterministic hash of the source row used to derive this step.
+    pub source_hash: String,
+    /// Optional hashes for external source artifacts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_artifact_hashes: Vec<String>,
+    /// Redacted pane id, if the source row carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_hash: Option<String>,
+    /// Redacted agent id, if the source row carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_hash: Option<String>,
+    /// Redacted scenario or correlation id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_hash: Option<String>,
+    /// Scheduler sequence, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduler_sequence: Option<u64>,
+    /// Count of scheduler scale events represented by a snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale_history_len: Option<u64>,
+    /// Count of known agents represented by a scheduler snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_agent_count: Option<u64>,
+    /// Queue utilization observed by an admission or capacity source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_utilization: Option<f64>,
+    /// Pending work items observed by an admission or scheduler source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_items: Option<u64>,
+    /// Final admission action label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_action: Option<String>,
+    /// Stable reason labels carried by the decision source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    /// Raw pressure severity before protection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_pressure_severity: Option<u8>,
+    /// Effective pressure severity after protection/fail-closed gates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_pressure_severity: Option<u8>,
+    /// Compound fleet pressure label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fleet_pressure: Option<String>,
+    /// Memory-tier pressure label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_tier_pressure: Option<String>,
+    /// Maximum latency-over-budget ratio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_latency_over_budget_ratio: Option<f64>,
+    /// Total memory budget bytes represented by this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_budget_bytes: Option<u64>,
+    /// Total observed memory bytes represented by this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_actual_bytes: Option<u64>,
+    /// Resident memory bytes above budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resident_over_budget_bytes: Option<u64>,
+    /// Bytes reclaimable without losing authoritative state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reclaimable_bytes: Option<u64>,
+    /// Proof row status, if this step came from scale evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_status: Option<ProofStatus>,
+    /// Proof evidence source, if this step came from scale evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_source: Option<ScaleProofEvidenceSource>,
+    /// Whether hardware evidence is complete for live proof claims.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_evidence_complete: Option<bool>,
+    /// Normalized pressure score used by compaction and risk ordering.
+    pub pressure_score: u8,
+    /// Step-local data quality flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_flags: Vec<DigitalTwinTraceQualityFlag>,
+}
+
+impl DigitalTwinTraceStep {
+    fn normalized(mut self) -> Self {
+        sort_dedup(&mut self.source_artifact_hashes);
+        sort_dedup(&mut self.reason_codes);
+        sort_dedup(&mut self.quality_flags);
+        self
+    }
+}
+
+/// Deterministic trace consumed by future baseline-vs-candidate digital twins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DigitalTwinTrace {
+    /// Versioned schema id.
+    pub schema_version: String,
+    /// Stable generation timestamp supplied by the caller.
+    pub generated_at_ms: u64,
+    /// Deterministic hash of normalized trace content.
+    pub trace_hash: String,
+    /// Hashes of source artifacts represented by this trace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_artifact_hashes: Vec<String>,
+    /// Ordered trace steps.
+    pub steps: Vec<DigitalTwinTraceStep>,
+    /// Aggregate data-quality flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_flags: Vec<DigitalTwinTraceQualityFlag>,
+}
+
+impl DigitalTwinTrace {
+    /// Whether any source step reports incomplete, stale, synthetic, or adjusted data.
+    #[must_use]
+    pub fn has_quality_warnings(&self) -> bool {
+        !self.quality_flags.is_empty()
+    }
+
+    /// Stable JSON representation for golden fixtures and Robot contracts.
+    #[must_use]
+    pub fn to_stable_json(&self) -> String {
+        serde_json::to_string_pretty(self).expect("digital twin trace serializes to stable JSON")
+    }
+
+    /// Stable compact TOON-like representation for golden fixtures and robot summaries.
+    #[must_use]
+    pub fn to_toon(&self) -> String {
+        let mut output = format!(
+            "schema_version: {}\ngenerated_at_ms: {}\ntrace_hash: {}\nquality_flags: {}\nsteps[{}]:\n",
+            self.schema_version,
+            self.generated_at_ms,
+            self.trace_hash,
+            label_list(&self.quality_flags),
+            self.steps.len()
+        );
+        for step in &self.steps {
+            output.push_str(&format!(
+                "  - id={} source={} t={} pressure={} action={} fleet={} memory={} proof={} evidence={} flags={}\n",
+                step.step_id,
+                step.source.as_str(),
+                step.monotonic_ms,
+                step.pressure_score,
+                step.admission_action.as_deref().unwrap_or("-"),
+                step.fleet_pressure.as_deref().unwrap_or("-"),
+                step.memory_tier_pressure.as_deref().unwrap_or("-"),
+                option_label(step.proof_status.as_ref()),
+                option_label(step.evidence_source.as_ref()),
+                label_list(&step.quality_flags)
+            ));
+        }
+        output
+    }
+}
+
+/// Builder and source adapters for deterministic digital-twin traces.
+pub struct DigitalTwinTraceAdapter;
+
+impl DigitalTwinTraceAdapter {
+    /// Build a normalized deterministic trace from pre-adapted source steps.
+    #[must_use]
+    pub fn build(generated_at_ms: u64, steps: Vec<DigitalTwinTraceStep>) -> DigitalTwinTrace {
+        Self::build_with_compaction(generated_at_ms, steps, None)
+    }
+
+    /// Build a trace and optionally compact low-value repeated samples.
+    #[must_use]
+    pub fn build_with_compaction(
+        generated_at_ms: u64,
+        steps: Vec<DigitalTwinTraceStep>,
+        max_steps: Option<usize>,
+    ) -> DigitalTwinTrace {
+        let mut steps = steps
+            .into_iter()
+            .map(DigitalTwinTraceStep::normalized)
+            .collect::<Vec<_>>();
+        steps.sort_by(|left, right| {
+            left.monotonic_ms
+                .cmp(&right.monotonic_ms)
+                .then_with(|| left.source.cmp(&right.source))
+                .then_with(|| left.step_id.cmp(&right.step_id))
+        });
+        clamp_monotonic_timestamps(&mut steps);
+
+        let mut aggregate_flags = Vec::new();
+        if let Some(limit) = max_steps.filter(|limit| *limit > 1) {
+            let before = steps.len();
+            steps = compact_phase_changes_and_extrema(steps, limit);
+            if steps.len() < before {
+                aggregate_flags.push(DigitalTwinTraceQualityFlag::CompactedSamples);
+                for step in &mut steps {
+                    step.quality_flags
+                        .push(DigitalTwinTraceQualityFlag::CompactedSamples);
+                    sort_dedup(&mut step.quality_flags);
+                }
+            }
+        }
+
+        let mut source_artifact_hashes = Vec::new();
+        for step in &steps {
+            aggregate_flags.extend(step.quality_flags.iter().copied());
+            source_artifact_hashes.extend(step.source_artifact_hashes.iter().cloned());
+            source_artifact_hashes.push(step.source_hash.clone());
+        }
+        sort_dedup(&mut aggregate_flags);
+        sort_dedup(&mut source_artifact_hashes);
+
+        let trace_hash = stable_hash(&(
+            DIGITAL_TWIN_TRACE_SCHEMA_VERSION,
+            generated_at_ms,
+            &source_artifact_hashes,
+            &steps,
+        ));
+
+        DigitalTwinTrace {
+            schema_version: DIGITAL_TWIN_TRACE_SCHEMA_VERSION.to_string(),
+            generated_at_ms,
+            trace_hash,
+            source_artifact_hashes,
+            steps,
+            quality_flags: aggregate_flags,
+        }
+    }
+
+    /// Adapt a scheduler snapshot into a digital-twin trace step.
+    #[must_use]
+    pub fn from_scheduler_snapshot(
+        step_id: &str,
+        snapshot: &SchedulerSnapshot,
+        source_artifact_hash: Option<&str>,
+    ) -> DigitalTwinTraceStep {
+        let mut quality_flags = Vec::new();
+        if snapshot.last_evaluation_ms == 0 {
+            quality_flags.push(DigitalTwinTraceQualityFlag::StaleTimestamp);
+        }
+
+        DigitalTwinTraceStep {
+            step_id: step_id.to_string(),
+            source: DigitalTwinTraceSource::SchedulerSnapshot,
+            monotonic_ms: snapshot.last_evaluation_ms,
+            source_hash: stable_hash(snapshot),
+            source_artifact_hashes: source_hashes(
+                source_artifact_hash,
+                snapshot,
+                &mut quality_flags,
+            ),
+            pane_hash: None,
+            agent_hash: None,
+            correlation_hash: None,
+            scheduler_sequence: Some(snapshot.sequence),
+            scale_history_len: Some(snapshot.scale_history.len() as u64),
+            active_agent_count: Some(snapshot.agent_first_seen.len() as u64),
+            queue_utilization: None,
+            pending_items: None,
+            admission_action: None,
+            reason_codes: Vec::new(),
+            raw_pressure_severity: None,
+            effective_pressure_severity: None,
+            fleet_pressure: None,
+            memory_tier_pressure: None,
+            max_latency_over_budget_ratio: None,
+            memory_budget_bytes: None,
+            memory_actual_bytes: None,
+            resident_over_budget_bytes: None,
+            reclaimable_bytes: None,
+            proof_status: None,
+            evidence_source: None,
+            hardware_evidence_complete: None,
+            pressure_score: 0,
+            quality_flags,
+        }
+    }
+
+    /// Adapt one resource admission decision into a digital-twin trace step.
+    #[must_use]
+    pub fn from_resource_admission_decision(
+        step_id: &str,
+        observed_at_ms: u64,
+        decision: &ResourceAdmissionDecisionSummary,
+        pane_id: Option<&str>,
+        agent_id: Option<&str>,
+        source_artifact_hash: Option<&str>,
+    ) -> DigitalTwinTraceStep {
+        let mut quality_flags = Vec::new();
+        if observed_at_ms == 0 {
+            quality_flags.push(DigitalTwinTraceQualityFlag::StaleTimestamp);
+        }
+        let queue_utilization = finite_f64(decision.queue_utilization, &mut quality_flags);
+        let max_latency_over_budget_ratio =
+            finite_f64(decision.max_latency_over_budget_ratio, &mut quality_flags);
+        if queue_utilization.is_none() || decision.pending_items.is_none() {
+            quality_flags.push(DigitalTwinTraceQualityFlag::MissingQueueTelemetry);
+        }
+        if decision.fleet_pressure.is_none() {
+            quality_flags.push(DigitalTwinTraceQualityFlag::MissingFleetTelemetry);
+        }
+        if decision.memory_tier_pressure.is_none() {
+            quality_flags.push(DigitalTwinTraceQualityFlag::MissingMemoryTierTelemetry);
+        }
+        if max_latency_over_budget_ratio.is_none() {
+            quality_flags.push(DigitalTwinTraceQualityFlag::MissingLatencyTelemetry);
+        }
+
+        let pane_hash = redacted_hash("pane", pane_id, &mut quality_flags);
+        let agent_hash = redacted_hash("agent", agent_id, &mut quality_flags);
+
+        DigitalTwinTraceStep {
+            step_id: step_id.to_string(),
+            source: DigitalTwinTraceSource::ResourceAdmission,
+            monotonic_ms: observed_at_ms,
+            source_hash: stable_hash(decision),
+            source_artifact_hashes: source_hashes(
+                source_artifact_hash,
+                decision,
+                &mut quality_flags,
+            ),
+            pane_hash,
+            agent_hash,
+            correlation_hash: None,
+            scheduler_sequence: None,
+            scale_history_len: None,
+            active_agent_count: None,
+            queue_utilization,
+            pending_items: decision.pending_items.map(u64::from),
+            admission_action: Some(stable_label(&decision.action)),
+            reason_codes: decision.reason_codes.iter().map(stable_label).collect(),
+            raw_pressure_severity: Some(decision.raw_pressure_severity),
+            effective_pressure_severity: Some(decision.effective_pressure_severity),
+            fleet_pressure: decision.fleet_pressure.map(|tier| stable_label(&tier)),
+            memory_tier_pressure: decision
+                .memory_tier_pressure
+                .map(|tier| stable_label(&tier)),
+            max_latency_over_budget_ratio,
+            memory_budget_bytes: None,
+            memory_actual_bytes: None,
+            resident_over_budget_bytes: None,
+            reclaimable_bytes: None,
+            proof_status: None,
+            evidence_source: None,
+            hardware_evidence_complete: None,
+            pressure_score: decision.effective_pressure_severity,
+            quality_flags,
+        }
+    }
+
+    /// Adapt a memory-tier budget snapshot into a digital-twin trace step.
+    #[must_use]
+    pub fn from_memory_budget_snapshot(
+        step_id: &str,
+        observed_at_ms: u64,
+        snapshot: &FleetMemoryTierBudgetSnapshot,
+        source_artifact_hash: Option<&str>,
+    ) -> DigitalTwinTraceStep {
+        let mut quality_flags = Vec::new();
+        if observed_at_ms == 0 {
+            quality_flags.push(DigitalTwinTraceQualityFlag::StaleTimestamp);
+        }
+        if snapshot.tiers.is_empty() {
+            quality_flags.push(DigitalTwinTraceQualityFlag::MissingMemoryTierTelemetry);
+        }
+        let pressure = snapshot.pressure_tier();
+
+        DigitalTwinTraceStep {
+            step_id: step_id.to_string(),
+            source: DigitalTwinTraceSource::MemoryTierBudget,
+            monotonic_ms: observed_at_ms,
+            source_hash: stable_hash(snapshot),
+            source_artifact_hashes: source_hashes(
+                source_artifact_hash,
+                snapshot,
+                &mut quality_flags,
+            ),
+            pane_hash: None,
+            agent_hash: None,
+            correlation_hash: None,
+            scheduler_sequence: None,
+            scale_history_len: None,
+            active_agent_count: None,
+            queue_utilization: None,
+            pending_items: None,
+            admission_action: None,
+            reason_codes: Vec::new(),
+            raw_pressure_severity: Some(pressure.as_u8()),
+            effective_pressure_severity: Some(pressure.as_u8()),
+            fleet_pressure: Some(stable_label(&pressure)),
+            memory_tier_pressure: Some(stable_label(&pressure)),
+            max_latency_over_budget_ratio: None,
+            memory_budget_bytes: Some(snapshot.totals.budget_bytes),
+            memory_actual_bytes: Some(snapshot.totals.actual_bytes),
+            resident_over_budget_bytes: Some(snapshot.totals.resident_over_budget_bytes),
+            reclaimable_bytes: Some(snapshot.totals.reclaimable_bytes),
+            proof_status: None,
+            evidence_source: None,
+            hardware_evidence_complete: None,
+            pressure_score: pressure.as_u8(),
+            quality_flags,
+        }
+    }
+
+    /// Adapt a scale proof matrix into one trace step per proof row.
+    #[must_use]
+    pub fn from_scale_proof_matrix(
+        observed_at_ms: u64,
+        matrix: &ScaleProofMatrix,
+        source_artifact_hash: Option<&str>,
+    ) -> Vec<DigitalTwinTraceStep> {
+        matrix
+            .proofs
+            .iter()
+            .enumerate()
+            .map(|(idx, proof)| {
+                let mut quality_flags = Vec::new();
+                if observed_at_ms == 0 {
+                    quality_flags.push(DigitalTwinTraceQualityFlag::StaleTimestamp);
+                }
+                if proof.class != ScaleScenarioClass::LiveHardware
+                    || proof.evidence_source != ScaleProofEvidenceSource::LiveHardware
+                {
+                    quality_flags.push(DigitalTwinTraceQualityFlag::SimulatedEvidence);
+                }
+                let evidence_complete = proof.evidence.as_ref().is_some_and(|e| e.is_complete());
+                if proof.dimensions.contains(&ProofDimension::Hardware) && !evidence_complete {
+                    quality_flags.push(DigitalTwinTraceQualityFlag::IncompleteHardwareEvidence);
+                }
+                let correlation_hash =
+                    redacted_hash("scenario", Some(&proof.scenario_id), &mut quality_flags);
+                let pressure_score = match proof.status {
+                    ProofStatus::Passed => 0,
+                    ProofStatus::SkippedNotProven => 1,
+                    ProofStatus::Failed => 3,
+                };
+
+                DigitalTwinTraceStep {
+                    step_id: format!("scale_proof:{idx:04}"),
+                    source: DigitalTwinTraceSource::ScaleProof,
+                    monotonic_ms: observed_at_ms.saturating_add(idx as u64),
+                    source_hash: stable_hash(proof),
+                    source_artifact_hashes: source_hashes(
+                        source_artifact_hash,
+                        proof,
+                        &mut quality_flags,
+                    ),
+                    pane_hash: None,
+                    agent_hash: None,
+                    correlation_hash,
+                    scheduler_sequence: None,
+                    scale_history_len: None,
+                    active_agent_count: None,
+                    queue_utilization: None,
+                    pending_items: None,
+                    admission_action: None,
+                    reason_codes: proof.dimensions.iter().map(stable_label).collect(),
+                    raw_pressure_severity: Some(pressure_score),
+                    effective_pressure_severity: Some(pressure_score),
+                    fleet_pressure: None,
+                    memory_tier_pressure: None,
+                    max_latency_over_budget_ratio: None,
+                    memory_budget_bytes: proof.evidence.as_ref().map(|e| e.memory_bytes),
+                    memory_actual_bytes: None,
+                    resident_over_budget_bytes: None,
+                    reclaimable_bytes: None,
+                    proof_status: Some(proof.status),
+                    evidence_source: Some(proof.evidence_source),
+                    hardware_evidence_complete: Some(evidence_complete),
+                    pressure_score,
+                    quality_flags,
+                }
+            })
+            .collect()
+    }
+
+    /// Adapt a resource-pressure chaos verdict into a digital-twin trace step.
+    #[must_use]
+    pub fn from_resource_pressure_verdict(
+        step_id: &str,
+        observed_at_ms: u64,
+        verdict: &ResourcePressureChaosVerdict,
+        source_artifact_hash: Option<&str>,
+    ) -> DigitalTwinTraceStep {
+        let mut quality_flags = Vec::new();
+        if observed_at_ms == 0 {
+            quality_flags.push(DigitalTwinTraceQualityFlag::StaleTimestamp);
+        }
+        if verdict.hardware_evidence.is_none() {
+            quality_flags.push(DigitalTwinTraceQualityFlag::IncompleteHardwareEvidence);
+        }
+        let correlation_hash =
+            redacted_hash("scenario", Some(&verdict.scenario_id), &mut quality_flags);
+        let pressure_score = match verdict.status {
+            ResourcePressureChaosStatus::Pass => 0,
+            ResourcePressureChaosStatus::SkippedNotProven
+            | ResourcePressureChaosStatus::ExpectedBlockedByInfra => 1,
+            ResourcePressureChaosStatus::Fail => 3,
+        };
+        let queue_utilization = verdict
+            .admission_observation
+            .as_ref()
+            .and_then(|observation| {
+                finite_f64(
+                    Some(f64::from(observation.queue.queue_utilization_basis_points) / 10_000.0),
+                    &mut quality_flags,
+                )
+            });
+        let mut reason_codes = vec![stable_label(&verdict.pressure_class)];
+        if let Some(observation) = verdict.admission_observation.as_ref() {
+            reason_codes.extend(observation.admission_reason_codes.iter().map(stable_label));
+            sort_dedup(&mut reason_codes);
+        }
+
+        DigitalTwinTraceStep {
+            step_id: step_id.to_string(),
+            source: DigitalTwinTraceSource::ResourcePressureChaos,
+            monotonic_ms: observed_at_ms,
+            source_hash: stable_hash(verdict),
+            source_artifact_hashes: source_hashes(
+                source_artifact_hash,
+                verdict,
+                &mut quality_flags,
+            ),
+            pane_hash: None,
+            agent_hash: None,
+            correlation_hash,
+            scheduler_sequence: None,
+            scale_history_len: None,
+            active_agent_count: None,
+            queue_utilization,
+            pending_items: verdict
+                .admission_observation
+                .as_ref()
+                .map(|observation| u64::from(observation.queue.pending_items)),
+            admission_action: verdict
+                .admission_observation
+                .as_ref()
+                .map(|observation| stable_label(&observation.admission_action)),
+            reason_codes,
+            raw_pressure_severity: verdict
+                .admission_observation
+                .as_ref()
+                .map_or(Some(pressure_score), |observation| {
+                    Some(observation.resource_cockpit.raw_pressure_severity)
+                }),
+            effective_pressure_severity: verdict
+                .admission_observation
+                .as_ref()
+                .map_or(Some(pressure_score), |observation| {
+                    Some(observation.resource_cockpit.effective_pressure_severity)
+                }),
+            fleet_pressure: None,
+            memory_tier_pressure: verdict.memory_observation.as_ref().map(|observation| {
+                stable_label(&observation.resource_cockpit.compound_pressure_tier)
+            }),
+            max_latency_over_budget_ratio: None,
+            memory_budget_bytes: verdict
+                .memory_observation
+                .as_ref()
+                .map(|observation| observation.tier_budget.totals.budget_bytes),
+            memory_actual_bytes: verdict
+                .memory_observation
+                .as_ref()
+                .map(|observation| observation.tier_budget.totals.actual_bytes),
+            resident_over_budget_bytes: verdict
+                .memory_observation
+                .as_ref()
+                .map(|observation| observation.tier_budget.totals.resident_over_budget_bytes),
+            reclaimable_bytes: verdict
+                .memory_observation
+                .as_ref()
+                .map(|observation| observation.tier_budget.totals.reclaimable_bytes),
+            proof_status: None,
+            evidence_source: None,
+            hardware_evidence_complete: Some(verdict.hardware_evidence.is_some()),
+            pressure_score,
+            quality_flags,
+        }
+    }
+}
+
+fn compact_phase_changes_and_extrema(
+    steps: Vec<DigitalTwinTraceStep>,
+    max_steps: usize,
+) -> Vec<DigitalTwinTraceStep> {
+    if steps.len() <= max_steps {
+        return steps;
+    }
+    if max_steps == 0 {
+        return Vec::new();
+    }
+    if max_steps == 1 {
+        return steps.into_iter().take(1).collect();
+    }
+
+    let mut keep = vec![0, steps.len() - 1];
+    if max_steps == keep.len() {
+        keep.sort_unstable();
+        return keep.into_iter().map(|idx| steps[idx].clone()).collect();
+    }
+    let mut phase_changes = Vec::new();
+    for idx in 1..steps.len() {
+        let previous = &steps[idx - 1];
+        let current = &steps[idx];
+        if current.source != previous.source || current.pressure_score != previous.pressure_score {
+            phase_changes.push(idx);
+        }
+    }
+
+    phase_changes.sort_by(|left, right| {
+        steps[*right]
+            .pressure_score
+            .cmp(&steps[*left].pressure_score)
+            .then_with(|| steps[*left].monotonic_ms.cmp(&steps[*right].monotonic_ms))
+    });
+    for idx in phase_changes {
+        if keep.len() >= max_steps {
+            break;
+        }
+        if !keep.contains(&idx) {
+            keep.push(idx);
+            sort_dedup(&mut keep);
+        }
+        if keep.len() >= max_steps {
+            break;
+        }
+    }
+
+    let mut ranked = (0..steps.len()).collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        steps[*right]
+            .pressure_score
+            .cmp(&steps[*left].pressure_score)
+            .then_with(|| steps[*left].monotonic_ms.cmp(&steps[*right].monotonic_ms))
+    });
+    for idx in ranked {
+        if keep.len() >= max_steps {
+            break;
+        }
+        if !keep.contains(&idx) {
+            keep.push(idx);
+            sort_dedup(&mut keep);
+        }
+        if keep.len() >= max_steps {
+            break;
+        }
+    }
+    keep.sort_unstable();
+    keep.into_iter().map(|idx| steps[idx].clone()).collect()
+}
+
+fn clamp_monotonic_timestamps(steps: &mut [DigitalTwinTraceStep]) {
+    let mut last = 0_u64;
+    for step in steps {
+        if step.monotonic_ms < last {
+            step.monotonic_ms = last;
+            step.quality_flags
+                .push(DigitalTwinTraceQualityFlag::NonMonotonicTimestampAdjusted);
+            sort_dedup(&mut step.quality_flags);
+        }
+        last = step.monotonic_ms;
+    }
+}
+
+fn source_hashes<T: Serialize>(
+    source_artifact_hash: Option<&str>,
+    source: &T,
+    quality_flags: &mut Vec<DigitalTwinTraceQualityFlag>,
+) -> Vec<String> {
+    match source_artifact_hash {
+        Some(hash) if !hash.trim().is_empty() => vec![hash.trim().to_string()],
+        _ => {
+            quality_flags.push(DigitalTwinTraceQualityFlag::DerivedSourceHash);
+            vec![stable_hash(source)]
+        }
+    }
+}
+
+fn redacted_hash(
+    namespace: &str,
+    raw: Option<&str>,
+    quality_flags: &mut Vec<DigitalTwinTraceQualityFlag>,
+) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    quality_flags.push(DigitalTwinTraceQualityFlag::RedactedIdentity);
+    Some(stable_hash(&(namespace, raw)))
+}
+
+fn finite_f64(
+    value: Option<f64>,
+    quality_flags: &mut Vec<DigitalTwinTraceQualityFlag>,
+) -> Option<f64> {
+    match value {
+        Some(value) if value.is_finite() => Some(value),
+        Some(_) => {
+            quality_flags.push(DigitalTwinTraceQualityFlag::NonFiniteTelemetry);
+            None
+        }
+        None => None,
+    }
+}
+
+fn stable_label<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(label)) => label,
+        Ok(value) => value.to_string(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn option_label<T: Serialize>(value: Option<&T>) -> String {
+    value.map(stable_label).unwrap_or_else(|| "-".to_string())
+}
+
+fn label_list<T: Serialize>(values: &[T]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values
+            .iter()
+            .map(stable_label)
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+}
+
+fn stable_hash<T: Serialize>(value: &T) -> String {
+    let bytes =
+        serde_json::to_vec(value).expect("digital twin trace source serializes to stable JSON");
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn sort_dedup<T: Ord>(values: &mut Vec<T>) {
+    values.sort();
+    values.dedup();
+}
+
+// ============================================================================
 // ScenarioMatrixRunner — executes the matrix
 // ============================================================================
 
@@ -1043,8 +1857,489 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankenterm_core::fleet_memory_controller::{
+        FleetMemoryTier, FleetMemoryTierBudgetRecord, FleetPressureTier,
+    };
+    use frankenterm_core::resource_pressure_chaos::{sample_fail_verdict, sample_pass_verdict};
+    use frankenterm_core::swarm_scheduler::{
+        AdmissionAction, AdmissionDecisionCounters, AdmissionReasonCode, SchedulerConfig,
+    };
     use proptest::prelude::*;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn scheduler_snapshot(last_evaluation_ms: u64, sequence: u64) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            config: SchedulerConfig::default(),
+            last_scale_up_ms: 0,
+            last_scale_down_ms: 0,
+            last_evaluation_ms,
+            consecutive_scale_ops: 0,
+            circuit_breaker_tripped_at: None,
+            scale_history: Vec::new(),
+            agent_first_seen: BTreeMap::new(),
+            agent_completed: BTreeMap::new(),
+            agent_failed: BTreeMap::new(),
+            sequence,
+        }
+    }
+
+    fn admission_summary(
+        action: AdmissionAction,
+        queue_utilization: Option<f64>,
+        pending_items: Option<u32>,
+        fleet_pressure: Option<FleetPressureTier>,
+        memory_tier_pressure: Option<FleetPressureTier>,
+        max_latency_over_budget_ratio: Option<f64>,
+    ) -> ResourceAdmissionDecisionSummary {
+        let counters = match action {
+            AdmissionAction::Admit => AdmissionDecisionCounters {
+                admitted: 1,
+                ..AdmissionDecisionCounters::default()
+            },
+            AdmissionAction::Defer => AdmissionDecisionCounters {
+                deferred: 1,
+                ..AdmissionDecisionCounters::default()
+            },
+            AdmissionAction::Degrade => AdmissionDecisionCounters {
+                degraded: 1,
+                ..AdmissionDecisionCounters::default()
+            },
+            AdmissionAction::Shed => AdmissionDecisionCounters {
+                shed: 1,
+                ..AdmissionDecisionCounters::default()
+            },
+        };
+
+        ResourceAdmissionDecisionSummary {
+            action,
+            reason_codes: vec![
+                AdmissionReasonCode::QueueSaturated,
+                AdmissionReasonCode::LatencyStageOverBudget,
+            ],
+            counters,
+            raw_pressure_severity: 3,
+            effective_pressure_severity: action.severity(),
+            priority_protection_units: 1,
+            queue_utilization,
+            pending_items,
+            fleet_pressure,
+            memory_tier_pressure,
+            max_latency_over_budget_ratio,
+            herd_wave_pressure: None,
+            herd_wave_recommended_stagger_ms: None,
+            herd_wave_cohort_max_stagger_ms: None,
+        }
+    }
+
+    fn minimal_trace_step(
+        step_id: &str,
+        source: DigitalTwinTraceSource,
+        monotonic_ms: u64,
+        pressure_score: u8,
+    ) -> DigitalTwinTraceStep {
+        DigitalTwinTraceStep {
+            step_id: step_id.to_string(),
+            source,
+            monotonic_ms,
+            source_hash: format!("source-{step_id}"),
+            source_artifact_hashes: vec![format!("artifact-{step_id}")],
+            pane_hash: None,
+            agent_hash: None,
+            correlation_hash: None,
+            scheduler_sequence: None,
+            scale_history_len: None,
+            active_agent_count: None,
+            queue_utilization: None,
+            pending_items: None,
+            admission_action: None,
+            reason_codes: Vec::new(),
+            raw_pressure_severity: Some(pressure_score),
+            effective_pressure_severity: Some(pressure_score),
+            fleet_pressure: None,
+            memory_tier_pressure: None,
+            max_latency_over_budget_ratio: None,
+            memory_budget_bytes: None,
+            memory_actual_bytes: None,
+            resident_over_budget_bytes: None,
+            reclaimable_bytes: None,
+            proof_status: None,
+            evidence_source: None,
+            hardware_evidence_complete: None,
+            pressure_score,
+            quality_flags: Vec::new(),
+        }
+    }
+
+    fn golden_admission_step(
+        step_id: &str,
+        observed_at_ms: u64,
+        action: AdmissionAction,
+        queue_utilization: Option<f64>,
+        pending_items: Option<u32>,
+        fleet_pressure: Option<FleetPressureTier>,
+        memory_tier_pressure: Option<FleetPressureTier>,
+        max_latency_over_budget_ratio: Option<f64>,
+        reason_codes: Vec<AdmissionReasonCode>,
+        source_artifact_hash: Option<&str>,
+    ) -> DigitalTwinTraceStep {
+        let mut summary = admission_summary(
+            action,
+            queue_utilization,
+            pending_items,
+            fleet_pressure,
+            memory_tier_pressure,
+            max_latency_over_budget_ratio,
+        );
+        summary.reason_codes = reason_codes;
+        summary.raw_pressure_severity = action.severity();
+        summary.effective_pressure_severity = action.severity();
+
+        DigitalTwinTraceAdapter::from_resource_admission_decision(
+            step_id,
+            observed_at_ms,
+            &summary,
+            None,
+            None,
+            source_artifact_hash,
+        )
+    }
+
+    fn digital_twin_golden_trace() -> DigitalTwinTrace {
+        DigitalTwinTraceAdapter::build(
+            4_000,
+            vec![
+                golden_admission_step(
+                    "healthy",
+                    10,
+                    AdmissionAction::Admit,
+                    Some(0.20),
+                    Some(2),
+                    Some(FleetPressureTier::Normal),
+                    Some(FleetPressureTier::Normal),
+                    Some(0.50),
+                    vec![AdmissionReasonCode::Healthy],
+                    Some("golden-healthy"),
+                ),
+                golden_admission_step(
+                    "pressured",
+                    20,
+                    AdmissionAction::Defer,
+                    Some(0.84),
+                    Some(48),
+                    Some(FleetPressureTier::Elevated),
+                    Some(FleetPressureTier::Elevated),
+                    Some(1.10),
+                    vec![
+                        AdmissionReasonCode::QueueElevated,
+                        AdmissionReasonCode::FleetPressure,
+                    ],
+                    Some("golden-pressured"),
+                ),
+                golden_admission_step(
+                    "degraded",
+                    30,
+                    AdmissionAction::Degrade,
+                    Some(0.94),
+                    Some(96),
+                    Some(FleetPressureTier::Critical),
+                    Some(FleetPressureTier::Critical),
+                    Some(1.75),
+                    vec![
+                        AdmissionReasonCode::QueueSaturated,
+                        AdmissionReasonCode::MemoryTierPressure,
+                        AdmissionReasonCode::LatencyStageOverBudget,
+                    ],
+                    Some("golden-degraded"),
+                ),
+                golden_admission_step(
+                    "missing_telemetry",
+                    40,
+                    AdmissionAction::Defer,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![
+                        AdmissionReasonCode::MissingQueueTelemetry,
+                        AdmissionReasonCode::MissingFleetTelemetry,
+                        AdmissionReasonCode::MissingMemoryTierTelemetry,
+                        AdmissionReasonCode::MissingLatencyTelemetry,
+                    ],
+                    None,
+                ),
+            ],
+        )
+    }
+
+    fn scale_lab_fixture_path(file_name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/scale-lab")
+            .join(file_name)
+    }
+
+    #[test]
+    fn digital_twin_trace_orders_hashes_and_redacts_identities() {
+        let admission = DigitalTwinTraceAdapter::from_resource_admission_decision(
+            "admission",
+            200,
+            &admission_summary(
+                AdmissionAction::Degrade,
+                Some(0.91),
+                Some(42),
+                Some(FleetPressureTier::Critical),
+                Some(FleetPressureTier::Elevated),
+                Some(1.7),
+            ),
+            Some("pane-raw-7"),
+            Some("agent-raw-alpha"),
+            None,
+        );
+        let scheduler = DigitalTwinTraceAdapter::from_scheduler_snapshot(
+            "scheduler",
+            &scheduler_snapshot(100, 9),
+            None,
+        );
+
+        let trace =
+            DigitalTwinTraceAdapter::build(1_000, vec![admission.clone(), scheduler.clone()]);
+        let repeated = DigitalTwinTraceAdapter::build(1_000, vec![admission, scheduler]);
+
+        assert_eq!(trace.schema_version, DIGITAL_TWIN_TRACE_SCHEMA_VERSION);
+        assert_eq!(
+            trace.steps[0].source,
+            DigitalTwinTraceSource::SchedulerSnapshot
+        );
+        assert_eq!(
+            trace.steps[1].source,
+            DigitalTwinTraceSource::ResourceAdmission
+        );
+        assert_eq!(trace.steps[1].admission_action.as_deref(), Some("degrade"));
+        assert_eq!(
+            DigitalTwinTraceSource::ResourceAdmission.as_str(),
+            "resource_admission"
+        );
+        assert_eq!(trace.trace_hash, repeated.trace_hash);
+        assert!(
+            trace
+                .quality_flags
+                .contains(&DigitalTwinTraceQualityFlag::DerivedSourceHash)
+        );
+        assert!(
+            trace
+                .quality_flags
+                .contains(&DigitalTwinTraceQualityFlag::RedactedIdentity)
+        );
+
+        let json = trace.to_stable_json();
+        assert!(json.contains("\"schema_version\": \"ft.digital_twin_trace.v1\""));
+        assert!(!json.contains("pane-raw-7"));
+        assert!(!json.contains("agent-raw-alpha"));
+    }
+
+    #[test]
+    fn digital_twin_trace_flags_missing_telemetry_without_derived_hash_when_artifact_hash_exists() {
+        let step = DigitalTwinTraceAdapter::from_resource_admission_decision(
+            "missing",
+            0,
+            &admission_summary(AdmissionAction::Defer, None, None, None, None, None),
+            None,
+            None,
+            Some("artifact-hash-explicit"),
+        );
+        let trace = DigitalTwinTraceAdapter::build(2_000, vec![step]);
+
+        for flag in [
+            DigitalTwinTraceQualityFlag::StaleTimestamp,
+            DigitalTwinTraceQualityFlag::MissingQueueTelemetry,
+            DigitalTwinTraceQualityFlag::MissingFleetTelemetry,
+            DigitalTwinTraceQualityFlag::MissingMemoryTierTelemetry,
+            DigitalTwinTraceQualityFlag::MissingLatencyTelemetry,
+        ] {
+            assert!(trace.quality_flags.contains(&flag), "missing flag {flag:?}");
+        }
+        assert!(
+            !trace
+                .quality_flags
+                .contains(&DigitalTwinTraceQualityFlag::DerivedSourceHash)
+        );
+        assert!(
+            trace
+                .source_artifact_hashes
+                .iter()
+                .any(|hash| hash == "artifact-hash-explicit")
+        );
+    }
+
+    #[test]
+    fn digital_twin_trace_compaction_preserves_boundaries_and_pressure_extrema() {
+        let trace = DigitalTwinTraceAdapter::build_with_compaction(
+            3_000,
+            vec![
+                minimal_trace_step("first", DigitalTwinTraceSource::SchedulerSnapshot, 10, 0),
+                minimal_trace_step("elevated", DigitalTwinTraceSource::SchedulerSnapshot, 20, 1),
+                minimal_trace_step("critical", DigitalTwinTraceSource::SchedulerSnapshot, 30, 3),
+                minimal_trace_step(
+                    "admission",
+                    DigitalTwinTraceSource::ResourceAdmission,
+                    40,
+                    2,
+                ),
+                minimal_trace_step("last", DigitalTwinTraceSource::ResourceAdmission, 50, 0),
+            ],
+            Some(3),
+        );
+
+        assert_eq!(trace.steps.len(), 3);
+        assert_eq!(trace.steps.first().unwrap().step_id, "first");
+        assert_eq!(trace.steps.last().unwrap().step_id, "last");
+        assert!(trace.steps.iter().any(|step| step.step_id == "critical"));
+        assert!(
+            trace
+                .quality_flags
+                .contains(&DigitalTwinTraceQualityFlag::CompactedSamples)
+        );
+        assert!(trace.steps.iter().all(|step| {
+            step.quality_flags
+                .contains(&DigitalTwinTraceQualityFlag::CompactedSamples)
+        }));
+    }
+
+    #[test]
+    fn digital_twin_trace_clamps_regressed_timestamps() {
+        let mut steps = vec![
+            minimal_trace_step("a", DigitalTwinTraceSource::SchedulerSnapshot, 20, 0),
+            minimal_trace_step("b", DigitalTwinTraceSource::SchedulerSnapshot, 10, 1),
+        ];
+        clamp_monotonic_timestamps(&mut steps);
+
+        assert_eq!(steps[1].monotonic_ms, 20);
+        assert!(
+            steps[1]
+                .quality_flags
+                .contains(&DigitalTwinTraceQualityFlag::NonMonotonicTimestampAdjusted)
+        );
+    }
+
+    #[test]
+    fn digital_twin_trace_adapts_memory_and_scale_proof_sources() {
+        let memory = FleetMemoryTierBudgetSnapshot::from_tiers([
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::HotResident, 100, 140)
+                .with_reclaimable_bytes(25),
+            FleetMemoryTierBudgetRecord::new(FleetMemoryTier::ColdDisk, 1_000, 250),
+        ]);
+        let memory_step = DigitalTwinTraceAdapter::from_memory_budget_snapshot(
+            "memory",
+            42,
+            &memory,
+            Some("memory-artifact"),
+        );
+        assert_eq!(
+            memory_step.memory_budget_bytes,
+            Some(memory.totals.budget_bytes)
+        );
+        assert_eq!(
+            memory_step.memory_actual_bytes,
+            Some(memory.totals.actual_bytes)
+        );
+        assert!(memory_step.pressure_score > 0);
+
+        let proof = ScaleScenarioProof {
+            scenario_id: "synthetic_10k_policy_audit".to_string(),
+            class: ScaleScenarioClass::Synthetic,
+            dimensions: vec![ProofDimension::Hardware],
+            status: ProofStatus::SkippedNotProven,
+            evidence_source: ScaleProofEvidenceSource::Synthetic,
+            evidence: None,
+            note: "SKIPPED_NOT_PROVEN: waiting for live high-core worker".to_string(),
+        };
+        let matrix =
+            ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), vec![proof]);
+        let proof_steps = DigitalTwinTraceAdapter::from_scale_proof_matrix(50, &matrix, None);
+        let trace = DigitalTwinTraceAdapter::build(5_000, proof_steps);
+
+        assert_eq!(trace.steps.len(), 1);
+        assert_eq!(
+            trace.steps[0].proof_status,
+            Some(ProofStatus::SkippedNotProven)
+        );
+        assert_eq!(
+            trace.steps[0].evidence_source,
+            Some(ScaleProofEvidenceSource::Synthetic)
+        );
+        assert_eq!(trace.steps[0].hardware_evidence_complete, Some(false));
+        for flag in [
+            DigitalTwinTraceQualityFlag::SimulatedEvidence,
+            DigitalTwinTraceQualityFlag::IncompleteHardwareEvidence,
+            DigitalTwinTraceQualityFlag::RedactedIdentity,
+            DigitalTwinTraceQualityFlag::DerivedSourceHash,
+        ] {
+            assert!(trace.quality_flags.contains(&flag), "missing flag {flag:?}");
+        }
+    }
+
+    #[test]
+    fn digital_twin_trace_adapts_resource_pressure_verdict_statuses() {
+        let pass = DigitalTwinTraceAdapter::from_resource_pressure_verdict(
+            "pass",
+            60,
+            &sample_pass_verdict(),
+            Some("pass-artifact"),
+        );
+        assert_eq!(pass.pressure_score, 0);
+        assert_eq!(pass.hardware_evidence_complete, Some(true));
+        assert!(pass.queue_utilization.is_some());
+        assert!(
+            pass.reason_codes
+                .iter()
+                .any(|reason| reason == "queue_saturated")
+        );
+
+        let fail = DigitalTwinTraceAdapter::from_resource_pressure_verdict(
+            "fail",
+            70,
+            &sample_fail_verdict(),
+            None,
+        );
+        let trace = DigitalTwinTraceAdapter::build(6_000, vec![fail]);
+        assert_eq!(trace.steps[0].pressure_score, 3);
+        assert_eq!(trace.steps[0].hardware_evidence_complete, Some(false));
+        assert!(
+            trace
+                .quality_flags
+                .contains(&DigitalTwinTraceQualityFlag::IncompleteHardwareEvidence)
+        );
+        assert!(
+            trace
+                .quality_flags
+                .contains(&DigitalTwinTraceQualityFlag::DerivedSourceHash)
+        );
+    }
+
+    #[test]
+    fn digital_twin_trace_golden_json_and_toon_fixtures_match() {
+        let trace = digital_twin_golden_trace();
+        let actual_json = trace.to_stable_json() + "\n";
+        let actual_toon = trace.to_toon();
+        let json_path = scale_lab_fixture_path("digital-twin-trace-summary.v1.json");
+        let toon_path = scale_lab_fixture_path("digital-twin-trace-summary.v1.toon");
+
+        if std::env::var_os("UPDATE_GOLDENS").is_some() {
+            fs::write(&json_path, &actual_json).expect("digital twin JSON fixture can be updated");
+            fs::write(&toon_path, &actual_toon).expect("digital twin TOON fixture can be updated");
+        }
+
+        let expected_json =
+            fs::read_to_string(&json_path).expect("digital twin JSON fixture is checked in");
+        let expected_toon =
+            fs::read_to_string(&toon_path).expect("digital twin TOON fixture is checked in");
+
+        assert_eq!(expected_json, actual_json);
+        assert_eq!(expected_toon, actual_toon);
+    }
 
     fn sample_matrix_toml() -> &'static str {
         r#"
