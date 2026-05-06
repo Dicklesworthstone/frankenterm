@@ -5386,9 +5386,9 @@ impl StorageHandle {
         let workflow_id = workflow_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_action_plan(&conn, &workflow_id)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_action_plan_backend(backend, &workflow_id)
+            })
         })
         .await
     }
@@ -17226,7 +17226,9 @@ fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<Workflo
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
 }
 
-/// Query workflow step logs by workflow ID
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_action_plan_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_action_plan(
     conn: &Connection,
     workflow_id: &str,
@@ -17247,6 +17249,45 @@ fn query_action_plan(
     )
     .optional()
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+}
+
+fn workflow_action_plan_from_backend_cells(row: &[SqlCell]) -> Result<WorkflowActionPlanRecord> {
+    let reader = CellRowReader::new(row);
+
+    Ok(WorkflowActionPlanRecord {
+        workflow_id: reader
+            .string(0)
+            .map_err(|err| storage_backend_error("Workflow action plan workflow_id", err))?,
+        plan_id: reader
+            .string(1)
+            .map_err(|err| storage_backend_error("Workflow action plan plan_id", err))?,
+        plan_hash: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Workflow action plan plan_hash", err))?,
+        plan_json: reader
+            .string(3)
+            .map_err(|err| storage_backend_error("Workflow action plan plan_json", err))?,
+        created_at: reader
+            .i64(4)
+            .map_err(|err| storage_backend_error("Workflow action plan created_at", err))?,
+    })
+}
+
+fn query_action_plan_backend(
+    backend: &dyn StorageBackend,
+    workflow_id: &str,
+) -> Result<Option<WorkflowActionPlanRecord>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT workflow_id, plan_id, plan_hash, plan_json, created_at \
+             FROM workflow_action_plans WHERE workflow_id = ?1",
+            &[ToSqlValue::Text(workflow_id)],
+        )
+        .map_err(|err| storage_backend_error("Query action plan", err))?;
+
+    row.as_deref()
+        .map(workflow_action_plan_from_backend_cells)
+        .transpose()
 }
 
 #[cfg(test)]
@@ -18528,7 +18569,7 @@ fn workflow_step_log_record_serializes() {
 
 #[test]
 fn can_insert_and_query_workflow_action_plan() {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now_ms = 1_700_000_000_000i64;
@@ -18558,18 +18599,37 @@ fn can_insert_and_query_workflow_action_plan() {
         ))
         .build();
 
+    let backend = RusqliteBackend::new(conn);
     let record = action_plan_record_from_plan("wf-plan-001", &plan).unwrap();
-    with_writer_backend(&mut conn, |backend| {
-        upsert_action_plan_backend(backend, &record)
-    })
-    .unwrap();
+    upsert_action_plan_backend(&backend, &record).unwrap();
 
-    let fetched = query_action_plan(&conn, "wf-plan-001").unwrap().unwrap();
+    let fetched = query_action_plan_backend(&backend, "wf-plan-001")
+        .unwrap()
+        .unwrap();
     assert_eq!(fetched.plan_id, plan.plan_id.to_string());
     assert_eq!(fetched.plan_hash, plan.compute_hash());
 
+    let conn = backend.into_connection();
+    let direct_fetched = query_action_plan(&conn, "wf-plan-001").unwrap().unwrap();
+    assert_eq!(direct_fetched.plan_id, fetched.plan_id);
+    assert_eq!(direct_fetched.plan_hash, fetched.plan_hash);
+
     let parsed: crate::plan::ActionPlan = serde_json::from_str(&fetched.plan_json).unwrap();
     assert_eq!(parsed.plan_id, plan.plan_id);
+}
+
+#[test]
+fn query_action_plan_returns_none_for_unknown_workflow() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let backend = RusqliteBackend::new(conn);
+    let fetched = query_action_plan_backend(&backend, "missing-workflow").unwrap();
+    assert!(fetched.is_none());
+
+    let conn = backend.into_connection();
+    let direct_fetched = query_action_plan(&conn, "missing-workflow").unwrap();
+    assert!(direct_fetched.is_none());
 }
 
 #[test]
