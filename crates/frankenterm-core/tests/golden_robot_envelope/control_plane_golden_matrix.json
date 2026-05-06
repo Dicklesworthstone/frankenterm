@@ -58,6 +58,34 @@
       "notes": "The fixture pins hybrid search falling back to lexical with semantic_no_hits metrics."
     },
     {
+      "id": "mcp-wa-send-json-dry-run-healthy",
+      "surface": "wa.send",
+      "family": "send",
+      "action": "send_dry_run",
+      "transport": "mcp",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": "wa_send.json",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "notes": "Pins wa.send dry-run as a policy-evaluated success envelope with no pane mutation."
+    },
+    {
+      "id": "mcp-wa-send-toon-dry-run-healthy",
+      "surface": "wa.send",
+      "family": "send",
+      "action": "send_dry_run",
+      "transport": "mcp",
+      "format": "toon",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": "wa_send.json",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test mcp_conformance_core_tools --no-default-features --features mcp,asupersync-runtime",
+      "notes": "mcp_conformance_core_tools decodes wa.send TOON and checks parity with the JSON golden semantics."
+    },
+    {
       "id": "mcp-wa-events-json-healthy",
       "surface": "wa.events",
       "family": "events",
@@ -100,7 +128,7 @@
     {
       "id": "robot-send-json-blocked-policy-denied",
       "surface": "robot send",
-      "family": "policy",
+      "family": "send",
       "action": "send",
       "transport": "robot",
       "format": "json",
@@ -119,6 +147,51 @@
         "now": 0
       },
       "notes": "Documents the blocked robot envelope code path used by policy gates."
+    },
+    {
+      "id": "robot-send-json-dry-run-healthy",
+      "surface": "robot send",
+      "family": "send",
+      "action": "send_dry_run",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --test cli_contract_tests contract_no_mock_control_plane_receipts_cover_read_and_policy_gated_robot_paths",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "command": "ft robot send 5252 \"conformance-ok\" --dry-run",
+          "dry_run": true,
+          "warnings": [],
+          "target_resolution": {
+            "pane_id": 5252,
+            "status": "resolved"
+          },
+          "policy_evaluation": {
+            "checks": [
+              {
+                "name": "policy_surface",
+                "status": "checked"
+              }
+            ],
+            "result": "requires_approval"
+          },
+          "expected_actions": [
+            {
+              "action_type": "send_text",
+              "pane_id": 5252,
+              "would_send": true
+            }
+          ]
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the Robot CLI dry-run report envelope that previews a send without pane mutation."
     },
     {
       "id": "robot-events-mutate-json-policy-required",
@@ -144,13 +217,13 @@
       "notes": "Pins require-approval as distinct from a hard policy denial."
     },
     {
-      "id": "robot-fleet-scale-json-unsupported",
+      "id": "robot-fleet-scale-json-capability-unavailable",
       "surface": "robot fleet scale",
       "family": "fleet",
       "action": "scale",
       "transport": "robot",
       "format": "json",
-      "scenario": "unsupported",
+      "scenario": "capability_unavailable",
       "status": "error",
       "expected_code": "robot.fleet.capability_unavailable",
       "fixture": null,
@@ -181,6 +254,45 @@
         "now": 0
       },
       "notes": "Pins the namespaced capability-unavailable code emitted by native fleet mutation stubs."
+    },
+    {
+      "id": "robot-fleet-scale-toon-capability-unavailable",
+      "surface": "robot fleet scale",
+      "family": "fleet",
+      "action": "scale",
+      "transport": "robot",
+      "format": "toon",
+      "scenario": "capability_unavailable",
+      "status": "error",
+      "expected_code": "robot.fleet.capability_unavailable",
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin frankenterm robot_fleet_toon_roundtrip",
+      "envelope": {
+        "ok": false,
+        "error": "ft robot fleet scale is parsed natively but daemon-side fleet mutation is not available yet.",
+        "error_code": "robot.fleet.capability_unavailable",
+        "hint": "Use read-only ft robot fleet status or ft robot fleet agents until daemon-side mutation is wired.",
+        "data": {
+          "family": "fleet",
+          "action": "scale",
+          "backend": "native_agent_inventory",
+          "capability_available": false,
+          "capability": "daemon_side_fleet_mutation",
+          "requested": {
+            "program": "codex",
+            "target_count": 2,
+            "dry_run": true
+          },
+          "audit": {
+            "event": "fleet.scale.denied",
+            "reason": "capability_unavailable"
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the decoded TOON envelope for the same capability-unavailable fleet mutation contract."
     },
     {
       "id": "robot-agents-json-feature-not-available",

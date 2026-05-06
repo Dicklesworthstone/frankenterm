@@ -96,6 +96,83 @@ fn validation_errors(schema: &Validator, envelope: &Value) -> Vec<String> {
     }
 }
 
+fn envelope_from_fixture<'a>(fixture: &'a Value, entry: &MatrixEntry) -> (&'a Value, &'static str) {
+    if fixture.get("ok").is_some() {
+        return (fixture, "fixture root");
+    }
+    if let Some(envelope) = fixture.get("success_envelope") {
+        return (envelope, "fixture success_envelope");
+    }
+    panic!(
+        "{} fixture must expose either an envelope root or success_envelope",
+        entry.id
+    );
+}
+
+fn schema_for_entry<'a>(
+    entry: &MatrixEntry,
+    robot_schema: &'a Validator,
+    mcp_schema: &'a Validator,
+) -> &'a Validator {
+    match entry.transport.as_str() {
+        "robot" => robot_schema,
+        "mcp" => mcp_schema,
+        other => panic!(
+            "{} references an envelope for unsupported transport {other}",
+            entry.id
+        ),
+    }
+}
+
+fn assert_envelope_matches_entry(
+    entry: &MatrixEntry,
+    envelope: &Value,
+    schema: &Validator,
+    source: &str,
+) {
+    let mut canonical = envelope.clone();
+    canonicalize_json(&mut canonical, None);
+    assert_eq!(
+        &canonical, envelope,
+        "{} {source} must already be canonical and scrubbed",
+        entry.id
+    );
+
+    let failures = validation_errors(schema, envelope);
+    assert!(
+        failures.is_empty(),
+        "{} {source} failed schema validation:\n{}",
+        entry.id,
+        failures.join("\n")
+    );
+
+    match entry.status.as_str() {
+        "ok" => assert_eq!(
+            envelope.get("ok").and_then(Value::as_bool),
+            Some(true),
+            "{} {source} must be a success envelope",
+            entry.id
+        ),
+        "error" => assert_eq!(
+            envelope.get("ok").and_then(Value::as_bool),
+            Some(false),
+            "{} {source} must be an error envelope",
+            entry.id
+        ),
+        "contract" => panic!("{} contract entries must not carry envelopes", entry.id),
+        status => panic!("{} has unknown status {status}", entry.id),
+    }
+
+    if let Some(expected_code) = entry.expected_code.as_deref() {
+        assert_eq!(
+            envelope.get("error_code").and_then(Value::as_str),
+            Some(expected_code),
+            "{} {source} does not carry expected_code",
+            entry.id
+        );
+    }
+}
+
 #[test]
 fn matrix_metadata_is_current_and_rch_backed() {
     let matrix = load_matrix();
@@ -189,6 +266,7 @@ fn matrix_covers_required_control_plane_surfaces_and_scenarios() {
         "search",
         "events",
         "rules",
+        "send",
         "profile",
         "checkpoint",
         "context",
@@ -211,6 +289,7 @@ fn matrix_covers_required_control_plane_surfaces_and_scenarios() {
         "degraded",
         "blocked",
         "policy_required",
+        "capability_unavailable",
         "unsupported",
     ] {
         assert!(
@@ -234,6 +313,49 @@ fn matrix_covers_required_control_plane_surfaces_and_scenarios() {
         .collect();
     assert!(formats.contains("json"), "matrix must cover JSON");
     assert!(formats.contains("toon"), "matrix must cover TOON");
+}
+
+#[test]
+fn matrix_covers_representative_contract_cases() {
+    let matrix = load_matrix();
+
+    assert!(
+        matrix.entries.iter().any(|entry| entry.family == "send"
+            && entry.action == "send_dry_run"
+            && entry.transport == "mcp"
+            && entry.status == "ok"),
+        "matrix must pin an MCP send dry-run success envelope"
+    );
+    assert!(
+        matrix.entries.iter().any(|entry| entry.family == "send"
+            && entry.action == "send_dry_run"
+            && entry.transport == "robot"
+            && entry.status == "ok"),
+        "matrix must pin a Robot CLI send dry-run success envelope"
+    );
+    assert!(
+        matrix.entries.iter().any(|entry| entry.family == "send"
+            && entry.scenario == "blocked"
+            && entry.expected_code.as_deref() == Some("robot.policy_denied")),
+        "matrix must pin policy-denied send as robot.policy_denied"
+    );
+    assert!(
+        matrix
+            .entries
+            .iter()
+            .any(|entry| entry.scenario == "policy_required"
+                && entry.expected_code.as_deref() == Some("robot.require_approval")),
+        "matrix must pin require-approval separately from hard denial"
+    );
+    assert!(
+        matrix
+            .entries
+            .iter()
+            .any(|entry| entry.scenario == "capability_unavailable"
+                && entry.format == "toon"
+                && entry.expected_code.as_deref() == Some("robot.fleet.capability_unavailable")),
+        "matrix must pin capability-unavailable TOON parity"
+    );
 }
 
 #[test]
@@ -294,43 +416,43 @@ fn matrix_embedded_envelopes_validate_against_transport_schema() {
         let Some(envelope) = &entry.envelope else {
             continue;
         };
-        let mut canonical = envelope.clone();
-        canonicalize_json(&mut canonical, None);
-        assert_eq!(
-            &canonical, envelope,
-            "{} embedded envelope must already be canonical and scrubbed",
-            entry.id
-        );
-
-        let schema = match entry.transport.as_str() {
-            "robot" => &robot_schema,
-            "mcp" => &mcp_schema,
-            other => panic!(
-                "{} embeds an envelope for unsupported transport {other}",
-                entry.id
-            ),
-        };
-        let failures = validation_errors(schema, envelope);
-        assert!(
-            failures.is_empty(),
-            "{} envelope failed schema validation:\n{}",
-            entry.id,
-            failures.join("\n")
-        );
-        if let Some(expected_code) = entry.expected_code.as_deref() {
-            assert_eq!(
-                envelope.get("error_code").and_then(Value::as_str),
-                Some(expected_code),
-                "{} embedded envelope does not carry expected_code",
-                entry.id
-            );
-        }
+        let schema = schema_for_entry(entry, &robot_schema, &mcp_schema);
+        assert_envelope_matches_entry(entry, envelope, schema, "embedded envelope");
         validated += 1;
     }
 
     assert!(
         validated >= 5,
         "expected at least five embedded envelopes, got {validated}"
+    );
+}
+
+#[test]
+fn matrix_fixture_envelopes_validate_against_transport_schema() {
+    let matrix = load_matrix();
+    let dir = fixtures_dir();
+    let robot_schema = load_schema("wa-robot-envelope.json");
+    let mcp_schema = load_schema("wa-mcp-envelope.json");
+
+    let mut validated = 0usize;
+    for entry in &matrix.entries {
+        let Some(fixture) = &entry.fixture else {
+            continue;
+        };
+        let path = dir.join(fixture);
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|err| panic!("failed to read fixture {}: {err}", path.display()));
+        let fixture_json: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|err| panic!("fixture {} is not JSON: {err}", path.display()));
+        let (envelope, source) = envelope_from_fixture(&fixture_json, entry);
+        let schema = schema_for_entry(entry, &robot_schema, &mcp_schema);
+        assert_envelope_matches_entry(entry, envelope, schema, source);
+        validated += 1;
+    }
+
+    assert!(
+        validated >= 4,
+        "expected at least four fixture-backed envelopes, got {validated}"
     );
 }
 
