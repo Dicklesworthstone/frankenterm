@@ -1578,7 +1578,8 @@ fn can_insert_and_query_audit_actions() {
         action_kind: Some("send_text".to_string()),
         ..Default::default()
     };
-    let rows = query_audit_actions(&conn, &query).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let rows = query_audit_actions_backend(&backend, &query).unwrap();
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].actor_kind, "human");
@@ -1633,7 +1634,8 @@ fn action_history_includes_undo_metadata() {
     })
     .unwrap();
 
-    let rows = query_action_history(&conn, &ActionHistoryQuery::default()).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let rows = query_action_history_backend(&backend, &ActionHistoryQuery::default()).unwrap();
     assert!(!rows.is_empty());
 
     let row = &rows[0];
@@ -1712,8 +1714,9 @@ fn action_history_orders_by_ts_and_id() {
     )
     .unwrap();
 
-    let rows = query_action_history(
-        &conn,
+    let backend = RusqliteBackend::new(conn);
+    let rows = query_action_history_backend(
+        &backend,
         &ActionHistoryQuery {
             limit: Some(10),
             ..Default::default()
@@ -1800,8 +1803,9 @@ fn action_history_filters_undoable() {
     })
     .unwrap();
 
-    let undoable = query_action_history(
-        &conn,
+    let backend = RusqliteBackend::new(conn);
+    let undoable = query_action_history_backend(
+        &backend,
         &ActionHistoryQuery {
             undoable: Some(true),
             ..Default::default()
@@ -1811,8 +1815,8 @@ fn action_history_filters_undoable() {
     assert_eq!(undoable.len(), 1);
     assert_eq!(undoable[0].id, undoable_id);
 
-    let non_undoable = query_action_history(
-        &conn,
+    let non_undoable = query_action_history_backend(
+        &backend,
         &ActionHistoryQuery {
             undoable: Some(false),
             ..Default::default()
@@ -1868,7 +1872,8 @@ fn action_history_includes_workflow_step_info() {
         )
         .unwrap();
 
-    let rows = query_action_history(&conn, &ActionHistoryQuery::default()).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let rows = query_action_history_backend(&backend, &ActionHistoryQuery::default()).unwrap();
     let row = rows.iter().find(|row| row.id == action_id).unwrap();
     assert_eq!(row.workflow_id.as_deref(), Some("wf-1"));
     assert_eq!(row.step_name.as_deref(), Some("step-0"));
@@ -1979,12 +1984,11 @@ fn purge_audit_actions_removes_old_entries() {
     // br-ft-l1jgo: purge_audit_actions_sync was migrated to
     // purge_audit_actions_backend at c64527d9c. Wrap the test
     // conn into a RusqliteBackend for the backend-trait call.
-    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
+    let backend = RusqliteBackend::new(conn);
     let deleted = purge_audit_actions_backend(&backend, 1_500).unwrap();
     assert_eq!(deleted, 1);
 
-    let conn = backend.into_connection();
-    let rows = query_audit_actions(&conn, &AuditQuery::default()).unwrap();
+    let rows = query_audit_actions_backend(&backend, &AuditQuery::default()).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].ts, 2_000);
 }
@@ -2031,8 +2035,9 @@ fn audit_query_filters_and_limits() {
     record_audit_action_for_conn(&mut conn, &allow).unwrap();
     record_audit_action_for_conn(&mut conn, &deny).unwrap();
 
-    let last_one = query_audit_actions(
-        &conn,
+    let backend = RusqliteBackend::new(conn);
+    let last_one = query_audit_actions_backend(
+        &backend,
         &AuditQuery {
             limit: Some(1),
             ..Default::default()
@@ -2042,8 +2047,8 @@ fn audit_query_filters_and_limits() {
     assert_eq!(last_one.len(), 1);
     assert_eq!(last_one[0].ts, 2_000);
 
-    let by_pane = query_audit_actions(
-        &conn,
+    let by_pane = query_audit_actions_backend(
+        &backend,
         &AuditQuery {
             pane_id: Some(1),
             ..Default::default()
@@ -2052,8 +2057,8 @@ fn audit_query_filters_and_limits() {
     .unwrap();
     assert_eq!(by_pane.len(), 2);
 
-    let by_workflow = query_audit_actions(
-        &conn,
+    let by_workflow = query_audit_actions_backend(
+        &backend,
         &AuditQuery {
             actor_id: Some("wf-123".to_string()),
             ..Default::default()
@@ -2063,8 +2068,8 @@ fn audit_query_filters_and_limits() {
     assert_eq!(by_workflow.len(), 1);
     assert_eq!(by_workflow[0].actor_kind, "workflow");
 
-    let denied = query_audit_actions(
-        &conn,
+    let denied = query_audit_actions_backend(
+        &backend,
         &AuditQuery {
             policy_decision: Some("deny".to_string()),
             ..Default::default()
@@ -2124,8 +2129,9 @@ fn audit_stream_query_pages_with_cursor() {
     )
     .unwrap();
 
-    let page1 = query_audit_actions_stream(
-        &conn,
+    let backend = RusqliteBackend::new(conn);
+    let page1 = query_audit_actions_stream_backend(
+        &backend,
         &AuditStreamQuery {
             limit: Some(2),
             ..Default::default()
@@ -2138,8 +2144,8 @@ fn audit_stream_query_pages_with_cursor() {
     assert_eq!(page1.records[1].id, id2);
     assert_eq!(page1.next_cursor, Some(id2));
 
-    let page2 = query_audit_actions_stream(
-        &conn,
+    let page2 = query_audit_actions_stream_backend(
+        &backend,
         &AuditStreamQuery {
             cursor: page1.next_cursor,
             ..Default::default()
@@ -2156,7 +2162,8 @@ fn audit_stream_query_empty_returns_none_cursor() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
-    let page = query_audit_actions_stream(&conn, &AuditStreamQuery::default()).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let page = query_audit_actions_stream_backend(&backend, &AuditStreamQuery::default()).unwrap();
     assert!(page.records.is_empty());
     assert!(page.next_cursor.is_none());
 }
@@ -2201,8 +2208,9 @@ fn audit_stream_query_respects_limit() {
     )
     .unwrap();
 
-    let page = query_audit_actions_stream(
-        &conn,
+    let backend = RusqliteBackend::new(conn);
+    let page = query_audit_actions_stream_backend(
+        &backend,
         &AuditStreamQuery {
             limit: Some(1),
             ..Default::default()
