@@ -4810,9 +4810,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_unhandled_events(&conn, limit)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_unhandled_events_backend(backend, limit)
+            })
         })
         .await
     }
@@ -4942,9 +4942,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_last_activity_by_pane(&conn)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_last_activity_by_pane_backend(backend)
+            })
         })
         .await
     }
@@ -15653,6 +15653,9 @@ fn query_sessions_for_pane_backend(
 }
 
 /// Query unhandled events
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_unhandled_events_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredEvent>> {
     let limit_i64 = usize_to_i64(limit, "limit")?;
 
@@ -15712,6 +15715,90 @@ fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredE
     Ok(results)
 }
 
+fn stored_event_from_backend_cells(row: &[SqlCell]) -> Result<StoredEvent> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .i64(1)
+        .and_then(|value| backend_i64_to_u64(value, "events.pane_id"))
+        .map_err(|err| storage_backend_error("Event row pane_id", err))?;
+    let extracted_str = reader
+        .optional_string(7)
+        .map_err(|err| storage_backend_error("Event row extracted", err))?;
+    // br-ft-4d6ic: route silent serde failure through observability counter.
+    let extracted = parse_storage_json_col::<serde_json::Value>(
+        extracted_str.as_deref(),
+        "events",
+        "extracted",
+    );
+
+    Ok(StoredEvent {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Event row id", err))?,
+        pane_id,
+        rule_id: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Event row rule_id", err))?,
+        agent_type: reader
+            .string(3)
+            .map_err(|err| storage_backend_error("Event row agent_type", err))?,
+        event_type: reader
+            .string(4)
+            .map_err(|err| storage_backend_error("Event row event_type", err))?,
+        severity: reader
+            .string(5)
+            .map_err(|err| storage_backend_error("Event row severity", err))?,
+        confidence: reader
+            .f64(6)
+            .map_err(|err| storage_backend_error("Event row confidence", err))?,
+        extracted,
+        matched_text: reader
+            .optional_string(8)
+            .map_err(|err| storage_backend_error("Event row matched_text", err))?,
+        segment_id: reader
+            .optional_i64(9)
+            .map_err(|err| storage_backend_error("Event row segment_id", err))?,
+        detected_at: reader
+            .i64(10)
+            .map_err(|err| storage_backend_error("Event row detected_at", err))?,
+        dedupe_key: reader
+            .optional_string(11)
+            .map_err(|err| storage_backend_error("Event row dedupe_key", err))?,
+        handled_at: reader
+            .optional_i64(12)
+            .map_err(|err| storage_backend_error("Event row handled_at", err))?,
+        handled_by_workflow_id: reader
+            .optional_string(13)
+            .map_err(|err| storage_backend_error("Event row handled_by_workflow_id", err))?,
+        handled_status: reader
+            .optional_string(14)
+            .map_err(|err| storage_backend_error("Event row handled_status", err))?,
+    })
+}
+
+fn query_unhandled_events_backend(
+    backend: &dyn StorageBackend,
+    limit: usize,
+) -> Result<Vec<StoredEvent>> {
+    let limit_i64 = usize_to_i64(limit, "limit")?;
+    let rows = backend
+        .query_map_cells(
+            "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+             extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
+             handled_by_workflow_id, handled_status
+             FROM events
+             WHERE handled_at IS NULL
+             ORDER BY detected_at DESC
+             LIMIT ?1",
+            &[ToSqlValue::Integer(limit_i64)],
+        )
+        .map_err(|err| storage_backend_error("Query unhandled events", err))?;
+
+    rows.iter()
+        .map(|row| stored_event_from_backend_cells(row))
+        .collect()
+}
+
 /// Count unhandled events per pane
 fn query_unhandled_event_counts(
     backend: &dyn StorageBackend,
@@ -15744,6 +15831,9 @@ fn query_unhandled_event_counts(
 }
 
 /// Get most recent activity timestamp per pane (from segments table)
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_last_activity_by_pane_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_last_activity_by_pane(conn: &Connection) -> Result<std::collections::HashMap<u64, i64>> {
     let mut stmt = conn
         .prepare(
@@ -15766,6 +15856,34 @@ fn query_last_activity_by_pane(conn: &Connection) -> Result<std::collections::Ha
     for row in rows {
         let (pane_id, last_activity) =
             row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?;
+        result.insert(pane_id, last_activity);
+    }
+
+    Ok(result)
+}
+
+fn query_last_activity_by_pane_backend(
+    backend: &dyn StorageBackend,
+) -> Result<std::collections::HashMap<u64, i64>> {
+    let rows = backend
+        .query_map_cells(
+            "SELECT pane_id, MAX(captured_at) as last_activity
+             FROM output_segments
+             GROUP BY pane_id",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Query last activity by pane", err))?;
+
+    let mut result = std::collections::HashMap::new();
+    for row in &rows {
+        let reader = CellRowReader::new(row);
+        let pane_id = reader
+            .i64(0)
+            .and_then(|value| backend_i64_to_u64(value, "output_segments.pane_id"))
+            .map_err(|err| storage_backend_error("Last activity row pane_id", err))?;
+        let last_activity = reader
+            .i64(1)
+            .map_err(|err| storage_backend_error("Last activity row timestamp", err))?;
         result.insert(pane_id, last_activity);
     }
 
