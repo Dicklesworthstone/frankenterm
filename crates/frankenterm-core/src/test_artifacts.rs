@@ -303,7 +303,7 @@ pub enum ScaleLabWorkloadPersona {
 }
 
 /// Hardware and runtime substrate metadata for a scale-lab run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScaleLabHostShape {
     pub host_class: String,
     pub os: String,
@@ -450,14 +450,14 @@ impl ScaleLabWorkloadCatalog {
             });
         }
 
-        let host = require_some_ref("host", &self.host)?;
+        let host = require_some_ref("host", self.host.as_ref())?;
         validate_host_shape(host, mode)?;
-        validate_command(require_some_ref("command", &self.command)?)?;
+        validate_command(require_some_ref("command", self.command.as_ref())?)?;
         validate_workload_mix(&self.workload_mix, target_panes)?;
-        validate_timings(require_some_ref("timings", &self.timings)?)?;
-        validate_memory(require_some_ref("memory", &self.memory)?)?;
-        validate_disk(require_some_ref("disk", &self.disk)?)?;
-        validate_events(require_some_ref("events", &self.events)?)?;
+        validate_timings(require_some_ref("timings", self.timings.as_ref())?)?;
+        validate_memory(require_some_ref("memory", self.memory.as_ref())?)?;
+        validate_disk(require_some_ref("disk", self.disk.as_ref())?)?;
+        validate_events(require_some_ref("events", self.events.as_ref())?)?;
         validate_non_empty_strings("limitations", &self.limitations)?;
         validate_scale_lab_artifacts(&self.artifacts)?;
 
@@ -535,11 +535,9 @@ fn require_some<T>(
 
 fn require_some_ref<'a, T>(
     field: &'static str,
-    value: &'a Option<T>,
+    value: Option<&'a T>,
 ) -> Result<&'a T, ScaleLabWorkloadSchemaError> {
-    value
-        .as_ref()
-        .ok_or(ScaleLabWorkloadSchemaError::MissingField { field })
+    value.ok_or(ScaleLabWorkloadSchemaError::MissingField { field })
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), ScaleLabWorkloadSchemaError> {
