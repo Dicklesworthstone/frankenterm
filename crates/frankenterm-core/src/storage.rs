@@ -4411,9 +4411,9 @@ impl StorageHandle {
         let query = query.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            search_fts_with_snippets(&conn, &query, &options)
+            pooled_backend(db_path.as_str(), |backend| {
+                search_fts_with_snippets_backend(backend, &query, &options)
+            })
         })
         .await
     }
@@ -7420,25 +7420,25 @@ fn storage_io_command_name(cmd: &WriteCommand) -> &'static str {
 fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
     match cmd {
         WriteCommand::AppendSegment { respond, .. } => {
-            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         WriteCommand::RecordGap { respond, .. } => {
-            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         WriteCommand::RecordEvent { respond, .. } => {
-            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         WriteCommand::RecordAuditAction { respond, .. } => {
-            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         WriteCommand::RecordPolicyDenialAudit { respond, .. } => {
-            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         WriteCommand::SyncFts { respond, .. } => {
-            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         WriteCommand::RebuildFts { respond, .. } => {
-            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()))
+            respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
         }
         other => {
             tracing::error!(
@@ -7598,7 +7598,7 @@ fn writer_loop(
                 // Park briefly to avoid busy-waiting under no-load.
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            Err(mpsc::RecvError::Disconnected) | Err(mpsc::RecvError::Cancelled) => {
+            Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => {
                 break 'main;
             }
         }
@@ -8908,26 +8908,6 @@ fn pane_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneRecord>
         observed: i64_to_bool_sql(row.get(10)?, 10, "panes.observed")?,
         ignore_reason: row.get(11)?,
         last_decision_at: row.get(12)?,
-    })
-}
-
-fn approval_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalTokenRecord> {
-    Ok(ApprovalTokenRecord {
-        id: row.get(0)?,
-        code_hash: row.get(1)?,
-        created_at: row.get(2)?,
-        expires_at: row.get(3)?,
-        used_at: row.get(4)?,
-        workspace_id: row.get(5)?,
-        action_kind: row.get(6)?,
-        pane_id: row
-            .get::<_, Option<i64>>(7)?
-            .map(|v| i64_to_u64_sql(v, 7, "approval_tokens.pane_id"))
-            .transpose()?,
-        action_fingerprint: row.get(8)?,
-        plan_hash: row.get(9)?,
-        plan_version: row.get(10)?,
-        risk_summary: row.get(11)?,
     })
 }
 
@@ -10644,10 +10624,11 @@ impl PoolTelemetrySnapshot {
     }
 }
 
-/// br-ft-rvt1z: snapshot the process-global pool counters. Tests
-/// + ops use this to verify the read pool is actually hitting (the
-/// br-ft-l1jgo migration regression silently bypassed it for 9
-/// paths until ft-3twzm).
+/// br-ft-rvt1z: snapshot the process-global pool counters.
+///
+/// Tests and ops use this to verify the read pool is actually hitting; the
+/// br-ft-l1jgo migration regression silently bypassed it for 9 paths until
+/// ft-3twzm.
 #[must_use]
 pub fn pool_telemetry_snapshot() -> PoolTelemetrySnapshot {
     use std::sync::atomic::Ordering;
@@ -13594,6 +13575,266 @@ fn search_fts_with_snippets(
     Ok(results)
 }
 
+type FtsHydratedRows = std::collections::HashMap<i64, (Segment, Option<String>, Option<String>)>;
+
+fn validate_fts_query_backend(backend: &dyn StorageBackend, query: &str) -> Result<()> {
+    let result = backend.query_row_cells(
+        "SELECT 1 FROM output_segments_fts WHERE output_segments_fts MATCH ?1 LIMIT 1",
+        &[ToSqlValue::Text(query)],
+    );
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let msg = err.to_string();
+            if looks_like_fts_syntax_error(&msg) {
+                Err(StorageError::FtsQueryError(format!(
+                    "Invalid FTS5 query syntax: {msg}. \
+                     Valid syntax includes: simple words, \"phrases\", prefix*, AND/OR/NOT operators."
+                ))
+                .into())
+            } else {
+                Err(StorageError::FtsQueryError(format!("Query validation failed: {msg}")).into())
+            }
+        }
+    }
+}
+
+fn looks_like_fts_syntax_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("fts5")
+        || lower.contains("syntax error")
+        || lower.contains("malformed match")
+        || lower.contains("unterminated")
+}
+
+/// br-ft-l1jgo: trait-backed sibling of [`search_fts_with_snippets`].
+fn search_fts_with_snippets_backend(
+    backend: &dyn StorageBackend,
+    query: &str,
+    options: &SearchOptions,
+) -> Result<Vec<SearchResult>> {
+    validate_fts_query_backend(backend, query)?;
+
+    let limit = options.limit.unwrap_or(100);
+    let include_snippets = options.include_snippets.unwrap_or(true);
+    let include_highlights = options.include_highlights.unwrap_or(include_snippets);
+
+    if !include_snippets {
+        return search_fts_rank_only_backend(backend, query, options, limit);
+    }
+
+    let ranked = search_fts_rank_stage_backend(backend, query, options, limit)?;
+    if ranked.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_tokens = options.snippet_max_tokens.unwrap_or(64);
+    let prefix = options.highlight_prefix.as_deref().unwrap_or(">>>");
+    let suffix = options.highlight_suffix.as_deref().unwrap_or("<<<");
+
+    let hydrated = search_fts_hydrate_stage_backend(
+        backend,
+        query,
+        &ranked,
+        prefix,
+        suffix,
+        max_tokens,
+        include_highlights,
+    )?;
+
+    tracing::trace!(
+        rank_count = ranked.len(),
+        hydrate_count = hydrated.len(),
+        "search_fts_with_snippets backend two-stage path"
+    );
+
+    let mut results = Vec::with_capacity(ranked.len());
+    for (id, score) in &ranked {
+        if let Some((segment, snippet, highlight)) = hydrated.get(id).cloned() {
+            results.push(SearchResult {
+                segment,
+                snippet,
+                highlight,
+                score: *score,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+fn append_fts_filter_backend_params(
+    sql: &mut String,
+    params: &mut Vec<ToSqlValue<'_>>,
+    options: &SearchOptions,
+) -> Result<()> {
+    if let Some(pane_id) = options.pane_id {
+        sql.push_str(" AND s.pane_id = ?");
+        params.push(ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?));
+    }
+    if let Some(since) = options.since {
+        sql.push_str(" AND s.captured_at >= ?");
+        params.push(ToSqlValue::Integer(since));
+    }
+    if let Some(until) = options.until {
+        sql.push_str(" AND s.captured_at <= ?");
+        params.push(ToSqlValue::Integer(until));
+    }
+    Ok(())
+}
+
+fn search_fts_rank_stage_backend(
+    backend: &dyn StorageBackend,
+    query: &str,
+    options: &SearchOptions,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>> {
+    let mut sql = String::from(
+        "SELECT s.id, bm25(output_segments_fts) as score, s.captured_at
+         FROM output_segments s
+         JOIN output_segments_fts fts ON s.id = fts.rowid
+         WHERE output_segments_fts MATCH ?1",
+    );
+    let mut params = vec![ToSqlValue::Text(query)];
+    append_fts_filter_backend_params(&mut sql, &mut params, options)?;
+
+    sql.push_str(" ORDER BY score ASC, s.captured_at ASC, s.id ASC LIMIT ?");
+    params.push(ToSqlValue::Integer(usize_to_i64(limit, "limit")?));
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| StorageError::FtsQueryError(format!("Rank query failed: {err}")))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let reader = CellRowReader::new(&row);
+        let id = reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Rank row id", err))?;
+        let score = reader
+            .f64(1)
+            .map_err(|err| storage_backend_error("Rank row score", err))?;
+        out.push((id, score));
+    }
+    Ok(out)
+}
+
+fn search_fts_hydrate_stage_backend(
+    backend: &dyn StorageBackend,
+    query: &str,
+    ranked: &[(i64, f64)],
+    prefix: &str,
+    suffix: &str,
+    max_tokens: usize,
+    include_highlights: bool,
+) -> Result<FtsHydratedRows> {
+    let placeholders = std::iter::repeat_n("?", ranked.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let highlight_col = if include_highlights {
+        "highlight(output_segments_fts, 0, ?, ?) as highlight"
+    } else {
+        "NULL as highlight"
+    };
+
+    let sql = format!(
+        "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
+                snippet(output_segments_fts, 0, ?, ?, '...', ?) as snippet,
+                {highlight_col}
+         FROM output_segments s
+         JOIN output_segments_fts fts ON s.id = fts.rowid
+         WHERE output_segments_fts MATCH ? AND s.id IN ({placeholders})"
+    );
+
+    let mut params = vec![
+        ToSqlValue::Text(prefix),
+        ToSqlValue::Text(suffix),
+        ToSqlValue::Integer(usize_to_i64(max_tokens, "max_tokens")?),
+    ];
+    if include_highlights {
+        params.push(ToSqlValue::Text(prefix));
+        params.push(ToSqlValue::Text(suffix));
+    }
+    params.push(ToSqlValue::Text(query));
+    for (id, _) in ranked {
+        params.push(ToSqlValue::Integer(*id));
+    }
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| StorageError::FtsQueryError(format!("Hydrate query failed: {err}")))?;
+
+    let mut out = std::collections::HashMap::with_capacity(ranked.len());
+    for row in rows {
+        let segment = segment_from_backend_cells(&row)?;
+        let reader = CellRowReader::new(&row);
+        let snippet = reader
+            .optional_string(7)
+            .map_err(|err| storage_backend_error("Hydrate row snippet", err))?;
+        let highlight = reader
+            .optional_string(8)
+            .map_err(|err| storage_backend_error("Hydrate row highlight", err))?;
+        out.insert(segment.id, (segment, snippet, highlight));
+    }
+    Ok(out)
+}
+
+fn search_fts_rank_only_backend(
+    backend: &dyn StorageBackend,
+    query: &str,
+    options: &SearchOptions,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let mut sql = String::from(
+        "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
+                NULL as snippet,
+                NULL as highlight,
+                bm25(output_segments_fts) as score
+         FROM output_segments s
+         JOIN output_segments_fts fts ON s.id = fts.rowid
+         WHERE output_segments_fts MATCH ?1",
+    );
+    let mut params = vec![ToSqlValue::Text(query)];
+    append_fts_filter_backend_params(&mut sql, &mut params, options)?;
+
+    sql.push_str(" ORDER BY score ASC, s.captured_at ASC, s.id ASC LIMIT ?");
+    params.push(ToSqlValue::Integer(usize_to_i64(limit, "limit")?));
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| StorageError::FtsQueryError(format!("Query failed: {err}")))?;
+
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        results.push(search_result_from_backend_cells(&row)?);
+    }
+
+    Ok(results)
+}
+
+fn search_result_from_backend_cells(row: &[SqlCell]) -> Result<SearchResult> {
+    let segment = segment_from_backend_cells(row)?;
+    let reader = CellRowReader::new(row);
+    let snippet = reader
+        .optional_string(7)
+        .map_err(|err| storage_backend_error("Search row snippet", err))?;
+    let highlight = reader
+        .optional_string(8)
+        .map_err(|err| storage_backend_error("Search row highlight", err))?;
+    let score = reader
+        .f64(9)
+        .map_err(|err| storage_backend_error("Search row score", err))?;
+
+    Ok(SearchResult {
+        segment,
+        snippet,
+        highlight,
+        score,
+    })
+}
+
 /// Stage 1 of the two-stage FTS search path (ft-okhhj). Returns the top-N
 /// `(rowid, bm25_score)` pairs in deterministic order without materializing
 /// content, snippet, or highlight.
@@ -13663,9 +13904,8 @@ fn search_fts_hydrate_stage(
     suffix: &str,
     max_tokens: usize,
     include_highlights: bool,
-) -> Result<std::collections::HashMap<i64, (Segment, Option<String>, Option<String>)>> {
-    let placeholders = std::iter::repeat("?")
-        .take(ranked.len())
+) -> Result<FtsHydratedRows> {
+    let placeholders = std::iter::repeat_n("?", ranked.len())
         .collect::<Vec<_>>()
         .join(",");
 
@@ -18920,6 +19160,48 @@ fn fts_search_returns_matching_segments() {
     assert_eq!(results.len(), 2, "Should find 2 segments with 'error'");
     assert!(results[0].segment.content.contains("error"));
     assert!(results[1].segment.content.contains("error"));
+}
+
+#[test]
+fn fts_backend_search_matches_direct_results() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+
+    conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        ).unwrap();
+    conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 0i64, "backend needle one", 18, now_ms],
+        ).unwrap();
+    conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 1i64, "backend needle two", 18, now_ms + 1],
+        ).unwrap();
+
+    let options = SearchOptions::default();
+    let direct = search_fts_with_snippets(&conn, "needle", &options).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let via_backend = search_fts_with_snippets_backend(&backend, "needle", &options).unwrap();
+
+    assert_eq!(via_backend.len(), direct.len());
+    for (backend_result, direct_result) in via_backend.iter().zip(direct.iter()) {
+        assert_eq!(backend_result.segment.id, direct_result.segment.id);
+        assert_eq!(backend_result.segment.pane_id, direct_result.segment.pane_id);
+        assert_eq!(backend_result.segment.seq, direct_result.segment.seq);
+        assert_eq!(backend_result.segment.content, direct_result.segment.content);
+        assert_eq!(backend_result.snippet, direct_result.snippet);
+        assert_eq!(backend_result.highlight, direct_result.highlight);
+        assert!(
+            (backend_result.score - direct_result.score).abs() <= f64::EPSILON,
+            "backend score {} must match direct score {}",
+            backend_result.score,
+            direct_result.score
+        );
+    }
 }
 
 #[test]
