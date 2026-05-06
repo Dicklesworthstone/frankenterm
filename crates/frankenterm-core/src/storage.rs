@@ -5028,9 +5028,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            crate::storage::query_action_history(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_action_history_backend(backend, &query)
+            })
         })
         .await
     }
@@ -17151,7 +17151,96 @@ fn query_audit_actions_stream_backend(
     })
 }
 
-/// Query action history view with optional filters
+fn action_history_from_backend_cells(row: &[SqlCell]) -> Result<ActionHistoryRecord> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .optional_i64(5)
+        .and_then(|value| {
+            value
+                .map(|pane_id| backend_i64_to_u64(pane_id, "action_history.pane_id"))
+                .transpose()
+        })
+        .map_err(|err| storage_backend_error("Action history row pane_id", err))?;
+    let undoable = reader
+        .optional_i64(15)
+        .and_then(|value| {
+            value
+                .map(|undoable| backend_i64_to_bool(undoable, "action_history.undoable"))
+                .transpose()
+        })
+        .map_err(|err| storage_backend_error("Action history row undoable", err))?;
+
+    Ok(ActionHistoryRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Action history row id", err))?,
+        ts: reader
+            .i64(1)
+            .map_err(|err| storage_backend_error("Action history row ts", err))?,
+        actor_kind: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Action history row actor_kind", err))?,
+        actor_id: reader
+            .optional_string(3)
+            .map_err(|err| storage_backend_error("Action history row actor_id", err))?,
+        correlation_id: reader
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("Action history row correlation_id", err))?,
+        pane_id,
+        domain: reader
+            .optional_string(6)
+            .map_err(|err| storage_backend_error("Action history row domain", err))?,
+        action_kind: reader
+            .string(7)
+            .map_err(|err| storage_backend_error("Action history row action_kind", err))?,
+        policy_decision: reader
+            .string(8)
+            .map_err(|err| storage_backend_error("Action history row policy_decision", err))?,
+        decision_reason: reader
+            .optional_string(9)
+            .map_err(|err| storage_backend_error("Action history row decision_reason", err))?,
+        rule_id: reader
+            .optional_string(10)
+            .map_err(|err| storage_backend_error("Action history row rule_id", err))?,
+        input_summary: reader
+            .optional_string(11)
+            .map_err(|err| storage_backend_error("Action history row input_summary", err))?,
+        verification_summary: reader
+            .optional_string(12)
+            .map_err(|err| storage_backend_error("Action history row verification_summary", err))?,
+        decision_context: reader
+            .optional_string(13)
+            .map_err(|err| storage_backend_error("Action history row decision_context", err))?,
+        result: reader
+            .string(14)
+            .map_err(|err| storage_backend_error("Action history row result", err))?,
+        undoable,
+        undo_strategy: reader
+            .optional_string(16)
+            .map_err(|err| storage_backend_error("Action history row undo_strategy", err))?,
+        undo_hint: reader
+            .optional_string(17)
+            .map_err(|err| storage_backend_error("Action history row undo_hint", err))?,
+        undone_at: reader
+            .optional_i64(18)
+            .map_err(|err| storage_backend_error("Action history row undone_at", err))?,
+        undone_by: reader
+            .optional_string(19)
+            .map_err(|err| storage_backend_error("Action history row undone_by", err))?,
+        workflow_id: reader
+            .optional_string(20)
+            .map_err(|err| storage_backend_error("Action history row workflow_id", err))?,
+        step_name: reader
+            .optional_string(21)
+            .map_err(|err| storage_backend_error("Action history row step_name", err))?,
+    })
+}
+
+/// Query action history view with optional filters.
+///
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_action_history_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_action_history(
     conn: &Connection,
     query: &ActionHistoryQuery,
@@ -17272,6 +17361,90 @@ fn query_action_history(
     }
 
     Ok(results)
+}
+
+fn query_action_history_backend(
+    backend: &dyn StorageBackend,
+    query: &ActionHistoryQuery,
+) -> Result<Vec<ActionHistoryRecord>> {
+    let mut sql = String::from(
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+         policy_decision, decision_reason, rule_id, input_summary, verification_summary,
+         decision_context, result, undoable, undo_strategy, undo_hint, undone_at, undone_by,
+         workflow_id, step_name
+         FROM action_history WHERE 1=1",
+    );
+    let mut params = Vec::new();
+
+    if let Some(audit_action_id) = query.audit_action_id {
+        sql.push_str(" AND id = ?");
+        params.push(ToSqlValue::Integer(audit_action_id));
+    }
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(ToSqlValue::Integer(pane_id_i64));
+    }
+    if let Some(domain) = &query.domain {
+        sql.push_str(" AND domain = ?");
+        params.push(ToSqlValue::Text(domain.as_str()));
+    }
+    if let Some(actor_kind) = &query.actor_kind {
+        sql.push_str(" AND actor_kind = ?");
+        params.push(ToSqlValue::Text(actor_kind.as_str()));
+    }
+    if let Some(actor_id) = &query.actor_id {
+        sql.push_str(" AND actor_id = ?");
+        params.push(ToSqlValue::Text(actor_id.as_str()));
+    }
+    if let Some(correlation_id) = &query.correlation_id {
+        sql.push_str(" AND correlation_id = ?");
+        params.push(ToSqlValue::Text(correlation_id.as_str()));
+    }
+    if let Some(action_kind) = &query.action_kind {
+        sql.push_str(" AND action_kind = ?");
+        params.push(ToSqlValue::Text(action_kind.as_str()));
+    }
+    if let Some(policy_decision) = &query.policy_decision {
+        sql.push_str(" AND policy_decision = ?");
+        params.push(ToSqlValue::Text(policy_decision.as_str()));
+    }
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(ToSqlValue::Text(rule_id.as_str()));
+    }
+    if let Some(result) = &query.result {
+        sql.push_str(" AND result = ?");
+        params.push(ToSqlValue::Text(result.as_str()));
+    }
+    if let Some(undoable) = query.undoable {
+        if undoable {
+            sql.push_str(" AND undoable = 1");
+        } else {
+            sql.push_str(" AND (undoable = 0 OR undoable IS NULL)");
+        }
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(ToSqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND ts <= ?");
+        params.push(ToSqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY ts DESC, id DESC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    params.push(ToSqlValue::Integer(limit_i64));
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query action history", err))?;
+
+    rows.iter()
+        .map(Vec::as_slice)
+        .map(action_history_from_backend_cells)
+        .collect()
 }
 
 /// Query maximum sequence number for a pane.
@@ -19887,7 +20060,7 @@ fn storage_tick148_action_undo_cluster_roundtrip() {
             actor_id: Some(tag.to_string()),
             correlation_id: None,
             pane_id: Some(63),
-            domain: None,
+            domain: Some("local".to_string()),
             action_kind: "send_text".to_string(),
             policy_decision: "allow".to_string(),
             decision_reason: None,
@@ -19949,6 +20122,39 @@ fn storage_tick148_action_undo_cluster_roundtrip() {
             .expect("marked undo row should still exist");
         assert_eq!(marked_round.undone_by.as_deref(), Some("tick148"));
         assert!(marked_round.undone_at.is_some());
+        let history_round = storage
+            .get_action_history_with_cx(
+                &cx,
+                ActionHistoryQuery {
+                    audit_action_id: Some(audit_plain),
+                    limit: Some(5),
+                    pane_id: Some(63),
+                    domain: Some("local".to_string()),
+                    actor_kind: Some("human".to_string()),
+                    actor_id: Some("tick148-plain".to_string()),
+                    correlation_id: None,
+                    action_kind: Some("send_text".to_string()),
+                    policy_decision: Some("allow".to_string()),
+                    rule_id: None,
+                    result: Some("success".to_string()),
+                    undoable: Some(true),
+                    since: Some(1_700_000_000_000),
+                    until: Some(1_700_000_000_000),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_round.len(), 1);
+        let history_row = &history_round[0];
+        assert_eq!(history_row.id, audit_plain);
+        assert_eq!(history_row.actor_id.as_deref(), Some("tick148-plain"));
+        assert_eq!(history_row.pane_id, Some(63));
+        assert_eq!(history_row.domain.as_deref(), Some("local"));
+        assert_eq!(history_row.undoable, Some(true));
+        assert_eq!(history_row.undo_strategy.as_deref(), Some("manual"));
+        assert_eq!(history_row.undo_hint.as_deref(), Some("revert the send"));
+        assert_eq!(history_row.undone_by.as_deref(), Some("tick148"));
+        assert!(history_row.undone_at.is_some());
 
         // 2. upsert_action_undo_redacted_with_cx — composite; hint + payload
         //    are routed through Redactor before the cx-threaded insert.
