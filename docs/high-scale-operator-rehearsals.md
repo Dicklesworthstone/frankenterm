@@ -65,6 +65,63 @@ is not a source failure and cannot support a high-scale performance claim.
 | Mission chaos recovery | `scripts/high-scale-rehearsal.sh` | `docs/metrics/mission_chaos_evidence.json` exists | copied chaos evidence, event row | `READY` for fixture presence | If missing or stale, use the chaos harness owner path; do not synthesize a pass from operator notes. |
 | SLO cockpit bottlenecks | `scripts/high-scale-rehearsal.sh` | `SloCockpitSnapshot` exists in `runtime_health.rs` | `slo-cockpit-symbols.txt`, event row | `READY` for core API availability | For missing domains or wrong next steps, reopen the cockpit bead or file a focused follow-up. |
 
+## Chaos Restore Scenario Specs
+
+Status: scenario contract for `ft-8xw5v`. These rows are executable
+requirements for future harness work. They do not claim that the current
+bounded rehearsal script already runs them. Until the named commands exist and
+produce the required receipts, the correct rehearsal receipt is
+`SKIPPED_NOT_PROVEN`.
+
+All scenarios inherit the safety rules above: no live pane kill, watcher
+restart, service restart, or destructive filesystem action is allowed unless the
+harness explicitly creates an isolated fixture process and records that sandbox
+boundary in the artifact.
+
+### Required Artifact Shape
+
+Every chaos restore scenario must emit:
+
+| Artifact | Requirement |
+| --- | --- |
+| `commands.txt` | Exact command lines in execution order, including the full `rch exec -- env CARGO_TARGET_DIR=...` command for Cargo-backed proof. |
+| `env.txt` | Host, repo SHA, branch, target dir, feature flags, seed, fixture root, and whether any live dependency was used. |
+| `scenario.json` | Stable `scenario_id`, schema version, injected fault class, proof mode, expected receipts, and whether the run is `reduced`, `loopback`, or `live_mux`. |
+| `events.jsonl` | One row per injected fault, recovery transition, typed unavailable response, policy decision, queue/drop event, and compensation step. |
+| `storage-receipts.jsonl` | Observed database/audit rows, keyed by table or typed store, with stable row ids when available. |
+| `summary.json` | Pass/fail/skip verdict, reason code, coverage flags, elapsed time, and paths to all artifacts. |
+
+Structured log rows must include `timestamp`, `bead_id`, `scenario_id`,
+`correlation_id`, `step`, `status`, `duration_ms`, `backend`, `artifact_dir`,
+`fault`, `receipt`, and `reason_code`. A log row may redact pane text, but it
+must still include the pane id, sequence number, and response envelope type.
+
+### Scenario Matrix
+
+| Scenario id | Fault and fixture setup | Contract command | Expected events | Expected storage and audit receipts | Pass criteria |
+| --- | --- | --- | --- | --- | --- |
+| `chaos_mux_disconnect_typed_unavailable` | Use a loopback mux fixture with one healthy pane and one simulated disconnected pane. Inject the disconnect through the mux adapter or `FaultPoint::WeztermCliCall`; do not kill a live GUI process. | `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-8xw5v-mux cargo test -p frankenterm-core --lib ft_8xw5v_mux_disconnect_typed_unavailable -- --nocapture` | `mux.disconnect.injected`, `pane.live_text_unavailable`, `robot.typed_unavailable_returned`, and `search.persisted_fallback_checked`. | Persisted pane/output rows remain readable. No policy-denial row is required. The unavailable live-read response must include a typed error code and hint to persisted search. | Live `get-text` style read fails closed with a typed unavailable envelope; persisted search remains available; no raw panic, generic runtime string, or empty success response is accepted. |
+| `chaos_storage_contention_bounded_backoff` | Use a temporary SQLite fixture and a writer/read contention injector. Prefer `FaultPoint::DbWrite` delay or fail-n-times over OS-level file locking. | `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-8xw5v-storage cargo test -p frankenterm-core --lib ft_8xw5v_storage_contention_bounded_backoff -- --nocapture` | `storage.contention.injected`, `storage.backoff.started`, `storage.retry.receipt`, `event.persisted_after_recovery`, and no `panic` row. | `events` or equivalent event persistence shows the post-recovery event. Any denied write must have a typed storage error receipt. If a policy gate fires, `policy_denied_audit` row id must be logged. | Queue depth and retry count stay within declared bounds; after the injected contention clears, at least one event/segment persists successfully; timeout or fail-closed rows must explain whether data was skipped or retried. |
+| `chaos_watcher_restart_lock_recovery` | Start an isolated watcher fixture with a temp workspace and lock file. Simulate a stale watcher lock by stopping only the fixture process or by writing a fixture lock record; do not stop a developer's real watcher. | `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-8xw5v-watcher cargo test -p frankenterm-core --lib ft_8xw5v_watcher_restart_lock_recovery -- --nocapture` | `watcher.fixture_started`, `watcher.stale_lock_detected`, `watcher.recovery_started`, `watcher.recovered`, and `robot.state_after_recovery`. | Lock metadata is copied to `storage-receipts.jsonl`; if runtime storage participates, the recovered watcher run id and prior stale owner id are both recorded. | Recovery must not reuse the stale owner id, must not drop newly captured fixture output, and must surface a diagnostic when the lock cannot be proven stale. Ambiguous liveness is `SKIPPED_NOT_PROVEN`, not pass. |
+| `chaos_event_bus_subscriber_lag` | Use an in-process `EventBus` with capacity small enough to force lag, one intentionally slow subscriber, and one healthy subscriber. Publish a deterministic event sequence. | `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-8xw5v-event-bus cargo test -p frankenterm-core --lib ft_8xw5v_event_bus_subscriber_lag -- --nocapture` | `event_bus.publish.started`, `event_bus.subscriber_lagged`, `event_bus.latest_retained_delivered`, and `event_bus.healthy_subscriber_unaffected`. | No database row is required unless the implementation persists lag diagnostics. If it does, the diagnostic row id and lag count must be logged. | Slow subscriber observes the documented lag behavior and resumes at the newest retained event; healthy subscriber keeps receiving ordered events; lag does not become an unbounded retry loop. |
+| `chaos_tx_partial_commit_compensation` | Use a mission tx fixture with two commit steps and compensations. Force step 2 to fail after step 1 records a committed receipt. Reuse existing tx/compensation test helpers where possible. | `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-8xw5v-tx cargo test -p frankenterm-core --lib ft_8xw5v_tx_partial_commit_compensation -- --nocapture` | `tx.prepare.all_ready`, `tx.commit.partial_failure`, `tx.compensation.started`, `tx.compensation.receipt`, and `tx.final_state.compensated` or typed failure. | `storage-receipts.jsonl` must include the tx id, committed step receipt id, failed step id, compensation receipt id, and final lifecycle state. If compensation fails, include the failure barrier reason. | Every committed step has either a successful compensation receipt or an explicit compensation-failed receipt. No final state may claim committed success after a partial commit failure. |
+
+### Scenario Implementation Notes
+
+- Use `crates/frankenterm-core/src/chaos.rs` for fault injection where the
+  existing `FaultPoint` surface matches the scenario.
+- Use `docs/metrics/mission_chaos_evidence.json` and
+  `tests/e2e/test_mission_chaos.sh` as precedent for fixed seeds and evidence
+  bundling.
+- Use `tests/e2e/e2e_tx_run.py`,
+  `tests/e2e/test_mission_tx_interfaces.sh`, and
+  `crates/frankenterm-core/src/tx_killswitch_model.rs` as the tx compensation
+  contract anchors.
+- For event-bus lag, prefer a reduced in-process proof first; live stream
+  probes must still prove the same typed lag receipt before graduating.
+- For storage contention, separate source failures from RCH wrapper or worker
+  failures. RCH sync without Cargo is infra evidence only, not a source verdict.
+
 ## Proof And Truthfulness Rules
 
 Use these anchors when interpreting rehearsal output:
