@@ -4711,8 +4711,10 @@ impl StorageHandle {
         let query_vector = query_vector.to_vec();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
+            // br-ft-l1jgo: route semantic read through the storage trait path.
+            pooled_backend(db_path.as_str(), |backend| {
+                search_semantic_backend(backend, &embedder_id, &query_vector, &options)
+            })
         })
         .await
     }
@@ -13930,17 +13932,6 @@ struct SemanticLaneResolution {
     backoff_until_ms: Option<i64>,
 }
 
-fn search_semantic_sync(
-    conn: &Connection,
-    embedder_id: &str,
-    query_vector: &[f32],
-    options: &SearchOptions,
-) -> Result<Vec<SemanticSearchHit>> {
-    let (hits, _) =
-        search_semantic_sync_with_scan_limit(conn, embedder_id, query_vector, options, None)?;
-    Ok(hits)
-}
-
 fn search_semantic_sync_with_scan_limit(
     conn: &Connection,
     embedder_id: &str,
@@ -14015,6 +14006,108 @@ fn search_semantic_sync_with_scan_limit(
         let (segment_id, vector_blob) =
             row.map_err(|e| StorageError::Database(format!("semantic_search row error: {e}")))?;
         let candidate = decode_f32_embedding_blob(&vector_blob, query_vector.len())?;
+        let Some(score) = cosine_similarity_f32(query_vector, &candidate) else {
+            continue;
+        };
+        hits.push(SemanticSearchHit {
+            segment_id,
+            score: f64::from(score),
+        });
+    }
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.segment_id.cmp(&b.segment_id))
+    });
+    hits.truncate(limit);
+    Ok((hits, rows_scanned))
+}
+
+/// br-ft-l1jgo: trait-typed sibling of [`search_semantic_sync_with_scan_limit`].
+fn search_semantic_backend(
+    backend: &dyn StorageBackend,
+    embedder_id: &str,
+    query_vector: &[f32],
+    options: &SearchOptions,
+) -> Result<Vec<SemanticSearchHit>> {
+    let (hits, _) =
+        search_semantic_backend_with_scan_limit(backend, embedder_id, query_vector, options, None)?;
+    Ok(hits)
+}
+
+fn search_semantic_backend_with_scan_limit(
+    backend: &dyn StorageBackend,
+    embedder_id: &str,
+    query_vector: &[f32],
+    options: &SearchOptions,
+    scan_limit_rows: Option<usize>,
+) -> Result<(Vec<SemanticSearchHit>, usize)> {
+    if query_vector.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    if query_vector.iter().any(|v| !v.is_finite()) {
+        return Err(
+            StorageError::Database("Query vector contains non-finite values".to_string()).into(),
+        );
+    }
+
+    let dimension = usize_to_i64(query_vector.len(), "query_vector dimension")?;
+    let limit = options.limit.unwrap_or(100);
+
+    let mut params = vec![
+        ToSqlValue::Text(embedder_id),
+        ToSqlValue::Integer(dimension),
+    ];
+    let mut sql = String::from(
+        "SELECT se.segment_id, se.vector
+         FROM segment_embeddings se
+         JOIN output_segments s ON s.id = se.segment_id
+         WHERE se.embedder_id = ?1
+           AND se.dimension = ?2",
+    );
+
+    if let Some(pane_id) = options.pane_id {
+        sql.push_str(" AND s.pane_id = ?");
+        params.push(ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?));
+    }
+    if let Some(since) = options.since {
+        sql.push_str(" AND s.captured_at >= ?");
+        params.push(ToSqlValue::Integer(since));
+    }
+    if let Some(until) = options.until {
+        sql.push_str(" AND s.captured_at <= ?");
+        params.push(ToSqlValue::Integer(until));
+    }
+
+    // Stable base order before similarity sort.
+    sql.push_str(" ORDER BY s.id ASC");
+    if let Some(scan_limit) = scan_limit_rows {
+        let bounded_scan_limit = scan_limit.max(limit).max(1);
+        sql.push_str(" LIMIT ?");
+        params.push(ToSqlValue::Integer(usize_to_i64(
+            bounded_scan_limit,
+            "semantic scan limit",
+        )?));
+    }
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("semantic_search query", err))?;
+
+    let mut hits = Vec::new();
+    let mut rows_scanned = 0usize;
+    for row in rows {
+        rows_scanned = rows_scanned.saturating_add(1);
+        let reader = CellRowReader::new(&row);
+        let segment_id = reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("semantic_search row segment_id", err))?;
+        let vector_blob = reader
+            .blob(1)
+            .map_err(|err| storage_backend_error("semantic_search row vector", err))?;
+        let candidate = decode_f32_embedding_blob(vector_blob, query_vector.len())?;
         let Some(score) = cosine_similarity_f32(query_vector, &candidate) else {
             continue;
         };
