@@ -8,7 +8,7 @@ use codec::{
 use frankenterm_mux_server_impl::sessionhandler::{PduSender, SessionHandler};
 use libfuzzer_sys::arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use mux::{client::ClientId, Mux};
+use mux::{Mux, client::ClientId};
 use promise::spawn::SimpleExecutor;
 use std::sync::{Arc, Mutex};
 

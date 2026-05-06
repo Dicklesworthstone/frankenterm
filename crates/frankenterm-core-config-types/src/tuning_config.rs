@@ -1312,8 +1312,7 @@ default_port = 9000
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("br-ft-g681u")
-                    && e.contains("stream_scan_limit must be >= 1")),
+                .any(|e| e.contains("br-ft-g681u") && e.contains("stream_scan_limit must be >= 1")),
             "expected stream_scan_limit error; got {errors:?}"
         );
         assert!(
@@ -1331,7 +1330,10 @@ default_port = 9000
         let cfg = TuningConfig::default();
         let errors = cfg.validate();
         // No web errors at all.
-        let web_errors: Vec<&String> = errors.iter().filter(|e| e.contains("tuning.web.")).collect();
+        let web_errors: Vec<&String> = errors
+            .iter()
+            .filter(|e| e.contains("tuning.web."))
+            .collect();
         assert!(
             web_errors.is_empty(),
             "default web tuning must validate; got {web_errors:?}"

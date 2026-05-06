@@ -24,8 +24,8 @@
 
 use std::future::Future;
 
-use anyhow::{Context, Error, anyhow, bail};
-use flume::{Receiver, Sender, unbounded};
+use anyhow::{anyhow, bail, Context, Error};
+use flume::{unbounded, Receiver, Sender};
 #[cfg(feature = "lua")]
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction};
 use frankenterm_dynamic::{ToDynamic, Value};

@@ -3127,9 +3127,14 @@ mod tests {
             min_ms: Some(2000),
             max_ms: Some(1000),
         };
-        let err = bad.validate().expect_err("misordered TimeRange must reject");
+        let err = bad
+            .validate()
+            .expect_err("misordered TimeRange must reject");
         let msg = format!("{err:?}");
-        assert!(msg.contains("br-ft-m5bne"), "error must cite breadcrumb: {msg}");
+        assert!(
+            msg.contains("br-ft-m5bne"),
+            "error must cite breadcrumb: {msg}"
+        );
         assert!(msg.contains("min_ms=2000") && msg.contains("max_ms=1000"));
     }
 
@@ -3148,7 +3153,9 @@ mod tests {
             min_seq: Some(1000),
             max_seq: Some(10),
         };
-        let err = bad.validate().expect_err("misordered SequenceRange must reject");
+        let err = bad
+            .validate()
+            .expect_err("misordered SequenceRange must reject");
         assert!(format!("{err:?}").contains("min_seq=1000"));
     }
 

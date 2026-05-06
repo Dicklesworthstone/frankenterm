@@ -15,10 +15,10 @@
 //! to Lua config or defaults.
 
 use crate::{
-    CONFIG_FILE_OVERRIDE, HOME_DIR, LoadedConfig, frankenterm_config_dirs, merge_dynamic_overrides,
-    toml_to_dynamic,
+    frankenterm_config_dirs, merge_dynamic_overrides, toml_to_dynamic, LoadedConfig,
+    CONFIG_FILE_OVERRIDE, HOME_DIR,
 };
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
 

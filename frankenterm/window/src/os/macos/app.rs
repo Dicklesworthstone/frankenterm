@@ -6,11 +6,11 @@ use crate::{ApplicationEvent, Connection};
 use cocoa::appkit::NSApplicationTerminateReply;
 use cocoa::base::id;
 use cocoa::foundation::NSInteger;
-use config::WindowCloseConfirmation;
 use config::keyassignment::KeyAssignment;
+use config::WindowCloseConfirmation;
 use objc::declare::ClassDecl;
 use objc::rc::StrongPtr;
-use objc::runtime::{BOOL, Class, NO, Object, Sel, YES};
+use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::*;
 
 const CLS_NAME: &str = "FrankenTermAppDelegate";

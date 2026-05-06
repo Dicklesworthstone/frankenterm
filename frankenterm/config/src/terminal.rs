@@ -1,9 +1,9 @@
 //! Bridge our gui config into the terminal crate configuration
 
-use crate::{ConfigHandle, NewlineCanon, configuration};
-use frankenterm_term::MonospaceKpCostModel;
+use crate::{configuration, ConfigHandle, NewlineCanon};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::{BidiMode, ScrollbackSpillSink};
+use frankenterm_term::MonospaceKpCostModel;
 use std::sync::{Arc, Mutex, OnceLock};
 use termwiz::cell::UnicodeVersion;
 

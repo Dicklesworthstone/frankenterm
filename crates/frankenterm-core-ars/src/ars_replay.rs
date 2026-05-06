@@ -971,12 +971,8 @@ mod tests {
         // call sites migrate to validate_with_trigger.
         let mut harness = ReplayHarness::with_defaults();
         let incidents = make_incidents(3);
-        let session = harness.validate(
-            42,
-            &["systemctl restart app".to_string()],
-            &incidents,
-            1000,
-        );
+        let session =
+            harness.validate(42, &["systemctl restart app".to_string()], &incidents, 1000);
         for v in &session.verdicts {
             if let ReplayVerdict::Fail {
                 reason: FailReason::PatternMismatch,
@@ -1000,12 +996,8 @@ mod tests {
         };
         let mut harness = ReplayHarness::new(config);
         let incidents = vec![make_incident("inc-0", true)];
-        let session = harness.validate(
-            42,
-            &["systemctl restart app".to_string()],
-            &incidents,
-            1000,
-        );
+        let session =
+            harness.validate(42, &["systemctl restart app".to_string()], &incidents, 1000);
         for v in &session.verdicts {
             if let ReplayVerdict::Fail {
                 reason: FailReason::Timeout { .. },
@@ -1031,7 +1023,10 @@ mod tests {
         // Sleep >1ms to ensure elapsed > budget.
         std::thread::sleep(std::time::Duration::from_millis(5));
         let verdict = harness.maybe_timeout("inc-test", started);
-        assert!(verdict.is_some(), "must surface Timeout after budget overrun");
+        assert!(
+            verdict.is_some(),
+            "must surface Timeout after budget overrun"
+        );
         let v = verdict.unwrap();
         match v {
             ReplayVerdict::Fail {
