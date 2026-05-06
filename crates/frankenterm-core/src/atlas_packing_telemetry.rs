@@ -43,7 +43,6 @@
 //! their own teardown.
 
 use std::io::{self, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 

@@ -43,9 +43,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::cold_tier_pipeline::{
-    ChunkWriteSummary, StepFailureReason, WritePipelineState, WritePipelineStep,
-};
+#[cfg(test)]
+use crate::cold_tier_pipeline::StepFailureReason;
+use crate::cold_tier_pipeline::{ChunkWriteSummary, WritePipelineState, WritePipelineStep};
 
 // ============================================================================
 // Retry config

@@ -2364,16 +2364,22 @@ fn bundled_app_font_dirs() -> Vec<PathBuf> {
 }
 
 fn bundled_app_font_dirs_from_executable_dir(exe_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
     #[cfg(target_os = "macos")]
-    if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
-        if let Some(contents_dir) = exe_dir.parent() {
-            dirs.push(contents_dir.join("Resources").join("fonts"));
+    {
+        let mut dirs = Vec::new();
+        if exe_dir.file_name() == Some(OsStr::new("MacOS")) {
+            if let Some(contents_dir) = exe_dir.parent() {
+                dirs.push(contents_dir.join("Resources").join("fonts"));
+            }
         }
+        dirs
     }
 
-    dirs
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exe_dir;
+        Vec::new()
+    }
 }
 
 fn default_status_update_interval() -> u64 {

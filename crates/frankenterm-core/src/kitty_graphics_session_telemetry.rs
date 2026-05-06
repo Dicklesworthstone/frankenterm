@@ -49,9 +49,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::kitty_graphics::{
-    ImageAcceptDecision, ImageRejectionReason, KittyAction, KittyImageFormat,
-};
+use crate::kitty_graphics::{ImageRejectionReason, KittyAction, KittyImageFormat};
 use crate::kitty_graphics_compositor::{CompositorLayer, KittyQueryOutcome, StructuredLogRow};
 
 // ============================================================================

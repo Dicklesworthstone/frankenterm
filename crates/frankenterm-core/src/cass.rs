@@ -16,6 +16,7 @@ use crate::storage::{AgentSessionRecord, ExportQuery, Segment, SegmentScanQuery,
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+#[cfg(feature = "cass-export")]
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};

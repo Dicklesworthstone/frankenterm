@@ -64,7 +64,7 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 use crate::render_call_graph_audit::{
-    CallEdge, CallGraph, CallSiteId, GuardConstructionSite, RenderEntryPoint,
+    CallGraph, CallSiteId, GuardConstructionSite, RenderEntryPoint,
 };
 use crate::render_snapshot_guard::SnapshotKind;
 
