@@ -9,9 +9,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use frankenterm_core::hardware_profile::ProbeValue;
 use frankenterm_core::large_swarm_replay::{
-    LARGE_SWARM_REPLAY_CORPUS_VERSION, LargeSwarmRegressionThresholds, LargeSwarmScenario,
-    evaluate_large_swarm_thresholds, generate_large_swarm_corpus, summarize_large_swarm_replay,
+    LARGE_SWARM_PROOF_GAUNTLET_VERSION, LARGE_SWARM_REPLAY_CORPUS_VERSION,
+    LargeSwarmProofEvidenceMode, LargeSwarmProofGauntletConfig, LargeSwarmProofGauntletManifest,
+    LargeSwarmProofGauntletStatus, LargeSwarmProofRunContext, LargeSwarmProofScaleRequest,
+    LargeSwarmRegressionThresholds, LargeSwarmReleaseClaimStatus, LargeSwarmScenario,
+    build_large_swarm_proof_gauntlet_manifest, evaluate_large_swarm_thresholds,
+    generate_large_swarm_corpus, large_swarm_release_claim_status, summarize_large_swarm_replay,
 };
 use frankenterm_core::test_artifacts::{
     ArtifactEntry, ArtifactFormat, ArtifactKind, SCALE_LAB_WORKLOAD_CATALOG_SCHEMA_VERSION,
@@ -24,8 +29,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 const SCALE_LAB_SMOKE_RUN_SCHEMA_VERSION: &str = "ft.scale_lab.smoke_run.v1";
+const SCALE_LAB_STAGED_PROOF_SCHEMA_VERSION: &str = "ft.scale_lab.staged_proof.v1";
 const RUN_ID: &str = "ft-nk575.scale-lab-smoke.10-pane";
+const STAGED_RUN_ID: &str = "ft-5kt3d.scale-lab-staged.50-200-1000-pane";
 const WORKLOAD_SEED: &str = "ft-nk575-deterministic-10-pane-v1";
+const STAGED_WORKLOAD_SEED: &str = "ft-5kt3d-deterministic-staged-v1";
 const TARGET_PANE_COUNT: u32 = 10;
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -58,6 +66,44 @@ struct ScaleLabSmokeEventCounts {
     capture_gaps: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ScaleLabStagedProofArtifact {
+    schema_version: String,
+    run_id: String,
+    workload_seed: String,
+    command_line: String,
+    target_dir: String,
+    artifact_dir: String,
+    manifest_schema_version: String,
+    manifest_status: LargeSwarmProofGauntletStatus,
+    release_claim_status: LargeSwarmReleaseClaimStatus,
+    manifest: LargeSwarmProofGauntletManifest,
+    stage_records: Vec<ScaleLabStageTruthRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ScaleLabStageTruthRecord {
+    stage_id: String,
+    stage_class: String,
+    pane_count: u64,
+    evidence_mode: LargeSwarmProofEvidenceMode,
+    truth_status: LargeSwarmProofGauntletStatus,
+    release_claim_status: LargeSwarmReleaseClaimStatus,
+    requested_logical_cores: u64,
+    requested_memory_bytes: u64,
+    timeout_secs: u64,
+    memory_limit_bytes: u64,
+    disk_available_bytes: ProbeValue<u64>,
+    queue_depth_upper_bound_events_per_pane: u64,
+    event_drop_count: u64,
+    capture_gap_count: u64,
+    threshold_passed: bool,
+    live_mux_required: bool,
+    live_mux_available: bool,
+    hardware_truth_labels: Vec<String>,
+    degraded_reasons: Vec<String>,
+}
+
 #[test]
 fn scale_lab_smoke_harness_emits_valid_10_pane_artifact() {
     let started = Instant::now();
@@ -81,7 +127,10 @@ fn scale_lab_smoke_harness_emits_valid_10_pane_artifact() {
     fs::create_dir_all(&artifact_dir).expect("create scale-lab smoke artifact dir");
 
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let command_line = proof_command(&target_dir);
+    let command_line = proof_command(
+        &target_dir,
+        "scale_lab_smoke_harness_emits_valid_10_pane_artifact",
+    );
     let event_counts = ScaleLabSmokeEventCounts {
         target_pane_count: summary.pane_count,
         replay_events: summary.event_count,
@@ -188,6 +237,131 @@ fn scale_lab_smoke_harness_emits_valid_10_pane_artifact() {
     );
 }
 
+#[test]
+fn scale_lab_staged_lanes_mark_replay_unproven_without_live_hardware() {
+    let target_dir = target_dir();
+    let workspace_root = workspace_root();
+    let command_line = proof_command(
+        &target_dir,
+        "scale_lab_staged_lanes_mark_replay_unproven_without_live_hardware",
+    );
+    let manifest = build_large_swarm_proof_gauntlet_manifest(
+        &workspace_root,
+        staged_scale_lab_config(STAGED_RUN_ID),
+    )
+    .expect("build staged scale-lab proof manifest");
+    let release_claim_status = large_swarm_release_claim_status(Some(&manifest));
+
+    assert_eq!(
+        manifest.status,
+        LargeSwarmProofGauntletStatus::SkippedNotProven,
+        "synthetic staged lanes must not graduate hardware proof"
+    );
+    assert_eq!(
+        release_claim_status,
+        LargeSwarmReleaseClaimStatus::LocalSmoke
+    );
+    assert_eq!(manifest.scale_artifacts.len(), 3);
+    assert!(
+        manifest
+            .scale_artifacts
+            .iter()
+            .all(|artifact| artifact.verdict.passed),
+        "staged replay thresholds should pass before truth labels mark the run unproven"
+    );
+    assert!(
+        manifest.skip_reasons.iter().any(|reason| reason
+            .contains("synthetic smoke replay cannot prove the 64-core/256GB release claim")),
+        "synthetic replay must carry an explicit release-proof blocker"
+    );
+
+    let stage_records = staged_truth_records(&manifest, release_claim_status);
+    assert_eq!(stage_records.len(), 3);
+    assert!(
+        stage_records.iter().any(|record| record.pane_count >= 500),
+        "future 500+ lane must be represented by the built-in 1000-pane scenario"
+    );
+    for record in &stage_records {
+        assert_eq!(
+            record.truth_status,
+            LargeSwarmProofGauntletStatus::SkippedNotProven
+        );
+        assert_eq!(
+            record.release_claim_status,
+            LargeSwarmReleaseClaimStatus::LocalSmoke
+        );
+        assert!(record.threshold_passed);
+        assert!(record.timeout_secs > 0);
+        assert!(record.memory_limit_bytes > 0);
+        assert_eq!(record.event_drop_count, 0);
+        assert_eq!(record.capture_gap_count, 0);
+        assert!(record.live_mux_required);
+        assert!(!record.live_mux_available);
+        assert!(
+            record
+                .hardware_truth_labels
+                .iter()
+                .any(|label| label == "evidence_mode=synthetic_smoke"),
+            "stage must label synthetic evidence mode"
+        );
+        assert!(
+            record
+                .degraded_reasons
+                .iter()
+                .any(|reason| reason.contains("live mux")),
+            "stage must explain the missing live-mux substrate"
+        );
+    }
+
+    let artifact_dir = target_dir
+        .join("scale-lab-smoke")
+        .join(STAGED_RUN_ID)
+        .join(manifest.summary_digest.replace(':', "_"));
+    fs::create_dir_all(&artifact_dir).expect("create staged scale-lab artifact dir");
+    let artifact = ScaleLabStagedProofArtifact {
+        schema_version: SCALE_LAB_STAGED_PROOF_SCHEMA_VERSION.to_string(),
+        run_id: STAGED_RUN_ID.to_string(),
+        workload_seed: STAGED_WORKLOAD_SEED.to_string(),
+        command_line,
+        target_dir: target_dir.display().to_string(),
+        artifact_dir: artifact_dir.display().to_string(),
+        manifest_schema_version: LARGE_SWARM_PROOF_GAUNTLET_VERSION.to_string(),
+        manifest_status: manifest.status,
+        release_claim_status,
+        manifest,
+        stage_records,
+    };
+    let artifact_json =
+        serde_json::to_string_pretty(&artifact).expect("staged artifact serializes");
+    let artifact_path = artifact_dir.join("scale-lab-staged-proof.v1.json");
+    fs::write(&artifact_path, artifact_json.as_bytes()).expect("write staged proof artifact JSON");
+    let roundtrip: ScaleLabStagedProofArtifact =
+        serde_json::from_slice(&fs::read(&artifact_path).expect("read staged artifact JSON"))
+            .expect("staged artifact JSON deserializes");
+    assert_eq!(roundtrip, artifact);
+
+    eprintln!(
+        "[ARTIFACT][scale-lab-staged] {}",
+        serde_json::to_string(&json!({
+            "run_id": STAGED_RUN_ID,
+            "artifact_path": artifact_path,
+            "manifest_status": roundtrip.manifest_status,
+            "release_claim_status": roundtrip.release_claim_status,
+            "stage_pane_counts": roundtrip
+                .stage_records
+                .iter()
+                .map(|record| record.pane_count)
+                .collect::<Vec<_>>(),
+            "truth_labels": roundtrip
+                .stage_records
+                .iter()
+                .flat_map(|record| record.hardware_truth_labels.iter().cloned())
+                .collect::<Vec<_>>(),
+        }))
+        .expect("staged artifact summary serializes")
+    );
+}
+
 fn target_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -200,11 +374,149 @@ fn target_dir() -> PathBuf {
         })
 }
 
-fn proof_command(target_dir: &std::path::Path) -> String {
+fn proof_command(target_dir: &std::path::Path, test_name: &str) -> String {
     format!(
-        "rch exec -- env CARGO_TARGET_DIR={} cargo test -p frankenterm-core --test scale_lab_smoke_harness --no-default-features scale_lab_smoke_harness_emits_valid_10_pane_artifact -- --nocapture",
-        target_dir.display()
+        "rch exec -- env CARGO_TARGET_DIR={} cargo test -p frankenterm-core --test scale_lab_smoke_harness --no-default-features {test_name} -- --nocapture",
+        target_dir.display(),
     )
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root exists")
+        .to_path_buf()
+}
+
+fn staged_scale_lab_config(run_id: &str) -> LargeSwarmProofGauntletConfig {
+    LargeSwarmProofGauntletConfig {
+        run_context: LargeSwarmProofRunContext {
+            run_id: run_id.to_string(),
+            evidence_mode: LargeSwarmProofEvidenceMode::SyntheticSmoke,
+            build_profile: "scale-lab-staged-replay".to_string(),
+            kernel: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            ft_config_digest: "test-harness:unrecorded".to_string(),
+            runtime_feature_flags: vec!["no-default-features".to_string()],
+            agent_count: 1_000,
+            input_rate_events_per_sec: 10_000,
+            capture_rate_events_per_sec: 10_000,
+            search_query_mix: BTreeMap::from([
+                ("exact_tail_lookup".to_string(), 40),
+                ("lexical_search".to_string(), 35),
+                ("hybrid_search".to_string(), 25),
+            ]),
+        },
+        scale_requests: vec![
+            staged_scale_request(8, 8 * GIB, 50),
+            staged_scale_request(16, 32 * GIB, 200),
+            staged_scale_request(64, 256 * GIB, 1_000),
+        ],
+    }
+}
+
+fn staged_scale_request(
+    requested_logical_cores: u64,
+    requested_memory_bytes: u64,
+    pane_count: u64,
+) -> LargeSwarmProofScaleRequest {
+    LargeSwarmProofScaleRequest {
+        requested_logical_cores,
+        requested_memory_bytes,
+        scenario: LargeSwarmScenario::scale_point(pane_count)
+            .expect("built-in staged scale point exists"),
+    }
+}
+
+fn staged_truth_records(
+    manifest: &LargeSwarmProofGauntletManifest,
+    release_claim_status: LargeSwarmReleaseClaimStatus,
+) -> Vec<ScaleLabStageTruthRecord> {
+    manifest
+        .scale_artifacts
+        .iter()
+        .map(|artifact| {
+            let request = &artifact.request;
+            ScaleLabStageTruthRecord {
+                stage_id: format!("{}-pane", request.scenario.pane_count),
+                stage_class: stage_class(request.scenario.pane_count).to_string(),
+                pane_count: request.scenario.pane_count,
+                evidence_mode: manifest.run_context.evidence_mode,
+                truth_status: manifest.status,
+                release_claim_status,
+                requested_logical_cores: request.requested_logical_cores,
+                requested_memory_bytes: request.requested_memory_bytes,
+                timeout_secs: timeout_secs_for_stage(request.scenario.pane_count),
+                memory_limit_bytes: request.requested_memory_bytes,
+                disk_available_bytes: manifest.hardware_profile.storage.available_bytes.clone(),
+                queue_depth_upper_bound_events_per_pane: artifact.summary.max_events_per_pane,
+                event_drop_count: 0,
+                capture_gap_count: 0,
+                threshold_passed: artifact.verdict.passed,
+                live_mux_required: true,
+                live_mux_available: false,
+                hardware_truth_labels: hardware_truth_labels(
+                    manifest,
+                    request.scenario.pane_count,
+                    release_claim_status,
+                ),
+                degraded_reasons: degraded_reasons(manifest, request.scenario.pane_count),
+            }
+        })
+        .collect()
+}
+
+fn stage_class(pane_count: u64) -> &'static str {
+    match pane_count {
+        50 => "rch-replay-50-pane",
+        200 => "rch-replay-200-pane",
+        count if count >= 500 => "future-500-plus-live-mux-required",
+        _ => "unstaged",
+    }
+}
+
+fn timeout_secs_for_stage(pane_count: u64) -> u64 {
+    match pane_count {
+        50 => 300,
+        200 => 900,
+        count if count >= 500 => 1_800,
+        _ => 120,
+    }
+}
+
+fn hardware_truth_labels(
+    manifest: &LargeSwarmProofGauntletManifest,
+    pane_count: u64,
+    release_claim_status: LargeSwarmReleaseClaimStatus,
+) -> Vec<String> {
+    vec![
+        format!(
+            "evidence_mode={}",
+            match manifest.run_context.evidence_mode {
+                LargeSwarmProofEvidenceMode::SyntheticSmoke => "synthetic_smoke",
+                LargeSwarmProofEvidenceMode::RealHardwareRun => "real_hardware_run",
+            }
+        ),
+        format!("manifest_status={:?}", manifest.status),
+        format!("release_claim_status={}", release_claim_status.as_str()),
+        format!("pane_count={pane_count}"),
+        format!(
+            "hardware_predicate_status={:?}",
+            manifest.hardware_profile.proof_predicates.proof_status
+        ),
+        "live_mux_available=false".to_string(),
+    ]
+}
+
+fn degraded_reasons(manifest: &LargeSwarmProofGauntletManifest, pane_count: u64) -> Vec<String> {
+    let mut reasons = manifest.skip_reasons.clone();
+    reasons.push("live mux substrate was not launched by this replay harness".to_string());
+    if pane_count >= 500 {
+        reasons.push("500+ pane lane is replay-only until an operator stages live hardware".into());
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }
 
 fn fixture_versions() -> BTreeMap<String, String> {
