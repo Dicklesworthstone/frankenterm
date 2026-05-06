@@ -26,12 +26,15 @@ mod common;
 
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::accounts::AccountRecord;
-use frankenterm_core::search::{FusionBackend, SearchMode};
+use frankenterm_core::search::{
+    FusionBackend, SearchMode, SemanticSearchFreshnessStatus, SemanticSearchProofCase,
+    SemanticSearchProofCaseInput, SemanticSearchProofReport,
+};
 use frankenterm_core::storage::{
-    AgentSessionRecord, Correlation, CorrelationRef, CorrelationType, EventQuery, Gap, MetricQuery,
-    MetricType, PaneInfo, PaneRecord, SearchOptions, Segment, SemanticBudgetConfig, StorageConfig,
-    StorageHandle, StoredEvent, Timeline, TimelineEvent, TimelineQuery, UsageMetricRecord,
-    WorkflowRecord, WorkflowStepLogRecord, now_ms,
+    AgentSessionRecord, Correlation, CorrelationRef, CorrelationType, EventQuery, Gap,
+    HybridSearchBundle, MetricQuery, MetricType, PaneInfo, PaneRecord, SearchOptions, Segment,
+    SemanticBudgetConfig, StorageConfig, StorageHandle, StoredEvent, Timeline, TimelineEvent,
+    TimelineQuery, UsageMetricRecord, WorkflowRecord, WorkflowStepLogRecord, now_ms,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -67,6 +70,43 @@ fn test_pane(pane_id: u64) -> PaneRecord {
         ignore_reason: None,
         last_decision_at: None,
     }
+}
+
+struct ProofCaseFixture<'a> {
+    case_id: &'a str,
+    bundle: &'a HybridSearchBundle,
+    embedder_id: &'a str,
+    embedder_dimension: usize,
+    latest_segment: &'a Segment,
+    embedded_segment_ids: &'a [i64],
+    observed_at_ms: i64,
+    freshness_window_ms: i64,
+}
+
+fn proof_case_from_bundle(input: ProofCaseFixture<'_>) -> SemanticSearchProofCase {
+    SemanticSearchProofCase::from_input(SemanticSearchProofCaseInput {
+        case_id: input.case_id.to_string(),
+        requested_mode: input.bundle.requested_mode.clone(),
+        effective_mode: input.bundle.mode.clone(),
+        embedder_id: input.embedder_id.to_string(),
+        embedder_tier: "hash".to_string(),
+        embedder_dimension: input.embedder_dimension,
+        latest_segment_id: Some(input.latest_segment.id),
+        latest_segment_captured_at_ms: Some(input.latest_segment.captured_at),
+        embedded_segment_ids: input.embedded_segment_ids.to_vec(),
+        result_segment_ids: input
+            .bundle
+            .results
+            .iter()
+            .map(|hit| hit.result.segment.id)
+            .collect(),
+        observed_at_ms: input.observed_at_ms,
+        freshness_window_ms: input.freshness_window_ms,
+        fallback_reason: input.bundle.fallback_reason.clone(),
+        semantic_budget_state: input.bundle.semantic_budget_state.clone(),
+        semantic_cache_hit: input.bundle.semantic_cache_hit,
+        semantic_rows_scanned: input.bundle.semantic_rows_scanned,
+    })
 }
 
 fn make_timeline_pane(pane_id: u64, now: i64) -> PaneRecord {
@@ -519,6 +559,194 @@ fn storage_handle_hybrid_search_falls_back_to_lexical_when_semantic_degraded() {
             assert!(hit.lexical_contribution.is_some());
             assert!((hit.fusion_score - hit.lexical_contribution.unwrap_or_default()).abs() < 1e-6);
         }
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
+#[test]
+fn storage_handle_semantic_search_proof_lane_reports_freshness_and_provenance() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        const EMBEDDER_ID: &str = "hash:semantic-proof-lane-v1";
+        const EMBEDDER_DIMENSION: usize = 2;
+        const FRESHNESS_WINDOW_MS: i64 = 30_000;
+
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        handle.set_semantic_budget_config(SemanticBudgetConfig {
+            max_semantic_latency_ms: u64::MAX,
+            ..SemanticBudgetConfig::default()
+        });
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        let lexical_segment = handle
+            .append_segment(1, "needle lexical proof segment", None)
+            .await
+            .unwrap();
+        let semantic_segment = handle
+            .append_segment(1, "vector-only proof segment", None)
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(lexical_segment.id, EMBEDDER_ID, &[1.0, 0.0])
+            .await
+            .unwrap();
+        handle
+            .store_embedding_f32(semantic_segment.id, EMBEDDER_ID, &[0.0, 1.0])
+            .await
+            .unwrap();
+
+        let options = SearchOptions {
+            limit: Some(5),
+            include_snippets: Some(false),
+            ..SearchOptions::default()
+        };
+        let lexical_bundle = handle
+            .hybrid_search_with_results(
+                "needle",
+                options.clone(),
+                EMBEDDER_ID,
+                &[1.0, 0.0],
+                SearchMode::Lexical,
+                60,
+                1.0,
+                1.0,
+                Some(FusionBackend::FrankenSearchRrf),
+            )
+            .await
+            .unwrap();
+        let semantic_bundle = handle
+            .hybrid_search_with_results(
+                "not-used-by-semantic-mode",
+                options.clone(),
+                EMBEDDER_ID,
+                &[0.0, 1.0],
+                SearchMode::Semantic,
+                60,
+                1.0,
+                1.0,
+                Some(FusionBackend::FrankenSearchRrf),
+            )
+            .await
+            .unwrap();
+        let hybrid_bundle = handle
+            .hybrid_search_with_results(
+                "needle",
+                options.clone(),
+                EMBEDDER_ID,
+                &[1.0, 0.0],
+                SearchMode::Hybrid,
+                60,
+                1.0,
+                1.0,
+                Some(FusionBackend::FrankenSearchRrf),
+            )
+            .await
+            .unwrap();
+
+        let stale_segment = handle
+            .append_segment(1, "needle newest segment without embedding", None)
+            .await
+            .unwrap();
+        let stale_bundle = handle
+            .hybrid_search_with_results(
+                "needle",
+                options,
+                EMBEDDER_ID,
+                &[1.0, 0.0],
+                SearchMode::Hybrid,
+                60,
+                1.0,
+                1.0,
+                Some(FusionBackend::FrankenSearchRrf),
+            )
+            .await
+            .unwrap();
+
+        let observed_at_ms = now_ms();
+        let embedded_segment_ids = vec![lexical_segment.id, semantic_segment.id];
+        let fresh_cases = [
+            ("lexical-disabled", &lexical_bundle),
+            ("semantic-fresh", &semantic_bundle),
+            ("hybrid-fresh", &hybrid_bundle),
+        ]
+        .into_iter()
+        .map(|(case_id, bundle)| {
+            proof_case_from_bundle(ProofCaseFixture {
+                case_id,
+                bundle,
+                embedder_id: EMBEDDER_ID,
+                embedder_dimension: EMBEDDER_DIMENSION,
+                latest_segment: &semantic_segment,
+                embedded_segment_ids: &embedded_segment_ids,
+                observed_at_ms,
+                freshness_window_ms: FRESHNESS_WINDOW_MS,
+            })
+        });
+        let stale_case = proof_case_from_bundle(ProofCaseFixture {
+            case_id: "hybrid-stale-index",
+            bundle: &stale_bundle,
+            embedder_id: EMBEDDER_ID,
+            embedder_dimension: EMBEDDER_DIMENSION,
+            latest_segment: &stale_segment,
+            embedded_segment_ids: &embedded_segment_ids,
+            observed_at_ms,
+            freshness_window_ms: FRESHNESS_WINDOW_MS,
+        });
+        let report = SemanticSearchProofReport {
+            proof_id: "semantic-search-freshness-proof.v1".to_string(),
+            generated_at_ms: observed_at_ms,
+            cases: fresh_cases.chain(std::iter::once(stale_case)).collect(),
+        };
+
+        assert!(report.distinguishes_required_states());
+        assert!(!report.contains_false_fresh_stale_claim());
+
+        let lexical_case = report
+            .cases
+            .iter()
+            .find(|case| case.case_id == "lexical-disabled")
+            .unwrap();
+        assert_eq!(lexical_case.semantic_budget_state, "disabled");
+        assert_eq!(lexical_case.requested_mode, "lexical");
+        assert_eq!(lexical_case.effective_mode, "lexical");
+
+        let semantic_case = report
+            .cases
+            .iter()
+            .find(|case| case.case_id == "semantic-fresh")
+            .unwrap();
+        assert_eq!(semantic_case.requested_mode, "semantic");
+        assert_eq!(semantic_case.effective_mode, "semantic");
+        assert_eq!(
+            semantic_case.freshness_status,
+            SemanticSearchFreshnessStatus::Fresh
+        );
+        assert!(
+            semantic_case
+                .result_segment_ids
+                .contains(&semantic_segment.id)
+        );
+
+        let stale_case = report
+            .cases
+            .iter()
+            .find(|case| case.case_id == "hybrid-stale-index")
+            .unwrap();
+        assert!(stale_case.stale_index);
+        assert_eq!(
+            stale_case.freshness_status,
+            SemanticSearchFreshnessStatus::Stale
+        );
+        assert_eq!(stale_case.latest_segment_id, Some(stale_segment.id));
+        assert!(!stale_case.embedded_segment_ids.contains(&stale_segment.id));
+
+        let json = serde_json::to_string(&report).expect("serialize proof report");
+        let roundtrip: SemanticSearchProofReport =
+            serde_json::from_str(&json).expect("deserialize proof report");
+        assert_eq!(roundtrip, report);
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
