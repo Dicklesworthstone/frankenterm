@@ -262,10 +262,16 @@ Force-releasing immediately erodes trust and wastes work-in-progress.
 If `swarm-tick.json` reports `disk_used_pct >= 96`:
 
 ```bash
+scripts/clean-stale-targets.sh --inventory --threshold-hours 12
+scripts/clean-stale-targets.sh --inventory --format json --threshold-hours 12
 scripts/clean-stale-targets.sh --dry-run --threshold-hours 12
 # Review the would-remove list; if it looks safe:
 scripts/clean-stale-targets.sh --threshold-hours 12
 ```
+
+The inventory commands are read-only. Use the text form for human review and
+the JSON form in Beads comments when requesting deletion authorization; it
+reports per-target age, size, active-skip status, and total reclaimable bytes.
 
 Also nudge any agent whose bead is closed to clean their own
 `/tmp/ft-<slug>-target/release` directory. Per AGENTS.md Rule SO-6,

@@ -295,6 +295,62 @@ count_remaining() {
     [[ "$output" == *"threshold hours specified more than once"* ]]
 }
 
+@test "--inventory reports size age active skip and never deletes" {
+    d_stale="$(make_target "ft-stale-target" 1500)"
+    d_active="$(make_target "ft-active-target" 1500)"
+    d_fresh="$(make_target "ft-fresh-target" 30)"
+
+    FT_TEST_FAKE_ACTIVE_DIRS="$d_active" run "$SCRIPT" --inventory --threshold-hours 12
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"inventory target_glob=$TARGET_GLOB threshold_hours=12 threshold_min=720"* ]]
+    [[ "$output" == *"candidate status=stale reason=older_than_threshold"*"path=$d_stale"* ]]
+    [[ "$output" == *"candidate status=active reason=active_usage"*"path=$d_active"* ]]
+    [[ "$output" == *"candidate status=fresh reason=below_threshold"*"path=$d_fresh"* ]]
+    [[ "$output" == *"inventory summary candidates=3 fresh=1 stale=1 active=1 reclaimable_kb="*"reclaimable_bytes="* ]]
+    [ "$(count_remaining)" -eq 3 ]
+}
+
+@test "--inventory --format json emits machine-readable summary" {
+    d_stale="$(make_target "ft-stale-target" 1500)"
+    d_fresh="$(make_target "ft-fresh-target" 30)"
+
+    run "$SCRIPT" --inventory --format json --threshold-hours 12
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" | jq -e \
+        --arg stale "$d_stale" \
+        --arg fresh "$d_fresh" \
+        '.ok == true
+         and .mode == "inventory"
+         and .threshold_hours == 12
+         and .summary.candidates == 2
+         and .summary.stale == 1
+         and .summary.fresh == 1
+         and .summary.active == 0
+         and (.summary.reclaimable_bytes | type == "number")
+         and (.candidates[] | select(.path == $stale and .status == "stale" and .reason == "older_than_threshold"))
+         and (.candidates[] | select(.path == $fresh and .status == "fresh" and .reason == "below_threshold"))' >/dev/null
+    [ "$(count_remaining)" -eq 2 ]
+}
+
+@test "--inventory-json alias emits json inventory" {
+    make_target "ft-stale-target" 1500 >/dev/null
+
+    run "$SCRIPT" --inventory-json --threshold-hours=12
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" | jq -e \
+        '.mode == "inventory" and .summary.candidates == 1 and .summary.stale == 1' >/dev/null
+}
+
+@test "--inventory format validation rejects bad or missing formats" {
+    run "$SCRIPT" --inventory --format xml
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"inventory format must be text or json"* ]]
+
+    run "$SCRIPT" --inventory --format
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"missing value for --format"* ]]
+}
+
 @test "race: dir disappears between scan and remove → script still exits 0" {
     d="$(make_target "ft-race-target" 1500)"
 

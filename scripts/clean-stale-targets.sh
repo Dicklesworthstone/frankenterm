@@ -6,6 +6,8 @@
 #   clean-stale-targets.sh --dry-run [hours]                        (no deletions; reports would-remove)
 #   clean-stale-targets.sh --dry-run --threshold-hours <hours>      (documented runbook form)
 #   clean-stale-targets.sh --dry-run --threshold-hours=<hours>      (equals form)
+#   clean-stale-targets.sh --inventory --threshold-hours <hours>    (read-only size/age inventory)
+#   clean-stale-targets.sh --inventory --format json [hours]        (machine-readable inventory)
 #   DRY_RUN=1 clean-stale-targets.sh [hours]                        (env-var form of --dry-run)
 #
 # Override target glob for tests:
@@ -130,7 +132,101 @@ active_usage() {
   return 1
 }
 
+path_size_kb() {
+  local path="$1"
+  /usr/bin/du -sk "$path" 2>/dev/null | awk 'NR == 1 {print $1 + 0} END {if (NR == 0) print 0}'
+}
+
+json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+emit_inventory() {
+  local now="$1"
+  local total=0
+  local fresh=0
+  local stale=0
+  local active=0
+  local reclaimable_kb=0
+  local first=1
+
+  if [ "$inventory_format" = "json" ]; then
+    printf '{\n'
+    printf '  "ok": true,\n'
+    printf '  "mode": "inventory",\n'
+    printf '  "target_glob": "%s",\n' "$(json_escape "$target_glob")"
+    printf '  "threshold_hours": %s,\n' "$hours"
+    printf '  "threshold_min": %s,\n' "$threshold_min"
+    printf '  "candidates": [\n'
+  else
+    echo "inventory target_glob=$target_glob threshold_hours=$hours threshold_min=$threshold_min"
+  fi
+
+  for d in "${candidates[@]}"; do
+    [ -d "$d" ] || continue
+
+    local mtime
+    local age_min
+    local size_kb
+    local status
+    local reason
+    local candidate_reclaimable_kb=0
+
+    total=$((total + 1))
+    mtime=$(read_mtime_seconds "$d")
+    age_min=$(( (now - mtime) / 60 ))
+    size_kb=$(path_size_kb "$d")
+    status="fresh"
+    reason="below_threshold"
+
+    if [ "$age_min" -gt "$threshold_min" ]; then
+      if active_usage "$d"; then
+        active=$((active + 1))
+        status="active"
+        reason="active_usage"
+      else
+        stale=$((stale + 1))
+        status="stale"
+        reason="older_than_threshold"
+        candidate_reclaimable_kb="$size_kb"
+        reclaimable_kb=$((reclaimable_kb + candidate_reclaimable_kb))
+      fi
+    else
+      fresh=$((fresh + 1))
+    fi
+
+    if [ "$inventory_format" = "json" ]; then
+      if [ "$first" = "1" ]; then
+        first=0
+      else
+        printf ',\n'
+      fi
+      printf '    {"path":"%s","status":"%s","reason":"%s","age_min":%s,"size_kb":%s,"reclaimable_kb":%s}' \
+        "$(json_escape "$d")" "$status" "$reason" "$age_min" "$size_kb" "$candidate_reclaimable_kb"
+    else
+      echo "candidate status=$status reason=$reason age_min=$age_min size_kb=$size_kb reclaimable_kb=$candidate_reclaimable_kb path=$d"
+    fi
+  done
+
+  if [ "$inventory_format" = "json" ]; then
+    printf '\n  ],\n'
+    printf '  "summary": {"candidates":%s,"fresh":%s,"stale":%s,"active":%s,"reclaimable_kb":%s,"reclaimable_bytes":%s}\n' \
+      "$total" "$fresh" "$stale" "$active" "$reclaimable_kb" "$((reclaimable_kb * 1024))"
+    printf '}\n'
+  else
+    echo "inventory summary candidates=$total fresh=$fresh stale=$stale active=$active reclaimable_kb=$reclaimable_kb reclaimable_bytes=$((reclaimable_kb * 1024))"
+  fi
+}
+
 dry_run=0
+inventory=0
+inventory_format="text"
 hours=""
 set_hours() {
   local value="$1"
@@ -142,11 +238,42 @@ set_hours() {
   hours="$value"
 }
 
+set_inventory_format() {
+  local value="$1"
+  case "$value" in
+    text|json)
+      inventory_format="$value"
+      ;;
+    *)
+      echo "inventory format must be text or json (got: $value)" >&2
+      exit 2
+      ;;
+  esac
+}
+
 while [ "$#" -gt 0 ]; do
   arg="$1"
   shift
   case "$arg" in
     --dry-run) dry_run=1 ;;
+    --inventory) inventory=1 ;;
+    --inventory-json)
+      inventory=1
+      inventory_format="json"
+      ;;
+    --format)
+      if [ "$#" -eq 0 ] || [[ "$1" == --* ]]; then
+        echo "missing value for --format" >&2
+        exit 2
+      fi
+      inventory=1
+      set_inventory_format "$1"
+      shift
+      ;;
+    --format=*)
+      inventory=1
+      set_inventory_format "${arg#--format=}"
+      ;;
     --threshold-hours)
       if [ "$#" -eq 0 ] || [[ "$1" == --* ]]; then
         echo "missing value for --threshold-hours" >&2
@@ -198,6 +325,11 @@ shopt -s nullglob
 # shellcheck disable=SC2206
 candidates=( $target_glob )
 shopt -u nullglob
+
+if [ "$inventory" = "1" ]; then
+  emit_inventory "$(date +%s)"
+  exit 0
+fi
 
 if [ "${#candidates[@]}" -gt 0 ]; then
   before=$(/usr/bin/du -sk "${candidates[@]}" 2>/dev/null | awk '{s+=$1} END{print s}')
