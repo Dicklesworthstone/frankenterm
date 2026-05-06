@@ -4970,9 +4970,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            crate::storage::query_audit_actions(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_audit_actions_backend(backend, &query)
+            })
         })
         .await
     }
@@ -5000,9 +5000,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            crate::storage::query_audit_actions_stream(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_audit_actions_stream_backend(backend, &query)
+            })
         })
         .await
     }
@@ -16714,7 +16714,68 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
     correlations
 }
 
-/// Query audit actions with optional filters
+fn audit_action_from_backend_cells(row: &[SqlCell]) -> Result<AuditActionRecord> {
+    let reader = CellRowReader::new(row);
+    let pane_id = reader
+        .optional_i64(5)
+        .and_then(|value| {
+            value
+                .map(|pane_id| backend_i64_to_u64(pane_id, "audit_actions.pane_id"))
+                .transpose()
+        })
+        .map_err(|err| storage_backend_error("Audit action row pane_id", err))?;
+
+    Ok(AuditActionRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Audit action row id", err))?,
+        ts: reader
+            .i64(1)
+            .map_err(|err| storage_backend_error("Audit action row ts", err))?,
+        actor_kind: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Audit action row actor_kind", err))?,
+        actor_id: reader
+            .optional_string(3)
+            .map_err(|err| storage_backend_error("Audit action row actor_id", err))?,
+        correlation_id: reader
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("Audit action row correlation_id", err))?,
+        pane_id,
+        domain: reader
+            .optional_string(6)
+            .map_err(|err| storage_backend_error("Audit action row domain", err))?,
+        action_kind: reader
+            .string(7)
+            .map_err(|err| storage_backend_error("Audit action row action_kind", err))?,
+        policy_decision: reader
+            .string(8)
+            .map_err(|err| storage_backend_error("Audit action row policy_decision", err))?,
+        decision_reason: reader
+            .optional_string(9)
+            .map_err(|err| storage_backend_error("Audit action row decision_reason", err))?,
+        rule_id: reader
+            .optional_string(10)
+            .map_err(|err| storage_backend_error("Audit action row rule_id", err))?,
+        input_summary: reader
+            .optional_string(11)
+            .map_err(|err| storage_backend_error("Audit action row input_summary", err))?,
+        verification_summary: reader
+            .optional_string(12)
+            .map_err(|err| storage_backend_error("Audit action row verification_summary", err))?,
+        decision_context: reader
+            .optional_string(13)
+            .map_err(|err| storage_backend_error("Audit action row decision_context", err))?,
+        result: reader
+            .string(14)
+            .map_err(|err| storage_backend_error("Audit action row result", err))?,
+    })
+}
+
+/// Query audit actions with optional filters.
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_audit_actions_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<AuditActionRecord>> {
     let mut sql = String::from(
         "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
@@ -16812,7 +16873,82 @@ fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<Audi
     Ok(results)
 }
 
+fn query_audit_actions_backend(
+    backend: &dyn StorageBackend,
+    query: &AuditQuery,
+) -> Result<Vec<AuditActionRecord>> {
+    let mut sql = String::from(
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+         policy_decision, decision_reason, rule_id, input_summary, verification_summary,
+         decision_context, result
+         FROM audit_actions WHERE 1=1",
+    );
+    let mut params = Vec::new();
+
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(ToSqlValue::Integer(pane_id_i64));
+    }
+    if let Some(domain) = &query.domain {
+        sql.push_str(" AND domain = ?");
+        params.push(ToSqlValue::Text(domain.as_str()));
+    }
+    if let Some(actor_kind) = &query.actor_kind {
+        sql.push_str(" AND actor_kind = ?");
+        params.push(ToSqlValue::Text(actor_kind.as_str()));
+    }
+    if let Some(actor_id) = &query.actor_id {
+        sql.push_str(" AND actor_id = ?");
+        params.push(ToSqlValue::Text(actor_id.as_str()));
+    }
+    if let Some(correlation_id) = &query.correlation_id {
+        sql.push_str(" AND correlation_id = ?");
+        params.push(ToSqlValue::Text(correlation_id.as_str()));
+    }
+    if let Some(action_kind) = &query.action_kind {
+        sql.push_str(" AND action_kind = ?");
+        params.push(ToSqlValue::Text(action_kind.as_str()));
+    }
+    if let Some(policy_decision) = &query.policy_decision {
+        sql.push_str(" AND policy_decision = ?");
+        params.push(ToSqlValue::Text(policy_decision.as_str()));
+    }
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(ToSqlValue::Text(rule_id.as_str()));
+    }
+    if let Some(result) = &query.result {
+        sql.push_str(" AND result = ?");
+        params.push(ToSqlValue::Text(result.as_str()));
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(ToSqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND ts <= ?");
+        params.push(ToSqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY ts DESC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    params.push(ToSqlValue::Integer(limit_i64));
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query audit actions", err))?;
+
+    rows.iter()
+        .map(Vec::as_slice)
+        .map(audit_action_from_backend_cells)
+        .collect()
+}
+
 /// Query audit actions using a cursor for stable streaming.
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_audit_actions_stream_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_audit_actions_stream(
     conn: &Connection,
     query: &AuditStreamQuery,
@@ -16921,6 +17057,94 @@ fn query_audit_actions_stream(
     }
 
     let next_cursor = records.last().map(|record| record.id);
+    Ok(AuditStreamPage {
+        records,
+        next_cursor,
+    })
+}
+
+fn query_audit_actions_stream_backend(
+    backend: &dyn StorageBackend,
+    query: &AuditStreamQuery,
+) -> Result<AuditStreamPage> {
+    let mut sql = String::from(
+        "SELECT id, ts, actor_kind, actor_id, correlation_id, pane_id, domain, action_kind,
+         policy_decision, decision_reason, rule_id, input_summary, verification_summary,
+         decision_context, result
+         FROM audit_actions WHERE 1=1",
+    );
+    let mut params = Vec::new();
+
+    if let Some(cursor) = query.cursor {
+        sql.push_str(" AND id > ?");
+        params.push(ToSqlValue::Integer(cursor));
+    }
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(ToSqlValue::Integer(pane_id_i64));
+    }
+    if let Some(domain) = &query.domain {
+        sql.push_str(" AND domain = ?");
+        params.push(ToSqlValue::Text(domain.as_str()));
+    }
+    if let Some(actor_kind) = &query.actor_kind {
+        sql.push_str(" AND actor_kind = ?");
+        params.push(ToSqlValue::Text(actor_kind.as_str()));
+    }
+    if let Some(actor_id) = &query.actor_id {
+        sql.push_str(" AND actor_id = ?");
+        params.push(ToSqlValue::Text(actor_id.as_str()));
+    }
+    if let Some(correlation_id) = &query.correlation_id {
+        sql.push_str(" AND correlation_id = ?");
+        params.push(ToSqlValue::Text(correlation_id.as_str()));
+    }
+    if let Some(action_kind) = &query.action_kind {
+        sql.push_str(" AND action_kind = ?");
+        params.push(ToSqlValue::Text(action_kind.as_str()));
+    }
+    if let Some(policy_decision) = &query.policy_decision {
+        sql.push_str(" AND policy_decision = ?");
+        params.push(ToSqlValue::Text(policy_decision.as_str()));
+    }
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(ToSqlValue::Text(rule_id.as_str()));
+    }
+    if let Some(result) = &query.result {
+        sql.push_str(" AND result = ?");
+        params.push(ToSqlValue::Text(result.as_str()));
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(ToSqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND ts <= ?");
+        params.push(ToSqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    params.push(ToSqlValue::Integer(limit_i64));
+
+    if let Some(offset) = query.offset {
+        sql.push_str(" OFFSET ?");
+        let offset_i64 = usize_to_i64(offset, "offset")?;
+        params.push(ToSqlValue::Integer(offset_i64));
+    }
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query audit action stream", err))?;
+    let records = rows
+        .iter()
+        .map(Vec::as_slice)
+        .map(audit_action_from_backend_cells)
+        .collect::<Result<Vec<_>>>()?;
+    let next_cursor = records.last().map(|record| record.id);
+
     Ok(AuditStreamPage {
         records,
         next_cursor,
@@ -19764,11 +19988,12 @@ fn storage_tick148_action_undo_cluster_roundtrip() {
 }
 
 /// ft-xbnl0.2.3 Cx-first: tick 147 misc step-log/plan/audit cluster —
-/// 8 new storage cx-first siblings exercised end-to-end:
+/// 9 storage cx-first siblings exercised end-to-end:
 /// `insert_step_log_with_cx`, `get_latest_step_log_with_cx`,
-/// `get_audit_actions_stream_with_cx`, `get_approval_token_with_cx`,
-/// `get_segments_with_cx`, `get_action_plan_with_cx`,
-/// `get_prepared_plan_with_cx`, `is_writable_with_cx`.
+/// `get_audit_actions_with_cx`, `get_audit_actions_stream_with_cx`,
+/// `get_approval_token_with_cx`, `get_segments_with_cx`,
+/// `get_action_plan_with_cx`, `get_prepared_plan_with_cx`,
+/// `is_writable_with_cx`.
 #[test]
 fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
     run_storage_async_test(async {
@@ -19847,40 +20072,109 @@ fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
         assert_eq!(latest.step_name, "step-zero");
         assert_eq!(latest.step_index, 0);
 
-        // 3. get_audit_actions_stream_with_cx — empty DB: default query
-        //    roundtrips to an empty page.
-        let stream = storage
-            .get_audit_actions_stream_with_cx(&cx, AuditStreamQuery::default())
+        let audit_id = storage
+            .record_audit_action_with_cx(
+                &cx,
+                AuditActionRecord {
+                    id: 0,
+                    ts: 1_700_000_000_050,
+                    actor_kind: "robot".to_string(),
+                    actor_id: Some("tick147".to_string()),
+                    correlation_id: Some("corr-tick147".to_string()),
+                    pane_id: Some(57),
+                    domain: Some("local".to_string()),
+                    action_kind: "send_text".to_string(),
+                    policy_decision: "allow".to_string(),
+                    decision_reason: Some("ok".to_string()),
+                    rule_id: Some("rule.tick147".to_string()),
+                    input_summary: Some("input".to_string()),
+                    verification_summary: Some("verified".to_string()),
+                    decision_context: Some("{\"kind\":\"test\"}".to_string()),
+                    result: "success".to_string(),
+                },
+            )
             .await
             .unwrap();
-        assert!(stream.records.is_empty());
 
-        // 4. get_approval_token_with_cx — no tokens, returns None.
+        // 3. get_audit_actions_with_cx — filtered query returns the seeded
+        //    audit row through the cx-first backend read path.
+        let audits = storage
+            .get_audit_actions_with_cx(
+                &cx,
+                AuditQuery {
+                    pane_id: Some(57),
+                    limit: Some(10),
+                    domain: Some("local".to_string()),
+                    actor_kind: Some("robot".to_string()),
+                    actor_id: Some("tick147".to_string()),
+                    correlation_id: Some("corr-tick147".to_string()),
+                    action_kind: Some("send_text".to_string()),
+                    policy_decision: Some("allow".to_string()),
+                    rule_id: Some("rule.tick147".to_string()),
+                    result: Some("success".to_string()),
+                    since: Some(1_700_000_000_000),
+                    until: Some(1_700_000_000_100),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].id, audit_id);
+
+        // 4. get_audit_actions_stream_with_cx — filtered query returns the
+        //    same seeded audit row through the cursor backend read path.
+        let stream = storage
+            .get_audit_actions_stream_with_cx(
+                &cx,
+                AuditStreamQuery {
+                    cursor: None,
+                    limit: Some(10),
+                    offset: None,
+                    pane_id: Some(57),
+                    domain: Some("local".to_string()),
+                    actor_kind: Some("robot".to_string()),
+                    actor_id: Some("tick147".to_string()),
+                    correlation_id: Some("corr-tick147".to_string()),
+                    action_kind: Some("send_text".to_string()),
+                    policy_decision: Some("allow".to_string()),
+                    rule_id: Some("rule.tick147".to_string()),
+                    result: Some("success".to_string()),
+                    since: Some(1_700_000_000_000),
+                    until: Some(1_700_000_000_100),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.records.len(), 1);
+        assert_eq!(stream.records[0].id, audit_id);
+        assert_eq!(stream.next_cursor, Some(audit_id));
+
+        // 5. get_approval_token_with_cx — no tokens, returns None.
         let token = storage
             .get_approval_token_with_cx(&cx, "nonexistent-hash")
             .await
             .unwrap();
         assert!(token.is_none());
 
-        // 5. get_segments_with_cx — no segments captured, empty list.
+        // 6. get_segments_with_cx — no segments captured, empty list.
         let segments = storage.get_segments_with_cx(&cx, 57, 10).await.unwrap();
         assert!(segments.is_empty());
 
-        // 6. get_action_plan_with_cx — no plan upserted, returns None.
+        // 7. get_action_plan_with_cx — no plan upserted, returns None.
         let plan = storage
             .get_action_plan_with_cx(&cx, "wf-tick147")
             .await
             .unwrap();
         assert!(plan.is_none());
 
-        // 7. get_prepared_plan_with_cx — likewise None.
+        // 8. get_prepared_plan_with_cx — likewise None.
         let prepared = storage
             .get_prepared_plan_with_cx(&cx, "plan-nonexistent")
             .await
             .unwrap();
         assert!(prepared.is_none());
 
-        // 8. is_writable_with_cx — writer thread up, expect true.
+        // 9. is_writable_with_cx — writer thread up, expect true.
         let writable = storage.is_writable_with_cx(&cx).await.unwrap();
         assert!(writable, "fresh storage should be writable");
 
