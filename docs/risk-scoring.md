@@ -180,6 +180,51 @@ Risk information appears in policy decision JSON:
 ft why denied --pane 3
 ```
 
+## Policy Recommendation Mode
+
+Recommendation mode is a dry-run receipt for Robot and MCP callers that need to
+ask "what should happen next?" without executing the action. It evaluates the
+normal policy gates without consuming rate-limit budget, then overlays current
+operator signals such as resource pressure, stale ownership, degraded Agent
+Mail, degraded RCH, and read-path redaction.
+
+Receipts use stable outcomes: `allow`, `deny`, `require_approval`, `delay`,
+`degrade`, and `ask_human`. They include reason codes and redacted evidence so
+automation can explain the recommendation without leaking pane text or command
+secrets.
+
+Approval previews in recommendation receipts are intentionally not approvals.
+`approval_preview.would_issue_token` is always `false`, and no allow-once code is
+created. To obtain a live approval token, rerun the separate mutating approval
+path; recommendation mode only reports that such a token would be required.
+
+Example receipt shape:
+
+```json
+{
+  "schema_version": 1,
+  "mode": "recommendation",
+  "dry_run": true,
+  "outcome": "require_approval",
+  "policy_decision": "require_approval",
+  "action": "close",
+  "actor": "robot",
+  "pane_id": 3,
+  "reason_codes": ["policy.destructive_action"],
+  "evidence": [
+    {"key": "policy_reason", "value": "Destructive action 'close' requires approval"}
+  ],
+  "approval_preview": {
+    "required": true,
+    "would_issue_token": false,
+    "token_status": "preview_only_not_issued",
+    "rule_id": "policy.destructive_action"
+  },
+  "redacted_evidence_fields": 0,
+  "summary": "robot may not close on pane 3 until the separate approval path issues a live token"
+}
+```
+
 ## Safety Guidelines
 
 **Do not blindly lower all risk thresholds.** The defaults are designed to prevent accidents.

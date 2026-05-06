@@ -1680,6 +1680,583 @@ impl PolicyDecision {
     }
 }
 
+/// Schema version for policy recommendation receipts.
+pub const POLICY_RECOMMENDATION_SCHEMA_VERSION: u32 = 1;
+
+/// Outcome returned by policy recommendation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRecommendationOutcome {
+    /// Candidate action is safe to run under current policy and signals.
+    Allow,
+    /// Candidate action is blocked by a hard policy deny.
+    Deny,
+    /// Candidate action needs the normal approval path before execution.
+    RequireApproval,
+    /// Candidate action should wait for resource pressure to clear.
+    Delay,
+    /// Candidate action can continue only with reduced fidelity or degraded infrastructure.
+    Degrade,
+    /// Candidate action needs an operator decision outside the allow-once token path.
+    AskHuman,
+}
+
+impl PolicyRecommendationOutcome {
+    /// Returns a stable string tag.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::RequireApproval => "require_approval",
+            Self::Delay => "delay",
+            Self::Degrade => "degrade",
+            Self::AskHuman => "ask_human",
+        }
+    }
+}
+
+/// Resource pressure signal consumed by policy recommendation mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRecommendationResourcePressure {
+    /// No meaningful pressure signal is present.
+    #[default]
+    Nominal,
+    /// Some subsystem is pressured, but execution can continue with caution.
+    Elevated,
+    /// Pressure is high enough that new work should be delayed.
+    Critical,
+}
+
+impl PolicyRecommendationResourcePressure {
+    /// Returns a stable string tag.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nominal => "nominal",
+            Self::Elevated => "elevated",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+/// Stale-ownership signal consumed by policy recommendation mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRecommendationOwnershipState {
+    /// Ownership is fresh or no ownership conflict is present.
+    #[default]
+    Fresh,
+    /// Existing ownership looks stale but not actively conflicting.
+    Stale,
+    /// Existing ownership conflicts with the candidate action.
+    Conflicting,
+    /// Ownership could not be resolved.
+    Unknown,
+}
+
+impl PolicyRecommendationOwnershipState {
+    /// Returns a stable string tag.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Conflicting => "conflicting",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Infrastructure health signal consumed by policy recommendation mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRecommendationInfrastructureState {
+    /// The infrastructure dependency is available.
+    #[default]
+    Available,
+    /// The dependency is reachable but degraded.
+    Degraded,
+    /// The dependency is unavailable.
+    Unavailable,
+}
+
+impl PolicyRecommendationInfrastructureState {
+    /// Returns a stable string tag.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Degraded => "degraded",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// Returns true when the dependency is degraded or unavailable.
+    #[must_use]
+    pub const fn is_degraded(self) -> bool {
+        !matches!(self, Self::Available)
+    }
+}
+
+/// External signals used to turn a policy preview into an operator recommendation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyRecommendationSignals {
+    /// Current resource pressure.
+    #[serde(default)]
+    pub resource_pressure: PolicyRecommendationResourcePressure,
+    /// Candidate action's ownership/liveness signal.
+    #[serde(default)]
+    pub ownership: PolicyRecommendationOwnershipState,
+    /// Agent Mail health signal.
+    #[serde(default)]
+    pub agent_mail: PolicyRecommendationInfrastructureState,
+    /// RCH/proof-lane health signal.
+    #[serde(default)]
+    pub rch: PolicyRecommendationInfrastructureState,
+}
+
+/// Redacted evidence item returned in a recommendation receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyRecommendationEvidence {
+    /// Stable evidence key.
+    pub key: String,
+    /// Redacted evidence value.
+    pub value: String,
+}
+
+impl PolicyRecommendationEvidence {
+    /// Create a recommendation evidence item.
+    #[must_use]
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// Approval-token preview metadata for recommendation mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyRecommendationApprovalPreview {
+    /// Whether current policy would require approval before live execution.
+    pub required: bool,
+    /// Recommendation mode never issues a live allow-once token.
+    pub would_issue_token: bool,
+    /// Token issuance status for stable machine parsing.
+    pub token_status: String,
+    /// Rule that would require approval, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// Human-readable approval reason, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Operator hint for the separate mutating approval path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_hint: Option<String>,
+}
+
+impl PolicyRecommendationApprovalPreview {
+    fn from_decision(decision: &PolicyDecision) -> Self {
+        let required = decision.requires_approval();
+        Self {
+            required,
+            would_issue_token: false,
+            token_status: if required {
+                "preview_only_not_issued".to_string()
+            } else {
+                "not_required".to_string()
+            },
+            rule_id: required.then(|| decision.rule_id()).flatten().map(str::to_string),
+            reason: required.then(|| decision.reason()).flatten().map(str::to_string),
+            command_hint: required.then(|| {
+                "Recommendation only: run the separate mutating approval path to issue an allow-once token.".to_string()
+            }),
+        }
+    }
+}
+
+/// Input to dry-run policy recommendation mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRecommendationRequest {
+    /// Candidate action to evaluate.
+    pub input: PolicyInput,
+    /// External pressure/ownership/infrastructure signals.
+    #[serde(default)]
+    pub signals: PolicyRecommendationSignals,
+    /// Caller-supplied evidence to include in the receipt after redaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<PolicyRecommendationEvidence>,
+}
+
+impl PolicyRecommendationRequest {
+    /// Create a recommendation request for a policy input.
+    #[must_use]
+    pub fn new(input: PolicyInput) -> Self {
+        Self {
+            input,
+            signals: PolicyRecommendationSignals::default(),
+            evidence: Vec::new(),
+        }
+    }
+
+    /// Attach external recommendation signals.
+    #[must_use]
+    pub fn with_signals(mut self, signals: PolicyRecommendationSignals) -> Self {
+        self.signals = signals;
+        self
+    }
+
+    /// Attach caller-supplied evidence.
+    #[must_use]
+    pub fn with_evidence(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.evidence
+            .push(PolicyRecommendationEvidence::new(key, value));
+        self
+    }
+}
+
+/// Deterministic dry-run policy recommendation receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyRecommendationReceipt {
+    /// Stable schema version for Robot/MCP-facing serialization.
+    pub schema_version: u32,
+    /// Mode marker. Always `recommendation`.
+    pub mode: String,
+    /// True because recommendation mode never executes the action.
+    pub dry_run: bool,
+    /// Final recommendation outcome after policy and external signals.
+    pub outcome: PolicyRecommendationOutcome,
+    /// Raw policy decision before recommendation overlays.
+    pub policy_decision: String,
+    /// Candidate action.
+    pub action: ActionKind,
+    /// Candidate actor.
+    pub actor: ActorKind,
+    /// Target pane, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    /// Target domain, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Stable reason codes explaining the outcome.
+    pub reason_codes: Vec<String>,
+    /// Redacted evidence fields.
+    pub evidence: Vec<PolicyRecommendationEvidence>,
+    /// Approval-token preview metadata. No token is issued in this mode.
+    pub approval_preview: PolicyRecommendationApprovalPreview,
+    /// Number of evidence values changed by redaction.
+    pub redacted_evidence_fields: usize,
+    /// Compact operator-facing summary.
+    pub summary: String,
+}
+
+impl PolicyRecommendationReceipt {
+    fn from_decision(
+        input: &PolicyInput,
+        decision: &PolicyDecision,
+        signals: &PolicyRecommendationSignals,
+        request_evidence: &[PolicyRecommendationEvidence],
+    ) -> Self {
+        let mut reason_codes = Vec::new();
+        let mut evidence = Vec::new();
+        let mut redacted_evidence_fields = 0;
+
+        let mut outcome = match decision {
+            PolicyDecision::Allow { .. } => PolicyRecommendationOutcome::Allow,
+            PolicyDecision::Deny { .. } => PolicyRecommendationOutcome::Deny,
+            PolicyDecision::RequireApproval { .. } => PolicyRecommendationOutcome::RequireApproval,
+        };
+
+        add_recommendation_reason_code(
+            &mut reason_codes,
+            decision.rule_id().unwrap_or("policy.default_allow"),
+        );
+
+        if let Some(reason) = decision.reason() {
+            push_recommendation_evidence(
+                &mut evidence,
+                "policy_reason",
+                reason,
+                &mut redacted_evidence_fields,
+            );
+        }
+
+        if let Some(context) = decision.context() {
+            if let Some(rule_id) = context.determining_rule.as_deref() {
+                add_recommendation_reason_code(&mut reason_codes, rule_id);
+            }
+            if let Some(summary) = context.text_summary.as_deref() {
+                push_recommendation_evidence(
+                    &mut evidence,
+                    "text_summary",
+                    summary,
+                    &mut redacted_evidence_fields,
+                );
+            }
+            for item in &context.evidence {
+                push_recommendation_evidence(
+                    &mut evidence,
+                    item.key.as_str(),
+                    item.value.as_str(),
+                    &mut redacted_evidence_fields,
+                );
+            }
+            if let Some(risk) = &context.risk {
+                push_recommendation_evidence(
+                    &mut evidence,
+                    "risk_score",
+                    risk.score.to_string(),
+                    &mut redacted_evidence_fields,
+                );
+                push_recommendation_evidence(
+                    &mut evidence,
+                    "risk_summary",
+                    &risk.summary,
+                    &mut redacted_evidence_fields,
+                );
+            }
+        }
+
+        for item in request_evidence {
+            push_recommendation_evidence(
+                &mut evidence,
+                item.key.as_str(),
+                item.value.as_str(),
+                &mut redacted_evidence_fields,
+            );
+        }
+
+        if !matches!(
+            signals.resource_pressure,
+            PolicyRecommendationResourcePressure::Nominal
+        ) {
+            push_recommendation_evidence(
+                &mut evidence,
+                "resource_pressure",
+                signals.resource_pressure.as_str(),
+                &mut redacted_evidence_fields,
+            );
+        }
+
+        if !matches!(signals.ownership, PolicyRecommendationOwnershipState::Fresh) {
+            push_recommendation_evidence(
+                &mut evidence,
+                "ownership",
+                signals.ownership.as_str(),
+                &mut redacted_evidence_fields,
+            );
+        }
+
+        if signals.agent_mail.is_degraded() {
+            push_recommendation_evidence(
+                &mut evidence,
+                "agent_mail",
+                signals.agent_mail.as_str(),
+                &mut redacted_evidence_fields,
+            );
+        }
+
+        if signals.rch.is_degraded() {
+            push_recommendation_evidence(
+                &mut evidence,
+                "rch",
+                signals.rch.as_str(),
+                &mut redacted_evidence_fields,
+            );
+        }
+
+        if !matches!(outcome, PolicyRecommendationOutcome::Deny) {
+            match signals.resource_pressure {
+                PolicyRecommendationResourcePressure::Nominal => {}
+                PolicyRecommendationResourcePressure::Elevated => {
+                    add_recommendation_reason_code(
+                        &mut reason_codes,
+                        "policy.recommendation.resource_pressure_degrade",
+                    );
+                    if matches!(
+                        outcome,
+                        PolicyRecommendationOutcome::Allow
+                            | PolicyRecommendationOutcome::RequireApproval
+                    ) {
+                        outcome = PolicyRecommendationOutcome::Degrade;
+                    }
+                }
+                PolicyRecommendationResourcePressure::Critical => {
+                    add_recommendation_reason_code(
+                        &mut reason_codes,
+                        "policy.recommendation.resource_pressure_delay",
+                    );
+                    outcome = PolicyRecommendationOutcome::Delay;
+                }
+            }
+
+            match signals.ownership {
+                PolicyRecommendationOwnershipState::Fresh => {}
+                PolicyRecommendationOwnershipState::Stale => {
+                    add_recommendation_reason_code(
+                        &mut reason_codes,
+                        "policy.recommendation.ownership_stale",
+                    );
+                    if input.action.is_mutating() {
+                        outcome = PolicyRecommendationOutcome::AskHuman;
+                    }
+                }
+                PolicyRecommendationOwnershipState::Conflicting => {
+                    add_recommendation_reason_code(
+                        &mut reason_codes,
+                        "policy.recommendation.ownership_conflict",
+                    );
+                    if input.action.is_mutating() {
+                        outcome = PolicyRecommendationOutcome::AskHuman;
+                    }
+                }
+                PolicyRecommendationOwnershipState::Unknown => {
+                    add_recommendation_reason_code(
+                        &mut reason_codes,
+                        "policy.recommendation.ownership_unknown",
+                    );
+                    if input.action.is_mutating() {
+                        outcome = PolicyRecommendationOutcome::AskHuman;
+                    }
+                }
+            }
+
+            if signals.agent_mail.is_degraded() {
+                add_recommendation_reason_code(
+                    &mut reason_codes,
+                    "policy.recommendation.agent_mail_degraded",
+                );
+                if decision.requires_approval() {
+                    outcome = PolicyRecommendationOutcome::AskHuman;
+                } else if matches!(outcome, PolicyRecommendationOutcome::Allow) {
+                    outcome = PolicyRecommendationOutcome::Degrade;
+                }
+            }
+
+            if signals.rch.is_degraded() {
+                add_recommendation_reason_code(
+                    &mut reason_codes,
+                    "policy.recommendation.rch_degraded",
+                );
+                if decision.rule_id() == Some(RCH_HEAVY_COMPUTE_RULE_ID) {
+                    outcome = PolicyRecommendationOutcome::AskHuman;
+                } else if matches!(outcome, PolicyRecommendationOutcome::Allow) {
+                    outcome = PolicyRecommendationOutcome::Degrade;
+                }
+            }
+
+            if matches!(
+                input.action,
+                ActionKind::ReadOutput | ActionKind::SearchOutput
+            ) && redacted_evidence_fields > 0
+            {
+                add_recommendation_reason_code(
+                    &mut reason_codes,
+                    "policy.recommendation.read_path_redacted",
+                );
+                if matches!(outcome, PolicyRecommendationOutcome::Allow) {
+                    outcome = PolicyRecommendationOutcome::Degrade;
+                }
+            }
+        }
+
+        let summary = policy_recommendation_summary(outcome, decision, input, signals);
+
+        Self {
+            schema_version: POLICY_RECOMMENDATION_SCHEMA_VERSION,
+            mode: "recommendation".to_string(),
+            dry_run: true,
+            outcome,
+            policy_decision: decision.as_str().to_string(),
+            action: input.action,
+            actor: input.actor,
+            pane_id: input.pane_id,
+            domain: input.domain.clone(),
+            reason_codes,
+            evidence,
+            approval_preview: PolicyRecommendationApprovalPreview::from_decision(decision),
+            redacted_evidence_fields,
+            summary,
+        }
+    }
+}
+
+fn add_recommendation_reason_code(codes: &mut Vec<String>, code: impl Into<String>) {
+    let code = code.into();
+    if !code.is_empty() && !codes.contains(&code) {
+        codes.push(code);
+    }
+}
+
+fn push_recommendation_evidence(
+    evidence: &mut Vec<PolicyRecommendationEvidence>,
+    key: impl Into<String>,
+    value: impl AsRef<str>,
+    redacted_evidence_fields: &mut usize,
+) {
+    let original = value.as_ref();
+    let redacted = redact_recommendation_value(original);
+    if redacted != original {
+        *redacted_evidence_fields += 1;
+    }
+    evidence.push(PolicyRecommendationEvidence::new(key, redacted));
+}
+
+fn redact_recommendation_value(value: &str) -> String {
+    static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
+    REDACTOR.redact(value)
+}
+
+fn policy_recommendation_summary(
+    outcome: PolicyRecommendationOutcome,
+    decision: &PolicyDecision,
+    input: &PolicyInput,
+    signals: &PolicyRecommendationSignals,
+) -> String {
+    let target = input.pane_id.map_or_else(
+        || "no pane".to_string(),
+        |pane_id| format!("pane {pane_id}"),
+    );
+    match outcome {
+        PolicyRecommendationOutcome::Allow => {
+            format!(
+                "{} may {} on {target}; no approval token would be issued in recommendation mode",
+                input.actor.as_str(),
+                input.action.as_str()
+            )
+        }
+        PolicyRecommendationOutcome::Deny => format!(
+            "{} must not {} on {target}: {}",
+            input.actor.as_str(),
+            input.action.as_str(),
+            decision.reason().unwrap_or("blocked by policy")
+        ),
+        PolicyRecommendationOutcome::RequireApproval => format!(
+            "{} may not {} on {target} until the separate approval path issues a live token",
+            input.actor.as_str(),
+            input.action.as_str()
+        ),
+        PolicyRecommendationOutcome::Delay => format!(
+            "{} should delay {} on {target}; resource pressure is {}",
+            input.actor.as_str(),
+            input.action.as_str(),
+            signals.resource_pressure.as_str()
+        ),
+        PolicyRecommendationOutcome::Degrade => format!(
+            "{} may {} on {target} only with degraded fidelity or infrastructure",
+            input.actor.as_str(),
+            input.action.as_str()
+        ),
+        PolicyRecommendationOutcome::AskHuman => format!(
+            "{} should ask a human before {} on {target}; recommendation mode cannot resolve this safely",
+            input.actor.as_str(),
+            input.action.as_str()
+        ),
+    }
+}
+
 // ============================================================================
 // Policy Input
 // ============================================================================
@@ -5321,6 +5898,26 @@ impl PolicyEngine {
         decision
     }
 
+    /// Build a dry-run recommendation receipt without executing the action.
+    ///
+    /// This evaluates the same policy gates as [`Self::authorize_preview`]
+    /// without consuming rate-limit budget and without appending a decision-log
+    /// entry. The returned receipt is intended for Robot/MCP surfaces that need
+    /// to explain what would happen before any live action or approval-token
+    /// issuance occurs.
+    pub fn recommend(
+        &mut self,
+        request: &PolicyRecommendationRequest,
+    ) -> PolicyRecommendationReceipt {
+        let decision = self.evaluate_authorization(&request.input, None, None, false);
+        PolicyRecommendationReceipt::from_decision(
+            &request.input,
+            &decision,
+            &request.signals,
+            &request.evidence,
+        )
+    }
+
     /// Drop all rate-limit state for the given pane (ft-yjt9e).
     ///
     /// Forwards to [`RateLimiter::remove_pane`] on the engine's inner
@@ -8841,6 +9438,217 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
         assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
+    }
+
+    #[test]
+    fn policy_recommendation_allows_safe_read_without_approval_token() {
+        let mut engine = PolicyEngine::permissive();
+        let request = PolicyRecommendationRequest::new(
+            PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+                .with_surface(PolicySurface::Robot)
+                .with_pane(7)
+                .with_domain("local"),
+        );
+
+        let receipt = engine.recommend(&request);
+
+        assert_eq!(receipt.schema_version, POLICY_RECOMMENDATION_SCHEMA_VERSION);
+        assert_eq!(receipt.mode, "recommendation");
+        assert!(receipt.dry_run);
+        assert_eq!(receipt.outcome, PolicyRecommendationOutcome::Allow);
+        assert_eq!(receipt.policy_decision, "allow");
+        assert!(!receipt.approval_preview.required);
+        assert!(!receipt.approval_preview.would_issue_token);
+        assert_eq!(receipt.approval_preview.token_status, "not_required");
+        assert_eq!(engine.decision_log().len(), 0);
+    }
+
+    #[test]
+    fn policy_recommendation_denies_destructive_command() {
+        let mut engine = PolicyEngine::permissive();
+        let request = PolicyRecommendationRequest::new(
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_surface(PolicySurface::Robot)
+                .with_pane(1)
+                .with_capabilities(PaneCapabilities::prompt())
+                .with_text_summary("rm -rf /")
+                .with_command_text("rm -rf /"),
+        );
+
+        let receipt = engine.recommend(&request);
+
+        assert_eq!(receipt.outcome, PolicyRecommendationOutcome::Deny);
+        assert_eq!(receipt.policy_decision, "deny");
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| code == "command.rm_rf_root")
+        );
+        assert!(!receipt.approval_preview.required);
+        assert!(!receipt.approval_preview.would_issue_token);
+        assert_eq!(engine.decision_log().len(), 0);
+    }
+
+    #[test]
+    fn policy_recommendation_previews_approval_without_issuing_token() {
+        let mut engine = PolicyEngine::permissive();
+        let request = PolicyRecommendationRequest::new(
+            PolicyInput::new(ActionKind::Close, ActorKind::Robot)
+                .with_surface(PolicySurface::Robot)
+                .with_pane(3),
+        );
+
+        let receipt = engine.recommend(&request);
+
+        assert_eq!(
+            receipt.outcome,
+            PolicyRecommendationOutcome::RequireApproval
+        );
+        assert_eq!(receipt.policy_decision, "require_approval");
+        assert!(receipt.approval_preview.required);
+        assert!(!receipt.approval_preview.would_issue_token);
+        assert_eq!(
+            receipt.approval_preview.token_status,
+            "preview_only_not_issued"
+        );
+        assert_eq!(
+            receipt.approval_preview.rule_id.as_deref(),
+            Some("policy.destructive_action")
+        );
+        assert!(receipt.approval_preview.command_hint.is_some());
+        assert_eq!(engine.decision_log().len(), 0);
+    }
+
+    #[test]
+    fn policy_recommendation_delays_under_resource_pressure() {
+        let mut engine = PolicyEngine::permissive();
+        let signals = PolicyRecommendationSignals {
+            resource_pressure: PolicyRecommendationResourcePressure::Critical,
+            ..PolicyRecommendationSignals::default()
+        };
+        let request = PolicyRecommendationRequest::new(
+            PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+                .with_surface(PolicySurface::Robot)
+                .with_pane(9),
+        )
+        .with_signals(signals);
+
+        let receipt = engine.recommend(&request);
+
+        assert_eq!(receipt.outcome, PolicyRecommendationOutcome::Delay);
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| code == "policy.recommendation.resource_pressure_delay")
+        );
+        assert!(
+            receipt
+                .evidence
+                .iter()
+                .any(|item| item.key == "resource_pressure" && item.value == "critical")
+        );
+    }
+
+    #[test]
+    fn policy_recommendation_degrades_for_agent_mail_and_rch_infrastructure() {
+        let mut engine = PolicyEngine::permissive();
+        let signals = PolicyRecommendationSignals {
+            agent_mail: PolicyRecommendationInfrastructureState::Degraded,
+            rch: PolicyRecommendationInfrastructureState::Unavailable,
+            ..PolicyRecommendationSignals::default()
+        };
+        let request = PolicyRecommendationRequest::new(
+            PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+                .with_surface(PolicySurface::Robot)
+                .with_pane(11),
+        )
+        .with_signals(signals);
+
+        let receipt = engine.recommend(&request);
+
+        assert_eq!(receipt.outcome, PolicyRecommendationOutcome::Degrade);
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| code == "policy.recommendation.agent_mail_degraded")
+        );
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| code == "policy.recommendation.rch_degraded")
+        );
+        assert!(
+            receipt
+                .evidence
+                .iter()
+                .any(|item| item.key == "agent_mail" && item.value == "degraded")
+        );
+        assert!(
+            receipt
+                .evidence
+                .iter()
+                .any(|item| item.key == "rch" && item.value == "unavailable")
+        );
+    }
+
+    #[test]
+    fn policy_recommendation_redacts_robot_json_evidence() {
+        let mut engine = PolicyEngine::permissive();
+        let secret = "sk-svcacct-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let request = PolicyRecommendationRequest::new(
+            PolicyInput::new(ActionKind::SearchOutput, ActorKind::Robot)
+                .with_surface(PolicySurface::Robot)
+                .with_text_summary(format!("search output contained {secret}")),
+        )
+        .with_evidence("pane_tail", format!("OPENAI_API_KEY={secret}"));
+
+        let receipt = engine.recommend(&request);
+        let json = serde_json::to_string(&receipt).expect("recommendation receipt json");
+
+        assert_eq!(receipt.outcome, PolicyRecommendationOutcome::Degrade);
+        assert!(receipt.redacted_evidence_fields >= 2, "{receipt:#?}");
+        assert!(!json.contains("sk-svcacct-aBcDeFg"));
+        assert!(json.contains("[REDACTED"), "{json}");
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| code == "policy.recommendation.read_path_redacted")
+        );
+    }
+
+    #[cfg(feature = "mcp-server")]
+    #[test]
+    fn policy_recommendation_receipt_round_trips_through_toon() {
+        let mut engine = PolicyEngine::permissive();
+        let request = PolicyRecommendationRequest::new(
+            PolicyInput::new(ActionKind::Close, ActorKind::Robot)
+                .with_surface(PolicySurface::Robot)
+                .with_pane(3),
+        );
+        let receipt = engine.recommend(&request);
+        let json_value = serde_json::to_value(&receipt).expect("recommendation receipt value");
+
+        let toon = toon_rust::encode(json_value.clone(), None);
+        let decoded = toon_rust::try_decode(&toon, None).expect("decode recommendation toon");
+        let json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+        let roundtripped: serde_json::Value =
+            serde_json::from_str(&json).expect("recommendation toon json");
+
+        assert_eq!(roundtripped["mode"], json_value["mode"]);
+        assert_eq!(roundtripped["outcome"], json_value["outcome"]);
+        assert_eq!(
+            roundtripped["approval_preview"]["would_issue_token"],
+            json_value["approval_preview"]["would_issue_token"]
+        );
+        assert_eq!(
+            roundtripped["reason_codes"][0],
+            json_value["reason_codes"][0]
+        );
     }
 
     #[test]
