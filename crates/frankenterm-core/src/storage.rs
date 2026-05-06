@@ -5238,9 +5238,11 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_scan_segments(&conn, &query)
+            // br-ft-l1jgo: trait-typed pooled_backend scan path (was direct
+            // PooledReadConn::acquire + query_scan_segments).
+            pooled_backend(db_path.as_str(), |backend| {
+                query_scan_segments_backend(backend, &query)
+            })
         })
         .await
     }
@@ -17443,6 +17445,67 @@ fn build_segment_scan_where(
     (where_clause, params)
 }
 
+fn build_segment_scan_backend_where(
+    query: &SegmentScanQuery,
+    time_column: &str,
+) -> Result<(String, Vec<ToSqlValue<'static>>)> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<ToSqlValue<'static>> = Vec::new();
+
+    if let Some(after_id) = query.after_id {
+        clauses.push(format!("id > ?{}", params.len() + 1));
+        params.push(ToSqlValue::Integer(after_id));
+    }
+    if let Some(pane_id) = query.pane_id {
+        clauses.push(format!("pane_id = ?{}", params.len() + 1));
+        params.push(ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?));
+    }
+    if let Some(since) = query.since {
+        clauses.push(format!("{time_column} >= ?{}", params.len() + 1));
+        params.push(ToSqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        clauses.push(format!("{time_column} <= ?{}", params.len() + 1));
+        params.push(ToSqlValue::Integer(until));
+    }
+
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+
+    Ok((where_clause, params))
+}
+
+fn query_scan_segments_backend(
+    backend: &dyn StorageBackend,
+    query: &SegmentScanQuery,
+) -> Result<Vec<Segment>> {
+    let (where_clause, mut params) = build_segment_scan_backend_where(query, "captured_at")?;
+    let limit = if query.limit == 0 { 1_000 } else { query.limit };
+    let limit_i64 = usize_to_i64(limit, "limit")?;
+    let sql = format!(
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+         FROM output_segments{where_clause}
+         ORDER BY id ASC
+         LIMIT ?{}",
+        params.len() + 1
+    );
+    params.push(ToSqlValue::Integer(limit_i64));
+
+    let rows = backend
+        .query_map_cells(&sql, &params)
+        .map_err(|err| storage_backend_error("Query scan segments", err))?;
+
+    rows.iter()
+        .map(|row| segment_from_backend_cells(row))
+        .collect()
+}
+
+/// Direct-rusqlite path. Kept for transitional fallback while
+/// [`query_scan_segments_backend`] settles in (br-ft-l1jgo).
+#[allow(dead_code)]
 fn query_scan_segments(conn: &Connection, query: &SegmentScanQuery) -> Result<Vec<Segment>> {
     let (where_clause, params) = build_segment_scan_where(query, "captured_at");
     let limit = if query.limit == 0 { 1_000 } else { query.limit };
@@ -20589,6 +20652,47 @@ fn storage_tick120_hot_path_siblings_roundtrip() {
             .await
             .unwrap();
         assert!(segments.is_empty());
+
+        let seg_a = storage
+            .append_segment_with_cx(&cx, 1, "tick120-scan-a", None)
+            .await
+            .unwrap();
+        let seg_b = storage
+            .append_segment_with_cx(&cx, 1, "tick120-scan-b", None)
+            .await
+            .unwrap();
+        let scanned = storage
+            .scan_segments_with_cx(
+                &cx,
+                SegmentScanQuery {
+                    after_id: Some(0),
+                    pane_id: Some(1),
+                    since: None,
+                    until: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned[0].id, seg_a.id);
+        assert_eq!(scanned[1].id, seg_b.id);
+
+        let after_first = storage
+            .scan_segments_with_cx(
+                &cx,
+                SegmentScanQuery {
+                    after_id: Some(seg_a.id),
+                    pane_id: Some(1),
+                    since: None,
+                    until: None,
+                    limit: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].id, seg_b.id);
 
         // 6. get_accounts_by_service_with_cx — empty on fresh DB.
         let accts = storage
