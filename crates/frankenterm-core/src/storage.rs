@@ -3592,8 +3592,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            get_fts_index_state_sync(&conn)
+            pooled_backend(db_path.as_str(), get_fts_index_state_backend)
         })
         .await
     }
