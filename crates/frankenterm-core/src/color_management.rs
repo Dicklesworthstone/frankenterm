@@ -160,12 +160,13 @@ fn srgb_decode(c: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn srgb_encode(linear: f64) -> f64 {
     let l = linear.clamp(0.0, 1.0);
     if l <= 0.003_130_8 {
         l * 12.92
     } else {
-        1.055 * l.powf(1.0 / 2.4) - 0.055
+        1.055_f64.mul_add(l.powf(1.0 / 2.4), -0.055)
     }
 }
 
@@ -180,9 +181,9 @@ fn srgb_encode(linear: f64) -> f64 {
 /// 3x3 matrix multiplication helper.
 fn mul3(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+        m[0][2].mul_add(v[2], m[0][1].mul_add(v[1], m[0][0] * v[0])),
+        m[1][2].mul_add(v[2], m[1][1].mul_add(v[1], m[1][0] * v[0])),
+        m[2][2].mul_add(v[2], m[2][1].mul_add(v[1], m[2][0] * v[0])),
     ]
 }
 
@@ -232,13 +233,17 @@ fn xyz_to_lab(xyz: [f64; 3]) -> [f64; 3] {
         if t > EPSILON {
             t.cbrt()
         } else {
-            (KAPPA * t + 16.0) / 116.0
+            KAPPA.mul_add(t, 16.0) / 116.0
         }
     }
     let fx = f(xyz[0] / XN);
     let fy = f(xyz[1] / YN);
     let fz = f(xyz[2] / ZN);
-    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+    [
+        116.0_f64.mul_add(fy, -16.0),
+        500.0 * (fx - fy),
+        200.0 * (fy - fz),
+    ]
 }
 
 /// Compute the CIE Lab coordinates of a `Color`.
@@ -272,20 +277,20 @@ fn delta_e_2000_lab(lab1: [f64; 3], lab2: [f64; 3]) -> f64 {
     let (l1, a1, b1) = (lab1[0], lab1[1], lab1[2]);
     let (l2, a2, b2) = (lab2[0], lab2[1], lab2[2]);
 
-    let avg_l = (l1 + l2) / 2.0;
-    let c1 = (a1 * a1 + b1 * b1).sqrt();
-    let c2 = (a2 * a2 + b2 * b2).sqrt();
-    let avg_c = (c1 + c2) / 2.0;
+    let average_lightness = l1.midpoint(l2);
+    let c1 = a1.hypot(b1);
+    let c2 = a2.hypot(b2);
+    let average_chroma = c1.midpoint(c2);
 
-    let pow7_avg_c = avg_c.powi(7);
+    let pow7_avg_c = average_chroma.powi(7);
     let pow7_25 = 25f64.powi(7);
     let g = 0.5 * (1.0 - (pow7_avg_c / (pow7_avg_c + pow7_25)).sqrt());
 
     let a1p = (1.0 + g) * a1;
     let a2p = (1.0 + g) * a2;
-    let c1p = (a1p * a1p + b1 * b1).sqrt();
-    let c2p = (a2p * a2p + b2 * b2).sqrt();
-    let avg_cp = (c1p + c2p) / 2.0;
+    let c1p = a1p.hypot(b1);
+    let c2p = a2p.hypot(b2);
+    let average_prime_chroma = c1p.midpoint(c2p);
 
     let h1p = if b1 == 0.0 && a1p == 0.0 {
         0.0
@@ -298,10 +303,10 @@ fn delta_e_2000_lab(lab1: [f64; 3], lab2: [f64; 3]) -> f64 {
         b2.atan2(a2p).to_degrees().rem_euclid(360.0)
     };
 
-    let delta_lp = l2 - l1;
-    let delta_cp = c2p - c1p;
+    let delta_lightness = l2 - l1;
+    let delta_chroma = c2p - c1p;
 
-    let delta_hp = if c1p * c2p == 0.0 {
+    let delta_hue_angle = if c1p * c2p == 0.0 {
         0.0
     } else {
         let raw = h2p - h1p;
@@ -313,42 +318,50 @@ fn delta_e_2000_lab(lab1: [f64; 3], lab2: [f64; 3]) -> f64 {
             raw + 360.0
         }
     };
-    let delta_hp_capital = 2.0 * (c1p * c2p).sqrt() * (delta_hp.to_radians() / 2.0).sin();
+    let delta_hue = 2.0 * (c1p * c2p).sqrt() * (delta_hue_angle.to_radians() / 2.0).sin();
 
-    let avg_hp = if c1p * c2p == 0.0 {
+    let average_prime_hue = if c1p * c2p == 0.0 {
         h1p + h2p
     } else if (h1p - h2p).abs() <= 180.0 {
-        (h1p + h2p) / 2.0
+        h1p.midpoint(h2p)
     } else if h1p + h2p < 360.0 {
-        (h1p + h2p + 360.0) / 2.0
+        (h1p + h2p).midpoint(360.0)
     } else {
-        (h1p + h2p - 360.0) / 2.0
+        (h1p + h2p).midpoint(-360.0)
     };
 
-    let t = 1.0 - 0.17 * ((avg_hp - 30.0).to_radians()).cos()
-        + 0.24 * (2.0 * avg_hp.to_radians()).cos()
-        + 0.32 * ((3.0 * avg_hp + 6.0).to_radians()).cos()
-        - 0.20 * ((4.0 * avg_hp - 63.0).to_radians()).cos();
+    let average_prime_hue_radians = average_prime_hue.to_radians();
+    let t = (-0.20_f64).mul_add(
+        4.0_f64.mul_add(average_prime_hue, -63.0).to_radians().cos(),
+        0.32_f64.mul_add(
+            3.0_f64.mul_add(average_prime_hue, 6.0).to_radians().cos(),
+            0.24_f64.mul_add(
+                (2.0 * average_prime_hue_radians).cos(),
+                (-0.17_f64).mul_add((average_prime_hue - 30.0).to_radians().cos(), 1.0),
+            ),
+        ),
+    );
 
-    let delta_theta = 30.0 * (-(((avg_hp - 275.0) / 25.0).powi(2))).exp();
-    let pow7_avg_cp = avg_cp.powi(7);
+    let delta_theta = 30.0 * (-(((average_prime_hue - 275.0) / 25.0).powi(2))).exp();
+    let pow7_avg_cp = average_prime_chroma.powi(7);
     let rc = 2.0 * (pow7_avg_cp / (pow7_avg_cp + pow7_25)).sqrt();
-    let sl = 1.0 + (0.015 * (avg_l - 50.0).powi(2)) / (20.0 + (avg_l - 50.0).powi(2)).sqrt();
-    let sc = 1.0 + 0.045 * avg_cp;
-    let sh = 1.0 + 0.015 * avg_cp * t;
+    let lightness_offset_sq = (average_lightness - 50.0).powi(2);
+    let sl =
+        (0.015 * lightness_offset_sq).mul_add((20.0 + lightness_offset_sq).sqrt().recip(), 1.0);
+    let sc = 0.045_f64.mul_add(average_prime_chroma, 1.0);
+    let sh = (0.015 * average_prime_chroma).mul_add(t, 1.0);
     let rt = -(2.0 * delta_theta.to_radians()).sin() * rc;
 
     let kl = 1.0;
     let kc = 1.0;
     let kh = 1.0;
 
-    let term_l = delta_lp / (kl * sl);
-    let term_c = delta_cp / (kc * sc);
-    let term_h = delta_hp_capital / (kh * sh);
+    let term_l = delta_lightness / (kl * sl);
+    let term_c = delta_chroma / (kc * sc);
+    let term_h = delta_hue / (kh * sh);
 
-    (term_l * term_l + term_c * term_c + term_h * term_h + rt * term_c * term_h)
-        .max(0.0)
-        .sqrt()
+    let squared_terms = term_h.mul_add(term_h, term_c.mul_add(term_c, term_l * term_l));
+    rt.mul_add(term_c * term_h, squared_terms).max(0.0).sqrt()
 }
 
 // ============================================================================

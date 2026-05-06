@@ -122,6 +122,9 @@ pub enum RuntimeOperationSource {
     /// The hot-reload/config watch channel has no active receivers.
     #[error("watch channel closed")]
     WatchChannelClosed,
+    /// Backend-specific failure details when no stronger typed source exists yet.
+    #[error("{0}")]
+    Backend(String),
     /// Operation was cancelled with backend-specific context.
     #[error("cancelled: {0}")]
     Cancelled(String),
@@ -235,6 +238,7 @@ pub enum Error {
 
 impl Error {
     /// Return remediation guidance when available.
+    #[allow(deprecated)]
     #[must_use]
     pub fn remediation(&self) -> Option<Remediation> {
         match self {
@@ -266,6 +270,12 @@ impl Error {
                 .command("Status", "ft status")
                 .command("Diagnostics", "ft doctor")
                 .alternative("If the runtime is shutting down, restart `ft watch` before retrying."),
+                RuntimeOperationSource::Backend(_) => Remediation::new(format!(
+                    "Runtime operation '{operation}' failed in the backend."
+                ))
+                .command("Status", "ft status")
+                .command("Diagnostics", "ft doctor")
+                .alternative("Retry after the backend/runtime state is healthy."),
                 RuntimeOperationSource::Cancelled(_) => Remediation::new(format!(
                     "Runtime operation '{operation}' was cancelled before completion."
                 ))
@@ -326,6 +336,7 @@ impl Error {
     }
 
     /// Classify this error using the network reliability taxonomy.
+    #[allow(deprecated)]
     #[must_use]
     pub fn error_kind(&self) -> crate::network_reliability::NetworkErrorKind {
         use crate::network_reliability::NetworkErrorKind;

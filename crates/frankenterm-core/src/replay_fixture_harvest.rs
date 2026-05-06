@@ -40,6 +40,13 @@ const FTREPLAY_FOOTER_SECTION: &str = "--- ftreplay-footer ---";
 const DUPLICATE_OVERLAP_THRESHOLD: f64 = 0.90;
 const DEFAULT_MAX_EVENTS_PER_CHUNK: usize = 100_000;
 
+fn fixture_harvest_error(message: impl Into<String>) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation: "replay_fixture_harvest",
+        source: crate::error::RuntimeOperationSource::Backend(message.into()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarvestSourceType {
@@ -178,14 +185,14 @@ pub struct ReplayArtifact {
 impl ReplayArtifact {
     pub fn validate(&self) -> crate::Result<()> {
         if self.schema_version != REPLAY_FIXTURE_HARVEST_SCHEMA_VERSION {
-            return Err(crate::Error::Runtime(format!(
+            return Err(fixture_harvest_error(format!(
                 "unsupported replay fixture schema '{}'",
                 self.schema_version
             )));
         }
 
         if self.metadata.event_count != self.events.len() {
-            return Err(crate::Error::Runtime(format!(
+            return Err(fixture_harvest_error(format!(
                 "event count mismatch: metadata={}, actual={}",
                 self.metadata.event_count,
                 self.events.len()
@@ -194,7 +201,7 @@ impl ReplayArtifact {
 
         let pane_count = unique_pane_count(&self.events);
         if pane_count != self.metadata.pane_count {
-            return Err(crate::Error::Runtime(format!(
+            return Err(fixture_harvest_error(format!(
                 "pane count mismatch: metadata={}, actual={pane_count}",
                 self.metadata.pane_count
             )));
@@ -202,7 +209,7 @@ impl ReplayArtifact {
 
         let decision_count = count_decisions(&self.events);
         if decision_count != self.metadata.decision_count {
-            return Err(crate::Error::Runtime(format!(
+            return Err(fixture_harvest_error(format!(
                 "decision count mismatch: metadata={}, actual={decision_count}",
                 self.metadata.decision_count
             )));
@@ -210,7 +217,7 @@ impl ReplayArtifact {
 
         let checksum = checksum_events(&self.events)?;
         if checksum != self.metadata.checksum_sha256 {
-            return Err(crate::Error::Runtime(format!(
+            return Err(fixture_harvest_error(format!(
                 "checksum mismatch: metadata={}, actual={checksum}",
                 self.metadata.checksum_sha256
             )));
@@ -454,7 +461,7 @@ impl FixtureHarvester {
     pub fn harvest(&self, source: HarvestSource) -> crate::Result<ReplayArtifact> {
         let source_path = source.path().to_path_buf();
         if !source_path.exists() {
-            return Err(crate::Error::Runtime(format!(
+            return Err(fixture_harvest_error(format!(
                 "harvest source path not found: {}",
                 source_path.display()
             )));
@@ -462,7 +469,7 @@ impl FixtureHarvester {
 
         let mut events = parse_events_from_source(&source_path)?;
         if events.is_empty() {
-            return Err(crate::Error::Runtime(format!(
+            return Err(fixture_harvest_error(format!(
                 "harvest source had no recorder events: {}",
                 source_path.display()
             )));
@@ -573,7 +580,7 @@ impl HarvestSourceFilter {
         match flag {
             "all" => Ok(Self::All),
             "incident-only" => Ok(Self::IncidentOnly),
-            other => Err(crate::Error::Runtime(format!(
+            other => Err(fixture_harvest_error(format!(
                 "invalid harvest filter '{other}', expected 'all' or 'incident-only'"
             ))),
         }
@@ -1014,7 +1021,7 @@ impl SchemaMigrator {
         let chain_indices = self
             .resolve_chain_indices(from_version, target_version)
             .ok_or_else(|| {
-                crate::Error::Runtime(format!(
+                fixture_harvest_error(format!(
                     "no migration path from '{}' to '{}'",
                     from_version, target_version
                 ))
@@ -1135,14 +1142,14 @@ impl ArtifactReader {
     pub fn open(&self, path: &Path) -> crate::Result<FtreplayArtifact> {
         let payload = read_ftreplay_payload(path)?;
         let text = std::str::from_utf8(&payload).map_err(|err| {
-            crate::Error::Runtime(format!(
+            fixture_harvest_error(format!(
                 "failed to decode artifact {} as UTF-8: {err}",
                 path.display()
             ))
         })?;
         let sections = parse_ftreplay_sections(text)?;
         let header: serde_json::Value = serde_json::from_str(&sections.header).map_err(|err| {
-            crate::Error::Runtime(format!(
+            fixture_harvest_error(format!(
                 "failed to parse ftreplay header JSON in {}: {err}",
                 path.display()
             ))
@@ -1151,7 +1158,7 @@ impl ArtifactReader {
             .get("schema_version")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
-                crate::Error::Runtime(format!(
+                fixture_harvest_error(format!(
                     "ftreplay header in {} is missing schema_version",
                     path.display()
                 ))
@@ -1159,7 +1166,7 @@ impl ArtifactReader {
 
         let compatibility = self.compatibility_checker.check(artifact_version);
         if let ArtifactCompatibility::Incompatible { reason } = &compatibility {
-            return Err(crate::Error::Runtime(reason.clone()));
+            return Err(fixture_harvest_error(reason.clone()));
         }
 
         let validation_report = validate_ftreplay_payload_for_schema(&payload, artifact_version)?;
@@ -1203,7 +1210,7 @@ impl ArtifactReader {
     pub fn stream_events(&self, path: &Path) -> crate::Result<ArtifactEventStream> {
         let payload = read_ftreplay_payload(path)?;
         let text = std::str::from_utf8(&payload).map_err(|err| {
-            crate::Error::Runtime(format!(
+            fixture_harvest_error(format!(
                 "failed to decode artifact {} as UTF-8: {err}",
                 path.display()
             ))
@@ -1214,7 +1221,7 @@ impl ArtifactReader {
             .get("schema_version")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
-                crate::Error::Runtime(format!(
+                fixture_harvest_error(format!(
                     "ftreplay header in {} is missing schema_version",
                     path.display()
                 ))
@@ -1223,13 +1230,13 @@ impl ArtifactReader {
         match self.compatibility_checker.check(artifact_version) {
             ArtifactCompatibility::Exact => {}
             ArtifactCompatibility::MigrationAvailable { chain } => {
-                return Err(crate::Error::Runtime(format!(
+                return Err(fixture_harvest_error(format!(
                     "streaming mode requires exact schema compatibility; migration chain [{}] available. Use ArtifactReader::open for in-memory migration.",
                     chain.join(", ")
                 )));
             }
             ArtifactCompatibility::Incompatible { reason } => {
-                return Err(crate::Error::Runtime(reason));
+                return Err(fixture_harvest_error(reason));
             }
         }
 
@@ -1317,7 +1324,7 @@ fn parse_json_value_lines(
         .enumerate()
         .map(|(index, line)| {
             serde_json::from_str::<serde_json::Value>(line).map_err(|err| {
-                crate::Error::Runtime(format!(
+                fixture_harvest_error(format!(
                     "failed to parse {} JSON line {} in {}: {err}",
                     section_name,
                     index + 1,
@@ -1360,7 +1367,7 @@ impl HarvestPipeline {
         filter: HarvestSourceFilter,
     ) -> crate::Result<HarvestReport> {
         if !source_dir.is_dir() {
-            return Err(crate::Error::Runtime(format!(
+            return Err(fixture_harvest_error(format!(
                 "source directory does not exist or is not a directory: {}",
                 source_dir.display()
             )));
@@ -1544,7 +1551,7 @@ fn parse_events_from_jsonl(path: &Path) -> crate::Result<Vec<RecorderEvent>> {
             continue;
         }
         let parsed = parse_recorder_event_json(trimmed).map_err(|err| {
-            crate::Error::Runtime(format!(
+            fixture_harvest_error(format!(
                 "failed to parse recorder event at {}:{}: {err}",
                 path.display(),
                 line_idx + 1
@@ -1559,7 +1566,7 @@ fn parse_events_from_jsonl(path: &Path) -> crate::Result<Vec<RecorderEvent>> {
 fn parse_events_from_json(path: &Path) -> crate::Result<Vec<RecorderEvent>> {
     let raw = fs::read_to_string(path)?;
     let value: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
-        crate::Error::Runtime(format!(
+        fixture_harvest_error(format!(
             "failed to parse JSON source {}: {err}",
             path.display()
         ))
@@ -1581,7 +1588,7 @@ fn parse_events_from_json_value(
         return Ok(events);
     }
 
-    Err(crate::Error::Runtime(format!(
+    Err(fixture_harvest_error(format!(
         "JSON source {} must be an event array or {{\"events\": [...]}}",
         path.display()
     )))
@@ -1590,7 +1597,7 @@ fn parse_events_from_json_value(
 fn parse_events_from_ftreplay(path: &Path) -> crate::Result<Vec<RecorderEvent>> {
     let payload = read_ftreplay_payload(path)?;
     let text = String::from_utf8(payload).map_err(|err| {
-        crate::Error::Runtime(format!(
+        fixture_harvest_error(format!(
             "failed to decode ftreplay payload as UTF-8 ({}): {err}",
             path.display()
         ))
@@ -1607,7 +1614,7 @@ fn parse_events_from_ftreplay(path: &Path) -> crate::Result<Vec<RecorderEvent>> 
     }
 
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-        crate::Error::Runtime(format!(
+        fixture_harvest_error(format!(
             "failed to parse ftreplay source {}: {err}",
             path.display()
         ))
@@ -1658,7 +1665,7 @@ fn parse_ftreplay_sections(payload: &str) -> crate::Result<ParsedFtreplaySection
                         current = ParsedSection::AfterFooter;
                         continue;
                     }
-                    return Err(crate::Error::Runtime(format!(
+                    return Err(fixture_harvest_error(format!(
                         "unknown ftreplay section marker '{}' at line {}",
                         line,
                         line_idx + 1
@@ -1667,14 +1674,14 @@ fn parse_ftreplay_sections(payload: &str) -> crate::Result<ParsedFtreplaySection
             };
 
             if i8::try_from(rank).unwrap_or_default() <= last_section_rank {
-                return Err(crate::Error::Runtime(format!(
+                return Err(fixture_harvest_error(format!(
                     "duplicate or out-of-order ftreplay section marker '{}' at line {}",
                     line,
                     line_idx + 1
                 )));
             }
             if i8::try_from(rank).unwrap_or_default() > last_section_rank + 1 {
-                return Err(crate::Error::Runtime(format!(
+                return Err(fixture_harvest_error(format!(
                     "missing ftreplay section before '{}' at line {}",
                     line,
                     line_idx + 1
@@ -1689,7 +1696,7 @@ fn parse_ftreplay_sections(payload: &str) -> crate::Result<ParsedFtreplaySection
         match current {
             ParsedSection::Header => {
                 if !parsed.header.is_empty() {
-                    return Err(crate::Error::Runtime(
+                    return Err(fixture_harvest_error(
                         "ftreplay header must be a single JSON line".to_string(),
                     ));
                 }
@@ -1700,7 +1707,7 @@ fn parse_ftreplay_sections(payload: &str) -> crate::Result<ParsedFtreplaySection
             ParsedSection::Decisions => parsed.decisions.push(line.to_string()),
             ParsedSection::Footer => {
                 if !parsed.footer.is_empty() {
-                    return Err(crate::Error::Runtime(
+                    return Err(fixture_harvest_error(
                         "ftreplay footer must be a single JSON line".to_string(),
                     ));
                 }
@@ -1709,7 +1716,7 @@ fn parse_ftreplay_sections(payload: &str) -> crate::Result<ParsedFtreplaySection
             }
             ParsedSection::AfterFooter => {}
             ParsedSection::None => {
-                return Err(crate::Error::Runtime(format!(
+                return Err(fixture_harvest_error(format!(
                     "unexpected content before ftreplay header at line {}",
                     line_idx + 1
                 )));
@@ -1718,7 +1725,7 @@ fn parse_ftreplay_sections(payload: &str) -> crate::Result<ParsedFtreplaySection
     }
 
     if last_section_rank != 4 || parsed.header.is_empty() || parsed.footer.is_empty() {
-        return Err(crate::Error::Runtime(
+        return Err(fixture_harvest_error(
             "ftreplay payload missing required sections".to_string(),
         ));
     }
@@ -1732,7 +1739,7 @@ fn parse_timeline_line_to_event(
     line: &str,
 ) -> crate::Result<RecorderEvent> {
     parse_recorder_event_json(line).map_err(|err| {
-        crate::Error::Runtime(format!(
+        fixture_harvest_error(format!(
             "failed to parse ftreplay timeline event at {}:{}: {err}",
             path.display(),
             line_idx
@@ -1765,13 +1772,13 @@ fn write_chunked_ftreplay(
     compression: ArtifactCompression,
 ) -> crate::Result<ArtifactWriteResult> {
     if max_events_per_chunk == 0 {
-        return Err(crate::Error::Runtime(
+        return Err(fixture_harvest_error(
             "max_events_per_chunk must be greater than zero".to_string(),
         ));
     }
 
     let output_dir = artifact_path.parent().ok_or_else(|| {
-        crate::Error::Runtime(format!(
+        fixture_harvest_error(format!(
             "artifact path has no parent directory: {}",
             artifact_path.display()
         ))
@@ -2205,7 +2212,7 @@ fn validate_ftreplay_payload_for_schema(
     expected_schema_version: &str,
 ) -> crate::Result<FtreplayValidationReport> {
     let text = std::str::from_utf8(raw).map_err(|err| {
-        crate::Error::Runtime(format!("ftreplay payload is not valid UTF-8: {err}"))
+        fixture_harvest_error(format!("ftreplay payload is not valid UTF-8: {err}"))
     })?;
     let sections = parse_ftreplay_sections(text)?;
 
@@ -2215,7 +2222,7 @@ fn validate_ftreplay_payload_for_schema(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     if schema_version != expected_schema_version {
-        return Err(crate::Error::Runtime(format!(
+        return Err(fixture_harvest_error(format!(
             "unsupported ftreplay schema version '{schema_version}' (expected '{expected_schema_version}')"
         )));
     }
@@ -2228,19 +2235,19 @@ fn validate_ftreplay_payload_for_schema(
         .pointer("/integrity/timeline_sha256")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            crate::Error::Runtime("ftreplay header missing integrity.timeline_sha256".to_string())
+            fixture_harvest_error("ftreplay header missing integrity.timeline_sha256".to_string())
         })?;
     let expected_decisions_sha = header
         .pointer("/integrity/decisions_sha256")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            crate::Error::Runtime("ftreplay header missing integrity.decisions_sha256".to_string())
+            fixture_harvest_error("ftreplay header missing integrity.decisions_sha256".to_string())
         })?;
     let expected_entities_sha = header
         .pointer("/integrity/entities_sha256")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            crate::Error::Runtime("ftreplay header missing integrity.entities_sha256".to_string())
+            fixture_harvest_error("ftreplay header missing integrity.entities_sha256".to_string())
         })?;
 
     let actual_timeline_sha = checksum_lines(&sections.timeline);
@@ -2250,7 +2257,7 @@ fn validate_ftreplay_payload_for_schema(
         || expected_decisions_sha != actual_decisions_sha
         || expected_entities_sha != actual_entities_sha
     {
-        return Err(crate::Error::Runtime(
+        return Err(fixture_harvest_error(
             "ftreplay integrity mismatch detected".to_string(),
         ));
     }
@@ -2274,7 +2281,7 @@ fn validate_ftreplay_payload_for_schema(
         || header_decision_count != decision_count
         || header_entity_count != entity_count
     {
-        return Err(crate::Error::Runtime(format!(
+        return Err(fixture_harvest_error(format!(
             "ftreplay content count mismatch: header=({header_event_count},{header_decision_count},{header_entity_count}) actual=({event_count},{decision_count},{entity_count})"
         )));
     }
@@ -2285,7 +2292,7 @@ fn validate_ftreplay_payload_for_schema(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     if footer_schema_version != expected_schema_version {
-        return Err(crate::Error::Runtime(format!(
+        return Err(fixture_harvest_error(format!(
             "ftreplay footer schema version mismatch: footer='{footer_schema_version}', expected='{expected_schema_version}'"
         )));
     }
@@ -2309,7 +2316,7 @@ fn validate_ftreplay_payload_for_schema(
         || footer_decision_count != decision_count
         || footer_entity_count != entity_count
     {
-        return Err(crate::Error::Runtime(format!(
+        return Err(fixture_harvest_error(format!(
             "ftreplay footer count mismatch: footer=({footer_event_count},{footer_decision_count},{footer_entity_count}) actual=({event_count},{decision_count},{entity_count})"
         )));
     }
