@@ -110,7 +110,7 @@ impl RobotFormatPreference {
 }
 
 /// Compression/capture profile selected for one robot or capture request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateDistortionProfile {
     /// Stable profile identifier for logs and golden evidence.
     pub id: String,
@@ -326,13 +326,11 @@ pub struct DistortionMetrics {
 
 impl DistortionMetrics {
     fn correctness_floor_violation(&self, budget: &RateDistortionBudget) -> f64 {
-        (budget.min_pattern_recall - self.pattern_recall)
-            .max(0.0)
-            .mul_add(
-                7.0,
-                (budget.min_search_recall - self.search_recall).max(0.0) * 3.0,
-            )
-            + (budget.min_replay_fidelity - self.replay_fidelity).max(0.0) * 4.0
+        let pattern_violation = (budget.min_pattern_recall - self.pattern_recall).max(0.0);
+        let search_violation = (budget.min_search_recall - self.search_recall).max(0.0);
+        let replay_violation = (budget.min_replay_fidelity - self.replay_fidelity).max(0.0);
+
+        pattern_violation.mul_add(7.0, search_violation.mul_add(3.0, replay_violation * 4.0))
     }
 }
 
@@ -606,23 +604,37 @@ impl RateDistortionController {
         let replay_loss = (1.0 - metrics.replay_fidelity).max(0.0);
         let context_loss = (1.0 - metrics.context_recall).max(0.0);
 
-        let correctness =
-            self.config.pattern_weight * (1.0 + pressure.incident_risk) * pattern_loss
-                + self.config.search_weight * (1.0 + pressure.search_pressure) * search_loss
-                + self.config.replay_weight * (1.0 + pressure.replay_pressure) * replay_loss
-                + self.config.context_weight * context_loss;
+        let pattern_weight = self.config.pattern_weight * (1.0 + pressure.incident_risk);
+        let search_weight = self.config.search_weight * (1.0 + pressure.search_pressure);
+        let replay_weight = self.config.replay_weight * (1.0 + pressure.replay_pressure);
+        let correctness = pattern_loss.mul_add(
+            pattern_weight,
+            search_loss.mul_add(
+                search_weight,
+                replay_loss.mul_add(replay_weight, self.config.context_weight * context_loss),
+            ),
+        );
 
-        let resources = self.config.token_weight * (1.0 + pressure.context_pressure) * token_ratio
-            + self.config.cpu_weight * cpu_ratio
-            + self.config.memory_weight * memory_ratio
-            + self.config.latency_weight * latency_ratio;
+        let token_weight = self.config.token_weight * (1.0 + pressure.context_pressure);
+        let resources = token_ratio.mul_add(
+            token_weight,
+            cpu_ratio.mul_add(
+                self.config.cpu_weight,
+                memory_ratio.mul_add(
+                    self.config.memory_weight,
+                    self.config.latency_weight * latency_ratio,
+                ),
+            ),
+        );
 
-        correctness + resources + metrics.correctness_floor_violation(budget) * 100.0
+        metrics
+            .correctness_floor_violation(budget)
+            .mul_add(100.0, correctness + resources)
     }
 }
 
 /// Reduction output for one pane transcript.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptReduction {
     /// Reduced text to emit.
     pub text: String,
@@ -869,8 +881,8 @@ fn search_recall(
         _ => 1.0,
     };
     let char_factor = (profile.search_excerpt_chars.min(512) as f64 / 512.0).max(0.25);
-    let body = retained_fraction * 0.45 + excerpt_factor * char_factor * 0.55;
-    (body + search_pressure.clamp(0.0, 1.0) * 0.04).min(1.0)
+    let body = retained_fraction.mul_add(0.45, excerpt_factor * char_factor * 0.55);
+    search_pressure.clamp(0.0, 1.0).mul_add(0.04, body).min(1.0)
 }
 
 fn replay_fidelity(profile: &RateDistortionProfile, replay_pressure: f64) -> f64 {
@@ -887,7 +899,10 @@ fn replay_fidelity(profile: &RateDistortionProfile, replay_pressure: f64) -> f64
     } else {
         0.0
     };
-    (base + context_bonus + hash_bonus + replay_pressure.clamp(0.0, 1.0) * 0.02).min(1.0)
+    replay_pressure
+        .clamp(0.0, 1.0)
+        .mul_add(0.02, base + context_bonus + hash_bonus)
+        .min(1.0)
 }
 
 fn context_recall(profile: &RateDistortionProfile, retained_fraction: f64) -> f64 {
