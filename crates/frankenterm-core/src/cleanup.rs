@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::StorageConfig;
+use crate::error::RuntimeOperationSource;
 use crate::storage::{StorageHandle, now_ms};
 
 /// Per-table cleanup counts for preview and apply results.
@@ -31,6 +32,13 @@ pub struct CleanupPlan {
 
 /// Batch size for apply-mode deletions to avoid long-running transactions.
 const DELETE_BATCH_SIZE: usize = 5000;
+
+fn cleanup_cancelled(operation: &'static str, err: impl std::fmt::Display) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(err.to_string()),
+    }
+}
 
 /// Preview what would be cleaned up (dry-run).
 ///
@@ -126,7 +134,7 @@ pub async fn cleanup_preview_with_cx(
     config: &StorageConfig,
 ) -> crate::Result<CleanupPlan> {
     cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("cleanup_preview cancelled: {err}")))?;
+        .map_err(|err| cleanup_cancelled("cleanup_preview", err))?;
 
     let now = now_ms();
     let global_cutoff_ms = retention_cutoff_ms(now, config.retention_days);
@@ -144,11 +152,8 @@ pub async fn cleanup_preview_with_cx(
     plan.tables.extend(events_summaries);
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "cleanup_preview cancelled before output_segments: {err}"
-            ))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_preview.output_segments", err))?;
         let count = storage
             .count_segments_before_with_cx(cx, global_cutoff_ms)
             .await?;
@@ -162,11 +167,8 @@ pub async fn cleanup_preview_with_cx(
     }
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "cleanup_preview cancelled before audit_actions: {err}"
-            ))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_preview.audit_actions", err))?;
         let count = storage
             .count_audit_actions_before_with_cx(cx, global_cutoff_ms)
             .await?;
@@ -180,11 +182,8 @@ pub async fn cleanup_preview_with_cx(
     }
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "cleanup_preview cancelled before usage_metrics: {err}"
-            ))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_preview.usage_metrics", err))?;
         let count = storage
             .count_usage_metrics_before_with_cx(cx, global_cutoff_ms)
             .await?;
@@ -198,11 +197,8 @@ pub async fn cleanup_preview_with_cx(
     }
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "cleanup_preview cancelled before notification_history: {err}"
-            ))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_preview.notification_history", err))?;
         let count = storage
             .count_notification_history_before_with_cx(cx, global_cutoff_ms)
             .await?;
@@ -346,7 +342,7 @@ pub async fn cleanup_apply_with_cx(
     config: &StorageConfig,
 ) -> crate::Result<CleanupPlan> {
     cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("cleanup_apply cancelled: {err}")))?;
+        .map_err(|err| cleanup_cancelled("cleanup_apply", err))?;
 
     let now = now_ms();
     let global_cutoff_ms = retention_cutoff_ms(now, config.retention_days);
@@ -365,11 +361,8 @@ pub async fn cleanup_apply_with_cx(
     plan.tables.extend(events_summaries);
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "cleanup_apply cancelled before output_segments: {err}"
-            ))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_apply.output_segments", err))?;
         let count = storage
             .count_segments_before_with_cx(cx, global_cutoff_ms)
             .await?;
@@ -387,11 +380,8 @@ pub async fn cleanup_apply_with_cx(
     }
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "cleanup_apply cancelled before audit_actions: {err}"
-            ))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_apply.audit_actions", err))?;
         let count = storage
             .count_audit_actions_before_with_cx(cx, global_cutoff_ms)
             .await?;
@@ -409,11 +399,8 @@ pub async fn cleanup_apply_with_cx(
     }
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "cleanup_apply cancelled before usage_metrics: {err}"
-            ))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_apply.usage_metrics", err))?;
         let count = storage
             .count_usage_metrics_before_with_cx(cx, global_cutoff_ms)
             .await?;
@@ -431,11 +418,8 @@ pub async fn cleanup_apply_with_cx(
     }
 
     if config.retention_days > 0 {
-        cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "cleanup_apply cancelled before notification_history: {err}"
-            ))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| cleanup_cancelled("cleanup_apply.notification_history", err))?;
         let count = storage
             .count_notification_history_before_with_cx(cx, global_cutoff_ms)
             .await?;
@@ -793,6 +777,22 @@ mod tests {
         assert!(json.contains("\"total_eligible\": 210"));
         assert!(json.contains("\"total_deleted\": 210"));
         assert!(json.contains("\"dry_run\": false"));
+    }
+
+    #[test]
+    fn cleanup_cancelled_uses_structured_runtime_operation_error() {
+        let err = cleanup_cancelled("cleanup_preview.output_segments", "caller cancelled");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "cleanup_preview.output_segments");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected structured cleanup cancellation error, got {other:?}"),
+        }
     }
 
     // ---------------------------------------------------------------
