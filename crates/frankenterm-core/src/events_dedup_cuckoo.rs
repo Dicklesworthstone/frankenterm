@@ -158,9 +158,9 @@ impl EventCuckooDedup {
     /// VecDeque of (key, recorded_at) pairs; periodically pop entries
     /// older than the window + call `forget()` on each.
     ///
-    /// Cuckoo filter `delete()` is exact for true-positive entries
-    /// + may incorrectly delete a different entry whose fingerprint
-    /// collides with the requested key.
+    /// Cuckoo filter `delete()` is exact for true-positive entries and may
+    /// incorrectly delete a different entry whose fingerprint collides with the
+    /// requested key.
     /// In dedup terms: forgetting key A may also forget unrelated
     /// key B that shares A's fingerprint. This is acceptable for
     /// high-volume events (B's next observation is treated as `New`
