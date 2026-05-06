@@ -7,8 +7,16 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::error::RuntimeOperationSource;
 use crate::rulesets::RulesetProfileSummary;
 use crate::storage::{PaneBookmarkRecord, SavedSearchRecord, StorageHandle};
+
+fn ui_query_cancelled_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
 
 /// Bookmark data prepared for UI rendering.
 #[derive(Debug, Clone, Serialize)]
@@ -118,8 +126,12 @@ pub async fn list_pane_bookmarks_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
 ) -> crate::Result<Vec<PaneBookmarkView>> {
-    cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("list_pane_bookmarks cancelled: {err}")))?;
+    cx.checkpoint().map_err(|err| {
+        ui_query_cancelled_error(
+            "ui_query.list_pane_bookmarks.pre_flight",
+            format!("pre-flight checkpoint failed: {err}"),
+        )
+    })?;
     let records = storage.list_pane_bookmarks_with_cx(cx).await?;
     Ok(records.into_iter().map(PaneBookmarkView::from).collect())
 }
@@ -140,8 +152,12 @@ pub async fn list_saved_searches_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
 ) -> crate::Result<Vec<SavedSearchView>> {
-    cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("list_saved_searches cancelled: {err}")))?;
+    cx.checkpoint().map_err(|err| {
+        ui_query_cancelled_error(
+            "ui_query.list_saved_searches.pre_flight",
+            format!("pre-flight checkpoint failed: {err}"),
+        )
+    })?;
     let records = storage.list_saved_searches_with_cx(cx).await?;
     Ok(records.into_iter().map(SavedSearchView::from).collect())
 }
@@ -192,6 +208,22 @@ pub fn resolve_ruleset_profile_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_query_cancelled_error_uses_structured_runtime_operation() {
+        let err = ui_query_cancelled_error("ui_query.test_checkpoint", "caller cancelled");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "ui_query.test_checkpoint");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
+        }
+    }
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         let now = std::time::SystemTime::now()
