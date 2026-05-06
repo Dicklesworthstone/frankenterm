@@ -42,7 +42,7 @@ impl EmbedServer {
         self.worker.processed()
     }
 
-    /// Process a single request (stub).
+    /// Process a single request in-process.
     pub fn handle(&self, request: DaemonRequest) -> DaemonResponse {
         match request {
             DaemonRequest::Ping => DaemonResponse::Pong,
