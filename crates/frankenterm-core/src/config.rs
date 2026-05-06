@@ -1375,7 +1375,7 @@ impl StorageConfig {
 
         if self.recorder_backend == crate::recorder_storage::RecorderBackendKind::FrankenSqlite {
             return Err(
-                "storage.recorder_backend=frankensqlite is not supported in this build; use append_log"
+                "storage.recorder_backend=frankensqlite is not yet implemented; use append_log"
                     .to_string(),
             );
         }
@@ -6719,7 +6719,7 @@ log_level = "debug"
     }
 
     #[test]
-    fn storage_recorder_backend_toml_accepts_frankensqlite_and_legacy_alias() {
+    fn storage_recorder_backend_toml_rejects_frankensqlite_and_legacy_alias() {
         let err = Config::from_toml(
             r#"
 [storage]
@@ -6728,7 +6728,7 @@ recorder_backend = "frankensqlite"
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("frankensqlite backend not yet implemented"));
+        assert!(err.contains("frankensqlite recorder backend is not yet implemented"));
         assert!(err.contains("append_log"));
 
         let legacy = Config::from_toml(
@@ -6739,7 +6739,7 @@ recorder_backend = "franken_sqlite"
         )
         .unwrap_err()
         .to_string();
-        assert!(legacy.contains("frankensqlite backend not yet implemented"));
+        assert!(legacy.contains("frankensqlite recorder backend is not yet implemented"));
         assert!(legacy.contains("append_log"));
     }
 

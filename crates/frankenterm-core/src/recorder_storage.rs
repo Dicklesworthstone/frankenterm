@@ -48,17 +48,10 @@ impl<'de> Deserialize<'de> for RecorderBackendKind {
     {
         match String::deserialize(deserializer)?.as_str() {
             "append_log" => Ok(Self::AppendLog),
-            "frankensqlite" | "franken_sqlite" => {
-                if cfg!(feature = "frankensqlite-recorder") {
-                    Ok(Self::FrankenSqlite)
-                } else {
-                    Err(D::Error::custom(
-                        "frankensqlite recorder backend is not compiled in \
-                         (enable the `frankensqlite-recorder` cargo feature), \
-                         or select `append_log` instead",
-                    ))
-                }
-            }
+            "frankensqlite" | "franken_sqlite" => Err(D::Error::custom(
+                "frankensqlite recorder backend is not yet implemented; \
+                 select `append_log` instead",
+            )),
             other => Err(D::Error::unknown_variant(
                 other,
                 &["append_log", "frankensqlite"],
