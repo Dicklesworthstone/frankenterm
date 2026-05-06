@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::WeztermError;
+use crate::error::{RuntimeOperationSource, WeztermError};
 use crate::policy::{PolicyEngine, PolicyGatedInjector};
 use crate::storage::{ActionHistoryQuery, ActionUndoRecord, StorageHandle};
 use crate::wezterm::WeztermHandle;
@@ -15,6 +15,13 @@ use crate::workflows::{
     CxPolicyInjector, PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner, WorkflowRunnerConfig,
 };
 use crate::{Error, Result};
+
+fn undo_cancelled_error(operation: &'static str, detail: impl Into<String>) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
 
 /// Outcome classification for undo execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,8 +270,12 @@ impl UndoExecutor {
         cx: &crate::cx::Cx,
         request: UndoRequest,
     ) -> Result<UndoExecutionResult> {
-        cx.checkpoint()
-            .map_err(|err| Error::Runtime(format!("undo.execute cancelled pre-start: {err}")))?;
+        cx.checkpoint().map_err(|err| {
+            undo_cancelled_error(
+                "undo.execute.pre_start",
+                format!("pre-start checkpoint failed: {err}"),
+            )
+        })?;
 
         // ft-xbnl0.2.3 tick 130: route through cx-first storage.
         let mut history = self
@@ -291,10 +302,13 @@ impl UndoExecutor {
         };
 
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!(
-                "undo.execute cancelled between get_action_history and get_action_undo (action_id={}): {err}",
-                request.action_id
-            ))
+            undo_cancelled_error(
+                "undo.execute.after_action_history",
+                format!(
+                    "between get_action_history and get_action_undo for action_id={}: {err}",
+                    request.action_id
+                ),
+            )
         })?;
 
         let Some(undo) = self
@@ -338,10 +352,13 @@ impl UndoExecutor {
         }
 
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!(
-                "undo.execute cancelled before strategy dispatch (action_id={}, strategy={}): {err}",
-                request.action_id, undo.undo_strategy
-            ))
+            undo_cancelled_error(
+                "undo.execute.before_strategy_dispatch",
+                format!(
+                    "before strategy dispatch for action_id={} strategy={}: {err}",
+                    request.action_id, undo.undo_strategy
+                ),
+            )
         })?;
 
         match undo.undo_strategy.as_str() {
@@ -618,9 +635,10 @@ impl UndoExecutor {
         };
 
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!(
-                "undo.execute_pane_close cancelled before get_pane_with_cx (pane_id={pane_id}): {err}"
-            ))
+            undo_cancelled_error(
+                "undo.execute_pane_close.before_get_pane",
+                format!("before get_pane_with_cx for pane_id={pane_id}: {err}"),
+            )
         })?;
 
         match self.wezterm.get_pane_with_cx(cx, pane_id).await {
@@ -648,9 +666,10 @@ impl UndoExecutor {
         }
 
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!(
-                "undo.execute_pane_close cancelled before kill_pane_with_cx (pane_id={pane_id}): {err}"
-            ))
+            undo_cancelled_error(
+                "undo.execute_pane_close.before_kill_pane",
+                format!("before kill_pane_with_cx for pane_id={pane_id}: {err}"),
+            )
         })?;
 
         match self.wezterm.kill_pane_with_cx(cx, pane_id).await {
@@ -848,6 +867,22 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn undo_cancelled_error_uses_structured_runtime_operation() {
+        let err = undo_cancelled_error("undo.test_checkpoint", "caller cancelled");
+
+        match err {
+            Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "undo.test_checkpoint");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
         }
     }
 
