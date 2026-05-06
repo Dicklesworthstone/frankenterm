@@ -41,6 +41,7 @@ workspace = true
 #   replay_provenance
 #   replay_remediation
 #   replay_report
+#   replay_resource_digital_twin
 #   replay_risk_scoring
 #   replay_robot
 #   replay_scenario_matrix

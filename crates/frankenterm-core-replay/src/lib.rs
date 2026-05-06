@@ -29,6 +29,7 @@ pub mod replay_post_incident;
 pub mod replay_provenance;
 pub mod replay_remediation;
 pub mod replay_report;
+pub mod replay_resource_digital_twin;
 pub mod replay_risk_scoring;
 pub mod replay_robot;
 pub mod replay_scenario_matrix;
