@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::error::RuntimeOperationSource;
 use crate::storage::SCHEMA_VERSION;
 use crate::{Error, Result};
 
@@ -279,6 +280,13 @@ fn parse_cron_field(raw: &str, min: u32, max: u32) -> Result<Option<u32>> {
     Ok(Some(value))
 }
 
+fn backup_schedule_runtime_error(operation: &'static str, detail: &'static str) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Backend(detail.to_string()),
+    }
+}
+
 fn next_hourly(now: DateTime<Local>, minute: u32) -> Result<DateTime<Local>> {
     if minute > 59 {
         return Err(Error::Config(crate::error::ConfigError::ParseError(
@@ -291,7 +299,12 @@ fn next_hourly(now: DateTime<Local>, minute: u32) -> Result<DateTime<Local>> {
         .with_minute(minute)
         .and_then(|t| t.with_second(0))
         .and_then(|t| t.with_nanosecond(0))
-        .ok_or_else(|| Error::Runtime("Failed to compute hourly schedule time".to_string()))?;
+        .ok_or_else(|| {
+            backup_schedule_runtime_error(
+                "backup.schedule.next_hourly",
+                "failed to compute hourly schedule time",
+            )
+        })?;
 
     if candidate_utc <= now_utc {
         candidate_utc += ChronoDuration::hours(1);
@@ -320,8 +333,12 @@ fn next_daily(now: DateTime<Local>, hour: u32, minute: u32) -> Result<DateTime<L
     }
     // Try tomorrow.
     let tomorrow = now + ChronoDuration::days(1);
-    let candidate = try_date(tomorrow)
-        .ok_or_else(|| Error::Runtime("Failed to compute daily schedule time".to_string()))?;
+    let candidate = try_date(tomorrow).ok_or_else(|| {
+        backup_schedule_runtime_error(
+            "backup.schedule.next_daily",
+            "failed to compute daily schedule time",
+        )
+    })?;
     Ok(candidate)
 }
 
@@ -347,13 +364,23 @@ fn next_weekly(
     let mut candidate = now
         .date_naive()
         .and_hms_opt(hour, minute, 0)
-        .ok_or_else(|| Error::Runtime("Failed to compute weekly schedule time".to_string()))?;
+        .ok_or_else(|| {
+            backup_schedule_runtime_error(
+                "backup.schedule.next_weekly",
+                "failed to compute weekly schedule time",
+            )
+        })?;
     candidate += ChronoDuration::days(days_ahead);
     // Use `earliest()` to handle ambiguous DST fall-back times (picks first occurrence).
     let candidate = Local
         .from_local_datetime(&candidate)
         .earliest()
-        .ok_or_else(|| Error::Runtime("Failed to localize weekly schedule time".to_string()))?;
+        .ok_or_else(|| {
+            backup_schedule_runtime_error(
+                "backup.schedule.localize_weekly",
+                "failed to localize weekly schedule time",
+            )
+        })?;
 
     if candidate <= now {
         return Ok(candidate + ChronoDuration::days(7));
@@ -370,8 +397,9 @@ fn next_cron(now: DateTime<Local>, cron: &CronSchedule) -> Result<DateTime<Local
             return Ok(candidate);
         }
     }
-    Err(Error::Runtime(
-        "Failed to find next cron run within 366 days".to_string(),
+    Err(backup_schedule_runtime_error(
+        "backup.schedule.next_cron",
+        "failed to find next cron run within 366 days",
     ))
 }
 
