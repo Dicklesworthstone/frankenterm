@@ -28,7 +28,18 @@ use crate::runtime_async::{Semaphore, sleep};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::error::RuntimeOperationSource;
 use crate::wezterm::WeztermHandle;
+
+fn restore_scrollback_cancelled_error(
+    operation: &'static str,
+    detail: impl Into<String>,
+) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
 
 // =============================================================================
 // Configuration
@@ -291,18 +302,22 @@ impl ScrollbackInjector {
     /// restorations where each pane may emit many chunks with
     /// inter-chunk sleeps.
     ///
-    /// On cancellation the method returns the partial
-    /// `InjectionReport` gathered so far — panes that have not
-    /// yet been processed are simply absent from the result, so
-    /// callers can inspect what did land before shutdown.
+    /// Pre-flight and inter-pane cancellation return a structured
+    /// runtime error before more panes are touched. Per-pane
+    /// injection failures are still captured in the partial
+    /// `InjectionReport` gathered so far.
     pub async fn inject_with_cx(
         &self,
         cx: &crate::cx::Cx,
         pane_id_map: &HashMap<u64, u64>,
         scrollbacks: &HashMap<u64, ScrollbackData>,
     ) -> crate::Result<InjectionReport> {
-        cx.checkpoint()
-            .map_err(|err| crate::Error::Runtime(format!("inject cancelled: {err}")))?;
+        cx.checkpoint().map_err(|err| {
+            restore_scrollback_cancelled_error(
+                "restore_scrollback.inject.pre_flight",
+                format!("pre-flight checkpoint failed: {err}"),
+            )
+        })?;
 
         let mut report = InjectionReport::default();
 
@@ -323,7 +338,10 @@ impl ScrollbackInjector {
 
         for (old_id, scrollback) in scrollbacks {
             cx.checkpoint().map_err(|err| {
-                crate::Error::Runtime(format!("inject cancelled between panes: {err}"))
+                restore_scrollback_cancelled_error(
+                    "restore_scrollback.inject.between_panes",
+                    format!("checkpoint before old pane {old_id} failed: {err}"),
+                )
             })?;
 
             let new_id = match pane_id_map.get(old_id) {
@@ -455,10 +473,13 @@ impl ScrollbackInjector {
 
         for (i, chunk) in chunks.iter().enumerate() {
             cx.checkpoint().map_err(|err| {
-                crate::Error::Runtime(format!(
-                    "inject_pane cancelled at chunk {i}/{total} for new pane {new_pane_id}: {err}",
-                    total = chunks.len()
-                ))
+                restore_scrollback_cancelled_error(
+                    "restore_scrollback.inject_pane.chunk_checkpoint",
+                    format!(
+                        "chunk {i}/{total} checkpoint for new pane {new_pane_id} failed: {err}",
+                        total = chunks.len()
+                    ),
+                )
             })?;
             self.wezterm
                 .send_text_with_cx(cx, new_pane_id, chunk)
@@ -611,6 +632,25 @@ mod tests {
 
     fn mock_scrollback(lines: Vec<&str>) -> ScrollbackData {
         ScrollbackData::from_segments(lines.into_iter().map(String::from).collect())
+    }
+
+    #[test]
+    fn restore_scrollback_cancelled_error_uses_structured_runtime_operation() {
+        let err = restore_scrollback_cancelled_error(
+            "restore_scrollback.test_checkpoint",
+            "caller cancelled",
+        );
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "restore_scrollback.test_checkpoint");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
+        }
     }
 
     // --- ScrollbackData ---
