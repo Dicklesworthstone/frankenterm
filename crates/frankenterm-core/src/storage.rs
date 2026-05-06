@@ -4776,20 +4776,21 @@ impl StorageHandle {
         let query_vector = query_vector.to_vec();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            hybrid_search_with_results_sync(
-                &conn,
-                &query,
-                &options,
-                &embedder_id,
-                &query_vector,
-                mode,
-                rrf_k,
-                lexical_weight,
-                semantic_weight,
-                fusion_backend,
-                &semantic_budget_state,
-            )
+            pooled_backend(db_path.as_str(), |backend| {
+                hybrid_search_with_results_backend(
+                    backend,
+                    &query,
+                    &options,
+                    &embedder_id,
+                    &query_vector,
+                    mode,
+                    rrf_k,
+                    lexical_weight,
+                    semantic_weight,
+                    fusion_backend,
+                    &semantic_budget_state,
+                )
+            })
         })
         .await
     }
@@ -14172,6 +14173,7 @@ struct SemanticLaneResolution {
     backoff_until_ms: Option<i64>,
 }
 
+#[allow(dead_code)]
 fn search_semantic_sync_with_scan_limit(
     conn: &Connection,
     embedder_id: &str,
@@ -14367,6 +14369,142 @@ fn search_semantic_backend_with_scan_limit(
     Ok((hits, rows_scanned))
 }
 
+fn resolve_semantic_lane_backend(
+    backend: &dyn StorageBackend,
+    options: &SearchOptions,
+    embedder_id: &str,
+    query_vector: &[f32],
+    requested_mode: SearchMode,
+    semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
+) -> Result<SemanticLaneResolution> {
+    if !matches!(requested_mode, SearchMode::Hybrid | SearchMode::Semantic) {
+        return Ok(SemanticLaneResolution {
+            hits: Vec::new(),
+            unavailable_reason: None,
+            cache_hit: false,
+            latency_ms: 0,
+            rows_scanned: 0,
+            budget_state: "disabled".to_string(),
+            backoff_until_ms: None,
+        });
+    }
+
+    if query_vector.is_empty() {
+        if let Ok(mut state) = semantic_budget_state.lock() {
+            state.note_semantic_fallback_reason("semantic_query_empty");
+        }
+        return Ok(SemanticLaneResolution {
+            hits: Vec::new(),
+            unavailable_reason: Some("semantic_query_empty".to_string()),
+            cache_hit: false,
+            latency_ms: 0,
+            rows_scanned: 0,
+            budget_state: "invalid_query".to_string(),
+            backoff_until_ms: None,
+        });
+    }
+
+    if query_vector.iter().any(|v| !v.is_finite()) {
+        if let Ok(mut state) = semantic_budget_state.lock() {
+            state.note_semantic_fallback_reason("semantic_query_non_finite");
+        }
+        return Ok(SemanticLaneResolution {
+            hits: Vec::new(),
+            unavailable_reason: Some("semantic_query_non_finite".to_string()),
+            cache_hit: false,
+            latency_ms: 0,
+            rows_scanned: 0,
+            budget_state: "invalid_query".to_string(),
+            backoff_until_ms: None,
+        });
+    }
+
+    let now = now_ms();
+    let decision = match semantic_budget_state.lock() {
+        Ok(mut state) => state.begin_semantic_lane(now, options, embedder_id, query_vector),
+        Err(_) => SemanticBudgetDecision::Skip {
+            reason: "semantic_budget_poisoned".to_string(),
+            budget_state: "error".to_string(),
+            backoff_until_ms: None,
+        },
+    };
+
+    match decision {
+        SemanticBudgetDecision::UseCache { hits } => {
+            let unavailable_reason = if hits.is_empty() {
+                Some("semantic_no_hits".to_string())
+            } else {
+                None
+            };
+            if unavailable_reason.is_some()
+                && let Ok(mut state) = semantic_budget_state.lock()
+            {
+                state.note_semantic_fallback_reason("semantic_no_hits");
+            }
+            Ok(SemanticLaneResolution {
+                hits,
+                unavailable_reason,
+                cache_hit: true,
+                latency_ms: 0,
+                rows_scanned: 0,
+                budget_state: "cache_hit".to_string(),
+                backoff_until_ms: None,
+            })
+        }
+        SemanticBudgetDecision::Skip {
+            reason,
+            budget_state,
+            backoff_until_ms,
+        } => Ok(SemanticLaneResolution {
+            hits: Vec::new(),
+            unavailable_reason: Some(reason),
+            cache_hit: false,
+            latency_ms: 0,
+            rows_scanned: 0,
+            budget_state,
+            backoff_until_ms,
+        }),
+        SemanticBudgetDecision::Execute { key, max_scan_rows } => {
+            let started = Instant::now();
+            let (hits, rows_scanned) = search_semantic_backend_with_scan_limit(
+                backend,
+                embedder_id,
+                query_vector,
+                options,
+                Some(max_scan_rows),
+            )?;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let now_after = now_ms();
+            let backoff_until_ms = match semantic_budget_state.lock() {
+                Ok(mut state) => {
+                    state.complete_semantic_lane(now_after, key, &hits, elapsed_ms, rows_scanned)
+                }
+                Err(_) => None,
+            };
+
+            let unavailable_reason = if hits.is_empty() {
+                if let Ok(mut state) = semantic_budget_state.lock() {
+                    state.note_semantic_fallback_reason("semantic_no_hits");
+                }
+                Some("semantic_no_hits".to_string())
+            } else {
+                None
+            };
+
+            Ok(SemanticLaneResolution {
+                hits,
+                unavailable_reason,
+                cache_hit: false,
+                latency_ms: elapsed_ms,
+                rows_scanned,
+                budget_state: "active".to_string(),
+                backoff_until_ms,
+            })
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn resolve_semantic_lane(
     conn: &Connection,
     options: &SearchOptions,
@@ -14502,6 +14640,186 @@ fn resolve_semantic_lane(
     }
 }
 
+fn hybrid_search_with_results_backend(
+    backend: &dyn StorageBackend,
+    query: &str,
+    options: &SearchOptions,
+    embedder_id: &str,
+    query_vector: &[f32],
+    mode: SearchMode,
+    rrf_k: u32,
+    lexical_weight: f32,
+    semantic_weight: f32,
+    fusion_backend: Option<FusionBackend>,
+    semantic_budget_state: &Arc<Mutex<SemanticBudgetState>>,
+) -> Result<HybridSearchBundle> {
+    let top_k = options.limit.unwrap_or(100);
+
+    let requested_mode = mode;
+    let lexical_weight = if lexical_weight.is_finite() {
+        lexical_weight.max(0.0)
+    } else {
+        1.0
+    };
+    let semantic_weight = if semantic_weight.is_finite() {
+        semantic_weight.max(0.0)
+    } else {
+        1.0
+    };
+    let (lexical_weight, semantic_weight) = if lexical_weight == 0.0 && semantic_weight == 0.0 {
+        (1.0, 1.0)
+    } else {
+        (lexical_weight, semantic_weight)
+    };
+    let fusion_backend = fusion_backend.unwrap_or_else(FusionBackend::from_env);
+
+    let semantic_lane = resolve_semantic_lane_backend(
+        backend,
+        options,
+        embedder_id,
+        query_vector,
+        requested_mode,
+        semantic_budget_state,
+    )?;
+    let semantic_hits = semantic_lane.hits.clone();
+
+    let effective_mode = if semantic_hits.is_empty() && matches!(requested_mode, SearchMode::Hybrid)
+    {
+        SearchMode::Lexical
+    } else {
+        requested_mode
+    };
+    let fallback_reason = if matches!(requested_mode, SearchMode::Hybrid)
+        && matches!(effective_mode, SearchMode::Lexical)
+    {
+        Some(
+            semantic_lane
+                .unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "semantic_unavailable".to_string()),
+        )
+    } else {
+        None
+    };
+
+    let mut lexical_options = options.clone();
+    lexical_options.limit = Some(top_k.saturating_mul(4).max(top_k));
+    let lexical_results = if matches!(effective_mode, SearchMode::Semantic) {
+        Vec::new()
+    } else {
+        search_fts_with_snippets_backend(backend, query, &lexical_options)?
+    };
+
+    let lexical_ranked: Vec<(u64, f32)> = lexical_results
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, row)| {
+            u64::try_from(row.segment.id)
+                .ok()
+                .map(|id| (id, reciprocal_rank_score(rank)))
+        })
+        .collect();
+    let semantic_ranked: Vec<(u64, f32)> = semantic_hits
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, hit)| {
+            u64::try_from(hit.segment_id)
+                .ok()
+                .map(|id| (id, reciprocal_rank_score(rank)))
+        })
+        .collect();
+
+    let mut fused = HybridSearchService::new()
+        .with_mode(effective_mode)
+        .with_rrf_k(rrf_k)
+        .with_rrf_weights(lexical_weight, semantic_weight)
+        .with_fusion_backend(fusion_backend)
+        .fuse(&lexical_ranked, &semantic_ranked, top_k);
+    // Make tie behavior deterministic despite internal HashMap aggregation.
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut lexical_by_id: std::collections::HashMap<i64, (usize, SearchResult)> =
+        std::collections::HashMap::with_capacity(lexical_results.len());
+    for (rank, row) in lexical_results.into_iter().enumerate() {
+        lexical_by_id.insert(row.segment.id, (rank, row));
+    }
+
+    let mut semantic_by_id: std::collections::HashMap<i64, (usize, f64)> =
+        std::collections::HashMap::with_capacity(semantic_hits.len());
+    for (rank, hit) in semantic_hits.into_iter().enumerate() {
+        semantic_by_id.insert(hit.segment_id, (rank, hit.score));
+    }
+
+    let mut results = Vec::with_capacity(fused.len());
+    for (fusion_rank, item) in fused.into_iter().enumerate() {
+        let segment_id = match i64::try_from(item.id) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let search_result = if let Some((_, row)) = lexical_by_id.get(&segment_id) {
+            row.clone()
+        } else if let Some(segment) = query_segment_by_id_backend(backend, segment_id)? {
+            SearchResult {
+                segment,
+                snippet: None,
+                highlight: None,
+                score: 0.0,
+            }
+        } else {
+            continue;
+        };
+
+        let semantic_score = semantic_by_id.get(&segment_id).map(|(_, score)| *score);
+        let lexical_rank = lexical_by_id.get(&segment_id).map(|(rank, _)| *rank);
+        let semantic_rank = semantic_by_id.get(&segment_id).map(|(rank, _)| *rank);
+        let fusion_score = f64::from(item.score);
+        let (lexical_contribution, semantic_contribution) = match effective_mode {
+            SearchMode::Lexical => (Some(fusion_score), None),
+            SearchMode::Semantic => (None, Some(fusion_score)),
+            SearchMode::Hybrid => (
+                lexical_rank.map(|rank| rrf_component_contribution(rank, rrf_k, lexical_weight)),
+                semantic_rank.map(|rank| rrf_component_contribution(rank, rrf_k, semantic_weight)),
+            ),
+        };
+
+        results.push(HybridSearchResult {
+            result: search_result,
+            semantic_score,
+            lexical_rank,
+            semantic_rank,
+            lexical_contribution,
+            semantic_contribution,
+            fusion_rank,
+            fusion_score,
+        });
+    }
+
+    Ok(HybridSearchBundle {
+        mode: search_mode_label(effective_mode).to_string(),
+        requested_mode: search_mode_label(requested_mode).to_string(),
+        fallback_reason,
+        rrf_k,
+        lexical_weight,
+        semantic_weight,
+        fusion_backend: fusion_backend.as_str().to_string(),
+        lexical_candidates: lexical_ranked.len(),
+        semantic_candidates: semantic_ranked.len(),
+        semantic_cache_hit: semantic_lane.cache_hit,
+        semantic_latency_ms: semantic_lane.latency_ms,
+        semantic_rows_scanned: semantic_lane.rows_scanned,
+        semantic_budget_state: semantic_lane.budget_state,
+        semantic_backoff_until_ms: semantic_lane.backoff_until_ms,
+        results,
+    })
+}
+
+#[allow(dead_code)]
 fn hybrid_search_with_results_sync(
     conn: &Connection,
     query: &str,
@@ -18335,6 +18653,24 @@ fn query_segments_from_mmap(
     Ok(Some(segments))
 }
 
+fn query_segment_by_id_backend(
+    backend: &dyn StorageBackend,
+    segment_id: i64,
+) -> Result<Option<Segment>> {
+    let row = backend
+        .query_row_cells(
+            "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+             FROM output_segments
+             WHERE id = ?1",
+            &[ToSqlValue::Integer(segment_id)],
+        )
+        .map_err(|err| storage_backend_error("query_segment_by_id", err))?;
+
+    row.map(|cells| segment_from_backend_cells(&cells))
+        .transpose()
+}
+
+#[allow(dead_code)]
 #[allow(clippy::cast_sign_loss)]
 fn query_segment_by_id(conn: &Connection, segment_id: i64) -> Result<Option<Segment>> {
     conn.query_row(
@@ -19200,6 +19536,104 @@ fn fts_backend_search_matches_direct_results() {
             "backend score {} must match direct score {}",
             backend_result.score,
             direct_result.score
+        );
+    }
+}
+
+#[test]
+fn hybrid_backend_search_matches_direct_results() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+    conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        ).unwrap();
+
+    let content_a = "hybrid needle alpha";
+    conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 0i64, content_a, i64::try_from(content_a.len()).unwrap(), now_ms],
+        ).unwrap();
+    let seg_a = conn.last_insert_rowid();
+
+    let content_b = "hybrid needle beta";
+    conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 1i64, content_b, i64::try_from(content_b.len()).unwrap(), now_ms + 1],
+        ).unwrap();
+    let seg_b = conn.last_insert_rowid();
+
+    let query_vector = [1.0_f32, 0.0];
+    let vector_a = encode_f32_embedding_blob(&[1.0_f32, 0.0]).unwrap();
+    let vector_b = encode_f32_embedding_blob(&[0.0_f32, 1.0]).unwrap();
+    conn.execute(
+            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![seg_a, "hybrid-embedder", 2i64, vector_a, now_ms],
+        ).unwrap();
+    conn.execute(
+            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![seg_b, "hybrid-embedder", 2i64, vector_b, now_ms + 1],
+        ).unwrap();
+
+    let options = SearchOptions {
+        limit: Some(2),
+        ..SearchOptions::default()
+    };
+    let direct_state = Arc::new(Mutex::new(SemanticBudgetState::new(
+        SemanticBudgetConfig::default(),
+    )));
+    let direct = hybrid_search_with_results_sync(
+        &conn,
+        "needle",
+        &options,
+        "hybrid-embedder",
+        &query_vector,
+        SearchMode::Hybrid,
+        60,
+        0.5,
+        0.5,
+        Some(FusionBackend::FrankenSearchRrf),
+        &direct_state,
+    ).unwrap();
+
+    let backend = RusqliteBackend::new(conn);
+    let backend_state = Arc::new(Mutex::new(SemanticBudgetState::new(
+        SemanticBudgetConfig::default(),
+    )));
+    let via_backend = hybrid_search_with_results_backend(
+        &backend,
+        "needle",
+        &options,
+        "hybrid-embedder",
+        &query_vector,
+        SearchMode::Hybrid,
+        60,
+        0.5,
+        0.5,
+        Some(FusionBackend::FrankenSearchRrf),
+        &backend_state,
+    ).unwrap();
+
+    assert_eq!(via_backend.mode, direct.mode);
+    assert_eq!(via_backend.requested_mode, direct.requested_mode);
+    assert_eq!(via_backend.fallback_reason, direct.fallback_reason);
+    assert_eq!(via_backend.lexical_candidates, direct.lexical_candidates);
+    assert_eq!(via_backend.semantic_candidates, direct.semantic_candidates);
+    assert_eq!(via_backend.semantic_rows_scanned, direct.semantic_rows_scanned);
+    assert_eq!(via_backend.results.len(), direct.results.len());
+    for (backend_result, direct_result) in via_backend.results.iter().zip(direct.results.iter()) {
+        assert_eq!(backend_result.result.segment.id, direct_result.result.segment.id);
+        assert_eq!(backend_result.result.segment.content, direct_result.result.segment.content);
+        assert_eq!(backend_result.lexical_rank, direct_result.lexical_rank);
+        assert_eq!(backend_result.semantic_rank, direct_result.semantic_rank);
+        assert_eq!(backend_result.fusion_rank, direct_result.fusion_rank);
+        assert!(
+            (backend_result.fusion_score - direct_result.fusion_score).abs() <= f64::EPSILON,
+            "backend fusion score {} must match direct score {}",
+            backend_result.fusion_score,
+            direct_result.fusion_score
         );
     }
 }
