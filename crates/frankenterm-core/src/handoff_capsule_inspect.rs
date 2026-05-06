@@ -4,11 +4,11 @@
 //! This is slice 1 of the `ft handoff` CLI surface tracked under
 //! ft-yk9lp. The CLI subcommand `ft handoff inspect <capsule-path>` will
 //! load a capsule from disk, deserialize via serde, and render via this
-//! module's [`CapsuleInspector`]. The export and import subcommands are
-//! deferred to follow-up beads (filed as ft-yk9lp slice 2 / slice 3) —
-//! both require live mux-server context (current-pane state for export,
-//! destination passport store for import) which extends beyond the
-//! pure-function scope of this slice.
+//! module's [`CapsuleInspector`]. Import dry-run validates a capsule
+//! without mutation; import apply can apply supported sections into a
+//! durable destination passport store. Export still requires live
+//! mux-server context and returns a typed unavailable envelope when
+//! that context is absent.
 //!
 //! # Privacy invariants
 //!
@@ -40,6 +40,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capability_passport::{CapabilityClass, CapabilityPassport};
+use crate::capability_passport_durable_store::{
+    DurablePassportStore, DurablePassportStoreError, UpsertOutcome,
+};
+use crate::capability_passport_store::PassportKey;
 use crate::handoff_capsule::{
     CapsuleSection, CapsuleValidationError, HandoffCapsule, SkipReason, ValidationOutcome,
 };
@@ -652,6 +656,464 @@ pub struct ValidatedCapsuleDocument {
     pub validation: ValidationOutcomeRendering,
 }
 
+// =============================================================================
+// ft-zrt2z: apply + export CLI support
+// =============================================================================
+
+/// Error produced when applying a handoff capsule to durable
+/// destination state cannot complete.
+#[derive(Debug)]
+pub enum CapsuleApplyError {
+    Read {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Decode {
+        path: std::path::PathBuf,
+        source: serde_json::Error,
+    },
+    Store {
+        path: std::path::PathBuf,
+        source: DurablePassportStoreError,
+    },
+    DestinationPassportMissing {
+        key: PassportKey,
+        store_path: std::path::PathBuf,
+    },
+    DestinationPassportMismatch {
+        expected: PassportKey,
+        found: PassportKey,
+    },
+    Validation {
+        path: std::path::PathBuf,
+        source: CapsuleValidationError,
+    },
+    Render {
+        source: serde_json::Error,
+    },
+}
+
+impl std::fmt::Display for CapsuleApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(
+                f,
+                "failed to read handoff capsule from {}: {source}",
+                path.display()
+            ),
+            Self::Decode { path, source } => write!(
+                f,
+                "failed to decode handoff capsule at {}: {source}",
+                path.display()
+            ),
+            Self::Store { path, source } => write!(
+                f,
+                "failed to access destination passport store {}: {source}",
+                path.display()
+            ),
+            Self::DestinationPassportMissing { key, store_path } => write!(
+                f,
+                "destination passport missing for agent={} pane={} in {} \
+                 (provide --destination-passport or pre-populate the store)",
+                key.agent_id,
+                key.pane_id
+                    .map_or_else(|| "agent".to_string(), |pane| pane.to_string()),
+                store_path.display()
+            ),
+            Self::DestinationPassportMismatch { expected, found } => write!(
+                f,
+                "destination passport key mismatch: expected agent={} pane={}, found agent={} pane={}",
+                expected.agent_id,
+                expected
+                    .pane_id
+                    .map_or_else(|| "agent".to_string(), |pane| pane.to_string()),
+                found.agent_id,
+                found
+                    .pane_id
+                    .map_or_else(|| "agent".to_string(), |pane| pane.to_string()),
+            ),
+            Self::Validation { path, source } => write!(
+                f,
+                "handoff capsule at {} failed validation: {source}",
+                path.display()
+            ),
+            Self::Render { source } => write!(f, "failed to render apply summary: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for CapsuleApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::Decode { source, .. } => Some(source),
+            Self::Store { source, .. } => Some(source),
+            Self::Validation { source, .. } => Some(source),
+            Self::Render { source } => Some(source),
+            Self::DestinationPassportMissing { .. } | Self::DestinationPassportMismatch { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// JSON/text document for an applied capsule import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedCapsuleDocument {
+    pub inspection: CapsuleInspection,
+    pub validation: ValidationOutcomeRendering,
+    pub apply: ApplySummaryRendering,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplySummaryRendering {
+    pub passport_store_path: String,
+    pub actor_agent_id: String,
+    pub actor_pane_id: Option<u64>,
+    pub actor_passport_source: ActorPassportSource,
+    pub destination_passport_upsert: Option<PassportUpsertRendering>,
+    pub passport_excerpt_applies: Vec<PassportExcerptApplyRendering>,
+    pub deferred_to_operator_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorPassportSource {
+    Provided,
+    Store,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassportExcerptApplyRendering {
+    pub section_index: usize,
+    pub agent_id: String,
+    pub pane_id: Option<u64>,
+    pub disposition: PassportUpsertRendering,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PassportUpsertRendering {
+    Inserted,
+    Updated {
+        previous_generation: u64,
+    },
+    AlreadyPresent {
+        existing_generation: u64,
+        incoming_generation: u64,
+    },
+}
+
+impl PassportUpsertRendering {
+    fn from_upsert(outcome: UpsertOutcome) -> Self {
+        match outcome {
+            UpsertOutcome::Inserted => Self::Inserted,
+            UpsertOutcome::Updated {
+                previous_generation,
+            } => Self::Updated {
+                previous_generation,
+            },
+            UpsertOutcome::RejectedStaleGeneration {
+                existing_generation,
+                incoming_generation,
+            } => Self::AlreadyPresent {
+                existing_generation,
+                incoming_generation,
+            },
+        }
+    }
+}
+
+/// Load a capsule, validate it against the destination passport, and
+/// apply supported accepted sections into the durable passport store.
+///
+/// Today the concrete apply surface supports
+/// [`CapsuleSection::PassportExcerpt`]. Other accepted section kinds
+/// are counted in `deferred_to_operator_count`; skipped sections
+/// remain represented in the validation rendering.
+pub fn load_and_apply_capsule_to_durable_store(
+    capsule_path: &std::path::Path,
+    passport_store_path: &std::path::Path,
+    destination_passport: Option<&CapabilityPassport>,
+    target_pane_id: Option<u64>,
+    now_ms: u64,
+) -> Result<AppliedCapsuleDocument, CapsuleApplyError> {
+    let bytes = std::fs::read(capsule_path).map_err(|source| CapsuleApplyError::Read {
+        path: capsule_path.to_path_buf(),
+        source,
+    })?;
+    let capsule: HandoffCapsule =
+        serde_json::from_slice(&bytes).map_err(|source| CapsuleApplyError::Decode {
+            path: capsule_path.to_path_buf(),
+            source,
+        })?;
+
+    let mut actor_key = capsule.destination.passport_key();
+    if let Some(target) = target_pane_id {
+        actor_key.pane_id = Some(target);
+    }
+
+    let store = DurablePassportStore::open(passport_store_path).map_err(|source| {
+        CapsuleApplyError::Store {
+            path: passport_store_path.to_path_buf(),
+            source,
+        }
+    })?;
+
+    let (actor_passport, actor_source, destination_passport_upsert) = match destination_passport {
+        Some(passport) => {
+            let found = PassportKey::from(passport);
+            if found != actor_key {
+                return Err(CapsuleApplyError::DestinationPassportMismatch {
+                    expected: actor_key,
+                    found,
+                });
+            }
+            let upsert = store
+                .upsert(passport)
+                .map_err(|source| CapsuleApplyError::Store {
+                    path: passport_store_path.to_path_buf(),
+                    source,
+                })?;
+            let actor_passport = store
+                .fetch_by_key(&actor_key)
+                .map_err(|source| CapsuleApplyError::Store {
+                    path: passport_store_path.to_path_buf(),
+                    source,
+                })?
+                .unwrap_or_else(|| passport.clone());
+            (
+                actor_passport,
+                ActorPassportSource::Provided,
+                Some(PassportUpsertRendering::from_upsert(upsert)),
+            )
+        }
+        None => {
+            let Some(passport) =
+                store
+                    .fetch_by_key(&actor_key)
+                    .map_err(|source| CapsuleApplyError::Store {
+                        path: passport_store_path.to_path_buf(),
+                        source,
+                    })?
+            else {
+                return Err(CapsuleApplyError::DestinationPassportMissing {
+                    key: actor_key,
+                    store_path: passport_store_path.to_path_buf(),
+                });
+            };
+            (passport, ActorPassportSource::Store, None)
+        }
+    };
+
+    let validation = capsule
+        .validate_for_destination(Some(&actor_passport))
+        .map_err(|source| CapsuleApplyError::Validation {
+            path: capsule_path.to_path_buf(),
+            source,
+        })?;
+
+    let mut passport_excerpt_applies = Vec::new();
+    let mut deferred_to_operator_count = 0usize;
+
+    for &section_index in &validation.accepted {
+        let section = &capsule.sections[section_index];
+        match section {
+            CapsuleSection::PassportExcerpt { passport } => {
+                let disposition =
+                    store
+                        .upsert(passport)
+                        .map_err(|source| CapsuleApplyError::Store {
+                            path: passport_store_path.to_path_buf(),
+                            source,
+                        })?;
+                passport_excerpt_applies.push(PassportExcerptApplyRendering {
+                    section_index,
+                    agent_id: passport.agent_id.clone(),
+                    pane_id: passport.pane_id,
+                    disposition: PassportUpsertRendering::from_upsert(disposition),
+                });
+            }
+            CapsuleSection::ContextSummary { .. }
+            | CapsuleSection::VerificationChecklist { .. }
+            | CapsuleSection::MissionState { .. }
+            | CapsuleSection::CausalSummary { .. }
+            | CapsuleSection::PendingApprovals { .. } => {
+                deferred_to_operator_count += 1;
+            }
+        }
+    }
+
+    Ok(AppliedCapsuleDocument {
+        inspection: CapsuleInspector::at(now_ms).inspect(&capsule),
+        validation: ValidationOutcomeRendering::from_outcome(&validation),
+        apply: ApplySummaryRendering {
+            passport_store_path: passport_store_path.display().to_string(),
+            actor_agent_id: actor_key.agent_id,
+            actor_pane_id: actor_key.pane_id,
+            actor_passport_source: actor_source,
+            destination_passport_upsert,
+            passport_excerpt_applies,
+            deferred_to_operator_count,
+        },
+    })
+}
+
+/// Text variant for `ft handoff import --apply`.
+pub fn load_and_apply_capsule_to_durable_store_text(
+    capsule_path: &std::path::Path,
+    passport_store_path: &std::path::Path,
+    destination_passport: Option<&CapabilityPassport>,
+    target_pane_id: Option<u64>,
+    now_ms: u64,
+) -> Result<String, CapsuleApplyError> {
+    let document = load_and_apply_capsule_to_durable_store(
+        capsule_path,
+        passport_store_path,
+        destination_passport,
+        target_pane_id,
+        now_ms,
+    )?;
+    Ok(render_applied_capsule_text(&document))
+}
+
+/// JSON variant for `ft handoff import --apply`.
+pub fn load_and_apply_capsule_to_durable_store_json(
+    capsule_path: &std::path::Path,
+    passport_store_path: &std::path::Path,
+    destination_passport: Option<&CapabilityPassport>,
+    target_pane_id: Option<u64>,
+    now_ms: u64,
+) -> Result<String, CapsuleApplyError> {
+    let document = load_and_apply_capsule_to_durable_store(
+        capsule_path,
+        passport_store_path,
+        destination_passport,
+        target_pane_id,
+        now_ms,
+    )?;
+    serde_json::to_string_pretty(&document).map_err(|source| CapsuleApplyError::Render { source })
+}
+
+#[must_use]
+pub fn render_applied_capsule_text(document: &AppliedCapsuleDocument) -> String {
+    let mut out = String::new();
+    out.push_str("apply: status=completed\n");
+    out.push_str(&format!(
+        "  actor: agent={} pane={}\n",
+        document.apply.actor_agent_id,
+        document
+            .apply
+            .actor_pane_id
+            .map_or_else(|| "agent".to_string(), |pane| pane.to_string()),
+    ));
+    out.push_str(&format!(
+        "  passport_store: {}\n",
+        document.apply.passport_store_path
+    ));
+    out.push_str(&format!(
+        "  actor_passport_source: {:?}\n",
+        document.apply.actor_passport_source
+    ));
+    if let Some(upsert) = &document.apply.destination_passport_upsert {
+        out.push_str(&format!(
+            "  destination_passport_upsert: {}\n",
+            format_passport_upsert(upsert)
+        ));
+    }
+    out.push_str(&format!(
+        "  validation: accepted={} skipped={} fully_accepted={}\n",
+        document.validation.accepted_count,
+        document.validation.skipped_count,
+        document.validation.fully_accepted,
+    ));
+    if document.apply.passport_excerpt_applies.is_empty() {
+        out.push_str("  passport_excerpt_applies: none\n");
+    } else {
+        out.push_str("  passport_excerpt_applies:\n");
+        for apply in &document.apply.passport_excerpt_applies {
+            out.push_str(&format!(
+                "    [{}] agent={} pane={} disposition={}\n",
+                apply.section_index,
+                apply.agent_id,
+                apply
+                    .pane_id
+                    .map_or_else(|| "agent".to_string(), |pane| pane.to_string()),
+                format_passport_upsert(&apply.disposition),
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "  deferred_to_operator_count: {}\n",
+        document.apply.deferred_to_operator_count,
+    ));
+    if !document.validation.skipped.is_empty() {
+        out.push_str("  skipped:\n");
+        for skip in &document.validation.skipped {
+            out.push_str(&format!(
+                "    [{}] {}: {}\n",
+                skip.section_index, skip.section_label, skip.reason,
+            ));
+        }
+    }
+    out
+}
+
+fn format_passport_upsert(value: &PassportUpsertRendering) -> String {
+    match value {
+        PassportUpsertRendering::Inserted => "inserted".to_string(),
+        PassportUpsertRendering::Updated {
+            previous_generation,
+        } => format!("updated(previous_generation={previous_generation})"),
+        PassportUpsertRendering::AlreadyPresent {
+            existing_generation,
+            incoming_generation,
+        } => format!(
+            "already_present(existing_generation={existing_generation}, incoming_generation={incoming_generation})"
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffExportUnavailable {
+    pub ok: bool,
+    pub error_code: String,
+    pub message: String,
+    pub hint: String,
+    pub requested_output_path: String,
+    pub requested_sections: Vec<String>,
+    pub target_pane_id: Option<u64>,
+}
+
+#[must_use]
+pub fn handoff_export_unavailable(
+    output_path: &std::path::Path,
+    requested_sections: Vec<String>,
+    target_pane_id: Option<u64>,
+) -> HandoffExportUnavailable {
+    HandoffExportUnavailable {
+        ok: false,
+        error_code: "handoff.export.context_unavailable".to_string(),
+        message: "handoff export requires live mux handoff context".to_string(),
+        hint: "Run export from a process with mux handoff context; inspect/import dry-run remain available for offline capsule files.".to_string(),
+        requested_output_path: output_path.display().to_string(),
+        requested_sections,
+        target_pane_id,
+    }
+}
+
+pub fn handoff_export_unavailable_json(
+    output_path: &std::path::Path,
+    requested_sections: Vec<String>,
+    target_pane_id: Option<u64>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&handoff_export_unavailable(
+        output_path,
+        requested_sections,
+        target_pane_id,
+    ))
+}
+
 /// Structured inspection of a [`HandoffCapsule`] suitable for JSON
 /// rendering. Section payloads are deliberately absent — only labels +
 /// required-capabilities + payload byte sizes appear.
@@ -1163,6 +1625,41 @@ mod tests {
         }
     }
 
+    fn capsule_destination_passport_with(
+        verified_classes: Vec<CapabilityClass>,
+    ) -> CapabilityPassport {
+        CapabilityPassport {
+            agent_id: "dest-agent".to_string(),
+            pane_id: Some(2),
+            capabilities: verified_classes
+                .into_iter()
+                .map(|class| CapabilityEntry {
+                    class,
+                    verification: CapabilityVerification::Verified,
+                    last_observed_at_ms: Some(1_000),
+                    proof: RedactedProof::empty(),
+                })
+                .collect(),
+            generation: 1,
+            signed_at_ms: 1_000,
+        }
+    }
+
+    fn inherited_passport(generation: u64) -> CapabilityPassport {
+        CapabilityPassport {
+            agent_id: "inherited-agent".to_string(),
+            pane_id: Some(9),
+            capabilities: vec![CapabilityEntry {
+                class: CapabilityClass::ToolAvailability("bash".to_string()),
+                verification: CapabilityVerification::Verified,
+                last_observed_at_ms: Some(900),
+                proof: RedactedProof::empty(),
+            }],
+            generation,
+            signed_at_ms: 900,
+        }
+    }
+
     #[test]
     fn save_capsule_to_path_round_trips_via_serde() {
         let capsule = capsule_with(
@@ -1450,5 +1947,201 @@ mod tests {
         let json = serde_json::to_string(&rendering).unwrap();
         let parsed: ValidationOutcomeRendering = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, rendering);
+    }
+
+    #[test]
+    fn load_and_apply_capsule_to_durable_store_applies_passport_excerpt() {
+        let inherited = inherited_passport(1);
+        let capsule = capsule_with(
+            vec![
+                CapsuleSection::ContextSummary {
+                    text: "operator payload that must not render".to_string(),
+                },
+                CapsuleSection::PassportExcerpt {
+                    passport: inherited.clone(),
+                },
+            ],
+            1_000,
+        );
+        let capsule_file = write_capsule_to_temp(&capsule);
+        let store_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = store_dir.path().join("passports.sqlite3");
+        let actor = capsule_destination_passport_with(vec![CapabilityClass::SafetyConstraint(
+            "accept_passport_excerpt".to_string(),
+        )]);
+
+        let document = load_and_apply_capsule_to_durable_store(
+            capsule_file.path(),
+            &store_path,
+            Some(&actor),
+            None,
+            2_000,
+        )
+        .expect("apply succeeds");
+
+        assert_eq!(document.validation.accepted_indices, vec![0, 1]);
+        assert_eq!(document.apply.deferred_to_operator_count, 1);
+        assert_eq!(document.apply.passport_excerpt_applies.len(), 1);
+        assert_eq!(
+            document.apply.passport_excerpt_applies[0].disposition,
+            PassportUpsertRendering::Inserted
+        );
+
+        let store =
+            crate::capability_passport_durable_store::DurablePassportStore::open(&store_path)
+                .expect("reopen store");
+        let fetched = store
+            .fetch_by_key(&crate::capability_passport_store::PassportKey::pane(
+                "inherited-agent",
+                9,
+            ))
+            .expect("fetch inherited");
+        assert_eq!(fetched, Some(inherited));
+    }
+
+    #[test]
+    fn load_and_apply_capsule_to_durable_store_can_use_stored_destination_passport() {
+        let inherited = inherited_passport(1);
+        let capsule = capsule_with(
+            vec![CapsuleSection::PassportExcerpt {
+                passport: inherited,
+            }],
+            1_000,
+        );
+        let capsule_file = write_capsule_to_temp(&capsule);
+        let store_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = store_dir.path().join("passports.sqlite3");
+        let store =
+            crate::capability_passport_durable_store::DurablePassportStore::open(&store_path)
+                .expect("open store");
+        store
+            .upsert(&capsule_destination_passport_with(vec![
+                CapabilityClass::SafetyConstraint("accept_passport_excerpt".to_string()),
+            ]))
+            .expect("seed actor passport");
+
+        let document = load_and_apply_capsule_to_durable_store(
+            capsule_file.path(),
+            &store_path,
+            None,
+            None,
+            2_000,
+        )
+        .expect("apply succeeds from stored passport");
+
+        assert_eq!(
+            document.apply.actor_passport_source,
+            ActorPassportSource::Store
+        );
+        assert_eq!(document.apply.passport_excerpt_applies.len(), 1);
+    }
+
+    #[test]
+    fn load_and_apply_capsule_to_durable_store_requires_destination_passport() {
+        let capsule = capsule_with(
+            vec![CapsuleSection::ContextSummary {
+                text: "safe but still requires an apply actor".to_string(),
+            }],
+            1_000,
+        );
+        let capsule_file = write_capsule_to_temp(&capsule);
+        let store_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = store_dir.path().join("passports.sqlite3");
+
+        let err = load_and_apply_capsule_to_durable_store(
+            capsule_file.path(),
+            &store_path,
+            None,
+            None,
+            2_000,
+        )
+        .expect_err("missing actor passport must fail closed");
+
+        match err {
+            CapsuleApplyError::DestinationPassportMissing { key, .. } => {
+                assert_eq!(key.agent_id, "dest-agent");
+                assert_eq!(key.pane_id, Some(2));
+            }
+            other => panic!("expected DestinationPassportMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_and_apply_capsule_to_durable_store_rejects_mismatched_destination_passport() {
+        let capsule = capsule_with(Vec::new(), 1_000);
+        let capsule_file = write_capsule_to_temp(&capsule);
+        let store_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = store_dir.path().join("passports.sqlite3");
+        let wrong_passport = passport_with(Vec::new());
+
+        let err = load_and_apply_capsule_to_durable_store(
+            capsule_file.path(),
+            &store_path,
+            Some(&wrong_passport),
+            None,
+            2_000,
+        )
+        .expect_err("mismatch must fail");
+
+        match err {
+            CapsuleApplyError::DestinationPassportMismatch { expected, found } => {
+                assert_eq!(expected.agent_id, "dest-agent");
+                assert_eq!(found.agent_id, "destination-agent");
+            }
+            other => panic!("expected DestinationPassportMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_and_apply_capsule_json_does_not_leak_payload_text() {
+        const PLANTED: &str = "ANTHROPIC_API_KEY=sk-fake-zrt2z-canary-1234567890";
+        let inherited = inherited_passport(1);
+        let capsule = capsule_with(
+            vec![
+                CapsuleSection::ContextSummary {
+                    text: PLANTED.to_string(),
+                },
+                CapsuleSection::PassportExcerpt {
+                    passport: inherited,
+                },
+            ],
+            1_000,
+        );
+        let capsule_file = write_capsule_to_temp(&capsule);
+        let store_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = store_dir.path().join("passports.sqlite3");
+        let actor = capsule_destination_passport_with(vec![CapabilityClass::SafetyConstraint(
+            "accept_passport_excerpt".to_string(),
+        )]);
+
+        let json = load_and_apply_capsule_to_durable_store_json(
+            capsule_file.path(),
+            &store_path,
+            Some(&actor),
+            None,
+            2_000,
+        )
+        .expect("json apply succeeds");
+
+        assert!(!json.contains(PLANTED));
+        let parsed: AppliedCapsuleDocument = serde_json::from_str(&json).expect("parse document");
+        assert_eq!(parsed.apply.passport_excerpt_applies.len(), 1);
+    }
+
+    #[test]
+    fn handoff_export_unavailable_json_is_typed_and_actionable() {
+        let json = handoff_export_unavailable_json(
+            std::path::Path::new("/tmp/capsule.json"),
+            vec!["context_summary".to_string()],
+            Some(7),
+        )
+        .expect("render json");
+        let parsed: HandoffExportUnavailable = serde_json::from_str(&json).expect("parse");
+
+        assert!(!parsed.ok);
+        assert_eq!(parsed.error_code, "handoff.export.context_unavailable");
+        assert!(parsed.message.contains("live mux handoff context"));
+        assert_eq!(parsed.requested_sections, vec!["context_summary"]);
+        assert_eq!(parsed.target_pane_id, Some(7));
     }
 }

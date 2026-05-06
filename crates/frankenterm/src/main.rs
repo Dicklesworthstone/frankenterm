@@ -1660,13 +1660,14 @@ SEE ALSO:
         command: AttestationCommands,
     },
 
-    /// br-ft-difnz (ft-yk9lp slice 2): handoff capsule
-    /// management. Currently exposes `inspect` for read-
-    /// only structural rendering of a capsule file.
-    /// Export + import (slice 3, ft-r6kg2) follow.
+    /// Handoff capsule management: inspect, import, and export
+    /// operator handoff capsules.
     #[command(after_help = r#"EXAMPLES:
     ft handoff inspect ./capsule.json              Print structural rendering as plain text
     ft handoff inspect ./capsule.json --format json   Print structural rendering as JSON
+    ft handoff import ./capsule.json --dry-run --destination-passport ./passport.json
+    ft handoff import ./capsule.json --apply --passport-store ./passports.sqlite3 --destination-passport ./passport.json
+    ft handoff export ./capsule.json --format json
 
 NOTES:
     Inspect is read-only — it loads, deserializes, and renders the capsule
@@ -1678,8 +1679,7 @@ NOTES:
     },
 }
 
-/// br-ft-difnz: handoff subcommands. Slice 2 ships only
-/// `inspect`; slice 3 (ft-r6kg2) wires `export` + `import`.
+/// Handoff subcommands.
 #[derive(Subcommand)]
 enum HandoffCommands {
     /// Inspect a handoff capsule JSON file, rendering its
@@ -1695,14 +1695,9 @@ enum HandoffCommands {
         #[arg(long, value_enum, default_value_t = HandoffInspectFormat::Text)]
         format: HandoffInspectFormat,
     },
-    /// br-ft-r6kg2 (ft-yk9lp slice 3 partial): import a
-    /// handoff capsule. Currently only `--dry-run` is wired —
-    /// dry-run is pure-function (loads the capsule, optionally
-    /// loads a destination passport from disk, runs
-    /// validate_for_destination, prints the ValidationOutcome).
-    /// Apply mode (without `--dry-run`) is deferred until a
-    /// live-mux-context helper API lands; today it errors
-    /// rather than silently no-op.
+    /// Import a handoff capsule. `--dry-run` validates without
+    /// mutation. `--apply` applies supported sections into the
+    /// durable destination passport store.
     Import {
         /// Path to the capsule JSON file to import.
         capsule_path: std::path::PathBuf,
@@ -1715,18 +1710,36 @@ enum HandoffCommands {
         #[arg(long, value_name = "PATH")]
         destination_passport: Option<std::path::PathBuf>,
         /// Preview-only mode: load + validate the capsule but do
-        /// NOT apply it. Required for slice-3-partial; the apply
-        /// path needs live mux context that's not yet plumbed.
+        /// NOT apply it.
         #[arg(long)]
         dry_run: bool,
+        /// Apply supported sections. Requires --passport-store.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        /// Durable destination passport store path used by --apply.
+        #[arg(long, value_name = "PATH")]
+        passport_store: Option<std::path::PathBuf>,
         /// Output format for the validation outcome rendering.
         #[arg(long, value_enum, default_value_t = HandoffInspectFormat::Text)]
         format: HandoffInspectFormat,
-        /// Optional pane id to scope the apply against. Accepted
-        /// for forward-compat with the apply path (slice-3-full);
-        /// has no effect under `--dry-run`.
+        /// Optional pane id to scope the apply actor. Has no effect
+        /// under `--dry-run`.
         #[arg(long)]
         target: Option<u64>,
+    },
+    /// Export a handoff capsule from live mux context.
+    Export {
+        /// Output path for the new capsule JSON file.
+        output_path: std::path::PathBuf,
+        /// Optional comma-separated section labels to include.
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+        /// Optional pane id to export from.
+        #[arg(long)]
+        target: Option<u64>,
+        /// Output format for unavailable-context errors.
+        #[arg(long, value_enum, default_value_t = HandoffInspectFormat::Text)]
+        format: HandoffInspectFormat,
     },
 }
 
@@ -20645,21 +20658,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     capsule_path,
                     destination_passport,
                     dry_run,
+                    apply,
+                    passport_store,
                     format,
-                    target: _target,
+                    target,
                 } => {
-                    // br-ft-r6kg2 (slice 3 partial): only --dry-run
-                    // is wired today. The apply path needs live mux
-                    // context (destination PassportStore handle,
-                    // pane lifecycle hooks, etc.) that's not yet
-                    // plumbed through the CLI. Fail loudly rather
-                    // than silently no-op so operators don't think
-                    // they applied a capsule when they didn't.
-                    if !dry_run {
+                    if !dry_run && !apply {
                         eprintln!(
-                            "ft handoff import: --dry-run is required (apply path \
-                             not yet wired; tracked in ft-r6kg2 slice 3-full)"
+                            "ft handoff import: choose either --dry-run or --apply \
+                             (use --dry-run to validate without mutation)"
                         );
+                        std::process::exit(2);
+                    }
+                    if dry_run && passport_store.is_some() {
+                        eprintln!("ft handoff import: --passport-store is only used with --apply");
                         std::process::exit(2);
                     }
 
@@ -20695,6 +20707,46 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
+
+                    if apply {
+                        let Some(store_path) = passport_store else {
+                            eprintln!(
+                                "ft handoff import: --apply requires --passport-store <PATH>"
+                            );
+                            std::process::exit(2);
+                        };
+                        let result = match format {
+                            HandoffInspectFormat::Text => {
+                                frankenterm_core::handoff_capsule_inspect::load_and_apply_capsule_to_durable_store_text(
+                                    &capsule_path,
+                                    &store_path,
+                                    dest_passport.as_ref(),
+                                    target,
+                                    now_ms,
+                                )
+                            }
+                            HandoffInspectFormat::Json => {
+                                frankenterm_core::handoff_capsule_inspect::load_and_apply_capsule_to_durable_store_json(
+                                    &capsule_path,
+                                    &store_path,
+                                    dest_passport.as_ref(),
+                                    target,
+                                    now_ms,
+                                )
+                            }
+                        };
+                        match result {
+                            Ok(rendered) => {
+                                println!("{rendered}");
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                eprintln!("ft handoff import: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+
                     let result = match format {
                         HandoffInspectFormat::Text => {
                             frankenterm_core::handoff_capsule_inspect::load_and_validate_capsule(
@@ -20719,6 +20771,51 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         Err(e) => {
                             eprintln!("ft handoff import: {e}");
                             std::process::exit(1);
+                        }
+                    }
+                }
+
+                HandoffCommands::Export {
+                    output_path,
+                    include,
+                    target,
+                    format,
+                } => {
+                    let sections = if include.is_empty() {
+                        vec!["all".to_string()]
+                    } else {
+                        include
+                    };
+                    match format {
+                        HandoffInspectFormat::Text => {
+                            let unavailable =
+                                frankenterm_core::handoff_capsule_inspect::handoff_export_unavailable(
+                                    &output_path,
+                                    sections,
+                                    target,
+                                );
+                            eprintln!(
+                                "ft handoff export: {} [error_code={}]",
+                                unavailable.message, unavailable.error_code
+                            );
+                            eprintln!("hint: {}", unavailable.hint);
+                            std::process::exit(2);
+                        }
+                        HandoffInspectFormat::Json => {
+                            match frankenterm_core::handoff_capsule_inspect::handoff_export_unavailable_json(
+                                &output_path,
+                                sections,
+                                target,
+                            ) {
+                                Ok(rendered) => {
+                                    println!("{rendered}");
+                                    std::process::exit(2);
+                                }
+                                Err(e) => {
+                                    eprintln!("ft handoff export: failed to render unavailable-context envelope: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                     }
                 }
