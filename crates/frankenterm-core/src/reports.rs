@@ -3,8 +3,16 @@
 //! Produces session reports (per-pane or global), including major events,
 //! workflow executions with step logs, and output gaps.
 
+use crate::error::RuntimeOperationSource;
 use crate::policy::{Redactor, parse_serialized_decision_surface};
 use crate::storage::{AuditQuery, EventQuery, ExportQuery, StorageHandle};
+
+fn report_cancelled_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
 
 /// Options for report generation.
 pub struct ReportOptions {
@@ -237,10 +245,10 @@ pub async fn generate_session_report(
 ///   4. between workflows and gaps.
 ///   5. between gaps and audit denials.
 ///
-/// A pre-cancelled cx returns `Err(Error::Runtime("cancelled"))`
-/// before any storage call. A mid-generation cancel returns with
-/// the failed stage named in the error message — operators can
-/// see how far the report got before cancellation. Partial output
+/// A pre-cancelled cx returns a structured cancellation error before
+/// any storage call. A mid-generation cancel returns with the failed
+/// stage named in the error source, so operators can see how far the
+/// report got before cancellation. Partial output
 /// is discarded (the String is abandoned) because a partial
 /// Markdown report would be misleading.
 ///
@@ -253,7 +261,10 @@ pub async fn generate_session_report_with_cx(
     opts: &ReportOptions,
 ) -> crate::Result<String> {
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!("generate_session_report cancelled: {err}"))
+        report_cancelled_error(
+            "report.generate_session.pre_flight",
+            format!("pre-flight checkpoint failed: {err}"),
+        )
     })?;
 
     let redactor = if opts.redact {
@@ -326,9 +337,10 @@ pub async fn generate_session_report_with_cx(
     }
 
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!(
-            "generate_session_report cancelled before workflows section: {err}"
-        ))
+        report_cancelled_error(
+            "report.generate_session.before_workflows",
+            format!("before workflows section: {err}"),
+        )
     })?;
 
     let workflows = storage.export_workflows_with_cx(cx, query.clone()).await?;
@@ -388,9 +400,10 @@ pub async fn generate_session_report_with_cx(
     }
 
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!(
-            "generate_session_report cancelled before gaps section: {err}"
-        ))
+        report_cancelled_error(
+            "report.generate_session.before_gaps",
+            format!("before gaps section: {err}"),
+        )
     })?;
 
     let gaps = storage.export_gaps_with_cx(cx, query.clone()).await?;
@@ -415,9 +428,10 @@ pub async fn generate_session_report_with_cx(
     }
 
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!(
-            "generate_session_report cancelled before audit section: {err}"
-        ))
+        report_cancelled_error(
+            "report.generate_session.before_audit",
+            format!("before audit section: {err}"),
+        )
     })?;
 
     let audit_query = AuditQuery {
@@ -566,6 +580,22 @@ mod tests {
     }
 
     // ── Unit tests for helpers ──────────────────────────────────────────
+
+    #[test]
+    fn report_cancelled_error_uses_structured_runtime_operation() {
+        let err = report_cancelled_error("report.test_checkpoint", "caller cancelled");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "report.test_checkpoint");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
+        }
+    }
 
     #[test]
     fn format_ts_basic() {
