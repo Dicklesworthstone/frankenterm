@@ -261,6 +261,321 @@ pub struct BackpressureSnapshot {
     pub paused_panes: Vec<u64>,
 }
 
+// ─── Load-Proof Timeline Artifact ────────────────────────────────────
+
+/// Schema version for machine-readable backpressure load-proof timelines.
+pub const BACKPRESSURE_TIMELINE_SCHEMA_VERSION: u32 = 1;
+
+/// Upper bound applied to per-run timeline events.
+pub const BACKPRESSURE_TIMELINE_MAX_EVENTS: usize = 4096;
+
+/// Upper bound applied to each event's evidence list.
+pub const BACKPRESSURE_TIMELINE_MAX_EVIDENCE: usize = 8;
+
+/// Machine-readable load-test artifact for backpressure and memory pressure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackpressureTimelineArtifact {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub scenario: String,
+    pub generated_at_ms: u64,
+    pub host_label: String,
+    pub events: Vec<BackpressureTimelineEvent>,
+    pub summary: BackpressureTimelineSummary,
+    #[serde(default)]
+    pub truncated_events: usize,
+}
+
+impl BackpressureTimelineArtifact {
+    /// Build an untruncated artifact and derive the summary from events.
+    #[must_use]
+    pub fn new(
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        generated_at_ms: u64,
+        host_label: impl Into<String>,
+        events: Vec<BackpressureTimelineEvent>,
+    ) -> Self {
+        Self::from_events_bounded(
+            run_id,
+            scenario,
+            generated_at_ms,
+            host_label,
+            events,
+            usize::MAX,
+        )
+    }
+
+    /// Build a bounded artifact suitable for repeated scale-lab proof runs.
+    #[must_use]
+    pub fn from_events_bounded(
+        run_id: impl Into<String>,
+        scenario: impl Into<String>,
+        generated_at_ms: u64,
+        host_label: impl Into<String>,
+        events: Vec<BackpressureTimelineEvent>,
+        max_events: usize,
+    ) -> Self {
+        let total_events = events.len();
+        let bounded_events: Vec<BackpressureTimelineEvent> = events
+            .into_iter()
+            .take(max_events)
+            .map(BackpressureTimelineEvent::bounded)
+            .collect();
+        let truncated_events = total_events.saturating_sub(bounded_events.len());
+        let summary = BackpressureTimelineSummary::from_events(&bounded_events);
+
+        Self {
+            schema_version: BACKPRESSURE_TIMELINE_SCHEMA_VERSION,
+            run_id: run_id.into(),
+            scenario: scenario.into(),
+            generated_at_ms,
+            host_label: host_label.into(),
+            events: bounded_events,
+            summary,
+            truncated_events,
+        }
+    }
+}
+
+/// One timestamped resource-pressure event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackpressureTimelineEvent {
+    pub timestamp_ms: u64,
+    pub kind: BackpressureTimelineEventKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<BackpressureTimelineEvidence>,
+}
+
+impl BackpressureTimelineEvent {
+    /// Build an event without auxiliary evidence.
+    #[must_use]
+    pub fn new(timestamp_ms: u64, kind: BackpressureTimelineEventKind) -> Self {
+        Self {
+            timestamp_ms,
+            kind,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// Build an event with bounded evidence links.
+    #[must_use]
+    pub fn with_evidence(
+        timestamp_ms: u64,
+        kind: BackpressureTimelineEventKind,
+        evidence: Vec<BackpressureTimelineEvidence>,
+    ) -> Self {
+        Self {
+            timestamp_ms,
+            kind,
+            evidence,
+        }
+        .bounded()
+    }
+
+    #[must_use]
+    fn bounded(mut self) -> Self {
+        self.evidence.truncate(BACKPRESSURE_TIMELINE_MAX_EVIDENCE);
+        self
+    }
+}
+
+/// Event kinds emitted into the load-proof timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureTimelineEventKind {
+    QueueSample {
+        tier: BackpressureTier,
+        capture_depth: usize,
+        capture_capacity: usize,
+        write_depth: usize,
+        write_capacity: usize,
+    },
+    TierTransition {
+        from: BackpressureTier,
+        to: BackpressureTier,
+        reason: String,
+    },
+    Throttle {
+        action: BackpressureThrottleAction,
+        pane_id: Option<u64>,
+        reason: String,
+    },
+    SegmentDrop {
+        pane_id: u64,
+        dropped_segments: u64,
+        reason: String,
+    },
+    MemoryTierTransition {
+        pane_id: u64,
+        from: BackpressureMemoryTier,
+        to: BackpressureMemoryTier,
+        bytes: u64,
+        reason: String,
+    },
+    ApiLatency {
+        surface: BackpressureApiSurface,
+        operation: String,
+        latency_ms: u64,
+        ok: bool,
+    },
+}
+
+/// Normalized throttle action vocabulary for proof artifacts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureThrottleAction {
+    PollBackoff,
+    SkipDetection,
+    PausePane,
+    DeferFts,
+    DropSegment,
+    ReduceBufferLimit,
+}
+
+/// Normalized memory residency tiers for pressure transition explanations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureMemoryTier {
+    Hot,
+    Warm,
+    Cold,
+    Evicted,
+}
+
+/// API surface labels for latency samples in proof artifacts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureApiSurface {
+    Cli,
+    Robot,
+    Mcp,
+    Web,
+    WatchDaemon,
+}
+
+/// Bounded evidence pointer attached to a timeline event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackpressureTimelineEvidence {
+    pub source: BackpressureTimelineEvidenceSource,
+    pub key: String,
+    pub value: String,
+}
+
+impl BackpressureTimelineEvidence {
+    /// Build a key/value evidence pointer.
+    #[must_use]
+    pub fn new(
+        source: BackpressureTimelineEvidenceSource,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            source,
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// Source kind for timeline evidence entries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureTimelineEvidenceSource {
+    QueueDepth,
+    BackpressureSnapshot,
+    MemoryTier,
+    ApiTrace,
+    ScaleLabFixture,
+}
+
+/// Summary counters derived from the bounded event list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackpressureTimelineSummary {
+    pub total_events: usize,
+    pub queue_samples: usize,
+    pub tier_transitions: usize,
+    pub throttle_events: usize,
+    pub segment_drop_events: usize,
+    pub memory_tier_transitions: usize,
+    pub api_latency_events: usize,
+    pub highest_backpressure_tier: Option<BackpressureTier>,
+    pub max_capture_depth: usize,
+    pub max_write_depth: usize,
+    pub total_segments_dropped: u64,
+    pub distinct_throttled_panes: usize,
+    pub memory_bytes_moved: u64,
+    pub max_api_latency_ms: u64,
+    pub failed_api_calls: usize,
+}
+
+impl BackpressureTimelineSummary {
+    /// Derive artifact-level counters from events.
+    #[must_use]
+    pub fn from_events(events: &[BackpressureTimelineEvent]) -> Self {
+        let mut summary = Self {
+            total_events: events.len(),
+            ..Self::default()
+        };
+        let mut throttled_panes = HashSet::new();
+
+        for event in events {
+            match &event.kind {
+                BackpressureTimelineEventKind::QueueSample {
+                    tier,
+                    capture_depth,
+                    write_depth,
+                    ..
+                } => {
+                    summary.queue_samples += 1;
+                    summary.observe_tier(*tier);
+                    summary.max_capture_depth = summary.max_capture_depth.max(*capture_depth);
+                    summary.max_write_depth = summary.max_write_depth.max(*write_depth);
+                }
+                BackpressureTimelineEventKind::TierTransition { to, .. } => {
+                    summary.tier_transitions += 1;
+                    summary.observe_tier(*to);
+                }
+                BackpressureTimelineEventKind::Throttle { pane_id, .. } => {
+                    summary.throttle_events += 1;
+                    if let Some(pane_id) = pane_id {
+                        throttled_panes.insert(*pane_id);
+                    }
+                }
+                BackpressureTimelineEventKind::SegmentDrop {
+                    dropped_segments, ..
+                } => {
+                    summary.segment_drop_events += 1;
+                    summary.total_segments_dropped = summary
+                        .total_segments_dropped
+                        .saturating_add(*dropped_segments);
+                }
+                BackpressureTimelineEventKind::MemoryTierTransition { bytes, .. } => {
+                    summary.memory_tier_transitions += 1;
+                    summary.memory_bytes_moved = summary.memory_bytes_moved.saturating_add(*bytes);
+                }
+                BackpressureTimelineEventKind::ApiLatency { latency_ms, ok, .. } => {
+                    summary.api_latency_events += 1;
+                    summary.max_api_latency_ms = summary.max_api_latency_ms.max(*latency_ms);
+                    if !ok {
+                        summary.failed_api_calls += 1;
+                    }
+                }
+            }
+        }
+
+        summary.distinct_throttled_panes = throttled_panes.len();
+        summary
+    }
+
+    fn observe_tier(&mut self, tier: BackpressureTier) {
+        self.highest_backpressure_tier = Some(
+            self.highest_backpressure_tier
+                .map_or(tier, |current| current.max(tier)),
+        );
+    }
+}
+
 // ─── Metrics ─────────────────────────────────────────────────────────
 
 /// Counters tracked across the lifetime of the backpressure manager.
@@ -1594,5 +1909,221 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: BackpressureTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    // ── Load-proof timeline artifact tests ─────────────────────────────
+
+    fn sample_queue_event(
+        ts: u64,
+        depths: QueueDepths,
+        tier: BackpressureTier,
+    ) -> BackpressureTimelineEvent {
+        BackpressureTimelineEvent::new(
+            ts,
+            BackpressureTimelineEventKind::QueueSample {
+                tier,
+                capture_depth: depths.capture_depth,
+                capture_capacity: depths.capture_capacity,
+                write_depth: depths.write_depth,
+                write_capacity: depths.write_capacity,
+            },
+        )
+    }
+
+    #[test]
+    fn timeline_artifact_bounds_events_and_derives_summary() {
+        let events = vec![
+            sample_queue_event(1000, depths(10, 100, 20, 100), BackpressureTier::Green),
+            sample_queue_event(1100, depths(75, 100, 20, 100), BackpressureTier::Red),
+            BackpressureTimelineEvent::new(
+                1110,
+                BackpressureTimelineEventKind::TierTransition {
+                    from: BackpressureTier::Green,
+                    to: BackpressureTier::Red,
+                    reason: "capture queue crossed red threshold".into(),
+                },
+            ),
+            BackpressureTimelineEvent::new(
+                1120,
+                BackpressureTimelineEventKind::Throttle {
+                    action: BackpressureThrottleAction::PausePane,
+                    pane_id: Some(42),
+                    reason: "red tier pause ratio selected lowest priority pane".into(),
+                },
+            ),
+            BackpressureTimelineEvent::new(
+                1130,
+                BackpressureTimelineEventKind::SegmentDrop {
+                    pane_id: 42,
+                    dropped_segments: 3,
+                    reason: "persistence buffer at max_buffered_segments".into(),
+                },
+            ),
+        ];
+
+        let artifact = BackpressureTimelineArtifact::from_events_bounded(
+            "run-ft-rhamq",
+            "10-pane-replay-pressure",
+            1_780_000_000_000,
+            "local-replay",
+            events,
+            4,
+        );
+
+        assert_eq!(
+            artifact.schema_version,
+            BACKPRESSURE_TIMELINE_SCHEMA_VERSION
+        );
+        assert_eq!(artifact.events.len(), 4);
+        assert_eq!(artifact.truncated_events, 1);
+        assert_eq!(artifact.summary.total_events, 4);
+        assert_eq!(artifact.summary.queue_samples, 2);
+        assert_eq!(artifact.summary.tier_transitions, 1);
+        assert_eq!(artifact.summary.throttle_events, 1);
+        assert_eq!(artifact.summary.segment_drop_events, 0);
+        assert_eq!(
+            artifact.summary.highest_backpressure_tier,
+            Some(BackpressureTier::Red)
+        );
+        assert_eq!(artifact.summary.max_capture_depth, 75);
+        assert_eq!(artifact.summary.distinct_throttled_panes, 1);
+    }
+
+    #[test]
+    fn timeline_serializes_explainable_throttle_and_memory_transition() {
+        let evidence = (0..(BACKPRESSURE_TIMELINE_MAX_EVIDENCE + 2))
+            .map(|idx| {
+                BackpressureTimelineEvidence::new(
+                    BackpressureTimelineEvidenceSource::QueueDepth,
+                    format!("queue_sample_{idx}"),
+                    format!("capture={idx}"),
+                )
+            })
+            .collect();
+        let events = vec![
+            BackpressureTimelineEvent::with_evidence(
+                2000,
+                BackpressureTimelineEventKind::Throttle {
+                    action: BackpressureThrottleAction::SkipDetection,
+                    pane_id: Some(7),
+                    reason: "yellow tier skipped low-priority detection work".into(),
+                },
+                evidence,
+            ),
+            BackpressureTimelineEvent::with_evidence(
+                2100,
+                BackpressureTimelineEventKind::MemoryTierTransition {
+                    pane_id: 7,
+                    from: BackpressureMemoryTier::Hot,
+                    to: BackpressureMemoryTier::Warm,
+                    bytes: 8192,
+                    reason: "warm scrollback admission reduced hot memory pressure".into(),
+                },
+                vec![BackpressureTimelineEvidence::new(
+                    BackpressureTimelineEvidenceSource::MemoryTier,
+                    "scrollback_chunk",
+                    "pane=7 bytes=8192",
+                )],
+            ),
+            BackpressureTimelineEvent::new(
+                2200,
+                BackpressureTimelineEventKind::ApiLatency {
+                    surface: BackpressureApiSurface::Robot,
+                    operation: "fleet.status".into(),
+                    latency_ms: 37,
+                    ok: true,
+                },
+            ),
+        ];
+
+        let artifact = BackpressureTimelineArtifact::new(
+            "run-ft-rhamq-json",
+            "timeline-serialization",
+            1_780_000_000_100,
+            "fixture-host",
+            events,
+        );
+        let json = serde_json::to_string_pretty(&artifact).unwrap();
+        let parsed: BackpressureTimelineArtifact = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, artifact);
+        assert_eq!(
+            parsed.events[0].evidence.len(),
+            BACKPRESSURE_TIMELINE_MAX_EVIDENCE
+        );
+        assert_eq!(parsed.summary.throttle_events, 1);
+        assert_eq!(parsed.summary.memory_tier_transitions, 1);
+        assert_eq!(parsed.summary.memory_bytes_moved, 8192);
+        assert_eq!(parsed.summary.api_latency_events, 1);
+        assert_eq!(parsed.summary.max_api_latency_ms, 37);
+        assert!(json.contains("\"skip_detection\""));
+        assert!(json.contains("\"warm\""));
+        assert!(json.contains("\"fleet.status\""));
+    }
+
+    #[test]
+    fn timeline_load_fixture_explains_pressure_transition() {
+        let manager = default_manager();
+        let green = depths(5, 100, 8, 100);
+        let red = depths(76, 100, 40, 100);
+        let transition = manager.evaluate(&red).expect("fixture must enter red");
+
+        assert_eq!(transition, (BackpressureTier::Green, BackpressureTier::Red));
+
+        let artifact = BackpressureTimelineArtifact::new(
+            "run-ft-rhamq-fixture",
+            "small-load-fixture",
+            1_780_000_000_200,
+            "rch-replay",
+            vec![
+                sample_queue_event(3000, green, manager.classify(&green)),
+                sample_queue_event(3010, red, manager.current_tier()),
+                BackpressureTimelineEvent::with_evidence(
+                    3011,
+                    BackpressureTimelineEventKind::TierTransition {
+                        from: transition.0,
+                        to: transition.1,
+                        reason: "capture depth 76/100 crossed red threshold 0.75".into(),
+                    },
+                    vec![BackpressureTimelineEvidence::new(
+                        BackpressureTimelineEvidenceSource::BackpressureSnapshot,
+                        "capture_queue",
+                        "76/100",
+                    )],
+                ),
+                BackpressureTimelineEvent::new(
+                    3020,
+                    BackpressureTimelineEventKind::Throttle {
+                        action: BackpressureThrottleAction::ReduceBufferLimit,
+                        pane_id: None,
+                        reason: "red tier applies max_buffered_segments pressure guard".into(),
+                    },
+                ),
+                BackpressureTimelineEvent::new(
+                    3030,
+                    BackpressureTimelineEventKind::ApiLatency {
+                        surface: BackpressureApiSurface::Web,
+                        operation: "/stream/events".into(),
+                        latency_ms: 125,
+                        ok: false,
+                    },
+                ),
+            ],
+        );
+
+        assert_eq!(artifact.summary.total_events, 5);
+        assert_eq!(artifact.summary.queue_samples, 2);
+        assert_eq!(artifact.summary.tier_transitions, 1);
+        assert_eq!(artifact.summary.throttle_events, 1);
+        assert_eq!(artifact.summary.failed_api_calls, 1);
+        assert_eq!(artifact.summary.max_api_latency_ms, 125);
+        assert_eq!(
+            artifact.summary.highest_backpressure_tier,
+            Some(BackpressureTier::Red)
+        );
+
+        let transition_event = &artifact.events[2];
+        assert_eq!(transition_event.timestamp_ms, 3011);
+        assert!(!transition_event.evidence.is_empty());
     }
 }
