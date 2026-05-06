@@ -32,7 +32,7 @@ The producing-bead column is the source of truth for which work item gates the a
 | `security/distributed-threat-model` | `ft-x0666.3` | G11 |
 | `proofs/loom-runtime-async` | `ft-syqcz.6` | G8 |
 | `proofs/runtime-proof-trait` | `ft-i2eni.1` | G1 |
-| `proofs/robot-contracts` | `ft-hac7w.1` | G2 |
+| `proofs/robot-contracts` | `ft-q5njp` | G2 |
 | `doctrine/agents-md-counts` | `ft-i2eni.5` | G6 |
 | `doctrine/vendored-provenance` | `ft-i2eni.6` | G15 |
 

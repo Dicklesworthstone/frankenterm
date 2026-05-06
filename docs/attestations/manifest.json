@@ -88,10 +88,10 @@
     },
     {
       "category": "proofs/robot-contracts",
-      "path": null,
+      "path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
       "media_type": "application/json",
-      "produced_by_bead": "ft-hac7w.1",
-      "description": "Schema-driven robot family conformance contracts (G2)."
+      "produced_by_bead": "ft-q5njp",
+      "description": "Robot/MCP/CLI control-plane golden matrix for schema-backed envelope, policy, and capability contract coverage (G2)."
     },
     {
       "category": "doctrine/agents-md-counts",

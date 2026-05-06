@@ -40,7 +40,7 @@ in [`docs/attestations/README.md`](../attestations/README.md)
 | `security/distributed-threat-model` | `ft-x0666.3`       | `br show ft-x0666.3` reports closed |
 | `proofs/loom-runtime-async`         | `ft-syqcz.6`       | `br show ft-syqcz.6` reports closed |
 | `proofs/runtime-proof-trait`        | `ft-i2eni.1`       | `br show ft-i2eni.1` reports closed |
-| `proofs/robot-contracts`            | `ft-hac7w.1`       | `br show ft-hac7w.1` reports closed |
+| `proofs/robot-contracts`            | `ft-q5njp`         | `br show ft-q5njp` reports closed |
 | `doctrine/agents-md-counts`         | `ft-i2eni.5`       | `br show ft-i2eni.5` reports closed |
 
 If any bead is **not closed**, the release MUST NOT proceed —
