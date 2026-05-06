@@ -79,6 +79,31 @@ changed knob ID, action, and reason. Candidate runs must label decisions that
 derive from these packages as simulated output; they are replay evidence, not
 proof that the live runtime would accept the same resource settings.
 
+### 3.1 Resource What-If Command Surface
+
+Operators can inspect a resource-control candidate without mutating the live
+runtime:
+
+```bash
+ft resource what-if \
+  --trace fixtures/scale-lab/resource-what-if-trace.v1.json \
+  --override-package fixtures/scale-lab/resource-what-if-candidate.v1.toml
+
+ft robot --format toon resource what-if \
+  --trace fixtures/scale-lab/resource-what-if-trace.v1.json \
+  --override-package fixtures/scale-lab/resource-what-if-candidate.v1.toml
+```
+
+The human command defaults to a concise plain-text summary. `--format json` and
+`--format toon` expose the same versioned report as Robot Mode: `schema_version`,
+`trace_hash`, `override_hash`, `decision_deltas`, `risk_score`,
+`confidence_score`, `proof_status`, and `next_proof_steps` are contract fields.
+The report always declares `dry_run: true` and an empty `mutation_surface`; it
+does not change live panes, runtime knobs, workflows, Beads, Agent Mail, or
+external services. Golden contract cases live in
+`fixtures/scale-lab/resource-what-if-contracts.v1.json` and cover pass,
+warning, blocked, and missing-telemetry output shapes.
+
 ---
 
 ## 4. Equivalence Levels

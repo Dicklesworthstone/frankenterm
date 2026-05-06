@@ -1283,6 +1283,20 @@ SEE ALSO:
         json: bool,
     },
 
+    /// Replay-backed resource-control what-if analysis
+    #[command(after_help = r#"EXAMPLES:
+    ft resource what-if --trace fixtures/scale-lab/resource-what-if-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-candidate.v1.toml
+    ft resource what-if --trace trace.json --override-package candidate.toml --format json
+    ft resource what-if --trace trace.json --override-package candidate.toml --format toon
+
+NOTES:
+    This is a read-only replay surface. It never mutates live panes, runtime
+    knobs, workflows, Beads, Agent Mail, or external services."#)]
+    Resource {
+        #[command(subcommand)]
+        command: ResourceCommands,
+    },
+
     /// Reserve a pane for exclusive use
     #[command(after_help = r#"EXAMPLES:
     ft reserve 3 --owner-id agent-1   Reserve pane 3 for agent-1
@@ -2303,6 +2317,45 @@ enum ReplayCommands {
 }
 
 #[derive(Subcommand)]
+enum ResourceCommands {
+    /// Run replay-backed resource-control what-if analysis
+    #[command(after_help = r#"EXAMPLES:
+    ft resource what-if --trace fixtures/scale-lab/resource-what-if-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-candidate.v1.toml
+    ft resource what-if --trace trace.json --override-package candidate.toml --format json
+    ft resource what-if --trace trace.json --override-package candidate.toml --format toon
+"#)]
+    WhatIf {
+        /// DigitalTwinTrace JSON artifact
+        #[arg(long)]
+        trace: PathBuf,
+
+        /// Resource-control override TOML package
+        #[arg(long = "override-package", visible_alias = "package")]
+        override_package: PathBuf,
+
+        /// Output format: plain, json, or toon
+        #[arg(long, short = 'f', value_enum, default_value = "plain")]
+        format: ResourceWhatIfOutputFormat,
+
+        /// Stable generation timestamp for the simulation report
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
+
+        /// Minimum confidence score required before apply can be recommended
+        #[arg(long)]
+        minimum_apply_confidence_score: Option<u8>,
+
+        /// Minimum logical CPUs for live high-scale proof classification
+        #[arg(long)]
+        high_scale_min_cpu_count: Option<u32>,
+
+        /// Minimum memory bytes for live high-scale proof classification
+        #[arg(long)]
+        high_scale_min_memory_bytes: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ArtifactCommands {
     /// List registered replay artifacts
     List {
@@ -2811,6 +2864,12 @@ enum RobotCommands {
         level: u8,
     },
 
+    /// Resource-control what-if simulation endpoints
+    Resource {
+        #[command(subcommand)]
+        command: RobotResourceCommands,
+    },
+
     /// Validate an approval code for a pending action
     Approve {
         /// The approval code (8-character alphanumeric)
@@ -2887,6 +2946,37 @@ enum RobotCommands {
         /// Intended proof command argv. Use `--` before the command.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RobotResourceCommands {
+    /// Run a read-only resource-control what-if simulation
+    #[command(visible_alias = "whatif")]
+    WhatIf {
+        /// DigitalTwinTrace JSON artifact
+        #[arg(long)]
+        trace: PathBuf,
+
+        /// Resource-control override TOML package
+        #[arg(long = "override-package", visible_alias = "package")]
+        override_package: PathBuf,
+
+        /// Stable generation timestamp for the simulation report
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
+
+        /// Minimum confidence score required before apply can be recommended
+        #[arg(long)]
+        minimum_apply_confidence_score: Option<u8>,
+
+        /// Minimum logical CPUs for live high-scale proof classification
+        #[arg(long)]
+        high_scale_min_cpu_count: Option<u32>,
+
+        /// Minimum memory bytes for live high-scale proof classification
+        #[arg(long)]
+        high_scale_min_memory_bytes: Option<u64>,
     },
 }
 
@@ -4881,6 +4971,7 @@ const ROBOT_ERR_CHECKPOINT_NOT_FOUND: &str = "robot.checkpoint_not_found";
 const ROBOT_ERR_WORK_ITEM_NOT_FOUND: &str = "robot.work_item_not_found";
 const ROBOT_ERR_WORK_ITEM_CONFLICT: &str = "robot.work_item_conflict";
 const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
+const ROBOT_ERR_RESOURCE_WHAT_IF: &str = "robot.resource.what_if_error";
 const ROBOT_APPROVAL_RECOVERY_HINT: &str = "Run `ft watch` so approvals can be issued, then validate any issued token with `ft approve <CODE>` before retrying.";
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE: &str =
     "Live get-text is unavailable for distributed panes";
@@ -4945,6 +5036,13 @@ fn robot_reservation_error_details(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RobotOutputFormat {
+    Json,
+    Toon,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ResourceWhatIfOutputFormat {
+    Plain,
     Json,
     Toon,
 }
@@ -6165,6 +6263,327 @@ struct RobotTxShowData {
     legal_transitions: Vec<RobotTxTransitionInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contract: Option<frankenterm_core::plan::MissionTxContract>,
+}
+
+const RESOURCE_WHAT_IF_SCHEMA_VERSION: &str = "ft.resource_what_if.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct ResourceWhatIfDecisionDeltas {
+    changed_steps: u64,
+    unchanged_steps: u64,
+    admission_action_changes: u64,
+    latency_stage_movements: u64,
+    beneficial_changes: u64,
+    harmful_changes: u64,
+    mixed_changes: u64,
+    queue_depth_delta_sum: i128,
+    resident_memory_delta_bytes: i128,
+    cold_memory_delta_bytes: i128,
+    topology_migration_delta: i128,
+    policy_audit_delta: i128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct ResourceWhatIfRiskSummary {
+    code: String,
+    severity: frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinGateVerdict,
+    score: u8,
+    candidate_knobs: Vec<String>,
+    blocker_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct ResourceWhatIfReport {
+    schema_version: &'static str,
+    dry_run: bool,
+    mutation_surface: Vec<&'static str>,
+    trace_hash: String,
+    override_hash: String,
+    simulation_hash: String,
+    digital_twin_schema_version: String,
+    package_name: String,
+    package_override_count: usize,
+    applied_overrides: Vec<String>,
+    decision_deltas: ResourceWhatIfDecisionDeltas,
+    confidence_score: u8,
+    confidence_threshold: u8,
+    confidence_verdict:
+        frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinGateVerdict,
+    confidence_blockers: Vec<String>,
+    confidence_warnings: Vec<String>,
+    risk_score: u8,
+    risk_verdict:
+        frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinGateVerdict,
+    risk_fail_closed: bool,
+    risk_items: Vec<ResourceWhatIfRiskSummary>,
+    proof_status: frankenterm_core_replay::replay_scenario_matrix::ProofStatus,
+    proof_evidence_source: Option<
+        frankenterm_core_replay::replay_scenario_matrix::ScaleProofEvidenceSource,
+    >,
+    hardware_predicate:
+        frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinHardwarePredicate,
+    high_scale_claim_allowed: bool,
+    next_proof_steps: Vec<String>,
+    apply_recommendation:
+        frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinApplyRecommendation,
+    apply_reason_codes: Vec<String>,
+    apply_blocker_text: String,
+    data_quality_warnings: Vec<String>,
+    top_improvements: Vec<String>,
+    top_regressions: Vec<String>,
+    side_effect_barrier_mode: String,
+    side_effects_captured: usize,
+}
+
+fn resource_what_if_options(
+    generated_at_ms: Option<u64>,
+    minimum_apply_confidence_score: Option<u8>,
+    high_scale_min_cpu_count: Option<u32>,
+    high_scale_min_memory_bytes: Option<u64>,
+) -> frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinRunOptions {
+    let mut options =
+        frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinRunOptions::default(
+        );
+    if let Some(value) = generated_at_ms {
+        options.generated_at_ms = value;
+    }
+    if let Some(value) = minimum_apply_confidence_score {
+        options.minimum_apply_confidence_score = value;
+    }
+    if let Some(value) = high_scale_min_cpu_count {
+        options.high_scale_min_cpu_count = value;
+    }
+    if let Some(value) = high_scale_min_memory_bytes {
+        options.high_scale_min_memory_bytes = value;
+    }
+    options
+}
+
+fn resource_what_if_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
+fn resource_what_if_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn resource_what_if_report_from_inputs(
+    trace: &frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace,
+    package: &frankenterm_core_replay::replay_counterfactual::ResourceControlOverridePackage,
+    package_source: &str,
+    options: &frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinRunOptions,
+) -> anyhow::Result<ResourceWhatIfReport> {
+    use frankenterm_core_replay::replay_resource_digital_twin::{
+        CandidateImpact, ResourceDigitalTwinEngine,
+    };
+    use frankenterm_core_replay::replay_side_effect_barrier::ReplayBarrier;
+
+    let barrier = ReplayBarrier::new();
+    let simulation = ResourceDigitalTwinEngine::default()
+        .simulate_with_options(trace, package, &barrier, options)
+        .map_err(|error| anyhow::anyhow!("resource what-if simulation failed: {error}"))?;
+
+    let mut top_improvements = Vec::new();
+    let mut top_regressions = Vec::new();
+    for change in &simulation.diff.changes {
+        let summary = format!(
+            "{}: action {} -> {}, latency {} -> {}, queue_delta={}, resident_delta_bytes={}, topology_delta={}, policy_audit_delta={}",
+            change.step_id,
+            resource_what_if_label(&change.baseline_action),
+            resource_what_if_label(&change.candidate_action),
+            resource_what_if_label(&change.baseline_latency_stage),
+            resource_what_if_label(&change.candidate_latency_stage),
+            change.queue_depth_delta,
+            change.resident_memory_delta_bytes,
+            change.topology_migration_delta,
+            change.policy_audit_delta,
+        );
+        match change.impact {
+            CandidateImpact::Beneficial => top_improvements.push(summary),
+            CandidateImpact::Harmful | CandidateImpact::Mixed => top_regressions.push(summary),
+            CandidateImpact::Neutral => {}
+        }
+    }
+    top_improvements.truncate(3);
+    top_regressions.truncate(3);
+
+    let risk_items = simulation
+        .risk
+        .items
+        .iter()
+        .map(|item| ResourceWhatIfRiskSummary {
+            code: item.code.clone(),
+            severity: item.severity,
+            score: item.score,
+            candidate_knobs: item.candidate_knobs.clone(),
+            blocker_text: item.blocker_text.clone(),
+        })
+        .collect();
+
+    Ok(ResourceWhatIfReport {
+        schema_version: RESOURCE_WHAT_IF_SCHEMA_VERSION,
+        dry_run: true,
+        mutation_surface: Vec::new(),
+        trace_hash: simulation.trace_hash.clone(),
+        override_hash: resource_what_if_sha256_hex(package_source.as_bytes()),
+        simulation_hash: simulation.simulation_hash.clone(),
+        digital_twin_schema_version: simulation.schema_version.clone(),
+        package_name: simulation.package_name.clone(),
+        package_override_count: simulation.package_override_count,
+        applied_overrides: simulation.applied_overrides.clone(),
+        decision_deltas: ResourceWhatIfDecisionDeltas {
+            changed_steps: simulation.diff.changed_steps,
+            unchanged_steps: simulation.diff.unchanged_steps,
+            admission_action_changes: simulation.diff.admission_action_changes,
+            latency_stage_movements: simulation.diff.latency_stage_movements,
+            beneficial_changes: simulation.diff.beneficial_changes,
+            harmful_changes: simulation.diff.harmful_changes,
+            mixed_changes: simulation.diff.mixed_changes,
+            queue_depth_delta_sum: simulation.diff.queue_depth_delta_sum,
+            resident_memory_delta_bytes: simulation.diff.resident_memory_delta_bytes,
+            cold_memory_delta_bytes: simulation.diff.cold_memory_delta_bytes,
+            topology_migration_delta: simulation.diff.topology_migration_delta,
+            policy_audit_delta: simulation.diff.policy_audit_delta,
+        },
+        confidence_score: simulation.confidence.score,
+        confidence_threshold: simulation.confidence.threshold,
+        confidence_verdict: simulation.confidence.verdict,
+        confidence_blockers: simulation.confidence.blockers.clone(),
+        confidence_warnings: simulation.confidence.warnings.clone(),
+        risk_score: simulation.risk.score,
+        risk_verdict: simulation.risk.verdict,
+        risk_fail_closed: simulation.risk.fail_closed,
+        risk_items,
+        proof_status: simulation.proof_classification.proof_status,
+        proof_evidence_source: simulation.proof_classification.evidence_source,
+        hardware_predicate: simulation.proof_classification.hardware_predicate,
+        high_scale_claim_allowed: simulation.proof_classification.high_scale_claim_allowed,
+        next_proof_steps: simulation.proof_classification.next_proof_steps.clone(),
+        apply_recommendation: simulation.apply_decision.recommendation,
+        apply_reason_codes: simulation.apply_decision.reason_codes.clone(),
+        apply_blocker_text: simulation.apply_decision.blocker_text.clone(),
+        data_quality_warnings: simulation.data_quality_warnings.clone(),
+        top_improvements,
+        top_regressions,
+        side_effect_barrier_mode: simulation.side_effect_barrier_mode.clone(),
+        side_effects_captured: simulation.side_effects_captured,
+    })
+}
+
+fn load_resource_what_if_report(
+    trace_path: &Path,
+    override_package_path: &Path,
+    options: &frankenterm_core_replay::replay_resource_digital_twin::ResourceDigitalTwinRunOptions,
+) -> anyhow::Result<ResourceWhatIfReport> {
+    use frankenterm_core_replay::replay_counterfactual::ResourceControlOverrideLoader;
+    use frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace;
+
+    let trace_json = fs::read_to_string(trace_path).map_err(|error| {
+        anyhow::anyhow!("failed to read trace '{}': {error}", trace_path.display())
+    })?;
+    let trace: DigitalTwinTrace = serde_json::from_str(&trace_json).map_err(|error| {
+        anyhow::anyhow!("failed to parse trace '{}': {error}", trace_path.display())
+    })?;
+
+    let package_toml = fs::read_to_string(override_package_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read override package '{}': {error}",
+            override_package_path.display()
+        )
+    })?;
+    let package = ResourceControlOverrideLoader::load(&package_toml).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to parse override package '{}': {error}",
+            override_package_path.display()
+        )
+    })?;
+
+    resource_what_if_report_from_inputs(&trace, &package, &package_toml, options)
+}
+
+fn render_resource_what_if_human(report: &ResourceWhatIfReport) -> String {
+    let proof_source = report
+        .proof_evidence_source
+        .as_ref()
+        .map(resource_what_if_label)
+        .unwrap_or_else(|| "none".to_string());
+    let next_proof = if report.next_proof_steps.is_empty() {
+        "none".to_string()
+    } else {
+        report.next_proof_steps.join(" | ")
+    };
+    let improvements = if report.top_improvements.is_empty() {
+        "none".to_string()
+    } else {
+        report.top_improvements.join(" | ")
+    };
+    let regressions = if report.top_regressions.is_empty() {
+        "none".to_string()
+    } else {
+        report.top_regressions.join(" | ")
+    };
+
+    format!(
+        concat!(
+            "Resource what-if: {}\n",
+            "Confidence: {} {}/{}\n",
+            "Risk: {} {} fail_closed={}\n",
+            "Proof: {} source={} hardware={} high_scale_claim_allowed={}\n",
+            "Deltas: changed={} beneficial={} harmful={} mixed={} queue_delta={} resident_delta_bytes={} topology_delta={} policy_audit_delta={}\n",
+            "Top improvements: {}\n",
+            "Top regressions: {}\n",
+            "Next proof: {}\n",
+            "Simulation: {}\n",
+            "Dry-run: no live panes, runtime knobs, workflows, Beads, Agent Mail, or external services mutated\n"
+        ),
+        resource_what_if_label(&report.apply_recommendation),
+        resource_what_if_label(&report.confidence_verdict),
+        report.confidence_score,
+        report.confidence_threshold,
+        resource_what_if_label(&report.risk_verdict),
+        report.risk_score,
+        report.risk_fail_closed,
+        resource_what_if_label(&report.proof_status),
+        proof_source,
+        resource_what_if_label(&report.hardware_predicate),
+        report.high_scale_claim_allowed,
+        report.decision_deltas.changed_steps,
+        report.decision_deltas.beneficial_changes,
+        report.decision_deltas.harmful_changes,
+        report.decision_deltas.mixed_changes,
+        report.decision_deltas.queue_depth_delta_sum,
+        report.decision_deltas.resident_memory_delta_bytes,
+        report.decision_deltas.topology_migration_delta,
+        report.decision_deltas.policy_audit_delta,
+        improvements,
+        regressions,
+        next_proof,
+        report.simulation_hash,
+    )
+}
+
+fn print_resource_what_if_report(
+    report: &ResourceWhatIfReport,
+    format: ResourceWhatIfOutputFormat,
+) -> anyhow::Result<()> {
+    match format {
+        ResourceWhatIfOutputFormat::Plain => {
+            print!("{}", render_resource_what_if_human(report));
+        }
+        ResourceWhatIfOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+        }
+        ResourceWhatIfOutputFormat::Toon => {
+            println!("{}", toon_rust::encode(serde_json::to_value(report)?, None));
+        }
+    }
+    Ok(())
 }
 
 /// Pane state for CLI output (list and robot state commands)
@@ -9207,6 +9626,9 @@ fn now_ms_i64() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+type RobotJsonResponse = RobotResponse<serde_json::Value>;
+type RobotJsonResult<T> = Result<T, Box<RobotJsonResponse>>;
+
 #[derive(Debug, Clone)]
 struct RobotWorkRow {
     claim_id: String,
@@ -9230,14 +9652,11 @@ fn robot_work_error_response(
     message: impl Into<String>,
     hint: Option<String>,
     elapsed_ms: u64,
-) -> RobotResponse<serde_json::Value> {
+) -> RobotJsonResponse {
     RobotResponse::<serde_json::Value>::error_with_code(code, message, hint, elapsed_ms)
 }
 
-fn robot_work_backend_error(
-    err: impl std::fmt::Display,
-    elapsed_ms: u64,
-) -> RobotResponse<serde_json::Value> {
+fn robot_work_backend_error(err: impl std::fmt::Display, elapsed_ms: u64) -> RobotJsonResponse {
     robot_work_error_response(
         ROBOT_ERR_STORAGE,
         format!("Failed to update native work queue: {err}"),
@@ -9263,7 +9682,7 @@ fn robot_work_conflict(
     reason: &str,
     current_owner: Option<&str>,
     elapsed_ms: u64,
-) -> RobotResponse<serde_json::Value> {
+) -> RobotJsonResponse {
     let mut message = format!("Work item `{item_id}` cannot transition: {reason}.");
     if let Some(owner) = current_owner {
         message.push_str(&format!(" Current owner: {owner}."));
@@ -9279,26 +9698,22 @@ fn robot_work_conflict(
     )
 }
 
-fn robot_work_validate_id(
-    kind: &str,
-    value: &str,
-    elapsed_ms: u64,
-) -> Result<(), RobotResponse<serde_json::Value>> {
+fn robot_work_validate_id(kind: &str, value: &str, elapsed_ms: u64) -> RobotJsonResult<()> {
     if value.trim().is_empty() {
-        return Err(robot_work_error_response(
+        return Err(Box::new(robot_work_error_response(
             ROBOT_ERR_INVALID_ARGS,
             format!("{kind} must not be empty."),
             None,
             elapsed_ms,
-        ));
+        )));
     }
     if value.len() > 256 {
-        return Err(robot_work_error_response(
+        return Err(Box::new(robot_work_error_response(
             ROBOT_ERR_INVALID_ARGS,
             format!("{kind} is too long; maximum is 256 bytes."),
             None,
             elapsed_ms,
-        ));
+        )));
     }
     Ok(())
 }
@@ -9312,7 +9727,7 @@ fn robot_work_open_conn(db_path: &str) -> anyhow::Result<rusqlite::Connection> {
 
 fn robot_work_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch(
-        r#"
+        r"
         CREATE TABLE IF NOT EXISTS work_claims (
             claim_id TEXT PRIMARY KEY NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('unclaimed', 'claimed', 'completed')),
@@ -9333,7 +9748,7 @@ fn robot_work_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_work_claims_state ON work_claims(state);
         CREATE INDEX IF NOT EXISTS idx_work_claims_owner ON work_claims(owner);
-        "#,
+        ",
     )?;
     Ok(())
 }
@@ -9357,13 +9772,13 @@ fn robot_work_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<RobotWor
     })
 }
 
-const ROBOT_WORK_SELECT_ROW: &str = r#"
+const ROBOT_WORK_SELECT_ROW: &str = r"
     SELECT claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
            claimed_at_ms, completed_at_ms, summary, evidence_json, blocked_by_count,
            unblocks_count, last_reason
     FROM work_claims
     WHERE claim_id = ?1
-"#;
+";
 
 fn robot_work_fetch_row_tx(
     tx: &rusqlite::Transaction<'_>,
@@ -9411,7 +9826,8 @@ fn robot_work_summary(row: &RobotWorkRow) -> serde_json::Value {
 }
 
 fn robot_work_normalize_status_filter(status: Option<&str>) -> Option<String> {
-    status.map(|s| match s.trim().to_ascii_lowercase().as_str() {
+    let status = status?;
+    Some(match status.trim().to_ascii_lowercase().as_str() {
         "open" | "ready" | "unclaimed" => "unclaimed".to_string(),
         "in_progress" | "claimed" | "assigned" => "claimed".to_string(),
         "closed" | "done" | "completed" => "completed".to_string(),
@@ -9443,7 +9859,7 @@ fn robot_work_claim_data(
     item_id: &str,
     agent_id: &str,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     robot_work_validate_id("item_id", item_id, elapsed_ms)?;
     robot_work_validate_id("agent_id", agent_id, elapsed_ms)?;
 
@@ -9473,28 +9889,28 @@ fn robot_work_claim_data(
         }
         ("claimed", Some(owner)) if owner == agent_id => {}
         ("claimed", owner) => {
-            return Err(robot_work_conflict(
+            return Err(Box::new(robot_work_conflict(
                 item_id,
                 "already_claimed",
                 owner,
                 elapsed_ms,
-            ));
+            )));
         }
         ("completed", owner) => {
-            return Err(robot_work_conflict(
+            return Err(Box::new(robot_work_conflict(
                 item_id,
                 "already_completed",
                 owner,
                 elapsed_ms,
-            ));
+            )));
         }
         _ => {
-            return Err(robot_work_conflict(
+            return Err(Box::new(robot_work_conflict(
                 item_id,
                 "invalid_state",
                 row.owner.as_deref(),
                 elapsed_ms,
-            ));
+            )));
         }
     }
 
@@ -9529,7 +9945,7 @@ fn robot_work_release_data(
     item_id: &str,
     reason: Option<&str>,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     robot_work_validate_id("item_id", item_id, elapsed_ms)?;
 
     let mut conn =
@@ -9542,12 +9958,12 @@ fn robot_work_release_data(
         .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
         .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
     if row.state == "completed" {
-        return Err(robot_work_conflict(
+        return Err(Box::new(robot_work_conflict(
             item_id,
             "already_completed",
             row.owner.as_deref(),
             elapsed_ms,
-        ));
+        )));
     }
 
     let now_ms = now_ms_i64();
@@ -9585,7 +10001,7 @@ fn robot_work_complete_data(
     summary: Option<&str>,
     evidence: &[String],
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     robot_work_validate_id("item_id", item_id, elapsed_ms)?;
 
     let mut conn =
@@ -9640,7 +10056,7 @@ fn robot_work_assign_data(
     agent_id: &str,
     strategy: Option<&str>,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     robot_work_validate_id("item_id", item_id, elapsed_ms)?;
     robot_work_validate_id("agent_id", agent_id, elapsed_ms)?;
 
@@ -9660,20 +10076,20 @@ fn robot_work_assign_data(
         .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
 
     if row.state == "completed" {
-        return Err(robot_work_conflict(
+        return Err(Box::new(robot_work_conflict(
             item_id,
             "already_completed",
             row.owner.as_deref(),
             elapsed_ms,
-        ));
+        )));
     }
     if row.state == "claimed" && row.owner.as_deref() != Some(agent_id) && !force {
-        return Err(robot_work_conflict(
+        return Err(Box::new(robot_work_conflict(
             item_id,
             "already_claimed",
             row.owner.as_deref(),
             elapsed_ms,
-        ));
+        )));
     }
 
     tx.execute(
@@ -9714,13 +10130,13 @@ fn robot_work_list_rows(
     let normalized_status = robot_work_normalize_status_filter(status);
     let limit = robot_work_limit(limit);
     let mut stmt = conn.prepare(
-        r#"
+        r"
         SELECT claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
                claimed_at_ms, completed_at_ms, summary, evidence_json, blocked_by_count,
                unblocks_count, last_reason
         FROM work_claims
         ORDER BY priority ASC, updated_at_ms DESC, claim_id ASC
-        "#,
+        ",
     )?;
     let rows = stmt.query_map([], robot_work_row_from_sql)?;
 
@@ -9757,7 +10173,7 @@ fn robot_work_list_data(
     label: Option<&str>,
     limit: usize,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     let (items, total) = robot_work_list_rows(db_path, status, agent, label, limit)
         .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
     Ok(serde_json::json!({
@@ -9781,7 +10197,7 @@ fn robot_work_ready_data(
     agent_id: Option<&str>,
     limit: usize,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     let conn =
         robot_work_open_conn(db_path).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
     let total_ready: i64 = conn
@@ -9872,7 +10288,7 @@ fn robot_work_command_response(
 
     match result {
         Ok(data) => RobotResponse::<serde_json::Value>::success(data, elapsed_ms),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -9907,14 +10323,11 @@ fn robot_context_error_response(
     message: impl Into<String>,
     hint: Option<String>,
     elapsed_ms: u64,
-) -> RobotResponse<serde_json::Value> {
+) -> RobotJsonResponse {
     RobotResponse::<serde_json::Value>::error_with_code(code, message, hint, elapsed_ms)
 }
 
-fn robot_context_backend_error(
-    err: impl std::fmt::Display,
-    elapsed_ms: u64,
-) -> RobotResponse<serde_json::Value> {
+fn robot_context_backend_error(err: impl std::fmt::Display, elapsed_ms: u64) -> RobotJsonResponse {
     robot_context_error_response(
         ROBOT_ERR_STORAGE,
         format!("Failed to update native context registry: {err}"),
@@ -9927,25 +10340,25 @@ fn robot_context_validate_text(
     field: &str,
     value: Option<&str>,
     elapsed_ms: u64,
-) -> Result<(), RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<()> {
     let Some(value) = value else {
         return Ok(());
     };
     if value.trim().is_empty() {
-        return Err(robot_context_error_response(
+        return Err(Box::new(robot_context_error_response(
             ROBOT_ERR_INVALID_ARGS,
             format!("{field} must not be empty when supplied."),
             None,
             elapsed_ms,
-        ));
+        )));
     }
     if value.len() > 256 {
-        return Err(robot_context_error_response(
+        return Err(Box::new(robot_context_error_response(
             ROBOT_ERR_INVALID_ARGS,
             format!("{field} is too long; maximum is 256 bytes."),
             None,
             elapsed_ms,
-        ));
+        )));
     }
     Ok(())
 }
@@ -9959,7 +10372,7 @@ fn robot_context_open_conn(db_path: &str) -> anyhow::Result<rusqlite::Connection
 
 fn robot_context_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch(
-        r#"
+        r"
         CREATE TABLE IF NOT EXISTS pane_contexts (
             context_id TEXT PRIMARY KEY NOT NULL,
             pane_id INTEGER NOT NULL,
@@ -9999,7 +10412,7 @@ fn robot_context_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()
         CREATE UNIQUE INDEX IF NOT EXISTS idx_context_rotations_idempotency
             ON context_rotations(pane_id, caller_idempotency_key)
             WHERE caller_idempotency_key IS NOT NULL;
-        "#,
+        ",
     )?;
     Ok(())
 }
@@ -10034,17 +10447,17 @@ fn robot_context_rotation_row_from_sql(
     })
 }
 
-const ROBOT_CONTEXT_SELECT_ACTIVE: &str = r#"
+const ROBOT_CONTEXT_SELECT_ACTIVE: &str = r"
     SELECT context_id, depth, token_budget, tokens_consumed, pressure_tier
     FROM pane_contexts
     WHERE pane_id = ?1 AND state = 'active'
-"#;
+";
 
-const ROBOT_CONTEXT_SELECT_ROTATION: &str = r#"
+const ROBOT_CONTEXT_SELECT_ROTATION: &str = r"
     SELECT rotation_id, pane_id, previous_context_id, new_context_id, strategy, reason,
            caller_idempotency_key, rotated_at_ms, tokens_before, tokens_after, tokens_freed
     FROM context_rotations
-"#;
+";
 
 fn robot_context_fetch_active_tx(
     tx: &rusqlite::Transaction<'_>,
@@ -10101,17 +10514,17 @@ fn robot_context_fetch_rotation_by_key_tx(
 fn robot_context_normalize_strategy(
     strategy: &str,
     elapsed_ms: u64,
-) -> Result<&'static str, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<&'static str> {
     match strategy.trim().to_ascii_lowercase().as_str() {
         "agent_default" | "default" | "agent-default" => Ok("agent_default"),
         "aggressive" => Ok("aggressive"),
         "gentle" => Ok("gentle"),
-        other => Err(robot_context_error_response(
+        other => Err(Box::new(robot_context_error_response(
             ROBOT_ERR_INVALID_ARGS,
             format!("Unknown context rotation strategy `{other}`."),
             Some("Use one of: agent_default, aggressive, gentle.".to_string()),
             elapsed_ms,
-        )),
+        ))),
     }
 }
 
@@ -10236,7 +10649,7 @@ fn robot_context_status_data(
     db_path: &str,
     pane_id: Option<u64>,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     let conn = robot_context_open_conn(db_path)
         .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
     let now_ms = now_ms_i64();
@@ -10320,7 +10733,7 @@ fn robot_context_rotate_data(
     reason: Option<&str>,
     idempotency_key: Option<&str>,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     robot_context_validate_text("reason", reason, elapsed_ms)?;
     robot_context_validate_text("idempotency_key", idempotency_key, elapsed_ms)?;
     let strategy = robot_context_normalize_strategy(strategy, elapsed_ms)?;
@@ -10350,18 +10763,20 @@ fn robot_context_rotate_data(
     let new_depth = previous_depth.saturating_add(1);
 
     let pane_s = pane_id.to_string();
-    let now_s = now_ms.to_string();
+    let now_string = now_ms.to_string();
     let depth_s = new_depth.to_string();
     let previous_s = previous_context_id.as_deref().unwrap_or("");
     let key_s = idempotency_key.unwrap_or("");
     let strategy_s = strategy;
-    let new_context_id =
-        robot_context_make_id("ctx", &[&pane_s, &now_s, &depth_s, previous_s, strategy_s]);
+    let new_context_id = robot_context_make_id(
+        "ctx",
+        &[&pane_s, &now_string, &depth_s, previous_s, strategy_s],
+    );
     let rotation_id = robot_context_make_id(
         "rot",
         &[
             &pane_s,
-            &now_s,
+            &now_string,
             &depth_s,
             previous_s,
             &new_context_id,
@@ -10432,7 +10847,7 @@ fn robot_context_history_data(
     pane_id: u64,
     limit: usize,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     let conn = robot_context_open_conn(db_path)
         .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
     let limit = robot_context_limit(limit);
@@ -10533,7 +10948,7 @@ fn robot_context_command_response(
 
     match result {
         Ok(data) => RobotResponse::<serde_json::Value>::success(data, elapsed_ms),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -10557,24 +10972,20 @@ mod robot_context_backend_tests {
         .expect("count context rotations")
     }
 
-    fn expect_context_ok(
-        result: Result<serde_json::Value, RobotResponse<serde_json::Value>>,
-    ) -> serde_json::Value {
+    fn expect_context_ok(result: RobotJsonResult<serde_json::Value>) -> serde_json::Value {
         match result {
             Ok(value) => value,
             Err(response) => panic!(
                 "expected context success, got {}",
-                serde_json::to_string(&response).expect("serialize context response")
+                serde_json::to_string(&*response).expect("serialize context response")
             ),
         }
     }
 
-    fn expect_context_error(
-        result: Result<serde_json::Value, RobotResponse<serde_json::Value>>,
-    ) -> RobotResponse<serde_json::Value> {
+    fn expect_context_error(result: RobotJsonResult<serde_json::Value>) -> RobotJsonResponse {
         match result {
             Ok(value) => panic!("expected context error, got success {value}"),
-            Err(response) => response,
+            Err(response) => *response,
         }
     }
 
@@ -10719,26 +11130,21 @@ mod robot_work_backend_tests {
         (dir, db_path)
     }
 
-    fn expect_ok(
-        result: Result<serde_json::Value, RobotResponse<serde_json::Value>>,
-    ) -> serde_json::Value {
+    fn expect_ok(result: RobotJsonResult<serde_json::Value>) -> serde_json::Value {
         match result {
             Ok(value) => value,
             Err(response) => panic!(
                 "expected success, got {}",
-                serde_json::to_string(&response).expect("serialize response")
+                serde_json::to_string(&*response).expect("serialize response")
             ),
         }
     }
 
-    fn expect_error_code(
-        result: Result<serde_json::Value, RobotResponse<serde_json::Value>>,
-        expected_code: &str,
-    ) {
+    fn expect_error_code(result: RobotJsonResult<serde_json::Value>, expected_code: &str) {
         match result {
             Ok(value) => panic!("expected {expected_code}, got success {value}"),
             Err(response) => {
-                let value = serde_json::to_value(response).expect("serialize response");
+                let value = serde_json::to_value(&*response).expect("serialize response");
                 assert_eq!(value["error_code"].as_str(), Some(expected_code));
             }
         }
@@ -11033,16 +11439,18 @@ fn robot_checkpoint_resolve_id(
     db_path: &str,
     checkpoint_id: &str,
     elapsed_ms: u64,
-) -> Result<i64, RobotResponse<serde_json::Value>> {
-    resolve_checkpoint_id(db_path, checkpoint_id).map_err(|err| {
-        let message = err.to_string();
-        let code = if message.contains("No snapshots found") {
-            ROBOT_ERR_CHECKPOINT_NOT_FOUND
-        } else {
-            ROBOT_ERR_INVALID_ARGS
-        };
-        robot_checkpoint_error_response(code, message, None, elapsed_ms)
-    })
+) -> RobotJsonResult<i64> {
+    Ok(
+        resolve_checkpoint_id(db_path, checkpoint_id).map_err(|err| {
+            let message = err.to_string();
+            let code = if message.contains("No snapshots found") {
+                ROBOT_ERR_CHECKPOINT_NOT_FOUND
+            } else {
+                ROBOT_ERR_INVALID_ARGS
+            };
+            robot_checkpoint_error_response(code, message, None, elapsed_ms)
+        })?,
+    )
 }
 
 fn robot_checkpoint_nonnegative_u64(field: &str, value: i64) -> anyhow::Result<u64> {
@@ -11065,7 +11473,7 @@ fn robot_checkpoint_label_from_metadata(metadata_json: Option<&str>) -> Option<S
 fn persist_robot_checkpoint_metadata(
     db_path: &str,
     checkpoint_id: i64,
-    label: &Option<String>,
+    label: Option<&str>,
     include_scrollback: bool,
     pane_ids: &[u64],
 ) -> anyhow::Result<()> {
@@ -11296,13 +11704,13 @@ fn robot_checkpoint_delete_data(
 }
 
 async fn robot_checkpoint_save_data(
-    label: &Option<String>,
+    label: Option<&str>,
     include_scrollback: bool,
-    pane_ids: &Option<Vec<u64>>,
+    pane_ids: Option<&[u64]>,
     layout: &frankenterm_core::config::WorkspaceLayout,
     config: &frankenterm_core::config::Config,
     elapsed_ms: u64,
-) -> Result<serde_json::Value, RobotResponse<serde_json::Value>> {
+) -> RobotJsonResult<serde_json::Value> {
     use frankenterm_core::snapshot_engine::SnapshotEngine;
     use std::sync::Arc;
 
@@ -11320,13 +11728,13 @@ async fn robot_checkpoint_save_data(
         )
     })?;
 
-    if let Some(requested_panes) = pane_ids.as_ref().filter(|ids| !ids.is_empty()) {
+    if let Some(requested_panes) = pane_ids.filter(|ids| !ids.is_empty()) {
         let requested: std::collections::HashSet<u64> = requested_panes.iter().copied().collect();
         panes.retain(|pane| requested.contains(&pane.pane_id));
     }
 
     if panes.is_empty() {
-        return Err(robot_checkpoint_error_response(
+        return Err(Box::new(robot_checkpoint_error_response(
             ROBOT_ERR_PANE_NOT_FOUND,
             "No panes matched the checkpoint request.",
             Some(
@@ -11334,7 +11742,7 @@ async fn robot_checkpoint_save_data(
                     .to_string(),
             ),
             elapsed_ms,
-        ));
+        )));
     }
 
     let engine = SnapshotEngine::new(Arc::new(db_path.clone()), config.snapshots.clone());
@@ -11355,13 +11763,13 @@ async fn robot_checkpoint_save_data(
             )
         })?;
 
-    let requested_pane_ids = pane_ids.clone().unwrap_or_default();
+    let requested_pane_ids = pane_ids.unwrap_or_default();
     persist_robot_checkpoint_metadata(
         &db_path,
         result.checkpoint_id,
         label,
         include_scrollback,
-        &requested_pane_ids,
+        requested_pane_ids,
     )
     .map_err(|err| {
         robot_checkpoint_error_response(
@@ -11405,9 +11813,9 @@ async fn handle_robot_checkpoint_command(
             include_scrollback,
             pane_ids,
         } => match robot_checkpoint_save_data(
-            label,
+            label.as_deref(),
             *include_scrollback,
-            pane_ids,
+            pane_ids.as_deref(),
             layout,
             config,
             elapsed_ms,
@@ -11415,7 +11823,7 @@ async fn handle_robot_checkpoint_command(
         .await
         {
             Ok(data) => RobotResponse::success(data, elapsed_ms),
-            Err(response) => response,
+            Err(response) => *response,
         },
         RobotCheckpointCommands::List { limit, offset } => {
             match robot_checkpoint_list_data(&db_path, *limit, *offset) {
@@ -11432,7 +11840,7 @@ async fn handle_robot_checkpoint_command(
             let checkpoint_id_i64 =
                 match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
                     Ok(id) => id,
-                    Err(response) => return response,
+                    Err(response) => return *response,
                 };
             match robot_checkpoint_show_data(&db_path, checkpoint_id_i64) {
                 Ok(Some(data)) => RobotResponse::success(data, elapsed_ms),
@@ -11449,7 +11857,7 @@ async fn handle_robot_checkpoint_command(
             let checkpoint_id_i64 =
                 match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
                     Ok(id) => id,
-                    Err(response) => return response,
+                    Err(response) => return *response,
                 };
             match robot_checkpoint_delete_data(&db_path, checkpoint_id_i64) {
                 Ok(Some(data)) => RobotResponse::success(data, elapsed_ms),
@@ -11469,7 +11877,7 @@ async fn handle_robot_checkpoint_command(
             let checkpoint_id_i64 =
                 match robot_checkpoint_resolve_id(&db_path, checkpoint_id, elapsed_ms) {
                     Ok(id) => id,
-                    Err(response) => return response,
+                    Err(response) => return *response,
                 };
             let checkpoint = match frankenterm_core::session_restore::load_checkpoint_by_id(
                 &db_path,
@@ -13389,7 +13797,7 @@ fn build_ntm_not_implemented_response(
 
     let mut response = RobotResponse::<serde_json::Value>::error_with_code(
         ROBOT_ERR_NOT_IMPLEMENTED,
-        format!("Command `ft robot {family} {action}` is recognized but not yet implemented.",),
+        format!("Command `ft robot {family} {action}` is recognized but not yet implemented."),
         Some(format!(
             "This command will be available in a future release. \
              NTM equivalent: {}.",
@@ -13540,6 +13948,10 @@ fn build_robot_help() -> RobotHelp {
             RobotCommandInfo {
                 name: "capacity",
                 description: "Get swarm capacity certificate/controller summary",
+            },
+            RobotCommandInfo {
+                name: "resource what-if",
+                description: "Run a read-only resource-control digital-twin simulation",
             },
             RobotCommandInfo {
                 name: "approve",
@@ -13766,6 +14178,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot search-index reindex",
                     "ft robot search-index reindex --pane 3 --batch-size 500",
+                ],
+            },
+            QuickStartCommand {
+                name: "resource what-if",
+                args: "--trace <trace.json> --override-package <candidate.toml>",
+                summary: "Run read-only resource-control digital-twin analysis",
+                examples: vec![
+                    "ft robot resource what-if --trace fixtures/scale-lab/resource-what-if-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-candidate.v1.toml",
+                    "ft robot --format toon resource what-if --trace trace.json --override-package candidate.toml",
                 ],
             },
             QuickStartCommand {
@@ -14396,10 +14817,14 @@ async fn batch_get_pane_text(
         let wezterm = wezterm.clone();
         let semaphore = semaphore.clone();
         let task = frankenterm_core::runtime_async::task::spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .map_err(|err| frankenterm_core::Error::Runtime(err.to_string()))?;
+            let _permit = semaphore.acquire_owned().await.map_err(|err| {
+                frankenterm_core::Error::RuntimeOperation {
+                    operation: "batch_get_text.acquire_permit",
+                    source: frankenterm_core::error::RuntimeOperationSource::Cancelled(
+                        err.to_string(),
+                    ),
+                }
+            })?;
             // ft-xbnl0.2.3 tick 230: cx-first wezterm get_text (inside spawn).
             let cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -14412,7 +14837,10 @@ async fn batch_get_pane_text(
     for (pane_id, task) in tasks {
         let result = match task.await {
             Ok(result) => result,
-            Err(err) => Err(frankenterm_core::Error::Runtime(err.to_string())),
+            Err(err) => Err(frankenterm_core::Error::RuntimeOperation {
+                operation: "batch_get_text.await_task",
+                source: frankenterm_core::error::RuntimeOperationSource::Cancelled(err.to_string()),
+            }),
         };
 
         match result {
@@ -20022,6 +20450,75 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
     // The Box avoids stack overflow for the 56-variant Commands enum in debug/test builds.
     let command = command.map(|b| *b);
 
+    if let Some(Commands::Resource {
+        command:
+            ResourceCommands::WhatIf {
+                trace,
+                override_package,
+                format,
+                generated_at_ms,
+                minimum_apply_confidence_score,
+                high_scale_min_cpu_count,
+                high_scale_min_memory_bytes,
+            },
+    }) = command.as_ref()
+    {
+        let options = resource_what_if_options(
+            *generated_at_ms,
+            *minimum_apply_confidence_score,
+            *high_scale_min_cpu_count,
+            *high_scale_min_memory_bytes,
+        );
+        let report = load_resource_what_if_report(trace, override_package, &options)?;
+        print_resource_what_if_report(&report, *format)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Robot {
+        format,
+        stats,
+        command: Some(RobotCommands::Resource { command }),
+    }) = command.as_ref()
+    {
+        let format = resolve_robot_output_format(*format);
+        match command {
+            RobotResourceCommands::WhatIf {
+                trace,
+                override_package,
+                generated_at_ms,
+                minimum_apply_confidence_score,
+                high_scale_min_cpu_count,
+                high_scale_min_memory_bytes,
+            } => {
+                let options = resource_what_if_options(
+                    *generated_at_ms,
+                    *minimum_apply_confidence_score,
+                    *high_scale_min_cpu_count,
+                    *high_scale_min_memory_bytes,
+                );
+                match load_resource_what_if_report(trace, override_package, &options) {
+                    Ok(report) => {
+                        let response = RobotResponse::success(report, elapsed_ms(start));
+                        print_robot_response(&response, format, *stats)?;
+                    }
+                    Err(error) => {
+                        let response = RobotResponse::<serde_json::Value>::error_with_code(
+                            ROBOT_ERR_RESOURCE_WHAT_IF,
+                            error.to_string(),
+                            Some(
+                                "Check --trace JSON and --override-package TOML; the resource what-if surface is read-only."
+                                    .to_string(),
+                            ),
+                            elapsed_ms(start),
+                        );
+                        print_robot_response(&response, format, *stats)?;
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let mut overrides = frankenterm_core::config::ConfigOverrides::default();
     if verbose > 0 {
         overrides.log_level = Some("debug".to_string());
@@ -20447,7 +20944,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 }
                                             };
                                         if !decision.is_allowed() {
-                                            let status = if decision.requires_approval() {
+                                            let policy_status = if decision.requires_approval() {
                                                 "require_approval"
                                             } else {
                                                 "denied"
@@ -20460,7 +20957,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 domain.as_deref(),
                                                 &summary,
                                                 &decision,
-                                                status,
+                                                policy_status,
                                             )
                                             .await;
                                             let (code, message, hint) =
@@ -20766,7 +21263,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
                                 if !decision.is_allowed() {
-                                    let status = if decision.requires_approval() {
+                                    let policy_status = if decision.requires_approval() {
                                         "require_approval"
                                     } else {
                                         "denied"
@@ -20779,7 +21276,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         domain.as_deref(),
                                         &summary,
                                         &decision,
-                                        status,
+                                        policy_status,
                                     )
                                     .await;
                                     let (code, message, hint) =
@@ -20956,7 +21453,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             }
                                         }
                                     } else {
-                                        let status = if decision.requires_approval() {
+                                        let policy_status = if decision.requires_approval() {
                                             "require_approval"
                                         } else {
                                             "denied"
@@ -20969,7 +21466,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             domain.as_deref(),
                                             &summary,
                                             &decision,
-                                            status,
+                                            policy_status,
                                         )
                                         .await;
                                         let (code, message, hint) =
@@ -21497,7 +21994,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             };
                             if !decision.is_allowed() {
-                                let status = if decision.requires_approval() {
+                                let policy_status = if decision.requires_approval() {
                                     "require_approval"
                                 } else {
                                     "denied"
@@ -21510,7 +22007,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     domain.as_deref(),
                                     &summary,
                                     &decision,
-                                    status,
+                                    policy_status,
                                 )
                                 .await;
                                 let (code, message, hint) =
@@ -26367,6 +26864,46 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let response = RobotResponse::success(summary, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
+                        RobotCommands::Resource { command } => match command {
+                            RobotResourceCommands::WhatIf {
+                                trace,
+                                override_package,
+                                generated_at_ms,
+                                minimum_apply_confidence_score,
+                                high_scale_min_cpu_count,
+                                high_scale_min_memory_bytes,
+                            } => {
+                                let options = resource_what_if_options(
+                                    generated_at_ms,
+                                    minimum_apply_confidence_score,
+                                    high_scale_min_cpu_count,
+                                    high_scale_min_memory_bytes,
+                                );
+                                match load_resource_what_if_report(
+                                    &trace,
+                                    &override_package,
+                                    &options,
+                                ) {
+                                    Ok(report) => {
+                                        let response =
+                                            RobotResponse::success(report, elapsed_ms(start));
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                    Err(error) => {
+                                        let response =
+                                            RobotResponse::<serde_json::Value>::error_with_code(
+                                                ROBOT_ERR_RESOURCE_WHAT_IF,
+                                                error.to_string(),
+                                                Some(
+                                                    "Check --trace JSON and --override-package TOML; the resource what-if surface is read-only.".to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                    }
+                                }
+                            }
+                        },
                         RobotCommands::Checkpoint { command } => {
                             let response = handle_robot_checkpoint_command(
                                 &command,
@@ -34282,7 +34819,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
 
-                    match wez.get_text_with_cx(&record_cx, pane_id, false).await {
+                    match Box::pin(wez.get_text_with_cx(&record_cx, pane_id, false)).await {
                         Ok(text) => {
                             if text != last_text {
                                 let delta = if last_text.is_empty() {
@@ -34529,6 +35066,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             }
         },
+
+        Some(Commands::Resource {
+            command:
+                ResourceCommands::WhatIf {
+                    trace,
+                    override_package,
+                    format,
+                    generated_at_ms,
+                    minimum_apply_confidence_score,
+                    high_scale_min_cpu_count,
+                    high_scale_min_memory_bytes,
+                },
+        }) => {
+            let options = resource_what_if_options(
+                generated_at_ms,
+                minimum_apply_confidence_score,
+                high_scale_min_cpu_count,
+                high_scale_min_memory_bytes,
+            );
+            let report = load_resource_what_if_report(&trace, &override_package, &options)?;
+            print_resource_what_if_report(&report, format)?;
+        }
 
         Some(Commands::Replay {
             command:
@@ -35043,7 +35602,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         fn write_output(&mut self, bytes: &[u8]) -> frankenterm_core::Result<()> {
                             use std::io::Write;
                             std::io::stdout().write_all(bytes).map_err(|e| {
-                                frankenterm_core::Error::Runtime(format!("stdout write error: {e}"))
+                                frankenterm_core::Error::RuntimeOperation {
+                                    operation: "replay.write_stdout",
+                                    source:
+                                        frankenterm_core::error::RuntimeOperationSource::Cancelled(
+                                            e.to_string(),
+                                        ),
+                                }
                             })
                         }
                         fn show_event(
@@ -36561,9 +37126,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 scenario.setup_with_cx(&sim_cx, &mock).await?;
 
                 if resize_timeline_json && !json {
-                    return Err(frankenterm_core::Error::Runtime(
-                        "--resize-timeline-json requires --json".to_string(),
-                    )
+                    return Err(frankenterm_core::Error::RuntimeOperation {
+                        operation: "simulate.validate_resize_timeline_json",
+                        source: frankenterm_core::error::RuntimeOperationSource::Cancelled(
+                            "--resize-timeline-json requires --json".to_string(),
+                        ),
+                    }
                     .into());
                 }
 
@@ -49173,6 +49741,519 @@ mod tests {
         }
     }
 
+    fn sample_resource_what_if_package()
+    -> frankenterm_core_replay::replay_counterfactual::ResourceControlOverridePackage {
+        use frankenterm_core_replay::replay_counterfactual::ResourceControlOverrideLoader;
+
+        let toml = sample_resource_what_if_package_toml();
+        ResourceControlOverrideLoader::load(&toml).expect("resource override fixture loads")
+    }
+
+    fn sample_resource_what_if_package_toml() -> String {
+        use frankenterm_core_replay::replay_counterfactual::RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION;
+
+        format!(
+            r#"
+[meta]
+schema_version = "{RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION}"
+name = "resource what-if candidate"
+description = "contract-test candidate"
+base_trace = "resource-what-if-trace"
+created_at = "2026-05-06T00:00:00Z"
+author = "test"
+
+[[admission]]
+knob_id = "admission.max_queue_utilization"
+domain = "admission"
+value = "0.95"
+reason = "allow bursty high-scale queue"
+
+[[admission]]
+knob_id = "admission.max_pending_items"
+domain = "admission"
+value = "128"
+reason = "allow bursty high-scale pending work"
+"#
+        )
+    }
+
+    fn sample_resource_what_if_harmful_package()
+    -> frankenterm_core_replay::replay_counterfactual::ResourceControlOverridePackage {
+        use frankenterm_core_replay::replay_counterfactual::ResourceControlOverrideLoader;
+
+        let toml = sample_resource_what_if_harmful_package_toml();
+        ResourceControlOverrideLoader::load(&toml).expect("harmful override fixture loads")
+    }
+
+    fn sample_resource_what_if_harmful_package_toml() -> String {
+        use frankenterm_core_replay::replay_counterfactual::RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION;
+
+        format!(
+            r#"
+[meta]
+schema_version = "{RESOURCE_CONTROL_OVERRIDE_SCHEMA_VERSION}"
+name = "resource what-if harmful candidate"
+description = "contract-test harmful candidate"
+base_trace = "resource-what-if-trace"
+created_at = "2026-05-06T00:00:00Z"
+author = "test"
+
+[[admission]]
+knob_id = "admission.max_queue_utilization"
+domain = "admission"
+value = "0.55"
+reason = "overly conservative queue threshold"
+
+[[admission]]
+knob_id = "admission.max_pending_items"
+domain = "admission"
+value = "20"
+reason = "overly conservative pending threshold"
+"#
+        )
+    }
+
+    fn sample_resource_what_if_trace()
+    -> frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace {
+        use frankenterm_core_replay::replay_resource_digital_twin::{
+            RESOURCE_DIGITAL_TWIN_HIGH_SCALE_MIN_CPU_COUNT,
+            RESOURCE_DIGITAL_TWIN_HIGH_SCALE_MIN_MEMORY_BYTES,
+        };
+        use frankenterm_core_replay::replay_scenario_matrix::{
+            DigitalTwinTraceAdapter, DigitalTwinTraceSource, DigitalTwinTraceStep, ProofDimension,
+            ProofExecutionEvidence, ProofStatus, ScaleProofEvidenceSource, ScaleProofMatrix,
+            ScaleScenarioClass, ScaleScenarioManifest, ScaleScenarioProof,
+        };
+
+        let proof = ScaleScenarioProof {
+            scenario_id: "live_64core_256gib_resource_what_if".to_string(),
+            class: ScaleScenarioClass::LiveHardware,
+            dimensions: vec![ProofDimension::Hardware, ProofDimension::Throughput],
+            status: ProofStatus::Passed,
+            evidence_source: ScaleProofEvidenceSource::LiveHardware,
+            evidence: Some(ProofExecutionEvidence {
+                cpu_count: RESOURCE_DIGITAL_TWIN_HIGH_SCALE_MIN_CPU_COUNT,
+                memory_bytes: RESOURCE_DIGITAL_TWIN_HIGH_SCALE_MIN_MEMORY_BYTES,
+                storage_bytes: 1_099_511_627_776,
+                storage_class: "nvme".to_string(),
+                os: "linux".to_string(),
+                worker_id: "worker-proof".to_string(),
+                command: "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-resource-what-if-target cargo test -p frankenterm --bin ft resource_what_if".to_string(),
+                elapsed_ms: 12_345,
+                git_commit: "3273cf755".to_string(),
+            }),
+            note: String::new(),
+        };
+        let matrix =
+            ScaleProofMatrix::new(ScaleScenarioManifest::massive_swarm_defaults(), vec![proof]);
+        let mut steps =
+            DigitalTwinTraceAdapter::from_scale_proof_matrix(1, &matrix, Some("proof-artifact"));
+        steps.push(DigitalTwinTraceStep {
+            step_id: "admission-burst".to_string(),
+            source: DigitalTwinTraceSource::ResourceAdmission,
+            monotonic_ms: 100,
+            source_hash: "source-admission-burst".to_string(),
+            source_artifact_hashes: vec!["artifact-admission".to_string()],
+            pane_hash: None,
+            agent_hash: None,
+            correlation_hash: None,
+            scheduler_sequence: None,
+            scale_history_len: None,
+            active_agent_count: None,
+            queue_utilization: Some(0.90),
+            pending_items: Some(96),
+            admission_action: Some("defer".to_string()),
+            reason_codes: vec!["fixture".to_string()],
+            raw_pressure_severity: Some(1),
+            effective_pressure_severity: Some(1),
+            fleet_pressure: None,
+            memory_tier_pressure: None,
+            max_latency_over_budget_ratio: Some(0.75),
+            memory_budget_bytes: None,
+            memory_actual_bytes: None,
+            resident_over_budget_bytes: None,
+            reclaimable_bytes: None,
+            proof_status: None,
+            evidence_source: None,
+            hardware_evidence_complete: None,
+            hardware_cpu_count: None,
+            hardware_memory_bytes: None,
+            pressure_score: 1,
+            quality_flags: Vec::new(),
+        });
+        steps.push(DigitalTwinTraceStep {
+            step_id: "admission-stable".to_string(),
+            source: DigitalTwinTraceSource::ResourceAdmission,
+            monotonic_ms: 150,
+            source_hash: "source-admission-stable".to_string(),
+            source_artifact_hashes: vec!["artifact-admission".to_string()],
+            pane_hash: None,
+            agent_hash: None,
+            correlation_hash: None,
+            scheduler_sequence: None,
+            scale_history_len: None,
+            active_agent_count: None,
+            queue_utilization: Some(0.45),
+            pending_items: Some(16),
+            admission_action: Some("admit".to_string()),
+            reason_codes: vec!["fixture".to_string()],
+            raw_pressure_severity: Some(0),
+            effective_pressure_severity: Some(0),
+            fleet_pressure: None,
+            memory_tier_pressure: None,
+            max_latency_over_budget_ratio: Some(0.70),
+            memory_budget_bytes: None,
+            memory_actual_bytes: None,
+            resident_over_budget_bytes: None,
+            reclaimable_bytes: None,
+            proof_status: None,
+            evidence_source: None,
+            hardware_evidence_complete: None,
+            hardware_cpu_count: None,
+            hardware_memory_bytes: None,
+            pressure_score: 0,
+            quality_flags: Vec::new(),
+        });
+        steps.push(DigitalTwinTraceStep {
+            step_id: "memory-stable".to_string(),
+            source: DigitalTwinTraceSource::MemoryTierBudget,
+            monotonic_ms: 200,
+            source_hash: "source-memory-stable".to_string(),
+            source_artifact_hashes: vec!["artifact-memory".to_string()],
+            pane_hash: None,
+            agent_hash: None,
+            correlation_hash: None,
+            scheduler_sequence: None,
+            scale_history_len: None,
+            active_agent_count: None,
+            queue_utilization: None,
+            pending_items: None,
+            admission_action: None,
+            reason_codes: Vec::new(),
+            raw_pressure_severity: Some(0),
+            effective_pressure_severity: Some(0),
+            fleet_pressure: None,
+            memory_tier_pressure: Some("normal".to_string()),
+            max_latency_over_budget_ratio: None,
+            memory_budget_bytes: Some(134_217_728),
+            memory_actual_bytes: Some(100_663_296),
+            resident_over_budget_bytes: Some(0),
+            reclaimable_bytes: Some(8_388_608),
+            proof_status: None,
+            evidence_source: None,
+            hardware_evidence_complete: None,
+            hardware_cpu_count: None,
+            hardware_memory_bytes: None,
+            pressure_score: 0,
+            quality_flags: Vec::new(),
+        });
+
+        DigitalTwinTraceAdapter::build(42, steps)
+    }
+
+    fn harmful_resource_what_if_package_toml() -> String {
+        sample_resource_what_if_harmful_package_toml()
+    }
+
+    fn resource_what_if_report_for_package(
+        trace: &frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace,
+        package: &frankenterm_core_replay::replay_counterfactual::ResourceControlOverridePackage,
+        package_toml: &str,
+    ) -> ResourceWhatIfReport {
+        let options = resource_what_if_options(None, None, None, None);
+        resource_what_if_report_from_inputs(trace, package, package_toml, &options)
+            .expect("resource what-if fixture report should build")
+    }
+
+    fn resource_what_if_report_for_toml(
+        trace: &frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace,
+        package_toml: &str,
+    ) -> ResourceWhatIfReport {
+        use frankenterm_core_replay::replay_counterfactual::ResourceControlOverrideLoader;
+
+        let package =
+            ResourceControlOverrideLoader::load(package_toml).expect("fixture package loads");
+        resource_what_if_report_for_package(trace, &package, package_toml)
+    }
+
+    fn resource_what_if_warning_trace()
+    -> frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace {
+        use frankenterm_core_replay::replay_scenario_matrix::{
+            DigitalTwinTraceAdapter, DigitalTwinTraceQualityFlag,
+        };
+
+        let mut steps = sample_resource_what_if_trace().steps;
+        steps
+            .iter_mut()
+            .find(|step| step.step_id == "admission-stable")
+            .expect("fixture includes a stable admission step")
+            .quality_flags = vec![DigitalTwinTraceQualityFlag::CompactedSamples];
+        DigitalTwinTraceAdapter::build(42, steps)
+    }
+
+    fn resource_what_if_missing_telemetry_trace()
+    -> frankenterm_core_replay::replay_scenario_matrix::DigitalTwinTrace {
+        use frankenterm_core_replay::replay_scenario_matrix::{
+            DigitalTwinTraceAdapter, DigitalTwinTraceQualityFlag, DigitalTwinTraceSource,
+        };
+
+        let mut steps = sample_resource_what_if_trace().steps;
+        for admission in steps
+            .iter_mut()
+            .filter(|step| step.source == DigitalTwinTraceSource::ResourceAdmission)
+        {
+            admission.queue_utilization = None;
+            admission.pending_items = None;
+            admission.max_latency_over_budget_ratio = None;
+            admission.admission_action = None;
+            admission.quality_flags = vec![
+                DigitalTwinTraceQualityFlag::MissingLatencyTelemetry,
+                DigitalTwinTraceQualityFlag::MissingQueueTelemetry,
+            ];
+        }
+        DigitalTwinTraceAdapter::build(42, steps)
+    }
+
+    #[test]
+    fn resource_what_if_cli_families_parse_artifact_flags() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "resource",
+            "what-if",
+            "--trace",
+            "trace.json",
+            "--override-package",
+            "candidate.toml",
+            "--format",
+            "toon",
+            "--generated-at-ms",
+            "42",
+            "--minimum-apply-confidence-score",
+            "80",
+            "--high-scale-min-cpu-count",
+            "96",
+            "--high-scale-min-memory-bytes",
+            "549755813888",
+        ])
+        .expect("human resource what-if should parse");
+
+        match cli.command.map(|cmd| *cmd) {
+            Some(Commands::Resource {
+                command:
+                    ResourceCommands::WhatIf {
+                        trace,
+                        override_package,
+                        format,
+                        generated_at_ms,
+                        minimum_apply_confidence_score,
+                        high_scale_min_cpu_count,
+                        high_scale_min_memory_bytes,
+                    },
+            }) => {
+                assert_eq!(trace, PathBuf::from("trace.json"));
+                assert_eq!(override_package, PathBuf::from("candidate.toml"));
+                assert_eq!(format, ResourceWhatIfOutputFormat::Toon);
+                assert_eq!(generated_at_ms, Some(42));
+                assert_eq!(minimum_apply_confidence_score, Some(80));
+                assert_eq!(high_scale_min_cpu_count, Some(96));
+                assert_eq!(high_scale_min_memory_bytes, Some(549_755_813_888));
+            }
+            _ => panic!("unexpected human resource what-if parse result"),
+        }
+
+        let robot_cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "--format",
+            "toon",
+            "resource",
+            "what-if",
+            "--trace",
+            "trace.json",
+            "--override-package",
+            "candidate.toml",
+            "--generated-at-ms",
+            "42",
+        ])
+        .expect("robot resource what-if should parse");
+
+        match robot_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Robot {
+                format,
+                stats,
+                command: Some(RobotCommands::Resource { command }),
+            }) => {
+                assert_eq!(format, Some(RobotOutputFormat::Toon));
+                assert!(!stats);
+                match command {
+                    RobotResourceCommands::WhatIf {
+                        trace,
+                        override_package,
+                        generated_at_ms,
+                        ..
+                    } => {
+                        assert_eq!(trace, PathBuf::from("trace.json"));
+                        assert_eq!(override_package, PathBuf::from("candidate.toml"));
+                        assert_eq!(generated_at_ms, Some(42));
+                    }
+                }
+            }
+            _ => panic!("unexpected robot resource what-if parse result"),
+        }
+    }
+
+    #[test]
+    fn resource_what_if_report_contract_covers_json_toon_and_human_gate_cases() {
+        use frankenterm_core_replay::replay_resource_digital_twin::{
+            ResourceDigitalTwinApplyRecommendation, ResourceDigitalTwinGateVerdict,
+        };
+        use frankenterm_core_replay::replay_scenario_matrix::ProofStatus;
+
+        #[derive(Debug, serde::Deserialize)]
+        struct ContractFixture {
+            schema_version: String,
+            cases: Vec<ContractCase>,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct ContractCase {
+            case_id: String,
+            recommendation: ResourceDigitalTwinApplyRecommendation,
+            confidence_verdict: ResourceDigitalTwinGateVerdict,
+            risk_verdict: ResourceDigitalTwinGateVerdict,
+            proof_status: ProofStatus,
+            high_scale_claim_allowed: bool,
+            expected_code: Option<String>,
+            json_required_fields: Vec<String>,
+            toon_required_fragments: Vec<String>,
+            human_line_prefixes: Vec<String>,
+        }
+
+        let fixture: ContractFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/scale-lab/resource-what-if-contracts.v1.json"
+        ))
+        .expect("resource what-if contract fixture parses");
+        assert_eq!(fixture.schema_version, "ft.resource_what_if.contracts.v1");
+        assert_eq!(
+            fixture
+                .cases
+                .iter()
+                .map(|case| case.case_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pass", "warning", "blocked", "missing_telemetry"]
+        );
+
+        let pass_trace = sample_resource_what_if_trace();
+        let pass_package = sample_resource_what_if_package();
+        let pass_package_toml = sample_resource_what_if_package_toml();
+        let warning_trace = resource_what_if_warning_trace();
+        let missing_trace = resource_what_if_missing_telemetry_trace();
+        let harmful_package = sample_resource_what_if_harmful_package();
+        let harmful_toml = harmful_resource_what_if_package_toml();
+
+        for case in fixture.cases {
+            let report = match case.case_id.as_str() {
+                "pass" => resource_what_if_report_for_package(
+                    &pass_trace,
+                    &pass_package,
+                    &pass_package_toml,
+                ),
+                "warning" => resource_what_if_report_for_toml(&warning_trace, &pass_package_toml),
+                "blocked" => resource_what_if_report_for_package(
+                    &pass_trace,
+                    &harmful_package,
+                    &harmful_toml,
+                ),
+                "missing_telemetry" => {
+                    resource_what_if_report_for_toml(&missing_trace, &pass_package_toml)
+                }
+                other => panic!("unknown resource what-if contract case {other}"),
+            };
+
+            assert!(report.dry_run, "{}: command must be dry-run", case.case_id);
+            assert!(
+                report.mutation_surface.is_empty(),
+                "{}: dry-run must declare no mutation surface",
+                case.case_id
+            );
+            assert_eq!(report.side_effect_barrier_mode, "replay");
+            assert_eq!(report.side_effects_captured, 0);
+            assert_eq!(
+                report.apply_recommendation, case.recommendation,
+                "{}: apply recommendation drifted",
+                case.case_id
+            );
+            assert_eq!(
+                report.confidence_verdict, case.confidence_verdict,
+                "{}: confidence verdict drifted",
+                case.case_id
+            );
+            assert_eq!(
+                report.risk_verdict, case.risk_verdict,
+                "{}: risk verdict drifted",
+                case.case_id
+            );
+            assert_eq!(
+                report.proof_status, case.proof_status,
+                "{}: proof status drifted",
+                case.case_id
+            );
+            assert_eq!(
+                report.high_scale_claim_allowed, case.high_scale_claim_allowed,
+                "{}: high-scale claim gate drifted",
+                case.case_id
+            );
+
+            let json = serde_json::to_value(&report).expect("report serializes as JSON");
+            for field in &case.json_required_fields {
+                assert!(
+                    json.get(field).is_some(),
+                    "{}: missing {field}",
+                    case.case_id
+                );
+            }
+
+            let toon = toon_rust::encode(json.clone(), None);
+            for needle in &case.toon_required_fragments {
+                assert!(
+                    toon.contains(needle),
+                    "{}: TOON missing {needle}\n{toon}",
+                    case.case_id
+                );
+            }
+
+            let human = render_resource_what_if_human(&report);
+            for prefix in &case.human_line_prefixes {
+                assert!(
+                    human.lines().any(|line| line.starts_with(prefix)),
+                    "{}: human output missing line prefix {prefix}\n{human}",
+                    case.case_id
+                );
+            }
+            assert!(
+                human.lines().count() <= 10,
+                "{}: concise human output grew too long:\n{human}",
+                case.case_id
+            );
+            assert!(
+                human.lines().all(|line| line.len() <= 260),
+                "{}: human output line too wide:\n{human}",
+                case.case_id
+            );
+
+            if let Some(code) = &case.expected_code {
+                let mut observed_codes = report.apply_reason_codes.clone();
+                observed_codes.extend(report.confidence_blockers.clone());
+                observed_codes.extend(report.risk_items.iter().map(|item| item.code.clone()));
+                assert!(
+                    observed_codes.iter().any(|candidate| candidate == code),
+                    "{}: expected code {code}, got {observed_codes:?}",
+                    case.case_id
+                );
+            }
+        }
+    }
+
     #[test]
     fn mission_cli_command_family_parses_all_subcommands() {
         let plan_cli = Cli::try_parse_from([
@@ -49430,6 +50511,166 @@ mod tests {
             }
             _ => panic!("unexpected replay parity parse result"),
         }
+    }
+
+    #[test]
+    fn resource_what_if_command_family_parses_human_and_robot() {
+        let human_cli = Cli::try_parse_from([
+            "ft",
+            "resource",
+            "what-if",
+            "--trace",
+            "fixtures/scale-lab/resource-what-if-trace.v1.json",
+            "--override-package",
+            "fixtures/scale-lab/resource-what-if-candidate.v1.toml",
+            "--format",
+            "json",
+            "--generated-at-ms",
+            "42",
+            "--minimum-apply-confidence-score",
+            "80",
+        ])
+        .expect("human resource what-if should parse");
+        match human_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Resource {
+                command:
+                    ResourceCommands::WhatIf {
+                        trace,
+                        override_package,
+                        format,
+                        generated_at_ms,
+                        minimum_apply_confidence_score,
+                        ..
+                    },
+            }) => {
+                assert_eq!(
+                    trace,
+                    PathBuf::from("fixtures/scale-lab/resource-what-if-trace.v1.json")
+                );
+                assert_eq!(
+                    override_package,
+                    PathBuf::from("fixtures/scale-lab/resource-what-if-candidate.v1.toml")
+                );
+                assert_eq!(format, ResourceWhatIfOutputFormat::Json);
+                assert_eq!(generated_at_ms, Some(42));
+                assert_eq!(minimum_apply_confidence_score, Some(80));
+            }
+            _ => panic!("unexpected human resource what-if parse result"),
+        }
+
+        let robot_cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "--format",
+            "toon",
+            "resource",
+            "what-if",
+            "--trace",
+            "trace.json",
+            "--override-package",
+            "candidate.toml",
+            "--high-scale-min-cpu-count",
+            "64",
+            "--high-scale-min-memory-bytes",
+            "274877906944",
+        ])
+        .expect("robot resource what-if should parse");
+        match robot_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Robot {
+                format,
+                command: Some(RobotCommands::Resource { command }),
+                ..
+            }) => {
+                assert_eq!(format, Some(RobotOutputFormat::Toon));
+                match command {
+                    RobotResourceCommands::WhatIf {
+                        trace,
+                        override_package,
+                        high_scale_min_cpu_count,
+                        high_scale_min_memory_bytes,
+                        ..
+                    } => {
+                        assert_eq!(trace, PathBuf::from("trace.json"));
+                        assert_eq!(override_package, PathBuf::from("candidate.toml"));
+                        assert_eq!(high_scale_min_cpu_count, Some(64));
+                        assert_eq!(high_scale_min_memory_bytes, Some(274_877_906_944));
+                    }
+                }
+            }
+            _ => panic!("unexpected robot resource what-if parse result"),
+        }
+    }
+
+    #[test]
+    fn resource_what_if_report_is_read_only_and_contract_shaped() {
+        let trace = sample_resource_what_if_trace();
+        let package = sample_resource_what_if_package();
+        let package_toml = sample_resource_what_if_package_toml();
+        let report = resource_what_if_report_from_inputs(
+            &trace,
+            &package,
+            &package_toml,
+            &resource_what_if_options(Some(42), None, None, None),
+        )
+        .expect("resource what-if report builds");
+
+        assert_eq!(report.schema_version, RESOURCE_WHAT_IF_SCHEMA_VERSION);
+        assert!(report.dry_run);
+        assert!(report.mutation_surface.is_empty());
+        assert_eq!(report.trace_hash, trace.trace_hash);
+        assert_eq!(report.package_name, "resource what-if candidate");
+        assert_eq!(report.package_override_count, 2);
+        assert!(!report.override_hash.is_empty());
+        assert!(!report.simulation_hash.is_empty());
+        assert_eq!(report.side_effect_barrier_mode, "replay");
+        assert_eq!(report.side_effects_captured, 0);
+        assert_eq!(
+            report.proof_status,
+            frankenterm_core_replay::replay_scenario_matrix::ProofStatus::Passed
+        );
+        assert!(report.high_scale_claim_allowed);
+        assert!(report.next_proof_steps.is_empty());
+        assert!(
+            report.decision_deltas.changed_steps > 0,
+            "candidate should change at least one decision"
+        );
+
+        let value = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(
+            value["schema_version"].as_str(),
+            Some(RESOURCE_WHAT_IF_SCHEMA_VERSION)
+        );
+        assert!(value.get("decision_deltas").is_some());
+        assert!(value.get("risk_score").is_some());
+        assert!(value.get("confidence_score").is_some());
+        assert!(value.get("proof_status").is_some());
+        assert!(value.get("next_proof_steps").is_some());
+    }
+
+    #[test]
+    fn resource_what_if_human_output_is_concise_and_operator_focused() {
+        let trace = sample_resource_what_if_trace();
+        let package = sample_resource_what_if_package();
+        let package_toml = sample_resource_what_if_package_toml();
+        let report = resource_what_if_report_from_inputs(
+            &trace,
+            &package,
+            &package_toml,
+            &resource_what_if_options(Some(42), None, None, None),
+        )
+        .expect("resource what-if report builds");
+        let output = render_resource_what_if_human(&report);
+
+        assert!(output.contains("Resource what-if:"));
+        assert!(output.contains("Confidence:"));
+        assert!(output.contains("Risk:"));
+        assert!(output.contains("Proof:"));
+        assert!(output.contains("Deltas:"));
+        assert!(output.contains("Dry-run: no live panes"));
+        assert!(
+            output.lines().count() <= 10,
+            "human output should stay scan-friendly"
+        );
     }
 
     #[test]

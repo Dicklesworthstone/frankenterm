@@ -1,0 +1,169 @@
+{
+  "schema_version": "ft.resource_what_if.contracts.v1",
+  "cases": [
+    {
+      "case_id": "pass",
+      "recommendation": "apply",
+      "confidence_verdict": "pass",
+      "risk_verdict": "pass",
+      "proof_status": "PASSED",
+      "high_scale_claim_allowed": true,
+      "expected_code": null,
+      "json_required_fields": [
+        "schema_version",
+        "trace_hash",
+        "override_hash",
+        "decision_deltas",
+        "risk_score",
+        "confidence_score",
+        "proof_status",
+        "next_proof_steps"
+      ],
+      "toon_required_fragments": [
+        "schema_version",
+        "trace_hash",
+        "override_hash",
+        "decision_deltas",
+        "risk_score",
+        "confidence_score",
+        "proof_status",
+        "next_proof_steps"
+      ],
+      "human_line_prefixes": [
+        "Resource what-if:",
+        "Confidence:",
+        "Risk:",
+        "Proof:",
+        "Deltas:",
+        "Top improvements:",
+        "Top regressions:",
+        "Next proof:",
+        "Simulation:",
+        "Dry-run:"
+      ]
+    },
+    {
+      "case_id": "warning",
+      "recommendation": "blocked",
+      "confidence_verdict": "warning",
+      "risk_verdict": "blocked",
+      "proof_status": "PASSED",
+      "high_scale_claim_allowed": true,
+      "expected_code": "data_quality_apply_blocker",
+      "json_required_fields": [
+        "schema_version",
+        "trace_hash",
+        "override_hash",
+        "decision_deltas",
+        "risk_score",
+        "confidence_score",
+        "proof_status",
+        "next_proof_steps"
+      ],
+      "toon_required_fragments": [
+        "schema_version",
+        "trace_hash",
+        "override_hash",
+        "decision_deltas",
+        "risk_score",
+        "confidence_score",
+        "proof_status",
+        "next_proof_steps"
+      ],
+      "human_line_prefixes": [
+        "Resource what-if:",
+        "Confidence:",
+        "Risk:",
+        "Proof:",
+        "Deltas:",
+        "Top improvements:",
+        "Top regressions:",
+        "Next proof:",
+        "Simulation:",
+        "Dry-run:"
+      ]
+    },
+    {
+      "case_id": "blocked",
+      "recommendation": "blocked",
+      "confidence_verdict": "pass",
+      "risk_verdict": "blocked",
+      "proof_status": "PASSED",
+      "high_scale_claim_allowed": true,
+      "expected_code": "harmful_candidate_rejection",
+      "json_required_fields": [
+        "schema_version",
+        "trace_hash",
+        "override_hash",
+        "decision_deltas",
+        "risk_score",
+        "confidence_score",
+        "proof_status",
+        "next_proof_steps"
+      ],
+      "toon_required_fragments": [
+        "schema_version",
+        "trace_hash",
+        "override_hash",
+        "decision_deltas",
+        "risk_score",
+        "confidence_score",
+        "proof_status",
+        "next_proof_steps"
+      ],
+      "human_line_prefixes": [
+        "Resource what-if:",
+        "Confidence:",
+        "Risk:",
+        "Proof:",
+        "Deltas:",
+        "Top improvements:",
+        "Top regressions:",
+        "Next proof:",
+        "Simulation:",
+        "Dry-run:"
+      ]
+    },
+    {
+      "case_id": "missing_telemetry",
+      "recommendation": "blocked",
+      "confidence_verdict": "blocked",
+      "risk_verdict": "warning",
+      "proof_status": "PASSED",
+      "high_scale_claim_allowed": true,
+      "expected_code": "missing_queue_coverage",
+      "json_required_fields": [
+        "schema_version",
+        "trace_hash",
+        "override_hash",
+        "decision_deltas",
+        "risk_score",
+        "confidence_score",
+        "proof_status",
+        "next_proof_steps"
+      ],
+      "toon_required_fragments": [
+        "schema_version",
+        "trace_hash",
+        "override_hash",
+        "decision_deltas",
+        "risk_score",
+        "confidence_score",
+        "proof_status",
+        "next_proof_steps"
+      ],
+      "human_line_prefixes": [
+        "Resource what-if:",
+        "Confidence:",
+        "Risk:",
+        "Proof:",
+        "Deltas:",
+        "Top improvements:",
+        "Top regressions:",
+        "Next proof:",
+        "Simulation:",
+        "Dry-run:"
+      ]
+    }
+  ]
+}

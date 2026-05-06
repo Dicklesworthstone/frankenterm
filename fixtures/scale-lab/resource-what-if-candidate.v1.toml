@@ -1,0 +1,19 @@
+[meta]
+schema_version = "ft.resource_control_override.v1"
+name = "resource what-if candidate"
+description = "Stable resource what-if fixture candidate for Robot and CLI contracts"
+base_trace = "fixtures/scale-lab/resource-what-if-trace.v1.json"
+created_at = "2026-05-06T00:00:00Z"
+author = "fixture"
+
+[[admission]]
+knob_id = "admission.max_queue_utilization"
+domain = "admission"
+value = "0.95"
+reason = "allow bursty high-scale queue"
+
+[[admission]]
+knob_id = "admission.max_pending_items"
+domain = "admission"
+value = "128"
+reason = "allow bursty high-scale pending work"

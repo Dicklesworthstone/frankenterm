@@ -1,0 +1,82 @@
+{
+  "schema_version": "ft.digital_twin_trace.v1",
+  "generated_at_ms": 42,
+  "trace_hash": "resource-what-if-trace-v1",
+  "source_artifact_hashes": [
+    "artifact-admission",
+    "artifact-memory",
+    "proof-artifact"
+  ],
+  "steps": [
+    {
+      "step_id": "proof-live",
+      "source": "scale_proof",
+      "monotonic_ms": 1,
+      "source_hash": "source-proof-live",
+      "source_artifact_hashes": [
+        "proof-artifact"
+      ],
+      "proof_status": "PASSED",
+      "evidence_source": "live_hardware",
+      "hardware_evidence_complete": true,
+      "hardware_cpu_count": 64,
+      "hardware_memory_bytes": 274877906944,
+      "pressure_score": 0
+    },
+    {
+      "step_id": "admission-burst",
+      "source": "resource_admission",
+      "monotonic_ms": 100,
+      "source_hash": "source-admission-burst",
+      "source_artifact_hashes": [
+        "artifact-admission"
+      ],
+      "queue_utilization": 0.9,
+      "pending_items": 96,
+      "admission_action": "defer",
+      "reason_codes": [
+        "fixture"
+      ],
+      "raw_pressure_severity": 1,
+      "effective_pressure_severity": 1,
+      "max_latency_over_budget_ratio": 0.75,
+      "pressure_score": 1
+    },
+    {
+      "step_id": "admission-stable",
+      "source": "resource_admission",
+      "monotonic_ms": 150,
+      "source_hash": "source-admission-stable",
+      "source_artifact_hashes": [
+        "artifact-admission"
+      ],
+      "queue_utilization": 0.45,
+      "pending_items": 16,
+      "admission_action": "admit",
+      "reason_codes": [
+        "fixture"
+      ],
+      "raw_pressure_severity": 0,
+      "effective_pressure_severity": 0,
+      "max_latency_over_budget_ratio": 0.7,
+      "pressure_score": 0
+    },
+    {
+      "step_id": "memory-stable",
+      "source": "memory_tier_budget",
+      "monotonic_ms": 200,
+      "source_hash": "source-memory-stable",
+      "source_artifact_hashes": [
+        "artifact-memory"
+      ],
+      "raw_pressure_severity": 0,
+      "effective_pressure_severity": 0,
+      "memory_tier_pressure": "normal",
+      "memory_budget_bytes": 134217728,
+      "memory_actual_bytes": 100663296,
+      "resident_over_budget_bytes": 0,
+      "reclaimable_bytes": 8388608,
+      "pressure_score": 0
+    }
+  ]
+}

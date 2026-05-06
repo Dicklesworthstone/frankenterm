@@ -49,7 +49,7 @@ fn write_test_scrollback(
     uuid_byte: u8,
 ) -> (String, std::path::PathBuf) {
     std::fs::create_dir_all(scrollback_dir).expect("create scrollback dir");
-    let pane_uuid: String = (0..32).map(|_| format!("{uuid_byte:02x}")).collect();
+    let pane_uuid = format!("{uuid_byte:02x}").repeat(32);
     let path = scrollback_dir.join(format!("{pane_uuid}.bin"));
     let header = ScrollbackHeader {
         version: FormatVersion::V1,
