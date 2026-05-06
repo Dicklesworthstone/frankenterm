@@ -202,6 +202,41 @@ Do not turn a lifecycle note into implicit deletion permission. The AGENTS.md
 no-file-deletion rule still applies to `/tmp` target directories and `release`
 subdirectories unless the user gives explicit written authorization.
 
+### 2.5 Owned-file clippy attribution
+
+When broad clippy is red from inherited workspace debt, use
+`scripts/filter-clippy-owned-files.sh` to separate full-command status from
+owned-file attribution. This helper is evidence extraction only. It cannot turn
+a failed clippy command into a workspace-green claim.
+
+Capture the full JSONL stream and original exit status:
+
+```bash
+set +e
+rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-clippy-target \
+  cargo clippy --no-deps -p <crate> --lib --message-format=json -- -D warnings \
+  > /tmp/<bead>-clippy.jsonl
+cargo_status=$?
+set -e
+
+scripts/filter-clippy-owned-files.sh \
+  --cargo-status "$cargo_status" \
+  --owned-file crates/frankenterm-core/src/color_management.rs \
+  --owned-file crates/frankenterm-core/src/replay_fixture_harvest.rs \
+  --input /tmp/<bead>-clippy.jsonl \
+  --format json
+```
+
+Beads comment template:
+
+```text
+Clippy attribution: cargo_status=<status>; workspace_green=<true|false>; owned_error_count=<n>; owned_warning_count=<n>; attribution_verdict=<owned_files_clean|owned_non_error_diagnostics|owned_errors>; owned_files=<paths>. This is not a workspace-green substitute when cargo_status != 0.
+```
+
+Use `owned_files_clean` only to say the touched slice had no clippy diagnostics
+in the retained JSONL stream. Keep the full command failure and first unrelated
+diagnostic in the same Beads comment when `cargo_status != 0`.
+
 ---
 
 ## 3. Tick #1 — establish baseline
