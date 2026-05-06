@@ -8850,6 +8850,7 @@ fn usize_to_i64(value: usize, label: &str) -> Result<i64> {
     })
 }
 
+#[cfg(test)]
 fn sql_integer_decode_error(
     column_index: usize,
     label: &str,
@@ -8866,11 +8867,13 @@ fn sql_integer_decode_error(
     )
 }
 
+#[cfg(test)]
 fn i64_to_u64_sql(value: i64, column_index: usize, label: &str) -> rusqlite::Result<u64> {
     u64::try_from(value)
         .map_err(|_| sql_integer_decode_error(column_index, label, value, "is out of u64 range"))
 }
 
+#[cfg(test)]
 fn i64_to_bool_sql(value: i64, column_index: usize, label: &str) -> rusqlite::Result<bool> {
     match value {
         0 => Ok(false),
@@ -8886,30 +8889,6 @@ fn i64_to_bool_sql(value: i64, column_index: usize, label: &str) -> rusqlite::Re
 
 fn i64_to_usize(value: i64) -> rusqlite::Result<usize> {
     usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
-}
-
-fn pane_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneRecord> {
-    Ok(PaneRecord {
-        pane_id: i64_to_u64_sql(row.get(0)?, 0, "panes.pane_id")?,
-        pane_uuid: row.get(1)?,
-        domain: row.get(2)?,
-        window_id: row
-            .get::<_, Option<i64>>(3)?
-            .map(|v| i64_to_u64_sql(v, 3, "panes.window_id"))
-            .transpose()?,
-        tab_id: row
-            .get::<_, Option<i64>>(4)?
-            .map(|v| i64_to_u64_sql(v, 4, "panes.tab_id"))
-            .transpose()?,
-        title: row.get(5)?,
-        cwd: row.get(6)?,
-        tty_name: row.get(7)?,
-        first_seen_at: row.get(8)?,
-        last_seen_at: row.get(9)?,
-        observed: i64_to_bool_sql(row.get(10)?, 10, "panes.observed")?,
-        ignore_reason: row.get(11)?,
-        last_decision_at: row.get(12)?,
-    })
 }
 
 #[cfg(test)]
@@ -18124,7 +18103,7 @@ fn query_panes_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneRecord>> 
         .collect()
 }
 
-/// br-ft-l1jgo: trait-typed sibling of [`query_pane`].
+/// Query a specific pane through the trait-typed backend path.
 fn query_pane_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<Option<PaneRecord>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
     let row = backend
@@ -18140,27 +18119,7 @@ fn query_pane_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<Opti
         .transpose()
 }
 
-/// Query a specific pane
-///
-/// Direct-rusqlite path. Kept for transitional fallback and direct
-/// row-shape tests while [`query_pane_backend`] settles in
-/// (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_pane(conn: &Connection, pane_id: u64) -> Result<Option<PaneRecord>> {
-    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-
-    conn.query_row(
-        "SELECT pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
-         first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
-         FROM panes WHERE pane_id = ?1",
-        [pane_id_i64],
-        pane_record_from_row,
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
-}
-
-/// br-ft-l1jgo: trait-typed sibling of [`query_segments`].
+/// Query segments for a pane through the trait-typed backend path.
 fn query_segments_backend(
     backend: &dyn StorageBackend,
     pane_id: u64,
@@ -18185,64 +18144,6 @@ fn query_segments_backend(
     rows.iter()
         .map(|row| segment_from_backend_cells(row))
         .collect()
-}
-
-/// Query segments for a pane
-///
-/// Direct-rusqlite path. Kept for transitional fallback and direct
-/// row-shape tests while [`query_segments_backend`] settles in
-/// (br-ft-l1jgo).
-#[allow(dead_code)]
-#[allow(clippy::cast_sign_loss)]
-fn query_segments(conn: &Connection, pane_id: u64, limit: usize) -> Result<Vec<Segment>> {
-    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-    let limit_i64 = usize_to_i64(limit, "limit")?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
-             FROM output_segments
-             WHERE pane_id = ?1
-             ORDER BY seq DESC
-             LIMIT ?2",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([pane_id_i64, limit_i64], |row| {
-            Ok(Segment {
-                id: row.get(0)?,
-                pane_id: {
-                    let val: i64 = row.get(1)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                seq: {
-                    let val: i64 = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                content: row.get(3)?,
-                content_len: {
-                    let val: i64 = row.get(4)?;
-                    i64_to_usize(val)?
-                },
-                content_hash: row.get(5)?,
-                captured_at: row.get(6)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-
-    Ok(results)
 }
 
 fn query_segments_from_mmap(

@@ -995,7 +995,8 @@ fn query_pane_rejects_invalid_observed_flag() {
     )
     .unwrap();
 
-    let err = query_pane(&conn, 42).expect_err("invalid observed flag");
+    let backend = RusqliteBackend::new(conn);
+    let err = query_pane_backend(&backend, 42).expect_err("invalid observed flag");
     let message = err.to_string();
     assert!(message.contains("panes.observed"), "{message}");
     assert!(message.contains("must be 0 or 1"), "{message}");
@@ -3020,7 +3021,8 @@ fn last_n_segments_returns_deterministic_order() {
     }
 
     // Query last 3 segments
-    let segments = query_segments(&conn, 1, 3).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let segments = query_segments_backend(&backend, 1, 3).unwrap();
 
     // Should return in descending seq order: 8, 5, 3
     assert_eq!(segments.len(), 3);
@@ -3029,7 +3031,7 @@ fn last_n_segments_returns_deterministic_order() {
     assert_eq!(segments[2].seq, 3);
 
     // Query all segments
-    let all_segments = query_segments(&conn, 1, 100).unwrap();
+    let all_segments = query_segments_backend(&backend, 1, 100).unwrap();
     assert_eq!(all_segments.len(), 5);
 
     // Verify strictly descending order
