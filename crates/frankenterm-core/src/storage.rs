@@ -16308,69 +16308,6 @@ fn query_sessions_for_pane_backend(
         .collect()
 }
 
-/// Query unhandled events
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_unhandled_events_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredEvent>> {
-    let limit_i64 = usize_to_i64(limit, "limit")?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
-             extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
-             handled_by_workflow_id, handled_status
-             FROM events
-             WHERE handled_at IS NULL
-             ORDER BY detected_at DESC
-             LIMIT ?1",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([limit_i64], |row| {
-            let extracted_str: Option<String> = row.get(7)?;
-            // br-ft-4d6ic: route silent serde failure through observability counter.
-            let extracted = parse_storage_json_col::<serde_json::Value>(
-                extracted_str.as_deref(),
-                "events",
-                "extracted",
-            );
-
-            Ok(StoredEvent {
-                id: row.get(0)?,
-                pane_id: {
-                    let val: i64 = row.get(1)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                rule_id: row.get(2)?,
-                agent_type: row.get(3)?,
-                event_type: row.get(4)?,
-                severity: row.get(5)?,
-                confidence: row.get(6)?,
-                extracted,
-                matched_text: row.get(8)?,
-                segment_id: row.get(9)?,
-                detected_at: row.get(10)?,
-                dedupe_key: row.get(11)?,
-                handled_at: row.get(12)?,
-                handled_by_workflow_id: row.get(13)?,
-                handled_status: row.get(14)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-
-    Ok(results)
-}
-
 fn stored_event_from_backend_cells(row: &[SqlCell]) -> Result<StoredEvent> {
     let reader = CellRowReader::new(row);
     let pane_id = reader
@@ -16481,38 +16418,6 @@ fn query_unhandled_event_counts(
         let pane_id = u64::try_from(pane_id).unwrap_or(0);
         let count = u32::try_from(count).unwrap_or(u32::MAX);
         result.insert(pane_id, count);
-    }
-
-    Ok(result)
-}
-
-/// Get most recent activity timestamp per pane (from segments table)
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_last_activity_by_pane_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_last_activity_by_pane(conn: &Connection) -> Result<std::collections::HashMap<u64, i64>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT pane_id, MAX(captured_at) as last_activity
-             FROM output_segments
-             GROUP BY pane_id",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let pane_id: i64 = row.get(0)?;
-            let last_activity: i64 = row.get(1)?;
-            #[allow(clippy::cast_sign_loss)]
-            Ok((pane_id as u64, last_activity))
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut result = std::collections::HashMap::new();
-    for row in rows {
-        let (pane_id, last_activity) =
-            row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?;
-        result.insert(pane_id, last_activity);
     }
 
     Ok(result)
@@ -18328,29 +18233,6 @@ fn query_action_history_backend(
 }
 
 /// Query maximum sequence number for a pane.
-///
-/// Direct-rusqlite path. Kept as a fallback while the
-/// [`query_max_seq_backend`] migration target settles in
-/// (br-ft-l1jgo); will be removed once no callers remain.
-#[allow(dead_code)]
-fn query_max_seq(conn: &Connection, pane_id: u64) -> Result<Option<u64>> {
-    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-
-    conn.query_row(
-        "SELECT MAX(seq) FROM output_segments WHERE pane_id = ?1",
-        [pane_id_i64],
-        |row| {
-            let val: Option<i64> = row.get(0)?;
-            #[allow(clippy::cast_sign_loss)]
-            Ok(val.map(|v| v as u64))
-        },
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
-    .map(Option::flatten)
-}
-
-/// br-ft-l1jgo: trait-typed sibling of [`query_max_seq`].
 ///
 /// `MAX(seq)` returns SQL NULL when no rows match the WHERE clause
 /// (empty pane). The string-substrate path can't distinguish NULL
