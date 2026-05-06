@@ -290,7 +290,7 @@ fn toon_mcp_state_envelope_matches_golden() {
 #[test]
 fn toon_mcp_error_envelope_matches_golden() {
     let envelope = mcp_error(
-        "FT-MCP-0008",
+        "FT-MCP-0007",
         "pane 99 not found",
         Some("Use wa.state to list available panes"),
         3,

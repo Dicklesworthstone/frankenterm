@@ -1,17 +1,17 @@
 # Robot Family Contract: `profile`
 
 **Bead:** [BR-RC-ROBOT-CONTRACT.1] / `ft-hac7w.2`.
-**Status:** Substrate slice shipped. Schema-DSL contract (under
-`profile_family_contract()` in
-`crates/frankenterm-core/src/robot_family_contract.rs`) plus
-state-space proof + 7 conformance tests in
-`tests/robot_family_conformance.rs` are live; wiring
-`RobotCommands::Profile` to the existing config/profile
-machinery + `agent_profiles` schema migration is the integration
-follow-on. ntm differential test (action #5 of the parent
-bead's actions) consumes the state-machine model + the
-`crate::robot_ntm_differential::DifferentialHarness` from
-`ft-hac7w.1.1`.
+**Status:** Contract substrate and wired read/dry-run handler are live.
+Schema-DSL contract (under `profile_family_contract()` in
+`crates/frankenterm-core/src/robot_family_contract.rs`) plus state-space proof
++ conformance tests in `tests/robot_family_conformance.rs` are live.
+`RobotCommands::Profile` dispatches through
+`frankenterm_core::robot_profile_handler::handle_profile_command` against the
+workspace `agent_profiles` table. `list`, `show`, `validate`, and dry-run
+`apply` are wired; non-dry-run `apply` returns the typed
+`robot.profile.spawn_failed` envelope until daemon-mediated pane spawning is
+connected. The ntm differential test consumes the state-machine model + the
+`crate::robot_ntm_differential::DifferentialHarness` from `ft-hac7w.1.1`.
 
 ## Family overview
 
@@ -215,25 +215,21 @@ Verified by:
 
 ## What this contract is NOT
 
-- Not the actual handler. Wiring `RobotCommands::Profile`
-  into the existing config/profile machinery + the new
-  `agent_profiles` schema migration is the integration follow-on
-  (filed as `ft-hac7w.2.cont.handler`).
-- Not the differential test against `ntm profile`. That uses
-  `crate::robot_ntm_differential::DifferentialHarness` from
-  `ft-hac7w.1.1` and runs in a separate harness once the real
-  handler is wired (filed as `ft-hac7w.2.cont.differential`).
-- Not the schema migration. The `agent_profiles` table is
-  declared in this doc + the contract factory; the actual DDL +
-  migration step lands under `ft-hac7w.2.cont.handler`.
-- Not the README e2e example. Filed as `ft-hac7w.2.cont.readme`.
+- Not daemon-side pane spawning. The in-process handler deliberately fails
+  non-dry-run `apply` with `robot.profile.spawn_failed` because the actual pane
+  mutation must run through the mux service.
+- Not a guarantee that profile apply has an approval-aware live daemon RPC yet.
+  The handler pins the request/response contract and safe read/dry-run paths
+  while keeping real spawn unavailable instead of partially mutating.
+- Not the release attestation for a production profile-spawn daemon path. That
+  remains a follow-on once the mux-service mutation lane is wired.
 
 ## Substrate vs wired-pass scope
 
 Same substrate-pass / wired-pass split pattern as ft-2okh0.5,
 ft-t9a6q.1 / .2 / .3:
 
-**Substrate-pass (this bead):**
+**Substrate-pass (shipped):**
 - Contract doc (this file).
 - `profile_family_contract()` factory in
   `robot_family_contract.rs` (already exists per ft-hac7w.1).
@@ -241,15 +237,16 @@ ft-t9a6q.1 / .2 / .3:
   `tests/robot_family_conformance.rs`).
 - State-space proof at
   `crate::robot_profile_state_machine`.
+- NTM mirror differential harness in
+  `tests/robot_profile_ntm_differential.rs`.
 
-**Wired-pass (named follow-ups):**
-- `ft-hac7w.2.cont.handler`: `agent_profiles` schema migration
-  + `RobotCommands::Profile` handler replacing the
-  `build_ntm_not_implemented_response` site at
-  `crates/frankenterm/src/main.rs:23227`.
-- `ft-hac7w.2.cont.differential`: ntm differential test using
-  `DifferentialHarness` once the real handler is wired.
-- `ft-hac7w.2.cont.readme`: README e2e example.
+**Wired-pass (partially shipped):**
+- `agent_profiles` schema + SQL primitives are live.
+- `RobotCommands::Profile` routes to the DB-backed handler in
+  `crates/frankenterm/src/main.rs`.
+- `list`, `show`, `validate`, and dry-run `apply` return typed data envelopes.
+- Non-dry-run `apply` returns `robot.profile.spawn_failed` until the daemon-side
+  mux mutation path exists.
 
 ## Cross-references
 

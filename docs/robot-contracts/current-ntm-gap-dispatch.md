@@ -35,6 +35,14 @@ JSON robot envelope, and does not return the retired
 require success, because a real backend can still return typed errors for
 missing state, unavailable daemons, or denied policy.
 
+The cross-surface Robot/MCP golden matrix lives at
+`crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json`.
+`crates/frankenterm-core/tests/control_plane_golden_matrix.rs` validates that
+matrix for required families, scenarios, checked-in fixture/schema/doc
+references, and proof commands. Use it when updating README or robot-contract
+examples so healthy, degraded, blocked, policy-required, unsupported, and
+capability-unavailable envelopes stay tied to executable proof lanes.
+
 Re-run the live dispatch proof through RCH:
 
 ```bash
