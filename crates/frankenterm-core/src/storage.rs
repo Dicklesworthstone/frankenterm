@@ -5214,9 +5214,9 @@ impl StorageHandle {
                 }
             }
 
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_segments(&conn, pane_id, limit)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_segments_backend(backend, pane_id, limit)
+            })
         })
         .await
     }
@@ -16986,7 +16986,39 @@ fn query_pane(conn: &Connection, pane_id: u64) -> Result<Option<PaneRecord>> {
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
 }
 
+/// br-ft-l1jgo: trait-typed sibling of [`query_segments`].
+fn query_segments_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    limit: usize,
+) -> Result<Vec<Segment>> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let limit_i64 = usize_to_i64(limit, "limit")?;
+    let rows = backend
+        .query_map_cells(
+            "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+             FROM output_segments
+             WHERE pane_id = ?1
+             ORDER BY seq DESC
+             LIMIT ?2",
+            &[
+                ToSqlValue::Integer(pane_id_i64),
+                ToSqlValue::Integer(limit_i64),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Query segments", err))?;
+
+    rows.iter()
+        .map(|row| segment_from_backend_cells(row))
+        .collect()
+}
+
 /// Query segments for a pane
+///
+/// Direct-rusqlite path. Kept for transitional fallback and direct
+/// row-shape tests while [`query_segments_backend`] settles in
+/// (br-ft-l1jgo).
+#[allow(dead_code)]
 #[allow(clippy::cast_sign_loss)]
 fn query_segments(conn: &Connection, pane_id: u64, limit: usize) -> Result<Vec<Segment>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
