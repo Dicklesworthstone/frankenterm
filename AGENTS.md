@@ -41,7 +41,7 @@ This rule exists because agents have REPEATEDLY deleted this entire crate (860+ 
 
 The `am serve-http` process is a **shared singleton** that all agents depend on. Restarting or killing it disrupts every other agent. Multiple agents running `am service restart` create a **restart cascade** that makes the service permanently unavailable.
 
-**If `am` commands fail or the API is unreachable:** retry once after a few seconds, then proceed with your work WITHOUT agent-mail. Do NOT attempt to diagnose, repair, or restart the service.
+**If `am` commands fail or the API is unreachable:** retry once after a few seconds, then proceed with your work WITHOUT agent-mail. Do NOT attempt to diagnose, repair, or restart the service. For coordination context while mail is red, run `scripts/swarm-tick.sh --agent-mail-fallback frankenterm` and use the Beads/git snapshot as the handoff surface until Agent Mail recovers.
 
 ---
 
@@ -1274,6 +1274,7 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 - `"from_agent not registered"`: Always `register_agent` in the correct `project_key` first
 - `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
 - **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
+- **Agent Mail unavailable:** Retry once, then do not repair/restart/kill the shared service. Run `scripts/swarm-tick.sh --agent-mail-fallback frankenterm` and continue with Beads-only coordination.
 
 ---
 

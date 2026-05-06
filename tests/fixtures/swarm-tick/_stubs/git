@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Stub `git` for swarm-tick tests. Routes `git log --since=...` to fixtures.
-# All other invocations no-op (the script only uses log).
+# Stub `git` for swarm-tick tests. Routes `git log --since=...` and
+# `git status --short` to fixtures. All other invocations no-op.
+if [ "${1:-}" = "status" ]; then
+    if [ -f "$FIXTURE_DIR/git_status_short.txt" ]; then
+        cat "$FIXTURE_DIR/git_status_short.txt"
+    fi
+    exit 0
+fi
+
 case "${2:-}" in
     --since=*1*hour*) cat "$FIXTURE_DIR/git_log_1h.txt" ;;
     --since=*4*minute*) cat "$FIXTURE_DIR/git_log_4m.txt" ;;

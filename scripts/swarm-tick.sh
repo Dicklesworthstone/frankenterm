@@ -5,18 +5,59 @@
 # `ntm coordinator ...`, this script exposes the closest read-only robot-mode
 # equivalents under `.coordinator`.
 #
-# Usage: swarm-tick.sh [session]
+# Usage:
+#   swarm-tick.sh [session]
+#   swarm-tick.sh --agent-mail-fallback [session]
+#
+# `--agent-mail-fallback` emits a read-only Beads/git coordination snapshot
+# for the AGENTS.md rule where Agent Mail is unavailable after one retry.
 # Env overrides (mainly for tests):
 #   REPO_ROOT  — repo path to cd into (default: /Users/jemanuel/projects/frankenterm)
 #   DISK_VOL   — `df -h` target volume. Default branches on uname:
 #                /System/Volumes/Data on Darwin, / elsewhere.
 #   FT_OPERATOR_LOCK_DIR — shared operator-script lock dir (default: /tmp/ft-operator-scripts.lock)
+#   FT_OPERATOR_NOW_ISO / FT_OPERATOR_NOW_EPOCH — deterministic test clock.
 #
 # Platform: macOS + Linux (ft-v5lz3.2.7). All external commands used here
 # (df -h, du -sk, find -maxdepth -mmin, ls -d) accept identical flags on
 # BSD and GNU coreutils.
 set -uo pipefail
-session="${1:-frankenterm}"
+
+mode="tick"
+session="frankenterm"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --agent-mail-fallback)
+      mode="agent_mail_fallback"
+      shift
+      ;;
+    --help|-h)
+      cat <<'EOF'
+Usage:
+  swarm-tick.sh [session]
+  swarm-tick.sh --agent-mail-fallback [session]
+
+Emit a read-only operator snapshot for the frankenterm swarm.
+EOF
+      exit 0
+      ;;
+    --)
+      shift
+      if [ "$#" -gt 0 ]; then
+        session="$1"
+        shift
+      fi
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      exit 64
+      ;;
+    *)
+      session="$1"
+      shift
+      ;;
+  esac
+done
 
 # Pick a sensible default disk volume per platform. macOS volumes mount
 # the user's data partition under /System/Volumes/Data; Linux puts it
@@ -75,13 +116,7 @@ trap 'release_operator_lock "$operator_lock_dir"' EXIT
 trap 'release_operator_lock "$operator_lock_dir"; exit 130' INT
 trap 'release_operator_lock "$operator_lock_dir"; exit 143' TERM
 
-now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-git_commits_1h=$(cd "$repo_root" && git log --since="1 hour ago" --oneline 2>/dev/null | wc -l | tr -d ' ')
-git_commits_4m=$(cd "$repo_root" && git log --since="4 minutes ago" --oneline 2>/dev/null | wc -l | tr -d ' ')
-
-beads_open=$(cd "$repo_root" && br list --status open --json 2>/dev/null | jq '.issues|length' 2>/dev/null || echo 0)
-beads_in_progress=$(cd "$repo_root" && br list --status in_progress --json 2>/dev/null | jq '.issues|length' 2>/dev/null || echo 0)
-beads_blocked=$(cd "$repo_root" && br list --status blocked --json 2>/dev/null | jq '.issues|length' 2>/dev/null || echo 0)
+now="${FT_OPERATOR_NOW_ISO:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
 json_array_count_or_zero() {
   local output
@@ -93,6 +128,148 @@ json_array_count_or_zero() {
   fi
 }
 
+beads_issue_array() {
+  local output
+  output=$(cd "$repo_root" && "$@" 2>/dev/null || true)
+  if [ -n "$output" ]; then
+    printf '%s\n' "$output" | jq '
+      if type == "object" and (.issues | type) == "array" then
+        .issues
+      elif type == "array" then
+        .
+      else
+        []
+      end
+    ' 2>/dev/null || printf '[]\n'
+  else
+    printf '[]\n'
+  fi
+}
+
+git_dirty_paths_json() {
+  cd "$repo_root" && git status --short --untracked-files=all 2>/dev/null | jq -Rcs '
+    split("\n")
+    | map(select(length > 0)
+      | {
+          raw: .,
+          status: .[0:2],
+          path: (.[3:] | sub(" -> .*"; ""))
+        })
+  ' 2>/dev/null || printf '[]\n'
+}
+
+emit_agent_mail_fallback_snapshot() {
+  local now_epoch
+  now_epoch="${FT_OPERATOR_NOW_EPOCH:-$(date -u +%s)}"
+
+  local in_progress_json ready_json dirty_json
+  in_progress_json=$(beads_issue_array br list --status in_progress --json)
+  ready_json=$(beads_issue_array br ready --json)
+  dirty_json=$(git_dirty_paths_json)
+
+  jq -cn \
+    --arg ts "$now" \
+    --arg session "$session" \
+    --argjson now_epoch "$now_epoch" \
+    --argjson in_progress "$in_progress_json" \
+    --argjson ready "$ready_json" \
+    --argjson dirty "$dirty_json" \
+    '
+    def parse_bead_ts:
+      if . == null then
+        null
+      else
+        (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // null)
+      end;
+
+    def enriched_issue:
+      . as $issue
+      | (($issue.updated_at // $issue.created_at // null) | parse_bead_ts) as $updated_epoch
+      | {
+          id: $issue.id,
+          title: $issue.title,
+          status: ($issue.status // null),
+          priority: ($issue.priority // null),
+          assignee: ($issue.assignee // "unassigned"),
+          updated_at: ($issue.updated_at // null),
+          age_seconds: (if $updated_epoch == null then null else (($now_epoch - $updated_epoch) | floor) end),
+          stale_over_2h: (if $updated_epoch == null then false else (($now_epoch - $updated_epoch) >= 7200) end)
+        };
+
+    def active_agents:
+      map(enriched_issue)
+      | sort_by(.assignee, .id)
+      | group_by(.assignee)
+      | map({
+          assignee: .[0].assignee,
+          active_count: length,
+          beads: map({
+            id,
+            title,
+            updated_at,
+            age_seconds,
+            stale_over_2h
+          })
+        });
+
+    {
+      ts: $ts,
+      session: $session,
+      mode: "agent_mail_unavailable_beads_only",
+      agent_mail: {
+        status: "unavailable",
+        marker: "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
+        forbidden_actions: [
+          "am service restart",
+          "am service stop",
+          "am doctor fix",
+          "am doctor repair",
+          "am doctor reconstruct",
+          "kill am/serve-http/mcp-agent-mail"
+        ]
+      },
+      beads: {
+        in_progress_count: ($in_progress | length),
+        ready_count: ($ready | length),
+        active_agents: ($in_progress | active_agents),
+        in_progress: ($in_progress | map(enriched_issue)),
+        ready: ($ready | map({
+          id,
+          title,
+          status: (.status // "ready"),
+          priority: (.priority // null),
+          assignee: (.assignee // "unassigned")
+        }))
+      },
+      git: {
+        dirty_count: ($dirty | length),
+        dirty_paths: $dirty,
+        conflict_hints: ($dirty | map({
+          path,
+          status,
+          guidance: "Treat as shared-worktree conflict until owner is known; do not edit or stage unrelated paths."
+        }))
+      },
+      next_actions: [
+        "Use Beads status as the coordination source of truth until Agent Mail recovers.",
+        "Before editing, compare dirty_paths and in_progress assignees with your intended files.",
+        "Record this snapshot in the Beads comment when closing or handing off work."
+      ],
+      proof_doctor: "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed."
+    }'
+}
+
+if [ "$mode" = "agent_mail_fallback" ]; then
+  emit_agent_mail_fallback_snapshot
+  exit 0
+fi
+
+git_commits_1h=$(cd "$repo_root" && git log --since="1 hour ago" --oneline 2>/dev/null | wc -l | tr -d ' ')
+git_commits_4m=$(cd "$repo_root" && git log --since="4 minutes ago" --oneline 2>/dev/null | wc -l | tr -d ' ')
+
+beads_open=$(cd "$repo_root" && br list --status open --json 2>/dev/null | jq '.issues|length' 2>/dev/null || echo 0)
+beads_in_progress=$(cd "$repo_root" && br list --status in_progress --json 2>/dev/null | jq '.issues|length' 2>/dev/null || echo 0)
+beads_blocked=$(cd "$repo_root" && br list --status blocked --json 2>/dev/null | jq '.issues|length' 2>/dev/null || echo 0)
 ready=$(cd "$repo_root" && json_array_count_or_zero br ready --json || echo 0)
 
 # Disk

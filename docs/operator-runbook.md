@@ -44,6 +44,7 @@ Before sending the first marching order, verify the environment.
 | Beads DB walkable | `br ready --json \| jq length` | Returns an integer (no errors) |
 | ntm session exists | `tmux has-session -t frankenterm` | Exit 0 |
 | Agent panes responding | `ntm --robot-snapshot -t frankenterm` | All panes named (cc_1, cc_2, cod_1...) |
+| Agent Mail usable | Agent Mail MCP macro/tool call | Succeeds, or fails once and succeeds on one retry |
 
 **If any pre-flight check fails:**
 - rch unhealthy → for RCH-required proof lanes, record an infra-blocked
@@ -52,6 +53,11 @@ Before sending the first marching order, verify the environment.
 - Disk >90% → run `scripts/clean-stale-targets.sh` *before* dispatching work, not after.
 - Beads DB locked → wait 10s; if persistent, `lsof .beads/beads.db` to find writer; if no writer, the DB is corrupted (use `bv` for triage instead, per MEMORY.md note `br-db-corruption`).
 - ntm pane missing → relaunch via the project's spawn script before the swarm tick begins.
+- Agent Mail red/unreachable → retry once after a few seconds; if it still fails, do not repair, restart, or kill the shared service. Continue with a Beads-only handoff snapshot:
+  ```bash
+  scripts/swarm-tick.sh --agent-mail-fallback frankenterm
+  ```
+  The snapshot includes the red-mail marker, active assignees from in-progress Beads, freshness/staleness, ready work, and dirty-file conflict hints.
 
 ## 2. Proof-Doctor Gate For Proof Lanes
 

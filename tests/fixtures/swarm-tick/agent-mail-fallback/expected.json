@@ -1,0 +1,120 @@
+{
+  "agent_mail": {
+    "forbidden_actions": [
+      "am service restart",
+      "am service stop",
+      "am doctor fix",
+      "am doctor repair",
+      "am doctor reconstruct",
+      "kill am/serve-http/mcp-agent-mail"
+    ],
+    "marker": "Agent Mail unavailable: retry once, do not repair/restart service; continue with Beads-only coordination.",
+    "status": "unavailable"
+  },
+  "beads": {
+    "active_agents": [
+      {
+        "active_count": 1,
+        "assignee": "BlueLake",
+        "beads": [
+          {
+            "age_seconds": 9000,
+            "id": "ft-stale1",
+            "stale_over_2h": true,
+            "title": "Dormant proof lane",
+            "updated_at": "2026-05-06T14:30:00Z"
+          }
+        ]
+      },
+      {
+        "active_count": 1,
+        "assignee": "RedTower",
+        "beads": [
+          {
+            "age_seconds": 1800,
+            "id": "ft-active1",
+            "stale_over_2h": false,
+            "title": "Storage call-site migration",
+            "updated_at": "2026-05-06T16:30:00Z"
+          }
+        ]
+      }
+    ],
+    "in_progress": [
+      {
+        "age_seconds": 1800,
+        "assignee": "RedTower",
+        "id": "ft-active1",
+        "priority": 3,
+        "stale_over_2h": false,
+        "status": "in_progress",
+        "title": "Storage call-site migration",
+        "updated_at": "2026-05-06T16:30:00Z"
+      },
+      {
+        "age_seconds": 9000,
+        "assignee": "BlueLake",
+        "id": "ft-stale1",
+        "priority": 2,
+        "stale_over_2h": true,
+        "status": "in_progress",
+        "title": "Dormant proof lane",
+        "updated_at": "2026-05-06T14:30:00Z"
+      }
+    ],
+    "in_progress_count": 2,
+    "ready": [
+      {
+        "assignee": "unassigned",
+        "id": "ft-ready1",
+        "priority": 3,
+        "status": "open",
+        "title": "Ready fallback docs"
+      },
+      {
+        "assignee": "SilverHarbor",
+        "id": "ft-ready2",
+        "priority": 4,
+        "status": "open",
+        "title": "Ready target lint"
+      }
+    ],
+    "ready_count": 2
+  },
+  "git": {
+    "conflict_hints": [
+      {
+        "guidance": "Treat as shared-worktree conflict until owner is known; do not edit or stage unrelated paths.",
+        "path": "crates/frankenterm-core/src/storage.rs",
+        "status": " M"
+      },
+      {
+        "guidance": "Treat as shared-worktree conflict until owner is known; do not edit or stage unrelated paths.",
+        "path": "docs/robot-contracts/policy-recommendations.md",
+        "status": "??"
+      }
+    ],
+    "dirty_count": 2,
+    "dirty_paths": [
+      {
+        "path": "crates/frankenterm-core/src/storage.rs",
+        "raw": " M crates/frankenterm-core/src/storage.rs",
+        "status": " M"
+      },
+      {
+        "path": "docs/robot-contracts/policy-recommendations.md",
+        "raw": "?? docs/robot-contracts/policy-recommendations.md",
+        "status": "??"
+      }
+    ]
+  },
+  "mode": "agent_mail_unavailable_beads_only",
+  "next_actions": [
+    "Use Beads status as the coordination source of truth until Agent Mail recovers.",
+    "Before editing, compare dirty_paths and in_progress assignees with your intended files.",
+    "Record this snapshot in the Beads comment when closing or handing off work."
+  ],
+  "proof_doctor": "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed.",
+  "session": "frankenterm",
+  "ts": "2026-05-06T17:00:00Z"
+}

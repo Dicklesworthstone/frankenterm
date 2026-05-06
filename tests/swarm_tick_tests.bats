@@ -82,6 +82,27 @@ run_fixture() {
     log_event "compare" "actual=${TMP_DIR}/actual.json expected=${TMP_DIR}/expected.json"
 }
 
+run_agent_mail_fallback_fixture() {
+    local fixture="${FIXTURES_ROOT}/agent-mail-fallback"
+    [[ -d "$fixture" ]] || { echo "missing fixture: $fixture" >&2; return 2; }
+
+    log_event "setup" "fixture=agent-mail-fallback"
+
+    local raw="${TMP_DIR}/raw.json"
+    PATH="${STUBS_DIR}:$PATH" \
+        FIXTURE_DIR="$fixture" \
+        REPO_ROOT="$REPO_ROOT" \
+        FT_OPERATOR_NOW_ISO="2026-05-06T17:00:00Z" \
+        FT_OPERATOR_NOW_EPOCH="1778086800" \
+        bash "$SCRIPT" --agent-mail-fallback frankenterm > "$raw" 2>"${TMP_DIR}/stderr.log"
+
+    log_event "run" "raw_bytes=$(wc -c < "$raw" | tr -d ' ')"
+
+    jq -S . "$raw" > "${TMP_DIR}/actual.json"
+    jq -S . "${fixture}/expected.json" > "${TMP_DIR}/expected.json"
+    log_event "compare" "actual=${TMP_DIR}/actual.json expected=${TMP_DIR}/expected.json"
+}
+
 # Assert that the running fixture's actual matches expected.
 assert_match() {
     if ! diff -u "${TMP_DIR}/expected.json" "${TMP_DIR}/actual.json" > "${TMP_DIR}/diff.txt"; then
@@ -116,6 +137,13 @@ assert_match() {
 @test "converged fixture: 0 ready / 0 in_progress / no recent commits → matches golden" {
     run_fixture converged
     assert_match
+}
+
+@test "agent-mail fallback fixture: red-mail marker / beads / dirty paths → matches golden" {
+    run_agent_mail_fallback_fixture
+    assert_match
+    [[ "$(jq -r '.agent_mail.marker' "${TMP_DIR}/actual.json")" == *"retry once, do not repair/restart service"* ]]
+    [[ "$(jq -r '.mode' "${TMP_DIR}/actual.json")" == "agent_mail_unavailable_beads_only" ]]
 }
 
 # ─── Schema invariants (run on healthy fixture) ──────────────────────────────
