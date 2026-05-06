@@ -938,6 +938,387 @@ pub struct AgentInventoryData {
     pub filesystem_detection_available: bool,
 }
 
+/// Schema version for active-agent health snapshots.
+pub const ACTIVE_AGENT_HEALTH_SCHEMA_VERSION: u32 = 1;
+
+/// Per-agent evidence entries are intentionally bounded so robot responses
+/// remain suitable for repeated operator polling.
+pub const ACTIVE_AGENT_HEALTH_MAX_EVIDENCE_LINKS: usize = 8;
+
+/// Per-agent risk lists are bounded for the same reason as evidence links.
+pub const ACTIVE_AGENT_HEALTH_MAX_RISK_FLAGS: usize = 12;
+
+/// Joined active-agent health response for operator convergence views.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveAgentHealthData {
+    /// Schema version for forward-compatible robot/MCP payloads.
+    pub schema_version: u32,
+    /// Epoch milliseconds when the snapshot was assembled.
+    pub generated_at_ms: u64,
+    /// Per-agent records after response bounds have been applied.
+    pub agents: Vec<ActiveAgentHealthRecord>,
+    /// Aggregate counts derived from `agents`.
+    pub summary: ActiveAgentHealthSummary,
+    /// Number of records omitted by `from_agents_bounded`.
+    #[serde(default)]
+    pub truncated_agents: usize,
+}
+
+impl ActiveAgentHealthData {
+    /// Build an untruncated snapshot and derive summary counts from the records.
+    #[must_use]
+    pub fn new(generated_at_ms: u64, agents: Vec<ActiveAgentHealthRecord>) -> Self {
+        Self::from_agents_bounded(generated_at_ms, agents, usize::MAX)
+    }
+
+    /// Build a bounded snapshot, truncating per-agent evidence/risk lists and
+    /// limiting the number of returned agents to `max_agents`.
+    #[must_use]
+    pub fn from_agents_bounded(
+        generated_at_ms: u64,
+        agents: Vec<ActiveAgentHealthRecord>,
+        max_agents: usize,
+    ) -> Self {
+        let total_agents = agents.len();
+        let bounded_agents: Vec<ActiveAgentHealthRecord> = agents
+            .into_iter()
+            .take(max_agents)
+            .map(ActiveAgentHealthRecord::bounded)
+            .collect();
+        let truncated_agents = total_agents.saturating_sub(bounded_agents.len());
+        let summary = ActiveAgentHealthSummary::from_records(&bounded_agents);
+
+        Self {
+            schema_version: ACTIVE_AGENT_HEALTH_SCHEMA_VERSION,
+            generated_at_ms,
+            agents: bounded_agents,
+            summary,
+            truncated_agents,
+        }
+    }
+}
+
+/// Aggregate active-agent health counts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveAgentHealthSummary {
+    pub total_agents: usize,
+    pub idle_agents: usize,
+    pub active_agents: usize,
+    pub stuck_agents: usize,
+    pub rate_limited_agents: usize,
+    pub converged_agents: usize,
+    pub unknown_agents: usize,
+    pub high_risk_agents: usize,
+    pub needs_human_action: usize,
+    pub missing_bead_assignment: usize,
+    pub missing_proof_lane: usize,
+}
+
+impl ActiveAgentHealthSummary {
+    /// Derive summary counters from per-agent records.
+    #[must_use]
+    pub fn from_records(records: &[ActiveAgentHealthRecord]) -> Self {
+        let mut summary = Self {
+            total_agents: records.len(),
+            ..Self::default()
+        };
+
+        for record in records {
+            match record.state {
+                ActiveAgentConvergenceState::Idle => summary.idle_agents += 1,
+                ActiveAgentConvergenceState::Active => summary.active_agents += 1,
+                ActiveAgentConvergenceState::Stuck => summary.stuck_agents += 1,
+                ActiveAgentConvergenceState::RateLimited => summary.rate_limited_agents += 1,
+                ActiveAgentConvergenceState::Converged => summary.converged_agents += 1,
+                ActiveAgentConvergenceState::Unknown => summary.unknown_agents += 1,
+            }
+
+            if record
+                .risk_flags
+                .iter()
+                .any(AgentHealthRiskFlag::is_high_or_critical)
+            {
+                summary.high_risk_agents += 1;
+            }
+
+            if record.recommended_action.requires_human_action() {
+                summary.needs_human_action += 1;
+            }
+
+            if record.bead.is_none() {
+                summary.missing_bead_assignment += 1;
+            }
+
+            if record.proof_lane.is_none() {
+                summary.missing_proof_lane += 1;
+            }
+        }
+
+        summary
+    }
+}
+
+/// One active-agent health row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveAgentHealthRecord {
+    /// Stable agent identifier from Agent Mail, pane inventory, or fallback slug.
+    pub agent_id: String,
+    /// Human-facing agent name when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    /// Canonical provider slug such as `codex`, `claude`, or `gemini`.
+    pub provider: String,
+    /// Pane id when this record is attached to a live pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    /// Current working directory reported by the pane or agent tracker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Joined convergence classification.
+    pub state: ActiveAgentConvergenceState,
+    /// Age of the last state transition or evidence refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_ms: Option<u64>,
+    /// Current Beads assignment, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bead: Option<AgentHealthBeadRef>,
+    /// Latest commit attributed to this agent, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_commit: Option<AgentHealthCommitRef>,
+    /// Most relevant proof lane for the current assignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_lane: Option<AgentHealthProofLane>,
+    /// Bounded risk flags supporting the recommendation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risk_flags: Vec<AgentHealthRiskFlag>,
+    /// Next recommended operator or robot action.
+    pub recommended_action: AgentHealthRecommendedAction,
+    /// Bounded evidence references. These are links/ids, not raw pane text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<AgentHealthEvidenceLink>,
+    /// Confidence in the joined state.
+    pub confidence: AgentHealthConfidence,
+}
+
+impl ActiveAgentHealthRecord {
+    /// Return a copy with bounded risk/evidence vectors.
+    #[must_use]
+    pub fn bounded(mut self) -> Self {
+        self.evidence
+            .truncate(ACTIVE_AGENT_HEALTH_MAX_EVIDENCE_LINKS);
+        self.risk_flags.truncate(ACTIVE_AGENT_HEALTH_MAX_RISK_FLAGS);
+        self
+    }
+
+    /// Whether a `stuck` classification is backed by non-placeholder evidence.
+    #[must_use]
+    pub fn has_actionable_stuck_evidence(&self) -> bool {
+        self.state == ActiveAgentConvergenceState::Stuck
+            && self
+                .evidence
+                .iter()
+                .any(AgentHealthEvidenceLink::can_support_stuck_state)
+    }
+
+    /// Whether the record only knows about placeholder idle text.
+    #[must_use]
+    pub fn has_only_placeholder_idle_evidence(&self) -> bool {
+        !self.evidence.is_empty()
+            && self
+                .evidence
+                .iter()
+                .all(|e| e.kind == AgentHealthEvidenceKind::PlaceholderIdleText)
+    }
+}
+
+/// Joined convergence state for an active agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveAgentConvergenceState {
+    Idle,
+    Active,
+    Stuck,
+    RateLimited,
+    Converged,
+    Unknown,
+}
+
+/// Confidence bucket for inferred health state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHealthConfidence {
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+/// Current Beads assignment for an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentHealthBeadRef {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_ms: Option<u64>,
+}
+
+/// Latest commit attributed to an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentHealthCommitRef {
+    pub sha: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<bool>,
+}
+
+/// Proof lane attached to the current assignment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentHealthProofLane {
+    pub command: String,
+    pub status: AgentHealthProofStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_uri: Option<String>,
+}
+
+/// Proof status exposed in the agent health model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHealthProofStatus {
+    Unknown,
+    NotRequired,
+    Queued,
+    Running,
+    Passed,
+    Failed,
+    SkippedNotProven,
+}
+
+/// Risk flag attached to an agent health row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentHealthRiskFlag {
+    pub code: AgentHealthRiskCode,
+    pub severity: AgentHealthRiskSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_index: Option<usize>,
+}
+
+impl AgentHealthRiskFlag {
+    #[must_use]
+    pub fn is_high_or_critical(&self) -> bool {
+        matches!(
+            self.severity,
+            AgentHealthRiskSeverity::High | AgentHealthRiskSeverity::Critical
+        )
+    }
+}
+
+/// Machine-readable risk code for operator filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHealthRiskCode {
+    UnknownAgent,
+    StalePaneState,
+    StaleBeadClaim,
+    NoBeadAssignment,
+    ProofMissing,
+    ProofFailed,
+    RateLimited,
+    UncommittedWork,
+    DirtyWorkspace,
+    CrossAgentConflict,
+    PlaceholderIdleOnly,
+    HumanReviewRequired,
+}
+
+/// Risk severity for an active-agent health flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHealthRiskSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Recommended next action for an agent row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentHealthRecommendedAction {
+    pub kind: AgentHealthRecommendedActionKind,
+    pub confidence: AgentHealthConfidence,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_indices: Vec<usize>,
+}
+
+impl AgentHealthRecommendedAction {
+    #[must_use]
+    pub fn requires_human_action(&self) -> bool {
+        self.kind == AgentHealthRecommendedActionKind::EscalateHuman
+    }
+}
+
+/// Operator action categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHealthRecommendedActionKind {
+    None,
+    ContinueWork,
+    Wait,
+    InspectPane,
+    RunProofLane,
+    ReassignBead,
+    ReopenBead,
+    MarkConverged,
+    EscalateHuman,
+    Unknown,
+}
+
+/// Evidence reference supporting a health row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentHealthEvidenceLink {
+    pub kind: AgentHealthEvidenceKind,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl AgentHealthEvidenceLink {
+    #[must_use]
+    pub fn can_support_stuck_state(&self) -> bool {
+        self.kind != AgentHealthEvidenceKind::PlaceholderIdleText
+    }
+}
+
+/// Evidence kind used for health-state attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHealthEvidenceKind {
+    PaneState,
+    BeadsAssignment,
+    GitCommit,
+    ProofLane,
+    AgentMail,
+    RobotEvent,
+    PlaceholderIdleText,
+    ManualNote,
+}
+
 /// Individual installed agent from filesystem detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledAgentInfo {
