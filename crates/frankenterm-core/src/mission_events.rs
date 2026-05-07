@@ -212,7 +212,7 @@ pub mod reason_codes {
 /// that invariant for builder-created events. The custom
 /// `Deserialize` impl below extends the same invariant across the
 /// serde boundary: any persisted JSON with `kind: "assignment_emitted"`
-/// + `phase: "lifecycle"` (or any other mismatch) is healed at load
+/// and `phase: "lifecycle"` (or any other mismatch) is healed at load
 /// time by overwriting `phase` with `kind.phase()`. Operators
 /// inspecting the resulting log via `events_by_phase` /
 /// `count_by_phase` / `summary` see the canonical phase, not the

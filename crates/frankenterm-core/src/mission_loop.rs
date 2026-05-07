@@ -2035,14 +2035,14 @@ impl OperatorOverride {
 /// Today the only failure mode is the active-cap; structured as an
 /// enum so future reasons (e.g. duplicate target, missing TTL on a
 /// non-privileged source) can be added without breaking callers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorOverrideRejection {
     /// The active override vec already holds `cap` entries; the
     /// rejected override is returned so the caller can log / surface
     /// it rather than silently drop the operator's intent.
     ActiveCapReached {
         cap: usize,
-        rejected: OperatorOverride,
+        rejected: Box<OperatorOverride>,
     },
 }
 
@@ -2103,7 +2103,7 @@ impl OperatorOverrideState {
         if self.active.len() >= Self::MAX_ACTIVE {
             return Err(OperatorOverrideRejection::ActiveCapReached {
                 cap: Self::MAX_ACTIVE,
-                rejected: ovr,
+                rejected: Box::new(ovr),
             });
         }
         self.active.push(ovr);

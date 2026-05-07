@@ -26,6 +26,11 @@ use frankenterm_core::plan::{
     mission_tx_compensation_inputs as build_robot_tx_compensation_inputs,
     tx_prepare_gate_inputs_allow_all as build_robot_tx_prepare_gate_inputs,
 };
+use frankenterm_core::proof_doctor::{
+    PROOF_DOCTOR_SCHEMA_VERSION, ProofDoctorBeadRef, ProofDoctorDirtyPath, ProofDoctorEvidence,
+    ProofDoctorPhase, ProofDoctorPreflightInput, classify_proof_doctor,
+};
+use frankenterm_core::proof_lane::{ProofBackend, ProofScope};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 
 /// Build metadata captured at compile time.
@@ -5077,34 +5082,12 @@ enum ProofDoctorScopeArg {
     Static,
 }
 
-impl ProofDoctorScopeArg {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::CargoTest => "cargo_test",
-            Self::CargoCheck => "cargo_check",
-            Self::CargoClippy => "cargo_clippy",
-            Self::CargoBuild => "cargo_build",
-            Self::Static => "static",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum ProofDoctorBackendArg {
     Rch,
     Static,
     Local,
-}
-
-impl ProofDoctorBackendArg {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Rch => "rch",
-            Self::Static => "static",
-            Self::Local => "local",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -5683,17 +5666,6 @@ impl<T> RobotResponse<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ProofDoctorCommandClassification {
-    status: &'static str,
-    phase: &'static str,
-    blocker_kind: Option<&'static str>,
-    reason_code: Option<&'static str>,
-    severity: Option<&'static str>,
-    message: &'static str,
-    next_action: &'static str,
-}
-
 fn proof_doctor_agent_name(agent: Option<&str>) -> String {
     agent
         .filter(|value| !value.trim().is_empty())
@@ -5725,7 +5697,25 @@ fn proof_doctor_git_branch(workspace_root: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn proof_doctor_dirty_paths(workspace_root: &Path) -> Vec<serde_json::Value> {
+fn proof_doctor_scope(scope: ProofDoctorScopeArg) -> ProofScope {
+    match scope {
+        ProofDoctorScopeArg::CargoTest => ProofScope::CargoTest,
+        ProofDoctorScopeArg::CargoCheck => ProofScope::CargoCheck,
+        ProofDoctorScopeArg::CargoClippy => ProofScope::CargoClippy,
+        ProofDoctorScopeArg::CargoBuild => ProofScope::CargoBuild,
+        ProofDoctorScopeArg::Static => ProofScope::DocsStatic,
+    }
+}
+
+fn proof_doctor_backend(required_backend: ProofDoctorBackendArg) -> ProofBackend {
+    match required_backend {
+        ProofDoctorBackendArg::Rch => ProofBackend::Rch,
+        ProofDoctorBackendArg::Static => ProofBackend::None,
+        ProofDoctorBackendArg::Local => ProofBackend::LocalShell,
+    }
+}
+
+fn proof_doctor_dirty_paths(workspace_root: &Path) -> Vec<ProofDoctorDirtyPath> {
     let Some(output) = proof_doctor_git_output(workspace_root, &["status", "--porcelain=v1"])
     else {
         return Vec::new();
@@ -5740,12 +5730,67 @@ fn proof_doctor_dirty_paths(workspace_root: &Path) -> Vec<serde_json::Value> {
             let index_status = line.chars().next().unwrap_or(' ');
             let worktree_status = line.chars().nth(1).unwrap_or(' ');
             let path = line[3..].to_string();
-            Some(serde_json::json!({
-                "path": path,
-                "index_status": index_status.to_string(),
-                "worktree_status": worktree_status.to_string(),
-                "owner": null,
-            }))
+            let status = format!("{index_status}{worktree_status}")
+                .trim()
+                .to_string();
+            Some(ProofDoctorDirtyPath {
+                path,
+                status,
+                affects_proof: false,
+                owner: None,
+            })
+        })
+        .collect()
+}
+
+fn proof_doctor_active_beads(workspace_root: &Path) -> Vec<ProofDoctorBeadRef> {
+    let output = match std::process::Command::new("br")
+        .args(["list", "--json"])
+        .current_dir(workspace_root)
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+    proof_doctor_active_beads_from_json(&stdout)
+}
+
+fn proof_doctor_active_beads_from_json(raw: &str) -> Vec<ProofDoctorBeadRef> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let issues = value
+        .get("issues")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
+    let Some(issues) = issues else {
+        return Vec::new();
+    };
+
+    issues
+        .iter()
+        .filter_map(|issue| {
+            let status = issue.get("status")?.as_str()?.to_string();
+            if status != "in_progress" {
+                return None;
+            }
+            Some(ProofDoctorBeadRef {
+                bead_id: issue.get("id")?.as_str()?.to_string(),
+                title: issue
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                assignee: issue
+                    .get("assignee")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                status,
+            })
         })
         .collect()
 }
@@ -5757,124 +5802,12 @@ fn proof_doctor_binary_name(token: &str) -> &str {
         .unwrap_or(token)
 }
 
-fn proof_doctor_is_cargo_token(token: &str) -> bool {
-    proof_doctor_binary_name(token) == "cargo"
-}
-
-fn proof_doctor_is_rch_token(token: &str) -> bool {
-    proof_doctor_binary_name(token) == "rch"
-}
-
 fn proof_doctor_is_local_cargo_command(command: &[String]) -> bool {
     let Some(first) = command.first() else {
         return false;
     };
     let first_bin = proof_doctor_binary_name(first);
     first_bin == "cargo" || first_bin == "cargo-local.sh"
-}
-
-fn proof_doctor_is_shell_wrapped(command: &[String]) -> bool {
-    command.windows(2).any(|window| {
-        matches!(window[0].as_str(), "bash" | "sh" | "zsh")
-            && matches!(window[1].as_str(), "-lc" | "-c")
-    })
-}
-
-fn proof_doctor_is_rch_cargo_command(command: &[String]) -> bool {
-    if !command
-        .first()
-        .is_some_and(|token| proof_doctor_is_rch_token(token))
-    {
-        return false;
-    }
-    if !command.iter().any(|token| token == "exec") {
-        return false;
-    }
-    command
-        .iter()
-        .any(|token| proof_doctor_is_cargo_token(token))
-}
-
-fn classify_proof_doctor_command(
-    required_backend: ProofDoctorBackendArg,
-    command: &[String],
-) -> ProofDoctorCommandClassification {
-    if command.is_empty() {
-        return ProofDoctorCommandClassification {
-            status: "invalid",
-            phase: "preflight",
-            blocker_kind: Some("command_shape"),
-            reason_code: Some("proof.command.empty"),
-            severity: Some("error"),
-            message: "No proof command argv was provided.",
-            next_action: "Pass the intended proof command after `--` so proof-doctor can classify it.",
-        };
-    }
-
-    match required_backend {
-        ProofDoctorBackendArg::Rch => {
-            if proof_doctor_is_local_cargo_command(command) {
-                return ProofDoctorCommandClassification {
-                    status: "invalid",
-                    phase: "preflight",
-                    blocker_kind: Some("command_shape"),
-                    reason_code: Some("proof.command.local_cargo_invalid"),
-                    severity: Some("error"),
-                    message: "Local Cargo cannot be used as proof for an RCH-required lane.",
-                    next_action: "Rewrite the proof command to use `rch exec -- ... cargo ...` before claiming remote proof.",
-                };
-            }
-            if proof_doctor_is_shell_wrapped(command) {
-                return ProofDoctorCommandClassification {
-                    status: "invalid",
-                    phase: "preflight",
-                    blocker_kind: Some("command_shape"),
-                    reason_code: Some("proof.command.shell_wrapped_rch_unclassified"),
-                    severity: Some("error"),
-                    message: "Shell-wrapped RCH commands are not classified as remote Cargo proof by default.",
-                    next_action: "Use direct argv form: `rch exec -- env CARGO_TARGET_DIR=... cargo ...`.",
-                };
-            }
-            if proof_doctor_is_rch_cargo_command(command) {
-                return ProofDoctorCommandClassification {
-                    status: "runnable",
-                    phase: "preflight",
-                    blocker_kind: None,
-                    reason_code: None,
-                    severity: None,
-                    message: "The command shape is a direct RCH Cargo proof lane.",
-                    next_action: "Run the RCH proof command and attach worker, Cargo reachability, and terminal pass/fail evidence.",
-                };
-            }
-            ProofDoctorCommandClassification {
-                status: "invalid",
-                phase: "preflight",
-                blocker_kind: Some("command_shape"),
-                reason_code: Some("proof.command.rch_cargo_shape_required"),
-                severity: Some("error"),
-                message: "RCH-required proof must be a direct `rch exec -- ... cargo ...` command.",
-                next_action: "Rewrite the command into direct RCH Cargo argv form before using it as proof.",
-            }
-        }
-        ProofDoctorBackendArg::Static => ProofDoctorCommandClassification {
-            status: "runnable",
-            phase: "preflight",
-            blocker_kind: None,
-            reason_code: None,
-            severity: None,
-            message: "The command is treated as static proof intent, not remote Cargo proof.",
-            next_action: "Run the static check and label the evidence as static, not source-health proof.",
-        },
-        ProofDoctorBackendArg::Local => ProofDoctorCommandClassification {
-            status: "runnable",
-            phase: "preflight",
-            blocker_kind: None,
-            reason_code: None,
-            severity: None,
-            message: "The command is explicitly marked as local proof intent.",
-            next_action: "Use local-only evidence only when the Bead allows it; do not claim RCH proof from this verdict.",
-        },
-    }
 }
 
 fn extract_proof_doctor_target_dir(command: &[String]) -> Option<String> {
@@ -5902,80 +5835,42 @@ fn build_proof_doctor_payload(
     command: &[String],
     workspace_root: &Path,
 ) -> serde_json::Value {
-    let classification = classify_proof_doctor_command(required_backend, command);
     let agent_name = proof_doctor_agent_name(agent);
     let git_head = proof_doctor_git_head(workspace_root);
     let branch = proof_doctor_git_branch(workspace_root);
     let generated_at_utc = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let verdict_id = format!(
-        "proof-doctor:{}:{}",
-        bead_id.unwrap_or("adhoc"),
-        generated_at_utc
-    );
     let intended_target_dir = target_dir
         .map(ToOwned::to_owned)
         .or_else(|| extract_proof_doctor_target_dir(command));
 
-    let blockers = if let Some(reason_code) = classification.reason_code {
-        vec![serde_json::json!({
-            "blocker_kind": classification.blocker_kind.unwrap_or("command_shape"),
-            "reason_code": reason_code,
-            "severity": classification.severity.unwrap_or("error"),
-            "owner": null,
-            "affected_paths": [],
-            "evidence_keys": ["intended_command"],
-            "message": classification.message,
-            "next_action": classification.next_action,
-        })]
-    } else {
-        Vec::new()
+    let evidence = ProofDoctorEvidence {
+        local_cargo_detected: proof_doctor_is_local_cargo_command(command),
+        dirty_paths: proof_doctor_dirty_paths(workspace_root),
+        active_beads: proof_doctor_active_beads(workspace_root),
+        reservations: Vec::new(),
+        ..ProofDoctorEvidence::default()
     };
+    let input = ProofDoctorPreflightInput {
+        bead_id: bead_id.map(ToOwned::to_owned),
+        parent_bead_id: None,
+        agent_name,
+        repo_path: workspace_root.display().to_string(),
+        git_head,
+        branch,
+        generated_at_utc,
+        intended_command: command.to_vec(),
+        intended_target_dir,
+        intended_scope: proof_doctor_scope(scope),
+        required_backend: proof_doctor_backend(required_backend),
+        phase: ProofDoctorPhase::Preflight,
+        proof_path_prefixes: Vec::new(),
+        evidence,
+    };
+    let verdict = classify_proof_doctor(&input);
 
     serde_json::json!({
-        "schema_version": 1,
-        "verdict": {
-            "schema_version": 1,
-            "verdict_id": verdict_id,
-            "bead_id": bead_id,
-            "parent_bead_id": null,
-            "generated_at_utc": generated_at_utc,
-            "agent_name": agent_name,
-            "repo_path": workspace_root.display().to_string(),
-            "git_head": git_head,
-            "branch": branch,
-            "intended_command": command,
-            "intended_target_dir": intended_target_dir,
-            "intended_scope": scope.as_str(),
-            "required_backend": required_backend.as_str(),
-            "phase": classification.phase,
-            "status": classification.status,
-            "blockers": blockers,
-            "evidence": {
-                "rch_binary_path": null,
-                "rch_version": null,
-                "rch_config_sources": [],
-                "selected_worker": null,
-                "worker_probe_artifact": null,
-                "sync_duration_ms": null,
-                "remote_command_duration_ms": null,
-                "wrapper_exit_code": null,
-                "remote_exit_code": null,
-                "remote_cargo_reached": false,
-                "rustc_reached": false,
-                "test_binary_started": false,
-                "local_cargo_detected": proof_doctor_is_local_cargo_command(command),
-                "artifact_retrieval_status": "unknown",
-                "dirty_paths": proof_doctor_dirty_paths(workspace_root),
-                "active_beads": [],
-                "reservations": [],
-                "artifact_paths": [],
-            },
-            "ledger_projection": null,
-            "operator_summary": classification.message,
-            "next_action": {
-                "message": classification.next_action,
-            },
-        }
+        "schema_version": PROOF_DOCTOR_SCHEMA_VERSION,
+        "verdict": verdict,
     })
 }
 
@@ -63022,6 +62917,25 @@ log_level = "debug"
             payload["verdict"]["evidence"]["local_cargo_detected"].as_bool(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn proof_doctor_active_beads_parser_keeps_only_in_progress() {
+        let raw = r#"{
+          "issues": [
+            {"id":"ft-active","title":"Active slice","status":"in_progress","assignee":"SandyFalcon"},
+            {"id":"ft-deferred","title":"Deferred slice","status":"deferred"},
+            {"id":"ft-closed","title":"Closed slice","status":"closed","assignee":"OtherAgent"}
+          ]
+        }"#;
+
+        let beads = proof_doctor_active_beads_from_json(raw);
+
+        assert_eq!(beads.len(), 1);
+        assert_eq!(beads[0].bead_id, "ft-active");
+        assert_eq!(beads[0].title, "Active slice");
+        assert_eq!(beads[0].assignee.as_deref(), Some("SandyFalcon"));
+        assert_eq!(beads[0].status, "in_progress");
     }
 
     #[test]

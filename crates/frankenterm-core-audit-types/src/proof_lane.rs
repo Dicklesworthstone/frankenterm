@@ -97,6 +97,8 @@ pub enum ProofScope {
     CargoCheck,
     /// Cargo clippy lane.
     CargoClippy,
+    /// Cargo build lane.
+    CargoBuild,
     /// Cargo test lane.
     CargoTest,
     /// Cargo bench lane.
@@ -822,6 +824,7 @@ fn proof_scope_requires_rustc(scope: ProofScope) -> bool {
         scope,
         ProofScope::CargoCheck
             | ProofScope::CargoClippy
+            | ProofScope::CargoBuild
             | ProofScope::CargoTest
             | ProofScope::CargoBench
             | ProofScope::ReleaseGate

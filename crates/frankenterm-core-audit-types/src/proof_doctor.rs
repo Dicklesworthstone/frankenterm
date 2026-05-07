@@ -607,6 +607,19 @@ fn classify_command_shape(
     input: &ProofDoctorPreflightInput,
     blockers: &mut Vec<ProofDoctorBlocker>,
 ) {
+    if input.intended_command.is_empty() {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::CommandShape,
+                "proof.command.empty",
+                "No proof command argv was provided.",
+                "Pass the intended proof command after `--` so proof-doctor can classify it.",
+            )
+            .with_evidence("intended_command"),
+        );
+        return;
+    }
+
     if input.required_backend != ProofBackend::Rch {
         return;
     }
@@ -631,6 +644,19 @@ fn classify_command_shape(
                 "proof.command.shell_wrapped_rch_unclassified",
                 "Shell-wrapped RCH Cargo cannot be claimed as remote proof without positive remote-Cargo evidence.",
                 "Use direct `rch exec -- env CARGO_TARGET_DIR=... cargo ...` or retain metadata proving remote Cargo started.",
+            )
+            .with_evidence("intended_command"),
+        );
+        return;
+    }
+
+    if !is_direct_rch_cargo_command(&input.intended_command) {
+        blockers.push(
+            ProofDoctorBlocker::block(
+                ProofDoctorBlockerKind::CommandShape,
+                "proof.command.rch_cargo_shape_required",
+                "RCH-required proof must be a direct `rch exec -- ... cargo ...` command.",
+                "Rewrite the command into direct RCH Cargo argv form before using it as proof.",
             )
             .with_evidence("intended_command"),
         );
@@ -1202,6 +1228,14 @@ fn is_shell_wrapped_cargo(command: &[String]) -> bool {
     }) || command
         .windows(2)
         .any(|window| window[0] == "-lc" && window[1].contains("cargo"))
+}
+
+fn is_direct_rch_cargo_command(command: &[String]) -> bool {
+    command
+        .first()
+        .is_some_and(|first| command_token_is(first, "rch"))
+        && command.iter().any(|token| token == "exec")
+        && command.iter().any(|token| command_token_is(token, "cargo"))
 }
 
 fn command_token_is(token: &str, expected: &str) -> bool {
@@ -1888,6 +1922,30 @@ mod tests {
                 .as_ref()
                 .map(|projection| projection.state),
             Some(ProofState::LocalInvalid)
+        );
+    }
+
+    #[test]
+    fn non_cargo_rch_shape_is_invalid_for_rch_required_lane() {
+        let mut input = base_input();
+        input.intended_command = vec![
+            "rch".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "env".to_string(),
+            "true".to_string(),
+        ];
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Invalid);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.command.rch_cargo_shape_required"
+        );
+        assert_eq!(
+            verdict.next_action.action_code,
+            "fix_command_shape".to_string()
         );
     }
 
