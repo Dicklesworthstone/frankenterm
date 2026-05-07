@@ -275,7 +275,7 @@ impl ByteCompressor {
             // truncated buffer, decompress_batch's bounds check at the
             // length-prefix boundary surfaces InvalidInput).
             debug_assert!(
-                compressed.len() <= u32::MAX as usize,
+                u32::try_from(compressed.len()).is_ok(),
                 "compress_batch: compressed buffer {} bytes exceeds u32::MAX prefix",
                 compressed.len()
             );
