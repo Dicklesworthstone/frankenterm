@@ -12,6 +12,16 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+fn workflow_checkpoint_cancelled_error(
+    operation: &'static str,
+    err: impl std::fmt::Display,
+) -> crate::error::Error {
+    crate::error::Error::RuntimeOperation {
+        operation,
+        source: crate::error::RuntimeOperationSource::Cancelled(format!("cx checkpoint: {err}")),
+    }
+}
+
 // ============================================================================
 // Workflow Execution State
 // ============================================================================
@@ -171,7 +181,7 @@ impl WorkflowEngine {
         context: Option<serde_json::Value>,
     ) -> crate::Result<WorkflowExecution> {
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.start_with_id_cx", e))?;
 
         let now = now_ms();
         let record = crate::storage::WorkflowRecord {
@@ -193,7 +203,7 @@ impl WorkflowEngine {
         storage.upsert_workflow_with_cx(cx, record).await?;
 
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.start_with_id_cx", e))?;
         Ok(WorkflowExecution {
             id: execution_id,
             workflow_name: workflow_name.to_string(),
@@ -217,7 +227,7 @@ impl WorkflowEngine {
         execution_id: &str,
     ) -> crate::Result<Option<(WorkflowExecution, usize)>> {
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.resume_cx", e))?;
         let Some(record) = storage.get_workflow_with_cx(cx, execution_id).await? else {
             return Ok(None);
         };
@@ -243,7 +253,7 @@ impl WorkflowEngine {
         };
 
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.resume_cx", e))?;
         Ok(Some((execution, next_step)))
     }
 
@@ -282,10 +292,10 @@ impl WorkflowEngine {
         storage: &crate::storage::StorageHandle,
     ) -> crate::Result<Vec<crate::storage::WorkflowRecord>> {
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.find_incomplete_cx", e))?;
         let result = storage.find_incomplete_workflows_with_cx(cx).await;
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.find_incomplete_cx", e))?;
         result
     }
 
@@ -306,7 +316,7 @@ impl WorkflowEngine {
         error: Option<&str>,
     ) -> crate::Result<()> {
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.update_status_cx", e))?;
 
         let now = now_ms();
         let status_str = match status {
@@ -358,7 +368,7 @@ impl WorkflowEngine {
 
         let result = storage.upsert_workflow_with_cx(cx, record).await;
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.update_status_cx", e))?;
         result
     }
 
@@ -402,7 +412,7 @@ impl WorkflowEngine {
         started_at: i64,
     ) -> crate::Result<()> {
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.log_step_cx", e))?;
 
         let completed_at = now_ms();
         let result_type = match result {
@@ -441,7 +451,7 @@ impl WorkflowEngine {
             )
             .await;
         cx.checkpoint()
-            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+            .map_err(|e| workflow_checkpoint_cancelled_error("workflow.log_step_cx", e))?;
         res
     }
 
@@ -1360,13 +1370,30 @@ mod tests {
         })
     }
 
+    #[test]
+    fn workflow_checkpoint_cancelled_error_is_typed_runtime_operation() {
+        let err = workflow_checkpoint_cancelled_error("workflow.test_cx", "caller stopped");
+        match err {
+            crate::error::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "workflow.test_cx");
+                assert_eq!(
+                    source,
+                    crate::error::RuntimeOperationSource::Cancelled(
+                        "cx checkpoint: caller stopped".to_string()
+                    )
+                );
+            }
+            other => panic!("expected RuntimeOperation, got {other:?}"),
+        }
+    }
+
     /// Cx-first plumbing smoke test (ft-xbnl0.2.2): exercise
     /// [`WorkflowEngine::find_incomplete_cx`] end to end against a real
     /// tempfile storage so the checkpoint-before / checkpoint-after
     /// boundary logic runs its full error-mapping path. A canceled caller
-    /// would observe `Error::Runtime("cx checkpoint: ...")` without the
-    /// storage write being attempted; under a healthy Cx the call returns
-    /// the (empty) incomplete-workflow list.
+    /// would observe a typed `Error::RuntimeOperation` without the storage
+    /// write being attempted; under a healthy Cx the call returns the
+    /// (empty) incomplete-workflow list.
     ///
     /// This is not a LabRuntime test because workflows/engine.rs has no
     /// sleeps or timeouts to bind to virtual time — the Cx-first pattern
