@@ -78,7 +78,7 @@ impl MemoryOverheadSample {
 }
 
 /// Aggregate of N samples — used by the decision rubric.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MemoryOverheadAggregate {
     pub samples: Vec<MemoryOverheadSample>,
 }
@@ -127,7 +127,7 @@ impl MemoryOverheadAggregate {
 
 /// Performance-comparison input for the decision rubric.
 /// Bench measures these as p50/p99 timings.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerformanceComparison {
     /// Render-frame time, flat-grid baseline (ns).
     pub render_p99_ns_flat: u64,
@@ -396,7 +396,7 @@ impl SnapshotRetentionPolicy {
             .iter()
             .filter_map(|r| match r {
                 SnapshotLogRow::Snapshot { total_bytes, .. } => Some(*total_bytes),
-                _ => None,
+                SnapshotLogRow::SessionSummary { .. } => None,
             })
             .collect();
         if snapshots.len() < 2 {
