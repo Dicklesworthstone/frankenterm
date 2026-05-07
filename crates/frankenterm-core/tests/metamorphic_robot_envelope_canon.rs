@@ -13,6 +13,10 @@
 //!
 //! Every relation uses proptest so each CI run reshapes the JSON under test.
 
+// Requires the `vc-export` feature flag because `robot_envelope` is gated with
+// the vc export surface.
+#![cfg(feature = "vc-export")]
+
 use frankenterm_core::robot_envelope::canonicalize_json;
 use proptest::prelude::*;
 use serde_json::{Value, json};

@@ -5,6 +5,9 @@
 //! code, golden artifact, and proof command together so drift is caught where
 //! operators actually consume the API.
 
+// Requires the `vc-export` feature flag because this matrix canonicalizes
+// robot envelopes through the vc export surface.
+#![cfg(feature = "vc-export")]
 #![allow(deprecated)]
 
 use std::collections::BTreeSet;

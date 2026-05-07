@@ -7669,20 +7669,12 @@ thread_local! {
 /// every WriteCommand previously). The thread-local placeholder
 /// is recycled across all calls on the same thread.
 ///
-/// **Re-entrancy.** Not safe. The thread-local placeholder is
-/// taken at the top of each call and re-parked on Drop; a nested
-/// `with_writer_backend` call from inside `f` would panic at
-/// `RefCell::borrow_mut` because the outer call is mid-flight
-/// (the placeholder has been taken and not yet re-parked when
-/// the inner call's `take()` runs — wait, that's wrong, the
-/// outer's `take()` already released its borrow before invoking
-/// `f`; the actual hazard is the inner call's Drop and the outer
-/// call's Drop racing for the same RefCell, which they wouldn't
-/// because `f` runs single-threaded). In practice the writer
-/// thread never recurses, and the closure receives only
-/// `&dyn StorageBackend` so it can't re-enter without explicit
-/// access to a `&mut Connection`. Documented as non-reentrant
-/// for clarity.
+/// **Re-entrancy.** Not part of the contract. The writer dispatch
+/// path never recurses, and the closure receives only
+/// `&dyn StorageBackend`, not the borrowed `&mut Connection`.
+/// Nested bridge calls would at best disturb the thread-local
+/// placeholder cache, so keep this as a single-level writer
+/// bridge.
 ///
 /// Used by per-WriteCommand dispatch handlers that have been
 /// migrated to call a `_backend` helper instead of a `_sync`
@@ -20959,7 +20951,7 @@ mod pool_telemetry_tests {
         POOL_HITS, POOL_LOCK_POISONED, POOL_MISSES, POOL_RETURNS, PoolTelemetrySnapshot,
         PooledReadConn, pool_telemetry_snapshot, pooled_backend,
     };
-    use crate::storage_backend_trait::{StorageBackend, ToSqlValue};
+    use crate::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue};
     use std::sync::atomic::Ordering;
 
     /// Reset the process-global counters so a single test owns the
@@ -21060,10 +21052,9 @@ mod pool_telemetry_tests {
         let db_path = temp_dir.path().join("pool_telemetry.db");
         let db_path_str = db_path.to_string_lossy().to_string();
 
-        // Touch the file by opening + closing once (so subsequent
-        // open_read_storage_conn calls succeed against a present file).
-        let _seed = rusqlite::Connection::open(&db_path).expect("seed open");
-        drop(_seed);
+        // Touch the file once so the pool path exercises an existing
+        // file without using a raw rusqlite seed connection.
+        std::fs::File::create(&db_path).expect("seed database file");
 
         let start = baseline();
         const N: u64 = 20;
@@ -21127,7 +21118,8 @@ mod pool_telemetry_tests {
         let db_path = temp_dir.path().join("pooled_backend_trait.db");
         let db_path_str = db_path.to_string_lossy().to_string();
 
-        let seed = rusqlite::Connection::open(&db_path).expect("seed open");
+        let seed =
+            RusqliteBackend::open(&db_path_str, &OpenConfig::default()).expect("open seed backend");
         seed.execute_batch(
             "CREATE TABLE sample (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
              INSERT INTO sample (id, name) VALUES (1, 'trait-object');",
