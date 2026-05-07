@@ -178,7 +178,7 @@ impl ForcePaintSignal {
 
 /// `ft doctor` snapshot for the should_paint predicate.
 /// Mirrors the `*Health` shape used across this session.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedrawDecisionHealth {
     /// Total predicate evaluations.
     pub evaluations_total: u64,
@@ -392,7 +392,7 @@ pub fn bench_scenario_corpus() -> Vec<IdlePaintSkipBenchScenario> {
     IdlePaintSkipBenchScenario::ALL.to_vec()
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdlePaintSkipBenchResult {
     pub scenario: IdlePaintSkipBenchScenario,
     pub final_health: RedrawDecisionHealth,
@@ -423,7 +423,7 @@ impl IdlePaintSkipBenchResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdlePaintSkipBenchSnapshot {
     pub schema_version: u32,
     pub bead: String,

@@ -338,7 +338,7 @@ pub enum RemoteResponse {
 }
 
 /// Per-section apply summary for [`RemoteResponse::HandoffApplied`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerHandoffApplySummary {
     /// Indices into `capsule.sections` that preflight allowed.
     pub accepted_indices: Vec<usize>,
@@ -355,14 +355,14 @@ pub struct ServerHandoffApplySummary {
     pub deferred_to_operator_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffSkipReport {
     pub section_index: usize,
     pub section_label: String,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassportExcerptApplyReport {
     pub section_index: usize,
     pub agent_id: String,
