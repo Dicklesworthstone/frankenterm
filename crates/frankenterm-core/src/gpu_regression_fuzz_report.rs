@@ -349,7 +349,7 @@ pub struct ScenarioRecord {
 /// description.
 #[must_use]
 pub fn scenario_manifest() -> Vec<ScenarioRecord> {
-    use ScenarioStatus::*;
+    use ScenarioStatus::{BlockedOnSubBead, Gap, Partial, Shipped};
     let req = |s: &str| s.to_string();
     let row = |slug: &str,
                reqs: &[&str],
