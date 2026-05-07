@@ -41,7 +41,7 @@ use crate::crash::{
     HealthSnapshot, LeakRiskInventorySnapshot, LeakRiskWatchdogComponentSnapshot,
     LeakRiskWatchdogSnapshot, ShutdownSummary,
 };
-use crate::error::Result;
+use crate::error::{Result, RuntimeOperationSource};
 use crate::events::{Event, EventBus, UserVarPayload, event_identity_key};
 use crate::fleet_memory_controller::{FleetMemoryConfig, PaneScrollbackInfo};
 use crate::fleet_scrollback_coordinator::{
@@ -79,6 +79,20 @@ use crate::wezterm::{
     PaneInfo, PaneTieredScrollbackSummary, WeztermHandle, WeztermHandleSource, WeztermInterface,
     wezterm_handle_with_timeout,
 };
+
+fn runtime_cancelled_error(operation: &'static str, err: impl std::fmt::Display) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(err.to_string()),
+    }
+}
+
+fn runtime_backend_error(operation: &'static str, err: impl std::fmt::Display) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Backend(err.to_string()),
+    }
+}
 
 fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
     rx.has_changed()
@@ -1353,7 +1367,7 @@ impl ObservationRuntime {
     /// preserved at every boundary the runtime crosses.
     pub async fn start_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<RuntimeHandle> {
         cx.checkpoint()
-            .map_err(|e| Error::Runtime(format!("runtime start cancelled: {e}")))?;
+            .map_err(|e| runtime_cancelled_error("runtime.start", e))?;
         self.start().await
     }
 
@@ -4608,7 +4622,7 @@ impl RuntimeHandle {
     pub fn apply_config_update(&self, new_config: HotReloadableConfig) -> Result<()> {
         self.config_tx
             .send(new_config)
-            .map_err(|e| crate::Error::Runtime(format!("Failed to send config update: {e}")))
+            .map_err(|e| runtime_backend_error("runtime.apply_config_update", e))
     }
 
     /// Get the current hot-reloadable config.
@@ -4976,6 +4990,38 @@ mod tests {
             .join();
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn runtime_cancelled_error_uses_structured_runtime_operation() {
+        let err = runtime_cancelled_error("runtime.test_start", "caller cancelled");
+
+        match err {
+            Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "runtime.test_start");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_backend_error_uses_structured_runtime_operation() {
+        let err = runtime_backend_error("runtime.test_update", "watch channel closed");
+
+        match err {
+            Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "runtime.test_update");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Backend("watch channel closed".to_string())
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
         }
     }
 
