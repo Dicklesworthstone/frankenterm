@@ -314,11 +314,11 @@ fn collect_memory_profile() -> MemoryProfile {
                     ProbeValue::unavailable("/proc/meminfo unavailable"),
                 )
             });
-        return MemoryProfile {
+        MemoryProfile {
             total_bytes: total,
             available_bytes: available,
             source: "/proc/meminfo".to_string(),
-        };
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -326,13 +326,13 @@ fn collect_memory_profile() -> MemoryProfile {
         let total = read_sysctl_u64("hw.memsize")
             .map(ProbeValue::known)
             .unwrap_or_else(|| ProbeValue::unavailable("sysctl hw.memsize unavailable"));
-        return MemoryProfile {
+        MemoryProfile {
             total_bytes: total,
             available_bytes: ProbeValue::unsupported(
                 "available memory requires vm_stat interpretation outside this proof predicate",
             ),
             source: "sysctl hw.memsize".to_string(),
-        };
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
