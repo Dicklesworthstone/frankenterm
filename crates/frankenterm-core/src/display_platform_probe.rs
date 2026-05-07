@@ -347,15 +347,15 @@ pub fn merge_probe_results(
     merged.recompute_succeeded();
     if merged.confident_probe_count() == 0 {
         merged.probe_skipped_reason = merge_skipped_reasons(
-            &primary.probe_skipped_reason,
-            &secondary.probe_skipped_reason,
+            primary.probe_skipped_reason.as_deref(),
+            secondary.probe_skipped_reason.as_deref(),
         );
     }
     Some(merged)
 }
 
-fn merge_skipped_reasons(primary: &Option<String>, secondary: &Option<String>) -> Option<String> {
-    match (primary.as_deref(), secondary.as_deref()) {
+fn merge_skipped_reasons(primary: Option<&str>, secondary: Option<&str>) -> Option<String> {
+    match (primary, secondary) {
         (Some(a), Some(b)) if a == b => Some(a.to_string()),
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
         (Some(a), None) => Some(a.to_string()),
