@@ -50,7 +50,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Error;
+use crate::error::{Error, RuntimeOperationSource};
 
 /// Global fault injector instance.
 static GLOBAL_INJECTOR: OnceLock<Arc<FaultInjector>> = OnceLock::new();
@@ -86,6 +86,16 @@ impl std::fmt::Display for FaultPoint {
             Self::ConfigReload => write!(f, "config_reload"),
             Self::WebhookDelivery => write!(f, "webhook_delivery"),
         }
+    }
+}
+
+fn chaos_fault_error(point: FaultPoint, detail: impl Into<String>) -> Error {
+    Error::RuntimeOperation {
+        operation: "chaos.fault_injected",
+        source: RuntimeOperationSource::Backend(format!(
+            "chaos fault injected at {point}: {}",
+            detail.into()
+        )),
     }
 }
 
@@ -288,7 +298,7 @@ impl FaultInjector {
     }
 
     /// Check a fault point.  Returns `Ok(())` if no fault, or
-    /// `Err(Error::Runtime(...))` if a fault fires.
+    /// `Err(Error::RuntimeOperation { .. })` if a fault fires.
     ///
     /// When the global injector is not initialized, this is a
     /// single failed `OnceLock::get()` — effectively a no-op.
@@ -385,9 +395,7 @@ impl FaultInjector {
         }
 
         match should_fail {
-            Some(error_msg) => Err(Error::Runtime(format!(
-                "chaos fault injected at {point}: {error_msg}"
-            ))),
+            Some(error_msg) => Err(chaos_fault_error(point, error_msg)),
             None => Ok(()),
         }
     }
@@ -821,6 +829,25 @@ mod tests {
         assert!(injector.check_point(FaultPoint::DbWrite).is_err());
         assert!(injector.check_point(FaultPoint::DbWrite).is_err());
         assert_eq!(injector.fired_count(FaultPoint::DbWrite), 3);
+    }
+
+    #[test]
+    fn injected_fault_uses_structured_runtime_operation() {
+        let injector = FaultInjector::new();
+        injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("disk full"));
+
+        match injector.check_point(FaultPoint::DbWrite).unwrap_err() {
+            Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "chaos.fault_injected");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Backend(
+                        "chaos fault injected at db_write: disk full".to_string()
+                    )
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
+        }
     }
 
     #[test]
