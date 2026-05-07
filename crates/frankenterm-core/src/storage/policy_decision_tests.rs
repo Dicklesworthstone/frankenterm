@@ -13,6 +13,34 @@ fn record_audit_action_for_conn(conn: &mut Connection, action: &AuditActionRecor
     with_writer_backend(conn, |backend| record_audit_action_backend(backend, action))
 }
 
+fn upsert_fts_pane_progress_for_conn(
+    conn: &mut Connection,
+    progress: &FtsPaneProgress,
+) -> Result<()> {
+    with_writer_backend(conn, |backend| {
+        upsert_fts_pane_progress_backend(backend, progress)
+    })
+}
+
+fn get_fts_pane_progress_for_conn(
+    conn: &mut Connection,
+    pane_id: u64,
+) -> Result<Option<FtsPaneProgress>> {
+    with_writer_backend(conn, |backend| {
+        get_fts_pane_progress_backend(backend, pane_id)
+    })
+}
+
+fn sync_fts_for_pane_for_conn(
+    conn: &mut Connection,
+    pane_id: u64,
+    config: &FtsSyncConfig,
+) -> Result<(u64, u64)> {
+    with_writer_backend(conn, |backend| {
+        sync_fts_for_pane_backend(backend, pane_id, config)
+    })
+}
+
 fn typed_decision_context_json(
     action: crate::policy::ActionKind,
     actor: crate::policy::ActorKind,
@@ -2344,7 +2372,7 @@ fn retention_prunes_old_segments_and_fts() {
 // `include_from_zero` branch and picks seq=0 back up.
 #[test]
 fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let old_ts = 1_700_000_000_000i64;
@@ -2366,8 +2394,8 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
         .unwrap();
     }
 
-    upsert_fts_pane_progress_sync(
-        &conn,
+    upsert_fts_pane_progress_for_conn(
+        &mut conn,
         &FtsPaneProgress {
             pane_id: pane as u64,
             last_indexed_seq: 5,
@@ -2377,7 +2405,7 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
     )
     .unwrap();
 
-    let progress_before = get_fts_pane_progress_sync(&conn, pane as u64)
+    let progress_before = get_fts_pane_progress_for_conn(&mut conn, pane as u64)
         .unwrap()
         .expect("progress row present before prune");
     assert_eq!(progress_before.last_indexed_seq, 5);
@@ -2385,9 +2413,9 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
     let backend = RusqliteBackend::new(conn);
     let deleted = prune_segments_backend(&backend, old_ts).unwrap();
     assert_eq!(deleted, 6, "full pre-prune chain must be removed");
-    let conn = backend.into_connection();
+    let mut conn = backend.into_connection();
 
-    let progress_after = get_fts_pane_progress_sync(&conn, pane as u64).unwrap();
+    let progress_after = get_fts_pane_progress_for_conn(&mut conn, pane as u64).unwrap();
     assert!(
         progress_after.is_none(),
         "ft-znu6v: prune must rewind stranded FTS progress, got {:?}",
@@ -2403,7 +2431,7 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
     .unwrap();
 
     let config = FtsSyncConfig::default();
-    let (indexed, final_seq) = sync_fts_for_pane(&conn, pane as u64, &config).unwrap();
+    let (indexed, final_seq) = sync_fts_for_pane_for_conn(&mut conn, pane as u64, &config).unwrap();
     assert_eq!(
         indexed, 1,
         "ft-znu6v: post-reset seq=0 must be picked up by incremental sync"
@@ -2434,7 +2462,7 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
 // this truncation case too.
 #[test]
 fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let pane: i64 = 7;
@@ -2463,8 +2491,8 @@ fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
         .unwrap();
     }
 
-    upsert_fts_pane_progress_sync(
-        &conn,
+    upsert_fts_pane_progress_for_conn(
+        &mut conn,
         &FtsPaneProgress {
             pane_id: pane as u64,
             last_indexed_seq: 5,
@@ -2477,9 +2505,9 @@ fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
     let backend = RusqliteBackend::new(conn);
     let deleted = prune_segments_backend(&backend, boundary_ts).unwrap();
     assert_eq!(deleted, 3, "only pre-boundary rows must be pruned");
-    let conn = backend.into_connection();
+    let mut conn = backend.into_connection();
 
-    let progress_after = get_fts_pane_progress_sync(&conn, pane as u64).unwrap();
+    let progress_after = get_fts_pane_progress_for_conn(&mut conn, pane as u64).unwrap();
     assert!(
         progress_after.is_none(),
         "ft-znu6v: partial prune that leaves MAX(seq)=2 must delete the \

@@ -1798,7 +1798,7 @@ fn indexing_health_report_aggregates() {
 #[test]
 fn fts_integrity_check_on_healthy_db() {
     let db_path = temp_db_path();
-    let conn = Connection::open(&db_path).unwrap();
+    let mut conn = Connection::open(&db_path).unwrap();
     conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
     initialize_schema(&conn).unwrap();
 
@@ -1812,7 +1812,7 @@ fn fts_integrity_check_on_healthy_db() {
             [],
         ).unwrap();
 
-    let ok = check_fts_integrity_sync(&conn).unwrap();
+    let ok = with_writer_backend(&mut conn, check_fts_integrity_backend).unwrap();
     assert!(ok, "Healthy FTS should pass integrity check");
 
     drop(conn);
