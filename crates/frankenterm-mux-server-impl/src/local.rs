@@ -4,7 +4,15 @@ use fs2::FileExt;
 use promise::spawn::spawn_into_main_thread;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use wezterm_uds::UnixListener;
+
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorAction {
+    ContinueAfter(Duration),
+}
 
 pub struct LocalListener {
     listener: UnixListener,
@@ -36,6 +44,11 @@ impl LocalListener {
         })
     }
 
+    fn accept_error_action(err: &std::io::Error) -> AcceptErrorAction {
+        log::error!("accept failed: {}", err);
+        AcceptErrorAction::ContinueAfter(ACCEPT_ERROR_BACKOFF)
+    }
+
     pub fn run(&mut self) {
         for stream in self.listener.incoming() {
             match stream {
@@ -51,10 +64,11 @@ impl LocalListener {
                     })
                     .detach();
                 }
-                Err(err) => {
-                    log::error!("accept failed: {}", err);
-                    return;
-                }
+                Err(err) => match Self::accept_error_action(&err) {
+                    AcceptErrorAction::ContinueAfter(backoff) => {
+                        std::thread::sleep(backoff);
+                    }
+                },
             }
         }
     }
@@ -144,6 +158,19 @@ fn acquire_socket_lock(sock_path: &Path) -> anyhow::Result<File> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn transient_accept_failure_keeps_listener_alive_after_backoff() {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "client disconnected during accept",
+        );
+
+        assert_eq!(
+            LocalListener::accept_error_action(&err),
+            AcceptErrorAction::ContinueAfter(ACCEPT_ERROR_BACKOFF)
+        );
+    }
 
     #[test]
     fn socket_lock_path_appends_lock_suffix_without_replacing_extension() {

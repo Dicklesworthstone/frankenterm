@@ -2639,7 +2639,7 @@ mod tests {
                     len,
                 } => Pdu::GetLines(GetLines {
                     pane_id,
-                    lines: vec![start..start + len],
+                    lines: std::iter::once(start..start + len).collect(),
                 }),
                 Self::GetImageCell {
                     pane_id,
@@ -3118,9 +3118,8 @@ mod tests {
             let mut active: Option<(SessionHandler, usize, ClientId)> = None;
             let mut stale: Vec<(SessionHandler, usize, ClientId)> = Vec::new();
             let mut latest_owner_by_client: HashMap<ClientId, usize> = HashMap::new();
-            let mut next_owner = 1usize;
 
-            for (idx, step) in steps.iter().enumerate() {
+            for (next_owner, (idx, step)) in (1usize..).zip(steps.iter().enumerate()) {
                 if step.drop_stale_before_reconnect {
                     drop_stale_reconnect_owner(&mux, &mut stale, &mut latest_owner_by_client);
                 }
@@ -3133,7 +3132,6 @@ mod tests {
                 let mut handler = SessionHandler::new(sender);
                 let client = reconnect_client(step.client_variant);
                 let owner = next_owner;
-                next_owner += 1;
                 handler.process_one(DecodedPdu {
                     serial: idx as u64 + 1,
                     pdu: Pdu::SetClientId(SetClientId {

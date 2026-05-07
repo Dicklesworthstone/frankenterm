@@ -18,7 +18,6 @@ fn readiness() -> DispatchIoBackend {
 #[derive(Clone, Copy, Debug)]
 enum ExpectedFallback {
     None,
-    Some,
     ContainsUnix,
     ContainsUnavailable,
     ContainsCompiled,
@@ -47,10 +46,6 @@ fn check(
             reactor.fallback_reason().is_none(),
             "expected no fallback_reason for pref={pref:?} stream={stream:?} compiled={compiled} runtime={runtime}, got {:?}",
             reactor.fallback_reason()
-        ),
-        ExpectedFallback::Some => assert!(
-            reactor.fallback_reason().is_some(),
-            "expected fallback_reason for pref={pref:?} stream={stream:?} compiled={compiled} runtime={runtime}",
         ),
         ExpectedFallback::ContainsUnix => {
             let reason = reactor
@@ -230,7 +225,6 @@ fn explicit_epoll_is_linux_only() {
     {
         assert_eq!(reactor.backend(), readiness());
         assert!(reactor.fallback_reason().is_some());
-        let _ = ExpectedFallback::Some;
     }
 }
 
