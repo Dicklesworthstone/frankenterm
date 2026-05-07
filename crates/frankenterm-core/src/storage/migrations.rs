@@ -11,7 +11,10 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::*;
+use super::{
+    SCHEMA_SQL, SCHEMA_VERSION, StoragePipelineSnapshot, ensure_parent_dir, now_epoch_ms, now_ms,
+};
+use crate::error::{Result, StorageError};
 use crate::recorder_invariants::{InvariantReport, ViolationSeverity};
 use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
 use crate::storage_telemetry::{SloStatus, StorageHealthTier};
@@ -2169,12 +2172,6 @@ fn check_v0_init_fault(step: V0InitStep) -> Result<()> {
         ))
         .into());
     }
-    Ok(())
-}
-
-#[cfg(not(test))]
-#[inline]
-fn check_v0_init_fault(_step: ()) -> Result<()> {
     Ok(())
 }
 
