@@ -25,13 +25,16 @@ const PATTERN_REGEX_BACKTRACK_LIMIT: usize = 10_000_000;
 pub const PATTERN_PACK_SIGNATURE_ALGORITHM: &str = "frankenterm.sha256-attestation.v1";
 pub const PATTERN_PACK_COMPATIBILITY_TARGET: &str = "frankenterm-patterns.v1";
 
+type RuleRegexResult = std::result::Result<Regex, Box<fancy_regex::Error>>;
+
 /// Compile a rule regex with the shared backtrack limit. All compile
 /// sites in this module MUST use this helper so the security contract
 /// stays in one place.
-fn compile_rule_regex(pattern: &str) -> std::result::Result<Regex, fancy_regex::Error> {
+fn compile_rule_regex(pattern: &str) -> RuleRegexResult {
     RegexBuilder::new(pattern)
         .backtrack_limit(PATTERN_REGEX_BACKTRACK_LIMIT)
         .build()
+        .map_err(Box::new)
 }
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
@@ -1223,6 +1226,7 @@ impl std::fmt::Debug for EngineIndex {
     }
 }
 
+#[cfg(test)]
 fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
     build_engine_index_with_pack_lookup(rules, |_| None::<&'static str>)
 }
