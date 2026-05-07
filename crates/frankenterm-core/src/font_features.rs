@@ -258,7 +258,7 @@ impl AxisVector {
             self.entries.push(value);
         }
         // Re-sort by tag for canonical order.
-        self.entries.sort_by(|a, b| a.axis.tag().cmp(&b.axis.tag()));
+        self.entries.sort_by_key(|entry| entry.axis.tag());
     }
 
     #[must_use]
