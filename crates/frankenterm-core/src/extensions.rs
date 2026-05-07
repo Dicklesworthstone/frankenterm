@@ -8,9 +8,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
 use crate::config::PatternsConfig;
+use crate::error::RuntimeOperationSource;
 use crate::patterns::{PatternPack, RuleDef};
+use crate::{Error, Result};
+
+fn extension_backend_error(operation: &'static str, detail: impl Into<String>) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Backend(detail.into()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Extension info
@@ -231,8 +239,9 @@ pub fn extension_info(
         format!("builtin:{name}")
     };
 
-    let pack = load_pack_safe(&pack_id, config_root)
-        .map_err(|_| crate::Error::Runtime(format!("extension '{name}' not found")))?;
+    let pack = load_pack_safe(&pack_id, config_root).map_err(|_| {
+        extension_backend_error("extensions.info", format!("extension '{name}' not found"))
+    })?;
 
     let source = if pack_id.starts_with("builtin:") {
         ExtensionSource::Builtin
@@ -357,26 +366,32 @@ pub fn install_extension(source_path: &Path, config_path: Option<&Path>) -> Resu
     // Validate first.
     let validation = validate_extension(source_path);
     if !validation.valid {
-        return Err(crate::Error::Runtime(format!(
-            "extension validation failed: {}",
-            validation.errors.join("; ")
-        )));
+        return Err(extension_backend_error(
+            "extensions.install",
+            format!(
+                "extension validation failed: {}",
+                validation.errors.join("; ")
+            ),
+        ));
     }
 
     let ext_dir = resolve_extensions_dir(config_path);
     std::fs::create_dir_all(&ext_dir)?;
 
-    let file_name = source_path
-        .file_name()
-        .ok_or_else(|| crate::Error::Runtime("source path has no filename".into()))?;
+    let file_name = source_path.file_name().ok_or_else(|| {
+        extension_backend_error("extensions.install", "source path has no filename")
+    })?;
     let dest = ext_dir.join(file_name);
 
     // Don't overwrite without warning.
     if dest.exists() && dest.canonicalize().ok() != source_path.canonicalize().ok() {
-        return Err(crate::Error::Runtime(format!(
-            "extension already exists at {}; remove it first",
-            dest.display()
-        )));
+        return Err(extension_backend_error(
+            "extensions.install",
+            format!(
+                "extension already exists at {}; remove it first",
+                dest.display()
+            ),
+        ));
     }
 
     // Copy file.
@@ -465,10 +480,12 @@ fn load_pack_safe(pack_id: &str, root: Option<&Path>) -> Result<PatternPack> {
     };
     let engine = PatternEngine::from_config_with_root(&config, root)?;
     let packs = engine.packs();
-    packs
-        .first()
-        .cloned()
-        .ok_or_else(|| crate::Error::Runtime(format!("pack '{pack_id}' not loadable")))
+    packs.first().cloned().ok_or_else(|| {
+        extension_backend_error(
+            "extensions.load_pack",
+            format!("pack '{pack_id}' not loadable"),
+        )
+    })
 }
 
 fn find_extensions_dir(config_root: Option<&Path>) -> Option<PathBuf> {
@@ -511,25 +528,34 @@ fn try_resolve_name(
 
 fn ensure_managed_extension_path(candidate: &Path, ext_dir: &Path) -> Result<()> {
     let canonical_candidate = candidate.canonicalize().map_err(|e| {
-        crate::Error::Runtime(format!(
-            "failed to resolve extension path {}: {e}",
-            candidate.display()
-        ))
+        extension_backend_error(
+            "extensions.remove",
+            format!(
+                "failed to resolve extension path {}: {e}",
+                candidate.display()
+            ),
+        )
     })?;
     let canonical_ext_dir = ext_dir.canonicalize().map_err(|e| {
-        crate::Error::Runtime(format!(
-            "failed to resolve extensions directory {}: {e}",
-            ext_dir.display()
-        ))
+        extension_backend_error(
+            "extensions.remove",
+            format!(
+                "failed to resolve extensions directory {}: {e}",
+                ext_dir.display()
+            ),
+        )
     })?;
 
     if canonical_candidate.starts_with(&canonical_ext_dir) {
         Ok(())
     } else {
-        Err(crate::Error::Runtime(format!(
-            "refusing to remove extension outside managed directory: {}",
-            candidate.display()
-        )))
+        Err(extension_backend_error(
+            "extensions.remove",
+            format!(
+                "refusing to remove extension outside managed directory: {}",
+                candidate.display()
+            ),
+        ))
     }
 }
 
@@ -864,7 +890,18 @@ mod tests {
     fn extension_info_not_found() {
         let config = PatternsConfig::default();
         let result = extension_info("nonexistent_extension_xyz", &config, None);
-        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "extensions.info");
+                match source {
+                    RuntimeOperationSource::Backend(detail) => {
+                        assert!(detail.contains("extension 'nonexistent_extension_xyz' not found"));
+                    }
+                    other => panic!("expected backend runtime source, got {other:?}"),
+                }
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
+        }
     }
 
     #[test]
