@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::config::{PaneFilterConfig, TraumaGuardConfig};
-use crate::error::Result;
+use crate::error::{Result, RuntimeOperationSource};
 use crate::storage::{Gap, PaneRecord, Segment, StorageHandle};
 use crate::trauma_guard::{TraumaDecision, TraumaState, hash_command};
 use crate::wezterm::{PaneInfo, stable_hash};
@@ -1119,7 +1119,7 @@ impl PaneRegistry {
         closed_panes.clear();
         closed_panes.extend(self.entries.keys().filter(|id| !seen.contains(id)).copied());
 
-        for pane_id in closed_panes.drain(..) {
+        for pane_id in closed_panes.iter().copied() {
             diff.closed_panes.push(pane_id);
             // Remove UUID from index before removing entry
             if let Some(entry) = self.entries.get(&pane_id) {
@@ -1130,6 +1130,7 @@ impl PaneRegistry {
             self.trauma_states.remove(&pane_id);
             self.pane_arenas.release(pane_id);
         }
+        closed_panes.clear();
         self.closed_panes_scratch = closed_panes;
 
         self.telemetry.record_discovery_tick(&diff);
@@ -1614,6 +1615,13 @@ fn redact_segment_for_persist(content: &str) -> String {
     crate::redactor::Redactor::new().redact(content)
 }
 
+fn ingest_cancelled_error(operation: &'static str, err: impl std::fmt::Display) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(err.to_string()),
+    }
+}
+
 /// Persist a captured segment and optional gap into storage.
 ///
 /// The pane must already exist in storage (use `upsert_pane` elsewhere).
@@ -1724,9 +1732,8 @@ pub async fn persist_captured_segment_with_cx(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
 ) -> Result<PersistedCapture> {
-    cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!("persist_captured_segment cancelled: {err}"))
-    })?;
+    cx.checkpoint()
+        .map_err(|err| ingest_cancelled_error("persist_captured_segment", err))?;
 
     let (bounded_segment, truncation) =
         enforce_segment_size_for_persistence(captured, max_segment_bytes);
@@ -2847,6 +2854,22 @@ mod tests {
     static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
     const TEST_MAX_PERSIST_SEGMENT_BYTES: usize =
         crate::tuning_config::IngestTuning::DEFAULT_MAX_PERSIST_SEGMENT_BYTES;
+
+    #[test]
+    fn ingest_cancelled_error_uses_structured_runtime_operation() {
+        let err = ingest_cancelled_error("persist_captured_segment", "caller cancelled");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "persist_captured_segment");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected RuntimeOperation, got {other:?}"),
+        }
+    }
 
     fn temp_db_path() -> String {
         let counter = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
