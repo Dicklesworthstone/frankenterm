@@ -540,6 +540,7 @@ where
 ///
 /// Some errors should not be retried (e.g., invalid arguments, not found).
 /// This function provides a heuristic for retryability.
+#[allow(deprecated)]
 #[must_use]
 pub fn is_retryable(error: &Error) -> bool {
     use crate::error::{StorageError, WeztermError};
