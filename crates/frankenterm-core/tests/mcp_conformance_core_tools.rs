@@ -325,7 +325,7 @@ fn spawn_client_with_config(config: Config, db_path: Option<PathBuf>) -> Framewo
     let server = build_server_with_db(&config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -566,22 +566,6 @@ fn assert_success_envelope_shape(envelope: &Value) {
     assert!(envelope.get("hint").is_none());
 }
 
-fn assert_invalid_format_envelope_shape(envelope: &Value) {
-    assert_common_envelope_fields(envelope, false);
-    assert!(envelope.get("data").is_none());
-    assert_eq!(envelope["error_code"], "FT-MCP-0001");
-    assert!(
-        envelope["error"]
-            .as_str()
-            .is_some_and(|message| message.contains("Invalid format 'yaml'"))
-    );
-    assert!(
-        envelope["hint"]
-            .as_str()
-            .is_some_and(|hint| hint.contains("json") && hint.contains("toon"))
-    );
-}
-
 fn assert_framework_invalid_params_response(response: &Value, message_substring: &str) {
     assert_eq!(response["kind"], "framework_error");
     assert_eq!(response["code"], "InvalidParams");
@@ -642,6 +626,17 @@ fn assert_tool_invalid_args_envelope_shape(response: &Value, expected_hint_subst
     assert!(payload.get("elapsed_ms").is_some_and(Value::is_number));
 }
 
+fn assert_json_number_field(data: &Map<String, Value>, field: &str, expected: f64) {
+    let actual = data
+        .get(field)
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("{field} should be numeric: {data:?}"));
+    assert_eq!(
+        actual, expected,
+        "{field} should equal {expected} regardless of JSON integer/float encoding"
+    );
+}
+
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
@@ -657,12 +652,9 @@ fn assert_search_success_data(envelope: &Value) {
         data.get("query"),
         Some(&Value::String("needle".to_string()))
     );
-    assert_eq!(data.get("pane_filter"), Some(&Value::from(1_u64)));
-    assert_eq!(data.get("since_filter"), Some(&Value::from(0_i64)));
-    assert_eq!(
-        data.get("until_filter"),
-        Some(&Value::from(4_102_444_800_000_i64))
-    );
+    assert_json_number_field(data, "pane_filter", 1.0);
+    assert_json_number_field(data, "since_filter", 0.0);
+    assert_json_number_field(data, "until_filter", 4_102_444_800_000.0);
     assert_eq!(
         data.get("mode"),
         Some(&Value::String("lexical".to_string()))
@@ -687,7 +679,7 @@ fn assert_search_success_data(envelope: &Value) {
         .expect("search results array");
     assert_eq!(results.len(), 1, "expected one deterministic search hit");
     let hit = results.first().expect("search hit");
-    assert_eq!(hit["pane_id"], Value::from(1_u64));
+    assert_eq!(hit["pane_id"].as_f64(), Some(1.0));
     assert!(hit["segment_id"].is_number());
     assert!(hit["seq"].is_number());
     assert!(hit["captured_at"].is_number());
@@ -700,8 +692,8 @@ fn assert_search_success_data(envelope: &Value) {
 
 fn assert_get_text_success_data(envelope: &Value) {
     let data = envelope["data"].as_object().expect("get_text data object");
-    assert_eq!(data.get("pane_id"), Some(&Value::from(4_242_u64)));
-    assert_eq!(data.get("tail_lines"), Some(&Value::from(2_u64)));
+    assert_json_number_field(data, "pane_id", 4_242.0);
+    assert_json_number_field(data, "tail_lines", 2.0);
     assert_eq!(data.get("escapes_included"), Some(&Value::Bool(false)));
     assert_eq!(
         data.get("text"),
@@ -719,7 +711,7 @@ fn assert_get_text_success_data(envelope: &Value) {
 
 fn assert_send_success_data(envelope: &Value) {
     let data = envelope["data"].as_object().expect("send data object");
-    assert_eq!(data.get("pane_id"), Some(&Value::from(5_252_u64)));
+    assert_json_number_field(data, "pane_id", 5_252.0);
     assert_eq!(data.get("dry_run"), Some(&Value::Bool(true)));
     let injection = data
         .get("injection")
@@ -835,7 +827,7 @@ fn mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits() {
     let deny_row = deny_rows.first().expect("wa.get_text denial row");
     assert_eq!(deny_row.tool_name, "wa.get_text");
     assert_eq!(deny_row.decision, "denied");
-    assert_eq!(deny_row.reason_code, "denied");
+    assert_eq!(deny_row.reason_code, "policy_denied");
     assert_eq!(deny_row.reason, deny_message);
     assert_eq!(
         deny_row.rule_id.as_deref(),
@@ -850,6 +842,7 @@ fn mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits() {
         "audit_row_id": deny_row.id,
         "normalized_response": canonical_value(&deny_envelope),
     }));
+    drop(deny_harness);
 
     let require_message = "ft-hp70k require approval search drill";
     let mut approval_harness = TestHarness::new_with_config(mcp_policy_test_config(
@@ -909,7 +902,7 @@ fn mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits() {
 
 fn assert_wait_for_success_data(envelope: &Value) {
     let data = envelope["data"].as_object().expect("wait_for data object");
-    assert_eq!(data.get("pane_id"), Some(&Value::from(6_262_u64)));
+    assert_json_number_field(data, "pane_id", 6_262.0);
     assert_eq!(
         data.get("pattern"),
         Some(&Value::String("ready$".to_string()))
@@ -918,8 +911,8 @@ fn assert_wait_for_success_data(envelope: &Value) {
     assert_eq!(data.get("is_regex"), Some(&Value::Bool(true)));
     assert!(
         data.get("polls")
-            .and_then(Value::as_u64)
-            .is_some_and(|polls| polls >= 1)
+            .and_then(Value::as_f64)
+            .is_some_and(|polls| polls >= 1.0)
     );
 }
 
@@ -971,6 +964,17 @@ fn canonicalize(value: &mut Value) {
         Value::Array(items) => {
             for item in items {
                 canonicalize(item);
+            }
+        }
+        Value::Number(number) => {
+            if number.as_i64().is_none()
+                && let Some(float) = number.as_f64()
+                && float.is_finite()
+                && float.fract() == 0.0
+                && float >= i64::MIN as f64
+                && float <= i64::MAX as f64
+            {
+                *value = Value::from(float as i64);
             }
         }
         _ => {}
@@ -1395,12 +1399,7 @@ fn mcp_conformance_core_tools_invalid_format_returns_documented_envelope() {
     ];
 
     for (tool_name, args) in cases {
-        let envelope = parse_tool_envelope(
-            &harness
-                .client
-                .call_tool(tool_name, args)
-                .expect("call core tool invalid-format case"),
-        );
-        assert_invalid_format_envelope_shape(&envelope);
+        let response = parse_invalid_args_response(harness.client.call_tool(tool_name, args));
+        assert_framework_invalid_params_response(&response, "root.format: value must be one of");
     }
 }

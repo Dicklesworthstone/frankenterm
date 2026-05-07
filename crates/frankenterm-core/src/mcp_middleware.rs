@@ -203,7 +203,7 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
 
         let result = self.inner.call(ctx, arguments);
 
-        let (ok, error_code) = classify_tool_result(&result);
+        let (ok, error_code) = classify_audited_tool_result(&self.tool_name, &result);
 
         // br-ft-2fjx0: pass None to preserve the backward-compat
         // 10s retry deadline default. The caller-budget plumbing
@@ -281,11 +281,26 @@ fn classify_tool_result(result: &McpResult<Vec<Content>>) -> (bool, Option<Strin
     }
 }
 
+fn classify_audited_tool_result(
+    tool_name: &str,
+    result: &McpResult<Vec<Content>>,
+) -> (bool, Option<String>) {
+    if tool_name.starts_with("remote/") {
+        return match result {
+            Ok(_) => (true, None),
+            Err(_) => (false, Some("MCP_INTERNAL".to_string())),
+        };
+    }
+
+    classify_tool_result(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditedToolHandler, McpOutputFormat, augment_tool_schema_with_format, classify_tool_result,
-        encode_mcp_contents, extract_mcp_output_format, parse_mcp_output_format,
+        AuditedToolHandler, McpOutputFormat, augment_tool_schema_with_format,
+        classify_audited_tool_result, classify_tool_result, encode_mcp_contents,
+        extract_mcp_output_format, parse_mcp_output_format,
     };
     use crate::mcp_framework::{
         FrameworkContent as Content, FrameworkMcpContext as McpContext,
@@ -702,6 +717,28 @@ mod tests {
             "error_code": "ignored_when_ok"
         })));
         assert_eq!(classify_tool_result(&result), (true, None));
+    }
+
+    #[test]
+    fn classify_audited_local_tool_still_fails_closed_on_raw_text() {
+        let result = Ok(vec![Content::Text {
+            text: "plain remote-style content".to_string(),
+        }]);
+        assert_eq!(
+            classify_audited_tool_result("wa.search", &result),
+            (false, Some("envelope_unparsable".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_audited_remote_proxy_tool_allows_raw_success_content() {
+        let result = Ok(vec![Content::Text {
+            text: "plain remote-style content".to_string(),
+        }]);
+        assert_eq!(
+            classify_audited_tool_result("remote/mock/echo", &result),
+            (true, None)
+        );
     }
 
     // ========================================================================

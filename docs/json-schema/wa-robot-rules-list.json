@@ -27,7 +27,7 @@
     "rule_item": {
       "type": "object",
       "description": "A pattern detection rule",
-      "required": ["id", "agent_type", "event_type", "severity", "description", "anchor_count", "has_regex"],
+      "required": ["id", "agent_type", "event_type", "severity", "anchor_count", "has_regex"],
       "properties": {
         "id": {
           "type": "string",

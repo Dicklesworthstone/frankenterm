@@ -1,7 +1,7 @@
 #![cfg(feature = "mcp")]
 
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::build_server_with_db;
+use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
     framework_create_memory_transport_pair,
@@ -152,10 +152,14 @@ print(json.dumps(panes))
 fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     let mut config = Config::default();
     config.safety.require_prompt_active = false;
-    let server = build_server_with_db(&config, db_path).expect("build MCP server");
+    let server = match db_path {
+        Some(db_path) => build_server_with_db(&config, Some(db_path)),
+        None => build_server_degraded(&config),
+    }
+    .expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);

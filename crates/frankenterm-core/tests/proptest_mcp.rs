@@ -4,7 +4,7 @@
 
 use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::build_server_with_db;
+use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::{
     FrameworkTestClient, framework_create_memory_transport_pair,
 };
@@ -19,7 +19,12 @@ struct ServerSnapshot {
 }
 
 fn spawn_client(db_path: Option<PathBuf>) -> (FrameworkTestClient, ServerSnapshot) {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    let config = Config::default();
+    let server = match db_path {
+        Some(db_path) => build_server_with_db(&config, Some(db_path)),
+        None => build_server_degraded(&config),
+    }
+    .expect("build MCP server");
     let snapshot = ServerSnapshot {
         tool_names: tool_names(server.tools()),
         resource_uris: resource_uris(server.resources()),
@@ -27,7 +32,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> (FrameworkTestClient, ServerSnapsho
     };
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
     (FrameworkTestClient::new(client_transport), snapshot)
 }

@@ -49,7 +49,7 @@ fn spawn_client() -> FrameworkTestClient {
     let server = build_server_degraded(&config).expect("build degraded MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
     let mut client = FrameworkTestClient::new(client_transport);
     client
@@ -152,6 +152,18 @@ fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMc
     }
 }
 
+fn assert_framework_invalid_params_response(response: &Value, message_substring: &str) {
+    assert_eq!(response["kind"], "framework_error");
+    assert_eq!(response["code"], "InvalidParams");
+    assert!(
+        response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(message_substring)),
+        "framework InvalidParams message should contain `{message_substring}`; got {response}"
+    );
+    assert!(response["data"].is_null());
+}
+
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
     assert_eq!(envelope["ok"], Value::Bool(ok));
     assert!(
@@ -252,6 +264,17 @@ fn canonicalize(value: &mut Value) {
         Value::Array(items) => {
             for item in items {
                 canonicalize(item);
+            }
+        }
+        Value::Number(number) => {
+            if number.as_i64().is_none()
+                && let Some(float) = number.as_f64()
+                && float.is_finite()
+                && float.fract() == 0.0
+                && float >= i64::MIN as f64
+                && float <= i64::MAX as f64
+            {
+                *value = Value::from(float as i64);
             }
         }
         _ => {}
@@ -450,29 +473,11 @@ fn mcp_conformance_rules_test_toon_success_matches_json_semantics() {
 #[test]
 fn mcp_conformance_rules_test_invalid_format_returns_documented_envelope() {
     let mut client = spawn_client();
-    let reply = client
-        .call_tool(
-            "wa.rules_test",
-            json!({ "text": ANCHOR_TEXT_COMPACTION, "format": "yaml" }),
-        )
-        .expect("call wa.rules_test");
-    let envelope = parse_tool_envelope(&reply);
-    assert_common_envelope_fields(&envelope, false);
-    assert_eq!(envelope["error_code"], "FT-MCP-0001");
-    assert!(
-        envelope["error"]
-            .as_str()
-            .expect("error string")
-            .contains("Invalid format"),
-        "expected 'Invalid format' hint; got {envelope}"
-    );
-    assert!(
-        envelope["hint"]
-            .as_str()
-            .expect("hint string")
-            .contains("json"),
-        "hint must mention 'json'; got {envelope}"
-    );
+    let response = parse_invalid_args_response(client.call_tool(
+        "wa.rules_test",
+        json!({ "text": ANCHOR_TEXT_COMPACTION, "format": "yaml" }),
+    ));
+    assert_framework_invalid_params_response(&response, "root.format: value must be one of");
 }
 
 #[test]
@@ -552,14 +557,10 @@ fn mcp_conformance_rules_test_contract_matches_golden() {
             .call_tool("wa.rules_test", json!({ "text": "", "format": "json" }))
             .expect("call wa.rules_test empty"),
     );
-    let invalid_format_json = parse_tool_envelope(
-        &client
-            .call_tool(
-                "wa.rules_test",
-                json!({ "text": ANCHOR_TEXT_COMPACTION, "format": "yaml" }),
-            )
-            .expect("call wa.rules_test invalid format"),
-    );
+    let invalid_format_json = parse_invalid_args_response(client.call_tool(
+        "wa.rules_test",
+        json!({ "text": ANCHOR_TEXT_COMPACTION, "format": "yaml" }),
+    ));
     let missing_required =
         parse_invalid_args_response(client.call_tool("wa.rules_test", json!({ "trace": false })));
 

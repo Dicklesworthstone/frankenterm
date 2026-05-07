@@ -27,6 +27,7 @@
       "timeout_secs": {
         "default": 30,
         "description": "Wait-for timeout (seconds)",
+        "maximum": 600,
         "minimum": 1,
         "type": "integer"
       },

@@ -179,24 +179,25 @@ fn wait_for_proxy_audit_row(db_path: &Path, action_kind: &str) -> (String, Strin
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let conn = Connection::open(db_path).expect("open audit db");
-        let mut stmt = conn
-            .prepare(
-                "SELECT COALESCE(input_summary, ''), result, COALESCE(decision_context, '')
-                 FROM audit_actions
-                 WHERE action_kind = ?1
-                 ORDER BY id DESC
-                 LIMIT 1",
-            )
-            .expect("prepare audit query");
-        let row = stmt
-            .query_row([action_kind], |row| {
-                let input_summary = row.get::<_, String>(0)?;
-                let result = row.get::<_, String>(1)?;
-                let decision_context = row.get::<_, String>(2)?;
-                Ok((input_summary, result, decision_context))
-            })
-            .optional()
-            .expect("query audit row");
+        let row = match conn.prepare(
+            "SELECT COALESCE(input_summary, ''), result, COALESCE(decision_context, '')
+             FROM audit_actions
+             WHERE action_kind = ?1
+             ORDER BY id DESC
+             LIMIT 1",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_row([action_kind], |row| {
+                    let input_summary = row.get::<_, String>(0)?;
+                    let result = row.get::<_, String>(1)?;
+                    let decision_context = row.get::<_, String>(2)?;
+                    Ok((input_summary, result, decision_context))
+                })
+                .optional()
+                .expect("query audit row"),
+            Err(err) if err.to_string().contains("no such table: audit_actions") => None,
+            Err(err) => panic!("prepare audit query: {err}"),
+        };
 
         if let Some(found) = row {
             return found;
@@ -240,7 +241,8 @@ fn proxy_mounts_remote_tools_with_prefixed_routes() {
         discovery_path.display(),
         script_path.display()
     );
-    let server = build_server_degraded(&config).expect("build degraded proxy-enabled server");
+    let db_path = temp_dir.path().join("proxy_mount.sqlite3");
+    let server = build_server_with_db(&config, Some(db_path)).expect("build proxy-enabled server");
     let tool_names: BTreeSet<String> = server.tools().into_iter().map(|tool| tool.name).collect();
 
     eprintln!("Registered tool names: {tool_names:?}");
@@ -280,7 +282,8 @@ fn proxy_does_not_let_failed_server_claim_shared_route_prefix() {
     let config =
         make_proxy_config_with_servers(&discovery_path, &["GitHub Copilot", "GitHub/Copilot"]);
 
-    let server = build_server_degraded(&config).expect("build degraded proxy-enabled server");
+    let db_path = temp_dir.path().join("proxy_shared_prefix.sqlite3");
+    let server = build_server_with_db(&config, Some(db_path)).expect("build proxy-enabled server");
     let tool_names: BTreeSet<String> = server.tools().into_iter().map(|tool| tool.name).collect();
 
     eprintln!("Tool names after broken-then-valid shared-prefix servers: {tool_names:?}");
@@ -308,11 +311,12 @@ fn proxy_routes_calls_to_remote_tools() {
         &["-u".to_string(), script_path.display().to_string()],
     );
     let config = make_proxy_config(&discovery_path, "mock");
-    let server = build_server_degraded(&config).expect("build degraded proxy-enabled server");
+    let db_path = temp_dir.path().join("proxy_route.sqlite3");
+    let server = build_server_with_db(&config, Some(db_path)).expect("build proxy-enabled server");
 
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -352,7 +356,7 @@ fn proxy_routes_remote_calls_with_audit_traceability() {
 
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);

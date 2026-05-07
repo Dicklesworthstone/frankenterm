@@ -34,7 +34,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -101,10 +101,29 @@ fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
-        serde_json::to_string_pretty(actual_schema).expect("serialize actual schema"),
-        serde_json::to_string_pretty(&expected_schema).expect("serialize expected schema"),
+        canonical_value(actual_schema),
+        canonical_value(&expected_schema),
         "schema drift vs tests/fixtures/mcp_manifest.json for {tool_name}"
     );
+}
+
+fn canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted = std::collections::BTreeMap::new();
+            for (key, child) in map {
+                sorted.insert(key.clone(), canonical_value(child));
+            }
+
+            let mut rebuilt = serde_json::Map::new();
+            for (key, child) in sorted {
+                rebuilt.insert(key, child);
+            }
+            Value::Object(rebuilt)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
+        _ => value.clone(),
+    }
 }
 
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {

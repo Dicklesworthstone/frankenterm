@@ -2,10 +2,11 @@
 
 use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
-use frankenterm_core::mcp::build_server_with_db;
+use frankenterm_core::mcp::{build_server_degraded, build_server_with_db};
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkResource, FrameworkResourceContent, FrameworkResourceTemplate,
-    FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
+    FrameworkContent, FrameworkMcpError, FrameworkResource, FrameworkResourceContent,
+    FrameworkResourceTemplate, FrameworkTestClient, FrameworkTool,
+    framework_create_memory_transport_pair,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -17,10 +18,15 @@ const RULES_LIST_SCHEMA: &str = include_str!(concat!(
 ));
 
 fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    let config = Config::default();
+    let server = match db_path {
+        Some(db_path) => build_server_with_db(&config, Some(db_path)),
+        None => build_server_degraded(&config),
+    }
+    .expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -87,17 +93,24 @@ fn assert_success_envelope_shape(envelope: &Value) {
     assert!(envelope.get("hint").is_none());
 }
 
-fn assert_invalid_args_envelope_shape(envelope: &Value, hint_substring: &str) {
-    assert_common_envelope_fields(envelope, false);
-    assert!(envelope.get("data").is_none());
-    assert_eq!(envelope["error_code"], "FT-MCP-0001");
-    assert!(envelope["error"].is_string());
-    assert!(
-        envelope["hint"]
-            .as_str()
-            .expect("hint string")
-            .contains(hint_substring)
-    );
+fn assert_framework_invalid_params(
+    result: Result<Vec<FrameworkContent>, FrameworkMcpError>,
+    message_substring: &str,
+) {
+    match result {
+        Ok(contents) => panic!(
+            "expected framework invalid params, got tool contents: {:?}",
+            contents
+        ),
+        Err(err) => {
+            assert_eq!(format!("{:?}", err.code), "InvalidParams");
+            assert!(
+                err.message.contains(message_substring),
+                "expected framework error to contain {message_substring:?}, got {:?}",
+                err.message
+            );
+        }
+    }
 }
 
 fn assert_object_matches_documented_schema(value: &Value, schema: &Value, label: &str) {
@@ -143,9 +156,24 @@ fn assert_rules_list_data_matches_documented_schema(data: &Value) {
         assert!(rule["agent_type"].is_string());
         assert!(rule["event_type"].is_string());
         assert!(rule["severity"].is_string());
-        assert!(rule["description"].is_string());
+        if let Some(description) = rule.get("description") {
+            assert!(description.is_string());
+        }
         assert!(rule["anchor_count"].is_number());
         assert!(rule["has_regex"].is_boolean());
+    }
+}
+
+fn assert_rules_have_descriptions(data: &Value) {
+    let rules = data["rules"].as_array().expect("rules array");
+    for (index, rule) in rules.iter().enumerate() {
+        let description = rule["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("rule[{index}] missing verbose description"));
+        assert!(
+            !description.trim().is_empty(),
+            "rule[{index}] had empty verbose description"
+        );
     }
 }
 
@@ -243,6 +271,7 @@ fn mcp_conformance_rules_list_json_success_matches_documented_envelope_and_schem
     let envelope = parse_tool_envelope(&reply, "json");
     assert_success_envelope_shape(&envelope);
     assert_rules_list_data_matches_documented_schema(&envelope["data"]);
+    assert_rules_have_descriptions(&envelope["data"]);
 }
 
 #[test]
@@ -258,36 +287,20 @@ fn mcp_conformance_rules_list_toon_success_preserves_documented_semantics() {
 }
 
 #[test]
-fn mcp_conformance_invalid_format_returns_documented_error_envelope() {
+fn mcp_conformance_invalid_format_returns_framework_error() {
     let mut client = spawn_client(None);
-    let reply = client
-        .call_tool("wa.rules_list", json!({"verbose": true, "format": "yaml"}))
-        .expect("call wa.rules_list");
-
-    let envelope = parse_tool_envelope(&reply, "json");
-    assert_invalid_args_envelope_shape(&envelope, "json");
-    assert!(
-        envelope["error"]
-            .as_str()
-            .expect("error string")
-            .contains("Invalid format")
+    assert_framework_invalid_params(
+        client.call_tool("wa.rules_list", json!({"verbose": true, "format": "yaml"})),
+        "root.format: value must be one of",
     );
 }
 
 #[test]
-fn mcp_conformance_inner_invalid_args_still_return_documented_error_envelope() {
+fn mcp_conformance_schema_type_errors_return_framework_error() {
     let mut client = spawn_client(None);
-    let reply = client
-        .call_tool("wa.rules_list", json!({"agent_type": 7, "format": "json"}))
-        .expect("call wa.rules_list");
-
-    let envelope = parse_tool_envelope(&reply, "json");
-    assert_invalid_args_envelope_shape(&envelope, "Expected object with optional agent_type");
-    assert!(
-        envelope["error"]
-            .as_str()
-            .expect("error string")
-            .contains("Invalid params")
+    assert_framework_invalid_params(
+        client.call_tool("wa.rules_list", json!({"agent_type": 7, "format": "json"})),
+        "root.agent_type: expected type string",
     );
 }
 
@@ -325,6 +338,7 @@ fn mcp_conformance_rules_resource_returns_well_formed_json_envelope() {
     let envelope = parse_resource_envelope(&resources);
     assert_success_envelope_shape(&envelope);
     assert_rules_list_data_matches_documented_schema(&envelope["data"]);
+    assert_rules_have_descriptions(&envelope["data"]);
 }
 
 #[test]
@@ -343,6 +357,7 @@ fn mcp_conformance_rules_template_resource_returns_filtered_json_envelope() {
     assert_success_envelope_shape(&envelope);
     assert_eq!(envelope["data"]["agent_type_filter"], "codex");
     assert_rules_list_data_matches_documented_schema(&envelope["data"]);
+    assert_rules_have_descriptions(&envelope["data"]);
 }
 
 #[test]

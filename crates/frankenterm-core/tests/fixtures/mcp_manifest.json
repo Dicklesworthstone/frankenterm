@@ -1378,11 +1378,6 @@
             "description": "Preview without executing",
             "type": "boolean"
           },
-          "force": {
-            "default": false,
-            "description": "Force run (bypass handled guard)",
-            "type": "boolean"
-          },
           "format": {
             "description": "Optional output format override for this call",
             "enum": [

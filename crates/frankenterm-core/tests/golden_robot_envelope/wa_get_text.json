@@ -22,7 +22,8 @@
       },
       "tail": {
         "default": 500,
-        "description": "Number of lines to return (from end)",
+        "description": "Number of lines to return (from end). Server enforces 1..=10000 (ft-ii8ss); requests outside this range return policy_error.",
+        "maximum": 10000,
         "minimum": 1,
         "type": "integer"
       }

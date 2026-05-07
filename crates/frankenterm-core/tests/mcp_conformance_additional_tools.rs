@@ -182,7 +182,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     let server = build_server_with_db(&config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -513,7 +513,10 @@ fn mcp_conformance_wa_accounts_matches_snapshot() {
     assert_schema_matches_manifest("wa.accounts", &capture.input_schema);
     assert_success_envelope_shape(&capture.success_envelope);
     assert_accounts_success(&capture.success_envelope);
-    assert_framework_invalid_params_response(&capture.invalid_args_response, "root.service");
+    assert_framework_invalid_params_response(
+        &capture.invalid_args_response,
+        "missing required field: service",
+    );
 
     assert_json_snapshot!("wa_accounts_conformance", snapshot_capture(&capture));
 }
@@ -568,7 +571,10 @@ fn mcp_conformance_wa_cass_search_matches_snapshot() {
     assert_schema_matches_manifest("wa.cass_search", &capture.input_schema);
     assert_success_envelope_shape(&capture.success_envelope);
     assert_cass_search_success(&capture.success_envelope);
-    assert_framework_invalid_params_response(&capture.invalid_args_response, "root.query");
+    assert_framework_invalid_params_response(
+        &capture.invalid_args_response,
+        "missing required field: query",
+    );
 
     assert_json_snapshot!("wa_cass_search_conformance", snapshot_capture(&capture));
 }
@@ -625,7 +631,10 @@ fn mcp_conformance_wa_cass_view_matches_snapshot() {
     assert_schema_matches_manifest("wa.cass_view", &capture.input_schema);
     assert_success_envelope_shape(&capture.success_envelope);
     assert_cass_view_success(&capture.success_envelope);
-    assert_framework_invalid_params_response(&capture.invalid_args_response, "root.line_number");
+    assert_framework_invalid_params_response(
+        &capture.invalid_args_response,
+        "missing required field: line_number",
+    );
 
     assert_json_snapshot!("wa_cass_view_conformance", snapshot_capture(&capture));
 }
@@ -659,7 +668,10 @@ fn mcp_conformance_wa_workflow_run_matches_snapshot() {
     assert_schema_matches_manifest("wa.workflow_run", &capture.input_schema);
     assert_success_envelope_shape(&capture.success_envelope);
     assert_workflow_run_success(&capture.success_envelope);
-    assert_framework_invalid_params_response(&capture.invalid_args_response, "root.name");
+    assert_framework_invalid_params_response(
+        &capture.invalid_args_response,
+        "missing required field: name",
+    );
 
     assert_json_snapshot!("wa_workflow_run_conformance", snapshot_capture(&capture));
 }

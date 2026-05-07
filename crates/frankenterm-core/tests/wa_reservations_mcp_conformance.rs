@@ -6,7 +6,7 @@ use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
 };
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
-use frankenterm_core::storage::{PaneReservation, StorageHandle};
+use frankenterm_core::storage::{PaneRecord, PaneReservation, StorageHandle};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     let server = build_server_with_db(&config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -93,10 +93,29 @@ fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
-        serde_json::to_string_pretty(actual_schema).expect("serialize actual schema"),
-        serde_json::to_string_pretty(&expected_schema).expect("serialize expected schema"),
+        canonical_value(actual_schema),
+        canonical_value(&expected_schema),
         "schema drift vs tests/fixtures/mcp_manifest.json for {tool_name}"
     );
+}
+
+fn canonical_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted = std::collections::BTreeMap::new();
+            for (key, child) in map {
+                sorted.insert(key.clone(), canonical_value(child));
+            }
+
+            let mut rebuilt = serde_json::Map::new();
+            for (key, child) in sorted {
+                rebuilt.insert(key, child);
+            }
+            Value::Object(rebuilt)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
+        _ => value.clone(),
+    }
 }
 
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
@@ -121,6 +140,37 @@ fn runtime() -> frankenterm_core::runtime_async::Runtime {
         .expect("build runtime")
 }
 
+fn make_pane(pane_id: u64) -> PaneRecord {
+    PaneRecord {
+        pane_id,
+        pane_uuid: None,
+        domain: "local".to_string(),
+        window_id: Some(1),
+        tab_id: Some(1),
+        title: Some("codex".to_string()),
+        cwd: Some("/tmp/wa-reservations".to_string()),
+        tty_name: None,
+        first_seen_at: 1_700_000_000_123,
+        last_seen_at: 1_700_000_000_123,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    }
+}
+
+fn seed_pane(harness: &TestHarness, pane_id: u64) {
+    runtime().block_on(async {
+        let storage = StorageHandle::new(&harness.db_path.to_string_lossy())
+            .await
+            .expect("open storage");
+        storage
+            .upsert_pane(make_pane(pane_id))
+            .await
+            .expect("upsert pane");
+        storage.shutdown().await.expect("shutdown storage");
+    });
+}
+
 fn seed_reservation(
     harness: &TestHarness,
     pane_id: u64,
@@ -133,6 +183,10 @@ fn seed_reservation(
         let storage = StorageHandle::new(&harness.db_path.to_string_lossy())
             .await
             .expect("open storage");
+        storage
+            .upsert_pane(make_pane(pane_id))
+            .await
+            .expect("upsert pane");
         let reservation = storage
             .create_reservation(pane_id, owner_kind, owner_id, reason, ttl_ms)
             .await
@@ -172,6 +226,7 @@ fn mcp_conformance_wa_reserve_contract_matches_expected_envelope() {
     let mut harness = new_harness();
     let input_schema = tool_input_schema(&mut harness.client, "wa.reserve");
     assert_schema_matches_manifest("wa.reserve", &input_schema);
+    seed_pane(&harness, FIXTURE_PANE_ID);
 
     let success_envelope = parse_tool_envelope(
         &harness
