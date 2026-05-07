@@ -8850,65 +8850,21 @@ fn usize_to_i64(value: usize, label: &str) -> Result<i64> {
 }
 
 #[cfg(test)]
-fn sql_integer_decode_error(
-    column_index: usize,
-    label: &str,
-    value: i64,
-    reason: &str,
-) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        column_index,
-        rusqlite::types::Type::Integer,
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{label} value {value} {reason}"),
-        )),
-    )
-}
-
-#[cfg(test)]
 fn i64_to_u64_sql(value: i64, column_index: usize, label: &str) -> rusqlite::Result<u64> {
-    u64::try_from(value)
-        .map_err(|_| sql_integer_decode_error(column_index, label, value, "is out of u64 range"))
-}
-
-#[cfg(test)]
-fn i64_to_bool_sql(value: i64, column_index: usize, label: &str) -> rusqlite::Result<bool> {
-    match value {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(sql_integer_decode_error(
+    u64::try_from(value).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
             column_index,
-            label,
-            value,
-            "must be 0 or 1",
-        )),
-    }
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{label} value {value} is out of u64 range"),
+            )),
+        )
+    })
 }
 
 fn i64_to_usize(value: i64) -> rusqlite::Result<usize> {
     usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
-}
-
-#[cfg(test)]
-fn prepared_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreparedPlanRecord> {
-    Ok(PreparedPlanRecord {
-        plan_id: row.get(0)?,
-        plan_hash: row.get(1)?,
-        workspace_id: row.get(2)?,
-        action_kind: row.get(3)?,
-        pane_id: row
-            .get::<_, Option<i64>>(4)?
-            .map(|v| i64_to_u64_sql(v, 4, "prepared_plans.pane_id"))
-            .transpose()?,
-        pane_uuid: row.get(5)?,
-        params_json: row.get(6)?,
-        plan_json: row.get(7)?,
-        requires_approval: i64_to_bool_sql(row.get(8)?, 8, "prepared_plans.requires_approval")?,
-        created_at: row.get(9)?,
-        expires_at: row.get(10)?,
-        consumed_at: row.get(11)?,
-    })
 }
 
 fn approval_token_from_backend_row(row: &[String]) -> Result<ApprovalTokenRecord> {
@@ -17937,20 +17893,6 @@ fn query_action_plan_backend(
         .transpose()
 }
 
-#[cfg(test)]
-fn query_prepared_plan(conn: &Connection, plan_id: &str) -> Result<Option<PreparedPlanRecord>> {
-    conn.query_row(
-        "SELECT plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
-                plan_json, requires_approval, created_at, expires_at, consumed_at
-         FROM prepared_plans
-         WHERE plan_id = ?1",
-        [plan_id],
-        prepared_plan_from_row,
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
-}
-
 fn workflow_step_log_from_backend_cells(row: &[SqlCell]) -> Result<WorkflowStepLogRecord> {
     let reader = CellRowReader::new(row);
     let step_index = reader
@@ -19147,7 +19089,9 @@ fn can_insert_and_consume_prepared_plan() {
         insert_prepared_plan_backend(backend, &record)
     })
     .unwrap();
-    let fetched = query_prepared_plan(&conn, "plan:abcd1234")
+    let fetched = with_writer_backend(&mut conn, |backend| {
+        query_prepared_plan_backend(backend, "plan:abcd1234")
+    })
         .unwrap()
         .unwrap();
     assert_eq!(fetched.plan_id, record.plan_id);
@@ -19195,7 +19139,8 @@ fn prepared_plan_query_rejects_invalid_requires_approval_flag() {
     )
     .unwrap();
 
-    let err = query_prepared_plan(&conn, "plan:bad-approval")
+    let backend = RusqliteBackend::new(conn);
+    let err = query_prepared_plan_backend(&backend, "plan:bad-approval")
         .expect_err("invalid requires_approval flag");
     let message = err.to_string();
     assert!(
@@ -19233,8 +19178,9 @@ fn prepared_plan_query_rejects_negative_pane_id() {
     )
     .unwrap();
 
-    let err =
-        query_prepared_plan(&conn, "plan:bad-pane").expect_err("negative prepared plan pane id");
+    let backend = RusqliteBackend::new(conn);
+    let err = query_prepared_plan_backend(&backend, "plan:bad-pane")
+        .expect_err("negative prepared plan pane id");
     let message = err.to_string();
     assert!(message.contains("prepared_plans.pane_id"), "{message}");
     assert!(message.contains("-9"), "{message}");
