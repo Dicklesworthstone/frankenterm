@@ -807,13 +807,14 @@ impl StreamingRedactor {
         // on the remaining tail. Merges into the same RedactionResult
         // as the normal-path emission so callers see a single result
         // per chunk regardless of overflow.
-        let mut overflow_result: Option<RedactionResult> = None;
-        if self.pending.len() > self.max_pending_bytes {
+        let overflow_result = if self.pending.len() > self.max_pending_bytes {
             record_streaming_redactor_pending_overflow();
             let half = self.max_pending_bytes / 2;
             let force_boundary = floor_char_boundary(&self.pending, half);
-            overflow_result = Some(self.emit_prefix(force_boundary));
-        }
+            Some(self.emit_prefix(force_boundary))
+        } else {
+            None
+        };
 
         let boundary = self.stable_emit_boundary();
         let normal = self.emit_prefix(boundary);
