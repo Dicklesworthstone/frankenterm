@@ -310,6 +310,13 @@ mod tests {
     use serde_json::{Map, Value, json};
     use std::path::PathBuf;
 
+    fn runtime_operation_error(detail: impl Into<String>) -> Error {
+        Error::RuntimeOperation {
+            operation: "error_renderer.test",
+            source: crate::error::RuntimeOperationSource::Backend(detail.into()),
+        }
+    }
+
     fn canonicalize(value: &Value) -> Value {
         match value {
             Value::Object(map) => {
@@ -455,7 +462,8 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Config")
         );
-        assert_eq!(json["category"], "Config");
+        let expected = serde_json::to_value(get_error_code("FT-7001").unwrap().category).unwrap();
+        assert_eq!(json["category"], expected);
     }
 
     #[test]
@@ -471,7 +479,7 @@ mod tests {
             Error::Workflow(WorkflowError::NotFound("missing".to_string())),
             Error::Config(ConfigError::ValidationError("bad".to_string())),
             Error::Policy("denied".to_string()),
-            Error::Runtime("boom".to_string()),
+            runtime_operation_error("boom"),
             io_error,
             json_error,
         ];
@@ -659,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn error_code_standalone_variants() {
         assert_eq!(
             ErrorRenderer::error_code(&Error::Policy("p".into())),
@@ -694,7 +703,7 @@ mod tests {
     fn default_renderer_uses_auto() {
         let renderer = ErrorRenderer::default();
         // Just verify it doesn't panic and renders
-        let error = Error::Runtime("test".into());
+        let error = runtime_operation_error("test");
         let output = renderer.render(&error);
         assert!(!output.is_empty());
     }
@@ -723,7 +732,7 @@ mod tests {
     #[test]
     fn render_plain_includes_error_message() {
         let renderer = ErrorRenderer::new(OutputFormat::Plain);
-        let error = Error::Runtime("unexpected shutdown".into());
+        let error = runtime_operation_error("unexpected shutdown");
         let output = renderer.render(&error);
         assert!(output.contains("unexpected shutdown"));
     }
@@ -765,7 +774,7 @@ mod tests {
     #[test]
     fn render_json_has_ok_false() {
         let renderer = ErrorRenderer::new(OutputFormat::Json);
-        let error = Error::Runtime("fail".into());
+        let error = runtime_operation_error("fail");
         let output = renderer.render(&error);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["ok"], false);
@@ -995,7 +1004,7 @@ mod tests {
             Error::Config(ConfigError::FileNotFound("x".into())),
             Error::Policy("x".into()),
             Error::Io(std::io::Error::other("x")),
-            Error::Runtime("x".into()),
+            runtime_operation_error("x"),
             Error::SetupError("x".into()),
             Error::Cancelled("x".into()),
             Error::Panicked("x".into()),
@@ -1020,7 +1029,7 @@ mod tests {
             Error::Config(ConfigError::FileNotFound("x".into())),
             Error::Policy("x".into()),
             Error::Io(std::io::Error::other("x")),
-            Error::Runtime("x".into()),
+            runtime_operation_error("x"),
         ];
 
         for error in errors {
