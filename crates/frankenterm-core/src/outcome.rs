@@ -17,7 +17,14 @@
 // Re-export asupersync types for downstream consumers
 pub use asupersync::{CancelKind, CancelReason, Outcome, OutcomeError, PanicPayload, Severity};
 
-use crate::Error;
+use crate::{Error, error::RuntimeOperationSource};
+
+fn runtime_operation_backend_error(operation: &'static str, detail: impl Into<String>) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Backend(detail.into()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -123,8 +130,8 @@ pub trait OutcomeExt<T, E> {
     /// be treated as a graceful shutdown (User or Shutdown kinds).
     fn is_graceful_cancel(&self) -> bool;
 
-    /// Maps a non-Ok outcome into an `Error::Runtime` and returns a
-    /// `Result<T, Error>`, discarding structured cancellation info.
+    /// Maps a non-Ok outcome into typed `Error` variants and returns a
+    /// `Result<T, Error>`.
     ///
     /// Use at public API boundaries when the caller doesn't understand
     /// Outcome semantics.
@@ -157,7 +164,10 @@ impl<T, E: std::fmt::Display> OutcomeExt<T, E> for Outcome<T, E> {
     {
         match self {
             Outcome::Ok(v) => Ok(v),
-            Outcome::Err(e) => Err(Error::Runtime(format!("{e}"))),
+            Outcome::Err(e) => Err(runtime_operation_backend_error(
+                "outcome.into_ft_result",
+                e.to_string(),
+            )),
             Outcome::Cancelled(r) => Err(Error::Cancelled(format!("{}", r.kind))),
             Outcome::Panicked(p) => Err(Error::Panicked(p.message().to_string())),
         }
@@ -277,7 +287,10 @@ pub fn cancel_shutdown(message: &'static str) -> CancelReason {
 /// async fn fetch_pane_text(pane_id: u64) -> crate::Result<String> {
 ///     let text = frankenterm_client.get_text(pane_id).await?;
 ///     if text.is_empty() {
-///         return Err(Error::Runtime("empty pane".into()));
+///         return Err(Error::RuntimeOperation {
+///             operation: "fetch_pane_text",
+///             source: RuntimeOperationSource::Backend("empty pane".into()),
+///         });
 ///     }
 ///     Ok(text)
 /// }
@@ -290,7 +303,10 @@ pub fn cancel_shutdown(message: &'static str) -> CancelReason {
 ///     let result = frankenterm_client.get_text(pane_id).await;
 ///     let text = try_outcome!(ft_result_to_outcome(result));
 ///     if text.is_empty() {
-///         return Outcome::err(Error::Runtime("empty pane".into()));
+///         return Outcome::err(Error::RuntimeOperation {
+///             operation: "fetch_pane_text_internal",
+///             source: RuntimeOperationSource::Backend("empty pane".into()),
+///         });
 ///     }
 ///     Outcome::ok(text)
 /// }
@@ -316,6 +332,10 @@ pub struct _MigrationPatternDocOnly;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime_error(detail: impl Into<String>) -> Error {
+        runtime_operation_backend_error("outcome.test", detail)
+    }
 
     // -- Helpers for building test CancelReasons --
 
@@ -343,7 +363,7 @@ mod tests {
 
     #[test]
     fn ft_outcome_err() {
-        let o: FtOutcome<i32> = Outcome::err(Error::Runtime("boom".into()));
+        let o: FtOutcome<i32> = Outcome::err(test_runtime_error("boom"));
         assert!(o.is_err());
     }
 
@@ -367,7 +387,7 @@ mod tests {
     }
 
     fn try_err() -> FtOutcome<i32> {
-        let _v = try_outcome!(Outcome::<i32, Error>::err(Error::Runtime("fail".into())));
+        let _v = try_outcome!(Outcome::<i32, Error>::err(test_runtime_error("fail")));
         Outcome::ok(999) // unreachable
     }
 
@@ -443,7 +463,7 @@ mod tests {
 
     #[test]
     fn ft_outcome_to_result_err() {
-        let r = ft_outcome_to_result::<i32>(Outcome::err(Error::Runtime("bad".into())));
+        let r = ft_outcome_to_result::<i32>(Outcome::err(test_runtime_error("bad")));
         assert!(r.is_err());
     }
 
@@ -532,7 +552,15 @@ mod tests {
         let o = Outcome::<i32, _>::err("boom".to_string());
         let r = o.into_ft_result();
         assert!(r.is_err());
-        let msg = format!("{}", r.unwrap_err());
+        let err = r.unwrap_err();
+        assert!(matches!(
+            err,
+            Error::RuntimeOperation {
+                operation: "outcome.into_ft_result",
+                source: RuntimeOperationSource::Backend(_),
+            }
+        ));
+        let msg = format!("{err}");
         assert!(msg.contains("boom"));
     }
 
@@ -566,7 +594,7 @@ mod tests {
 
     #[test]
     fn result_ext_err_into_outcome() {
-        let r: crate::Result<i32> = Err(Error::Runtime("fail".into()));
+        let r: crate::Result<i32> = Err(test_runtime_error("fail"));
         let o = r.into_outcome();
         assert!(o.is_err());
     }
