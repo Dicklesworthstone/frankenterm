@@ -84,6 +84,7 @@ use serde::{Deserialize, Serialize};
 const GF_PRIM: u32 = 0x11d;
 
 /// Generator of the multiplicative group of GF(256).
+#[cfg(test)]
 const GF_GEN: u8 = 0x02;
 
 /// Precomputed log / exp tables for fast multiplication.
@@ -143,6 +144,7 @@ fn gf_inv(a: u8) -> u8 {
 }
 
 #[inline]
+#[cfg(test)]
 fn gf_div(a: u8, b: u8) -> u8 {
     if a == 0 {
         return 0;
@@ -362,7 +364,7 @@ fn generator_matrix(cfg: ErasureConfig) -> Vec<Vec<u8>> {
     // points i = 1..=parity (avoiding 0 which would zero out a
     // row).
     for i in cfg.k..cfg.n {
-        let eval = (i - cfg.k + 1) as u8;
+        let eval = i - cfg.k + 1;
         for j in 0..cfg.k {
             g[i as usize][j as usize] = gf_pow(eval, j as u32);
         }
@@ -390,7 +392,7 @@ pub fn encode_row(cfg: ErasureConfig, data: &[u8]) -> Vec<ErasureShard> {
     payload.extend_from_slice(&original_len.to_le_bytes());
     payload.extend_from_slice(data);
     // Pad to multiple of k.
-    let chunk_size = (payload.len() + cfg.k as usize - 1) / cfg.k as usize;
+    let chunk_size = payload.len().div_ceil(cfg.k as usize);
     let padded_total = chunk_size * cfg.k as usize;
     payload.resize(padded_total, 0u8);
 
@@ -486,35 +488,34 @@ pub fn reconstruct(
     // Gauss-Jordan elimination.
     for col in 0..k {
         // Find a pivot row with non-zero entry in this column.
-        let mut pivot = None;
-        for row in col..k {
-            if aug[row][col] != 0 {
-                pivot = Some(row);
-                break;
-            }
-        }
-        let pivot =
-            pivot.expect("Vandermonde sub-matrix is invertible — k rows linearly independent");
+        let pivot = aug
+            .iter()
+            .enumerate()
+            .take(k)
+            .skip(col)
+            .find_map(|(row, aug_row)| (aug_row[col] != 0).then_some(row))
+            .expect("Vandermonde sub-matrix is invertible — k rows linearly independent");
         if pivot != col {
             aug.swap(col, pivot);
         }
         // Scale pivot row to make leading 1.
         let inv = gf_inv(aug[col][col]);
-        for j in 0..2 * k {
-            aug[col][j] = gf_mul(aug[col][j], inv);
+        for value in aug[col].iter_mut().take(2 * k) {
+            *value = gf_mul(*value, inv);
         }
+        let pivot_row = aug[col].clone();
         // Eliminate other rows.
-        for row in 0..k {
+        for (row, target_row) in aug.iter_mut().enumerate().take(k) {
             if row == col {
                 continue;
             }
-            let factor = aug[row][col];
+            let factor = target_row[col];
             if factor == 0 {
                 continue;
             }
-            for j in 0..2 * k {
-                let term = gf_mul(factor, aug[col][j]);
-                aug[row][j] = gf_add(aug[row][j], term);
+            for (target, pivot_value) in target_row.iter_mut().zip(pivot_row.iter()).take(2 * k) {
+                let term = gf_mul(factor, *pivot_value);
+                *target = gf_add(*target, term);
             }
         }
     }
@@ -657,6 +658,11 @@ mod tests {
         assert_eq!(gf_mul(5, 0), 0);
         // Mul: 1 × x = x.
         assert_eq!(gf_mul(1, 0x5a), 0x5a);
+        // Div: x / y reverses multiplication by y for nonzero y.
+        assert_eq!(gf_div(0, 5), 0);
+        for x in 1u8..=255 {
+            assert_eq!(gf_div(gf_mul(x, 0x53), 0x53), x);
+        }
         // Inverse: x × x⁻¹ = 1.
         for x in 1u8..=255 {
             assert_eq!(gf_mul(x, gf_inv(x)), 1, "inverse of {x:#x} broken");

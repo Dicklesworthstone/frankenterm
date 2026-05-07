@@ -438,9 +438,7 @@ pub fn check_invariants(
         (last_action, last_outcome)
     {
         let prior_owner = match prior.claims.get(&claim).copied() {
-            Some(ClaimState::Claimed { owner }) | Some(ClaimState::Completed { owner }) => {
-                Some(owner)
-            }
+            Some(ClaimState::Claimed { owner } | ClaimState::Completed { owner }) => Some(owner),
             _ => None,
         };
         if prior_owner != Some(agent) {
@@ -459,9 +457,7 @@ pub fn check_invariants(
     ) = (last_action, last_outcome)
     {
         let prior_owner = match prior.claims.get(&claim).copied() {
-            Some(ClaimState::Claimed { owner }) | Some(ClaimState::Completed { owner }) => {
-                Some(owner)
-            }
+            Some(ClaimState::Claimed { owner } | ClaimState::Completed { owner }) => Some(owner),
             _ => None,
         };
         if prior_owner != Some(agent) {

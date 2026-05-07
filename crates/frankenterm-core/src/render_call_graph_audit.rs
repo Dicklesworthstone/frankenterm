@@ -92,8 +92,8 @@ impl CallGraph {
         Self::default()
     }
 
-    pub fn add_edge(&mut self, caller: CallSiteId, callee: CallSiteId) {
-        self.edges.entry(caller).or_default().insert(callee);
+    pub fn add_edge(&mut self, caller: CallSiteId, target: CallSiteId) {
+        self.edges.entry(caller).or_default().insert(target);
     }
 
     /// Number of distinct callers in the graph.

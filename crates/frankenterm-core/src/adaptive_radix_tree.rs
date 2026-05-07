@@ -400,15 +400,9 @@ impl<V> AdaptiveRadixTree<V> {
                 return node.value.as_ref();
             }
 
-            // Follow child
             let byte = key[depth];
-            match node.inner.find_child(byte) {
-                Some(child) => {
-                    current = child;
-                    depth += 1;
-                }
-                None => return None,
-            }
+            current = node.inner.find_child(byte)?;
+            depth += 1;
         }
     }
 
