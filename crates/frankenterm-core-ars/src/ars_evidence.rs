@@ -789,7 +789,7 @@ fn compute_entry_hash(
     // had zero cryptographic strength.
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
-    for byte in digest.iter() {
+    for byte in &digest {
         use std::fmt::Write as _;
         let _ = write!(&mut hex, "{:02x}", byte);
     }
