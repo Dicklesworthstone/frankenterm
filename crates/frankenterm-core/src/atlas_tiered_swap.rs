@@ -283,7 +283,7 @@ pub enum StagingTransferDirection {
 ///
 /// Byte-accurate accounting per the bead's spec: every event
 /// carries `bytes` so the wgpu layer can size its copy buffer
-/// + the test harness can assert the total upload/download
+/// and the test harness can assert the total upload/download
 /// volume matches the staging buffer's `used_bytes` delta.
 ///
 /// `frame_id` is the monotonic frame counter — lets the wgpu
@@ -382,7 +382,7 @@ impl DiskTierHandoffQueue {
     /// Drain pending handoffs in push order. Resets to empty.
     pub fn drain_pending(&mut self) -> Vec<DiskTierHandoff> {
         let mut drained = Vec::with_capacity(self.handoffs.len());
-        drained.extend(self.handoffs.drain(..));
+        drained.append(&mut self.handoffs);
         drained
     }
 
@@ -779,7 +779,7 @@ impl StagingTransferQueue {
     /// swap-decision order. Resets the queue to empty.
     pub fn drain_pending(&mut self) -> Vec<StagingTransferEvent> {
         let mut drained = Vec::with_capacity(self.events.len());
-        drained.extend(self.events.drain(..));
+        drained.append(&mut self.events);
         drained
     }
 
@@ -1278,10 +1278,8 @@ pub const fn bandwidth_aware_demotion_target(
     tier: AtlasTier,
     config: EvictionSelectorConfig,
 ) -> Option<AtlasTier> {
-    if config.skip_host_ram_on_demote {
-        if let AtlasTier::Vram = tier {
-            return Some(AtlasTier::Disk);
-        }
+    if config.skip_host_ram_on_demote && matches!(tier, AtlasTier::Vram) {
+        return Some(AtlasTier::Disk);
     }
     tier.demotion_target()
 }
