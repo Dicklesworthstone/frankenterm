@@ -2514,6 +2514,12 @@ pub(crate) fn record_policy_decision_context_serde_drop() {
 // investigate downstream schema-skew on consumers, not the writers.
 static POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Cumulative count of audit-record decision_context payloads that
 /// could not be parsed back into a `DecisionContext` (or into a raw
 /// JSON object for legacy surface extraction) since process load.
@@ -2529,11 +2535,20 @@ pub fn policy_decision_context_parse_drop_count() -> u64 {
 #[cfg(test)]
 pub(crate) fn reset_policy_decision_context_parse_drop_count_for_test() {
     POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT.store(0, Ordering::Relaxed);
+    POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT_FOR_TEST.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn policy_decision_context_parse_drop_count_for_test() -> u64 {
+    POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT_FOR_TEST.with(std::cell::Cell::get)
 }
 
 #[inline]
 fn record_policy_decision_context_parse_drop(phase: &'static str) {
     POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    POLICY_DECISION_CONTEXT_PARSE_DROP_COUNT_FOR_TEST
+        .with(|count| count.set(count.get().saturating_add(1)));
     tracing::warn!(
         target: "ft.policy.audit",
         event = "policy_decision_context_parse_drop",
@@ -3122,14 +3137,13 @@ impl RateLimiter {
         if let Some(pane_id) = pane_id {
             if self.limit_per_pane > 0 {
                 let key = (pane_id, action);
-                let mut current = 0;
-                let mut drop_empty_bucket = false;
-                if let Some(timestamps) = self.pane_counts.get_mut(&key) {
+                let current = if let Some(timestamps) = self.pane_counts.get_mut(&key) {
                     prune_old(timestamps, window_start);
-                    current = timestamps.len();
-                    drop_empty_bucket = current == 0;
-                }
-                if drop_empty_bucket {
+                    timestamps.len()
+                } else {
+                    0
+                };
+                if current == 0 {
                     self.pane_counts.remove(&key);
                 }
                 if current >= self.limit_per_pane as usize {
@@ -7971,7 +7985,7 @@ where
                         ActionKind::SendControl => {
                             client.send_control_with_cx(cx, pane_id, &text_owned).await
                         }
-                        other => Err(crate::Error::Runtime(format!(
+                        other => Err(crate::Error::Policy(format!(
                             "dispatch_wezterm_send_with_cx called with non-injection action: {other:?}"
                         ))),
                     };
@@ -8125,7 +8139,7 @@ where
                     .await
             }
             ActionKind::SendControl => client.send_control(pane_id, text).await,
-            other => Err(crate::Error::Runtime(format!(
+            other => Err(crate::Error::Policy(format!(
                 "dispatch_wezterm_send called with non-injection action: {other:?}"
             ))),
         }
@@ -8157,7 +8171,7 @@ where
                     .await
             }
             ActionKind::SendControl => client.send_control_with_cx(cx, pane_id, text).await,
-            other => Err(crate::Error::Runtime(format!(
+            other => Err(crate::Error::Policy(format!(
                 "dispatch_wezterm_send_with_cx called with non-injection action: {other:?}"
             ))),
         }
@@ -13097,7 +13111,7 @@ mod tests {
         let json = serde_json::to_string(&ctx).unwrap();
         assert!(parse_serialized_decision_context(Some(&json)).is_some());
         assert_eq!(
-            super::policy_decision_context_parse_drop_count(),
+            super::policy_decision_context_parse_drop_count_for_test(),
             0,
             "well-formed payload must not bump the counter"
         );
@@ -13109,7 +13123,10 @@ mod tests {
         // payload was lost.
         super::reset_policy_decision_context_parse_drop_count_for_test();
         assert!(parse_serialized_decision_context(None).is_none());
-        assert_eq!(super::policy_decision_context_parse_drop_count(), 0);
+        assert_eq!(
+            super::policy_decision_context_parse_drop_count_for_test(),
+            0
+        );
     }
 
     #[test]
@@ -13120,7 +13137,10 @@ mod tests {
         super::reset_policy_decision_context_parse_drop_count_for_test();
         let bad = r#"{"surface":"workflow","action":"NOT_A_REAL_ACTION"}"#;
         assert!(parse_serialized_decision_context(Some(bad)).is_none());
-        assert_eq!(super::policy_decision_context_parse_drop_count(), 1);
+        assert_eq!(
+            super::policy_decision_context_parse_drop_count_for_test(),
+            1
+        );
     }
 
     #[test]
@@ -13134,7 +13154,10 @@ mod tests {
         assert!(parse_serialized_decision_surface(Some("{not json")).is_none());
         // Both the typed_context AND raw_value_shape phases fire
         // for invalid-JSON input.
-        assert_eq!(super::policy_decision_context_parse_drop_count(), 2);
+        assert_eq!(
+            super::policy_decision_context_parse_drop_count_for_test(),
+            2
+        );
     }
 
     #[test]
@@ -13148,7 +13171,10 @@ mod tests {
         super::reset_policy_decision_context_parse_drop_count_for_test();
         let bad = r#"{"surface":"NOT_A_REAL_SURFACE"}"#;
         assert!(parse_serialized_decision_surface(Some(bad)).is_none());
-        assert_eq!(super::policy_decision_context_parse_drop_count(), 2);
+        assert_eq!(
+            super::policy_decision_context_parse_drop_count_for_test(),
+            2
+        );
     }
 
     #[test]
@@ -13158,7 +13184,10 @@ mod tests {
         super::reset_policy_decision_context_parse_drop_count_for_test();
         super::reset_policy_decision_context_serde_drop_count_for_test();
         assert!(parse_serialized_decision_context(Some("{bad")).is_none());
-        assert_eq!(super::policy_decision_context_parse_drop_count(), 1);
+        assert_eq!(
+            super::policy_decision_context_parse_drop_count_for_test(),
+            1
+        );
         assert_eq!(
             super::policy_decision_context_serde_drop_count(),
             0,
