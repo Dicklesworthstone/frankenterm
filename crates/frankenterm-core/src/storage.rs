@@ -7622,9 +7622,9 @@ thread_local! {
     /// `RusqliteBackend::new` consumes the connection, so the bridge has
     /// to swap the live `Connection` out of `&mut Connection` against
     /// some other `Connection` for the duration of the wrap. Allocating
-    /// a fresh `Connection::open_in_memory()` on every call burned
-    /// ~200 µs per WriteCommand. This thread-local caches that
-    /// allocation so the bridge pays the cost ONCE per writer thread
+    /// a fresh in-memory placeholder on every call burned ~200 µs per
+    /// WriteCommand. This thread-local caches that allocation so the
+    /// bridge pays the cost ONCE per writer thread
     /// (or per test thread), not once per command.
     ///
     /// `RefCell` (not `Cell`) so the Drop guard inside
@@ -7664,10 +7664,10 @@ thread_local! {
 /// during a held lock), so the Drop path itself can't double-
 /// panic and abort the process.
 ///
-/// **Cost.** `Connection::open_in_memory()` is called at most
-/// once per writer thread via [`WRITER_PLACEHOLDER_POOL`] (vs
-/// every WriteCommand previously). The thread-local placeholder
-/// is recycled across all calls on the same thread.
+/// **Cost.** The in-memory placeholder is constructed at most once
+/// per writer thread via [`WRITER_PLACEHOLDER_POOL`] (vs every
+/// WriteCommand previously). The thread-local placeholder is recycled
+/// across all calls on the same thread.
 ///
 /// **Re-entrancy.** Not part of the contract. The writer dispatch
 /// path never recurses, and the closure receives only
@@ -7679,16 +7679,23 @@ thread_local! {
 /// Used by per-WriteCommand dispatch handlers that have been
 /// migrated to call a `_backend` helper instead of a `_sync`
 /// helper.
+fn new_writer_placeholder_connection() -> Connection {
+    let config = crate::storage_backend_trait::OpenConfig {
+        wal_mode: false,
+        ..crate::storage_backend_trait::OpenConfig::default()
+    };
+    RusqliteBackend::open(":memory:", &config)
+        .expect("temp placeholder backend for writer-thread backend wrap")
+        .into_connection()
+}
+
 fn with_writer_backend<F, R>(conn: &mut Connection, f: F) -> R
 where
     F: FnOnce(&dyn StorageBackend) -> R,
 {
     let placeholder = WRITER_PLACEHOLDER_POOL
         .with(|cell| cell.borrow_mut().take())
-        .unwrap_or_else(|| {
-            Connection::open_in_memory()
-                .expect("temp placeholder Connection for writer-thread backend wrap")
-        });
+        .unwrap_or_else(new_writer_placeholder_connection);
     let owned = std::mem::replace(conn, placeholder);
 
     // Drop guard restores the live Connection from the wrapped
