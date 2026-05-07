@@ -17,6 +17,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::config::{Config, WorkspaceLayout};
+use crate::error::RuntimeOperationSource;
 use crate::policy::Redactor;
 use crate::storage::{AuditQuery, EventQuery, ExportQuery, SCHEMA_VERSION, StorageHandle};
 
@@ -516,6 +517,16 @@ fn redact_audit(
 // Bundle generation
 // =============================================================================
 
+fn diagnostic_cancelled_error(
+    operation: &'static str,
+    err: impl std::fmt::Display,
+) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(err.to_string()),
+    }
+}
+
 /// Generate a diagnostic bundle.
 ///
 /// The bundle is written as a set of JSON files into a timestamped directory.
@@ -770,7 +781,7 @@ pub async fn generate_bundle_with_cx(
     opts: &DiagnosticOptions,
 ) -> crate::Result<DiagnosticResult> {
     cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("generate_bundle cancelled: {err}")))?;
+        .map_err(|err| diagnostic_cancelled_error("generate_bundle", err))?;
 
     let redactor = Redactor::new();
 
@@ -1042,6 +1053,22 @@ fn dir_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_cancelled_error_uses_structured_runtime_operation() {
+        let err = diagnostic_cancelled_error("generate_bundle", "caller cancelled");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "generate_bundle");
+                assert_eq!(
+                    source,
+                    RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected RuntimeOperation, got {other:?}"),
+        }
+    }
 
     fn typed_decision_context_json(secret: &str) -> String {
         let mut context = crate::policy::DecisionContext::empty();
