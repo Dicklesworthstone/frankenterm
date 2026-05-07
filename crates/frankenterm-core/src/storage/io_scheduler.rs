@@ -962,10 +962,8 @@ fn class_operator_rank(row: &StorageIoClassSnapshot) -> u8 {
         3
     } else if row.degraded_total > 0 {
         2
-    } else if row.deferred_total > 0 {
-        1
     } else {
-        0
+        u8::from(row.deferred_total > 0)
     }
 }
 
