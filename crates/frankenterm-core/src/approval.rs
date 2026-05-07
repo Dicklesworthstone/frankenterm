@@ -6,11 +6,18 @@ use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ApprovalConfig;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, RuntimeOperationSource};
 use crate::policy::{ApprovalRequest, DecisionContext, PolicyDecision, PolicyInput};
 use crate::storage::{ApprovalTokenRecord, AuditActionRecord, StorageHandle};
 
 const DEFAULT_CODE_LEN: usize = 8;
+
+fn approval_cancelled_error(operation: &'static str, detail: impl Into<String>) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
 
 /// Workspace- and action-scoped approval context.
 ///
@@ -197,8 +204,9 @@ impl<'a> ApprovalStore<'a> {
         input: &PolicyInput,
         summary: Option<String>,
     ) -> Result<ApprovalRequest> {
-        cx.checkpoint()
-            .map_err(|err| Error::Runtime(format!("approval.issue cancelled pre-start: {err}")))?;
+        cx.checkpoint().map_err(|err| {
+            approval_cancelled_error("approval.issue", format!("pre-start: {err}"))
+        })?;
 
         let now = now_ms();
         let active = self
@@ -213,9 +221,10 @@ impl<'a> ApprovalStore<'a> {
         }
 
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!(
-                "approval.issue cancelled between count and insert (active={active}): {err}"
-            ))
+            approval_cancelled_error(
+                "approval.issue",
+                format!("between count and insert (active={active}): {err}"),
+            )
         })?;
 
         let code = generate_allow_once_code(DEFAULT_CODE_LEN);
@@ -325,9 +334,7 @@ impl<'a> ApprovalStore<'a> {
         risk_summary: Option<String>,
     ) -> Result<ApprovalRequest> {
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!(
-                "approval.issue_for_plan cancelled pre-start: {err}"
-            ))
+            approval_cancelled_error("approval.issue_for_plan", format!("pre-start: {err}"))
         })?;
 
         let now = now_ms();
@@ -343,9 +350,10 @@ impl<'a> ApprovalStore<'a> {
         }
 
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!(
-                "approval.issue_for_plan cancelled between count and insert (active={active}): {err}"
-            ))
+            approval_cancelled_error(
+                "approval.issue_for_plan",
+                format!("between count and insert (active={active}): {err}"),
+            )
         })?;
 
         let code = generate_allow_once_code(DEFAULT_CODE_LEN);
@@ -492,9 +500,7 @@ impl<'a> ApprovalStore<'a> {
         audit_context: Option<ApprovalAuditContext>,
     ) -> Result<Option<ApprovalTokenRecord>> {
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!(
-                "approval.consume_for_plan cancelled pre-start: {err}"
-            ))
+            approval_cancelled_error("approval.consume_for_plan", format!("pre-start: {err}"))
         })?;
 
         let code_hash = hash_allow_once_code(allow_once_code);
@@ -523,9 +529,10 @@ impl<'a> ApprovalStore<'a> {
                 }
 
                 cx.checkpoint().map_err(|err| {
-                    Error::Runtime(format!(
-                        "approval.consume_for_plan cancelled after plan-match, before audit: {err}"
-                    ))
+                    approval_cancelled_error(
+                        "approval.consume_for_plan",
+                        format!("after plan-match, before audit: {err}"),
+                    )
                 })?;
 
                 self.audit_approval_grant_with_cx(
@@ -659,7 +666,7 @@ impl<'a> ApprovalStore<'a> {
         audit_context: Option<ApprovalAuditContext>,
     ) -> Result<Option<ApprovalTokenRecord>> {
         cx.checkpoint().map_err(|err| {
-            Error::Runtime(format!("approval.consume cancelled pre-start: {err}"))
+            approval_cancelled_error("approval.consume", format!("pre-start: {err}"))
         })?;
 
         let code_hash = hash_allow_once_code(allow_once_code);
@@ -678,9 +685,10 @@ impl<'a> ApprovalStore<'a> {
 
         if record.is_some() {
             cx.checkpoint().map_err(|err| {
-                Error::Runtime(format!(
-                    "approval.consume cancelled after token consumed, before audit: {err}"
-                ))
+                approval_cancelled_error(
+                    "approval.consume",
+                    format!("after token consumed, before audit: {err}"),
+                )
             })?;
 
             self.audit_approval_grant_with_cx(
