@@ -1,10 +1,9 @@
 //! Persistent-rope terminal-grid prototype + flat-grid baseline
 //! ([BR-TERM-EMULATOR-UPLIFT.2.5] / `ft-mpc9b.2.5`).
 //!
-//! P3 alien-artifact research bead. Explicit acceptance: "prototype
-//! + bench results checked in regardless of ship/no-ship + decision
-//! documented at docs/perf/persistent-rope-evaluation.md". The bead's
-//! rubric:
+//! P3 alien-artifact research bead. Explicit acceptance: "prototype plus
+//! bench results checked in regardless of ship/no-ship, with the decision
+//! documented at docs/perf/persistent-rope-evaluation.md". The bead's rubric:
 //!
 //! > Ship rope-backed grid IFF reflow ≥2× faster on 200-pane fleet
 //! > AND memory overhead ≤30% AND render thread unaffected.
@@ -236,10 +235,6 @@ impl RopeNode {
         }
     }
 
-    fn is_leaf_full(&self) -> bool {
-        matches!(self, Self::Leaf { lines } if lines.len() >= LINES_PER_GROUP)
-    }
-
     /// Recursively get a line by index.
     fn get(&self, idx: usize) -> Option<&Line> {
         match self {
@@ -377,10 +372,6 @@ impl RopeNode {
                 }
             }
         }
-    }
-
-    fn _is_leaf_full(&self) -> bool {
-        self.is_leaf_full()
     }
 }
 
