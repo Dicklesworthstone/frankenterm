@@ -610,9 +610,10 @@ pub fn assert_ran_to_completion(report: &LabReport) {
                 report.steps
             );
         }
-        ref other => {
+        AutoAdvanceTermination::StepLimitReached => {
             panic!(
-                "LabRuntime did not complete: termination = {other:?} after {} steps",
+                "LabRuntime did not complete: termination = {:?} after {} steps",
+                AutoAdvanceTermination::StepLimitReached,
                 report.steps
             );
         }
