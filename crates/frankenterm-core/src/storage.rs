@@ -16689,35 +16689,110 @@ mod policy_decision_tests;
 mod fts_async_flat_tests {
     use super::*;
 
-#[test]
-fn fts_search_returns_matching_segments() {
+fn memory_backend() -> RusqliteBackend {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
+    RusqliteBackend::new(conn)
+}
+
+fn seed_pane_backend(backend: &dyn StorageBackend, pane_id: i64, now_ms: i64) {
+    execute_typed(
+        backend,
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            ToSqlValue::Integer(pane_id),
+            ToSqlValue::Text("local"),
+            ToSqlValue::Integer(now_ms),
+            ToSqlValue::Integer(now_ms),
+            ToSqlValue::Integer(1),
+        ],
+    )
+    .unwrap();
+}
+
+fn seed_pane_with_last_seen_backend(
+    backend: &dyn StorageBackend,
+    pane_id: i64,
+    first_seen_at: i64,
+    last_seen_at: i64,
+) {
+    execute_typed(
+        backend,
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            ToSqlValue::Integer(pane_id),
+            ToSqlValue::Text("local"),
+            ToSqlValue::Integer(first_seen_at),
+            ToSqlValue::Integer(last_seen_at),
+            ToSqlValue::Integer(1),
+        ],
+    )
+    .unwrap();
+}
+
+fn seed_segment_backend(
+    backend: &dyn StorageBackend,
+    pane_id: i64,
+    seq: i64,
+    content: &str,
+    captured_at: i64,
+) -> i64 {
+    let content_len = i64::try_from(content.len()).unwrap();
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(pane_id),
+                ToSqlValue::Integer(seq),
+                ToSqlValue::Text(content),
+                ToSqlValue::Integer(content_len),
+                ToSqlValue::Integer(captured_at),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+    RowReader::new(&row).i64(0).unwrap()
+}
+
+fn seed_segment_embedding_backend(
+    backend: &dyn StorageBackend,
+    segment_id: i64,
+    embedder_id: &str,
+    dimension: i64,
+    vector: &[u8],
+    embedded_at: i64,
+) {
+    execute_typed(
+        backend,
+        "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            ToSqlValue::Integer(segment_id),
+            ToSqlValue::Text(embedder_id),
+            ToSqlValue::Integer(dimension),
+            ToSqlValue::Blob(vector),
+            ToSqlValue::Integer(embedded_at),
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn fts_search_returns_matching_segments() {
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    // Insert pane
-    conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
-
-    // Insert segments with different content
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 0i64, "error: connection refused", 26, now_ms],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 1i64, "successfully connected to server", 32, now_ms + 100],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 2i64, "another error occurred here", 27, now_ms + 200],
-        ).unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_segment_backend(&backend, 1, 0, "error: connection refused", now_ms);
+    seed_segment_backend(&backend, 1, 1, "successfully connected to server", now_ms + 100);
+    seed_segment_backend(&backend, 1, 2, "another error occurred here", now_ms + 200);
 
     // Search for "error" through the trait-backed path.
-    let backend = RusqliteBackend::new(conn);
     let results =
         search_fts_with_snippets_backend(&backend, "error", &SearchOptions::default()).unwrap();
 
@@ -16728,25 +16803,14 @@ fn fts_search_returns_matching_segments() {
 
 #[test]
 fn fts_backend_search_returns_inserted_rows() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 0i64, "backend needle one", 18, now_ms],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 1i64, "backend needle two", 18, now_ms + 1],
-        ).unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_segment_backend(&backend, 1, 0, "backend needle one", now_ms);
+    seed_segment_backend(&backend, 1, 1, "backend needle two", now_ms + 1);
 
-    let backend = RusqliteBackend::new(conn);
     let options = SearchOptions::default();
     let via_backend = search_fts_with_snippets_backend(&backend, "needle", &options).unwrap();
 
@@ -16763,46 +16827,27 @@ fn fts_backend_search_returns_inserted_rows() {
 
 #[test]
 fn hybrid_backend_search_returns_fused_ranked_results() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
-    conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
 
     let content_a = "hybrid needle alpha";
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 0i64, content_a, i64::try_from(content_a.len()).unwrap(), now_ms],
-        ).unwrap();
-    let seg_a = conn.last_insert_rowid();
+    let seg_a = seed_segment_backend(&backend, 1, 0, content_a, now_ms);
 
     let content_b = "hybrid needle beta";
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 1i64, content_b, i64::try_from(content_b.len()).unwrap(), now_ms + 1],
-        ).unwrap();
-    let seg_b = conn.last_insert_rowid();
+    let seg_b = seed_segment_backend(&backend, 1, 1, content_b, now_ms + 1);
 
     let query_vector = [1.0_f32, 0.0];
     let vector_a = encode_f32_embedding_blob(&[1.0_f32, 0.0]).unwrap();
     let vector_b = encode_f32_embedding_blob(&[0.0_f32, 1.0]).unwrap();
-    conn.execute(
-            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![seg_a, "hybrid-embedder", 2i64, vector_a, now_ms],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![seg_b, "hybrid-embedder", 2i64, vector_b, now_ms + 1],
-        ).unwrap();
+    seed_segment_embedding_backend(&backend, seg_a, "hybrid-embedder", 2, &vector_a, now_ms);
+    seed_segment_embedding_backend(&backend, seg_b, "hybrid-embedder", 2, &vector_b, now_ms + 1);
 
     let options = SearchOptions {
         limit: Some(2),
         ..SearchOptions::default()
     };
-    let backend = RusqliteBackend::new(conn);
     let backend_state = Arc::new(Mutex::new(SemanticBudgetState::new(
         SemanticBudgetConfig::default(),
     )));
@@ -16856,27 +16901,18 @@ fn hybrid_backend_search_returns_fused_ranked_results() {
 
 #[test]
 fn fts_search_returns_snippets_with_highlights() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
-
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 0i64, "The important error message appears here", 40, now_ms],
-        ).unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_segment_backend(&backend, 1, 0, "The important error message appears here", now_ms);
 
     let options = SearchOptions {
         highlight_prefix: Some("[[".to_string()),
         highlight_suffix: Some("]]".to_string()),
         ..Default::default()
     };
-    let backend = RusqliteBackend::new(conn);
     let results = search_fts_with_snippets_backend(&backend, "error", &options).unwrap();
 
     assert_eq!(results.len(), 1);
@@ -16889,34 +16925,20 @@ fn fts_search_returns_snippets_with_highlights() {
 
 #[test]
 fn fts_search_respects_pane_filter() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![2i64, "local", now_ms, now_ms, 1],
-        ).unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_pane_backend(&backend, 2, now_ms);
 
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 0i64, "pane one test message", 21, now_ms],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![2i64, 0i64, "pane two test message", 21, now_ms],
-        ).unwrap();
+    seed_segment_backend(&backend, 1, 0, "pane one test message", now_ms);
+    seed_segment_backend(&backend, 2, 0, "pane two test message", now_ms);
 
     let options = SearchOptions {
         pane_id: Some(1),
         ..Default::default()
     };
-    let backend = RusqliteBackend::new(conn);
     let results = search_fts_with_snippets_backend(&backend, "test", &options).unwrap();
 
     assert_eq!(results.len(), 1);
@@ -16925,35 +16947,21 @@ fn fts_search_respects_pane_filter() {
 
 #[test]
 fn fts_search_respects_time_filter() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, "local", now_ms, now_ms + 2000, 1],
-        ).unwrap();
+    seed_pane_with_last_seen_backend(&backend, 1, now_ms, now_ms + 2000);
 
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 0i64, "early test message", 18, now_ms],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 1i64, "middle test message", 19, now_ms + 1000],
-        ).unwrap();
-    conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, 2i64, "late test message", 17, now_ms + 2000],
-        ).unwrap();
+    seed_segment_backend(&backend, 1, 0, "early test message", now_ms);
+    seed_segment_backend(&backend, 1, 1, "middle test message", now_ms + 1000);
+    seed_segment_backend(&backend, 1, 2, "late test message", now_ms + 2000);
 
     let options = SearchOptions {
         since: Some(now_ms + 500),
         until: Some(now_ms + 1500),
         ..Default::default()
     };
-    let backend = RusqliteBackend::new(conn);
     let results = search_fts_with_snippets_backend(&backend, "test", &options).unwrap();
 
     assert_eq!(results.len(), 1);
@@ -16962,10 +16970,7 @@ fn fts_search_respects_time_filter() {
 
 #[test]
 fn fts_search_invalid_query_returns_error() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
-
-    let backend = RusqliteBackend::new(conn);
+    let backend = memory_backend();
     let result = validate_fts_query_backend(&backend, "\"unclosed quote");
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -16984,11 +16989,9 @@ fn fts_search_invalid_query_returns_error() {
 /// empty match sets — pin that we promote that to `Ok(())`.
 #[test]
 fn ft_76d9i_validate_fts_query_accepts_empty_match_set() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
     // Empty FTS index. Any well-formed query must validate successfully
     // because the syntax is fine — there are simply no rows to match.
-    let backend = RusqliteBackend::new(conn);
     let result =
         validate_fts_query_backend(&backend, "absolutely_nothing_matches_this_token");
     assert!(
@@ -17007,22 +17010,12 @@ fn ft_76d9i_validate_fts_query_accepts_empty_match_set() {
 /// regressing the happy path.
 #[test]
 fn ft_76d9i_validate_fts_query_accepts_well_formed_matching_query() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
     let now_ms = 1_700_000_000_000i64;
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
     for i in 0i64..5 {
-        conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![1i64, i, "needle in many haystacks", 24, now_ms + i],
-        )
-        .unwrap();
+        seed_segment_backend(&backend, 1, i, "needle in many haystacks", now_ms + i);
     }
-    let backend = RusqliteBackend::new(conn);
     assert!(validate_fts_query_backend(&backend, "needle").is_ok());
     assert!(validate_fts_query_backend(&backend, "haystacks").is_ok());
     // FTS5 prefix and operators still work after the shape change.
@@ -17032,36 +17025,21 @@ fn ft_76d9i_validate_fts_query_accepts_well_formed_matching_query() {
 
 #[test]
 fn fts_search_respects_limit() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
 
     for i in 0i64..10 {
-        conn.execute(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                1i64,
-                i,
-                format!("test message number {i}"),
-                20,
-                now_ms + i * 100
-            ],
-        )
-        .unwrap();
+        let content = format!("test message number {i}");
+        seed_segment_backend(&backend, 1, i, &content, now_ms + i * 100);
     }
 
     let options = SearchOptions {
         limit: Some(3),
         ..Default::default()
     };
-    let backend = RusqliteBackend::new(conn);
     let results = search_fts_with_snippets_backend(&backend, "test", &options).unwrap();
 
     assert_eq!(results.len(), 3, "Should respect limit of 3");
@@ -17069,29 +17047,14 @@ fn fts_search_respects_limit() {
 
 #[test]
 fn fts_search_bm25_ordering() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_segment_backend(&backend, 1, 0, "single error here", now_ms);
+    seed_segment_backend(&backend, 1, 1, "error error error multiple errors", now_ms + 100);
 
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, 0i64, "single error here", 17, now_ms],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, 1i64, "error error error multiple errors", 33, now_ms + 100],
-    )
-    .unwrap();
-
-    let backend = RusqliteBackend::new(conn);
     let results =
         search_fts_with_snippets_backend(&backend, "error", &SearchOptions::default()).unwrap();
 
@@ -17104,28 +17067,17 @@ fn fts_search_bm25_ordering() {
 
 #[test]
 fn fts_search_no_snippets_option() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
-
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, 0i64, "test content here", 17, now_ms],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_segment_backend(&backend, 1, 0, "test content here", now_ms);
 
     let options = SearchOptions {
         include_snippets: Some(false),
         ..Default::default()
     };
-    let backend = RusqliteBackend::new(conn);
     let results = search_fts_with_snippets_backend(&backend, "test", &options).unwrap();
 
     assert_eq!(results.len(), 1);
@@ -17142,26 +17094,17 @@ fn fts_search_no_snippets_option() {
 /// set `include_highlights = Some(false)`.
 #[test]
 fn fts_search_skips_highlight_when_disabled_but_keeps_snippet() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            1i64,
-            0i64,
-            "an interesting needle hides in this haystack of text",
-            52,
-            now_ms,
-        ],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_segment_backend(
+        &backend,
+        1,
+        0,
+        "an interesting needle hides in this haystack of text",
+        now_ms,
+    );
 
     let options = SearchOptions {
         include_snippets: Some(true),
@@ -17170,7 +17113,6 @@ fn fts_search_skips_highlight_when_disabled_but_keeps_snippet() {
         highlight_suffix: Some("]]".to_string()),
         ..Default::default()
     };
-    let backend = RusqliteBackend::new(conn);
     let results = search_fts_with_snippets_backend(&backend, "needle", &options).unwrap();
 
     assert_eq!(results.len(), 1);
@@ -17196,37 +17138,19 @@ fn fts_search_skips_highlight_when_disabled_but_keeps_snippet() {
 /// order.
 #[test]
 fn fts_search_two_stage_preserves_ordering() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
 
     // Two segments share the same content (same BM25 score), inserted at
     // different timestamps; tie-break must order by captured_at ASC.
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, 0i64, "needle word", 11, now_ms + 200],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, 1i64, "needle word", 11, now_ms + 100],
-    )
-    .unwrap();
+    seed_segment_backend(&backend, 1, 0, "needle word", now_ms + 200);
+    seed_segment_backend(&backend, 1, 1, "needle word", now_ms + 100);
     // High-density "needle" segment — BM25 should rank this first
     // (more occurrences in shorter content yields a more-negative score).
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, 2i64, "needle needle needle", 20, now_ms + 50],
-    )
-    .unwrap();
+    seed_segment_backend(&backend, 1, 2, "needle needle needle", now_ms + 50);
 
-    let backend = RusqliteBackend::new(conn);
     let results =
         search_fts_with_snippets_backend(&backend, "needle", &SearchOptions::default()).unwrap();
     assert_eq!(results.len(), 3);
@@ -17254,25 +17178,14 @@ fn fts_search_two_stage_preserves_ordering() {
 
 #[test]
 fn fts_search_no_match_returns_empty() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
-
-    conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, 0i64, "hello world", 11, now_ms],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_segment_backend(&backend, 1, 0, "hello world", now_ms);
 
     // Search for term that doesn't exist
-    let backend = RusqliteBackend::new(conn);
     let results =
         search_fts_with_snippets_backend(&backend, "nonexistent", &SearchOptions::default())
             .unwrap();
@@ -17282,11 +17195,9 @@ fn fts_search_no_match_returns_empty() {
 
 #[test]
 fn fts_search_empty_db_returns_empty() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     // Search on empty database (no panes, no segments)
-    let backend = RusqliteBackend::new(conn);
     let results =
         search_fts_with_snippets_backend(&backend, "anything", &SearchOptions::default()).unwrap();
 
