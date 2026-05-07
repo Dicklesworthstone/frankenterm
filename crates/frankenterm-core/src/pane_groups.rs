@@ -465,7 +465,7 @@ pub fn apply_group_op(registry: &mut PaneGroupRegistry, op: &GroupOp) -> GroupOp
                 };
             };
             let old_normalized = g.name.to_ascii_lowercase();
-            g.name = new_name.clone();
+            g.name.clone_from(new_name);
             registry.name_index.remove(&old_normalized);
             registry.name_index.insert(new_normalized, *group);
             push_event(
