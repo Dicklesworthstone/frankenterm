@@ -338,3 +338,27 @@ fn synthetic_pack_unknown_top_level_property_must_fail() {
          (additionalProperties: false should kick)"
     );
 }
+
+#[test]
+fn synthetic_pack_unknown_rule_property_must_fail() {
+    let validator = load_schema();
+    let bad = serde_json::json!({
+        "name": "synthetic",
+        "version": "1.0.0",
+        "rules": [{
+            "id": "codex.synthetic.unknown_field",
+            "agent_type": "codex",
+            "event_type": "synthetic_unknown_field",
+            "severity": "warning",
+            "anchors": ["synthetic"],
+            "description": "Synthetic rule carrying an unknown field.",
+            "unexpected_rule_field": "this is not allowed"
+        }]
+    });
+    let result = validator.validate(&bad);
+    assert!(
+        result.is_err(),
+        "schema validator did not reject a rule with an unknown property \
+         (Rule.additionalProperties: false should kick)"
+    );
+}

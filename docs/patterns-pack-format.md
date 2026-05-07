@@ -74,10 +74,10 @@ A rule (Rust: `RuleDef`) has the following fields. `MUST` /
 | `learn_more_url` | string | MAY | URL for additional documentation about this rule. |
 
 Unknown rule fields are tolerated by the parser (silent drop), but
-the conformance gate flags the JSON Schema `additionalProperties`
-contract: pack files SHOULD NOT carry unknown rule fields. CI
-treats this as a warning (not a build failure) so older packs
-continue to load.
+the conformance gate enforces the JSON Schema `additionalProperties`
+contract: pack files MUST NOT carry unknown rule fields. CI treats
+unknown rule fields as a build failure even though the lower-level
+serde parser can still deserialize them.
 
 ## Validation
 
@@ -140,7 +140,7 @@ fixture corpus mirroring this spec:
 - `valid/multi_rule_pack.json` — multiple rules in JSON form.
 - `valid/toml_pack.toml` — TOML round-trip example.
 - `invalid/duplicate_rule_id.yaml` — two rules with the same `id`.
-- `invalid/missing_required.yaml` — rule with no `severity`.
+- `invalid/missing_severity.yaml` — rule with no `severity`.
 - `invalid/empty_name.yaml` — pack with `name: ""`.
 
 The conformance test
