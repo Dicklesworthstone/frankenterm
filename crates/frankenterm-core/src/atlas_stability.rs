@@ -6,8 +6,8 @@
 //! integration shipped in `ft-c9arc` (drop the
 //! `recreate_texture_atlas` from `apply_scale_change`, wire the
 //! `last_synced_version` cursor on `GlyphCache`, expose `Atlas::grow`
-//! + `atlas_grow_count`). This module pins the **structured-logging
-//! contract** the renderer emits per atlas op + per resize, and the
+//! and `atlas_grow_count`). This module pins the **structured-logging
+//! contract** the renderer emits per atlas op and per resize, and the
 //! **stability invariants** the regression fixture asserts.
 //!
 //! The headline correctness rule:
@@ -225,7 +225,7 @@ pub fn check_pure_resize(resize: &AtlasStabilityResize) -> Vec<AtlasStabilityVio
 ///
 /// The GUI populates this from the live `metrics` recorder at
 /// snapshot time; the regression fixture exercises the field shape
-/// + serde stability so the future GUI integration can plug in
+/// plus serde stability so the future GUI integration can plug in
 /// without re-deriving the contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtlasStabilityHealth {
