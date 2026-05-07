@@ -85,8 +85,10 @@ if cargo_test "config" > "${ARTIFACT_DIR}/config_test_output.txt" 2>&1; then
             "config_source=all" "override_path=none" "effective_value_hash=n/a" "redacted_fields=0"
     fi
 else
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: config tests (filter may not match all)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: config tests (see ${ARTIFACT_DIR}/config_test_output.txt)"
+    log_jsonl "$VALIDATION_JSONL" "$SCENARIO" "config_test" "fail" \
+        "config_source=all" "override_path=none" "effective_value_hash=n/a" "redacted_fields=0"
 fi
 
 # ── Phase 3: Precedence verification ──────────────────────────

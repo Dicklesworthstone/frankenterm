@@ -76,8 +76,10 @@ if cargo_test "pane_tier" > "${ARTIFACT_DIR}/pane_tier_output.txt" 2>&1; then
             "p50_ms=0" "p95_ms=0" "p99_ms=0" "pane_count=50" "event_rate=1000"
     fi
 else
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: pane tier tests (filter may not match)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: pane tier tests (see ${ARTIFACT_DIR}/pane_tier_output.txt)"
+    log_jsonl "$TIMELINE_JSONL" "$SCENARIO" "pane_tier_test" "fail" \
+        "p50_ms=0" "p95_ms=0" "p99_ms=0" "pane_count=0" "event_rate=0"
 fi
 
 # ── Phase 3: Benchmark data collection ─────────────────────────

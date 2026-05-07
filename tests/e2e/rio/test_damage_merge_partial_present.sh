@@ -40,10 +40,10 @@ if cargo_test "damage" > "${ARTIFACT_DIR}/unit_test_output.txt" 2>&1; then
         echo "  PASS: damage merge unit tests"
     fi
 else
-    log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "unit_test" "skip" \
+    log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "unit_test" "fail" \
         "damage_scope=none" "fallback_to_full=false" "dirty_regions=0"
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: damage merge unit tests not yet implemented"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: damage merge unit tests (see ${ARTIFACT_DIR}/unit_test_output.txt)"
 fi
 
 # ── Phase 2: Rio anchor verification ───────────────────────────
@@ -95,10 +95,10 @@ if cargo_test "resize" > "${ARTIFACT_DIR}/resize_test_output.txt" 2>&1; then
         echo "  PASS: resize-related tests (partial damage correctness)"
     fi
 else
-    log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "damage_precedence" "skip" \
+    log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "damage_precedence" "fail" \
         "damage_scope=none" "fallback_to_full=false" "dirty_regions=0"
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: resize/damage tests not yet targeted"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: resize/damage tests (see ${ARTIFACT_DIR}/resize_test_output.txt)"
 fi
 
 # ── Write summary ──────────────────────────────────────────────

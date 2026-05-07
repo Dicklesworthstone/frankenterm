@@ -78,8 +78,10 @@ if cargo_test "scheduler\|pacing\|frame_rate" > "${ARTIFACT_DIR}/pacing_test_out
             "p50_ms=0" "p95_ms=0" "p99_ms=0" "pane_count=0" "event_rate=0"
     fi
 else
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: scheduler/pacing tests (filter may not match)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: scheduler/pacing tests (see ${ARTIFACT_DIR}/pacing_test_output.txt)"
+    log_jsonl "$PACING_JSONL" "$SCENARIO" "pacing_test" "fail" \
+        "p50_ms=0" "p95_ms=0" "p99_ms=0" "pane_count=0" "event_rate=0"
 fi
 
 # ── Phase 3: Policy tier definitions check ─────────────────────

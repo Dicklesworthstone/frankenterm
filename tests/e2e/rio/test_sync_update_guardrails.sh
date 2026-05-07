@@ -112,8 +112,10 @@ if cargo_test "backpressure" > "${ARTIFACT_DIR}/backpressure_test_output.txt" 2>
             "sync_hold_bytes=0" "batch_size=0" "activity_tier=all" "guardrail_triggered=false"
     fi
 else
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: backpressure tests (may not match exact filter)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: backpressure tests (see ${ARTIFACT_DIR}/backpressure_test_output.txt)"
+    log_jsonl "$BATCH_JSONL" "$SCENARIO" "backpressure_test" "fail" \
+        "sync_hold_bytes=0" "batch_size=0" "activity_tier=all" "guardrail_triggered=false"
 fi
 
 # ── Write artifacts ────────────────────────────────────────────

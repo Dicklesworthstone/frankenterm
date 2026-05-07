@@ -74,8 +74,10 @@ if cargo_test "tier" > "${ARTIFACT_DIR}/tier_test_output.txt" 2>&1; then
             "memory_tier=all" "scrollback_bytes=0" "cache_bytes=0" "queue_bytes=0"
     fi
 else
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: tier tests (filter may not match)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: tier tests (see ${ARTIFACT_DIR}/tier_test_output.txt)"
+    log_jsonl "$BUDGET_JSONL" "$SCENARIO" "tier_validation" "fail" \
+        "memory_tier=all" "scrollback_bytes=0" "cache_bytes=0" "queue_bytes=0"
 fi
 
 # ── Phase 3: Budget transition tests ──────────────────────────
@@ -89,8 +91,10 @@ if cargo_test "budget\|pressure\|evict" > "${ARTIFACT_DIR}/budget_test_output.tx
             "memory_tier=normal" "scrollback_bytes=0" "cache_bytes=0" "queue_bytes=0"
     fi
 else
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: budget/pressure transition tests"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: budget/pressure transition tests (see ${ARTIFACT_DIR}/budget_test_output.txt)"
+    log_jsonl "$BUDGET_JSONL" "$SCENARIO" "budget_transitions" "fail" \
+        "memory_tier=normal" "scrollback_bytes=0" "cache_bytes=0" "queue_bytes=0"
 fi
 
 # ── Write artifacts ────────────────────────────────────────────

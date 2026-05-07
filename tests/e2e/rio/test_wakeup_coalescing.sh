@@ -77,11 +77,10 @@ if cargo_test "coalesce" > "${ARTIFACT_DIR}/coalesce_test_output.txt" 2>&1; then
         echo "  PASS: coalescing semantics tests"
     fi
 else
-    # Tests may not exist yet — that's expected during scaffold phase
-    log_jsonl "$EVENTS_JSONL" "$SCENARIO" "coalescing_semantics" "skip" \
+    log_jsonl "$EVENTS_JSONL" "$SCENARIO" "coalescing_semantics" "fail" \
         "queue_depth=0" "coalesced_count=0" "wakeup_to_frame_ms=0"
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    echo "  SKIP: coalescing semantics tests not yet implemented"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "  FAIL: coalescing semantics tests (see ${ARTIFACT_DIR}/coalesce_test_output.txt)"
 fi
 
 # ── Phase 4: Rio anchor verification ───────────────────────────
