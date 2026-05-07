@@ -18176,37 +18176,6 @@ fn query_latest_secret_scan_report_backend(
         .transpose()
 }
 
-/// Direct-rusqlite path. Kept for transitional fallback while
-/// [`query_latest_secret_scan_report_backend`] settles in (br-ft-l1jgo).
-#[allow(dead_code)]
-fn query_latest_secret_scan_report(
-    conn: &Connection,
-    scope_hash: &str,
-) -> Result<Option<SecretScanReportRecord>> {
-    conn.query_row(
-        "SELECT id, scope_hash, scope_json, report_version, last_segment_id, \
-         report_json, created_at
-         FROM secret_scan_reports
-         WHERE scope_hash = ?1
-         ORDER BY created_at DESC, id DESC
-         LIMIT 1",
-        params![scope_hash],
-        |row| {
-            Ok(SecretScanReportRecord {
-                id: row.get(0)?,
-                scope_hash: row.get(1)?,
-                scope_json: row.get(2)?,
-                report_version: row.get(3)?,
-                last_segment_id: row.get(4)?,
-                report_json: row.get(5)?,
-                created_at: row.get(6)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
-}
-
 // =============================================================================
 // Export Query Functions  →  moved to `storage/export.rs`
 // =============================================================================
