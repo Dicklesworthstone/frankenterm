@@ -20,8 +20,16 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::error::RuntimeOperationSource;
 use crate::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
 use crate::wezterm::{SpawnTarget, SplitDirection, WeztermHandle};
+
+fn restore_cancelled_error(operation: &'static str, err: impl std::fmt::Display) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(err.to_string()),
+    }
+}
 
 // =============================================================================
 // Configuration
@@ -148,7 +156,7 @@ impl LayoutRestorer {
         snapshot: &TopologySnapshot,
     ) -> crate::Result<RestoreResult> {
         cx.checkpoint()
-            .map_err(|err| crate::Error::Runtime(format!("restore cancelled: {err}")))?;
+            .map_err(|err| restore_cancelled_error("restore_layout.restore.preflight", err))?;
 
         let mut result = RestoreResult::new();
 
@@ -159,7 +167,7 @@ impl LayoutRestorer {
 
         for (win_idx, window) in snapshot.windows.iter().enumerate() {
             cx.checkpoint().map_err(|err| {
-                crate::Error::Runtime(format!("restore cancelled between windows: {err}"))
+                restore_cancelled_error("restore_layout.restore.between_windows", err)
             })?;
             match self.restore_window(window, win_idx, &mut result).await {
                 Ok(restored_any_tabs) => {
@@ -827,6 +835,22 @@ mod tests {
                 }],
                 active_tab_index: None,
             }],
+        }
+    }
+
+    #[test]
+    fn restore_cancelled_error_uses_structured_runtime_operation() {
+        let err = restore_cancelled_error("restore_layout.test_checkpoint", "caller cancelled");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "restore_layout.test_checkpoint");
+                assert_eq!(
+                    source,
+                    crate::error::RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
         }
     }
 
