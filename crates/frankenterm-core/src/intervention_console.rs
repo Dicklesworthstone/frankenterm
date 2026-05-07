@@ -1464,8 +1464,8 @@ mod tests {
 
     // br-ft-fmeic: property test — for any sequence of register +
     // submit-approval + unregister calls, pending_approvals MUST
-    // never include an approval whose pane was unregistered after
-    // its submission.
+    // never include an approval request that was pending when its
+    // pane was unregistered.
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config {
             cases: 64,
@@ -1484,40 +1484,39 @@ mod tests {
             ),
         ) {
             let mut console = InterventionConsole::new();
-            // Track which panes have been unregistered AFTER any
-            // submission for them (i.e., should-be-expired set).
-            let mut unregistered: std::collections::HashSet<u64> =
+            let mut submitted_by_pane: std::collections::HashMap<u64, Vec<u64>> =
+                std::collections::HashMap::new();
+            let mut expired_by_unregister: std::collections::HashSet<u64> =
                 std::collections::HashSet::new();
 
             for op in ops {
                 match op {
                     ConsoleOp::Register(p) => {
                         console.register_pane(p);
-                        // A re-register clears the unregister flag —
-                        // a fresh registration is a fresh lifecycle.
-                        unregistered.remove(&p);
                     }
                     ConsoleOp::Submit(p, d) => {
-                        // Submit only succeeds (yields visible
-                        // pending) if pane is currently registered
-                        // AND not in the unregistered set.
-                        let _ = console.submit_approval(p, d, RiskLevel::Low, 0);
+                        let request_id = console.submit_approval(p, d, RiskLevel::Low, 0);
+                        submitted_by_pane.entry(p).or_default().push(request_id);
                     }
                     ConsoleOp::Unregister(p) => {
                         console.unregister_pane(p);
-                        unregistered.insert(p);
+                        if let Some(request_ids) = submitted_by_pane.remove(&p) {
+                            expired_by_unregister.extend(request_ids);
+                        }
                     }
                 }
             }
 
-            // INVARIANT: no pending_approval references a pane that
-            // was unregistered after its submission and not
-            // re-registered.
+            // INVARIANT: no approval that was pending at pane
+            // unregister remains visible in pending_approvals. A later
+            // submit for the same pane ID is a separate request and
+            // should not be treated as stale unless another unregister
+            // follows it.
             for approval in console.pending_approvals() {
                 prop_assert!(
-                    !unregistered.contains(&approval.pane_id),
-                    "br-ft-fmeic: pending approval for pane {} survived unregister: {:?}",
-                    approval.pane_id,
+                    !expired_by_unregister.contains(&approval.request_id),
+                    "br-ft-fmeic: pending approval request {} survived unregister: {:?}",
+                    approval.request_id,
                     approval
                 );
             }
