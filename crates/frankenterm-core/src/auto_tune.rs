@@ -699,7 +699,6 @@ impl BoundedCandidateEngine {
     }
 
     /// Validate that a textual knob id belongs to the safe registry.
-    #[must_use]
     pub fn validate_knob_id(&self, knob_id: &str) -> Result<TunableKnobId, CandidateSkipReason> {
         let Some(id) = TunableKnobId::from_registry_id(knob_id) else {
             return Err(CandidateSkipReason::UnknownKnob);
@@ -776,7 +775,7 @@ impl BoundedCandidateEngine {
                         max_concurrent_explorations: self.config.max_concurrent_explorations,
                     };
                 }
-                Err(CandidateSkipReason::NoPressureSignal) => continue,
+                Err(CandidateSkipReason::NoPressureSignal) => {}
                 Err(reason) => return self.skipped(vec![reason]),
             }
         }
@@ -1824,31 +1823,30 @@ fn advisor_recommendations(
     let backend_constrained = input.lexical_backend != TuningBackendAvailability::Available
         || input.semantic_backend != TuningBackendAvailability::Available;
 
-    let (coalesce_window, coalesce_bytes, mut backpressure, mut search_memory): (
-        (f64, f64),
-        (f64, f64),
-        (f64, f64),
-        (f64, f64),
-    ) = match pane_class {
-        TuningPaneScaleClass::TenPanes => (
-            (25.0, 50.0),
-            (131_072.0, 262_144.0),
-            (0.70, 0.80),
-            (16_000_000.0, 50_000_000.0),
-        ),
-        TuningPaneScaleClass::FiftyPanes => (
-            (50.0, 75.0),
-            (262_144.0, 524_288.0),
-            (0.70, 0.80),
-            (50_000_000.0, 100_000_000.0),
-        ),
-        TuningPaneScaleClass::TwoHundredPlusPanes => (
-            (75.0, 150.0),
-            (524_288.0, 1_048_576.0),
-            (0.60, 0.75),
-            (100_000_000.0, 256_000_000.0),
-        ),
-    };
+    type AdvisorRange = (f64, f64);
+    type AdvisorRanges = (AdvisorRange, AdvisorRange, AdvisorRange, AdvisorRange);
+
+    let (coalesce_window, coalesce_bytes, mut backpressure, mut search_memory): AdvisorRanges =
+        match pane_class {
+            TuningPaneScaleClass::TenPanes => (
+                (25.0, 50.0),
+                (131_072.0, 262_144.0),
+                (0.70, 0.80),
+                (16_000_000.0, 50_000_000.0),
+            ),
+            TuningPaneScaleClass::FiftyPanes => (
+                (50.0, 75.0),
+                (262_144.0, 524_288.0),
+                (0.70, 0.80),
+                (50_000_000.0, 100_000_000.0),
+            ),
+            TuningPaneScaleClass::TwoHundredPlusPanes => (
+                (75.0, 150.0),
+                (524_288.0, 1_048_576.0),
+                (0.60, 0.75),
+                (100_000_000.0, 256_000_000.0),
+            ),
+        };
 
     if queue_high {
         backpressure.1 =
