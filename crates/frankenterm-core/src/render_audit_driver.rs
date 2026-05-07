@@ -185,7 +185,7 @@ pub fn render_diagnostic_report(report: &AuditDriverReport) -> String {
             ));
             for (i, v) in violations.iter().enumerate() {
                 out.push_str(&format!("\n  Violation #{}:\n", i + 1));
-                out.push_str(&format!("    {}\n", render_violation_block(v, &labels),));
+                out.push_str(&format!("    {}\n", render_violation_block(v, &labels)));
             }
             if report.is_release_blocker() {
                 out.push_str("\nRELEASE BLOCKED. Fix the violations above or set\n");
