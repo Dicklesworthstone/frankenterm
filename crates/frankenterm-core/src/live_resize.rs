@@ -511,7 +511,7 @@ impl LiveResizeStateMachine {
         }
     }
 
-    fn classify_configure(&mut self, ts_ms: u64) -> CoalesceDecision {
+    fn classify_configure(&self, ts_ms: u64) -> CoalesceDecision {
         let cutoff = ts_ms.saturating_sub(COALESCE_WINDOW_MS);
         let recent = self
             .recent_configure_ts
