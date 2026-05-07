@@ -101,6 +101,30 @@ pub enum QualityConfigError {
         /// Event id targeted by the assertion.
         event_id: String,
     },
+    /// Multiple budgets for one query class are ambiguous.
+    #[error(
+        "latency budget for query class {class:?} appears more than once (first at index {first_index}, duplicate at index {duplicate_index}); each class must have exactly one budget"
+    )]
+    DuplicateLatencyBudget {
+        /// Duplicated query class.
+        class: QueryClass,
+        /// First budget index using this class.
+        first_index: usize,
+        /// Later budget index using this class.
+        duplicate_index: usize,
+    },
+    /// A query class used by the suite has no latency budget.
+    #[error(
+        "golden query {query_index} ('{query_name}') uses query class {class:?}, but no latency budget is configured for that class"
+    )]
+    MissingLatencyBudget {
+        /// Index of the query in the suite.
+        query_index: usize,
+        /// Human-readable query name.
+        query_name: String,
+        /// Query class missing a configured latency budget.
+        class: QueryClass,
+    },
 }
 
 impl GoldenQuery {
@@ -248,6 +272,7 @@ impl QualityHarness {
         queries: Vec<GoldenQuery>,
         budgets: Vec<LatencyBudget>,
     ) -> Result<Self, QualityConfigError> {
+        validate_budget_config(&queries, &budgets)?;
         for (query_index, query) in queries.iter().enumerate() {
             query.validate_at(query_index)?;
         }
@@ -338,6 +363,37 @@ impl QualityHarness {
             },
         }
     }
+}
+
+fn validate_budget_config(
+    queries: &[GoldenQuery],
+    budgets: &[LatencyBudget],
+) -> Result<(), QualityConfigError> {
+    for (budget_index, budget) in budgets.iter().enumerate() {
+        if let Some((first_index, _)) = budgets[..budget_index]
+            .iter()
+            .enumerate()
+            .find(|(_, prior)| prior.class == budget.class)
+        {
+            return Err(QualityConfigError::DuplicateLatencyBudget {
+                class: budget.class,
+                first_index,
+                duplicate_index: budget_index,
+            });
+        }
+    }
+
+    for (query_index, query) in queries.iter().enumerate() {
+        if !budgets.iter().any(|budget| budget.class == query.class) {
+            return Err(QualityConfigError::MissingLatencyBudget {
+                query_index,
+                query_name: query.name.clone(),
+                class: query.class,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Evaluate a single relevance assertion against search results.
@@ -1087,6 +1143,67 @@ mod tests {
         assert_eq!(report.latency_violations, 1);
         assert!(report.results[0].passed); // assertions still pass
         assert!(!report.results[0].latency_ok);
+    }
+
+    #[test]
+    fn harness_rejects_missing_latency_budget_before_run() {
+        let budgets = vec![LatencyBudget {
+            class: QueryClass::Filtered,
+            max_duration: Duration::from_millis(100),
+        }];
+        let queries = vec![GoldenQuery {
+            name: "missing_budget".to_string(),
+            class: QueryClass::SimpleTerm,
+            query: SearchQuery::simple("error"),
+            assertions: vec![RelevanceAssertion::MinTotalHits(1)],
+            description: "Missing budget must not silently disable latency checks".to_string(),
+        }];
+
+        let err = QualityHarness::with_budgets(queries, budgets)
+            .expect_err("query classes without a budget must be rejected");
+        assert_eq!(
+            err,
+            QualityConfigError::MissingLatencyBudget {
+                query_index: 0,
+                query_name: "missing_budget".to_string(),
+                class: QueryClass::SimpleTerm,
+            }
+        );
+        assert!(err.to_string().contains("no latency budget"));
+    }
+
+    #[test]
+    fn harness_rejects_duplicate_latency_budgets_before_run() {
+        let budgets = vec![
+            LatencyBudget {
+                class: QueryClass::SimpleTerm,
+                max_duration: Duration::from_millis(50),
+            },
+            LatencyBudget {
+                class: QueryClass::SimpleTerm,
+                max_duration: Duration::from_millis(500),
+            },
+        ];
+
+        let err = QualityHarness::with_budgets(vec![], budgets)
+            .expect_err("duplicate budget classes are ambiguous");
+        assert_eq!(
+            err,
+            QualityConfigError::DuplicateLatencyBudget {
+                class: QueryClass::SimpleTerm,
+                first_index: 0,
+                duplicate_index: 1,
+            }
+        );
+        assert!(err.to_string().contains("appears more than once"));
+    }
+
+    #[test]
+    fn custom_budget_harness_allows_empty_queries_without_budgets() {
+        let harness = QualityHarness::with_budgets(vec![], vec![]).unwrap();
+        let report = harness.run(&corpus_service());
+        assert_eq!(report.total_queries, 0);
+        assert!(report.all_passed);
     }
 
     #[test]
