@@ -813,67 +813,13 @@ pub(super) fn policy_error_code_from_injection(
     }
 }
 
-async fn record_workflow_action(
-    storage: &crate::storage::StorageHandle,
-    action_kind: &str,
-    execution_id: &str,
-    pane_id: u64,
-    workflow_name: &str,
-    input_summary: Option<String>,
-    result: &str,
-    decision_reason: Option<String>,
-) -> Option<i64> {
-    let timestamp_ms = now_ms();
-    let decision_context = build_workflow_audit_decision_context(
-        action_kind,
-        execution_id,
-        pane_id,
-        workflow_name,
-        input_summary.as_deref(),
-        result,
-        decision_reason.as_deref(),
-        timestamp_ms,
-    );
-    let action = crate::storage::AuditActionRecord {
-        id: 0,
-        ts: timestamp_ms,
-        actor_kind: "workflow".to_string(),
-        actor_id: Some(execution_id.to_string()),
-        correlation_id: None,
-        pane_id: Some(pane_id),
-        domain: None,
-        action_kind: action_kind.to_string(),
-        policy_decision: "allow".to_string(),
-        decision_reason,
-        rule_id: None,
-        input_summary,
-        verification_summary: None,
-        decision_context,
-        result: result.to_string(),
-    };
-
-    match storage.record_audit_action_redacted(action).await {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::warn!(
-                execution_id,
-                action_kind,
-                error = %e,
-                "Failed to record workflow audit action"
-            );
-            None
-        }
-    }
-}
-
-/// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_action`].
+/// ft-xbnl0.2.3 Cx-aware workflow audit action recorder.
 ///
 /// Threads caller cx into `record_audit_action_redacted_with_cx`
 /// so the audit-row write honours cancellation. On cancel the
-/// return is `None` (same as legacy when the storage call fails)
-/// so callers in the startup path degrade gracefully — the
-/// workflow continues without a linked audit id rather than
-/// aborting.
+/// return is `None` (same as any storage write failure) so callers
+/// in the startup path degrade gracefully — the workflow continues
+/// without a linked audit id rather than aborting.
 #[allow(clippy::too_many_arguments)]
 async fn record_workflow_action_with_cx(
     cx: &crate::cx::Cx,
@@ -1200,16 +1146,16 @@ pub(super) async fn record_workflow_terminal_action(
         steps_executed,
         start_action_id,
     )
-    .await
+    .await;
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_terminal_action`].
 ///
-/// Tick 185: routes both inner writes (record_workflow_action +
-/// storage.upsert_action_undo_redacted) through their cx-first
-/// siblings. Preserves the "fire-and-forget on error" contract
-/// that matches the legacy helper — every audit/undo failure
-/// is warn-and-continue, not fail-fast.
+/// Tick 185: routes both inner writes through cx-aware paths:
+/// `record_workflow_action_with_cx` for the audit row and
+/// `storage.upsert_action_undo_redacted_with_cx` for undo metadata.
+/// Preserves the "fire-and-forget on error" contract — every
+/// audit/undo failure is warn-and-continue, not fail-fast.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn record_workflow_terminal_action_with_cx(
     cx: &crate::cx::Cx,
