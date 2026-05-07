@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034
 # Shared e2e test harness for Rio validation scenarios.
 # Bead: ft-34sko.8
 #
@@ -85,10 +86,24 @@ log_jsonl() {
 }
 
 # ── Summary generation ──────────────────────────────────────────
+rio_verdict() {
+    if [[ "$FAIL_COUNT" -gt 0 ]]; then
+        echo "FAIL"
+    elif [[ "$PASS_COUNT" -eq 0 ]]; then
+        echo "SKIP"
+    elif [[ "$SKIP_COUNT" -gt 0 ]]; then
+        echo "PARTIAL"
+    else
+        echo "PASS"
+    fi
+}
+
 write_summary() {
     local output_file="$1"
     local scenario="$2"
     local total=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
+    local verdict
+    verdict="$(rio_verdict)"
 
     cat > "$output_file" <<SUMMARY_EOF
 {
@@ -102,7 +117,7 @@ write_summary() {
     "failed": ${FAIL_COUNT},
     "skipped": ${SKIP_COUNT}
   },
-  "verdict": "$([ $FAIL_COUNT -eq 0 ] && echo "PASS" || echo "FAIL")"
+  "verdict": "${verdict}"
 }
 SUMMARY_EOF
 }
@@ -222,7 +237,7 @@ scenario_footer() {
     local name="$1"
     echo "----------------------------------------------------------------"
     echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
-    echo "Verdict: $([ $FAIL_COUNT -eq 0 ] && echo "PASS" || echo "FAIL")"
+    echo "Verdict: $(rio_verdict)"
     echo "================================================================"
     return $FAIL_COUNT
 }
