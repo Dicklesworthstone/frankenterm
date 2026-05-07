@@ -433,7 +433,7 @@ pub fn storage_io_search_high_scale_predicate_artifact() -> StorageIoSearchStres
 pub fn storage_io_search_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
     let observation = storage_io_search_reduced_pass_observation();
     let mut verdict = sample_pass_verdict();
-    verdict.scenario_id = observation.scenario_id.clone();
+    verdict.scenario_id.clone_from(&observation.scenario_id);
     verdict.pressure_class = ResourcePressureClass::StorageIoSearch;
     verdict.mode = ResourcePressureChaosMode::Reduced;
     verdict.preconditions = vec![
@@ -484,7 +484,7 @@ pub fn storage_io_search_reduced_pass_verdict() -> ResourcePressureChaosVerdict 
 pub fn storage_io_search_write_error_fail_closed_verdict() -> ResourcePressureChaosVerdict {
     let observation = storage_io_search_write_error_observation();
     let mut verdict = sample_pass_verdict();
-    verdict.scenario_id = observation.scenario_id.clone();
+    verdict.scenario_id.clone_from(&observation.scenario_id);
     verdict.pressure_class = ResourcePressureClass::StorageIoSearch;
     verdict.mode = ResourcePressureChaosMode::Reduced;
     verdict.preconditions = vec![
@@ -528,7 +528,7 @@ pub fn storage_io_search_write_error_fail_closed_verdict() -> ResourcePressureCh
 pub fn storage_io_search_stranded_history_fail_verdict() -> ResourcePressureChaosVerdict {
     let observation = storage_io_search_stranded_history_fail_observation();
     let mut verdict = sample_fail_verdict();
-    verdict.scenario_id = observation.scenario_id.clone();
+    verdict.scenario_id.clone_from(&observation.scenario_id);
     verdict.pressure_class = ResourcePressureClass::StorageIoSearch;
     verdict.mode = ResourcePressureChaosMode::Reduced;
     verdict.preconditions = vec![
@@ -569,7 +569,7 @@ pub fn storage_io_search_stranded_history_fail_verdict() -> ResourcePressureChao
 pub fn storage_io_search_reduced_stress_verdict() -> ResourcePressureChaosVerdict {
     let artifact = storage_io_search_reduced_stress_proof_artifact();
     let mut verdict = sample_pass_verdict();
-    verdict.scenario_id = artifact.scenario_id.clone();
+    verdict.scenario_id.clone_from(&artifact.scenario_id);
     verdict.pressure_class = ResourcePressureClass::StorageIoSearch;
     verdict.mode = ResourcePressureChaosMode::Reduced;
     verdict.preconditions = vec![
@@ -577,7 +577,7 @@ pub fn storage_io_search_reduced_stress_verdict() -> ResourcePressureChaosVerdic
         "durable writes, FTS catch-up, and cold-tier hydration share the scheduler".into(),
         "operator snapshot reason codes are recorded before pass is claimed".into(),
     ];
-    verdict.injected_fault = artifact.injected_fault.clone();
+    verdict.injected_fault.clone_from(&artifact.injected_fault);
     verdict.observed_mitigation = format!(
         "scheduler peaked at queue_depth={} bytes_pending={} search_lag={} hydration_lag={} and drained search/hydration lag to zero",
         artifact.queue_depth_peak,
@@ -596,7 +596,7 @@ pub fn storage_io_search_reduced_stress_verdict() -> ResourcePressureChaosVerdic
         message: "reduced stress proof exercised scheduler-backed FTS and hydration lag".into(),
         severity: ResourcePressureDiagnosticSeverity::Warn,
     }];
-    verdict.logs_path = artifact.artifact_path.clone();
+    verdict.logs_path.clone_from(&artifact.artifact_path);
     verdict.proof_level = artifact.proof_level;
     verdict.skip_reason = None;
     verdict.status = artifact.status;
