@@ -464,10 +464,10 @@ pub fn pane_budget_has_room(
 /// Pick the image-cache entry to evict: largest `idle_ms`. Ties
 /// broken by lower `id` for deterministic telemetry.
 #[must_use]
-pub fn select_eviction_target<'a>(
-    entries: &'a [ImageCacheEntry],
+pub fn select_eviction_target(
+    entries: &[ImageCacheEntry],
     now_ms: u64,
-) -> Option<&'a ImageCacheEntry> {
+) -> Option<&ImageCacheEntry> {
     entries.iter().max_by(|a, b| {
         a.idle_ms(now_ms)
             .cmp(&b.idle_ms(now_ms))
