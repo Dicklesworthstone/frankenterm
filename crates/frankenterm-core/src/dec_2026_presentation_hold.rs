@@ -335,7 +335,7 @@ pub fn check_invariants(
     }
 
     // HoldOutsideWindow / PresentDuringWindow.
-    if let PresentationHoldEvent::FrameReady = last_event {
+    if last_event == PresentationHoldEvent::FrameReady {
         match (state.synchronized_output_active, last_outcome) {
             (true, PresentationHoldOutcome::Present) => {
                 out.push(PresentationHoldViolation::PresentDuringWindow);
