@@ -85,7 +85,7 @@ fn load_mcp_envelope_schema() -> Validator {
 
 #[allow(deprecated)]
 fn load_schema(path: &Path) -> Validator {
-    let bytes = fs::read(&path).unwrap_or_else(|err| {
+    let bytes = fs::read(path).unwrap_or_else(|err| {
         panic!(
             "failed to read envelope schema at {}: {err}",
             path.display()
@@ -115,7 +115,10 @@ fn discover_fixtures() -> Vec<(String, PathBuf)> {
         .filter_map(|entry| {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("wa_") && name.ends_with(".json") {
+            let is_json = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            if name.starts_with("wa_") && is_json {
                 Some((name, path))
             } else {
                 None
@@ -365,6 +368,46 @@ fn synthetic_mcp_success_envelope_validates_against_schema() {
 }
 
 #[test]
+fn synthetic_mcp_success_envelope_without_data_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP ok=true envelopes missing required `data`"
+    );
+}
+
+#[test]
+fn synthetic_mcp_success_envelope_with_hint_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "tool": "wa.search", "matches": [] },
+        "hint": "success envelopes must not carry remediation text",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP ok=true envelopes that carry `hint`"
+    );
+}
+
+#[test]
 fn synthetic_mcp_error_envelope_with_hint_validates_against_schema() {
     let schema = load_mcp_envelope_schema();
 
@@ -401,6 +444,26 @@ fn synthetic_mcp_error_envelope_without_hint_validates_against_schema() {
     schema
         .validate(&envelope)
         .unwrap_or_else(|errors| panic_validation_errors("MCP error envelope", errors));
+}
+
+#[test]
+fn synthetic_mcp_error_envelope_missing_error_code_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "invalid arguments",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP ok=false envelopes missing required `error_code`"
+    );
 }
 
 #[test]
@@ -468,6 +531,27 @@ fn synthetic_mcp_error_envelope_missing_mcp_version_must_fail() {
 }
 
 #[test]
+fn synthetic_mcp_error_envelope_with_unknown_error_code_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "invalid arguments",
+        "error_code": "FT-MCP-9999",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP error_code values outside the schema enum"
+    );
+}
+
+#[test]
 fn synthetic_mcp_error_envelope_with_robot_error_code_must_fail() {
     let schema = load_mcp_envelope_schema();
 
@@ -485,6 +569,27 @@ fn synthetic_mcp_error_envelope_with_robot_error_code_must_fail() {
     assert!(
         result.is_err(),
         "validator MUST reject robot.* error codes in MCP envelopes"
+    );
+}
+
+#[test]
+fn synthetic_mcp_envelope_with_wrong_mcp_version_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "invalid arguments",
+        "error_code": "FT-MCP-0001",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v2",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP envelopes whose `mcp_version` is not `v1`"
     );
 }
 
