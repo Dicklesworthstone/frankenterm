@@ -1,0 +1,306 @@
+{
+  "schema_version": "ft.control_plane.golden_matrix.v1",
+  "description": "Cross-surface Robot and MCP control-plane response matrix. Rows bind representative stable envelopes to checked-in fixtures, schemas, docs, and focused RCH proof lanes.",
+  "dynamic_scrub_rules": [
+    {
+      "pointer": "/elapsed_ms",
+      "replacement": 0,
+      "reason": "Command runtime varies across local and RCH workers."
+    },
+    {
+      "pointer": "/now",
+      "replacement": 0,
+      "reason": "Robot and MCP envelopes stamp wall-clock time."
+    },
+    {
+      "pointer": "/created_at",
+      "replacement": 0,
+      "reason": "Storage-backed rows receive creation timestamps."
+    },
+    {
+      "pointer": "/updated_at",
+      "replacement": 0,
+      "reason": "Storage-backed rows receive update timestamps."
+    },
+    {
+      "pointer": "/checkpoint_at",
+      "replacement": 0,
+      "reason": "Checkpoint list and rollback rows are time ordered."
+    },
+    {
+      "pointer": "/session_id",
+      "replacement": "<uuid-session>",
+      "reason": "Session identifiers can be generated per test workspace."
+    },
+    {
+      "pointer": "/pane_uuid",
+      "replacement": "<uuid>",
+      "reason": "Live pane UUIDs are host-specific."
+    },
+    {
+      "pointer": "/worker_id",
+      "replacement": "<worker>",
+      "reason": "Remote proof workers are assigned dynamically."
+    },
+    {
+      "pointer": "/path",
+      "replacement": "<path>",
+      "reason": "Workspace and database paths differ by machine and temp directory."
+    },
+    {
+      "pointer": "/paths",
+      "replacement": "<paths>",
+      "reason": "Path arrays inherit host-specific workspace roots."
+    }
+  ],
+  "required_scenarios": [
+    "healthy",
+    "degraded",
+    "blocked",
+    "policy_required",
+    "unsupported",
+    "capability_unavailable"
+  ],
+  "required_robot_families": [
+    "state",
+    "get-text",
+    "search",
+    "events",
+    "rules",
+    "profile",
+    "checkpoint",
+    "context",
+    "work",
+    "fleet"
+  ],
+  "required_transports": [
+    "robot_cli",
+    "mcp_tool"
+  ],
+  "rows": [
+    {
+      "id": "robot.state.toon.healthy",
+      "transport": "robot_cli",
+      "family": "state",
+      "action": "list-panes",
+      "format": "toon",
+      "scenario": "healthy",
+      "command": "ft robot --format toon state",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": "crates/frankenterm/tests/fixtures/golden_artifacts/robot_state_toon/local_single_pane.toon",
+      "schema_path": "docs/json-schema/wa-robot-state.json",
+      "doc_path": "README.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-cli-goldens cargo test -p frankenterm --test cli_golden_artifacts robot_state_toon_local_single_pane_matches_golden -- --nocapture",
+      "notes": "Pins the stable TOON Robot success envelope for pane discovery."
+    },
+    {
+      "id": "robot.get_text.toon.degraded",
+      "transport": "robot_cli",
+      "family": "get-text",
+      "action": "tail-truncated",
+      "format": "toon",
+      "scenario": "degraded",
+      "command": "ft robot --format toon get-text 7 --tail 40",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": "tests/goldens/toon/robot_get_text.toon",
+      "schema_path": "docs/json-schema/wa-robot-get-text.json",
+      "doc_path": "README.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_robot_get_text_matches_golden -- --nocapture",
+      "notes": "The degraded case is an ok envelope with data.truncated=true and truncation_info present."
+    },
+    {
+      "id": "robot.search.toon.healthy",
+      "transport": "robot_cli",
+      "family": "search",
+      "action": "hybrid-query",
+      "format": "toon",
+      "scenario": "healthy",
+      "command": "ft robot --format toon search \"golden toon\" --limit 5",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": "tests/goldens/toon/robot_search_results.toon",
+      "schema_path": "docs/json-schema/wa-robot-search.json",
+      "doc_path": "README.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_robot_search_results_matches_golden -- --nocapture",
+      "notes": "Pins lexical/semantic result fields including optional metrics."
+    },
+    {
+      "id": "robot.events.json.healthy",
+      "transport": "robot_cli",
+      "family": "events",
+      "action": "list-recent",
+      "format": "json",
+      "scenario": "healthy",
+      "command": "ft robot --format json events --limit 10",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": null,
+      "schema_path": "docs/json-schema/wa-robot-events.json",
+      "doc_path": "README.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-schema cargo test -p frankenterm-core --test schema_golden -- --nocapture",
+      "notes": "Schema row for event fanout envelopes; dynamic event bodies are scrubbed by schema-level proof."
+    },
+    {
+      "id": "robot.rules.json.healthy",
+      "transport": "robot_cli",
+      "family": "rules",
+      "action": "list",
+      "format": "json",
+      "scenario": "healthy",
+      "command": "ft robot --format json rules list",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": null,
+      "schema_path": "docs/json-schema/wa-robot-rules-list.json",
+      "doc_path": "README.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-schema cargo test -p frankenterm-core --test schema_golden -- --nocapture",
+      "notes": "Schema row for pattern-rule inventory envelopes."
+    },
+    {
+      "id": "robot.profile.json.unsupported",
+      "transport": "robot_cli",
+      "family": "profile",
+      "action": "apply",
+      "format": "json",
+      "scenario": "unsupported",
+      "command": "ft robot --format json profile apply ready --count 1",
+      "expected_ok": false,
+      "expected_code": "robot.profile.spawn_failed",
+      "fixture_path": null,
+      "schema_path": null,
+      "doc_path": "docs/robot-contracts/profile.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-profile cargo test -p frankenterm-core --lib robot_profile_handler::tests::apply_non_dry_run_returns_spawn_failed -- --nocapture",
+      "notes": "Read and dry-run profile paths are wired; non-dry-run apply is typed unsupported until daemon-mediated pane spawning is connected."
+    },
+    {
+      "id": "robot.checkpoint.json.policy_required",
+      "transport": "robot_cli",
+      "family": "checkpoint",
+      "action": "rollback",
+      "format": "json",
+      "scenario": "policy_required",
+      "command": "ft robot --format json checkpoint rollback <checkpoint-id>",
+      "expected_ok": false,
+      "expected_code": "robot.approval_error",
+      "fixture_path": null,
+      "schema_path": null,
+      "doc_path": "docs/robot-contracts/checkpoint.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-checkpoint cargo test -p frankenterm --bin ft robot_checkpoint_rollback_dry_run_and_approval_envelopes -- --nocapture",
+      "notes": "Pins the approval-required Robot envelope for mutating rollback without dry-run."
+    },
+    {
+      "id": "robot.context.json.healthy",
+      "transport": "robot_cli",
+      "family": "context",
+      "action": "status",
+      "format": "json",
+      "scenario": "healthy",
+      "command": "ft robot --format json context status --pane-id 1",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": null,
+      "schema_path": null,
+      "doc_path": "docs/robot-contracts/context.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-ntm-gap cargo test -p frankenterm --test robot_ntm_gap_contract_tests robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture",
+      "notes": "Live context dispatch must stay native and never regress to robot.not_implemented."
+    },
+    {
+      "id": "robot.work.json.healthy",
+      "transport": "robot_cli",
+      "family": "work",
+      "action": "ready",
+      "format": "json",
+      "scenario": "healthy",
+      "command": "ft robot --format json work ready --agent-id agent-a --limit 1",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": null,
+      "schema_path": null,
+      "doc_path": "docs/robot-contracts/work.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-ntm-gap cargo test -p frankenterm --test robot_ntm_gap_contract_tests robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture",
+      "notes": "Live work dispatch must stay native and never regress to robot.not_implemented."
+    },
+    {
+      "id": "robot.fleet.json.healthy",
+      "transport": "robot_cli",
+      "family": "fleet",
+      "action": "status",
+      "format": "json",
+      "scenario": "healthy",
+      "command": "ft robot --format json fleet status --detailed",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": null,
+      "schema_path": null,
+      "doc_path": "docs/robot-contracts/fleet.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-fleet cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
+      "notes": "Pins the native agent-inventory fleet status success path."
+    },
+    {
+      "id": "robot.fleet.json.capability_unavailable",
+      "transport": "robot_cli",
+      "family": "fleet",
+      "action": "scale",
+      "format": "json",
+      "scenario": "capability_unavailable",
+      "command": "ft robot --format json fleet scale codex 1 --dry-run",
+      "expected_ok": false,
+      "expected_code": "robot.fleet.capability_unavailable",
+      "fixture_path": null,
+      "schema_path": null,
+      "doc_path": "docs/robot-contracts/fleet.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-fleet cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
+      "notes": "Scale and rebalance parse natively but intentionally fail typed until daemon-side mutation is wired."
+    },
+    {
+      "id": "mcp.state.toon.healthy",
+      "transport": "mcp_tool",
+      "family": "state",
+      "action": "wa.state",
+      "format": "toon",
+      "scenario": "healthy",
+      "command": "MCP wa.state",
+      "expected_ok": true,
+      "expected_code": null,
+      "fixture_path": "tests/goldens/toon/mcp_state_envelope.toon",
+      "schema_path": "docs/json-schema/wa-mcp-envelope.json",
+      "doc_path": "README.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_mcp_state_envelope_matches_golden -- --nocapture",
+      "notes": "Pins the MCP success envelope shape for state-like tool responses."
+    },
+    {
+      "id": "mcp.get_text.toon.blocked",
+      "transport": "mcp_tool",
+      "family": "get-text",
+      "action": "wa.get_text",
+      "format": "toon",
+      "scenario": "blocked",
+      "command": "MCP wa.get_text pane_id=99",
+      "expected_ok": false,
+      "expected_code": "FT-MCP-0007",
+      "fixture_path": "tests/goldens/toon/mcp_error_envelope.toon",
+      "schema_path": "docs/json-schema/wa-mcp-envelope.json",
+      "doc_path": "docs/security/read-path-redaction-matrix.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-core-toon cargo test -p frankenterm-core --test toon_golden toon_mcp_error_envelope_matches_golden -- --nocapture",
+      "notes": "Pins a representative blocked MCP error envelope with stable FT-MCP code and hint fields."
+    },
+    {
+      "id": "mcp.mutation.json.policy_required",
+      "transport": "mcp_tool",
+      "family": "mutation",
+      "action": "wa.tx_run",
+      "format": "json",
+      "scenario": "policy_required",
+      "command": "MCP wa.tx_run with RequireApproval policy",
+      "expected_ok": false,
+      "expected_code": "FT-MCP-0006",
+      "fixture_path": null,
+      "schema_path": "docs/json-schema/wa-mcp-envelope.json",
+      "doc_path": "docs/security/policy-denial-audit-wiring-matrix.md",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5-mcp-policy cargo test -p frankenterm-core --lib mcp_tools::tests::mcp_authorize_mutation_tx_run_require_approval_is_fail_closed_ft_6h1rv -- --nocapture",
+      "notes": "MCP mutation surfaces fail closed when policy returns RequireApproval and no allow-once approval flow is available."
+    }
+  ]
+}
