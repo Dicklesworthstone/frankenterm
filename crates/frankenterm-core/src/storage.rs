@@ -16732,6 +16732,34 @@ fn seed_pane_with_last_seen_backend(
     .unwrap();
 }
 
+fn seed_workflow_execution_backend(
+    backend: &dyn StorageBackend,
+    workflow_id: &str,
+    workflow_name: &str,
+    pane_id: i64,
+    current_step: i64,
+    status: &str,
+    started_at: i64,
+    updated_at: i64,
+) {
+    execute_typed(
+        backend,
+        "INSERT INTO workflow_executions (
+            id, workflow_name, pane_id, current_step, status, started_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        &[
+            ToSqlValue::Text(workflow_id),
+            ToSqlValue::Text(workflow_name),
+            ToSqlValue::Integer(pane_id),
+            ToSqlValue::Integer(current_step),
+            ToSqlValue::Text(status),
+            ToSqlValue::Integer(started_at),
+            ToSqlValue::Integer(updated_at),
+        ],
+    )
+    .unwrap();
+}
+
 fn seed_segment_backend(
     backend: &dyn StorageBackend,
     pane_id: i64,
@@ -17213,28 +17241,23 @@ fn fts_search_empty_db_returns_empty() {
 
 #[test]
 fn can_insert_and_query_workflow_step_logs() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    // Insert pane
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
-
-    // Insert workflow execution
-    conn.execute(
-        "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params!["wf-test-001", "test_workflow", 1i64, 0, "running", now_ms, now_ms],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_workflow_execution_backend(
+        &backend,
+        "wf-test-001",
+        "test_workflow",
+        1,
+        0,
+        "running",
+        now_ms,
+        now_ms,
+    );
 
     // Insert step logs through the StorageBackend trait path.
-    let backend = RusqliteBackend::new(conn);
     insert_step_log_backend(
         &backend,
         "wf-test-001",
@@ -17289,10 +17312,7 @@ fn can_insert_and_query_workflow_step_logs() {
 
 #[test]
 fn query_step_logs_returns_empty_for_unknown_workflow() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
-
-    let backend = RusqliteBackend::new(conn);
+    let backend = memory_backend();
     let logs = query_step_logs_backend(&backend, "nonexistent-workflow").unwrap();
 
     assert!(
@@ -17303,25 +17323,22 @@ fn query_step_logs_returns_empty_for_unknown_workflow() {
 
 #[test]
 fn query_latest_step_log_returns_last_step() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_workflow_execution_backend(
+        &backend,
+        "wf-test-latest",
+        "test_workflow",
+        1,
+        0,
+        "running",
+        now_ms,
+        now_ms,
+    );
 
-    conn.execute(
-        "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params!["wf-test-latest", "test_workflow", 1i64, 0, "running", now_ms, now_ms],
-    )
-    .unwrap();
-
-    let backend = RusqliteBackend::new(conn);
     insert_step_log_backend(
         &backend,
         "wf-test-latest",
@@ -17386,36 +17403,30 @@ fn query_latest_step_log_returns_last_step() {
 
 #[test]
 fn query_latest_step_log_returns_none_for_unknown_workflow() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
-
-    let backend = RusqliteBackend::new(conn);
+    let backend = memory_backend();
     let latest = query_latest_step_log_backend(&backend, "unknown-workflow").unwrap();
     assert!(latest.is_none());
 }
 
 #[test]
 fn workflow_step_log_result_data_is_optional() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
-
-    conn.execute(
-        "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params!["wf-test-002", "test_workflow", 1i64, 0, "running", now_ms, now_ms],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_workflow_execution_backend(
+        &backend,
+        "wf-test-002",
+        "test_workflow",
+        1,
+        0,
+        "running",
+        now_ms,
+        now_ms,
+    );
 
     // Insert step log without result_data through the StorageBackend trait path.
-    let backend = RusqliteBackend::new(conn);
     insert_step_log_backend(
         &backend,
         "wf-test-002",
@@ -17468,23 +17479,21 @@ fn workflow_step_log_record_serializes() {
 
 #[test]
 fn can_insert_and_query_workflow_action_plan() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
 
-    conn.execute(
-        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![1i64, "local", now_ms, now_ms, 1],
-    )
-    .unwrap();
-
-    conn.execute(
-        "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params!["wf-plan-001", "test_workflow", 1i64, 0, "running", now_ms, now_ms],
-    )
-    .unwrap();
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_workflow_execution_backend(
+        &backend,
+        "wf-plan-001",
+        "test_workflow",
+        1,
+        0,
+        "running",
+        now_ms,
+        now_ms,
+    );
 
     let plan = crate::plan::ActionPlan::builder("Test Plan", "workspace-1")
         .add_step(crate::plan::StepPlan::new(
@@ -17498,7 +17507,6 @@ fn can_insert_and_query_workflow_action_plan() {
         ))
         .build();
 
-    let backend = RusqliteBackend::new(conn);
     let record = action_plan_record_from_plan("wf-plan-001", &plan).unwrap();
     upsert_action_plan_backend(&backend, &record).unwrap();
 
@@ -17519,10 +17527,7 @@ fn can_insert_and_query_workflow_action_plan() {
 
 #[test]
 fn query_action_plan_returns_none_for_unknown_workflow() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
-
-    let backend = RusqliteBackend::new(conn);
+    let backend = memory_backend();
     let fetched = query_action_plan_backend(&backend, "missing-workflow").unwrap();
     assert!(fetched.is_none());
 }
