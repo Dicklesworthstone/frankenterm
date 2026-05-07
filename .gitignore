@@ -57,6 +57,11 @@ test_output/
 coverage/
 *.profraw
 *.profdata
+# Golden/conformance drift artifacts written next to checked-in fixtures.
+*.actual.json
+*.actual.toon
+*.actual.plain
+*.actual.bin
 crates/frankenterm-core/tests/fixtures/mcp_manifest_no_db.actual.json
 
 # Temporary files
