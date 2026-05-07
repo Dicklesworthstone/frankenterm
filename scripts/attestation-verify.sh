@@ -60,6 +60,10 @@ sha256_stdin() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
   else shasum -a 256 | awk '{print $1}'; fi
 }
+is_hex_len() {
+  local value="$1" expected_len="$2"
+  [[ ${#value} -eq "$expected_len" && ! "$value" =~ [^0-9A-Fa-f] ]]
+}
 
 declare -a checks=()
 declare -a errors=()
@@ -214,7 +218,52 @@ case "$sig_method" in
     fi
     ;;
   ed25519)
-    record_check "signature" false "ed25519 verification not yet implemented (schema reserves it; ft-syqcz.1.1 will land it)"
+    if ! command -v openssl >/dev/null 2>&1; then
+      record_check "signature" false "openssl not installed; cannot verify ed25519"
+    elif ! command -v xxd >/dev/null 2>&1; then
+      record_check "signature" false "xxd not installed; cannot decode ed25519 hex material"
+    else
+      signature_path="$(jq -r '.signature.signature_path // ""' <<<"$bundle_json")"
+      public_key="$(jq -r '.signature.public_key // ""' <<<"$bundle_json")"
+      if [[ -z "$signature_path" || "$signature_path" == /* ]]; then
+        record_check "signature" false "ed25519 signature_path must be a repo-relative path"
+      elif ! is_hex_len "$public_key" 64; then
+        record_check "signature" false "ed25519 public_key must be 32 bytes hex-encoded"
+      else
+        signature_abs="$REPO_ROOT/$signature_path"
+        if [[ ! -f "$signature_abs" ]]; then
+          record_check "signature" false "ed25519 signature file missing: $signature_path"
+        else
+          signature_hex="$(tr -d '[:space:]' < "$signature_abs")"
+          if ! is_hex_len "$signature_hex" 128; then
+            record_check "signature" false "ed25519 signature file must contain a 64-byte hex signature"
+          else
+            canon_tmp="$(mktemp)"
+            pubkey_der_tmp="$(mktemp)"
+            sig_tmp="$(mktemp)"
+            printf '%s' "$canonical_payload" > "$canon_tmp"
+            # SubjectPublicKeyInfo DER prefix for Ed25519 (RFC 8410) followed by
+            # the raw 32-byte public key from the attestation schema.
+            printf '302a300506032b6570032100%s' "$public_key" | xxd -r -p > "$pubkey_der_tmp"
+            printf '%s' "$signature_hex" | xxd -r -p > "$sig_tmp"
+            if openssl pkeyutl \
+                -verify \
+                -rawin \
+                -pubin \
+                -keyform DER \
+                -inkey "$pubkey_der_tmp" \
+                -sigfile "$sig_tmp" \
+                -in "$canon_tmp" >/dev/null 2>&1; then
+              key_fingerprint="$(printf '%s' "$public_key" | sha256_stdin)"
+              record_check "signature" true "ed25519 verify ok (public_key_sha256=$key_fingerprint)"
+            else
+              record_check "signature" false "ed25519 verify failed (signature_path=$signature_path)"
+            fi
+            rm -f "$canon_tmp" "$pubkey_der_tmp" "$sig_tmp"
+          fi
+        fi
+      fi
+    fi
     ;;
   unsigned)
     reason="$(jq -r '.signature.reason // ""' <<<"$bundle_json")"

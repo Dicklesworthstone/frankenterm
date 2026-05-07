@@ -30,7 +30,12 @@ cp "$ART_DIR/manifest.json" "$BACKUP"
 cp "$TMP_MANIFEST" "$ART_DIR/manifest.json"
 restore_manifest() {
   cp "$BACKUP" "$ART_DIR/manifest.json"
-  rm -f "$ART_DIR/0.0.0-smoke.json" "$ART_DIR/0.0.0-smoke.canonical.json" "$ART_DIR/0.0.0-smoke.sigstore"
+  rm -f \
+    "$ART_DIR/0.0.0-smoke.json" \
+    "$ART_DIR/0.0.0-smoke.canonical.json" \
+    "$ART_DIR/0.0.0-smoke.sigstore" \
+    "$ART_DIR/0.0.0-smoke.ed25519.sig.hex" \
+    "$ART_DIR/0.0.0-smoke.bad-ed25519.sig.hex"
 }
 trap 'restore_manifest; rm -rf "$WORKDIR"' EXIT
 
@@ -52,6 +57,66 @@ if [[ "$count" != "1" ]]; then
 fi
 echo
 echo "=== positive verify: artifact count OK ==="
+
+if command -v openssl >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
+  ED_KEY="$WORKDIR/ed25519.pem"
+  ED_PUB_DER="$WORKDIR/ed25519-public.der"
+  ED_SIG_BIN="$WORKDIR/ed25519.sig"
+  ED_CANON="$WORKDIR/ed25519.canonical.json"
+  ED_BUNDLE="$WORKDIR/ed25519-bundle.json"
+  ED_BAD_BUNDLE="$WORKDIR/ed25519-bad-bundle.json"
+  ED_SIG_REL="docs/attestations/0.0.0-smoke.ed25519.sig.hex"
+  ED_BAD_SIG_REL="docs/attestations/0.0.0-smoke.bad-ed25519.sig.hex"
+
+  openssl genpkey -algorithm ED25519 -out "$ED_KEY" >/dev/null 2>&1
+  openssl pkey -in "$ED_KEY" -pubout -outform DER > "$ED_PUB_DER"
+  ED_PUB_HEX="$(tail -c 32 "$ED_PUB_DER" | xxd -p -c 256)"
+  printf '%s' "$(jq -S -c 'del(.signature)' "$ART_DIR/0.0.0-smoke.json")" > "$ED_CANON"
+  openssl pkeyutl -sign -rawin -inkey "$ED_KEY" -in "$ED_CANON" -out "$ED_SIG_BIN"
+  xxd -p -c 256 "$ED_SIG_BIN" > "$REPO_ROOT/$ED_SIG_REL"
+
+  jq \
+    --arg sig_path "$ED_SIG_REL" \
+    --arg public_key "$ED_PUB_HEX" \
+    'del(.signature.reason) |
+     .signature.method = "ed25519" |
+     .signature.signature_path = $sig_path |
+     .signature.public_key = $public_key' \
+    "$ART_DIR/0.0.0-smoke.json" > "$ED_BUNDLE"
+
+  echo
+  echo "=== ed25519 verify ==="
+  bash scripts/attestation-verify.sh "$ED_BUNDLE" >"$WORKDIR/ed25519.out"
+  cat "$WORKDIR/ed25519.out"
+
+  cp "$REPO_ROOT/$ED_SIG_REL" "$REPO_ROOT/$ED_BAD_SIG_REL"
+  # Flip the first byte to a different valid hex value while preserving length.
+  sig_value="$(tr -d '[:space:]' < "$REPO_ROOT/$ED_BAD_SIG_REL")"
+  replacement="00"
+  if [[ "${sig_value:0:2}" == "00" ]]; then
+    replacement="ff"
+  fi
+  printf '%s%s\n' "$replacement" "${sig_value:2}" > "$REPO_ROOT/$ED_BAD_SIG_REL"
+  jq --arg sig_path "$ED_BAD_SIG_REL" '.signature.signature_path = $sig_path' \
+    "$ED_BUNDLE" > "$ED_BAD_BUNDLE"
+
+  echo
+  echo "=== ed25519 bad-signature test (expect verify to FAIL) ==="
+  if bash scripts/attestation-verify.sh "$ED_BAD_BUNDLE" >"$WORKDIR/ed25519_bad.out" 2>&1; then
+    echo "FAIL: bad ed25519 signature verified successfully"
+    cat "$WORKDIR/ed25519_bad.out"
+    exit 1
+  fi
+  grep -q "ed25519 verify failed" "$WORKDIR/ed25519_bad.out" || {
+    echo "FAIL: ed25519 verifier did not report signature failure"
+    cat "$WORKDIR/ed25519_bad.out"
+    exit 1
+  }
+  cat "$WORKDIR/ed25519_bad.out"
+else
+  echo
+  echo "=== ed25519 verify skipped: openssl and xxd are required ==="
+fi
 
 # Tamper test: corrupt the recorded sha256 in the bundle, expect verify to fail.
 TAMPERED="$WORKDIR/tampered.json"

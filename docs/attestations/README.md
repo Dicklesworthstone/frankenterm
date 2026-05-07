@@ -54,7 +54,7 @@ sets these automatically.
 
 ```bash
 # Re-derive every artifact's SHA-256 from disk + recompute the canonical signing payload
-# + (when present) verify the sigstore signature.
+# + (when present) verify the sigstore or ed25519 signature.
 scripts/attestation-verify.sh docs/attestations/0.2.0.json
 
 # JSON output for AI/tooling consumers.
@@ -65,6 +65,11 @@ scripts/attestation-verify.sh docs/attestations/0.2.0.json --strict-required
 ```
 
 Exit code: `0` on full pass, `1` on any failure, `2` on usage error.
+
+Ed25519 bundles use the same canonical signing payload. The schema records a
+32-byte hex public key in `signature.public_key` and a repo-relative
+`signature.signature_path` file containing the raw 64-byte signature as hex.
+The verifier decodes both and checks the payload with OpenSSL.
 
 ## Canonical signing payload
 
@@ -91,5 +96,5 @@ validate); removing one is a major bump.
 ## Roadmap
 
 - `ft attestation verify` CLI command — user-facing offline verification (tracked by [`ft-syqcz.1.1`](#)).
-- ed25519 signing fallback — schema reserves the slot; not yet implemented.
+- ed25519 signing fallback in `attestation-build.sh` — verification support exists, but build-side signing still emits only sigstore-cosign-keyless or unsigned bundles.
 - Per-PR attestation diff — show which categories changed between releases.
