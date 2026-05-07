@@ -87,8 +87,8 @@ impl CapsuleInspector {
 
     /// Render a tabular plain-text inspection of `capsule`.
     ///
-    /// Format: header line with capsule version + endpoints + integrity
-    /// + freshness; one line per section showing index, label,
+    /// Format: header line with capsule version, endpoints, integrity, and
+    /// freshness; one line per section showing index, label,
     /// required-capability count, and payload byte size.
     #[must_use]
     pub fn inspect_text(&self, capsule: &HandoffCapsule) -> String {
