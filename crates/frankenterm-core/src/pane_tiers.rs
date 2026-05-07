@@ -383,7 +383,7 @@ impl PaneTierClassifier {
         let mut estimated_rps = 0.0;
         let mut total_panes: u64 = 0;
 
-        for entry in self.panes.iter() {
+        for entry in &self.panes {
             let tier = self.compute_tier(entry.value());
             *tier_counts.entry(tier.to_string()).or_insert(0u64) += 1;
             // RPS contribution: 1 / interval_seconds
