@@ -27,9 +27,8 @@
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
 ///
 /// Per ft-4yr9i: bumped 24 → 25 to gate the agent_profiles table
-/// + role index from agent_profiles.rs (ft-df3cz substrate). The
-/// migration entry sits at MIGRATIONS[24] in
-/// storage/migrations.rs.
+/// and role index from agent_profiles.rs (ft-df3cz substrate). The
+/// migration entry sits at MIGRATIONS[24] in storage/migrations.rs.
 ///
 /// Per br-ft-4iz0q substrate-pass: bumped 25 → 26 to gate the
 /// `profiles_applied_log` table the daemon-side
@@ -39,13 +38,6 @@
 /// `ApplyReceipt` substrate type at
 /// crates/frankenterm-core/src/robot_profile_handler.rs.
 pub const SCHEMA_VERSION: i32 = 26;
-
-/// Schema initialization SQL
-///
-/// Convention notes:
-/// - Timestamps: epoch milliseconds (i64) for hot-path queries
-/// - JSON columns: TEXT containing JSON (v0 simplicity)
-/// - All tables use INTEGER PRIMARY KEY for rowid aliasing
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -57,7 +49,7 @@ pub const SCHEMA_VERSION: i32 = 26;
 /// KEEP IN SYNC with the `CREATE TRIGGER IF NOT EXISTS output_segments_*`
 /// block inside `SCHEMA_SQL` below — if a trigger body changes here,
 /// change it there too and vice versa.
-pub(crate) const FTS_TRIGGER_RECREATE_SQL: &str = r#"
+pub(crate) const FTS_TRIGGER_RECREATE_SQL: &str = r"
 CREATE TRIGGER IF NOT EXISTS output_segments_ai AFTER INSERT ON output_segments BEGIN
     INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
 END;
@@ -70,8 +62,15 @@ CREATE TRIGGER IF NOT EXISTS output_segments_au AFTER UPDATE ON output_segments 
     INSERT INTO output_segments_fts(output_segments_fts, rowid, content) VALUES('delete', old.id, old.content);
     INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
 END;
-"#;
+";
 
+/// Schema initialization SQL.
+///
+/// Convention notes:
+///
+/// - Timestamps: epoch milliseconds (i64) for hot-path queries.
+/// - JSON columns: TEXT containing JSON (v0 simplicity).
+/// - All tables use INTEGER PRIMARY KEY for rowid aliasing.
 pub const SCHEMA_SQL: &str = r#"
 -- Enable WAL mode for concurrent reads and single-writer semantics
 PRAGMA journal_mode = WAL;
