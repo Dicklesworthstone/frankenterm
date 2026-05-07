@@ -1080,7 +1080,8 @@ fn fts_search_returns_snippet_and_highlight() {
         )
         .unwrap();
 
-    let results = search_fts_with_snippets(&conn, "world", &SearchOptions::default())
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "world", &SearchOptions::default())
         .expect("search should succeed");
     assert_eq!(results.len(), 1);
 
@@ -1123,8 +1124,9 @@ fn fts_search_scopes_by_pane_and_limit() {
         ..Default::default()
     };
 
-    let results =
-        search_fts_with_snippets(&conn, "needle", &options).expect("search should succeed");
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "needle", &options)
+        .expect("search should succeed");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].segment.pane_id, 2);
 }
@@ -1134,8 +1136,10 @@ fn fts_search_invalid_query_is_structured_error() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
-    let err = search_fts_with_snippets(&conn, "\"unterminated", &SearchOptions::default())
-        .expect_err("expected invalid query error");
+    let backend = RusqliteBackend::new(conn);
+    let err =
+        search_fts_with_snippets_backend(&backend, "\"unterminated", &SearchOptions::default())
+            .expect_err("expected invalid query error");
 
     match err {
         crate::Error::Storage(StorageError::FtsQueryError(msg)) => {
@@ -1239,7 +1243,8 @@ fn fts_search_order_is_deterministic_on_ties() {
         )
         .unwrap();
 
-    let results = search_fts_with_snippets(&conn, "needle", &SearchOptions::default())
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "needle", &SearchOptions::default())
         .expect("search should succeed");
     assert_eq!(results.len(), 2);
     assert!(results[0].segment.captured_at <= results[1].segment.captured_at);

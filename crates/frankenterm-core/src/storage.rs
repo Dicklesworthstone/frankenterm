@@ -13306,130 +13306,6 @@ fn consume_approval_token_by_code_backend(
 /// FTS5 syntax errors surface at execution time (xFilter), not
 /// prepare time, so we can't replace this with a pure prepare-only
 /// check — but we can stop the probe after the first match.
-#[cfg(test)]
-fn validate_fts_query(conn: &Connection, query: &str) -> Result<()> {
-    let result = conn.query_row(
-        "SELECT 1 FROM output_segments_fts WHERE output_segments_fts MATCH ?1 LIMIT 1",
-        [query],
-        |_| Ok(()),
-    );
-
-    match result {
-        // Match found on the first row — the query is syntactically valid.
-        Ok(()) => Ok(()),
-        // Empty match set is also syntactically valid: a well-formed query
-        // simply found nothing. The pre-fix `COUNT(*)` shape returned
-        // Ok(0) here; we mirror that semantics by promoting no-rows to Ok.
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(err, Some(msg))) => {
-            // FTS5 syntax errors have specific error codes
-            Err(StorageError::FtsQueryError(format!(
-                "Invalid FTS5 query syntax: {msg}. \
-                 Valid syntax includes: simple words, \"phrases\", prefix*, AND/OR/NOT operators. \
-                 SQLite error code: {}",
-                err.extended_code
-            ))
-            .into())
-        }
-        Err(e) => Err(StorageError::FtsQueryError(format!("Query validation failed: {e}")).into()),
-    }
-}
-
-/// Search using FTS5 with snippet extraction and BM25 scores
-///
-/// Returns structured results with:
-/// - The matching segment data
-/// - A snippet with highlighted matching terms (using configurable markers)
-/// - Highlighted content (full segment with markers)
-/// - The BM25 relevance score (lower = more relevant)
-///
-/// # Two-stage query path (ft-okhhj)
-///
-/// When `include_snippets=true` the function runs two queries:
-///
-/// 1. **Rank stage** — selects only `(rowid, score)` (and the captured_at /
-///    id tie-break columns) ordered by BM25, with `LIMIT ?` applied.
-///    No content is materialized; no snippet/highlight functions run.
-/// 2. **Hydration stage** — re-queries `output_segments` and the FTS table
-///    for the top-N rowids returned by stage 1. `snippet()` and `highlight()`
-///    are computed only for those N rows, not for every matching candidate.
-///
-/// The single-query shape used to compute `snippet(...)` and `highlight(...)`
-/// for every matching row before sorting + LIMIT, which materialized the
-/// full highlighted content even for rows that never made the cutoff.
-/// On broad MATCH queries over panes with thousands of matching segments
-/// this dominated query cost; the two-stage path bounds it to N.
-///
-/// When `include_snippets=false` the function falls back to a single-stage
-/// query that still skips the snippet/highlight functions — there's no
-/// asymmetric work to split out.
-#[allow(clippy::cast_sign_loss)]
-#[cfg(test)]
-fn search_fts_with_snippets(
-    conn: &Connection,
-    query: &str,
-    options: &SearchOptions,
-) -> Result<Vec<SearchResult>> {
-    // Validate query syntax first for better error messages
-    validate_fts_query(conn, query)?;
-
-    let limit = options.limit.unwrap_or(100);
-    let include_snippets = options.include_snippets.unwrap_or(true);
-    // include_highlights defaults to whatever include_snippets is — when
-    // snippets are off there's nothing to highlight; when snippets are on
-    // callers historically got both unless they opt out.
-    let include_highlights = options.include_highlights.unwrap_or(include_snippets);
-
-    if !include_snippets {
-        return search_fts_rank_only(conn, query, options, limit);
-    }
-
-    // Stage 1: rank only — cheap query that returns just the ordered ids
-    // we'll hydrate. No content / snippet / highlight materialization.
-    let ranked = search_fts_rank_stage(conn, query, options, limit)?;
-    if ranked.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Stage 2: hydrate snippet/highlight for the top-N ids only.
-    let max_tokens = options.snippet_max_tokens.unwrap_or(64);
-    let prefix = options.highlight_prefix.as_deref().unwrap_or(">>>");
-    let suffix = options.highlight_suffix.as_deref().unwrap_or("<<<");
-
-    let hydrated = search_fts_hydrate_stage(
-        conn,
-        query,
-        &ranked,
-        prefix,
-        suffix,
-        max_tokens,
-        include_highlights,
-    )?;
-
-    tracing::trace!(
-        rank_count = ranked.len(),
-        hydrate_count = hydrated.len(),
-        "search_fts_with_snippets two-stage path"
-    );
-
-    // Re-stitch hydrated rows in rank order. A row can only be missing if
-    // it was concurrently deleted between the two queries; drop it
-    // silently rather than fail the whole search.
-    let mut results = Vec::with_capacity(ranked.len());
-    for (id, score) in &ranked {
-        if let Some((segment, snippet, highlight)) = hydrated.get(id).cloned() {
-            results.push(SearchResult {
-                segment,
-                snippet,
-                highlight,
-                score: *score,
-            });
-        }
-    }
-
-    Ok(results)
-}
-
 type FtsHydratedRows = std::collections::HashMap<i64, (Segment, Option<String>, Option<String>)>;
 
 fn validate_fts_query_backend(backend: &dyn StorageBackend, query: &str) -> Result<()> {
@@ -13688,253 +13564,6 @@ fn search_result_from_backend_cells(row: &[SqlCell]) -> Result<SearchResult> {
         highlight,
         score,
     })
-}
-
-/// Stage 1 of the two-stage FTS search path (ft-okhhj). Returns the top-N
-/// `(rowid, bm25_score)` pairs in deterministic order without materializing
-/// content, snippet, or highlight.
-#[cfg(test)]
-fn search_fts_rank_stage(
-    conn: &Connection,
-    query: &str,
-    options: &SearchOptions,
-    limit: usize,
-) -> Result<Vec<(i64, f64)>> {
-    let mut sql = String::from(
-        "SELECT s.id, bm25(output_segments_fts) as score, s.captured_at
-         FROM output_segments s
-         JOIN output_segments_fts fts ON s.id = fts.rowid
-         WHERE output_segments_fts MATCH ?1",
-    );
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
-
-    if let Some(pane_id) = options.pane_id {
-        sql.push_str(" AND s.pane_id = ?");
-        params_vec.push(Box::new(u64_to_i64(pane_id, "pane_id")?));
-    }
-    if let Some(since) = options.since {
-        sql.push_str(" AND s.captured_at >= ?");
-        params_vec.push(Box::new(since));
-    }
-    if let Some(until) = options.until {
-        sql.push_str(" AND s.captured_at <= ?");
-        params_vec.push(Box::new(until));
-    }
-
-    sql.push_str(" ORDER BY score ASC, s.captured_at ASC, s.id ASC LIMIT ?");
-    params_vec.push(Box::new(usize_to_i64(limit, "limit")?));
-
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::FtsQueryError(format!("Failed to prepare rank query: {e}")))?;
-
-    let rows = stmt
-        .query_map(params_refs.as_slice(), |row| {
-            let id: i64 = row.get(0)?;
-            let score: f64 = row.get(1)?;
-            Ok((id, score))
-        })
-        .map_err(|e| StorageError::FtsQueryError(format!("Rank query failed: {e}")))?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|e| StorageError::Database(format!("Rank row error: {e}")))?);
-    }
-    Ok(out)
-}
-
-/// Stage 2 of the two-stage FTS search path (ft-okhhj). Hydrates the
-/// segment row plus snippet (and optionally highlight) for the given
-/// pre-ranked ids. The MATCH clause is required because `snippet()` and
-/// `highlight()` are FTS5 auxiliary functions — they need MATCH context
-/// to know which terms to mark.
-#[allow(clippy::cast_sign_loss)]
-#[cfg(test)]
-fn search_fts_hydrate_stage(
-    conn: &Connection,
-    query: &str,
-    ranked: &[(i64, f64)],
-    prefix: &str,
-    suffix: &str,
-    max_tokens: usize,
-    include_highlights: bool,
-) -> Result<FtsHydratedRows> {
-    let placeholders = std::iter::repeat_n("?", ranked.len())
-        .collect::<Vec<_>>()
-        .join(",");
-
-    // Highlight column toggled at SQL build time so the FTS5 highlight()
-    // function isn't invoked at all when callers opt out.
-    let highlight_col = if include_highlights {
-        "highlight(output_segments_fts, 0, ?, ?) as highlight"
-    } else {
-        "NULL as highlight"
-    };
-
-    let sql = format!(
-        "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
-                snippet(output_segments_fts, 0, ?, ?, '...', ?) as snippet,
-                {highlight_col}
-         FROM output_segments s
-         JOIN output_segments_fts fts ON s.id = fts.rowid
-         WHERE output_segments_fts MATCH ? AND s.id IN ({placeholders})"
-    );
-
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    // Snippet args: prefix, suffix, max_tokens.
-    params_vec.push(Box::new(prefix.to_string()));
-    params_vec.push(Box::new(suffix.to_string()));
-    params_vec.push(Box::new(usize_to_i64(max_tokens, "max_tokens")?));
-    if include_highlights {
-        // Highlight args: prefix, suffix.
-        params_vec.push(Box::new(prefix.to_string()));
-        params_vec.push(Box::new(suffix.to_string()));
-    }
-    // MATCH query.
-    params_vec.push(Box::new(query.to_string()));
-    // IN-clause ids.
-    for (id, _) in ranked {
-        params_vec.push(Box::new(*id));
-    }
-
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
-
-    let mut stmt = conn.prepare(&sql).map_err(|e| {
-        StorageError::FtsQueryError(format!("Failed to prepare hydrate query: {e}"))
-    })?;
-
-    let rows = stmt
-        .query_map(params_refs.as_slice(), |row| {
-            let id: i64 = row.get(0)?;
-            let segment = Segment {
-                id,
-                pane_id: {
-                    let val: i64 = row.get(1)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                seq: {
-                    let val: i64 = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                content: row.get(3)?,
-                content_len: {
-                    let val: i64 = row.get(4)?;
-                    i64_to_usize(val)?
-                },
-                content_hash: row.get(5)?,
-                captured_at: row.get(6)?,
-            };
-            let snippet: Option<String> = row.get(7)?;
-            let highlight: Option<String> = row.get(8)?;
-            Ok((id, segment, snippet, highlight))
-        })
-        .map_err(|e| StorageError::FtsQueryError(format!("Hydrate query failed: {e}")))?;
-
-    let mut out = std::collections::HashMap::with_capacity(ranked.len());
-    for row in rows {
-        let (id, segment, snippet, highlight) =
-            row.map_err(|e| StorageError::Database(format!("Hydrate row error: {e}")))?;
-        out.insert(id, (segment, snippet, highlight));
-    }
-    Ok(out)
-}
-
-/// Single-stage path for callers that opt out of snippets entirely.
-/// Kept separate from the two-stage path so the snippet=true case can stay
-/// focused; this query still doesn't invoke snippet()/highlight() so there's
-/// no asymmetric work to split.
-#[allow(clippy::cast_sign_loss)]
-#[cfg(test)]
-fn search_fts_rank_only(
-    conn: &Connection,
-    query: &str,
-    options: &SearchOptions,
-    limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let mut sql = String::from(
-        "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
-                NULL as snippet,
-                NULL as highlight,
-                bm25(output_segments_fts) as score
-         FROM output_segments s
-         JOIN output_segments_fts fts ON s.id = fts.rowid
-         WHERE output_segments_fts MATCH ?1",
-    );
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
-
-    if let Some(pane_id) = options.pane_id {
-        sql.push_str(" AND s.pane_id = ?");
-        params_vec.push(Box::new(u64_to_i64(pane_id, "pane_id")?));
-    }
-    if let Some(since) = options.since {
-        sql.push_str(" AND s.captured_at >= ?");
-        params_vec.push(Box::new(since));
-    }
-    if let Some(until) = options.until {
-        sql.push_str(" AND s.captured_at <= ?");
-        params_vec.push(Box::new(until));
-    }
-
-    sql.push_str(" ORDER BY score ASC, s.captured_at ASC, s.id ASC LIMIT ?");
-    params_vec.push(Box::new(usize_to_i64(limit, "limit")?));
-
-    let params_refs: Vec<&dyn rusqlite::ToSql> =
-        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::FtsQueryError(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map(params_refs.as_slice(), |row| {
-            Ok(SearchResult {
-                segment: Segment {
-                    id: row.get(0)?,
-                    pane_id: {
-                        let val: i64 = row.get(1)?;
-                        #[allow(clippy::cast_sign_loss)]
-                        {
-                            val as u64
-                        }
-                    },
-                    seq: {
-                        let val: i64 = row.get(2)?;
-                        #[allow(clippy::cast_sign_loss)]
-                        {
-                            val as u64
-                        }
-                    },
-                    content: row.get(3)?,
-                    content_len: {
-                        let val: i64 = row.get(4)?;
-                        i64_to_usize(val)?
-                    },
-                    content_hash: row.get(5)?,
-                    captured_at: row.get(6)?,
-                },
-                snippet: row.get(7)?,
-                highlight: row.get(8)?,
-                score: row.get(9)?,
-            })
-        })
-        .map_err(|e| StorageError::FtsQueryError(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-
-    Ok(results)
 }
 
 fn search_mode_label(mode: SearchMode) -> &'static str {
@@ -17542,8 +17171,10 @@ fn fts_search_returns_matching_segments() {
             params![1i64, 2i64, "another error occurred here", 27, now_ms + 200],
         ).unwrap();
 
-    // Search for "error"
-    let results = search_fts_with_snippets(&conn, "error", &SearchOptions::default()).unwrap();
+    // Search for "error" through the trait-backed path.
+    let backend = RusqliteBackend::new(conn);
+    let results =
+        search_fts_with_snippets_backend(&backend, "error", &SearchOptions::default()).unwrap();
 
     assert_eq!(results.len(), 2, "Should find 2 segments with 'error'");
     assert!(results[0].segment.content.contains("error"));
@@ -17551,7 +17182,7 @@ fn fts_search_returns_matching_segments() {
 }
 
 #[test]
-fn fts_backend_search_matches_direct_results() {
+fn fts_backend_search_returns_inserted_rows() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
@@ -17570,26 +17201,19 @@ fn fts_backend_search_matches_direct_results() {
             params![1i64, 1i64, "backend needle two", 18, now_ms + 1],
         ).unwrap();
 
-    let options = SearchOptions::default();
-    let direct = search_fts_with_snippets(&conn, "needle", &options).unwrap();
     let backend = RusqliteBackend::new(conn);
+    let options = SearchOptions::default();
     let via_backend = search_fts_with_snippets_backend(&backend, "needle", &options).unwrap();
 
-    assert_eq!(via_backend.len(), direct.len());
-    for (backend_result, direct_result) in via_backend.iter().zip(direct.iter()) {
-        assert_eq!(backend_result.segment.id, direct_result.segment.id);
-        assert_eq!(backend_result.segment.pane_id, direct_result.segment.pane_id);
-        assert_eq!(backend_result.segment.seq, direct_result.segment.seq);
-        assert_eq!(backend_result.segment.content, direct_result.segment.content);
-        assert_eq!(backend_result.snippet, direct_result.snippet);
-        assert_eq!(backend_result.highlight, direct_result.highlight);
-        assert!(
-            (backend_result.score - direct_result.score).abs() <= f64::EPSILON,
-            "backend score {} must match direct score {}",
-            backend_result.score,
-            direct_result.score
-        );
-    }
+    assert_eq!(via_backend.len(), 2);
+    assert_eq!(via_backend[0].segment.pane_id, 1);
+    assert_eq!(via_backend[0].segment.seq, 0);
+    assert_eq!(via_backend[0].segment.content, "backend needle one");
+    assert_eq!(via_backend[1].segment.pane_id, 1);
+    assert_eq!(via_backend[1].segment.seq, 1);
+    assert_eq!(via_backend[1].segment.content, "backend needle two");
+    assert!(via_backend.iter().all(|result| result.snippet.is_some()));
+    assert!(via_backend.iter().all(|result| result.highlight.is_some()));
 }
 
 #[test]
@@ -17707,7 +17331,8 @@ fn fts_search_returns_snippets_with_highlights() {
         highlight_suffix: Some("]]".to_string()),
         ..Default::default()
     };
-    let results = search_fts_with_snippets(&conn, "error", &options).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "error", &options).unwrap();
 
     assert_eq!(results.len(), 1);
     let snippet = results[0].snippet.as_ref().expect("Should have snippet");
@@ -17746,7 +17371,8 @@ fn fts_search_respects_pane_filter() {
         pane_id: Some(1),
         ..Default::default()
     };
-    let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "test", &options).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].segment.pane_id, 1);
@@ -17782,7 +17408,8 @@ fn fts_search_respects_time_filter() {
         until: Some(now_ms + 1500),
         ..Default::default()
     };
-    let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "test", &options).unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(results[0].segment.content.contains("middle"));
@@ -17793,7 +17420,8 @@ fn fts_search_invalid_query_returns_error() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
-    let result = validate_fts_query(&conn, "\"unclosed quote");
+    let backend = RusqliteBackend::new(conn);
+    let result = validate_fts_query_backend(&backend, "\"unclosed quote");
     assert!(result.is_err());
     let err = result.unwrap_err();
     let err_msg = err.to_string();
@@ -17815,7 +17443,9 @@ fn ft_76d9i_validate_fts_query_accepts_empty_match_set() {
     initialize_schema(&conn).unwrap();
     // Empty FTS index. Any well-formed query must validate successfully
     // because the syntax is fine — there are simply no rows to match.
-    let result = validate_fts_query(&conn, "absolutely_nothing_matches_this_token");
+    let backend = RusqliteBackend::new(conn);
+    let result =
+        validate_fts_query_backend(&backend, "absolutely_nothing_matches_this_token");
     assert!(
         result.is_ok(),
         "well-formed query against empty FTS index must validate: {result:?}"
@@ -17847,11 +17477,12 @@ fn ft_76d9i_validate_fts_query_accepts_well_formed_matching_query() {
         )
         .unwrap();
     }
-    assert!(validate_fts_query(&conn, "needle").is_ok());
-    assert!(validate_fts_query(&conn, "haystacks").is_ok());
+    let backend = RusqliteBackend::new(conn);
+    assert!(validate_fts_query_backend(&backend, "needle").is_ok());
+    assert!(validate_fts_query_backend(&backend, "haystacks").is_ok());
     // FTS5 prefix and operators still work after the shape change.
-    assert!(validate_fts_query(&conn, "need*").is_ok());
-    assert!(validate_fts_query(&conn, "needle AND haystacks").is_ok());
+    assert!(validate_fts_query_backend(&backend, "need*").is_ok());
+    assert!(validate_fts_query_backend(&backend, "needle AND haystacks").is_ok());
 }
 
 #[test]
@@ -17885,7 +17516,8 @@ fn fts_search_respects_limit() {
         limit: Some(3),
         ..Default::default()
     };
-    let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "test", &options).unwrap();
 
     assert_eq!(results.len(), 3, "Should respect limit of 3");
 }
@@ -17914,7 +17546,9 @@ fn fts_search_bm25_ordering() {
     )
     .unwrap();
 
-    let results = search_fts_with_snippets(&conn, "error", &SearchOptions::default()).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results =
+        search_fts_with_snippets_backend(&backend, "error", &SearchOptions::default()).unwrap();
 
     assert_eq!(results.len(), 2);
     assert!(
@@ -17946,7 +17580,8 @@ fn fts_search_no_snippets_option() {
         include_snippets: Some(false),
         ..Default::default()
     };
-    let results = search_fts_with_snippets(&conn, "test", &options).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "test", &options).unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -17990,7 +17625,8 @@ fn fts_search_skips_highlight_when_disabled_but_keeps_snippet() {
         highlight_suffix: Some("]]".to_string()),
         ..Default::default()
     };
-    let results = search_fts_with_snippets(&conn, "needle", &options).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results = search_fts_with_snippets_backend(&backend, "needle", &options).unwrap();
 
     assert_eq!(results.len(), 1);
     let snippet = results[0]
@@ -18045,7 +17681,9 @@ fn fts_search_two_stage_preserves_ordering() {
     )
     .unwrap();
 
-    let results = search_fts_with_snippets(&conn, "needle", &SearchOptions::default()).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results =
+        search_fts_with_snippets_backend(&backend, "needle", &SearchOptions::default()).unwrap();
     assert_eq!(results.len(), 3);
 
     // Highest-density "needle needle needle" must come first.
@@ -18089,8 +17727,10 @@ fn fts_search_no_match_returns_empty() {
     .unwrap();
 
     // Search for term that doesn't exist
+    let backend = RusqliteBackend::new(conn);
     let results =
-        search_fts_with_snippets(&conn, "nonexistent", &SearchOptions::default()).unwrap();
+        search_fts_with_snippets_backend(&backend, "nonexistent", &SearchOptions::default())
+            .unwrap();
 
     assert!(results.is_empty(), "Should return empty vec for no matches");
 }
@@ -18101,7 +17741,9 @@ fn fts_search_empty_db_returns_empty() {
     initialize_schema(&conn).unwrap();
 
     // Search on empty database (no panes, no segments)
-    let results = search_fts_with_snippets(&conn, "anything", &SearchOptions::default()).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let results =
+        search_fts_with_snippets_backend(&backend, "anything", &SearchOptions::default()).unwrap();
 
     assert!(
         results.is_empty(),
