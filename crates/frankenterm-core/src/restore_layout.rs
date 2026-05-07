@@ -537,6 +537,13 @@ mod tests {
         MockWezterm, SpawnTarget, WeztermFuture, WeztermHandle, WeztermInterface,
     };
 
+    fn test_runtime_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {
+        crate::Error::RuntimeOperation {
+            operation,
+            source: crate::error::RuntimeOperationSource::Backend(detail.into()),
+        }
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -579,25 +586,28 @@ mod tests {
 
         fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, crate::wezterm::PaneInfo> {
             Box::pin(async move {
-                Err(crate::Error::Runtime(format!(
-                    "unexpected get_pane({pane_id}) on failing spawn mock"
-                )))
+                Err(test_runtime_error(
+                    "restore_layout.test.unexpected_get_pane",
+                    format!("unexpected get_pane({pane_id}) on failing spawn mock"),
+                ))
             })
         }
 
         fn get_text(&self, pane_id: u64, _: bool) -> WeztermFuture<'_, String> {
             Box::pin(async move {
-                Err(crate::Error::Runtime(format!(
-                    "unexpected get_text({pane_id}) on failing spawn mock"
-                )))
+                Err(test_runtime_error(
+                    "restore_layout.test.unexpected_get_text",
+                    format!("unexpected get_text({pane_id}) on failing spawn mock"),
+                ))
             })
         }
 
         fn send_text(&self, pane_id: u64, _: &str) -> WeztermFuture<'_, ()> {
             Box::pin(async move {
-                Err(crate::Error::Runtime(format!(
-                    "unexpected send_text({pane_id}) on failing spawn mock"
-                )))
+                Err(test_runtime_error(
+                    "restore_layout.test.unexpected_send_text",
+                    format!("unexpected send_text({pane_id}) on failing spawn mock"),
+                ))
             })
         }
 
@@ -628,7 +638,12 @@ mod tests {
         }
 
         fn spawn(&self, _: Option<&str>, _: Option<&str>) -> WeztermFuture<'_, u64> {
-            Box::pin(async { Err(crate::Error::Runtime("simulated spawn failure".to_string())) })
+            Box::pin(async {
+                Err(test_runtime_error(
+                    "restore_layout.test.spawn",
+                    "simulated spawn failure",
+                ))
+            })
         }
 
         fn spawn_targeted(
@@ -637,7 +652,12 @@ mod tests {
             _: Option<&str>,
             _: SpawnTarget,
         ) -> WeztermFuture<'_, u64> {
-            Box::pin(async { Err(crate::Error::Runtime("simulated spawn failure".to_string())) })
+            Box::pin(async {
+                Err(test_runtime_error(
+                    "restore_layout.test.spawn_targeted",
+                    "simulated spawn failure",
+                ))
+            })
         }
 
         fn split_pane(
@@ -648,17 +668,19 @@ mod tests {
             _: Option<u8>,
         ) -> WeztermFuture<'_, u64> {
             Box::pin(async move {
-                Err(crate::Error::Runtime(format!(
-                    "unexpected split_pane({pane_id}) on failing spawn mock"
-                )))
+                Err(test_runtime_error(
+                    "restore_layout.test.unexpected_split_pane",
+                    format!("unexpected split_pane({pane_id}) on failing spawn mock"),
+                ))
             })
         }
 
         fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
             Box::pin(async move {
-                Err(crate::Error::Runtime(format!(
-                    "unexpected activate_pane({pane_id}) on failing spawn mock"
-                )))
+                Err(test_runtime_error(
+                    "restore_layout.test.unexpected_activate_pane",
+                    format!("unexpected activate_pane({pane_id}) on failing spawn mock"),
+                ))
             })
         }
 
@@ -668,25 +690,28 @@ mod tests {
             _: crate::wezterm::MoveDirection,
         ) -> WeztermFuture<'_, Option<u64>> {
             Box::pin(async move {
-                Err(crate::Error::Runtime(format!(
-                    "unexpected get_pane_direction({pane_id}) on failing spawn mock"
-                )))
+                Err(test_runtime_error(
+                    "restore_layout.test.unexpected_get_pane_direction",
+                    format!("unexpected get_pane_direction({pane_id}) on failing spawn mock"),
+                ))
             })
         }
 
         fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
             Box::pin(async move {
-                Err(crate::Error::Runtime(format!(
-                    "unexpected kill_pane({pane_id}) on failing spawn mock"
-                )))
+                Err(test_runtime_error(
+                    "restore_layout.test.unexpected_kill_pane",
+                    format!("unexpected kill_pane({pane_id}) on failing spawn mock"),
+                ))
             })
         }
 
         fn zoom_pane(&self, pane_id: u64, _: bool) -> WeztermFuture<'_, ()> {
             Box::pin(async move {
-                Err(crate::Error::Runtime(format!(
-                    "unexpected zoom_pane({pane_id}) on failing spawn mock"
-                )))
+                Err(test_runtime_error(
+                    "restore_layout.test.unexpected_zoom_pane",
+                    format!("unexpected zoom_pane({pane_id}) on failing spawn mock"),
+                ))
             })
         }
 
@@ -759,7 +784,12 @@ mod tests {
             _: Option<&str>,
             _: Option<u8>,
         ) -> WeztermFuture<'_, u64> {
-            Box::pin(async { Err(crate::Error::Runtime("simulated split failure".to_string())) })
+            Box::pin(async {
+                Err(test_runtime_error(
+                    "restore_layout.test.split_pane",
+                    "simulated split failure",
+                ))
+            })
         }
 
         fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {

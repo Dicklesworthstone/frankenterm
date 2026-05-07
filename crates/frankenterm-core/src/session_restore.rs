@@ -1897,6 +1897,13 @@ mod tests {
     };
     use rusqlite::params;
 
+    fn test_runtime_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {
+        crate::Error::RuntimeOperation {
+            operation,
+            source: crate::error::RuntimeOperationSource::Backend(detail.into()),
+        }
+    }
+
     // ── ft-ybtyg regression: compute_restore_state_hash ─────────────
 
     #[test]
@@ -2281,7 +2288,10 @@ mod tests {
         ) -> WeztermFuture<'_, u64> {
             if self.split_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Box::pin(async {
-                    Err(crate::Error::Runtime("simulated split failure".to_string()))
+                    Err(test_runtime_error(
+                        "session_restore.test.split_pane",
+                        "simulated split failure",
+                    ))
                 });
             }
 
@@ -2374,8 +2384,9 @@ mod tests {
         fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
             if self.spawn_calls.fetch_add(1, Ordering::SeqCst) == 1 {
                 return Box::pin(async {
-                    Err(crate::Error::Runtime(
-                        "simulated second-tab spawn failure".to_string(),
+                    Err(test_runtime_error(
+                        "session_restore.test.spawn",
+                        "simulated second-tab spawn failure",
                     ))
                 });
             }
@@ -2391,8 +2402,9 @@ mod tests {
         ) -> WeztermFuture<'_, u64> {
             if self.spawn_calls.fetch_add(1, Ordering::SeqCst) == 1 {
                 return Box::pin(async {
-                    Err(crate::Error::Runtime(
-                        "simulated second-tab spawn failure".to_string(),
+                    Err(test_runtime_error(
+                        "session_restore.test.spawn_targeted",
+                        "simulated second-tab spawn failure",
                     ))
                 });
             }

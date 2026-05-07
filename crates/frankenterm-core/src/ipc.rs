@@ -117,7 +117,7 @@ enum MpscRecvState<T> {
     Cancelled,
 }
 
-#[cfg(any(test, not(unix)))]
+#[cfg(not(unix))]
 async fn mpsc_recv_state<T>(rx: &mut mpsc::Receiver<T>) -> MpscRecvState<T> {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     mpsc_recv_state_with_cx(rx, &cx).await

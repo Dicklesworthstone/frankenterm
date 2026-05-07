@@ -2625,6 +2625,7 @@ mod tests {
     /// Like `run_async_test` but spawns a dedicated thread so the test gets
     /// a pristine TLS state. Prevents interference when 25 000+ tests run
     /// in parallel and stomp each other's `ASUPERSYNC_HANDLE` thread-local.
+    #[cfg(all(feature = "asupersync-runtime", unix))]
     fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
     where
         F: std::future::Future<Output = ()>,

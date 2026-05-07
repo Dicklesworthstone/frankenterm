@@ -704,6 +704,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    fn retry_runtime_error(detail: impl Into<String>) -> Error {
+        Error::RuntimeOperation {
+            operation: "retry.test",
+            source: crate::error::RuntimeOperationSource::Backend(detail.into()),
+        }
+    }
+
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove that Cx-first
     /// retry runs under seed-locked virtual-time scheduling with no wall-clock
     /// dependence. If inter-attempt sleeps ever re-acquire a tokio-shaped
@@ -743,7 +750,7 @@ mod tests {
                     let n = attempts_task.fetch_add(1, Ordering::SeqCst);
                     async move {
                         if n < 3 {
-                            Err(Error::Runtime(format!("attempt {n} transient")))
+                            Err(retry_runtime_error(format!("attempt {n} transient")))
                         } else {
                             Ok::<_, Error>(n)
                         }
@@ -1080,7 +1087,7 @@ mod tests {
                 async move {
                     let n = count.fetch_add(1, Ordering::SeqCst);
                     if n < 2 {
-                        Err(Error::Runtime("transient failure".into()))
+                        Err(retry_runtime_error("transient failure"))
                     } else {
                         Ok::<_, Error>(42)
                     }
@@ -1111,7 +1118,7 @@ mod tests {
                 let count = Arc::clone(&call_count_clone);
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::Runtime("persistent failure".into()))
+                    Err(retry_runtime_error("persistent failure"))
                 }
             })
             .await;
@@ -1139,7 +1146,7 @@ mod tests {
                 async move {
                     let n = count.fetch_add(1, Ordering::SeqCst);
                     if n < 2 {
-                        Err(Error::Runtime("transient".into()))
+                        Err(retry_runtime_error("transient"))
                     } else {
                         Ok::<_, Error>(42)
                     }
@@ -1173,7 +1180,7 @@ mod tests {
 
             // First call fails and trips circuit
             let result: Result<i32> = with_retry_and_circuit(&policy, &mut circuit, || async {
-                Err(Error::Runtime("fail".into()))
+                Err(retry_runtime_error("fail"))
             })
             .await;
             assert!(result.is_err());
@@ -1863,8 +1870,8 @@ mod tests {
     }
 
     #[test]
-    fn is_retryable_runtime_error() {
-        assert!(is_retryable(&Error::Runtime("channel closed".into())));
+    fn is_retryable_runtime_operation_error() {
+        assert!(is_retryable(&retry_runtime_error("channel closed")));
     }
 
     #[test]
@@ -1971,7 +1978,7 @@ mod tests {
                 async move {
                     let n = count.fetch_add(1, Ordering::SeqCst);
                     if n < 2 {
-                        Err(Error::Runtime("transient".into()))
+                        Err(retry_runtime_error("transient"))
                     } else {
                         Ok::<_, Error>(99)
                     }
@@ -2002,7 +2009,7 @@ mod tests {
                 let count = Arc::clone(&call_count_clone);
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::Runtime("always fails".into()))
+                    Err(retry_runtime_error("always fails"))
                 }
             })
             .await;
@@ -2035,7 +2042,7 @@ mod tests {
             };
 
             let outcome: RetryOutcome<i32> = with_retry_outcome(&policy, || async {
-                Err::<i32, Error>(Error::Runtime("fail".into()))
+                Err::<i32, Error>(retry_runtime_error("fail"))
             })
             .await;
 
@@ -2260,7 +2267,7 @@ mod tests {
                             Some("cancel after first attempt"),
                         );
                     }
-                    Err::<u32, _>(Error::Runtime(format!("attempt {n} fail")))
+                    Err::<u32, _>(retry_runtime_error(format!("attempt {n} fail")))
                 }
             })
             .await;
@@ -2444,7 +2451,7 @@ mod tests {
             };
             let outcome = with_retry_outcome_cx(&cx, &policy, || {
                 attempts_task.fetch_add(1, Ordering::SeqCst);
-                async { Err::<u32, _>(Error::Runtime("always fail".into())) }
+                async { Err::<u32, _>(retry_runtime_error("always fail")) }
             })
             .await;
             assert!(outcome.result.is_err());
