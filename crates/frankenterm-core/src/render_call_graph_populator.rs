@@ -59,6 +59,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -368,11 +369,13 @@ pub fn populate_from_source(
 /// `function_to_id` map. Walks every source file again, maps
 /// `name(` tokens to known function ids, and adds edges from
 /// the enclosing function.
-pub fn resolve_call_edges_from_source(
+pub fn resolve_call_edges_from_source<S>(
     source: &str,
-    function_to_id: &HashMap<String, CallSiteId>,
+    function_to_id: &HashMap<String, CallSiteId, S>,
     graph: &mut CallGraph,
-) {
+) where
+    S: BuildHasher,
+{
     let mut depth: i32 = 0;
     let mut stack: Vec<(CallSiteId, i32)> = Vec::new();
 
