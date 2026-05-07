@@ -23,8 +23,7 @@
 //! - `REAL`    → [`row_f64`].
 //! - `TEXT`    → [`row_string`] / [`row_optional_string`].
 //! - `BLOB`    → [`row_blob_size`] (parses `<blob:N bytes>` → N).
-//! - `NULL`    → empty string; the optional helpers return
-//!               `None`.
+//! - `NULL`    → empty string; the optional helpers return `None`.
 //!
 //! The module is wholly contained — touching it does not modify
 //! storage.rs. The wired-pass call-site migration imports from
@@ -375,7 +374,7 @@ pub fn cell_bool(row: &[SqlCell], idx: usize) -> Result<bool, BackendError> {
 }
 
 /// Borrow a column as `&[u8]` when the cell is a Blob.
-pub fn cell_blob<'a>(row: &'a [SqlCell], idx: usize) -> Result<&'a [u8], BackendError> {
+pub fn cell_blob(row: &[SqlCell], idx: usize) -> Result<&[u8], BackendError> {
     match cell_at(row, idx)? {
         SqlCell::Blob(b) => Ok(b.as_slice()),
         SqlCell::Null => Err(BackendError::Query(format!(
