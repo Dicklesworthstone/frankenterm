@@ -239,7 +239,7 @@ scenario_footer() {
     echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped"
     echo "Verdict: $(rio_verdict)"
     echo "================================================================"
-    return $FAIL_COUNT
+    [[ "$FAIL_COUNT" -eq 0 ]]
 }
 
 skip_if_no_ft() {
