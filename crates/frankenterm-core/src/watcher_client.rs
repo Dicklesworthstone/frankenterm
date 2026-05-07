@@ -40,7 +40,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::policy::ActionKind;
 
@@ -548,10 +547,7 @@ impl ClientRegistry {
 // =============================================================================
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::clock_anomaly::epoch_ms_u64("ft.watcher_client.clock")
 }
 
 // =============================================================================

@@ -19,7 +19,7 @@
 //! every call site can route through.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Cumulative count of `SystemTime::now() < UNIX_EPOCH` events
 /// across every call site that routes through [`epoch_ms_u64`] or
@@ -47,7 +47,8 @@ pub fn reset_clock_anomaly_count_for_test() {
     CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
 }
 
-/// Returns current epoch ms as `u64`. On clock-before-epoch error,
+/// Returns current epoch ms as `u64`. Saturates to `u64::MAX` if the
+/// millisecond count overflows `u64`. On clock-before-epoch error,
 /// bumps [`CLOCK_ANOMALY_COUNT`], emits a structured `tracing::warn`
 /// with `target = source` (caller-supplied for site-level
 /// attribution) and the `br-ft-0n4nx` breadcrumb, and returns 0 so
@@ -62,7 +63,7 @@ pub fn epoch_ms_u64(source: &'static str) -> u64 {
 /// SystemTime) without depending on the host clock.
 pub(crate) fn epoch_ms_u64_from(now: SystemTime, source: &'static str) -> u64 {
     match now.duration_since(UNIX_EPOCH) {
-        Ok(ts) => ts.as_millis() as u64,
+        Ok(ts) => duration_ms_u64(ts),
         Err(err) => {
             CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
@@ -75,6 +76,11 @@ pub(crate) fn epoch_ms_u64_from(now: SystemTime, source: &'static str) -> u64 {
             0
         }
     }
+}
+
+#[must_use]
+fn duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Returns current epoch ms as `i64`. Saturates to `i64::MAX` if
@@ -107,10 +113,18 @@ pub(crate) fn epoch_ms_i64_from(now: SystemTime, source: &'static str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn clock_anomaly_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("clock anomaly test lock poisoned")
+    }
 
     #[test]
     fn epoch_ms_u64_post_epoch_no_anomaly_ft_0n4nx() {
+        let _guard = clock_anomaly_test_lock();
         reset_clock_anomaly_count_for_test();
         let post = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
         let ms = epoch_ms_u64_from(post, "ft.test.clock");
@@ -119,7 +133,17 @@ mod tests {
     }
 
     #[test]
+    fn epoch_ms_u64_duration_overflow_saturates_ft_0n4nx() {
+        let _guard = clock_anomaly_test_lock();
+        let overflow = Duration::from_millis(u64::MAX)
+            .checked_add(Duration::from_millis(1))
+            .expect("u64::MAX + 1 milliseconds must fit in Duration");
+        assert_eq!(duration_ms_u64(overflow), u64::MAX);
+    }
+
+    #[test]
     fn epoch_ms_u64_pre_epoch_bumps_counter_ft_0n4nx() {
+        let _guard = clock_anomaly_test_lock();
         reset_clock_anomaly_count_for_test();
         let pre = UNIX_EPOCH - Duration::from_secs(100);
         let ms = epoch_ms_u64_from(pre, "ft.test.clock");
@@ -129,6 +153,7 @@ mod tests {
 
     #[test]
     fn epoch_ms_i64_pre_epoch_returns_zero_ft_0n4nx() {
+        let _guard = clock_anomaly_test_lock();
         reset_clock_anomaly_count_for_test();
         let pre = UNIX_EPOCH - Duration::from_secs(50);
         let ms = epoch_ms_i64_from(pre, "ft.test.clock");
@@ -138,6 +163,7 @@ mod tests {
 
     #[test]
     fn epoch_ms_i64_post_epoch_returns_positive_ft_0n4nx() {
+        let _guard = clock_anomaly_test_lock();
         reset_clock_anomaly_count_for_test();
         let post = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let ms = epoch_ms_i64_from(post, "ft.test.clock");
@@ -149,6 +175,7 @@ mod tests {
     fn shared_counter_aggregates_across_callers_ft_0n4nx() {
         // Multiple distinct sources bump the same shared counter
         // so a single observability scrape covers all sites.
+        let _guard = clock_anomaly_test_lock();
         reset_clock_anomaly_count_for_test();
         let pre = UNIX_EPOCH - Duration::from_secs(10);
         let _ = epoch_ms_u64_from(pre, "ft.recording.clock");
