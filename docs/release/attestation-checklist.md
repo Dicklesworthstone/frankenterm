@@ -53,12 +53,21 @@ the build script) or claim coverage that doesn't exist.
 scripts/attestation-build.sh --version 0.X.0 --channel stable --sign cosign
 ```
 
+Offline fallback when keyless sigstore is unavailable:
+
+```sh
+ED25519_PRIVATE_KEY_PATH=release-ed25519.pem \
+  scripts/attestation-build.sh --version 0.X.0 --channel stable --sign ed25519
+```
+
 Outputs:
 - `docs/attestations/0.X.0.json` — the signed bundle
   (artifact paths + SHA-256 + size + producing-bead pointer).
 - `docs/attestations/0.X.0.sigstore` — the cosign sigstore
   bundle (cert chain + signature over the canonical signing
   payload).
+- `docs/attestations/0.X.0.ed25519.sig.hex` — the Ed25519
+  fallback signature when using `--sign ed25519`.
 
 The build script **fails loudly** on:
 - Any required-category slot with `path: null`.
@@ -80,7 +89,8 @@ The verifier:
 2. Re-derives every artifact's SHA-256 from disk.
 3. Recomputes the canonical signing payload.
 4. Verifies the sigstore signature against
-   `COSIGN_IDENTITY` (the expected workflow ref).
+   `COSIGN_IDENTITY` (the expected workflow ref), or verifies the
+   Ed25519 signature against the bundle's `signature.public_key`.
 5. Exits 0 on full pass; non-zero on any check failure.
 
 For machine-readable output (CI gates):

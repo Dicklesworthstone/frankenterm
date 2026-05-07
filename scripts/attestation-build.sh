@@ -282,10 +282,10 @@ case "$SIGN_METHOD" in
     ;;
   unsigned)
     if [[ "$CHANNEL" != "dev" ]]; then
-      echo "error: --sign unsigned only permitted on --channel dev (got: $CHANNEL). Production releases must use --sign cosign." >&2
+      echo "error: --sign unsigned only permitted on --channel dev (got: $CHANNEL). Production releases must use --sign cosign or --sign ed25519." >&2
       exit 1
     fi
-    reason_text="dev channel bundle — sigstore signing wired in CI under ft-syqcz.1; production releases must use --sign cosign"
+    reason_text="dev channel bundle — production releases must use --sign cosign or --sign ed25519"
     sig_obj="$(jq -n \
       --arg method "unsigned" \
       --arg canonical_sha256 "$canonical_sha" \
