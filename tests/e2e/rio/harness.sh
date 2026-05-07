@@ -34,6 +34,10 @@ parse_harness_args() {
             *)           shift ;;
         esac
     done
+    if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "ERROR: --run-id must contain only letters, numbers, dot, underscore, and hyphen" >&2
+        return 2
+    fi
 }
 
 # ── Directory setup ─────────────────────────────────────────────
@@ -146,21 +150,42 @@ write_summary() {
     local verdict
     verdict="$(rio_verdict)"
 
-    cat > "$output_file" <<SUMMARY_EOF
-{
-  "run_id": "${RUN_ID}",
-  "scenario": "${scenario}",
-  "harness_version": "${HARNESS_VERSION}",
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "results": {
-    "total": ${total},
-    "passed": ${PASS_COUNT},
-    "failed": ${FAIL_COUNT},
-    "skipped": ${SKIP_COUNT}
-  },
-  "verdict": "${verdict}"
+    python3 - "$output_file" "$RUN_ID" "$scenario" "$HARNESS_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "$total" "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT" "$verdict" <<'PY'
+import json
+import sys
+
+(
+    output_file,
+    run_id,
+    scenario,
+    harness_version,
+    timestamp,
+    total,
+    passed,
+    failed,
+    skipped,
+    verdict,
+) = sys.argv[1:11]
+
+record = {
+    "run_id": run_id,
+    "scenario": scenario,
+    "harness_version": harness_version,
+    "timestamp": timestamp,
+    "results": {
+        "total": int(total),
+        "passed": int(passed),
+        "failed": int(failed),
+        "skipped": int(skipped),
+    },
+    "verdict": verdict,
 }
-SUMMARY_EOF
+
+with open(output_file, "w", encoding="utf-8") as fh:
+    json.dump(record, fh, indent=2)
+    fh.write("\n")
+PY
 }
 
 # ── Assertion helpers ───────────────────────────────────────────
