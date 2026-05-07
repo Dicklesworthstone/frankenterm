@@ -9,9 +9,11 @@
 # Usage:
 #   scripts/attestation-build.sh --version 0.2.0
 #   scripts/attestation-build.sh --version 0.2.0 --channel stable --sign cosign
+#   ED25519_PRIVATE_KEY_PATH=release-ed25519.pem scripts/attestation-build.sh --version 0.2.0 --sign ed25519
 #   scripts/attestation-build.sh --version 0.2.0 --channel dev   --sign unsigned --allow-partial
 #
 # Required tools: bash, jq, git, sha256sum (or shasum -a 256). cosign required for --sign cosign.
+# openssl + xxd required for --sign ed25519.
 
 set -euo pipefail
 
@@ -27,14 +29,16 @@ SIGN_METHOD="unsigned"
 ALLOW_PARTIAL=0
 COSIGN_IDENTITY="${COSIGN_IDENTITY:-}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+ED25519_PRIVATE_KEY_PATH="${ED25519_PRIVATE_KEY_PATH:-}"
 
 usage() {
   cat <<EOF
-Usage: $0 --version <semver> [--channel stable|beta|nightly|dev] [--sign cosign|unsigned] [--allow-partial]
+Usage: $0 --version <semver> [--channel stable|beta|nightly|dev] [--sign cosign|ed25519|unsigned] [--allow-partial]
 
   --version       Required. Semver, no leading 'v'.
   --channel       Release channel. Default: dev.
-  --sign          Signature method. Default: unsigned. cosign requires \$COSIGN_IDENTITY (e.g. the GHA workflow ref).
+  --sign          Signature method. Default: unsigned. cosign requires \$COSIGN_IDENTITY
+                  (e.g. the GHA workflow ref); ed25519 requires \$ED25519_PRIVATE_KEY_PATH.
   --allow-partial Permit missing artifact paths in the manifest. Without this the build fails on any null path,
                   which is the desired CI behavior (bridge plan: "CI fails any release that omits a required artifact").
   -h, --help      Show this message.
@@ -42,6 +46,7 @@ Usage: $0 --version <semver> [--channel stable|beta|nightly|dev] [--sign cosign|
 Environment:
   COSIGN_IDENTITY        Expected SAN/identity for cosign keyless. Required when --sign cosign.
   COSIGN_OIDC_ISSUER     Override OIDC issuer. Default: https://token.actions.githubusercontent.com
+  ED25519_PRIVATE_KEY_PATH  PEM-encoded Ed25519 private key for --sign ed25519.
 EOF
 }
 
@@ -64,8 +69,8 @@ case "$CHANNEL" in
 esac
 
 case "$SIGN_METHOD" in
-  cosign|unsigned) ;;
-  *) echo "error: --sign must be one of cosign|unsigned (got: $SIGN_METHOD)" >&2; exit 2 ;;
+  cosign|ed25519|unsigned) ;;
+  *) echo "error: --sign must be one of cosign|ed25519|unsigned (got: $SIGN_METHOD)" >&2; exit 2 ;;
 esac
 
 command -v jq  >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
@@ -241,6 +246,39 @@ case "$SIGN_METHOD" in
       --arg certificate_identity "$COSIGN_IDENTITY" \
       --arg certificate_oidc_issuer "$COSIGN_OIDC_ISSUER" \
       '{method:$method, canonical_sha256:$canonical_sha256, bundle_path:$bundle_path, certificate_identity:$certificate_identity, certificate_oidc_issuer:$certificate_oidc_issuer}')"
+    ;;
+  ed25519)
+    command -v openssl >/dev/null 2>&1 || { echo "error: openssl not installed; required for --sign ed25519" >&2; exit 1; }
+    command -v xxd >/dev/null 2>&1 || { echo "error: xxd not installed; required for --sign ed25519" >&2; exit 1; }
+    [[ -n "$ED25519_PRIVATE_KEY_PATH" ]] || { echo "error: ED25519_PRIVATE_KEY_PATH env var required for --sign ed25519" >&2; exit 1; }
+    [[ -f "$ED25519_PRIVATE_KEY_PATH" ]] || { echo "error: ED25519_PRIVATE_KEY_PATH file not found: $ED25519_PRIVATE_KEY_PATH" >&2; exit 1; }
+    if ! openssl pkey -in "$ED25519_PRIVATE_KEY_PATH" -text -noout 2>/dev/null | head -n 1 | grep -q '^ED25519 Private-Key:'; then
+      echo "error: ED25519_PRIVATE_KEY_PATH must point to a PEM-encoded Ed25519 private key" >&2
+      exit 1
+    fi
+
+    canon_path="$OUT_DIR/${VERSION}.canonical.json"
+    sig_path="$OUT_DIR/${VERSION}.ed25519.sig.hex"
+    pubkey_der_tmp="$(mktemp)"
+    sig_bin_tmp="$(mktemp)"
+    printf '%s' "$canonical_payload" > "$canon_path"
+    openssl pkey -in "$ED25519_PRIVATE_KEY_PATH" -pubout -outform DER > "$pubkey_der_tmp"
+    public_key="$(tail -c 32 "$pubkey_der_tmp" | xxd -p -c 256)"
+    if [[ ${#public_key} -ne 64 || "$public_key" =~ [^0-9A-Fa-f] ]]; then
+      echo "error: failed to derive a 32-byte Ed25519 public key from $ED25519_PRIVATE_KEY_PATH" >&2
+      rm -f "$pubkey_der_tmp" "$sig_bin_tmp"
+      exit 1
+    fi
+    openssl pkeyutl -sign -rawin -inkey "$ED25519_PRIVATE_KEY_PATH" -in "$canon_path" -out "$sig_bin_tmp"
+    xxd -p -c 256 "$sig_bin_tmp" > "$sig_path"
+    rm -f "$pubkey_der_tmp" "$sig_bin_tmp"
+
+    sig_obj="$(jq -n \
+      --arg method "ed25519" \
+      --arg canonical_sha256 "$canonical_sha" \
+      --arg signature_path "docs/attestations/${VERSION}.ed25519.sig.hex" \
+      --arg public_key "$public_key" \
+      '{method:$method, canonical_sha256:$canonical_sha256, signature_path:$signature_path, public_key:$public_key}')"
     ;;
   unsigned)
     if [[ "$CHANNEL" != "dev" ]]; then

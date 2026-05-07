@@ -42,13 +42,20 @@ The producing-bead column is the source of truth for which work item gates the a
 # Production release (fails loudly if any required category is unfilled).
 scripts/attestation-build.sh --version 0.2.0 --channel stable --sign cosign
 
+# Offline Ed25519 signing fallback.
+ED25519_PRIVATE_KEY_PATH=release-ed25519.pem \
+  scripts/attestation-build.sh --version 0.2.0 --channel stable --sign ed25519
+
 # Dev bundle — partial OK, signature optional.
 scripts/attestation-build.sh --version 0.0.0-dev --channel dev --sign unsigned --allow-partial
 ```
 
 `--sign cosign` requires `cosign` on PATH and `COSIGN_IDENTITY` in the environment (the
 expected SAN/identity, typically the GitHub Actions workflow ref). The release CI lane
-sets these automatically.
+sets these automatically. `--sign ed25519` requires `openssl`, `xxd`, and a
+PEM-encoded Ed25519 private key path in `ED25519_PRIVATE_KEY_PATH`; it emits
+`<version>.ed25519.sig.hex` beside the bundle and records the matching raw
+32-byte public key in `signature.public_key`.
 
 ## Verifying a bundle
 
@@ -96,5 +103,4 @@ validate); removing one is a major bump.
 ## Roadmap
 
 - `ft attestation verify` CLI command — user-facing offline verification (tracked by [`ft-syqcz.1.1`](#)).
-- ed25519 signing fallback in `attestation-build.sh` — verification support exists, but build-side signing still emits only sigstore-cosign-keyless or unsigned bundles.
 - Per-PR attestation diff — show which categories changed between releases.

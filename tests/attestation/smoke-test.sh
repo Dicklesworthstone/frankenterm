@@ -34,8 +34,10 @@ restore_manifest() {
     "$ART_DIR/0.0.0-smoke.json" \
     "$ART_DIR/0.0.0-smoke.canonical.json" \
     "$ART_DIR/0.0.0-smoke.sigstore" \
-    "$ART_DIR/0.0.0-smoke.ed25519.sig.hex" \
-    "$ART_DIR/0.0.0-smoke.bad-ed25519.sig.hex"
+    "$ART_DIR/0.0.0-smoke-ed25519.json" \
+    "$ART_DIR/0.0.0-smoke-ed25519.canonical.json" \
+    "$ART_DIR/0.0.0-smoke-ed25519.ed25519.sig.hex" \
+    "$ART_DIR/0.0.0-smoke-ed25519.bad-ed25519.sig.hex"
 }
 trap 'restore_manifest; rm -rf "$WORKDIR"' EXIT
 
@@ -60,32 +62,23 @@ echo "=== positive verify: artifact count OK ==="
 
 if command -v openssl >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
   ED_KEY="$WORKDIR/ed25519.pem"
-  ED_PUB_DER="$WORKDIR/ed25519-public.der"
-  ED_SIG_BIN="$WORKDIR/ed25519.sig"
-  ED_CANON="$WORKDIR/ed25519.canonical.json"
-  ED_BUNDLE="$WORKDIR/ed25519-bundle.json"
+  ED_BUILD_VERSION="0.0.0-smoke-ed25519"
+  ED_BUNDLE="$ART_DIR/${ED_BUILD_VERSION}.json"
   ED_BAD_BUNDLE="$WORKDIR/ed25519-bad-bundle.json"
-  ED_SIG_REL="docs/attestations/0.0.0-smoke.ed25519.sig.hex"
-  ED_BAD_SIG_REL="docs/attestations/0.0.0-smoke.bad-ed25519.sig.hex"
+  ED_SIG_REL="docs/attestations/${ED_BUILD_VERSION}.ed25519.sig.hex"
+  ED_BAD_SIG_REL="docs/attestations/${ED_BUILD_VERSION}.bad-ed25519.sig.hex"
 
   openssl genpkey -algorithm ED25519 -out "$ED_KEY" >/dev/null 2>&1
-  openssl pkey -in "$ED_KEY" -pubout -outform DER > "$ED_PUB_DER"
-  ED_PUB_HEX="$(tail -c 32 "$ED_PUB_DER" | xxd -p -c 256)"
-  printf '%s' "$(jq -S -c 'del(.signature)' "$ART_DIR/0.0.0-smoke.json")" > "$ED_CANON"
-  openssl pkeyutl -sign -rawin -inkey "$ED_KEY" -in "$ED_CANON" -out "$ED_SIG_BIN"
-  xxd -p -c 256 "$ED_SIG_BIN" > "$REPO_ROOT/$ED_SIG_REL"
-
-  jq \
-    --arg sig_path "$ED_SIG_REL" \
-    --arg public_key "$ED_PUB_HEX" \
-    'del(.signature.reason) |
-     .signature.method = "ed25519" |
-     .signature.signature_path = $sig_path |
-     .signature.public_key = $public_key' \
-    "$ART_DIR/0.0.0-smoke.json" > "$ED_BUNDLE"
+  ED25519_PRIVATE_KEY_PATH="$ED_KEY" \
+    bash scripts/attestation-build.sh \
+      --version "$ED_BUILD_VERSION" \
+      --channel dev \
+      --sign ed25519 \
+      --allow-partial >"$WORKDIR/ed25519_build.out" 2>&1
+  cat "$WORKDIR/ed25519_build.out"
 
   echo
-  echo "=== ed25519 verify ==="
+  echo "=== ed25519 build + verify ==="
   bash scripts/attestation-verify.sh "$ED_BUNDLE" >"$WORKDIR/ed25519.out"
   cat "$WORKDIR/ed25519.out"
 
