@@ -187,15 +187,18 @@ pub fn build_server(config: &Config) -> Result<Server> {
 pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
     if db_path.is_none() {
         let skipped_entries = mcp_bridge_degraded_mode_skipped_entries();
-        return Err(crate::error::Error::Runtime(format!(
-            "br-ft-647cj: build_server_with_db called with db_path=None, \
-             which used to silently strip {skipped_entries} \
-             tool + resource registrations from the server surface. The \
-             silent-degradation path was removed; if a database-less \
-             server is genuinely required, call build_server_degraded(config) \
-             by name to opt in to the stripped catalog (which still bumps \
-             MCP_BRIDGE_TOOLS_SKIPPED_NO_DB and warn-logs the absent tools)."
-        )));
+        return Err(crate::error::Error::RuntimeOperation {
+            operation: "mcp_bridge.build_server_with_db",
+            source: crate::error::RuntimeOperationSource::Backend(format!(
+                "br-ft-647cj: build_server_with_db called with db_path=None, \
+                 which used to silently strip {skipped_entries} \
+                 tool + resource registrations from the server surface. The \
+                 silent-degradation path was removed; if a database-less \
+                 server is genuinely required, call build_server_degraded(config) \
+                 by name to opt in to the stripped catalog (which still bumps \
+                 MCP_BRIDGE_TOOLS_SKIPPED_NO_DB and warn-logs the absent tools)."
+            )),
+        });
     }
     build_server_inner(config, db_path)
 }
@@ -498,8 +501,12 @@ pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()>
         Some(path) => build_server_with_db(config, Some(path))?,
         None => build_server_degraded(config)?,
     };
-    run_framework_stdio_server(server)
-        .map_err(|err| crate::error::Error::Runtime(format!("MCP stdio server failed: {err}")))
+    run_framework_stdio_server(server).map_err(|err| crate::error::Error::RuntimeOperation {
+        operation: "mcp_bridge.run_stdio_server",
+        source: crate::error::RuntimeOperationSource::Backend(format!(
+            "MCP stdio server failed: {err}"
+        )),
+    })
 }
 
 #[cfg(test)]
