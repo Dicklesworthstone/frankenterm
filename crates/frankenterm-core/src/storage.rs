@@ -16691,9 +16691,15 @@ mod policy_decision_tests;
 #[rustfmt::skip]
 mod fts_async_flat_tests {
     use super::*;
+    use crate::storage_backend_trait::OpenConfig;
 
 fn memory_backend() -> RusqliteBackend {
-    let conn = Connection::open_in_memory().unwrap();
+    let config = OpenConfig {
+        wal_mode: false,
+        ..OpenConfig::default()
+    };
+    let backend = RusqliteBackend::open(":memory:", &config).unwrap();
+    let conn = backend.into_connection();
     initialize_schema(&conn).unwrap();
     RusqliteBackend::new(conn)
 }
