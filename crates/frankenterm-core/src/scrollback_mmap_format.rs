@@ -52,10 +52,10 @@ pub const MAGIC: &[u8; 4] = b"FTSB";
 /// lines.
 pub const HEADER_SIZE: usize = 256;
 
-/// Size of [`RecordHeader`] (the per-record tag prefix in the
-/// ring buffer). 8 bytes total: `u32 record_len + u8 record_kind
-/// + 3 reserved bytes`. The reserved bytes preserve future
-/// tagging room without a format-version bump.
+/// Size of [`RecordHeader`] (the per-record tag prefix in the ring buffer).
+/// The 8-byte layout is `u32 record_len + u8 record_kind + 3 reserved bytes`.
+/// The reserved bytes preserve future tagging room without a format-version
+/// bump.
 pub const RECORD_HEADER_SIZE: usize = 8;
 
 /// File-format version. Bump on incompatible changes; the
