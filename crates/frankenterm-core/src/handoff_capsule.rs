@@ -85,7 +85,7 @@ impl CapsuleEndpoint {
 /// One section of a handoff capsule. Each variant declares its own
 /// required capabilities so the destination-compatibility check can
 /// skip sections the receiver cannot safely consume.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CapsuleSection {
     /// Long-running mission state digest (operator-supplied JSON).
@@ -203,7 +203,7 @@ impl CapsuleIntegrity {
 }
 
 /// A signed, portable handoff capsule.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffCapsule {
     /// Schema version — bumped on breaking wire changes.
     pub version: u32,
@@ -325,7 +325,7 @@ impl HandoffCapsule {
 }
 
 /// Outcome of [`HandoffCapsule::validate_for_destination`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationOutcome {
     /// Indices into `capsule.sections` that the destination can
     /// safely apply.
@@ -345,7 +345,7 @@ impl ValidationOutcome {
 }
 
 /// Per-section skip reason carried in [`ValidationOutcome`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkipReason {
     pub section_index: usize,
     pub section_label: String,
@@ -354,7 +354,7 @@ pub struct SkipReason {
 }
 
 /// Errors from capsule validation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapsuleValidationError {
     IntegrityMismatch {
         stored: CapsuleIntegrity,
