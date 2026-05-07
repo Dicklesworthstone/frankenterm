@@ -6874,13 +6874,11 @@ impl MockWezterm {
     /// Inject an event into a specific pane.
     pub async fn inject(&self, pane_id: u64, event: MockEvent) -> crate::Result<()> {
         let mut panes = self.panes.write().await;
-        let pane = panes
-            .get_mut(&pane_id)
-            .ok_or_else(|| crate::Error::PaneOperation {
-                pane_id,
-                operation: "inject",
-                source: crate::error::PaneOperationSource::PaneNotFound,
-            })?;
+        let pane = panes.get_mut(&pane_id).ok_or(crate::Error::PaneOperation {
+            pane_id,
+            operation: "inject",
+            source: crate::error::PaneOperationSource::PaneNotFound,
+        })?;
         match event {
             MockEvent::AppendOutput(text) => pane.content.push_str(&text),
             MockEvent::ClearScreen => pane.content.clear(),
@@ -6908,13 +6906,11 @@ impl MockWezterm {
         event: MockEvent,
     ) -> crate::Result<()> {
         let mut panes = self.panes.write_with_cx(cx).await;
-        let pane = panes
-            .get_mut(&pane_id)
-            .ok_or_else(|| crate::Error::PaneOperation {
-                pane_id,
-                operation: "inject_with_cx",
-                source: crate::error::PaneOperationSource::PaneNotFound,
-            })?;
+        let pane = panes.get_mut(&pane_id).ok_or(crate::Error::PaneOperation {
+            pane_id,
+            operation: "inject_with_cx",
+            source: crate::error::PaneOperationSource::PaneNotFound,
+        })?;
         match event {
             MockEvent::AppendOutput(text) => pane.content.push_str(&text),
             MockEvent::ClearScreen => pane.content.clear(),
@@ -6976,7 +6972,7 @@ impl MockWezterm {
     pub async fn set_watchdog_warnings(&self, warnings: Vec<String>) {
         // ft-7xbaz: ergonomic wrapper around `set_watchdog_warnings_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.set_watchdog_warnings_with_cx(&cx, warnings).await
+        self.set_watchdog_warnings_with_cx(&cx, warnings).await;
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::set_watchdog_warnings`].
@@ -6989,7 +6985,7 @@ impl MockWezterm {
     pub async fn set_watchdog_warning_error(&self, error: Option<String>) {
         // ft-7xbaz: ergonomic wrapper around `set_watchdog_warning_error_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.set_watchdog_warning_error_with_cx(&cx, error).await
+        self.set_watchdog_warning_error_with_cx(&cx, error).await;
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::set_watchdog_warning_error`].
