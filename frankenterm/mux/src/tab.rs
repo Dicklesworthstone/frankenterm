@@ -846,11 +846,7 @@ fn split_dimension_for_request(
     first: AxisConstraints,
     second: AxisConstraints,
 ) -> Option<(usize, usize)> {
-    let requested = match request.size {
-        SplitSize::Cells(n) => n,
-        SplitSize::Percent(n) => (dim * (n as usize)) / 100,
-    }
-    .max(1);
+    let requested = requested_split_target_axis_size(dim, request);
 
     if request.target_is_second {
         let preferred_first = dim.saturating_sub(1).saturating_sub(requested);
@@ -858,6 +854,14 @@ fn split_dimension_for_request(
     } else {
         split_allocation(dim, first, second, Some(requested))
     }
+}
+
+fn requested_split_target_axis_size(dim: usize, request: SplitRequest) -> usize {
+    match request.size {
+        SplitSize::Cells(n) => n,
+        SplitSize::Percent(n) => (dim * (n as usize)) / 100,
+    }
+    .max(1)
 }
 
 fn pane_size_satisfies_constraints(
@@ -3982,6 +3986,27 @@ impl TabInner {
                 } else {
                     (split_info.second, split_info.first)
                 };
+                let requested_new_axis = requested_split_target_axis_size(
+                    match request.direction {
+                        SplitDirection::Horizontal => tab_size.cols,
+                        SplitDirection::Vertical => tab_size.rows,
+                    },
+                    request,
+                );
+                let actual_new_axis = match request.direction {
+                    SplitDirection::Horizontal => new_size.cols,
+                    SplitDirection::Vertical => new_size.rows,
+                };
+
+                if actual_new_axis < requested_new_axis {
+                    anyhow::bail!(
+                        "No space for top-level split request: requested={} actual={} existing={:?} new={:?}",
+                        requested_new_axis,
+                        actual_new_axis,
+                        existing_size,
+                        new_size
+                    );
+                }
 
                 if !pane_size_satisfies_constraints(
                     &existing_size,
@@ -5503,7 +5528,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // wa-2dd4s.4: constraint validation not yet implemented
     fn top_level_split_rejects_incompatible_existing_tree_constraints() {
         let size = TerminalSize {
             rows: 24,
