@@ -21,6 +21,8 @@ use crate::runtime_async::{sleep, watch};
 /// Size of the binary frame header (timestamp_ms + type + flags + payload_len).
 const FRAME_HEADER_LEN: usize = 14;
 
+const RESIZE_PAYLOAD_LEN: usize = 4;
+
 /// Default keyframe interval (one keyframe every N output frames).
 const KEYFRAME_INTERVAL: usize = 50;
 
@@ -221,21 +223,29 @@ pub enum DecodedFrame {
     Input(Vec<u8>),
 }
 
+fn decode_resize_payload(payload: &[u8]) -> Result<(u16, u16)> {
+    if payload.len() != RESIZE_PAYLOAD_LEN {
+        return Err(replay_backend_error(
+            "replay.decode_frame",
+            format!(
+                "resize frame payload length {} invalid; expected {RESIZE_PAYLOAD_LEN} bytes",
+                payload.len()
+            ),
+        ));
+    }
+
+    let cols = u16::from_le_bytes(payload[0..2].try_into().unwrap()); // ubs:ignore
+    let rows = u16::from_le_bytes(payload[2..4].try_into().unwrap()); // ubs:ignore
+    Ok((cols, rows))
+}
+
 /// Decode a [`RecordingFrame`] into its semantic representation.
 pub fn decode_frame(frame: &RecordingFrame) -> Result<DecodedFrame> {
     match frame.header.frame_type {
         FrameType::Output => Ok(DecodedFrame::Output(frame.payload.clone())),
         FrameType::Resize => {
-            if frame.payload.len() >= 4 {
-                let cols = u16::from_le_bytes(frame.payload[0..2].try_into().unwrap()); // ubs:ignore
-                let rows = u16::from_le_bytes(frame.payload[2..4].try_into().unwrap()); // ubs:ignore
-                Ok(DecodedFrame::Resize { cols, rows })
-            } else {
-                Err(replay_backend_error(
-                    "replay.decode_frame",
-                    "resize frame payload too short",
-                ))
-            }
+            let (cols, rows) = decode_resize_payload(&frame.payload)?;
+            Ok(DecodedFrame::Resize { cols, rows })
         }
         FrameType::Event => {
             let value: serde_json::Value = serde_json::from_slice(&frame.payload)?;
@@ -975,9 +985,13 @@ pub fn export_asciinema<W: std::io::Write>(
                 })?;
                 event_count += 1;
             }
-            FrameType::Resize if frame.payload.len() >= 4 => {
-                let c = u16::from_le_bytes([frame.payload[0], frame.payload[1]]);
-                let r = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
+            FrameType::Resize => {
+                let (c, r) = decode_resize_payload(&frame.payload).map_err(|err| {
+                    replay_backend_error(
+                        "replay.export_asciinema",
+                        format!("Invalid resize frame payload: {err}"),
+                    )
+                })?;
                 let event = serde_json::json!([rel_secs, "r", format!("{c}x{r}")]);
                 let line = serde_json::to_string(&event).map_err(|e| {
                     replay_backend_error(
@@ -1130,9 +1144,10 @@ pub fn export_html<W: std::io::Write>(
 /// Find terminal size from resize frames, falling back to defaults.
 fn find_terminal_size(recording: &Recording, default_cols: u16, default_rows: u16) -> (u16, u16) {
     for frame in &recording.frames {
-        if frame.header.frame_type == FrameType::Resize && frame.payload.len() >= 4 {
-            let cols = u16::from_le_bytes([frame.payload[0], frame.payload[1]]);
-            let rows = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
+        if frame.header.frame_type == FrameType::Resize {
+            let Ok((cols, rows)) = decode_resize_payload(&frame.payload) else {
+                continue;
+            };
             if cols > 0 && rows > 0 {
                 return (cols, rows);
             }
@@ -2155,6 +2170,25 @@ mod tests {
         };
         let result = decode_frame(&frame);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_resize_rejects_trailing_payload_bytes() {
+        let frame = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 0,
+                frame_type: FrameType::Resize,
+                flags: 0,
+                payload_len: 5,
+            },
+            payload: vec![80, 0, 24, 0, 99],
+        };
+        let err = decode_frame(&frame).expect_err("resize payload with trailing bytes must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("expected 4 bytes"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]

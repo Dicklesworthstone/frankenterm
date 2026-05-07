@@ -14,7 +14,7 @@
 //! without routing through the encoder first.
 
 use frankenterm_core::recording::{FrameHeader, FrameType, RecordingFrame};
-use frankenterm_core::replay::Recording;
+use frankenterm_core::replay::{Recording, decode_frame};
 
 const FRAME_HEADER_LEN: usize = 14;
 
@@ -314,6 +314,29 @@ fn conformance_truncated_second_frame_is_rejected() {
     let message = err.to_string();
     assert!(
         message.contains("unexpected EOF reading frame header"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn conformance_fixed_width_resize_payload_rejects_trailing_bytes() {
+    let mut resize_payload = Vec::new();
+    resize_payload.extend_from_slice(&80u16.to_le_bytes());
+    resize_payload.extend_from_slice(&24u16.to_le_bytes());
+    resize_payload.push(0xff);
+    let bytes = raw_frame(
+        123,
+        frame_type_tag(FrameType::Resize),
+        0,
+        resize_payload.len() as u32,
+        &resize_payload,
+    );
+
+    let frame = parse_single_frame(&bytes);
+    let err = decode_frame(&frame).expect_err("resize frame with trailing bytes must fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("expected 4 bytes"),
         "unexpected error: {message}"
     );
 }
