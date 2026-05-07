@@ -7405,6 +7405,27 @@ rules:
     }
 
     #[test]
+    fn load_pack_from_file_accepts_uppercase_yaml_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.YAML");
+        let yaml = r#"
+name: "test-uppercase-yaml"
+version: "1.0.0"
+rules:
+  - id: "codex.uppercase_yaml_test"
+    agent_type: "codex"
+    event_type: "test"
+    severity: "info"
+    anchors: ["uppercase_yaml_anchor"]
+    description: "Uppercase YAML extension test rule"
+"#;
+        fs::write(&path, yaml).unwrap();
+        let pack = load_pack_from_file(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(pack.name, "test-uppercase-yaml");
+        assert_eq!(pack.rules.len(), 1);
+    }
+
+    #[test]
     fn load_pack_from_file_unsupported_extension() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.xml");
