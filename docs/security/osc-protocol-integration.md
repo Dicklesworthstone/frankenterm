@@ -69,17 +69,23 @@ rule.
 The privacy rule is structural. Pipeline:
 
 ```
-Decoded → policy_gate(Allow|Prompt|Deny) → Allowed | Denied
-Allowed → emit_with_base64(targets, base64_fn) → bytes
+Decoded → policy_gate(Allow|Prompt|Deny) → Allowed | Prompted | Denied
+Allowed → emit_base64(targets) → bytes
+Prompted → confirmed_by_operator() / confirmed_for_session() → Allowed
+Prompted → denied_by_operator() → Denied
 Denied  → emit_empty(targets) → bytes
 ```
+
+`emit_base64` owns the RFC-required base64 encoding step;
+callers cannot substitute an encoder or accidentally emit
+raw clipboard bytes on the allowed path.
 
 The `Denied` typed-state has these methods:
 - `emit_empty(&self, targets: &str) -> Vec<u8>` — produces
   `\x1b]52;<targets>;\x1b\\` (empty payload).
 
 The `Denied` typed-state does NOT have:
-- Any method that takes a base64 closure.
+- Any method that emits a non-empty payload.
 - Any public reader for `bytes`.
 - Any way to construct an `Allowed` from a `Denied`.
 

@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use frankenterm_core::osc_protocol_integration::{
     CellCoord, CursorShapeSlug, Decoded, HyperlinkInteraction, HyperlinkSpan,
     Osc22PerPaneCursorMap, Osc52PolicyGated, Osc52PolicySlug, Osc52ReadResponse,
@@ -55,6 +56,15 @@ fn osc52_envelope(targets: &str, payload: &[u8]) -> Vec<u8> {
     expected.extend_from_slice(payload);
     expected.extend_from_slice(&b"\x1b\\"[..]);
     expected
+}
+
+fn osc52_base64_envelope(targets: &str, payload: &[u8]) -> Vec<u8> {
+    osc52_envelope(
+        targets,
+        base64::engine::general_purpose::STANDARD
+            .encode(payload)
+            .as_bytes(),
+    )
 }
 
 proptest! {
@@ -154,8 +164,8 @@ proptest! {
 
         match (policy, gated) {
             (Osc52PolicySlug::Allow, Osc52PolicyGated::Allowed(allowed)) => {
-                let emitted = allowed.emit_with_base64(&targets, |bytes| bytes.to_vec());
-                prop_assert_eq!(emitted, osc52_envelope(&expected_targets, &payload));
+                let emitted = allowed.emit_base64(&targets);
+                prop_assert_eq!(emitted, osc52_base64_envelope(&expected_targets, &payload));
             }
             (Osc52PolicySlug::Deny, Osc52PolicyGated::Denied(denied)) => {
                 let emitted = denied.emit_empty(&targets);
@@ -166,8 +176,8 @@ proptest! {
                 let denied = prompted.denied_by_operator();
 
                 prop_assert_eq!(
-                    allowed.emit_with_base64(&targets, |bytes| bytes.to_vec()),
-                    osc52_envelope(&expected_targets, &payload)
+                    allowed.emit_base64(&targets),
+                    osc52_base64_envelope(&expected_targets, &payload)
                 );
                 prop_assert_eq!(denied.emit_empty(&targets), osc52_envelope(&expected_targets, &[]));
             }

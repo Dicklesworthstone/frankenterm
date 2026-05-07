@@ -32,6 +32,7 @@ use std::marker::PhantomData;
 use crate::osc_protocol_omnibus::{
     Osc52AuditDecision, Osc52AuditEvent, Osc52DenyReason, Osc52Direction, parse_osc52_targets,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -453,8 +454,7 @@ impl Osc52ReadResponse<Allowed> {
             .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
     }
 
-    /// Emit the OSC 52 response with base64-encoded
-    /// clipboard bytes.
+    /// Emit the OSC 52 response with base64-encoded clipboard bytes.
     ///
     /// Format: `\x1b]52;<targets>;<base64>\x1b\\`
     ///
@@ -467,16 +467,17 @@ impl Osc52ReadResponse<Allowed> {
     /// valid targets remain, falls back to `c`
     /// (clipboard).
     #[must_use]
-    pub fn emit_with_base64<F>(&self, targets: &str, base64: F) -> Vec<u8>
-    where
-        F: FnOnce(&[u8]) -> Vec<u8>,
-    {
+    pub fn emit_base64(&self, targets: &str) -> Vec<u8> {
         let safe_targets = sanitize_osc52_targets(targets);
         let mut out = Vec::from(&b"\x1b]52;"[..]);
         out.extend_from_slice(safe_targets.as_bytes());
         out.push(b';');
         if let Some(ref bytes) = self.bytes {
-            out.extend(base64(bytes));
+            out.extend(
+                base64::engine::general_purpose::STANDARD
+                    .encode(bytes)
+                    .bytes(),
+            );
         }
         out.extend_from_slice(&b"\x1b\\"[..]);
         out
@@ -796,23 +797,15 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
-    fn osc52_allowed_path_emits_with_base64() {
+    fn osc52_allowed_path_emits_base64() {
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
         let gated = response.policy_gate(Osc52PolicySlug::Allow);
         let emitted = match gated {
-            Osc52PolicyGated::Allowed(allowed) => {
-                allowed.emit_with_base64("c", |b| {
-                    let mut out = Vec::new();
-                    for &byte in b {
-                        out.push(byte); // mock base64 — produces raw bytes
-                    }
-                    out
-                })
-            }
+            Osc52PolicyGated::Allowed(allowed) => allowed.emit_base64("c"),
             Osc52PolicyGated::Denied(_) => panic!("expected Allowed"),
             Osc52PolicyGated::Prompted(_) => panic!("expected Allowed"),
         };
-        assert_eq!(emitted, b"\x1b]52;c;secret\x1b\\");
+        assert_eq!(emitted, b"\x1b]52;c;c2VjcmV0\x1b\\");
     }
 
     #[test]
@@ -870,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn osc52_emit_with_base64_sanitizes_injection_attempt() {
+    fn osc52_emit_base64_sanitizes_injection_attempt() {
         // SECURITY REGRESSION TEST: a malicious caller
         // passes targets containing \x1b\\ (ST). Before
         // the fix this would inject "INJECTED" into the
@@ -880,9 +873,7 @@ mod tests {
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"data".to_vec());
         let gated = response.policy_gate(Osc52PolicySlug::Allow);
         let emitted = match gated {
-            Osc52PolicyGated::Allowed(allowed) => {
-                allowed.emit_with_base64("c\x1b\\INJECTED", |b| b.to_vec())
-            }
+            Osc52PolicyGated::Allowed(allowed) => allowed.emit_base64("c\x1b\\INJECTED"),
             _ => panic!("expected Allowed"),
         };
         let s = String::from_utf8_lossy(&emitted);
@@ -906,7 +897,7 @@ mod tests {
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(Vec::new());
         let gated = response.policy_gate(Osc52PolicySlug::Allow);
         let emitted = match gated {
-            Osc52PolicyGated::Allowed(allowed) => allowed.emit_with_base64("c", |b| b.to_vec()),
+            Osc52PolicyGated::Allowed(allowed) => allowed.emit_base64("c"),
             _ => panic!("expected Allowed"),
         };
         assert_eq!(emitted, b"\x1b]52;c;\x1b\\");
@@ -932,7 +923,7 @@ mod tests {
         // Prompt now returns a Prompted state — NOT
         // Allowed. Previously this returned Allowed which
         // was a privacy hole: a maintainer could call
-        // emit_with_base64 immediately, bypassing the
+        // emit_base64 immediately, bypassing the
         // prompt UI.
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
         let gated = response.policy_gate(Osc52PolicySlug::Prompt);
@@ -947,8 +938,8 @@ mod tests {
             Osc52PolicyGated::Prompted(p) => p.confirmed_by_operator(),
             _ => panic!("expected Prompted"),
         };
-        let emitted = allowed.emit_with_base64("c", |b| b.to_vec());
-        assert_eq!(emitted, b"\x1b]52;c;secret\x1b\\");
+        let emitted = allowed.emit_base64("c");
+        assert_eq!(emitted, b"\x1b]52;c;c2VjcmV0\x1b\\");
     }
 
     #[test]
@@ -973,8 +964,8 @@ mod tests {
             Osc52PolicyGated::Prompted(p) => p.confirmed_for_session(),
             _ => panic!("expected Prompted"),
         };
-        let emitted = allowed.emit_with_base64("c", |b| b.to_vec());
-        assert_eq!(emitted, b"\x1b]52;c;secret\x1b\\");
+        let emitted = allowed.emit_base64("c");
+        assert_eq!(emitted, b"\x1b]52;c;c2VjcmV0\x1b\\");
     }
 
     #[test]
@@ -1074,10 +1065,10 @@ mod tests {
     // The privacy rule for Prompted is structural — these
     // patterns do not compile:
     //
-    // // Cannot emit_with_base64 from Prompted state:
+    // // Cannot emit_base64 from Prompted state:
     // let prompted: Osc52ReadResponse<Prompted> = ...;
-    // prompted.emit_with_base64("c", |b| b.to_vec());
-    // // ^^^ compile error: emit_with_base64 only on Allowed
+    // prompted.emit_base64("c");
+    // // ^^^ compile error: emit_base64 only on Allowed
     //
     // // Cannot emit_empty from Prompted state:
     // let prompted: Osc52ReadResponse<Prompted> = ...;
@@ -1091,10 +1082,10 @@ mod tests {
     // let denied: Osc52ReadResponse<Denied> = ...;
     // let bytes = denied.bytes; // private field, no public reader
     //
-    // // Cannot emit_with_base64 from Denied state:
+    // // Cannot emit_base64 from Denied state:
     // let denied: Osc52ReadResponse<Denied> = ...;
-    // denied.emit_with_base64("c", |b| ...);
-    // // ^^^ compile error: emit_with_base64 only on Allowed
+    // denied.emit_base64("c");
+    // // ^^^ compile error: emit_base64 only on Allowed
 
     // ------------------------------------------------------------------------
     // Health snapshot
