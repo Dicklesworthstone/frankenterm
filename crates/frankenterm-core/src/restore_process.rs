@@ -648,7 +648,7 @@ fn shell_escape(path: &Path) -> String {
 /// Returns `Ok(command)` unchanged on success. Errors are stringly
 /// typed to match the surrounding `Result<(), String>` convention of
 /// the restore path.
-fn sanitize_restored_command<'a>(command: &'a str) -> Result<&'a str, String> {
+fn sanitize_restored_command(command: &str) -> Result<&str, String> {
     for (idx, ch) in command.char_indices() {
         match ch {
             '\r' | '\n' => {
