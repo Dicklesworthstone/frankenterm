@@ -111,7 +111,7 @@ impl std::error::Error for EncryptionError {}
 /// Encrypted capsule envelope. The plaintext form
 /// ([`HandoffCapsule`]) is recovered by feeding `ciphertext` through
 /// the same-`hook_id` hook's open() method.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedCapsuleEnvelope {
     /// Schema version mirrors HandoffCapsule's so envelope evolution
     /// can move in lockstep.
@@ -204,7 +204,7 @@ impl EncryptedCapsuleEnvelope {
 }
 
 /// Errors from [`EncryptedCapsuleEnvelope::open`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvelopeOpenError {
     /// The envelope's stored integrity does not match the recomputed
     /// digest of the ciphertext bytes — tampered envelope.
