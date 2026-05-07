@@ -5,7 +5,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::RuntimeOperationSource;
 use crate::storage::{MetricType, StorageHandle, UsageMetricRecord};
+
+fn alert_check_cancelled_error(detail: impl Into<String>) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation: "alerts.check_alerts",
+        source: RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
 
 /// Time period for aggregating alert thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,7 +412,7 @@ impl AlertMonitor {
         storage: &StorageHandle,
     ) -> crate::error::Result<Vec<TriggeredAlert>> {
         cx.checkpoint()
-            .map_err(|err| crate::Error::Runtime(format!("check_alerts cancelled: {err}")))?;
+            .map_err(|err| alert_check_cancelled_error(format!("pre-start: {err}")))?;
 
         let now = now_ms();
         let mut triggered = Vec::new();
@@ -414,12 +422,8 @@ impl AlertMonitor {
                 continue;
             }
 
-            cx.checkpoint().map_err(|err| {
-                crate::Error::Runtime(format!(
-                    "check_alerts cancelled at rule '{}': {err}",
-                    rule.id
-                ))
-            })?;
+            cx.checkpoint()
+                .map_err(|err| alert_check_cancelled_error(format!("rule '{}': {err}", rule.id)))?;
 
             let current_value = self
                 .get_current_value_with_cx(cx, storage, rule, now)
@@ -604,6 +608,23 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alert_check_cancelled_error_uses_structured_runtime_operation() {
+        let error = alert_check_cancelled_error("rule 'budget': cancelled");
+        match error {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "alerts.check_alerts");
+                match source {
+                    RuntimeOperationSource::Cancelled(detail) => {
+                        assert_eq!(detail, "rule 'budget': cancelled");
+                    }
+                    other => panic!("unexpected runtime source: {other:?}"),
+                }
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
 
     /// ft-xbnl0.2.3 Cx-first: `check_alerts_with_cx` must match
     /// `check_alerts` on a manager with 0 enabled rules — both
