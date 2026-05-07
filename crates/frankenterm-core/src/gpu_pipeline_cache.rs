@@ -131,7 +131,7 @@ pub fn derive_cache_key(v: PipelineCacheVersion) -> u64 {
         v.ft_binary_hash.to_le_bytes(),
     ];
     let mut hash = FNV_OFFSET_BASIS_64;
-    for slot in bytes.iter() {
+    for slot in &bytes {
         for &byte in slot {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(FNV_PRIME_64);
