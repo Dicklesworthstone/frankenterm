@@ -411,18 +411,18 @@ pub fn check_invariants(
     None
 }
 
+type PersistentProfileView<'a> = (
+    &'a BTreeSet<ProfileId>,
+    &'a BTreeMap<ProfileId, ApplyReceipt>,
+    &'a BTreeMap<ProfileId, BTreeSet<PaneId>>,
+    PaneId,
+);
+
 /// Project the persistent (non-event-trace) fields of the world
 /// for purity comparisons. Events are append-only and used as a
 /// trace; comparing them between pre/post would falsely fail
 /// purity invariants when an event is emitted.
-fn persistent_view(
-    w: &ProfileWorld,
-) -> (
-    &BTreeSet<ProfileId>,
-    &BTreeMap<ProfileId, ApplyReceipt>,
-    &BTreeMap<ProfileId, BTreeSet<PaneId>>,
-    PaneId,
-) {
+fn persistent_view(w: &ProfileWorld) -> PersistentProfileView<'_> {
     (
         &w.defined_profiles,
         &w.agent_profiles,
@@ -484,7 +484,7 @@ fn canonicalize(w: &ProfileWorld) -> Vec<u8> {
         v.push(*k);
         v.push(r.count);
         v.push(r.env_overrides_hash);
-        v.push(if r.dry_run { 1 } else { 0 });
+        v.push(u8::from(r.dry_run));
         for p in &r.panes_spawned {
             v.push(*p);
         }
