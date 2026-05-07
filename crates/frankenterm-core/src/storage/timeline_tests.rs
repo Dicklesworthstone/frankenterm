@@ -34,6 +34,10 @@ fn insert_test_event(
     conn.last_insert_rowid()
 }
 
+fn query_test_timeline(conn: &mut Connection, query: &TimelineQuery) -> Timeline {
+    with_writer_backend(conn, |backend| query_timeline_backend(backend, query)).unwrap()
+}
+
 #[test]
 fn correlation_type_display_batch2() {
     assert_eq!(CorrelationType::Failover.to_string(), "failover");
@@ -61,11 +65,11 @@ fn timeline_query_builder() {
 
 #[test]
 fn empty_timeline_query() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let query = TimelineQuery::new();
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     assert!(timeline.events.is_empty());
     assert!(timeline.correlations.is_empty());
@@ -75,7 +79,7 @@ fn empty_timeline_query() {
 
 #[test]
 fn timeline_with_events() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     // Create panes
@@ -103,7 +107,7 @@ fn timeline_with_events() {
     insert_test_event(&conn, 1, "codex.error", "error", "critical", now);
 
     let query = TimelineQuery::new();
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     assert_eq!(timeline.events.len(), 3);
     assert_eq!(timeline.total_count, 3);
@@ -120,7 +124,7 @@ fn timeline_with_events() {
 
 #[test]
 fn timeline_with_pane_filter() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1, "local");
@@ -132,7 +136,7 @@ fn timeline_with_pane_filter() {
     insert_test_event(&conn, 1, "rule3", "event3", "info", now + 1000);
 
     let query = TimelineQuery::new().with_panes(vec![1]);
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     assert_eq!(timeline.events.len(), 2);
     assert!(timeline.events.iter().all(|e| e.pane_info.pane_id == 1));
@@ -140,7 +144,7 @@ fn timeline_with_pane_filter() {
 
 #[test]
 fn timeline_with_severity_filter() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1, "local");
@@ -151,7 +155,7 @@ fn timeline_with_severity_filter() {
     insert_test_event(&conn, 1, "rule3", "event3", "critical", now);
 
     let query = TimelineQuery::new().with_severities(vec!["critical".to_string()]);
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     assert_eq!(timeline.events.len(), 1);
     assert_eq!(timeline.events[0].severity, "critical");
@@ -159,7 +163,7 @@ fn timeline_with_severity_filter() {
 
 #[test]
 fn timeline_pagination() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1, "local");
@@ -178,7 +182,7 @@ fn timeline_pagination() {
 
     // First page
     let query = TimelineQuery::new().with_pagination(3, 0);
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     assert_eq!(timeline.events.len(), 3);
     assert_eq!(timeline.total_count, 10);
@@ -186,14 +190,14 @@ fn timeline_pagination() {
 
     // Second page
     let query = TimelineQuery::new().with_pagination(3, 3);
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     assert_eq!(timeline.events.len(), 3);
     assert!(timeline.has_more);
 
     // Last page
     let query = TimelineQuery::new().with_pagination(3, 9);
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     assert_eq!(timeline.events.len(), 1);
     assert!(!timeline.has_more);
@@ -201,7 +205,7 @@ fn timeline_pagination() {
 
 #[test]
 fn detect_temporal_correlations() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1, "local");
@@ -213,7 +217,7 @@ fn detect_temporal_correlations() {
     insert_test_event(&conn, 2, "rule2", "event2", "info", now + 2000); // 2s later
 
     let query = TimelineQuery::new();
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     // Should detect temporal correlation
     assert!(!timeline.correlations.is_empty());
@@ -226,7 +230,7 @@ fn detect_temporal_correlations() {
 
 #[test]
 fn detect_failover_correlations() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1, "local");
@@ -250,7 +254,7 @@ fn detect_failover_correlations() {
         now + 10_000,
     );
 
-    let timeline = query_timeline(&conn, &TimelineQuery::new()).unwrap();
+    let timeline = query_test_timeline(&mut conn, &TimelineQuery::new());
     let failover = timeline
         .correlations
         .iter()
@@ -260,7 +264,7 @@ fn detect_failover_correlations() {
 
 #[test]
 fn detect_cascade_correlations() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1, "local");
@@ -284,7 +288,7 @@ fn detect_cascade_correlations() {
         now + 5_000,
     );
 
-    let timeline = query_timeline(&conn, &TimelineQuery::new()).unwrap();
+    let timeline = query_test_timeline(&mut conn, &TimelineQuery::new());
     let cascade = timeline
         .correlations
         .iter()
@@ -294,7 +298,7 @@ fn detect_cascade_correlations() {
 
 #[test]
 fn unhandled_only_filter() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1, "local");
@@ -311,7 +315,7 @@ fn unhandled_only_filter() {
     .unwrap();
 
     let query = TimelineQuery::new().unhandled_only();
-    let timeline = query_timeline(&conn, &query).unwrap();
+    let timeline = query_test_timeline(&mut conn, &query);
 
     assert_eq!(timeline.events.len(), 1);
     assert!(timeline.events[0].handled.is_none());
