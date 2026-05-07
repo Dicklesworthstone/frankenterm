@@ -28,6 +28,7 @@
 //!   subset of that contract.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
@@ -397,11 +398,11 @@ pub struct ApplyReceipt {
 /// under another. The wired-pass migration handles old-format rows
 /// by dropping them (re-applies just pay the spawn cost once more).
 #[must_use]
-pub fn compute_apply_content_hash(
+pub fn compute_apply_content_hash<S: BuildHasher>(
     profile_name: &str,
     profile_updated_at_ms: i64,
     count: u32,
-    env_overrides: &std::collections::HashMap<String, String>,
+    env_overrides: &HashMap<String, String, S>,
 ) -> String {
     use sha2::{Digest as _, Sha256};
 
