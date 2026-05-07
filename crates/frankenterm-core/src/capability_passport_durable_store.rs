@@ -168,14 +168,6 @@ impl DurablePassportStore {
         }
     }
 
-    fn pane_id_from_storage(stored: i64) -> Option<u64> {
-        if stored == AGENT_SCOPED_PANE_SENTINEL {
-            None
-        } else {
-            Some(stored as u64)
-        }
-    }
-
     /// Insert or update a passport, enforcing generation-monotonic
     /// rule at the SQL transaction boundary.
     pub fn upsert(
