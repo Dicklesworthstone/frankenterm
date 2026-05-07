@@ -61,6 +61,7 @@ pub struct FusedResult {
     pub semantic_rank: Option<usize>,
 }
 
+#[cfg(any(feature = "frankensearch", test))]
 fn rrf_component_score(rank: usize, k: u32, weight: f32) -> f32 {
     if weight <= 0.0 {
         return 0.0;

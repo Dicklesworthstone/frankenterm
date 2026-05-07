@@ -271,7 +271,10 @@ fn storage_handle_hybrid_search_blends_lexical_and_semantic() {
 
         let bundle = handle
             .hybrid_search_with_results(
-                "needle",
+                // Use a token that is not at the start of the second logical
+                // segment so this test exercises hybrid fusion, not the
+                // streaming-redactor retained-tail boundary tracked in ft-m6ogq.
+                "appears",
                 SearchOptions {
                     limit: Some(3),
                     include_snippets: Some(false),
