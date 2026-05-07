@@ -10,8 +10,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
+use crate::error::RuntimeOperationSource;
 use crate::wezterm::{MockEvent, MockPane, MockWezterm};
+use crate::{Error, Result};
+
+fn simulation_backend_error(operation: &'static str, detail: impl Into<String>) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Backend(detail.into()),
+    }
+}
+
+fn simulation_cancelled_error(operation: &'static str, detail: impl Into<String>) -> Error {
+    Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Scenario types
@@ -484,8 +499,12 @@ impl Scenario {
 
     /// Parse a scenario from a YAML string.
     pub fn from_yaml(yaml: &str) -> Result<Self> {
-        let scenario: Scenario = serde_yaml::from_str(yaml)
-            .map_err(|e| crate::Error::Runtime(format!("Failed to parse scenario YAML: {e}")))?;
+        let scenario: Scenario = serde_yaml::from_str(yaml).map_err(|e| {
+            simulation_backend_error(
+                "simulation.scenario.from_yaml",
+                format!("Failed to parse scenario YAML: {e}"),
+            )
+        })?;
         scenario.validate()?;
         Ok(scenario)
     }
@@ -496,20 +515,23 @@ impl Scenario {
         let mut seen_ids = HashSet::new();
         for pane in &self.panes {
             if !seen_ids.insert(pane.id) {
-                return Err(crate::Error::Runtime(format!(
-                    "Duplicate pane ID {} in scenario '{}'",
-                    pane.id, self.name
-                )));
+                return Err(simulation_backend_error(
+                    "simulation.scenario.validate",
+                    format!("Duplicate pane ID {} in scenario '{}'", pane.id, self.name),
+                ));
             }
         }
 
         // Check events reference valid panes
         for event in &self.events {
             if !seen_ids.contains(&event.pane) {
-                return Err(crate::Error::Runtime(format!(
-                    "Event at {:?} references unknown pane {} in scenario '{}'",
-                    event.at, event.pane, self.name
-                )));
+                return Err(simulation_backend_error(
+                    "simulation.scenario.validate",
+                    format!(
+                        "Event at {:?} references unknown pane {} in scenario '{}'",
+                        event.at, event.pane, self.name
+                    ),
+                ));
             }
 
             match event.action {
@@ -518,10 +540,13 @@ impl Scenario {
                 }
                 EventAction::SetFontSize => {
                     if event.content.trim().is_empty() {
-                        return Err(crate::Error::Runtime(format!(
-                            "SetFontSize requires non-empty content in scenario '{}'",
-                            self.name
-                        )));
+                        return Err(simulation_backend_error(
+                            "simulation.scenario.validate",
+                            format!(
+                                "SetFontSize requires non-empty content in scenario '{}'",
+                                self.name
+                            ),
+                        ));
                     }
                 }
                 EventAction::GenerateScrollback => {
@@ -529,18 +554,24 @@ impl Scenario {
                 }
                 EventAction::Typing | EventAction::Paste => {
                     if event.content.trim().is_empty() {
-                        return Err(crate::Error::Runtime(format!(
-                            "{:?} requires non-empty content in scenario '{}'",
-                            event.action, self.name
-                        )));
+                        return Err(simulation_backend_error(
+                            "simulation.scenario.validate",
+                            format!(
+                                "{:?} requires non-empty content in scenario '{}'",
+                                event.action, self.name
+                            ),
+                        ));
                     }
                 }
                 EventAction::Mouse => {
                     if event.name.trim().is_empty() && event.content.trim().is_empty() {
-                        return Err(crate::Error::Runtime(format!(
-                            "Mouse requires non-empty name or content in scenario '{}'",
-                            self.name
-                        )));
+                        return Err(simulation_backend_error(
+                            "simulation.scenario.validate",
+                            format!(
+                                "Mouse requires non-empty name or content in scenario '{}'",
+                                self.name
+                            ),
+                        ));
                     }
                 }
                 EventAction::Append
@@ -553,25 +584,31 @@ impl Scenario {
         // Check events are in chronological order
         for window in self.events.windows(2) {
             if window[1].at < window[0].at {
-                return Err(crate::Error::Runtime(format!(
-                    "Events out of order: {:?} before {:?} in scenario '{}'",
-                    window[0].at, window[1].at, self.name
-                )));
+                return Err(simulation_backend_error(
+                    "simulation.scenario.validate",
+                    format!(
+                        "Events out of order: {:?} before {:?} in scenario '{}'",
+                        window[0].at, window[1].at, self.name
+                    ),
+                ));
             }
         }
 
         for (key, value) in &self.metadata {
             if key.trim().is_empty() {
-                return Err(crate::Error::Runtime(format!(
-                    "Scenario '{}' contains an empty metadata key",
-                    self.name
-                )));
+                return Err(simulation_backend_error(
+                    "simulation.scenario.validate",
+                    format!("Scenario '{}' contains an empty metadata key", self.name),
+                ));
             }
             if value.trim().is_empty() {
-                return Err(crate::Error::Runtime(format!(
-                    "Scenario '{}' metadata '{}' has an empty value",
-                    self.name, key
-                )));
+                return Err(simulation_backend_error(
+                    "simulation.scenario.validate",
+                    format!(
+                        "Scenario '{}' metadata '{}' has an empty value",
+                        self.name, key
+                    ),
+                ));
             }
         }
 
@@ -625,14 +662,12 @@ impl Scenario {
     /// rollback — MockWezterm has no transactional bulk-add).
     pub async fn setup_with_cx(&self, cx: &crate::cx::Cx, mock: &MockWezterm) -> Result<()> {
         cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!("simulation.setup cancelled pre-start: {err}"))
+            simulation_cancelled_error("simulation.setup", format!("pre-start: {err}"))
         })?;
 
         for (index, pane_def) in self.panes.iter().enumerate() {
             cx.checkpoint().map_err(|err| {
-                crate::Error::Runtime(format!(
-                    "simulation.setup cancelled at pane index {index}: {err}"
-                ))
+                simulation_cancelled_error("simulation.setup", format!("pane index {index}: {err}"))
             })?;
             let pane = MockPane {
                 pane_id: pane_def.id,
@@ -718,9 +753,9 @@ impl Scenario {
     /// caller `&Cx` through the event injection loop via
     /// `cx.checkpoint()` before each mock.inject call. A
     /// pre-cancelled cx returns `Ok(0)` immediately; a
-    /// mid-iteration cancel returns an `Err` via Error::Runtime
-    /// with the event index embedded so the caller knows how far
-    /// the scenario progressed before cancellation.
+    /// mid-iteration cancel returns a structured runtime-operation
+    /// error with the event index embedded so the caller knows how
+    /// far the scenario progressed before cancellation.
     pub async fn execute_until_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -728,9 +763,7 @@ impl Scenario {
         elapsed: Duration,
     ) -> Result<usize> {
         cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "simulation.execute_until cancelled pre-start: {err}"
-            ))
+            simulation_cancelled_error("simulation.execute_until", format!("pre-start: {err}"))
         })?;
 
         let mut count = 0;
@@ -739,9 +772,10 @@ impl Scenario {
                 break;
             }
             cx.checkpoint().map_err(|err| {
-                crate::Error::Runtime(format!(
-                    "simulation.execute_until cancelled at event index {index}: {err}"
-                ))
+                simulation_cancelled_error(
+                    "simulation.execute_until",
+                    format!("event index {index}: {err}"),
+                )
             })?;
             let mock_event = Self::to_mock_event(event)?;
             // Tick 202 (ft-xbnl0.2.3): route the mock inject through
@@ -972,9 +1006,10 @@ impl Scenario {
         elapsed: Duration,
     ) -> Result<(usize, ResizeTimeline)> {
         cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
-                "execute_until_with_resize_timeline cancelled: {err}"
-            ))
+            simulation_cancelled_error(
+                "simulation.execute_until_with_resize_timeline",
+                err.to_string(),
+            )
         })?;
         self.execute_until_with_resize_timeline(mock, elapsed).await
     }
@@ -1420,22 +1455,30 @@ fn parse_resize_spec(spec: &str) -> Result<(u32, u32)> {
         .split_once('x')
         .or_else(|| spec.split_once('X'))
         .ok_or_else(|| {
-            crate::Error::Runtime(format!("Resize content must be 'COLSxROWS', got '{spec}'"))
+            simulation_backend_error(
+                "simulation.resize.parse",
+                format!("Resize content must be 'COLSxROWS', got '{spec}'"),
+            )
         })?;
 
-    let cols: u32 = cols_raw
-        .trim()
-        .parse()
-        .map_err(|_| crate::Error::Runtime(format!("Invalid cols in resize: '{cols_raw}'")))?;
-    let rows: u32 = rows_raw
-        .trim()
-        .parse()
-        .map_err(|_| crate::Error::Runtime(format!("Invalid rows in resize: '{rows_raw}'")))?;
+    let cols: u32 = cols_raw.trim().parse().map_err(|_| {
+        simulation_backend_error(
+            "simulation.resize.parse",
+            format!("Invalid cols in resize: '{cols_raw}'"),
+        )
+    })?;
+    let rows: u32 = rows_raw.trim().parse().map_err(|_| {
+        simulation_backend_error(
+            "simulation.resize.parse",
+            format!("Invalid rows in resize: '{rows_raw}'"),
+        )
+    })?;
 
     if cols == 0 || rows == 0 {
-        return Err(crate::Error::Runtime(format!(
-            "Resize dimensions must be > 0, got '{spec}'"
-        )));
+        return Err(simulation_backend_error(
+            "simulation.resize.parse",
+            format!("Resize dimensions must be > 0, got '{spec}'"),
+        ));
     }
 
     Ok((cols, rows))
@@ -1444,7 +1487,8 @@ fn parse_resize_spec(spec: &str) -> Result<(u32, u32)> {
 fn parse_scrollback_spec(spec: &str) -> Result<(usize, usize)> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::Runtime(
+        return Err(simulation_backend_error(
+            "simulation.scrollback.parse",
             "GenerateScrollback requires non-empty content".to_string(),
         ));
     }
@@ -1457,31 +1501,38 @@ fn parse_scrollback_spec(spec: &str) -> Result<(usize, usize)> {
         };
 
     let lines: usize = lines_raw.parse().map_err(|_| {
-        crate::Error::Runtime(format!(
-            "Invalid line count for GenerateScrollback: '{lines_raw}'"
-        ))
+        simulation_backend_error(
+            "simulation.scrollback.parse",
+            format!("Invalid line count for GenerateScrollback: '{lines_raw}'"),
+        )
     })?;
     if lines == 0 {
-        return Err(crate::Error::Runtime(
+        return Err(simulation_backend_error(
+            "simulation.scrollback.parse",
             "GenerateScrollback line count must be > 0".to_string(),
         ));
     }
     if lines > 250_000 {
-        return Err(crate::Error::Runtime(format!(
-            "GenerateScrollback line count too large ({lines}); max 250000"
-        )));
+        return Err(simulation_backend_error(
+            "simulation.scrollback.parse",
+            format!("GenerateScrollback line count too large ({lines}); max 250000"),
+        ));
     }
 
     let width: usize = match width_raw_opt {
         Some(raw) => raw.parse().map_err(|_| {
-            crate::Error::Runtime(format!("Invalid width for GenerateScrollback: '{raw}'"))
+            simulation_backend_error(
+                "simulation.scrollback.parse",
+                format!("Invalid width for GenerateScrollback: '{raw}'"),
+            )
         })?,
         None => 96,
     };
     if !(20..=4096).contains(&width) {
-        return Err(crate::Error::Runtime(format!(
-            "GenerateScrollback width out of range ({width}); expected 20..=4096"
-        )));
+        return Err(simulation_backend_error(
+            "simulation.scrollback.parse",
+            format!("GenerateScrollback width out of range ({width}); expected 20..=4096"),
+        ));
     }
 
     Ok((lines, width))
@@ -1674,6 +1725,24 @@ mod tests {
         }
     }
 
+    fn assert_runtime_backend_error(err: Error, expected_operation: &'static str, expected: &str) {
+        match err {
+            Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, expected_operation);
+                match source {
+                    RuntimeOperationSource::Backend(detail) => {
+                        assert!(
+                            detail.contains(expected),
+                            "expected detail containing `{expected}`, got `{detail}`"
+                        );
+                    }
+                    other => panic!("expected backend runtime source, got {other:?}"),
+                }
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
+        }
+    }
+
     const BASIC_SCENARIO: &str = r#"
 name: basic_test
 description: "A simple test scenario"
@@ -1753,8 +1822,11 @@ events: []
 "#;
         let result = Scenario::from_yaml(yaml);
         assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("Duplicate pane ID"));
+        assert_runtime_backend_error(
+            result.unwrap_err(),
+            "simulation.scenario.validate",
+            "Duplicate pane ID",
+        );
     }
 
     #[test]
@@ -2995,6 +3067,12 @@ events: []
     }
 
     #[test]
+    fn parse_resize_spec_error_uses_runtime_operation() {
+        let err = parse_resize_spec("0x24").unwrap_err();
+        assert_runtime_backend_error(err, "simulation.resize.parse", "must be > 0");
+    }
+
+    #[test]
     fn parse_resize_spec_zero_rows() {
         let err = parse_resize_spec("80x0");
         assert!(err.is_err());
@@ -3067,6 +3145,12 @@ events: []
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("too large"));
+    }
+
+    #[test]
+    fn parse_scrollback_spec_error_uses_runtime_operation() {
+        let err = parse_scrollback_spec("300000x80").unwrap_err();
+        assert_runtime_backend_error(err, "simulation.scrollback.parse", "line count too large");
     }
 
     #[test]
