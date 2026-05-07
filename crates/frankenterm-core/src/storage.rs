@@ -113,6 +113,12 @@ pub use schema_ddl::{SCHEMA_SQL, SCHEMA_VERSION};
 // `export::query_export_*`.
 mod export;
 
+/// br-ft-l3u5k: cumulative count of export JSON-column parse failures.
+#[must_use]
+pub fn storage_export_json_parse_drop_count() -> u64 {
+    export::storage_export_json_parse_drop_count()
+}
+
 // [ft-aw52a / ft-dn2tu Phase 6] StorageHandle impl-split scaffolding.
 // Per-feature impl blocks live under `storage/handle/`; the first
 // beachhead covers the event-mute methods. See `storage::handle::mod`
