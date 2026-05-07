@@ -1,7 +1,7 @@
 //! End-to-end test for the `ft watch` daemon's discovery+persist loop.
 //!
 //! Mock-free: spins up a real SQLite database in a tempfile, drives one
-//! iteration of the discovery loop against a 2-pane mock pane list,
+//! iteration of the discovery loop against a 2-pane fixture list,
 //! persists each new pane through the real storage writer, verifies the
 //! rows round-trip from disk, and exercises graceful shutdown.
 //!
@@ -19,10 +19,9 @@
 //!   real SQLite write and readback through the writer-thread channel.
 //! - `StorageHandle::shutdown()`: graceful drain of the writer thread.
 //!
-//! Scope note: this test does NOT edit `runtime.rs` (pane 6 is working
-//! there). It only calls the already-public surface that `ft watch`
-//! drives, so it can be extended independently when the full
-//! `ObservationRuntime::start` path becomes testable under asupersync.
+//! Scope note: this test calls the already-public surface that `ft watch`
+//! drives, so it can stay always-on while the full
+//! `ObservationRuntime::start` path remains a heavier integration lane.
 //!
 //! Domain: watch daemon real-service E2E (pane 5).
 
@@ -91,7 +90,6 @@ fn pane_record_from_info(info: &PaneInfo, now: i64) -> PaneRecord {
 }
 
 #[test]
-#[ignore = "e2e wip — build loop interrupted before local verification; un-ignore once green"]
 fn watch_daemon_one_iteration_persists_two_panes_and_shuts_down_cleanly() {
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -114,17 +112,17 @@ fn watch_daemon_one_iteration_persists_two_panes_and_shuts_down_cleanly() {
 
         let mut registry = PaneRegistry::new();
 
-        let mock_panes = vec![
+        let fixture_panes = vec![
             make_pane(1, "claude", "file:///home/agent", true),
             make_pane(2, "editor", "file:///srv/repo", false),
         ];
 
         // ── Act: one discovery iteration ────────────────────────────────
-        let diff = registry.discovery_tick(mock_panes.clone());
+        let diff = registry.discovery_tick(fixture_panes.clone());
         assert_eq!(
             diff.new_panes,
             vec![1, 2],
-            "both mock panes must be reported as newly discovered"
+            "both fixture panes must be reported as newly discovered"
         );
         assert!(
             diff.closed_panes.is_empty() && diff.changed_panes.is_empty(),
@@ -134,7 +132,7 @@ fn watch_daemon_one_iteration_persists_two_panes_and_shuts_down_cleanly() {
 
         // Persist each newly-discovered pane through the real writer.
         let now = now_ms();
-        for info in &mock_panes {
+        for info in &fixture_panes {
             storage
                 .upsert_pane(pane_record_from_info(info, now))
                 .await
@@ -180,7 +178,7 @@ fn watch_daemon_one_iteration_persists_two_panes_and_shuts_down_cleanly() {
         assert_eq!(entry_count, 2, "registry must carry exactly 2 entries");
 
         // ── Second iteration: idempotent when panes unchanged ──────────
-        let diff2 = registry.discovery_tick(mock_panes.clone());
+        let diff2 = registry.discovery_tick(fixture_panes.clone());
         assert!(
             diff2.new_panes.is_empty() && diff2.closed_panes.is_empty(),
             "second tick with identical panes must not produce new/closed diffs, got {:?}",
@@ -205,7 +203,6 @@ fn watch_daemon_one_iteration_persists_two_panes_and_shuts_down_cleanly() {
 }
 
 #[test]
-#[ignore = "e2e wip — build loop interrupted before local verification; un-ignore once green"]
 fn watch_daemon_discovery_tick_detects_closed_panes_on_second_iteration() {
     // A second-iteration E2E: the first tick registers 2 panes, the
     // second tick presents only 1 — the registry must report pane 2
