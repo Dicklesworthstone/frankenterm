@@ -404,6 +404,50 @@ fn synthetic_mcp_error_envelope_without_hint_validates_against_schema() {
 }
 
 #[test]
+fn synthetic_mcp_success_envelope_with_error_fields_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": true,
+        "data": { "tool": "wa.search", "matches": [] },
+        "error": "stale error message must not be present on success",
+        "error_code": "FT-MCP-0005",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP ok=true envelopes that also carry error fields"
+    );
+}
+
+#[test]
+fn synthetic_mcp_error_envelope_with_data_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "data": { "tool": "wa.search", "matches": [] },
+        "error": "storage unavailable",
+        "error_code": "FT-MCP-0005",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP ok=false envelopes that also carry data"
+    );
+}
+
+#[test]
 fn synthetic_mcp_error_envelope_missing_mcp_version_must_fail() {
     let schema = load_mcp_envelope_schema();
 
