@@ -143,7 +143,7 @@ impl<K: Hash + Eq + Clone> SpaceSavingTopK<K> {
     /// confident estimates first).
     ///
     /// Distribution-free guarantee: any item with true frequency
-    /// > N/capacity is in the result set; counts have error ≤
+    /// greater than N/capacity is in the result set; counts have error ≤
     /// total_inserts/capacity.
     #[must_use]
     pub fn top_k(&self, k: usize) -> Vec<MonitoredItem<K>> {
