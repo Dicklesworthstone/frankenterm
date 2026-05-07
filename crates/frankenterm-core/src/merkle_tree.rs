@@ -82,28 +82,30 @@ impl MerkleHash {
     /// Hash a key-value leaf node.
     ///
     /// The length prefixes are u32-sized to keep the on-disk leaf format
-    /// stable. The `as u32` casts on `.len()` would silently wrap if a
-    /// caller ever produced a key or value at or above `u32::MAX` bytes —
+    /// stable. Unchecked conversion from `.len()` to `u32` would silently
+    /// wrap if a caller ever produced a key or value above `u32::MAX` bytes —
     /// two distinct (key, value) pairs whose lengths collide modulo 2^32
     /// would then hash to the same leaf, defeating the whole point of
     /// length-prefix domain separation. Real merkle leaves are tiny
     /// (KV-pair-sized), so this is defense in depth: panic loudly rather
     /// than silently corrupt the hash.
     fn leaf(key: &[u8], value: &[u8]) -> Self {
-        assert!(
-            key.len() <= u32::MAX as usize,
-            "merkle_tree::leaf: key length {} exceeds u32::MAX; would silently truncate length prefix and risk hash collision",
-            key.len()
-        );
-        assert!(
-            value.len() <= u32::MAX as usize,
-            "merkle_tree::leaf: value length {} exceeds u32::MAX; would silently truncate length prefix and risk hash collision",
-            value.len()
-        );
+        let key_len = u32::try_from(key.len()).unwrap_or_else(|_| {
+            panic!(
+                "merkle_tree::leaf: key length {} exceeds u32::MAX; would silently truncate length prefix and risk hash collision",
+                key.len()
+            )
+        });
+        let value_len = u32::try_from(value.len()).unwrap_or_else(|_| {
+            panic!(
+                "merkle_tree::leaf: value length {} exceeds u32::MAX; would silently truncate length prefix and risk hash collision",
+                value.len()
+            )
+        });
         let mut data = Vec::with_capacity(8 + key.len() + value.len());
         // Prefix with lengths to prevent collision between different key/value splits
-        data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        data.extend_from_slice(&key_len.to_le_bytes());
+        data.extend_from_slice(&value_len.to_le_bytes());
         data.extend_from_slice(key);
         data.extend_from_slice(value);
         Self::compute(&data)
