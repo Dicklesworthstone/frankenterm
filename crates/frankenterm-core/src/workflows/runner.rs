@@ -23,6 +23,13 @@ fn workflow_wait_aborted(label: &str, err: impl std::fmt::Display) -> crate::Err
     )))
 }
 
+fn workflow_runner_cancelled(operation: &'static str, detail: impl Into<String>) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: crate::error::RuntimeOperationSource::Cancelled(detail.into()),
+    }
+}
+
 async fn wait_duration_maybe_cx(
     cx: Option<&crate::cx::Cx>,
     duration: Duration,
@@ -3131,8 +3138,9 @@ impl WorkflowRunner {
         _force: bool,
     ) -> crate::Result<AbortResult> {
         if cx.is_cancel_requested() {
-            return Err(crate::Error::Runtime(
-                "capability context already cancelled; abort_execution refused".to_owned(),
+            return Err(workflow_runner_cancelled(
+                "workflow.abort_execution",
+                "capability context already cancelled; abort_execution refused",
             ));
         }
 
@@ -3196,9 +3204,10 @@ impl WorkflowRunner {
         }
 
         cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!(
+            let detail = format!(
                 "abort_execution cancelled between get_workflow and upsert_workflow (exec_id={execution_id}): {err}"
-            ))
+            );
+            workflow_runner_cancelled("workflow.abort_execution", detail)
         })?;
 
         let previous_status = record.status.clone();
