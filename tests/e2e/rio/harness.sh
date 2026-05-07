@@ -64,25 +64,66 @@ log_jsonl() {
     local error_code="${ERROR_CODE:-null}"
     local decision="${DECISION:-null}"
 
-    # Build base JSON
-    local json
-    json=$(printf '{"run_id":"%s","scenario_id":"%s","timestamp":"%s","pane_id":%s,"window_id":%s,"phase":"%s","decision":%s,"elapsed_ms":%s,"error_code":%s,"outcome":"%s"' \
-        "$RUN_ID" "$scenario_id" "$ts" "$pane_id" "$window_id" "$phase" "$decision" "$elapsed_ms" "$error_code" "$outcome")
+    python3 - "$output_file" "$RUN_ID" "$scenario_id" "$ts" "$pane_id" "$window_id" "$phase" "$decision" "$elapsed_ms" "$error_code" "$outcome" "$@" <<'PY'
+import json
+import re
+import sys
 
-    # Append scenario-specific fields
-    for kv in "$@"; do
-        local key="${kv%%=*}"
-        local val="${kv#*=}"
-        # Check if value is numeric or boolean
-        if [[ "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [[ "$val" == "true" ]] || [[ "$val" == "false" ]]; then
-            json="${json},\"${key}\":${val}"
-        else
-            json="${json},\"${key}\":\"${val}\""
-        fi
-    done
+(
+    output_file,
+    run_id,
+    scenario_id,
+    ts,
+    pane_id,
+    window_id,
+    phase,
+    decision,
+    elapsed_ms,
+    error_code,
+    outcome,
+) = sys.argv[1:12]
+extras = sys.argv[12:]
 
-    json="${json}}"
-    echo "$json" >> "$output_file"
+
+def parse_base_value(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def parse_extra_value(value):
+    if re.fullmatch(r"[0-9]+(\.[0-9]+)?", value):
+        if "." in value:
+            return float(value)
+        return int(value)
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return value
+
+
+record = {
+    "run_id": run_id,
+    "scenario_id": scenario_id,
+    "timestamp": ts,
+    "pane_id": parse_base_value(pane_id),
+    "window_id": parse_base_value(window_id),
+    "phase": phase,
+    "decision": parse_base_value(decision),
+    "elapsed_ms": parse_base_value(elapsed_ms),
+    "error_code": parse_base_value(error_code),
+    "outcome": outcome,
+}
+
+for kv in extras:
+    key, sep, value = kv.partition("=")
+    record[key] = parse_extra_value(value if sep else kv)
+
+with open(output_file, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+PY
 }
 
 # ── Summary generation ──────────────────────────────────────────
