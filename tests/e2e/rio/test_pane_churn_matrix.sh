@@ -18,6 +18,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/e2e/rio/harness.sh
 source "${SCRIPT_DIR}/harness.sh"
 parse_harness_args "$@"
 
@@ -68,10 +69,12 @@ log_jsonl "$TIMELINE_JSONL" "$SCENARIO" "anchor_verification" \
 echo "[Phase 2] Running pane tier / churn tests..."
 
 if cargo_test "pane_tier" > "${ARTIFACT_DIR}/pane_tier_output.txt" 2>&1; then
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: pane tier tests"
-    log_jsonl "$TIMELINE_JSONL" "$SCENARIO" "pane_tier_test" "pass" \
-        "p50_ms=0" "p95_ms=0" "p99_ms=0" "pane_count=50" "event_rate=1000"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: pane tier tests"
+        log_jsonl "$TIMELINE_JSONL" "$SCENARIO" "pane_tier_test" "pass" \
+            "p50_ms=0" "p95_ms=0" "p99_ms=0" "pane_count=50" "event_rate=1000"
+    fi
 else
     SKIP_COUNT=$((SKIP_COUNT + 1))
     echo "  SKIP: pane tier tests (filter may not match)"

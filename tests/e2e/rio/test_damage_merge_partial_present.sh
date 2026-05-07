@@ -18,6 +18,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/e2e/rio/harness.sh
 source "${SCRIPT_DIR}/harness.sh"
 parse_harness_args "$@"
 
@@ -32,10 +33,12 @@ scenario_header "R2: Damage Merge Partial Present"
 echo "[Phase 1] Running unit tests for damage merge semantics..."
 
 if cargo_test "damage" > "${ARTIFACT_DIR}/unit_test_output.txt" 2>&1; then
-    log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "unit_test" "pass" \
-        "damage_scope=full" "fallback_to_full=false" "dirty_regions=0"
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: damage merge unit tests"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "unit_test" "pass" \
+            "damage_scope=full" "fallback_to_full=false" "dirty_regions=0"
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: damage merge unit tests"
+    fi
 else
     log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "unit_test" "skip" \
         "damage_scope=none" "fallback_to_full=false" "dirty_regions=0"
@@ -85,10 +88,12 @@ echo "[Phase 3] Validating damage merge precedence..."
 
 # Check that damage merge types are defined in FrankenTerm
 if cargo_test "resize" > "${ARTIFACT_DIR}/resize_test_output.txt" 2>&1; then
-    log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "damage_precedence" "pass" \
-        "damage_scope=partial" "fallback_to_full=false" "dirty_regions=3"
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: resize-related tests (partial damage correctness)"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "damage_precedence" "pass" \
+            "damage_scope=partial" "fallback_to_full=false" "dirty_regions=3"
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: resize-related tests (partial damage correctness)"
+    fi
 else
     log_jsonl "$DAMAGE_JSONL" "$SCENARIO" "damage_precedence" "skip" \
         "damage_scope=none" "fallback_to_full=false" "dirty_regions=0"

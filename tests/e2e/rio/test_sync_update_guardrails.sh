@@ -18,6 +18,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/e2e/rio/harness.sh
 source "${SCRIPT_DIR}/harness.sh"
 parse_harness_args "$@"
 
@@ -104,10 +105,12 @@ fi
 echo "[Phase 4] Running backpressure/guardrail tests..."
 
 if cargo_test "backpressure" > "${ARTIFACT_DIR}/backpressure_test_output.txt" 2>&1; then
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: backpressure tests"
-    log_jsonl "$BATCH_JSONL" "$SCENARIO" "backpressure_test" "pass" \
-        "sync_hold_bytes=0" "batch_size=0" "activity_tier=all" "guardrail_triggered=false"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: backpressure tests"
+        log_jsonl "$BATCH_JSONL" "$SCENARIO" "backpressure_test" "pass" \
+            "sync_hold_bytes=0" "batch_size=0" "activity_tier=all" "guardrail_triggered=false"
+    fi
 else
     SKIP_COUNT=$((SKIP_COUNT + 1))
     echo "  SKIP: backpressure tests (may not match exact filter)"

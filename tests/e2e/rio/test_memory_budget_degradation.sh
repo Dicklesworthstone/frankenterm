@@ -20,6 +20,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/e2e/rio/harness.sh
 source "${SCRIPT_DIR}/harness.sh"
 parse_harness_args "$@"
 
@@ -66,10 +67,12 @@ echo "[Phase 2] Validating FrankenTerm memory budget tier existence..."
 
 # Check if backpressure tiers exist (Green/Yellow/Red/Black map to normal/constrained/emergency)
 if cargo_test "tier" > "${ARTIFACT_DIR}/tier_test_output.txt" 2>&1; then
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: tier-related tests pass"
-    log_jsonl "$BUDGET_JSONL" "$SCENARIO" "tier_validation" "pass" \
-        "memory_tier=all" "scrollback_bytes=0" "cache_bytes=0" "queue_bytes=0"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: tier-related tests pass"
+        log_jsonl "$BUDGET_JSONL" "$SCENARIO" "tier_validation" "pass" \
+            "memory_tier=all" "scrollback_bytes=0" "cache_bytes=0" "queue_bytes=0"
+    fi
 else
     SKIP_COUNT=$((SKIP_COUNT + 1))
     echo "  SKIP: tier tests (filter may not match)"
@@ -79,10 +82,12 @@ fi
 echo "[Phase 3] Running budget/pressure transition tests..."
 
 if cargo_test "budget\|pressure\|evict" > "${ARTIFACT_DIR}/budget_test_output.txt" 2>&1; then
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: budget/pressure tests"
-    log_jsonl "$BUDGET_JSONL" "$SCENARIO" "budget_transitions" "pass" \
-        "memory_tier=normal" "scrollback_bytes=0" "cache_bytes=0" "queue_bytes=0"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: budget/pressure tests"
+        log_jsonl "$BUDGET_JSONL" "$SCENARIO" "budget_transitions" "pass" \
+            "memory_tier=normal" "scrollback_bytes=0" "cache_bytes=0" "queue_bytes=0"
+    fi
 else
     SKIP_COUNT=$((SKIP_COUNT + 1))
     echo "  SKIP: budget/pressure transition tests"

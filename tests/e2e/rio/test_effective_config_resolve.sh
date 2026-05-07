@@ -20,6 +20,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/e2e/rio/harness.sh
 source "${SCRIPT_DIR}/harness.sh"
 parse_harness_args "$@"
 
@@ -77,10 +78,12 @@ FAIL_COUNT=$((FAIL_COUNT + (anchor_total - anchor_pass)))
 echo "[Phase 2] Running FrankenTerm config tests..."
 
 if cargo_test "config" > "${ARTIFACT_DIR}/config_test_output.txt" 2>&1; then
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: config tests"
-    log_jsonl "$VALIDATION_JSONL" "$SCENARIO" "config_test" "pass" \
-        "config_source=all" "override_path=none" "effective_value_hash=n/a" "redacted_fields=0"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: config tests"
+        log_jsonl "$VALIDATION_JSONL" "$SCENARIO" "config_test" "pass" \
+            "config_source=all" "override_path=none" "effective_value_hash=n/a" "redacted_fields=0"
+    fi
 else
     SKIP_COUNT=$((SKIP_COUNT + 1))
     echo "  SKIP: config tests (filter may not match all)"

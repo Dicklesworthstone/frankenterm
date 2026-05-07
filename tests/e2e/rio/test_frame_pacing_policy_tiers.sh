@@ -18,6 +18,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/e2e/rio/harness.sh
 source "${SCRIPT_DIR}/harness.sh"
 parse_harness_args "$@"
 
@@ -70,10 +71,12 @@ echo "[Phase 2] Checking FrankenTerm frame pacing infrastructure..."
 
 # Look for resize_scheduler or frame_pacing related tests
 if cargo_test "scheduler\|pacing\|frame_rate" > "${ARTIFACT_DIR}/pacing_test_output.txt" 2>&1; then
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: scheduler/pacing tests"
-    log_jsonl "$PACING_JSONL" "$SCENARIO" "pacing_test" "pass" \
-        "p50_ms=0" "p95_ms=0" "p99_ms=0" "pane_count=0" "event_rate=0"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: scheduler/pacing tests"
+        log_jsonl "$PACING_JSONL" "$SCENARIO" "pacing_test" "pass" \
+            "p50_ms=0" "p95_ms=0" "p99_ms=0" "pane_count=0" "event_rate=0"
+    fi
 else
     SKIP_COUNT=$((SKIP_COUNT + 1))
     echo "  SKIP: scheduler/pacing tests (filter may not match)"

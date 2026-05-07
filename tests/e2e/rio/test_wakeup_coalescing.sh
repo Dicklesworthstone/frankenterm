@@ -21,6 +21,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/e2e/rio/harness.sh
 source "${SCRIPT_DIR}/harness.sh"
 parse_harness_args "$@"
 
@@ -33,7 +34,6 @@ scenario_header "R1: Wakeup Coalescing"
 
 # ── Phase 1: Validate unit tests exist and pass ─────────────────
 echo "[Phase 1] Running unit tests for wakeup/coalescing semantics..."
-PHASE="unit_test"
 
 # Test that the ingest module's coalescing logic exists and works
 if cargo_test "wakeup" > "${ARTIFACT_DIR}/unit_test_output.txt" 2>&1; then
@@ -52,7 +52,6 @@ fi
 
 # ── Phase 2: Validate fixture data ─────────────────────────────
 echo "[Phase 2] Checking fixture data..."
-PHASE="fixture_validation"
 
 if [[ -d "$FIXTURES_DIR" ]]; then
     fixture_count=$(find "$FIXTURES_DIR" -type f | wc -l | tr -d ' ')
@@ -68,14 +67,15 @@ fi
 
 # ── Phase 3: Coalescing semantics (Rust-level) ─────────────────
 echo "[Phase 3] Validating coalescing semantics via cargo test..."
-PHASE="coalescing_semantics"
 
 # Run integration tests that exercise the ingest->eventbus->render chain
 if cargo_test "coalesce" > "${ARTIFACT_DIR}/coalesce_test_output.txt" 2>&1; then
-    log_jsonl "$EVENTS_JSONL" "$SCENARIO" "coalescing_semantics" "pass" \
-        "queue_depth=10" "coalesced_count=8" "wakeup_to_frame_ms=2"
-    PASS_COUNT=$((PASS_COUNT + 1))
-    echo "  PASS: coalescing semantics tests"
+    if [[ "$CARGO_TEST_SKIPPED" -eq 0 ]]; then
+        log_jsonl "$EVENTS_JSONL" "$SCENARIO" "coalescing_semantics" "pass" \
+            "queue_depth=10" "coalesced_count=8" "wakeup_to_frame_ms=2"
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo "  PASS: coalescing semantics tests"
+    fi
 else
     # Tests may not exist yet — that's expected during scaffold phase
     log_jsonl "$EVENTS_JSONL" "$SCENARIO" "coalescing_semantics" "skip" \
@@ -86,7 +86,6 @@ fi
 
 # ── Phase 4: Rio anchor verification ───────────────────────────
 echo "[Phase 4] Verifying Rio code anchors are accessible..."
-PHASE="anchor_verification"
 
 ANCHOR_1="${SCRIPT_DIR}/../../../legacy_rio/rio/rio-backend/src/performer/mod.rs"
 ANCHOR_2="${SCRIPT_DIR}/../../../legacy_rio/rio/frontends/rioterm/src/application.rs"
