@@ -258,8 +258,9 @@ impl BackoffConfig {
             return initial;
         }
 
-        let attempts_to_cap =
-            ((self.max_ms as f64 / self.initial_ms as f64).ln() / self.multiplier.ln()).ceil();
+        let attempts_to_cap = (self.max_ms as f64 / self.initial_ms as f64)
+            .log(self.multiplier)
+            .ceil();
         if (attempt as f64) >= attempts_to_cap {
             return self.max_ms;
         }
