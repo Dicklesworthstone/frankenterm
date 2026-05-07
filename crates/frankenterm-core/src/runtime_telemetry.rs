@@ -12118,11 +12118,11 @@ mod tests {
     fn evidence_context_accessors_expose_documented_values() {
         // Construct via safe path + verify the public accessors.
         let mut raw = BTreeMap::new();
-        raw.insert("k1".to_string(), "v1".to_string());
         raw.insert(
-            "k2".to_string(),
-            "v2_will_be_truncated_x_x_x_x_x_x_x_x_x_x".to_string(),
+            "a_retained".to_string(),
+            "v1_will_be_truncated_x_x_x_x_x_x_x_x_x_x".to_string(),
         );
+        raw.insert("z_dropped".to_string(), "v2".to_string());
         let mut config = SwarmCapacityEvidenceLedgerConfig::default();
         config.max_context_fields = 1; // Force one field to be dropped.
         config.max_context_value_bytes = 4; // Force the surviving value to be truncated.

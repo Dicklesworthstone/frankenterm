@@ -1080,7 +1080,7 @@ impl TelemetryCollector {
     /// Samples resource metrics at `config.sample_interval`.
     pub async fn run(&self) {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.run_cx(&cx).await
+        self.run_cx(&cx).await;
     }
 
     /// Run the collection loop under an explicit `&Cx` (ft-xbnl0.2.2
@@ -3496,15 +3496,19 @@ mod tests {
     fn integration_store_multiple_flushes() {
         let store = TelemetryStore::open_in_memory(30).unwrap();
         let buf = CircularMetricBuffer::new(100);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let hour_ts = now - (now % 3600);
 
         // First flush
-        buf.push(make_snap(1, 1000, 10, 1700000000));
+        buf.push(make_snap(1, 1000, 10, hour_ts));
         let c1 = store.flush_buffer(&buf).unwrap();
         assert_eq!(c1, 1);
 
         // Second flush with more data
-        buf.push(make_snap(1, 2000, 20, 1700000030));
-        buf.push(make_snap(1, 3000, 30, 1700000060));
+        buf.push(make_snap(1, 2000, 20, hour_ts + 30));
+        buf.push(make_snap(1, 3000, 30, hour_ts + 60));
         let c2 = store.flush_buffer(&buf).unwrap();
         assert_eq!(c2, 3); // buffer still has all 3 (no drain on flush)
 
