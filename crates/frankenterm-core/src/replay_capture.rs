@@ -259,6 +259,7 @@ impl CaptureAdapter {
     ///   * the only invariant the lock enforces is single-writer access to the
     ///     map's internal hashing structure, which `PoisonError::into_inner`
     ///     restores intact.
+    ///
     /// We therefore recover from poison and continue rather than aborting the
     /// recorder.
     fn next_pane_seq(&self, pane_id: u64) -> u64 {

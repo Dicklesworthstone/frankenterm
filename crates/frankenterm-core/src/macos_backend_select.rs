@@ -96,13 +96,8 @@ impl MacosVersion {
     /// Whether this version meets the bead's macOS 13.0+ baseline.
     #[must_use]
     pub const fn meets_baseline(&self) -> bool {
-        if self.major > BASELINE_MAJOR {
-            return true;
-        }
-        if self.major == BASELINE_MAJOR && self.minor >= BASELINE_MINOR {
-            return true;
-        }
-        false
+        self.major > BASELINE_MAJOR
+            || (self.major == BASELINE_MAJOR && self.minor >= BASELINE_MINOR)
     }
 }
 

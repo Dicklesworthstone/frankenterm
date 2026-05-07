@@ -115,7 +115,7 @@ pub fn clock_timer_missing_progress_fail_observation() -> ClockTimerAnomalyObser
 pub fn clock_timer_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
     let observation = clock_timer_reduced_pass_observation();
     let mut verdict = sample_pass_verdict();
-    verdict.scenario_id = observation.scenario_id.clone();
+    verdict.scenario_id.clone_from(&observation.scenario_id);
     verdict.pressure_class = ResourcePressureClass::ClockTimerAnomaly;
     verdict.mode = ResourcePressureChaosMode::Reduced;
     verdict.preconditions = vec![
@@ -165,7 +165,7 @@ pub fn clock_timer_reduced_pass_verdict() -> ResourcePressureChaosVerdict {
 pub fn clock_timer_missing_progress_fail_verdict() -> ResourcePressureChaosVerdict {
     let observation = clock_timer_missing_progress_fail_observation();
     let mut verdict = sample_fail_verdict();
-    verdict.scenario_id = observation.scenario_id.clone();
+    verdict.scenario_id.clone_from(&observation.scenario_id);
     verdict.pressure_class = ResourcePressureClass::ClockTimerAnomaly;
     verdict.mode = ResourcePressureChaosMode::Reduced;
     verdict.preconditions = vec![

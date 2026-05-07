@@ -122,7 +122,8 @@ impl BlockId {
         Self(id)
     }
 
-    pub fn next(&mut self) -> Self {
+    #[must_use]
+    pub fn next_id(&mut self) -> Self {
         let curr = *self;
         self.0 = self.0.saturating_add(1);
         curr
@@ -287,7 +288,7 @@ impl BlockModeState {
             return BlockTransition::NoOp;
         }
         let from = self.phase;
-        let id = self.next_id.next();
+        let id = self.next_id.next_id();
         self.active = Some(Block {
             id,
             prompt_start_ts: now_ms,
@@ -480,9 +481,9 @@ mod tests {
     #[test]
     fn block_id_next_increments() {
         let mut id = BlockId::default();
-        assert_eq!(id.next(), BlockId(0));
-        assert_eq!(id.next(), BlockId(1));
-        assert_eq!(id.next(), BlockId(2));
+        assert_eq!(id.next_id(), BlockId(0));
+        assert_eq!(id.next_id(), BlockId(1));
+        assert_eq!(id.next_id(), BlockId(2));
     }
 
     // ----------------------------------------------------------------

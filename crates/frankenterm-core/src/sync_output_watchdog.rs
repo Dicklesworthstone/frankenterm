@@ -286,7 +286,7 @@ impl WatchdogState {
 
     /// True iff the watchdog already force-fired this BSU
     /// and is waiting for the integration to call `disarm()`
-    /// + `arm()` for the next BSU. A long-stuck `Triggered`
+    /// and `arm()` for the next BSU. A long-stuck `Triggered`
     /// state indicates the integration's timer-loop wiring
     /// is broken (forgot to reset).
     #[must_use]

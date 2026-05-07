@@ -229,10 +229,9 @@ impl KittySessionSummary {
     /// Returns 0 when no images were admitted.
     #[must_use]
     pub const fn avg_decode_ns(&self) -> u64 {
-        if self.total_admitted == 0 {
-            0
-        } else {
-            self.total_decode_ns / self.total_admitted
+        match self.total_decode_ns.checked_div(self.total_admitted) {
+            Some(avg) => avg,
+            None => 0,
         }
     }
 
@@ -241,10 +240,13 @@ impl KittySessionSummary {
     /// when bytes_in is 0.
     #[must_use]
     pub const fn compression_ratio_bp(&self) -> u64 {
-        if self.total_bytes_in == 0 {
-            0
-        } else {
-            (self.total_bytes_out * 10_000) / self.total_bytes_in
+        match self
+            .total_bytes_out
+            .saturating_mul(10_000)
+            .checked_div(self.total_bytes_in)
+        {
+            Some(ratio) => ratio,
+            None => 0,
         }
     }
 }

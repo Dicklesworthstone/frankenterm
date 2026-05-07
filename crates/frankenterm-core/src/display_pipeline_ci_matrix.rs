@@ -508,6 +508,12 @@ impl IdleBenchSummary {
     }
 }
 
+impl Default for IdleBenchSummary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ============================================================================
 // Recording-active probe
 // ============================================================================
@@ -593,7 +599,7 @@ impl ScanoutModifierAllowlist {
         if modifier == DRM_FORMAT_MOD_INVALID {
             return false;
         }
-        self.allowed.iter().any(|m| *m == modifier)
+        self.allowed.contains(&modifier)
     }
 }
 

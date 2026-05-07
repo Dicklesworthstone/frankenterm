@@ -366,9 +366,7 @@ impl MultipartFileBuffer {
             // `is_complete()` guarantees every index is
             // populated, but we still guard against the
             // map walking an unexpected key.
-            let Some(chunk) = self.chunks.get(&idx) else {
-                return None;
-            };
+            let chunk = self.chunks.get(&idx)?;
             out.extend_from_slice(chunk);
         }
         Some(out)

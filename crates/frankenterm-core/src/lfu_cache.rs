@@ -291,11 +291,8 @@ impl<K: Hash + Eq + Clone, V> LfuCache<K, V> {
     }
 
     fn remove_internal(&mut self, key: &K, count_eviction: bool) -> Option<(K, V)> {
-        let (frequency, prev, next) = if let Some(entry) = self.entries.get(key) {
-            (entry.frequency, entry.prev.clone(), entry.next.clone())
-        } else {
-            return None;
-        };
+        let entry = self.entries.get(key)?;
+        let (frequency, prev, next) = (entry.frequency, entry.prev.clone(), entry.next.clone());
 
         self.unlink_from_bucket(key, frequency, prev, next);
         let removed = self.entries.remove(key)?;

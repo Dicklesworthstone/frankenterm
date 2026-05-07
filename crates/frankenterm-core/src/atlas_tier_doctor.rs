@@ -117,7 +117,7 @@ pub struct TierSwapDoctorRow {
     /// (`current - prev`) instead of the cumulative lifetime
     /// count. When `None`, the threshold is treated as 0 delta
     /// (the first observation has no baseline yet — pressure_pct
-    /// + disk_eviction_count still fire). Callers that poll the
+    /// and disk_eviction_count still fire). Callers that poll the
     /// doctor on a fixed cadence pass the previous tick's snapshot
     /// to define the observation window.
     #[serde(skip_serializing_if = "Option::is_none", default)]

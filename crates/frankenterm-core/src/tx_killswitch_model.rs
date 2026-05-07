@@ -149,26 +149,25 @@ pub enum KillSwitchAction {
 #[must_use]
 pub fn enabled_actions(state: &KillSwitchModelState) -> Vec<KillSwitchAction> {
     let mut actions = Vec::new();
-    use MissionTxState::*;
     let hard = matches!(state.kill_switch, MissionKillSwitchLevel::HardStop);
 
     match state.tx_state {
-        Draft => {
+        MissionTxState::Draft => {
             if !hard {
                 actions.push(KillSwitchAction::Plan);
             }
         }
-        Planned => {
+        MissionTxState::Planned => {
             if !hard {
                 actions.push(KillSwitchAction::Prepare);
             }
         }
-        Prepared => {
+        MissionTxState::Prepared => {
             if !hard {
                 actions.push(KillSwitchAction::BeginCommit);
             }
         }
-        Committing => {
+        MissionTxState::Committing => {
             // Find the next uncommitted step.
             for step_id in 0..state.step_count {
                 if !state.committed_steps.contains(&step_id) {
@@ -185,10 +184,10 @@ pub fn enabled_actions(state: &KillSwitchModelState) -> Vec<KillSwitchAction> {
             // FailCommit can happen any time during Committing.
             actions.push(KillSwitchAction::FailCommit);
         }
-        Failed => {
+        MissionTxState::Failed => {
             actions.push(KillSwitchAction::BeginCompensate);
         }
-        Compensating => {
+        MissionTxState::Compensating => {
             // Find the next compensable step (committed but not
             // yet compensated).
             for step_id in &state.committed_steps {
@@ -201,10 +200,10 @@ pub fn enabled_actions(state: &KillSwitchModelState) -> Vec<KillSwitchAction> {
                 actions.push(KillSwitchAction::FinishCompensate);
             }
         }
-        Compensated => {
+        MissionTxState::Compensated => {
             actions.push(KillSwitchAction::RollBack);
         }
-        Committed | RolledBack => {
+        MissionTxState::Committed | MissionTxState::RolledBack => {
             // Terminal states. The bead's correctness rule is
             // that no NEW transitions are enabled here; the
             // kill-switch flip MAY still fire (operators can
@@ -235,22 +234,21 @@ pub fn enabled_actions(state: &KillSwitchModelState) -> Vec<KillSwitchAction> {
 #[must_use]
 pub fn apply(state: &KillSwitchModelState, action: KillSwitchAction) -> KillSwitchModelState {
     let mut next = state.clone();
-    use MissionTxState::*;
     match action {
-        KillSwitchAction::Plan => next.tx_state = Planned,
-        KillSwitchAction::Prepare => next.tx_state = Prepared,
-        KillSwitchAction::BeginCommit => next.tx_state = Committing,
+        KillSwitchAction::Plan => next.tx_state = MissionTxState::Planned,
+        KillSwitchAction::Prepare => next.tx_state = MissionTxState::Prepared,
+        KillSwitchAction::BeginCommit => next.tx_state = MissionTxState::Committing,
         KillSwitchAction::CommitStep { step_id } => {
             next.committed_steps.insert(step_id);
         }
-        KillSwitchAction::FinishCommit => next.tx_state = Committed,
-        KillSwitchAction::FailCommit => next.tx_state = Failed,
-        KillSwitchAction::BeginCompensate => next.tx_state = Compensating,
+        KillSwitchAction::FinishCommit => next.tx_state = MissionTxState::Committed,
+        KillSwitchAction::FailCommit => next.tx_state = MissionTxState::Failed,
+        KillSwitchAction::BeginCompensate => next.tx_state = MissionTxState::Compensating,
         KillSwitchAction::CompensateStep { step_id } => {
             next.compensated_steps.insert(step_id);
         }
-        KillSwitchAction::FinishCompensate => next.tx_state = Compensated,
-        KillSwitchAction::RollBack => next.tx_state = RolledBack,
+        KillSwitchAction::FinishCompensate => next.tx_state = MissionTxState::Compensated,
+        KillSwitchAction::RollBack => next.tx_state = MissionTxState::RolledBack,
         KillSwitchAction::FlipKillSwitch { to } => next.kill_switch = to,
     }
     next

@@ -260,41 +260,33 @@ impl<K: Ord, V> SkipList<K, V> {
             update[level] = current;
         }
 
-        // Check if the next node at level 0 has the target key
-        if let Some(target_idx) = self.nodes[current].forward[0] {
-            if let Some(ref target_key) = self.nodes[target_idx].key {
-                if *target_key != *key {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-
-            // Unwire from all levels
-            let target_level = self.nodes[target_idx].level();
-            #[allow(clippy::needless_range_loop)]
-            for level in 0..=target_level {
-                if self.nodes[update[level]].forward[level] == Some(target_idx) {
-                    self.nodes[update[level]].forward[level] =
-                        self.nodes[target_idx].forward[level];
-                }
-            }
-
-            // Extract value
-            let value = self.nodes[target_idx].value.take();
-            self.nodes[target_idx].key = None;
-            self.free.push(target_idx);
-
-            // Adjust current_level if needed
-            while self.current_level > 0 && self.nodes[0].forward[self.current_level].is_none() {
-                self.current_level -= 1;
-            }
-
-            self.len -= 1;
-            value
-        } else {
-            None
+        let target_idx = self.nodes[current].forward[0]?;
+        let target_key = self.nodes[target_idx].key.as_ref()?;
+        if *target_key != *key {
+            return None;
         }
+
+        // Unwire from all levels
+        let target_level = self.nodes[target_idx].level();
+        #[allow(clippy::needless_range_loop)]
+        for level in 0..=target_level {
+            if self.nodes[update[level]].forward[level] == Some(target_idx) {
+                self.nodes[update[level]].forward[level] = self.nodes[target_idx].forward[level];
+            }
+        }
+
+        // Extract value
+        let value = self.nodes[target_idx].value.take();
+        self.nodes[target_idx].key = None;
+        self.free.push(target_idx);
+
+        // Adjust current_level if needed
+        while self.current_level > 0 && self.nodes[0].forward[self.current_level].is_none() {
+            self.current_level -= 1;
+        }
+
+        self.len -= 1;
+        value
     }
 
     /// Get the minimum key-value pair.

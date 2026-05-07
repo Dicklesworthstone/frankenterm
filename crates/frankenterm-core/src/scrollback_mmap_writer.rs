@@ -284,7 +284,7 @@ impl MmapScrollback {
         self.file
             .seek(SeekFrom::Start(offset))
             .and_then(|_| self.file.write_all(&record))
-            .and_then(|_| self.file.write_all(&payload))
+            .and_then(|()| self.file.write_all(&payload))
             .map_err(|source| MmapScrollbackError::WriteRecord {
                 path: self.path.clone(),
                 source,
@@ -359,7 +359,7 @@ impl MmapScrollback {
 
 impl Drop for MmapScrollback {
     fn drop(&mut self) {
-        let _ = self.lock_file.unlock();
+        let _ = FileExt::unlock(&self.lock_file);
     }
 }
 

@@ -438,7 +438,7 @@ fn walk_normalize(value: &mut Value, lookup: &BTreeMap<&str, &str>) {
 }
 
 /// Trait abstracting the `ntm` subprocess so the harness compiles
-/// + self-tests without a real `ntm` binary. The production
+/// and self-tests without a real `ntm` binary. The production
 /// implementation shells out to `ntm <action> --json <request>`;
 /// tests use [`MockNtmInvoker`].
 pub trait NtmInvoker {

@@ -408,11 +408,7 @@ impl RenderSnapshotTelemetry {
 
     #[must_use]
     pub fn average_hold_ns(&self) -> Option<u64> {
-        if self.frames_rendered == 0 {
-            None
-        } else {
-            Some(self.total_hold_ns / self.frames_rendered)
-        }
+        self.total_hold_ns.checked_div(self.frames_rendered)
     }
 }
 
