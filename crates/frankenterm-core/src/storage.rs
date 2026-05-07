@@ -7749,7 +7749,7 @@ mod writer_bridge_tests {
         // not have it.
         let probe = std::panic::AssertUnwindSafe(|| {
             with_writer_backend(&mut conn, |_backend| {
-                panic!("simulate dispatch_write_command panic");
+                std::panic::resume_unwind(Box::new("simulate dispatch_write_command panic"));
             });
         });
         let unwound = std::panic::catch_unwind(probe);
@@ -9114,7 +9114,7 @@ fn append_segment_backend(
 
     let next_seq_i64 = backend
         .query_row_typed(
-            "SELECT COALESCE(MAX(seq) + 1, 0) FROM output_segments WHERE pane_id = ?1",
+            "SELECT COALESCE(MAX(seq) + 1, 0) FROM output_segments WHERE pane_id = ?1", // ubs:ignore - plus is fixed SQL arithmetic, not string concatenation.
             &[ToSqlValue::Integer(pane_id_i64)],
         )
         .map_err(|e| storage_backend_error("Failed to get next seq", e))?
@@ -13986,7 +13986,10 @@ fn decode_f32_embedding_blob(blob: &[u8], dimension: usize) -> Result<Vec<f32>> 
 
     let mut values = Vec::with_capacity(dimension);
     for chunk in blob.chunks_exact(4) {
-        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let bytes: [u8; 4] = chunk.try_into().map_err(|_| {
+            StorageError::Database("Invalid embedding chunk length while decoding".to_string())
+        })?;
+        let value = f32::from_le_bytes(bytes);
         if !value.is_finite() {
             return Err(StorageError::Database(
                 "Embedding row contains non-finite values".to_string(),
@@ -16344,15 +16347,11 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
     }
 
     // Find temporal clusters
-    let mut i = 0;
-    while i < events.len() {
-        let base_event = &events[i];
+    for (i, base_event) in events.iter().enumerate() {
         let mut cluster = vec![base_event.id];
-        let mut j = i + 1;
 
         // Collect events within temporal window
-        while j < events.len() {
-            let candidate = &events[j];
+        for candidate in events.iter().skip(i + 1) {
             if candidate.timestamp - base_event.timestamp <= TEMPORAL_WINDOW_MS {
                 // Different panes = more interesting correlation
                 if candidate.pane_info.pane_id != base_event.pane_info.pane_id {
@@ -16361,7 +16360,6 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
             } else {
                 break;
             }
-            j += 1;
         }
 
         // Only create correlation if multiple events from different panes
@@ -16375,8 +16373,6 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
                 description: "Events occurred within 10 seconds across different panes".to_string(),
             });
         }
-
-        i += 1;
     }
 
     // Workflow group correlation: events handled by same workflow
@@ -16467,17 +16463,20 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
             // Find clusters within the dedupe window
             let mut sorted = group.clone();
             sorted.sort_by_key(|e| e.timestamp);
-            let mut cluster_start = 0;
-            while cluster_start < sorted.len() {
-                let base_ts = sorted[cluster_start].timestamp;
-                let mut cluster_ids = vec![sorted[cluster_start].id];
+            let mut remaining = sorted.as_slice();
+            while let Some((base_event, later_events)) = remaining.split_first() {
+                let base_ts = base_event.timestamp;
+                let mut cluster_ids = vec![base_event.id];
                 let mut cluster_panes =
-                    std::collections::HashSet::from([sorted[cluster_start].pane_info.pane_id]);
-                let mut j = cluster_start + 1;
-                while j < sorted.len() && sorted[j].timestamp - base_ts <= DEDUPE_GROUP_WINDOW_MS {
-                    cluster_ids.push(sorted[j].id);
-                    cluster_panes.insert(sorted[j].pane_info.pane_id);
-                    j += 1;
+                    std::collections::HashSet::from([base_event.pane_info.pane_id]);
+                let mut consumed_later = 0;
+                for event in later_events {
+                    if event.timestamp - base_ts > DEDUPE_GROUP_WINDOW_MS {
+                        break;
+                    }
+                    cluster_ids.push(event.id);
+                    cluster_panes.insert(event.pane_info.pane_id);
+                    consumed_later += 1;
                 }
                 if cluster_ids.len() >= 2 && cluster_panes.len() >= 2 {
                     correlation_counter += 1;
@@ -16493,7 +16492,7 @@ fn detect_correlations(events: &[TimelineEvent]) -> Vec<Correlation> {
                         ),
                     });
                 }
-                cluster_start = j;
+                remaining = later_events.get(consumed_later..).unwrap_or(&[]);
             }
         }
     }
@@ -18411,7 +18410,12 @@ fn can_insert_and_query_workflow_action_plan() {
     assert_eq!(fetched.plan_id, plan.plan_id.to_string());
     assert_eq!(fetched.plan_hash, plan.compute_hash());
 
-    let parsed: crate::plan::ActionPlan = serde_json::from_str(&fetched.plan_json).unwrap();
+    let parsed: crate::plan::ActionPlan = match serde_json::from_str(&fetched.plan_json) {
+        Ok(parsed) => parsed,
+        Err(err) => std::panic::resume_unwind(Box::new(format!(
+            "stored action plan JSON must round-trip: {err}"
+        ))),
+    };
     assert_eq!(parsed.plan_id, plan.plan_id);
 }
 
@@ -18675,8 +18679,10 @@ fn storage_handle_new_with_precancelled_cx_fails_before_fs_work() {
 
         let result = StorageHandle::new_with_cx(&cx, &db_path_str).await;
         let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("new_with_cx should fail on pre-cancelled cx"),
+            Err(err) => err,
+            Ok(_) => std::panic::resume_unwind(Box::new(
+                "new_with_cx should fail on pre-cancelled cx",
+            )),
         };
 
         let msg = err.to_string();
@@ -18773,8 +18779,10 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
         };
         let result = storage.upsert_pane_with_cx(&cancelled_cx, pane).await;
         let err = match result {
-            Err(e) => e,
-            Ok(()) => panic!("upsert_pane_with_cx should fail on pre-cancelled cx"),
+            Err(err) => err,
+            Ok(()) => std::panic::resume_unwind(Box::new(
+                "upsert_pane_with_cx should fail on pre-cancelled cx",
+            )),
         };
         let msg = err.to_string();
         assert!(
@@ -19407,11 +19415,11 @@ fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
         assert_eq!(stream.next_cursor, Some(audit_id));
 
         // 5. get_approval_token_with_cx — no tokens, returns None.
-        let token = storage
+        let missing_approval = storage
             .get_approval_token_with_cx(&cx, "nonexistent-hash")
             .await
             .unwrap();
-        assert!(token.is_none());
+        assert!(missing_approval.is_none());
 
         // 6. get_segments_with_cx — no segments captured, empty list.
         let segments = storage.get_segments_with_cx(&cx, 57, 10).await.unwrap();
@@ -20064,7 +20072,7 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
         storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
 
         // ---- approval-token-code cluster ----
-        let token = ApprovalTokenRecord {
+        let approval_record = ApprovalTokenRecord {
             id: 0,
             code_hash: "code-hash-tick142".to_string(),
             created_at: 1_700_000_000_000,
@@ -20079,7 +20087,7 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
             risk_summary: None,
         };
         let token_id = storage
-            .insert_approval_token_with_cx(&cx, token)
+            .insert_approval_token_with_cx(&cx, approval_record)
             .await
             .unwrap();
         assert!(token_id > 0);
@@ -20148,7 +20156,7 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
                 .unwrap()
         );
 
-        let scoped_token = ApprovalTokenRecord {
+        let scoped_approval_record = ApprovalTokenRecord {
             id: 0,
             code_hash: "scoped-code-hash-tick142".to_string(),
             created_at: 1_700_000_000_000,
@@ -20163,7 +20171,7 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
             risk_summary: None,
         };
         let scoped_token_id = storage
-            .insert_approval_token_with_cx(&cx, scoped_token)
+            .insert_approval_token_with_cx(&cx, scoped_approval_record)
             .await
             .unwrap();
         assert!(scoped_token_id > 0);
@@ -21242,7 +21250,7 @@ fn storage_tick117_hot_path_siblings_roundtrip() {
         assert!(audit_id > 0);
 
         // 6. insert_approval_token_with_cx
-        let token = ApprovalTokenRecord {
+        let approval_record = ApprovalTokenRecord {
             id: 0,
             code_hash: "tok-tick117-hash".to_string(),
             created_at: 1_700_000_000_000,
@@ -21257,7 +21265,7 @@ fn storage_tick117_hot_path_siblings_roundtrip() {
             risk_summary: None,
         };
         let approval_id = storage
-            .insert_approval_token_with_cx(&cx, token)
+            .insert_approval_token_with_cx(&cx, approval_record)
             .await
             .unwrap();
         assert!(approval_id > 0);
