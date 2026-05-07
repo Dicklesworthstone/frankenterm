@@ -18,6 +18,12 @@ struct OpenSSLNetListener {
     dispatch_config: frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerCertAction {
+    Dispatch,
+    RejectConnection,
+}
+
 impl OpenSSLNetListener {
     pub fn new(
         listener: TcpListener,
@@ -132,6 +138,16 @@ impl OpenSSLNetListener {
         Ok(stream)
     }
 
+    fn peer_cert_action(result: anyhow::Result<()>) -> PeerCertAction {
+        match result {
+            Ok(()) => PeerCertAction::Dispatch,
+            Err(err) => {
+                log::error!("problem with peer cert: {}", err);
+                PeerCertAction::RejectConnection
+            }
+        }
+    }
+
     fn run(&mut self) {
         for stream in self.listener.incoming() {
             match stream {
@@ -142,9 +158,10 @@ impl OpenSSLNetListener {
 
                     match Self::accept_tls_with_timeout(&acceptor, stream) {
                         Ok(stream) => {
-                            if let Err(err) = Self::verify_peer_cert(&stream) {
-                                log::error!("problem with peer cert: {}", err);
-                                break;
+                            if Self::peer_cert_action(Self::verify_peer_cert(&stream))
+                                == PeerCertAction::RejectConnection
+                            {
+                                continue;
                             }
                             spawn_into_main_thread(async move {
                                 log::error!("Making new AsyncSslStream");
@@ -270,6 +287,18 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn peer_cert_verification_failure_rejects_only_current_connection() {
+        assert_eq!(
+            OpenSSLNetListener::peer_cert_action(Ok(())),
+            PeerCertAction::Dispatch
+        );
+        assert_eq!(
+            OpenSSLNetListener::peer_cert_action(Err(anyhow!("bad peer cn"))),
+            PeerCertAction::RejectConnection
+        );
+    }
 
     #[test]
     fn tls_handshake_timeout_drops_silent_client_within_six_seconds() {
