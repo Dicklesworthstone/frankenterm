@@ -157,7 +157,7 @@ impl PassportDoctorRenderer {
 
 /// Structured doctor rendering of a [`CapabilityPassport`] —
 /// human-readable labels alongside machine-parseable fields.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassportRendering {
     pub agent_id: String,
     #[serde(default)]
@@ -170,7 +170,7 @@ pub struct PassportRendering {
 }
 
 /// Per-capability entry rendering.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryRendering {
     pub class_label: String,
     pub verification: CapabilityVerification,
