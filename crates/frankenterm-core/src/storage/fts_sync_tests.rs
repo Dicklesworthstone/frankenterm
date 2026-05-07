@@ -4,6 +4,57 @@
 
 use super::*;
 
+fn with_fts_backend<F, R>(conn: &mut Connection, f: F) -> Result<R>
+where
+    F: FnOnce(&dyn crate::storage_backend_trait::StorageBackend) -> Result<R>,
+{
+    with_writer_backend(conn, f)
+}
+
+fn get_fts_index_state_test(conn: &mut Connection) -> Result<Option<FtsIndexState>> {
+    with_fts_backend(conn, get_fts_index_state_backend)
+}
+
+fn upsert_fts_index_state_test(conn: &mut Connection, state: &FtsIndexState) -> Result<()> {
+    with_fts_backend(conn, |backend| {
+        upsert_fts_index_state_backend(backend, state)
+    })
+}
+
+fn get_fts_pane_progress_test(
+    conn: &mut Connection,
+    pane_id: u64,
+) -> Result<Option<FtsPaneProgress>> {
+    with_fts_backend(conn, |backend| {
+        get_fts_pane_progress_backend(backend, pane_id)
+    })
+}
+
+fn upsert_fts_pane_progress_test(conn: &mut Connection, progress: &FtsPaneProgress) -> Result<()> {
+    with_fts_backend(conn, |backend| {
+        upsert_fts_pane_progress_backend(backend, progress)
+    })
+}
+
+fn clear_fts_pane_progress_test(conn: &mut Connection) -> Result<()> {
+    with_fts_backend(conn, clear_fts_pane_progress_backend)
+}
+
+fn panes_needing_fts_sync_test(conn: &mut Connection) -> Result<Vec<u64>> {
+    with_fts_backend(conn, panes_needing_fts_sync_backend)
+}
+
+fn full_fts_rebuild_test(conn: &mut Connection, config: &FtsSyncConfig) -> Result<FtsSyncResult> {
+    with_fts_backend(conn, |backend| full_fts_rebuild_backend(backend, config))
+}
+
+fn sync_fts_on_startup_test(
+    conn: &mut Connection,
+    config: &FtsSyncConfig,
+) -> Result<FtsSyncResult> {
+    with_fts_backend(conn, |backend| sync_fts_on_startup_backend(backend, config))
+}
+
 /// Helper to insert a test segment directly
 fn insert_test_segment(conn: &Connection, pane_id: u64, seq: u64, content: &str) {
     let now = now_ms();
@@ -60,18 +111,18 @@ fn fts_index_state_tables_exist() {
 
 #[test]
 fn get_fts_index_state_returns_none_when_empty() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     // State table exists but is empty until sync initializes it
-    let state = get_fts_index_state_sync(&conn).unwrap();
+    let state = get_fts_index_state_test(&mut conn).unwrap();
     // After migration, we insert a default row
     assert!(state.is_some() || state.is_none()); // Depends on migration logic
 }
 
 #[test]
 fn upsert_fts_index_state_works() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now = now_ms();
@@ -82,16 +133,16 @@ fn upsert_fts_index_state_works() {
         updated_at: now,
     };
 
-    upsert_fts_index_state_sync(&conn, &state).unwrap();
+    upsert_fts_index_state_test(&mut conn, &state).unwrap();
 
-    let loaded = get_fts_index_state_sync(&conn).unwrap().unwrap();
+    let loaded = get_fts_index_state_test(&mut conn).unwrap().unwrap();
     assert_eq!(loaded.index_version, 42);
     assert_eq!(loaded.last_full_rebuild_at, Some(now));
 }
 
 #[test]
 fn fts_pane_progress_roundtrip() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     // Create pane first (foreign key)
@@ -105,9 +156,9 @@ fn fts_pane_progress_roundtrip() {
         last_indexed_at: now,
     };
 
-    upsert_fts_pane_progress_sync(&conn, &progress).unwrap();
+    upsert_fts_pane_progress_test(&mut conn, &progress).unwrap();
 
-    let loaded = get_fts_pane_progress_sync(&conn, 100).unwrap().unwrap();
+    let loaded = get_fts_pane_progress_test(&mut conn, 100).unwrap().unwrap();
     assert_eq!(loaded.pane_id, 100);
     assert_eq!(loaded.last_indexed_seq, 50);
     assert_eq!(loaded.indexed_count, 50);
@@ -115,18 +166,18 @@ fn fts_pane_progress_roundtrip() {
 
 #[test]
 fn sync_fts_on_startup_initializes_state() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let config = FtsSyncConfig::default();
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     // Should complete with no segments (empty db)
     assert_eq!(result.segments_indexed, 0);
     assert!(!result.full_rebuild);
 
     // State should be initialized
-    let state = get_fts_index_state_sync(&conn).unwrap().unwrap();
+    let state = get_fts_index_state_test(&mut conn).unwrap().unwrap();
     assert_eq!(state.index_version, FTS_INDEX_VERSION);
 }
 
@@ -194,7 +245,7 @@ fn fts_trigger_count(conn: &Connection) -> i64 {
 /// Baseline: with triggers present, insertions flow straight into FTS.
 /// Pins the "sync" mode that StorageConfig::default() preserves.
 ///
-/// Starts seq at 1 because `sync_fts_for_pane` has a pre-existing
+/// Starts seq at 1 because `sync_fts_for_pane_backend` had a pre-existing
 /// off-by-one in its `seq > last_indexed_seq` query that excludes a
 /// fresh pane's seq=0 segment from the deferred-catchup path —
 /// tracked as its own bead. For this test, we exercise the trigger
@@ -239,13 +290,13 @@ fn fts_deferred_mode_does_not_index_on_insert() {
     );
 }
 
-/// [ft-wk5fo] End-to-end: the `sync_fts_on_startup` catchup engine
+/// [ft-wk5fo] End-to-end: the backend startup-sync catchup engine
 /// sees all 500 deferred segments and indexes them through the
 /// `fts_pane_progress` resume mechanism. Proves the deferred path
 /// achieves eventual consistency — the whole point of the rollout.
 #[test]
 fn fts_deferred_mode_catchup_indexes_all_segments() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
     apply_defer_fts_triggers(&conn);
 
@@ -259,7 +310,7 @@ fn fts_deferred_mode_catchup_indexes_all_segments() {
     // Trigger the batched catchup engine. Same entry point the
     // future periodic writer-thread tick will use.
     let config = FtsSyncConfig::default();
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     assert_eq!(result.segments_indexed, 500);
     assert_eq!(result.panes_processed, 1);
@@ -271,7 +322,7 @@ fn fts_deferred_mode_catchup_indexes_all_segments() {
     );
 
     // And a second catchup is a no-op (progress prevents re-indexing).
-    let second = sync_fts_on_startup(&conn, &config).unwrap();
+    let second = sync_fts_on_startup_test(&mut conn, &config).unwrap();
     assert_eq!(
         second.segments_indexed, 0,
         "second catchup must see no new work (progress is resumable)"
@@ -281,7 +332,7 @@ fn fts_deferred_mode_catchup_indexes_all_segments() {
 
 /// [ft-7do6c] The seq=0 off-by-one: a fresh pane's FIRST segment
 /// gets seq=0 (COALESCE(MAX(seq)+1, 0) at append_segment_sync:12355).
-/// Before the fix, sync_fts_for_pane's `WHERE seq > last_indexed_seq`
+/// Before the fix, `sync_fts_for_pane_backend`'s `WHERE seq > last_indexed_seq`
 /// filter — with last_indexed_seq defaulting to 0 for a never-synced
 /// pane — silently skipped that first segment forever under deferred
 /// mode. This test constructs the exact shape that was broken:
@@ -291,7 +342,7 @@ fn fts_deferred_mode_catchup_indexes_all_segments() {
 /// this bug was open; this test removes that restriction.
 #[test]
 fn ft_7do6c_catchup_indexes_seq_zero_on_first_sync() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
     apply_defer_fts_triggers(&conn);
 
@@ -304,7 +355,7 @@ fn ft_7do6c_catchup_indexes_seq_zero_on_first_sync() {
     assert_eq!(fts_match_count(&conn, "seqzero"), 0);
 
     let config = FtsSyncConfig::default();
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     // Before the fix: 4 (seq 1,2,3,4 indexed; seq=0 dropped).
     // After the fix: 5 (seq 0,1,2,3,4 all indexed).
@@ -330,7 +381,7 @@ fn ft_7do6c_catchup_indexes_seq_zero_on_first_sync() {
     // Resume invariant still holds: a second catchup is a no-op
     // (progress table was written with last_indexed_seq=4 in the
     // first pass, so `seq > 4` correctly excludes everything).
-    let second = sync_fts_on_startup(&conn, &config).unwrap();
+    let second = sync_fts_on_startup_test(&mut conn, &config).unwrap();
     assert_eq!(second.segments_indexed, 0);
     assert_eq!(fts_match_count(&conn, "seqzero"), 5);
 }
@@ -341,10 +392,10 @@ fn ft_7do6c_catchup_indexes_seq_zero_on_first_sync() {
 ///
 /// Seq range is 1..=500 (not 0..500) — see the note on
 /// `fts_sync_mode_indexes_on_insert` about the seq=0 off-by-one
-/// in `sync_fts_for_pane`.
+/// in `sync_fts_for_pane_backend`.
 #[test]
 fn fts_deferred_mode_catchup_resumes_across_rounds() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
     apply_defer_fts_triggers(&conn);
 
@@ -357,7 +408,7 @@ fn fts_deferred_mode_catchup_resumes_across_rounds() {
         for seq in start..end {
             insert_test_segment(&conn, 1, seq, &format!("roundtoken{round}"));
         }
-        let result = sync_fts_on_startup(&conn, &config).unwrap();
+        let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
         assert_eq!(
             result.segments_indexed, 100,
             "round {round} must index exactly the 100 new segments, not re-index prior rounds"
@@ -650,7 +701,7 @@ fn fts_deferred_mode_toggle_round_trip() {
 
 #[test]
 fn sync_fts_indexes_new_segments() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     // Create pane and segments
@@ -664,10 +715,10 @@ fn sync_fts_indexes_new_segments() {
     // Let's clear FTS and progress to simulate recovery
     conn.execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')")
         .ok(); // May fail if empty
-    clear_fts_pane_progress_sync(&conn).unwrap();
+    clear_fts_pane_progress_test(&mut conn).unwrap();
 
     let config = FtsSyncConfig::default();
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     // Should rebuild all 3 segments
     assert_eq!(result.segments_indexed, 3);
@@ -676,7 +727,7 @@ fn sync_fts_indexes_new_segments() {
 
 #[test]
 fn sync_fts_respects_progress() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     // Create pane and segments
@@ -697,10 +748,10 @@ fn sync_fts_respects_progress() {
         indexed_count: 2,
         last_indexed_at: now,
     };
-    upsert_fts_pane_progress_sync(&conn, &progress).unwrap();
+    upsert_fts_pane_progress_test(&mut conn, &progress).unwrap();
 
     let config = FtsSyncConfig::default();
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     // Should only index segment 3
     assert_eq!(result.segments_indexed, 1);
@@ -708,7 +759,7 @@ fn sync_fts_respects_progress() {
 
 #[test]
 fn sync_fts_on_startup_skips_caught_up_panes() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
     apply_defer_fts_triggers(&conn);
 
@@ -717,8 +768,8 @@ fn sync_fts_on_startup_skips_caught_up_panes() {
         insert_test_pane(&conn, pane);
         insert_test_segment(&conn, pane, 0, &format!("caughtup-{pane}-zero"));
         insert_test_segment(&conn, pane, 1, &format!("caughtup-{pane}-one"));
-        upsert_fts_pane_progress_sync(
-            &conn,
+        upsert_fts_pane_progress_test(
+            &mut conn,
             &FtsPaneProgress {
                 pane_id: pane,
                 last_indexed_seq: 1,
@@ -732,8 +783,8 @@ fn sync_fts_on_startup_skips_caught_up_panes() {
     insert_test_pane(&conn, 100);
     insert_test_segment(&conn, 100, 0, "dirty-old");
     insert_test_segment(&conn, 100, 1, "dirtyneedle");
-    upsert_fts_pane_progress_sync(
-        &conn,
+    upsert_fts_pane_progress_test(
+        &mut conn,
         &FtsPaneProgress {
             pane_id: 100,
             last_indexed_seq: 0,
@@ -746,7 +797,7 @@ fn sync_fts_on_startup_skips_caught_up_panes() {
     insert_test_pane(&conn, 200);
     insert_test_segment(&conn, 200, 0, "missingneedle");
 
-    let pane_ids = panes_needing_fts_sync(&conn).unwrap();
+    let pane_ids = panes_needing_fts_sync_test(&mut conn).unwrap();
     assert_eq!(
         pane_ids,
         vec![100, 200],
@@ -754,21 +805,21 @@ fn sync_fts_on_startup_skips_caught_up_panes() {
     );
 
     let config = FtsSyncConfig::default();
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     assert_eq!(result.panes_processed, 2);
     assert_eq!(result.segments_indexed, 2);
     assert_eq!(fts_match_count(&conn, "dirtyneedle"), 1);
     assert_eq!(fts_match_count(&conn, "missingneedle"), 1);
     assert!(
-        panes_needing_fts_sync(&conn).unwrap().is_empty(),
+        panes_needing_fts_sync_test(&mut conn).unwrap().is_empty(),
         "second startup pass should have no panes to visit"
     );
 }
 
 #[test]
 fn full_rebuild_clears_progress() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     // Create pane and segments
@@ -778,8 +829,8 @@ fn full_rebuild_clears_progress() {
 
     // Set some progress
     let now = now_ms();
-    upsert_fts_pane_progress_sync(
-        &conn,
+    upsert_fts_pane_progress_test(
+        &mut conn,
         &FtsPaneProgress {
             pane_id: 1,
             last_indexed_seq: 1,
@@ -790,20 +841,20 @@ fn full_rebuild_clears_progress() {
     .unwrap();
 
     let config = FtsSyncConfig::default();
-    let result = full_fts_rebuild_sync(&conn, &config).unwrap();
+    let result = full_fts_rebuild_test(&mut conn, &config).unwrap();
 
     assert!(result.full_rebuild);
     assert_eq!(result.segments_indexed, 2);
 
     // Progress should be updated
-    let progress = get_fts_pane_progress_sync(&conn, 1).unwrap().unwrap();
+    let progress = get_fts_pane_progress_test(&mut conn, 1).unwrap().unwrap();
     assert_eq!(progress.last_indexed_seq, 2);
     assert_eq!(progress.indexed_count, 2);
 }
 
 #[test]
 fn full_rebuild_is_idempotent() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1);
@@ -812,7 +863,7 @@ fn full_rebuild_is_idempotent() {
     insert_test_segment(&conn, 1, 3, "Gamma");
 
     let config = FtsSyncConfig::default();
-    let first = full_fts_rebuild_sync(&conn, &config).unwrap();
+    let first = full_fts_rebuild_test(&mut conn, &config).unwrap();
     assert!(first.full_rebuild);
     assert_eq!(first.segments_indexed, 3);
 
@@ -823,7 +874,7 @@ fn full_rebuild_is_idempotent() {
         .unwrap();
     assert_eq!(fts_rows, 3);
 
-    let second = full_fts_rebuild_sync(&conn, &config).unwrap();
+    let second = full_fts_rebuild_test(&mut conn, &config).unwrap();
     assert!(second.full_rebuild);
     assert_eq!(second.segments_indexed, 3);
 
@@ -837,7 +888,7 @@ fn full_rebuild_is_idempotent() {
 
 #[test]
 fn version_mismatch_triggers_rebuild() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     // Set an old version
@@ -848,34 +899,34 @@ fn version_mismatch_triggers_rebuild() {
         created_at: now,
         updated_at: now,
     };
-    upsert_fts_index_state_sync(&conn, &old_state).unwrap();
+    upsert_fts_index_state_test(&mut conn, &old_state).unwrap();
 
     // Create pane and segment
     insert_test_pane(&conn, 1);
     insert_test_segment(&conn, 1, 1, "Test content");
 
     let config = FtsSyncConfig::default();
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     // Should trigger full rebuild due to version mismatch
     assert!(result.full_rebuild);
 
     // State should be updated to new version
-    let state = get_fts_index_state_sync(&conn).unwrap().unwrap();
+    let state = get_fts_index_state_test(&mut conn).unwrap().unwrap();
     assert_eq!(state.index_version, FTS_INDEX_VERSION);
 }
 
 #[test]
 fn fts_rebuild_pending_version_triggers_full_rebuild() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1);
     insert_test_segment(&conn, 1, 1, "Test content");
 
     let now = now_ms();
-    upsert_fts_index_state_sync(
-        &conn,
+    upsert_fts_index_state_test(
+        &mut conn,
         &FtsIndexState {
             index_version: FTS_INDEX_REBUILD_PENDING_VERSION,
             last_full_rebuild_at: None,
@@ -884,16 +935,16 @@ fn fts_rebuild_pending_version_triggers_full_rebuild() {
         },
     )
     .unwrap();
-    clear_fts_pane_progress_sync(&conn).unwrap();
+    clear_fts_pane_progress_test(&mut conn).unwrap();
     conn.execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')")
         .unwrap();
 
     let config = FtsSyncConfig::default();
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     assert!(result.full_rebuild);
 
-    let state = get_fts_index_state_sync(&conn).unwrap().unwrap();
+    let state = get_fts_index_state_test(&mut conn).unwrap().unwrap();
     assert_eq!(state.index_version, FTS_INDEX_VERSION);
     assert!(state.last_full_rebuild_at.is_some());
 
@@ -907,15 +958,15 @@ fn fts_rebuild_pending_version_triggers_full_rebuild() {
 
 #[test]
 fn fts_hard_rebuild_failure_marks_index_pending_and_clears_progress() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     insert_test_pane(&conn, 1);
     insert_test_segment(&conn, 1, 1, "Alpha");
 
     let now = now_ms();
-    upsert_fts_index_state_sync(
-        &conn,
+    upsert_fts_index_state_test(
+        &mut conn,
         &FtsIndexState {
             index_version: FTS_INDEX_VERSION,
             last_full_rebuild_at: Some(now),
@@ -924,8 +975,8 @@ fn fts_hard_rebuild_failure_marks_index_pending_and_clears_progress() {
         },
     )
     .unwrap();
-    upsert_fts_pane_progress_sync(
-        &conn,
+    upsert_fts_pane_progress_test(
+        &mut conn,
         &FtsPaneProgress {
             pane_id: 1,
             last_indexed_seq: 1,
@@ -938,19 +989,19 @@ fn fts_hard_rebuild_failure_marks_index_pending_and_clears_progress() {
     conn.execute_batch("DROP TABLE output_segments_fts")
         .unwrap();
 
-    let err = full_fts_rebuild_sync(&conn, &FtsSyncConfig::default()).unwrap_err();
+    let err = full_fts_rebuild_test(&mut conn, &FtsSyncConfig::default()).unwrap_err();
     let err_msg = err.to_string();
     assert!(err_msg.contains("FTS rebuild incomplete"));
 
-    let state = get_fts_index_state_sync(&conn).unwrap().unwrap();
+    let state = get_fts_index_state_test(&mut conn).unwrap().unwrap();
     assert_eq!(state.index_version, FTS_INDEX_REBUILD_PENDING_VERSION);
     assert_eq!(state.last_full_rebuild_at, None);
-    assert!(get_fts_pane_progress_sync(&conn, 1).unwrap().is_none());
+    assert!(get_fts_pane_progress_test(&mut conn, 1).unwrap().is_none());
 }
 
 #[test]
 fn batch_config_limits_work() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     // Create pane and multiple segments
@@ -962,7 +1013,7 @@ fn batch_config_limits_work() {
     // Clear FTS
     conn.execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')")
         .ok();
-    clear_fts_pane_progress_sync(&conn).unwrap();
+    clear_fts_pane_progress_test(&mut conn).unwrap();
 
     // Use small batch size
     let config = FtsSyncConfig {
@@ -971,12 +1022,12 @@ fn batch_config_limits_work() {
         commit_progress: true,
     };
 
-    let result = sync_fts_on_startup(&conn, &config).unwrap();
+    let result = sync_fts_on_startup_test(&mut conn, &config).unwrap();
 
     // Should index all 10 segments in multiple batches
     assert_eq!(result.segments_indexed, 10);
 
     // Progress should be at the end
-    let progress = get_fts_pane_progress_sync(&conn, 1).unwrap().unwrap();
+    let progress = get_fts_pane_progress_test(&mut conn, 1).unwrap().unwrap();
     assert_eq!(progress.last_indexed_seq, 10);
 }
