@@ -153,22 +153,22 @@ fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
     let payload = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(encoded)
         .ok()?;
-    let decoded = if compressed {
+    let decoded_payload = if compressed {
         let decoder = zstd::Decoder::new(payload.as_slice()).ok()?;
-        let mut decoded = Vec::new();
+        let mut decompressed = Vec::new();
         decoder
             .take(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES + 1)
-            .read_to_end(&mut decoded)
+            .read_to_end(&mut decompressed)
             .ok()?;
-        if decoded.len() as u64 > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES {
+        if decompressed.len() as u64 > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES {
             return None;
         }
-        decoded
+        decompressed
     } else {
         payload
     };
 
-    varbincode::deserialize(decoded.as_slice()).ok()
+    varbincode::deserialize(decoded_payload.as_slice()).ok()
 }
 
 fn legacy_text_scrollback_line(text: &str) -> wezterm_term::Line {

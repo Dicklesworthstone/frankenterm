@@ -200,13 +200,41 @@ fn encoded_mixed_compression_ping_series(n: u64) -> (Vec<u8>, Vec<u64>) {
     (buf, serials)
 }
 
-fn decode_all(bytes: &[u8]) -> Vec<DecodedPdu> {
+fn try_decode_all(bytes: &[u8]) -> Result<Vec<DecodedPdu>, String> {
     let mut out = Vec::new();
     let mut buffer = bytes.to_vec();
-    while let Some(decoded) = Pdu::stream_decode(&mut buffer).expect("stream_decode frame") {
+    while let Some(decoded) =
+        Pdu::stream_decode(&mut buffer).map_err(|err| format!("stream_decode frame: {err:#}"))?
+    {
         out.push(decoded);
     }
-    out
+    if !buffer.is_empty() {
+        return Err(format!(
+            "dispatch conformance output ended with {} trailing undecoded byte(s): {:02x?}",
+            buffer.len(),
+            buffer
+        ));
+    }
+    Ok(out)
+}
+
+fn decode_all(bytes: &[u8]) -> Vec<DecodedPdu> {
+    try_decode_all(bytes).unwrap_or_else(|message| panic!("{message}"))
+}
+
+#[test]
+fn decoder_rejects_trailing_partial_frame() {
+    let mut wire = encoded_ping_series(1);
+    let mut partial = encoded_ping_series(1);
+    partial.pop().expect("encoded ping frame must not be empty");
+    wire.extend_from_slice(&partial);
+
+    let message =
+        try_decode_all(&wire).expect_err("trailing partial frame must fail conformance decoding");
+    assert!(
+        message.contains("trailing undecoded"),
+        "unexpected decoder error: {message}"
+    );
 }
 
 fn run_once(
