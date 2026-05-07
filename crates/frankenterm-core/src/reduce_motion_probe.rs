@@ -32,7 +32,7 @@
 //! The crate enforces `#![forbid(unsafe_code)]`, so the
 //! probe drives platform CLIs via `std::process::Command`
 //! and parses stdout. The probe is run rarely (session start
-//! + on `SIGUSR1` reload), so the process-spawn cost is
+//! and on `SIGUSR1` reload), so the process-spawn cost is
 //! immaterial against a 60-Hz paint loop.
 //!
 //! ## Failure handling
@@ -199,7 +199,11 @@ fn run_with_timeout(mut cmd: Command) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::*;
+    use std::process::Command;
+
+    use crate::accessibility_preferences::MotionPreference;
+
+    use super::{parse_macos_reduce_motion, run_with_timeout};
 
     pub(super) fn probe() -> Option<MotionPreference> {
         let mut cmd = Command::new("defaults");
@@ -211,7 +215,11 @@ mod macos {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::*;
+    use std::process::Command;
+
+    use crate::accessibility_preferences::MotionPreference;
+
+    use super::{parse_linux_enable_animations, run_with_timeout};
 
     pub(super) fn probe() -> Option<MotionPreference> {
         let mut cmd = Command::new("gsettings");
@@ -223,7 +231,11 @@ mod linux {
 
 #[cfg(target_os = "windows")]
 mod windows {
-    use super::*;
+    use std::process::Command;
+
+    use crate::accessibility_preferences::MotionPreference;
+
+    use super::{parse_windows_min_animate, run_with_timeout};
 
     pub(super) fn probe() -> Option<MotionPreference> {
         let mut cmd = Command::new("powershell");
