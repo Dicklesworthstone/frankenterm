@@ -38,10 +38,7 @@ fn replay_backend_error(operation: &'static str, source: impl std::fmt::Display)
     }
 }
 
-fn replay_cancelled_error(
-    operation: &'static str,
-    source: impl std::fmt::Display,
-) -> crate::Error {
+fn replay_cancelled_error(operation: &'static str, source: impl std::fmt::Display) -> crate::Error {
     crate::Error::RuntimeOperation {
         operation,
         source: RuntimeOperationSource::Cancelled(source.to_string()),
@@ -716,7 +713,7 @@ impl Player {
                     "replay.play",
                     format!(
                         "cancelled at frame_index={} (timestamp_ms={}): {err}",
-                    self.position.frame_index, self.position.timestamp_ms
+                        self.position.frame_index, self.position.timestamp_ms
                     ),
                 )
             })?;
@@ -936,10 +933,18 @@ pub fn export_asciinema<W: std::io::Write>(
             ),
         );
     }
-    let header_json = serde_json::to_string(&header)
-        .map_err(|e| replay_backend_error("replay.export_asciinema", format!("Failed to serialize cast header: {e}")))?;
-    writeln!(writer, "{header_json}")
-        .map_err(|e| replay_backend_error("replay.export_asciinema", format!("Failed to write cast header: {e}")))?;
+    let header_json = serde_json::to_string(&header).map_err(|e| {
+        replay_backend_error(
+            "replay.export_asciinema",
+            format!("Failed to serialize cast header: {e}"),
+        )
+    })?;
+    writeln!(writer, "{header_json}").map_err(|e| {
+        replay_backend_error(
+            "replay.export_asciinema",
+            format!("Failed to write cast header: {e}"),
+        )
+    })?;
 
     // Write events
     let base_ts = source
@@ -957,10 +962,16 @@ pub fn export_asciinema<W: std::io::Write>(
                 let text = String::from_utf8_lossy(&frame.payload);
                 let event = serde_json::json!([rel_secs, "o", text]);
                 let line = serde_json::to_string(&event).map_err(|e| {
-                    replay_backend_error("replay.export_asciinema", format!("Failed to serialize cast event: {e}"))
+                    replay_backend_error(
+                        "replay.export_asciinema",
+                        format!("Failed to serialize cast event: {e}"),
+                    )
                 })?;
                 writeln!(writer, "{line}").map_err(|e| {
-                    replay_backend_error("replay.export_asciinema", format!("Failed to write cast event: {e}"))
+                    replay_backend_error(
+                        "replay.export_asciinema",
+                        format!("Failed to write cast event: {e}"),
+                    )
                 })?;
                 event_count += 1;
             }
@@ -969,10 +980,16 @@ pub fn export_asciinema<W: std::io::Write>(
                 let r = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
                 let event = serde_json::json!([rel_secs, "r", format!("{c}x{r}")]);
                 let line = serde_json::to_string(&event).map_err(|e| {
-                    replay_backend_error("replay.export_asciinema", format!("Failed to serialize cast event: {e}"))
+                    replay_backend_error(
+                        "replay.export_asciinema",
+                        format!("Failed to serialize cast event: {e}"),
+                    )
                 })?;
                 writeln!(writer, "{line}").map_err(|e| {
-                    replay_backend_error("replay.export_asciinema", format!("Failed to write cast event: {e}"))
+                    replay_backend_error(
+                        "replay.export_asciinema",
+                        format!("Failed to write cast event: {e}"),
+                    )
                 })?;
                 event_count += 1;
             }
@@ -981,10 +998,16 @@ pub fn export_asciinema<W: std::io::Write>(
                 let text = String::from_utf8_lossy(&frame.payload);
                 let event = serde_json::json!([rel_secs, "m", text]);
                 let line = serde_json::to_string(&event).map_err(|e| {
-                    replay_backend_error("replay.export_asciinema", format!("Failed to serialize cast event: {e}"))
+                    replay_backend_error(
+                        "replay.export_asciinema",
+                        format!("Failed to serialize cast event: {e}"),
+                    )
                 })?;
                 writeln!(writer, "{line}").map_err(|e| {
-                    replay_backend_error("replay.export_asciinema", format!("Failed to write cast event: {e}"))
+                    replay_backend_error(
+                        "replay.export_asciinema",
+                        format!("Failed to write cast event: {e}"),
+                    )
                 })?;
                 event_count += 1;
             }
@@ -1213,9 +1236,9 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
 
     // Trailing number without unit → treat as seconds
     if !num_buf.is_empty() {
-        let val: f64 = num_buf
-            .parse()
-            .map_err(|_| replay_backend_error("replay.parse_duration", format!("Invalid duration: '{s}'")))?;
+        let val: f64 = num_buf.parse().map_err(|_| {
+            replay_backend_error("replay.parse_duration", format!("Invalid duration: '{s}'"))
+        })?;
         total_ms += (val * 1_000.0).round() as u64;
     }
 
@@ -1297,6 +1320,38 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn replay_backend_error_uses_runtime_operation() {
+        let err = replay_backend_error("replay.test", "backend detail");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "replay.test");
+                assert_eq!(
+                    source,
+                    crate::error::RuntimeOperationSource::Backend("backend detail".to_string())
+                );
+            }
+            other => panic!("expected RuntimeOperation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_cancelled_error_uses_runtime_operation() {
+        let err = replay_cancelled_error("replay.test", "cancel detail");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "replay.test");
+                assert_eq!(
+                    source,
+                    crate::error::RuntimeOperationSource::Cancelled("cancel detail".to_string())
+                );
+            }
+            other => panic!("expected RuntimeOperation, got {other:?}"),
         }
     }
 
