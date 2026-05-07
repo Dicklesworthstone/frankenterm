@@ -17,6 +17,7 @@ use crate::runtime_async::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::error::RuntimeOperationSource;
 use crate::ingest::{CapturedSegment, CapturedSegmentKind};
 use crate::patterns::Detection;
 use crate::policy::Redactor;
@@ -627,6 +628,13 @@ pub struct RecordingManager {
     recorders: Mutex<HashMap<u64, Recorder>>,
 }
 
+fn recording_runtime_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Backend(detail.into()),
+    }
+}
+
 impl RecordingManager {
     /// Create a new recording manager with the given options.
     #[must_use]
@@ -664,9 +672,10 @@ impl RecordingManager {
     ) -> Result<()> {
         let mut guard = self.recorders.lock_with_cx(cx).await;
         if guard.contains_key(&pane_id) {
-            return Err(crate::Error::Runtime(format!(
-                "Recorder already active for pane {pane_id}"
-            )));
+            return Err(recording_runtime_error(
+                "recording.start",
+                format!("Recorder already active for pane {pane_id}"),
+            ));
         }
         let mut recorder = Recorder::new(pane_id, path, self.options.flush_threshold)?;
         recorder.start(started_at_ms);
@@ -900,10 +909,13 @@ pub fn parse_recorder_event_json(json: &str) -> crate::Result<RecorderEvent> {
         .unwrap_or("");
 
     if version != RECORDER_EVENT_SCHEMA_VERSION_V1 {
-        return Err(crate::Error::Runtime(format!(
-            "unsupported recorder event schema version: {version:?} \
+        return Err(recording_runtime_error(
+            "recording.parse_event",
+            format!(
+                "unsupported recorder event schema version: {version:?} \
              (expected {RECORDER_EVENT_SCHEMA_VERSION_V1:?})"
-        )));
+            ),
+        ));
     }
 
     // Second pass: deserialize with serde, tolerating unknown fields.
@@ -1308,6 +1320,28 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn assert_runtime_operation_backend(
+        err: crate::Error,
+        expected_operation: &'static str,
+        expected_detail: &str,
+    ) {
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, expected_operation);
+                match source {
+                    RuntimeOperationSource::Backend(detail) => {
+                        assert!(
+                            detail.contains(expected_detail),
+                            "expected detail to contain {expected_detail:?}, got {detail:?}"
+                        );
+                    }
+                    other => panic!("expected Backend source, got {other:?}"),
+                }
+            }
+            other => panic!("expected RuntimeOperation, got {other:?}"),
         }
     }
 
@@ -2039,7 +2073,11 @@ mod tests {
             manager.start_recording(1, &path, 0).await.unwrap();
 
             let result = manager.start_recording(1, &path, 0).await;
-            assert!(result.is_err());
+            assert_runtime_operation_backend(
+                result.expect_err("duplicate start should fail"),
+                "recording.start",
+                "Recorder already active for pane 1",
+            );
         });
     }
 
@@ -2590,7 +2628,11 @@ mod tests {
             "pane_id": 1,
         });
         let result = parse_recorder_event_json(&json.to_string());
-        assert!(result.is_err());
+        assert_runtime_operation_backend(
+            result.expect_err("wrong schema version should fail"),
+            "recording.parse_event",
+            "ft.recorder.event.v99",
+        );
     }
 
     #[test]
@@ -3150,12 +3192,10 @@ mod tests {
             "ingress_kind": "send_text"
         });
         let result = parse_recorder_event_json(&bad_json.to_string());
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("v2"),
-            "error should mention wrong version, got: {}",
-            err_msg
+        assert_runtime_operation_backend(
+            result.expect_err("wrong schema version should fail"),
+            "recording.parse_event",
+            "ft.recorder.event.v2",
         );
     }
 
@@ -3180,7 +3220,11 @@ mod tests {
             "ingress_kind": "send_text"
         });
         let result = parse_recorder_event_json(&no_version.to_string());
-        assert!(result.is_err(), "missing schema_version should be rejected");
+        assert_runtime_operation_backend(
+            result.expect_err("missing schema_version should fail"),
+            "recording.parse_event",
+            "unsupported recorder event schema version",
+        );
     }
 
     #[test]
