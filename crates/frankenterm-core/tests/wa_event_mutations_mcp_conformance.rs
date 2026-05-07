@@ -36,7 +36,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     let server = build_server_with_db(&config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -346,10 +346,9 @@ fn capture_tool_contract(
     }
 }
 
-// TODO(ft-4o5mb.6): remove #[ignore] once this harness has a reproducible local or remote
-// verification lane that can regenerate and check the golden without a long full-crate build.
+// ft-4o5mb.6: event mutation tools are part of the MCP conformance surface;
+// keep this golden in the normal test suite so schema/envelope drift is visible.
 #[test]
-#[ignore = "verify partial: local golden generation currently requires a full frankenterm-core integration build that did not complete within the session cap"]
 fn mcp_conformance_wa_event_mutations_contract_matches_golden() {
     let captures = vec![
         capture_tool_contract(

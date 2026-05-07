@@ -1,0 +1,190 @@
+[
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.note: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "by": {
+          "description": "Actor identifier (optional)",
+          "type": "string"
+        },
+        "clear": {
+          "default": false,
+          "description": "Clear the note",
+          "type": "boolean"
+        },
+        "event_id": {
+          "description": "Event ID",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "type": "string"
+        },
+        "note": {
+          "description": "Note text to set",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id"
+      ],
+      "type": "object"
+    },
+    "success_envelope": {
+      "data": {
+        "annotations": {
+          "labels": [
+            "customer-impacting"
+          ],
+          "note": "Investigating customer impact",
+          "note_updated_at": 0,
+          "note_updated_by": "ops",
+          "triage_state": null,
+          "triage_updated_at": 0,
+          "triage_updated_by": null
+        },
+        "changed": true,
+        "event_id": 1
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    },
+    "tool": "wa.events_annotate"
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.state: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "by": {
+          "description": "Actor identifier (optional)",
+          "type": "string"
+        },
+        "clear": {
+          "default": false,
+          "description": "Clear the triage state",
+          "type": "boolean"
+        },
+        "event_id": {
+          "description": "Event ID",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "description": "Triage state to set",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id"
+      ],
+      "type": "object"
+    },
+    "success_envelope": {
+      "data": {
+        "annotations": {
+          "labels": [
+            "urgent"
+          ],
+          "note": null,
+          "note_updated_at": 0,
+          "note_updated_by": null,
+          "triage_state": "investigating",
+          "triage_updated_at": 0,
+          "triage_updated_by": "ops"
+        },
+        "changed": true,
+        "event_id": 1
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    },
+    "tool": "wa.events_triage"
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.add: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "add": {
+          "description": "Label to add",
+          "type": "string"
+        },
+        "by": {
+          "description": "Actor identifier (optional; applies to add)",
+          "type": "string"
+        },
+        "event_id": {
+          "description": "Event ID",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "type": "string"
+        },
+        "list": {
+          "default": false,
+          "description": "List labels only",
+          "type": "boolean"
+        },
+        "remove": {
+          "description": "Label to remove",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id"
+      ],
+      "type": "object"
+    },
+    "success_envelope": {
+      "data": {
+        "annotations": {
+          "labels": [
+            "customer-impacting",
+            "urgent"
+          ],
+          "note": null,
+          "note_updated_at": 0,
+          "note_updated_by": null,
+          "triage_state": null,
+          "triage_updated_at": 0,
+          "triage_updated_by": null
+        },
+        "changed": true,
+        "event_id": 1
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    },
+    "tool": "wa.events_label"
+  }
+]
