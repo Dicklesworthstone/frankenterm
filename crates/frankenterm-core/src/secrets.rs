@@ -12,11 +12,22 @@ use sha2::{Digest, Sha256};
 
 use crate::Result;
 use crate::accounts::now_ms;
+use crate::error::RuntimeOperationSource;
 use crate::policy::Redactor;
 use crate::storage::{SecretScanReportRecord, Segment, SegmentScanQuery, StorageHandle};
 
 /// Current report schema version for secret scans.
 pub const SECRET_SCAN_REPORT_VERSION: u32 = 1;
+
+fn secret_scan_cancelled_error(
+    operation: &'static str,
+    err: impl std::fmt::Display,
+) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(err.to_string()),
+    }
+}
 
 /// Options for secret scans over stored segments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,7 +242,7 @@ impl SecretScanEngine {
         options: SecretScanOptions,
     ) -> Result<SecretScanReport> {
         cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!("scan_storage_incremental cancelled: {err}"))
+            secret_scan_cancelled_error("secrets.scan_storage_incremental.preflight", err)
         })?;
 
         let scope = SecretScanScope::from_options(&options);
@@ -273,7 +284,7 @@ impl SecretScanEngine {
         resume_after_id: Option<i64>,
     ) -> Result<SecretScanReport> {
         cx.checkpoint()
-            .map_err(|err| crate::Error::Runtime(format!("scan_storage cancelled: {err}")))?;
+            .map_err(|err| secret_scan_cancelled_error("secrets.scan_storage.preflight", err))?;
 
         if options.batch_size == 0 {
             options.batch_size = 1_000;
@@ -292,9 +303,10 @@ impl SecretScanEngine {
             }
 
             cx.checkpoint().map_err(|err| {
-                crate::Error::Runtime(format!(
-                    "scan_storage cancelled mid-batch (after_id={after_id:?}): {err}"
-                ))
+                secret_scan_cancelled_error(
+                    "secrets.scan_storage.before_batch",
+                    format!("after_id={after_id:?}: {err}"),
+                )
             })?;
 
             let limit = remaining
@@ -547,6 +559,22 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn secret_scan_cancelled_error_uses_structured_runtime_operation() {
+        let err = secret_scan_cancelled_error("secrets.test_checkpoint", "caller cancelled");
+
+        match err {
+            crate::Error::RuntimeOperation { operation, source } => {
+                assert_eq!(operation, "secrets.test_checkpoint");
+                assert_eq!(
+                    source,
+                    crate::error::RuntimeOperationSource::Cancelled("caller cancelled".to_string())
+                );
+            }
+            other => panic!("expected structured runtime operation, got {other:?}"),
         }
     }
 
