@@ -10110,8 +10110,13 @@ fn record_policy_denial_audit_backend(
 /// PRAGMA recipe in `session_restore::open_conn`. Without this, every
 /// MCP / robot / TUI read path could fail under modest writer load.
 fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
-    let conn = Connection::open(db_path)
-        .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
+    let config = crate::storage_backend_trait::OpenConfig {
+        wal_mode: false,
+        ..crate::storage_backend_trait::OpenConfig::default()
+    };
+    let conn = RusqliteBackend::open(db_path, &config)
+        .map_err(|err| StorageError::Database(format!("Failed to open read connection: {err}")))?
+        .into_connection();
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     Ok(conn)
 }
@@ -10171,10 +10176,10 @@ where
 //
 // Every `StorageHandle::*_with_cx` reader path used to call
 // `open_read_storage_conn(db_path)` inside a `spawn_blocking_storage`
-// closure. With ~78 call sites and a per-call `Connection::open` (file
-// open + page cache warmup + 5s busy_timeout PRAGMA), a 200-agent fleet
-// hammering `wa.search` / `wa.get_text` / web `/search` could rack up
-// hundreds of SQLite-open syscalls per second.
+// closure. With ~78 call sites and a per-call file open (file handle +
+// page cache warmup + 5s busy_timeout PRAGMA), a 200-agent fleet hammering
+// `wa.search` / `wa.get_text` / web `/search` could rack up hundreds of
+// SQLite-open syscalls per second.
 //
 // `PooledReadConn` is a small LIFO pool keyed by db_path:
 //   - `acquire(db_path)` pops a pre-warmed Connection or opens fresh.
@@ -20974,17 +20979,23 @@ mod pool_telemetry_tests {
     use super::{
         POOL_HITS, POOL_LOCK_POISONED, POOL_MISSES, POOL_RETURNS, PoolTelemetrySnapshot,
         PooledReadConn, pool_telemetry_snapshot, pooled_backend,
+        reset_pool_lock_poisoned_count_for_test,
     };
     use crate::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue};
     use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, OnceLock};
 
-    /// Reset the process-global counters so a single test owns the
-    /// hit/miss arithmetic. The pool itself is process-global; sibling
-    /// tests in the same crate that incidentally acquire pooled conns
-    /// will perturb the deltas. This helper takes a baseline snapshot
-    /// and computes deltas relative to it instead — that way two
-    /// pool-telemetry tests running in parallel on the same process
-    /// don't race.
+    fn pool_counter_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Snapshot the process-global counters for delta assertions.
+    ///
+    /// Tests that mutate the shared pool must hold
+    /// [`pool_counter_test_lock`]; otherwise sibling tests can increment
+    /// the process-global counters between this baseline and the final
+    /// snapshot.
     fn baseline() -> PoolTelemetrySnapshot {
         PoolTelemetrySnapshot {
             hits: POOL_HITS.load(Ordering::Relaxed),
@@ -21045,6 +21056,11 @@ mod pool_telemetry_tests {
     /// be useless because every database read would inflate it.
     #[test]
     fn pool_lock_poisoned_unchanged_for_clean_acquire_release() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+        reset_pool_lock_poisoned_count_for_test();
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ft-ac4j0-clean.db");
         let path_str = db_path.to_string_lossy().to_string();
@@ -21064,6 +21080,10 @@ mod pool_telemetry_tests {
 
     #[test]
     fn pool_acquire_release_cycle_records_hits() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+
         // br-ft-rvt1z acceptance: N sequential acquires against the
         // same db_path should yield 1 miss + (N-1) hits, since the
         // first acquire opens fresh + every subsequent acquire pops
@@ -21136,6 +21156,10 @@ mod pool_telemetry_tests {
 
     #[test]
     fn pooled_backend_lends_trait_object() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+
         fn require_trait_object(_: &dyn StorageBackend) {}
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
