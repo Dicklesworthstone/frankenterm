@@ -3,8 +3,8 @@ use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
 use frankenterm_core::display_pipeline::{
-    PresentAction, ScanoutBlockReason, ScanoutEligibility, VrrMechanism, VrrPlatform,
-    WaylandCompositor, X11WindowManager, decide_present, negotiate_vrr_support,
+    ForcePresentSignals, PresentAction, ScanoutBlockReason, ScanoutEligibility, VrrMechanism,
+    VrrPlatform, WaylandCompositor, X11WindowManager, decide_present, negotiate_vrr_support,
     should_force_present,
 };
 use frankenterm_core::display_platform_probe::{DisplayProbeResult, PlatformOs};
@@ -148,12 +148,12 @@ pub fn decide_webgpu_present_from_probe(inputs: WebGpuPresentProbeInputs<'_>) ->
     let (platform, wayland_compositor, x11_present_available) =
         webgpu_vrr_probe_inputs(inputs.probe.platform, inputs.session);
     let vrr = negotiate_vrr_support(platform, wayland_compositor, x11_present_available);
-    let force_present = should_force_present(
-        inputs.probe.recording.forces_present(),
-        inputs.a11y_query_in_flight,
-        inputs.manual_flush_requested,
-        inputs.post_layout_change,
-    );
+    let force_present = should_force_present(ForcePresentSignals {
+        recording_active: inputs.probe.recording.forces_present(),
+        a11y_query_in_flight: inputs.a11y_query_in_flight,
+        manual_flush_requested: inputs.manual_flush_requested,
+        post_layout_change: inputs.post_layout_change,
+    });
 
     decide_present(vrr, inputs.scanout, inputs.dedup_says_skip, force_present)
 }

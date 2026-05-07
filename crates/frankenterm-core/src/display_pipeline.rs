@@ -514,27 +514,36 @@ pub enum ForcePresentReason {
     PostLayoutChange,
 }
 
+/// Input signals that can force a Present even when frame dedup says a frame
+/// could be skipped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ForcePresentSignals {
+    /// Screen recording or capture pipeline requires every visual update.
+    pub recording_active: bool,
+    /// Assistive-technology query is waiting on the latest visual state.
+    pub a11y_query_in_flight: bool,
+    /// Operator explicitly requested a flush.
+    pub manual_flush_requested: bool,
+    /// Layout changed and stale dedup state must be bypassed once.
+    pub post_layout_change: bool,
+}
+
 /// Pure predicate. Returns the *highest-priority* reason if any
 /// applies; ties resolve toward operator intent (manual > a11y >
 /// recording > layout) since the operator's a11y reader is the most
 /// latency-sensitive observer of a missed Present.
 #[must_use]
-pub fn should_force_present(
-    recording_active: bool,
-    a11y_query_in_flight: bool,
-    manual_flush_requested: bool,
-    post_layout_change: bool,
-) -> Option<ForcePresentReason> {
-    if manual_flush_requested {
+pub fn should_force_present(signals: ForcePresentSignals) -> Option<ForcePresentReason> {
+    if signals.manual_flush_requested {
         return Some(ForcePresentReason::ManualFlush);
     }
-    if a11y_query_in_flight {
+    if signals.a11y_query_in_flight {
         return Some(ForcePresentReason::A11yQueryInFlight);
     }
-    if recording_active {
+    if signals.recording_active {
         return Some(ForcePresentReason::ScreenRecordingActive);
     }
-    if post_layout_change {
+    if signals.post_layout_change {
         return Some(ForcePresentReason::PostLayoutChange);
     }
     None
@@ -1017,13 +1026,16 @@ mod tests {
 
     #[test]
     fn force_present_none_when_all_signals_clear() {
-        assert_eq!(should_force_present(false, false, false, false), None);
+        assert_eq!(should_force_present(ForcePresentSignals::default()), None);
     }
 
     #[test]
     fn force_present_recording_only() {
         assert_eq!(
-            should_force_present(true, false, false, false),
+            should_force_present(ForcePresentSignals {
+                recording_active: true,
+                ..ForcePresentSignals::default()
+            }),
             Some(ForcePresentReason::ScreenRecordingActive)
         );
     }
@@ -1031,7 +1043,10 @@ mod tests {
     #[test]
     fn force_present_a11y_only() {
         assert_eq!(
-            should_force_present(false, true, false, false),
+            should_force_present(ForcePresentSignals {
+                a11y_query_in_flight: true,
+                ..ForcePresentSignals::default()
+            }),
             Some(ForcePresentReason::A11yQueryInFlight)
         );
     }
@@ -1039,7 +1054,10 @@ mod tests {
     #[test]
     fn force_present_manual_only() {
         assert_eq!(
-            should_force_present(false, false, true, false),
+            should_force_present(ForcePresentSignals {
+                manual_flush_requested: true,
+                ..ForcePresentSignals::default()
+            }),
             Some(ForcePresentReason::ManualFlush)
         );
     }
@@ -1047,7 +1065,10 @@ mod tests {
     #[test]
     fn force_present_post_layout_only() {
         assert_eq!(
-            should_force_present(false, false, false, true),
+            should_force_present(ForcePresentSignals {
+                post_layout_change: true,
+                ..ForcePresentSignals::default()
+            }),
             Some(ForcePresentReason::PostLayoutChange)
         );
     }
@@ -1055,7 +1076,12 @@ mod tests {
     #[test]
     fn force_present_priority_manual_beats_all() {
         assert_eq!(
-            should_force_present(true, true, true, true),
+            should_force_present(ForcePresentSignals {
+                recording_active: true,
+                a11y_query_in_flight: true,
+                manual_flush_requested: true,
+                post_layout_change: true,
+            }),
             Some(ForcePresentReason::ManualFlush)
         );
     }
@@ -1065,7 +1091,11 @@ mod tests {
         // Operator's a11y reader is more latency-sensitive than the
         // recording timeline.
         assert_eq!(
-            should_force_present(true, true, false, false),
+            should_force_present(ForcePresentSignals {
+                recording_active: true,
+                a11y_query_in_flight: true,
+                ..ForcePresentSignals::default()
+            }),
             Some(ForcePresentReason::A11yQueryInFlight)
         );
     }
@@ -1073,7 +1103,11 @@ mod tests {
     #[test]
     fn force_present_priority_recording_beats_layout() {
         assert_eq!(
-            should_force_present(true, false, false, true),
+            should_force_present(ForcePresentSignals {
+                recording_active: true,
+                post_layout_change: true,
+                ..ForcePresentSignals::default()
+            }),
             Some(ForcePresentReason::ScreenRecordingActive)
         );
     }
@@ -1200,7 +1234,10 @@ mod tests {
         // says we must NOT elide frames, even if dedup would have.
         let vrr = negotiate_vrr_support(VrrPlatform::MacOs, None, false);
         let scanout = ScanoutEligibility::Blocked(ScanoutBlockReason::CompositorNoDmabuf);
-        let force = should_force_present(true, false, false, false);
+        let force = should_force_present(ForcePresentSignals {
+            recording_active: true,
+            ..ForcePresentSignals::default()
+        });
         let action = decide_present(vrr, scanout, true, force);
         match action {
             PresentAction::ForcePresent { mechanism, reason } => {
