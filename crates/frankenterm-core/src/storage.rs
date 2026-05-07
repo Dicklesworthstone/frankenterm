@@ -55,7 +55,7 @@ use crate::policy::Redactor;
 use crate::recorder_invariants::InvariantReport;
 #[cfg(test)]
 use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
-use crate::redactor::{RedactionResult, StreamingRedactor};
+use crate::redactor::StreamingRedactor;
 use crate::runtime_async::mpsc;
 use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
@@ -8154,16 +8154,21 @@ fn dispatch_write_command_raw(
             content_hash,
             respond,
         } => {
-            let redacted_content =
-                redact_segment_for_persistence(pane_id, &content, segment_redactors);
-            let persisted_hash = if redacted_content == content {
-                content_hash.as_deref()
-            } else {
-                None
-            };
+            let mut moved_retained_tail = false;
             let result = with_writer_backend(conn, |backend| {
+                let (redacted_content, moved_tail) =
+                    redact_segment_for_persistence(backend, pane_id, &content, segment_redactors)?;
+                moved_retained_tail = moved_tail;
+                let persisted_hash = if redacted_content == content {
+                    content_hash.as_deref()
+                } else {
+                    None
+                };
                 append_segment_backend(backend, pane_id, &redacted_content, persisted_hash)
             });
+            if moved_retained_tail {
+                disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pane_id);
+            }
             if let Ok(segment) = &result {
                 mirror_segment_into_mmap(mmap_mirror, segment);
             }
@@ -8773,27 +8778,39 @@ fn dispatch_write_command_raw(
 }
 
 fn redact_segment_for_persistence(
+    backend: &dyn StorageBackend,
     pane_id: u64,
     content: &str,
     segment_redactors: &mut HashMap<u64, StreamingRedactor>,
-) -> String {
-    let result = segment_redactors
-        .entry(pane_id)
-        .or_default()
-        .redact_chunk(content.as_bytes());
-    redaction_result_to_string(result)
-}
+) -> Result<(String, bool)> {
+    let streaming_redactor = segment_redactors.entry(pane_id).or_default();
+    let pending_before = streaming_redactor.pending_text().to_string();
+    let _ = streaming_redactor.redact_chunk(content.as_bytes());
 
-fn redaction_result_to_string(result: RedactionResult) -> String {
-    String::from_utf8(result.bytes).unwrap_or_else(|error| {
-        let bytes = error.into_bytes();
-        String::from_utf8_lossy(&bytes).into_owned()
-    })
+    let redactor = Redactor::new();
+    if pending_before.is_empty() {
+        return Ok((redactor.redact(content), false));
+    }
+
+    let combined = format!("{pending_before}{content}");
+    let boundary = pending_before.len();
+    let crosses_boundary = redactor
+        .detect(&combined)
+        .iter()
+        .any(|(_, start, end)| *start < boundary && boundary < *end);
+
+    if crosses_boundary {
+        let updated_prior =
+            remove_suffix_from_last_segment_backend(backend, pane_id, &pending_before)?;
+        return Ok((redactor.redact(&combined), updated_prior));
+    }
+
+    Ok((redactor.redact(content), false))
 }
 
 fn flush_segment_redactor_for_pane(
-    conn: &mut Connection,
-    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    _conn: &mut Connection,
+    _mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, StreamingRedactor>,
     pane_id: u64,
 ) -> Result<()> {
@@ -8801,16 +8818,73 @@ fn flush_segment_redactor_for_pane(
         return Ok(());
     };
 
-    let content = redaction_result_to_string(redactor.finish());
-    if content.is_empty() {
-        return Ok(());
+    let _ = redactor.finish();
+    Ok(())
+}
+
+fn remove_suffix_from_last_segment_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    suffix: &str,
+) -> Result<bool> {
+    if suffix.is_empty() {
+        return Ok(false);
     }
 
-    let segment = with_writer_backend(conn, |backend| {
-        append_segment_backend(backend, pane_id, &content, None)
-    })?;
-    mirror_segment_into_mmap(mmap_mirror, &segment);
-    Ok(())
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let Some(row) = backend
+        .query_row_typed(
+            "SELECT id, content
+             FROM output_segments
+             WHERE pane_id = ?1
+             ORDER BY seq DESC, id DESC
+             LIMIT 1",
+            &[ToSqlValue::Integer(pane_id_i64)],
+        )
+        .map_err(|err| storage_backend_error("Failed to query last segment", err))?
+    else {
+        return Ok(false);
+    };
+
+    let reader = RowReader::new(&row);
+    let segment_id = reader
+        .i64(0)
+        .map_err(|err| storage_backend_error("Failed to parse last segment id", err))?;
+    let mut content = reader
+        .string(1)
+        .map_err(|err| storage_backend_error("Failed to parse last segment content", err))?;
+    let Some(stripped_len) = content.strip_suffix(suffix).map(str::len) else {
+        return Ok(false);
+    };
+    content.truncate(stripped_len);
+    let content_len_i64 = usize_to_i64(content.len(), "content_len")?;
+
+    execute_typed(
+        backend,
+        "UPDATE output_segments
+         SET content = ?1, content_len = ?2, content_hash = NULL
+         WHERE id = ?3",
+        &[
+            ToSqlValue::Text(&content),
+            ToSqlValue::Integer(content_len_i64),
+            ToSqlValue::Integer(segment_id),
+        ],
+    )
+    .map_err(|err| storage_backend_error("Failed to remove split secret tail", err))?;
+    Ok(true)
+}
+
+fn disable_mmap_mirror_after_retained_tail_move(
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    pane_id: u64,
+) {
+    if mmap_mirror.is_some() {
+        tracing::warn!(
+            pane_id,
+            "disabled mmap segment mirror after retained redaction tail updated a prior segment"
+        );
+        *mmap_mirror = None;
+    }
 }
 
 fn flush_segment_redactors(

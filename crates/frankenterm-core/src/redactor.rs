@@ -837,6 +837,12 @@ impl StreamingRedactor {
         self.pending.len()
     }
 
+    /// Text currently retained to protect the next chunk boundary.
+    #[must_use]
+    pub(crate) fn pending_text(&self) -> &str {
+        &self.pending
+    }
+
     fn stable_emit_boundary(&self) -> usize {
         let mut boundary = self.pending.len();
         let detections = self.redactor.detect(&self.pending);

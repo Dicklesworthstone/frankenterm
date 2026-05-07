@@ -271,10 +271,7 @@ fn storage_handle_hybrid_search_blends_lexical_and_semantic() {
 
         let bundle = handle
             .hybrid_search_with_results(
-                // Use a token that is not at the start of the second logical
-                // segment so this test exercises hybrid fusion, not the
-                // streaming-redactor retained-tail boundary tracked in ft-m6ogq.
-                "appears",
+                "needle",
                 SearchOptions {
                     limit: Some(3),
                     include_snippets: Some(false),
@@ -334,6 +331,53 @@ fn storage_handle_hybrid_search_blends_lexical_and_semantic() {
         assert!(semantic_only_hit.lexical_rank.is_none());
         assert!(semantic_only_hit.semantic_contribution.is_some());
         assert!(semantic_only_hit.lexical_contribution.is_none());
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
+#[test]
+fn storage_handle_streaming_redactor_redacts_secret_split_across_segments() {
+    run_async_test(async {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        let secret_tail = "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
+        let full_secret = format!("sk-ant-api03-{secret_tail}");
+        handle
+            .append_segment(1, "prefix sk-ant-api03-", None)
+            .await
+            .unwrap();
+        handle
+            .append_segment(1, &format!("{secret_tail} suffix"), None)
+            .await
+            .unwrap();
+        handle
+            .record_gap(1, "flush_streaming_redactor")
+            .await
+            .unwrap();
+
+        let segments = handle.get_segments(1, 10).await.unwrap();
+        let joined = segments
+            .iter()
+            .rev()
+            .map(|segment| segment.content.as_str())
+            .collect::<String>();
+        assert!(
+            joined.contains(crate::redactor::REDACTED_MARKER),
+            "split secret should be replaced with a redaction marker: {joined:?}"
+        );
+        assert!(
+            !joined.contains(&full_secret),
+            "split secret leaked in stored segment content: {joined:?}"
+        );
+        assert!(
+            !joined.contains("sk-ant-api03-"),
+            "split secret prefix leaked in stored segment content: {joined:?}"
+        );
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
