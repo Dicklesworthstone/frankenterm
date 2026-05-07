@@ -406,10 +406,9 @@ impl AtlasArrayConfig {
     /// tile = 32 tiles per side, 1024 tiles per slice.
     #[must_use]
     pub const fn tiles_per_slice_axis(&self) -> u32 {
-        if self.tile_dim == 0 {
-            0
-        } else {
-            self.slice_dim / self.tile_dim
+        match self.slice_dim.checked_div(self.tile_dim) {
+            Some(axis) => axis,
+            None => 0,
         }
     }
 
@@ -1144,12 +1143,16 @@ mod tests {
 
     #[test]
     fn sparse_override_serde_round_trips_via_toml_string() {
-        let cfg: SparseOverride = toml::from_str("\"force_off\"").unwrap();
-        assert_eq!(cfg, SparseOverride::ForceOff);
-        let serialized = toml::to_string(&cfg).unwrap_or_default();
-        // toml::to_string on a bare value emits the string literal.
+        #[derive(Debug, serde::Deserialize, serde::Serialize)]
+        struct SparseOverrideConfig {
+            override_: SparseOverride,
+        }
+
+        let cfg: SparseOverrideConfig = toml::from_str("override_ = \"force_off\"").unwrap();
+        assert_eq!(cfg.override_, SparseOverride::ForceOff);
+        let serialized = toml::to_string(&cfg).unwrap();
         assert!(
-            serialized.contains("force_off"),
+            serialized.contains("override_ = \"force_off\""),
             "expected serialized form to contain `force_off`, got `{serialized}`"
         );
     }
