@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 /// match the Nichols & Jacobson 2012 universal recommendations
 /// (5ms target, 100ms interval); these have been validated across
 /// many deployment regimes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodelConfig {
     /// Acceptable steady-state queueing delay. Default: 5ms.
@@ -187,7 +187,7 @@ impl CodelQueue {
                 if now.duration_since(start) >= self.config.interval() {
                     self.state = CodelState::Dropping;
                     self.drop_count = 0;
-                    self.last_drop_at = Some(now);
+                    self.last_drop_at = None;
                 }
             }
         }
@@ -213,7 +213,7 @@ impl CodelQueue {
         let cadence = Duration::from_millis(cadence_ms);
         let due = self
             .last_drop_at
-            .map_or(true, |t| now.duration_since(t) >= cadence);
+            .is_none_or(|t| now.duration_since(t) >= cadence);
         if due {
             self.drop_count = self.drop_count.saturating_add(1);
             self.last_drop_at = Some(now);
@@ -256,7 +256,7 @@ impl CodelQueue {
 }
 
 /// br-ft-codel: serde snapshot for telemetry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodelSnapshot {
     pub state: CodelState,
     pub drop_count: u32,
