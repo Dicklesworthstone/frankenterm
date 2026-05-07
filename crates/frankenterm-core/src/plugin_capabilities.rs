@@ -290,16 +290,19 @@ impl PluginManifest {
         }
     }
 
+    #[must_use]
     pub fn with_capabilities<I: IntoIterator<Item = PluginCapability>>(mut self, caps: I) -> Self {
         self.capabilities.extend(caps);
         self
     }
 
+    #[must_use]
     pub fn with_signature(mut self, sig: PluginSignatureClass) -> Self {
         self.signature_class = sig;
         self
     }
 
+    #[must_use]
     pub fn with_budget(mut self, b: PluginResourceBudget) -> Self {
         self.resource_budget = b;
         self
