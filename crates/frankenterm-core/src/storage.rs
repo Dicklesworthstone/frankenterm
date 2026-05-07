@@ -16760,6 +16760,38 @@ fn seed_workflow_execution_backend(
     .unwrap();
 }
 
+fn seed_prepared_plan_raw_backend(
+    backend: &dyn StorageBackend,
+    plan_id: &str,
+    plan_hash: &str,
+    pane_id: Option<i64>,
+    requires_approval: i64,
+    now_ms: i64,
+) {
+    execute_typed(
+        backend,
+        "INSERT INTO prepared_plans (
+            plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
+            plan_json, requires_approval, created_at, expires_at, consumed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        &[
+            ToSqlValue::Text(plan_id),
+            ToSqlValue::Text(plan_hash),
+            ToSqlValue::Text("/tmp/wa"),
+            ToSqlValue::Text("send_text"),
+            ToSqlValue::optional_i64(pane_id),
+            ToSqlValue::Null,
+            ToSqlValue::Null,
+            ToSqlValue::Text("{}"),
+            ToSqlValue::Integer(requires_approval),
+            ToSqlValue::Integer(now_ms),
+            ToSqlValue::Integer(now_ms + 60_000),
+            ToSqlValue::Null,
+        ],
+    )
+    .unwrap();
+}
+
 fn seed_segment_backend(
     backend: &dyn StorageBackend,
     pane_id: i64,
@@ -17534,8 +17566,7 @@ fn query_action_plan_returns_none_for_unknown_workflow() {
 
 #[test]
 fn can_insert_and_consume_prepared_plan() {
-    let mut conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
     let record = PreparedPlanRecord {
@@ -17553,61 +17584,35 @@ fn can_insert_and_consume_prepared_plan() {
         consumed_at: None,
     };
 
-    with_writer_backend(&mut conn, |backend| {
-        insert_prepared_plan_backend(backend, &record)
-    })
+    insert_prepared_plan_backend(&backend, &record).unwrap();
+    let fetched = query_prepared_plan_backend(&backend, "plan:abcd1234")
+    .unwrap()
     .unwrap();
-    let fetched = with_writer_backend(&mut conn, |backend| {
-        query_prepared_plan_backend(backend, "plan:abcd1234")
-    })
-        .unwrap()
-        .unwrap();
     assert_eq!(fetched.plan_id, record.plan_id);
     assert_eq!(fetched.action_kind, "send_text");
 
-    let consumed = with_writer_backend(&mut conn, |backend| {
-        consume_prepared_plan_backend(backend, "plan:abcd1234", now_ms + 1)
-    })
-        .unwrap()
-        .unwrap();
+    let consumed = consume_prepared_plan_backend(&backend, "plan:abcd1234", now_ms + 1)
+    .unwrap()
+    .unwrap();
     assert!(consumed.consumed_at.is_some());
 
-    let second = with_writer_backend(&mut conn, |backend| {
-        consume_prepared_plan_backend(backend, "plan:abcd1234", now_ms + 2)
-    })
-    .unwrap();
+    let second = consume_prepared_plan_backend(&backend, "plan:abcd1234", now_ms + 2).unwrap();
     assert!(second.is_none());
 }
 
 #[test]
 fn prepared_plan_query_rejects_invalid_requires_approval_flag() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
-    conn.execute(
-        "INSERT INTO prepared_plans (
-            plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
-            plan_json, requires_approval, created_at, expires_at, consumed_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            "plan:bad-approval",
-            "sha256:bad-approval",
-            "/tmp/wa",
-            "send_text",
-            Option::<i64>::None,
-            Option::<String>::None,
-            Option::<String>::None,
-            "{}",
-            2i64,
-            now_ms,
-            now_ms + 60_000,
-            Option::<i64>::None,
-        ],
-    )
-    .unwrap();
-
-    let backend = RusqliteBackend::new(conn);
+    seed_prepared_plan_raw_backend(
+        &backend,
+        "plan:bad-approval",
+        "sha256:bad-approval",
+        None,
+        2,
+        now_ms,
+    );
     let err = query_prepared_plan_backend(&backend, "plan:bad-approval")
         .expect_err("invalid requires_approval flag");
     let message = err.to_string();
@@ -17620,33 +17625,17 @@ fn prepared_plan_query_rejects_invalid_requires_approval_flag() {
 
 #[test]
 fn prepared_plan_query_rejects_negative_pane_id() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+    let backend = memory_backend();
 
     let now_ms = 1_700_000_000_000i64;
-    conn.execute(
-        "INSERT INTO prepared_plans (
-            plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
-            plan_json, requires_approval, created_at, expires_at, consumed_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            "plan:bad-pane",
-            "sha256:bad-pane",
-            "/tmp/wa",
-            "send_text",
-            -9i64,
-            Option::<String>::None,
-            Option::<String>::None,
-            "{}",
-            0i64,
-            now_ms,
-            now_ms + 60_000,
-            Option::<i64>::None,
-        ],
-    )
-    .unwrap();
-
-    let backend = RusqliteBackend::new(conn);
+    seed_prepared_plan_raw_backend(
+        &backend,
+        "plan:bad-pane",
+        "sha256:bad-pane",
+        Some(-9),
+        0,
+        now_ms,
+    );
     let err = query_prepared_plan_backend(&backend, "plan:bad-pane")
         .expect_err("negative prepared plan pane id");
     let message = err.to_string();
