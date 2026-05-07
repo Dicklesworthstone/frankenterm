@@ -865,13 +865,27 @@ fn fresh_db_init_creates_policy_denied_audit_via_v24_migration() {
     // (added via migration v24) silently never landed on fresh DBs
     // even though `user_version` claimed they were at HEAD.
     //
-    // This test pins the fix: open a brand-new in-memory DB,
+    // This test pins the fix: open a brand-new on-disk DB,
     // initialize_schema, then assert that BOTH conditions hold —
     // (i) user_version is at SCHEMA_VERSION, (ii) the v24
     // policy_denied_audit table exists with its documented column
     // shape. Either condition failing on its own is the v24-drift
     // bug.
-    let conn = Connection::open_in_memory().unwrap();
+    let db_path = std::env::temp_dir().join(format!(
+        "frankenterm-policy-denied-audit-v24-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos()
+    ));
+    let config = crate::storage_backend_trait::OpenConfig {
+        wal_mode: false,
+        ..crate::storage_backend_trait::OpenConfig::default()
+    };
+    let backend =
+        RusqliteBackend::open_path(&db_path, &config).expect("open fresh policy_denied_audit DB");
+    let conn = backend.into_connection();
     initialize_schema(&conn).unwrap();
 
     // Invariant 1: the version stamp matches the constant.
@@ -909,10 +923,10 @@ fn fresh_db_init_creates_policy_denied_audit_via_v24_migration() {
         );
     }
 
-    // Invariant 4: a write through the documented sync path actually
-    // lands a row. This is the surface ft-cro2u's audit-persist test
-    // exercises in production; if migrations didn't run on the fresh
-    // path, the INSERT would fail with "no such table" and the
+    // Invariant 4: a write through the documented blocking sync path
+    // actually lands a row. This is the surface ft-cro2u's audit-persist
+    // test exercises in production; if migrations didn't run on the
+    // fresh path, the INSERT would fail with "no such table" and the
     // best-effort persist would warn-log + drop the audit silently.
     let record = PolicyDeniedAuditRecord {
         id: 0,
@@ -925,10 +939,32 @@ fn fresh_db_init_creates_policy_denied_audit_via_v24_migration() {
         rule_id: None,
         decision: PolicyDeniedAuditRecord::DECISION_DENIED.to_string(),
     };
-    let backend = RusqliteBackend::new(conn);
-    let row_id = record_policy_denial_audit_backend(&backend, &record)
+    drop(conn);
+    let row_id = record_policy_denial_audit_blocking(&db_path, &record)
         .expect("policy_denied_audit insert must succeed on a fresh DB");
     assert!(row_id > 0);
+
+    let read_backend =
+        RusqliteBackend::open_path(&db_path, &config).expect("reopen policy_denied_audit DB");
+    let read_conn = read_backend.into_connection();
+    let matching_rows: i64 = read_conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM policy_denied_audit
+             WHERE id = ?1
+               AND tool_name = ?2
+               AND reason_code = ?3
+               AND decision = ?4",
+            rusqlite::params![
+                row_id,
+                &record.tool_name,
+                &record.reason_code,
+                &record.decision,
+            ],
+            |row| row.get(0),
+        )
+        .expect("query inserted policy_denied_audit row");
+    assert_eq!(matching_rows, 1);
 }
 
 #[test]

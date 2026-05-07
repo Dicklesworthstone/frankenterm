@@ -986,9 +986,14 @@ impl RusqliteBackend {
         }
     }
 
-    /// Open a fresh connection at `path` with the given config.
+    /// Open a fresh connection at UTF-8 `path` with the given config.
     /// `path = ":memory:"` for in-memory.
     pub fn open(path: &str, config: &OpenConfig) -> Result<Self, BackendError> {
+        Self::open_path(Path::new(path), config)
+    }
+
+    /// Open a fresh connection at filesystem `path` with the given config.
+    pub fn open_path(path: &Path, config: &OpenConfig) -> Result<Self, BackendError> {
         let flags = if config.read_only {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
         } else {
@@ -1005,6 +1010,14 @@ impl RusqliteBackend {
                 .map_err(|e| BackendError::Connect(format!("page_size pragma: {e}")))?;
         }
         Ok(Self::new(conn))
+    }
+}
+
+impl StorageBackendFactory for RusqliteBackend {
+    type Backend = Self;
+
+    fn open(path: &Path, config: OpenConfig) -> Result<Self::Backend, BackendError> {
+        Self::open_path(path, &config)
     }
 }
 
