@@ -7981,6 +7981,292 @@ fn infer_running_agents_from_panes(
     correlator.inventory().running.into_iter().collect()
 }
 
+const ROBOT_HEALTH_ACTIVE_AGENT_MAX_AGENTS: usize = 256;
+
+fn active_agent_confidence_from_source(
+    source: frankenterm_core::agent_correlator::DetectionSource,
+) -> frankenterm_core::robot_types::AgentHealthConfidence {
+    match source {
+        frankenterm_core::agent_correlator::DetectionSource::PatternEngine => {
+            frankenterm_core::robot_types::AgentHealthConfidence::High
+        }
+        frankenterm_core::agent_correlator::DetectionSource::PaneTitle => {
+            frankenterm_core::robot_types::AgentHealthConfidence::Medium
+        }
+        frankenterm_core::agent_correlator::DetectionSource::ProcessName => {
+            frankenterm_core::robot_types::AgentHealthConfidence::Low
+        }
+    }
+}
+
+fn active_agent_state_from_running_state(
+    state: &str,
+) -> frankenterm_core::robot_types::ActiveAgentConvergenceState {
+    match state.trim().to_ascii_lowercase().as_str() {
+        "idle" => frankenterm_core::robot_types::ActiveAgentConvergenceState::Idle,
+        "rate_limited" | "rate-limited" => {
+            frankenterm_core::robot_types::ActiveAgentConvergenceState::RateLimited
+        }
+        "waiting_approval" | "waiting-approval" | "stuck" | "stalled" | "blocked"
+        | "auth_error" => frankenterm_core::robot_types::ActiveAgentConvergenceState::Stuck,
+        "converged" | "complete" | "completed" | "done" => {
+            frankenterm_core::robot_types::ActiveAgentConvergenceState::Converged
+        }
+        "unknown" | "" => frankenterm_core::robot_types::ActiveAgentConvergenceState::Unknown,
+        _ => frankenterm_core::robot_types::ActiveAgentConvergenceState::Active,
+    }
+}
+
+fn active_agent_recommended_action(
+    state: frankenterm_core::robot_types::ActiveAgentConvergenceState,
+    pane_id: u64,
+) -> frankenterm_core::robot_types::AgentHealthRecommendedAction {
+    use frankenterm_core::robot_types::{
+        AgentHealthConfidence, AgentHealthRecommendedAction, AgentHealthRecommendedActionKind,
+    };
+
+    match state {
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::Idle => {
+            AgentHealthRecommendedAction {
+                kind: AgentHealthRecommendedActionKind::ContinueWork,
+                confidence: AgentHealthConfidence::Medium,
+                reason: "agent appears idle; keep assignment unless other evidence is stale"
+                    .to_string(),
+                command: None,
+                evidence_indices: vec![0],
+            }
+        }
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::Active => {
+            AgentHealthRecommendedAction {
+                kind: AgentHealthRecommendedActionKind::ContinueWork,
+                confidence: AgentHealthConfidence::Medium,
+                reason: "agent appears active from pane inventory".to_string(),
+                command: None,
+                evidence_indices: vec![0],
+            }
+        }
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::RateLimited => {
+            AgentHealthRecommendedAction {
+                kind: AgentHealthRecommendedActionKind::Wait,
+                confidence: AgentHealthConfidence::High,
+                reason: "rate-limit evidence is current; avoid reassignment without newer evidence"
+                    .to_string(),
+                command: None,
+                evidence_indices: vec![0],
+            }
+        }
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::Stuck => {
+            AgentHealthRecommendedAction {
+                kind: AgentHealthRecommendedActionKind::InspectPane,
+                confidence: AgentHealthConfidence::Medium,
+                reason: "agent is blocked or waiting for approval; inspect before reassignment"
+                    .to_string(),
+                command: Some(format!("ft robot get-text {pane_id} --tail 80")),
+                evidence_indices: vec![0],
+            }
+        }
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::Converged => {
+            AgentHealthRecommendedAction {
+                kind: AgentHealthRecommendedActionKind::MarkConverged,
+                confidence: AgentHealthConfidence::Low,
+                reason:
+                    "agent reports a converged state; verify bead and proof evidence before closing"
+                        .to_string(),
+                command: None,
+                evidence_indices: vec![0],
+            }
+        }
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::Unknown => {
+            AgentHealthRecommendedAction {
+                kind: AgentHealthRecommendedActionKind::InspectPane,
+                confidence: AgentHealthConfidence::Low,
+                reason: "agent state is unknown; inspect pane and assignment evidence".to_string(),
+                command: Some(format!("ft robot get-text {pane_id} --tail 80")),
+                evidence_indices: vec![0],
+            }
+        }
+    }
+}
+
+fn active_agent_missing_evidence_flags(
+    state: frankenterm_core::robot_types::ActiveAgentConvergenceState,
+) -> Vec<frankenterm_core::robot_types::AgentHealthRiskFlag> {
+    use frankenterm_core::robot_types::{
+        AgentHealthRiskCode, AgentHealthRiskFlag, AgentHealthRiskSeverity,
+    };
+
+    let mut flags = vec![
+        AgentHealthRiskFlag {
+            code: AgentHealthRiskCode::NoBeadAssignment,
+            severity: AgentHealthRiskSeverity::Low,
+            message: "live Beads assignment is not joined into this robot health snapshot yet"
+                .to_string(),
+            evidence_index: None,
+        },
+        AgentHealthRiskFlag {
+            code: AgentHealthRiskCode::ProofMissing,
+            severity: AgentHealthRiskSeverity::Low,
+            message: "proof-lane evidence is not joined into this robot health snapshot yet"
+                .to_string(),
+            evidence_index: None,
+        },
+    ];
+
+    match state {
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::RateLimited => {
+            flags.push(AgentHealthRiskFlag {
+                code: AgentHealthRiskCode::RateLimited,
+                severity: AgentHealthRiskSeverity::Medium,
+                message: "agent inventory reports a rate-limited state".to_string(),
+                evidence_index: Some(0),
+            });
+        }
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::Stuck => {
+            flags.push(AgentHealthRiskFlag {
+                code: AgentHealthRiskCode::HumanReviewRequired,
+                severity: AgentHealthRiskSeverity::High,
+                message: "blocked or approval-waiting state needs operator inspection".to_string(),
+                evidence_index: Some(0),
+            });
+        }
+        frankenterm_core::robot_types::ActiveAgentConvergenceState::Unknown => {
+            flags.push(AgentHealthRiskFlag {
+                code: AgentHealthRiskCode::UnknownAgent,
+                severity: AgentHealthRiskSeverity::Medium,
+                message: "agent state could not be classified from current pane evidence"
+                    .to_string(),
+                evidence_index: Some(0),
+            });
+        }
+        _ => {}
+    }
+
+    flags
+}
+
+fn active_agent_health_from_running_agents(
+    generated_at_ms: u64,
+    running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    pane_cwds: &BTreeMap<u64, Option<String>>,
+) -> frankenterm_core::robot_types::ActiveAgentHealthData {
+    use frankenterm_core::robot_types::{
+        ActiveAgentHealthData, ActiveAgentHealthRecord, AgentHealthEvidenceKind,
+        AgentHealthEvidenceLink,
+    };
+
+    let records = running_agents
+        .iter()
+        .map(|(pane_id, entry)| {
+            let provider =
+                frankenterm_core::agent_provider::AgentProvider::from_slug(entry.slug.as_str());
+            let state = active_agent_state_from_running_state(&entry.state);
+            let evidence = vec![AgentHealthEvidenceLink {
+                kind: AgentHealthEvidenceKind::PaneState,
+                label: format!("pane {pane_id} inventory state {}", entry.state),
+                uri: Some(format!("pane:{pane_id}")),
+                observed_at_ms: Some(generated_at_ms),
+                note: Some(format!("detected via {:?}", entry.source)),
+            }];
+
+            ActiveAgentHealthRecord {
+                agent_id: format!("{}:{pane_id}", entry.slug),
+                agent_name: Some(provider.display_name().to_string()),
+                provider: entry.slug.clone(),
+                pane_id: Some(*pane_id),
+                cwd: pane_cwds.get(pane_id).and_then(Clone::clone),
+                state,
+                status_age_ms: None,
+                bead: None,
+                latest_commit: None,
+                proof_lane: None,
+                risk_flags: active_agent_missing_evidence_flags(state),
+                recommended_action: active_agent_recommended_action(state, *pane_id),
+                evidence,
+                confidence: active_agent_confidence_from_source(entry.source),
+            }
+        })
+        .collect();
+
+    ActiveAgentHealthData::from_agents_bounded(
+        generated_at_ms,
+        records,
+        ROBOT_HEALTH_ACTIVE_AGENT_MAX_AGENTS,
+    )
+}
+
+async fn load_robot_active_agent_health(
+    config: &frankenterm_core::config::Config,
+) -> (
+    frankenterm_core::robot_types::ActiveAgentHealthData,
+    serde_json::Value,
+) {
+    let generated_at_ms = u64::try_from(now_epoch_ms()).unwrap_or(0);
+    let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+
+    match wezterm.list_panes_with_cx(&cx).await {
+        Ok(panes) => {
+            let running_agents = infer_running_agents_from_panes(&panes);
+            let pane_cwds = panes
+                .iter()
+                .map(|pane| (pane.pane_id, pane.cwd.clone()))
+                .collect();
+            let data = active_agent_health_from_running_agents(
+                generated_at_ms,
+                &running_agents,
+                &pane_cwds,
+            );
+            let sources = serde_json::json!({
+                "running_inventory": {
+                    "ok": true,
+                    "count": running_agents.len(),
+                    "source": "wezterm_pane_inventory",
+                },
+                "beads_assignment": {
+                    "ok": false,
+                    "reason": "not_joined_in_this_snapshot",
+                },
+                "recent_commits": {
+                    "ok": false,
+                    "reason": "not_joined_in_this_snapshot",
+                },
+                "proof_lanes": {
+                    "ok": false,
+                    "reason": "not_joined_in_this_snapshot",
+                },
+            });
+            (data, sources)
+        }
+        Err(err) => {
+            let data = frankenterm_core::robot_types::ActiveAgentHealthData::from_agents_bounded(
+                generated_at_ms,
+                Vec::new(),
+                ROBOT_HEALTH_ACTIVE_AGENT_MAX_AGENTS,
+            );
+            let sources = serde_json::json!({
+                "running_inventory": {
+                    "ok": false,
+                    "error": err.to_string(),
+                    "source": "wezterm_pane_inventory",
+                },
+                "beads_assignment": {
+                    "ok": false,
+                    "reason": "not_joined_in_this_snapshot",
+                },
+                "recent_commits": {
+                    "ok": false,
+                    "reason": "not_joined_in_this_snapshot",
+                },
+                "proof_lanes": {
+                    "ok": false,
+                    "reason": "not_joined_in_this_snapshot",
+                },
+            });
+            (data, sources)
+        }
+    }
+}
+
 fn robot_fleet_state_bucket(state: &str) -> &'static str {
     match state.trim().to_ascii_lowercase().as_str() {
         "idle" => "idle",
@@ -26881,6 +27167,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     ))
                                     .unwrap_or(serde_json::Value::Null);
                             }
+
+                            let (active_agents, active_agent_sources) =
+                                load_robot_active_agent_health(&config).await;
+                            payload["active_agents"] = serde_json::to_value(active_agents)
+                                .unwrap_or(serde_json::Value::Null);
+                            payload["active_agent_sources"] = active_agent_sources;
 
                             if let Some(snapshot) =
                                 frankenterm_core::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global()
@@ -60837,6 +61129,155 @@ log_level = "debug"
         assert_eq!(
             running.get(&8).map(|entry| entry.slug.as_str()),
             Some("gemini")
+        );
+    }
+
+    #[test]
+    fn test_active_agent_health_from_running_agents_surfaces_convergence_rows() {
+        use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
+        use frankenterm_core::robot_types::{
+            ActiveAgentConvergenceState, AgentHealthRecommendedActionKind, AgentHealthRiskCode,
+        };
+
+        let mut running = BTreeMap::new();
+        running.insert(
+            42,
+            RunningAgentInventoryEntry {
+                slug: "codex".to_string(),
+                state: "rate_limited".to_string(),
+                session_id: Some("sess-rate".to_string()),
+                source: DetectionSource::PatternEngine,
+            },
+        );
+        running.insert(
+            43,
+            RunningAgentInventoryEntry {
+                slug: "claude".to_string(),
+                state: "waiting_approval".to_string(),
+                session_id: None,
+                source: DetectionSource::PaneTitle,
+            },
+        );
+        let pane_cwds = BTreeMap::from([
+            (42, Some("file:///work/codex".to_string())),
+            (43, Some("file:///work/claude".to_string())),
+        ]);
+
+        let data = active_agent_health_from_running_agents(1_800_000_001_000, &running, &pane_cwds);
+        assert_eq!(data.schema_version, 1);
+        assert_eq!(data.summary.total_agents, 2);
+        assert_eq!(data.summary.rate_limited_agents, 1);
+        assert_eq!(data.summary.stuck_agents, 1);
+        assert_eq!(data.summary.missing_bead_assignment, 2);
+        assert_eq!(data.summary.missing_proof_lane, 2);
+        assert_eq!(data.summary.high_risk_agents, 1);
+
+        let rate_limited = data
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == Some(42))
+            .expect("rate-limited agent row");
+        assert_eq!(rate_limited.state, ActiveAgentConvergenceState::RateLimited);
+        assert_eq!(rate_limited.cwd.as_deref(), Some("file:///work/codex"));
+        assert_eq!(
+            rate_limited.recommended_action.kind,
+            AgentHealthRecommendedActionKind::Wait
+        );
+        assert!(
+            rate_limited
+                .risk_flags
+                .iter()
+                .any(|flag| flag.code == AgentHealthRiskCode::RateLimited)
+        );
+
+        let approval_wait = data
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == Some(43))
+            .expect("approval-waiting agent row");
+        assert_eq!(approval_wait.state, ActiveAgentConvergenceState::Stuck);
+        assert_eq!(
+            approval_wait.recommended_action.kind,
+            AgentHealthRecommendedActionKind::InspectPane
+        );
+        assert_eq!(
+            approval_wait.recommended_action.command.as_deref(),
+            Some("ft robot get-text 43 --tail 80")
+        );
+    }
+
+    #[test]
+    fn test_active_agent_health_classifies_all_convergence_states() {
+        use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
+        use frankenterm_core::robot_types::ActiveAgentConvergenceState;
+
+        let cases = [
+            (10, "idle", ActiveAgentConvergenceState::Idle),
+            (11, "active", ActiveAgentConvergenceState::Active),
+            (12, "rate_limited", ActiveAgentConvergenceState::RateLimited),
+            (13, "blocked", ActiveAgentConvergenceState::Stuck),
+            (14, "done", ActiveAgentConvergenceState::Converged),
+            (15, "unknown", ActiveAgentConvergenceState::Unknown),
+        ];
+        let running = cases
+            .iter()
+            .map(|(pane_id, state, _expected)| {
+                (
+                    *pane_id,
+                    RunningAgentInventoryEntry {
+                        slug: "codex".to_string(),
+                        state: (*state).to_string(),
+                        session_id: None,
+                        source: DetectionSource::PatternEngine,
+                    },
+                )
+            })
+            .collect();
+
+        let data =
+            active_agent_health_from_running_agents(1_800_000_001_500, &running, &BTreeMap::new());
+
+        for (pane_id, _state, expected) in cases {
+            let row = data
+                .agents
+                .iter()
+                .find(|agent| agent.pane_id == Some(pane_id))
+                .expect("agent row for convergence state");
+            assert_eq!(row.state, expected);
+        }
+        assert_eq!(data.summary.idle_agents, 1);
+        assert_eq!(data.summary.active_agents, 1);
+        assert_eq!(data.summary.rate_limited_agents, 1);
+        assert_eq!(data.summary.stuck_agents, 1);
+        assert_eq!(data.summary.converged_agents, 1);
+        assert_eq!(data.summary.unknown_agents, 1);
+    }
+
+    #[test]
+    fn test_active_agent_health_bounds_agent_rows() {
+        use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
+
+        let mut running = BTreeMap::new();
+        for idx in 0..(ROBOT_HEALTH_ACTIVE_AGENT_MAX_AGENTS + 2) {
+            let pane_id = u64::try_from(idx).expect("idx fits u64");
+            running.insert(
+                pane_id,
+                RunningAgentInventoryEntry {
+                    slug: "codex".to_string(),
+                    state: "active".to_string(),
+                    session_id: None,
+                    source: DetectionSource::PaneTitle,
+                },
+            );
+        }
+
+        let data =
+            active_agent_health_from_running_agents(1_800_000_002_000, &running, &BTreeMap::new());
+        assert_eq!(data.agents.len(), ROBOT_HEALTH_ACTIVE_AGENT_MAX_AGENTS);
+        assert_eq!(data.truncated_agents, 2);
+        assert_eq!(
+            data.summary.total_agents,
+            ROBOT_HEALTH_ACTIVE_AGENT_MAX_AGENTS
         );
     }
 

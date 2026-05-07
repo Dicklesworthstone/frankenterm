@@ -308,6 +308,14 @@ fn smoke_ft_robot_health() {
         val["data"]["version"].is_string() || val["version"].is_string(),
         "ft robot health should include version"
     );
+    assert!(
+        val["data"]["active_agents"]["schema_version"].is_number(),
+        "ft robot health should include bounded active-agent health data"
+    );
+    assert!(
+        val["data"]["active_agent_sources"]["running_inventory"]["ok"].is_boolean(),
+        "ft robot health should report active-agent source availability"
+    );
 }
 
 #[test]

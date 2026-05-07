@@ -217,7 +217,7 @@ work / fleet / profile — see AGENTS.md "Not Yet Implemented") return the
 
 | Command | Type | Description |
 |---------|------|-------------|
-| `robot health` | `HealthDiagnosticsData` | Composite health report including `HealthLeakRiskData` + `Vec<HealthGuidance>` |
+| `robot health` | `HealthDiagnosticsData` + nested `ActiveAgentHealthData` | Composite health report including `HealthLeakRiskData`, `Vec<HealthGuidance>`, and bounded active-agent convergence rows under `active_agents` |
 | `robot cass search` | `frankenterm_core::cass::CassSearchResult` | Agent-session lexical search hits |
 | `robot cass view` | `frankenterm_core::cass::CassViewResult` | Session-line context view |
 | `robot cass status` | `frankenterm_core::cass::CassStatus` | cass daemon status + index metadata |

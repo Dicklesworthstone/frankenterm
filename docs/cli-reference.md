@@ -290,6 +290,11 @@ ft robot fleet status|scale|rebalance|agents
 ft robot profile list|show|apply|validate
 ```
 
+`ft robot health` includes an `active_agents` snapshot for operator
+convergence polling. The snapshot is bounded and evidence-linked; unavailable
+joins such as Beads assignments, recent commits, or proof lanes are reported
+explicitly under `active_agent_sources` instead of being inferred.
+
 Examples:
 - `ft robot search "compilation failed" --mode lexical`
 - `ft robot search "compilation failed" --mode semantic`
