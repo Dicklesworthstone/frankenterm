@@ -355,9 +355,9 @@ pub trait StorageBackend: Send + Sync {
 /// juggling. SQLite's storage classes are NULL / INTEGER / REAL /
 /// TEXT / BLOB; we keep the surface tight to those five.
 ///
-/// Defined alongside the trait so [`StorageBackend::query_row_cells`]
-/// + [`StorageBackend::query_map_cells`] can name it without a
-/// circular module dependency. Re-exported by
+/// Defined alongside the trait so [`StorageBackend::query_row_cells`] and
+/// [`StorageBackend::query_map_cells`] can name it without a circular module
+/// dependency. Re-exported by
 /// [`crate::storage_backend_cells`] for consumers that want the
 /// higher-level [`crate::storage_backend_cells::Row`] / `RowCells`
 /// types alongside it.
@@ -597,25 +597,25 @@ impl<'a> From<&'a str> for ToSqlValue<'a> {
     }
 }
 
-impl<'a> From<i64> for ToSqlValue<'a> {
+impl From<i64> for ToSqlValue<'_> {
     fn from(i: i64) -> Self {
         Self::Integer(i)
     }
 }
 
-impl<'a> From<u32> for ToSqlValue<'a> {
+impl From<u32> for ToSqlValue<'_> {
     fn from(u: u32) -> Self {
         Self::Integer(i64::from(u))
     }
 }
 
-impl<'a> From<f64> for ToSqlValue<'a> {
+impl From<f64> for ToSqlValue<'_> {
     fn from(f: f64) -> Self {
         Self::Real(f)
     }
 }
 
-impl<'a> From<bool> for ToSqlValue<'a> {
+impl From<bool> for ToSqlValue<'_> {
     fn from(b: bool) -> Self {
         Self::bool(b)
     }
@@ -729,7 +729,7 @@ impl TransactionGuard<'_> {
     }
 }
 
-impl<'a> Drop for TransactionGuard<'a> {
+impl Drop for TransactionGuard<'_> {
     fn drop(&mut self) {
         if !self.committed {
             // Best effort — if the backend is already in an
@@ -1037,7 +1037,7 @@ impl StorageBackend for RusqliteBackend {
                 let v: rusqlite::types::Value =
                     row.get(0).map_err(|e| BackendError::Query(e.to_string()))?;
                 Ok(Some(match v {
-                    rusqlite::types::Value::Null => "".to_string(),
+                    rusqlite::types::Value::Null => String::new(),
                     rusqlite::types::Value::Integer(i) => i.to_string(),
                     rusqlite::types::Value::Real(f) => f.to_string(),
                     rusqlite::types::Value::Text(s) => s,
@@ -1319,9 +1319,9 @@ impl StorageBackend for RusqliteBackend {
 }
 
 /// Translate a [`ToSqlValue`] into a [`rusqlite::types::Value`] for
-/// native parameter binding. Used by [`RusqliteBackend::query_row_typed`]
-/// + [`RusqliteBackend::query_map_typed`] to bypass the trait's
-/// string round-trip default impl.
+/// native parameter binding. Used by [`RusqliteBackend::query_row_typed`] and
+/// [`RusqliteBackend::query_map_typed`] to bypass the trait's string round-trip
+/// default impl.
 ///
 /// Borrowed `Text(&str)` and `Blob(&[u8])` are cloned into owned
 /// `rusqlite::types::Value::{Text, Blob}` because `params_from_iter`
