@@ -1130,7 +1130,7 @@ where
     pub async fn shutdown(&mut self) {
         // ft-tr5a0: ergonomic wrapper around `shutdown_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.shutdown_with_cx(&cx).await
+        self.shutdown_with_cx(&cx).await;
     }
 
     /// ft-tr5a0 Cx-first sibling of [`Self::shutdown`].
