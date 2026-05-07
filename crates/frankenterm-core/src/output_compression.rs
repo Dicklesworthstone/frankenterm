@@ -197,7 +197,10 @@ fn max_distance_for_similarity_threshold(max_len: usize, threshold: f64) -> Opti
     let mut max_distance = (threshold * max_len as f64).floor() as usize;
     max_distance = max_distance.min(max_len);
 
-    while max_distance > 0 && !((max_distance as f64 / max_len as f64) < threshold) {
+    while max_distance > 0
+        && (max_distance as f64 / max_len as f64).partial_cmp(&threshold)
+            != Some(std::cmp::Ordering::Less)
+    {
         max_distance -= 1;
     }
 
