@@ -117,6 +117,7 @@ enum MpscRecvState<T> {
     Cancelled,
 }
 
+#[cfg(any(test, not(unix)))]
 async fn mpsc_recv_state<T>(rx: &mut mpsc::Receiver<T>) -> MpscRecvState<T> {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     mpsc_recv_state_with_cx(rx, &cx).await
@@ -1127,7 +1128,7 @@ impl IpcServer {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     shutdown_signal_pending_with_cx(shutdown_rx, &cx).await
