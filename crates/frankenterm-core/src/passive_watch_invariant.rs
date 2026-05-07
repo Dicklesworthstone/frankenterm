@@ -267,7 +267,7 @@ pub fn adversarial_seed_catalog() -> Vec<AdversarialSeed> {
             name: "csi_overlong_params".to_string(),
             bytes: {
                 let mut v = b"\x1b[".to_vec();
-                v.extend(std::iter::repeat(b'1').take(4096));
+                v.extend(std::iter::repeat_n(b'1', 4096));
                 v.extend(b";m");
                 v
             },
@@ -293,7 +293,7 @@ pub fn adversarial_seed_catalog() -> Vec<AdversarialSeed> {
             name: "osc_oversized_title".to_string(),
             bytes: {
                 let mut v = b"\x1b]0;".to_vec();
-                v.extend(std::iter::repeat(b'A').take(8192));
+                v.extend(std::iter::repeat_n(b'A', 8192));
                 v.extend(b"\x07");
                 v
             },
@@ -326,7 +326,7 @@ pub fn adversarial_seed_catalog() -> Vec<AdversarialSeed> {
             name: "dcs_sixel_like".to_string(),
             bytes: {
                 let mut v = b"\x1bPq".to_vec();
-                v.extend(std::iter::repeat(b'?').take(2048));
+                v.extend(std::iter::repeat_n(b'?', 2048));
                 v.extend(b"\x1b\\");
                 v
             },
