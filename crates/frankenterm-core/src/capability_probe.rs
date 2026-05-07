@@ -197,7 +197,7 @@ fn path_is_within(child: &Path, parent: &Path) -> bool {
     let mut child_iter = child.components();
     for parent_component in parent.components() {
         match child_iter.next() {
-            Some(c) if c == parent_component => continue,
+            Some(c) if c == parent_component => {}
             _ => return false,
         }
     }
