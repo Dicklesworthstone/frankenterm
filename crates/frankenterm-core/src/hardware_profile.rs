@@ -356,10 +356,10 @@ fn collect_numa_profile() -> NumaProfile {
             .unwrap_or_else(|| {
                 ProbeValue::unavailable("/sys/devices/system/node/online unavailable")
             });
-        return NumaProfile {
+        NumaProfile {
             nodes,
             source: "linux sysfs".to_string(),
-        };
+        }
     }
 
     #[cfg(target_os = "macos")]
