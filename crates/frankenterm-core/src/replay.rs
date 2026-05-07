@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::error::RuntimeOperationSource;
 use crate::recording::{FrameHeader, FrameType, RecordingFrame, checked_frame_payload_len};
 use crate::runtime_async::{sleep, watch};
 
@@ -30,13 +31,38 @@ const KEYFRAME_INTERVAL: usize = 50;
 /// any realistic recording (typical sessions are single-digit MB).
 pub const MAX_RECORDING_BYTES: u64 = 256 * 1024 * 1024;
 
+fn replay_backend_error(operation: &'static str, source: impl std::fmt::Display) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Backend(source.to_string()),
+    }
+}
+
+fn replay_cancelled_error(
+    operation: &'static str,
+    source: impl std::fmt::Display,
+) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::Cancelled(source.to_string()),
+    }
+}
+
+fn replay_watch_channel_closed(operation: &'static str) -> crate::Error {
+    crate::Error::RuntimeOperation {
+        operation,
+        source: RuntimeOperationSource::WatchChannelClosed,
+    }
+}
+
 /// Parse a single [`RecordingFrame`] from a byte slice starting at `offset`.
 ///
 /// Returns the parsed frame and the offset immediately after it.
 fn parse_frame(data: &[u8], offset: usize) -> crate::Result<(RecordingFrame, usize)> {
     if data.len() < offset + FRAME_HEADER_LEN {
-        return Err(crate::Error::Runtime(
-            "unexpected EOF reading frame header".into(),
+        return Err(replay_backend_error(
+            "replay.parse_frame",
+            "unexpected EOF reading frame header",
         ));
     }
 
@@ -53,17 +79,19 @@ fn parse_frame(data: &[u8], offset: usize) -> crate::Result<(RecordingFrame, usi
         4 => FrameType::Marker,
         5 => FrameType::Input,
         other => {
-            return Err(crate::Error::Runtime(format!(
-                "unknown frame type byte {other}"
-            )));
+            return Err(replay_backend_error(
+                "replay.parse_frame",
+                format!("unknown frame type byte {other}"),
+            ));
         }
     };
 
     let payload_start = offset + FRAME_HEADER_LEN;
     let payload_end = payload_start + payload_len;
     if data.len() < payload_end {
-        return Err(crate::Error::Runtime(
-            "unexpected EOF reading frame payload".into(),
+        return Err(replay_backend_error(
+            "replay.parse_frame",
+            "unexpected EOF reading frame payload",
         ));
     }
 
@@ -112,11 +140,14 @@ impl Recording {
     pub fn load(path: &Path) -> Result<Self> {
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_RECORDING_BYTES {
-            return Err(crate::Error::Runtime(format!(
-                "recording file {} bytes exceeds max {} bytes",
-                meta.len(),
-                MAX_RECORDING_BYTES
-            )));
+            return Err(replay_backend_error(
+                "replay.load",
+                format!(
+                    "recording file {} bytes exceeds max {} bytes",
+                    meta.len(),
+                    MAX_RECORDING_BYTES
+                ),
+            ));
         }
         let mut file = std::fs::File::open(path)?;
         let mut data = Vec::new();
@@ -203,8 +234,9 @@ pub fn decode_frame(frame: &RecordingFrame) -> Result<DecodedFrame> {
                 let rows = u16::from_le_bytes(frame.payload[2..4].try_into().unwrap()); // ubs:ignore
                 Ok(DecodedFrame::Resize { cols, rows })
             } else {
-                Err(crate::Error::Runtime(
-                    "resize frame payload too short".into(),
+                Err(replay_backend_error(
+                    "replay.decode_frame",
+                    "resize frame payload too short",
                 ))
             }
         }
@@ -368,7 +400,10 @@ impl PlaybackSpeed {
     /// Create a custom speed multiplier. Must be > 0.
     pub fn new(speed: f32) -> Result<Self> {
         if speed <= 0.0 {
-            return Err(crate::Error::Runtime("playback speed must be > 0".into()));
+            return Err(replay_backend_error(
+                "replay.playback_speed",
+                "playback speed must be > 0",
+            ));
         }
         Ok(Self(speed))
     }
@@ -515,7 +550,7 @@ impl Player {
                     control_rx
                         .changed(&watch_cx)
                         .await
-                        .map_err(|_| crate::Error::Runtime("control channel closed".into()))?;
+                        .map_err(|_| replay_watch_channel_closed("replay.handle_control"))?;
                 }
             }
             PlayerControl::SetSpeed(s) => {
@@ -540,7 +575,7 @@ impl Player {
     /// Return contract: `Ok(true)` means "stop playback" (caller
     /// should return from its play loop). `Ok(false)` means
     /// "continue". `Err(...)` folds both control-channel-closed
-    /// and cx-cancellation into `crate::Error::Runtime(...)`.
+    /// and cx-cancellation into `crate::Error::RuntimeOperation`.
     async fn handle_control_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -556,14 +591,15 @@ impl Player {
                 self.state = PlayerState::Paused;
                 loop {
                     cx.checkpoint().map_err(|err| {
-                        crate::Error::Runtime(format!(
-                            "replay.handle_control paused-wait cancelled: {err}"
-                        ))
+                        replay_cancelled_error(
+                            "replay.handle_control",
+                            format!("paused-wait cancelled: {err}"),
+                        )
                     })?;
                     control_rx
                         .changed(cx)
                         .await
-                        .map_err(|_| crate::Error::Runtime("control channel closed".into()))?;
+                        .map_err(|_| replay_watch_channel_closed("replay.handle_control"))?;
                     let sig = *control_rx.borrow();
                     match sig {
                         PlayerControl::Play => {
@@ -669,17 +705,20 @@ impl Player {
         mut control_rx: watch::Receiver<PlayerControl>,
     ) -> Result<()> {
         cx.checkpoint().map_err(|err| {
-            crate::Error::Runtime(format!("replay.play cancelled pre-start: {err}"))
+            replay_cancelled_error("replay.play", format!("cancelled pre-start: {err}"))
         })?;
 
         self.state = PlayerState::Playing;
 
         while self.position.frame_index < self.recording.frames.len() {
             cx.checkpoint().map_err(|err| {
-                crate::Error::Runtime(format!(
-                    "replay.play cancelled at frame_index={} (timestamp_ms={}): {err}",
+                replay_cancelled_error(
+                    "replay.play",
+                    format!(
+                        "cancelled at frame_index={} (timestamp_ms={}): {err}",
                     self.position.frame_index, self.position.timestamp_ms
-                ))
+                    ),
+                )
             })?;
 
             if let Some(ctrl) = check_control(&mut control_rx) {
@@ -817,7 +856,10 @@ fn redact_recording(recording: &Recording, redact_extra: &[String]) -> Result<Re
     let mut extra_patterns: Vec<regex::Regex> = Vec::new();
     for pat in redact_extra {
         let re = regex::Regex::new(pat).map_err(|e| {
-            crate::Error::Runtime(format!("Invalid redaction pattern '{pat}': {e}"))
+            replay_backend_error(
+                "replay.redact_recording",
+                format!("Invalid redaction pattern '{pat}': {e}"),
+            )
         })?;
         extra_patterns.push(re);
     }
@@ -895,9 +937,9 @@ pub fn export_asciinema<W: std::io::Write>(
         );
     }
     let header_json = serde_json::to_string(&header)
-        .map_err(|e| crate::Error::Runtime(format!("Failed to serialize cast header: {e}")))?;
+        .map_err(|e| replay_backend_error("replay.export_asciinema", format!("Failed to serialize cast header: {e}")))?;
     writeln!(writer, "{header_json}")
-        .map_err(|e| crate::Error::Runtime(format!("Failed to write cast header: {e}")))?;
+        .map_err(|e| replay_backend_error("replay.export_asciinema", format!("Failed to write cast header: {e}")))?;
 
     // Write events
     let base_ts = source
@@ -915,10 +957,10 @@ pub fn export_asciinema<W: std::io::Write>(
                 let text = String::from_utf8_lossy(&frame.payload);
                 let event = serde_json::json!([rel_secs, "o", text]);
                 let line = serde_json::to_string(&event).map_err(|e| {
-                    crate::Error::Runtime(format!("Failed to serialize cast event: {e}"))
+                    replay_backend_error("replay.export_asciinema", format!("Failed to serialize cast event: {e}"))
                 })?;
                 writeln!(writer, "{line}").map_err(|e| {
-                    crate::Error::Runtime(format!("Failed to write cast event: {e}"))
+                    replay_backend_error("replay.export_asciinema", format!("Failed to write cast event: {e}"))
                 })?;
                 event_count += 1;
             }
@@ -927,10 +969,10 @@ pub fn export_asciinema<W: std::io::Write>(
                 let r = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
                 let event = serde_json::json!([rel_secs, "r", format!("{c}x{r}")]);
                 let line = serde_json::to_string(&event).map_err(|e| {
-                    crate::Error::Runtime(format!("Failed to serialize cast event: {e}"))
+                    replay_backend_error("replay.export_asciinema", format!("Failed to serialize cast event: {e}"))
                 })?;
                 writeln!(writer, "{line}").map_err(|e| {
-                    crate::Error::Runtime(format!("Failed to write cast event: {e}"))
+                    replay_backend_error("replay.export_asciinema", format!("Failed to write cast event: {e}"))
                 })?;
                 event_count += 1;
             }
@@ -939,10 +981,10 @@ pub fn export_asciinema<W: std::io::Write>(
                 let text = String::from_utf8_lossy(&frame.payload);
                 let event = serde_json::json!([rel_secs, "m", text]);
                 let line = serde_json::to_string(&event).map_err(|e| {
-                    crate::Error::Runtime(format!("Failed to serialize cast event: {e}"))
+                    replay_backend_error("replay.export_asciinema", format!("Failed to serialize cast event: {e}"))
                 })?;
                 writeln!(writer, "{line}").map_err(|e| {
-                    crate::Error::Runtime(format!("Failed to write cast event: {e}"))
+                    replay_backend_error("replay.export_asciinema", format!("Failed to write cast event: {e}"))
                 })?;
                 event_count += 1;
             }
@@ -1057,7 +1099,7 @@ pub fn export_html<W: std::io::Write>(
         event_count = event_count,
         cast_data = html_escape(&cast_data),
     )
-    .map_err(|e| crate::Error::Runtime(format!("Failed to write HTML: {e}")))?;
+    .map_err(|e| replay_backend_error("replay.export_html", format!("Failed to write HTML: {e}")))?;
 
     Ok(event_count)
 }
@@ -1149,7 +1191,10 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
             num_buf.push(ch);
         } else {
             let val: f64 = num_buf.parse().map_err(|_| {
-                crate::Error::Runtime(format!("Invalid duration component: '{num_buf}'"))
+                replay_backend_error(
+                    "replay.parse_duration",
+                    format!("Invalid duration component: '{num_buf}'"),
+                )
             })?;
             num_buf.clear();
             match ch {
@@ -1157,9 +1202,10 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
                 'm' => total_ms += (val * 60_000.0) as u64,
                 's' => total_ms += (val * 1_000.0) as u64,
                 _ => {
-                    return Err(crate::Error::Runtime(format!(
-                        "Unknown duration unit '{ch}' in '{s}'"
-                    )));
+                    return Err(replay_backend_error(
+                        "replay.parse_duration",
+                        format!("Unknown duration unit '{ch}' in '{s}'"),
+                    ));
                 }
             }
         }
@@ -1169,7 +1215,7 @@ pub fn parse_duration_ms(s: &str) -> Result<u64> {
     if !num_buf.is_empty() {
         let val: f64 = num_buf
             .parse()
-            .map_err(|_| crate::Error::Runtime(format!("Invalid duration: '{s}'")))?;
+            .map_err(|_| replay_backend_error("replay.parse_duration", format!("Invalid duration: '{s}'")))?;
         total_ms += (val * 1_000.0).round() as u64;
     }
 
