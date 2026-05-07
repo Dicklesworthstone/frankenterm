@@ -757,7 +757,7 @@ impl Default for ResourcePlacementPlannerConfig {
 }
 
 impl ResourcePlacementPlannerConfig {
-    /// Validate finite ratio thresholds.
+    /// Validate finite ratio and per-1000 thresholds.
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
             ("max_cpu_utilization", self.max_cpu_utilization),
@@ -797,6 +797,12 @@ impl ResourcePlacementPlannerConfig {
                     "resource placement config {name} must be in [0, 1], got {value}"
                 ));
             }
+        }
+        if self.rebalance_hysteresis_min_benefit_per_1000 > 1000 {
+            return Err(format!(
+                "resource placement config rebalance_hysteresis_min_benefit_per_1000 must be in [0, 1000], got {}",
+                self.rebalance_hysteresis_min_benefit_per_1000
+            ));
         }
         Ok(())
     }
@@ -2496,6 +2502,20 @@ mod tests {
     }
 
     #[test]
+    fn invalid_planner_config_rejects_impossible_rebalance_hysteresis() {
+        let config = ResourcePlacementPlannerConfig {
+            rebalance_hysteresis_min_benefit_per_1000: 1001,
+            ..ResourcePlacementPlannerConfig::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("per-1000 hysteresis above 1000 is unreachable");
+
+        assert!(err.contains("rebalance_hysteresis_min_benefit_per_1000"));
+        assert!(err.contains("[0, 1000]"));
+    }
+
+    #[test]
     fn plan_serde_preserves_machine_readable_reasons() {
         let planner = ResourceAwarePlacementPlanner::default();
         let mut host = host_64c_256gib();
@@ -2646,6 +2666,31 @@ mod tests {
         assert_eq!(receipt.action, ResourceTopologyPlanAction::Migrate);
         assert_eq!(receipt.to_placements[0].numa_node_id, 1);
         assert!(receipt.cost.migration_cost_units > 0);
+    }
+
+    #[test]
+    fn topology_invalid_rebalance_hysteresis_fails_closed() {
+        let planner = ResourceAwarePlacementPlanner::new(ResourcePlacementPlannerConfig {
+            rebalance_hysteresis_min_benefit_per_1000: 1001,
+            ..ResourcePlacementPlannerConfig::default()
+        });
+        let request = topology_request("pane-a", ResourceTopologyWorkloadKind::AgentPane, 4, 8);
+
+        let plan = planner.simulate_topology_rebalance(&topology_two_node(), &[request]);
+        let receipt = &plan.receipts[0];
+
+        assert_eq!(receipt.action, ResourceTopologyPlanAction::Shed);
+        assert_eq!(plan.counters.shed, 1);
+        assert!(
+            receipt
+                .reason_codes
+                .contains(&ResourcePlacementReasonCode::InvalidPlannerConfig)
+        );
+        assert!(
+            receipt
+                .operator_summary
+                .contains("rebalance_hysteresis_min_benefit_per_1000")
+        );
     }
 
     #[test]
