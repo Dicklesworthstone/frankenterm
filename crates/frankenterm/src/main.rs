@@ -5675,7 +5675,7 @@ fn proof_doctor_agent_name(agent: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn proof_doctor_git_output(workspace_root: &Path, args: &[&str]) -> Option<String> {
+fn proof_doctor_git_stdout(workspace_root: &Path, args: &[&str]) -> Option<String> {
     std::process::Command::new("git")
         .args(args)
         .current_dir(workspace_root)
@@ -5683,6 +5683,10 @@ fn proof_doctor_git_output(workspace_root: &Path, args: &[&str]) -> Option<Strin
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
+}
+
+fn proof_doctor_git_output(workspace_root: &Path, args: &[&str]) -> Option<String> {
+    proof_doctor_git_stdout(workspace_root, args)
         .map(|output| output.trim().to_string())
         .filter(|output| !output.is_empty())
 }
@@ -5716,11 +5720,15 @@ fn proof_doctor_backend(required_backend: ProofDoctorBackendArg) -> ProofBackend
 }
 
 fn proof_doctor_dirty_paths(workspace_root: &Path) -> Vec<ProofDoctorDirtyPath> {
-    let Some(output) = proof_doctor_git_output(workspace_root, &["status", "--porcelain=v1"])
+    let Some(output) = proof_doctor_git_stdout(workspace_root, &["status", "--porcelain=v1"])
     else {
         return Vec::new();
     };
 
+    proof_doctor_dirty_paths_from_porcelain(&output)
+}
+
+fn proof_doctor_dirty_paths_from_porcelain(output: &str) -> Vec<ProofDoctorDirtyPath> {
     output
         .lines()
         .filter_map(|line| {
@@ -62936,6 +62944,26 @@ log_level = "debug"
         assert_eq!(beads[0].title, "Active slice");
         assert_eq!(beads[0].assignee.as_deref(), Some("SandyFalcon"));
         assert_eq!(beads[0].status, "in_progress");
+    }
+
+    #[test]
+    fn proof_doctor_dirty_paths_parser_preserves_unstaged_status_rows() {
+        let raw = " M .beads/issues.jsonl\n\
+?? tests/goldens/toon/mcp_error_envelope.actual.toon\n\
+A  docs/new-proof.md\n";
+
+        let dirty_paths = proof_doctor_dirty_paths_from_porcelain(raw);
+
+        assert_eq!(dirty_paths.len(), 3);
+        assert_eq!(dirty_paths[0].status, "M");
+        assert_eq!(dirty_paths[0].path, ".beads/issues.jsonl");
+        assert_eq!(dirty_paths[1].status, "??");
+        assert_eq!(
+            dirty_paths[1].path,
+            "tests/goldens/toon/mcp_error_envelope.actual.toon"
+        );
+        assert_eq!(dirty_paths[2].status, "A");
+        assert_eq!(dirty_paths[2].path, "docs/new-proof.md");
     }
 
     #[test]
