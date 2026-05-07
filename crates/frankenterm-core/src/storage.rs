@@ -7731,7 +7731,18 @@ where
 
 #[cfg(test)]
 mod writer_bridge_tests {
-    use super::{Connection, WRITER_PLACEHOLDER_POOL, with_writer_backend};
+    use super::{Connection, RusqliteBackend, WRITER_PLACEHOLDER_POOL, with_writer_backend};
+    use crate::storage_backend_trait::OpenConfig;
+
+    fn new_writer_bridge_conn() -> Connection {
+        let config = OpenConfig {
+            wal_mode: false,
+            ..OpenConfig::default()
+        };
+        RusqliteBackend::open(":memory:", &config)
+            .expect("open writer bridge test connection")
+            .into_connection()
+    }
 
     /// Pinned: the live `Connection` is restored even when `f` panics.
     /// Pre-fix the `mem::replace(conn, placeholder)` had already
@@ -7741,7 +7752,7 @@ mod writer_bridge_tests {
     /// placeholder.
     #[test]
     fn with_writer_backend_restores_conn_on_panic() {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = new_writer_bridge_conn();
         conn.execute("CREATE TABLE writer_bridge_panic_pin (k INTEGER)", [])
             .unwrap();
         // Identity probe: the post-panic conn must accept queries
@@ -7779,7 +7790,7 @@ mod writer_bridge_tests {
             cell.borrow_mut().take();
         });
 
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = new_writer_bridge_conn();
 
         // Cold call: bridge allocates a placeholder, runs closure,
         // parks placeholder in thread-local on Drop.
