@@ -6,9 +6,9 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_e34d9_10_1_4_rch_policy"
-CORRELATION_ID="ft-e34d9.10.1.4-${RUN_ID}"
-LOG_FILE="${LOG_DIR}/asupersync_rch_policy_${RUN_ID}.jsonl"
+SCENARIO_ID="ft_emjsg_proof_ledger_policy"
+CORRELATION_ID="ft-emjsg-${RUN_ID}"
+LOG_FILE="${LOG_DIR}/proof_ledger_policy_${RUN_ID}.jsonl"
 
 VALIDATOR="${ROOT_DIR}/scripts/validate_asupersync_rch_execution_policy.sh"
 POLICY_DOC="${ROOT_DIR}/docs/asupersync-rch-execution-policy.md"
@@ -51,6 +51,43 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
+expect_validation_failure() {
+  local evidence_file="$1"
+  local scenario="$2"
+  local decision_path="$3"
+  local input_summary="$4"
+
+  emit_log \
+    "running" \
+    "${scenario}" \
+    "${decision_path}" \
+    "none" \
+    "none" \
+    "$(basename "${evidence_file}")" \
+    "${input_summary}"
+
+  if "${VALIDATOR}" --validate-evidence "${evidence_file}" >/dev/null 2>&1; then
+    emit_log \
+      "failed" \
+      "${scenario}" \
+      "${decision_path}" \
+      "guardrail_not_enforced" \
+      "unexpected_negative_pass" \
+      "$(basename "${evidence_file}")" \
+      "invalid evidence unexpectedly passed"
+    exit 1
+  fi
+
+  emit_log \
+    "passed" \
+    "${scenario}" \
+    "${decision_path}" \
+    "negative_guardrail_enforced" \
+    "none" \
+    "$(basename "${evidence_file}")" \
+    "invalid evidence correctly rejected"
+}
+
 emit_log \
   "started" \
   "suite_init" \
@@ -58,7 +95,7 @@ emit_log \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "ft-e34d9.10.1.4 execution policy validation"
+  "ft-emjsg repository proof-ledger policy validation"
 
 if ! command -v jq >/dev/null 2>&1; then
   emit_log \
@@ -196,48 +233,72 @@ emit_log \
 
 tmp_dir="${LOG_DIR}/asupersync_rch_policy_${RUN_ID}_evidence"
 mkdir -p "${tmp_dir}"
+mock_artifact="${tmp_dir}/mock_rch_policy.jsonl"
+printf '{"mock":true}\n' > "${mock_artifact}"
+
 tmp_valid="${tmp_dir}/valid.json"
 tmp_invalid="${tmp_dir}/invalid.json"
 tmp_recovery="${tmp_dir}/recovery.json"
+tmp_sync_chatter="${tmp_dir}/sync-chatter.json"
+tmp_shell_wrapper="${tmp_dir}/shell-wrapper.json"
+tmp_missing_artifact="${tmp_dir}/missing-artifact.json"
+tmp_missing_is_heavy="${tmp_dir}/missing-is-heavy.json"
+tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
+tmp_stale_schema="${tmp_dir}/stale-schema.json"
 
-cat > "${tmp_valid}" <<'JSON'
+cat > "${tmp_valid}" <<JSON
 {
-  "schema_version": 1,
-  "bead_id": "ft-e34d9.10.1.4",
-  "policy_version": "1.0.0",
+  "schema_version": 2,
+  "bead_id": "ft-emjsg",
+  "policy_version": "2.0.0",
   "runs": [
     {
       "timestamp": "2026-02-25T00:00:00Z",
       "command": "rch exec -- cargo check --workspace --all-targets",
+      "command_class": "heavy",
       "is_heavy": true,
       "used_rch": true,
       "worker_context": "worker=contabo-2",
-      "artifact_paths": ["tests/e2e/logs/mock_rch_policy.jsonl"],
+      "execution_mode": "remote_rch",
+      "target_dir": "/tmp/ft-emjsg-rch-target",
+      "target_dir_lifecycle": "retained",
+      "artifact_paths": ["${mock_artifact}"],
       "elapsed_seconds": 31.4,
       "exit_status": 0,
-      "residual_risk_notes": ""
+      "residual_risk_notes": "",
+      "validation_status": "valid"
     },
     {
       "timestamp": "2026-02-25T00:01:00Z",
       "command": "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace",
+      "command_class": "heavy",
       "is_heavy": true,
       "used_rch": true,
       "worker_context": "worker=contabo-2",
-      "artifact_paths": ["tests/e2e/logs/mock_rch_policy.jsonl"],
+      "execution_mode": "remote_rch",
+      "target_dir": "target/rch-proof",
+      "target_dir_lifecycle": "retained",
+      "artifact_paths": ["${mock_artifact}"],
       "elapsed_seconds": 11.1,
       "exit_status": 0,
-      "residual_risk_notes": ""
+      "residual_risk_notes": "",
+      "validation_status": "valid"
     },
     {
       "timestamp": "2026-02-25T00:02:00Z",
       "command": "cargo fmt --check",
+      "command_class": "light",
       "is_heavy": false,
       "used_rch": false,
       "worker_context": "local",
-      "artifact_paths": ["tests/e2e/logs/mock_rch_policy.jsonl"],
+      "execution_mode": "local_light",
+      "target_dir": "not_applicable",
+      "target_dir_lifecycle": "not_applicable",
+      "artifact_paths": ["${mock_artifact}"],
       "elapsed_seconds": 0.6,
       "exit_status": 0,
-      "residual_risk_notes": ""
+      "residual_risk_notes": "",
+      "validation_status": "valid"
     }
   ]
 }
@@ -273,39 +334,24 @@ emit_log \
   "$(basename "${tmp_valid}")" \
   "valid evidence accepted"
 
-jq '.runs[0].command = "cargo test --workspace" | .runs[0].used_rch = false' "${tmp_valid}" > "${tmp_invalid}"
+jq '.runs[0].command = "cargo test --workspace" |
+    .runs[0].used_rch = false |
+    .runs[0].worker_context = "local" |
+    .runs[0].execution_mode = "remote_rch"' \
+  "${tmp_valid}" > "${tmp_invalid}"
 
-emit_log \
-  "running" \
+expect_validation_failure \
+  "${tmp_invalid}" \
   "failure_injection" \
   "heavy_without_rch" \
-  "none" \
-  "none" \
-  "$(basename "${tmp_invalid}")" \
   "heavy local run without fallback metadata should fail"
 
-if "${VALIDATOR}" --validate-evidence "${tmp_invalid}" >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "failure_injection" \
-    "heavy_without_rch" \
-    "guardrail_not_enforced" \
-    "unexpected_negative_pass" \
-    "$(basename "${tmp_invalid}")" \
-    "invalid evidence unexpectedly passed"
-  exit 1
-fi
-
-emit_log \
-  "passed" \
-  "failure_injection" \
-  "heavy_without_rch" \
-  "negative_guardrail_enforced" \
-  "none" \
-  "$(basename "${tmp_invalid}")" \
-  "invalid evidence correctly rejected"
-
-jq '.runs[0].fallback_reason_code = "RCH-E100" | .runs[0].fallback_approved_by = "human-operator"' "${tmp_invalid}" > "${tmp_recovery}"
+jq '.runs[0].fallback_reason_code = "RCH-E100" |
+    .runs[0].fallback_approved_by = "human-operator" |
+    .runs[0].execution_mode = "approved_local_fallback" |
+    .runs[0].target_dir_lifecycle = "inventory_only" |
+    .runs[0].validation_status = "approved_fallback"' \
+  "${tmp_invalid}" > "${tmp_recovery}"
 
 emit_log \
   "running" \
@@ -336,6 +382,55 @@ emit_log \
   "none" \
   "$(basename "${tmp_recovery}")" \
   "recovery evidence accepted with fallback metadata"
+
+jq '.runs[0].command = "rch status && cargo test --workspace" |
+    .runs[0].used_rch = true |
+    .runs[0].execution_mode = "remote_rch"' \
+  "${tmp_valid}" > "${tmp_sync_chatter}"
+expect_validation_failure \
+  "${tmp_sync_chatter}" \
+  "failure_injection" \
+  "sync_chatter_false_proof" \
+  "RCH status/setup chatter must not count as remote Cargo proof"
+
+jq '.runs[0].command = "bash -lc '\''echo rch exec -- cargo test; cargo test --workspace'\''" |
+    .runs[0].used_rch = true |
+    .runs[0].execution_mode = "remote_rch"' \
+  "${tmp_valid}" > "${tmp_shell_wrapper}"
+expect_validation_failure \
+  "${tmp_shell_wrapper}" \
+  "failure_injection" \
+  "shell_wrapper_false_proof" \
+  "shell wrapper that only mentions RCH must not validate as RCH proof"
+
+jq --arg missing "${tmp_dir}/missing.jsonl" '.runs[0].artifact_paths = [$missing]' \
+  "${tmp_valid}" > "${tmp_missing_artifact}"
+expect_validation_failure \
+  "${tmp_missing_artifact}" \
+  "failure_injection" \
+  "missing_artifact_path" \
+  "missing artifact paths must fail validation"
+
+jq 'del(.runs[0].is_heavy)' "${tmp_valid}" > "${tmp_missing_is_heavy}"
+expect_validation_failure \
+  "${tmp_missing_is_heavy}" \
+  "failure_injection" \
+  "missing_is_heavy" \
+  "missing is_heavy must fail validation"
+
+jq '.bead_id = "wa-old.1"' "${tmp_valid}" > "${tmp_malformed_bead}"
+expect_validation_failure \
+  "${tmp_malformed_bead}" \
+  "failure_injection" \
+  "malformed_bead_id" \
+  "non-ft or malformed bead IDs must fail validation"
+
+jq '.schema_version = 1' "${tmp_valid}" > "${tmp_stale_schema}"
+expect_validation_failure \
+  "${tmp_stale_schema}" \
+  "failure_injection" \
+  "stale_schema_version" \
+  "stale schema versions must fail validation"
 
 emit_log \
   "running" \
@@ -386,6 +481,6 @@ emit_log \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "ft-e34d9.10.1.4 policy validation passed"
+  "ft-emjsg proof-ledger policy validation passed"
 
-echo "ft-e34d9.10.1.4 policy e2e validation passed. Log: ${LOG_FILE}"
+echo "ft-emjsg proof-ledger policy e2e validation passed. Log: ${LOG_FILE}"

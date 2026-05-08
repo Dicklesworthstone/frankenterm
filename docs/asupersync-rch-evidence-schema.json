@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "ft.asupersync.rch.evidence.schema.v1",
-  "title": "asupersync Migration Heavy-Compute Evidence Schema",
+  "$id": "ft.rch.proof-ledger.evidence.schema.v2",
+  "title": "FrankenTerm RCH Proof Ledger Evidence Schema",
   "type": "object",
   "required": [
     "schema_version",
@@ -12,11 +12,11 @@
   "properties": {
     "schema_version": {
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "bead_id": {
       "type": "string",
-      "pattern": "^ft-e34d9\\.10\\..+"
+      "pattern": "^ft-[A-Za-z0-9][A-Za-z0-9-]*(\\.[A-Za-z0-9][A-Za-z0-9-]*)*$"
     },
     "policy_version": {
       "type": "string",
@@ -30,13 +30,18 @@
         "required": [
           "timestamp",
           "command",
+          "command_class",
           "is_heavy",
           "used_rch",
           "worker_context",
+          "execution_mode",
+          "target_dir",
+          "target_dir_lifecycle",
           "artifact_paths",
           "elapsed_seconds",
           "exit_status",
-          "residual_risk_notes"
+          "residual_risk_notes",
+          "validation_status"
         ],
         "properties": {
           "timestamp": {
@@ -47,6 +52,13 @@
             "type": "string",
             "minLength": 1
           },
+          "command_class": {
+            "type": "string",
+            "enum": [
+              "heavy",
+              "light"
+            ]
+          },
           "is_heavy": {
             "type": "boolean"
           },
@@ -56,6 +68,27 @@
           "worker_context": {
             "type": "string",
             "minLength": 1
+          },
+          "execution_mode": {
+            "type": "string",
+            "enum": [
+              "remote_rch",
+              "local_light",
+              "approved_local_fallback"
+            ]
+          },
+          "target_dir": {
+            "type": "string",
+            "minLength": 1
+          },
+          "target_dir_lifecycle": {
+            "type": "string",
+            "enum": [
+              "not_applicable",
+              "retained",
+              "inventory_only",
+              "cleanup_approved"
+            ]
           },
           "artifact_paths": {
             "type": "array",
@@ -74,6 +107,13 @@
           },
           "residual_risk_notes": {
             "type": "string"
+          },
+          "validation_status": {
+            "type": "string",
+            "enum": [
+              "valid",
+              "approved_fallback"
+            ]
           },
           "fallback_reason_code": {
             "type": [

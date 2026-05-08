@@ -1,19 +1,29 @@
-# asupersync Migration Execution Policy: rch-Only Heavy Compute
+# RCH Proof Ledger Execution Policy
 
-**Bead:** `ft-e34d9.10.1.4`  
-**Version:** `1.0.1`
-**Status:** Active baseline policy
+**Bead:** `ft-emjsg`
+**Version:** `2.0.0`
+**Status:** Active proof-ledger foundation
 
 ## Purpose
 
-This policy removes ambiguity in asupersync migration validation runs by
-requiring `rch` for heavy compute workloads and a standard evidence contract
-for every run.
+This policy removes ambiguity in FrankenTerm validation runs by requiring `rch`
+for heavy compute workloads and a standard proof-ledger evidence contract for
+every verifier run that future agents cite as proof. Agents should cite
+validated proof-ledger artifacts instead of treating RCH setup, sync, or
+transfer chatter as proof that a verifier ran.
 
 ## Scope
 
-Applies to all `ft-e34d9.10.*` migration beads whenever commands are expected
-to create material CPU/IO contention (build/test/bench/soak workloads).
+Applies to all `ft-*` FrankenTerm beads whenever commands are expected to
+create material CPU/IO contention (build/test/bench/soak workloads). It
+generalizes the original asupersync migration policy and carries forward the
+closed `ft-uz2gg` proof-lane requirement that RCH closeouts identify the target
+directory lifecycle instead of leaving temp-target state ambiguous.
+
+The historical file names still contain `asupersync` because this contract
+started in the asupersync migration lane. The contract is now repository-wide:
+normal `ft-*` bead IDs are accepted, and the schema is no longer restricted to
+`ft-e34d9.10.*`.
 
 ## Heavy vs Light Classifier
 
@@ -21,12 +31,15 @@ Commands are classified as follows:
 
 | Category | Command examples | rch required |
 |---|---|---|
-| Heavy | `cargo check`, `cargo build`, `cargo test`, `cargo clippy`, `cargo bench`, soak/perf loops that invoke cargo repeatedly | Yes |
+| Heavy | `cargo check`, `cargo build`, `cargo test`, `cargo clippy`, `cargo bench`, `cargo run`, `cargo install`, soak/perf loops that invoke Cargo repeatedly | Yes |
 | Light | `cargo fmt --check`, `cargo metadata`, `cargo locate-project`, docs/scripts that do not compile/test | No |
 
 Classifier implementation is canonical in:
 
 - `scripts/validate_asupersync_rch_execution_policy.sh --classify "<cmd>"`
+
+The classifier is intentionally strict: setup or sync chatter that merely
+mentions `rch` is not proof that Cargo ran remotely.
 
 ## Mandatory Rule
 
@@ -35,6 +48,7 @@ RCH-backed execution shapes:
 
 ```bash
 rch exec -- <command>
+VAR=value rch exec -- <command>
 ```
 
 or the shared fail-closed harness helpers:
@@ -48,6 +62,10 @@ The helper forms are evidence-equivalent to direct `rch exec -- ...` because
 they route through `tests/e2e/lib_rch_guards.sh`, reject local fallback markers,
 and emit RCH metadata sidecars.
 
+RCH status checks, worker probes, sync logs, or shell wrappers that merely echo
+`rch exec -- ...` are not proof. If the material Cargo command is local, the
+ledger must classify it as a fallback and include approval metadata.
+
 ## Local Fallback Rule
 
 Local fallback for heavy commands is allowed only when all are true:
@@ -55,28 +73,39 @@ Local fallback for heavy commands is allowed only when all are true:
 1. `rch` is unavailable or remote workers are unhealthy.
 2. Evidence entry includes non-empty `fallback_reason_code`.
 3. Evidence entry includes non-empty `fallback_approved_by`.
-4. Residual risk note explains impact on comparability/reproducibility.
+4. `execution_mode` is `approved_local_fallback`.
+5. `validation_status` is `approved_fallback`.
+6. Residual risk note explains impact on comparability/reproducibility.
 
 ## Evidence Contract
 
-Every heavy run must be logged with fields:
+Every proof-ledger run must be logged with fields:
 
 1. `timestamp`
 2. `command`
-3. `is_heavy`
-4. `used_rch`
-5. `worker_context`
-6. `artifact_paths`
-7. `elapsed_seconds`
-8. `exit_status`
-9. `residual_risk_notes`
-10. Optional fallback fields when `used_rch=false` on heavy runs:
+3. `command_class` (`heavy` or `light`)
+4. `is_heavy`
+5. `used_rch`
+6. `worker_context`
+7. `execution_mode` (`remote_rch`, `local_light`, or `approved_local_fallback`)
+8. `target_dir`
+9. `target_dir_lifecycle` (`not_applicable`, `retained`, `inventory_only`, or `cleanup_approved`)
+10. `artifact_paths` (each path must exist when evidence is validated)
+11. `elapsed_seconds`
+12. `exit_status`
+13. `residual_risk_notes`
+14. `validation_status` (`valid` or `approved_fallback`)
+15. Optional fallback fields when a heavy run is not confirmed as remote RCH:
    - `fallback_reason_code`
    - `fallback_approved_by`
 
+Heavy runs must include a real `target_dir` and a non-`not_applicable`
+`target_dir_lifecycle`. Light local checks should use `target_dir:
+"not_applicable"` and `target_dir_lifecycle: "not_applicable"`.
+
 Machine-readable schema:
 
-- `docs/asupersync-rch-evidence-schema.json`
+- `docs/asupersync-rch-evidence-schema.json` (`schema_version: 2`)
 
 ## Validation Tooling
 
@@ -94,8 +123,13 @@ E2E policy validation:
 bash tests/e2e/test_asupersync_rch_execution_policy.sh
 ```
 
+The self-test and E2E cover accepted remote proof, rejected local-heavy proof,
+accepted human-approved fallback, light local commands, stale schema versions,
+malformed bead IDs, missing artifacts, RCH setup chatter, and shell wrappers
+that mention RCH while running Cargo locally.
+
 ## User Impact
 
 1. Prevents accidental local compilation storms from degrading operator session responsiveness.
-2. Preserves reproducibility and auditability for migration quality gates.
+2. Preserves reproducibility and auditability for migration, storage, fleet, GUI, search, release, and future proof lanes.
 3. Makes degraded-mode exceptions explicit and reviewable instead of implicit.
