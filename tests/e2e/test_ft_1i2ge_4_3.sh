@@ -66,7 +66,13 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission approval-path durability and continuation contract checks"
 
-RCH_TARGET_DIR="target-rch-ft-1i2ge-4-3"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-ft-1i2ge-4-3-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_RCH_TARGET_DIR}" && "${REQUESTED_RCH_TARGET_DIR}" != /* ]]; then
+  RCH_TARGET_DIR="${REQUESTED_RCH_TARGET_DIR}"
+else
+  RCH_TARGET_DIR="${DEFAULT_RCH_TARGET_DIR}"
+fi
 TEST_FILTERS=(
   "mission_approval_request_transitions_to_pending_and_awaiting_approval"
   "mission_approval_request_is_idempotent_when_already_pending"
