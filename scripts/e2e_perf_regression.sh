@@ -16,7 +16,7 @@
 #   - Perf artifacts captured for regression tracking
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - rch for remote Cargo execution
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -26,6 +26,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+
+RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-perf-regression-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${E2E_PERF_REGRESSION_RCH_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "$REQUESTED_RCH_TARGET_DIR" && "$REQUESTED_RCH_TARGET_DIR" != /* ]]; then
+    RCH_TARGET_DIR="$REQUESTED_RCH_TARGET_DIR"
+else
+    RCH_TARGET_DIR="$DEFAULT_RCH_TARGET_DIR"
+fi
+RCH_READY=0
+RCH_SKIP_SMOKE_PREFLIGHT="${E2E_PERF_REGRESSION_RCH_SKIP_SMOKE_PREFLIGHT:-${RCH_SKIP_SMOKE_PREFLIGHT:-1}}"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -100,6 +113,48 @@ log_info() {
     fi
 }
 
+ensure_rch_for_cargo_tests() {
+    if [[ "$RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    if [[ -z "${E2E_RUN_DIR:-}" ]]; then
+        echo "ERROR: E2E artifacts must be initialized before RCH setup" >&2
+        return 1
+    fi
+
+    local rch_log_dir="$E2E_RUN_DIR/rch"
+    mkdir -p "$rch_log_dir"
+
+    rch_init "$rch_log_dir" "$RUN_ID" "perf_regression" "$PROJECT_ROOT"
+    ensure_rch_ready
+    RCH_READY=1
+}
+
+scenario_log_path() {
+    local name="$1"
+    printf '%s/%s/%s.rch.log\n' "$E2E_SCENARIOS_DIR" "$E2E_CURRENT_SCENARIO" "$name"
+}
+
+run_perf_cargo() {
+    local output_file="$1"
+    shift
+    ensure_rch_for_cargo_tests
+    run_rch_cargo_logged "$output_file" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo "$@"
+}
+
+run_perf_cargo_timeout() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+    ensure_rch_for_cargo_tests
+    run_rch_cargo_logged_with_timeout "$timeout_secs" "$output_file" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo "$@"
+}
+
 # ==============================================================================
 # Prerequisites
 # ==============================================================================
@@ -107,11 +162,11 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
+    if ! command -v rch &>/dev/null; then
+        echo -e "${RED}ERROR:${NC} rch not found. Cargo lanes must run remotely." >&2
         exit 5
     fi
-    log_pass "cargo available"
+    log_pass "rch available"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
@@ -128,12 +183,11 @@ scenario_pattern_detection() {
     log_test "Scenario 1: Pattern detection correctness"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "pattern_detection")"
     exit_code=0
 
-    cargo test -p frankenterm-core 'patterns::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_perf_cargo "$test_output" test -p frankenterm-core 'patterns::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "pattern_detection.log" "$(cat "$test_output")"
 
@@ -159,7 +213,6 @@ scenario_pattern_detection() {
         log_fail "S1.2: Could not parse pattern test results"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -170,12 +223,11 @@ scenario_delta_extraction() {
     log_test "Scenario 2: Delta extraction correctness"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "delta_extraction")"
     exit_code=0
 
-    cargo test -p frankenterm-core 'extract_delta' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_perf_cargo "$test_output" test -p frankenterm-core 'extract_delta' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "delta_extraction.log" "$(cat "$test_output")"
 
@@ -200,7 +252,6 @@ scenario_delta_extraction() {
         log_fail "S2.2: Could not parse delta test results"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -211,12 +262,11 @@ scenario_output_cache() {
     log_test "Scenario 3: Output cache (LRU, dedup, hit rates)"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "output_cache")"
     exit_code=0
 
-    cargo test -p frankenterm-core 'output_cache' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_perf_cargo "$test_output" test -p frankenterm-core 'output_cache' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "output_cache.log" "$(cat "$test_output")"
 
@@ -235,7 +285,6 @@ scenario_output_cache() {
         fi
     done
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -246,14 +295,13 @@ scenario_storage_benchmarks() {
     log_test "Scenario 4: Storage regression benchmarks"
 
     local test_output exit_code start_time end_time duration_s
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "storage_bench")"
 
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p frankenterm-core --bench storage_regression \
-        -- --test --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_perf_cargo_timeout 120 "$test_output" test -p frankenterm-core --bench storage_regression \
+        -- --test --nocapture || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
@@ -276,7 +324,6 @@ scenario_storage_benchmarks() {
         log_fail "S4.2: Budget manifest missing from benchmark output"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -287,14 +334,13 @@ scenario_delta_benchmarks() {
     log_test "Scenario 5: Delta extraction benchmarks"
 
     local test_output exit_code start_time end_time duration_s
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "delta_bench")"
 
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 60 cargo test -p frankenterm-core --bench delta_extraction \
-        -- --test --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_perf_cargo_timeout 60 "$test_output" test -p frankenterm-core --bench delta_extraction \
+        -- --test --nocapture || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
@@ -310,7 +356,6 @@ scenario_delta_benchmarks() {
         log_fail "S5.1: Delta benchmarks failed (exit=$exit_code, ${duration_s}s)"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -321,14 +366,13 @@ scenario_pattern_benchmarks() {
     log_test "Scenario 6: Pattern detection benchmarks"
 
     local test_output exit_code start_time end_time duration_s
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "pattern_bench")"
 
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 60 cargo test -p frankenterm-core --bench pattern_detection \
-        -- --test --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_perf_cargo_timeout 60 "$test_output" test -p frankenterm-core --bench pattern_detection \
+        -- --test --nocapture || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
@@ -344,7 +388,6 @@ scenario_pattern_benchmarks() {
         log_fail "S6.1: Pattern benchmarks failed (exit=$exit_code, ${duration_s}s)"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -355,14 +398,13 @@ scenario_backpressure_watcher_benchmarks() {
     log_test "Scenario 7: Backpressure + watcher loop benchmarks"
 
     local test_output exit_code start_time end_time duration_s
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "backpressure_bench")"
 
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p frankenterm-core --bench backpressure_performance \
-        -- --test --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_perf_cargo_timeout 120 "$test_output" test -p frankenterm-core --bench backpressure_performance \
+        -- --test --nocapture || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
@@ -379,13 +421,12 @@ scenario_backpressure_watcher_benchmarks() {
 
     # Watcher loop benchmarks
     local watcher_output watcher_exit watcher_start watcher_end watcher_duration
-    watcher_output=$(mktemp)
+    watcher_output="$(scenario_log_path "watcher_bench")"
     watcher_start=$(date +%s)
     watcher_exit=0
 
-    timeout 60 cargo test -p frankenterm-core --bench watcher_loop \
-        -- --test --nocapture \
-        >"$watcher_output" 2>&1 || watcher_exit=$?
+    run_perf_cargo_timeout 60 "$watcher_output" test -p frankenterm-core --bench watcher_loop \
+        -- --test --nocapture || watcher_exit=$?
 
     watcher_end=$(date +%s)
     watcher_duration=$((watcher_end - watcher_start))
@@ -400,7 +441,6 @@ scenario_backpressure_watcher_benchmarks() {
         log_fail "S7.2: Watcher loop benchmarks failed (exit=$watcher_exit, ${watcher_duration}s)"
     fi
 
-    rm -f "$test_output" "$watcher_output"
 }
 
 # ==============================================================================
@@ -411,15 +451,14 @@ scenario_bounded_execution() {
     log_test "Scenario 8: Bounded execution (all perf-critical tests)"
 
     local test_output exit_code start_time end_time duration_s
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "bounded_pattern_suite")"
 
     start_time=$(date +%s)
     exit_code=0
 
     # Run pattern + delta + cache tests together
-    timeout 60 cargo test -p frankenterm-core 'patterns::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_perf_cargo_timeout 60 "$test_output" test -p frankenterm-core 'patterns::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
@@ -440,7 +479,6 @@ scenario_bounded_execution() {
         log_fail "S8.2: Pattern suite exceeded 30s budget (${duration_s}s)"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
