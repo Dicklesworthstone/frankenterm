@@ -10,7 +10,14 @@ COMPONENT="tests.e2e.mcp_proxy_composition"
 CORRELATION_ID="mcp_proxy_composition_${RUN_ID}"
 LOG_FILE="${LOG_DIR}/mcp_proxy_composition_${RUN_ID}.jsonl"
 STDOUT_LOG="${LOG_DIR}/mcp_proxy_composition_${RUN_ID}.stdout.log"
-RCH_PROBE_LOG="${LOG_DIR}/mcp_proxy_composition_${RUN_ID}.rch_probe.json"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-mcp-proxy-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 json_escape() {
   local value="$1"
@@ -62,31 +69,25 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! rch workers probe --all --json >"${RCH_PROBE_LOG}"; then
-  log_event "failed" "rch_probe_failed" "RCH_PROBE_FAILED" "preflight>workers_probe" "rch workers probe command failed" "${RCH_PROBE_LOG}"
-  exit 1
-fi
-# rch probe has returned both "healthy" and "ok" across versions; accept either
-healthy_workers="$(jq '[.data[] | select(((.status // "") | ascii_downcase) == "healthy" or ((.status // "") | ascii_downcase) == "ok")] | length' "${RCH_PROBE_LOG}")"
-if [[ "${healthy_workers}" -lt 1 ]]; then
-  log_event "failed" "rch_workers_unavailable" "RCH_WORKERS_DOWN" "preflight>workers_probe" "no healthy rch workers; refusing local fallback" "${RCH_PROBE_LOG}"
-  exit 1
-fi
-log_event "passed" "rch_workers_available" "none" "preflight>workers_probe" "healthy_rch_workers=${healthy_workers}" "${RCH_PROBE_LOG}"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "mcp_proxy_composition"
+ensure_rch_ready
 
-TEST_CMD=(
-  rch exec --
-  env CARGO_TARGET_DIR=target-rch-mcp-proxy
+log_event "passed" "rch_workers_available" "none" "preflight>workers_probe" \
+  "shared rch guard reported reachable workers" "$(rch_probe_log_path)"
+log_event "passed" "rch_remote_smoke_passed" "none" "preflight>remote_smoke" \
+  "shared rch guard verified fail-closed remote cargo execution" "$(rch_smoke_log_path)"
+
+CARGO_CMD=(
   cargo test -p frankenterm-core --features "mcp,mcp-client" --test mcp_proxy_integration -- --nocapture
 )
 
-log_event "running" "invoke_rch_cargo_test" "none" "execute>cargo_test" "${TEST_CMD[*]}" "${STDOUT_LOG}"
+log_event "running" "invoke_rch_cargo_test" "none" "execute>cargo_test" \
+  "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} ${CARGO_CMD[*]}" "${STDOUT_LOG}"
 set +e
-(
-  cd "${ROOT_DIR}"
-  "${TEST_CMD[@]}"
-) 2>&1 | tee -a "${STDOUT_LOG}"
-status=${PIPESTATUS[0]}
+run_rch_cargo_logged "${STDOUT_LOG}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" "${CARGO_CMD[@]}"
+status=$?
 set -e
 
 if [[ ${status} -ne 0 ]]; then
