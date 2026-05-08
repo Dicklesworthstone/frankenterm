@@ -7642,7 +7642,7 @@ fn writer_loop(
         }
     }
 
-    flush_segment_redactors(conn, mmap_mirror, &mut segment_redactors);
+    flush_segment_redactors(&mut segment_redactors);
 }
 
 thread_local! {
@@ -8228,12 +8228,11 @@ fn dispatch_write_command_raw(
             respond,
         } => {
             let result =
-                flush_segment_redactor_for_pane(conn, mmap_mirror, segment_redactors, pane_id)
-                    .and_then(|()| {
-                        with_writer_backend(conn, |backend| {
-                            record_gap_backend(backend, pane_id, &reason)
-                        })
-                    });
+                flush_segment_redactor_for_pane(segment_redactors, pane_id).and_then(|()| {
+                    with_writer_backend(conn, |backend| {
+                        record_gap_backend(backend, pane_id, &reason)
+                    })
+                });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordEvent { event, respond } => {
@@ -8818,7 +8817,7 @@ fn dispatch_write_command_raw(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Shutdown { respond } => {
-            flush_segment_redactors(conn, mmap_mirror, segment_redactors);
+            flush_segment_redactors(segment_redactors);
             respond_oneshot_best_effort(respond, ());
             *should_break = true;
         }
@@ -8857,8 +8856,6 @@ fn redact_segment_for_persistence(
 }
 
 fn flush_segment_redactor_for_pane(
-    _conn: &mut Connection,
-    _mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, StreamingRedactor>,
     pane_id: u64,
 ) -> Result<()> {
@@ -8935,16 +8932,10 @@ fn disable_mmap_mirror_after_retained_tail_move(
     }
 }
 
-fn flush_segment_redactors(
-    conn: &mut Connection,
-    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
-    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
-) {
+fn flush_segment_redactors(segment_redactors: &mut HashMap<u64, StreamingRedactor>) {
     let pane_ids = segment_redactors.keys().copied().collect::<Vec<_>>();
     for pane_id in pane_ids {
-        if let Err(error) =
-            flush_segment_redactor_for_pane(conn, mmap_mirror, segment_redactors, pane_id)
-        {
+        if let Err(error) = flush_segment_redactor_for_pane(segment_redactors, pane_id) {
             tracing::warn!(
                 pane_id,
                 error = %error,
