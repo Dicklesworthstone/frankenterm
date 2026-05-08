@@ -21,6 +21,9 @@ PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${PROJECT_ROOT}/tests/e2e/lib_rch_guards.sh"
+
 # ── Argument parsing ────────────────────────────────────────────
 parse_harness_args() {
     QUICK_MODE=0
@@ -45,6 +48,7 @@ setup_artifact_dir() {
     local scenario="$1"
     ARTIFACT_DIR="${ARTIFACT_BASE}/${scenario}/${RUN_ID}"
     mkdir -p "${ARTIFACT_DIR}"
+    rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "rio_${scenario}" "${PROJECT_ROOT}"
     echo "${ARTIFACT_DIR}"
 }
 
@@ -254,16 +258,12 @@ ft_bin() {
         bin="${PROJECT_ROOT}/target/debug/ft"
     fi
     if [[ ! -x "$bin" ]]; then
-        # Try CARGO_TARGET_DIR locations
-        for dir in /tmp/ft-target "${CARGO_TARGET_DIR:-}"; do
-            if [[ -n "$dir" && -x "${dir}/release/ft" ]]; then
-                bin="${dir}/release/ft"
-                break
-            elif [[ -n "$dir" && -x "${dir}/debug/ft" ]]; then
-                bin="${dir}/debug/ft"
-                break
-            fi
-        done
+        local dir="${CARGO_TARGET_DIR:-}"
+        if [[ -n "$dir" && -x "${dir}/release/ft" ]]; then
+            bin="${dir}/release/ft"
+        elif [[ -n "$dir" && -x "${dir}/debug/ft" ]]; then
+            bin="${dir}/debug/ft"
+        fi
     fi
     echo "$bin"
 }
@@ -281,12 +281,35 @@ cargo_test() {
         return 0
     fi
     local timeout_sec="${CARGO_TEST_TIMEOUT:-120}"
-    if command -v rch &>/dev/null; then
-        timeout "$timeout_sec" rch exec -- cargo test -p frankenterm-core ${filter:+-- "$filter"} 2>&1
-    else
-        timeout "$timeout_sec" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/ft-target}" \
-            cargo test -p frankenterm-core ${filter:+-- "$filter"} 2>&1
+    local target_dir="${CARGO_TARGET_DIR:-target/rch-e2e-rio-${RUN_ID}}"
+    if [[ "${target_dir}" == /* ]]; then
+        target_dir="target/rch-e2e-rio-${RUN_ID}"
     fi
+    export CARGO_TARGET_DIR="${target_dir}"
+
+    local label="${filter:-all}"
+    label="${label//[^A-Za-z0-9_.-]/_}"
+    local output_dir="${ARTIFACT_DIR:-${ARTIFACT_BASE}/cargo_test/${RUN_ID}}"
+    local output_file="${output_dir}/cargo_test_${label}.log"
+    local cargo_args=(cargo test -p frankenterm-core)
+    local rc
+
+    mkdir -p "${output_dir}"
+    if [[ -n "${filter}" ]]; then
+        cargo_args+=(-- "${filter}")
+    fi
+
+    set +e
+    run_rch_cargo_logged_with_timeout \
+        "${timeout_sec}" \
+        "${output_file}" \
+        env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+        "${cargo_args[@]}"
+    rc=$?
+    set -e
+
+    cat "${output_file}"
+    return "${rc}"
 }
 
 # ── Scenario runner ─────────────────────────────────────────────
