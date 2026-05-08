@@ -8,7 +8,13 @@ mkdir -p "${LOG_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="mission_tx_interfaces"
 CORRELATION_ID="ft-1i2ge.8.8-${RUN_ID}"
-TARGET_DIR="${MISSION_TX_RCH_TARGET_DIR:-target-rch-mission-tx-interfaces}"
+DEFAULT_TARGET_DIR="target/rch-e2e-mission-tx-interfaces-${RUN_ID}"
+REQUESTED_TARGET_DIR="${MISSION_TX_RCH_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${REQUESTED_TARGET_DIR}"
+else
+  TARGET_DIR="${DEFAULT_TARGET_DIR}"
+fi
 REMOTE_TMPDIR="${MISSION_TX_RCH_REMOTE_TMPDIR:-/tmp/rch-mission-tx-interfaces}"
 LOG_FILE="${LOG_DIR}/mission_tx_interfaces_${RUN_ID}.jsonl"
 STDOUT_BASENAME="mission_tx_interfaces_${RUN_ID}"
