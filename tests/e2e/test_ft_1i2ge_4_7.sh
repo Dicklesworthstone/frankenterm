@@ -30,11 +30,6 @@ else
 fi
 export CARGO_TARGET_DIR
 
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${CORRELATION_ID}" "1i2ge_4_7"
-ensure_rch_ready
-
 json_escape() {
     local value="$1"
     value=${value//\\/\\\\}
@@ -65,34 +60,6 @@ log_structured() {
         | tee -a "$LOG_DIR/results.jsonl"
 }
 
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="$LOG_DIR/rch_probe.log"
-RCH_SMOKE_LOG="$LOG_DIR/rch_smoke.log"
-
-run_rch() {
-    TMPDIR=/tmp rch "$@"
-}
-
-run_rch_cargo() {
-    run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
-}
-
-probe_has_reachable_workers() {
-    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
-}
-
-check_rch_fallback_in_logs() {
-    local label="$1"
-    shift
-
-    if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
-        log_structured "FAIL" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" \
-            "$(json_field "input_summary" "$label")$(json_field "artifact_path" "$1")"
-        echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
-        exit 3
-    fi
-}
-
 count_matches() {
     local pattern="$1"
     local file="$2"
@@ -108,56 +75,51 @@ count_matches() {
     printf '%s\n' "$count"
 }
 
+run_cargo_step() {
+    local label="$1"
+    shift
+
+    local step_log="$LOG_DIR/${label}.log"
+    local test_cmd=(env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@")
+
+    set +e
+    run_rch_cargo_logged "$step_log" "${test_cmd[@]}"
+    local rc=$?
+    set -e
+
+    cat "$step_log" >>"$LOG_DIR/test_stdout.log"
+    return "$rc"
+}
+
 # ── Preflight ────────────────────────────────────────────────────────────────
 
-if ! command -v rch &>/dev/null; then
-    log_structured "FAIL" "rch_required_missing" "RCH-E001" ',"input_summary":"rch binary missing"'
-    echo "rch is required; refusing local cargo execution." >&2
-    exit 1
+if ! command -v jq &>/dev/null; then
+    log_structured "SKIP" "jq_missing" "jq_not_found" ',"input_summary":"jq binary not in PATH"'
+    echo "SKIP: jq not found — install jq to run structured assertions"
+    exit 0
 fi
 
-set +e
-run_rch --json workers probe --all >"$RCH_PROBE_LOG" 2>&1
-probe_rc=$?
-set -e
-if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
-    log_structured "FAIL" "rch_workers_unhealthy" "RCH-E100" \
-        "$(json_field "input_summary" "rch workers probe")$(json_field "artifact_path" "$RCH_PROBE_LOG")"
-    echo "rch workers are unavailable; refusing local cargo execution." >&2
-    exit 1
-fi
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${CORRELATION_ID}" "1i2ge_4_7"
+ensure_rch_ready
 
-set +e
-run_rch_cargo check --help >"$RCH_SMOKE_LOG" 2>&1
-smoke_rc=$?
-set -e
-check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
-if [[ $smoke_rc -ne 0 ]]; then
-    log_structured "FAIL" "rch_remote_smoke_failed" "RCH-E101" \
-        "$(json_field "input_summary" "cargo check --help")$(json_field "artifact_path" "$RCH_SMOKE_LOG")"
-    echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
-    exit 1
-fi
-
-CARGO_CMD="run_rch_cargo"
+: >"$LOG_DIR/test_stdout.log"
 
 echo "=== E2E: ${SCENARIO_ID} — Safety Guardrail Adversarial Suite ==="
-echo "    cargo_cmd=${CARGO_CMD}"
+echo "    cargo_cmd=run_rch_cargo_logged"
 echo "    log_dir=${LOG_DIR}"
 
 # ── Test 1: Full adversarial suite ────────────────────────────────────────────
 
 echo "[1/2] Running all 25 adversarial tests (ADV-01 through ADV-25)..."
-if $CARGO_CMD test --test mission_safety_adversarial --features subprocess-bridge \
-    2>"$LOG_DIR/test_stderr.log" | tee "$LOG_DIR/test_stdout.log"; then
-    check_rch_fallback_in_logs "mission_safety_adversarial" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
+if run_cargo_step "mission_safety_adversarial" test --test mission_safety_adversarial --features subprocess-bridge; then
     PASS_COUNT=$(count_matches '\.\.\..*ok' "$LOG_DIR/test_stdout.log")
     log_structured "PASS" "adversarial_suite_pass" "" "$(json_field "input_summary" "25 adversarial tests")$(json_field "decision_path" "cargo test")$(json_field "artifact_path" "$LOG_DIR/test_stdout.log")$(json_field "pass_count" "$PASS_COUNT")"
     echo "    ✓ ${PASS_COUNT} adversarial tests passed"
 else
-    check_rch_fallback_in_logs "mission_safety_adversarial" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
-    log_structured "FAIL" "adversarial_suite_fail" "E2E001" "$(json_field "input_summary" "adversarial tests")$(json_field "artifact_path" "$LOG_DIR/test_stderr.log")"
-    echo "    ✗ Adversarial tests failed — see $LOG_DIR/test_stderr.log"
+    log_structured "FAIL" "adversarial_suite_fail" "E2E001" "$(json_field "input_summary" "adversarial tests")$(json_field "artifact_path" "$LOG_DIR/mission_safety_adversarial.log")"
+    echo "    ✗ Adversarial tests failed — see $LOG_DIR/mission_safety_adversarial.log"
     exit 1
 fi
 
@@ -181,7 +143,7 @@ for test_name in "${EXPECTED_TESTS[@]}"; do
 done
 
 if [ "$MISSING" -eq 0 ]; then
-    log_structured "PASS" "category_coverage_pass" "" ',\"input_summary\":\"envelope + conflict + serde + metrics categories\"'
+    log_structured "PASS" "category_coverage_pass" "" "$(json_field "input_summary" "envelope + conflict + serde + metrics categories")"
     echo "    ✓ All test categories covered"
 else
     log_structured "FAIL" "category_coverage_fail" "E2E002" "$(json_field "missing_count" "$MISSING")"
@@ -192,4 +154,4 @@ fi
 echo ""
 echo "=== E2E: ${SCENARIO_ID} — ALL PASSED ==="
 echo "    Logs: ${LOG_DIR}/results.jsonl"
-log_structured "PASS" "e2e_suite_complete" "" ',\"input_summary\":\"all test groups passed\"'
+log_structured "PASS" "e2e_suite_complete" "" "$(json_field "input_summary" "all test groups passed")"
