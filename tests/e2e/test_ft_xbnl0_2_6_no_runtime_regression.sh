@@ -47,7 +47,7 @@ export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
 
-# shellcheck disable=SC1091
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "ft_xbnl0_2_6_no_runtime_regression"
 
@@ -141,6 +141,7 @@ require_cmd jq
 require_cmd python3
 require_cmd cargo
 require_cmd bash
+require_cmd rch
 
 if [[ ! -f "${VALIDATOR}" ]]; then
   emit_log "preflight" "required_artifacts" "validator=${VALIDATOR}" "failed" "missing_artifact" "ARTIFACT-MISSING" "${VALIDATOR}"
@@ -275,22 +276,22 @@ else
 fi
 
 # Step 7: rch-backed cargo test of the Rust integration test that re-invokes the gate.
-# Honors FT_XBNL0_2_6_SKIP_RCH=1 for environments where the rch worker substrate is
-# unavailable or known to be slow; the artifact bundle still records the skip reason.
 if [[ "${FT_XBNL0_2_6_SKIP_RCH:-0}" == "1" ]]; then
-  emit_log "validation" "rch.cargo_test" "skip=env_opt_out" "skipped" "skip_via_FT_XBNL0_2_6_SKIP_RCH" "none" "n/a"
-elif command -v rch >/dev/null 2>&1 && ensure_rch_ready 2>/dev/null; then
-  emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_2_6_no_runtime_regression_gate" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-  if run_rch_cargo_step "rch_cargo_test" \
-      test -p frankenterm-core --test ft_xbnl0_2_6_no_runtime_regression_gate -- --nocapture; then
-    emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_2_6_no_runtime_regression_gate" "passed" "rch_cargo_test_passed" "none" "$(basename "${LAST_STEP_LOG}")"
-  else
-    emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_2_6_no_runtime_regression_gate" "failed" "rch_cargo_test_failed" "RCH-CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
-    write_summary "failed"
-    exit 1
-  fi
+  emit_log "validation" "rch.cargo_test" "skip=env_opt_out" "failed" "rch_skip_not_allowed" "RCH-REQUIRED" "n/a"
+  write_summary "failed"
+  echo "FT_XBNL0_2_6_SKIP_RCH is not supported in this repo; cargo proof must use rch." >&2
+  exit 1
+fi
+
+ensure_rch_ready
+emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_2_6_no_runtime_regression_gate" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
+if run_rch_cargo_step "rch_cargo_test" \
+    test -p frankenterm-core --test ft_xbnl0_2_6_no_runtime_regression_gate -- --nocapture; then
+  emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_2_6_no_runtime_regression_gate" "passed" "rch_cargo_test_passed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
-  emit_log "validation" "rch.cargo_test" "skip=rch_unavailable" "skipped" "rch_unavailable" "none" "n/a"
+  emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_2_6_no_runtime_regression_gate" "failed" "rch_cargo_test_failed" "RCH-CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  write_summary "failed"
+  exit 1
 fi
 
 emit_log "summary" "self_test->nominal->determinism->failure_injection_src->failure_injection_dep->failure_injection_doc->recovery->rch_cargo_test" "scenario_complete" "passed" "all_checks_passed" "none" "$(basename "${SUMMARY_FILE}")"
