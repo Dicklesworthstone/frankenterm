@@ -13,7 +13,7 @@ RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_1i2ge_5_7_contract_golden"
 CORRELATION_ID="ft-1i2ge.5.7-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_5_7_${RUN_ID}.jsonl"
-LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
+LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-1i2ge-5-7-${RUN_ID}"
 INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
 if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
@@ -23,6 +23,7 @@ else
 fi
 export CARGO_TARGET_DIR
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_7_contract_golden"
 ensure_rch_ready
@@ -60,6 +61,17 @@ emit_log() {
       error_code: $error_code,
       artifact_path: $artifact_path
     }' >> "${LOG_FILE}"
+}
+
+count_matches() {
+  local pattern="$1"
+  local file="$2"
+  local count
+  count=$(grep -c -- "${pattern}" "${file}" 2>/dev/null || true)
+  if [[ -z "${count}" ]]; then
+    count=0
+  fi
+  printf '%s\n' "${count}"
 }
 
 emit_log "started" "script_init" "none" "none" \
@@ -189,7 +201,7 @@ if [[ ${test_rc} -ne 0 ]]; then
   exit 1
 fi
 
-contract_count=$(grep -c "ok$" "${tests_log}" || echo 0)
+contract_count=$(count_matches "ok$" "${tests_log}")
 if [[ ${contract_count} -lt 30 ]]; then
   emit_log "failed" "golden_tests" "insufficient_test_coverage" "COVERAGE_LOW" \
     "$(basename "${tests_log}")" \
@@ -213,7 +225,14 @@ else
   clippy_rc=$?
 fi
 
-contract_warnings=$(grep -c "mission_contract_golden.rs" "${clippy_log}" || echo 0)
+if [[ ${clippy_rc} -ne 0 ]]; then
+  emit_log "failed" "clippy_check" "clippy_failed" "CLIPPY_FAIL" \
+    "$(basename "${clippy_log}")" "cargo clippy failed"
+  echo "FAIL: cargo clippy failed" >&2
+  exit 1
+fi
+
+contract_warnings=$(count_matches "mission_contract_golden.rs" "${clippy_log}")
 if [[ ${contract_warnings} -gt 0 ]]; then
   emit_log "failed" "clippy_check" "clippy_warnings" "CLIPPY_WARN" \
     "$(basename "${clippy_log}")" \
@@ -272,8 +291,8 @@ if [[ ${repeat_rc} -ne 0 ]]; then
   exit 1
 fi
 
-pass_count_1=$(grep -c "ok$" "${tests_log}" || echo 0)
-pass_count_2=$(grep -c "ok$" "${tests_repeat_log}" || echo 0)
+pass_count_1=$(count_matches "ok$" "${tests_log}")
+pass_count_2=$(count_matches "ok$" "${tests_repeat_log}")
 if [[ ${pass_count_1} -ne ${pass_count_2} ]]; then
   emit_log "failed" "determinism" "count_mismatch" "DETERMINISM_FAIL" \
     "$(basename "${tests_repeat_log}")" \
@@ -289,7 +308,7 @@ emit_log "passed" "determinism" "repeat_run_stable" "none" \
 emit_log "running" "backward_compat" "compat_contract" "none" \
   "none" "validate backward compatibility contract tests pass"
 
-compat_count=$(grep -c "backward_compat.*ok" "${tests_log}" || echo 0)
+compat_count=$(count_matches "backward_compat.*ok" "${tests_log}")
 if [[ ${compat_count} -lt 1 ]]; then
   emit_log "failed" "backward_compat" "missing_compat_test" "COMPAT_MISSING" \
     "$(basename "${tests_log}")" "backward compatibility tests not found"

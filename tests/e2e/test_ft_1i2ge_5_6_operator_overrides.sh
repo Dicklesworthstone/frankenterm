@@ -13,7 +13,7 @@ RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_1i2ge_5_6_operator_overrides"
 CORRELATION_ID="ft-1i2ge.5.6-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.jsonl"
-LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
+LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
 RCH_TARGET_DIR="target/rch-e2e-operator-overrides-${RUN_ID}"
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
@@ -111,6 +111,17 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
+count_matches() {
+  local pattern="$1"
+  local file="$2"
+  local count
+  count=$(grep -c -- "${pattern}" "${file}" 2>/dev/null || true)
+  if [[ -z "${count}" ]]; then
+    count=0
+  fi
+  printf '%s\n' "${count}"
+}
+
 emit_log "started" "script_init" "none" "none" \
   "$(basename "${LOG_FILE}")" \
   "operator override controls e2e started"
@@ -162,8 +173,8 @@ if [[ ${test_rc} -ne 0 ]]; then
 fi
 
 # Count passing override tests.
-override_count=$(grep -c "override.*ok$" "${tests_log}" || echo 0)
-evaluate_count=$(grep -c "evaluate_with.*ok$" "${tests_log}" || echo 0)
+override_count=$(count_matches "override.*ok$" "${tests_log}")
+evaluate_count=$(count_matches "evaluate_with.*ok$" "${tests_log}")
 total_override=$((override_count + evaluate_count))
 
 if [[ ${total_override} -lt 17 ]]; then
@@ -188,7 +199,14 @@ run_rch_cargo_logged "${clippy_log}" \
 clippy_rc=$?
 set -e
 
-mission_loop_warnings=$(grep -c "mission_loop.rs" "${clippy_log}" || echo 0)
+if [[ ${clippy_rc} -ne 0 ]]; then
+  emit_log "failed" "clippy_check" "clippy_failed" "CLIPPY_FAIL" \
+    "$(basename "${clippy_log}")" "cargo clippy failed"
+  echo "FAIL: cargo clippy failed" >&2
+  exit 1
+fi
+
+mission_loop_warnings=$(count_matches "mission_loop.rs" "${clippy_log}")
 if [[ ${mission_loop_warnings} -gt 0 ]]; then
   emit_log "failed" "clippy_check" "clippy_warnings" "CLIPPY_WARN" \
     "ft_1i2ge_5_6_${RUN_ID}.clippy.log" \
@@ -233,8 +251,8 @@ if [[ ${repeat_rc} -ne 0 ]]; then
 fi
 
 # Compare test counts between runs.
-pass_count_1=$(grep -c "ok$" "${tests_log}" || echo 0)
-pass_count_2=$(grep -c "ok$" "${repeat_log}" || echo 0)
+pass_count_1=$(count_matches "ok$" "${tests_log}")
+pass_count_2=$(count_matches "ok$" "${repeat_log}")
 if [[ ${pass_count_1} -ne ${pass_count_2} ]]; then
   emit_log "failed" "determinism" "count_mismatch" "DETERMINISM_FAIL" \
     "ft_1i2ge_5_6_${RUN_ID}.tests_repeat.log" \
