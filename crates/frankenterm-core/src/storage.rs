@@ -1335,7 +1335,7 @@ impl StorageHandle {
         let db_existed = Path::new(&db_path_owned).exists();
         let defer_fts_triggers = config.defer_fts_triggers;
         let init_cx = cx.cloned();
-        let open_initialized_connection = move || -> Result<Connection> {
+        let open_initialized_backend = move || -> Result<RusqliteBackend> {
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "before database open")?;
             }
@@ -1455,17 +1455,17 @@ impl StorageHandle {
                 Self::checkpoint_storage_open(cx, "after permission setup")?;
             }
 
-            Ok(conn)
+            Ok(RusqliteBackend::new(conn))
         };
         let init_result = if let Some(cx) = cx {
             Self::spawn_blocking_storage_with_cx_with_join_error(
                 cx,
                 "Storage open task join error",
-                open_initialized_connection,
+                open_initialized_backend,
             )
             .await?
         } else {
-            Self::spawn_blocking_storage(open_initialized_connection).await?
+            Self::spawn_blocking_storage(open_initialized_backend).await?
         };
 
         if let Some(cx) = cx {
@@ -1480,7 +1480,7 @@ impl StorageHandle {
         let writer_handle = thread::Builder::new()
             .name("ft-storage-writer".to_string())
             .spawn(move || {
-                let backend = RusqliteBackend::new(init_result);
+                let backend = init_result;
                 let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
                 writer_loop(&backend, &mut write_rx, &mut mmap_mirror);
             })
