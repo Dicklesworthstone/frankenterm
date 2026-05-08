@@ -24,6 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Source the E2E artifacts library
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 # Binary path. Set FT_BIN or CARGO_TARGET_DIR to use an rch-built binary.
@@ -153,13 +154,11 @@ test_help_output() {
     # Required commands that must appear in help
     local required_cmds=("watch" "robot" "search" "list" "send" "workflow" "status" "events" "why" "doctor")
 
-    local all_present=true
     for cmd in "${required_cmds[@]}"; do
         if echo "$main_help" | grep -qw "$cmd"; then
             log_pass "Help lists command: $cmd"
         else
             log_fail "Help missing command: $cmd"
-            all_present=false
         fi
     done
 
