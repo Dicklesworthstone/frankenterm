@@ -12,6 +12,16 @@ LOG_FILE="${LOG_DIR}/mcp_proxy_composition_${RUN_ID}.jsonl"
 STDOUT_LOG="${LOG_DIR}/mcp_proxy_composition_${RUN_ID}.stdout.log"
 RCH_PROBE_LOG="${LOG_DIR}/mcp_proxy_composition_${RUN_ID}.rch_probe.json"
 
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
 log_event() {
   local outcome="$1"
   local reason_code="$2"
@@ -22,7 +32,16 @@ log_event() {
   local now
   now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   printf '{"timestamp":"%s","component":"%s","scenario_id":"%s","correlation_id":"%s","decision_path":"%s","input_summary":"%s","outcome":"%s","reason_code":"%s","error_code":"%s","artifact_path":"%s"}\n' \
-    "${now}" "${COMPONENT}" "${SCENARIO_ID}" "${CORRELATION_ID}" "${decision_path}" "${input_summary}" "${outcome}" "${reason_code}" "${error_code}" "${artifact_path}" \
+    "$(json_escape "${now}")" \
+    "$(json_escape "${COMPONENT}")" \
+    "$(json_escape "${SCENARIO_ID}")" \
+    "$(json_escape "${CORRELATION_ID}")" \
+    "$(json_escape "${decision_path}")" \
+    "$(json_escape "${input_summary}")" \
+    "$(json_escape "${outcome}")" \
+    "$(json_escape "${reason_code}")" \
+    "$(json_escape "${error_code}")" \
+    "$(json_escape "${artifact_path}")" \
     | tee -a "${LOG_FILE}"
 }
 
@@ -58,7 +77,7 @@ log_event "passed" "rch_workers_available" "none" "preflight>workers_probe" "hea
 TEST_CMD=(
   rch exec --
   env CARGO_TARGET_DIR=target-rch-mcp-proxy
-  cargo test -p frankenterm-core --features mcp,mcp-client --test mcp_proxy_integration -- --nocapture
+  cargo test -p frankenterm-core --features "mcp,mcp-client" --test mcp_proxy_integration -- --nocapture
 )
 
 log_event "running" "invoke_rch_cargo_test" "none" "execute>cargo_test" "${TEST_CMD[*]}" "${STDOUT_LOG}"

@@ -37,11 +37,22 @@ else
 fi
 export CARGO_TARGET_DIR
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${TIMESTAMP}" "3kxe_1"
 ensure_rch_ready
 
 # ── Structured log helper ──────────────────────────────────────────────────
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
 log_event() {
     local component="$1"
     local decision_path="$2"
@@ -51,14 +62,14 @@ log_event() {
     local error_code="${6:-none}"
     printf '{"timestamp":"%s","component":"%s","scenario_id":"%s","correlation_id":"%s-%s","decision_path":"%s","input_summary":"%s","outcome":"%s","reason_code":"%s","error_code":"%s"}\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        "$component" \
-        "$SCENARIO_ID" \
-        "$SCENARIO_ID" "$TIMESTAMP" \
-        "$decision_path" \
-        "$input_summary" \
-        "$outcome" \
-        "$reason_code" \
-        "$error_code" >> "$LOG_FILE"
+        "$(json_escape "$component")" \
+        "$(json_escape "$SCENARIO_ID")" \
+        "$(json_escape "$SCENARIO_ID")" "$(json_escape "$TIMESTAMP")" \
+        "$(json_escape "$decision_path")" \
+        "$(json_escape "$input_summary")" \
+        "$(json_escape "$outcome")" \
+        "$(json_escape "$reason_code")" \
+        "$(json_escape "$error_code")" >> "$LOG_FILE"
 }
 
 RCH_FAIL_OPEN_REGEX='\[RCH\] local|running locally'
