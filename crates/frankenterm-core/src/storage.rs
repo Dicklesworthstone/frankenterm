@@ -1392,13 +1392,13 @@ impl StorageHandle {
                         "Failed to enable foreign_keys PRAGMA (ft-s4myu): {e}"
                     ))
                 })?;
-            let conn = backend.into_connection();
-
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after foreign key setup")?;
             }
 
-            initialize_schema(&conn)?;
+            backend.with_connection(initialize_schema).map_err(|err| {
+                storage_backend_error("Failed to borrow database for schema initialization", err)
+            })??;
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after schema initialization")?;
@@ -1423,7 +1423,6 @@ impl StorageHandle {
             // is silently ignored. The CREATE statements mirror the ones
             // in SCHEMA_SQL at line ~169 (see FTS_TRIGGER_RECREATE_SQL);
             // keep the two in lockstep.
-            let backend = RusqliteBackend::new(conn);
             let (trigger_sql, trigger_error_context) = if defer_fts_triggers {
                 (
                     "DROP TRIGGER IF EXISTS output_segments_ai;
@@ -1440,7 +1439,6 @@ impl StorageHandle {
             backend
                 .execute_batch(trigger_sql)
                 .map_err(|e| StorageError::Database(format!("{trigger_error_context}: {e}")))?;
-            let conn = backend.into_connection();
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after FTS trigger setup")?;
@@ -1455,7 +1453,7 @@ impl StorageHandle {
                 Self::checkpoint_storage_open(cx, "after permission setup")?;
             }
 
-            Ok(RusqliteBackend::new(conn))
+            Ok(backend)
         };
         let init_result = if let Some(cx) = cx {
             Self::spawn_blocking_storage_with_cx_with_join_error(

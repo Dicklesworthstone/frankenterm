@@ -1004,6 +1004,18 @@ impl RusqliteBackend {
         }
     }
 
+    /// Borrow the wrapped connection for legacy rusqlite-only helpers.
+    ///
+    /// Keep this crate-private: new storage call sites should use the
+    /// [`StorageBackend`] trait surface, not reach through to rusqlite.
+    pub(crate) fn with_connection<F, R>(&self, f: F) -> Result<R, BackendError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> R,
+    {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        Ok(f(&conn))
+    }
+
     /// Open a fresh connection at UTF-8 `path` with the given config.
     /// `path = ":memory:"` for in-memory.
     pub fn open(path: &str, config: &OpenConfig) -> Result<Self, BackendError> {
