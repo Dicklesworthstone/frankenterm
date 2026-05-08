@@ -16,7 +16,7 @@
 #      Pre-cancel / mid-flight-cancel / happy path.
 #   5. Web server cx pre-cancel + mid-flight (2) — web_server_with_cx_*
 #      Tick 323 pre-cancel + tick 417 mid-flight on run_web_server_with_cx.
-#   6. runtime_compat primitive contracts (22) — _with_cx_observes_budget_deadline
+#   6. runtime_async primitive contracts (22) — _with_cx_observes_budget_deadline
 #      + yield_now_with_cx + oneshot_recv_with_cx + broadcast_recv_with_cx
 #      + semaphore_acquire_ + mpsc_recv_with_cx + watch_changed_with_cx
 #      + join_set_join_next_with_cx
@@ -45,36 +45,35 @@
 # Invoke as:
 #   ./scripts/check_ft_xbnl0_2_4.sh
 #
-# Or via rch for remote verification per the shared verification
-# contract (docs/ft-xbnl0-verification-contract.md):
-#   rch exec -- ./scripts/check_ft_xbnl0_2_4.sh
-#
-# Local invocation uses the fork-bypass CC/CXX/CARGO_TARGET_DIR pattern
-# from docs/ft-xbnl0-2-4-completion-evidence.md §3.
+# Invoke this script directly. It manages RCH setup internally and refuses local
+# Cargo execution. Do not wrap the script itself in `rch exec`.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-# Each agent should use an isolated target dir to avoid lock contention with
-# other concurrently-running agents. By default, keep artifacts under this
-# repo's target tree so stale /tmp targets are not left behind.
-# Override with CARGO_TARGET_DIR or CARGO_TARGET_DIR_OVERRIDE when a
-# caller needs a different location.
-: "${CARGO_TARGET_DIR:=${CARGO_TARGET_DIR_OVERRIDE:-target/ft-xbnl0-2-4/cargo-target}}"
-export CARGO_TARGET_DIR
+RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
+LOG_DIR="${FT_XBNL0_2_4_LOG_DIR:-target/ft-xbnl0-2-4}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-ft-xbnl0-2-4-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR_OVERRIDE:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "$REQUESTED_CARGO_TARGET_DIR" && "$REQUESTED_CARGO_TARGET_DIR" != /* ]]; then
+    RCH_CARGO_TARGET_DIR="$REQUESTED_CARGO_TARGET_DIR"
+else
+    RCH_CARGO_TARGET_DIR="$DEFAULT_CARGO_TARGET_DIR"
+fi
 
-# The `cc` shell alias on this dev machine maps to Claude Code rather
-# than the C compiler — native deps (aws-lc-sys etc.) fail to build
-# without explicit CC/CXX. CI runners where `cc` resolves correctly
-# can override these with CC=cc CXX=c++ or similar.
-: "${CC:=/opt/homebrew/opt/llvm/bin/clang}"
-: "${CXX:=/opt/homebrew/opt/llvm/bin/clang++}"
-export CC CXX
+mkdir -p "$LOG_DIR"
+RCH_SKIP_SMOKE_PREFLIGHT="${FT_XBNL0_2_4_RCH_SKIP_SMOKE_PREFLIGHT:-${RCH_SKIP_SMOKE_PREFLIGHT:-1}}"
+RCH_STEP_TIMEOUT_SECS="${FT_XBNL0_2_4_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-1800}}"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$ROOT_DIR/tests/e2e/lib_rch_guards.sh"
+rch_init "$LOG_DIR" "$RUN_ID" "ft_xbnl0_2_4" "$ROOT_DIR"
+ensure_rch_ready
 
 FAIL=0
 TOTAL_PASSED=0
+RUN_INDEX=0
 
 log_header() {
     echo
@@ -87,27 +86,30 @@ run_test() {
     local label="$1"
     shift
     log_header "${label}"
-    # Capture stdout + stderr to a tempfile so we can tally the "N passed"
-    # count while still showing the output to the operator.
-    local tmp
-    # Explicit template path for portability — BSD (`mktemp -t PREFIX`)
-    # and GNU (`mktemp -t TEMPLATE`) differ on the `-t` argument form,
-    # but both accept a full template path as a positional argument.
-    tmp="$(mktemp "${TMPDIR:-/tmp}/ft-xbnl0-2-4-check.XXXXXX")"
-    if cargo test "$@" 2>&1 | tee "${tmp}"; then
+    RUN_INDEX=$((RUN_INDEX + 1))
+    local log_file="$LOG_DIR/run_${RUN_INDEX}_${RUN_ID}.rch.log"
+
+    set +e
+    run_rch_cargo_logged "$log_file" \
+        env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" \
+        cargo test "$@"
+    local rc=$?
+    set -e
+    cat "$log_file"
+
+    if [[ "$rc" -eq 0 ]]; then
         # Sum all "N passed" counts from all `test result: ok.` lines in
         # this run (per-binary splits may produce multiple result lines
         # under --all-targets; normally there's just one for our filters).
         local passed
-        passed="$(grep -oE 'test result: ok\. [0-9]+ passed' "${tmp}" \
-            | awk '{ s += $4 } END { print (s ? s : 0) }')"
+        passed="$(grep -oE 'test result: ok\. [0-9]+ passed' "${log_file}" \
+            | awk '{ s += $4 } END { print (s ? s : 0) }' || true)"
         TOTAL_PASSED=$(( TOTAL_PASSED + passed ))
         echo "[PASS] ${label} — ${passed} tests"
     else
         echo "[FAIL] ${label}"
         FAIL=1
     fi
-    rm -f "${tmp}"
 }
 
 run_test "Run 1/6: HTTP client contract tests" \
@@ -140,7 +142,7 @@ run_test "Run 5/6: Web server cx pre-cancel + mid-flight" \
     web_server_with_cx_ \
     -- --nocapture
 
-run_test "Run 6/6: runtime_compat primitive contracts (budget + cancel observation)" \
+run_test "Run 6/6: runtime_async primitive contracts (budget + cancel observation)" \
     -p frankenterm-core \
     --features asupersync-runtime \
     --lib \
