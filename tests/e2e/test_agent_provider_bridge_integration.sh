@@ -7,6 +7,16 @@ mkdir -p "${LOG_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 LOG_FILE="${LOG_DIR}/agent_provider_bridge_integration_${RUN_ID}.log"
 
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
 log_json() {
   local level="$1"
   local event="$2"
@@ -14,7 +24,10 @@ log_json() {
   local now
   now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   printf '{"ts":"%s","level":"%s","event":"%s","message":"%s"}\n' \
-    "${now}" "${level}" "${event}" "${message}" | tee -a "${LOG_FILE}"
+    "$(json_escape "${now}")" \
+    "$(json_escape "${level}")" \
+    "$(json_escape "${event}")" \
+    "$(json_escape "${message}")" | tee -a "${LOG_FILE}"
 }
 
 log_json "info" "start" "Starting agent provider bridge integration e2e"

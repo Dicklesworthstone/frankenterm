@@ -11,6 +11,16 @@ fi
 OUT_PATH="${1:-${ROOT_DIR}/docs/asupersync-runtime-inventory.json}"
 mkdir -p "$(dirname "${OUT_PATH}")"
 
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
 log_json() {
   local level="$1"
   local event="$2"
@@ -18,7 +28,10 @@ log_json() {
   local now
   now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   printf '{"ts":"%s","level":"%s","event":"%s","message":"%s"}\n' \
-    "${now}" "${level}" "${event}" "${message}" >&2
+    "$(json_escape "${now}")" \
+    "$(json_escape "${level}")" \
+    "$(json_escape "${event}")" \
+    "$(json_escape "${message}")" >&2
 }
 
 if ! command -v python3 >/dev/null 2>&1; then
