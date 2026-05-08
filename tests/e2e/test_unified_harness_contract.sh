@@ -12,6 +12,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 ARTIFACT_DIR="${ROOT_DIR}/tests/e2e/artifacts/harness_contract"
+GUARD_LIB="${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
 mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
@@ -19,48 +20,16 @@ SCENARIO_ID="ft_e34d9_10_6_5_unified_harness"
 CORRELATION_ID="ft-e34d9.10.6.5-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/unified_harness_contract_${RUN_ID}.jsonl"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
+
 PASS=0
 FAIL=0
 TOTAL=0
 
 # ── rch infrastructure ──────────────────────────────────────────────────────
 RCH_TARGET_DIR="target/rch-e2e-unified-harness-${RUN_ID}"
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="${LOG_DIR}/unified_harness_${RUN_ID}.probe.log"
-RCH_SMOKE_LOG="${LOG_DIR}/unified_harness_${RUN_ID}.smoke.log"
-
-fatal() { echo "FATAL: $1" >&2; exit 1; }
-run_rch() { TMPDIR=/tmp rch "$@"; }
-run_rch_cargo() { run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"; }
-probe_has_reachable_workers() { grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"; }
-
-check_rch_fallback() {
-    local output_file="$1"
-    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
-        fatal "rch entered a fail-open or off-policy execution path; refusing offload policy violation. See ${output_file}"
-    fi
-}
-
-run_rch_cargo_logged() {
-    local output_file="$1"; shift
-    set +e; ( cd "${ROOT_DIR}"; run_rch_cargo "$@" ) >"${output_file}" 2>&1; local rc=$?; set -e
-    check_rch_fallback "${output_file}"; return "${rc}"
-}
-
-ensure_rch_ready() {
-    if ! command -v rch >/dev/null 2>&1; then
-        fatal "rch is required for this e2e harness; refusing local cargo execution."
-    fi
-    set +e; run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1; local probe_rc=$?; set -e
-    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
-        fatal "rch workers unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
-    fi
-    set +e; run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1; local smoke_rc=$?; set -e
-    check_rch_fallback "${RCH_SMOKE_LOG}"
-    if [[ ${smoke_rc} -ne 0 ]]; then
-        fatal "rch remote smoke preflight failed. See ${RCH_SMOKE_LOG}"
-    fi
-}
+rch_init "${LOG_DIR}" "${RUN_ID}" "unified_harness_contract" "${ROOT_DIR}"
 
 emit_log() {
   local outcome="$1" scenario="$2" decision_path="$3" reason_code="$4"
@@ -104,7 +73,7 @@ echo ""; echo "--- Scenario 1: Rust harness tests compile and pass ---"
 emit_log "started" "rust_test_compile" "cargo_test" "none" "none" "${LOG_FILE}" ""
 
 step1_log="${LOG_DIR}/unified_harness_${RUN_ID}.cargo_test.log"
-if run_rch_cargo_logged "${step1_log}" test -p frankenterm-core --test test_harness_contract -- --nocapture; then
+if run_rch_cargo_logged "${step1_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --test test_harness_contract -- --nocapture; then
   record_result "rust_harness_tests_pass" "true"
 else
   record_result "rust_harness_tests_pass" "false" "assertion_failed" "assertion_failed" "see ${step1_log}"
@@ -182,9 +151,8 @@ else
   record_result "cross_format_parity" "false" "invariant_violation" "assertion_failed" "parity mismatch"
 fi
 
-# Scenario 5: Shared rch guard library covers local-fallback warning surface
+# Scenario 5: Shared rch guard library covers local-fallback and remote mirror warning surfaces
 echo ""; echo "--- Scenario 5: Shared rch guard coverage ---"
-GUARD_LIB="${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
 BAD_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_fail_open_${RUN_ID}.log"
 GOOD_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_clean_${RUN_ID}.log"
 MISSING_FILE_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_remote_mirror_missing_file_${RUN_ID}.log"
@@ -197,10 +165,6 @@ printf '%s\n' \
   'Sync complete: 4812 files in 928ms' \
   "error: couldn't read crates/frankenterm-core-fleet/src/lib.rs: No such file or directory (os error 2)" \
   > "${MISSING_FILE_GUARD_LOG}"
-
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "${GUARD_LIB}"
-
 set +e
 (check_rch_fallback "${BAD_GUARD_LOG}") >/dev/null 2>"${BAD_GUARD_ERR}"
 BAD_GUARD_RC=$?
@@ -218,6 +182,7 @@ for token in \
   "too long for Unix domain socket" \
   "RCH-REMOTE-MIRROR-MISSING-FILE" \
   "check_rch_fallback" \
+  "rch_init" \
   "run_rch_cargo_logged"; do
   if ! grep -Eq "${token}" "${GUARD_LIB}" 2>/dev/null; then
     echo "    Shared guard missing token: ${token}"
