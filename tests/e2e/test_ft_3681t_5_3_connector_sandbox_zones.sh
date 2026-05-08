@@ -16,18 +16,21 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 SKIP_LIB_TESTS="${FT_SKIP_LIB_TESTS:-0}"
-CARGO_TARGET_DIR_OVERRIDE="${FT_CARGO_TARGET_DIR:-target-rch-ft3681t53-e2e}"
-
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-3681t-5-3-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
 SCENARIO_ID="ft_3681t_5_3_connector_sandbox_zones"
 CORRELATION_ID="ft-3681t.5.3-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_3681t_5_3_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_3681t_5_3_${RUN_ID}.stdout.log"
 STDERR_FILE="${LOG_DIR}/ft_3681t_5_3_${RUN_ID}.stderr.log"
-
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_5_3_connector_sandbox_zones"
-ensure_rch_ready
 
 emit_log() {
   local outcome="$1"
@@ -64,6 +67,16 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured e2e logs and shared rch metadata" >&2
+  exit 1
+fi
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_5_3_connector_sandbox_zones"
+ensure_rch_ready
+
 emit_log \
   "started" \
   "suite_init" \
@@ -72,16 +85,41 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "ft-3681t.5.3 sandbox zone + capability envelope validation"
 
-if ! command -v jq >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "preflight" \
-    "jq_missing" \
-    "jq_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "jq is required for structured e2e logs"
-  exit 1
-fi
+emit_log \
+  "passed" \
+  "preflight_rch_workers" \
+  "rch_shared_guard_passed" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared rch guard reported reachable workers"
+
+emit_log \
+  "passed" \
+  "preflight_rch_remote_smoke" \
+  "rch_remote_smoke_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "shared rch guard verified fail-closed remote cargo execution"
+
+run_cargo_test_phase() {
+  local phase="$1"
+  shift
+  local phase_log="${LOG_DIR}/ft_3681t_5_3_${RUN_ID}.${phase}.stdout.log"
+  local status
+
+  if run_rch_cargo_logged "${phase_log}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  cat "${phase_log}" >>"${STDOUT_FILE}"
+  return "${status}"
+}
+
+: >"${STDOUT_FILE}"
+: >"${STDERR_FILE}"
 
 if [[ "${SKIP_LIB_TESTS}" != "1" ]]; then
   emit_log \
@@ -90,11 +128,10 @@ if [[ "${SKIP_LIB_TESTS}" != "1" ]]; then
     "none" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR_OVERRIDE} cargo test -p frankenterm-core --lib connector_host_runtime_sandbox_ -- --nocapture"
+    "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib connector_host_runtime_sandbox_ -- --nocapture"
 
   set +e
-  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR_OVERRIDE}" cargo test -p frankenterm-core --lib connector_host_runtime_sandbox_ -- --nocapture \
-    >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
+  run_cargo_test_phase lib -p frankenterm-core --lib connector_host_runtime_sandbox_ -- --nocapture
   rc=$?
   set -e
 
@@ -104,14 +141,12 @@ if [[ "${SKIP_LIB_TESTS}" != "1" ]]; then
       "rch_exec_cargo_test_lib" \
       "cargo_test_failed" \
       "non_zero_exit" \
-      "$(basename "${STDERR_FILE}")" \
+      "$(basename "${STDOUT_FILE}")" \
       "rch-offloaded connector sandbox unit tests failed with exit ${rc}"
-    echo "ft-3681t.5.3 validation failed; inspect ${STDERR_FILE}" >&2
+    echo "ft-3681t.5.3 validation failed; inspect ${STDOUT_FILE}" >&2
     exit "${rc}"
   fi
 else
-  : >"${STDOUT_FILE}"
-  : >"${STDERR_FILE}"
   emit_log \
     "skipped" \
     "rch_exec_cargo_test_lib" \
@@ -127,11 +162,10 @@ emit_log \
   "none" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR_OVERRIDE} cargo test -p frankenterm-core --test connector_host_runtime_integration connector_host_runtime_integration_sandbox_ -- --nocapture"
+  "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --test connector_host_runtime_integration connector_host_runtime_integration_sandbox_ -- --nocapture"
 
 set +e
-rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR_OVERRIDE}" cargo test -p frankenterm-core --test connector_host_runtime_integration connector_host_runtime_integration_sandbox_ -- --nocapture \
-  >>"${STDOUT_FILE}" 2>>"${STDERR_FILE}"
+run_cargo_test_phase integration -p frankenterm-core --test connector_host_runtime_integration connector_host_runtime_integration_sandbox_ -- --nocapture
 rc=$?
 set -e
 
@@ -141,9 +175,9 @@ if [[ ${rc} -ne 0 ]]; then
     "rch_exec_cargo_test_integration" \
     "cargo_test_failed" \
     "non_zero_exit" \
-    "$(basename "${STDERR_FILE}")" \
+    "$(basename "${STDOUT_FILE}")" \
     "rch-offloaded connector sandbox integration tests failed with exit ${rc}"
-  echo "ft-3681t.5.3 validation failed; inspect ${STDERR_FILE}" >&2
+  echo "ft-3681t.5.3 validation failed; inspect ${STDOUT_FILE}" >&2
   exit "${rc}"
 fi
 
