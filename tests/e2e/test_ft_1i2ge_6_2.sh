@@ -28,10 +28,7 @@ else
 fi
 export CARGO_TARGET_DIR
 
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${TIMESTAMP}" "1i2ge_6_2"
-ensure_rch_ready
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 # ── Structured log helper ──────────────────────────────────────────────────
 json_escape() {
@@ -63,64 +60,26 @@ log_event() {
         "$(json_escape "$error_code")" >> "$LOG_FILE"
 }
 
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_probe.log"
-RCH_SMOKE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_smoke.log"
-
-run_rch() {
-    TMPDIR=/tmp rch "$@"
-}
-
-run_rch_cargo() {
-    run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
-}
-
-probe_has_reachable_workers() {
-    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
-}
-
-check_rch_fallback_in_logs() {
-    local label="$1"
+run_cargo_step() {
+    local output_file="$1"
     shift
-
-    if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
-        log_event "rch_offload" "cargo_step" "$label" "fail" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK"
-        echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
-        exit 3
-    fi
+    run_rch_cargo_logged "${output_file}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
 }
 
 # ── Preflight ──────────────────────────────────────────────────────────────
 log_event "preflight" "startup" "checking_rch" "started"
 
-if ! command -v rch &>/dev/null; then
-    log_event "preflight" "startup" "rch_binary_missing" "fail" "rch_required_missing" "RCH-E001"
-    echo "rch is required; refusing local cargo execution." >&2
+if ! command -v jq >/dev/null 2>&1; then
+    log_event "preflight" "startup" "jq_binary_missing" "fail" "jq_required_missing" "JQ-E001"
+    echo "jq is required for rch metadata artifacts." >&2
     exit 1
 fi
 
-set +e
-run_rch --json workers probe --all >"$RCH_PROBE_LOG" 2>&1
-probe_rc=$?
-set -e
-if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
-    log_event "preflight" "startup" "rch_workers_probe" "fail" "rch_workers_unhealthy" "RCH-E100"
-    echo "rch workers are unavailable; refusing local cargo execution." >&2
-    exit 1
-fi
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
+rch_init "${LOG_DIR}" "${TIMESTAMP}" "1i2ge_6_2"
+ensure_rch_ready
 
-set +e
-run_rch_cargo check --help >"$RCH_SMOKE_LOG" 2>&1
-smoke_rc=$?
-set -e
-check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
-if [[ $smoke_rc -ne 0 ]]; then
-    log_event "preflight" "startup" "cargo_check_help" "fail" "rch_remote_smoke_failed" "RCH-E101"
-    echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
-    exit 1
-fi
-
-CARGO_CMD="run_rch_cargo"
 log_event "preflight" "startup" "cargo_check_help" "pass" "rch_remote_smoke_ok" "none"
 
 cd "$PROJECT_ROOT"
@@ -172,12 +131,10 @@ log_event "harness" "nominal_path" "test_count=$TOTAL" "started"
 # ── Step 1: Compile check ─────────────────────────────────────────────────
 echo "[1/$((TOTAL+2))] Compile check..."
 COMPILE_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_compile.log"
-if $CARGO_CMD check -p frankenterm-core --features subprocess-bridge >"$COMPILE_OUTPUT" 2>&1; then
-    check_rch_fallback_in_logs "mission_events_compile" "$COMPILE_OUTPUT"
+if run_cargo_step "$COMPILE_OUTPUT" check -p frankenterm-core --features subprocess-bridge; then
     log_event "compile" "nominal_path" "cargo_check" "pass"
     echo "  ✓ Compile check passed"
 else
-    check_rch_fallback_in_logs "mission_events_compile" "$COMPILE_OUTPUT"
     log_event "compile" "failure_injection_path" "cargo_check" "fail" "compile_error" "CARGO-E001"
     echo "  ✗ Compile check FAILED"
     echo "Scenario: $SCENARIO_ID"
@@ -189,11 +146,11 @@ fi
 echo "[2/$((TOTAL+2))] Running unit tests..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_test_stdout.log"
 
-if $CARGO_CMD test -p frankenterm-core --features subprocess-bridge mission_events 2>&1 | tee "$TEST_OUTPUT"; then
-    check_rch_fallback_in_logs "mission_events_suite" "$TEST_OUTPUT"
+if run_cargo_step "$TEST_OUTPUT" test -p frankenterm-core --features subprocess-bridge mission_events; then
+    cat "$TEST_OUTPUT"
     log_event "unit_tests" "nominal_path" "mission_events_suite" "pass"
 else
-    check_rch_fallback_in_logs "mission_events_suite" "$TEST_OUTPUT"
+    cat "$TEST_OUTPUT"
     log_event "unit_tests" "failure_injection_path" "mission_events_suite" "partial_fail" "test_failure" "TEST-E001"
 fi
 
