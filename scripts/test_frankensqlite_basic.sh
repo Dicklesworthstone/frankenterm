@@ -1,17 +1,52 @@
 #!/bin/bash
 # E4.F1.T4: FrankenSqlite basic E2E — contract + unit tests
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%d_%H%M%S)-$$}"
 SCRIPT_NAME=$(basename "$0")
 LOG_DIR="test_results"
-LOG_FILE="${LOG_DIR}/${SCRIPT_NAME%.sh}_$(date +%Y%m%d_%H%M%S).log"
-RCH_BIN="${RCH_BIN:-rch}"
-RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-/tmp/ft-frankensqlite-basic-target}"
+LOG_FILE="${LOG_DIR}/${SCRIPT_NAME%.sh}_${RUN_ID}.log"
+DEFAULT_RCH_CARGO_TARGET_DIR="target/rch-frankensqlite-basic-${RUN_ID}"
+REQUESTED_RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_RCH_CARGO_TARGET_DIR" && "$REQUESTED_RCH_CARGO_TARGET_DIR" != /* ]]; then
+    RCH_CARGO_TARGET_DIR="$REQUESTED_RCH_CARGO_TARGET_DIR"
+else
+    RCH_CARGO_TARGET_DIR="$DEFAULT_RCH_CARGO_TARGET_DIR"
+fi
+RCH_READY=0
+RCH_STEP_INDEX=0
 mkdir -p "$LOG_DIR"
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+RCH_SKIP_SMOKE_PREFLIGHT=1
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+ensure_rch_for_cargo_tests() {
+    if [[ "$RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    rch_init "$LOG_DIR" "$RUN_ID" "frankensqlite_basic" "$PROJECT_ROOT"
+    ensure_rch_ready
+    RCH_READY=1
+}
+
 run_rch_cargo() {
-    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
+    ensure_rch_for_cargo_tests
+
+    RCH_STEP_INDEX=$((RCH_STEP_INDEX + 1))
+    local output_file="${LOG_DIR}/${SCRIPT_NAME%.sh}_${RUN_ID}_step${RCH_STEP_INDEX}.rch.log"
+
+    set +e
+    run_rch_cargo_logged "$output_file" env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
+    local rc=$?
+    set -e
+
+    cat "$output_file"
+    return "$rc"
 }
 
 echo "=== [$SCRIPT_NAME] Starting at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
