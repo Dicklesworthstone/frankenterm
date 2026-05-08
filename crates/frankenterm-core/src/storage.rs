@@ -121,6 +121,25 @@ pub fn storage_export_json_parse_drop_count() -> u64 {
     export::storage_export_json_parse_drop_count()
 }
 
+#[cfg(test)]
+fn with_test_storage_backend<F, R>(conn: &mut Connection, f: F) -> Result<R>
+where
+    F: FnOnce(&dyn StorageBackend) -> Result<R>,
+{
+    let placeholder = Connection::open_in_memory().map_err(|err| {
+        StorageError::Database(format!(
+            "failed to create temporary placeholder backend for storage test loan: {err}"
+        ))
+    })?;
+    let original = std::mem::replace(conn, placeholder);
+    let backend = RusqliteBackend::new(original);
+    let result = f(&backend);
+    let restored = backend.into_connection();
+    let placeholder = std::mem::replace(conn, restored);
+    drop(placeholder);
+    result
+}
+
 // [ft-aw52a / ft-dn2tu Phase 6] StorageHandle impl-split scaffolding.
 // Per-feature impl blocks live under `storage/handle/`; the first
 // beachhead covers the event-mute methods. See `storage::handle::mod`
