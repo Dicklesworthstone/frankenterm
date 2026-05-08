@@ -16,15 +16,21 @@ set -euo pipefail
 # - writes summary.json plus render-parity-gpu.json and prints a concise stdout summary
 #
 # Environment:
-#   CARGO_BIN              cargo executable (default: cargo)
 #   GPU_HARNESS_RUN_DIR    run artifact directory override
 #   GPU_HARNESS_CARGO_ARGS extra cargo args before "--" (space-separated)
+#   GPU_HARNESS_RCH_TARGET_DIR repo-relative remote CARGO_TARGET_DIR override
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CARGO_BIN="${CARGO_BIN:-cargo}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+DEFAULT_RCH_TARGET_DIR="target/rch-gpu-harness-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${GPU_HARNESS_RCH_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "$REQUESTED_RCH_TARGET_DIR" && "$REQUESTED_RCH_TARGET_DIR" != /* ]]; then
+  RCH_TARGET_DIR="$REQUESTED_RCH_TARGET_DIR"
+else
+  RCH_TARGET_DIR="$DEFAULT_RCH_TARGET_DIR"
+fi
 RUN_DIR="${GPU_HARNESS_RUN_DIR:-/tmp/gpu-harness-$RUN_ID}"
 LOG_FILE="$RUN_DIR/run.log"
 EVENTS_JSONL="$RUN_DIR/events.jsonl"
@@ -33,6 +39,12 @@ DIFF_DIR="$RUN_DIR/diffs"
 SUMMARY_JSON="$RUN_DIR/summary.json"
 PARITY_REPORT_JSON="$RUN_DIR/render-parity-gpu.json"
 PERF_REPORT="$RUN_DIR/perf-report.json"
+RCH_SKIP_SMOKE_PREFLIGHT="${GPU_HARNESS_RCH_SKIP_SMOKE_PREFLIGHT:-${RCH_SKIP_SMOKE_PREFLIGHT:-1}}"
+RCH_STEP_TIMEOUT_SECS="${GPU_HARNESS_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-1800}}"
+REMOTE_ARTIFACTS_BEGIN="__FT_GPU_HARNESS_ARTIFACTS_BEGIN__"
+REMOTE_ARTIFACTS_END="__FT_GPU_HARNESS_ARTIFACTS_END__"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 declare -a EXTRA_CARGO_ARGS=()
 if [[ -n "${GPU_HARNESS_CARGO_ARGS:-}" ]]; then
@@ -128,6 +140,53 @@ with log_path.open("r", encoding="utf-8", errors="replace") as source, events_pa
             continue
         dest.write(json.dumps(event, separators=(",", ":"), sort_keys=True))
         dest.write("\n")
+PY
+}
+
+extract_remote_artifacts() {
+  python3 - "$LOG_FILE" "$ARTIFACT_DIR" "$PERF_REPORT" "$REMOTE_ARTIFACTS_BEGIN" "$REMOTE_ARTIFACTS_END" <<'PY'
+import base64
+import os
+import sys
+from pathlib import Path
+
+log_path, artifact_dir, perf_report, begin, end = sys.argv[1:]
+artifact_dir = Path(artifact_dir)
+artifact_dir.mkdir(parents=True, exist_ok=True)
+perf_report = Path(perf_report)
+perf_report.parent.mkdir(parents=True, exist_ok=True)
+
+capturing = False
+if not Path(log_path).exists():
+    sys.exit(0)
+
+with Path(log_path).open("r", encoding="utf-8", errors="replace") as source:
+    for raw in source:
+        line = raw.rstrip("\n")
+        if line == begin:
+            capturing = True
+            continue
+        if line == end:
+            capturing = False
+            continue
+        if not capturing:
+            continue
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        kind, name, payload = parts
+        try:
+            data = base64.b64decode(payload.encode("ascii"), validate=True)
+        except Exception:
+            continue
+        if kind == "artifact":
+            target = artifact_dir / os.path.basename(name)
+        elif kind == "perf":
+            target = perf_report
+        else:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
 PY
 }
 
@@ -344,19 +403,77 @@ PY
 mkdir -p "$RUN_DIR" "$ARTIFACT_DIR"
 start_ms="$(now_ms)"
 emit_setup
+rch_init "$RUN_DIR" "$RUN_ID" "gpu_harness" "$PROJECT_ROOT"
+ensure_rch_ready
 
 set +e
-(
-  cd "$PROJECT_ROOT"
-  env GPU_HARNESS_ARTIFACT_DIR="$ARTIFACT_DIR" GPU_HARNESS_PERF_REPORT="$PERF_REPORT" \
-    "$CARGO_BIN" test \
-      -p frankenterm-gui \
-      --features headless-render \
-      --test gpu_regression \
-      "${EXTRA_CARGO_ARGS[@]}" \
-      -- \
-      "${HARNESS_ARGS[@]}"
-) > >(tee "$LOG_FILE" >&2) 2>&1
+# shellcheck disable=SC2016
+run_rch_cargo_logged "$LOG_FILE" \
+  env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+    FT_GPU_HARNESS_ARTIFACTS_BEGIN="$REMOTE_ARTIFACTS_BEGIN" \
+    FT_GPU_HARNESS_ARTIFACTS_END="$REMOTE_ARTIFACTS_END" \
+    bash -lc '
+      set -euo pipefail
+      begin="${FT_GPU_HARNESS_ARTIFACTS_BEGIN:?}"
+      end="${FT_GPU_HARNESS_ARTIFACTS_END:?}"
+      remote_run_dir="${CARGO_TARGET_DIR}/ft-gpu-harness"
+      remote_artifact_dir="${remote_run_dir}/artifacts"
+      remote_perf_report="${remote_run_dir}/perf-report.json"
+      mkdir -p "$remote_artifact_dir"
+
+      extra_args=()
+      while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--" ]]; then
+          shift
+          break
+        fi
+        extra_args+=("$1")
+        shift
+      done
+      harness_args=("$@")
+
+      set +e
+      env GPU_HARNESS_ARTIFACT_DIR="$remote_artifact_dir" GPU_HARNESS_PERF_REPORT="$remote_perf_report" \
+        cargo test \
+          -p frankenterm-gui \
+          --features headless-render \
+          --test gpu_regression \
+          "${extra_args[@]}" \
+          -- \
+          "${harness_args[@]}"
+      rc=$?
+      set -e
+
+      emit_remote_artifact() {
+        local kind="$1"
+        local path="$2"
+        [[ -f "$path" ]] || return 0
+        python3 - "$kind" "$path" <<'"'"'PY'"'"'
+import base64
+import os
+import sys
+
+kind, path = sys.argv[1:]
+with open(path, "rb") as source:
+    payload = base64.b64encode(source.read()).decode("ascii")
+print(f"{kind}\t{os.path.basename(path)}\t{payload}")
+PY
+      }
+
+      printf "%s\n" "$begin"
+      if [[ -d "$remote_artifact_dir" ]]; then
+        while IFS= read -r -d "" artifact; do
+          emit_remote_artifact "artifact" "$artifact"
+        done < <(
+          find "$remote_artifact_dir" -maxdepth 1 -type f \
+            \( -name "*.actual.png" -o -name "*.diff.png" -o -name "*.report.json" \) \
+            -print0
+        )
+      fi
+      emit_remote_artifact "perf" "$remote_perf_report"
+      printf "%s\n" "$end"
+      exit "$rc"
+    ' bash "${EXTRA_CARGO_ARGS[@]}" -- "${HARNESS_ARGS[@]}"
 run_exit_code=$?
 set -e
 
@@ -364,6 +481,7 @@ end_ms="$(now_ms)"
 duration_ms=$((end_ms - start_ms))
 emit_run "$run_exit_code"
 extract_json_lines
+extract_remote_artifacts
 collect_diff_artifacts
 write_summary "$run_exit_code" "$duration_ms"
 emit_summary_json
