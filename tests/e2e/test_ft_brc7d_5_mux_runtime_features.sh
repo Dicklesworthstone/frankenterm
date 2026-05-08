@@ -184,7 +184,6 @@ run_source_scan_expect_no_match() {
 require_cmd jq
 require_cmd rg
 require_cmd rch
-require_cmd cargo
 rch_init "${LOG_DIR}" "${RUN_ID}" "brc7d_5_mux_runtime_features"
 ensure_rch_ready
 

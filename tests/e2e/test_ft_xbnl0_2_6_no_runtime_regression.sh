@@ -139,7 +139,6 @@ cd "${ROOT_DIR}"
 
 require_cmd jq
 require_cmd python3
-require_cmd cargo
 require_cmd bash
 require_cmd rch
 

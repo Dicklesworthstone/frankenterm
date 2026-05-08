@@ -504,7 +504,6 @@ cd "${ROOT_DIR}"
 
 require_cmd jq
 require_cmd rch
-require_cmd cargo
 require_cmd python3
 require_cmd ssh
 

@@ -174,7 +174,6 @@ run_step() {
 
 require_cmd jq
 require_cmd rch
-require_cmd cargo
 probe_rch_workers
 ensure_rch_daemon_running
 
