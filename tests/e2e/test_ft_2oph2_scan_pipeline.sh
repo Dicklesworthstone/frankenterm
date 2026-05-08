@@ -10,17 +10,20 @@ SCENARIO_ID="ft_2oph2_scan_pipeline"
 CORRELATION_ID="ft-2oph2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.stdout.log"
-if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-  TARGET_DIR="${CARGO_TARGET_DIR}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-2oph2-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
 else
-  TARGET_DIR="/tmp/target-rch-ft-2oph2-${RUN_ID}"
+  TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
 fi
 LAST_STEP_LOG=""
 BENCH_ENOSPC=0
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "2oph2_scan_pipeline"
-ensure_rch_ready
+RCH_SKIP_SMOKE_PREFLIGHT=1
 
 emit_log() {
   local component="$1"
@@ -67,32 +70,6 @@ require_cmd() {
   fi
 }
 
-run_step() {
-  local label="$1"
-  shift
-
-  LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    "$@"
-  ) 2>&1 | tee "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
-  local rc=${PIPESTATUS[0]}
-  set -e
-  return "${rc}"
-}
-
-ensure_rch_remote_only() {
-  local decision_path="$1"
-  local input_summary="$2"
-  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${LAST_STEP_LOG}" 2>/dev/null; then
-    emit_log "validation" "${decision_path}" "${input_summary}" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
-    echo "rch fell back to local execution; failing per offload-only policy" >&2
-    exit 3
-  fi
-  emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_remote_offload" "none" "$(basename "${LAST_STEP_LOG}")"
-}
-
 run_rch_expect_success() {
   local label="$1"
   local decision_path="$2"
@@ -100,11 +77,14 @@ run_rch_expect_success() {
   shift 3
 
   emit_log "validation" "${decision_path}" "${input_summary}" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-  if run_step "${label}" run_rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"; then
-    ensure_rch_remote_only "${decision_path}" "${input_summary}"
+  LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
+  if run_rch_cargo_logged "${LAST_STEP_LOG}" env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"; then
+    tee -a "${STDOUT_FILE}" < "${LAST_STEP_LOG}"
+    emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_remote_offload" "none" "$(basename "${LAST_STEP_LOG}")"
     emit_log "validation" "${decision_path}" "${input_summary}" "passed" "command_succeeded" "none" "$(basename "${LAST_STEP_LOG}")"
   else
-    ensure_rch_remote_only "${decision_path}" "${input_summary}"
+    tee -a "${STDOUT_FILE}" < "${LAST_STEP_LOG}"
+    emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_remote_offload" "none" "$(basename "${LAST_STEP_LOG}")"
     emit_log "validation" "${decision_path}" "${input_summary}" "failed" "command_failed" "CARGO-FAIL" "$(basename "${LAST_STEP_LOG}")"
     exit 1
   fi
@@ -122,13 +102,16 @@ run_rch_expect_success_or_enospc_degraded() {
   fi
 
   emit_log "validation" "${decision_path}" "${input_summary}" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-  if run_step "${label}" run_rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"; then
-    ensure_rch_remote_only "${decision_path}" "${input_summary}"
+  LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
+  if run_rch_cargo_logged "${LAST_STEP_LOG}" env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"; then
+    tee -a "${STDOUT_FILE}" < "${LAST_STEP_LOG}"
+    emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_remote_offload" "none" "$(basename "${LAST_STEP_LOG}")"
     emit_log "validation" "${decision_path}" "${input_summary}" "passed" "command_succeeded" "none" "$(basename "${LAST_STEP_LOG}")"
     return 0
   fi
 
-  ensure_rch_remote_only "${decision_path}" "${input_summary}"
+  tee -a "${STDOUT_FILE}" < "${LAST_STEP_LOG}"
+  emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_remote_offload" "none" "$(basename "${LAST_STEP_LOG}")"
   if rg -q "No space left on device" "${LAST_STEP_LOG}"; then
     BENCH_ENOSPC=1
     emit_log "validation" "${decision_path}" "${input_summary}" "degraded" "disk_full_enospc" "ENOSPC" "$(basename "${LAST_STEP_LOG}")"
@@ -139,32 +122,21 @@ run_rch_expect_success_or_enospc_degraded() {
   exit 1
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "missing required command: jq" >&2
+  exit 1
+fi
+
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 : > "${STDOUT_FILE}"
 
-require_cmd jq
 require_cmd rg
 require_cmd rch
 require_cmd cargo
 
-if run_step "rch_check" rch check; then
-  check_log="${LAST_STEP_LOG}"
-  emit_log "preflight" "rch_check" "health_check" "passed" "rch_ready" "none" "$(basename "${check_log}")"
-else
-  emit_log "preflight" "rch_check" "health_check" "degraded" "rch_check_degraded" "RCH-E100" "$(basename "${LAST_STEP_LOG}")"
-fi
-
-if run_step "rch_probe" rch workers probe --all --json; then
-  probe_log="${LAST_STEP_LOG}"
-  healthy_workers="$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${probe_log}" 2>/dev/null || echo 0)"
-  if [[ "${healthy_workers}" -lt 1 ]]; then
-    emit_log "preflight" "rch_probe" "workers_probe" "degraded" "rch_workers_unreachable_probe" "RCH-E101" "$(basename "${probe_log}")"
-  else
-    emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
-  fi
-else
-  emit_log "preflight" "rch_probe" "workers_probe" "degraded" "rch_probe_failed" "RCH-E101" "$(basename "${LAST_STEP_LOG}")"
-fi
+ensure_rch_ready
+emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "$(rch_probe_log_path)")"
+emit_log "preflight" "rch_smoke" "remote_smoke" "skipped" "material_steps_use_shared_guard" "none" "$(basename "$(rch_smoke_log_path)")"
 
 run_rch_expect_success \
   "nominal_batch_chunk_parity" \
