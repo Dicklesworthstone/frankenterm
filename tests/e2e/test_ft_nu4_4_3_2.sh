@@ -10,7 +10,7 @@ SCENARIO_ID="ft_nu4_4_3_2_wa_agent_streaming"
 CORRELATION_ID="ft-nu4.4.3.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}.jsonl"
 SUMMARY_FILE="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_summary.json"
-REMOTE_SCRATCH_BASENAME="target-rch-ft-nu4-4-3-2-${RUN_ID}"
+REMOTE_SCRATCH_BASENAME="rch-e2e-ft-nu4-4-3-2-${RUN_ID}"
 # Keep cargo artifacts on the worker's synced workspace volume, but use an
 # existing absolute temp root so test processes do not reinterpret TMPDIR
 # relative to their own package directory and so we do not need a separate

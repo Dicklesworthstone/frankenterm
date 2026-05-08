@@ -19,8 +19,9 @@ CORRELATION_ID="ft-e34d9.10.5.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary_${RUN_ID}.json"
 RCH_REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-/var/tmp}"
-RCH_TARGET_DIR="${RCH_REMOTE_TMPDIR}/rch-target-ft-e34d9-10-5-2-mux-migration-${RUN_ID}"
+RCH_TARGET_DIR="${RCH_REMOTE_TMPDIR}/rch-e2e-ft-e34d9-10-5-2-mux-migration-${RUN_ID}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "ft_e34d9_10_5_2_mux_migration_completion" "${ROOT_DIR}"
 

@@ -12,17 +12,19 @@ CORRELATION_ID="ft-e34d9.10.5.3-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary_${RUN_ID}.json"
 RCH_REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-/var/tmp}"
-RCH_TARGET_DIR="${RCH_REMOTE_TMPDIR}/rch-target-ft-e34d9-10-5-3-ssh-transport-${RUN_ID}"
+RCH_TARGET_DIR="${RCH_REMOTE_TMPDIR}/rch-e2e-ft-e34d9-10-5-3-ssh-transport-${RUN_ID}"
 # The shared cargo-check smoke preflight currently hits a known post-success
 # artifact retrieval stall in this checkout. We still fail closed via worker
 # probe + the actual rch-backed SSH phases below.
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "${SCENARIO_ID}" "${ROOT_DIR}"
 # In this checkout, rch commonly logs "Dependency planner fail-open" while still
 # executing the command remotely with primary-root-only sync. Treat genuine
 # local fallback as off-policy, but allow this repo-specific remote-sync warning.
+# shellcheck disable=SC2034
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 
 PASS_COUNT=0
