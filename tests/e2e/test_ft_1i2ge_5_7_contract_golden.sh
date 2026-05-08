@@ -22,11 +22,7 @@ else
   CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
 fi
 export CARGO_TARGET_DIR
-
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_7_contract_golden"
-ensure_rch_ready
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 emit_log() {
   local outcome="$1"
@@ -74,99 +70,32 @@ count_matches() {
   printf '%s\n' "${count}"
 }
 
-emit_log "started" "script_init" "none" "none" \
-  "$(basename "${LOG_FILE}")" \
-  "mission contract golden e2e started"
+run_cargo_step() {
+  local output_file="$1"
+  shift
+  run_rch_cargo_logged "${output_file}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
+}
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required for structured logging" >&2
   exit 1
 fi
 
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="${LOG_DIR}/ft_1i2ge_5_7_${RUN_ID}.probe.log"
-RCH_SMOKE_LOG="${LOG_DIR}/ft_1i2ge_5_7_${RUN_ID}.smoke.log"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_7_contract_golden"
+ensure_rch_ready
 
-run_rch() {
-  TMPDIR=/tmp rch "$@"
-}
-
-run_rch_cargo() {
-  run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
-}
-
-probe_has_reachable_workers() {
-  grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
-}
-
-check_rch_fallback_in_logs() {
-  local decision_path="$1"
-  local artifact_path="$2"
-  local input_summary="$3"
-  if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$artifact_path" 2>/dev/null; then
-    emit_log "failed" "${decision_path}" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" \
-      "$(basename "${artifact_path}")" "${input_summary}"
-    echo "rch fell back to local execution during ${decision_path}; refusing offload policy violation." >&2
-    exit 3
-  fi
-}
-
-run_rch_cargo_logged() {
-  local decision_path="$1"
-  local artifact_path="$2"
-  shift 2
-
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    run_rch_cargo "$@"
-  ) 2>&1 | tee "${artifact_path}"
-  local rc=${PIPESTATUS[0]}
-  set -e
-  check_rch_fallback_in_logs "${decision_path}" "${artifact_path}" "rch cargo ${*}"
-  return "${rc}"
-}
-
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log "failed" "execution_preflight" "rch_required_missing" "RCH-E001" \
-    "$(basename "${LOG_FILE}")" "rch is required for cargo execution in this scenario"
-  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
-  exit 1
-fi
-
-set +e
-run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
-probe_rc=$?
-set -e
-if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
-  emit_log "failed" "execution_preflight" "rch_workers_unhealthy" "RCH-E100" \
-    "$(basename "${RCH_PROBE_LOG}")" "rch workers are unavailable; refusing local cargo execution"
-  echo "rch workers are unavailable; refusing local cargo execution." >&2
-  exit 1
-fi
-emit_log "running" "execution_preflight" "rch_workers_healthy" "none" \
-  "$(basename "${RCH_PROBE_LOG}")" "rch workers probe reported reachable capacity"
-
-set +e
-run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1
-smoke_rc=$?
-set -e
-check_rch_fallback_in_logs "execution_preflight" "${RCH_SMOKE_LOG}" "rch remote smoke check (cargo check --help)"
-if [[ ${smoke_rc} -ne 0 ]]; then
-  emit_log "failed" "execution_preflight" "rch_remote_smoke_failed" "RCH-E101" \
-    "$(basename "${RCH_SMOKE_LOG}")" "rch remote smoke failed; refusing local fallback"
-  echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
-  exit 1
-fi
-emit_log "running" "execution_preflight" "rch_remote_smoke_passed" "none" \
-  "$(basename "${RCH_SMOKE_LOG}")" "verified remote rch exec path before running cargo checks"
+emit_log "started" "script_init" "none" "none" \
+  "$(basename "${LOG_FILE}")" \
+  "mission contract golden e2e started"
 
 # ── Test 1: Compile check ──────────────────────────────────────────
 emit_log "running" "compile_check" "cargo_check" "none" \
   "none" "cargo check contract golden tests"
 
 compile_log="${LOG_DIR}/ft_1i2ge_5_7_${RUN_ID}.compile.log"
-if run_rch_cargo_logged "compile_check" "${compile_log}" \
+if run_cargo_step "${compile_log}" \
   check -p frankenterm-core --features subprocess-bridge --test mission_contract_golden; then
   compile_rc=0
 else
@@ -187,7 +116,7 @@ emit_log "running" "golden_tests" "cargo_test" "none" \
   "none" "run mission contract golden tests"
 
 tests_log="${LOG_DIR}/ft_1i2ge_5_7_${RUN_ID}.tests.log"
-if run_rch_cargo_logged "golden_tests" "${tests_log}" \
+if run_cargo_step "${tests_log}" \
   test -p frankenterm-core --features subprocess-bridge --test mission_contract_golden; then
   test_rc=0
 else
@@ -218,7 +147,7 @@ emit_log "running" "clippy_check" "cargo_clippy" "none" \
   "none" "verify zero clippy warnings in contract golden tests"
 
 clippy_log="${LOG_DIR}/ft_1i2ge_5_7_${RUN_ID}.clippy.log"
-if run_rch_cargo_logged "clippy_check" "${clippy_log}" \
+if run_cargo_step "${clippy_log}" \
   clippy -p frankenterm-core --features subprocess-bridge --test mission_contract_golden; then
   clippy_rc=0
 else
@@ -277,7 +206,7 @@ emit_log "running" "determinism" "repeat_run" "none" \
   "none" "verify contract test results are deterministic"
 
 tests_repeat_log="${LOG_DIR}/ft_1i2ge_5_7_${RUN_ID}.tests_repeat.log"
-if run_rch_cargo_logged "determinism" "${tests_repeat_log}" \
+if run_cargo_step "${tests_repeat_log}" \
   test -p frankenterm-core --features subprocess-bridge --test mission_contract_golden; then
   repeat_rc=0
 else
