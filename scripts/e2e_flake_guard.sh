@@ -18,7 +18,7 @@
 #   ./e2e_flake_guard.sh --verbose            # Show per-test details
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - rch for remote Cargo test execution
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -28,6 +28,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -53,6 +55,15 @@ TESTS_SKIPPED=0
 # Configuration
 VERBOSE=false
 ITERATIONS=5
+E2E_RCH_RUN_ID="${E2E_RCH_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
+DEFAULT_E2E_RCH_TARGET_DIR="target/rch-e2e-flake-guard-${E2E_RCH_RUN_ID}"
+REQUESTED_E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_E2E_RCH_TARGET_DIR" && "$REQUESTED_E2E_RCH_TARGET_DIR" != /* ]]; then
+    E2E_RCH_TARGET_DIR="$REQUESTED_E2E_RCH_TARGET_DIR"
+else
+    E2E_RCH_TARGET_DIR="$DEFAULT_E2E_RCH_TARGET_DIR"
+fi
+E2E_RCH_READY=0
 
 # ==============================================================================
 # Argument parsing
@@ -65,6 +76,16 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --iterations|-n)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for $1" >&2
+                echo "Usage: $0 [--verbose] [--iterations N]" >&2
+                exit 3
+            fi
+            if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Invalid iteration count: $2" >&2
+                echo "Iterations must be a positive integer." >&2
+                exit 3
+            fi
             ITERATIONS="$2"
             shift 2
             ;;
@@ -114,17 +135,32 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
-        exit 5
-    fi
-    log_pass "cargo available"
-
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
         exit 5
     fi
     log_pass "jq available"
+
+    if ! command -v rch &>/dev/null; then
+        echo -e "${RED}ERROR:${NC} rch not found; refusing local Cargo execution." >&2
+        exit 5
+    fi
+    log_pass "rch available"
+
+    ensure_rch_for_flake_guard
+    log_pass "rch remote Cargo guard ready"
+}
+
+ensure_rch_for_flake_guard() {
+    if [[ "$E2E_RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-${E2E_RCH_RUN_ID}}"
+    mkdir -p "$rch_log_dir"
+    rch_init "$rch_log_dir" "$E2E_RCH_RUN_ID" "flake_guard" "$PROJECT_ROOT"
+    ensure_rch_ready
+    E2E_RCH_READY=1
 }
 
 # ==============================================================================
@@ -146,13 +182,19 @@ run_repeated_suite() {
     local i
     for ((i = 1; i <= iters; i++)); do
         local iter_output exit_code start_time end_time duration_s
-        iter_output=$(mktemp)
+        iter_output="${E2E_RUN_DIR}/${suite_name}_iter${i}.rch.log"
         start_time=$(date +%s)
         exit_code=0
 
-        timeout 120 cargo test -p frankenterm-core "$filter" \
-            --no-fail-fast -- --nocapture \
-            >"$iter_output" 2>&1 || exit_code=$?
+        set +e
+        (
+            run_rch_cargo_logged_with_timeout 120 "$iter_output" \
+                env CARGO_TARGET_DIR="${E2E_RCH_TARGET_DIR}" \
+                cargo test -p frankenterm-core "$filter" \
+                --no-fail-fast -- --nocapture
+        )
+        exit_code=$?
+        set -e
 
         end_time=$(date +%s)
         duration_s=$((end_time - start_time))
@@ -162,12 +204,14 @@ run_repeated_suite() {
 
         if [[ $exit_code -ne 0 ]]; then
             ((ITER_FAILURES++)) || true
-            e2e_add_file "${suite_name}_iter${i}_FAIL.log" "$(cat "$iter_output")"
+            if [[ -f "$iter_output" ]]; then
+                e2e_add_file "${suite_name}_iter${i}_FAIL.log" "$(cat "$iter_output")"
+            else
+                e2e_add_file "${suite_name}_iter${i}_FAIL.log" "missing rch output log: $iter_output"
+            fi
         fi
 
         log_info "  Iteration $i/$iters: ${duration_s}s (exit=$exit_code)"
-
-        rm -f "$iter_output"
     done
 }
 
@@ -360,9 +404,8 @@ main() {
     echo -e "${BLUE}Iterations: ${ITERATIONS}${NC}"
     echo -e "${BLUE}================================================${NC}"
 
-    check_prerequisites
-
     e2e_init_artifacts "flake-guard" >/dev/null
+    check_prerequisites
 
     local overall_exit=0
 
