@@ -133,6 +133,19 @@ if [[ "$(jq -r '.is_heavy' <<<"${wrapped_rch}")" != "true" || "$(jq -r '.used_rc
   exit 1
 fi
 
+timeout_wrapped_rch="$("${VALIDATOR}" --classify "run_rch_cargo_logged_with_timeout 120 target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace")"
+if [[ "$(jq -r '.is_heavy' <<<"${timeout_wrapped_rch}")" != "true" || "$(jq -r '.used_rch' <<<"${timeout_wrapped_rch}")" != "true" || "$(jq -r '.policy_violation' <<<"${timeout_wrapped_rch}")" != "false" ]]; then
+  emit_log \
+    "failed" \
+    "unit_classifier" \
+    "command_classification" \
+    "classifier_mismatch" \
+    "unexpected_classifier_result" \
+    "$(basename "${VALIDATOR}")" \
+    "run_rch_cargo_logged_with_timeout should be heavy, rch-backed, and policy-compliant"
+  exit 1
+fi
+
 light_cmd="$("${VALIDATOR}" --classify "cargo fmt --check")"
 if [[ "$(jq -r '.is_heavy' <<<"${light_cmd}")" != "false" ]]; then
   emit_log \

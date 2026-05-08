@@ -217,6 +217,16 @@ run_self_test() {
     return 1
   }
 
+  out="$(classify_command_json "run_rch_cargo_logged_with_timeout 120 target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace")"
+  [[ "$(jq -r '.used_rch' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: shared timeout rch cargo wrapper should count as rch usage" >&2
+    return 1
+  }
+  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
+    echo "self-test failed: shared timeout rch cargo wrapper should not be violation" >&2
+    return 1
+  }
+
   out="$(classify_command_json "cargo fmt --check")"
   [[ "$(jq -r '.is_heavy' <<<"${out}")" == "false" ]] || {
     echo "self-test failed: cargo fmt --check should be light" >&2
