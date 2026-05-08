@@ -10775,7 +10775,15 @@ EOF
     local test_started
     test_started=$(date +%s)
     local rch_run_id="${RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
-    local rch_target_dir="${FT_E2E_DISTRIBUTED_RCH_TARGET_DIR:-/tmp/ft-e2e-distributed-streaming-${rch_run_id}}"
+    local default_rch_target_dir="target/rch-e2e-distributed-streaming-${rch_run_id}"
+    local requested_rch_target_dir="${FT_E2E_DISTRIBUTED_RCH_TARGET_DIR:-}"
+    local rch_target_dir
+    if [[ -n "$requested_rch_target_dir" && "$requested_rch_target_dir" != /* ]]; then
+        rch_target_dir="$requested_rch_target_dir"
+    else
+        rch_target_dir="$default_rch_target_dir"
+    fi
+    mkdir -p "$rch_target_dir"
     local cargo_status=0
     rch_init "$scenario_dir" "$rch_run_id" "distributed_streaming" "$PROJECT_ROOT"
     ensure_rch_ready
