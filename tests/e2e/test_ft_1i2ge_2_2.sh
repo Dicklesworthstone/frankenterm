@@ -10,9 +10,10 @@ SCENARIO_ID="ft_1i2ge_2_2_capability_availability_model"
 CORRELATION_ID="ft-1i2ge.2.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_2_2_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_2_2_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_2_2_${RUN_ID}.probe.log"
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_2_2"
 ensure_rch_ready
 
@@ -64,35 +65,21 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log "failed" "preflight_rch" "rch_missing" "rch_not_found" "$(basename "${LOG_FILE}")" "rch required"
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -eq 0 ]] && grep -q "✓" "${PROBE_FILE}"; then
-  emit_log "running" "execution_preflight" "rch_workers_healthy" "none" "$(basename "${PROBE_FILE}")" "running through healthy rch workers"
-else
-  emit_log "running" "execution_preflight" "rch_workers_unavailable_fail_open" "none" "$(basename "${PROBE_FILE}")" "running through rch fail-open path"
-fi
-
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_assignment_suitability_ -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_assignment_suitability_property_ -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-2-2"
+TEST_FILTERS=(
+  "mission_assignment_suitability_"
+  "mission_assignment_suitability_property_"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_2_2_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture)
   decision_path="assignment_suitability_surface"
   reason_code="none"
-  if [[ "${test_cmd}" == *"property_"* ]]; then
+  if [[ "${test_filter}" == *"property_"* ]]; then
     decision_path="assignment_exclusion_property_path"
     reason_code="property_invariant_validation"
   fi
@@ -103,15 +90,13 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-2-2 ${test_cmd}"
+    "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-2-2 ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -120,8 +105,8 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
-    exit ${status}
+      "exit=${status}; command=${test_cmd[*]}"
+    exit "${status}"
   fi
 done
 
