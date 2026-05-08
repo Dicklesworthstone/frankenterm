@@ -20,6 +20,7 @@ set -euo pipefail
 # Source E2E artifacts library
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
@@ -99,6 +100,7 @@ run_wa_timeout() {
 
     # Strip ANSI codes and extract JSON object
     local stripped
+    # shellcheck disable=SC2001
     stripped=$(echo "$raw_output" | sed 's/\x1b\[[0-9;]*m//g')
 
     # Extract JSON from first { to last }
