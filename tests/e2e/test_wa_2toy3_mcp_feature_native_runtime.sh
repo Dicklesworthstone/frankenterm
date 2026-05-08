@@ -16,7 +16,7 @@ STRUCTURED_LOG="${ARTIFACT_DIR}/structured.log"
 STDOUT_FILE="${ARTIFACT_DIR}/stdout.txt"
 STDERR_FILE="${ARTIFACT_DIR}/stderr.txt"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
-REMOTE_TARGET_DIR="/tmp/ft-cod2-target"
+REMOTE_TARGET_DIR="target/rch-e2e-${BEAD_ID}-${SCENARIO_ID}-${RUN_ID}"
 
 exec > >(tee -a "${STDOUT_FILE}")
 exec 2> >(tee -a "${STDERR_FILE}" >&2)
@@ -60,7 +60,7 @@ emit_log() {
     --arg step "${step}" \
     --arg status "${status}" \
     --arg correlation_id "${CORRELATION_ID}" \
-    --arg backend "rch-fork-bypass" \
+    --arg backend "rch-shared-guard" \
     --arg platform "$(uname -srm)" \
     --arg artifact_dir "${ARTIFACT_DIR}" \
     --arg redaction "none" \
@@ -117,39 +117,17 @@ run_checked() {
   return 1
 }
 
-run_fork_bypass_rch_step() {
+run_shared_rch_step() {
   local step="$1"
   local log_file="$2"
   shift 2
   local start_ns end_ns duration_ms rc
   start_ns="$(date +%s%N)"
-  record_command "python3 <fork-bypass> $*"
+  record_command "run_rch_cargo_logged $*"
   set +e
-  python3 - "${ROOT_DIR}" "${log_file}" "$@" <<'PY'
-import os
-import subprocess
-import sys
-
-root_dir = sys.argv[1]
-log_file = sys.argv[2]
-cmd = sys.argv[3:]
-
-with open(log_file, "w", encoding="utf-8") as fh:
-    proc = subprocess.run(
-        cmd,
-        cwd=root_dir,
-        env=os.environ.copy(),
-        stdout=fh,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-sys.exit(proc.returncode)
-PY
+  run_rch_cargo_logged "${log_file}" "$@"
   rc=$?
   set -e
-  check_rch_fallback "${log_file}"
-  rch_write_meta_json "${log_file}" "${rc}"
   end_ns="$(date +%s%N)"
   duration_ms="$(((end_ns - start_ns) / 1000000))"
   if [[ ${rc} -eq 0 ]]; then
@@ -163,7 +141,6 @@ PY
 echo "=== ${BEAD_ID} MCP feature native runtime ==="
 write_env
 command -v jq >/dev/null 2>&1
-command -v python3 >/dev/null 2>&1
 command -v rch >/dev/null 2>&1
 record_command "ensure_rch_ready (RCH_SKIP_SMOKE_PREFLIGHT=${RCH_SKIP_SMOKE_PREFLIGHT})"
 ensure_rch_ready
@@ -188,22 +165,22 @@ run_checked \
   "
 
 MCP_CHECK_LOG="${ARTIFACT_DIR}/frankenterm_core_mcp_check.log"
-run_fork_bypass_rch_step \
+run_shared_rch_step \
   "frankenterm_core_mcp_check" \
   "${MCP_CHECK_LOG}" \
-  rch exec -- env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo check -p frankenterm-core --features mcp
+  env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo check -p frankenterm-core --features mcp
 
 FEATURE_MATRIX_LOG="${ARTIFACT_DIR}/frankenterm_core_feature_matrix_check.log"
-run_fork_bypass_rch_step \
+run_shared_rch_step \
   "frankenterm_core_feature_matrix_check" \
   "${FEATURE_MATRIX_LOG}" \
-  rch exec -- env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo check -p frankenterm-core --features mcp,web,distributed,browser
+  env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo check -p frankenterm-core --features mcp,web,distributed,browser
 
 MCP_TEST_LOG="${ARTIFACT_DIR}/frankenterm_core_mcp_test.log"
-run_fork_bypass_rch_step \
+run_shared_rch_step \
   "frankenterm_core_mcp_test" \
   "${MCP_TEST_LOG}" \
-  rch exec -- env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo test -p frankenterm-core record_mcp_audit_sync_bootstraps_native_runtime_for_mcp_feature --features mcp -- --nocapture
+  env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo test -p frankenterm-core record_mcp_audit_sync_bootstraps_native_runtime_for_mcp_feature --features mcp -- --nocapture
 
 jq -cn \
   --arg bead_id "${BEAD_ID}" \
