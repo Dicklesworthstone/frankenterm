@@ -82,24 +82,9 @@ run_rch_cargo_logged "${build_log}" \
   env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo \
   build --package frankenterm
 
-# Find the ft binary
-FT_BIN=""
-for candidate in \
-    "${ROOT_DIR}/${CARGO_TARGET_DIR}/debug/ft" \
-    "${ROOT_DIR}/${CARGO_TARGET_DIR}/release/ft" \
-    "${ROOT_DIR}/target/debug/ft" \
-    "${ROOT_DIR}/target/release/ft" \
-    "/tmp/ft-pinkforge-target16/debug/ft" \
-    "/tmp/ft-pinkforge-target16/release/ft" \
-    "${ROOT_DIR}/target/debug/frankenterm" \
-    "${ROOT_DIR}/target/release/frankenterm"; do
-  if [[ -x "${candidate}" ]]; then
-    FT_BIN="${candidate}"
-    break
-  fi
-done
-
-if [[ -z "${FT_BIN}" ]]; then
+# Find the ft binary produced by the explicit RCH build target.
+FT_BIN="${ROOT_DIR}/${CARGO_TARGET_DIR}/debug/ft"
+if [[ ! -x "${FT_BIN}" ]]; then
   emit_log "failed" "preflight_binary" "ft_binary_not_found" "built_binary_missing" \
     "rch build succeeded but ft binary was not found in CARGO_TARGET_DIR"
   echo "FAIL: ft binary not found after rch build. Expected ${ROOT_DIR}/${CARGO_TARGET_DIR}/debug/ft" >&2
