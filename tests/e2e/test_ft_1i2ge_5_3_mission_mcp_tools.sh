@@ -132,36 +132,61 @@ cat >"${LOCAL_MISSION_PATH}" <<'JSON'
 }
 JSON
 
+extract_marked_stdout() {
+  local combined_file="$1"
+  local stdout_file="$2"
+
+  awk '
+    $0 == "__FT_STDOUT_BEGIN__" { capture = 1; found = 1; next }
+    $0 == "__FT_STDOUT_END__" { capture = 0; done = 1; exit }
+    capture && $0 !~ /^__FT_STDERR__/ && $0 !~ /^\[RCH\]/ { print }
+    END { if (!found || !done) exit 1 }
+  ' "${combined_file}" >"${stdout_file}"
+}
+
+extract_prefixed_stderr() {
+  local combined_file="$1"
+  local stderr_file="$2"
+
+  sed -n 's/^__FT_STDERR__//p' "${combined_file}" >"${stderr_file}"
+}
+
 run_mission_json() {
   local label="$1"
   shift
   local stdout_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}.stdout.json"
   local stderr_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}.stderr.log"
+  local combined_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}.rch.log"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    run_rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" \
-      cargo run -q -p frankenterm --bin ft -- \
-      --workspace "${WORKSPACE_REL_DIR}" \
-      mission \
-      -f json \
-      "$@"
-  ) >"${stdout_file}" 2>"${stderr_file}"
+  # shellcheck disable=SC2016
+  run_rch_cargo_logged "${combined_file}" \
+    env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    bash -lc '
+      printf "%s\n" "__FT_STDOUT_BEGIN__"
+      cargo run -q -p frankenterm --bin ft -- "$@" 2> >(sed "s/^/__FT_STDERR__/" >&2)
+      rc=$?
+      printf "%s\n" "__FT_STDOUT_END__"
+      exit "${rc}"
+    ' bash \
+    --workspace "${WORKSPACE_REL_DIR}" \
+    mission \
+    -f json \
+    "$@"
   local rc=$?
   set -e
 
   LAST_STDOUT_FILE="${stdout_file}"
   LAST_STDERR_FILE="${stderr_file}"
 
-  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${stdout_file}" "${stderr_file}" 2>/dev/null; then
-    emit_log "failed" "rch_offload_policy" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" \
-      "$(basename "${stderr_file}")" "rch emitted local fallback marker for ${label}; refusing local execution"
-    echo "RCH local fallback detected for ${label}; refusing local execution" >&2
-    echo "Stdout: ${stdout_file}" >&2
-    echo "Stderr: ${stderr_file}" >&2
+  if ! extract_marked_stdout "${combined_file}" "${stdout_file}"; then
+    emit_log "failed" "rch_output_capture" "stdout_marker_missing" "RCH-OUTPUT-MARKER" \
+      "$(basename "${combined_file}")" "could not extract mission JSON stdout for ${label}"
+    echo "Could not extract mission JSON stdout for ${label}" >&2
+    echo "Combined output: ${combined_file}" >&2
     exit 3
   fi
+  extract_prefixed_stderr "${combined_file}" "${stderr_file}"
 
   return "${rc}"
 }
