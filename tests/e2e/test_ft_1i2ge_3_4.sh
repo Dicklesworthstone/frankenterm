@@ -10,10 +10,11 @@ SCENARIO_ID="ft_1i2ge_3_4_adaptive_replanning"
 CORRELATION_ID="ft-1i2ge.3.4-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_3_4_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_3_4_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_3_4_${RUN_ID}.probe.log"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_3_4"
 ensure_rch_ready
 
@@ -65,71 +66,35 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission adaptive replanning trigger/backoff contract checks"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required_missing" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for cargo execution in this scenario"
-  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_workers_unhealthy" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "rch workers probe failed; refusing local fallback"
-  echo "rch workers are unavailable; refusing local cargo execution." >&2
-  exit 1
-fi
-
-cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-3-4"
-emit_log \
-  "running" \
-  "execution_preflight" \
-  "rch_workers_healthy" \
-  "none" \
-  "$(basename "${PROBE_FILE}")" \
-  "offloading tests through rch workers"
-
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_adaptive_replan_schedules_retry_pending_from_failed_state -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_adaptive_replan_backoff_blocks_tight_loop -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_adaptive_replan_deduplicates_correlation_ids -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_adaptive_replan_is_deterministic_under_bursty_streams -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_adaptive_replan_rate_limited_trigger_rejects_mismatched_reason_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_validate_rejects_replan_state_count_without_timestamp -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-3-4"
+TEST_FILTERS=(
+  "mission_adaptive_replan_schedules_retry_pending_from_failed_state"
+  "mission_adaptive_replan_backoff_blocks_tight_loop"
+  "mission_adaptive_replan_deduplicates_correlation_ids"
+  "mission_adaptive_replan_is_deterministic_under_bursty_streams"
+  "mission_adaptive_replan_rate_limited_trigger_rejects_mismatched_reason_code"
+  "mission_validate_rejects_replan_state_count_without_timestamp"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_3_4_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture)
   decision_path="adaptive_replan_policy_path"
   reason_code="adaptive_replan_contract_validation"
 
-  if [[ "${test_cmd}" == *"backoff_blocks_tight_loop"* ]]; then
+  if [[ "${test_filter}" == *"backoff_blocks_tight_loop"* ]]; then
     decision_path="backoff_guard_path"
     reason_code="replan_backoff_guard"
-  elif [[ "${test_cmd}" == *"deduplicates_correlation_ids"* ]]; then
+  elif [[ "${test_filter}" == *"deduplicates_correlation_ids"* ]]; then
     decision_path="dedupe_guard_path"
     reason_code="replan_dedupe_guard"
-  elif [[ "${test_cmd}" == *"deterministic_under_bursty_streams"* ]]; then
+  elif [[ "${test_filter}" == *"deterministic_under_bursty_streams"* ]]; then
     decision_path="burst_stability_path"
     reason_code="replan_burst_determinism"
-  elif [[ "${test_cmd}" == *"rejects_mismatched_reason_code"* ]] || [[ "${test_cmd}" == *"rejects_replan_state_count_without_timestamp"* ]]; then
+  elif [[ "${test_filter}" == *"rejects_mismatched_reason_code"* ]] || [[ "${test_filter}" == *"rejects_replan_state_count_without_timestamp"* ]]; then
     decision_path="failure_injection_path"
     reason_code="replan_validation_guards"
   fi
@@ -140,15 +105,13 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: ${cmd_prefix} ${test_cmd}"
+    "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${cmd_prefix} ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -157,7 +120,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
+      "exit=${status}; command=${test_cmd[*]}"
     exit "${status}"
   fi
 done
