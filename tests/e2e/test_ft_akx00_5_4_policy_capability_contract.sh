@@ -156,7 +156,7 @@ if run_checked \
 fi
 
 TEST_LOG="${ARTIFACT_DIR}/unknown_alt_screen_tests.log"
-record_command "rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib unknown_alt_screen -- --nocapture"
+record_command "run_rch_cargo_logged env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib unknown_alt_screen -- --nocapture"
 start_ns="$(date +%s%N)"
 if run_rch_cargo_logged \
     "${TEST_LOG}" \
