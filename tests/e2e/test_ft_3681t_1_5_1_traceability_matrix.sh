@@ -192,7 +192,7 @@ fi
 echo ""
 echo "--- Scenario 2: Rust validation tests ---"
 
-echo "  Running: rch exec -- env CARGO_TARGET_DIR=${TARGET_DIR} CARGO_BUILD_JOBS=${BUILD_JOBS} cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture"
+echo "  Running via shared rch guard: env CARGO_TARGET_DIR=${TARGET_DIR} CARGO_BUILD_JOBS=${BUILD_JOBS} cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture"
 if run_rch_step \
   "rust_tests" \
   env CARGO_TARGET_DIR="${TARGET_DIR}" CARGO_BUILD_JOBS="${BUILD_JOBS}" \
@@ -221,7 +221,7 @@ else
   jq '(.entries[0].status = "gap") | (.entries[0].gap_severity = "high") | (.entries[0].mapped_bead_ids = [])' \
     "${MATRIX_FILE}" > "${BAD_MATRIX_FILE}"
 
-  echo "  Running failure-injection command (expected failure): rch exec -- env FT_TRACEABILITY_MATRIX_PATH=${BAD_MATRIX_FILE} CARGO_TARGET_DIR=${TARGET_DIR} CARGO_BUILD_JOBS=${BUILD_JOBS} cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features traceability_matrix_schema_is_valid -- --exact --nocapture"
+  echo "  Running failure-injection command via shared rch guard (expected failure): env FT_TRACEABILITY_MATRIX_PATH=${BAD_MATRIX_FILE} CARGO_TARGET_DIR=${TARGET_DIR} CARGO_BUILD_JOBS=${BUILD_JOBS} cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features traceability_matrix_schema_is_valid -- --exact --nocapture"
   if run_rch_step \
     "failure_injection" \
     env FT_TRACEABILITY_MATRIX_PATH="${BAD_MATRIX_FILE}" CARGO_TARGET_DIR="${TARGET_DIR}" CARGO_BUILD_JOBS="${BUILD_JOBS}" \
