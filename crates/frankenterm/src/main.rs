@@ -5803,6 +5803,104 @@ fn proof_doctor_active_beads_from_json(raw: &str) -> Vec<ProofDoctorBeadRef> {
         .collect()
 }
 
+fn proof_doctor_cargo_package_filters(command: &[String]) -> Vec<String> {
+    let mut packages = Vec::new();
+    let mut tokens = command.iter();
+
+    while let Some(token) = tokens.next() {
+        let package = if token == "-p" || token == "--package" {
+            tokens.next().map(String::as_str)
+        } else {
+            token
+                .strip_prefix("--package=")
+                .or_else(|| token.strip_prefix("-p").filter(|value| !value.is_empty()))
+        };
+
+        if let Some(package) = package {
+            let package = package.split('@').next().unwrap_or(package).trim();
+            if !package.is_empty() && !packages.iter().any(|known| known == package) {
+                packages.push(package.to_string());
+            }
+        }
+    }
+
+    packages
+}
+
+fn proof_doctor_manifest_package_name(manifest_path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(manifest_path).ok()?;
+    let document = raw.parse::<toml::Value>().ok()?;
+    document
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn proof_doctor_workspace_members_from_manifest(manifest_path: &Path) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(manifest_path).ok()?;
+    let document = match raw.parse::<toml::Value>() {
+        Ok(document) => document,
+        Err(_) => return None,
+    };
+    let members = document
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)?
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect();
+    Some(members)
+}
+
+fn proof_doctor_workspace_root_and_members(
+    workspace_root: &Path,
+) -> Option<(PathBuf, Vec<String>)> {
+    let absolute_root = if workspace_root.is_absolute() {
+        workspace_root.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(workspace_root)
+    };
+    let start = absolute_root.canonicalize().unwrap_or(absolute_root);
+
+    for candidate in start.ancestors() {
+        let manifest_path = candidate.join("Cargo.toml");
+        let Some(members) = proof_doctor_workspace_members_from_manifest(&manifest_path) else {
+            continue;
+        };
+        return Some((candidate.to_path_buf(), members));
+    }
+
+    None
+}
+
+fn proof_doctor_package_path_prefixes(workspace_root: &Path, command: &[String]) -> Vec<String> {
+    let package_filters = proof_doctor_cargo_package_filters(command);
+    if package_filters.is_empty() {
+        return Vec::new();
+    }
+
+    let Some((resolved_workspace_root, members)) =
+        proof_doctor_workspace_root_and_members(workspace_root)
+    else {
+        return Vec::new();
+    };
+    let mut prefixes = Vec::new();
+    for member in members {
+        let manifest_path = resolved_workspace_root.join(&member).join("Cargo.toml");
+        let Some(package_name) = proof_doctor_manifest_package_name(&manifest_path) else {
+            continue;
+        };
+        if package_filters.iter().any(|filter| filter == &package_name)
+            && !prefixes.iter().any(|known| known == &member)
+        {
+            prefixes.push(member);
+        }
+    }
+    prefixes
+}
+
 fn proof_doctor_binary_name(token: &str) -> &str {
     Path::new(token)
         .file_name()
@@ -5850,6 +5948,7 @@ fn build_proof_doctor_payload(
     let intended_target_dir = target_dir
         .map(ToOwned::to_owned)
         .or_else(|| extract_proof_doctor_target_dir(command));
+    let proof_path_prefixes = proof_doctor_package_path_prefixes(workspace_root, command);
 
     let evidence = ProofDoctorEvidence {
         local_cargo_detected: proof_doctor_is_local_cargo_command(command),
@@ -5871,7 +5970,7 @@ fn build_proof_doctor_payload(
         intended_scope: proof_doctor_scope(scope),
         required_backend: proof_doctor_backend(required_backend),
         phase: ProofDoctorPhase::Preflight,
-        proof_path_prefixes: Vec::new(),
+        proof_path_prefixes,
         evidence,
     };
     let verdict = classify_proof_doctor(&input);
@@ -62868,7 +62967,7 @@ log_level = "debug"
             "cargo".to_string(),
             "test".to_string(),
             "-p".to_string(),
-            "frankenterm".to_string(),
+            "frankenterm-core-audit-types".to_string(),
         ];
 
         let payload = build_proof_doctor_payload(
@@ -62944,6 +63043,56 @@ log_level = "debug"
         assert_eq!(beads[0].title, "Active slice");
         assert_eq!(beads[0].assignee.as_deref(), Some("SandyFalcon"));
         assert_eq!(beads[0].status, "in_progress");
+    }
+
+    #[test]
+    fn proof_doctor_extracts_cargo_package_filters() {
+        let command = vec![
+            "rch".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "env".to_string(),
+            "CARGO_TARGET_DIR=/tmp/ft-target".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+            "-p".to_string(),
+            "frankenterm-core-audit-types".to_string(),
+            "--package=mux@0.1.0".to_string(),
+            "-ptermwiz".to_string(),
+            "-p".to_string(),
+            "mux".to_string(),
+        ];
+
+        let packages = proof_doctor_cargo_package_filters(&command);
+
+        assert_eq!(
+            packages,
+            vec!["frankenterm-core-audit-types", "mux", "termwiz"]
+        );
+    }
+
+    #[test]
+    fn proof_doctor_maps_cargo_packages_to_workspace_prefixes() {
+        let command = vec![
+            "rch".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "env".to_string(),
+            "CARGO_TARGET_DIR=/tmp/ft-target".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+            "-p".to_string(),
+            "frankenterm-core-audit-types".to_string(),
+            "--package".to_string(),
+            "mux".to_string(),
+        ];
+
+        let prefixes = proof_doctor_package_path_prefixes(Path::new("."), &command);
+
+        assert_eq!(
+            prefixes,
+            vec!["crates/frankenterm-core-audit-types", "frankenterm/mux"]
+        );
     }
 
     #[test]
