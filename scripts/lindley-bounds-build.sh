@@ -36,6 +36,19 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NO_WRITE=0
 STAGE_TELEMETRY_JSON=""
 EMPIRICAL_P99_MS=""
+RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
+ARTIFACT_DIR="${FT_LINDLEY_BOUNDS_ARTIFACT_DIR:-target/lindley-bounds-build}"
+DEFAULT_RCH_TARGET_DIR="target/rch-lindley-bounds-build-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${FT_LINDLEY_BOUNDS_RCH_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "$REQUESTED_RCH_TARGET_DIR" && "$REQUESTED_RCH_TARGET_DIR" != /* ]]; then
+  RCH_TARGET_DIR="$REQUESTED_RCH_TARGET_DIR"
+else
+  RCH_TARGET_DIR="$DEFAULT_RCH_TARGET_DIR"
+fi
+RCH_SKIP_SMOKE_PREFLIGHT="${FT_LINDLEY_BOUNDS_RCH_SKIP_SMOKE_PREFLIGHT:-${RCH_SKIP_SMOKE_PREFLIGHT:-1}}"
+RCH_STEP_TIMEOUT_SECS="${FT_LINDLEY_BOUNDS_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-1800}}"
+RCH_JSON_BEGIN_MARKER="__FT_LINDLEY_BOUNDS_JSON_BEGIN__"
+RCH_JSON_END_MARKER="__FT_LINDLEY_BOUNDS_JSON_END__"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,6 +72,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$REPO_ROOT"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$REPO_ROOT/tests/e2e/lib_rch_guards.sh"
+mkdir -p "$ARTIFACT_DIR"
 
 if [[ -n "$STAGE_TELEMETRY_JSON" ]]; then
   [[ -r "$STAGE_TELEMETRY_JSON" ]] || {
@@ -73,35 +89,82 @@ if [[ -n "$EMPIRICAL_P99_MS" ]]; then
   export FT_LINDLEY_EMPIRICAL_P99_MS="$EMPIRICAL_P99_MS"
 fi
 
-# Build + run the example. Output goes to a temp file so the tolerance
-# check on the example's exit code can fail without leaving a
-# partially-written attestation file on disk.
-tmp_out="$(mktemp)"
-trap 'rm -f "$tmp_out"' EXIT
+extract_rch_json() {
+  local input_log="$1"
+  local out_json="$2"
 
-if ! cargo run --release --example lindley_bounds_build \
-      -p frankenterm-core --no-default-features --quiet \
-      > "$tmp_out"; then
-  ec=$?
-  if [[ $ec -eq 1 ]]; then
+  awk -v begin="$RCH_JSON_BEGIN_MARKER" -v end="$RCH_JSON_END_MARKER" '
+    $0 == begin { capturing = 1; next }
+    $0 == end { found_end = 1; exit }
+    capturing { print }
+    END { if (!found_end) exit 1 }
+  ' "$input_log" >"$out_json"
+}
+
+rch_log="$ARTIFACT_DIR/lindley_bounds_${RUN_ID}.rch.log"
+artifact_json="$ARTIFACT_DIR/lindley-bounds.json"
+
+rch_init "$ARTIFACT_DIR" "$RUN_ID" "lindley_bounds_build" "$REPO_ROOT"
+ensure_rch_ready
+
+set +e
+# shellcheck disable=SC2016
+run_rch_cargo_logged "$rch_log" \
+  env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+    FT_LINDLEY_STAGE_TELEMETRY_JSON="${FT_LINDLEY_STAGE_TELEMETRY_JSON:-}" \
+    FT_LINDLEY_EMPIRICAL_P99_MS="${FT_LINDLEY_EMPIRICAL_P99_MS:-}" \
+    FT_LINDLEY_BOUNDS_JSON_BEGIN="$RCH_JSON_BEGIN_MARKER" \
+    FT_LINDLEY_BOUNDS_JSON_END="$RCH_JSON_END_MARKER" \
+    bash -lc '
+      set -euo pipefail
+      json_begin="${FT_LINDLEY_BOUNDS_JSON_BEGIN:?}"
+      json_end="${FT_LINDLEY_BOUNDS_JSON_END:?}"
+      remote_artifact_dir="${CARGO_TARGET_DIR}/ft-lindley-bounds-build"
+      mkdir -p "$remote_artifact_dir"
+      remote_json="${remote_artifact_dir}/lindley-bounds.json"
+      set +e
+      cargo run --release --example lindley_bounds_build \
+        -p frankenterm-core --no-default-features --quiet \
+        >"$remote_json"
+      rc=$?
+      set -e
+      printf "%s\n" "$json_begin"
+      if [[ -f "$remote_json" ]]; then
+        cat "$remote_json"
+      fi
+      printf "\n%s\n" "$json_end"
+      exit "$rc"
+    '
+ec=$?
+set -e
+
+extract_status=0
+extract_rch_json "$rch_log" "$artifact_json" || extract_status=$?
+
+if [[ $ec -ne 0 ]]; then
+  if [[ $ec -eq 1 && $extract_status -eq 0 ]]; then
     # Tolerance check failed — print the artifact to stderr for
     # diagnostic visibility and propagate the example's exit code.
-    cat "$tmp_out" >&2
+    cat "$artifact_json" >&2
     exit 1
   fi
   echo "lindley-bounds-build: example invocation failed (exit $ec)" >&2
   exit 2
 fi
 
+if [[ $extract_status -ne 0 ]]; then
+  echo "lindley-bounds-build: failed to extract JSON artifact from $rch_log" >&2
+  exit 2
+fi
+
 if [[ $NO_WRITE -eq 1 ]]; then
-  cat "$tmp_out"
+  cat "$artifact_json"
   exit 0
 fi
 
 out="docs/attestations/perf/lindley-bounds.json"
 mkdir -p "$(dirname "$out")"
-mv "$tmp_out" "$out"
-trap - EXIT
+cp "$artifact_json" "$out"
 
 echo "lindley-bounds-build: wrote $out" >&2
 echo "$out"
