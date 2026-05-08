@@ -10,14 +10,14 @@ use super::*;
 use rusqlite::Connection;
 
 fn record_audit_action_for_conn(conn: &mut Connection, action: &AuditActionRecord) -> Result<i64> {
-    with_writer_backend(conn, |backend| record_audit_action_backend(backend, action))
+    with_test_storage_backend(conn, |backend| record_audit_action_backend(backend, action))
 }
 
 fn upsert_fts_pane_progress_for_conn(
     conn: &mut Connection,
     progress: &FtsPaneProgress,
 ) -> Result<()> {
-    with_writer_backend(conn, |backend| {
+    with_test_storage_backend(conn, |backend| {
         upsert_fts_pane_progress_backend(backend, progress)
     })
 }
@@ -26,7 +26,7 @@ fn get_fts_pane_progress_for_conn(
     conn: &mut Connection,
     pane_id: u64,
 ) -> Result<Option<FtsPaneProgress>> {
-    with_writer_backend(conn, |backend| {
+    with_test_storage_backend(conn, |backend| {
         get_fts_pane_progress_backend(backend, pane_id)
     })
 }
@@ -36,7 +36,7 @@ fn sync_fts_for_pane_for_conn(
     pane_id: u64,
     config: &FtsSyncConfig,
 ) -> Result<(u64, u64)> {
-    with_writer_backend(conn, |backend| {
+    with_test_storage_backend(conn, |backend| {
         sync_fts_for_pane_backend(backend, pane_id, config)
     })
 }
@@ -1704,7 +1704,7 @@ fn action_history_includes_undo_metadata() {
         undone_at: None,
         undone_by: None,
     };
-    with_writer_backend(&mut conn, |backend| {
+    with_test_storage_backend(&mut conn, |backend| {
         upsert_action_undo_backend(backend, &undo)
     })
     .unwrap();
@@ -1847,7 +1847,7 @@ fn action_history_filters_undoable() {
     )
     .unwrap();
 
-    with_writer_backend(&mut conn, |backend| {
+    with_test_storage_backend(&mut conn, |backend| {
         upsert_action_undo_backend(
             backend,
             &ActionUndoRecord {
@@ -1862,7 +1862,7 @@ fn action_history_filters_undoable() {
         )
     })
     .unwrap();
-    with_writer_backend(&mut conn, |backend| {
+    with_test_storage_backend(&mut conn, |backend| {
         upsert_action_undo_backend(
             backend,
             &ActionUndoRecord {
@@ -1998,7 +1998,7 @@ fn action_undo_redaction_applied() {
     };
     let redactor = Redactor::new();
     undo.redact_fields(&redactor);
-    with_writer_backend(&mut conn, |backend| {
+    with_test_storage_backend(&mut conn, |backend| {
         upsert_action_undo_backend(backend, &undo)
     })
     .unwrap();
@@ -2627,12 +2627,12 @@ fn saved_search_roundtrip() {
         SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
         None,
     );
-    with_writer_backend(&mut conn, |backend| {
+    with_test_storage_backend(&mut conn, |backend| {
         insert_saved_search_backend(backend, &record)
     })
     .unwrap();
 
-    let fetched = with_writer_backend(&mut conn, |backend| {
+    let fetched = with_test_storage_backend(&mut conn, |backend| {
         query_saved_search_by_name_backend(backend, "errors")
     })
     .unwrap()
@@ -2643,11 +2643,11 @@ fn saved_search_roundtrip() {
     assert_eq!(fetched.limit, 25);
     assert_eq!(fetched.since_mode, SAVED_SEARCH_SINCE_MODE_LAST_RUN);
 
-    with_writer_backend(&mut conn, |backend| {
+    with_test_storage_backend(&mut conn, |backend| {
         update_saved_search_schedule_backend(backend, &fetched.id, true, Some(60_000))
     })
     .unwrap();
-    let scheduled = with_writer_backend(&mut conn, |backend| {
+    let scheduled = with_test_storage_backend(&mut conn, |backend| {
         query_saved_search_by_name_backend(backend, "errors")
     })
     .unwrap()
@@ -2663,22 +2663,22 @@ fn saved_search_roundtrip() {
         SAVED_SEARCH_SINCE_MODE_FIXED.to_string(),
         Some(1_700_000_000_000),
     );
-    with_writer_backend(&mut conn, |backend| {
+    with_test_storage_backend(&mut conn, |backend| {
         insert_saved_search_backend(backend, &record2)
     })
     .unwrap();
 
-    let list = with_writer_backend(&mut conn, list_saved_searches_backend).unwrap();
+    let list = with_test_storage_backend(&mut conn, list_saved_searches_backend).unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].name, "alpha");
     assert_eq!(list[1].name, "errors");
 
     let run_ts = now_ms();
-    with_writer_backend(&mut conn, |backend| {
+    with_test_storage_backend(&mut conn, |backend| {
         update_saved_search_run_backend(backend, &fetched.id, run_ts, Some(3), None)
     })
     .unwrap();
-    let updated = with_writer_backend(&mut conn, |backend| {
+    let updated = with_test_storage_backend(&mut conn, |backend| {
         query_saved_search_by_name_backend(backend, "errors")
     })
     .unwrap()
@@ -2687,12 +2687,12 @@ fn saved_search_roundtrip() {
     assert_eq!(updated.last_result_count, Some(3));
     assert!(updated.last_error.is_none());
 
-    let deleted = with_writer_backend(&mut conn, |backend| {
+    let deleted = with_test_storage_backend(&mut conn, |backend| {
         delete_saved_search_backend(backend, "errors")
     })
     .unwrap();
     assert_eq!(deleted, 1);
-    let missing = with_writer_backend(&mut conn, |backend| {
+    let missing = with_test_storage_backend(&mut conn, |backend| {
         query_saved_search_by_name_backend(backend, "errors")
     })
     .unwrap();
@@ -2730,7 +2730,7 @@ fn saved_search_query_rejects_negative_pane_id() {
     )
     .unwrap();
 
-    let err = with_writer_backend(&mut conn, |backend| {
+    let err = with_test_storage_backend(&mut conn, |backend| {
         query_saved_search_by_name_backend(backend, "bad-pane")
     })
     .expect_err("negative pane id");
@@ -2770,7 +2770,7 @@ fn saved_search_query_rejects_invalid_enabled_flag() {
     )
     .unwrap();
 
-    let err = with_writer_backend(&mut conn, |backend| {
+    let err = with_test_storage_backend(&mut conn, |backend| {
         query_saved_search_by_name_backend(backend, "bad-enabled")
     })
     .expect_err("invalid enabled");
@@ -2806,12 +2806,12 @@ fn can_insert_and_consume_approval_token() {
         risk_summary: None,
     };
 
-    let _token_id = with_writer_backend(&mut conn, |backend| {
+    let _token_id = with_test_storage_backend(&mut conn, |backend| {
         insert_approval_token_backend(backend, &token)
     })
     .unwrap();
 
-    let consumed = with_writer_backend(&mut conn, |backend| {
+    let consumed = with_test_storage_backend(&mut conn, |backend| {
         consume_approval_token_backend(
             backend,
             "sha256:tokenhash",
@@ -2825,7 +2825,7 @@ fn can_insert_and_consume_approval_token() {
     assert!(consumed.is_some());
     assert!(consumed.unwrap().used_at.is_some());
 
-    let second = with_writer_backend(&mut conn, |backend| {
+    let second = with_test_storage_backend(&mut conn, |backend| {
         consume_approval_token_backend(
             backend,
             "sha256:tokenhash",

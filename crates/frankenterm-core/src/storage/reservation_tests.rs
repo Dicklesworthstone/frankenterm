@@ -40,13 +40,13 @@ fn create_reservation_sync(
     reason: Option<&str>,
     ttl_ms: i64,
 ) -> Result<PaneReservation> {
-    with_writer_backend(conn, |backend| {
+    with_test_storage_backend(conn, |backend| {
         create_reservation_backend(backend, pane_id, owner_kind, owner_id, reason, ttl_ms)
     })
 }
 
 fn release_reservation_sync(conn: &mut Connection, reservation_id: i64) -> Result<bool> {
-    with_writer_backend(conn, |backend| {
+    with_test_storage_backend(conn, |backend| {
         release_reservation_backend(backend, reservation_id)
     })
 }
@@ -55,17 +55,17 @@ fn get_active_reservation_sync(
     conn: &mut Connection,
     pane_id: u64,
 ) -> Result<Option<PaneReservation>> {
-    with_writer_backend(conn, |backend| {
+    with_test_storage_backend(conn, |backend| {
         get_active_reservation_backend(backend, pane_id)
     })
 }
 
 fn list_active_reservations_sync(conn: &mut Connection) -> Result<Vec<PaneReservation>> {
-    with_writer_backend(conn, list_active_reservations_backend)
+    with_test_storage_backend(conn, list_active_reservations_backend)
 }
 
 fn expire_stale_reservations_sync(conn: &mut Connection) -> Result<usize> {
-    with_writer_backend(conn, expire_stale_reservations_backend)
+    with_test_storage_backend(conn, expire_stale_reservations_backend)
 }
 
 // =========================================================================

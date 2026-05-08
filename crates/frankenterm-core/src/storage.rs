@@ -1480,9 +1480,9 @@ impl StorageHandle {
         let writer_handle = thread::Builder::new()
             .name("ft-storage-writer".to_string())
             .spawn(move || {
-                let mut conn = init_result;
+                let backend = RusqliteBackend::new(init_result);
                 let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
-                writer_loop(&mut conn, &mut write_rx, &mut mmap_mirror);
+                writer_loop(&backend, &mut write_rx, &mut mmap_mirror);
             })
             .map_err(|e| {
                 StorageError::Database(format!("Failed to spawn storage writer thread: {e}"))
@@ -7309,7 +7309,7 @@ impl StorageIoWriterGate {
 }
 
 fn dispatch_write_command_batch(
-    conn: &mut Connection,
+    backend: &dyn StorageBackend,
     batch: VecDeque<WriteCommand>,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
@@ -7353,7 +7353,7 @@ fn dispatch_write_command_batch(
         }
 
         flush_storage_io_pending_commands(
-            conn,
+            backend,
             &mut pending_io,
             should_break,
             mmap_mirror,
@@ -7361,12 +7361,12 @@ fn dispatch_write_command_batch(
             io_gate,
         );
         if !*should_break {
-            dispatch_write_command_raw(conn, cmd, should_break, mmap_mirror, segment_redactors);
+            dispatch_write_command_raw(backend, cmd, should_break, mmap_mirror, segment_redactors);
         }
     }
 
     flush_storage_io_pending_commands(
-        conn,
+        backend,
         &mut pending_io,
         should_break,
         mmap_mirror,
@@ -7376,7 +7376,7 @@ fn dispatch_write_command_batch(
 }
 
 fn flush_storage_io_pending_commands(
-    conn: &mut Connection,
+    backend: &dyn StorageBackend,
     pending_io: &mut HashMap<u64, WriteCommand>,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
@@ -7412,7 +7412,7 @@ fn flush_storage_io_pending_commands(
             queued_for_ms = dispatched.queued_for_ms,
             "storage IO scheduler dispatching writer command"
         );
-        dispatch_write_command_raw(conn, cmd, should_break, mmap_mirror, segment_redactors);
+        dispatch_write_command_raw(backend, cmd, should_break, mmap_mirror, segment_redactors);
     }
 }
 
@@ -7583,7 +7583,7 @@ fn storage_io_fts_rebuild_bytes(config: &FtsSyncConfig) -> u64 {
 /// storage IO scheduler; non-routed commands act as barriers and every routed
 /// command is executed before its caller receives `Ok`.
 fn writer_loop(
-    conn: &mut Connection,
+    backend: &dyn StorageBackend,
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
 ) {
@@ -7620,7 +7620,7 @@ fn writer_loop(
                 }
 
                 dispatch_write_command_batch(
-                    conn,
+                    backend,
                     batch,
                     &mut should_break,
                     mmap_mirror,
@@ -7645,227 +7645,23 @@ fn writer_loop(
     flush_segment_redactors(&mut segment_redactors);
 }
 
-thread_local! {
-    /// Writer-thread placeholder cache for [`with_writer_backend`].
-    ///
-    /// `RusqliteBackend::new` consumes the connection, so the bridge has
-    /// to swap the live `Connection` out of `&mut Connection` against
-    /// some other `Connection` for the duration of the wrap. Allocating
-    /// a fresh in-memory placeholder on every call burned ~200 µs per
-    /// WriteCommand. This thread-local caches that allocation so the
-    /// bridge pays the cost ONCE per writer thread
-    /// (or per test thread), not once per command.
-    ///
-    /// `RefCell` (not `Cell`) so the Drop guard inside
-    /// [`with_writer_backend`] can hand the placeholder back through
-    /// a borrow without moving it — `Cell::set` on a `Connection`
-    /// would force a clone we don't have.
-    static WRITER_PLACEHOLDER_POOL: std::cell::RefCell<Option<Connection>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// br-ft-l1jgo writer-thread bridge: temporarily wrap the
-/// writer thread's owned `Connection` into a `RusqliteBackend`
-/// for the duration of `f`, then put the `Connection` back so
-/// the writer thread keeps running with the same wrapped state.
-///
-/// Mirrors `PooledReadConn::with_borrowed_backend` at line ~8957
-/// (read-side bridge for ft-3twzm), but for the writer thread:
-/// the writer holds `&mut Connection` (not `Option<Connection>`),
-/// so the bridge swaps a placeholder `Connection` into that slot
-/// for the duration of the wrap. `RusqliteBackend::new` consumes
-/// the connection it wraps, so a placeholder is the only way to
-/// keep the `&mut Connection` slot non-empty without rewriting
-/// the whole writer-thread API.
-///
-/// **Panic safety.** The original placeholder bridge had a
-/// silent-corruption hazard: if `f` panicked, the live
-/// `Connection` was already inside `RusqliteBackend` and the
-/// `*conn = backend.into_connection()` line was never reached.
-/// Today the writer thread propagates the panic and dies cleanly,
-/// but anyone wrapping `dispatch_write_command` in
-/// `panic::catch_unwind` would have left `*conn` pointing at the
-/// in-memory placeholder — every subsequent WriteCommand would
-/// silently target a fresh empty in-memory DB. Replaced with a
-/// Drop-guarded restore so the live `Connection` is always put
-/// back, panic or not. `RusqliteBackend::into_connection`
-/// recovers from a poisoned mutex (a rusqlite-internal panic
-/// during a held lock), so the Drop path itself can't double-
-/// panic and abort the process.
-///
-/// **Cost.** The in-memory placeholder is constructed at most once
-/// per writer thread via [`WRITER_PLACEHOLDER_POOL`] (vs every
-/// WriteCommand previously). The thread-local placeholder is recycled
-/// across all calls on the same thread.
-///
-/// **Re-entrancy.** Not part of the contract. The writer dispatch
-/// path never recurses, and the closure receives only
-/// `&dyn StorageBackend`, not the borrowed `&mut Connection`.
-/// Nested bridge calls would at best disturb the thread-local
-/// placeholder cache, so keep this as a single-level writer
-/// bridge.
-///
-/// Used by per-WriteCommand dispatch handlers that have been
-/// migrated to call a `_backend` helper instead of a `_sync`
-/// helper.
-fn new_writer_placeholder_connection() -> Connection {
+#[cfg(test)]
+fn with_test_storage_backend<F, R>(conn: &mut Connection, f: F) -> R
+where
+    F: FnOnce(&dyn StorageBackend) -> R,
+{
     let config = crate::storage_backend_trait::OpenConfig {
         wal_mode: false,
         ..crate::storage_backend_trait::OpenConfig::default()
     };
-    RusqliteBackend::open(":memory:", &config)
-        .expect("temp placeholder backend for writer-thread backend wrap")
-        .into_connection()
-}
-
-fn with_writer_backend<F, R>(conn: &mut Connection, f: F) -> R
-where
-    F: FnOnce(&dyn StorageBackend) -> R,
-{
-    let placeholder = WRITER_PLACEHOLDER_POOL
-        .with(|cell| cell.borrow_mut().take())
-        .unwrap_or_else(new_writer_placeholder_connection);
+    let placeholder = RusqliteBackend::open(":memory:", &config)
+        .expect("temporary placeholder backend for storage test loan")
+        .into_connection();
     let owned = std::mem::replace(conn, placeholder);
-
-    // Drop guard restores the live Connection from the wrapped
-    // backend even if `f` panics, and parks the placeholder back
-    // in the thread-local pool for the next call.
-    struct WriterBridgeRestore<'a> {
-        conn: &'a mut Connection,
-        backend: Option<RusqliteBackend>,
-    }
-    impl Drop for WriterBridgeRestore<'_> {
-        fn drop(&mut self) {
-            if let Some(backend) = self.backend.take() {
-                // `into_connection` is poison-tolerant (see
-                // RusqliteBackend impl), so this branch can't
-                // double-panic during unwinding.
-                let placeholder = std::mem::replace(self.conn, backend.into_connection());
-                WRITER_PLACEHOLDER_POOL.with(|cell| {
-                    *cell.borrow_mut() = Some(placeholder);
-                });
-            }
-        }
-    }
-
-    let restore = WriterBridgeRestore {
-        conn,
-        backend: Some(RusqliteBackend::new(owned)),
-    };
-    // `restore.backend` is `Some` from construction until the
-    // Drop impl `take()`s it, so the `expect` here is provably
-    // total. The borrow scoped to `restore` ends at the last use
-    // of `backend_ref`, before `drop(restore)` consumes it.
-    let backend_ref: &RusqliteBackend = restore
-        .backend
-        .as_ref()
-        .expect("writer bridge backend is Some until restore Drop");
-    let result = f(backend_ref);
-    drop(restore);
+    let backend = RusqliteBackend::new(owned);
+    let result = f(&backend);
+    *conn = backend.into_connection();
     result
-}
-
-#[cfg(test)]
-mod writer_bridge_tests {
-    use super::{Connection, RusqliteBackend, WRITER_PLACEHOLDER_POOL, with_writer_backend};
-    use crate::storage_backend_helpers::{execute_typed, table_exists};
-    use crate::storage_backend_trait::OpenConfig;
-
-    fn new_writer_bridge_conn() -> Connection {
-        let config = OpenConfig {
-            wal_mode: false,
-            ..OpenConfig::default()
-        };
-        RusqliteBackend::open(":memory:", &config)
-            .expect("open writer bridge test connection")
-            .into_connection()
-    }
-
-    fn create_writer_bridge_panic_pin(conn: Connection) -> Connection {
-        let backend = RusqliteBackend::new(conn);
-        execute_typed(
-            &backend,
-            "CREATE TABLE writer_bridge_panic_pin (k INTEGER)",
-            &[],
-        )
-        .unwrap();
-        backend.into_connection()
-    }
-
-    fn assert_writer_bridge_panic_pin_exists(conn: Connection) {
-        let backend = RusqliteBackend::new(conn);
-        let exists = table_exists(&backend, "writer_bridge_panic_pin").unwrap();
-        assert!(exists, "post-panic conn must still see the live schema");
-    }
-
-    /// Pinned: the live `Connection` is restored even when `f` panics.
-    /// Pre-fix the `mem::replace(conn, placeholder)` had already
-    /// happened by the time the closure unwound, so a hypothetical
-    /// catch_unwind around `dispatch_write_command` would have left
-    /// every subsequent WriteCommand pointing at the in-memory
-    /// placeholder.
-    #[test]
-    fn with_writer_backend_restores_conn_on_panic() {
-        let mut conn = create_writer_bridge_panic_pin(new_writer_bridge_conn());
-        // Identity probe: the post-panic conn must accept queries
-        // against the table we just created. The placeholder would
-        // not have it.
-        let probe = std::panic::AssertUnwindSafe(|| {
-            with_writer_backend(&mut conn, |_backend| {
-                std::panic::resume_unwind(Box::new("simulate dispatch_write_command panic"));
-            });
-        });
-        let unwound = std::panic::catch_unwind(probe);
-        assert!(unwound.is_err(), "the panic must propagate");
-
-        // The schema we created MUST still be reachable through `conn`.
-        // If the bridge had left `conn` pointing at the in-memory
-        // placeholder, this query would fail with "no such table".
-        assert_writer_bridge_panic_pin_exists(conn);
-    }
-
-    /// Pinned: the placeholder is recycled across calls (once-per-thread
-    /// allocation). Pre-fix every WriteCommand re-allocated the
-    /// in-memory placeholder.
-    #[test]
-    fn with_writer_backend_recycles_thread_local_placeholder() {
-        // Drain any leftover placeholder from previous tests on this
-        // thread so we measure a clean slate.
-        WRITER_PLACEHOLDER_POOL.with(|cell| {
-            cell.borrow_mut().take();
-        });
-
-        let mut conn = new_writer_bridge_conn();
-
-        // Cold call: bridge allocates a placeholder, runs closure,
-        // parks placeholder in thread-local on Drop.
-        with_writer_backend(&mut conn, |_| ());
-        let parked_after_cold = WRITER_PLACEHOLDER_POOL.with(|cell| cell.borrow().is_some());
-        assert!(
-            parked_after_cold,
-            "placeholder must be parked back in the thread-local pool after the cold call"
-        );
-
-        // Warm call: bridge reuses the parked placeholder. We can't
-        // observe the absence of allocation directly, but we can
-        // observe that the parked placeholder was taken (during the
-        // call) and re-parked (after Drop).
-        with_writer_backend(&mut conn, |_| {
-            // Inside the closure the placeholder is currently swapped
-            // into the live-conn slot, so the thread-local pool
-            // should be empty.
-            let parked_during_call = WRITER_PLACEHOLDER_POOL.with(|cell| cell.borrow().is_some());
-            assert!(
-                !parked_during_call,
-                "placeholder must be in-flight (not in thread-local) for the duration of f"
-            );
-        });
-        let parked_after_warm = WRITER_PLACEHOLDER_POOL.with(|cell| cell.borrow().is_some());
-        assert!(
-            parked_after_warm,
-            "placeholder must be parked back after the warm call too"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -8189,7 +7985,7 @@ fn respond_oneshot_best_effort<T>(tx: oneshot::Sender<T>, value: T) {
 /// `let _ = respond.send(...)` pattern is no longer present in
 /// the dispatch arms.
 fn dispatch_write_command_raw(
-    conn: &mut Connection,
+    backend: &dyn StorageBackend,
     cmd: WriteCommand,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
@@ -8203,7 +7999,7 @@ fn dispatch_write_command_raw(
             respond,
         } => {
             let mut moved_retained_tail = false;
-            let result = with_writer_backend(conn, |backend| {
+            let result = (|| {
                 let (redacted_content, moved_tail) =
                     redact_segment_for_persistence(backend, pane_id, &content, segment_redactors)?;
                 moved_retained_tail = moved_tail;
@@ -8213,7 +8009,7 @@ fn dispatch_write_command_raw(
                     None
                 };
                 append_segment_backend(backend, pane_id, &redacted_content, persisted_hash)
-            });
+            })();
             if moved_retained_tail {
                 disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pane_id);
             }
@@ -8227,16 +8023,12 @@ fn dispatch_write_command_raw(
             reason,
             respond,
         } => {
-            let result =
-                flush_segment_redactor_for_pane(segment_redactors, pane_id).and_then(|()| {
-                    with_writer_backend(conn, |backend| {
-                        record_gap_backend(backend, pane_id, &reason)
-                    })
-                });
+            let result = flush_segment_redactor_for_pane(segment_redactors, pane_id)
+                .and_then(|()| record_gap_backend(backend, pane_id, &reason));
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordEvent { event, respond } => {
-            let result = with_writer_backend(conn, |backend| record_event_backend(backend, &event));
+            let result = record_event_backend(backend, &event);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::MarkEventHandled {
@@ -8245,9 +8037,8 @@ fn dispatch_write_command_raw(
             status,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                mark_event_handled_backend(backend, event_id, workflow_id.as_deref(), &status)
-            });
+            let result =
+                mark_event_handled_backend(backend, event_id, workflow_id.as_deref(), &status);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::SetEventTriageState {
@@ -8256,14 +8047,12 @@ fn dispatch_write_command_raw(
             updated_by,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                set_event_triage_state_backend(
-                    backend,
-                    event_id,
-                    triage_state.as_deref(),
-                    updated_by.as_deref(),
-                )
-            });
+            let result = set_event_triage_state_backend(
+                backend,
+                event_id,
+                triage_state.as_deref(),
+                updated_by.as_deref(),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::SetEventNote {
@@ -8272,9 +8061,8 @@ fn dispatch_write_command_raw(
             updated_by,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                set_event_note_backend(backend, event_id, note.as_deref(), updated_by.as_deref())
-            });
+            let result =
+                set_event_note_backend(backend, event_id, note.as_deref(), updated_by.as_deref());
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::AddEventLabel {
@@ -8283,9 +8071,7 @@ fn dispatch_write_command_raw(
             created_by,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                add_event_label_backend(backend, event_id, &label, created_by.as_deref())
-            });
+            let result = add_event_label_backend(backend, event_id, &label, created_by.as_deref());
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RemoveEventLabel {
@@ -8293,51 +8079,40 @@ fn dispatch_write_command_raw(
             label,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                remove_event_label_backend(backend, event_id, &label)
-            });
+            let result = remove_event_label_backend(backend, event_id, &label);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertEventMute { record, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| upsert_event_mute_backend(backend, &record));
+            let result = upsert_event_mute_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteEventMute {
             identity_key,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                delete_event_mute_backend(backend, &identity_key)
-            });
+            let result = delete_event_mute_backend(backend, &identity_key);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertPane { pane, respond } => {
-            let result = with_writer_backend(conn, |backend| upsert_pane_backend(backend, &pane));
+            let result = upsert_pane_backend(backend, &pane);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertWorkflow { workflow, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| upsert_workflow_backend(backend, &workflow));
+            let result = upsert_workflow_backend(backend, &workflow);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertActionPlan { record, respond } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `upsert_action_plan_sync(&Connection, &WorkflowActionPlanRecord)`
-            // direct-rusqlite path.
-            let result =
-                with_writer_backend(conn, |backend| upsert_action_plan_backend(backend, &record));
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // upsert_action_plan direct-rusqlite path.
+            let result = upsert_action_plan_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertPreparedPlan { record, respond } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `insert_prepared_plan_sync(&Connection, &PreparedPlanRecord)`
-            // direct-rusqlite path.
-            let result = with_writer_backend(conn, |backend| {
-                insert_prepared_plan_backend(backend, &record)
-            });
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // insert_prepared_plan direct-rusqlite path.
+            let result = insert_prepared_plan_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ConsumePreparedPlan {
@@ -8345,9 +8120,7 @@ fn dispatch_write_command_raw(
             now_ms,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                consume_prepared_plan_backend(backend, &plan_id, now_ms)
-            });
+            let result = consume_prepared_plan_backend(backend, &plan_id, now_ms);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertStepLog {
@@ -8366,51 +8139,41 @@ fn dispatch_write_command_raw(
             completed_at,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                insert_step_log_backend(
-                    backend,
-                    &workflow_id,
-                    audit_action_id,
-                    step_index,
-                    &step_name,
-                    step_id.as_deref(),
-                    step_kind.as_deref(),
-                    &result_type,
-                    result_data.as_deref(),
-                    policy_summary.as_deref(),
-                    verification_refs.as_deref(),
-                    error_code.as_deref(),
-                    started_at,
-                    completed_at,
-                )
-            });
+            let result = insert_step_log_backend(
+                backend,
+                &workflow_id,
+                audit_action_id,
+                step_index,
+                &step_name,
+                step_id.as_deref(),
+                step_kind.as_deref(),
+                &result_type,
+                result_data.as_deref(),
+                policy_summary.as_deref(),
+                verification_refs.as_deref(),
+                error_code.as_deref(),
+                started_at,
+                completed_at,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertSession { session, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                upsert_agent_session_backend(backend, &session)
-            });
+            let result = upsert_agent_session_backend(backend, &session);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordAuditAction { action, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                record_audit_action_backend(backend, &action)
-            });
+            let result = record_audit_action_backend(backend, &action);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordPolicyDenialAudit { record, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                record_policy_denial_audit_backend(backend, &record)
-            });
+            let result = record_policy_denial_audit_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertActionUndo { record, respond } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `upsert_action_undo_sync(&Connection, &ActionUndoRecord)`
-            // direct-rusqlite path.
-            let result =
-                with_writer_backend(conn, |backend| upsert_action_undo_backend(backend, &record));
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // upsert_action_undo direct-rusqlite path.
+            let result = upsert_action_undo_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::MarkActionUndone {
@@ -8419,25 +8182,19 @@ fn dispatch_write_command_raw(
             undone_by,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                mark_action_undone_backend(backend, audit_action_id, undone_at, &undone_by)
-            });
+            let result =
+                mark_action_undone_backend(backend, audit_action_id, undone_at, &undone_by);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeAuditActions { before_ts, respond } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `purge_audit_actions_sync(&Connection, i64)` direct-
-            // rusqlite path.
-            let result = with_writer_backend(conn, |backend| {
-                purge_audit_actions_backend(backend, before_ts)
-            });
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // purge_audit_actions direct-rusqlite path.
+            let result = purge_audit_actions_backend(backend, before_ts);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertApprovalToken { token, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                insert_approval_token_backend(backend, &token)
-            });
+            let result = insert_approval_token_backend(backend, &token);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ConsumeApprovalToken {
@@ -8448,16 +8205,14 @@ fn dispatch_write_command_raw(
             action_fingerprint,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                consume_approval_token_backend(
-                    backend,
-                    &code_hash,
-                    &workspace_id,
-                    &action_kind,
-                    pane_id,
-                    &action_fingerprint,
-                )
-            });
+            let result = consume_approval_token_backend(
+                backend,
+                &code_hash,
+                &workspace_id,
+                &action_kind,
+                pane_id,
+                &action_fingerprint,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ConsumeApprovalTokenByCode {
@@ -8465,26 +8220,19 @@ fn dispatch_write_command_raw(
             workspace_id,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                consume_approval_token_by_code_backend(backend, &code_hash, &workspace_id)
-            });
+            let result = consume_approval_token_by_code_backend(backend, &code_hash, &workspace_id);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordMaintenance { record, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| record_maintenance_backend(backend, &record));
+            let result = record_maintenance_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordSecretScanReport { record, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                record_secret_scan_report_backend(backend, &record)
-            });
+            let result = record_secret_scan_report_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertSavedSearch { record, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                insert_saved_search_backend(backend, &record)
-            });
+            let result = insert_saved_search_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpdateSavedSearchRun {
@@ -8494,15 +8242,13 @@ fn dispatch_write_command_raw(
             last_error,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                update_saved_search_run_backend(
-                    backend,
-                    &id,
-                    last_run_at,
-                    last_result_count,
-                    last_error.as_deref(),
-                )
-            });
+            let result = update_saved_search_run_backend(
+                backend,
+                &id,
+                last_run_at,
+                last_result_count,
+                last_error.as_deref(),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpdateSavedSearchSchedule {
@@ -8511,46 +8257,39 @@ fn dispatch_write_command_raw(
             schedule_interval_ms,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                update_saved_search_schedule_backend(backend, &id, enabled, schedule_interval_ms)
-            });
+            let result =
+                update_saved_search_schedule_backend(backend, &id, enabled, schedule_interval_ms);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteSavedSearch { name, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| delete_saved_search_backend(backend, &name));
+            let result = delete_saved_search_backend(backend, &name);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::SyncFts { config, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                sync_fts_on_startup_backend(backend, &config)
-            });
+            let result = sync_fts_on_startup_backend(backend, &config);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RebuildFts { config, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| full_fts_rebuild_backend(backend, &config));
+            let result = full_fts_rebuild_backend(backend, &config);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSegments { before_ts, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| prune_segments_backend(backend, before_ts));
+            let result = prune_segments_backend(backend, before_ts);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Vacuum { respond } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `vacuum_sync(&Connection)` direct-rusqlite path.
-            let result = with_writer_backend(conn, vacuum_backend);
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // vacuum direct-rusqlite path.
+            let result = vacuum_backend(backend);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Checkpoint { respond } => {
-            let result = with_writer_backend(conn, checkpoint_backend);
+            let result = checkpoint_backend(backend);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertAccount { account, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| upsert_account_backend(backend, &account));
+            let result = upsert_account_backend(backend, &account);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpdateAccountLastUsed {
@@ -8559,9 +8298,8 @@ fn dispatch_write_command_raw(
             last_used_at,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                update_account_last_used_backend(backend, &service, &account_id, last_used_at)
-            });
+            let result =
+                update_account_last_used_backend(backend, &service, &account_id, last_used_at);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteAccount {
@@ -8569,9 +8307,7 @@ fn dispatch_write_command_raw(
             account_id,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                delete_account_backend(backend, &service, &account_id)
-            });
+            let result = delete_account_backend(backend, &service, &account_id);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::CreateReservation {
@@ -8582,55 +8318,43 @@ fn dispatch_write_command_raw(
             ttl_ms,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                create_reservation_backend(
-                    backend,
-                    pane_id,
-                    &owner_kind,
-                    &owner_id,
-                    reason.as_deref(),
-                    ttl_ms,
-                )
-            });
+            let result = create_reservation_backend(
+                backend,
+                pane_id,
+                &owner_kind,
+                &owner_id,
+                reason.as_deref(),
+                ttl_ms,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ReleaseReservation {
             reservation_id,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                release_reservation_backend(backend, reservation_id)
-            });
+            let result = release_reservation_backend(backend, reservation_id);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ExpireStaleReservations { respond } => {
-            let result = with_writer_backend(conn, expire_stale_reservations_backend);
+            let result = expire_stale_reservations_backend(backend);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordUsageMetric { record, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                record_usage_metric_backend(backend, &record)
-            });
+            let result = record_usage_metric_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordUsageMetricsBatch { records, respond } => {
             // br-ft-l1jgo: trait-typed bulk insert via execute_many
             // (was a direct rusqlite Transaction + prepare + loop).
-            let result = with_writer_backend(conn, |backend| {
-                record_usage_metrics_batch_backend(backend, &records)
-            });
+            let result = record_usage_metrics_batch_backend(backend, &records);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeUsageMetrics { before_ts, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                purge_usage_metrics_backend(backend, before_ts)
-            });
+            let result = purge_usage_metrics_backend(backend, before_ts);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordNotification { record, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                record_notification_backend(backend, &record)
-            });
+            let result = record_notification_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpdateNotificationStatus {
@@ -8639,9 +8363,8 @@ fn dispatch_write_command_raw(
             error_message,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                update_notification_status_backend(backend, id, status, error_message.as_deref())
-            });
+            let result =
+                update_notification_status_backend(backend, id, status, error_message.as_deref());
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::AcknowledgeNotification {
@@ -8650,26 +8373,20 @@ fn dispatch_write_command_raw(
             action_taken,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                acknowledge_notification_backend(
-                    backend,
-                    id,
-                    &acknowledged_by,
-                    action_taken.as_deref(),
-                )
-            });
+            let result = acknowledge_notification_backend(
+                backend,
+                id,
+                &acknowledged_by,
+                action_taken.as_deref(),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::IncrementNotificationRetry { id, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                increment_notification_retry_backend(backend, id)
-            });
+            let result = increment_notification_retry_backend(backend, id);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeNotificationHistory { before_ts, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                purge_notification_history_backend(backend, before_ts)
-            });
+            let result = purge_notification_history_backend(backend, before_ts);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteEventsBefore {
@@ -8677,9 +8394,7 @@ fn dispatch_write_command_raw(
             batch_size,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                delete_events_before_backend(backend, before_ts, batch_size)
-            });
+            let result = delete_events_before_backend(backend, before_ts, batch_size);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteEventsByTier {
@@ -8690,53 +8405,41 @@ fn dispatch_write_command_raw(
             batch_size,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                delete_events_by_tier_backend(
-                    backend,
-                    before_ts,
-                    &severities,
-                    &event_types,
-                    handled,
-                    batch_size,
-                )
-            });
+            let result = delete_events_by_tier_backend(
+                backend,
+                before_ts,
+                &severities,
+                &event_types,
+                handled,
+                batch_size,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertPaneBookmark { record, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                insert_pane_bookmark_backend(backend, &record)
-            });
+            let result = insert_pane_bookmark_backend(backend, &record);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeletePaneBookmark { alias, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                delete_pane_bookmark_backend(backend, &alias)
-            });
+            let result = delete_pane_bookmark_backend(backend, &alias);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertAgentProfile { profile, respond } => {
-            let result = with_writer_backend(conn, |backend| {
-                insert_agent_profile_backend(backend, &profile)
-            });
+            let result = insert_agent_profile_backend(backend, &profile);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::GetAgentProfile { name, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| get_agent_profile_backend(backend, &name));
+            let result = get_agent_profile_backend(backend, &name);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ListAgentProfiles {
             role_filter,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                list_agent_profiles_backend(backend, role_filter.as_deref())
-            });
+            let result = list_agent_profiles_backend(backend, role_filter.as_deref());
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteAgentProfile { name, respond } => {
-            let result =
-                with_writer_backend(conn, |backend| delete_agent_profile_backend(backend, &name));
+            let result = delete_agent_profile_backend(backend, &name);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertMuxSession {
@@ -8746,19 +8449,16 @@ fn dispatch_write_command_raw(
             host_id,
             respond,
         } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `insert_mux_session_sync(&Connection, ...)` direct-
-            // rusqlite path.
-            let result = with_writer_backend(conn, |backend| {
-                insert_mux_session_backend(
-                    backend,
-                    &session_id,
-                    &topology_json,
-                    &ft_version,
-                    host_id.as_deref(),
-                )
-            });
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // insert_mux_session direct-rusqlite path.
+            let result = insert_mux_session_backend(
+                backend,
+                &session_id,
+                &topology_json,
+                &ft_version,
+                host_id.as_deref(),
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertSessionCheckpoint {
@@ -8771,22 +8471,19 @@ fn dispatch_write_command_raw(
             pane_states,
             respond,
         } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `insert_session_checkpoint_sync(&mut Connection, ...)`
-            // direct-rusqlite transaction path.
-            let result = with_writer_backend(conn, |backend| {
-                insert_session_checkpoint_backend(
-                    backend,
-                    &session_id,
-                    &checkpoint_type,
-                    &state_hash,
-                    pane_count,
-                    total_bytes,
-                    metadata_json.as_deref(),
-                    &pane_states,
-                )
-            });
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // insert_session_checkpoint direct-rusqlite transaction path.
+            let result = insert_session_checkpoint_backend(
+                backend,
+                &session_id,
+                &checkpoint_type,
+                &state_hash,
+                pane_count,
+                total_bytes,
+                metadata_json.as_deref(),
+                &pane_states,
+            );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSessionCheckpoints {
@@ -8794,26 +8491,20 @@ fn dispatch_write_command_raw(
             retention,
             respond,
         } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `prune_session_checkpoints_sync(&Connection, &str, usize)`
-            // direct-rusqlite path.
-            let result = with_writer_backend(conn, |backend| {
-                prune_session_checkpoints_backend(backend, &session_id, retention)
-            });
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // prune_session_checkpoints direct-rusqlite path.
+            let result = prune_session_checkpoints_backend(backend, &session_id, retention);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::MarkSessionShutdownClean {
             session_id,
             respond,
         } => {
-            // br-ft-l1jgo: routes through the trait via the writer-
-            // thread wrap-unwrap bridge. Replaces the legacy
-            // `mark_session_shutdown_clean_sync(&Connection, ...)`
-            // direct-rusqlite path.
-            let result = with_writer_backend(conn, |backend| {
-                mark_session_shutdown_clean_backend(backend, &session_id)
-            });
+            // br-ft-l1jgo: routes through the writer backend trait surface.
+            // Replaces the legacy
+            // mark_session_shutdown_clean direct-rusqlite path.
+            let result = mark_session_shutdown_clean_backend(backend, &session_id);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Shutdown { respond } => {
@@ -9911,12 +9602,11 @@ fn upsert_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowReco
 /// Upsert a workflow action plan (writer-thread, backend-trait path).
 ///
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `upsert_action_plan_sync(&Connection, &WorkflowActionPlanRecord)`
-/// direct-rusqlite helper. Routes the `INSERT ... ON CONFLICT DO UPDATE`
+/// legacy direct-rusqlite action-plan helper. Routes the `INSERT ... ON CONFLICT DO UPDATE`
 /// through the trait surface using `execute_typed`. Same shape as the
 /// `upsert_action_undo_backend` (81589276c) and
 /// `insert_prepared_plan_backend` (1c3e5e433) slices. Called from the
-/// writer-thread dispatcher inside `with_writer_backend(...)`.
+/// writer-thread dispatcher.
 fn upsert_action_plan_backend(
     backend: &dyn StorageBackend,
     record: &WorkflowActionPlanRecord,
@@ -10938,12 +10628,10 @@ fn record_audit_action_backend(
 /// Upsert an action_undo record (writer-thread, backend-trait path).
 ///
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `upsert_action_undo_sync(&Connection, &ActionUndoRecord)`
-/// direct-rusqlite helper. Routes the `INSERT ... ON CONFLICT DO UPDATE`
+/// legacy direct-rusqlite action-undo helper. Routes the `INSERT ... ON CONFLICT DO UPDATE`
 /// through the trait surface using `execute_typed`. Same shape as the
 /// `purge_audit_actions_backend` and `mark_action_undone_backend`
-/// helpers; called from the writer-thread dispatcher inside
-/// `with_writer_backend(...)`.
+/// helpers; called from the writer-thread dispatcher.
 fn upsert_action_undo_backend(
     backend: &dyn StorageBackend,
     record: &ActionUndoRecord,
@@ -11057,14 +10745,12 @@ fn mark_action_undone_backend(
 
 /// Purge audit actions before a cutoff timestamp (synchronous)
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `purge_audit_actions_sync(&Connection, i64)` direct-rusqlite
-/// helper. Routes the DELETE through the trait surface using
+/// legacy direct-rusqlite purge helper. Routes the DELETE through the trait surface using
 /// `RETURNING id` + `query_map_typed` so the affected-row count
 /// is recovered without a separate `SELECT changes()` call —
 /// matches the pattern used by other backend-side delete helpers
 /// (e.g. `delete_saved_search_backend` at line ~9711). Called
-/// from the writer-thread dispatcher inside
-/// `with_writer_backend(...)`.
+/// from the writer-thread dispatcher.
 ///
 /// Returns the number of audit_actions rows deleted (rows whose
 /// `ts < before_ts`).
@@ -11558,13 +11244,12 @@ fn agent_profile_from_backend_cells(
 /// Insert a new mux_sessions row (writer-thread, backend-trait path).
 ///
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `insert_mux_session_sync(&Connection, ...)` direct-rusqlite
-/// helper. Routes the INSERT through the trait surface using
+/// legacy direct-rusqlite mux-session insert helper. Routes the INSERT through the trait surface using
 /// `execute_typed`. Same shape as the
 /// `prune_session_checkpoints_backend` (c72156eb4),
 /// `upsert_action_undo_backend` (81589276c), and
 /// `insert_prepared_plan_backend` (1c3e5e433) slices. Called from
-/// the writer-thread dispatcher inside `with_writer_backend(...)`.
+/// the writer-thread dispatcher.
 fn insert_mux_session_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
@@ -11594,12 +11279,10 @@ fn insert_mux_session_backend(
 }
 
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `insert_session_checkpoint_sync(&mut Connection, ...)` direct-
-/// rusqlite helper. Preserves the original IMMEDIATE transaction
+/// legacy direct-rusqlite session-checkpoint insert helper. Preserves the original IMMEDIATE transaction
 /// semantics while inserting the checkpoint row, pane-state batch,
 /// and mux-session timestamp update through [`StorageBackend`].
-/// Called from the writer-thread dispatcher inside
-/// `with_writer_backend(...)`.
+/// Called from the writer-thread dispatcher.
 fn insert_session_checkpoint_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
@@ -11711,16 +11394,14 @@ fn insert_session_checkpoint_backend(
 /// rows per session (writer-thread, backend-trait path).
 ///
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `prune_session_checkpoints_sync(&Connection, &str, usize)`
-/// direct-rusqlite helper. Routes the DELETE through the trait
+/// legacy direct-rusqlite session-checkpoint prune helper. Routes the DELETE through the trait
 /// surface using `RETURNING id` + `query_map_typed`; the affected-
 /// row count is recovered from `returned.len()` without a separate
 /// `SELECT changes()` call — same shape as the
 /// `purge_audit_actions_backend` slice (c64527d9c) and
 /// `delete_events_before_backend` slice (81589276c). The inner
 /// `id NOT IN (...)` subquery preserving the most-recent N rows
-/// is unchanged. Called from the writer-thread dispatcher inside
-/// `with_writer_backend(...)`.
+/// is unchanged. Called from the writer-thread dispatcher.
 fn prune_session_checkpoints_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
@@ -11748,10 +11429,9 @@ fn prune_session_checkpoints_backend(
 }
 
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `mark_session_shutdown_clean_sync(&Connection, ...)` direct-
-/// rusqlite helper. Routes through the StorageBackend trait via
-/// `execute_typed`. Called from the writer-thread dispatcher
-/// inside `with_writer_backend(...)`.
+/// legacy direct-rusqlite session-shutdown helper. Routes through the
+/// StorageBackend trait via `execute_typed`. Called from the writer-thread
+/// dispatcher.
 fn mark_session_shutdown_clean_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
@@ -11916,10 +11596,8 @@ fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Resul
 }
 
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `vacuum_sync(&Connection)` direct-rusqlite helper. Routes
-/// `VACUUM` through `StorageBackend::execute_batch`. Called
-/// from the writer-thread dispatcher inside
-/// `with_writer_backend(...)`.
+/// legacy direct-rusqlite vacuum helper. Routes `VACUUM` through
+/// `StorageBackend::execute_batch`. Called from the writer-thread dispatcher.
 fn vacuum_backend(backend: &dyn StorageBackend) -> Result<()> {
     backend
         .execute_batch("VACUUM")
@@ -13213,11 +12891,10 @@ fn insert_approval_token_backend(
 /// Insert a prepared plan (writer-thread, backend-trait path).
 ///
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
-/// `insert_prepared_plan_sync(&Connection, &PreparedPlanRecord)`
-/// direct-rusqlite helper. Routes the `INSERT OR REPLACE` through the
+/// legacy direct-rusqlite prepared-plan insert helper. Routes the `INSERT OR REPLACE` through the
 /// trait surface using `execute_typed`. Same shape as the
 /// `upsert_action_undo_backend` slice (81589276c). Called from the
-/// writer-thread dispatcher inside `with_writer_backend(...)`.
+/// writer-thread dispatcher.
 fn insert_prepared_plan_backend(
     backend: &dyn StorageBackend,
     record: &PreparedPlanRecord,

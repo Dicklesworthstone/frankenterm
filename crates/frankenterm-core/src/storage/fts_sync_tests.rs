@@ -8,7 +8,7 @@ fn with_fts_backend<F, R>(conn: &mut Connection, f: F) -> Result<R>
 where
     F: FnOnce(&dyn crate::storage_backend_trait::StorageBackend) -> Result<R>,
 {
-    with_writer_backend(conn, f)
+    with_test_storage_backend(conn, f)
 }
 
 fn get_fts_index_state_test(conn: &mut Connection) -> Result<Option<FtsIndexState>> {

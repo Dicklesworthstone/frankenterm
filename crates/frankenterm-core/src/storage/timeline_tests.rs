@@ -35,7 +35,7 @@ fn insert_test_event(
 }
 
 fn query_test_timeline(conn: &mut Connection, query: &TimelineQuery) -> Timeline {
-    with_writer_backend(conn, |backend| query_timeline_backend(backend, query)).unwrap()
+    with_test_storage_backend(conn, |backend| query_timeline_backend(backend, query)).unwrap()
 }
 
 #[test]

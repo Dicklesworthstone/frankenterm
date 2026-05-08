@@ -833,7 +833,7 @@ fn storage_handle_shutdown_flushes_pending_writes() {
 
 #[test]
 fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
-    let mut conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let (tx, mut rx) = mpsc::channel(8);
@@ -868,7 +868,9 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
     );
     drop(tx);
 
-    writer_loop(&mut conn, &mut rx, &mut mmap_mirror);
+    let backend = RusqliteBackend::new(conn);
+    writer_loop(&backend, &mut rx, &mut mmap_mirror);
+    let conn = backend.into_connection();
 
     let segment_count: i64 = conn
         .query_row(
@@ -1842,7 +1844,7 @@ fn indexing_health_report_aggregates() {
 #[test]
 fn fts_integrity_check_on_healthy_db() {
     let db_path = temp_db_path();
-    let mut conn = Connection::open(&db_path).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
     initialize_schema(&conn).unwrap();
 
@@ -1856,9 +1858,11 @@ fn fts_integrity_check_on_healthy_db() {
             [],
         ).unwrap();
 
-    let ok = with_writer_backend(&mut conn, check_fts_integrity_backend).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let ok = check_fts_integrity_backend(&backend).unwrap();
     assert!(ok, "Healthy FTS should pass integrity check");
 
+    let conn = backend.into_connection();
     drop(conn);
     let _ = std::fs::remove_file(&db_path);
 }
