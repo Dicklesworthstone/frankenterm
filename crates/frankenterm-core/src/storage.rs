@@ -7646,25 +7646,6 @@ fn writer_loop(
 }
 
 #[cfg(test)]
-fn with_test_storage_backend<F, R>(conn: &mut Connection, f: F) -> R
-where
-    F: FnOnce(&dyn StorageBackend) -> R,
-{
-    let config = crate::storage_backend_trait::OpenConfig {
-        wal_mode: false,
-        ..crate::storage_backend_trait::OpenConfig::default()
-    };
-    let placeholder = RusqliteBackend::open(":memory:", &config)
-        .expect("temporary placeholder backend for storage test loan")
-        .into_connection();
-    let owned = std::mem::replace(conn, placeholder);
-    let backend = RusqliteBackend::new(owned);
-    let result = f(&backend);
-    *conn = backend.into_connection();
-    result
-}
-
-#[cfg(test)]
 mod writer_io_scheduler_tests {
     use super::io_scheduler::{StorageIoAdmissionOutcome, StorageIoClassBudget};
     use super::*;
