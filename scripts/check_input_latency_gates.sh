@@ -21,7 +21,6 @@ ARTIFACT_DIR="${FT_INPUT_LATENCY_ARTIFACT_DIR:-target/input-latency-gates}"
 DEFAULT_TARGET_DIR="target/rch-input-latency-gates-${RUN_ID}"
 TARGET_DIR="${FT_INPUT_LATENCY_TARGET_DIR:-$DEFAULT_TARGET_DIR}"
 CHECK_ONLY_DIR=""
-RCH_MODE="${FT_INPUT_LATENCY_RCH_MODE:-auto}"
 RCH_SKIP_SMOKE_PREFLIGHT=1
 RCH_READY=0
 WARN_NEAR_RATIO="${FT_INPUT_LATENCY_WARN_NEAR_RATIO:-0.90}"
@@ -47,7 +46,6 @@ Options:
                        Expected files: <DIR>/<scenario-name>.json
   --artifacts-dir DIR  Override artifacts directory (default: $ARTIFACT_DIR)
   --target-dir DIR     Override cargo target dir (default: $TARGET_DIR)
-  --no-rch             Do not use rch even if available
   -h, --help           Show help
 EOF
 }
@@ -66,10 +64,6 @@ while [[ $# -gt 0 ]]; do
             TARGET_DIR="$2"
             shift 2
             ;;
-        --no-rch)
-            RCH_MODE="never"
-            shift
-            ;;
         -h|--help)
             usage
             exit 0
@@ -84,11 +78,6 @@ done
 
 if ! command -v jq >/dev/null 2>&1; then
     echo "[input-latency-gates] ERROR: jq is required" >&2
-    exit 5
-fi
-
-if [[ -z "$CHECK_ONLY_DIR" ]] && ! command -v cargo >/dev/null 2>&1; then
-    echo "[input-latency-gates] ERROR: cargo is required" >&2
     exit 5
 fi
 
@@ -140,54 +129,48 @@ run_simulate() {
     local out_json="$2"
     local out_log="$3"
 
-    local -a cmd=(cargo run -p frankenterm -- simulate run "$fixture" --json --resize-timeline-json)
+    ensure_rch_for_simulate
+    local rch_target_dir
+    rch_target_dir="$(resolve_rch_target_dir)"
 
-    if [[ "$RCH_MODE" != "never" ]] && command -v rch >/dev/null 2>&1; then
-        ensure_rch_for_simulate
-        local rch_target_dir
-        rch_target_dir="$(resolve_rch_target_dir)"
+    set +e
+    # shellcheck disable=SC2016
+    run_rch_cargo_logged "$out_log" \
+        env CARGO_TARGET_DIR="$rch_target_dir" \
+            FT_INPUT_LATENCY_JSON_BEGIN="$RCH_JSON_BEGIN_MARKER" \
+            FT_INPUT_LATENCY_JSON_END="$RCH_JSON_END_MARKER" \
+            bash -lc '
+                set -euo pipefail
+                fixture="$1"
+                json_begin="${FT_INPUT_LATENCY_JSON_BEGIN:?}"
+                json_end="${FT_INPUT_LATENCY_JSON_END:?}"
+                remote_artifact_dir="${CARGO_TARGET_DIR}/ft-input-latency"
+                mkdir -p "$remote_artifact_dir"
+                fixture_base="$(basename "$fixture" .yaml)"
+                remote_json="${remote_artifact_dir}/${fixture_base}.json"
+                remote_stderr="${remote_artifact_dir}/${fixture_base}.stderr.log"
 
-        set +e
-        # shellcheck disable=SC2016
-        run_rch_cargo_logged "$out_log" \
-            env CARGO_TARGET_DIR="$rch_target_dir" \
-                FT_INPUT_LATENCY_JSON_BEGIN="$RCH_JSON_BEGIN_MARKER" \
-                FT_INPUT_LATENCY_JSON_END="$RCH_JSON_END_MARKER" \
-                bash -lc '
-                    set -euo pipefail
-                    fixture="$1"
-                    json_begin="${FT_INPUT_LATENCY_JSON_BEGIN:?}"
-                    json_end="${FT_INPUT_LATENCY_JSON_END:?}"
-                    remote_artifact_dir="${CARGO_TARGET_DIR}/ft-input-latency"
-                    mkdir -p "$remote_artifact_dir"
-                    fixture_base="$(basename "$fixture" .yaml)"
-                    remote_json="${remote_artifact_dir}/${fixture_base}.json"
-                    remote_stderr="${remote_artifact_dir}/${fixture_base}.stderr.log"
+                set +e
+                cargo run -p frankenterm -- simulate run "$fixture" --json --resize-timeline-json >"$remote_json" 2>"$remote_stderr"
+                rc=$?
+                set -e
 
-                    set +e
-                    cargo run -p frankenterm -- simulate run "$fixture" --json --resize-timeline-json >"$remote_json" 2>"$remote_stderr"
-                    rc=$?
-                    set -e
-
-                    if [[ -f "$remote_stderr" ]]; then
-                        cat "$remote_stderr" >&2
-                    fi
-                    printf "%s\n" "$json_begin"
-                    if [[ -f "$remote_json" ]]; then
-                        cat "$remote_json"
-                    fi
-                    printf "\n%s\n" "$json_end"
-                    exit "$rc"
-                ' bash "$fixture"
-        local rc=$?
-        set -e
-        if [[ "$rc" -ne 0 ]]; then
-            return "$rc"
-        fi
-        extract_rch_json "$out_log" "$out_json"
-    else
-        env CARGO_TARGET_DIR="$TARGET_DIR" "${cmd[@]}" >"$out_json" 2>"$out_log"
+                if [[ -f "$remote_stderr" ]]; then
+                    cat "$remote_stderr" >&2
+                fi
+                printf "%s\n" "$json_begin"
+                if [[ -f "$remote_json" ]]; then
+                    cat "$remote_json"
+                fi
+                printf "\n%s\n" "$json_end"
+                exit "$rc"
+            ' bash "$fixture"
+    local rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+        return "$rc"
     fi
+    extract_rch_json "$out_log" "$out_json"
 }
 
 build_correlation_jsonl() {
