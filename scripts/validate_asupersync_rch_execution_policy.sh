@@ -18,6 +18,11 @@ has_rch_prefix() {
   [[ "${cmd}" =~ (^|[[:space:]])rch[[:space:]]+exec[[:space:]]+-- ]]
 }
 
+has_rch_cargo_wrapper() {
+  local cmd="$1"
+  [[ "${cmd}" =~ (^|[[:space:]])run_rch_cargo_logged(_with_timeout)?[[:space:]] ]]
+}
+
 is_heavy_command() {
   local cmd="$1"
   local normalized
@@ -48,7 +53,7 @@ classify_command_json() {
     heavy="true"
     requires_rch="true"
   fi
-  if has_rch_prefix "${cmd}"; then
+  if has_rch_prefix "${cmd}" || has_rch_cargo_wrapper "${cmd}"; then
     used_rch="true"
   fi
 
@@ -199,6 +204,16 @@ run_self_test() {
   }
   [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
     echo "self-test failed: env-prefixed rch heavy command should not be violation" >&2
+    return 1
+  }
+
+  out="$(classify_command_json "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace")"
+  [[ "$(jq -r '.used_rch' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: shared rch cargo wrapper should count as rch usage" >&2
+    return 1
+  }
+  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
+    echo "self-test failed: shared rch cargo wrapper should not be violation" >&2
     return 1
   }
 

@@ -120,6 +120,19 @@ if [[ "$(jq -r '.is_heavy' <<<"${heavy_no_rch}")" != "true" || "$(jq -r '.policy
   exit 1
 fi
 
+wrapped_rch="$("${VALIDATOR}" --classify "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace")"
+if [[ "$(jq -r '.is_heavy' <<<"${wrapped_rch}")" != "true" || "$(jq -r '.used_rch' <<<"${wrapped_rch}")" != "true" || "$(jq -r '.policy_violation' <<<"${wrapped_rch}")" != "false" ]]; then
+  emit_log \
+    "failed" \
+    "unit_classifier" \
+    "command_classification" \
+    "classifier_mismatch" \
+    "unexpected_classifier_result" \
+    "$(basename "${VALIDATOR}")" \
+    "run_rch_cargo_logged should be heavy, rch-backed, and policy-compliant"
+  exit 1
+fi
+
 light_cmd="$("${VALIDATOR}" --classify "cargo fmt --check")"
 if [[ "$(jq -r '.is_heavy' <<<"${light_cmd}")" != "false" ]]; then
   emit_log \
@@ -169,6 +182,17 @@ cat > "${tmp_valid}" <<'JSON'
     },
     {
       "timestamp": "2026-02-25T00:01:00Z",
+      "command": "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace",
+      "is_heavy": true,
+      "used_rch": true,
+      "worker_context": "worker=contabo-2",
+      "artifact_paths": ["tests/e2e/logs/mock_rch_policy.jsonl"],
+      "elapsed_seconds": 11.1,
+      "exit_status": 0,
+      "residual_risk_notes": ""
+    },
+    {
+      "timestamp": "2026-02-25T00:02:00Z",
       "command": "cargo fmt --check",
       "is_heavy": false,
       "used_rch": false,
