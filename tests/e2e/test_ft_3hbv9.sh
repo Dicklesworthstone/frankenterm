@@ -107,6 +107,21 @@ run_rch_cargo_logged() {
     return "$rc"
 }
 
+count_matches() {
+    local pattern="$1"
+    local file="$2"
+    local count
+    count=$(grep -c -- "$pattern" "$file") || {
+        local rc=$?
+        if [[ ${rc} -eq 1 ]]; then
+            count=0
+        else
+            return "${rc}"
+        fi
+    }
+    printf '%s\n' "$count"
+}
+
 # ── Preflight ──────────────────────────────────────────────────────────────
 log_event "preflight" "startup" "checking_rch" "started"
 
@@ -168,7 +183,7 @@ fi
 echo "[2/$TOTAL_STEPS] Testing dashboard module..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_unit.log"
 if run_rch_cargo_logged "dashboard_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- dashboard::tests; then
-    test_count=$(grep -c "test result: ok" "$TEST_OUTPUT" 2>/dev/null || echo "0")
+    test_count=$(count_matches "test result: ok" "$TEST_OUTPUT")
     log_event "unit_tests" "nominal_path" "dashboard" "pass" "tests_ok=$test_count"
     echo "  ✓ dashboard tests passed"
     PASSED=$((PASSED + 1))

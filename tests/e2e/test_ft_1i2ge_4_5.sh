@@ -94,6 +94,21 @@ check_rch_fallback_in_logs() {
     fi
 }
 
+count_matches() {
+    local pattern="$1"
+    local file="$2"
+    local count
+    count=$(grep -c -- "$pattern" "$file") || {
+        local rc=$?
+        if [[ ${rc} -eq 1 ]]; then
+            count=0
+        else
+            return "${rc}"
+        fi
+    }
+    printf '%s\n' "$count"
+}
+
 # ── Preflight ────────────────────────────────────────────────────────────────
 
 if ! command -v jq &>/dev/null; then
@@ -143,7 +158,7 @@ echo "[1/3] Running conflict detection unit tests..."
 if $CARGO_CMD test --lib -p frankenterm-core --features subprocess-bridge \
     -- mission_loop::tests::conflict_detection 2>"$LOG_DIR/test_stderr.log" | tee "$LOG_DIR/test_stdout.log"; then
     check_rch_fallback_in_logs "conflict_detection_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
-    PASS_COUNT=$(grep -c "test mission_loop::tests::conflict_detection.*ok" "$LOG_DIR/test_stdout.log" || echo "0")
+    PASS_COUNT=$(count_matches "test mission_loop::tests::conflict_detection.*ok" "$LOG_DIR/test_stdout.log")
     log_structured "PASS" "unit_tests_pass" "" "$(json_field "input_summary" "conflict_detection tests")$(json_field "decision_path" "cargo test")$(json_field "artifact_path" "$LOG_DIR/test_stdout.log")$(json_field "pass_count" "$PASS_COUNT")"
     echo "    ✓ ${PASS_COUNT} conflict detection tests passed"
 else
@@ -159,7 +174,7 @@ echo "[2/3] Running path overlap tests..."
 if $CARGO_CMD test --lib -p frankenterm-core --features subprocess-bridge \
     -- mission_loop::tests::paths_overlap 2>>"$LOG_DIR/test_stderr.log" | tee -a "$LOG_DIR/test_stdout.log"; then
     check_rch_fallback_in_logs "paths_overlap_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
-    PASS_COUNT=$(grep -c "test mission_loop::tests::paths_overlap.*ok" "$LOG_DIR/test_stdout.log" || echo "0")
+    PASS_COUNT=$(count_matches "test mission_loop::tests::paths_overlap.*ok" "$LOG_DIR/test_stdout.log")
     log_structured "PASS" "path_overlap_tests_pass" "" "$(json_field "input_summary" "paths_overlap + wildcard")$(json_field "pass_count" "$PASS_COUNT")"
     echo "    ✓ Path overlap tests passed"
 else

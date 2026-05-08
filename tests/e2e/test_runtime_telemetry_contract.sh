@@ -113,6 +113,21 @@ record_result() {
   fi
 }
 
+count_matches() {
+  local pattern="$1"
+  local file="$2"
+  local count
+  count=$(grep -c -- "$pattern" "$file") || {
+    local rc=$?
+    if [[ ${rc} -eq 1 ]]; then
+      count=0
+    else
+      return "${rc}"
+    fi
+  }
+  printf '%s\n' "$count"
+}
+
 echo "=== Runtime Telemetry Schema Contract E2E (ft-e34d9.10.7.1) ==="
 emit_log "started" "e2e_suite" "script_init" "none" "none" "${LOG_FILE}" "RUN_ID=${RUN_ID}"
 
@@ -128,7 +143,7 @@ emit_log "started" "unit_tests" "cargo_test" "none" "none" "${LOG_FILE}" ""
 step1_log="${LOG_DIR}/runtime_telemetry_${RUN_ID}.unit.log"
 if run_rch_cargo_logged "${step1_log}" test -p frankenterm-core --lib runtime_telemetry -- --nocapture; then
   # Count passed tests
-  test_count=$(grep -c 'test runtime_telemetry::tests::' "${step1_log}" || echo "0")
+  test_count=$(count_matches 'test runtime_telemetry::tests::' "${step1_log}")
   record_result "unit_tests_pass" "true"
   echo "    ${test_count} tests passed"
 else

@@ -25,6 +25,7 @@ PASS=0
 FAIL=0
 TOTAL=0
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "181uk_framework_seam"
 ensure_rch_ready
@@ -77,6 +78,21 @@ record_result() {
     emit_log "failed" "${name}" "scenario_end" "${3:-assertion_failed}" "${4:-assertion_failed}" "${LOG_FILE}" "${5:-}"
     echo "  FAIL: ${name}"
   fi
+}
+
+count_matches() {
+  local pattern="$1"
+  local file="$2"
+  local count
+  count=$(grep -c -- "$pattern" "$file") || {
+    local rc=$?
+    if [[ ${rc} -eq 1 ]]; then
+      count=0
+    else
+      return "${rc}"
+    fi
+  }
+  printf '%s\n' "$count"
 }
 
 allowed_framework_file() {
@@ -148,7 +164,7 @@ echo "--- Scenario 1: framework_seam_guard passes via rch ---"
 if rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test framework_seam_guard -- --nocapture \
     > "${ARTIFACT_DIR}/framework_seam_guard_stdout.log" \
     2> "${ARTIFACT_DIR}/framework_seam_guard_stderr.log"; then
-  test_count=$(grep -c '^test ' "${ARTIFACT_DIR}/framework_seam_guard_stdout.log" || echo "0")
+  test_count=$(count_matches '^test ' "${ARTIFACT_DIR}/framework_seam_guard_stdout.log")
   record_result "framework_seam_guard_pass" "true"
   echo "    ${test_count} tests observed"
 else
@@ -169,7 +185,7 @@ for file in \
   "${ROOT_DIR}/crates/frankenterm-core/tests/framework_seam_guard.rs"
 do
   if [ ! -f "${file}" ]; then
-    echo "missing file: ${file#${ROOT_DIR}/}" >> "${ARTIFACT_DIR}/module_presence.log"
+    echo "missing file: ${file#"${ROOT_DIR}"/}" >> "${ARTIFACT_DIR}/module_presence.log"
     MODULE_OK="false"
   fi
 done

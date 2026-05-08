@@ -93,6 +93,21 @@ check_rch_fallback_in_logs() {
     fi
 }
 
+count_matches() {
+    local pattern="$1"
+    local file="$2"
+    local count
+    count=$(grep -c -- "$pattern" "$file") || {
+        local rc=$?
+        if [[ ${rc} -eq 1 ]]; then
+            count=0
+        else
+            return "${rc}"
+        fi
+    }
+    printf '%s\n' "$count"
+}
+
 # ── Preflight ────────────────────────────────────────────────────────────────
 
 if ! command -v rch &>/dev/null; then
@@ -136,7 +151,7 @@ echo "[1/2] Running all 25 adversarial tests (ADV-01 through ADV-25)..."
 if $CARGO_CMD test --test mission_safety_adversarial --features subprocess-bridge \
     2>"$LOG_DIR/test_stderr.log" | tee "$LOG_DIR/test_stdout.log"; then
     check_rch_fallback_in_logs "mission_safety_adversarial" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
-    PASS_COUNT=$(grep -c '\.\.\..*ok' "$LOG_DIR/test_stdout.log" || echo "0")
+    PASS_COUNT=$(count_matches '\.\.\..*ok' "$LOG_DIR/test_stdout.log")
     log_structured "PASS" "adversarial_suite_pass" "" "$(json_field "input_summary" "25 adversarial tests")$(json_field "decision_path" "cargo test")$(json_field "artifact_path" "$LOG_DIR/test_stdout.log")$(json_field "pass_count" "$PASS_COUNT")"
     echo "    ✓ ${PASS_COUNT} adversarial tests passed"
 else
