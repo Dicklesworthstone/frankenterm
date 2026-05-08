@@ -26,10 +26,17 @@ SCENARIO_ID="ft_1i2ge_8_4_prepare_phase"
 CORRELATION_ID="ft-1i2ge.8.4-${RUN_ID}"
 TARGET_DIR="target-rch-ft-1i2ge-8-4-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_8_4_${RUN_ID}.jsonl"
-STDOUT_FILE="${LOG_DIR}/ft_1i2ge_8_4_${RUN_ID}.stdout.log"
+STDOUT_BASENAME="ft_1i2ge_8_4_${RUN_ID}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_8_4"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging" >&2
+  exit 1
+fi
+
 ensure_rch_ready
 
 emit_log() {
@@ -77,28 +84,6 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "ft-1i2ge.8.4 prepare-phase coordinator e2e"
 
-# Preflight checks
-if ! command -v jq >/dev/null 2>&1; then
-  emit_log "failed" "preflight_jq" "jq_missing" "jq_not_found" \
-    "$(basename "${LOG_FILE}")" "jq is required"
-  exit 1
-fi
-
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log "failed" "preflight_rch" "rch_missing" "rch_not_found" \
-    "$(basename "${LOG_FILE}")" "rch must be installed"
-  exit 1
-fi
-
-if ! rch workers probe --all --json \
-  | jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-    >/dev/null 2>&1; then
-  emit_log "failed" "preflight_rch_workers" "rch_workers_unreachable" \
-    "remote_worker_unavailable" "$(basename "${LOG_FILE}")" \
-    "No reachable rch workers; aborting"
-  exit 1
-fi
-
 # Run the unit tests for prepare-phase coordinator
 TESTS=(
   "prepare_all_steps_ready_when_all_gates_pass"
@@ -124,26 +109,25 @@ PASS_COUNT=0
 FAIL_COUNT=0
 
 for test_name in "${TESTS[@]}"; do
+  test_stdout_file="${LOG_DIR}/${STDOUT_BASENAME}.${test_name}.stdout.log"
+
   emit_log "running" "cargo_test" "none" "none" \
-    "$(basename "${STDOUT_FILE}")" "test=${test_name}"
+    "$(basename "${test_stdout_file}")" "test=${test_name}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    env TMPDIR=/tmp rch exec -- \
-      env CARGO_TARGET_DIR="${TARGET_DIR}" \
-      cargo test -p frankenterm-core --lib "${test_name}" -- --nocapture
-  ) >> "${STDOUT_FILE}" 2>&1
+  run_rch_cargo_logged "${test_stdout_file}" \
+    env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    cargo test -p frankenterm-core --lib "${test_name}" -- --nocapture
   rc=$?
   set -e
 
   if [[ ${rc} -ne 0 ]]; then
     emit_log "failed" "cargo_test" "test_failure" "cargo_test_failed" \
-      "$(basename "${STDOUT_FILE}")" "test=${test_name} exit=${rc}"
+      "$(basename "${test_stdout_file}")" "test=${test_name} exit=${rc}"
     FAIL_COUNT=$((FAIL_COUNT + 1))
   else
     emit_log "passed" "cargo_test" "test_passed" "none" \
-      "$(basename "${STDOUT_FILE}")" "test=${test_name}"
+      "$(basename "${test_stdout_file}")" "test=${test_name}"
     PASS_COUNT=$((PASS_COUNT + 1))
   fi
 done
