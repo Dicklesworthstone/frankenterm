@@ -1424,24 +1424,24 @@ impl StorageHandle {
             // is silently ignored. The CREATE statements mirror the ones
             // in SCHEMA_SQL at line ~169 (see FTS_TRIGGER_RECREATE_SQL);
             // keep the two in lockstep.
-            if defer_fts_triggers {
-                conn.execute_batch(
+            let backend = RusqliteBackend::new(conn);
+            let (trigger_sql, trigger_error_context) = if defer_fts_triggers {
+                (
                     "DROP TRIGGER IF EXISTS output_segments_ai;
                      DROP TRIGGER IF EXISTS output_segments_ad;
                      DROP TRIGGER IF EXISTS output_segments_au;",
+                    "Failed to drop FTS triggers for deferred indexing (ft-wk5fo)",
                 )
-                .map_err(|e| {
-                    StorageError::Database(format!(
-                        "Failed to drop FTS triggers for deferred indexing (ft-wk5fo): {e}"
-                    ))
-                })?;
             } else {
-                conn.execute_batch(schema_ddl::FTS_TRIGGER_RECREATE_SQL).map_err(|e| {
-                    StorageError::Database(format!(
-                        "Failed to re-create FTS triggers after deferred indexing was disabled (ft-ih4tm): {e}"
-                    ))
-                })?;
-            }
+                (
+                    schema_ddl::FTS_TRIGGER_RECREATE_SQL,
+                    "Failed to re-create FTS triggers after deferred indexing was disabled (ft-ih4tm)",
+                )
+            };
+            backend
+                .execute_batch(trigger_sql)
+                .map_err(|e| StorageError::Database(format!("{trigger_error_context}: {e}")))?;
+            let conn = backend.into_connection();
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after FTS trigger setup")?;
