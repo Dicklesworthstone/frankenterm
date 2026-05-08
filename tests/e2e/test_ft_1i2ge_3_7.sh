@@ -40,7 +40,13 @@ mkdir -p "${LOG_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_1i2ge_3_7_orchestration"
 CORRELATION_ID="ft-1i2ge.3.7-${RUN_ID}"
-TARGET_DIR="target-rch-ft-1i2ge-3-7-${RUN_ID}"
+DEFAULT_TARGET_DIR="target/rch-e2e-ft-1i2ge-3-7-${RUN_ID}"
+REQUESTED_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${REQUESTED_TARGET_DIR}"
+else
+  TARGET_DIR="${DEFAULT_TARGET_DIR}"
+fi
 LOG_FILE="${LOG_DIR}/ft_1i2ge_3_7_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_3_7_${RUN_ID}.stdout.log"
 

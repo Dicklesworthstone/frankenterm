@@ -12,7 +12,13 @@ mkdir -p "${LOG_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="mission_mcp_tools"
 CORRELATION_ID="ft-1i2ge.5.3-${RUN_ID}"
-TARGET_DIR="target-rch-mission-mcp-tools-${RUN_ID}"
+DEFAULT_TARGET_DIR="target/rch-e2e-mission-mcp-tools-${RUN_ID}"
+REQUESTED_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${REQUESTED_TARGET_DIR}"
+else
+  TARGET_DIR="${DEFAULT_TARGET_DIR}"
+fi
 LOG_FILE="${LOG_DIR}/mission_mcp_tools_${RUN_ID}.jsonl"
 STDOUT_BASENAME="mission_mcp_tools_${RUN_ID}"
 WORKSPACE_REL_DIR="tests/e2e/tmp/${SCENARIO_ID}_${RUN_ID}"

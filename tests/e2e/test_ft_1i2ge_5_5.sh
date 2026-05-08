@@ -8,7 +8,13 @@ mkdir -p "${LOG_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_1i2ge_5_5_operator_explain_report"
 CORRELATION_ID="ft-1i2ge.5.5-${RUN_ID}"
-TARGET_DIR="target-rch-ft-1i2ge-5-5-${RUN_ID}"
+DEFAULT_TARGET_DIR="target/rch-e2e-ft-1i2ge-5-5-${RUN_ID}"
+REQUESTED_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${REQUESTED_TARGET_DIR}"
+else
+  TARGET_DIR="${DEFAULT_TARGET_DIR}"
+fi
 LOG_FILE="${LOG_DIR}/ft_1i2ge_5_5_${RUN_ID}.jsonl"
 WORKSPACE_REL_DIR="tests/e2e/tmp/${SCENARIO_ID}_${RUN_ID}"
 MISSION_PATH="${WORKSPACE_REL_DIR}/.ft/mission/active.json"
