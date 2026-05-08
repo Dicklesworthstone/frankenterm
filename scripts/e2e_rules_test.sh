@@ -19,19 +19,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
-    YELLOW='\033[1;33m'
     BLUE='\033[0;34m'
     NC='\033[0m'
 else
     RED=''
     GREEN=''
-    YELLOW=''
     BLUE=''
     NC=''
 fi
@@ -83,11 +82,6 @@ log_fail() {
     echo -e "${RED}[FAIL]${NC} $*"
     ((TESTS_FAILED++)) || true
     ((TESTS_RUN++)) || true
-}
-
-log_skip() {
-    echo -e "${YELLOW}[SKIP]${NC} $*"
-    ((TESTS_SKIPPED++)) || true
 }
 
 log_info() {
@@ -355,7 +349,7 @@ test_rules_extraction() {
     fi
 
     # 3.3: Claude cost extraction
-    json=$(run_robot robot rules test 'Session cost: $2.50')
+    json=$(run_robot robot rules test "Session cost: \$2.50")
     local cost
     cost=$(echo "$json" | jq -r '.data.matches[0].extracted.cost // empty' 2>/dev/null)
     if [[ "$cost" == "2.50" ]]; then
@@ -452,18 +446,22 @@ test_schema_stability() {
 
     # 5.3: Match entry schema
     local match_fields
-    match_fields=$(echo "$test_json" | jq '.data.matches[0] | keys | sort | join(",")' 2>/dev/null)
-    local required_match_fields="agent_type,confidence,event_type,extracted,matched_text,rule_id,severity"
+    match_fields=$(echo "$test_json" | jq -r '.data.matches[0] | keys | sort | join(",")' 2>/dev/null)
+    local required_match_fields=(agent_type confidence event_type extracted matched_text rule_id severity)
+    local required_match_fields_csv="${required_match_fields[*]}"
+    required_match_fields_csv="${required_match_fields_csv// /,}"
     # Check each required field
     local all_present=true
-    for field in rule_id agent_type event_type severity; do
+    for field in "${required_match_fields[@]}"; do
         if ! echo "$test_json" | jq -e ".data.matches[0].$field" &>/dev/null; then
             log_fail "5.3: match entry missing required field: $field"
             all_present=false
         fi
     done
     if [[ "$all_present" == "true" ]]; then
-        log_pass "5.3: match entry has all required fields (rule_id, agent_type, event_type, severity)"
+        log_pass "5.3: match entry has all required fields ($required_match_fields_csv)"
+    else
+        log_info "5.3: match entry fields present: $match_fields"
     fi
 
     # Save artifact
