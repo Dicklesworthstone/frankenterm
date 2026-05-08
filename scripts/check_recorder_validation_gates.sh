@@ -19,7 +19,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 ARTIFACT_DIR="${FT_RECORDER_VALIDATION_ARTIFACT_DIR:-target/recorder-validation-gates}"
-TARGET_DIR="${FT_RECORDER_VALIDATION_TARGET_DIR:-target-recorder-validation-gates}"
+TARGET_DIR="${FT_RECORDER_VALIDATION_TARGET_DIR:-target/recorder-validation-gates/cargo-target}"
 RUN_LOAD_BENCH="${FT_RECORDER_GATE_RUN_LOAD_BENCH:-0}"
 
 mkdir -p "$ARTIFACT_DIR"
