@@ -132,7 +132,6 @@ emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basen
 
 require_cmd rg
 require_cmd rch
-require_cmd cargo
 
 ensure_rch_ready
 emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "$(rch_probe_log_path)")"
