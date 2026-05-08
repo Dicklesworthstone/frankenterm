@@ -15,6 +15,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+
+RUN_ID="${FTUI_GUARDRAILS_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+ARTIFACT_DIR="${FTUI_GUARDRAILS_ARTIFACT_DIR:-target/ftui-guardrails/${RUN_ID}}"
+RCH_TARGET_DIR="${FTUI_GUARDRAILS_TARGET_DIR:-target/rch-ftui-guardrails-${RUN_ID}}"
+mkdir -p "$ARTIFACT_DIR"
+rch_init "$ARTIFACT_DIR" "$RUN_ID" "ftui_guardrails" "$PROJECT_ROOT"
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -23,21 +32,47 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
 
+cargo_check_step() {
+    local log_name="$1"
+    shift
+
+    run_rch_cargo_logged "$ARTIFACT_DIR/${log_name}.log" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo check -p frankenterm-core "$@"
+}
+
+cargo_clippy_step() {
+    local log_name="$1"
+    shift
+
+    run_rch_cargo_logged "$ARTIFACT_DIR/${log_name}.log" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo clippy -p frankenterm-core "$@"
+}
+
 echo "=== FTUI Migration Guardrails ==="
 echo ""
+echo "RCH artifacts: $ARTIFACT_DIR"
+echo "RCH cargo target: $RCH_TARGET_DIR"
+echo ""
+
+ensure_rch_ready
 
 # ---------------------------------------------------------------------------
 # 1. Feature exclusion: tui-oracle + ftui must not compile together (unless rollout)
 # ---------------------------------------------------------------------------
 echo "--- Check 1: Mutual exclusion (tui-oracle + ftui) ---"
 
-if cargo check -p frankenterm-core --features tui-oracle,ftui >/dev/null 2>&1; then
+MUTUAL_EXCLUSION_LOG="$ARTIFACT_DIR/mutual_exclusion.log"
+if cargo_check_step "mutual_exclusion" --features tui-oracle,ftui; then
     fail "tui-oracle + ftui compiled successfully — compile_error! guard is missing or broken"
-else
+elif grep -qi "mutually exclusive" "$MUTUAL_EXCLUSION_LOG"; then
     pass "tui-oracle + ftui correctly fails to compile"
+else
+    fail "tui-oracle + ftui failed without the mutual-exclusion diagnostic (see $MUTUAL_EXCLUSION_LOG)"
 fi
 
-if cargo check -p frankenterm-core --features rollout >/dev/null 2>&1; then
+if cargo_check_step "rollout" --features rollout; then
     pass "rollout (tui + ftui) compiles with runtime dispatch"
 else
     fail "rollout feature does not compile"
@@ -51,14 +86,15 @@ echo ""
 echo "--- Check 2: Individual feature compilation ---"
 
 for feature in tui-oracle ftui; do
-    if cargo check -p frankenterm-core --features "$feature" >/dev/null 2>&1; then
+    log_feature="${feature//-/_}"
+    if cargo_check_step "feature_${log_feature}" --features "$feature"; then
         pass "--features $feature compiles"
     else
         fail "--features $feature does not compile"
     fi
 done
 
-if cargo check -p frankenterm-core >/dev/null 2>&1; then
+if cargo_check_step "default"; then
     pass "default (no features) compiles"
 else
     fail "default (no features) does not compile"
@@ -139,7 +175,8 @@ echo ""
 echo "--- Check 4: Clippy for both features ---"
 
 for feature in tui-oracle ftui rollout; do
-    if cargo clippy -p frankenterm-core --features "$feature" -- -D warnings >/dev/null 2>&1; then
+    log_feature="${feature//-/_}"
+    if cargo_clippy_step "clippy_${log_feature}" --features "$feature" -- -D warnings; then
         pass "clippy --features $feature passes"
     else
         fail "clippy --features $feature has warnings/errors"

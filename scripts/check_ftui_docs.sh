@@ -19,6 +19,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+
+RUN_ID="${FTUI_DOCS_CHECK_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+ARTIFACT_DIR="${FTUI_DOCS_CHECK_ARTIFACT_DIR:-target/ftui-docs-check/${RUN_ID}}"
+RCH_TARGET_DIR="${FTUI_DOCS_CHECK_TARGET_DIR:-target/rch-ftui-docs-check-${RUN_ID}}"
+mkdir -p "$ARTIFACT_DIR"
+rch_init "$ARTIFACT_DIR" "$RUN_ID" "ftui_docs_check" "$PROJECT_ROOT"
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -26,6 +35,15 @@ SKIP=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
+
+cargo_check_step() {
+    local log_name="$1"
+    shift
+
+    run_rch_cargo_logged "$ARTIFACT_DIR/${log_name}.log" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo check -p frankenterm-core "$@"
+}
 
 echo "=== FTUI Docs-Smoke & Contract-Drift Checks ==="
 echo ""
@@ -59,33 +77,40 @@ echo ""
 # 2. Feature matrix smoke: documented compile commands work
 # ---------------------------------------------------------------------------
 echo "--- Check 2: Feature matrix smoke ---"
+echo "  RCH artifacts: $ARTIFACT_DIR"
+echo "  RCH cargo target: $RCH_TARGET_DIR"
+
+ensure_rch_ready
 
 # Headless (no features)
-if cargo check -p frankenterm-core 2>/dev/null; then
+if cargo_check_step "headless"; then
     pass "cargo check -p frankenterm-core (headless)"
 else
     fail "cargo check -p frankenterm-core (headless)"
 fi
 
 # Legacy TUI oracle
-if cargo check -p frankenterm-core --features tui-oracle 2>/dev/null; then
+if cargo_check_step "tui_oracle" --features tui-oracle; then
     pass "cargo check --features tui-oracle"
 else
     fail "cargo check --features tui-oracle"
 fi
 
 # FrankenTUI
-if cargo check -p frankenterm-core --features ftui 2>/dev/null; then
+if cargo_check_step "ftui" --features ftui; then
     pass "cargo check --features ftui"
 else
     fail "cargo check --features ftui"
 fi
 
 # Mutual exclusion (must FAIL)
-if cargo check -p frankenterm-core --features tui-oracle,ftui 2>/dev/null; then
+MUTUAL_EXCLUSION_LOG="$ARTIFACT_DIR/mutual_exclusion.log"
+if cargo_check_step "mutual_exclusion" --features tui-oracle,ftui; then
     fail "tui-oracle+ftui compiled — mutual exclusion broken"
-else
+elif grep -qi "mutually exclusive" "$MUTUAL_EXCLUSION_LOG"; then
     pass "tui-oracle+ftui correctly rejected"
+else
+    fail "tui-oracle+ftui failed without the mutual-exclusion diagnostic (see $MUTUAL_EXCLUSION_LOG)"
 fi
 
 echo ""
