@@ -25,11 +25,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RCH_LOG_DIR="$PROJECT_ROOT/tests/e2e/logs"
-RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-/tmp/ft-e2e-prioritized-capture-target}"
+DEFAULT_RCH_CARGO_TARGET_DIR="target/rch-e2e-prioritized-capture-${RUN_ID}"
+REQUESTED_RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_RCH_CARGO_TARGET_DIR" && "$REQUESTED_RCH_CARGO_TARGET_DIR" != /* ]]; then
+    RCH_CARGO_TARGET_DIR="$REQUESTED_RCH_CARGO_TARGET_DIR"
+else
+    RCH_CARGO_TARGET_DIR="$DEFAULT_RCH_CARGO_TARGET_DIR"
+fi
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -615,6 +622,7 @@ main() {
     echo -e "${BLUE}================================================${NC}"
 
     e2e_init_artifacts "prioritized-capture" >/dev/null
+    check_prerequisites
     mkdir -p "$RCH_LOG_DIR"
     rch_init "$RCH_LOG_DIR" "$RUN_ID" "scripts_prioritized_capture" "$PROJECT_ROOT"
     if ! e2e_capture_scenario "rch_preflight" ensure_rch_ready_capture_artifacts; then
@@ -622,7 +630,6 @@ main() {
         e2e_finalize 1 >/dev/null
         return 1
     fi
-    check_prerequisites
 
     local overall_exit=0
 
