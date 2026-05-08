@@ -66,7 +66,13 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission reservation and ownership enforcement contract checks"
 
-RCH_TARGET_DIR="target-rch-ft-1i2ge-4-2"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-ft-1i2ge-4-2-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_RCH_TARGET_DIR}" && "${REQUESTED_RCH_TARGET_DIR}" != /* ]]; then
+  RCH_TARGET_DIR="${REQUESTED_RCH_TARGET_DIR}"
+else
+  RCH_TARGET_DIR="${DEFAULT_RCH_TARGET_DIR}"
+fi
 TEST_FILTERS=(
   "mission_dispatch_contract_maps_candidate_to_robot_and_coordination_primitives"
   "mission_dispatch_contract_maps_wait_for_to_robot_wait_for"

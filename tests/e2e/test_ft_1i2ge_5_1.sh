@@ -66,7 +66,13 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission CLI command surface validation (plan/run/status/explain/pause/resume/abort)"
 
-RCH_TARGET_DIR="target-rch-ft-1i2ge-5-1"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-ft-1i2ge-5-1-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_RCH_TARGET_DIR}" && "${REQUESTED_RCH_TARGET_DIR}" != /* ]]; then
+  RCH_TARGET_DIR="${REQUESTED_RCH_TARGET_DIR}"
+else
+  RCH_TARGET_DIR="${DEFAULT_RCH_TARGET_DIR}"
+fi
 TEST_FILTERS=(
   "mission_cli_command_family_parses_all_subcommands"
   "mission_cli_run_transition_plan_matches_contract"

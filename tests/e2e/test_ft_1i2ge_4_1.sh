@@ -66,7 +66,13 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-RCH_TARGET_DIR="target-rch-ft-1i2ge-4-1"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-ft-1i2ge-4-1-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_RCH_TARGET_DIR}" && "${REQUESTED_RCH_TARGET_DIR}" != /* ]]; then
+  RCH_TARGET_DIR="${REQUESTED_RCH_TARGET_DIR}"
+else
+  RCH_TARGET_DIR="${DEFAULT_RCH_TARGET_DIR}"
+fi
 TEST_FILTERS=(
   "mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons"
   "mission_policy_preflight_dispatch_time_requires_assignment_reference"

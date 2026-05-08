@@ -66,7 +66,13 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission adaptive replanning trigger/backoff contract checks"
 
-RCH_TARGET_DIR="target-rch-ft-1i2ge-3-4"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-ft-1i2ge-3-4-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_RCH_TARGET_DIR}" && "${REQUESTED_RCH_TARGET_DIR}" != /* ]]; then
+  RCH_TARGET_DIR="${REQUESTED_RCH_TARGET_DIR}"
+else
+  RCH_TARGET_DIR="${DEFAULT_RCH_TARGET_DIR}"
+fi
 TEST_FILTERS=(
   "mission_adaptive_replan_schedules_retry_pending_from_failed_state"
   "mission_adaptive_replan_backoff_blocks_tight_loop"

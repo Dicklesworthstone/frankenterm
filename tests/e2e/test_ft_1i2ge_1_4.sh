@@ -71,7 +71,13 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-RCH_TARGET_DIR="target-rch-ft-1i2ge-1-4"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-ft-1i2ge-1-4-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_RCH_TARGET_DIR}" && "${REQUESTED_RCH_TARGET_DIR}" != /* ]]; then
+  RCH_TARGET_DIR="${REQUESTED_RCH_TARGET_DIR}"
+else
+  RCH_TARGET_DIR="${DEFAULT_RCH_TARGET_DIR}"
+fi
 TEST_FILTERS=(
   "mission_lifecycle_transition_conformance_matches_transition_table"
   "mission_lifecycle_happy_path_reaches_completed"
