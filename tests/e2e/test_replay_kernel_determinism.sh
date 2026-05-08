@@ -20,9 +20,9 @@ else
   cargo_home_base="$cargo_home_input"
 fi
 
-cargo_target_base_input="${CARGO_TARGET_DIR:-target-replay-kernel-determinism}"
+cargo_target_base_input="${CARGO_TARGET_DIR:-target/rch-e2e-replay-kernel-determinism}"
 if [[ "$cargo_target_base_input" == /* ]]; then
-  cargo_target_base="target-replay-kernel-determinism"
+  cargo_target_base="target/rch-e2e-replay-kernel-determinism"
 else
   cargo_target_base="$cargo_target_base_input"
 fi
