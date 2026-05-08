@@ -124,8 +124,8 @@ check_prerequisites() {
     if [[ ! -x "$FT_BIN" ]]; then
         log_fail "wa binary not found"
         echo "[INFO] Build via rch first, for example:" >&2
-        echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cli-polish-target cargo build -p frankenterm" >&2
-        echo "[INFO] Then rerun with FT_BIN=/tmp/ft-cli-polish-target/debug/wa or CARGO_TARGET_DIR=/tmp/ft-cli-polish-target" >&2
+        echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=target/rch-e2e-cli-polish cargo build -p frankenterm" >&2
+        echo "[INFO] Then rerun with FT_BIN=target/rch-e2e-cli-polish/debug/wa or CARGO_TARGET_DIR=target/rch-e2e-cli-polish" >&2
         exit 2
     fi
 

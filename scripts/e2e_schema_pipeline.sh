@@ -163,8 +163,8 @@ check_prerequisites() {
     else
         log_fail "wa binary not found"
         echo "[INFO] Build via rch first, for example:" >&2
-        echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-schema-pipeline-target cargo build -p frankenterm" >&2
-        echo "[INFO] Then rerun with FT_BIN=/tmp/ft-schema-pipeline-target/debug/wa or CARGO_TARGET_DIR=/tmp/ft-schema-pipeline-target" >&2
+        echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=target/rch-e2e-schema-pipeline cargo build -p frankenterm" >&2
+        echo "[INFO] Then rerun with FT_BIN=target/rch-e2e-schema-pipeline/debug/wa or CARGO_TARGET_DIR=target/rch-e2e-schema-pipeline" >&2
         exit 1
     fi
 

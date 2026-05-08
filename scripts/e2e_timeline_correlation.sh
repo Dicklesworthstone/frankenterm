@@ -21,6 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 # Colors (disabled when piped)
@@ -158,8 +159,8 @@ find_ft_binary() {
 
     echo -e "${RED}ERROR:${NC} Cannot find ft binary" >&2
     echo "[INFO] Build via rch first, for example:" >&2
-    echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-timeline-target cargo build -p frankenterm" >&2
-    echo "[INFO] Then rerun with FT_BINARY=/tmp/ft-timeline-target/debug/ft or CARGO_TARGET_DIR=/tmp/ft-timeline-target" >&2
+    echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=target/rch-e2e-timeline cargo build -p frankenterm" >&2
+    echo "[INFO] Then rerun with FT_BINARY=target/rch-e2e-timeline/debug/ft or CARGO_TARGET_DIR=target/rch-e2e-timeline" >&2
     exit 5
 }
 
@@ -551,14 +552,17 @@ scenario_performance_guardrail() {
         if (( i % 10 == 0 )); then sev="warning"; fi
         if (( i % 50 == 0 )); then sev="critical"; fi
 
-        batch_sql+="INSERT INTO events (
+        local event_sql
+        printf -v event_sql 'INSERT INTO events (
             pane_id, rule_id, agent_type, event_type, severity, confidence,
             extracted, matched_text, segment_id, detected_at, handled_at,
             handled_by_workflow_id, handled_status, dedupe_key
         ) VALUES (
-            $pane_id, 'e2e.perf.event.$i', 'codex', 'perf.test', '$sev', 0.5,
-            NULL, 'perf event $i', NULL, $ts, NULL, NULL, NULL, 'e2e-perf-$i'
-        );"$'\n'
+            %s, '\''e2e.perf.event.%s'\'', '\''codex'\'', '\''perf.test'\'', '\''%s'\'', 0.5,
+            NULL, '\''perf event %s'\'', NULL, %s, NULL, NULL, NULL, '\''e2e-perf-%s'\''
+        );
+' "$pane_id" "$i" "$sev" "$i" "$ts" "$i"
+        batch_sql+="$event_sql"
     done
 
     sqlite3 "$DB_PATH" <<SQL

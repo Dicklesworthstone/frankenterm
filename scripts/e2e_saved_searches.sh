@@ -67,8 +67,8 @@ find_ft_binary() {
 
   echo "Could not find wa/ft binary" >&2
   echo "[INFO] Build via rch first, for example:" >&2
-  echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-saved-searches-target cargo build -p frankenterm" >&2
-  echo "[INFO] Then rerun with FT_BINARY=/tmp/ft-saved-searches-target/debug/wa or CARGO_TARGET_DIR=/tmp/ft-saved-searches-target" >&2
+  echo "[INFO]   rch exec -- env CARGO_TARGET_DIR=target/rch-e2e-saved-searches cargo build -p frankenterm" >&2
+  echo "[INFO] Then rerun with FT_BINARY=target/rch-e2e-saved-searches/debug/wa or CARGO_TARGET_DIR=target/rch-e2e-saved-searches" >&2
   return 1
 }
 
