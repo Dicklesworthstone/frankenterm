@@ -21254,6 +21254,10 @@ mod pool_telemetry_tests {
 
     #[test]
     fn storage_handle_default_rusqlite_provider_roundtrip_and_pool_parity_ft_3hfif() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+
         run_storage_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let db_path = temp_dir.path().join("rusqlite_provider_parity_ft_3hfif.db");
@@ -21328,12 +21332,7 @@ mod pool_telemetry_tests {
                 "default rusqlite open path must preserve output_segments FTS triggers"
             );
 
-            let start = {
-                let _guard = pool_counter_test_lock()
-                    .lock()
-                    .expect("pool telemetry test lock should not be poisoned");
-                baseline()
-            };
+            let start = baseline();
             for _ in 0..2 {
                 let segments = storage
                     .get_segments(9, 10)
@@ -21342,12 +21341,7 @@ mod pool_telemetry_tests {
                 assert_eq!(segments.len(), 1);
                 assert_eq!(segments[0].content, "rusqlite parity segment");
             }
-            let end = {
-                let _guard = pool_counter_test_lock()
-                    .lock()
-                    .expect("pool telemetry test lock should not be poisoned");
-                baseline()
-            };
+            let end = baseline();
             let d = delta(start, end);
             assert!(
                 d.hits + d.misses >= 2,
