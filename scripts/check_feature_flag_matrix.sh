@@ -1,11 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CARGO_BIN="${CARGO_BIN:-${CARGO:-cargo}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ARTIFACT_DIR="${FEATURE_FLAG_MATRIX_ARTIFACT_DIR:-target/feature-flag-matrix}"
+RUN_ID="${FEATURE_FLAG_MATRIX_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
+DEFAULT_RCH_TARGET_DIR="target/rch-feature-flag-matrix-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${FEATURE_FLAG_MATRIX_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_RCH_TARGET_DIR" && "$REQUESTED_RCH_TARGET_DIR" != /* ]]; then
+  RCH_TARGET_DIR="$REQUESTED_RCH_TARGET_DIR"
+else
+  RCH_TARGET_DIR="$DEFAULT_RCH_TARGET_DIR"
+fi
+RUN_CARGO_STEP=0
+
+cd "$PROJECT_ROOT"
+mkdir -p "$ARTIFACT_DIR"
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+rch_init "$ARTIFACT_DIR" "$RUN_ID" "feature_flag_matrix" "$PROJECT_ROOT"
+ensure_rch_ready
 
 run_cargo() {
-  echo "+ ${CARGO_BIN} $*"
-  "${CARGO_BIN}" "$@"
+  ((RUN_CARGO_STEP++)) || true
+  local step_name
+  printf -v step_name 'step_%02d' "$RUN_CARGO_STEP"
+  local log_file="$ARTIFACT_DIR/${step_name}.log"
+
+  echo "+ cargo $*"
+  run_rch_cargo_logged "$log_file" env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
 }
 
 run_cargo check -p frankenterm-core --no-default-features --lib
