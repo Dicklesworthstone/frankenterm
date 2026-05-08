@@ -15,9 +15,8 @@ TARGET_DIR="target-rch-ft-so7qh-1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_so7qh_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_so7qh_1_${RUN_ID}.stdout.log"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "so7qh_1"
-ensure_rch_ready
 
 emit_log() {
   local outcome="$1"
@@ -60,6 +59,14 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured log emission and rch metadata artifacts" >&2
+  exit 1
+fi
+
+rch_init "${LOG_DIR}" "${RUN_ID}" "so7qh_1"
+ensure_rch_ready
+
 emit_log \
   "started" \
   "script_init" \
@@ -68,63 +75,20 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "command=${COMMAND_INPUT} threshold=3 signature=core.codex:error_loop"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "preflight_rch" \
-    "rch_missing" \
-    "rch_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "rch must be installed for offloaded cargo execution"
-  exit 1
-fi
-
-if ! command -v jq >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "preflight_jq" \
-    "jq_missing" \
-    "jq_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "jq is required for structured log emission and worker probe parsing"
-  exit 1
-fi
-
-if ! rch workers probe --all --json \
-  | jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-    >/dev/null; then
-  emit_log \
-    "failed" \
-    "preflight_rch_workers" \
-    "rch_workers_unreachable" \
-    "remote_worker_unavailable" \
-    "$(basename "${LOG_FILE}")" \
-    "No reachable rch workers; aborting before cargo fallback can run locally"
-  exit 1
-fi
-
-TEST_CMD=(
-  env TMPDIR=/tmp
-  rch exec --
-  env CARGO_TARGET_DIR="${TARGET_DIR}"
-  cargo test -p frankenterm-core --lib e2e_repeated_failure_loop_decision_is_deterministic -- --nocapture
-)
-
 emit_log \
   "running" \
   "cargo_test" \
   "none" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "Executing: ${TEST_CMD[*]}"
+  "Executing via shared rch guard: cargo test -p frankenterm-core --lib e2e_repeated_failure_loop_decision_is_deterministic -- --nocapture"
 
 set +e
-(
-  cd "${ROOT_DIR}"
-  "${TEST_CMD[@]}"
-) 2>&1 | tee "${STDOUT_FILE}"
-status=${PIPESTATUS[0]}
+run_rch_cargo_logged "${STDOUT_FILE}" env CARGO_TARGET_DIR="${TARGET_DIR}" \
+  cargo test -p frankenterm-core --lib e2e_repeated_failure_loop_decision_is_deterministic -- --nocapture
+status=$?
 set -e
+cat "${STDOUT_FILE}"
 
 if [[ ${status} -ne 0 ]]; then
   emit_log \
@@ -135,17 +99,6 @@ if [[ ${status} -ne 0 ]]; then
     "$(basename "${STDOUT_FILE}")" \
     "exit=${status}"
   exit "${status}"
-fi
-
-if grep -q "\\[RCH\\] local" "${STDOUT_FILE}"; then
-  emit_log \
-    "failed" \
-    "offload_guard" \
-    "rch_local_fallback" \
-    "remote_offload_required" \
-    "$(basename "${STDOUT_FILE}")" \
-    "rch fell back to local execution; refusing CPU-intensive local run"
-  exit 1
 fi
 
 if ! grep -q "e2e_repeated_failure_loop_decision_is_deterministic ... ok" "${STDOUT_FILE}"; then
