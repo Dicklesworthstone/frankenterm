@@ -13,9 +13,8 @@ TARGET_DIR="target-rch-ft-so7qh-5-${RUN_ID}"
 
 LOG_FILE="${LOG_DIR}/ft_so7qh_5_${RUN_ID}.jsonl"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "so7qh_5"
-ensure_rch_ready
 
 emit_log() {
   local outcome="$1"
@@ -71,15 +70,6 @@ run_target_test() {
   local success_reason="$5"
 
   local stdout_file="${LOG_DIR}/ft_so7qh_5_${RUN_ID}_${scenario}.stdout.log"
-  local test_cmd=(
-    env TMPDIR=/tmp
-    rch exec --
-    env CARGO_TARGET_DIR="${TARGET_DIR}"
-    cargo test
-    -p frankenterm-core
-    --lib "${test_name}"
-    -- --nocapture
-  )
 
   emit_log \
     "running" \
@@ -89,28 +79,14 @@ run_target_test() {
     "none" \
     "none" \
     "$(basename "${stdout_file}")" \
-    "Executing: ${test_cmd[*]}"
+    "Executing via shared rch guard: cargo test -p frankenterm-core --lib ${test_name} -- --nocapture"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    "${test_cmd[@]}"
-  ) 2>&1 | tee "${stdout_file}"
-  local status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${stdout_file}" env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    cargo test -p frankenterm-core --lib "${test_name}" -- --nocapture
+  local status=$?
   set -e
-
-  if grep -q "\\[RCH\\] local" "${stdout_file}"; then
-    emit_log \
-      "failed" \
-      "${scenario}" \
-      "${command_input}" \
-      "offload_guard" \
-      "rch_local_fallback" \
-      "remote_offload_required" \
-      "$(basename "${stdout_file}")" \
-      "rch fell back to local execution; refusing CPU-intensive local run"
-    return 1
-  fi
+  cat "${stdout_file}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -151,6 +127,14 @@ run_target_test() {
   return 0
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured log emission and rch metadata artifacts" >&2
+  exit 1
+fi
+
+rch_init "${LOG_DIR}" "${RUN_ID}" "so7qh_5"
+ensure_rch_ready
+
 emit_log \
   "started" \
   "suite_init" \
@@ -160,47 +144,6 @@ emit_log \
   "none" \
   "$(basename "${LOG_FILE}")" \
   "scenarios=3"
-
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "suite_init" \
-    "rch exec -- cargo test ..." \
-    "preflight_rch" \
-    "rch_missing" \
-    "rch_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "rch must be installed for offloaded cargo execution"
-  exit 1
-fi
-
-if ! command -v jq >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "suite_init" \
-    "jq --version" \
-    "preflight_jq" \
-    "jq_missing" \
-    "jq_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "jq is required for structured log emission and worker probe parsing"
-  exit 1
-fi
-
-if ! rch workers probe --all --json \
-  | jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-    >/dev/null; then
-  emit_log \
-    "failed" \
-    "suite_init" \
-    "rch workers probe --all --json" \
-    "preflight_rch_workers" \
-    "rch_workers_unreachable" \
-    "remote_worker_unavailable" \
-    "$(basename "${LOG_FILE}")" \
-    "No reachable rch workers; aborting before cargo fallback can run locally"
-  exit 1
-fi
 
 run_target_test \
   "config_parses_and_hot_reload_diff" \
