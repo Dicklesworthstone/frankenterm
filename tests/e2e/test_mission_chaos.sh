@@ -101,7 +101,7 @@ run_suite() {
       "$(basename "${stderr_file}")" "$* (exit=${rc})"
   fi
 
-  pass_count="$(cat "${stdout_file}" "${stderr_file}" | grep -E '^test .+ \.\.\. ok$' | wc -l | tr -d ' ')"
+  pass_count="$(awk '/^test .+ \.\.\. ok$/ { count++ } END { print count + 0 }' "${stdout_file}" "${stderr_file}")"
   if [[ "${pass_count}" -lt "${expected_min}" ]]; then
     fail_now "${decision_path}" "insufficient_pass_count" "coverage_threshold_not_met" \
       "$(basename "${stdout_file}")" \
@@ -187,7 +187,7 @@ resume_a_stdout="$(parse_result "${resume_a_result}" 3)"
 resume_b_stdout="$(parse_result "${resume_b_result}" 3)"
 chaos_stderr="$(parse_result "${chaos_result}" 4)"
 tx_matrix_stderr="$(parse_result "${tx_matrix_result}" 4)"
-observability_stderr="$(parse_result "${observability_result}" 4)"
+_observability_stderr="$(parse_result "${observability_result}" 4)"
 resume_a_stderr="$(parse_result "${resume_a_result}" 4)"
 resume_b_stderr="$(parse_result "${resume_b_result}" 4)"
 
@@ -249,11 +249,11 @@ jq -n \
   --arg tx_id "${TX_ID}" \
   --arg fixed_seed "${FIXED_SEED}" \
   --arg heavy_command_policy "all cargo test commands executed via rch exec" \
-  --arg chaos_log "${chaos_stdout#${ROOT_DIR}/}" \
-  --arg tx_matrix_log "${tx_matrix_stdout#${ROOT_DIR}/}" \
-  --arg observability_log "${observability_stdout#${ROOT_DIR}/}" \
-  --arg resume_a_log "${resume_a_stdout#${ROOT_DIR}/}" \
-  --arg resume_b_log "${resume_b_stdout#${ROOT_DIR}/}" \
+  --arg chaos_log "${chaos_stdout#"${ROOT_DIR}"/}" \
+  --arg tx_matrix_log "${tx_matrix_stdout#"${ROOT_DIR}"/}" \
+  --arg observability_log "${observability_stdout#"${ROOT_DIR}"/}" \
+  --arg resume_a_log "${resume_a_stdout#"${ROOT_DIR}"/}" \
+  --arg resume_b_log "${resume_b_stdout#"${ROOT_DIR}"/}" \
   --argjson chaos_pass "$(parse_result "${chaos_result}" 1)" \
   --argjson tx_matrix_pass "$(parse_result "${tx_matrix_result}" 1)" \
   --argjson observability_pass "$(parse_result "${observability_result}" 1)" \
@@ -299,12 +299,12 @@ jq -n \
   }' > "${REPORT_FILE}"
 
 emit_log "passed" "chaos_evidence_bundle" "artifact_generated" "none" \
-  "${REPORT_FILE#${ROOT_DIR}/}" "generated chaos burn-in evidence bundle"
+  "${REPORT_FILE#"${ROOT_DIR}"/}" "generated chaos burn-in evidence bundle"
 
 emit_log "passed" "suite_complete" "all_scenarios_passed" "none" \
   "$(basename "${LOG_FILE}")" \
   "chaos burn-in completed with rollback storm and deterministic recovery assertions"
 
 echo "Mission chaos e2e passed."
-echo "Structured logs: ${LOG_FILE#${ROOT_DIR}/}"
-echo "Chaos report: ${REPORT_FILE#${ROOT_DIR}/}"
+echo "Structured logs: ${LOG_FILE#"${ROOT_DIR}"/}"
+echo "Chaos report: ${REPORT_FILE#"${ROOT_DIR}"/}"

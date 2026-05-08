@@ -18,6 +18,7 @@ STDOUT_BASENAME="mission_mcp_tools_${RUN_ID}"
 WORKSPACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ft-mission-mcp-tools.XXXXXX")"
 MISSION_PATH="${WORKSPACE_DIR}/.ft/mission/active.json"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_3_mission_mcp_tools"
 ensure_rch_ready
@@ -167,7 +168,6 @@ run_mission_json() {
 
   LAST_STDOUT_FILE="${stdout_file}"
   LAST_STDERR_FILE="${stderr_file}"
-  LAST_RC="${rc}"
   return "${rc}"
 }
 
@@ -191,7 +191,6 @@ assert_jq_true() {
 
 LAST_STDOUT_FILE=""
 LAST_STDERR_FILE=""
-LAST_RC=0
 
 # ── Scenario 1: Mission status (nominal, Running state) ────────────────
 emit_log "running" "mission_status_nominal" "command_execution" "none" \
@@ -389,4 +388,4 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "validated status, explain, pause, resume, abort, failure injection, recovery, and error paths"
 
-echo "Mission MCP tools e2e passed (10 scenarios). Logs: ${LOG_FILE#${ROOT_DIR}/}"
+echo "Mission MCP tools e2e passed (10 scenarios). Logs: ${LOG_FILE#"${ROOT_DIR}"/}"

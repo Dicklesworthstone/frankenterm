@@ -13,6 +13,7 @@ RAW_DIR="${LOG_DIR}/${RUN_ID}_raw"
 TARGET_DIR="target-rch-ft-2p9cb-6-1-3"
 mkdir -p "${RAW_DIR}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "2p9cb_6_1_3"
 ensure_rch_ready
@@ -85,7 +86,7 @@ emit_log \
   "none" \
   "none" \
   "unknown" \
-  "${JSON_LOG#${ROOT_DIR}/}" \
+  "${JSON_LOG#"${ROOT_DIR}"/}" \
   "ft-2p9cb.6.1.3 verification harness start" \
   0
 
@@ -98,7 +99,7 @@ if ! command -v rch >/dev/null 2>&1; then
     "rch_missing" \
     "rch_not_found" \
     "none" \
-    "${JSON_LOG#${ROOT_DIR}/}" \
+    "${JSON_LOG#"${ROOT_DIR}"/}" \
     "rch binary not found" \
     0
   exit 1
@@ -118,7 +119,7 @@ if [[ ${probe_status} -eq 0 ]]; then
     "workers_probe_ok" \
     "none" \
     "remote_probe" \
-    "${PROBE_LOG#${ROOT_DIR}/}" \
+    "${PROBE_LOG#"${ROOT_DIR}"/}" \
     "rch workers probe succeeded" \
     0
 else
@@ -130,7 +131,7 @@ else
     "workers_probe_failed" \
     "remote_worker_probe_failed" \
     "unknown" \
-    "${PROBE_LOG#${ROOT_DIR}/}" \
+    "${PROBE_LOG#"${ROOT_DIR}"/}" \
     "rch workers probe failed; proceeding with fallback-aware execution" \
     0
 fi
@@ -176,7 +177,7 @@ for i in "${!TEST_NAMES[@]}"; do
     "none" \
     "none" \
     "unknown" \
-    "${stdout_file#${ROOT_DIR}/}" \
+    "${stdout_file#"${ROOT_DIR}"/}" \
     "Executing: ${cmd}" \
     0
 
@@ -204,7 +205,7 @@ for i in "${!TEST_NAMES[@]}"; do
       "cargo_test_failed" \
       "nonzero_exit" \
       "${rch_mode}" \
-      "${stderr_file#${ROOT_DIR}/}" \
+      "${stderr_file#"${ROOT_DIR}"/}" \
       "Command failed with exit=${status}" \
       "${duration_ms}"
     tail -n 120 "${stderr_file}" >&2 || true
@@ -221,7 +222,7 @@ for i in "${!TEST_NAMES[@]}"; do
       "missing_success_marker" \
       "expected_test_marker_missing" \
       "${rch_mode}" \
-      "${stdout_file#${ROOT_DIR}/}" \
+      "${stdout_file#"${ROOT_DIR}"/}" \
       "Missing marker: ${marker}" \
       "${duration_ms}"
     tail -n 120 "${stdout_file}" >&2 || true
@@ -237,7 +238,7 @@ for i in "${!TEST_NAMES[@]}"; do
     "assertions_satisfied" \
     "none" \
     "${rch_mode}" \
-    "${stdout_file#${ROOT_DIR}/}" \
+    "${stdout_file#"${ROOT_DIR}"/}" \
     "Marker verified: ${marker}" \
     "${duration_ms}"
 done
@@ -255,7 +256,7 @@ emit_log \
   "verification_complete" \
   "none" \
   "mixed" \
-  "${JSON_LOG#${ROOT_DIR}/}" \
+  "${JSON_LOG#"${ROOT_DIR}"/}" \
   "pass=${pass_count}, fail=${fail_count}, local_fallback=${local_fallback_count}" \
   0
 
@@ -265,8 +266,8 @@ jq -cn \
   --argjson pass "${pass_count}" \
   --argjson fail "${fail_count}" \
   --argjson local_fallback "${local_fallback_count}" \
-  --arg log "${JSON_LOG#${ROOT_DIR}/}" \
-  --arg raw "${RAW_DIR#${ROOT_DIR}/}" \
+  --arg log "${JSON_LOG#"${ROOT_DIR}"/}" \
+  --arg raw "${RAW_DIR#"${ROOT_DIR}"/}" \
   '{
     test: "ft_2p9cb_6_1_3_fault_isolation_verify",
     run_id: $run_id,

@@ -125,7 +125,7 @@ add_artifact_if_exists() {
     local artifact_json="$1"
     local abs_path="$2"
     if [[ -f "$abs_path" ]]; then
-        local rel_path="${abs_path#$RUN_DIR/}"
+        local rel_path="${abs_path#"${RUN_DIR}"/}"
         add_unique_string "$artifact_json" "$rel_path"
     else
         echo "$artifact_json"
@@ -144,7 +144,7 @@ UNEXPECTED_FAILURES=$(count_jsonl_select "$FAULT_EVENTS_FILE" 'map(select(.class
 CRASH_SIGNATURES_JSON="[]"
 while IFS= read -r signature_file; do
     signature=$(jq -r '.signature // .failure_signature // "unknown"' "$signature_file" 2>/dev/null || echo "unknown")
-    rel_path="${signature_file#$RUN_DIR/}"
+    rel_path="${signature_file#"${RUN_DIR}"/}"
     CRASH_SIGNATURES_JSON=$(jq -c \
         --arg signature "$signature" \
         --arg path "$rel_path" \

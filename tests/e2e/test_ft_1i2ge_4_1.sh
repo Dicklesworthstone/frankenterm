@@ -11,8 +11,9 @@ CORRELATION_ID="ft-1i2ge.4.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.stdout.log"
 PROBE_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.probe.log"
-LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
+LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_4_1"
 ensure_rch_ready
@@ -151,7 +152,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
       "exit=${status}; command=${test_cmd}"
-    exit ${status}
+    exit "${status}"
   fi
 done
 

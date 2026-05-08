@@ -192,7 +192,7 @@ for report in "${REPORTS[@]}"; do
         ((FN_ESTIMATE_COUNT++)) || true
     fi
 
-    report_rel="${report#$RUN_DIR/}"
+    report_rel="${report#"${RUN_DIR}"/}"
     SCENARIOS_JSON=$(jq -c \
         --arg scenario_id "$scenario_id" \
         --arg score "$score" \

@@ -115,7 +115,7 @@ run_suite() {
       "$(basename "${stderr_file}")" "$* (exit=${rc})"
   fi
 
-  pass_count="$(grep -E '^test .+ \.\.\. ok$' "${stdout_file}" | wc -l | tr -d ' ')"
+  pass_count="$(awk '/^test .+ \.\.\. ok$/ { count++ } END { print count + 0 }' "${stdout_file}")"
   if [[ "${pass_count}" -lt "${expected_min}" ]]; then
     fail_now "${decision_path}" "insufficient_pass_count" "coverage_threshold_not_met" \
       "$(basename "${stdout_file}")" \
@@ -200,19 +200,19 @@ jq -n \
   --argjson chaos_pass "${chaos_pass}" \
   --argjson chaos_expected_min 24 \
   --argjson chaos_duration "${chaos_duration}" \
-  --arg chaos_log "${chaos_stdout#${ROOT_DIR}/}" \
+  --arg chaos_log "${chaos_stdout#"${ROOT_DIR}"/}" \
   --argjson perf_pass "${perf_pass}" \
   --argjson perf_expected_min 20 \
   --argjson perf_duration "${perf_duration}" \
-  --arg perf_log "${perf_stdout#${ROOT_DIR}/}" \
+  --arg perf_log "${perf_stdout#"${ROOT_DIR}"/}" \
   --argjson matrix_pass "${matrix_pass}" \
   --argjson matrix_expected_min 19 \
   --argjson matrix_duration "${matrix_duration}" \
-  --arg matrix_log "${matrix_stdout#${ROOT_DIR}/}" \
+  --arg matrix_log "${matrix_stdout#"${ROOT_DIR}"/}" \
   --argjson correctness_pass "${correctness_pass}" \
   --argjson correctness_expected_min 20 \
   --argjson correctness_duration "${correctness_duration}" \
-  --arg correctness_log "${correctness_stdout#${ROOT_DIR}/}" \
+  --arg correctness_log "${correctness_stdout#"${ROOT_DIR}"/}" \
   --argjson kill_switch_hits "${kill_switch_hits}" \
   --argjson rollback_hits "${rollback_hits}" \
   --arg metrics_contract "ft-1i2ge.8.12" \
@@ -271,7 +271,7 @@ jq -n \
   }' > "${METRICS_FILE}"
 
 emit_log "passed" "rollout_readiness_report" "artifact_generated" "none" \
-  "${METRICS_FILE#${ROOT_DIR}/}" \
+  "${METRICS_FILE#"${ROOT_DIR}"/}" \
   "generated mission tx rollout readiness metrics artifact"
 
 emit_log "passed" "suite_complete" "all_scenarios_passed" "none" \
@@ -279,5 +279,5 @@ emit_log "passed" "suite_complete" "all_scenarios_passed" "none" \
   "validated chaos + performance + failure/recovery + regression suites"
 
 echo "Mission tx chaos/perf e2e passed."
-echo "Structured logs: ${LOG_FILE#${ROOT_DIR}/}"
-echo "Readiness report: ${METRICS_FILE#${ROOT_DIR}/}"
+echo "Structured logs: ${LOG_FILE#"${ROOT_DIR}"/}"
+echo "Readiness report: ${METRICS_FILE#"${ROOT_DIR}"/}"

@@ -130,7 +130,7 @@ find_budget() {
 while IFS= read -r estimates_file; do
     # Extract group/bench from path:
     #   target/criterion/<group>/<bench>/new/estimates.json
-    rel="${estimates_file#$CRITERION_DIR/}"
+    rel="${estimates_file#"${CRITERION_DIR}"/}"
     # Strip /new/estimates.json
     bench_path="${rel%/new/estimates.json}"
 

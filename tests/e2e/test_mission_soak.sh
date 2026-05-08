@@ -101,7 +101,7 @@ run_suite() {
       "$(basename "${stderr_file}")" "$* (exit=${rc})"
   fi
 
-  pass_count="$(cat "${stdout_file}" "${stderr_file}" | grep -E '^test .+ \.\.\. ok$' | wc -l | tr -d ' ')"
+  pass_count="$(awk '/^test .+ \.\.\. ok$/ { count++ } END { print count + 0 }' "${stdout_file}" "${stderr_file}")"
   if [[ "${pass_count}" -lt "${expected_min}" ]]; then
     fail_now "${decision_path}" "insufficient_pass_count" "coverage_threshold_not_met" \
       "$(basename "${stdout_file}")" \
@@ -273,12 +273,12 @@ jq -n \
   }' > "${REPORT_FILE}"
 
 emit_log "passed" "soak_evidence_bundle" "artifact_generated" "none" \
-  "${REPORT_FILE#${ROOT_DIR}/}" "generated deterministic soak evidence bundle"
+  "${REPORT_FILE#"${ROOT_DIR}"/}" "generated deterministic soak evidence bundle"
 
 emit_log "passed" "suite_complete" "all_scenarios_passed" "none" \
   "$(basename "${LOG_FILE}")" \
   "long-haul soak campaign completed with bounded degradation and deterministic resume assertions"
 
 echo "Mission soak e2e passed."
-echo "Structured logs: ${LOG_FILE#${ROOT_DIR}/}"
-echo "Soak report: ${REPORT_FILE#${ROOT_DIR}/}"
+echo "Structured logs: ${LOG_FILE#"${ROOT_DIR}"/}"
+echo "Soak report: ${REPORT_FILE#"${ROOT_DIR}"/}"

@@ -14,8 +14,9 @@ STDOUT_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.stdout.log"
 PROBE_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.probe.log"
 STATUS_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.status.json"
 CHECK_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.check.log"
-LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
+LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_2"
 ensure_rch_ready

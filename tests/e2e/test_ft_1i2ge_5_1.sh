@@ -11,8 +11,9 @@ CORRELATION_ID="ft-1i2ge.5.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_5_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_5_1_${RUN_ID}.stdout.log"
 PROBE_FILE="${LOG_DIR}/ft_1i2ge_5_1_${RUN_ID}.probe.log"
-LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
+LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_1"
 ensure_rch_ready

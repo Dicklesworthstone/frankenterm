@@ -17,9 +17,9 @@ WORKSPACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ft-1i2ge-5-5.XXXXXX")"
 MISSION_PATH="${WORKSPACE_DIR}/.ft/mission/active.json"
 LAST_STDOUT_FILE=""
 LAST_STDERR_FILE=""
-LAST_RC=0
-LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
+LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_5"
 ensure_rch_ready
@@ -109,7 +109,6 @@ run_mission_json() {
 
   LAST_STDOUT_FILE="${stdout_file}"
   LAST_STDERR_FILE="${stderr_file}"
-  LAST_RC="${rc}"
   return "${rc}"
 }
 
