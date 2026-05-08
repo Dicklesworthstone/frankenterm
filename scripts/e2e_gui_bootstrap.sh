@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2329
 set -euo pipefail
 
 # End-to-end bootstrap validation for frankenterm-gui.
@@ -34,6 +35,16 @@ BUILD_STEP_STATUS="not_run"
 BUILD_STEP_DETAIL=""
 
 mkdir -p "$LOG_DIR"
+
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
 
 usage() {
   cat <<'EOF'
@@ -81,7 +92,11 @@ emit_step_json() {
   local duration_ms="$3"
   local detail="$4"
   printf '{"step":%d,"name":"%s","status":"%s","duration_ms":%d,"detail":"%s"}\n' \
-    "$step_index" "$name" "$status" "$duration_ms" "${detail//\"/\\\"}" >&2
+    "$step_index" \
+    "$(json_escape "$name")" \
+    "$(json_escape "$status")" \
+    "$duration_ms" \
+    "$(json_escape "$detail")" >&2
 }
 
 mark_skip() {
