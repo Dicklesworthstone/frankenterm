@@ -10,10 +10,11 @@ SCENARIO_ID="ft_1i2ge_4_3_approval_path_integration"
 CORRELATION_ID="ft-1i2ge.4.3-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_4_3_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_3_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_4_3_${RUN_ID}.probe.log"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_4_3"
 ensure_rch_ready
 
@@ -65,70 +66,34 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission approval-path durability and continuation contract checks"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required_missing" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for cargo execution in this scenario"
-  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_workers_unhealthy" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "rch workers probe failed; refusing local fallback"
-  echo "rch workers are unavailable; refusing local cargo execution." >&2
-  exit 1
-fi
-
-cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-4-3"
-emit_log \
-  "running" \
-  "execution_preflight" \
-  "rch_workers_healthy" \
-  "none" \
-  "$(basename "${PROBE_FILE}")" \
-  "offloading tests through rch workers"
-
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_approval_request_transitions_to_pending_and_awaiting_approval -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_approval_request_is_idempotent_when_already_pending -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_approval_continuation_transitions_to_running -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_approval_continuation_is_idempotent_for_same_approval -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_approval_continuation_on_expired_state_uses_safe_fallback -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_expire_approval_is_idempotent_and_sets_canonical_failure_outcome -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_validate_requires_pending_assignment_when_awaiting_approval -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_validate_rejects_pending_assignment_outside_awaiting_state -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-4-3"
+TEST_FILTERS=(
+  "mission_approval_request_transitions_to_pending_and_awaiting_approval"
+  "mission_approval_request_is_idempotent_when_already_pending"
+  "mission_approval_continuation_transitions_to_running"
+  "mission_approval_continuation_is_idempotent_for_same_approval"
+  "mission_approval_continuation_on_expired_state_uses_safe_fallback"
+  "mission_expire_approval_is_idempotent_and_sets_canonical_failure_outcome"
+  "mission_validate_requires_pending_assignment_when_awaiting_approval"
+  "mission_validate_rejects_pending_assignment_outside_awaiting_state"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_4_3_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture)
   decision_path="nominal_path"
   reason_code="approval_state_contract_validation"
 
-  if [[ "${test_cmd}" == *"idempotent"* ]]; then
+  if [[ "${test_filter}" == *"idempotent"* ]]; then
     decision_path="recovery_path"
     reason_code="idempotent_continuation_validation"
-  elif [[ "${test_cmd}" == *"expired"* ]]; then
+  elif [[ "${test_filter}" == *"expired"* ]]; then
     decision_path="failure_injection_path"
     reason_code="approval_expired_safe_fallback"
-  elif [[ "${test_cmd}" == *"pending_assignment"* ]]; then
+  elif [[ "${test_filter}" == *"pending_assignment"* ]]; then
     decision_path="failure_injection_path"
     reason_code="lifecycle_approval_state_coherence"
   fi
@@ -139,15 +104,13 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: ${cmd_prefix} ${test_cmd}"
+    "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${cmd_prefix} ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -156,7 +119,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
+      "exit=${status}; command=${test_cmd[*]}"
     exit "${status}"
   fi
 done
