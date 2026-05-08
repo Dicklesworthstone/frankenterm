@@ -16,11 +16,19 @@ STRUCTURED_LOG="${ARTIFACT_DIR}/structured.log"
 STDOUT_FILE="${ARTIFACT_DIR}/stdout.txt"
 STDERR_FILE="${ARTIFACT_DIR}/stderr.txt"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
-REMOTE_TARGET_DIR="/tmp/ft-$(whoami)-target"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-xbnl0-5-3-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+  REMOTE_TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+  REMOTE_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}"
 
 exec > >(tee -a "${STDOUT_FILE}")
 exec 2> >(tee -a "${STDERR_FILE}" >&2)
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
 RCH_SKIP_SMOKE_PREFLIGHT=1
 rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "ft_xbnl0_5_3_blessed_tuning_profiles"
@@ -123,7 +131,7 @@ run_rch_step() {
   shift 2
   local start_ns end_ns duration_ms
   start_ns="$(date +%s%N)"
-  record_command "rch exec -- $*"
+  record_command "run_rch_cargo_logged $*"
   if run_rch_cargo_logged "${log_file}" "$@"; then
     end_ns="$(date +%s%N)"
     duration_ms="$(((end_ns - start_ns) / 1000000))"
@@ -134,39 +142,6 @@ run_rch_step() {
   duration_ms="$(((end_ns - start_ns) / 1000000))"
   record_result "${step}" "false" "${duration_ms}" "${log_file}"
   return 1
-}
-
-run_rch_remote_logged() {
-  local output_file="$1"
-  shift
-
-  if [[ -z "${TIMEOUT_BIN:-}" ]]; then
-    resolve_timeout_bin
-  fi
-  if [[ -z "${TIMEOUT_BIN:-}" ]]; then
-    echo "timeout or gtimeout is required" >&2
-    return 2
-  fi
-
-  : > "${output_file}"
-
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    exec env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
-      rch exec -- "$@"
-  ) > "${output_file}" 2>&1
-  local rc=$?
-  set -e
-
-  check_rch_fallback "${output_file}"
-  if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-    local queue_log
-    queue_log="$(rch_timeout_queue_log "${output_file}")"
-    echo "RCH timeout; see ${queue_log}" >&2
-  fi
-
-  return "${rc}"
 }
 
 echo "=== ${BEAD_ID} blessed tuning profiles ==="
@@ -294,10 +269,10 @@ jq -cn \
 EOF
 
 REMOTE_FLOW_LOG="${ARTIFACT_DIR}/profile_cli_flow.log"
-record_command "rch exec -- env CARGO_TARGET_DIR=${REMOTE_TARGET_DIR} bash -lc <profile-cli-flow>"
+record_command "run_rch_cargo_logged env CARGO_TARGET_DIR=${REMOTE_TARGET_DIR} bash -lc <profile-cli-flow>"
 start_ns="$(date +%s%N)"
 set +e
-run_rch_remote_logged \
+run_rch_cargo_logged \
   "${REMOTE_FLOW_LOG}" \
   env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
     bash -lc "${REMOTE_SCRIPT}"
