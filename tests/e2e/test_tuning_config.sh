@@ -13,8 +13,8 @@ REMOTE_LOG="${LOG_DIR}/ft_ojpy0_tuning_config_${RUN_ID}.remote.log"
 DOCTOR_JSON="${LOG_DIR}/ft_ojpy0_tuning_config_${RUN_ID}.doctor.json"
 RCH_TARGET_DIR="target/rch-e2e-tuning-config-${RUN_ID}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "ft_ojpy0_tuning_config"
 
 emit_log() {
   local outcome="$1"
@@ -60,37 +60,14 @@ run_rch_remote_logged() {
   local output_file="$1"
   shift
 
-  if [[ -z "${TIMEOUT_BIN:-}" ]]; then
-    resolve_timeout_bin
-  fi
-  if [[ -z "${TIMEOUT_BIN:-}" ]]; then
-    fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
-  fi
-
-  : >"${output_file}"
-
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    exec env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 1800 \
-      rch exec -- "$@"
-  ) >"${output_file}" 2>&1
-  local rc=$?
-  set -e
-
-  check_rch_fallback "${output_file}"
-  if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-    local queue_log
-    queue_log="$(rch_timeout_queue_log "${output_file}")"
-    fatal "RCH timeout during remote tuning-config e2e run. See ${queue_log}"
-  fi
-
-  return "${rc}"
+  run_rch_cargo_logged_with_timeout 1800 "${output_file}" "$@"
 }
 
 if ! command -v jq >/dev/null 2>&1; then
   fatal "jq is required for structured logging and doctor JSON validation."
 fi
+
+rch_init "${LOG_DIR}" "${RUN_ID}" "ft_ojpy0_tuning_config"
 
 emit_log "started" "script_init" "none" "none" \
   "$(basename "${LOG_FILE}")" \
