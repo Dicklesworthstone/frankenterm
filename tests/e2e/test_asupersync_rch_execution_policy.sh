@@ -120,6 +120,19 @@ if [[ "$(jq -r '.is_heavy' <<<"${heavy_no_rch}")" != "true" || "$(jq -r '.policy
   exit 1
 fi
 
+install_no_rch="$("${VALIDATOR}" --classify "cargo install --locked --path crates/frankenterm")"
+if [[ "$(jq -r '.is_heavy' <<<"${install_no_rch}")" != "true" || "$(jq -r '.policy_violation' <<<"${install_no_rch}")" != "true" ]]; then
+  emit_log \
+    "failed" \
+    "unit_classifier" \
+    "command_classification" \
+    "classifier_mismatch" \
+    "unexpected_classifier_result" \
+    "$(basename "${VALIDATOR}")" \
+    "cargo install should be heavy and policy violation without rch"
+  exit 1
+fi
+
 wrapped_rch="$("${VALIDATOR}" --classify "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace")"
 if [[ "$(jq -r '.is_heavy' <<<"${wrapped_rch}")" != "true" || "$(jq -r '.used_rch' <<<"${wrapped_rch}")" != "true" || "$(jq -r '.policy_violation' <<<"${wrapped_rch}")" != "false" ]]; then
   emit_log \
@@ -130,6 +143,19 @@ if [[ "$(jq -r '.is_heavy' <<<"${wrapped_rch}")" != "true" || "$(jq -r '.used_rc
     "unexpected_classifier_result" \
     "$(basename "${VALIDATOR}")" \
     "run_rch_cargo_logged should be heavy, rch-backed, and policy-compliant"
+  exit 1
+fi
+
+wrapped_install_rch="$("${VALIDATOR}" --classify "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo install --locked --path crates/frankenterm")"
+if [[ "$(jq -r '.is_heavy' <<<"${wrapped_install_rch}")" != "true" || "$(jq -r '.used_rch' <<<"${wrapped_install_rch}")" != "true" || "$(jq -r '.policy_violation' <<<"${wrapped_install_rch}")" != "false" ]]; then
+  emit_log \
+    "failed" \
+    "unit_classifier" \
+    "command_classification" \
+    "classifier_mismatch" \
+    "unexpected_classifier_result" \
+    "$(basename "${VALIDATOR}")" \
+    "run_rch_cargo_logged cargo install should be heavy, rch-backed, and policy-compliant"
   exit 1
 fi
 
@@ -168,13 +194,11 @@ emit_log \
   "$(basename "${VALIDATOR}")" \
   "classifier behavior validated"
 
-tmp_valid="$(mktemp)"
-tmp_invalid="$(mktemp)"
-tmp_recovery="$(mktemp)"
-cleanup() {
-  rm -f "${tmp_valid}" "${tmp_invalid}" "${tmp_recovery}"
-}
-trap cleanup EXIT
+tmp_dir="${LOG_DIR}/asupersync_rch_policy_${RUN_ID}_evidence"
+mkdir -p "${tmp_dir}"
+tmp_valid="${tmp_dir}/valid.json"
+tmp_invalid="${tmp_dir}/invalid.json"
+tmp_recovery="${tmp_dir}/recovery.json"
 
 cat > "${tmp_valid}" <<'JSON'
 {

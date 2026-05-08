@@ -36,7 +36,7 @@ is_heavy_command() {
     return 1
   fi
 
-  if [[ "${normalized}" =~ (^|[[:space:]])cargo[[:space:]]+(check|build|test|clippy|bench|run)([[:space:]]|$) ]]; then
+  if [[ "${normalized}" =~ (^|[[:space:]])cargo[[:space:]]+(check|build|test|clippy|bench|run|install)([[:space:]]|$) ]]; then
     return 0
   fi
 
@@ -191,6 +191,16 @@ run_self_test() {
     return 1
   }
 
+  out="$(classify_command_json "cargo install --locked --path crates/frankenterm")"
+  [[ "$(jq -r '.is_heavy' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: cargo install should be heavy" >&2
+    return 1
+  }
+  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: cargo install without rch should be violation" >&2
+    return 1
+  }
+
   out="$(classify_command_json "rch exec -- cargo test --workspace")"
   [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
     echo "self-test failed: rch-wrapped heavy command should not be violation" >&2
@@ -217,6 +227,16 @@ run_self_test() {
     return 1
   }
 
+  out="$(classify_command_json "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo install --locked --path crates/frankenterm")"
+  [[ "$(jq -r '.used_rch' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: shared rch cargo wrapper should count for cargo install" >&2
+    return 1
+  }
+  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
+    echo "self-test failed: wrapped cargo install should not be violation" >&2
+    return 1
+  }
+
   out="$(classify_command_json "run_rch_cargo_logged_with_timeout 120 target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace")"
   [[ "$(jq -r '.used_rch' <<<"${out}")" == "true" ]] || {
     echo "self-test failed: shared timeout rch cargo wrapper should count as rch usage" >&2
@@ -233,8 +253,10 @@ run_self_test() {
     return 1
   }
 
-  local tmp_evidence
-  tmp_evidence="$(mktemp)"
+  local tmp_dir tmp_evidence
+  tmp_dir="${ROOT_DIR}/target/rch-policy-self-test/$(date -u +%Y%m%d_%H%M%S)-$$"
+  mkdir -p "${tmp_dir}"
+  tmp_evidence="${tmp_dir}/valid-evidence.json"
 
   cat > "${tmp_evidence}" <<'JSON'
 {
@@ -271,8 +293,8 @@ JSON
   validate_evidence_file "${tmp_evidence}" >/dev/null
 
   local tmp_fail_open tmp_fail_open_recovered
-  tmp_fail_open="$(mktemp)"
-  tmp_fail_open_recovered="$(mktemp)"
+  tmp_fail_open="${tmp_dir}/fail-open.json"
+  tmp_fail_open_recovered="${tmp_dir}/fail-open-recovered.json"
 
   cat > "${tmp_fail_open}" <<'JSON'
 {
@@ -297,14 +319,12 @@ JSON
 
   if validate_evidence_file "${tmp_fail_open}" >/dev/null 2>&1; then
     echo "self-test failed: heavy local execution after rch wrapper must require fallback metadata" >&2
-    rm -f "${tmp_evidence}" "${tmp_fail_open}" "${tmp_fail_open_recovered}"
     return 1
   fi
 
   jq '.runs[0].fallback_reason_code = "RCH-LOCAL-FALLBACK" | .runs[0].fallback_approved_by = "human-operator"' "${tmp_fail_open}" > "${tmp_fail_open_recovered}"
   validate_evidence_file "${tmp_fail_open_recovered}" >/dev/null
 
-  rm -f "${tmp_evidence}" "${tmp_fail_open}" "${tmp_fail_open_recovered}"
   echo "Self-test passed"
 }
 
