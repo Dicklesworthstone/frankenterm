@@ -14,7 +14,7 @@
 #   - System completes all work within bounded time
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - rch for remote Cargo execution
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -24,6 +24,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+
+RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-storage-stress-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${E2E_STORAGE_STRESS_RCH_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "$REQUESTED_RCH_TARGET_DIR" && "$REQUESTED_RCH_TARGET_DIR" != /* ]]; then
+    RCH_TARGET_DIR="$REQUESTED_RCH_TARGET_DIR"
+else
+    RCH_TARGET_DIR="$DEFAULT_RCH_TARGET_DIR"
+fi
+RCH_READY=0
+RCH_SKIP_SMOKE_PREFLIGHT="${E2E_STORAGE_STRESS_RCH_SKIP_SMOKE_PREFLIGHT:-${RCH_SKIP_SMOKE_PREFLIGHT:-1}}"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -98,6 +111,48 @@ log_info() {
     fi
 }
 
+ensure_rch_for_cargo_tests() {
+    if [[ "$RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    if [[ -z "${E2E_RUN_DIR:-}" ]]; then
+        echo "ERROR: E2E artifacts must be initialized before RCH setup" >&2
+        return 1
+    fi
+
+    local rch_log_dir="$E2E_RUN_DIR/rch"
+    mkdir -p "$rch_log_dir"
+
+    rch_init "$rch_log_dir" "$RUN_ID" "storage_stress" "$PROJECT_ROOT"
+    ensure_rch_ready
+    RCH_READY=1
+}
+
+scenario_log_path() {
+    local name="$1"
+    printf '%s/%s/%s.rch.log\n' "$E2E_SCENARIOS_DIR" "$E2E_CURRENT_SCENARIO" "$name"
+}
+
+run_storage_cargo() {
+    local output_file="$1"
+    shift
+    ensure_rch_for_cargo_tests
+    run_rch_cargo_logged "$output_file" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo "$@"
+}
+
+run_storage_cargo_timeout() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+    ensure_rch_for_cargo_tests
+    run_rch_cargo_logged_with_timeout "$timeout_secs" "$output_file" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo "$@"
+}
+
 # ==============================================================================
 # Prerequisites
 # ==============================================================================
@@ -105,11 +160,11 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
+    if ! command -v rch &>/dev/null; then
+        echo -e "${RED}ERROR:${NC} rch not found. Cargo lanes must run remotely." >&2
         exit 5
     fi
-    log_pass "cargo available"
+    log_pass "rch available"
 
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
@@ -126,13 +181,12 @@ scenario_storage_core_tests() {
     log_test "Scenario 1: Storage core test suite (correctness baseline)"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "storage_core_tests")"
     exit_code=0
 
     # Run ALL storage tests (200+ tests)
-    cargo test -p frankenterm-core 'storage::' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo "$test_output" test -p frankenterm-core 'storage::' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "storage_core_tests.log" "$(cat "$test_output")"
 
@@ -158,7 +212,6 @@ scenario_storage_core_tests() {
         log_fail "S1.2: Could not parse test results"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -169,13 +222,12 @@ scenario_fts_search_tests() {
     log_test "Scenario 2: FTS search correctness"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "fts_search_tests")"
     exit_code=0
 
     # Run FTS search tests
-    cargo test -p frankenterm-core 'storage::fts_search' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo "$test_output" test -p frankenterm-core 'storage::fts_search' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "fts_search_tests.log" "$(cat "$test_output")"
 
@@ -204,7 +256,6 @@ scenario_fts_search_tests() {
         log_fail "S2.4: Snippet highlighting test not found"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -215,12 +266,11 @@ scenario_fts_sync_tests() {
     log_test "Scenario 3: FTS sync pipeline (incremental indexing)"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "fts_sync_tests")"
     exit_code=0
 
-    cargo test -p frankenterm-core 'storage::fts_sync_tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo "$test_output" test -p frankenterm-core 'storage::fts_sync_tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "fts_sync_tests.log" "$(cat "$test_output")"
 
@@ -249,7 +299,6 @@ scenario_fts_sync_tests() {
         log_fail "S3.4: Version mismatch rebuild test missing"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -259,14 +308,15 @@ scenario_fts_sync_tests() {
 scenario_concurrent_writers() {
     log_test "Scenario 4: Concurrent writer safety"
 
-    local test_output exit_code
-    test_output=$(mktemp)
+    local test_output event_bus_output capture_channel_output exit_code
+    test_output="$(scenario_log_path "concurrent_writers")"
+    event_bus_output="$(scenario_log_path "event_bus_lag")"
+    capture_channel_output="$(scenario_log_path "capture_channel_drain")"
     exit_code=0
 
     # Run the concurrent writer deadlock test specifically
-    cargo test -p frankenterm-core 'storage_concurrent_writers_dont_deadlock' \
-        -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo "$test_output" test -p frankenterm-core 'storage_concurrent_writers_dont_deadlock' \
+        -- --nocapture || exit_code=$?
 
     e2e_add_file "concurrent_writers.log" "$(cat "$test_output")"
 
@@ -278,9 +328,10 @@ scenario_concurrent_writers() {
 
     # Run the event bus subscriber lag test
     exit_code=0
-    cargo test -p frankenterm-core 'event_bus_detects_subscriber_lag' \
-        -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo "$event_bus_output" test -p frankenterm-core 'event_bus_detects_subscriber_lag' \
+        -- --nocapture || exit_code=$?
+
+    e2e_add_file "event_bus_lag.log" "$(cat "$event_bus_output")"
 
     if [[ $exit_code -eq 0 ]]; then
         log_pass "S4.2: Event bus subscriber lag detection works"
@@ -290,9 +341,10 @@ scenario_concurrent_writers() {
 
     # Run capture channel drain test
     exit_code=0
-    cargo test -p frankenterm-core 'capture_channel_drains_when_consumer_resumes' \
-        -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo "$capture_channel_output" test -p frankenterm-core 'capture_channel_drains_when_consumer_resumes' \
+        -- --nocapture || exit_code=$?
+
+    e2e_add_file "capture_channel_drain.log" "$(cat "$capture_channel_output")"
 
     if [[ $exit_code -eq 0 ]]; then
         log_pass "S4.3: Capture channel drains after backpressure"
@@ -300,7 +352,6 @@ scenario_concurrent_writers() {
         log_fail "S4.3: Capture channel drain test failed"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -311,12 +362,11 @@ scenario_db_health_repair() {
     log_test "Scenario 5: DB health check and repair operations"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "db_health_repair")"
     exit_code=0
 
-    cargo test -p frankenterm-core 'storage::db_check_repair_tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo "$test_output" test -p frankenterm-core 'storage::db_check_repair_tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "db_check_repair.log" "$(cat "$test_output")"
 
@@ -345,7 +395,6 @@ scenario_db_health_repair() {
         log_fail "S5.4: Dry-run safety test missing"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -356,13 +405,12 @@ scenario_ingest_pipeline() {
     log_test "Scenario 6: Ingest pipeline (multi-pane lifecycle + stability)"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "ingest_pipeline")"
     exit_code=0
 
     # Run ingest tests covering multi-pane discovery, UUID stability, GAP handling
-    cargo test -p frankenterm-core 'ingest::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo "$test_output" test -p frankenterm-core 'ingest::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "ingest_pipeline.log" "$(cat "$test_output")"
 
@@ -388,7 +436,6 @@ scenario_ingest_pipeline() {
         log_fail "S6.3: Pane UUID stability test missing"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -398,8 +445,10 @@ scenario_ingest_pipeline() {
 scenario_benchmark_budgets() {
     log_test "Scenario 7: Storage + FTS benchmark regression guards"
 
-    local test_output exit_code start_time end_time duration_s
-    test_output=$(mktemp)
+    local test_output sizing_output fts_output exit_code start_time end_time duration_s
+    test_output="$(scenario_log_path "storage_bench_test")"
+    sizing_output="$(scenario_log_path "sizing_bench_test")"
+    fts_output="$(scenario_log_path "fts_query_bench_test")"
 
     # Run storage regression benchmarks in test mode (quick, no iterations)
     # This validates that the benchmark code compiles and the basic operations
@@ -408,9 +457,8 @@ scenario_benchmark_budgets() {
     exit_code=0
 
     # Run benchmarks as tests (--test flag) for quick validation
-    timeout 120 cargo test -p frankenterm-core --bench storage_regression \
-        -- --test --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo_timeout 120 "$test_output" test -p frankenterm-core --bench storage_regression \
+        -- --test --nocapture || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
@@ -427,9 +475,10 @@ scenario_benchmark_budgets() {
 
     # Run sizing benchmark in test mode
     exit_code=0
-    timeout 120 cargo test -p frankenterm-core --bench sizing_benchmark \
-        -- --test --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo_timeout 120 "$sizing_output" test -p frankenterm-core --bench sizing_benchmark \
+        -- --test --nocapture || exit_code=$?
+
+    e2e_add_file "sizing_bench_test.log" "$(cat "$sizing_output")"
 
     if [[ $exit_code -eq 124 ]]; then
         log_fail "S7.2: Sizing benchmark test TIMED OUT"
@@ -441,9 +490,10 @@ scenario_benchmark_budgets() {
 
     # Run FTS query benchmark in test mode
     exit_code=0
-    timeout 120 cargo test -p frankenterm-core --bench fts_query \
-        -- --test --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo_timeout 120 "$fts_output" test -p frankenterm-core --bench fts_query \
+        -- --test --nocapture || exit_code=$?
+
+    e2e_add_file "fts_query_bench_test.log" "$(cat "$fts_output")"
 
     if [[ $exit_code -eq 124 ]]; then
         log_fail "S7.3: FTS query benchmark test TIMED OUT"
@@ -453,7 +503,6 @@ scenario_benchmark_budgets() {
         log_fail "S7.3: FTS query benchmark test failed (exit=$exit_code)"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
@@ -464,15 +513,14 @@ scenario_bounded_execution() {
     log_test "Scenario 8: Bounded execution (no hangs, no OOM)"
 
     local test_output exit_code start_time end_time duration_s
-    test_output=$(mktemp)
+    test_output="$(scenario_log_path "full_storage_suite")"
 
     # Run ALL storage + ingest tests with timing
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 180 cargo test -p frankenterm-core 'storage::' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_storage_cargo_timeout 180 "$test_output" test -p frankenterm-core 'storage::' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
@@ -510,7 +558,6 @@ scenario_bounded_execution() {
         log_fail "S8.3: Could not parse test results"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
