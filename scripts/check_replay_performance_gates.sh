@@ -13,11 +13,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")-$$"
 RUN_BENCH=true
 WRITE_BASELINE=false
 BASELINE_SOURCE="manual_refresh"
 
-TARGET_DIR="${FT_REPLAY_PERF_TARGET_DIR:-target-replay-performance-gates}"
+DEFAULT_TARGET_DIR="target/rch-replay-performance-gates-${RUN_ID}"
+requested_target_dir="${FT_REPLAY_PERF_TARGET_DIR:-}"
+if [[ -n "$requested_target_dir" && "$requested_target_dir" != /* ]]; then
+    TARGET_DIR="$requested_target_dir"
+else
+    TARGET_DIR="$DEFAULT_TARGET_DIR"
+fi
 ARTIFACT_DIR="${FT_REPLAY_PERF_ARTIFACT_DIR:-target/replay-performance-gates}"
 BASELINE_FILE="${FT_REPLAY_PERF_BASELINE_FILE:-evidence/ft-og6q6.7.3/replay_performance_baseline.json}"
 CRITERION_DIR="${FT_REPLAY_PERF_CRITERION_DIR:-}"
@@ -100,12 +107,23 @@ if [[ -z "$CRITERION_DIR" ]]; then
     CRITERION_DIR="$TARGET_DIR/criterion"
 fi
 
+if $RUN_BENCH && [[ -z "$TARGET_DIR" || "$TARGET_DIR" == /* ]]; then
+    echo "[replay-perf] WARNING: ignoring absolute/empty target dir for RCH execution: ${TARGET_DIR:-<empty>}" >&2
+    TARGET_DIR="$DEFAULT_TARGET_DIR"
+    if [[ -z "$CRITERION_DIR" || "$CRITERION_DIR" == /* ]]; then
+        CRITERION_DIR="$TARGET_DIR/criterion"
+    fi
+fi
+
 if ! command -v jq >/dev/null 2>&1; then
     echo "[replay-perf] ERROR: jq is required" >&2
     exit 3
 fi
 
 mkdir -p "$ARTIFACT_DIR"
+if $RUN_BENCH; then
+    mkdir -p "$TARGET_DIR"
+fi
 BENCH_LOG="$ARTIFACT_DIR/replay-performance-bench.log"
 REPORT_FILE="$ARTIFACT_DIR/replay-performance-report.json"
 
@@ -146,20 +164,40 @@ if [[ "${FT_REPLAY_PERF_AUTO_WRITE_BASELINE:-false}" == "true" ]] \
 fi
 
 if $RUN_BENCH; then
+    RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
+    RCH_STEP_TIMEOUT_SECS="${FT_REPLAY_PERF_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-1800}}"
+    # shellcheck source=tests/e2e/lib_rch_guards.sh
+    source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+    rch_init "$ARTIFACT_DIR" "$RUN_ID" "replay_performance_gates" "$PROJECT_ROOT"
+    ensure_rch_ready
+
     : > "$BENCH_LOG"
     echo "[replay-perf] Running replay performance benches" | tee -a "$BENCH_LOG"
 
-    env CARGO_TARGET_DIR="$TARGET_DIR" \
-        cargo bench -p frankenterm-core --bench replay_capture \
-        2>&1 | tee -a "$BENCH_LOG"
+    run_bench_step() {
+        local label="$1"
+        local step_log="$ARTIFACT_DIR/replay-performance-${label}.log"
+        shift
 
-    env CARGO_TARGET_DIR="$TARGET_DIR" \
-        cargo bench -p frankenterm-core --bench replay_kernel \
-        2>&1 | tee -a "$BENCH_LOG"
+        echo "[replay-perf] Running ${label}" | tee -a "$BENCH_LOG"
+        set +e
+        run_rch_cargo_logged "$step_log" \
+            env CARGO_TARGET_DIR="$TARGET_DIR" \
+            "$@"
+        local rc=$?
+        set -e
+        cat "$step_log" | tee -a "$BENCH_LOG"
+        return "$rc"
+    }
 
-    env CARGO_TARGET_DIR="$TARGET_DIR" \
-        cargo bench -p frankenterm-core --bench replay_diff \
-        2>&1 | tee -a "$BENCH_LOG"
+    run_bench_step "replay-capture" \
+        cargo bench -p frankenterm-core --bench replay_capture
+
+    run_bench_step "replay-kernel" \
+        cargo bench -p frankenterm-core --bench replay_kernel
+
+    run_bench_step "replay-diff" \
+        cargo bench -p frankenterm-core --bench replay_diff
 fi
 
 CAPTURE_ESTIMATE="$CRITERION_DIR/replay_capture/capture_overhead_per_event/new/estimates.json"
