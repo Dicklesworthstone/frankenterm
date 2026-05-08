@@ -19,9 +19,10 @@ OUT_PATH="${DEFAULT_OUT}"
 VERBOSE=0
 
 # Keep local cargo-based finish-line guards off any globally-exported shared
-# target dir. By default we force the current swarm convention here and let a
-# bead-specific override opt out explicitly if needed.
-: "${FT_XBNL0_5_2_CARGO_TARGET_DIR:=/tmp/ft-$(whoami)-target}"
+# target dir. By default, keep artifacts under this repo's target tree so
+# callers do not leave stale /tmp targets behind; bead-specific runs may still
+# opt out explicitly.
+: "${FT_XBNL0_5_2_CARGO_TARGET_DIR:=target/finish-line-guards/cargo-target}"
 export CARGO_TARGET_DIR="${FT_XBNL0_5_2_CARGO_TARGET_DIR}"
 
 # On macOS, prefer the system OpenSSL unless the caller explicitly overrides.
