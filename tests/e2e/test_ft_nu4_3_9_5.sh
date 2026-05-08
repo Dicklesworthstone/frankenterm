@@ -10,11 +10,17 @@ SCENARIO_ID="ft_nu4_3_9_5_dogfood_capture"
 CORRELATION_ID="ft-nu4.3.9.5-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}.jsonl"
 SUMMARY_FILE="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}_summary.json"
-TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/ft-$(whoami)-target}"
+DEFAULT_TARGET_DIR="target/rch-e2e-ft-nu4-3-9-5-${RUN_ID}"
+INHERITED_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_TARGET_DIR}" && "${INHERITED_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${INHERITED_TARGET_DIR}"
+else
+  TARGET_DIR="${DEFAULT_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR="${TARGET_DIR}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "nu4_3_9_5"
-ensure_rch_ready
 
 resolve_wezterm_bin() {
   local candidate=""
@@ -146,13 +152,8 @@ emit_log \
   "ft-nu4.3.9.5 dogfood fixture capture validation"
 
 if ! command -v jq >/dev/null 2>&1; then
-  fail_now \
-    "suite_init" \
-    "preflight_jq" \
-    "jq_missing" \
-    "jq_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "jq is required for structured logging"
+  echo "jq is required for structured logging" >&2
+  exit 1
 fi
 
 if ! command -v rch >/dev/null 2>&1; then
@@ -165,49 +166,25 @@ if ! command -v rch >/dev/null 2>&1; then
     "rch is required; cargo must not run locally for this bead"
 fi
 
-RCH_PROBE_LOG="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}_rch_workers_probe.json"
-if ! rch workers probe --all --json > "${RCH_PROBE_LOG}" 2>"${RCH_PROBE_LOG}.stderr"; then
-  fail_now \
-    "suite_init" \
-    "preflight_rch_workers_command" \
-    "rch_workers_probe_failed" \
-    "rch_probe_command_failed" \
-    "$(basename "${RCH_PROBE_LOG}.stderr")" \
-    "rch workers probe command failed"
-fi
+rch_init "${LOG_DIR}" "${RUN_ID}" "nu4_3_9_5"
+ensure_rch_ready
 
-if ! jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-  "${RCH_PROBE_LOG}" >/dev/null; then
-  fail_now \
-    "suite_init" \
-    "preflight_rch_workers" \
-    "rch_workers_unreachable" \
-    "remote_worker_unavailable" \
-    "$(basename "${RCH_PROBE_LOG}")" \
-    "No reachable rch workers; aborting before any cargo invocation"
-fi
+emit_log \
+  "passed" \
+  "suite_init" \
+  "preflight_rch_ready" \
+  "shared_guard_ready" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared rch guard verified reachable workers and remote cargo smoke"
 
 CORPUS_TEST_LOG="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}_pattern_corpus.stdout.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  env TMPDIR=/tmp \
-    rch exec -- \
-    env CARGO_TARGET_DIR="${TARGET_DIR}" \
-    cargo test -p frankenterm-core --test pattern_corpus -- --nocapture
-) 2>&1 | tee "${CORPUS_TEST_LOG}"
-CORPUS_STATUS=${PIPESTATUS[0]}
+run_rch_cargo_logged "${CORPUS_TEST_LOG}" \
+  env CARGO_TARGET_DIR="${TARGET_DIR}" \
+  cargo test -p frankenterm-core --test pattern_corpus -- --nocapture
+CORPUS_STATUS=$?
 set -e
-
-if grep -q "\\[RCH\\] local" "${CORPUS_TEST_LOG}"; then
-  fail_now \
-    "corpus_validation" \
-    "offload_guard" \
-    "rch_local_fallback" \
-    "remote_offload_required" \
-    "$(basename "${CORPUS_TEST_LOG}")" \
-    "rch fell back to local execution; refusing local CPU-intensive run"
-fi
 
 if [[ ${CORPUS_STATUS} -ne 0 ]]; then
   fail_now \
