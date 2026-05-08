@@ -15,53 +15,17 @@ REPORT_FAIL="${LOG_DIR}/scope_watchdog_${RUN_ID}.report.fail.json"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
 # ── rch offload infrastructure ────────────────────────────────────
-RCH_TARGET_DIR="target/rch-e2e-scope-watchdog-${RUN_ID}"
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="${LOG_DIR}/scope_watchdog_${RUN_ID}.probe.log"
-RCH_SMOKE_LOG="${LOG_DIR}/scope_watchdog_${RUN_ID}.smoke.log"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-scope-watchdog-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
-fatal() { echo "FATAL: $1" >&2; exit 1; }
-
-run_rch() { TMPDIR=/tmp rch "$@"; }
-
-run_rch_cargo() {
-    run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
-}
-
-probe_has_reachable_workers() {
-    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
-}
-
-check_rch_fallback() {
-    local output_file="$1"
-    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
-        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
-    fi
-}
-
-run_rch_cargo_logged() {
-    local output_file="$1"; shift
-    set +e
-    ( cd "${ROOT_DIR}"; run_rch_cargo "$@" ) >"${output_file}" 2>&1
-    local rc=$?; set -e
-    check_rch_fallback "${output_file}"
-    return "${rc}"
-}
-
-ensure_rch_ready() {
-    if ! command -v rch >/dev/null 2>&1; then
-        fatal "rch is required for this e2e harness; refusing local cargo execution."
-    fi
-    set +e; run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1; local probe_rc=$?; set -e
-    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
-        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
-    fi
-    set +e; run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1; local smoke_rc=$?; set -e
-    check_rch_fallback "${RCH_SMOKE_LOG}"
-    if [[ ${smoke_rc} -ne 0 ]]; then
-        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
-    fi
-}
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 # ── end rch infrastructure ────────────────────────────────────────
 
@@ -102,11 +66,20 @@ run_step() {
   local output rc
   if [[ "$1" == "cargo" ]]; then
     # Route cargo commands through rch offloading
-    shift  # strip "cargo" — run_rch_cargo_logged re-adds it
-    set +e; output=$(run_rch_cargo_logged "${step_log}" "$@" 2>&1); rc=$?; set -e
+    shift
+    set +e
+    output=$(
+      run_rch_cargo_logged "${step_log}" \
+        env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@" 2>&1
+    )
+    rc=$?
+    set -e
   else
-    # Non-cargo commands run locally
-    set +e; output=$("$@" 2>&1); rc=$?; set -e
+    # Non-cargo commands run locally but still from the repository root.
+    set +e
+    output=$( (cd "${ROOT_DIR}"; "$@") 2>&1 )
+    rc=$?
+    set -e
   fi
   if [[ ${rc} -eq 0 ]]; then
     echo "PASS"
@@ -132,6 +105,12 @@ echo "================================================================"
 echo ""
 
 # ── rch preflight ─────────────────────────────────────────────────
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging" >&2
+  exit 1
+fi
+
+rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_3_4_scope_watchdog"
 ensure_rch_ready
 
 # ── Step 1: Compile module ─────────────────────────────────────────
