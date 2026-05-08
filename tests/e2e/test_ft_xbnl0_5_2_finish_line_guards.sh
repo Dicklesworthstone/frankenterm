@@ -7,8 +7,7 @@
 #   3. failure injection: mutate a manifest entry to point at a missing
 #      script — composition must surface guard_script_missing
 #   4. recovery: run against canonical manifest again, expect PASS
-#   5. rch-backed cargo test of the Rust integration test (best-effort;
-#      skipped under FT_XBNL0_5_2_SKIP_RCH=1)
+#   5. rch-backed cargo test of the Rust integration test
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -28,11 +27,17 @@ REPORT_OK="${ARTIFACT_DIR}/report.nominal.json"
 REPORT_REPEAT="${ARTIFACT_DIR}/report.repeat.json"
 REPORT_FAIL="${ARTIFACT_DIR}/report.fail_injected.json"
 REPORT_RECOVERY="${ARTIFACT_DIR}/report.recovery.json"
+BASE_CARGO_TARGET_DIR="target/rch-e2e-ft-xbnl0-5-2"
+if [[ -n "${CARGO_TARGET_DIR:-}" && "${CARGO_TARGET_DIR}" == target/* ]]; then
+  BASE_CARGO_TARGET_DIR="${CARGO_TARGET_DIR}"
+fi
+CARGO_TARGET_DIR="${BASE_CARGO_TARGET_DIR%/}-${RUN_ID}"
+export CARGO_TARGET_DIR
 
 SCRIPT="${ROOT_DIR}/scripts/check_finish_line_guards.sh"
 MANIFEST="${ROOT_DIR}/docs/ft-xbnl0-5-2-finish-line-guards.json"
 
-# shellcheck disable=SC1091
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "ft_xbnl0_5_2_finish_line_guards"
 
@@ -100,6 +105,7 @@ cd "${ROOT_DIR}"
 require_cmd jq
 require_cmd python3
 require_cmd bash
+require_cmd rch
 
 if [[ ! -f "${SCRIPT}" ]]; then
   emit_log "preflight" "required_artifacts" "script=${SCRIPT}" "failed" "missing_artifact" "ARTIFACT-MISSING" "${SCRIPT}"
@@ -211,31 +217,28 @@ if [[ ${recovery_rc} -ne 0 ]] || ! jq -e '.status == "passed"' "${REPORT_RECOVER
 fi
 emit_log "validation" "composition.recovery" "canonical_recheck" "passed" "recovery_passed" "none" "$(basename "${REPORT_RECOVERY}")"
 
-# Step 5: rch-backed cargo test (best effort; opt out with FT_XBNL0_5_2_SKIP_RCH=1).
+# Step 5: rch-backed cargo test.
 if [[ "${FT_XBNL0_5_2_SKIP_RCH:-0}" == "1" ]]; then
-  emit_log "validation" "rch.cargo_test" "skip=env_opt_out" "skipped" "skip_via_FT_XBNL0_5_2_SKIP_RCH" "none" "n/a"
-elif command -v rch >/dev/null 2>&1 && ensure_rch_ready 2>/dev/null; then
-  BASE_CARGO_TARGET_DIR="target/rch-e2e-ft-xbnl0-5-2"
-  if [[ -n "${CARGO_TARGET_DIR:-}" && "${CARGO_TARGET_DIR}" == target/* ]]; then
-    BASE_CARGO_TARGET_DIR="${CARGO_TARGET_DIR}"
-  fi
-  export CARGO_TARGET_DIR="${BASE_CARGO_TARGET_DIR%/}-${RUN_ID}"
-  step_log="${ARTIFACT_DIR}/rch_cargo_test.log"
-  emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_5_2_finish_line_guards" "running" "none" "none" "$(basename "${step_log}")"
-  set +e
-  run_rch_cargo_logged "${step_log}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
-    cargo test -p frankenterm-core --test ft_xbnl0_5_2_finish_line_guards -- --nocapture
-  rch_rc=$?
-  set -e
-  if [[ ${rch_rc} -eq 0 ]]; then
-    emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_5_2_finish_line_guards" "passed" "rch_cargo_test_passed" "none" "$(basename "${step_log}")"
-  else
-    emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_5_2_finish_line_guards" "failed" "rch_cargo_test_failed" "RCH-CARGO-TEST-FAIL" "$(basename "${step_log}")"
-    write_summary "failed"
-    exit 1
-  fi
+  emit_log "validation" "rch.cargo_test" "skip=env_opt_out" "failed" "rch_skip_not_allowed" "RCH-REQUIRED" "n/a"
+  write_summary "failed"
+  echo "FT_XBNL0_5_2_SKIP_RCH is not supported in this repo; cargo proof must use rch." >&2
+  exit 1
+fi
+
+ensure_rch_ready
+step_log="${ARTIFACT_DIR}/rch_cargo_test.log"
+emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_5_2_finish_line_guards" "running" "none" "none" "$(basename "${step_log}")"
+set +e
+run_rch_cargo_logged "${step_log}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+  cargo test -p frankenterm-core --test ft_xbnl0_5_2_finish_line_guards -- --nocapture
+rch_rc=$?
+set -e
+if [[ ${rch_rc} -eq 0 ]]; then
+  emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_5_2_finish_line_guards" "passed" "rch_cargo_test_passed" "none" "$(basename "${step_log}")"
 else
-  emit_log "validation" "rch.cargo_test" "skip=rch_unavailable" "skipped" "rch_unavailable" "none" "n/a"
+  emit_log "validation" "rch.cargo_test" "test=ft_xbnl0_5_2_finish_line_guards" "failed" "rch_cargo_test_failed" "RCH-CARGO-TEST-FAIL" "$(basename "${step_log}")"
+  write_summary "failed"
+  exit 1
 fi
 
 emit_log "summary" "nominal->determinism->failure_injection->recovery->rch_cargo_test" "scenario_complete" "passed" "all_checks_passed" "none" "$(basename "${SUMMARY_FILE}")"
