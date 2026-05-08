@@ -14,9 +14,8 @@ TARGET_DIR="target-rch-ft-brc7d-5-${RUN_ID}"
 
 LAST_STEP_LOG=""
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "brc7d_5_mux_runtime_features"
-ensure_rch_ready
 
 emit_log() {
   local component="$1"
@@ -75,18 +74,27 @@ run_step() {
   ) 2>&1 | tee "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
   local rc=${PIPESTATUS[0]}
   set -e
-  return ${rc}
+  return "${rc}"
 }
 
-record_rch_execution_mode() {
+run_rch_step() {
+  local label="$1"
+  shift
+
+  LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
+  set +e
+  run_rch_cargo_logged "${LAST_STEP_LOG}" env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"
+  local rc=$?
+  set -e
+  tee -a "${STDOUT_FILE}" <"${LAST_STEP_LOG}" >/dev/null
+  return "${rc}"
+}
+
+record_shared_rch_guard() {
   local decision_path="$1"
   local artifact
   artifact="$(basename "${LAST_STEP_LOG}")"
-  if grep -q "\\[RCH\\] local" "${LAST_STEP_LOG}"; then
-    emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_fail_open_local_fallback" "none" "${artifact}"
-  else
-    emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_remote_offload" "none" "${artifact}"
-  fi
+  emit_log "validation" "${decision_path}.rch_guard" "run_rch_cargo_logged" "passed" "shared_rch_guard" "none" "${artifact}"
 }
 
 run_rch_expect_success() {
@@ -96,8 +104,8 @@ run_rch_expect_success() {
   shift 3
 
   emit_log "validation" "${decision_path}" "${input_summary}" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-  if run_step "${label}" rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"; then
-    record_rch_execution_mode "${decision_path}"
+  if run_rch_step "${label}" "$@"; then
+    record_shared_rch_guard "${decision_path}"
     emit_log "validation" "${decision_path}" "${input_summary}" "passed" "command_succeeded" "none" "$(basename "${LAST_STEP_LOG}")"
   else
     emit_log "validation" "${decision_path}" "${input_summary}" "failed" "unexpected_command_failure" "CARGO-FAIL" "$(basename "${LAST_STEP_LOG}")"
@@ -112,11 +120,11 @@ run_rch_expect_failure() {
   shift 3
 
   emit_log "validation" "${decision_path}" "${input_summary}" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-  if run_step "${label}" rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"; then
+  if run_rch_step "${label}" "$@"; then
     emit_log "validation" "${decision_path}" "${input_summary}" "failed" "failure_injection_did_not_fail" "EXPECTED-FAIL-MISSING" "$(basename "${LAST_STEP_LOG}")"
     exit 1
   else
-    record_rch_execution_mode "${decision_path}"
+    record_shared_rch_guard "${decision_path}"
     emit_log "validation" "${decision_path}" "${input_summary}" "passed" "expected_failure_observed" "none" "$(basename "${LAST_STEP_LOG}")"
   fi
 }
@@ -177,6 +185,8 @@ require_cmd jq
 require_cmd rg
 require_cmd rch
 require_cmd cargo
+rch_init "${LOG_DIR}" "${RUN_ID}" "brc7d_5_mux_runtime_features"
+ensure_rch_ready
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 emit_log "preflight" "cargo_target" "target_dir=${TARGET_DIR}" "configured" "none" "none" "$(basename "${LOG_FILE}")"
