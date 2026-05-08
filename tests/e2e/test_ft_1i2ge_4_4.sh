@@ -65,7 +65,13 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission safety envelope validation (assignment volume, risky budget, retry-storm limiter)"
 
-RCH_TARGET_DIR="target-rch-ft-1i2ge-4-4"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-ft-1i2ge-4-4-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_RCH_TARGET_DIR}" && "${REQUESTED_RCH_TARGET_DIR}" != /* ]]; then
+  RCH_TARGET_DIR="${REQUESTED_RCH_TARGET_DIR}"
+else
+  RCH_TARGET_DIR="${DEFAULT_RCH_TARGET_DIR}"
+fi
 TEST_FILTERS=(
   "loop_envelope_limits_assignments_per_cycle"
   "loop_envelope_limits_risky_assignments_by_label"
