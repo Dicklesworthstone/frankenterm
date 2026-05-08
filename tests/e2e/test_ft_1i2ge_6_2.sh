@@ -6,7 +6,8 @@
 # builder ergonomics, bounded event log, cycle emitter, serde roundtrips,
 # and phase/kind filtering.
 #
-# Execution: rch exec -- bash tests/e2e/test_ft_1i2ge_6_2.sh
+# Execution: bash tests/e2e/test_ft_1i2ge_6_2.sh
+# Cargo work is offloaded through tests/e2e/lib_rch_guards.sh.
 # ────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -19,7 +20,7 @@ LOG_FILE="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}.jsonl"
 
 mkdir -p "$LOG_DIR"
 
-DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft1i2ge-6-2"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft1i2ge-6-2-${TIMESTAMP}"
 INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
 if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
     CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
