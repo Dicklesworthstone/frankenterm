@@ -9,6 +9,9 @@
 # Usage:
 #   scripts/check_bench_budgets.sh          # run benchmarks then check
 #   scripts/check_bench_budgets.sh --check  # check only (assume bench already ran)
+#
+# Environment:
+#   FT_BENCH_BUDGETS_TARGET_DIR  repo-relative CARGO_TARGET_DIR for RCH runs
 # =============================================================================
 
 set -euo pipefail
@@ -17,8 +20,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")-$$"
+DEFAULT_TARGET_DIR="target/rch-bench-budgets-${RUN_ID}"
+REQUESTED_TARGET_DIR="${FT_BENCH_BUDGETS_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "$REQUESTED_TARGET_DIR" && "$REQUESTED_TARGET_DIR" != /* ]]; then
+    TARGET_DIR="$REQUESTED_TARGET_DIR"
+else
+    TARGET_DIR="$DEFAULT_TARGET_DIR"
+fi
+
+UPLOAD_CRITERION_DIR="target/criterion"
 CRITERION_DIR="target/criterion"
 SUMMARY_FILE="$CRITERION_DIR/ft-budget-report.json"
+BENCH_LOG="$UPLOAD_CRITERION_DIR/bench-output.log"
 
 RUN_BENCH=true
 if [[ "${1:-}" == "--check" ]]; then
@@ -90,10 +104,24 @@ declare -A BUDGETS=(
 # --- Step 1: Run benchmarks (unless --check) ---------------------------------
 
 if $RUN_BENCH; then
-    mkdir -p "$CRITERION_DIR"
+    BENCH_CRITERION_DIR="$TARGET_DIR/criterion"
+    mkdir -p "$UPLOAD_CRITERION_DIR" "$TARGET_DIR" "$BENCH_CRITERION_DIR"
+    RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
+    RCH_STEP_TIMEOUT_SECS="${FT_BENCH_BUDGETS_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-3600}}"
+    # shellcheck source=tests/e2e/lib_rch_guards.sh
+    source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+    rch_init "$UPLOAD_CRITERION_DIR" "$RUN_ID" "bench_budgets" "$PROJECT_ROOT"
+    ensure_rch_ready
+
     echo "[bench-budgets] Running benchmarks..."
-    cargo bench -p frankenterm-core 2>&1 | tee "$CRITERION_DIR/bench-output.log"
+    run_rch_cargo_logged "$BENCH_LOG" \
+        env CARGO_TARGET_DIR="$TARGET_DIR" \
+        cargo bench -p frankenterm-core
+    cat "$BENCH_LOG"
     echo "[bench-budgets] Benchmarks complete."
+
+    CRITERION_DIR="$BENCH_CRITERION_DIR"
+    SUMMARY_FILE="$CRITERION_DIR/ft-budget-report.json"
 fi
 
 # --- Step 2: Walk Criterion estimates and check budgets -----------------------
@@ -201,6 +229,22 @@ cat > "$SUMMARY_FILE" <<EOF
   "results": $results_json
 }
 EOF
+
+if $RUN_BENCH && [[ "$CRITERION_DIR" != "$UPLOAD_CRITERION_DIR" ]]; then
+    mkdir -p "$UPLOAD_CRITERION_DIR"
+    shopt -s nullglob
+    upload_candidates=(
+        "$SUMMARY_FILE"
+        "$CRITERION_DIR"/ft-bench-meta.jsonl
+        "$CRITERION_DIR"/ft-bench-manifest-*.json
+        "$CRITERION_DIR"/wa-bench-distributions.jsonl
+    )
+    shopt -u nullglob
+    for artifact in "${upload_candidates[@]}"; do
+        [[ -f "$artifact" ]] || continue
+        cp "$artifact" "$UPLOAD_CRITERION_DIR/"
+    done
+fi
 
 echo ""
 echo "[bench-budgets] ========================================"
