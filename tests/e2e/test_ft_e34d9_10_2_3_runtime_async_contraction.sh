@@ -239,58 +239,13 @@ emit_log "preflight" "target_dir" "cargo_target_dir=${CARGO_TARGET_DIR}" "config
 
 if ensure_rch_ready_capture_artifacts; then
   emit_log "preflight" "rch_preflight" "ensure_rch_ready" "passed" "rch_preflight_passed" "none" "$(basename "${_RCH_SMOKE_LOG}")"
+  emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${_RCH_PROBE_LOG}")"
 else
   emit_log "preflight" "rch_preflight" "ensure_rch_ready" "failed" "rch_preflight_failed" "RCH-E100" "$(basename "${_RCH_SMOKE_LOG}")"
   exit 2
 fi
 
 run_static_contract_checks
-
-probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"
-status_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_status.json"
-check_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_check.log"
-set +e
-rch check > "${check_log}" 2>&1
-check_rc=$?
-set -e
-
-if [[ ${check_rc} -eq 0 ]]; then
-  emit_log "preflight" "rch_check" "rch_check" "passed" "rch_check_ready" "none" "$(basename "${check_log}")"
-else
-  emit_log "preflight" "rch_check" "rch_check" "failed" "rch_check_failed" "RCH-E000" "$(basename "${check_log}")"
-fi
-
-set +e
-rch workers probe --all --json > "${probe_log}" 2>>"${STDOUT_FILE}"
-probe_rc=$?
-set -e
-
-probe_reachable="false"
-if [[ ${probe_rc} -eq 0 ]]; then
-  healthy_workers=$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${probe_log}")
-  if [[ "${healthy_workers}" -ge 1 ]]; then
-    probe_reachable="true"
-  fi
-fi
-
-if [[ "${probe_reachable}" == "true" ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
-else
-  probe_reason_code="rch_workers_unreachable_probe"
-  probe_error_code="RCH-E100"
-  if [[ ${check_rc} -eq 0 ]]; then
-    probe_reason_code="rch_health_probe_mismatch"
-    probe_error_code="RCH-E101"
-  fi
-
-  if rch --json status --workers --jobs > "${status_log}" 2>>"${STDOUT_FILE}"; then
-    emit_log "preflight" "rch_probe" "workers_probe" "failed" "${probe_reason_code}" "${probe_error_code}" "$(basename "${status_log}")"
-  else
-    emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_status_unavailable" "${probe_error_code}" "$(basename "${status_log}")"
-  fi
-  echo "workers probe found no reachable remote workers; refusing local fallback" >&2
-  exit 2
-fi
 
 run_rch_test_step \
   "runtime_async_surface_guard_unit" \
