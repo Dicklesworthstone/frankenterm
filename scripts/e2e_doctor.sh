@@ -20,6 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 # Colors (disabled when piped)
@@ -559,7 +560,13 @@ test_nonexistent_workspace() {
 # Cleanup
 # ==============================================================================
 
+# Invoked through the EXIT trap below.
+# shellcheck disable=SC2329
 cleanup() {
+    if [[ "$KEEP_ARTIFACTS" == "true" ]]; then
+        return 0
+    fi
+
     for dir in "${TEMP_DIRS[@]}"; do
         if [[ -d "$dir" ]]; then
             # Restore permissions in case they were changed
