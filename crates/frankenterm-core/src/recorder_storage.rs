@@ -10,7 +10,8 @@
 //! - `append_batch` is append-only: accepted records advance `next_offset` and `next_ordinal`
 //!   monotonically and never rewrite prior bytes.
 //! - `batch_id` is idempotent within retention bounds: replaying an existing `batch_id`
-//!   returns the original `AppendResponse` without duplicating writes.
+//!   returns the same offsets without duplicating writes. A replay that requests stronger
+//!   durability upgrades the cached response after flushing the already-written batch.
 //! - `commit_checkpoint` is monotonic per consumer: lower ordinals are rejected with
 //!   `CheckpointRegression`, identical ordinals are `NoopAlreadyAdvanced`, and higher ordinals
 //!   are accepted as `Advanced`.
@@ -121,6 +122,20 @@ pub enum DurabilityLevel {
     Appended,
     /// Appended and fsync'd to durable media.
     Fsync,
+}
+
+impl DurabilityLevel {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Enqueued => 0,
+            Self::Appended => 1,
+            Self::Fsync => 2,
+        }
+    }
+
+    fn satisfies(self, required: Self) -> bool {
+        self.rank() >= required.rank()
+    }
 }
 
 /// Flush mode for explicit flush calls.
@@ -779,6 +794,34 @@ impl AppendLogRecorderStorage {
             err.class()
         ));
     }
+
+    fn ensure_cached_response_durability(
+        &self,
+        inner: &mut AppendLogInner,
+        response: &mut AppendResponse,
+        required_durability: DurabilityLevel,
+    ) -> std::result::Result<(), RecorderStorageError> {
+        if response.committed_durability.satisfies(required_durability) {
+            return Ok(());
+        }
+
+        match required_durability {
+            DurabilityLevel::Enqueued => {}
+            DurabilityLevel::Appended => {
+                inner.writer.flush()?;
+                self.persist_state(inner)?;
+            }
+            DurabilityLevel::Fsync => {
+                inner.writer.flush()?;
+                inner.writer.get_ref().sync_data()?;
+                self.persist_state(inner)?;
+            }
+        }
+
+        response.committed_durability = required_durability;
+        response.committed_at_ms = crate::recording::epoch_ms_now();
+        Ok(())
+    }
 }
 
 struct InFlightGuard<'a> {
@@ -834,9 +877,22 @@ impl RecorderStorage for AppendLogRecorderStorage {
             producer_ts_ms: _producer_ts_ms,
         } = req;
 
-        if let Some(existing) = inner.idempotency_cache.get(&batch_id).cloned() {
-            Self::clear_last_error(&mut inner);
-            return Ok(existing);
+        if let Some(mut existing) = inner.idempotency_cache.get(&batch_id).cloned() {
+            match self.ensure_cached_response_durability(
+                &mut inner,
+                &mut existing,
+                required_durability,
+            ) {
+                Ok(()) => {
+                    inner.idempotency_cache.insert(batch_id, existing.clone());
+                    Self::clear_last_error(&mut inner);
+                    return Ok(existing);
+                }
+                Err(err) => {
+                    Self::record_last_error(&mut inner, "append_batch_idempotent_durability", &err);
+                    return Err(err);
+                }
+            }
         }
 
         let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
@@ -1660,6 +1716,71 @@ mod tests {
 
             assert_eq!(first, second);
             assert_eq!(before_len, after_len);
+        });
+    }
+
+    #[test]
+    fn duplicate_batch_id_upgrades_requested_durability_without_duplication() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(dir.path());
+            let data_path = cfg.data_path.clone();
+            let state_path = cfg.state_path.clone();
+            let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+
+            let first = storage
+                .append_batch(AppendRequest {
+                    batch_id: "same-batch".to_string(),
+                    events: vec![sample_event("e1", 1, 0, "one")],
+                    required_durability: DurabilityLevel::Enqueued,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            assert_eq!(first.committed_durability, DurabilityLevel::Enqueued);
+            assert!(
+                !state_path.exists(),
+                "enqueued append should not persist state before a durability upgrade"
+            );
+
+            let upgraded = storage
+                .append_batch(AppendRequest {
+                    batch_id: "same-batch".to_string(),
+                    events: vec![sample_event("e2", 1, 1, "two")],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(upgraded.first_offset, first.first_offset);
+            assert_eq!(upgraded.last_offset, first.last_offset);
+            assert_eq!(upgraded.accepted_count, first.accepted_count);
+            assert_eq!(upgraded.committed_durability, DurabilityLevel::Fsync);
+            assert!(
+                state_path.exists(),
+                "durability upgrade should persist recorder state"
+            );
+            let upgraded_len = std::fs::metadata(&data_path).unwrap().len();
+
+            let cached = storage
+                .append_batch(AppendRequest {
+                    batch_id: "same-batch".to_string(),
+                    events: vec![sample_event("e3", 1, 2, "three")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 3,
+                })
+                .await
+                .unwrap();
+            let cached_len = std::fs::metadata(&data_path).unwrap().len();
+
+            assert_eq!(cached.first_offset, first.first_offset);
+            assert_eq!(cached.last_offset, first.last_offset);
+            assert_eq!(cached.committed_durability, DurabilityLevel::Fsync);
+            assert_eq!(
+                upgraded_len, cached_len,
+                "cached duplicate must not append another copy of the batch"
+            );
         });
     }
 
