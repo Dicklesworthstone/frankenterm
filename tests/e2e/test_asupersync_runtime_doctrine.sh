@@ -106,6 +106,7 @@ reject_current_runtime_compat_guidance() {
   local doc
   local pattern
   local docs=("${ADR_FILE}" "${BASELINE_FILE}" "${ARCH_DOCTRINE_FILE}")
+  # shellcheck disable=SC2016 # These are literal stale-guidance needles, not expansion sites.
   local forbidden_patterns=(
     'Prefer `runtime_compat`/`cx`'
     '| `tokio::time::*` | `runtime_compat::*`'
