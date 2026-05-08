@@ -16,12 +16,26 @@ FAIL=0
 
 mkdir -p "$LOG_DIR"
 
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
 log_json() {
     local test_name="$1" phase="$2" result="$3" detail="$4"
     local ts_ms
     ts_ms=$(python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null || date +%s000)
     printf '{"test_name":"%s","phase":"%s","timestamp_ms":%s,"result":"%s","detail":"%s"}\n' \
-        "$test_name" "$phase" "$ts_ms" "$result" "$detail" >> "$LOG_FILE"
+        "$(json_escape "$test_name")" \
+        "$(json_escape "$phase")" \
+        "$ts_ms" \
+        "$(json_escape "$result")" \
+        "$(json_escape "$detail")" >> "$LOG_FILE"
 }
 
 # ---- Test 1: Integration tests pass without agent-detection feature ----
