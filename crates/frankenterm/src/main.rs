@@ -5805,7 +5805,7 @@ fn proof_doctor_active_beads_from_json(raw: &str) -> Vec<ProofDoctorBeadRef> {
 
 fn proof_doctor_cargo_package_filters(command: &[String]) -> Vec<String> {
     let mut packages = Vec::new();
-    let mut tokens = command.iter();
+    let mut tokens = proof_doctor_cargo_argv(command).iter();
 
     while let Some(token) = tokens.next() {
         let package = if token == "-p" || token == "--package" {
@@ -5825,6 +5825,16 @@ fn proof_doctor_cargo_package_filters(command: &[String]) -> Vec<String> {
     }
 
     packages
+}
+
+fn proof_doctor_cargo_argv(command: &[String]) -> &[String] {
+    command
+        .iter()
+        .position(|token| {
+            let binary_name = proof_doctor_binary_name(token);
+            binary_name == "cargo" || binary_name == "cargo-local.sh"
+        })
+        .map_or(&[], |cargo_index| &command[cargo_index + 1..])
 }
 
 fn proof_doctor_manifest_package_name(manifest_path: &Path) -> Option<String> {
@@ -63069,6 +63079,27 @@ log_level = "debug"
             packages,
             vec!["frankenterm-core-audit-types", "mux", "termwiz"]
         );
+    }
+
+    #[test]
+    fn proof_doctor_ignores_wrapper_package_flags_before_cargo() {
+        let command = vec![
+            "rch".to_string(),
+            "exec".to_string(),
+            "-p".to_string(),
+            "frankenterm".to_string(),
+            "--".to_string(),
+            "env".to_string(),
+            "CARGO_TARGET_DIR=/tmp/ft-target".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+            "-p".to_string(),
+            "frankenterm-core-audit-types".to_string(),
+        ];
+
+        let packages = proof_doctor_cargo_package_filters(&command);
+
+        assert_eq!(packages, vec!["frankenterm-core-audit-types"]);
     }
 
     #[test]
