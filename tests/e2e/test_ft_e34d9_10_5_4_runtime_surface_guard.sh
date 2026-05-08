@@ -230,7 +230,6 @@ emit_log "started" "e2e_suite" "script_init" "none" "none" "${LOG_FILE}" "RUN_ID
 require_cmd jq
 require_cmd rg
 require_cmd rch
-require_cmd cargo
 
 echo ""
 echo "--- Scenario 1: nominal tokio runtime allowlist ---"
