@@ -26,14 +26,11 @@ if [[ "$cargo_target_base_input" == /* ]]; then
 else
   cargo_target_base="$cargo_target_base_input"
 fi
-rch_tmpdir="${RCH_TMPDIR:-/tmp}"
 cargo_git_fetch_with_cli="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}"
-
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="${LOG_DIR}/replay_kernel_determinism_${run_id}.probe.log"
-RCH_SMOKE_LOG="${LOG_DIR}/replay_kernel_determinism_${run_id}.smoke.log"
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
-TIMEOUT_BIN=""
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 with_run_id_suffix() {
   local path_base="$1"
@@ -48,91 +45,12 @@ cargo_home="$(with_run_id_suffix "$cargo_home_base")"
 cargo_target_dir="$(with_run_id_suffix "$cargo_target_base")"
 mkdir -p "$cargo_home" "$cargo_target_dir"
 
+rch_init "$LOG_DIR" "$run_id" "replay_kernel_determinism" "$ROOT_DIR"
+
 total_scenarios=4
 pass_scenarios=0
 fail_scenarios=0
 suite_status=0
-
-fatal() { echo "FATAL: $1" >&2; exit 1; }
-
-run_rch() {
-    TMPDIR=/tmp rch "$@"
-}
-
-resolve_timeout_bin() {
-    if command -v timeout >/dev/null 2>&1; then
-        TIMEOUT_BIN="timeout"
-    elif command -v gtimeout >/dev/null 2>&1; then
-        TIMEOUT_BIN="gtimeout"
-    else
-        TIMEOUT_BIN=""
-    fi
-}
-
-probe_has_reachable_workers() {
-    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
-}
-
-check_rch_fallback() {
-    local output_file="$1"
-    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
-        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
-    fi
-}
-
-run_rch_cargo_logged() {
-    local output_file="$1"
-    shift
-
-    set +e
-    (
-        cd "$ROOT_DIR"
-        env TMPDIR="$rch_tmpdir" "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
-            rch exec -- env \
-            CARGO_HOME="$cargo_home" \
-            CARGO_TARGET_DIR="$cargo_target_dir" \
-            CARGO_NET_GIT_FETCH_WITH_CLI="$cargo_git_fetch_with_cli" \
-            cargo "$@"
-    ) >"${output_file}" 2>&1
-    local rc=$?
-    set -e
-
-    check_rch_fallback "${output_file}"
-    if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-        local queue_log="${output_file%.log}.rch_queue_timeout.log"
-        if ! run_rch queue >"${queue_log}" 2>&1; then
-            queue_log="${output_file}"
-        fi
-        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s; refusing stalled remote execution. See ${queue_log}"
-    fi
-    return "${rc}"
-}
-
-ensure_rch_ready() {
-    if ! command -v rch >/dev/null 2>&1; then
-        fatal "rch is required for this replay e2e harness; refusing local cargo execution."
-    fi
-    resolve_timeout_bin
-    if [[ -z "${TIMEOUT_BIN}" ]]; then
-        fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
-    fi
-
-    set +e
-    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
-    local probe_rc=$?
-    set -e
-    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
-        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
-    fi
-
-    set +e
-    run_rch_cargo_logged "${RCH_SMOKE_LOG}" check --help
-    local smoke_rc=$?
-    set -e
-    if [[ ${smoke_rc} -ne 0 ]]; then
-        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
-    fi
-}
 
 now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -160,10 +78,14 @@ run_kernel_test() {
   local error_code
 
   started_ms="$(now_ms)"
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"running\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_filter\":\"${test_filter}\",\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\",\"rch_tmpdir\":\"${rch_tmpdir}\",\"cargo_net_git_fetch_with_cli\":\"${cargo_git_fetch_with_cli}\"}}"
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"running\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_filter\":\"${test_filter}\",\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\",\"cargo_net_git_fetch_with_cli\":\"${cargo_git_fetch_with_cli}\"}}"
 
   set +e
-  run_rch_cargo_logged "${combined_log}" test -p frankenterm-core --lib "$test_filter" -- --nocapture
+  run_rch_cargo_logged "${combined_log}" \
+    env CARGO_HOME="${cargo_home}" \
+    CARGO_TARGET_DIR="${cargo_target_dir}" \
+    CARGO_NET_GIT_FETCH_WITH_CLI="${cargo_git_fetch_with_cli}" \
+    cargo test -p frankenterm-core --lib "$test_filter" -- --nocapture
   local rc=$?
   set -e
 
@@ -200,7 +122,7 @@ run_kernel_test() {
 ensure_rch_ready
 
 suite_started_ms="$(now_ms)"
-log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"$scenario_id\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"start\",\"status\":\"running\",\"decision_path\":\"kernel_boot\",\"inputs\":{\"suite\":\"ft-og6q6.3.1\",\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\",\"rch_tmpdir\":\"${rch_tmpdir}\",\"cargo_net_git_fetch_with_cli\":\"${cargo_git_fetch_with_cli}\"}}"
+log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"$scenario_id\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"start\",\"status\":\"running\",\"decision_path\":\"kernel_boot\",\"inputs\":{\"suite\":\"ft-og6q6.3.1\",\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\",\"cargo_net_git_fetch_with_cli\":\"${cargo_git_fetch_with_cli}\"}}"
 
 # Scenario 1: identical trace replay should emit byte-identical decision traces
 run_kernel_test "1" "recorder_replay::tests::replay_scheduler_decision_trace_is_deterministic" "scheduler.run_twice_compare" || suite_status=1
