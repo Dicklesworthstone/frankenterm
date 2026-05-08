@@ -20,8 +20,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
 ARTIFACT_DIR="${FT_RESIZE_GATE_ARTIFACT_DIR:-target/resize-performance-gates}"
-TARGET_DIR="${FT_RESIZE_GATE_TARGET_DIR:-target/resize-performance-gates/cargo-target}"
+DEFAULT_TARGET_DIR="target/rch-resize-performance-gates-${RUN_ID}"
+TARGET_DIR="${FT_RESIZE_GATE_TARGET_DIR:-${CARGO_TARGET_DIR:-$DEFAULT_TARGET_DIR}}"
+if [[ "$TARGET_DIR" == /* ]]; then
+    TARGET_DIR="$DEFAULT_TARGET_DIR"
+fi
 BASELINE_FILE="${FT_RESIZE_GATE_BASELINE_FILE:-evidence/wa-1u90p.7.4/resize_perf_mid_baseline.json}"
 BASELINE_WARN_MULTIPLIER="${FT_RESIZE_GATE_BASELINE_WARN_MULTIPLIER:-1.10}"
 BASELINE_FAIL_MULTIPLIER="${FT_RESIZE_GATE_BASELINE_FAIL_MULTIPLIER:-1.20}"
@@ -29,6 +34,13 @@ BASELINE_REASON="${FT_RESIZE_GATE_BASELINE_REASON:-}"
 CHECK_ONLY_DIR=""
 WRITE_BASELINE=false
 SKIP_TEST_LANES=false
+RCH_READY=0
+RCH_SKIP_SMOKE_PREFLIGHT="${FT_RESIZE_GATE_RCH_SKIP_SMOKE_PREFLIGHT:-${RCH_SKIP_SMOKE_PREFLIGHT:-1}}"
+RCH_STEP_TIMEOUT_SECS="${FT_RESIZE_GATE_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-1800}}"
+RCH_JSON_BEGIN_MARKER="__FT_RESIZE_GATE_JSON_BEGIN__"
+RCH_JSON_END_MARKER="__FT_RESIZE_GATE_JSON_END__"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Mid-tier thresholds from docs/resize-performance-slos.md
 M1_P50_MAX_NS=12000000
@@ -112,8 +124,12 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 5
 fi
 
-if [[ -z "$CHECK_ONLY_DIR" ]] && ! command -v cargo >/dev/null 2>&1; then
-    echo "[resize-gates] ERROR: cargo is required" >&2
+if [[ "$TARGET_DIR" == /* ]]; then
+    TARGET_DIR="$DEFAULT_TARGET_DIR"
+fi
+
+if [[ -z "$CHECK_ONLY_DIR" ]] && ! command -v rch >/dev/null 2>&1; then
+    echo "[resize-gates] ERROR: rch is required for cargo execution" >&2
     exit 5
 fi
 
@@ -122,6 +138,16 @@ SCENARIO_ARTIFACT_DIR="$ARTIFACT_DIR/scenarios"
 mkdir -p "$SCENARIO_ARTIFACT_DIR"
 REPORT_FILE="$ARTIFACT_DIR/resize-performance-report.json"
 BASELINE_AUDIT_LOG="${BASELINE_FILE%.json}.audit.jsonl"
+
+ensure_rch_for_cargo() {
+    if [[ "$RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    rch_init "$ARTIFACT_DIR" "$RUN_ID" "resize_performance_gates" "$PROJECT_ROOT"
+    ensure_rch_ready
+    RCH_READY=1
+}
 
 now_iso() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -135,9 +161,18 @@ run_step() {
     local name="$1"
     shift
     local log_file="$ARTIFACT_DIR/${name}.log"
+    local rch_log_file="$ARTIFACT_DIR/${name}.rch.log"
     echo "[resize-gates] === $name ==="
     echo "[resize-gates] cmd: $*" >"$log_file"
-    if "$@" 2>&1 | tee -a "$log_file"; then
+    ensure_rch_for_cargo
+
+    set +e
+    run_rch_cargo_logged "$rch_log_file" "$@"
+    local rc=$?
+    set -e
+
+    cat "$rch_log_file" | tee -a "$log_file"
+    if [[ "$rc" -eq 0 ]]; then
         echo "[resize-gates] step $name: pass"
         return 0
     fi
@@ -145,16 +180,65 @@ run_step() {
     return 1
 }
 
+extract_rch_json() {
+    local input_log="$1"
+    local out_json="$2"
+
+    awk -v begin="$RCH_JSON_BEGIN_MARKER" -v end="$RCH_JSON_END_MARKER" '
+        $0 == begin { capturing = 1; next }
+        $0 == end { found_end = 1; exit }
+        capturing { print }
+        END { if (!found_end) exit 1 }
+    ' "$input_log" >"$out_json"
+}
+
 build_scenario_envelope() {
     local scenario_name="$1"
     local scenario_file="$2"
     local out_file="$3"
     local log_file="$4"
+    local rc
 
-    env CARGO_TARGET_DIR="$TARGET_DIR" \
-        cargo run -p frankenterm -- \
-            simulate run "$scenario_file" --json --resize-timeline-json \
-        >"$out_file" 2>"$log_file"
+    ensure_rch_for_cargo
+
+    set +e
+    # shellcheck disable=SC2016
+    run_rch_cargo_logged "$log_file" \
+        env CARGO_TARGET_DIR="$TARGET_DIR" \
+            FT_RESIZE_GATE_JSON_BEGIN="$RCH_JSON_BEGIN_MARKER" \
+            FT_RESIZE_GATE_JSON_END="$RCH_JSON_END_MARKER" \
+            bash -lc '
+                set -euo pipefail
+                scenario_file="$1"
+                json_begin="${FT_RESIZE_GATE_JSON_BEGIN:?}"
+                json_end="${FT_RESIZE_GATE_JSON_END:?}"
+                remote_artifact_dir="${CARGO_TARGET_DIR}/ft-resize-performance-gates"
+                mkdir -p "$remote_artifact_dir"
+                scenario_base="$(basename "$scenario_file" .yaml)"
+                remote_json="${remote_artifact_dir}/${scenario_base}.json"
+                remote_stderr="${remote_artifact_dir}/${scenario_base}.stderr.log"
+
+                set +e
+                cargo run -p frankenterm -- simulate run "$scenario_file" --json --resize-timeline-json >"$remote_json" 2>"$remote_stderr"
+                rc=$?
+                set -e
+
+                if [[ -f "$remote_stderr" ]]; then
+                    cat "$remote_stderr" >&2
+                fi
+                printf "%s\n" "$json_begin"
+                if [[ -f "$remote_json" ]]; then
+                    cat "$remote_json"
+                fi
+                printf "\n%s\n" "$json_end"
+                exit "$rc"
+            ' bash "$scenario_file"
+    rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+        return "$rc"
+    fi
+    extract_rch_json "$log_file" "$out_file"
 }
 
 read_metric_or_zero() {
