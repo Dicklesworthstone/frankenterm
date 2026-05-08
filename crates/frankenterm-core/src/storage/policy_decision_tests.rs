@@ -41,6 +41,12 @@ fn sync_fts_for_pane_for_conn(
     })
 }
 
+fn check_and_recover_wal_for_conn(conn: Connection, db_path: &str) -> Result<Connection> {
+    let backend = RusqliteBackend::new(conn);
+    check_and_recover_wal(&backend, db_path)?;
+    Ok(backend.into_connection())
+}
+
 fn typed_decision_context_json(
     action: crate::policy::ActionKind,
     actor: crate::policy::ActorKind,
@@ -399,7 +405,7 @@ fn wal_recovery_passes_on_fresh_in_memory_db() {
     let conn = Connection::open_in_memory().unwrap();
     // Should pass without error on a fresh database
     // Note: in-memory DBs don't have WAL files, but the function should handle this
-    check_and_recover_wal(&conn, ":memory:").unwrap();
+    check_and_recover_wal_for_conn(conn, ":memory:").unwrap();
 }
 
 #[test]
@@ -407,7 +413,7 @@ fn wal_recovery_passes_integrity_check() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
     // After schema init, integrity check should still pass
-    check_and_recover_wal(&conn, ":memory:").unwrap();
+    check_and_recover_wal_for_conn(conn, ":memory:").unwrap();
 }
 
 #[test]
@@ -432,7 +438,7 @@ fn wal_recovery_with_file_db() {
     // Re-open and run recovery
     {
         let conn = Connection::open(&db_path).unwrap();
-        check_and_recover_wal(&conn, &db_path_str).unwrap();
+        let conn = check_and_recover_wal_for_conn(conn, &db_path_str).unwrap();
         // Verify data is intact
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM panes", [], |row| row.get(0))

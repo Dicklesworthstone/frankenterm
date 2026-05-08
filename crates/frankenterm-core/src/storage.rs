@@ -278,7 +278,7 @@ pub(crate) const WAL_RECOVERY_THRESHOLD: i64 = 10_000;
 /// Returns an error if:
 /// - Database corruption is detected
 /// - WAL checkpoint fails
-pub fn check_and_recover_wal(conn: &Connection, db_path: &str) -> Result<()> {
+pub fn check_and_recover_wal(backend: &dyn StorageBackend, db_path: &str) -> Result<()> {
     let wal_path = format!("{db_path}-wal");
     let journal_path = format!("{db_path}-journal");
 
@@ -294,9 +294,10 @@ pub fn check_and_recover_wal(conn: &Connection, db_path: &str) -> Result<()> {
     }
 
     // Run quick integrity check
-    let integrity_result: String = conn
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(|e| StorageError::Database(format!("Integrity check failed: {e}")))?;
+    let integrity_result = backend
+        .query_scalar("PRAGMA quick_check")
+        .map_err(|err| storage_backend_error("Integrity check failed", err))?
+        .ok_or_else(|| StorageError::Database("Integrity check returned no row".to_string()))?;
 
     if integrity_result != "ok" {
         tracing::error!(result = %integrity_result, "Database corruption detected");
@@ -307,11 +308,20 @@ pub fn check_and_recover_wal(conn: &Connection, db_path: &str) -> Result<()> {
     }
 
     // Checkpoint WAL using PASSIVE mode (doesn't block readers)
-    let (busy, wal_frames, checkpointed): (i64, i64, i64) = conn
-        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .map_err(|e| StorageError::Database(format!("WAL checkpoint failed: {e}")))?;
+    let checkpoint_row = backend
+        .query_row_typed("PRAGMA wal_checkpoint(PASSIVE)", &[])
+        .map_err(|err| storage_backend_error("WAL checkpoint failed", err))?
+        .ok_or_else(|| StorageError::Database("WAL checkpoint returned no row".to_string()))?;
+    let checkpoint = RowReader::new(&checkpoint_row);
+    let busy = checkpoint
+        .i64(0)
+        .map_err(|err| storage_backend_error("WAL checkpoint busy flag", err))?;
+    let wal_frames = checkpoint
+        .i64(1)
+        .map_err(|err| storage_backend_error("WAL checkpoint frame count", err))?;
+    let checkpointed = checkpoint
+        .i64(2)
+        .map_err(|err| storage_backend_error("WAL checkpoint completed count", err))?;
 
     if wal_frames > 0 {
         tracing::info!(busy, wal_frames, checkpointed, "WAL checkpoint completed");
@@ -325,11 +335,22 @@ pub fn check_and_recover_wal(conn: &Connection, db_path: &str) -> Result<()> {
             "Large WAL detected, performing full checkpoint"
         );
 
-        let (busy2, wal_frames2, checkpointed2): (i64, i64, i64) = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .map_err(|e| StorageError::Database(format!("WAL truncate checkpoint failed: {e}")))?;
+        let truncate_row = backend
+            .query_row_typed("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+            .map_err(|err| storage_backend_error("WAL truncate checkpoint failed", err))?
+            .ok_or_else(|| {
+                StorageError::Database("WAL truncate checkpoint returned no row".to_string())
+            })?;
+        let truncate = RowReader::new(&truncate_row);
+        let busy2 = truncate
+            .i64(0)
+            .map_err(|err| storage_backend_error("WAL truncate checkpoint busy flag", err))?;
+        let wal_frames2 = truncate
+            .i64(1)
+            .map_err(|err| storage_backend_error("WAL truncate checkpoint frame count", err))?;
+        let checkpointed2 = truncate
+            .i64(2)
+            .map_err(|err| storage_backend_error("WAL truncate checkpoint completed count", err))?;
 
         tracing::info!(
             busy = busy2,
@@ -1325,9 +1346,9 @@ impl StorageHandle {
                 wal_mode: false,
                 ..crate::storage_backend_trait::OpenConfig::default()
             };
-            let conn = RusqliteBackend::open_path(Path::new(&db_path_owned), &open_config)
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?
-                .into_connection();
+            let backend = RusqliteBackend::open_path(Path::new(&db_path_owned), &open_config)
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            let conn = backend.into_connection();
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after database open")?;
@@ -1346,7 +1367,9 @@ impl StorageHandle {
             let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
             // Check for and recover from unclean shutdown (wa-o8j)
-            check_and_recover_wal(&conn, &db_path_owned)?;
+            let backend = RusqliteBackend::new(conn);
+            check_and_recover_wal(&backend, &db_path_owned)?;
+            let conn = backend.into_connection();
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after WAL recovery")?;
