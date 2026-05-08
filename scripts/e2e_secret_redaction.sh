@@ -22,7 +22,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
@@ -109,6 +111,7 @@ run_wa_timeout() {
     raw_output=$(timeout "$timeout_secs" "$FT_BIN" "$@" 2>&1 || true)
 
     local stripped
+    # shellcheck disable=SC2001
     stripped=$(echo "$raw_output" | sed 's/\x1b\[[0-9;]*m//g')
 
     echo "$stripped" | awk '
@@ -537,6 +540,46 @@ test_dryrun_redacts_db_url() {
 }
 
 # =============================================================================
+# Test: Dry-run command echo redacts generic password assignment
+# =============================================================================
+
+test_dryrun_redacts_generic_password() {
+    log_test "Dry-Run Redacts Generic Password Assignment"
+
+    local output
+    output=$(run_wa_timeout 10 robot send 0 "APP_$FAKE_PASSWORD deploy" --dry-run 2>&1 || true)
+
+    e2e_add_file "dryrun_redacts_generic_password.json" "$output"
+
+    if ! echo "$output" | jq -e . >/dev/null 2>&1; then
+        local error_check
+        error_check=$(echo "$output" | jq -r '.error.code // empty' 2>/dev/null || echo "")
+        if [[ "$error_check" == "robot.wezterm_not_running" ]] || [[ -z "$output" ]]; then
+            log_info "Compatibility backend bridge not running -- checking redaction via unit test"
+            local fallback_output
+            fallback_output=$(run_core_cargo_test redactor_redacts_generic_password redactor_redacts_generic_password -- --nocapture 2>&1 || true)
+            if echo "$fallback_output" | grep -q "ok"; then
+                log_pass "Generic password redacted (validated via unit test)"
+            else
+                log_fail "Generic password redaction test failed"
+            fi
+            return
+        fi
+        log_fail "Output is not valid JSON: $output"
+        return 1
+    fi
+
+    local command_echo
+    command_echo=$(echo "$output" | jq -r '.data.command // empty' 2>/dev/null || echo "")
+
+    if echo "$command_echo" | grep -q "$FAKE_PASSWORD"; then
+        log_fail "Raw generic password assignment appeared in dry-run command echo"
+    else
+        log_pass "Generic password assignment redacted in dry-run command echo"
+    fi
+}
+
+# =============================================================================
 # Test: Artifact safety — no fake secrets leaked in any artifact file
 # =============================================================================
 
@@ -560,6 +603,7 @@ test_no_secrets_in_artifacts() {
         "$FAKE_AWS_KEY_ID:AWS key ID"
         "$FAKE_STRIPE_KEY:Stripe key"
         "$FAKE_SLACK_TOKEN:Slack token"
+        "$FAKE_PASSWORD:Generic password assignment"
         "mysecretdbpassword:Database password"
         "supersecretpass123:Generic password"
     )
@@ -646,6 +690,7 @@ main() {
     test_dryrun_redacts_openai_key || true
     test_dryrun_redacts_github_pat || true
     test_dryrun_redacts_db_url || true
+    test_dryrun_redacts_generic_password || true
 
     # --- Artifact safety check (must run last) ---
     test_no_secrets_in_artifacts || true
