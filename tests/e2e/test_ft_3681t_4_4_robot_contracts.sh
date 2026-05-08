@@ -10,12 +10,17 @@ SCENARIO_ID="ft_3681t_4_4_robot_contracts"
 CORRELATION_ID="ft-3681t.4.4-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_3681t_4_4_robot_contracts_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_3681t_4_4_robot_contracts_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_3681t_4_4_robot_contracts_${RUN_ID}.probe.log"
-TARGET_DIR="target-rch-ft3681t44-contracts"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft3681t44-contracts-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_4_4_robot_contracts"
-ensure_rch_ready
 
 emit_log() {
   local outcome="$1"
@@ -55,7 +60,9 @@ emit_log() {
 run_rch_test() {
   local decision_path="$1"
   local reason_code="$2"
-  local cargo_cmd="$3"
+  shift 2
+  local step_slug="${decision_path//[^A-Za-z0-9_]/_}"
+  local step_log="${LOG_DIR}/ft_3681t_4_4_robot_contracts_${RUN_ID}.${step_slug}.log"
 
   emit_log \
     "running" \
@@ -63,15 +70,14 @@ run_rch_test() {
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing via rch: ${cargo_cmd}"
+    "Executing via rch: cargo $*"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "rch exec -- env CARGO_TARGET_DIR=${TARGET_DIR} ${cargo_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  local status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_log}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
+  local status=$?
   set -e
+  cat "${step_log}" | tee -a "${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -80,7 +86,7 @@ run_rch_test() {
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${cargo_cmd}"
+      "exit=${status}; command=cargo $*"
     exit "${status}"
   fi
 
@@ -90,8 +96,16 @@ run_rch_test() {
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Completed via rch: ${cargo_cmd}"
+    "Completed via rch: cargo $*"
 }
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging" >&2
+  exit 1
+fi
+
+rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_4_4_robot_contracts"
+ensure_rch_ready
 
 emit_log \
   "started" \
@@ -101,70 +115,30 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "robot contract artifact/export validation with rch offload"
 
-if ! command -v jq >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "preflight_jq" \
-    "jq_missing" \
-    "jq_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "jq is required for structured logging"
-  exit 1
-fi
-
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for contract test execution"
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) > "${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -eq 0 ]] && grep -q "✓" "${PROBE_FILE}"; then
-  emit_log \
-    "running" \
-    "execution_preflight" \
-    "rch_workers_healthy" \
-    "none" \
-    "$(basename "${PROBE_FILE}")" \
-    "running robot contract validation through healthy rch workers"
-else
-  emit_log \
-    "running" \
-    "execution_preflight" \
-    "rch_workers_unavailable_fail_open" \
-    "none" \
-    "$(basename "${PROBE_FILE}")" \
-    "running robot contract validation through rch fail-open path"
-fi
+emit_log \
+  "running" \
+  "execution_preflight" \
+  "rch_shared_guard_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "running robot contract validation through shared rch guard"
 
 : > "${STDOUT_FILE}"
 
 run_rch_test \
   "sdk_artifact_exports" \
   "sdk_bundle_validation" \
-  "cargo test -p frankenterm-core --lib contract_artifact_bundle_ -- --nocapture"
+  test -p frankenterm-core --lib contract_artifact_bundle_ -- --nocapture
 
 run_rch_test \
   "api_contract_exports" \
   "contract_export_validation" \
-  "cargo test -p frankenterm-core --lib contract_export_artifacts_ -- --nocapture"
+  test -p frankenterm-core --lib contract_export_artifacts_ -- --nocapture
 
 run_rch_test \
   "contract_lifecycle_smoke" \
   "contract_lifecycle_validation" \
-  "cargo test -p frankenterm-core --lib e2e_ -- --nocapture"
+  test -p frankenterm-core --lib e2e_ -- --nocapture
 
 required_markers=(
   "contract_artifact_bundle_renders_deterministic_exports ... ok"
@@ -197,4 +171,3 @@ emit_log \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
   "Robot contract artifact rendering, compatibility bundle export, and replay lifecycle validation completed"
-
