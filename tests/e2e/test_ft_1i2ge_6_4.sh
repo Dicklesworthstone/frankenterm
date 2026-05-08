@@ -29,10 +29,7 @@ else
 fi
 export CARGO_TARGET_DIR
 
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${TIMESTAMP}" "1i2ge_6_4"
-ensure_rch_ready
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 # ── Structured log helper ──────────────────────────────────────────────────
 json_escape() {
@@ -64,64 +61,26 @@ log_event() {
         "$(json_escape "$error_code")" >> "$LOG_FILE"
 }
 
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_probe.log"
-RCH_SMOKE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_smoke.log"
-
-run_rch() {
-    TMPDIR=/tmp rch "$@"
-}
-
-run_rch_cargo() {
-    run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
-}
-
-probe_has_reachable_workers() {
-    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
-}
-
-check_rch_fallback_in_logs() {
-    local label="$1"
+run_cargo_step() {
+    local output_file="$1"
     shift
-
-    if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
-        log_event "rch_offload" "cargo_step" "$label" "fail" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK"
-        echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
-        exit 3
-    fi
+    run_rch_cargo_logged "${output_file}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
 }
 
 # ── Preflight ──────────────────────────────────────────────────────────────
 log_event "preflight" "startup" "checking_rch" "started"
 
-if ! command -v rch &>/dev/null; then
-    log_event "preflight" "startup" "rch_binary_missing" "fail" "rch_required_missing" "RCH-E001"
-    echo "rch is required; refusing local cargo execution." >&2
+if ! command -v jq >/dev/null 2>&1; then
+    log_event "preflight" "startup" "jq_binary_missing" "fail" "jq_required_missing" "JQ-E001"
+    echo "jq is required for rch metadata artifacts." >&2
     exit 1
 fi
 
-set +e
-run_rch --json workers probe --all >"$RCH_PROBE_LOG" 2>&1
-probe_rc=$?
-set -e
-if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
-    log_event "preflight" "startup" "rch_workers_probe" "fail" "rch_workers_unhealthy" "RCH-E100"
-    echo "rch workers are unavailable; refusing local cargo execution." >&2
-    exit 1
-fi
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
+rch_init "${LOG_DIR}" "${TIMESTAMP}" "1i2ge_6_4"
+ensure_rch_ready
 
-set +e
-run_rch_cargo check --help >"$RCH_SMOKE_LOG" 2>&1
-smoke_rc=$?
-set -e
-check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
-if [[ $smoke_rc -ne 0 ]]; then
-    log_event "preflight" "startup" "cargo_check_help" "fail" "rch_remote_smoke_failed" "RCH-E101"
-    echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
-    exit 1
-fi
-
-CARGO_CMD="run_rch_cargo"
 log_event "preflight" "startup" "cargo_check_help" "pass" "rch_remote_smoke_ok" "none"
 
 cd "$PROJECT_ROOT"
@@ -140,17 +99,67 @@ run_test() {
     log_event "test" "run" "$name" "started"
 
     if bash -c "$*" >"$output_file" 2>&1; then
-        check_rch_fallback_in_logs "$name" "$output_file"
         local elapsed=$(( $(date +%s) - start ))
         log_event "test" "run" "$name" "pass" "nominal" "none"
         echo "  ✓ $name (${elapsed}s)"
         PASS=$((PASS + 1))
     else
-        check_rch_fallback_in_logs "$name" "$output_file"
         local elapsed=$(( $(date +%s) - start ))
         log_event "test" "run" "$name" "fail" "assertion_failed" "TEST-E001"
         echo "  ✗ $name (${elapsed}s)"
         FAIL=$((FAIL + 1))
+    fi
+}
+
+run_cargo_test() {
+    local name="$1"
+    shift
+    local start
+    local output_file="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_${name}.log"
+    start=$(date +%s)
+    log_event "test" "run" "$name" "started"
+
+    if run_cargo_step "$output_file" "$@"; then
+        local elapsed=$(( $(date +%s) - start ))
+        log_event "test" "run" "$name" "pass" "nominal" "none"
+        echo "  ✓ $name (${elapsed}s)"
+        PASS=$((PASS + 1))
+    else
+        local elapsed=$(( $(date +%s) - start ))
+        log_event "test" "run" "$name" "fail" "assertion_failed" "TEST-E001"
+        echo "  ✗ $name (${elapsed}s)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_clippy_canary_check() {
+    local name="$1"
+    shift
+    local start
+    local status
+    local output_file="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_${name}.log"
+    start=$(date +%s)
+    log_event "test" "run" "$name" "started"
+
+    set +e
+    run_cargo_step "$output_file" "$@"
+    status=$?
+    set -e
+
+    if grep 'canary_rollout_controller' "$output_file" | grep -q 'error'; then
+        local elapsed=$(( $(date +%s) - start ))
+        log_event "test" "run" "$name" "fail" "canary_clippy_error" "CLIPPY-E001"
+        echo "  ✗ $name (${elapsed}s)"
+        FAIL=$((FAIL + 1))
+    else
+        local elapsed=$(( $(date +%s) - start ))
+        local reason="nominal"
+        if [[ $status -ne 0 ]]; then
+            reason="non_canary_clippy_failure_ignored"
+        fi
+        log_event "test" "run" "$name" "pass" "$reason" "none"
+        echo "  ✓ $name (${elapsed}s)"
+        PASS=$((PASS + 1))
     fi
 }
 
@@ -175,18 +184,18 @@ run_test "feature_gated_subprocess_bridge" \
 echo ""
 echo "── Phase 2: Compilation ──"
 
-run_test "compiles_with_feature" \
-    "$CARGO_CMD check -p frankenterm-core --features subprocess-bridge 2>&1"
+run_cargo_test "compiles_with_feature" \
+    check -p frankenterm-core --features subprocess-bridge
 
-run_test "compiles_without_feature" \
-    "$CARGO_CMD check -p frankenterm-core 2>&1"
+run_cargo_test "compiles_without_feature" \
+    check -p frankenterm-core
 
 # ── 3. Unit tests ─────────────────────────────────────────────────────────
 echo ""
 echo "── Phase 3: Unit tests (42 tests) ──"
 
-run_test "unit_tests_pass" \
-    "$CARGO_CMD test -p frankenterm-core --lib --features subprocess-bridge -- canary_rollout_controller 2>&1"
+run_cargo_test "unit_tests_pass" \
+    test -p frankenterm-core --lib --features subprocess-bridge -- canary_rollout_controller
 
 # ── 4. Property tests ────────────────────────────────────────────────────
 echo ""
@@ -195,8 +204,8 @@ echo "── Phase 4: Property tests (10 tests) ──"
 run_test "proptest_file_exists" \
     "test -f crates/frankenterm-core/tests/proptest_canary_rollout.rs"
 
-run_test "proptests_pass" \
-    "$CARGO_CMD test -p frankenterm-core --test proptest_canary_rollout --features subprocess-bridge 2>&1"
+run_cargo_test "proptests_pass" \
+    test -p frankenterm-core --test proptest_canary_rollout --features subprocess-bridge
 
 # ── 5. API surface checks ────────────────────────────────────────────────
 echo ""
@@ -287,8 +296,8 @@ run_test "decision_serde" \
 echo ""
 echo "── Phase 9: Clippy ──"
 
-run_test "clippy_clean" \
-    "! $CARGO_CMD clippy -p frankenterm-core --features subprocess-bridge 2>&1 | grep 'canary_rollout_controller' | grep -q 'error'"
+run_clippy_canary_check "clippy_clean" \
+    clippy -p frankenterm-core --features subprocess-bridge
 
 # ── Summary ──────────────────────────────────────────────────────────────
 echo ""
