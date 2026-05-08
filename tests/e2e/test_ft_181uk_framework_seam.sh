@@ -18,12 +18,23 @@ SCENARIO_ID="ft_181uk_framework_seam"
 CORRELATION_ID="ft-181uk.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/framework_seam_contract_${RUN_ID}.jsonl"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary_${RUN_ID}.json"
-CARGO_TARGET_DIR="${ROOT_DIR}/.target-ft-181uk-framework-seam"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-181uk-framework-seam-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
 export CARGO_TARGET_DIR
 
 PASS=0
 FAIL=0
 TOTAL=0
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging and rch metadata artifacts." >&2
+  exit 1
+fi
 
 # shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
@@ -161,13 +172,15 @@ emit_log "started" "e2e_suite" "script_init" "none" "none" "${LOG_FILE}" "RUN_ID
 echo ""
 echo "--- Scenario 1: framework_seam_guard passes via rch ---"
 
-if rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test framework_seam_guard -- --nocapture \
-    > "${ARTIFACT_DIR}/framework_seam_guard_stdout.log" \
-    2> "${ARTIFACT_DIR}/framework_seam_guard_stderr.log"; then
+if run_rch_cargo_logged "${ARTIFACT_DIR}/framework_seam_guard_stdout.log" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+    cargo test -p frankenterm-core --test framework_seam_guard -- --nocapture; then
+  : > "${ARTIFACT_DIR}/framework_seam_guard_stderr.log"
   test_count=$(count_matches '^test ' "${ARTIFACT_DIR}/framework_seam_guard_stdout.log")
   record_result "framework_seam_guard_pass" "true"
   echo "    ${test_count} tests observed"
 else
+  : > "${ARTIFACT_DIR}/framework_seam_guard_stderr.log"
   record_result "framework_seam_guard_pass" "false" "command_failed" "cargo_test_failed" "see framework_seam_guard_stderr.log"
 fi
 
