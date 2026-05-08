@@ -12,7 +12,13 @@ raw_dir="$LOG_DIR/${run_id}_raw"
 mkdir -p "$raw_dir"
 
 cargo_home="/tmp/cargo-home-replay-fixture-harvest"
-cargo_target_dir="$ROOT_DIR/target-replay-fixture-harvest-${run_id}"
+default_cargo_target_dir="target/rch-e2e-replay-fixture-harvest-${run_id}"
+requested_cargo_target_dir="${CARGO_TARGET_DIR:-}"
+if [[ -n "${requested_cargo_target_dir}" && "${requested_cargo_target_dir}" != /* ]]; then
+  cargo_target_dir="${requested_cargo_target_dir}"
+else
+  cargo_target_dir="${default_cargo_target_dir}"
+fi
 work_dir="$ROOT_DIR/tests/e2e/tmp/${run_id}"
 mkdir -p "$work_dir"
 
