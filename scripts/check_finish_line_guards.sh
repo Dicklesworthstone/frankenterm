@@ -17,6 +17,8 @@ MANIFEST="${ROOT_DIR}/docs/ft-xbnl0-5-2-finish-line-guards.json"
 DEFAULT_OUT="${ROOT_DIR}/docs/ft-xbnl0-5-2-finish-line-guards-validation.json"
 OUT_PATH="${DEFAULT_OUT}"
 VERBOSE=0
+RCH_READY=0
+RCH_RUN_ID="${FT_XBNL0_5_2_RCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 
 # Keep local cargo-based finish-line guards off any globally-exported shared
 # target dir. By default, keep artifacts under this repo's target tree so
@@ -24,6 +26,10 @@ VERBOSE=0
 # opt out explicitly.
 : "${FT_XBNL0_5_2_CARGO_TARGET_DIR:=target/finish-line-guards/cargo-target}"
 export CARGO_TARGET_DIR="${FT_XBNL0_5_2_CARGO_TARGET_DIR}"
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
+RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 
 # On macOS, prefer the system OpenSSL unless the caller explicitly overrides.
 # This avoids flaky vendored openssl-src temp-dir collisions during guard runs.
@@ -92,6 +98,19 @@ append_result() {
   mv "${tmp_results}.new" "${tmp_results}"
 }
 
+ensure_rch_for_cargo_guard() {
+  if [[ "${RCH_READY}" -eq 1 ]]; then
+    return 0
+  fi
+
+  local rch_log_dir
+  rch_log_dir="${FT_XBNL0_5_2_RCH_LOG_DIR:-$(dirname "${OUT_PATH}")/rch-${RCH_RUN_ID}}"
+  mkdir -p "${rch_log_dir}"
+  rch_init "${rch_log_dir}" "${RCH_RUN_ID}" "finish_line_guards" "${ROOT_DIR}"
+  ensure_rch_ready
+  RCH_READY=1
+}
+
 run_shell_guard() {
   local guard_id="$1" script_rel="$2" policy_rel="$3" output_rel="$4"
   local script_abs="${ROOT_DIR}/${script_rel}"
@@ -152,22 +171,26 @@ run_shell_guard() {
 
 run_cargo_test_guard() {
   local guard_id="$1" test_name="$2" test_target="$3"
-  if ! command -v cargo >/dev/null 2>&1; then
-    append_result "${guard_id}" "skipped" "cargo_unavailable" '{}'
-    return 0
-  fi
   if [[ "${FT_XBNL0_5_2_SKIP_CARGO_TEST:-0}" == "1" ]]; then
     append_result "${guard_id}" "skipped" "skip_via_FT_XBNL0_5_2_SKIP_CARGO_TEST" \
-      "$(jq -n --arg t "${test_name}" '{test_name: $t, skip_reason: "FT_XBNL0_5_2_SKIP_CARGO_TEST=1 set — contributor must run cargo test manually or in a shell without the rch hook intercepting."}')"
+      "$(jq -n --arg t "${test_name}" '{test_name: $t, skip_reason: "FT_XBNL0_5_2_SKIP_CARGO_TEST=1 set; contributor must run the Cargo test through RCH before relying on this guard."}')"
     return 0
   fi
 
   local log_file
   log_file="$(mktemp)"
   local rc=0
+  local target_args=()
+  # Manifest entries intentionally store Cargo target args as shell words.
+  # shellcheck disable=SC2206
+  target_args=(${test_target})
+
+  ensure_rch_for_cargo_guard
+
   set +e
-  # shellcheck disable=SC2086
-  cargo test ${test_target} "${test_name}" -- --exact > "${log_file}" 2>&1
+  run_rch_cargo_logged "${log_file}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+    cargo test "${target_args[@]}" "${test_name}" -- --exact
   rc=$?
   set -e
 
