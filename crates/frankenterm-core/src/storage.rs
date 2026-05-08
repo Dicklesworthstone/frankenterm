@@ -44,7 +44,7 @@ use crate::runtime_async::oneshot;
 use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
 use rusqlite::types::Value as SqlValue;
 #[cfg(test)]
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
@@ -65,6 +65,8 @@ use crate::storage::io_scheduler::{
 };
 use crate::storage_backend_helpers::{count_table_where, execute_typed, row_exists_where};
 use crate::storage_backend_row_helpers::{CellRowReader, RowReader};
+#[cfg(test)]
+use crate::storage_backend_trait::with_test_storage_backend;
 use crate::storage_backend_trait::{
     BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
 };
@@ -119,25 +121,6 @@ mod export;
 #[must_use]
 pub fn storage_export_json_parse_drop_count() -> u64 {
     export::storage_export_json_parse_drop_count()
-}
-
-#[cfg(test)]
-fn with_test_storage_backend<F, R>(conn: &mut Connection, f: F) -> Result<R>
-where
-    F: FnOnce(&dyn StorageBackend) -> Result<R>,
-{
-    let placeholder = Connection::open_in_memory().map_err(|err| {
-        StorageError::Database(format!(
-            "failed to create temporary placeholder backend for storage test loan: {err}"
-        ))
-    })?;
-    let original = std::mem::replace(conn, placeholder);
-    let backend = RusqliteBackend::new(original);
-    let result = f(&backend);
-    let restored = backend.into_connection();
-    let placeholder = std::mem::replace(conn, restored);
-    drop(placeholder);
-    result
 }
 
 // [ft-aw52a / ft-dn2tu Phase 6] StorageHandle impl-split scaffolding.
@@ -1360,7 +1343,7 @@ impl StorageHandle {
             }
 
             let open_config = crate::storage_backend_trait::OpenConfig {
-                // Preserve the old Connection::open ordering: WAL mode is
+                // Preserve the old database-open ordering: WAL mode is
                 // established by schema initialization/migrations below.
                 wal_mode: false,
                 ..crate::storage_backend_trait::OpenConfig::default()
@@ -10487,7 +10470,7 @@ impl Drop for PooledReadConn {
         use std::sync::atomic::Ordering;
         if let Some(backend) = self.backend.take() {
             // If the closure panicked or returned mid-transaction, the
-            // Connection has an open transaction. Returning it to the pool
+            // backend has an open transaction. Returning it to the pool
             // would leak that transaction state to the next consumer.
             // Discard the connection in that case; rusqlite's Drop closes it
             // cleanly (which also rolls back the open transaction).

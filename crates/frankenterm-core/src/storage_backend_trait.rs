@@ -975,11 +975,9 @@ impl RusqliteBackend {
     }
 
     /// Reclaim the wrapped `rusqlite::Connection`. Used by the
-    /// pooled-backend bridge in storage.rs (br-ft-3twzm) to move
-    /// a `Connection` out of a `PooledReadConn` into a temporary
-    /// `RusqliteBackend` for the duration of a closure, then
-    /// move the `Connection` back so the pool's Drop returns it
-    /// to the LIFO.
+    /// read-pool and cfg(test) loan paths when an existing concrete
+    /// rusqlite handle must temporarily cross the [`StorageBackend`]
+    /// trait boundary and then be returned to its owner.
     ///
     /// Recovers the inner `Connection` even when the wrapping
     /// mutex is poisoned. Mutex poisoning happens when a previous
@@ -989,8 +987,7 @@ impl RusqliteBackend {
     /// failure, internal assertion) DURING an `execute`/`prepare`
     /// call still poisons. The earlier `expect("must not be
     /// poisoned")` form turned that rare case into a double-panic
-    /// inside the writer-thread Drop guard at storage.rs's
-    /// `with_writer_backend` (process abort under
+    /// inside storage's backend loan paths (process abort under
     /// `panic = "unwind"`, redundant under `panic = "abort"`).
     /// The poisoned `Connection` itself is intact (rusqlite
     /// doesn't keep cross-statement state in the Mutex), so
@@ -1041,6 +1038,28 @@ impl RusqliteBackend {
         }
         Ok(Self::new(conn))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_storage_backend<F, R>(
+    conn: &mut rusqlite::Connection,
+    f: F,
+) -> crate::error::Result<R>
+where
+    F: FnOnce(&dyn StorageBackend) -> crate::error::Result<R>,
+{
+    let placeholder = rusqlite::Connection::open_in_memory().map_err(|err| {
+        crate::error::StorageError::Database(format!(
+            "failed to create temporary placeholder backend for storage test loan: {err}"
+        ))
+    })?;
+    let original = std::mem::replace(conn, placeholder);
+    let backend = RusqliteBackend::new(original);
+    let result = f(&backend);
+    let restored = backend.into_connection();
+    let placeholder = std::mem::replace(conn, restored);
+    drop(placeholder);
+    result
 }
 
 impl StorageBackendFactory for RusqliteBackend {
