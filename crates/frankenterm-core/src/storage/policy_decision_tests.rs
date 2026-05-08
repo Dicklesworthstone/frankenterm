@@ -3284,8 +3284,16 @@ fn pooled_read_conn_drop_returns_clean_connection_to_pool() {
     let db_path = db_file.to_string_lossy().into_owned();
 
     {
-        let conn = PooledReadConn::acquire(&db_path).unwrap();
-        assert!(conn.is_autocommit(), "fresh conn must start in autocommit");
+        let pooled = PooledReadConn::acquire(&db_path).unwrap();
+        let is_autocommit = pooled.with_borrowed_backend(|backend| {
+            backend
+                .with_connection(|conn| conn.is_autocommit())
+                .expect("pooled backend autocommit probe")
+        });
+        assert!(
+            is_autocommit,
+            "fresh backend connection must start in autocommit"
+        );
         // No transaction opened — drop should recycle into the pool.
     }
 
@@ -3305,16 +3313,20 @@ fn pooled_read_conn_drop_discards_connection_with_open_tx() {
     let db_path = db_file.to_string_lossy().into_owned();
 
     {
-        let conn = PooledReadConn::acquire(&db_path).unwrap();
+        let pooled = PooledReadConn::acquire(&db_path).unwrap();
         // Mimic a borrowing closure that BEGIN'd and then panicked or
         // returned early without COMMIT/ROLLBACK. After this, the
         // Connection's autocommit flag is false — exactly the state
         // the Drop guard must detect.
-        conn.execute_batch("BEGIN").unwrap();
-        assert!(
-            !conn.is_autocommit(),
-            "BEGIN must put the conn out of autocommit mode"
-        );
+        let began_tx = pooled.with_borrowed_backend(|backend| {
+            backend
+                .with_connection(|conn| {
+                    conn.execute_batch("BEGIN").unwrap();
+                    !conn.is_autocommit()
+                })
+                .expect("pooled backend open-transaction probe")
+        });
+        assert!(began_tx, "BEGIN must put the conn out of autocommit mode");
         // Drop fires here.
     }
 
@@ -3333,8 +3345,12 @@ fn pooled_read_conn_acquire_after_dirty_drop_yields_fresh_autocommit_conn() {
     let db_path = db_file.to_string_lossy().into_owned();
 
     {
-        let conn = PooledReadConn::acquire(&db_path).unwrap();
-        conn.execute_batch("BEGIN").unwrap();
+        let pooled = PooledReadConn::acquire(&db_path).unwrap();
+        pooled.with_borrowed_backend(|backend| {
+            backend
+                .with_connection(|conn| conn.execute_batch("BEGIN").unwrap())
+                .expect("pooled backend begin")
+        });
         // Drop with open tx → guard discards.
     }
 
@@ -3342,8 +3358,13 @@ fn pooled_read_conn_acquire_after_dirty_drop_yields_fresh_autocommit_conn() {
     // never reached the pool). The fresh handle must be in autocommit
     // mode — i.e. the open transaction state did not leak.
     let next = PooledReadConn::acquire(&db_path).unwrap();
+    let is_autocommit = next.with_borrowed_backend(|backend| {
+        backend
+            .with_connection(|conn| conn.is_autocommit())
+            .expect("post-discard autocommit probe")
+    });
     assert!(
-        next.is_autocommit(),
+        is_autocommit,
         "post-discard re-acquire must yield a clean autocommit connection"
     );
 }

@@ -42,9 +42,9 @@ use std::{
 
 use crate::runtime_async::oneshot;
 use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
-use rusqlite::{Connection, types::Value as SqlValue};
+use rusqlite::types::Value as SqlValue;
 #[cfg(test)]
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
@@ -1376,7 +1376,7 @@ impl StorageHandle {
             // (WAL recovery, schema init, ALTER/CREATE migrations, normal
             // writes) needs the write lock. Without busy_timeout an active
             // reader (any spawn_blocking read path opened via
-            // `open_read_storage_conn`) makes the very next PRAGMA fail
+            // `open_read_storage_backend`) makes the very next PRAGMA fail
             // with SQLITE_BUSY. SCHEMA_SQL doesn't set this (and is
             // short-circuited on reopen of an up-to-date DB), so it must
             // be applied here on every connection-open path. The discard
@@ -9814,7 +9814,7 @@ fn record_policy_denial_audit_backend(
         .map_err(|err| storage_backend_error("policy_denied_audit insert id", err))?)
 }
 
-/// Open a short-lived read Connection for a `spawn_blocking` query path.
+/// Open a short-lived read backend for a `spawn_blocking` query path.
 ///
 /// All `StorageHandle` reader helpers funnel through this. It applies the
 /// standard 5s `busy_timeout` so a concurrent writer holding the WAL
@@ -9823,10 +9823,10 @@ fn record_policy_denial_audit_backend(
 /// `let _ =` discard on `busy_timeout` is intentional: failure to apply
 /// the PRAGMA is non-fatal; the read may simply contend more aggressively.
 ///
-/// Match the recipe in `record_policy_denial_audit_blocking` and the
-/// PRAGMA recipe in `session_restore::open_conn`. Without this, every
-/// MCP / robot / TUI read path could fail under modest writer load.
-fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
+/// Match the recipe in `record_policy_denial_audit_blocking`. Without
+/// this, every MCP / robot / TUI read path could fail under modest writer
+/// load.
+fn open_read_storage_backend(db_path: &str) -> Result<RusqliteBackend> {
     let config = crate::storage_backend_trait::OpenConfig {
         wal_mode: false,
         ..crate::storage_backend_trait::OpenConfig::default()
@@ -9834,7 +9834,7 @@ fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
     let backend = RusqliteBackend::open(db_path, &config)
         .map_err(|err| StorageError::Database(format!("Failed to open read connection: {err}")))?;
     let _ = backend.set_busy_timeout(std::time::Duration::from_secs(5));
-    Ok(backend.into_connection())
+    Ok(backend)
 }
 
 fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
@@ -9843,12 +9843,11 @@ fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
 
 /// br-ft-3twzm: pooled-backend helper that re-fixes ft-bhyxz.
 ///
-/// Lends a pre-warmed `rusqlite::Connection` from the per-`db_path`
-/// LIFO read pool, temporarily moves it into a `RusqliteBackend` so
-/// the closure can call the typed `StorageBackend` trait methods
-/// (`query_row_typed`, `query_map_typed`, etc. introduced by
-/// br-ft-qgj81), then moves the `Connection` back into the
-/// `PooledReadConn` whose `Drop` returns it to the pool.
+/// Lends a pre-warmed `RusqliteBackend` from the per-`db_path`
+/// LIFO read pool so the closure can call the typed `StorageBackend`
+/// trait methods (`query_row_typed`, `query_map_typed`, etc. introduced
+/// by br-ft-qgj81). `PooledReadConn` owns the backend and returns it to
+/// the pool on `Drop`.
 ///
 /// This pattern preserves the connection-pool optimization the
 /// br-ft-l1jgo migration accidentally bypassed by going through the
@@ -9891,23 +9890,18 @@ where
 // ─── Read-connection pool (ft-bhyxz) ──────────────────────────────────────
 //
 // Every `StorageHandle::*_with_cx` reader path used to call
-// `open_read_storage_conn(db_path)` inside a `spawn_blocking_storage`
+// `open_read_storage_backend(db_path)` inside a `spawn_blocking_storage`
 // closure. With ~78 call sites and a per-call file open (file handle +
 // page cache warmup + 5s busy_timeout PRAGMA), a 200-agent fleet hammering
 // `wa.search` / `wa.get_text` / web `/search` could rack up hundreds of
 // SQLite-open syscalls per second.
 //
 // `PooledReadConn` is a small LIFO pool keyed by db_path:
-//   - `acquire(db_path)` pops a pre-warmed Connection or opens fresh.
-//   - On Drop, the Connection returns to the pool (capped at 8 per path)
+//   - `acquire(db_path)` pops a pre-warmed backend or opens fresh.
+//   - On Drop, the backend returns to the pool (capped at 8 per path)
 //     instead of closing.
-//   - Connection's existing schema/PRAGMA state survives the round-trip
+//   - The backend connection's existing schema/PRAGMA state survives the round-trip
 //     (busy_timeout is a connection-scoped PRAGMA).
-//
-// `Deref<Target = Connection>` means call sites that previously held a
-// `Connection` (e.g. `&conn` passed to functions taking `&Connection`,
-// or method calls like `conn.prepare(...)`) work unchanged via Rust's
-// auto-deref + deref-coercion rules.
 //
 // Pool is process-global (`OnceLock`-backed `Mutex<HashMap<...>>`) rather
 // than per-StorageHandle because the spawn_blocking closures capture
@@ -9917,10 +9911,11 @@ where
 const READ_POOL_MAX_PER_PATH: usize = 8;
 
 static READ_POOL: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Vec<Connection>>>,
+    std::sync::Mutex<std::collections::HashMap<String, Vec<RusqliteBackend>>>,
 > = std::sync::OnceLock::new();
 
-fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Connection>>> {
+fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<RusqliteBackend>>>
+{
     READ_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -9932,7 +9927,7 @@ fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Ve
 // are process-global since the pool itself is process-global.
 //
 // `hits`    — `acquire` found a recycled connection in the LIFO.
-// `misses`  — `acquire` fell through to `open_read_storage_conn`
+// `misses`  — `acquire` fell through to `open_read_storage_backend`
 //             (pool empty for this db_path or first-ever acquire).
 // `returns` — `Drop` successfully placed a connection back in the
 //             pool (autocommit + slot available + lock OK).
@@ -10400,15 +10395,14 @@ pub(crate) fn reset_pool_lock_poisoned_count_for_test() {
     POOL_LOCK_POISONED.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Pooled read connection (ft-bhyxz). On Drop returns the Connection to
+/// Pooled read backend (ft-bhyxz). On Drop returns the backend to
 /// the per-`db_path` LIFO pool (capped at 8) instead of closing it.
 ///
 /// Use `PooledReadConn::acquire(db_path)` in place of
-/// `open_read_storage_conn(db_path)` inside `spawn_blocking_storage`
-/// closures. Method calls + `&conn` passing both work unchanged via
-/// `Deref<Target = Connection>` + auto-deref coercion.
+/// `open_read_storage_backend(db_path)` inside `spawn_blocking_storage`
+/// closures.
 pub(crate) struct PooledReadConn {
-    conn: Option<Connection>,
+    backend: Option<RusqliteBackend>,
     db_path: String,
 }
 
@@ -10434,7 +10428,7 @@ impl PooledReadConn {
                 });
                 pool.get_mut(db_path).and_then(|v| v.pop())
             };
-            let conn = match recycled {
+            let backend = match recycled {
                 Some(c) => {
                     // br-ft-rvt1z: pool hit — recycled an existing
                     // pre-warmed connection.
@@ -10448,11 +10442,11 @@ impl PooledReadConn {
                     // attempt (the test invariant is hit-rate, not
                     // success-rate).
                     POOL_MISSES.fetch_add(1, Ordering::Relaxed);
-                    open_read_storage_conn(db_path)?
+                    open_read_storage_backend(db_path)?
                 }
             };
             Ok(Self {
-                conn: Some(conn),
+                backend: Some(backend),
                 db_path: db_path.to_string(),
             })
         })();
@@ -10460,61 +10454,48 @@ impl PooledReadConn {
         result
     }
 
-    /// br-ft-3twzm: lend the pooled `Connection` as a
-    /// `RusqliteBackend` to the closure. Used by the
-    /// `pooled_rusqlite_backend` helper so storage.rs's
-    /// br-ft-l1jgo migration sites can call typed
-    /// `StorageBackend` trait methods without bypassing the
-    /// connection pool.
+    /// br-ft-3twzm: lend the pooled `RusqliteBackend` to the closure.
+    /// Used by the `pooled_rusqlite_backend` helper so storage.rs's
+    /// br-ft-l1jgo migration sites can call typed `StorageBackend`
+    /// trait methods without bypassing the connection pool.
     ///
-    /// The dance: `PooledReadConn` owns the `Connection` in an
-    /// `Option`. We `take()` it out, hand it to
-    /// `RusqliteBackend::new`, run the closure, then move the
-    /// `Connection` back via `RusqliteBackend::into_connection`.
-    /// `Self`'s `Drop` then returns the `Connection` to the
+    /// The dance: `PooledReadConn` owns the backend in an `Option`.
+    /// We `take()` it out, run the closure, then move the backend back
+    /// into `Self`. `Self`'s `Drop` then returns the backend to the
     /// pool's LIFO.
     ///
     /// Closure-panic semantics: if `f` panics, `self` drops
-    /// while `self.conn` is `None`. The Drop impl handles this
-    /// (early return), so the pool slot for this `db_path`
-    /// stays consistent — the panicked connection is discarded
-    /// (since `RusqliteBackend` owns it through the panic and
-    /// drops it via its own `Mutex<Connection>` Drop), preserving
-    /// the existing post-panic invariant.
+    /// while `self.backend` is `None`. The Drop impl handles this
+    /// (early return), so the pool slot for this `db_path` stays
+    /// consistent and the panicked backend is discarded, preserving the
+    /// existing post-panic invariant.
     pub(crate) fn with_borrowed_backend<F, R>(mut self, f: F) -> R
     where
         F: FnOnce(&RusqliteBackend) -> R,
     {
-        let conn = self.conn.take().expect("connection present until Drop");
-        let backend = RusqliteBackend::new(conn);
+        let backend = self.backend.take().expect("backend present until Drop");
         let result = f(&backend);
-        self.conn = Some(backend.into_connection());
-        // self drops here, returning the connection to the
+        self.backend = Some(backend);
+        // self drops here, returning the backend to the
         // per-db_path pool LIFO.
         result
-    }
-}
-
-impl std::ops::Deref for PooledReadConn {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        self.conn
-            .as_ref()
-            .expect("connection still present until Drop")
     }
 }
 
 impl Drop for PooledReadConn {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        if let Some(conn) = self.conn.take() {
+        if let Some(backend) = self.backend.take() {
             // If the closure panicked or returned mid-transaction, the
             // Connection has an open transaction. Returning it to the pool
             // would leak that transaction state to the next consumer.
             // Discard the connection in that case; rusqlite's Drop closes it
             // cleanly (which also rolls back the open transaction).
-            if !conn.is_autocommit() {
-                drop(conn);
+            let is_autocommit = backend
+                .with_connection(|conn| conn.is_autocommit())
+                .unwrap_or(false);
+            if !is_autocommit {
+                drop(backend);
                 return;
             }
             // br-ft-ac4j0: pre-fix this site silently dropped the
@@ -10528,7 +10509,7 @@ impl Drop for PooledReadConn {
                 Ok(mut pool) => {
                     let entry = pool.entry(self.db_path.clone()).or_default();
                     if entry.len() < READ_POOL_MAX_PER_PATH {
-                        entry.push(conn);
+                        entry.push(backend);
                         // br-ft-rvt1z: counted only on successful return.
                         POOL_RETURNS.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -10538,8 +10519,8 @@ impl Drop for PooledReadConn {
                     POOL_LOCK_POISONED.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            // Pool full (or lock poisoned) — let conn drop, which closes it.
-            drop(conn);
+            // Pool full (or lock poisoned) — let backend drop, which closes it.
+            drop(backend);
         }
     }
 }
@@ -20810,11 +20791,15 @@ mod pool_telemetry_tests {
         let start = baseline();
         const N: u64 = 20;
         for _ in 0..N {
-            let conn = PooledReadConn::acquire(&db_path_str).expect("acquire");
-            // Use the conn so it's not dead-stripped by an over-eager
-            // optimizer + so we exercise the Deref<Target = Connection>.
-            let _ = conn.is_autocommit();
-            // Drop returns the conn to the pool.
+            let pooled = PooledReadConn::acquire(&db_path_str).expect("acquire");
+            // Use the backend so it's not dead-stripped by an over-eager
+            // optimizer and so we exercise the backend-owned pool path.
+            let _ = pooled.with_borrowed_backend(|backend| {
+                backend
+                    .with_connection(|conn| conn.is_autocommit())
+                    .expect("pooled backend autocommit probe")
+            });
+            // Drop returns the backend to the pool.
         }
         let end = baseline();
         let d = delta(start, end);
