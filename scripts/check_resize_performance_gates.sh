@@ -21,7 +21,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 ARTIFACT_DIR="${FT_RESIZE_GATE_ARTIFACT_DIR:-target/resize-performance-gates}"
-TARGET_DIR="${FT_RESIZE_GATE_TARGET_DIR:-target-resize-performance-gates}"
+TARGET_DIR="${FT_RESIZE_GATE_TARGET_DIR:-target/resize-performance-gates/cargo-target}"
 BASELINE_FILE="${FT_RESIZE_GATE_BASELINE_FILE:-evidence/wa-1u90p.7.4/resize_perf_mid_baseline.json}"
 BASELINE_WARN_MULTIPLIER="${FT_RESIZE_GATE_BASELINE_WARN_MULTIPLIER:-1.10}"
 BASELINE_FAIL_MULTIPLIER="${FT_RESIZE_GATE_BASELINE_FAIL_MULTIPLIER:-1.20}"
@@ -127,17 +127,8 @@ now_iso() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
-ns_to_ms() {
-    local ns="$1"
-    awk "BEGIN { printf \"%.3f\", (${ns} / 1000000.0) }"
-}
-
 float_gt() {
     awk "BEGIN { exit !($1 > $2) }"
-}
-
-float_ge() {
-    awk "BEGIN { exit !($1 >= $2) }"
 }
 
 run_step() {
