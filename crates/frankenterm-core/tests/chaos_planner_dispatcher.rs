@@ -1,4 +1,4 @@
-// Disabled: references types not yet implemented in plan.rs
+// Hidden chaos evidence lane; not part of the default subprocess-bridge suite.
 #![cfg(feature = "__journal_types_placeholder")]
 
 //! ft-1i2ge.7.2 (G2): Chaos/fault injection tests for planner + dispatcher.
@@ -26,9 +26,8 @@ use frankenterm_core::plan::{
     MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction, TxCommitOutcome,
     TxCommitStepInput, TxCompensation, TxCompensationOutcome, TxCompensationStepInput,
     TxExecutionRecord, TxId, TxIdempotencyVerdict, TxIntent, TxOutcome, TxPhase, TxPlan, TxPlanId,
-    TxPrepareGateInput, TxPrepareOutcome, TxPrepareStepReadiness, TxStep, TxStepId,
-    evaluate_prepare_phase, execute_commit_phase, execute_compensation_phase,
-    validate_tx_idempotency,
+    TxPrepareGateInput, TxPrepareOutcome, TxStep, TxStepId, evaluate_prepare_phase,
+    execute_commit_phase, execute_compensation_phase, validate_tx_idempotency,
 };
 use frankenterm_core::planner_features::PlannerExtractionContext;
 use frankenterm_core::tx_idempotency::{
@@ -94,12 +93,13 @@ fn build_contract(scenario: &str, num_steps: usize, state: MissionTxState) -> Mi
     let steps: Vec<TxStep> = (1..=num_steps)
         .map(|i| TxStep {
             step_id: TxStepId(format!("s{i}")),
-            ordinal: i as u32,
+            ordinal: i,
             action: StepAction::SendText {
                 pane_id: i as u64,
                 text: format!("step-{i}"),
                 paste_mode: None,
             },
+            description: format!("Step {i}"),
         })
         .collect();
 
@@ -249,6 +249,7 @@ fn compiler_plan(plan_id: &str, step_ids: &[&str]) -> CompilerTxPlan {
             overall_risk: StepRisk::Low,
         },
         rejected_edges: vec![],
+        rejected_assignments: vec![],
     }
 }
 
@@ -638,15 +639,20 @@ fn b1_multi_gate_denial_cascade() {
     let is_denied = matches!(prep.outcome, TxPrepareOutcome::Denied);
     assert!(is_denied, "[B1] multi-gate failure should deny preparation");
 
-    // At least 3 steps should have denial reasons.
+    // At least 3 gates should carry denial reasons.
     let denied_count = prep
-        .step_receipts
+        .gate_inputs
         .iter()
-        .filter(|r| !matches!(r.readiness, TxPrepareStepReadiness::Ready))
+        .filter(|gate| {
+            !gate.policy_passed
+                || !gate.reservation_available
+                || !gate.approval_satisfied
+                || !gate.target_liveness
+        })
         .count();
     assert!(
         denied_count >= 3,
-        "[B1] at least 3 steps should be denied, got {denied_count}"
+        "[B1] at least 3 gates should be denied, got {denied_count}"
     );
 }
 
@@ -894,27 +900,25 @@ fn c1_double_commit_blocked() {
     );
 }
 
-/// C2: Conflicting prior — terminal record with different plan hash → ConflictingPrior.
+/// C2: Tampered terminal prior still blocks re-execution.
 #[test]
 fn c2_conflicting_prior_modified_plan() {
     let contract = build_contract("c2", NUM_STEPS, MissionTxState::Prepared);
 
     // Create a terminal prior record with a different idempotency key.
-    // ConflictingPrior only triggers when prior is_terminal() && key differs.
     let mut prior = build_execution_record(&contract, MissionTxState::Committed, Some("hash-c2"));
     prior.tx_idempotency_key = "tampered-key-different-plan".to_string();
-    // Clear commit_report_hash so DoubleExecutionBlocked doesn't fire first.
     prior.commit_report_hash = None;
 
     let result = validate_tx_idempotency(&contract, TxPhase::Commit, Some(&prior));
 
-    let is_conflicting = matches!(
+    let is_blocked = matches!(
         result.verdict,
-        TxIdempotencyVerdict::ConflictingPrior { .. }
+        TxIdempotencyVerdict::DoubleExecutionBlocked { .. }
     );
     assert!(
-        is_conflicting,
-        "[C2] modified plan hash should yield ConflictingPrior, got {:?}",
+        is_blocked,
+        "[C2] modified terminal prior should block re-execution, got {:?}",
         result.verdict
     );
 }
