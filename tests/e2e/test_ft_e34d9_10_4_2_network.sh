@@ -131,7 +131,6 @@ cd "${ROOT_DIR}"
 
 require_cmd jq
 require_cmd rch
-require_cmd cargo
 require_cmd python3
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
@@ -188,11 +187,7 @@ else
   exit 1
 fi
 
-tmp_mutated="$(mktemp "${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.mutated.XXXXXX.rs")"
-cleanup() {
-  rm -f "${tmp_mutated}"
-}
-trap cleanup EXIT
+tmp_mutated="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${BASHPID}.mutated.rs"
 
 python3 - "${WEB_TEST_SOURCE}" "${tmp_mutated}" <<'PY'
 import sys
