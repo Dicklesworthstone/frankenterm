@@ -161,30 +161,11 @@ emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basen
 
 if ensure_rch_ready_capture_artifacts; then
   emit_log "preflight" "rch_preflight" "ensure_rch_ready" "passed" "rch_preflight_passed" "none" "$(basename "${_RCH_SMOKE_LOG}")"
+  emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${_RCH_PROBE_LOG}")"
 else
   emit_log "preflight" "rch_preflight" "ensure_rch_ready" "failed" "rch_preflight_failed" "RCH-E100" "$(basename "${_RCH_SMOKE_LOG}")"
   exit 2
 fi
-
-probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"
-set +e
-rch workers probe --all --json > "${probe_log}" 2>>"${STDOUT_FILE}"
-probe_rc=$?
-set -e
-
-if [[ ${probe_rc} -ne 0 ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_probe_failed" "RCH-E100" "$(basename "${probe_log}")"
-  echo "rch workers probe failed" >&2
-  exit 2
-fi
-
-healthy_workers=$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${probe_log}")
-if [[ "${healthy_workers}" -lt 1 ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_workers_unreachable" "RCH-E100" "$(basename "${probe_log}")"
-  echo "no reachable rch workers; refusing local fallback" >&2
-  exit 2
-fi
-emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
 
 emit_log "validation" "guard_validator.nominal" "run=baseline+selftest" "running" "none" "none" "$(basename "${REPORT_OK}")"
 if bash "${VALIDATOR}" --self-test --policy-path "${POLICY}" --output "${REPORT_OK}" >> "${STDOUT_FILE}" 2>&1; then
