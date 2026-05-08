@@ -11,6 +11,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="$ROOT_DIR/tests/e2e/logs"
+GUARD_LIB="${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
 mkdir -p "$LOG_DIR"
 
 run_id="search_contract_freeze_$(date -u +%Y%m%dT%H%M%SZ)"
@@ -20,6 +21,9 @@ mkdir -p "$raw_dir"
 scenarios_pass=0
 scenarios_fail=0
 RUN_ID="${run_id}"
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 
 now_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log_json() { echo "$1" >>"$json_log"; }
@@ -37,42 +41,7 @@ count_matches() {
 
 # ── rch infrastructure ──────────────────────────────────────────────────────
 RCH_TARGET_DIR="target/rch-e2e-search-contract-${RUN_ID}"
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="${LOG_DIR}/search_contract_${RUN_ID}.probe.log"
-RCH_SMOKE_LOG="${LOG_DIR}/search_contract_${RUN_ID}.smoke.log"
-
-fatal() { echo "FATAL: $1" >&2; exit 1; }
-run_rch() { TMPDIR=/tmp rch "$@"; }
-run_rch_cargo() { run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"; }
-probe_has_reachable_workers() { grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"; }
-
-check_rch_fallback() {
-    local output_file="$1"
-    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
-        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
-    fi
-}
-
-run_rch_cargo_logged() {
-    local output_file="$1"; shift
-    set +e; ( cd "${ROOT_DIR}"; run_rch_cargo "$@" ) >"${output_file}" 2>&1; local rc=$?; set -e
-    check_rch_fallback "${output_file}"; return "${rc}"
-}
-
-ensure_rch_ready() {
-    if ! command -v rch >/dev/null 2>&1; then
-        fatal "rch is required for this e2e harness; refusing local cargo execution."
-    fi
-    set +e; run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1; local probe_rc=$?; set -e
-    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
-        fatal "rch workers unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
-    fi
-    set +e; run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1; local smoke_rc=$?; set -e
-    check_rch_fallback "${RCH_SMOKE_LOG}"
-    if [[ ${smoke_rc} -ne 0 ]]; then
-        fatal "rch remote smoke preflight failed. See ${RCH_SMOKE_LOG}"
-    fi
-}
+rch_init "${LOG_DIR}" "${RUN_ID}" "search_contract_freeze" "${ROOT_DIR}"
 
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"step\":\"start\",\"status\":\"running\"}"
 
@@ -84,7 +53,7 @@ log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",
 
 cargo_out="$raw_dir/${scenario}.stdout.log"
 set +e
-run_rch_cargo_logged "${cargo_out}" test -p frankenterm-core --test search_api_contract_freeze -- --nocapture
+run_rch_cargo_logged "${cargo_out}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --test search_api_contract_freeze -- --nocapture
 rc=$?
 set -e
 
@@ -104,9 +73,9 @@ log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",
 run1="$raw_dir/${scenario}_run1.log"
 run2="$raw_dir/${scenario}_run2.log"
 set +e
-run_rch_cargo_logged "${run1}" test -p frankenterm-core --test search_api_contract_freeze regression_ -- --nocapture
+run_rch_cargo_logged "${run1}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --test search_api_contract_freeze regression_ -- --nocapture
 rc1=$?
-run_rch_cargo_logged "${run2}" test -p frankenterm-core --test search_api_contract_freeze regression_ -- --nocapture
+run_rch_cargo_logged "${run2}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --test search_api_contract_freeze regression_ -- --nocapture
 rc2=$?
 set -e
 
@@ -143,7 +112,7 @@ log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",
 
 scenario4_log="$raw_dir/${scenario}.log"
 set +e
-run_rch_cargo_logged "${scenario4_log}" test -p frankenterm-core --test search_api_contract_freeze contract_search_schema -- --nocapture
+run_rch_cargo_logged "${scenario4_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --test search_api_contract_freeze contract_search_schema -- --nocapture
 rc=$?
 set -e
 
