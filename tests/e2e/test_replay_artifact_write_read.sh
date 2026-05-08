@@ -14,16 +14,23 @@ component="replay_artifact_write_read"
 
 cargo_home="/tmp/cargo-home-replay-artifact-write-read"
 local_tmpdir="${FT_REPLAY_CAPTURE_LOCAL_TMPDIR:-${TMPDIR:-/tmp}}"
-remote_tmpdir="${FT_REPLAY_CAPTURE_REMOTE_TMPDIR:-/home/ubuntu}"
-cargo_target_dir="${FT_REPLAY_CAPTURE_TARGET_DIR:-$remote_tmpdir/target-replay-artifact-write-read-${run_id}}"
+remote_tmpdir="${FT_REPLAY_CAPTURE_REMOTE_TMPDIR:-/tmp}"
+default_cargo_target_dir="target/rch-e2e-replay-artifact-write-read-${run_id}"
+requested_cargo_target_dir="${FT_REPLAY_CAPTURE_TARGET_DIR:-}"
+if [[ -n "${requested_cargo_target_dir}" && "${requested_cargo_target_dir}" != /* ]]; then
+  cargo_target_dir="${requested_cargo_target_dir}"
+else
+  cargo_target_dir="${default_cargo_target_dir}"
+fi
 work_dir="$ROOT_DIR/tests/e2e/tmp/${run_id}"
 mkdir -p "$work_dir"
 
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_DAEMON_STATUS_LOG="${LOG_DIR}/${run_id}.rch_daemon_status.json"
-RCH_DAEMON_START_LOG="${LOG_DIR}/${run_id}.rch_daemon_start.json"
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
-TIMEOUT_BIN=""
+RCH_LOCAL_TMPDIR="${local_tmpdir}"
+GUARD_LIB="${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
+rch_init "${raw_dir}" "${run_id}" "${component}" "${ROOT_DIR}"
 
 now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -70,152 +77,7 @@ log_json() {
     } + $payload' >>"$json_log"
 }
 
-require_cmd() {
-  local cmd="$1"
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"prereq_check\",\"status\":\"failed\",\"decision_path\":\"preflight\",\"inputs\":{\"command\":\"$cmd\"},\"outcome\":\"failed\",\"reason_code\":\"missing_prerequisite\",\"error_code\":\"E2E-PREREQ\"}"
-    echo "missing required command: $cmd" >&2
-    exit 1
-  fi
-}
-
-probe_rch_workers() {
-  local probe_log="$raw_dir/${run_id}.rch_probe.json"
-  local probe_json
-
-  log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_probe\",\"status\":\"running\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"running\",\"artifact_path\":\"${probe_log#"$ROOT_DIR"/}\"}"
-
-  set +e
-  env TMPDIR="$local_tmpdir" rch workers probe --all --json >"$probe_log" 2>&1
-  local probe_rc=$?
-  set -e
-
-  if [[ $probe_rc -ne 0 ]]; then
-    log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_probe\",\"status\":\"failed\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"failed\",\"reason_code\":\"rch_probe_failed\",\"error_code\":\"RCH-E100\",\"artifact_path\":\"${probe_log#"$ROOT_DIR"/}\"}"
-    echo "rch workers probe failed" >&2
-    exit 2
-  fi
-
-  probe_json="$(awk 'capture || /^[[:space:]]*[{]/{capture=1; print}' "$probe_log")"
-  local healthy_workers
-  healthy_workers="$(printf '%s\n' "$probe_json" | jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' 2>/dev/null || echo 0)"
-  if [[ "$healthy_workers" -lt 1 ]]; then
-    log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_probe\",\"status\":\"failed\",\"decision_path\":\"preflight\",\"inputs\":{\"healthy_workers\":$healthy_workers},\"outcome\":\"failed\",\"reason_code\":\"rch_workers_unreachable\",\"error_code\":\"RCH-E100\",\"artifact_path\":\"${probe_log#"$ROOT_DIR"/}\"}"
-    echo "no reachable rch workers; refusing local fallback" >&2
-    exit 2
-  fi
-
-  log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_probe\",\"status\":\"passed\",\"decision_path\":\"preflight\",\"inputs\":{\"healthy_workers\":$healthy_workers},\"outcome\":\"pass\",\"reason_code\":\"workers_reachable\",\"artifact_path\":\"${probe_log#"$ROOT_DIR"/}\"}"
-}
-
-ensure_rch_daemon_running() {
-  log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_daemon_status\",\"status\":\"running\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"running\",\"artifact_path\":\"${RCH_DAEMON_STATUS_LOG#"$ROOT_DIR"/}\"}"
-
-  set +e
-  env TMPDIR="$local_tmpdir" rch daemon status --json >"$RCH_DAEMON_STATUS_LOG" 2>&1
-  local status_rc=$?
-  set -e
-
-  if [[ $status_rc -ne 0 ]]; then
-    log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_daemon_status\",\"status\":\"failed\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"failed\",\"reason_code\":\"rch_daemon_status_failed\",\"error_code\":\"RCH-E101\",\"artifact_path\":\"${RCH_DAEMON_STATUS_LOG#"$ROOT_DIR"/}\"}"
-    echo "rch daemon status failed" >&2
-    exit 2
-  fi
-
-  if jq -e '.data.running == true' "$RCH_DAEMON_STATUS_LOG" >/dev/null 2>&1; then
-    log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_daemon_status\",\"status\":\"passed\",\"decision_path\":\"preflight\",\"inputs\":{\"running\":true},\"outcome\":\"pass\",\"reason_code\":\"daemon_running\",\"artifact_path\":\"${RCH_DAEMON_STATUS_LOG#"$ROOT_DIR"/}\"}"
-    return 0
-  fi
-
-  log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_daemon_status\",\"status\":\"passed\",\"decision_path\":\"preflight\",\"inputs\":{\"running\":false},\"outcome\":\"pass\",\"reason_code\":\"daemon_not_running\",\"artifact_path\":\"${RCH_DAEMON_STATUS_LOG#"$ROOT_DIR"/}\"}"
-  log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_daemon_start\",\"status\":\"running\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"running\",\"artifact_path\":\"${RCH_DAEMON_START_LOG#"$ROOT_DIR"/}\"}"
-
-  set +e
-  env TMPDIR="$local_tmpdir" rch daemon start --json >"$RCH_DAEMON_START_LOG" 2>&1
-  local start_rc=$?
-  set -e
-
-  if [[ $start_rc -ne 0 ]]; then
-    log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_daemon_start\",\"status\":\"failed\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"failed\",\"reason_code\":\"rch_daemon_start_failed\",\"error_code\":\"RCH-E101\",\"artifact_path\":\"${RCH_DAEMON_START_LOG#"$ROOT_DIR"/}\"}"
-    echo "rch daemon start failed" >&2
-    exit 2
-  fi
-
-  sleep 2
-
-  set +e
-  env TMPDIR="$local_tmpdir" rch daemon status --json >"$RCH_DAEMON_STATUS_LOG" 2>&1
-  status_rc=$?
-  set -e
-
-  if [[ $status_rc -ne 0 ]] || ! jq -e '.data.running == true' "$RCH_DAEMON_STATUS_LOG" >/dev/null 2>&1; then
-    log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_daemon_start\",\"status\":\"failed\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"failed\",\"reason_code\":\"rch_daemon_unavailable\",\"error_code\":\"RCH-E101\",\"artifact_path\":\"${RCH_DAEMON_STATUS_LOG#"$ROOT_DIR"/}\"}"
-    echo "rch daemon unavailable; refusing rch exec because it would fall back locally" >&2
-    exit 2
-  fi
-
-  log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_daemon_start\",\"status\":\"passed\",\"decision_path\":\"preflight\",\"inputs\":{\"running\":true},\"outcome\":\"pass\",\"reason_code\":\"daemon_started\",\"artifact_path\":\"${RCH_DAEMON_STATUS_LOG#"$ROOT_DIR"/}\"}"
-}
-
-fatal() { echo "FATAL: $1" >&2; exit 1; }
-
-run_rch() {
-    TMPDIR=/tmp rch "$@"
-}
-
-capture_rch_queue_timeout_log() {
-    local output_file="$1"
-    local queue_log="${output_file%.log}.rch_queue_timeout.log"
-    if ! run_rch queue >"${queue_log}" 2>&1; then
-        queue_log="${output_file}"
-    fi
-    printf '%s\n' "${queue_log}"
-}
-
-resolve_timeout_bin() {
-    if command -v timeout >/dev/null 2>&1; then
-        TIMEOUT_BIN="timeout"
-    elif command -v gtimeout >/dev/null 2>&1; then
-        TIMEOUT_BIN="gtimeout"
-    else
-        TIMEOUT_BIN=""
-    fi
-}
-
-check_rch_fallback() {
-    local output_file="$1"
-    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
-        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
-    fi
-}
-
-run_rch_cargo_logged() {
-    local output_file="$1"
-    shift
-    set +e
-    (
-        cd "${ROOT_DIR}"
-        env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
-            rch exec -- "$@"
-    ) >"${output_file}" 2>&1
-    local rc=$?
-    set -e
-    check_rch_fallback "${output_file}"
-    if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-        local queue_log
-        queue_log="$(capture_rch_queue_timeout_log "${output_file}")"
-        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${queue_log}"
-    fi
-    return "${rc}"
-}
-
-ensure_rch_ready() {
-    resolve_timeout_bin
-    if [[ -z "${TIMEOUT_BIN}" ]]; then
-        fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
-    fi
-    ensure_rch_daemon_running
-}
+fatal() { rch_fatal "$1"; }
 
 extract_section_json_line() {
   local file="$1"
@@ -246,34 +108,22 @@ run_harvest_command() {
   local rel_output_dir="${output_dir#"$ROOT_DIR"/}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    env TMPDIR="$local_tmpdir" "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
-      rch exec -- env \
-      TMPDIR="$remote_tmpdir" \
-      CARGO_HOME="$cargo_home" \
-      CARGO_TARGET_DIR="$cargo_target_dir" \
-      cargo run -q -p frankenterm -- \
-      replay harvest \
-      --source-dir "$rel_source_dir" \
-      --output-dir "$rel_output_dir" \
-      --filter "$filter" \
-      --json
-  ) >"$combined_file" 2>&1
+  run_rch_cargo_logged "$combined_file" env \
+    TMPDIR="$remote_tmpdir" \
+    CARGO_HOME="$cargo_home" \
+    CARGO_TARGET_DIR="$cargo_target_dir" \
+    cargo run -q -p frankenterm -- \
+    replay harvest \
+    --source-dir "$rel_source_dir" \
+    --output-dir "$rel_output_dir" \
+    --filter "$filter" \
+    --json
   local rc=$?
   set -e
 
   # Copy combined output for downstream consumers that expect separate files
   cp "$combined_file" "$stdout_file" 2>/dev/null || true
   cp "$combined_file" "$stderr_file" 2>/dev/null || true
-
-  check_rch_fallback "$combined_file"
-
-  if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-    local queue_log
-    queue_log="$(capture_rch_queue_timeout_log "${combined_file}")"
-    fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${queue_log}"
-  fi
 
   return "$rc"
 }
@@ -324,11 +174,6 @@ write_fixture() {
   fi
 }
 
-require_cmd jq
-require_cmd rch
-require_cmd cargo
-require_cmd shasum
-probe_rch_workers
 ensure_rch_ready
 
 log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"start\",\"status\":\"running\",\"decision_path\":\"suite\",\"inputs\":{},\"outcome\":\"running\",\"artifact_path\":\"${json_log#"$ROOT_DIR"/}\"}"
