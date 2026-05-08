@@ -25,16 +25,35 @@ SKIP_COUNT=0
 
 mkdir -p "$LOG_DIR"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "dr6zv_1_3_3_rrf_weights"
 ensure_rch_ready
+
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
 
 log_event() {
     local scenario="$1" event="$2" outcome="$3" reason_code="${4:-}" detail="${5:-}"
     local ts
     ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
     printf '{"timestamp":"%s","bead_id":"%s","scenario_id":"%s","run_id":"%s","component":"hybrid_search","scenario":"%s","event":"%s","outcome":"%s","reason_code":"%s","detail":"%s"}\n' \
-        "$ts" "$BEAD_ID" "$SCENARIO_ID" "$RUN_ID" "$scenario" "$event" "$outcome" "$reason_code" "$detail" \
+        "$(json_escape "$ts")" \
+        "$(json_escape "$BEAD_ID")" \
+        "$(json_escape "$SCENARIO_ID")" \
+        "$(json_escape "$RUN_ID")" \
+        "$(json_escape "$scenario")" \
+        "$(json_escape "$event")" \
+        "$(json_escape "$outcome")" \
+        "$(json_escape "$reason_code")" \
+        "$(json_escape "$detail")" \
         >> "$LOG_FILE"
 }
 

@@ -30,15 +30,38 @@ else
 fi
 export CARGO_TARGET_DIR
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${CORRELATION_ID}" "1i2ge_4_7"
 ensure_rch_ready
 
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
+json_field() {
+    local key="$1"
+    local value="$2"
+    printf ',"%s":"%s"' "$key" "$(json_escape "$value")"
+}
+
 log_structured() {
     local outcome="$1" reason_code="$2" error_code="${3:-}" extra="${4:-}"
     printf '{"timestamp":"%s","component":"%s","scenario_id":"%s","correlation_id":"%s","outcome":"%s","reason_code":"%s","error_code":"%s"%s}\n' \
-        "$TIMESTAMP" "$COMPONENT" "$SCENARIO_ID" "$CORRELATION_ID" \
-        "$outcome" "$reason_code" "$error_code" "$extra" \
+        "$(json_escape "$TIMESTAMP")" \
+        "$(json_escape "$COMPONENT")" \
+        "$(json_escape "$SCENARIO_ID")" \
+        "$(json_escape "$CORRELATION_ID")" \
+        "$(json_escape "$outcome")" \
+        "$(json_escape "$reason_code")" \
+        "$(json_escape "$error_code")" \
+        "$extra" \
         | tee -a "$LOG_DIR/results.jsonl"
 }
 
@@ -64,7 +87,7 @@ check_rch_fallback_in_logs() {
 
     if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
         log_structured "FAIL" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" \
-            "$(printf ',\"input_summary\":\"%s\",\"artifact_path\":\"%s\"' "$label" "$1")"
+            "$(json_field "input_summary" "$label")$(json_field "artifact_path" "$1")"
         echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
         exit 3
     fi
@@ -84,7 +107,7 @@ probe_rc=$?
 set -e
 if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
     log_structured "FAIL" "rch_workers_unhealthy" "RCH-E100" \
-        "$(printf ',\"input_summary\":\"rch workers probe\",\"artifact_path\":\"%s\"' "$RCH_PROBE_LOG")"
+        "$(json_field "input_summary" "rch workers probe")$(json_field "artifact_path" "$RCH_PROBE_LOG")"
     echo "rch workers are unavailable; refusing local cargo execution." >&2
     exit 1
 fi
@@ -96,7 +119,7 @@ set -e
 check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
 if [[ $smoke_rc -ne 0 ]]; then
     log_structured "FAIL" "rch_remote_smoke_failed" "RCH-E101" \
-        "$(printf ',\"input_summary\":\"cargo check --help\",\"artifact_path\":\"%s\"' "$RCH_SMOKE_LOG")"
+        "$(json_field "input_summary" "cargo check --help")$(json_field "artifact_path" "$RCH_SMOKE_LOG")"
     echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
     exit 1
 fi
@@ -114,11 +137,11 @@ if $CARGO_CMD test --test mission_safety_adversarial --features subprocess-bridg
     2>"$LOG_DIR/test_stderr.log" | tee "$LOG_DIR/test_stdout.log"; then
     check_rch_fallback_in_logs "mission_safety_adversarial" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     PASS_COUNT=$(grep -c '\.\.\..*ok' "$LOG_DIR/test_stdout.log" || echo "0")
-    log_structured "PASS" "adversarial_suite_pass" "" "$(printf ',\"input_summary\":\"25 adversarial tests\",\"decision_path\":\"cargo test\",\"artifact_path\":\"%s/test_stdout.log\",\"pass_count\":\"%s\"' "$LOG_DIR" "$PASS_COUNT")"
+    log_structured "PASS" "adversarial_suite_pass" "" "$(json_field "input_summary" "25 adversarial tests")$(json_field "decision_path" "cargo test")$(json_field "artifact_path" "$LOG_DIR/test_stdout.log")$(json_field "pass_count" "$PASS_COUNT")"
     echo "    ✓ ${PASS_COUNT} adversarial tests passed"
 else
     check_rch_fallback_in_logs "mission_safety_adversarial" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
-    log_structured "FAIL" "adversarial_suite_fail" "E2E001" "$(printf ',\"input_summary\":\"adversarial tests\",\"artifact_path\":\"%s/test_stderr.log\"' "$LOG_DIR")"
+    log_structured "FAIL" "adversarial_suite_fail" "E2E001" "$(json_field "input_summary" "adversarial tests")$(json_field "artifact_path" "$LOG_DIR/test_stderr.log")"
     echo "    ✗ Adversarial tests failed — see $LOG_DIR/test_stderr.log"
     exit 1
 fi
@@ -146,7 +169,7 @@ if [ "$MISSING" -eq 0 ]; then
     log_structured "PASS" "category_coverage_pass" "" ',\"input_summary\":\"envelope + conflict + serde + metrics categories\"'
     echo "    ✓ All test categories covered"
 else
-    log_structured "FAIL" "category_coverage_fail" "E2E002" "$(printf ',\"missing_count\":\"%s\"' "$MISSING")"
+    log_structured "FAIL" "category_coverage_fail" "E2E002" "$(json_field "missing_count" "$MISSING")"
     echo "    ✗ $MISSING expected tests missing"
     exit 1
 fi

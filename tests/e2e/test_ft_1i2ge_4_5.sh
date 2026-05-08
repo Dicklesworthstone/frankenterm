@@ -31,15 +31,38 @@ else
 fi
 export CARGO_TARGET_DIR
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${CORRELATION_ID}" "1i2ge_4_5"
 ensure_rch_ready
 
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
+json_field() {
+    local key="$1"
+    local value="$2"
+    printf ',"%s":"%s"' "$key" "$(json_escape "$value")"
+}
+
 log_structured() {
     local outcome="$1" reason_code="$2" error_code="${3:-}" extra="${4:-}"
     printf '{"timestamp":"%s","component":"%s","scenario_id":"%s","correlation_id":"%s","outcome":"%s","reason_code":"%s","error_code":"%s"%s}\n' \
-        "$TIMESTAMP" "$COMPONENT" "$SCENARIO_ID" "$CORRELATION_ID" \
-        "$outcome" "$reason_code" "$error_code" "$extra" \
+        "$(json_escape "$TIMESTAMP")" \
+        "$(json_escape "$COMPONENT")" \
+        "$(json_escape "$SCENARIO_ID")" \
+        "$(json_escape "$CORRELATION_ID")" \
+        "$(json_escape "$outcome")" \
+        "$(json_escape "$reason_code")" \
+        "$(json_escape "$error_code")" \
+        "$extra" \
         | tee -a "$LOG_DIR/results.jsonl"
 }
 
@@ -65,7 +88,7 @@ check_rch_fallback_in_logs() {
 
     if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
         log_structured "FAIL" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" \
-            "$(printf ',\"input_summary\":\"%s\",\"artifact_path\":\"%s\"' "$label" "$1")"
+            "$(json_field "input_summary" "$label")$(json_field "artifact_path" "$1")"
         echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
         exit 3
     fi
@@ -91,7 +114,7 @@ probe_rc=$?
 set -e
 if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
     log_structured "FAIL" "rch_workers_unhealthy" "RCH-E100" \
-        "$(printf ',\"input_summary\":\"rch workers probe\",\"artifact_path\":\"%s\"' "$RCH_PROBE_LOG")"
+        "$(json_field "input_summary" "rch workers probe")$(json_field "artifact_path" "$RCH_PROBE_LOG")"
     echo "rch workers are unavailable; refusing local cargo execution." >&2
     exit 1
 fi
@@ -103,7 +126,7 @@ set -e
 check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
 if [[ $smoke_rc -ne 0 ]]; then
     log_structured "FAIL" "rch_remote_smoke_failed" "RCH-E101" \
-        "$(printf ',\"input_summary\":\"cargo check --help\",\"artifact_path\":\"%s\"' "$RCH_SMOKE_LOG")"
+        "$(json_field "input_summary" "cargo check --help")$(json_field "artifact_path" "$RCH_SMOKE_LOG")"
     echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
     exit 1
 fi
@@ -121,11 +144,11 @@ if $CARGO_CMD test --lib -p frankenterm-core --features subprocess-bridge \
     -- mission_loop::tests::conflict_detection 2>"$LOG_DIR/test_stderr.log" | tee "$LOG_DIR/test_stdout.log"; then
     check_rch_fallback_in_logs "conflict_detection_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     PASS_COUNT=$(grep -c "test mission_loop::tests::conflict_detection.*ok" "$LOG_DIR/test_stdout.log" || echo "0")
-    log_structured "PASS" "unit_tests_pass" "" "$(printf ',\"input_summary\":\"conflict_detection tests\",\"decision_path\":\"cargo test\",\"artifact_path\":\"%s/test_stdout.log\",\"pass_count\":\"%s\"' "$LOG_DIR" "$PASS_COUNT")"
+    log_structured "PASS" "unit_tests_pass" "" "$(json_field "input_summary" "conflict_detection tests")$(json_field "decision_path" "cargo test")$(json_field "artifact_path" "$LOG_DIR/test_stdout.log")$(json_field "pass_count" "$PASS_COUNT")"
     echo "    ✓ ${PASS_COUNT} conflict detection tests passed"
 else
     check_rch_fallback_in_logs "conflict_detection_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
-    log_structured "FAIL" "unit_tests_fail" "E2E001" "$(printf ',\"input_summary\":\"conflict_detection tests\",\"artifact_path\":\"%s/test_stderr.log\"' "$LOG_DIR")"
+    log_structured "FAIL" "unit_tests_fail" "E2E001" "$(json_field "input_summary" "conflict_detection tests")$(json_field "artifact_path" "$LOG_DIR/test_stderr.log")"
     echo "    ✗ Unit tests failed — see $LOG_DIR/test_stderr.log"
     exit 1
 fi
@@ -137,7 +160,7 @@ if $CARGO_CMD test --lib -p frankenterm-core --features subprocess-bridge \
     -- mission_loop::tests::paths_overlap 2>>"$LOG_DIR/test_stderr.log" | tee -a "$LOG_DIR/test_stdout.log"; then
     check_rch_fallback_in_logs "paths_overlap_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     PASS_COUNT=$(grep -c "test mission_loop::tests::paths_overlap.*ok" "$LOG_DIR/test_stdout.log" || echo "0")
-    log_structured "PASS" "path_overlap_tests_pass" "" "$(printf ',\"input_summary\":\"paths_overlap + wildcard\",\"pass_count\":\"%s\"' "$PASS_COUNT")"
+    log_structured "PASS" "path_overlap_tests_pass" "" "$(json_field "input_summary" "paths_overlap + wildcard")$(json_field "pass_count" "$PASS_COUNT")"
     echo "    ✓ Path overlap tests passed"
 else
     check_rch_fallback_in_logs "paths_overlap_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
