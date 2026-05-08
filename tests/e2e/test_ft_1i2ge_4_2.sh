@@ -10,10 +10,11 @@ SCENARIO_ID="ft_1i2ge_4_2_reservation_enforcement"
 CORRELATION_ID="ft-1i2ge.4.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_4_2_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_2_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_4_2_${RUN_ID}.probe.log"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_4_2"
 ensure_rch_ready
 
@@ -65,82 +66,46 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission reservation and ownership enforcement contract checks"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required_missing" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for cargo execution in this scenario"
-  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_workers_unhealthy" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "rch workers probe failed; refusing local fallback"
-  echo "rch workers are unavailable; refusing local cargo execution." >&2
-  exit 1
-fi
-
-cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-4-2"
-emit_log \
-  "running" \
-  "execution_preflight" \
-  "rch_workers_healthy" \
-  "none" \
-  "$(basename "${PROBE_FILE}")" \
-  "offloading tests through rch workers"
-
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_dispatch_contract_maps_candidate_to_robot_and_coordination_primitives -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_contract_maps_wait_for_to_robot_wait_for -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_requires_assignment_reference -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_reservation_feasibility_denies_conflicting_lease_and_returns_feedback -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_reservation_feasibility_allows_same_holder_or_expired_lease -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_reservation_feasibility_marks_expired_intent_as_stale_state -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_reservation_paths_overlap_supports_wildcard_patterns -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-4-2"
+TEST_FILTERS=(
+  "mission_dispatch_contract_maps_candidate_to_robot_and_coordination_primitives"
+  "mission_dispatch_contract_maps_wait_for_to_robot_wait_for"
+  "mission_policy_preflight_dispatch_time_requires_assignment_reference"
+  "mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback"
+  "mission_reservation_feasibility_denies_conflicting_lease_and_returns_feedback"
+  "mission_reservation_feasibility_allows_same_holder_or_expired_lease"
+  "mission_reservation_feasibility_marks_expired_intent_as_stale_state"
+  "mission_reservation_paths_overlap_supports_wildcard_patterns"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_4_2_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture)
   decision_path="happy_path"
   reason_code="reservation_contract_validation"
 
-  if [[ "${test_cmd}" == *"maps_wait_for_to_robot_wait_for"* ]]; then
+  if [[ "${test_filter}" == *"maps_wait_for_to_robot_wait_for"* ]]; then
     decision_path="edge_case_path"
     reason_code="non_reservation_action_path"
-  elif [[ "${test_cmd}" == *"paths_overlap_supports_wildcard_patterns"* ]]; then
+  elif [[ "${test_filter}" == *"paths_overlap_supports_wildcard_patterns"* ]]; then
     decision_path="edge_case_path"
     reason_code="reservation_path_wildcard_matching"
-  elif [[ "${test_cmd}" == *"requires_assignment_reference"* ]]; then
+  elif [[ "${test_filter}" == *"requires_assignment_reference"* ]]; then
     decision_path="failure_injection_path"
     reason_code="dispatch_assignment_required"
-  elif [[ "${test_cmd}" == *"accepts_assignment_bound_denial_and_feedback"* ]]; then
+  elif [[ "${test_filter}" == *"accepts_assignment_bound_denial_and_feedback"* ]]; then
     decision_path="recovery_path"
     reason_code="reservation_conflict_feedback"
-  elif [[ "${test_cmd}" == *"denies_conflicting_lease_and_returns_feedback"* ]]; then
+  elif [[ "${test_filter}" == *"denies_conflicting_lease_and_returns_feedback"* ]]; then
     decision_path="failure_injection_path"
     reason_code="reservation_conflict_detected"
-  elif [[ "${test_cmd}" == *"allows_same_holder_or_expired_lease"* ]]; then
+  elif [[ "${test_filter}" == *"allows_same_holder_or_expired_lease"* ]]; then
     decision_path="recovery_path"
     reason_code="reservation_lifecycle_allows_progress"
-  elif [[ "${test_cmd}" == *"marks_expired_intent_as_stale_state"* ]]; then
+  elif [[ "${test_filter}" == *"marks_expired_intent_as_stale_state"* ]]; then
     decision_path="failure_injection_path"
     reason_code="reservation_intent_expired"
   fi
@@ -151,15 +116,13 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: ${cmd_prefix} ${test_cmd}"
+    "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${cmd_prefix} ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -168,7 +131,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
+      "exit=${status}; command=${test_cmd[*]}"
     exit "${status}"
   fi
 done
