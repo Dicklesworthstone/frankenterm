@@ -57,12 +57,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-# Each agent should use an isolated /tmp target dir to avoid lock
-# contention with other concurrently-running agents. This matches the
-# current swarm convention (`export CARGO_TARGET_DIR=/tmp/ft-$(whoami)-target`).
+# Each agent should use an isolated target dir to avoid lock contention with
+# other concurrently-running agents. By default, keep artifacts under this
+# repo's target tree so stale /tmp targets are not left behind.
 # Override with CARGO_TARGET_DIR or CARGO_TARGET_DIR_OVERRIDE when a
 # caller needs a different location.
-: "${CARGO_TARGET_DIR:=${CARGO_TARGET_DIR_OVERRIDE:-/tmp/ft-$(whoami)-target}}"
+: "${CARGO_TARGET_DIR:=${CARGO_TARGET_DIR_OVERRIDE:-target/ft-xbnl0-2-4/cargo-target}}"
 export CARGO_TARGET_DIR
 
 # The `cc` shell alias on this dev machine maps to Claude Code rather
