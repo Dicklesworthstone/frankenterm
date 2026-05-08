@@ -10,11 +10,9 @@ SCENARIO_ID="ft_1i2ge_5_5_operator_explain_report"
 CORRELATION_ID="ft-1i2ge.5.5-${RUN_ID}"
 TARGET_DIR="target-rch-ft-1i2ge-5-5-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_5_5_${RUN_ID}.jsonl"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_5_5_${RUN_ID}.probe.log"
-CHECK_FILE="${LOG_DIR}/ft_1i2ge_5_5_${RUN_ID}.check.log"
-STATUS_FILE="${LOG_DIR}/ft_1i2ge_5_5_${RUN_ID}.status.json"
-WORKSPACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ft-1i2ge-5-5.XXXXXX")"
-MISSION_PATH="${WORKSPACE_DIR}/.ft/mission/active.json"
+WORKSPACE_REL_DIR="tests/e2e/tmp/${SCENARIO_ID}_${RUN_ID}"
+MISSION_PATH="${WORKSPACE_REL_DIR}/.ft/mission/active.json"
+LOCAL_MISSION_PATH="${ROOT_DIR}/${MISSION_PATH}"
 LAST_STDOUT_FILE=""
 LAST_STDERR_FILE=""
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
@@ -22,6 +20,12 @@ LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 # shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_5"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging" >&2
+  exit 1
+fi
+
 ensure_rch_ready
 
 emit_log() {
@@ -86,9 +90,9 @@ run_mission_json() {
   set +e
   (
     cd "${ROOT_DIR}"
-    rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    run_rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" \
       cargo run -q -p frankenterm --bin ft -- \
-      --workspace "${WORKSPACE_DIR}" \
+      --workspace "${WORKSPACE_REL_DIR}" \
       mission \
       -f json \
       "$@"
@@ -96,14 +100,14 @@ run_mission_json() {
   local rc=$?
   set -e
 
-  if grep -q "\[RCH\] local" "${stdout_file}" "${stderr_file}" 2>/dev/null; then
+  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${stdout_file}" "${stderr_file}" 2>/dev/null; then
     emit_log \
       "failed" \
-      "execution_preflight" \
+      "rch_offload_policy" \
       "rch_local_fallback_detected" \
       "RCH-LOCAL-FALLBACK" \
       "$(basename "${stderr_file}")" \
-      "local fallback detected for label=${label}"
+      "rch emitted local fallback marker for label=${label}; refusing local execution"
     exit 3
   fi
 
@@ -113,8 +117,8 @@ run_mission_json() {
 }
 
 write_baseline_mission() {
-  mkdir -p "$(dirname "${MISSION_PATH}")"
-  cat > "${MISSION_PATH}" <<'JSON'
+  mkdir -p "$(dirname "${LOCAL_MISSION_PATH}")"
+  cat > "${LOCAL_MISSION_PATH}" <<'JSON'
 {
   "mission_version": 1,
   "mission_id": "mission:e2e-operator-views",
@@ -233,8 +237,8 @@ JSON
 }
 
 write_recovery_mission() {
-  mkdir -p "$(dirname "${MISSION_PATH}")"
-  cat > "${MISSION_PATH}" <<'JSON'
+  mkdir -p "$(dirname "${LOCAL_MISSION_PATH}")"
+  cat > "${LOCAL_MISSION_PATH}" <<'JSON'
 {
   "mission_version": 1,
   "mission_id": "mission:e2e-operator-views-recovery",
@@ -329,63 +333,12 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission operator explain/report e2e started"
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required for structured logging" >&2
-  exit 1
-fi
-if ! command -v rch >/dev/null 2>&1; then
-  echo "rch is required; refusing local cargo execution" >&2
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch check
-) >"${CHECK_FILE}" 2>&1
-check_status=$?
-set -e
-if [[ ${check_status} -ne 0 ]]; then
-  emit_log "failed" "execution_preflight" "rch_check_failed" "rch_health_check_failed" \
-    "$(basename "${CHECK_FILE}")" "rch check failed; refusing local fallback"
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all --json
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-probe_reachable=0
-if [[ ${probe_status} -eq 0 ]]; then
-  probe_reachable=$(jq -r '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${PROBE_FILE}" 2>/dev/null || echo 0)
-fi
-if [[ ${probe_status} -ne 0 ]] || [[ "${probe_reachable}" -lt 1 ]]; then
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    rch --json status --workers --jobs
-  ) >"${STATUS_FILE}" 2>&1
-  status_rc=$?
-  set -e
-  if [[ ${status_rc} -ne 0 ]]; then
-    emit_log "failed" "execution_preflight" "rch_status_failed" "remote_worker_unavailable" \
-      "$(basename "${STATUS_FILE}")" "rch status fallback failed after probe failure"
-    exit 1
-  fi
-  emit_log "failed" "execution_preflight" "rch_workers_unhealthy" "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" "rch workers probe/status failed; refusing local fallback"
-  exit 1
-fi
-
 emit_log \
   "running" \
   "execution_preflight" \
   "rch_workers_healthy" \
   "none" \
-  "$(basename "${PROBE_FILE}")" \
+  "$(basename "$(rch_probe_log_path)")" \
   "offloading all mission command checks through rch workers"
 
 write_baseline_mission
@@ -446,9 +399,9 @@ emit_log "passed" "failure_injection_missing_assignment" "expected_error" "none"
 
 emit_log "running" "degraded_blocked_state" "state_mutation" "none" \
   "$(basename "${MISSION_PATH}")" "set mission lifecycle_state to blocked"
-tmp_blocked="${MISSION_PATH}.blocked.tmp"
-jq '.lifecycle_state = "blocked"' "${MISSION_PATH}" > "${tmp_blocked}"
-mv "${tmp_blocked}" "${MISSION_PATH}"
+tmp_blocked="${LOCAL_MISSION_PATH}.blocked.tmp"
+jq '.lifecycle_state = "blocked"' "${LOCAL_MISSION_PATH}" > "${tmp_blocked}"
+mv "${tmp_blocked}" "${LOCAL_MISSION_PATH}"
 run_mission_json "status_blocked" status --mission-file "${MISSION_PATH}"
 assert_jq_true \
   "degraded_blocked_state" \
