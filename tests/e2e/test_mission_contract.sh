@@ -10,10 +10,21 @@ SCENARIO_ID="mission_contract"
 CORRELATION_ID="ft-1i2ge.1.6-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/mission_contract_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/mission_contract_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/mission_contract_${RUN_ID}.probe.log"
 
 PROPTEST_CASES_VALUE="${PROPTEST_CASES:-100}"
 PROPTEST_RNG_SEED_VALUE="${PROPTEST_RNG_SEED:-424242}"
+
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-mission-contract-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 emit_log() {
   local outcome="$1"
@@ -69,64 +80,48 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for mission contract test execution"
-  exit 1
-fi
+rch_init "${LOG_DIR}" "${RUN_ID}" "mission_contract"
+ensure_rch_ready
 
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
+emit_log \
+  "running" \
+  "execution_preflight" \
+  "rch_shared_guard_passed" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared rch guard reported reachable workers and fail-closed execution"
 
-if [[ ${probe_status} -eq 0 ]] && grep -q "✓" "${PROBE_FILE}"; then
-  emit_log \
-    "running" \
-    "execution_preflight" \
-    "rch_workers_healthy" \
-    "none" \
-    "$(basename "${PROBE_FILE}")" \
-    "running contract tests through healthy rch workers"
-else
-  emit_log \
-    "running" \
-    "execution_preflight" \
-    "rch_workers_unavailable_fail_open" \
-    "none" \
-    "$(basename "${PROBE_FILE}")" \
-    "running contract tests through rch fail-open path"
-fi
+emit_log \
+  "running" \
+  "execution_preflight" \
+  "rch_remote_smoke_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "verified remote rch exec path before mission contract tests"
 
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_json_roundtrip_preserves_required_fields -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_lifecycle_transition_conformance_matches_transition_table -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_failure_taxonomy_catalog_has_unique_reason_and_error_codes -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_contract_property_ -- --nocapture"
+MISSION_TEST_FILTERS=(
+  "mission_json_roundtrip_preserves_required_fields"
+  "mission_lifecycle_transition_conformance_matches_transition_table"
+  "mission_failure_taxonomy_catalog_has_unique_reason_and_error_codes"
+  "mission_contract_property_"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+for test_filter in "${MISSION_TEST_FILTERS[@]}"; do
   decision_path="mission_contract_surface"
   reason_code="none"
-  if [[ "${test_cmd}" == *"lifecycle_transition_conformance"* ]]; then
+  if [[ "${test_filter}" == *"lifecycle_transition_conformance"* ]]; then
     decision_path="lifecycle_transition_matrix"
     reason_code="state_machine_conformance"
-  elif [[ "${test_cmd}" == *"failure_taxonomy"* ]]; then
+  elif [[ "${test_filter}" == *"failure_taxonomy"* ]]; then
     decision_path="failure_taxonomy_matrix"
     reason_code="failure_code_catalog_validation"
-  elif [[ "${test_cmd}" == *"mission_contract_property_"* ]]; then
+  elif [[ "${test_filter}" == *"mission_contract_property_"* ]]; then
     decision_path="property_invariant_path"
     reason_code="property_invariant_validation"
   fi
+  step_slug="${test_filter//[^A-Za-z0-9_]/_}"
+  step_log="${LOG_DIR}/mission_contract_${RUN_ID}.${step_slug}.log"
 
   emit_log \
     "running" \
@@ -134,15 +129,17 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing with PROPTEST_CASES=${PROPTEST_CASES_VALUE} PROPTEST_RNG_SEED=${PROPTEST_RNG_SEED_VALUE}: rch exec -- env CARGO_TARGET_DIR=target-rch-mission-contract ${test_cmd}"
+    "Executing with PROPTEST_CASES=${PROPTEST_CASES_VALUE} PROPTEST_RNG_SEED=${PROPTEST_RNG_SEED_VALUE}: rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib ${test_filter} -- --nocapture"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "rch exec -- env CARGO_TARGET_DIR=target-rch-mission-contract PROPTEST_CASES=${PROPTEST_CASES_VALUE} PROPTEST_RNG_SEED=${PROPTEST_RNG_SEED_VALUE} ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_log}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+      PROPTEST_CASES="${PROPTEST_CASES_VALUE}" \
+      PROPTEST_RNG_SEED="${PROPTEST_RNG_SEED_VALUE}" \
+      cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture
+  status=$?
   set -e
+  tee -a "${STDOUT_FILE}" <"${step_log}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -151,7 +148,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}; seed=${PROPTEST_RNG_SEED_VALUE}; cases=${PROPTEST_CASES_VALUE}"
+      "exit=${status}; test_filter=${test_filter}; seed=${PROPTEST_RNG_SEED_VALUE}; cases=${PROPTEST_CASES_VALUE}"
     exit ${status}
   fi
 done

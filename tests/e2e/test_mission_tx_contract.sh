@@ -10,7 +10,18 @@ SCENARIO_ID="mission_tx_contract"
 CORRELATION_ID="ft-1i2ge.8.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/mission_tx_contract_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/mission_tx_contract_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/mission_tx_contract_${RUN_ID}.probe.log"
+
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-mission-tx-contract-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 emit_log() {
   local outcome="$1"
@@ -66,74 +77,58 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for all cargo test execution"
-  exit 1
-fi
+rch_init "${LOG_DIR}" "${RUN_ID}" "mission_tx_contract"
+ensure_rch_ready
 
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
+emit_log \
+  "running" \
+  "execution_preflight" \
+  "rch_shared_guard_passed" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared rch guard reported reachable workers and fail-closed execution"
 
-if [[ ${probe_status} -eq 0 ]] && grep -q "✓" "${PROBE_FILE}"; then
-  emit_log \
-    "running" \
-    "execution_preflight" \
-    "rch_workers_healthy" \
-    "none" \
-    "$(basename "${PROBE_FILE}")" \
-    "running cargo tests through healthy rch workers"
-else
-  emit_log \
-    "running" \
-    "execution_preflight" \
-    "rch_workers_unavailable_fail_open" \
-    "none" \
-    "$(basename "${PROBE_FILE}")" \
-    "running cargo tests through rch fail-open path"
-fi
+emit_log \
+  "running" \
+  "execution_preflight" \
+  "rch_remote_smoke_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "verified remote rch exec path before mission tx contract tests"
 
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_tx_failure_taxonomy_has_unique_reason_and_error_codes -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_transition_table_rejects_illegal_edges -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_contract_accepts_happy_path -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_contract_accepts_recovery_path_with_compensation -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_contract_rejects_non_monotonic_receipts -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_contract_rejects_commit_without_prepared_receipt -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_contract_rejects_double_commit_markers -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_contract_rejects_compensation_without_commit_failure_marker -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_contract_rejects_outcome_state_mismatch -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_transition_log_enforces_structured_contract -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_tx_contract_property_ -- --nocapture"
+MISSION_TX_TEST_FILTERS=(
+  "mission_tx_failure_taxonomy_has_unique_reason_and_error_codes"
+  "mission_tx_transition_table_rejects_illegal_edges"
+  "mission_tx_contract_accepts_happy_path"
+  "mission_tx_contract_accepts_recovery_path_with_compensation"
+  "mission_tx_contract_rejects_non_monotonic_receipts"
+  "mission_tx_contract_rejects_commit_without_prepared_receipt"
+  "mission_tx_contract_rejects_double_commit_markers"
+  "mission_tx_contract_rejects_compensation_without_commit_failure_marker"
+  "mission_tx_contract_rejects_outcome_state_mismatch"
+  "mission_tx_transition_log_enforces_structured_contract"
+  "mission_tx_contract_property_"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+for test_filter in "${MISSION_TX_TEST_FILTERS[@]}"; do
   decision_path="contract_surface"
   reason_code="none"
-  if [[ "${test_cmd}" == *"accepts_happy_path"* ]]; then
+  if [[ "${test_filter}" == *"accepts_happy_path"* ]]; then
     decision_path="nominal_path"
     reason_code="nominal_contract_path"
-  elif [[ "${test_cmd}" == *"accepts_recovery_path"* ]]; then
+  elif [[ "${test_filter}" == *"accepts_recovery_path"* ]]; then
     decision_path="recovery_path"
     reason_code="compensation_recovery_path"
-  elif [[ "${test_cmd}" == *"rejects_"* ]]; then
+  elif [[ "${test_filter}" == *"rejects_"* ]]; then
     decision_path="failure_injection_path"
     reason_code="invariant_violation_rejected"
-  elif [[ "${test_cmd}" == *"property_"* ]]; then
+  elif [[ "${test_filter}" == *"property_"* ]]; then
     decision_path="determinism_property_path"
     reason_code="property_invariant_validation"
   fi
+  step_slug="${test_filter//[^A-Za-z0-9_]/_}"
+  step_log="${LOG_DIR}/mission_tx_contract_${RUN_ID}.${step_slug}.log"
 
   emit_log \
     "running" \
@@ -141,15 +136,15 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: rch exec -- env CARGO_TARGET_DIR=target-rch-mission-tx-contract ${test_cmd}"
+    "Executing: rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib ${test_filter} -- --nocapture"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "rch exec -- env CARGO_TARGET_DIR=target-rch-mission-tx-contract ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_log}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+      cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture
+  status=$?
   set -e
+  tee -a "${STDOUT_FILE}" <"${step_log}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -158,7 +153,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
+      "exit=${status}; test_filter=${test_filter}"
     exit ${status}
   fi
 done
