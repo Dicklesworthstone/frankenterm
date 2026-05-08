@@ -1,7 +1,7 @@
 # asupersync Migration Execution Policy: rch-Only Heavy Compute
 
 **Bead:** `ft-e34d9.10.1.4`  
-**Version:** `1.0.0`  
+**Version:** `1.0.1`
 **Status:** Active baseline policy
 
 ## Purpose
@@ -30,11 +30,23 @@ Classifier implementation is canonical in:
 
 ## Mandatory Rule
 
-For heavy commands, execution must use:
+For heavy commands, execution must use one of the validator-recognized
+RCH-backed execution shapes:
 
 ```bash
 rch exec -- <command>
 ```
+
+or the shared fail-closed harness helpers:
+
+```bash
+run_rch_cargo_logged <log-file> env CARGO_TARGET_DIR=<repo-relative-target> cargo <args...>
+run_rch_cargo_logged_with_timeout <seconds> <log-file> env CARGO_TARGET_DIR=<repo-relative-target> cargo <args...>
+```
+
+The helper forms are evidence-equivalent to direct `rch exec -- ...` because
+they route through `tests/e2e/lib_rch_guards.sh`, reject local fallback markers,
+and emit RCH metadata sidecars.
 
 ## Local Fallback Rule
 
