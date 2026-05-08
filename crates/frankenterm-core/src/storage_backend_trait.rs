@@ -756,6 +756,7 @@ impl Drop for TransactionGuard<'_> {
 /// to `query_scalar` so tests can assert on the call sequence
 /// without spinning up a real DB.
 #[cfg(test)]
+#[derive(Clone)]
 pub struct MockBackend {
     inner: Arc<Mutex<MockState>>,
 }

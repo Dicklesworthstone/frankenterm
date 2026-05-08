@@ -21031,7 +21031,17 @@ mod pool_telemetry_tests {
         assert_eq!(name, "trait-object");
     }
 
-    struct MockBackendProvider;
+    #[derive(Clone, Default)]
+    struct MockBackendProvider {
+        writer: MockBackend,
+        reader: MockBackend,
+    }
+
+    impl MockBackendProvider {
+        fn new() -> Self {
+            Self::default()
+        }
+    }
 
     struct MockBackendLoan {
         backend: MockBackend,
@@ -21048,7 +21058,7 @@ mod pool_telemetry_tests {
             &self,
             _request: StorageWriterOpenRequest,
         ) -> super::Result<Box<dyn StorageBackend>> {
-            Ok(Box::new(MockBackend::new()))
+            Ok(Box::new(self.writer.clone()))
         }
 
         fn lend_read_backend<'a>(
@@ -21056,7 +21066,7 @@ mod pool_telemetry_tests {
             _db_path: &str,
         ) -> super::Result<Box<dyn StorageBackendLoan + 'a>> {
             Ok(Box::new(MockBackendLoan {
-                backend: MockBackend::new(),
+                backend: self.reader.clone(),
             }))
         }
 
@@ -21129,7 +21139,7 @@ mod pool_telemetry_tests {
             std::process::id(),
             baseline().total_acquires()
         );
-        let provider: Arc<dyn StorageBackendProvider> = Arc::new(MockBackendProvider);
+        let provider: Arc<dyn StorageBackendProvider> = Arc::new(MockBackendProvider::new());
         register_storage_backend_provider(&db_path, &provider);
 
         let backend_name = pooled_backend(&db_path, |backend| Ok(backend.backend_name()))
@@ -21144,7 +21154,7 @@ mod pool_telemetry_tests {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let db_path = temp_dir.path().join("mock_provider_handle.db");
             let db_path_str = db_path.to_string_lossy().to_string();
-            let provider: Arc<dyn StorageBackendProvider> = Arc::new(MockBackendProvider);
+            let provider: Arc<dyn StorageBackendProvider> = Arc::new(MockBackendProvider::new());
 
             let storage = StorageHandle::with_config_and_backend_provider_for_test(
                 &db_path_str,
@@ -21158,6 +21168,98 @@ mod pool_telemetry_tests {
             let backend_name = pooled_backend(&db_path_str, |backend| Ok(backend.backend_name()))
                 .expect("registered handle provider should lend reads");
             assert_eq!(backend_name, "mock");
+
+            storage
+                .shutdown()
+                .await
+                .expect("shutdown mock-backed handle");
+        });
+    }
+
+    #[test]
+    fn storage_handle_mock_provider_dispatches_write_and_read_ft_gybiv() {
+        run_storage_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = temp_dir.path().join("mock_provider_handle_ft_gybiv.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let provider = Arc::new(MockBackendProvider::new());
+
+            provider
+                .writer
+                .enqueue_row_response(Some(vec!["0".to_string()]));
+            provider
+                .writer
+                .enqueue_row_response(Some(vec!["101".to_string()]));
+            provider
+                .reader
+                .enqueue_row_response(Some(vec!["mock-read".to_string()]));
+
+            let provider_for_handle: Arc<dyn StorageBackendProvider> = provider.clone();
+            let storage = StorageHandle::with_config_and_backend_provider_for_test(
+                &db_path_str,
+                super::StorageConfig::default(),
+                provider_for_handle,
+            )
+            .await
+            .expect("construct storage handle with shared mock provider");
+
+            let segment = storage
+                .append_segment(55, "mock segment content", None)
+                .await
+                .expect("append segment through mock-backed writer thread");
+            assert_eq!(segment.id, 101);
+            assert_eq!(segment.pane_id, 55);
+            assert_eq!(segment.seq, 0);
+            assert_eq!(segment.content, "mock segment content");
+
+            let writer_queries = provider.writer.observed_queries();
+            assert!(
+                writer_queries.iter().any(|(sql, params)| {
+                    sql.contains("SELECT COALESCE(MAX(seq) + 1, 0)")
+                        && params.len() == 1
+                        && params[0] == "55"
+                }),
+                "StorageHandle append must ask the mock writer backend for the next seq; got {writer_queries:?}",
+            );
+            assert!(
+                writer_queries.iter().any(|(sql, params)| {
+                    sql.contains("INSERT INTO output_segments")
+                        && params.iter().any(|param| param == "mock segment content")
+                }),
+                "StorageHandle append must insert through the mock writer backend; got {writer_queries:?}",
+            );
+
+            let read_value = pooled_backend(&db_path_str, |backend| {
+                let row = backend
+                    .query_row_typed(
+                        "SELECT marker FROM mock_read WHERE id = ?1",
+                        &[ToSqlValue::Integer(7)],
+                    )
+                    .map_err(|err| {
+                        super::storage_backend_error("mock provider read backend test", err)
+                    })?
+                    .expect("mock reader response");
+                Ok(row
+                    .first()
+                    .cloned()
+                    .expect("mock reader returned one column"))
+            })
+            .expect("provider-backed read should use mock reader backend");
+            assert_eq!(read_value, "mock-read");
+
+            let reader_queries = provider.reader.observed_queries();
+            assert_eq!(
+                reader_queries,
+                vec![(
+                    "SELECT marker FROM mock_read WHERE id = ?1".to_string(),
+                    vec!["7".to_string()],
+                )],
+                "pooled_backend must lend the registered mock reader backend, not open sqlite",
+            );
+            assert!(
+                !db_path.exists(),
+                "mock-backed StorageHandle must not create a sqlite file"
+            );
 
             storage
                 .shutdown()
