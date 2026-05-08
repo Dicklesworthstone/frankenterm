@@ -11,7 +11,13 @@ CORRELATION_ID="ft-so7qh.1-${RUN_ID}"
 PANE_ID=1
 COMMAND_INPUT="cargo test"
 COMMAND_HASH="$(printf '%s' "${COMMAND_INPUT}" | cksum | awk '{print $1}')"
-TARGET_DIR="target-rch-ft-so7qh-1-${RUN_ID}"
+DEFAULT_TARGET_DIR="target/rch-e2e-ft-so7qh-1-${RUN_ID}"
+REQUESTED_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${REQUESTED_TARGET_DIR}"
+else
+  TARGET_DIR="${DEFAULT_TARGET_DIR}"
+fi
 LOG_FILE="${LOG_DIR}/ft_so7qh_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_so7qh_1_${RUN_ID}.stdout.log"
 
