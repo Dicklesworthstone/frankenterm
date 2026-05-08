@@ -16,65 +16,7 @@ LOG_FILE="${LOG_DIR}/ft_1i2ge_5_8_${RUN_ID}.jsonl"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
 RCH_TARGET_DIR="target/rch-e2e-operator-ux-${RUN_ID}"
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="${LOG_DIR}/operator_ux_${RUN_ID}.probe.log"
-RCH_SMOKE_LOG="${LOG_DIR}/operator_ux_${RUN_ID}.smoke.log"
-
-fatal() { echo "FATAL: $1" >&2; exit 1; }
-
-run_rch() {
-    TMPDIR=/tmp rch "$@"
-}
-
-run_rch_cargo() {
-    run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
-}
-
-probe_has_reachable_workers() {
-    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
-}
-
-check_rch_fallback() {
-    local output_file="$1"
-    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
-        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
-    fi
-}
-
-run_rch_cargo_logged() {
-    local output_file="$1"
-    shift
-    set +e
-    (
-        cd "${ROOT_DIR}"
-        run_rch_cargo "$@"
-    ) >"${output_file}" 2>&1
-    local rc=$?
-    set -e
-    check_rch_fallback "${output_file}"
-    return "${rc}"
-}
-
-ensure_rch_ready() {
-    if ! command -v rch >/dev/null 2>&1; then
-        fatal "rch is required for this e2e harness; refusing local cargo execution."
-    fi
-    set +e
-    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
-    local probe_rc=$?
-    set -e
-    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
-        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
-    fi
-    set +e
-    run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1
-    local smoke_rc=$?
-    set -e
-    check_rch_fallback "${RCH_SMOKE_LOG}"
-    if [[ ${smoke_rc} -ne 0 ]]; then
-        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
-    fi
-}
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 emit_log() {
   local outcome="$1"
@@ -122,16 +64,24 @@ count_matches() {
   printf '%s\n' "${count}"
 }
 
-emit_log "started" "script_init" "none" "none" \
-  "$(basename "${LOG_FILE}")" \
-  "operator workflow UX e2e started"
+run_cargo_step() {
+  local output_file="$1"
+  shift
+  run_rch_cargo_logged "${output_file}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
+}
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required for structured logging" >&2
   exit 1
 fi
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 ensure_rch_ready
+
+emit_log "started" "script_init" "none" "none" \
+  "$(basename "${LOG_FILE}")" \
+  "operator workflow UX e2e started"
 
 # ── Test 1: Compile check ──────────────────────────────────────────
 emit_log "running" "compile_check" "cargo_check" "none" \
@@ -139,7 +89,7 @@ emit_log "running" "compile_check" "cargo_check" "none" \
 
 compile_log="${LOG_DIR}/ft_1i2ge_5_8_${RUN_ID}.compile.log"
 set +e
-run_rch_cargo_logged "${compile_log}" \
+run_cargo_step "${compile_log}" \
   check -p frankenterm-core --features subprocess-bridge \
   --test operator_workflow_ux
 compile_rc=$?
@@ -160,7 +110,7 @@ emit_log "running" "ux_tests" "cargo_test" "none" \
 
 tests_log="${LOG_DIR}/ft_1i2ge_5_8_${RUN_ID}.tests.log"
 set +e
-run_rch_cargo_logged "${tests_log}" \
+run_cargo_step "${tests_log}" \
   test -p frankenterm-core --features subprocess-bridge \
   --test operator_workflow_ux
 test_rc=$?
@@ -192,7 +142,7 @@ emit_log "running" "clippy_check" "cargo_clippy" "none" \
 
 clippy_log="${LOG_DIR}/ft_1i2ge_5_8_${RUN_ID}.clippy.log"
 set +e
-run_rch_cargo_logged "${clippy_log}" \
+run_cargo_step "${clippy_log}" \
   clippy -p frankenterm-core --features subprocess-bridge \
   --test operator_workflow_ux
 clippy_rc=$?
@@ -256,7 +206,7 @@ emit_log "running" "determinism" "repeat_run" "none" \
 
 repeat_log="${LOG_DIR}/ft_1i2ge_5_8_${RUN_ID}.tests_repeat.log"
 set +e
-run_rch_cargo_logged "${repeat_log}" \
+run_cargo_step "${repeat_log}" \
   test -p frankenterm-core --features subprocess-bridge \
   --test operator_workflow_ux
 repeat_rc=$?
