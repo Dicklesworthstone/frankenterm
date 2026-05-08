@@ -7,7 +7,7 @@
 //! cargo test-binary entry name.
 
 use super::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 fn record_audit_action_for_conn(conn: &mut Connection, action: &AuditActionRecord) -> Result<i64> {
     with_test_storage_backend(conn, |backend| record_audit_action_backend(backend, action))

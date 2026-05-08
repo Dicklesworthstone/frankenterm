@@ -27345,8 +27345,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             // ft-b0g7g: real handler dispatch, replacing the
                             // build_ntm_not_implemented_response fallback. The
                             // handler is sync and operates on a fresh
-                            // rusqlite::Connection opened at the workspace
-                            // DB path; the read paths (List / Show /
+                            // RusqliteBackend opened at the workspace DB path;
+                            // the read paths (List / Show /
                             // Validate) ship complete, and the dry-run Apply
                             // path returns the contract's planned response
                             // shape. Non-dry-run Apply requires daemon-side
@@ -27395,7 +27395,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     return Ok(());
                                 }
                             };
-                            let conn = match rusqlite::Connection::open(&layout.db_path) {
+                            let backend = match frankenterm_core::storage_backend_trait::RusqliteBackend::open_path(
+                                &layout.db_path,
+                                &frankenterm_core::storage_backend_trait::OpenConfig {
+                                    wal_mode: false,
+                                    ..frankenterm_core::storage_backend_trait::OpenConfig::default()
+                                },
+                            ) {
                                 Ok(c) => c,
                                 Err(e) => {
                                     let response =
@@ -27418,7 +27424,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let response = match frankenterm_core::robot_profile_handler::handle_profile_command(
                                 action_name,
                                 &params_value,
-                                &conn,
+                                &backend,
                             ) {
                                 Ok(data) => RobotResponse::<serde_json::Value>::success(
                                     data,

@@ -42,8 +42,6 @@ use std::{
 
 use crate::runtime_async::oneshot;
 use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
-#[cfg(test)]
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};

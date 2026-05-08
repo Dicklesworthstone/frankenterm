@@ -1,8 +1,8 @@
-//! SQLite CRUD primitives for the `agent_profiles` table
+//! StorageBackend CRUD primitives for the `agent_profiles` table
 //! (br-ft-43lpu / ft-4yr9i.cont).
 //!
 //! Synchronous handlers callable from the storage writer thread
-//! (or from tests via in-memory SQLite). The async StorageHandle
+//! (or from tests via an in-memory backend). The async StorageHandle
 //! wrappers + WriteCommand variants are a separate slice — this
 //! module ships the actual SQL so a future commit can plug them
 //! into the writer-loop dispatch table without re-litigating
@@ -26,19 +26,22 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{Connection, OptionalExtension, params};
-
 use crate::agent_profiles::{AgentProfile, ProfileValidationError};
+use crate::storage_backend_helpers::execute_typed;
+use crate::storage_backend_row_helpers::CellRowReader;
+use crate::storage_backend_trait::{BackendError, SqlCell, StorageBackend, ToSqlValue};
+#[cfg(test)]
+use crate::storage_backend_trait::{OpenConfig, RusqliteBackend};
 
 /// Error type for the agent_profiles SQL primitives. Wraps
-/// rusqlite's error type, the substrate's validation error, and
-/// JSON decode failures so the caller can distinguish 'malformed
-/// row in DB' from 'caller passed bad input' from 'SQL itself
-/// failed'.
+/// the storage backend error type, the substrate's validation
+/// error, and JSON decode failures so the caller can distinguish
+/// 'malformed row in DB' from 'caller passed bad input' from
+/// 'SQL itself failed'.
 #[derive(Debug)]
 pub enum AgentProfileSqlError {
-    /// Underlying SQLite call failed.
-    Sqlite(rusqlite::Error),
+    /// Underlying storage backend call failed.
+    Backend(BackendError),
     /// Substrate's `AgentProfile::validate` rejected the input
     /// before the insert was attempted.
     Invalid(ProfileValidationError),
@@ -53,7 +56,7 @@ pub enum AgentProfileSqlError {
 impl core::fmt::Display for AgentProfileSqlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Sqlite(e) => write!(f, "agent_profiles SQLite error: {e}"),
+            Self::Backend(e) => write!(f, "agent_profiles storage backend error: {e}"),
             Self::Invalid(v) => {
                 write!(f, "agent_profiles validation rejected input: {v:?}")
             }
@@ -68,15 +71,15 @@ impl core::fmt::Display for AgentProfileSqlError {
 impl std::error::Error for AgentProfileSqlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Sqlite(e) => Some(e),
+            Self::Backend(e) => Some(e),
             Self::Invalid(_) | Self::Decode { .. } => None,
         }
     }
 }
 
-impl From<rusqlite::Error> for AgentProfileSqlError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::Sqlite(e)
+impl From<BackendError> for AgentProfileSqlError {
+    fn from(e: BackendError) -> Self {
+        Self::Backend(e)
     }
 }
 
@@ -90,31 +93,32 @@ impl From<ProfileValidationError> for AgentProfileSqlError {
 /// `AgentProfile::validate`. Returns the row's `name` (which is
 /// the PRIMARY KEY) on success.
 ///
-/// A duplicate name returns `AgentProfileSqlError::Sqlite`
-/// wrapping the SQLite UNIQUE constraint error — caller can
+/// A duplicate name returns `AgentProfileSqlError::Backend`
+/// wrapping the backend UNIQUE constraint error — caller can
 /// match on it for 'replace vs insert' logic.
 pub fn insert_agent_profile(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     profile: &AgentProfile,
 ) -> Result<String, AgentProfileSqlError> {
     profile.validate()?;
     let tags_json = serde_json::to_string(&profile.tags).expect("tags serialize");
     let env_json = serde_json::to_string(&profile.env).expect("env serialize");
     let metadata_json = serde_json::to_string(&profile.metadata).expect("metadata serialize");
-    conn.execute(
+    execute_typed(
+        backend,
         "INSERT INTO agent_profiles
          (name, role, tags, shell, command, env, metadata, created_at_ms, updated_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            profile.name,
-            profile.role,
-            tags_json,
-            profile.shell,
-            profile.command,
-            env_json,
-            metadata_json,
-            profile.created_at_ms,
-            profile.updated_at_ms,
+        &[
+            ToSqlValue::Text(profile.name.as_str()),
+            ToSqlValue::Text(profile.role.as_str()),
+            ToSqlValue::OwnedText(tags_json),
+            ToSqlValue::Text(profile.shell.as_str()),
+            ToSqlValue::optional_text(profile.command.as_deref()),
+            ToSqlValue::OwnedText(env_json),
+            ToSqlValue::OwnedText(metadata_json),
+            ToSqlValue::Integer(profile.created_at_ms),
+            ToSqlValue::Integer(profile.updated_at_ms),
         ],
     )?;
     Ok(profile.name.clone())
@@ -122,20 +126,17 @@ pub fn insert_agent_profile(
 
 /// Get a profile by name. Returns `None` if no row matches.
 pub fn get_agent_profile(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     name: &str,
 ) -> Result<Option<AgentProfile>, AgentProfileSqlError> {
-    conn.query_row(
+    let row = backend.query_row_cells(
         "SELECT name, role, tags, shell, command, env, metadata,
                 created_at_ms, updated_at_ms
          FROM agent_profiles
          WHERE name = ?1",
-        params![name],
-        row_from_sql,
-    )
-    .optional()
-    .map_err(AgentProfileSqlError::from)?
-    .transpose()
+        &[ToSqlValue::Text(name)],
+    )?;
+    row.as_deref().map(agent_profile_from_cells).transpose()
 }
 
 /// List profiles. When `role_filter` is `Some`, restrict to
@@ -143,118 +144,112 @@ pub fn get_agent_profile(
 /// `agent_profiles_role_idx` from the migration). When `None`,
 /// returns every row, ordered by `name` ASC for stable output.
 pub fn list_agent_profiles(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     role_filter: Option<&str>,
 ) -> Result<Vec<AgentProfile>, AgentProfileSqlError> {
-    // Two paths so the rusqlite::ToSql borrow stays inside the
-    // function body. Keeping the SELECT column list literal-
-    // identical between branches lets row_from_sql work for
-    // both unchanged.
-    let rows: Vec<rusqlite::Result<Result<AgentProfile, AgentProfileSqlError>>> = match role_filter
-    {
-        Some(r) => {
-            let mut stmt = conn.prepare(
-                "SELECT name, role, tags, shell, command, env, metadata,
-                            created_at_ms, updated_at_ms
-                     FROM agent_profiles
-                     WHERE role = ?1
-                     ORDER BY name ASC",
-            )?;
-            stmt.query_map(params![r], row_from_sql)?.collect()
-        }
-        None => {
-            let mut stmt = conn.prepare(
-                "SELECT name, role, tags, shell, command, env, metadata,
-                            created_at_ms, updated_at_ms
-                     FROM agent_profiles
-                     ORDER BY name ASC",
-            )?;
-            stmt.query_map([], row_from_sql)?.collect()
-        }
-    };
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(row?);
-    }
-    out.into_iter().collect()
+    let rows = match role_filter {
+        Some(role) => backend.query_map_cells(
+            "SELECT name, role, tags, shell, command, env, metadata,
+                    created_at_ms, updated_at_ms
+             FROM agent_profiles
+             WHERE role = ?1
+             ORDER BY name ASC",
+            &[ToSqlValue::Text(role)],
+        ),
+        None => backend.query_map_cells(
+            "SELECT name, role, tags, shell, command, env, metadata,
+                    created_at_ms, updated_at_ms
+             FROM agent_profiles
+             ORDER BY name ASC",
+            &[],
+        ),
+    }?;
+    rows.iter()
+        .map(|row| agent_profile_from_cells(row))
+        .collect()
 }
 
 /// Delete a profile by name. Returns `true` if a row was
 /// removed, `false` if no row matched (operator-friendly so
 /// 'delete --name foo' can distinguish 'foo never existed' from
 /// 'foo was deleted').
-pub fn delete_agent_profile(conn: &Connection, name: &str) -> Result<bool, AgentProfileSqlError> {
-    let n = conn.execute("DELETE FROM agent_profiles WHERE name = ?1", params![name])?;
-    Ok(n > 0)
+pub fn delete_agent_profile(
+    backend: &dyn StorageBackend,
+    name: &str,
+) -> Result<bool, AgentProfileSqlError> {
+    let row = backend.query_row_typed(
+        "DELETE FROM agent_profiles WHERE name = ?1 RETURNING 1",
+        &[ToSqlValue::Text(name)],
+    )?;
+    Ok(row.is_some())
 }
 
 /// Row deserializer used by the SELECT helpers. Returns a
-/// `rusqlite::Result<Result<AgentProfile, AgentProfileSqlError>>`
-/// shape so JSON-decode failures propagate via the inner error
-/// type (the SQLite layer is fine — the row exists; the column
-/// payload is malformed).
-fn row_from_sql(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<Result<AgentProfile, AgentProfileSqlError>> {
-    let name: String = row.get(0)?;
-    let role: String = row.get(1)?;
-    let tags_json: String = row.get(2)?;
-    let shell: String = row.get(3)?;
-    let command: Option<String> = row.get(4)?;
-    let env_json: String = row.get(5)?;
-    let metadata_json: String = row.get(6)?;
-    let created_at_ms: i64 = row.get(7)?;
-    let updated_at_ms: i64 = row.get(8)?;
+/// backend-level error when row shape/type extraction fails, or a
+/// decode error when a JSON column payload is malformed.
+fn agent_profile_from_cells(row: &[SqlCell]) -> Result<AgentProfile, AgentProfileSqlError> {
+    let reader = CellRowReader::new(row);
+    let tags_json = reader.string(2)?;
+    let env_json = reader.string(5)?;
+    let metadata_json = reader.string(6)?;
 
     let tags: Vec<String> = match serde_json::from_str(&tags_json) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(Err(AgentProfileSqlError::Decode {
+            return Err(AgentProfileSqlError::Decode {
                 column: "tags",
                 msg: e.to_string(),
-            }));
+            });
         }
     };
     let env: HashMap<String, String> = match serde_json::from_str(&env_json) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(Err(AgentProfileSqlError::Decode {
+            return Err(AgentProfileSqlError::Decode {
                 column: "env",
                 msg: e.to_string(),
-            }));
+            });
         }
     };
     let metadata: HashMap<String, String> = match serde_json::from_str(&metadata_json) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(Err(AgentProfileSqlError::Decode {
+            return Err(AgentProfileSqlError::Decode {
                 column: "metadata",
                 msg: e.to_string(),
-            }));
+            });
         }
     };
 
-    Ok(Ok(AgentProfile {
-        name,
-        role,
+    Ok(AgentProfile {
+        name: reader.string(0)?,
+        role: reader.string(1)?,
         tags,
-        shell,
-        command,
+        shell: reader.string(3)?,
+        command: reader.optional_string(4)?,
         env,
         metadata,
-        created_at_ms,
-        updated_at_ms,
-    }))
+        created_at_ms: reader.i64(7)?,
+        updated_at_ms: reader.i64(8)?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fresh_conn() -> Connection {
-        let conn = Connection::open_in_memory().expect("open in-memory");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS agent_profiles (
+    fn fresh_db() -> RusqliteBackend {
+        let backend = RusqliteBackend::open(
+            ":memory:",
+            &OpenConfig {
+                wal_mode: false,
+                ..OpenConfig::default()
+            },
+        )
+        .expect("open in-memory");
+        backend
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_profiles (
                 name           TEXT PRIMARY KEY NOT NULL,
                 role           TEXT NOT NULL DEFAULT '',
                 tags           TEXT NOT NULL DEFAULT '[]',
@@ -267,9 +262,9 @@ mod tests {
             );
             CREATE INDEX IF NOT EXISTS agent_profiles_role_idx
                 ON agent_profiles(role);",
-        )
-        .expect("schema");
-        conn
+            )
+            .expect("schema");
+        backend
     }
 
     fn synth_profile(name: &str, role: &str) -> AgentProfile {
@@ -294,7 +289,7 @@ mod tests {
     /// byte-for-byte through the JSON-encoded TEXT columns.
     #[test]
     fn insert_and_get_roundtrip_preserves_every_field() {
-        let conn = fresh_conn();
+        let conn = fresh_db();
         let p = synth_profile("alice", "ops");
         let returned = insert_agent_profile(&conn, &p).expect("insert");
         assert_eq!(returned, "alice");
@@ -309,7 +304,7 @@ mod tests {
     /// Operator-facing 'profile not found' relies on this.
     #[test]
     fn get_missing_name_returns_none() {
-        let conn = fresh_conn();
+        let conn = fresh_db();
         let out = get_agent_profile(&conn, "nobody").unwrap();
         assert!(out.is_none());
     }
@@ -319,7 +314,7 @@ mod tests {
     /// is the simplest invariant violation.
     #[test]
     fn insert_validates_via_substrate_before_sqlite() {
-        let conn = fresh_conn();
+        let conn = fresh_db();
         let mut bad = synth_profile("", "ops"); // empty name
         bad.name = String::new();
         let err = insert_agent_profile(&conn, &bad).unwrap_err();
@@ -333,17 +328,17 @@ mod tests {
     }
 
     /// br-ft-43lpu: duplicate name → SQLite UNIQUE constraint
-    /// (PRIMARY KEY). Wrapped in Sqlite variant so a 'replace
+    /// (PRIMARY KEY). Wrapped in Backend variant so a 'replace
     /// vs insert' caller can match on it.
     #[test]
-    fn insert_duplicate_name_is_sqlite_error() {
-        let conn = fresh_conn();
+    fn insert_duplicate_name_is_backend_error() {
+        let conn = fresh_db();
         let p = synth_profile("alice", "ops");
         insert_agent_profile(&conn, &p).expect("first insert");
         let err = insert_agent_profile(&conn, &p).unwrap_err();
         match err {
-            AgentProfileSqlError::Sqlite(_) => {}
-            other => panic!("expected Sqlite, got {other:?}"),
+            AgentProfileSqlError::Backend(_) => {}
+            other => panic!("expected Backend, got {other:?}"),
         }
     }
 
@@ -351,7 +346,7 @@ mod tests {
     /// ordered by name ASC.
     #[test]
     fn list_all_profiles_ordered_by_name() {
-        let conn = fresh_conn();
+        let conn = fresh_db();
         for name in ["zeta", "alice", "marcus"] {
             insert_agent_profile(&conn, &synth_profile(name, "ops")).unwrap();
         }
@@ -364,7 +359,7 @@ mod tests {
     /// matching rows. Uses the role index from the migration.
     #[test]
     fn list_with_role_filter_restricts_results() {
-        let conn = fresh_conn();
+        let conn = fresh_db();
         insert_agent_profile(&conn, &synth_profile("alice", "ops")).unwrap();
         insert_agent_profile(&conn, &synth_profile("bob", "dev")).unwrap();
         insert_agent_profile(&conn, &synth_profile("carol", "ops")).unwrap();
@@ -385,7 +380,7 @@ mod tests {
     /// br-ft-43lpu: delete returns true on hit, false on miss.
     #[test]
     fn delete_returns_true_on_hit_false_on_miss() {
-        let conn = fresh_conn();
+        let conn = fresh_db();
         insert_agent_profile(&conn, &synth_profile("alice", "ops")).unwrap();
         assert!(delete_agent_profile(&conn, "alice").unwrap());
         // Now it's gone.
@@ -401,23 +396,24 @@ mod tests {
     /// operator.
     #[test]
     fn malformed_tags_json_returns_decode_error() {
-        let conn = fresh_conn();
+        let conn = fresh_db();
         // Insert directly via raw SQL with deliberately
         // malformed tags.
-        conn.execute(
+        execute_typed(
+            &conn,
             "INSERT INTO agent_profiles
              (name, role, tags, shell, command, env, metadata, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                "alice",
-                "ops",
-                "not_valid_json[",
-                "/bin/zsh",
-                Option::<String>::None,
-                "{}",
-                "{}",
-                1_700_000_000_000_i64,
-                1_700_000_000_000_i64,
+            &[
+                ToSqlValue::Text("alice"),
+                ToSqlValue::Text("ops"),
+                ToSqlValue::Text("not_valid_json["),
+                ToSqlValue::Text("/bin/zsh"),
+                ToSqlValue::Null,
+                ToSqlValue::Text("{}"),
+                ToSqlValue::Text("{}"),
+                ToSqlValue::Integer(1_700_000_000_000_i64),
+                ToSqlValue::Integer(1_700_000_000_000_i64),
             ],
         )
         .unwrap();

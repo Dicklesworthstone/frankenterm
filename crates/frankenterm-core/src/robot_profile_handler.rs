@@ -2,9 +2,10 @@
 //!
 //! Replaces the `build_ntm_not_implemented_response` placeholder at
 //! `crates/frankenterm/src/main.rs:23270`. The handler operates on a
-//! [`rusqlite::Connection`] so the conformance test in
-//! `tests/robot_family_conformance.rs` can drive it against a fresh
-//! in-memory DB without standing up the full async `StorageHandle`.
+//! [`StorageBackend`](crate::storage_backend_trait::StorageBackend) so
+//! the conformance test in `tests/robot_family_conformance.rs` can drive
+//! it against a fresh in-memory backend without standing up the full
+//! async `StorageHandle`.
 //!
 //! ## Action coverage
 //!
@@ -31,7 +32,6 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::agent_profiles::{AgentProfile, ProfileValidationError};
@@ -79,6 +79,7 @@ use crate::robot_ntm_surface::{
 use crate::storage::agent_profiles_sql::{
     AgentProfileSqlError, get_agent_profile, list_agent_profiles,
 };
+use crate::storage_backend_trait::StorageBackend;
 
 /// Failure modes the handler exposes to its caller. The wire-level
 /// envelope at `main.rs` translates each variant into a typed
@@ -146,13 +147,13 @@ impl ProfileHandlerError {
 pub fn handle_profile_command(
     action: &str,
     params: &Value,
-    conn: &Connection,
+    backend: &dyn StorageBackend,
 ) -> Result<Value, ProfileHandlerError> {
     match action {
-        "list" => handle_list(params, conn),
-        "show" => handle_show(params, conn),
-        "apply" => handle_apply(params, conn),
-        "validate" => handle_validate(params, conn),
+        "list" => handle_list(params, backend),
+        "show" => handle_show(params, backend),
+        "apply" => handle_apply(params, backend),
+        "validate" => handle_validate(params, backend),
         other => Err(ProfileHandlerError::UnknownAction(other.to_string())),
     }
 }
@@ -192,10 +193,10 @@ fn summarize(profile: AgentProfile) -> ProfileSummary {
     }
 }
 
-fn handle_list(params: &Value, conn: &Connection) -> Result<Value, ProfileHandlerError> {
+fn handle_list(params: &Value, backend: &dyn StorageBackend) -> Result<Value, ProfileHandlerError> {
     let role_filter = opt_str(params, "role_filter");
     let tag_filter = opt_str(params, "tag_filter").map(str::to_string);
-    let rows = list_agent_profiles(conn, role_filter).map_err(ProfileHandlerError::Storage)?;
+    let rows = list_agent_profiles(backend, role_filter).map_err(ProfileHandlerError::Storage)?;
     let profiles: Vec<ProfileSummary> = rows
         .into_iter()
         .filter(|row| match &tag_filter {
@@ -207,9 +208,9 @@ fn handle_list(params: &Value, conn: &Connection) -> Result<Value, ProfileHandle
     to_value(&ProfileListData { profiles })
 }
 
-fn handle_show(params: &Value, conn: &Connection) -> Result<Value, ProfileHandlerError> {
+fn handle_show(params: &Value, backend: &dyn StorageBackend) -> Result<Value, ProfileHandlerError> {
     let name = require_str(params, "name")?;
-    let profile = get_agent_profile(conn, name)
+    let profile = get_agent_profile(backend, name)
         .map_err(ProfileHandlerError::Storage)?
         .ok_or_else(|| ProfileHandlerError::NotFound {
             name: name.to_string(),
@@ -233,9 +234,12 @@ fn handle_show(params: &Value, conn: &Connection) -> Result<Value, ProfileHandle
     Ok(strip_null_fields(to_value(&data)?))
 }
 
-fn handle_validate(params: &Value, conn: &Connection) -> Result<Value, ProfileHandlerError> {
+fn handle_validate(
+    params: &Value,
+    backend: &dyn StorageBackend,
+) -> Result<Value, ProfileHandlerError> {
     let name = require_str(params, "name")?;
-    let row = get_agent_profile(conn, name).map_err(ProfileHandlerError::Storage)?;
+    let row = get_agent_profile(backend, name).map_err(ProfileHandlerError::Storage)?;
     let (valid, issues) = match row {
         None => (
             false,
@@ -253,13 +257,16 @@ fn handle_validate(params: &Value, conn: &Connection) -> Result<Value, ProfileHa
     })
 }
 
-fn handle_apply(params: &Value, conn: &Connection) -> Result<Value, ProfileHandlerError> {
+fn handle_apply(
+    params: &Value,
+    backend: &dyn StorageBackend,
+) -> Result<Value, ProfileHandlerError> {
     let name = require_str(params, "name")?;
     let count = opt_u32(params, "count").unwrap_or(1);
     let dry_run = opt_bool(params, "dry_run").unwrap_or(false);
 
     // Verify the row exists before reporting any "would spawn" plan.
-    let _profile = get_agent_profile(conn, name)
+    let _profile = get_agent_profile(backend, name)
         .map_err(ProfileHandlerError::Storage)?
         .ok_or_else(|| ProfileHandlerError::NotFound {
             name: name.to_string(),
@@ -543,12 +550,21 @@ mod apply_receipt_tests {
 mod tests {
     use super::*;
     use crate::storage::agent_profiles_sql::insert_agent_profile;
+    use crate::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend};
     use serde_json::json;
 
-    fn fresh_conn() -> Connection {
-        let conn = Connection::open_in_memory().expect("open in-memory");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS agent_profiles (
+    fn fresh_conn() -> RusqliteBackend {
+        let backend = RusqliteBackend::open(
+            ":memory:",
+            &OpenConfig {
+                wal_mode: false,
+                ..OpenConfig::default()
+            },
+        )
+        .expect("open in-memory");
+        backend
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_profiles (
                 name           TEXT PRIMARY KEY NOT NULL,
                 role           TEXT NOT NULL DEFAULT '',
                 tags           TEXT NOT NULL DEFAULT '[]',
@@ -561,9 +577,9 @@ mod tests {
             );
             CREATE INDEX IF NOT EXISTS agent_profiles_role_idx
                 ON agent_profiles(role);",
-        )
-        .expect("schema");
-        conn
+            )
+            .expect("schema");
+        backend
     }
 
     fn synth(name: &str, role: &str, tags: Vec<&str>) -> AgentProfile {
