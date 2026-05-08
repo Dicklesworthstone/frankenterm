@@ -26,6 +26,7 @@ _LIB_RCH_GUARDS_LOADED=1
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
 RCH_SMOKE_TIMEOUT_SECS="${RCH_SMOKE_TIMEOUT_SECS:-600}"
+RCH_LOCAL_TMPDIR="${RCH_LOCAL_TMPDIR:-/tmp}"
 # Set this to 1 for harnesses whose first material verification steps already
 # run through `run_rch_cargo_logged`. That keeps remote execution fail-closed
 # without paying a duplicate full-repo sync for a cargo smoke command.
@@ -44,7 +45,7 @@ rch_fatal() {
 }
 
 run_rch() {
-    TMPDIR=/tmp rch "$@"
+    TMPDIR="${RCH_LOCAL_TMPDIR}" rch "$@"
 }
 
 resolve_timeout_bin() {
@@ -139,6 +140,7 @@ rch_write_meta_json() {
         --arg failure_reason_code "${failure_reason_code}" \
         --arg failure_reason_detail "${failure_reason_detail}" \
         --arg repo_root "${_RCH_REPO_ROOT}" \
+        --arg local_tmpdir "${RCH_LOCAL_TMPDIR}" \
         --arg smoke_target_dir "${_RCH_SMOKE_TARGET_DIR}" \
         --arg timeout_bin "${TIMEOUT_BIN}" \
         --arg step_timeout_secs "${RCH_STEP_TIMEOUT_SECS}" \
@@ -161,6 +163,7 @@ rch_write_meta_json() {
           failure_reason_code: (if $failure_reason_code == "" then null else $failure_reason_code end),
           failure_reason_detail: (if $failure_reason_detail == "" then null else $failure_reason_detail end),
           repo_root: (if $repo_root == "" then null else $repo_root end),
+          local_tmpdir: (if $local_tmpdir == "" then null else $local_tmpdir end),
           smoke_target_dir: (if $smoke_target_dir == "" then null else $smoke_target_dir end),
           timeout_bin: (if $timeout_bin == "" then null else $timeout_bin end),
           step_timeout_secs: (if $step_timeout_secs == "" then null else ($step_timeout_secs | tonumber) end),
@@ -364,7 +367,7 @@ run_rch_cargo_logged_with_timeout() {
     set +e
     (
         cd "${_RCH_REPO_ROOT}"
-        exec env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" \
+        exec env TMPDIR="${RCH_LOCAL_TMPDIR}" "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" \
             rch exec -- "$@"
     ) >"${output_file}" 2>&1 &
     runner_pid="$!"
@@ -407,6 +410,7 @@ rch_init() {
     _RCH_PROBE_LOG="${log_dir}/${harness_name}_${run_id}.rch_probe.log"
     _RCH_SMOKE_LOG="${log_dir}/${harness_name}_${run_id}.rch_smoke.log"
     _RCH_SMOKE_TARGET_DIR="target/rch-smoke/${harness_name}/${run_id}"
+    mkdir -p "${_RCH_SMOKE_TARGET_DIR}"
 }
 
 # Preflight check: ensure rch is available, workers reachable, and remote
