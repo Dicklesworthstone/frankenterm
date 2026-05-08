@@ -73,17 +73,22 @@ if [[ ! -f "${MANIFEST}" ]]; then
 fi
 
 mkdir -p "$(dirname "${OUT_PATH}")"
+RUN_ARTIFACT_DIR="${FT_XBNL0_5_2_ARTIFACT_DIR:-$(dirname "${OUT_PATH}")/finish-line-guard-artifacts/${RCH_RUN_ID}}"
+mkdir -p "${RUN_ARTIFACT_DIR}"
 
 checked_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-tmp_results="$(mktemp)"
-trap 'rm -f "${tmp_results}"' EXIT
+tmp_results="${RUN_ARTIFACT_DIR}/guard-results-000.json"
+RESULT_COUNT=0
 printf '[]' > "${tmp_results}"
 
 append_result() {
   local guard_id="$1" outcome="$2" reason_code="$3" detail_json="$4"
   local existing
   existing="$(cat "${tmp_results}")"
+  local next_index next_results
+  next_index=$((RESULT_COUNT + 1))
+  printf -v next_results "%s/guard-results-%03d.json" "${RUN_ARTIFACT_DIR}" "${next_index}"
   echo "${existing}" | jq \
     --arg guard_id "${guard_id}" \
     --arg outcome "${outcome}" \
@@ -94,8 +99,9 @@ append_result() {
       outcome: $outcome,
       reason_code: $reason_code,
       detail: $detail
-    }]' > "${tmp_results}.new"
-  mv "${tmp_results}.new" "${tmp_results}"
+    }]' > "${next_results}"
+  tmp_results="${next_results}"
+  RESULT_COUNT="${next_index}"
 }
 
 ensure_rch_for_cargo_guard() {
@@ -121,7 +127,9 @@ run_shell_guard() {
   fi
 
   local log_file
-  log_file="$(mktemp)"
+  local safe_guard_id
+  safe_guard_id="${guard_id//[^A-Za-z0-9_.-]/_}"
+  log_file="${RUN_ARTIFACT_DIR}/${safe_guard_id}.shell.log"
   local rc=0
   local args=()
   if [[ -n "${policy_rel}" ]]; then
@@ -155,10 +163,9 @@ run_shell_guard() {
     --arg rc "${rc}" \
     --arg status "${status}" \
     --arg error_code "${error_code}" \
+    --arg log_file "${log_file}" \
     --arg log_tail "$(tail -20 "${log_file}" | head -c 4000)" \
-    '{script: $script, exit_code: ($rc | tonumber), report_status: $status, error_code: $error_code, log_tail: $log_tail}')"
-
-  rm -f "${log_file}"
+    '{script: $script, exit_code: ($rc | tonumber), report_status: $status, error_code: $error_code, log_file: $log_file, log_tail: $log_tail}')"
 
   if [[ "${status}" == "passed" && ${rc} -eq 0 ]]; then
     append_result "${guard_id}" "passed" "guard_script_passed" "${detail}"
@@ -178,7 +185,9 @@ run_cargo_test_guard() {
   fi
 
   local log_file
-  log_file="$(mktemp)"
+  local safe_guard_id
+  safe_guard_id="${guard_id//[^A-Za-z0-9_.-]/_}"
+  log_file="${RUN_ARTIFACT_DIR}/${safe_guard_id}.cargo.log"
   local rc=0
   local target_args=()
   # Manifest entries intentionally store Cargo target args as shell words.
@@ -205,10 +214,9 @@ run_cargo_test_guard() {
     --arg rc "${rc}" \
     --arg cargo_target_dir "${CARGO_TARGET_DIR}" \
     --arg openssl_no_vendor "${OPENSSL_NO_VENDOR:-}" \
+    --arg log_file "${log_file}" \
     --arg log_tail "$(tail -20 "${log_file}" | head -c 4000)" \
-    '{test_name: $test, test_target: $target, exit_code: ($rc | tonumber), cargo_target_dir: $cargo_target_dir, openssl_no_vendor: (if $openssl_no_vendor == "" then null else $openssl_no_vendor end), log_tail: $log_tail}')"
-
-  rm -f "${log_file}"
+    '{test_name: $test, test_target: $target, exit_code: ($rc | tonumber), cargo_target_dir: $cargo_target_dir, openssl_no_vendor: (if $openssl_no_vendor == "" then null else $openssl_no_vendor end), log_file: $log_file, log_tail: $log_tail}')"
 
   if [[ ${rc} -eq 0 ]]; then
     append_result "${guard_id}" "passed" "cargo_test_passed" "${detail}"
@@ -231,7 +239,9 @@ verify_artifact_contract() {
     return 0
   fi
 
-  python3 - "${logs_dir}" "${MANIFEST}" <<'PY' > /tmp/_ft_xbnl0_5_2_art.json
+  local artifact_contract_json
+  artifact_contract_json="${RUN_ARTIFACT_DIR}/artifact-contract.json"
+  python3 - "${logs_dir}" "${MANIFEST}" <<'PY' > "${artifact_contract_json}"
 import json
 import re
 import sys
@@ -360,8 +370,7 @@ print(
 )
 PY
   local result
-  result="$(cat /tmp/_ft_xbnl0_5_2_art.json)"
-  rm -f /tmp/_ft_xbnl0_5_2_art.json
+  result="$(cat "${artifact_contract_json}")"
   local missing_count
   missing_count="$(echo "${result}" | jq '.missing | length')"
   if [[ "${missing_count}" -eq 0 ]]; then
@@ -414,6 +423,7 @@ jq -n \
   --arg checked_at "${checked_at}" \
   --arg status "${overall_status}" \
   --arg manifest_path "${MANIFEST}" \
+  --arg artifact_dir "${RUN_ARTIFACT_DIR}" \
   --argjson guards "${results_json}" \
   '{
     contract_id: $contract_id,
@@ -421,6 +431,7 @@ jq -n \
     checked_at: $checked_at,
     status: $status,
     manifest_path: $manifest_path,
+    artifact_dir: $artifact_dir,
     guards: $guards
   }' > "${OUT_PATH}"
 
