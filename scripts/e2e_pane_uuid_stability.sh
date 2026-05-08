@@ -23,6 +23,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+RCH_LOG_DIR="$PROJECT_ROOT/tests/e2e/logs"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -47,8 +52,16 @@ TESTS_SKIPPED=0
 
 # Configuration
 VERBOSE=false
-RCH_BIN="${RCH_BIN:-rch}"
-RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-/tmp/ft-e2e-pane-uuid-target}"
+DEFAULT_RCH_CARGO_TARGET_DIR="target/rch-e2e-pane-uuid-${RUN_ID}"
+REQUESTED_RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_RCH_CARGO_TARGET_DIR" && "$REQUESTED_RCH_CARGO_TARGET_DIR" != /* ]]; then
+    RCH_CARGO_TARGET_DIR="$REQUESTED_RCH_CARGO_TARGET_DIR"
+else
+    RCH_CARGO_TARGET_DIR="$DEFAULT_RCH_CARGO_TARGET_DIR"
+fi
+RCH_SKIP_SMOKE_PREFLIGHT=1
+RCH_READY=0
+RCH_STEP_INDEX=0
 
 # ==============================================================================
 # Argument parsing
@@ -106,11 +119,11 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v "$RCH_BIN" &>/dev/null; then
+    if ! command -v rch &>/dev/null; then
         echo -e "${RED}ERROR:${NC} rch not found. Cargo test lanes must be run through RCH." >&2
         exit 5
     fi
-    log_pass "rch available ($RCH_BIN)"
+    log_pass "rch available"
     log_info "Remote Cargo target dir: $RCH_CARGO_TARGET_DIR"
 
     if ! command -v jq &>/dev/null; then
@@ -120,14 +133,64 @@ check_prerequisites() {
     log_pass "jq available"
 }
 
+ensure_rch_for_cargo_tests() {
+    if [[ "$RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    mkdir -p "$RCH_LOG_DIR"
+    rch_init "$RCH_LOG_DIR" "$RUN_ID" "scripts_pane_uuid_stability" "$PROJECT_ROOT"
+    ensure_rch_ready
+    RCH_READY=1
+}
+
+normalize_rch_timeout_rc() {
+    local rc="$1"
+    local output_file="$2"
+    local meta_file
+    meta_file="$(rch_log_meta_path "$output_file")"
+    if [[ "$rc" -ne 0 && -f "$meta_file" ]] && jq -e '.timed_out == true' "$meta_file" >/dev/null 2>&1; then
+        printf '%s\n' 124
+    else
+        printf '%s\n' "$rc"
+    fi
+}
+
 run_rch_cargo() {
-    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
+    ensure_rch_for_cargo_tests
+
+    RCH_STEP_INDEX=$((RCH_STEP_INDEX + 1))
+    local output_file="${RCH_LOG_DIR}/pane_uuid_${RUN_ID}_step${RCH_STEP_INDEX}.rch.log"
+    local rc
+
+    set +e
+    (run_rch_cargo_logged "$output_file" env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@")
+    rc=$?
+    set -e
+
+    cat "$output_file"
+    rc="$(normalize_rch_timeout_rc "$rc" "$output_file")"
+    return "$rc"
 }
 
 run_rch_cargo_timeout() {
     local timeout_secs="$1"
     shift
-    timeout "$timeout_secs" "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@"
+
+    ensure_rch_for_cargo_tests
+
+    RCH_STEP_INDEX=$((RCH_STEP_INDEX + 1))
+    local output_file="${RCH_LOG_DIR}/pane_uuid_${RUN_ID}_step${RCH_STEP_INDEX}.rch.log"
+    local rc
+
+    set +e
+    (run_rch_cargo_logged_with_timeout "$timeout_secs" "$output_file" env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" cargo "$@")
+    rc=$?
+    set -e
+
+    cat "$output_file"
+    rc="$(normalize_rch_timeout_rc "$rc" "$output_file")"
+    return "$rc"
 }
 
 # ==============================================================================
