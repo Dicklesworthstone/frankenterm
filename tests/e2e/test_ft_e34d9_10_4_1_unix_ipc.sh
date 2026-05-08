@@ -15,14 +15,14 @@ VALIDATOR_FAIL_REPORT="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.validator.fail.json"
 VALIDATOR_RECOVERY_REPORT="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.validator.recovery.json"
 WORKFLOW_SURFACE_REPORT="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.workflow_surface.json"
 
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/rch-e2e-ft-e34d9-10-4-1-ipc}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-e34d9-10-4-1-ipc-${RUN_ID}"
+CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
 export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_4_1_unix_ipc"
-ensure_rch_ready
 
 emit_log() {
   local component="$1"
@@ -69,7 +69,22 @@ run_step() {
   "$@" 2>&1 | tee "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
   local rc=${PIPESTATUS[0]}
   set -e
-  return ${rc}
+  return "${rc}"
+}
+
+run_rch_logged_step() {
+  local label="$1"
+  shift
+
+  LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
+  set +e
+  run_rch_cargo_logged "${LAST_STEP_LOG}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" "$@"
+  local rc=$?
+  set -e
+  if [[ -f "${LAST_STEP_LOG}" ]]; then
+    cat "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
+  fi
+  return "${rc}"
 }
 
 require_cmd() {
@@ -78,14 +93,6 @@ require_cmd() {
     emit_log "preflight" "prereq_check" "missing:${cmd}" "failed" "missing_prerequisite" "E2E-PREREQ" "${cmd}"
     echo "missing required command: ${cmd}" >&2
     exit 1
-  fi
-}
-
-ensure_no_local_fallback() {
-  if grep -q "\[RCH\] local" "${LAST_STEP_LOG}"; then
-    emit_log "validation" "rch_offload_policy" "remote_exec_required" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
-    echo "rch fell back to local execution; failing per offload-only policy" >&2
-    exit 3
   fi
 }
 
@@ -170,26 +177,10 @@ require_cmd python3
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 
-probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"
-set +e
-rch workers probe --all --json > "${probe_log}" 2>>"${STDOUT_FILE}"
-probe_rc=$?
-set -e
-
-if [[ ${probe_rc} -ne 0 ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_probe_failed" "RCH-E100" "$(basename "${probe_log}")"
-  echo "rch workers probe failed" >&2
-  exit 2
-fi
-
-healthy_workers=$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${probe_log}")
-if [[ "${healthy_workers}" -lt 1 ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_workers_unreachable" "RCH-E100" "$(basename "${probe_log}")"
-  echo "no reachable rch workers; refusing local fallback" >&2
-  exit 2
-fi
-
-emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
+rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_4_1_unix_ipc"
+ensure_rch_ready
+cat "$(rch_probe_log_path)" "$(rch_smoke_log_path)" >> "${STDOUT_FILE}"
+emit_log "preflight" "rch_guard" "workers_probe_and_smoke" "passed" "rch_guard_ready" "none" "$(basename "$(rch_smoke_log_path)")"
 
 IPC_SOURCE="${ROOT_DIR}/crates/frankenterm-core/src/ipc.rs"
 HARNESS_SOURCE="${ROOT_DIR}/scripts/e2e_test.sh"
@@ -211,32 +202,27 @@ else
 fi
 
 emit_log "validation" "nominal_path" "asupersync_unix_socket_tests" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-if run_step nominal_socket_tests \
-  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test asupersync_unix_socket -- --nocapture; then
-  ensure_no_local_fallback
+if run_rch_logged_step nominal_socket_tests \
+  cargo test -p frankenterm-core --test asupersync_unix_socket -- --nocapture; then
   emit_log "validation" "nominal_path" "asupersync_unix_socket_tests" "passed" "socket_tests_passed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
-  ensure_no_local_fallback
   emit_log "validation" "nominal_path" "asupersync_unix_socket_tests" "failed" "socket_tests_failed" "CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
   exit 1
 fi
 
 emit_log "validation" "nominal_path" "ipc_restart_and_degraded_tests" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-if run_step nominal_ipc_tests \
-  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --lib ipc::tests::ipc_server_restarts_cleanly_on_same_socket_path -- --nocapture; then
-  ensure_no_local_fallback
+if run_rch_logged_step nominal_ipc_tests \
+  cargo test -p frankenterm-core --lib ipc::tests::ipc_server_restarts_cleanly_on_same_socket_path -- --nocapture; then
+  :
 else
-  ensure_no_local_fallback
   emit_log "validation" "nominal_path" "ipc_restart_and_degraded_tests" "failed" "ipc_restart_test_failed" "CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
   exit 1
 fi
 
-if run_step nominal_ipc_degraded \
-  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --lib ipc::tests::ipc_client_reports_server_closed_without_response -- --nocapture; then
-  ensure_no_local_fallback
+if run_rch_logged_step nominal_ipc_degraded \
+  cargo test -p frankenterm-core --lib ipc::tests::ipc_client_reports_server_closed_without_response -- --nocapture; then
   emit_log "validation" "nominal_path" "ipc_restart_and_degraded_tests" "passed" "ipc_targeted_tests_passed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
-  ensure_no_local_fallback
   emit_log "validation" "nominal_path" "ipc_restart_and_degraded_tests" "failed" "ipc_degraded_test_failed" "CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
   exit 1
 fi
