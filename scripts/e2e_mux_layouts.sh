@@ -12,11 +12,21 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
-RCH_BIN="${RCH_BIN:-rch}"
-RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-/tmp/ft-e2e-mux-layouts-target}"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+DEFAULT_RCH_CARGO_TARGET_DIR="target/rch-e2e-mux-layouts-${RUN_ID}"
+REQUESTED_RCH_CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_RCH_CARGO_TARGET_DIR" && "$REQUESTED_RCH_CARGO_TARGET_DIR" != /* ]]; then
+  RCH_CARGO_TARGET_DIR="$REQUESTED_RCH_CARGO_TARGET_DIR"
+else
+  RCH_CARGO_TARGET_DIR="$DEFAULT_RCH_CARGO_TARGET_DIR"
+fi
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/target/e2e/mux-layouts}"
 DRY_RUN=0
+RCH_SKIP_SMOKE_PREFLIGHT=1
+RCH_READY=0
 
 step_index=0
 pass_count=0
@@ -48,8 +58,7 @@ Options:
   -h, --help      Show help
 
 Environment:
-  RCH_BIN               rch executable (default: rch)
-  RCH_CARGO_TARGET_DIR  Remote Cargo target dir (default: /tmp/ft-e2e-mux-layouts-target)
+  RCH_CARGO_TARGET_DIR  Remote Cargo target dir (default: target/rch-e2e-mux-layouts-<run-id>)
 EOF
 }
 
@@ -133,6 +142,16 @@ run_step() {
   fi
 }
 
+ensure_rch_for_cargo_tests() {
+  if [[ "$RCH_READY" -eq 1 ]]; then
+    return 0
+  fi
+
+  rch_init "$LOG_DIR" "$RUN_ID" "scripts_e2e_mux_layouts" "$PROJECT_ROOT"
+  ensure_rch_ready
+  RCH_READY=1
+}
+
 # --- Helper: run cargo test via rch only ---
 run_tests() {
   local package="$1"
@@ -144,13 +163,22 @@ run_tests() {
     test_args+=("--" "$filter")
   fi
 
-  if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+  if ! command -v rch >/dev/null 2>&1; then
     mark_skip "rch not found; cargo test lanes must be run through RCH"
     return 125
   fi
 
-  run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" \
-    cargo test "${test_args[@]}" 2>&1 | tee "$LOG_DIR/${package}-${filter:-all}.log"
+  local output_file="$LOG_DIR/${package}-${filter:-all}.log"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "[DRY-RUN] run_rch_cargo_logged ${output_file} env CARGO_TARGET_DIR=${RCH_CARGO_TARGET_DIR} cargo test ${test_args[*]}"
+    return 0
+  fi
+
+  ensure_rch_for_cargo_tests
+  run_rch_cargo_logged "$output_file" env CARGO_TARGET_DIR="$RCH_CARGO_TARGET_DIR" \
+    cargo test "${test_args[@]}"
+  cat "$output_file"
 }
 
 # ======================================================================
