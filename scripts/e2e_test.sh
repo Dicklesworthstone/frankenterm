@@ -736,19 +736,19 @@ scenario_metadata_json() {
     local entry=""
     local desc=""
     local default_flag="false"
-    local prereqs=""
+    local prereqs_value=""
     local why=""
 
     entry=$(find_scenario_registry_entry "$name" || true)
     if [[ -n "$entry" ]]; then
-        IFS='|' read -r _ desc default_flag prereqs why <<< "$entry"
+        IFS='|' read -r _ desc default_flag prereqs_value why <<< "$entry"
     fi
 
     jq -cn \
         --arg name "$name" \
         --arg description "$desc" \
         --argjson default "$([[ "$default_flag" == "true" ]] && echo true || echo false)" \
-        --arg prereqs "$prereqs" \
+        --arg prereqs "$prereqs_value" \
         --arg why "$why" \
         '{
             name: $name,
@@ -1582,7 +1582,8 @@ soak_record_fault_event() {
         echo "$event_json" >> "$SOAK_FAULT_EVENTS_JSONL"
     fi
 
-    local scenario_dir="$RUN_ARTIFACTS_DIR/scenario_$(printf '%02d' "$sequence_no")_$scenario_name"
+    local scenario_dir
+    scenario_dir="$RUN_ARTIFACTS_DIR/scenario_$(printf '%02d' "$sequence_no")_$scenario_name"
     if [[ -d "$scenario_dir" ]]; then
         echo "$event_json" > "$scenario_dir/fault_outcome.json"
     fi
@@ -1827,7 +1828,7 @@ run_soak_cycles() {
             summary_entry=$(jq -c --argjson fault_plan "$fault_plan" '. + {fault_plan: $fault_plan}' <<< "$summary_entry")
             if [[ "${#SCENARIO_SUMMARIES[@]}" -gt 0 ]]; then
                 local summary_index=$(( ${#SCENARIO_SUMMARIES[@]} - 1 ))
-                SCENARIO_SUMMARIES[$summary_index]="$summary_entry"
+                SCENARIO_SUMMARIES[summary_index]="$summary_entry"
             fi
 
             soak_record_fault_event "$scenario_name" "$SOAK_SCENARIO_SEQUENCE" "$scenario_rc" "$summary_status" "$summary_duration" "$summary_error" "$fault_plan"
@@ -1937,6 +1938,7 @@ rust_version: $(rustc --version 2>/dev/null || echo "N/A")
 os: $(uname -a)
 shell: $SHELL
 temp_workspace: ${WORKSPACE:-auto}
+config_file: ${CONFIG_FILE:-auto}
 run_seed: $RUN_SEED
 run_seed_source: $RUN_SEED_SOURCE
 run_id: $RUN_ID
@@ -2139,7 +2141,8 @@ wait_for_condition() {
     local description="$1"
     local check_cmd="$2"
     local timeout="${3:-30}"
-    local start=$(date +%s)
+    local start
+    start=$(date +%s)
 
     log_verbose "Waiting for: $description (timeout: ${timeout}s)"
 
@@ -2529,7 +2532,8 @@ emit_scenario_artifact_manifest() {
 
 run_scenario_capture_search() {
     local scenario_dir="$1"
-    local marker="E2E_MARKER_$(date +%s%N)"
+    local marker
+    marker="E2E_MARKER_$(date +%s%N)"
     local temp_workspace
     temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
     local ft_pid=""
@@ -2979,6 +2983,7 @@ run_scenario_compaction_workflow() {
     # Wait and then check pane content
 
     # Poll for "Received:" or "Refresh acknowledged" in pane output
+    # shellcheck disable=SC2016 # Delayed command string is evaluated by wait_for_condition.
     local check_workflow_cmd='pane_text=$("'"$FT_BINARY"'" robot get-text '"$pane_id"' 2>/dev/null); echo "$pane_text" | grep -q "Received:"'
 
     if wait_for_condition "workflow send detected in pane" "$check_workflow_cmd" "$wait_timeout"; then
@@ -3647,7 +3652,8 @@ run_scenario_notification_webhook() {
     local pane_id=""
     local result=0
     local wait_timeout=${TIMEOUT:-120}
-    local secret_token="SECRET_NOTIFY_$(date +%s%N)"
+    local secret_token
+    secret_token="SECRET_NOTIFY_$(date +%s%N)"
     local mock_script="$temp_workspace/mock_webhook_server.py"
     local emit_script="$temp_workspace/emit_compaction.sh"
     local throttle_script="$temp_workspace/emit_compaction_throttle.sh"
@@ -3869,9 +3875,11 @@ PY
     fi
     mock_addr="http://127.0.0.1:$mock_port"
 
-    echo "[NOTIFY_E2E] workspace=$temp_workspace" >> "$scenario_dir/scenario.log"
-    echo "[NOTIFY_E2E] mock_addr=$mock_addr" >> "$scenario_dir/scenario.log"
-    echo "[NOTIFY_E2E] secret_token=$secret_token" >> "$scenario_dir/scenario.log"
+    {
+        echo "[NOTIFY_E2E] workspace=$temp_workspace"
+        echo "[NOTIFY_E2E] mock_addr=$mock_addr"
+        echo "[NOTIFY_E2E] secret_token=$secret_token"
+    } >> "$scenario_dir/scenario.log"
 
     # Helper functions for mock server
     start_mock_server() {
@@ -3904,6 +3912,7 @@ PY
         mock_pid=""
     }
 
+    # shellcheck disable=SC2329 # Referenced by delayed wait_for_condition expressions.
     mock_received_count() {
         local payload=""
         payload=$(curl -s "$mock_addr/received" 2>/dev/null || true)
@@ -4030,6 +4039,7 @@ EOF
         result=1
     fi
 
+    # shellcheck disable=SC2016 # Delayed command string is evaluated by wait_for_condition.
     local check_success_cmd='[[ $(mock_received_count) -ge 1 ]]'
     if ! wait_for_condition "webhook received (success)" "$check_success_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for webhook delivery"
@@ -4071,6 +4081,7 @@ EOF
         result=1
     fi
 
+    # shellcheck disable=SC2016 # Delayed command string is evaluated by wait_for_condition.
     local check_attempts_cmd='[[ $(mock_attempt_count) -ge 3 ]]'
     if ! wait_for_condition "webhook attempts >=3" "$check_attempts_cmd" "$wait_timeout"; then
         log_fail "Retry attempts did not reach expected count"
@@ -4105,6 +4116,7 @@ EOF
         result=1
     fi
 
+    # shellcheck disable=SC2016 # Delayed command string is evaluated by wait_for_condition.
     local check_throttle_cmd='[[ $(mock_received_count) -ge 2 ]]'
     if ! wait_for_condition "throttle second delivery" "$check_throttle_cmd" "$wait_timeout"; then
         log_fail "Throttle second delivery not observed"
@@ -4155,6 +4167,7 @@ EOF
         "$scenario_dir/mock_server_recovery.out"; then
         return 1
     fi
+    # shellcheck disable=SC2016 # Delayed command string is evaluated by wait_for_condition.
     local check_recovery_cmd='[[ $(mock_received_count) -ge 1 ]]'
     if ! wait_for_condition "webhook recovery delivery" "$check_recovery_cmd" "$wait_timeout"; then
         log_fail "Recovery delivery not observed"
@@ -4195,7 +4208,8 @@ run_scenario_watch_notify_only() {
     local pane_burst=""
     local result=0
     local wait_timeout=${TIMEOUT:-120}
-    local secret_token="SECRET_NOTIFY_ONLY_$(date +%s%N)"
+    local secret_token
+    secret_token="SECRET_NOTIFY_ONLY_$(date +%s%N)"
     local mock_script="$temp_workspace/mock_webhook_server.py"
     local usage_script="$temp_workspace/emit_usage_limit.sh"
     local token_script="$temp_workspace/emit_token_usage.sh"
@@ -4408,9 +4422,11 @@ PY
     fi
     mock_addr="http://127.0.0.1:$mock_port"
 
-    echo "[NOTIFYONLY_E2E] workspace=$temp_workspace" >> "$scenario_dir/scenario.log"
-    echo "[NOTIFYONLY_E2E] mock_addr=$mock_addr" >> "$scenario_dir/scenario.log"
-    echo "[NOTIFYONLY_E2E] secret_token=$secret_token" >> "$scenario_dir/scenario.log"
+    {
+        echo "[NOTIFYONLY_E2E] workspace=$temp_workspace"
+        echo "[NOTIFYONLY_E2E] mock_addr=$mock_addr"
+        echo "[NOTIFYONLY_E2E] secret_token=$secret_token"
+    } >> "$scenario_dir/scenario.log"
 
     start_mock_server() {
         if [[ -n "${mock_pid:-}" ]] && kill -0 "$mock_pid" 2>/dev/null; then
@@ -4577,6 +4593,7 @@ EOF
         result=1
     fi
 
+    # shellcheck disable=SC2016 # Delayed command string is evaluated by wait_for_condition.
     local check_notify_cmd='[[ $(mock_received_count) -ge 1 ]]'
     if ! wait_for_condition "notify-only webhook received" "$check_notify_cmd" "$wait_timeout"; then
         log_fail "Timeout waiting for notify-only webhook"
@@ -4729,6 +4746,7 @@ EOF
         result=1
     fi
 
+    # shellcheck disable=SC2016 # Delayed command string is evaluated by wait_for_condition.
     local check_throttle_cmd='[[ $(mock_received_count) -ge 2 ]]'
     if ! wait_for_condition "throttle second delivery" "$check_throttle_cmd" "$wait_timeout"; then
         log_fail "Throttle second delivery not observed"
@@ -4880,7 +4898,8 @@ run_scenario_policy_denial() {
     local ok_status=""
     if echo "$send_output" | jq -e '.' >/dev/null 2>&1; then
         ok_status=$(echo "$send_output" | jq -r '.ok // empty')
-        local error_code=$(echo "$send_output" | jq -r '.error.code // .error // empty')
+        local error_code
+        error_code=$(echo "$send_output" | jq -r '.error.code // .error // empty')
 
         if [[ "$ok_status" == "false" ]]; then
             log_pass "Send denied (ok: false)"
@@ -4949,7 +4968,8 @@ run_scenario_audit_tail_streaming() {
     local pane_id=""
     local tail_pid=""
     local result=0
-    local secret_token="sk-test-$(date +%s)1234567890"
+    local secret_token
+    secret_token="sk-test-$(date +%s)1234567890"
 
     log_info "Workspace: $temp_workspace"
 
@@ -4965,6 +4985,7 @@ run_scenario_audit_tail_streaming() {
         log_verbose "Using baseline config: $baseline_config"
     fi
 
+    # shellcheck disable=SC2329 # Registered through trap for scenario cleanup.
     cleanup_audit_tail() {
         log_verbose "Cleaning up audit_tail_streaming scenario"
         if [[ -n "$tail_pid" ]] && kill -0 "$tail_pid" 2>/dev/null; then
@@ -5111,11 +5132,16 @@ run_scenario_ipc_rpc_roundtrip() {
     temp_workspace=$(mktemp -d /tmp/ft-e2e-ipc-XXXXXX)
     local ft_pid=""
     local result=0
-    local read_token="e2e-read-$(date +%s%N)"
-    local write_token="e2e-write-$(date +%s%N)"
-    local request_id_help="e2e-ipc-help-$(date +%s%N)"
-    local request_id_denied="e2e-ipc-denied-$(date +%s%N)"
-    local request_id_write="e2e-ipc-write-$(date +%s%N)"
+    local read_token
+    local write_token
+    local request_id_help
+    local request_id_denied
+    local request_id_write
+    read_token="e2e-read-$(date +%s%N)"
+    write_token="e2e-write-$(date +%s%N)"
+    request_id_help="e2e-ipc-help-$(date +%s%N)"
+    request_id_denied="e2e-ipc-denied-$(date +%s%N)"
+    request_id_write="e2e-ipc-write-$(date +%s%N)"
 
     log_info "Workspace: $temp_workspace"
 
@@ -5371,7 +5397,8 @@ EOF
     echo "pane_id: $pane_id" >> "$scenario_dir/scenario.log"
     echo "spawn_output: $spawn_output" >> "$scenario_dir/scenario.log"
 
-    local marker="FT_PREPARE_COMMIT_OK_$(date +%s%N)"
+    local marker
+    marker="FT_PREPARE_COMMIT_OK_$(date +%s%N)"
     local send_text="echo $marker"
 
     # Step 2: Prepare plan (expect approval required)
@@ -5395,9 +5422,11 @@ EOF
     approval_code=$(jq -r '.approval.code // empty' "$scenario_dir/prepare_output.json" 2>/dev/null || echo "")
     requires_approval=$(jq -r '.requires_approval // false' "$scenario_dir/prepare_output.json" 2>/dev/null || echo "false")
 
-    echo "plan_id: $plan_id" >> "$scenario_dir/scenario.log"
-    echo "plan_hash: $plan_hash" >> "$scenario_dir/scenario.log"
-    echo "requires_approval: $requires_approval" >> "$scenario_dir/scenario.log"
+    {
+        echo "plan_id: $plan_id"
+        echo "plan_hash: $plan_hash"
+        echo "requires_approval: $requires_approval"
+    } >> "$scenario_dir/scenario.log"
 
     if [[ "$requires_approval" == "true" ]]; then
         log_pass "Prepare requires approval"
@@ -5509,6 +5538,7 @@ run_scenario_quickfix_suggestions() {
 
     log_info "Workspace: $temp_workspace"
 
+    # shellcheck disable=SC2329 # Registered through trap for scenario cleanup.
     cleanup_quickfix_suggestions() {
         log_verbose "Cleaning up quickfix_suggestions scenario"
         if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
@@ -5552,6 +5582,7 @@ run_scenario_quickfix_suggestions() {
         if [[ "$cmd" == *$'\n'* ]]; then
             return 1
         fi
+        # shellcheck disable=SC2016 # Literal pattern rejects command substitution syntax.
         case "$cmd" in
             *';'*|*'|'*|*'&'*|*'`'*|*'<'*|*'>'*|*'$('*)
                 return 1
@@ -6204,7 +6235,8 @@ run_scenario_stress_scale() {
     local fts_budget_ms="${STRESS_FTS_MS_MAX:-800}"
     local long_run_secs="${STRESS_LONG_RUN_SECS:-0}"
     local mem_growth_budget_pct="${STRESS_MEM_GROWTH_PCT_MAX:-15}"
-    local marker="E2E_STRESS_$(date +%s%N)"
+    local marker
+    marker="E2E_STRESS_$(date +%s%N)"
     local burst_script="$PROJECT_ROOT/fixtures/e2e/dummy_burst.sh"
     local chatter_script="$temp_workspace/emit_chatter.sh"
     local pane_ids=()
@@ -6214,10 +6246,13 @@ run_scenario_stress_scale() {
 
     log_info "Workspace: $temp_workspace"
     log_info "Stress marker: $marker"
-    echo "pane_count: $pane_count" >> "$scenario_dir/scenario.log"
-    echo "lines_per_pane: $lines_per_pane" >> "$scenario_dir/scenario.log"
-    echo "large_lines: $large_lines" >> "$scenario_dir/scenario.log"
+    {
+        echo "pane_count: $pane_count"
+        echo "lines_per_pane: $lines_per_pane"
+        echo "large_lines: $large_lines"
+    } >> "$scenario_dir/scenario.log"
 
+    # shellcheck disable=SC2329 # Registered through trap for scenario cleanup.
     cleanup_stress_scale() {
         log_verbose "Cleaning up stress_scale scenario"
         if [[ -n "${ft_pid:-}" ]] && kill -0 "$ft_pid" 2>/dev/null; then
@@ -6395,9 +6430,11 @@ EOS
             if [[ -n "$rss_after" ]]; then
                 rss_kb_end="$rss_after"
                 mem_growth_pct=$(awk -v start="$rss_kb_start" -v end="$rss_kb_end" 'BEGIN { if (start <= 0) {print "null"; exit}; printf "%.2f", ((end - start) / start) * 100 }')
-                echo "rss_kb_start: $rss_kb_start" >> "$scenario_dir/scenario.log"
-                echo "rss_kb_end: $rss_kb_end" >> "$scenario_dir/scenario.log"
-                echo "mem_growth_pct: $mem_growth_pct" >> "$scenario_dir/scenario.log"
+                {
+                    echo "rss_kb_start: $rss_kb_start"
+                    echo "rss_kb_end: $rss_kb_end"
+                    echo "mem_growth_pct: $mem_growth_pct"
+                } >> "$scenario_dir/scenario.log"
                 if [[ "$mem_growth_pct" != "null" ]] && awk -v v="$mem_growth_pct" -v max="$mem_growth_budget_pct" 'BEGIN { exit !(v <= max) }'; then
                     log_pass "Memory growth ${mem_growth_pct}% within budget (${mem_growth_budget_pct}%)"
                 else
@@ -6491,7 +6528,8 @@ EOF
 
 run_scenario_graceful_shutdown() {
     local scenario_dir="$1"
-    local marker="E2E_SHUTDOWN_$(date +%s%N)"
+    local marker
+    marker="E2E_SHUTDOWN_$(date +%s%N)"
     local temp_workspace
     temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
     local ft_pid=""
@@ -6591,7 +6629,8 @@ run_scenario_graceful_shutdown() {
 
     # Step 4: Send SIGINT to ft watch and measure shutdown time
     log_info "Step 4: Sending SIGINT to ft watch..."
-    local shutdown_start=$(date +%s)
+    local shutdown_start
+    shutdown_start=$(date +%s)
     kill -INT "$ft_pid" 2>/dev/null
 
     # Wait for graceful exit (bounded timeout)
@@ -6611,7 +6650,8 @@ run_scenario_graceful_shutdown() {
         fi
     fi
 
-    local shutdown_end=$(date +%s)
+    local shutdown_end
+    shutdown_end=$(date +%s)
     local shutdown_duration=$((shutdown_end - shutdown_start))
     echo "shutdown_duration_secs: $shutdown_duration" >> "$scenario_dir/scenario.log"
 
@@ -6687,10 +6727,12 @@ run_scenario_graceful_shutdown() {
     fi
 
     # Record final summary
-    echo "" >> "$scenario_dir/scenario.log"
-    echo "=== Shutdown Summary ===" >> "$scenario_dir/scenario.log"
-    echo "shutdown_clean: $([[ $result -eq 0 ]] && echo 'yes' || echo 'no')" >> "$scenario_dir/scenario.log"
-    echo "fts_hits_after_shutdown: $hit_count" >> "$scenario_dir/scenario.log"
+    {
+        echo ""
+        echo "=== Shutdown Summary ==="
+        echo "shutdown_clean: $([[ $result -eq 0 ]] && echo 'yes' || echo 'no')"
+        echo "fts_hits_after_shutdown: $hit_count"
+    } >> "$scenario_dir/scenario.log"
 
     # Cleanup trap will handle the rest
     trap - EXIT
@@ -6711,8 +6753,10 @@ run_scenario_graceful_shutdown() {
 
 run_scenario_pane_exclude_filter() {
     local scenario_dir="$1"
-    local observed_marker="OBSERVED_TOKEN_$(date +%s%N)"
-    local secret_token="SECRET_TOKEN_$(date +%s%N)"
+    local observed_marker
+    local secret_token
+    observed_marker="OBSERVED_TOKEN_$(date +%s%N)"
+    secret_token="SECRET_TOKEN_$(date +%s%N)"
     local temp_workspace
     temp_workspace=$(mktemp -d /tmp/ft-e2e-XXXXXX)
     local ft_pid=""
@@ -6956,8 +7000,10 @@ run_scenario_pane_exclude_filter() {
 
 run_scenario_workspace_isolation() {
     local scenario_dir="$1"
-    local token_a="WORKSPACE_TOKEN_A_$(date +%s%N)"
-    local token_b="WORKSPACE_TOKEN_B_$(date +%s%N)"
+    local token_a
+    local token_b
+    token_a="WORKSPACE_TOKEN_A_$(date +%s%N)"
+    token_b="WORKSPACE_TOKEN_B_$(date +%s%N)"
     local workspace_a
     local workspace_b
     workspace_a=$(mktemp -d /tmp/ft-e2e-a-XXXXXX)
@@ -6974,10 +7020,12 @@ run_scenario_workspace_isolation() {
 
     mkdir -p "$workspace_a/.ft" "$workspace_b/.ft"
 
-    echo "workspace_a: $workspace_a" >> "$scenario_dir/scenario.log"
-    echo "workspace_b: $workspace_b" >> "$scenario_dir/scenario.log"
-    echo "token_a: $token_a" >> "$scenario_dir/scenario.log"
-    echo "token_b: $token_b" >> "$scenario_dir/scenario.log"
+    {
+        echo "workspace_a: $workspace_a"
+        echo "workspace_b: $workspace_b"
+        echo "token_a: $token_a"
+        echo "token_b: $token_b"
+    } >> "$scenario_dir/scenario.log"
 
     cleanup_workspace_isolation() {
         log_verbose "Cleaning up workspace_isolation scenario"
@@ -7181,14 +7229,16 @@ run_scenario_workspace_isolation() {
     logs_dir_a=$(jq -r '.paths.logs_dir // empty' "$scenario_dir/config_effective_a.json" 2>/dev/null || echo "")
     logs_dir_b=$(jq -r '.paths.logs_dir // empty' "$scenario_dir/config_effective_b.json" 2>/dev/null || echo "")
 
-    echo "workspace_root_a: $root_a" >> "$scenario_dir/scenario.log"
-    echo "workspace_root_b: $root_b" >> "$scenario_dir/scenario.log"
-    echo "db_path_a: $db_a" >> "$scenario_dir/scenario.log"
-    echo "db_path_b: $db_b" >> "$scenario_dir/scenario.log"
-    echo "log_path_a: $log_a" >> "$scenario_dir/scenario.log"
-    echo "log_path_b: $log_b" >> "$scenario_dir/scenario.log"
-    echo "logs_dir_a: $logs_dir_a" >> "$scenario_dir/scenario.log"
-    echo "logs_dir_b: $logs_dir_b" >> "$scenario_dir/scenario.log"
+    {
+        echo "workspace_root_a: $root_a"
+        echo "workspace_root_b: $root_b"
+        echo "db_path_a: $db_a"
+        echo "db_path_b: $db_b"
+        echo "log_path_a: $log_a"
+        echo "log_path_b: $log_b"
+        echo "logs_dir_a: $logs_dir_a"
+        echo "logs_dir_b: $logs_dir_b"
+    } >> "$scenario_dir/scenario.log"
 
     if [[ -n "$root_a" && -n "$root_b" ]]; then
         if [[ "$root_a" == "$workspace_a" && "$root_b" == "$workspace_b" ]]; then
@@ -7463,7 +7513,8 @@ run_scenario_uservar_forwarding() {
     local wezterm_pid=""
     local pane_id=""
     local result=0
-    local wezterm_class="ft-e2e-uservar-$(date +%s%N)"
+    local wezterm_class
+    wezterm_class="ft-e2e-uservar-$(date +%s%N)"
     local uservar_name="wa_event"
     local payload_json
     payload_json=$(printf '{"type":"e2e_uservar","ts":%s}' "$(date +%s)")
@@ -7480,10 +7531,12 @@ run_scenario_uservar_forwarding() {
 
     mkdir -p "$temp_workspace/.ft"
 
-    echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
-    echo "wezterm_class: $wezterm_class" >> "$scenario_dir/scenario.log"
-    echo "uservar_name: $uservar_name" >> "$scenario_dir/scenario.log"
-    echo "payload_json: $payload_json" >> "$scenario_dir/scenario.log"
+    {
+        echo "workspace: $temp_workspace"
+        echo "wezterm_class: $wezterm_class"
+        echo "uservar_name: $uservar_name"
+        echo "payload_json: $payload_json"
+    } >> "$scenario_dir/scenario.log"
 
     cleanup_uservar_forwarding() {
         log_verbose "Cleaning up uservar_forwarding scenario"
@@ -9147,11 +9200,13 @@ PY
     export FT_WORKSPACE="$temp_workspace"
     mkdir -p "$FT_DATA_DIR"
 
-    echo "scenario: alt_screen_detection" >> "$scenario_dir/scenario.log"
-    echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
-    echo "wezterm_socket: $wezterm_socket" >> "$scenario_dir/scenario.log"
-    echo "enter_seq_file: $enter_seq_file" >> "$scenario_dir/scenario.log"
-    echo "leave_seq_file: $leave_seq_file" >> "$scenario_dir/scenario.log"
+    {
+        echo "scenario: alt_screen_detection"
+        echo "workspace: $temp_workspace"
+        echo "wezterm_socket: $wezterm_socket"
+        echo "enter_seq_file: $enter_seq_file"
+        echo "leave_seq_file: $leave_seq_file"
+    } >> "$scenario_dir/scenario.log"
 
     cleanup_alt_screen_detection() {
         log_verbose "Cleaning up alt_screen_detection scenario"
@@ -9522,7 +9577,7 @@ PY
     }
 
     ensure_profile_artifact_completeness() {
-        local missing=0
+        local missing_artifact=0
         local profile_count=0
         local index=0
         local app=""
@@ -9539,40 +9594,40 @@ PY
 
             if [[ ! -s "$app_dir/app_context.json" ]]; then
                 log_fail "Missing app context artifact for profile $app"
-                missing=1
+                missing_artifact=1
             fi
             if [[ ! -s "$app_dir/resize_pulses.jsonl" ]]; then
                 log_fail "Missing resize pulse log for profile $app"
-                missing=1
+                missing_artifact=1
             fi
 
             if [[ "$app_status" != "passed" ]]; then
                 if [[ ! -s "$app_dir/pane_state_final.json" ]]; then
                     log_fail "Missing pane_state_final artifact for failed profile $app"
-                    missing=1
+                    missing_artifact=1
                 fi
                 if [[ ! -f "$app_dir/${app}.log" ]]; then
                     log_fail "Missing pane text log artifact for failed profile $app"
-                    missing=1
+                    missing_artifact=1
                 fi
                 if [[ ! -s "$app_dir/trace_bundle.json" ]]; then
                     log_fail "Missing trace_bundle artifact for failed profile $app"
-                    missing=1
+                    missing_artifact=1
                 fi
                 if [[ ! -s "$app_dir/frame_histogram.json" ]]; then
                     log_fail "Missing frame_histogram artifact for failed profile $app"
-                    missing=1
+                    missing_artifact=1
                 fi
                 if [[ ! -s "$app_dir/failure_signature.json" ]]; then
                     log_fail "Missing failure_signature artifact for failed profile $app"
-                    missing=1
+                    missing_artifact=1
                 fi
             fi
 
             index=$((index + 1))
         done
 
-        return "$missing"
+        return "$missing_artifact"
     }
 
     run_alt_screen_conformance_fixture_only_mode() {
@@ -9780,15 +9835,17 @@ PY
     log_info "WezTerm socket: $wezterm_socket"
     : > "$events_file"
 
-    echo "scenario: alt_screen_conformance" >> "$scenario_dir/scenario.log"
-    echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
-    echo "wezterm_socket: $wezterm_socket" >> "$scenario_dir/scenario.log"
-    echo "run_id: $RUN_ID" >> "$scenario_dir/scenario.log"
-    echo "events_file: $(basename "$events_file")" >> "$scenario_dir/scenario.log"
-    echo "enter_seq_file: $enter_seq_file" >> "$scenario_dir/scenario.log"
-    echo "leave_seq_file: $leave_seq_file" >> "$scenario_dir/scenario.log"
-    echo "dummy_alt_script: $fixture_dummy_script" >> "$scenario_dir/scenario.log"
-    echo "allow_fixture_only: $allow_fixture_only" >> "$scenario_dir/scenario.log"
+    {
+        echo "scenario: alt_screen_conformance"
+        echo "workspace: $temp_workspace"
+        echo "wezterm_socket: $wezterm_socket"
+        echo "run_id: $RUN_ID"
+        echo "events_file: $(basename "$events_file")"
+        echo "enter_seq_file: $enter_seq_file"
+        echo "leave_seq_file: $leave_seq_file"
+        echo "dummy_alt_script: $fixture_dummy_script"
+        echo "allow_fixture_only: $allow_fixture_only"
+    } >> "$scenario_dir/scenario.log"
 
     if [[ ! -f "$enter_seq_file" || ! -f "$leave_seq_file" ]]; then
         log_fail "Missing alt-screen regression fixture files"
@@ -9948,7 +10005,8 @@ EOS
         app_index=$((app_index + 1))
         local app_status="passed"
         local app_failures="[]"
-        local app_dir="$scenario_dir/app_$(printf '%02d' "$app_index")_${app}"
+        local app_dir
+        app_dir="$scenario_dir/app_$(printf '%02d' "$app_index")_${app}"
         local app_log="$app_dir/${app}.log"
         local pulse_file="$app_dir/resize_pulses.jsonl"
         local pane_id=0
@@ -10883,6 +10941,37 @@ run_scenario_replay_capture_pipeline() {
     return 0
 }
 
+write_sorted_existing_paths() {
+    local output_file="$1"
+    shift
+    local path
+
+    for path in "$@"; do
+        [[ -e "$path" ]] || continue
+        printf '%s\n' "$path"
+    done | LC_ALL=C sort >"$output_file"
+}
+
+newest_existing_path() {
+    local latest_path=""
+    local latest_mtime="-1"
+    local path
+    local mtime
+
+    for path in "$@"; do
+        [[ -e "$path" ]] || continue
+        mtime=$(stat -f '%m' "$path" 2>/dev/null || stat -c '%Y' "$path" 2>/dev/null || echo 0)
+        if [[ "$mtime" -gt "$latest_mtime" ]]; then
+            latest_mtime="$mtime"
+            latest_path="$path"
+        fi
+    done
+
+    if [[ -n "$latest_path" ]]; then
+        printf '%s\n' "$latest_path"
+    fi
+}
+
 run_scenario_ft_1i2ge_4_1() {
     local scenario_dir="$1"
     local case_name="ft_1i2ge_4_1"
@@ -10891,7 +10980,7 @@ run_scenario_ft_1i2ge_4_1() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_1_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_1_*
 
     log_info "[$case_name] Step 1: running mission policy preflight e2e harness"
     set +e
@@ -10910,7 +10999,7 @@ run_scenario_ft_1i2ge_4_1() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_1_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_1_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -10932,7 +11021,7 @@ run_scenario_ft_1i2ge_3_2() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_2_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_2_*
 
     log_info "[$case_name] Step 1: running mission dispatch adapter e2e harness"
     set +e
@@ -10951,7 +11040,7 @@ run_scenario_ft_1i2ge_3_2() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_2_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_2_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -10973,7 +11062,7 @@ run_scenario_ft_1i2ge_3_3() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_3_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_3_*
 
     log_info "[$case_name] Step 1: running mission outcome reconciliation e2e harness"
     set +e
@@ -10992,7 +11081,7 @@ run_scenario_ft_1i2ge_3_3() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_3_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_3_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11014,7 +11103,7 @@ run_scenario_ft_1i2ge_3_4() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_4_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_4_*
 
     log_info "[$case_name] Step 1: running adaptive mission replanning e2e harness"
     set +e
@@ -11033,7 +11122,7 @@ run_scenario_ft_1i2ge_3_4() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_4_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_4_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11055,7 +11144,7 @@ run_scenario_ft_1i2ge_3_5() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_5_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_5_*
 
     log_info "[$case_name] Step 1: running pause/resume/abort semantics e2e harness"
     set +e
@@ -11074,7 +11163,7 @@ run_scenario_ft_1i2ge_3_5() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_5_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_5_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11096,7 +11185,7 @@ run_scenario_ft_1i2ge_3_8() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_8_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_8_*
 
     log_info "[$case_name] Step 1: running crash-consistent mission journal e2e harness"
     set +e
@@ -11115,7 +11204,7 @@ run_scenario_ft_1i2ge_3_8() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_8_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_8_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11137,7 +11226,7 @@ run_scenario_ft_1i2ge_3_7() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_7_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_7_*
 
     log_info "[$case_name] Step 1: running orchestration integration e2e harness"
     set +e
@@ -11156,7 +11245,7 @@ run_scenario_ft_1i2ge_3_7() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_7_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_7_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11178,7 +11267,7 @@ run_scenario_ft_1i2ge_8_5() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_5_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_5_*
 
     log_info "[$case_name] Step 1: running commit-phase executor e2e harness"
     set +e
@@ -11197,7 +11286,7 @@ run_scenario_ft_1i2ge_8_5() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_5_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_5_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11219,7 +11308,7 @@ run_scenario_ft_1i2ge_8_6() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_6_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_6_*
 
     log_info "[$case_name] Step 1: running compensation planner and rollback engine e2e harness"
     set +e
@@ -11238,7 +11327,7 @@ run_scenario_ft_1i2ge_8_6() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_6_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_6_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11260,7 +11349,7 @@ run_scenario_ft_1i2ge_8_7() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_7_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_7_*
 
     log_info "[$case_name] Step 1: running durable idempotency/dedupe/resume e2e harness"
     set +e
@@ -11279,7 +11368,7 @@ run_scenario_ft_1i2ge_8_7() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_7_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_7_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11301,7 +11390,7 @@ run_scenario_ft_1i2ge_8_10() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_10_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_10_*
 
     log_info "[$case_name] Step 1: running tx correctness/concurrency e2e harness"
     set +e
@@ -11320,7 +11409,7 @@ run_scenario_ft_1i2ge_8_10() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_10_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_10_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11342,7 +11431,7 @@ run_scenario_ft_1i2ge_8_12() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/mission_tx_chaos_perf_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/mission_tx_chaos_perf_*
 
     log_info "[$case_name] Step 1: running tx chaos/perf hardening e2e harness"
     set +e
@@ -11361,7 +11450,7 @@ run_scenario_ft_1i2ge_8_12() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/mission_tx_chaos_perf_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/mission_tx_chaos_perf_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11393,8 +11482,9 @@ run_scenario_ft_1i2ge_7_6() {
     local soak_report="$PROJECT_ROOT/docs/metrics/mission_soak_evidence.json"
     local chaos_report="$PROJECT_ROOT/docs/metrics/mission_chaos_evidence.json"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_* "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_* \
-        2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" \
+        "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_* \
+        "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_*
 
     log_info "[$case_name] Step 1: running mission soak harness"
     set +e
@@ -11430,8 +11520,9 @@ run_scenario_ft_1i2ge_7_6() {
         return "$chaos_rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_* "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_* \
-        2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" \
+        "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_* \
+        "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11454,8 +11545,8 @@ run_scenario_ft_1i2ge_7_6() {
             --arg bead_id "ft-1i2ge.7.6" \
             --arg run_id "$RUN_ID" \
             --arg scenario_name "$case_name" \
-            --arg soak_log "$(ls -1t "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_*.jsonl 2>/dev/null | head -n1 | sed "s#^${PROJECT_ROOT}/##")" \
-            --arg chaos_log "$(ls -1t "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_*.jsonl 2>/dev/null | head -n1 | sed "s#^${PROJECT_ROOT}/##")" \
+            --arg soak_log "$(newest_existing_path "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_*.jsonl | sed "s#^${PROJECT_ROOT}/##")" \
+            --arg chaos_log "$(newest_existing_path "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_*.jsonl | sed "s#^${PROJECT_ROOT}/##")" \
             --argjson soak "$(cat "$soak_report")" \
             --argjson chaos "$(cat "$chaos_report")" \
             '{
@@ -11485,7 +11576,7 @@ run_scenario_ft_e34d9_10_3_2_cancellation() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_3_2_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_3_2_*
 
     log_info "[$case_name] Step 1: running two-phase cancellation/shutdown e2e harness"
     set +e
@@ -11504,7 +11595,7 @@ run_scenario_ft_e34d9_10_3_2_cancellation() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_3_2_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_3_2_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11526,7 +11617,7 @@ run_scenario_ft_e34d9_10_1_2_doctrine_pack() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_doctrine_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_doctrine_*
 
     log_info "[$case_name] Step 1: running asupersync runtime doctrine pack e2e harness"
     set +e
@@ -11545,7 +11636,7 @@ run_scenario_ft_e34d9_10_1_2_doctrine_pack() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_doctrine_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_doctrine_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11567,7 +11658,7 @@ run_scenario_ft_e34d9_10_2_1_runtime_bootstrap() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_bootstrap_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_bootstrap_*
 
     log_info "[$case_name] Step 1: running asupersync runtime bootstrap contract e2e harness"
     set +e
@@ -11586,7 +11677,7 @@ run_scenario_ft_e34d9_10_2_1_runtime_bootstrap() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_bootstrap_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_bootstrap_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11608,7 +11699,7 @@ run_scenario_ft_e34d9_10_2_2_cx_outcome_contract() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_cx_outcome_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/asupersync_cx_outcome_*
 
     log_info "[$case_name] Step 1: running asupersync Cx/Outcome contract e2e harness"
     set +e
@@ -11627,7 +11718,7 @@ run_scenario_ft_e34d9_10_2_2_cx_outcome_contract() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_cx_outcome_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/asupersync_cx_outcome_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11649,7 +11740,7 @@ run_scenario_ft_1i2ge_4_2() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_2_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_2_*
 
     log_info "[$case_name] Step 1: running mission reservation enforcement e2e harness"
     set +e
@@ -11668,7 +11759,7 @@ run_scenario_ft_1i2ge_4_2() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_2_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_2_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11690,7 +11781,7 @@ run_scenario_ft_1i2ge_4_3() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_3_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_3_*
 
     log_info "[$case_name] Step 1: running mission approval-path integration e2e harness"
     set +e
@@ -11709,7 +11800,7 @@ run_scenario_ft_1i2ge_4_3() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_3_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_4_3_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11731,7 +11822,7 @@ run_scenario_ft_1i2ge_5_1() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_5_1_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_5_1_*
 
     log_info "[$case_name] Step 1: running mission CLI command surface e2e harness"
     set +e
@@ -11750,7 +11841,7 @@ run_scenario_ft_1i2ge_5_1() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_5_1_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_5_1_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11772,7 +11863,7 @@ run_scenario_ft_1i2ge_5_2() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_5_2_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_5_2_*
 
     log_info "[$case_name] Step 1: running robot mission endpoint e2e harness"
     set +e
@@ -11791,7 +11882,7 @@ run_scenario_ft_1i2ge_5_2() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_5_2_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_5_2_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11813,7 +11904,7 @@ run_scenario_ft_l5em3_2() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_l5em3_2_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_l5em3_2_*
 
     log_info "[$case_name] Step 1: running SIMD stateful scan e2e harness"
     set +e
@@ -11832,7 +11923,7 @@ run_scenario_ft_l5em3_2() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_l5em3_2_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_l5em3_2_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11854,7 +11945,7 @@ run_scenario_ft_3axa_allocator_diagnostics() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_3axa_allocator_diagnostics_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_3axa_allocator_diagnostics_*
 
     log_info "[$case_name] Step 1: running allocator diagnostics e2e harness"
     set +e
@@ -11873,7 +11964,7 @@ run_scenario_ft_3axa_allocator_diagnostics() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_3axa_allocator_diagnostics_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_3axa_allocator_diagnostics_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11895,7 +11986,7 @@ run_scenario_ft_124z4() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_124z4_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_124z4_*
 
     log_info "[$case_name] Step 1: running tailer asupersync e2e harness"
     set +e
@@ -11914,7 +12005,7 @@ run_scenario_ft_124z4() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_124z4_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_124z4_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11936,7 +12027,7 @@ run_scenario_ft_e34d9_10_4_1_unix_ipc() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_4_1_unix_ipc_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_4_1_unix_ipc_*
 
     log_info "[$case_name] Step 1: running unix ipc invariants e2e harness"
     set +e
@@ -11955,7 +12046,7 @@ run_scenario_ft_e34d9_10_4_1_unix_ipc() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_4_1_unix_ipc_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_4_1_unix_ipc_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -11977,7 +12068,7 @@ run_scenario_ft_e34d9_10_4_2_network() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_4_2_network_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_4_2_network_*
 
     log_info "[$case_name] Step 1: running network runtime-compat invariants e2e harness"
     set +e
@@ -11996,7 +12087,7 @@ run_scenario_ft_e34d9_10_4_2_network() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_4_2_network_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_4_2_network_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -12018,7 +12109,7 @@ run_scenario_ft_e34d9_10_8_2_cutover_runtime_guards() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_8_2_cutover_runtime_guards_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_8_2_cutover_runtime_guards_*
 
     log_info "[$case_name] Step 1: running cutover runtime guardrail e2e harness"
     set +e
@@ -12037,7 +12128,7 @@ run_scenario_ft_e34d9_10_8_2_cutover_runtime_guards() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_8_2_cutover_runtime_guards_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_8_2_cutover_runtime_guards_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -12059,7 +12150,7 @@ run_scenario_ft_e34d9_10_6_2_concurrency_fault_matrix() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/concurrency_fault_matrix_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/concurrency_fault_matrix_*
 
     log_info "[$case_name] Step 1: running concurrency fault matrix e2e harness"
     set +e
@@ -12078,7 +12169,7 @@ run_scenario_ft_e34d9_10_6_2_concurrency_fault_matrix() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/concurrency_fault_matrix_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/concurrency_fault_matrix_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -12100,7 +12191,7 @@ run_scenario_ft_1memj_30_swarm_stress() {
     local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
     local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1memj_30_swarm_stress_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+    write_sorted_existing_paths "$before_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1memj_30_swarm_stress_*
 
     log_info "[$case_name] Step 1: running swarm stress harness contract"
     set +e
@@ -12119,7 +12210,7 @@ run_scenario_ft_1memj_30_swarm_stress() {
         return "$rc"
     fi
 
-    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1memj_30_swarm_stress_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    write_sorted_existing_paths "$after_snapshot" "$PROJECT_ROOT/tests/e2e/logs"/ft_1memj_30_swarm_stress_*
     while IFS= read -r log_path; do
         if [[ -z "$log_path" ]]; then
             continue
@@ -12366,7 +12457,7 @@ run_scenario() {
     local name="$1"
     local scenario_num="$2"
     local fault_plan_json="${3:-}"
-    local scenario_dir="$RUN_ARTIFACTS_DIR/scenario_$(printf '%02d' "$scenario_num")_$name"
+    local scenario_dir
     local scenario_seed_hex=""
     local scenario_metadata=""
     local fault_active="false"
@@ -12376,10 +12467,12 @@ run_scenario() {
     local max_attempts=$((SCENARIO_RETRIES + 1))
     local attempts_json="[]"
     local selected_attempt_dir=""
-    local start_time=$(date +%s)
+    local start_time
     local result=1
     local attempt=1
 
+    scenario_dir="$RUN_ARTIFACTS_DIR/scenario_$(printf '%02d' "$scenario_num")_$name"
+    start_time=$(date +%s)
     mkdir -p "$scenario_dir"
 
     scenario_seed_hex=$(compute_scenario_seed_hex "$name" "$scenario_num")
@@ -12433,15 +12526,17 @@ run_scenario() {
     fi
 
     for ((attempt=1; attempt<=max_attempts; attempt++)); do
-        local attempt_dir="$scenario_dir/attempt_$(printf '%02d' "$attempt")"
+        local attempt_dir
         local attempt_result=0
-        local attempt_start=$(date +%s)
+        local attempt_start
         local attempt_duration=0
         local attempt_started_at=""
         local backoff_secs=0
         local fault_effect_json="null"
         local prereq_failed=false
 
+        attempt_dir="$scenario_dir/attempt_$(printf '%02d' "$attempt")"
+        attempt_start=$(date +%s)
         mkdir -p "$attempt_dir"
         attempt_started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -12584,7 +12679,8 @@ run_scenario_worker() {
     local name="$1"
     local scenario_num="$2"
     local state_dir="$3"
-    local prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
+    local prefix
+    prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
     local worker_log="${prefix}.runner.log"
     local summary_file="${prefix}.summary.json"
     local rc_file="${prefix}.exit_code"
@@ -12610,7 +12706,8 @@ reap_parallel_job() {
     local pid="${active_pids[0]}"
     local scenario_num="${active_nums[0]}"
     local scenario_name="${active_names[0]}"
-    local prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
+    local prefix
+    prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
     local rc_file="${prefix}.exit_code"
     local rc_value="unknown"
 
@@ -12672,13 +12769,16 @@ run_scenarios_parallel() {
     local total="${#scenario_names[@]}"
     for ((scenario_num=1; scenario_num<=total; scenario_num++)); do
         local name="${scenario_names[$((scenario_num - 1))]}"
-        local prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
-        local summary_file="${prefix}.summary.json"
-        local rc_file="${prefix}.exit_code"
+        local prefix
+        local summary_file
+        local rc_file
         local rc_value=1
         local summary_entry=""
         local status="failed"
 
+        prefix="$state_dir/scenario_$(printf '%02d' "$scenario_num")"
+        summary_file="${prefix}.summary.json"
+        rc_file="${prefix}.exit_code"
         if [[ -f "$rc_file" ]]; then
             rc_value=$(cat "$rc_file")
         fi
