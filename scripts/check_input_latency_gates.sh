@@ -13,11 +13,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 ARTIFACT_DIR="${FT_INPUT_LATENCY_ARTIFACT_DIR:-target/input-latency-gates}"
-TARGET_DIR="${FT_INPUT_LATENCY_TARGET_DIR:-target-input-latency-gates}"
+DEFAULT_TARGET_DIR="target/rch-input-latency-gates-${RUN_ID}"
+TARGET_DIR="${FT_INPUT_LATENCY_TARGET_DIR:-$DEFAULT_TARGET_DIR}"
 CHECK_ONLY_DIR=""
 RCH_MODE="${FT_INPUT_LATENCY_RCH_MODE:-auto}"
+RCH_SKIP_SMOKE_PREFLIGHT=1
+RCH_READY=0
 WARN_NEAR_RATIO="${FT_INPUT_LATENCY_WARN_NEAR_RATIO:-0.90}"
+RCH_JSON_BEGIN_MARKER="__FT_INPUT_LATENCY_JSON_BEGIN__"
+RCH_JSON_END_MARKER="__FT_INPUT_LATENCY_JSON_END__"
 
 # Global stage budget (queueing is the most direct pressure signal).
 QUEUE_WAIT_P95_MAX_MS="${FT_INPUT_LATENCY_QUEUE_WAIT_P95_MAX_MS:-120}"
@@ -96,6 +105,36 @@ float_gt() {
     awk "BEGIN { exit !($1 > $2) }"
 }
 
+ensure_rch_for_simulate() {
+    if [[ "$RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    rch_init "$ARTIFACT_DIR" "$RUN_ID" "input_latency_gates" "$PROJECT_ROOT"
+    ensure_rch_ready
+    RCH_READY=1
+}
+
+resolve_rch_target_dir() {
+    if [[ "$TARGET_DIR" != /* ]]; then
+        printf '%s\n' "$TARGET_DIR"
+    else
+        printf '%s\n' "$DEFAULT_TARGET_DIR"
+    fi
+}
+
+extract_rch_json() {
+    local input_log="$1"
+    local out_json="$2"
+
+    awk -v begin="$RCH_JSON_BEGIN_MARKER" -v end="$RCH_JSON_END_MARKER" '
+        $0 == begin { capturing = 1; next }
+        $0 == end { found_end = 1; exit }
+        capturing { print }
+        END { if (!found_end) exit 1 }
+    ' "$input_log" >"$out_json"
+}
+
 run_simulate() {
     local fixture="$1"
     local out_json="$2"
@@ -104,7 +143,48 @@ run_simulate() {
     local -a cmd=(cargo run -p frankenterm -- simulate run "$fixture" --json --resize-timeline-json)
 
     if [[ "$RCH_MODE" != "never" ]] && command -v rch >/dev/null 2>&1; then
-        rch exec -- env CARGO_TARGET_DIR="$TARGET_DIR" "${cmd[@]}" >"$out_json" 2>"$out_log"
+        ensure_rch_for_simulate
+        local rch_target_dir
+        rch_target_dir="$(resolve_rch_target_dir)"
+
+        set +e
+        # shellcheck disable=SC2016
+        run_rch_cargo_logged "$out_log" \
+            env CARGO_TARGET_DIR="$rch_target_dir" \
+                FT_INPUT_LATENCY_JSON_BEGIN="$RCH_JSON_BEGIN_MARKER" \
+                FT_INPUT_LATENCY_JSON_END="$RCH_JSON_END_MARKER" \
+                bash -lc '
+                    set -euo pipefail
+                    fixture="$1"
+                    json_begin="${FT_INPUT_LATENCY_JSON_BEGIN:?}"
+                    json_end="${FT_INPUT_LATENCY_JSON_END:?}"
+                    remote_artifact_dir="${CARGO_TARGET_DIR}/ft-input-latency"
+                    mkdir -p "$remote_artifact_dir"
+                    fixture_base="$(basename "$fixture" .yaml)"
+                    remote_json="${remote_artifact_dir}/${fixture_base}.json"
+                    remote_stderr="${remote_artifact_dir}/${fixture_base}.stderr.log"
+
+                    set +e
+                    cargo run -p frankenterm -- simulate run "$fixture" --json --resize-timeline-json >"$remote_json" 2>"$remote_stderr"
+                    rc=$?
+                    set -e
+
+                    if [[ -f "$remote_stderr" ]]; then
+                        cat "$remote_stderr" >&2
+                    fi
+                    printf "%s\n" "$json_begin"
+                    if [[ -f "$remote_json" ]]; then
+                        cat "$remote_json"
+                    fi
+                    printf "\n%s\n" "$json_end"
+                    exit "$rc"
+                ' bash "$fixture"
+        local rc=$?
+        set -e
+        if [[ "$rc" -ne 0 ]]; then
+            return "$rc"
+        fi
+        extract_rch_json "$out_log" "$out_json"
     else
         env CARGO_TARGET_DIR="$TARGET_DIR" "${cmd[@]}" >"$out_json" 2>"$out_log"
     fi
