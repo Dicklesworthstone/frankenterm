@@ -209,6 +209,17 @@ rch_extract_remote_exit_code() {
     sed -nE 's/.*Remote command finished: exit=([-0-9]+) in [0-9]+ms.*/\1/p' "${output_file}" 2>/dev/null | tail -n 1 | tr -cd '0-9-'
 }
 
+rch_log_has_remote_execution_marker() {
+    local output_file="$1"
+    grep -Eq "Selected worker:|Sync complete:|Remote command finished:" "${output_file}" 2>/dev/null
+}
+
+rch_log_has_remote_mirror_missing_file() {
+    local output_file="$1"
+    grep -Eq "error: couldn't read .+: No such file or directory \\(os error 2\\)" "${output_file}" 2>/dev/null \
+        && rch_log_has_remote_execution_marker "${output_file}"
+}
+
 rch_extract_failure_reason_code() {
     local output_file="$1"
 
@@ -224,6 +235,8 @@ rch_extract_failure_reason_code() {
         printf '%s\n' "RCH-PKG-CONFIG-DEPENDENCY-MISSING"
     elif grep -Fq "Error building OpenSSL:" "${output_file}" 2>/dev/null; then
         printf '%s\n' "RCH-VENDORED-OPENSSL-BUILD-FAILED"
+    elif rch_log_has_remote_mirror_missing_file "${output_file}"; then
+        printf '%s\n' "RCH-REMOTE-MIRROR-MISSING-FILE"
     fi
 }
 
@@ -242,6 +255,8 @@ rch_extract_failure_reason_detail() {
         grep -E "was not found in the pkg-config search path|No package '.*' found" "${output_file}" 2>/dev/null | head -n 1
     elif grep -Fq "Error building OpenSSL:" "${output_file}" 2>/dev/null; then
         grep -F "Error building OpenSSL:" "${output_file}" 2>/dev/null | tail -n 1
+    elif rch_log_has_remote_mirror_missing_file "${output_file}"; then
+        grep -E "error: couldn't read .+: No such file or directory \\(os error 2\\)" "${output_file}" 2>/dev/null | head -n 1
     fi
 }
 
