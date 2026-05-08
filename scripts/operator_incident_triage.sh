@@ -16,12 +16,27 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 PASS=0
 FAIL=0
 
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
+timestamp_utc() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
 step() {
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo "  Step $1: $2"
     echo "═══════════════════════════════════════════════════════════════"
-    echo '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","journey":"incident","step":'"$1"',"description":"'"$2"'"}'
+    printf '{"timestamp":"%s","journey":"incident","step":%s,"description":"%s"}\n' \
+        "$(timestamp_utc)" "$1" "$(json_escape "$2")"
 }
 
 pass() {

@@ -16,23 +16,40 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 PASS=0
 FAIL=0
 
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
+timestamp_utc() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
 step() {
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo "  Step $1: $2"
     echo "═══════════════════════════════════════════════════════════════"
-    echo '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","journey":"migration","step":'"$1"',"description":"'"$2"'"}'
+    printf '{"timestamp":"%s","journey":"migration","step":%s,"description":"%s"}\n' \
+        "$(timestamp_utc)" "$1" "$(json_escape "$2")"
 }
 
 pass() {
     echo "  ✓ $1"
-    echo '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","result":"pass","detail":"'"$1"'"}'
+    printf '{"timestamp":"%s","result":"pass","detail":"%s"}\n' \
+        "$(timestamp_utc)" "$(json_escape "$1")"
     PASS=$((PASS + 1))
 }
 
 fail() {
     echo "  ✗ $1"
-    echo '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","result":"fail","detail":"'"$1"'"}'
+    printf '{"timestamp":"%s","result":"fail","detail":"%s"}\n' \
+        "$(timestamp_utc)" "$(json_escape "$1")"
     echo "  → Recommended action: $2"
     FAIL=$((FAIL + 1))
 }
