@@ -134,12 +134,11 @@ run_rch_step_with_timeout() {
 : > "${STDOUT_FILE}"
 require_cmd jq
 require_cmd rch
-require_cmd cargo
 emit_log \
     "preflight" \
     "scenario_start" \
     "startup" \
-    "allocator_diagnostics" \
+    "allocator_diagnostics; local prerequisites jq+rch only; cargo executes remotely via rch" \
     "started" \
     "none" \
     "none" \
