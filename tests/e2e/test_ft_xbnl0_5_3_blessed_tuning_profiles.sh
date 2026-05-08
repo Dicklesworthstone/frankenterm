@@ -23,6 +23,7 @@ if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /
 else
   REMOTE_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
 fi
+REMOTE_PROFILE_FLOW_DIR="${REMOTE_TARGET_DIR}/profile-cli-flow-${RUN_ID}"
 export CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}"
 
 exec > >(tee -a "${STDOUT_FILE}")
@@ -51,6 +52,7 @@ write_env() {
     printf 'platform=%s\n' "$(uname -srm)"
     printf 'cwd=%s\n' "${ROOT_DIR}"
     printf 'remote_cargo_target_dir=%s\n' "${REMOTE_TARGET_DIR}"
+    printf 'remote_profile_flow_dir=%s\n' "${REMOTE_PROFILE_FLOW_DIR}"
     printf 'rch_skip_smoke_preflight=%s\n' "${RCH_SKIP_SMOKE_PREFLIGHT}"
   } > "${ENV_FILE}"
 }
@@ -196,11 +198,11 @@ rch_write_meta_json "${CHECK_LOG}"
 read -r -d '' REMOTE_SCRIPT <<'EOF' || true
 set -euo pipefail
 
-tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/ft-xbnl0-5-3.XXXXXX")"
-cleanup() {
-  rm -rf "${tmpdir}"
-}
-trap cleanup EXIT
+tmpdir="${FT_PROFILE_FLOW_DIR:?FT_PROFILE_FLOW_DIR is required}"
+if [[ "${tmpdir}" == /* || "${tmpdir}" == *".."* ]]; then
+  echo "FT_PROFILE_FLOW_DIR must be a repo-relative path without parent traversal: ${tmpdir}" >&2
+  exit 2
+fi
 
 config_path="${tmpdir}/ft.toml"
 profiles_dir="${tmpdir}/profiles"
@@ -269,12 +271,13 @@ jq -cn \
 EOF
 
 REMOTE_FLOW_LOG="${ARTIFACT_DIR}/profile_cli_flow.log"
-record_command "run_rch_cargo_logged env CARGO_TARGET_DIR=${REMOTE_TARGET_DIR} bash -lc <profile-cli-flow>"
+record_command "run_rch_cargo_logged env CARGO_TARGET_DIR=${REMOTE_TARGET_DIR} FT_PROFILE_FLOW_DIR=${REMOTE_PROFILE_FLOW_DIR} bash -lc <profile-cli-flow>"
 start_ns="$(date +%s%N)"
 set +e
 run_rch_cargo_logged \
   "${REMOTE_FLOW_LOG}" \
   env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
+    FT_PROFILE_FLOW_DIR="${REMOTE_PROFILE_FLOW_DIR}" \
     bash -lc "${REMOTE_SCRIPT}"
 remote_rc=$?
 set -e
