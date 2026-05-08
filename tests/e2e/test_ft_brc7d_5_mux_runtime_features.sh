@@ -10,7 +10,7 @@ SCENARIO_ID="ft_brc7d_5_mux_runtime_features"
 CORRELATION_ID="ft-brc7d.5-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.stdout.log"
-TARGET_DIR="target-rch-ft-brc7d-5-${RUN_ID}"
+TARGET_DIR="target/rch-e2e-ft-brc7d-5-${RUN_ID}"
 
 LAST_STEP_LOG=""
 
