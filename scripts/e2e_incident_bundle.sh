@@ -13,7 +13,7 @@
 #   - Edge cases: unicode, empty messages, large configs, size budgets
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - rch for remote Cargo test execution
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -23,6 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -47,6 +49,18 @@ TESTS_SKIPPED=0
 
 # Configuration
 VERBOSE=false
+
+# RCH cargo offload state
+E2E_RCH_RUN_ID="${E2E_RCH_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
+DEFAULT_E2E_RCH_TARGET_DIR="target/rch-e2e-incident-bundle-${E2E_RCH_RUN_ID}"
+REQUESTED_E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_E2E_RCH_TARGET_DIR" && "$REQUESTED_E2E_RCH_TARGET_DIR" != /* ]]; then
+    E2E_RCH_TARGET_DIR="$REQUESTED_E2E_RCH_TARGET_DIR"
+else
+    E2E_RCH_TARGET_DIR="$DEFAULT_E2E_RCH_TARGET_DIR"
+fi
+RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
+E2E_RCH_READY=0
 
 # ==============================================================================
 # Argument parsing
@@ -97,6 +111,41 @@ log_info() {
     fi
 }
 
+ensure_rch_for_cargo_tests() {
+    if [[ "$E2E_RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-incident-bundle-${E2E_RCH_RUN_ID}}"
+    mkdir -p "$rch_log_dir"
+    rch_init "$rch_log_dir" "$E2E_RCH_RUN_ID" "incident_bundle" "$PROJECT_ROOT"
+    ensure_rch_ready
+    E2E_RCH_READY=1
+}
+
+run_core_cargo_test() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+
+    ensure_rch_for_cargo_tests
+
+    set +e
+    if [[ "$timeout_secs" -gt 0 ]]; then
+        run_rch_cargo_logged_with_timeout "$timeout_secs" "$output_file" \
+            env CARGO_TARGET_DIR="$E2E_RCH_TARGET_DIR" \
+            cargo "$@"
+    else
+        run_rch_cargo_logged "$output_file" \
+            env CARGO_TARGET_DIR="$E2E_RCH_TARGET_DIR" \
+            cargo "$@"
+    fi
+    local rc=$?
+    set -e
+
+    return "$rc"
+}
+
 # ==============================================================================
 # Prerequisites
 # ==============================================================================
@@ -104,17 +153,14 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
-        exit 5
-    fi
-    log_pass "cargo available"
-
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
         exit 5
     fi
     log_pass "jq available"
+
+    ensure_rch_for_cargo_tests
+    log_pass "rch cargo offload available"
 }
 
 # ==============================================================================
@@ -128,9 +174,9 @@ scenario_bundle_format_contracts() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'incident_bundle::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'incident_bundle::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "bundle_format_contracts.log" "$(cat "$test_output")"
 
@@ -188,9 +234,9 @@ scenario_crash_bundle_redaction() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core --test incident_bundle_tests 'crash_bundle_redacts' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core --test incident_bundle_tests 'crash_bundle_redacts' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "crash_bundle_redaction.log" "$(cat "$test_output")"
 
@@ -223,9 +269,9 @@ scenario_incident_bundle_collector() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core --test incident_bundle_tests 'collect_incident_bundle' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core --test incident_bundle_tests 'collect_incident_bundle' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "incident_bundle_collector.log" "$(cat "$test_output")"
 
@@ -258,9 +304,9 @@ scenario_replay_validation() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core --test incident_bundle_tests 'replay' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core --test incident_bundle_tests 'replay' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "replay_validation.log" "$(cat "$test_output")"
 
@@ -293,9 +339,9 @@ scenario_crash_module_tests() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'crash::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'crash::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "crash_module_tests.log" "$(cat "$test_output")"
 
@@ -344,9 +390,9 @@ scenario_redaction_standalone() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'redact' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'redact' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "redaction_standalone.log" "$(cat "$test_output")"
 
@@ -386,9 +432,9 @@ scenario_replay_module() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'replay::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'replay::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "replay_module.log" "$(cat "$test_output")"
 
@@ -438,9 +484,9 @@ scenario_edge_cases() {
     exit_code=0
 
     # Run full integration test suite and validate edge cases are present
-    cargo test -p frankenterm-core --test incident_bundle_tests \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core --test incident_bundle_tests \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "edge_cases.log" "$(cat "$test_output")"
 
@@ -475,9 +521,9 @@ scenario_bounded_execution() {
     start_time=$(date +%s)
     exit_code=0
 
-    timeout 120 cargo test -p frankenterm-core --test incident_bundle_tests \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 120 "$test_output" \
+        test -p frankenterm-core --test incident_bundle_tests \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     end_time=$(date +%s)
     duration_s=$((end_time - start_time))
