@@ -14,8 +14,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+
 ARTIFACT_DIR="${FTUI_ARTIFACT_DIR:-target/ftui-test-artifacts}"
+RUN_ID="${FTUI_TEST_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+RCH_TARGET_DIR="${FTUI_TEST_RCH_TARGET_DIR:-target/rch-ftui-tests-${RUN_ID}}"
 mkdir -p "$ARTIFACT_DIR"
+rch_init "$ARTIFACT_DIR" "$RUN_ID" "ftui_tests" "$PROJECT_ROOT"
+
+run_ftui_cargo_logged() {
+    local log_file="$1"
+    shift
+
+    run_rch_cargo_logged "$log_file" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo "$@"
+}
 
 # =============================================================================
 # Minimum test count thresholds
@@ -29,10 +44,19 @@ MIN_TOTAL_TESTS=50
 # Step 1: List all ftui tests to compute counts before running
 # =============================================================================
 echo "[ftui-tests] Listing ftui tests..."
+echo "[ftui-tests] RCH artifacts: $ARTIFACT_DIR"
+echo "[ftui-tests] RCH cargo target: $RCH_TARGET_DIR"
 
 TEST_LIST_FILE="$ARTIFACT_DIR/test-list.txt"
-cargo test -p frankenterm-core --features ftui --lib -- --list 2>/dev/null \
-    | grep ': test$' > "$TEST_LIST_FILE" || true
+TEST_LIST_LOG="$ARTIFACT_DIR/test-list.log"
+ensure_rch_ready
+
+if ! run_ftui_cargo_logged "$TEST_LIST_LOG" \
+    test -p frankenterm-core --features ftui --lib -- --list; then
+    echo "[ftui-tests] FAIL: unable to list ftui tests through RCH (see $TEST_LIST_LOG)"
+    exit 1
+fi
+grep ': test$' "$TEST_LIST_LOG" > "$TEST_LIST_FILE" || true
 
 TOTAL_COUNT=$(wc -l < "$TEST_LIST_FILE" | tr -d ' ')
 SNAPSHOT_COUNT=$(grep -c '::snapshot_' "$TEST_LIST_FILE" || true)
@@ -80,8 +104,9 @@ echo "[ftui-tests] === Running snapshot tests ==="
 
 SNAPSHOT_LOG="$ARTIFACT_DIR/snapshot-tests.log"
 SNAPSHOT_EXIT=0
-cargo test -p frankenterm-core --features ftui --lib -- snapshot_ --nocapture 2>&1 \
-    | tee "$SNAPSHOT_LOG" || SNAPSHOT_EXIT=$?
+run_ftui_cargo_logged "$SNAPSHOT_LOG" \
+    test -p frankenterm-core --features ftui --lib -- snapshot_ --nocapture \
+    || SNAPSHOT_EXIT=$?
 
 SNAPSHOT_PASSED=$(grep -c '^test .* ok$' "$SNAPSHOT_LOG" || true)
 SNAPSHOT_FAILED=$(grep -c '^test .* FAILED$' "$SNAPSHOT_LOG" || true)
@@ -96,8 +121,9 @@ echo "[ftui-tests] === Running E2E tests ==="
 
 E2E_LOG="$ARTIFACT_DIR/e2e-tests.log"
 E2E_EXIT=0
-cargo test -p frankenterm-core --features ftui --lib -- e2e_ --nocapture 2>&1 \
-    | tee "$E2E_LOG" || E2E_EXIT=$?
+run_ftui_cargo_logged "$E2E_LOG" \
+    test -p frankenterm-core --features ftui --lib -- e2e_ --nocapture \
+    || E2E_EXIT=$?
 
 E2E_PASSED=$(grep -c '^test .* ok$' "$E2E_LOG" || true)
 E2E_FAILED=$(grep -c '^test .* FAILED$' "$E2E_LOG" || true)
@@ -112,8 +138,9 @@ echo "[ftui-tests] === Running unit tests ==="
 
 UNIT_LOG="$ARTIFACT_DIR/unit-tests.log"
 UNIT_EXIT=0
-cargo test -p frankenterm-core --features ftui --lib -- --skip snapshot_ --skip e2e_ 2>&1 \
-    | tee "$UNIT_LOG" || UNIT_EXIT=$?
+run_ftui_cargo_logged "$UNIT_LOG" \
+    test -p frankenterm-core --features ftui --lib -- --skip snapshot_ --skip e2e_ \
+    || UNIT_EXIT=$?
 
 UNIT_PASSED=$(grep -c '^test .* ok$' "$UNIT_LOG" || true)
 UNIT_FAILED=$(grep -c '^test .* FAILED$' "$UNIT_LOG" || true)
