@@ -10,9 +10,10 @@ SCENARIO_ID="ft_1i2ge_1_1_mission_schema_pack"
 CORRELATION_ID="ft-1i2ge.1.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_1_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_1_1_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_1_1_${RUN_ID}.probe.log"
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_1_1"
 ensure_rch_ready
 
@@ -70,45 +71,8 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-cmd_prefix="env CARGO_TARGET_DIR=target-ft-1i2ge-1-1"
-if command -v rch >/dev/null 2>&1; then
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    rch workers probe --all
-  ) >"${PROBE_FILE}" 2>&1
-  probe_status=$?
-  set -e
-
-  if [[ ${probe_status} -eq 0 ]] && grep -q "✓" "${PROBE_FILE}"; then
-    cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-1-1"
-    emit_log \
-      "running" \
-      "execution_preflight" \
-      "rch_workers_healthy" \
-      "none" \
-      "$(basename "${PROBE_FILE}")" \
-      "offloading tests through rch workers"
-  else
-    emit_log \
-      "running" \
-      "execution_preflight" \
-      "rch_workers_unreachable_local_fallback" \
-      "remote_worker_unavailable" \
-      "$(basename "${PROBE_FILE}")" \
-      "falling back to local execution for this e2e run"
-  fi
-else
-  emit_log \
-    "running" \
-    "execution_preflight" \
-    "rch_not_installed_local_fallback" \
-    "none" \
-    "$(basename "${LOG_FILE}")" \
-    "rch unavailable; running tests locally"
-fi
-
-TEST_CMD="cargo test -p frankenterm-core --lib mission_ -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-1-1"
+TEST_CMD=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib mission_ -- --nocapture)
 
 emit_log \
   "running" \
@@ -116,14 +80,11 @@ emit_log \
   "none" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "Executing: ${cmd_prefix} ${TEST_CMD}"
+  "Executing through rch: ${TEST_CMD[*]}"
 
 set +e
-(
-  cd "${ROOT_DIR}"
-  eval "${cmd_prefix} ${TEST_CMD}"
-) 2>&1 | tee "${STDOUT_FILE}"
-status=${PIPESTATUS[0]}
+run_rch_cargo_logged "${STDOUT_FILE}" "${TEST_CMD[@]}"
+status=$?
 set -e
 
 if [[ ${status} -ne 0 ]]; then
@@ -134,7 +95,7 @@ if [[ ${status} -ne 0 ]]; then
     "cargo_test_failed" \
     "$(basename "${STDOUT_FILE}")" \
     "exit=${status}"
-  exit ${status}
+  exit "${status}"
 fi
 
 required_markers=(
