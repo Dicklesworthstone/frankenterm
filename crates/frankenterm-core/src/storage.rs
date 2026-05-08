@@ -1123,6 +1123,255 @@ impl WriteCommandSender {
     }
 }
 
+struct StorageWriterOpenRequest {
+    db_path: String,
+    db_existed: bool,
+    defer_fts_triggers: bool,
+    cx: Option<crate::cx::Cx>,
+}
+
+trait StorageBackendLoan {
+    fn backend(&self) -> &dyn StorageBackend;
+
+    fn mark_successful_use(&mut self) {}
+}
+
+trait StorageBackendProvider: Send + Sync {
+    fn open_writer_backend(
+        &self,
+        request: StorageWriterOpenRequest,
+    ) -> Result<Box<dyn StorageBackend>>;
+
+    fn lend_read_backend<'a>(&'a self, db_path: &str) -> Result<Box<dyn StorageBackendLoan + 'a>>;
+
+    fn provider_name(&self) -> &'static str;
+}
+
+#[derive(Debug, Default)]
+struct RusqliteStorageBackendProvider;
+
+impl RusqliteStorageBackendProvider {
+    fn open_config_for_storage_handle() -> crate::storage_backend_trait::OpenConfig {
+        crate::storage_backend_trait::OpenConfig {
+            // Preserve the old database-open ordering: WAL mode is
+            // established by schema initialization/migrations below.
+            wal_mode: false,
+            ..crate::storage_backend_trait::OpenConfig::default()
+        }
+    }
+}
+
+impl StorageBackendProvider for RusqliteStorageBackendProvider {
+    fn open_writer_backend(
+        &self,
+        request: StorageWriterOpenRequest,
+    ) -> Result<Box<dyn StorageBackend>> {
+        if let Some(cx) = request.cx.as_ref() {
+            StorageHandle::checkpoint_storage_open(cx, "before database open")?;
+        }
+
+        let open_config = Self::open_config_for_storage_handle();
+        let backend = RusqliteBackend::open_path(Path::new(&request.db_path), &open_config)
+            .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+
+        if let Some(cx) = request.cx.as_ref() {
+            StorageHandle::checkpoint_storage_open(cx, "after database open")?;
+        }
+
+        // The primary writer connection: every subsequent operation
+        // (WAL recovery, schema init, ALTER/CREATE migrations, normal
+        // writes) needs the write lock. Without busy_timeout an active
+        // reader (any spawn_blocking read path opened via
+        // `open_read_storage_backend`) makes the very next PRAGMA fail
+        // with SQLITE_BUSY. SCHEMA_SQL doesn't set this (and is
+        // short-circuited on reopen of an up-to-date DB), so it must
+        // be applied here on every connection-open path. The discard
+        // is intentional — failure to apply busy_timeout is non-fatal,
+        // just makes the writer more contention-sensitive.
+        let _ = backend.set_busy_timeout(std::time::Duration::from_secs(5));
+
+        // Check for and recover from unclean shutdown (wa-o8j)
+        check_and_recover_wal(&backend, &request.db_path)?;
+
+        if let Some(cx) = request.cx.as_ref() {
+            StorageHandle::checkpoint_storage_open(cx, "after WAL recovery")?;
+        }
+
+        // [ft-s4myu] SQLite's `PRAGMA foreign_keys` is per-connection.
+        // `SCHEMA_SQL` enables it on schema init, but
+        // `initialize_schema` short-circuits for up-to-date databases
+        // (current == SCHEMA_VERSION → return at line ~4344 without
+        // executing SCHEMA_SQL), so without this explicit pragma every
+        // writer connection on a reopen of an existing DB would run
+        // with whatever the SQLite runtime default is. That silently
+        // disables every `ON DELETE CASCADE` in the schema
+        // (mux_pane_state → session_checkpoints, output_segments →
+        // panes, events → panes, and 12+ more). Concrete breakage:
+        // prune_session_checkpoints_sync leaves orphan mux_pane_state
+        // rows across restarts. Enforce FKs unconditionally on every
+        // connection open — idempotent, O(1).
+        backend
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .map_err(|e| {
+                StorageError::Database(format!(
+                    "Failed to enable foreign_keys PRAGMA (ft-s4myu): {e}"
+                ))
+            })?;
+        if let Some(cx) = request.cx.as_ref() {
+            StorageHandle::checkpoint_storage_open(cx, "after foreign key setup")?;
+        }
+
+        backend.with_connection(initialize_schema).map_err(|err| {
+            storage_backend_error("Failed to borrow database for schema initialization", err)
+        })??;
+
+        if let Some(cx) = request.cx.as_ref() {
+            StorageHandle::checkpoint_storage_open(cx, "after schema initialization")?;
+        }
+
+        // [ft-wk5fo] Deferred FTS indexing: drop the three
+        // per-INSERT/DELETE/UPDATE triggers on output_segments so new
+        // segment writes no longer synchronously rebuild the FTS
+        // inverted-index pages inside the append-segment writer
+        // path. Callers are responsible for invoking
+        // `StorageHandle::sync_fts` periodically to catch the index
+        // up — the `fts_pane_progress` table + backend startup-sync
+        // engine already support resumable batched indexing.
+        //
+        // [ft-ih4tm] Both branches are now idempotent so the flag is
+        // truly bidirectional. `initialize_schema` short-circuits for
+        // up-to-date databases (line ~4315 — returns without
+        // re-running SCHEMA_SQL), so a DB opened first with
+        // `defer_fts_triggers: true` and then reopened with `false`
+        // needs the explicit re-create here; otherwise the triggers
+        // stay dropped and the operator's "turn deferred off" intent
+        // is silently ignored. The CREATE statements mirror the ones
+        // in SCHEMA_SQL at line ~169 (see FTS_TRIGGER_RECREATE_SQL);
+        // keep the two in lockstep.
+        let (trigger_sql, trigger_error_context) = if request.defer_fts_triggers {
+            (
+                "DROP TRIGGER IF EXISTS output_segments_ai;
+                 DROP TRIGGER IF EXISTS output_segments_ad;
+                 DROP TRIGGER IF EXISTS output_segments_au;",
+                "Failed to drop FTS triggers for deferred indexing (ft-wk5fo)",
+            )
+        } else {
+            (
+                schema_ddl::FTS_TRIGGER_RECREATE_SQL,
+                "Failed to re-create FTS triggers after deferred indexing was disabled (ft-ih4tm)",
+            )
+        };
+        backend
+            .execute_batch(trigger_sql)
+            .map_err(|e| StorageError::Database(format!("{trigger_error_context}: {e}")))?;
+
+        if let Some(cx) = request.cx.as_ref() {
+            StorageHandle::checkpoint_storage_open(cx, "after FTS trigger setup")?;
+        }
+
+        #[cfg(unix)]
+        {
+            ensure_db_permissions(Path::new(&request.db_path), !request.db_existed)?;
+        }
+
+        if let Some(cx) = request.cx.as_ref() {
+            StorageHandle::checkpoint_storage_open(cx, "after permission setup")?;
+        }
+
+        Ok(Box::new(backend))
+    }
+
+    fn lend_read_backend<'a>(&'a self, db_path: &str) -> Result<Box<dyn StorageBackendLoan + 'a>> {
+        Ok(Box::new(RusqliteReadBackendLoan {
+            pooled: PooledReadConn::acquire(db_path)?,
+            return_to_pool: false,
+        }))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "rusqlite"
+    }
+}
+
+struct RusqliteReadBackendLoan {
+    pooled: PooledReadConn,
+    return_to_pool: bool,
+}
+
+impl StorageBackendLoan for RusqliteReadBackendLoan {
+    fn backend(&self) -> &dyn StorageBackend {
+        self.pooled.backend_ref()
+    }
+
+    fn mark_successful_use(&mut self) {
+        self.return_to_pool = true;
+    }
+}
+
+impl Drop for RusqliteReadBackendLoan {
+    fn drop(&mut self) {
+        if !self.return_to_pool {
+            self.pooled.discard_backend();
+        }
+    }
+}
+
+static STORAGE_BACKEND_PROVIDERS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<dyn StorageBackendProvider>>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn storage_backend_provider_registry() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Weak<dyn StorageBackendProvider>>,
+> {
+    STORAGE_BACKEND_PROVIDERS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn default_storage_backend_provider() -> Arc<dyn StorageBackendProvider> {
+    Arc::new(RusqliteStorageBackendProvider)
+}
+
+fn register_storage_backend_provider(db_path: &str, provider: &Arc<dyn StorageBackendProvider>) {
+    let provider_name = provider.provider_name();
+    let mut registry = storage_backend_provider_registry()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    registry.insert(db_path.to_string(), Arc::downgrade(provider));
+    tracing::debug!(
+        target: "ft.storage.backend",
+        db_path = db_path,
+        provider = provider_name,
+        "registered storage backend provider"
+    );
+}
+
+fn storage_backend_provider_for_path(db_path: &str) -> Option<Arc<dyn StorageBackendProvider>> {
+    let mut registry = storage_backend_provider_registry()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(provider) = registry.get(db_path).and_then(std::sync::Weak::upgrade) else {
+        registry.remove(db_path);
+        return None;
+    };
+    Some(provider)
+}
+
+fn with_provider_read_backend<F, R>(
+    provider: &dyn StorageBackendProvider,
+    db_path: &str,
+    f: F,
+) -> Result<R>
+where
+    F: FnOnce(&dyn StorageBackend) -> Result<R>,
+{
+    let mut loan = provider.lend_read_backend(db_path)?;
+    let result = f(loan.backend());
+    loan.mark_successful_use();
+    result
+}
+
 /// Thread-safe handle to the storage writer and its backing database.
 #[derive(Clone)]
 pub struct StorageHandle {
@@ -1130,6 +1379,8 @@ pub struct StorageHandle {
     write_tx: WriteCommandSender,
     /// Database path for read connections
     db_path: Arc<String>,
+    /// Backend provider that owns writer creation and read-backend lending.
+    backend_provider: Arc<dyn StorageBackendProvider>,
     /// Optional mmap mirror directory for segment fast-path reads.
     mmap_mirror_dir: Option<Arc<PathBuf>>,
     /// Writer thread join handle (for shutdown) - shared to allow Clone
@@ -1310,6 +1561,15 @@ impl StorageHandle {
         Self::with_config_inner(db_path, config, None).await
     }
 
+    #[cfg(test)]
+    async fn with_config_and_backend_provider_for_test(
+        db_path: &str,
+        config: StorageConfig,
+        backend_provider: Arc<dyn StorageBackendProvider>,
+    ) -> Result<Self> {
+        Self::with_config_inner_with_provider(db_path, config, None, backend_provider).await
+    }
+
     fn checkpoint_storage_open(cx: &crate::cx::Cx, phase: &str) -> Result<()> {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("storage open cancelled {phase}: {err}")).into()
@@ -1320,6 +1580,21 @@ impl StorageHandle {
         db_path: &str,
         config: StorageConfig,
         cx: Option<&crate::cx::Cx>,
+    ) -> Result<Self> {
+        Self::with_config_inner_with_provider(
+            db_path,
+            config,
+            cx,
+            default_storage_backend_provider(),
+        )
+        .await
+    }
+
+    async fn with_config_inner_with_provider(
+        db_path: &str,
+        config: StorageConfig,
+        cx: Option<&crate::cx::Cx>,
+        backend_provider: Arc<dyn StorageBackendProvider>,
     ) -> Result<Self> {
         if let Some(cx) = cx {
             Self::checkpoint_storage_open(cx, "before parent directory setup")?;
@@ -1332,127 +1607,15 @@ impl StorageHandle {
         // Open connection, recover WAL if needed, and initialize schema (blocking)
         let db_path_owned = db_path.to_string();
         let db_existed = Path::new(&db_path_owned).exists();
-        let defer_fts_triggers = config.defer_fts_triggers;
         let init_cx = cx.cloned();
-        let open_initialized_backend = move || -> Result<RusqliteBackend> {
-            if let Some(cx) = init_cx.as_ref() {
-                Self::checkpoint_storage_open(cx, "before database open")?;
-            }
-
-            let open_config = crate::storage_backend_trait::OpenConfig {
-                // Preserve the old database-open ordering: WAL mode is
-                // established by schema initialization/migrations below.
-                wal_mode: false,
-                ..crate::storage_backend_trait::OpenConfig::default()
-            };
-            let backend = RusqliteBackend::open_path(Path::new(&db_path_owned), &open_config)
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-
-            if let Some(cx) = init_cx.as_ref() {
-                Self::checkpoint_storage_open(cx, "after database open")?;
-            }
-
-            // The primary writer connection: every subsequent operation
-            // (WAL recovery, schema init, ALTER/CREATE migrations, normal
-            // writes) needs the write lock. Without busy_timeout an active
-            // reader (any spawn_blocking read path opened via
-            // `open_read_storage_backend`) makes the very next PRAGMA fail
-            // with SQLITE_BUSY. SCHEMA_SQL doesn't set this (and is
-            // short-circuited on reopen of an up-to-date DB), so it must
-            // be applied here on every connection-open path. The discard
-            // is intentional — failure to apply busy_timeout is non-fatal,
-            // just makes the writer more contention-sensitive.
-            let _ = backend.set_busy_timeout(std::time::Duration::from_secs(5));
-
-            // Check for and recover from unclean shutdown (wa-o8j)
-            check_and_recover_wal(&backend, &db_path_owned)?;
-
-            if let Some(cx) = init_cx.as_ref() {
-                Self::checkpoint_storage_open(cx, "after WAL recovery")?;
-            }
-
-            // [ft-s4myu] SQLite's `PRAGMA foreign_keys` is per-connection.
-            // `SCHEMA_SQL` enables it on schema init, but
-            // `initialize_schema` short-circuits for up-to-date databases
-            // (current == SCHEMA_VERSION → return at line ~4344 without
-            // executing SCHEMA_SQL), so without this explicit pragma every
-            // writer connection on a reopen of an existing DB would run
-            // with whatever the SQLite runtime default is. That silently
-            // disables every `ON DELETE CASCADE` in the schema
-            // (mux_pane_state → session_checkpoints, output_segments →
-            // panes, events → panes, and 12+ more). Concrete breakage:
-            // prune_session_checkpoints_sync leaves orphan mux_pane_state
-            // rows across restarts. Enforce FKs unconditionally on every
-            // connection open — idempotent, O(1).
-            backend
-                .execute_batch("PRAGMA foreign_keys = ON")
-                .map_err(|e| {
-                    StorageError::Database(format!(
-                        "Failed to enable foreign_keys PRAGMA (ft-s4myu): {e}"
-                    ))
-                })?;
-            if let Some(cx) = init_cx.as_ref() {
-                Self::checkpoint_storage_open(cx, "after foreign key setup")?;
-            }
-
-            backend.with_connection(initialize_schema).map_err(|err| {
-                storage_backend_error("Failed to borrow database for schema initialization", err)
-            })??;
-
-            if let Some(cx) = init_cx.as_ref() {
-                Self::checkpoint_storage_open(cx, "after schema initialization")?;
-            }
-
-            // [ft-wk5fo] Deferred FTS indexing: drop the three
-            // per-INSERT/DELETE/UPDATE triggers on output_segments so new
-            // segment writes no longer synchronously rebuild the FTS
-            // inverted-index pages inside the append-segment writer
-            // path. Callers are responsible for invoking
-            // `StorageHandle::sync_fts` periodically to catch the index
-            // up — the `fts_pane_progress` table + backend startup-sync
-            // engine already support resumable batched indexing.
-            //
-            // [ft-ih4tm] Both branches are now idempotent so the flag is
-            // truly bidirectional. `initialize_schema` short-circuits for
-            // up-to-date databases (line ~4315 — returns without
-            // re-running SCHEMA_SQL), so a DB opened first with
-            // `defer_fts_triggers: true` and then reopened with `false`
-            // needs the explicit re-create here; otherwise the triggers
-            // stay dropped and the operator's "turn deferred off" intent
-            // is silently ignored. The CREATE statements mirror the ones
-            // in SCHEMA_SQL at line ~169 (see FTS_TRIGGER_RECREATE_SQL);
-            // keep the two in lockstep.
-            let (trigger_sql, trigger_error_context) = if defer_fts_triggers {
-                (
-                    "DROP TRIGGER IF EXISTS output_segments_ai;
-                     DROP TRIGGER IF EXISTS output_segments_ad;
-                     DROP TRIGGER IF EXISTS output_segments_au;",
-                    "Failed to drop FTS triggers for deferred indexing (ft-wk5fo)",
-                )
-            } else {
-                (
-                    schema_ddl::FTS_TRIGGER_RECREATE_SQL,
-                    "Failed to re-create FTS triggers after deferred indexing was disabled (ft-ih4tm)",
-                )
-            };
-            backend
-                .execute_batch(trigger_sql)
-                .map_err(|e| StorageError::Database(format!("{trigger_error_context}: {e}")))?;
-
-            if let Some(cx) = init_cx.as_ref() {
-                Self::checkpoint_storage_open(cx, "after FTS trigger setup")?;
-            }
-
-            #[cfg(unix)]
-            {
-                ensure_db_permissions(Path::new(&db_path_owned), !db_existed)?;
-            }
-
-            if let Some(cx) = init_cx.as_ref() {
-                Self::checkpoint_storage_open(cx, "after permission setup")?;
-            }
-
-            Ok(backend)
+        let provider_for_open = Arc::clone(&backend_provider);
+        let open_initialized_backend = move || -> Result<Box<dyn StorageBackend>> {
+            provider_for_open.open_writer_backend(StorageWriterOpenRequest {
+                db_path: db_path_owned,
+                db_existed,
+                defer_fts_triggers: config.defer_fts_triggers,
+                cx: init_cx,
+            })
         };
         let init_result = if let Some(cx) = cx {
             Self::spawn_blocking_storage_with_cx_with_join_error(
@@ -1479,21 +1642,24 @@ impl StorageHandle {
             .spawn(move || {
                 let backend = init_result;
                 let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
-                writer_loop(&backend, &mut write_rx, &mut mmap_mirror);
+                writer_loop(backend.as_ref(), &mut write_rx, &mut mmap_mirror);
             })
             .map_err(|e| {
                 StorageError::Database(format!("Failed to spawn storage writer thread: {e}"))
             })?;
 
-        Ok(Self {
+        let handle = Self {
             write_tx: WriteCommandSender::new(write_tx),
             db_path: Arc::new(db_path.to_string()),
+            backend_provider,
             mmap_mirror_dir: mmap_runtime.map(|runtime| Arc::new(runtime.base_dir)),
             writer_handle: Arc::new(Mutex::new(Some(writer_handle))),
             semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
                 SemanticBudgetConfig::default(),
             ))),
-        })
+        };
+        register_storage_backend_provider(handle.db_path.as_str(), &handle.backend_provider);
+        Ok(handle)
     }
 
     /// Append a segment to storage
@@ -9863,8 +10029,9 @@ pub fn pooled_backend<F, R>(db_path: &str, f: F) -> Result<R>
 where
     F: FnOnce(&dyn StorageBackend) -> Result<R>,
 {
-    let pooled = PooledReadConn::acquire(db_path)?;
-    pooled.with_borrowed_backend(|backend| f(backend as &dyn StorageBackend))
+    let provider =
+        storage_backend_provider_for_path(db_path).unwrap_or_else(default_storage_backend_provider);
+    with_provider_read_backend(provider.as_ref(), db_path, f)
 }
 
 // ─── Read-connection pool (ft-bhyxz) ──────────────────────────────────────
@@ -10459,6 +10626,14 @@ impl PooledReadConn {
         // self drops here, returning the backend to the
         // per-db_path pool LIFO.
         result
+    }
+
+    pub(crate) fn backend_ref(&self) -> &RusqliteBackend {
+        self.backend.as_ref().expect("backend present until Drop")
+    }
+
+    pub(crate) fn discard_backend(&mut self) {
+        let _ = self.backend.take();
     }
 }
 
@@ -20631,10 +20806,15 @@ use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
 mod pool_telemetry_tests {
     use super::{
         POOL_HITS, POOL_LOCK_POISONED, POOL_MISSES, POOL_RETURNS, PoolTelemetrySnapshot,
-        PooledReadConn, pool_telemetry_snapshot, pooled_backend,
-        reset_pool_lock_poisoned_count_for_test,
+        PooledReadConn, StorageBackendLoan, StorageBackendProvider, StorageHandle,
+        StorageWriterOpenRequest, default_storage_backend_provider, pool_telemetry_snapshot,
+        pooled_backend, register_storage_backend_provider, reset_pool_lock_poisoned_count_for_test,
+        run_storage_async_test, with_provider_read_backend,
     };
-    use crate::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue};
+    use crate::storage_backend_trait::{
+        MockBackend, OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+    };
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::sync::{Mutex, OnceLock};
 
@@ -20849,6 +21029,141 @@ mod pool_telemetry_tests {
         .expect("pooled trait backend query");
 
         assert_eq!(name, "trait-object");
+    }
+
+    struct MockBackendProvider;
+
+    struct MockBackendLoan {
+        backend: MockBackend,
+    }
+
+    impl StorageBackendLoan for MockBackendLoan {
+        fn backend(&self) -> &dyn StorageBackend {
+            &self.backend
+        }
+    }
+
+    impl StorageBackendProvider for MockBackendProvider {
+        fn open_writer_backend(
+            &self,
+            _request: StorageWriterOpenRequest,
+        ) -> super::Result<Box<dyn StorageBackend>> {
+            Ok(Box::new(MockBackend::new()))
+        }
+
+        fn lend_read_backend<'a>(
+            &'a self,
+            _db_path: &str,
+        ) -> super::Result<Box<dyn StorageBackendLoan + 'a>> {
+            Ok(Box::new(MockBackendLoan {
+                backend: MockBackend::new(),
+            }))
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock-provider"
+        }
+    }
+
+    #[test]
+    fn default_provider_read_lending_preserves_pool_ft_qz6wi() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("provider_pool_trait.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let seed =
+            RusqliteBackend::open(&db_path_str, &OpenConfig::default()).expect("open seed backend");
+        seed.execute_batch(
+            "CREATE TABLE sample (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO sample (id, name) VALUES (1, 'provider-pool');",
+        )
+        .expect("seed table");
+        drop(seed);
+
+        let provider = default_storage_backend_provider();
+        let start = baseline();
+        for _ in 0..2 {
+            let name = with_provider_read_backend(provider.as_ref(), &db_path_str, |backend| {
+                let row = backend
+                    .query_row_typed(
+                        "SELECT name FROM sample WHERE id = ?1",
+                        &[ToSqlValue::Integer(1)],
+                    )
+                    .map_err(|err| {
+                        super::storage_backend_error("provider read backend trait test", err)
+                    })?
+                    .expect("seed row");
+                Ok(row
+                    .first()
+                    .cloned()
+                    .expect("seed query returned one column"))
+            })
+            .expect("provider read backend query");
+            assert_eq!(name, "provider-pool");
+        }
+        let end = baseline();
+        let d = delta(start, end);
+
+        assert!(
+            d.misses >= 1,
+            "first provider-backed read should open through the pool"
+        );
+        assert!(
+            d.hits >= 1,
+            "second provider-backed read should reuse the pooled backend"
+        );
+    }
+
+    #[test]
+    fn registered_provider_overrides_pooled_backend_lending_ft_qz6wi() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+
+        let db_path = format!(
+            "mock-provider-{}-{}",
+            std::process::id(),
+            baseline().total_acquires()
+        );
+        let provider: Arc<dyn StorageBackendProvider> = Arc::new(MockBackendProvider);
+        register_storage_backend_provider(&db_path, &provider);
+
+        let backend_name = pooled_backend(&db_path, |backend| Ok(backend.backend_name()))
+            .expect("registered provider should lend a backend");
+
+        assert_eq!(backend_name, "mock");
+    }
+
+    #[test]
+    fn storage_handle_custom_provider_registers_read_lending_ft_qz6wi() {
+        run_storage_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = temp_dir.path().join("mock_provider_handle.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let provider: Arc<dyn StorageBackendProvider> = Arc::new(MockBackendProvider);
+
+            let storage = StorageHandle::with_config_and_backend_provider_for_test(
+                &db_path_str,
+                super::StorageConfig::default(),
+                provider,
+            )
+            .await
+            .expect("construct storage handle with mock provider");
+
+            assert_eq!(storage.backend_provider.provider_name(), "mock-provider");
+            let backend_name = pooled_backend(&db_path_str, |backend| Ok(backend.backend_name()))
+                .expect("registered handle provider should lend reads");
+            assert_eq!(backend_name, "mock");
+
+            storage
+                .shutdown()
+                .await
+                .expect("shutdown mock-backed handle");
+        });
     }
 }
 
