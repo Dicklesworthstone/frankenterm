@@ -11,7 +11,7 @@ CORRELATION_ID="ft-124z4-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.stdout.log"
 
-DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft124z4"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft124z4-${RUN_ID}"
 INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
 if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
   CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
@@ -95,6 +95,29 @@ run_step() {
   return "${rc}"
 }
 
+run_cargo_step() {
+  local label="$1"
+  shift
+
+  LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
+  LAST_STEP_QUEUE_LOG=""
+  set +e
+  (run_rch_cargo_logged "${LAST_STEP_LOG}" "$@")
+  local rc=$?
+  set -e
+
+  if [[ -f "${LAST_STEP_LOG}" ]]; then
+    cat "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
+  fi
+
+  LAST_STEP_QUEUE_LOG="${LAST_STEP_LOG%.log}.rch_queue_timeout.log"
+  if [[ ! -f "${LAST_STEP_QUEUE_LOG}" ]]; then
+    LAST_STEP_QUEUE_LOG=""
+  fi
+
+  return "${rc}"
+}
+
 rch_fail_open_detected() {
   local log_path="$1"
   grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${log_path}"
@@ -132,12 +155,37 @@ run_with_timeout() {
 
 step_timed_out() {
   local step_rc="$1"
-  [[ ${step_rc} -eq 124 || ${step_rc} -eq 137 ]]
+  local meta_path
+
+  if [[ ${step_rc} -eq 124 || ${step_rc} -eq 137 ]]; then
+    return 0
+  fi
+
+  if [[ -n "${LAST_STEP_LOG}" ]]; then
+    meta_path="$(rch_log_meta_path "${LAST_STEP_LOG}")"
+    if [[ -f "${meta_path}" ]] && jq -e '.timed_out == true' "${meta_path}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
 }
 
 step_timeout_artifact() {
+  local queue_log meta_path
+
   if [[ -n "${LAST_STEP_QUEUE_LOG}" ]]; then
     basename "${LAST_STEP_QUEUE_LOG}"
+  elif [[ -n "${LAST_STEP_LOG}" && -f "${LAST_STEP_LOG%.log}.rch_queue_timeout.log" ]]; then
+    queue_log="${LAST_STEP_LOG%.log}.rch_queue_timeout.log"
+    basename "${queue_log}"
+  elif [[ -n "${LAST_STEP_LOG}" ]]; then
+    meta_path="$(rch_log_meta_path "${LAST_STEP_LOG}")"
+    if [[ -f "${meta_path}" ]]; then
+      basename "${meta_path}"
+    else
+      basename "${LAST_STEP_LOG}"
+    fi
   else
     basename "${LAST_STEP_LOG}"
   fi
@@ -509,7 +557,7 @@ if ! run_rch_topology_preflight; then
 fi
 
 emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-if run_step rch_remote_smoke run_rch exec -- cargo check --help; then
+if run_cargo_step rch_remote_smoke env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check --help; then
   if rch_fail_open_detected "${LAST_STEP_LOG}"; then
     if rch_socket_path_issue_detected "${LAST_STEP_LOG}"; then
       emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${LAST_STEP_LOG}")"
@@ -522,7 +570,13 @@ if run_step rch_remote_smoke run_rch exec -- cargo check --help; then
   emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "passed" "remote_exec_confirmed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
   step_rc=$?
-  if step_timed_out "${step_rc}"; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    if rch_socket_path_issue_detected "${LAST_STEP_LOG}"; then
+      emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${LAST_STEP_LOG}")"
+    else
+      emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    fi
+  elif step_timed_out "${step_rc}"; then
     emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
   else
     emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_smoke_failed" "RCH-REMOTE-SMOKE-FAIL" "$(basename "${LAST_STEP_LOG}")"
@@ -531,8 +585,8 @@ else
 fi
 
 emit_log "validation" "nominal_path" "tailer_labruntime_tests" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-if run_step nominal_labruntime \
-  run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test tailer_labruntime --features asupersync-runtime -- --nocapture; then
+if run_cargo_step nominal_labruntime \
+  env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test tailer_labruntime --features asupersync-runtime -- --nocapture; then
   if rch_fail_open_detected "${LAST_STEP_LOG}"; then
     emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
     echo "rch fell back to local execution; failing per offload-only policy" >&2
@@ -541,7 +595,10 @@ if run_step nominal_labruntime \
   emit_log "validation" "nominal_path" "tailer_labruntime_tests" "passed" "tests_passed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
   step_rc=$?
-  if step_timed_out "${step_rc}"; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    echo "rch fell back to local execution; failing per offload-only policy" >&2
+  elif step_timed_out "${step_rc}"; then
     emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
   else
     emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "test_failure" "CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
@@ -551,8 +608,8 @@ fi
 
 emit_log "validation" "failure_injection_path" "bench_without_feature" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
 set +e
-run_step failure_missing_feature \
-  run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --message-format short
+run_cargo_step failure_missing_feature \
+  env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --message-format short
 missing_feature_rc=$?
 set -e
 
@@ -580,8 +637,8 @@ fi
 emit_log "validation" "failure_injection_path" "bench_without_feature" "passed" "expected_feature_gate_failure" "none" "$(basename "${LAST_STEP_LOG}")"
 
 emit_log "validation" "recovery_path" "bench_with_feature" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-if run_step recovery_with_feature \
-  run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --features asupersync-runtime --message-format short; then
+if run_cargo_step recovery_with_feature \
+  env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --features asupersync-runtime --message-format short; then
   if rch_fail_open_detected "${LAST_STEP_LOG}"; then
     emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
     echo "rch fell back to local execution; failing per offload-only policy" >&2
@@ -590,7 +647,10 @@ if run_step recovery_with_feature \
   emit_log "validation" "recovery_path" "bench_with_feature" "passed" "recovery_success" "none" "$(basename "${LAST_STEP_LOG}")"
 else
   step_rc=$?
-  if step_timed_out "${step_rc}"; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    echo "rch fell back to local execution; failing per offload-only policy" >&2
+  elif step_timed_out "${step_rc}"; then
     emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
   else
     emit_log "validation" "recovery_path" "bench_with_feature" "failed" "recovery_failed" "CARGO-CHECK-FAIL" "$(basename "${LAST_STEP_LOG}")"
