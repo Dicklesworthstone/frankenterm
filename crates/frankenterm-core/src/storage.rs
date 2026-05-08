@@ -7769,6 +7769,7 @@ where
 #[cfg(test)]
 mod writer_bridge_tests {
     use super::{Connection, RusqliteBackend, WRITER_PLACEHOLDER_POOL, with_writer_backend};
+    use crate::storage_backend_helpers::{execute_typed, table_exists};
     use crate::storage_backend_trait::OpenConfig;
 
     fn new_writer_bridge_conn() -> Connection {
@@ -7781,6 +7782,23 @@ mod writer_bridge_tests {
             .into_connection()
     }
 
+    fn create_writer_bridge_panic_pin(conn: Connection) -> Connection {
+        let backend = RusqliteBackend::new(conn);
+        execute_typed(
+            &backend,
+            "CREATE TABLE writer_bridge_panic_pin (k INTEGER)",
+            &[],
+        )
+        .unwrap();
+        backend.into_connection()
+    }
+
+    fn assert_writer_bridge_panic_pin_exists(conn: Connection) {
+        let backend = RusqliteBackend::new(conn);
+        let exists = table_exists(&backend, "writer_bridge_panic_pin").unwrap();
+        assert!(exists, "post-panic conn must still see the live schema");
+    }
+
     /// Pinned: the live `Connection` is restored even when `f` panics.
     /// Pre-fix the `mem::replace(conn, placeholder)` had already
     /// happened by the time the closure unwound, so a hypothetical
@@ -7789,9 +7807,7 @@ mod writer_bridge_tests {
     /// placeholder.
     #[test]
     fn with_writer_backend_restores_conn_on_panic() {
-        let mut conn = new_writer_bridge_conn();
-        conn.execute("CREATE TABLE writer_bridge_panic_pin (k INTEGER)", [])
-            .unwrap();
+        let mut conn = create_writer_bridge_panic_pin(new_writer_bridge_conn());
         // Identity probe: the post-panic conn must accept queries
         // against the table we just created. The placeholder would
         // not have it.
@@ -7806,14 +7822,7 @@ mod writer_bridge_tests {
         // The schema we created MUST still be reachable through `conn`.
         // If the bridge had left `conn` pointing at the in-memory
         // placeholder, this query would fail with "no such table".
-        let exists: i64 = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='writer_bridge_panic_pin'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("post-panic conn must still see the live schema");
-        assert_eq!(exists, 1);
+        assert_writer_bridge_panic_pin_exists(conn);
     }
 
     /// Pinned: the placeholder is recycled across calls (once-per-thread
