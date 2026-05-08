@@ -18,7 +18,7 @@ else
   TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
 fi
 LAST_STEP_LOG=""
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_SOCKET_PATH_REGEX='unix_listener: path .*too long for Unix domain socket|too long for Unix domain socket'
 LOCAL_RCH_TMPDIR_OVERRIDE=""
 
@@ -26,6 +26,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
 fi
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "8vla_mmap_scrollback"
 ensure_rch_ready

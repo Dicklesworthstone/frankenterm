@@ -19,7 +19,7 @@ REMOTE_WORKSPACE_ROOT="${RCH_REMOTE_WORKSPACE_ROOT:-/data/projects/$(basename "$
 REMOTE_SCRATCH_ROOT="${RCH_REMOTE_SCRATCH_ROOT:-${REMOTE_WORKSPACE_ROOT}/target/${REMOTE_SCRATCH_BASENAME}}"
 REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-/var/tmp}"
 REMOTE_TARGET_DIR="${RCH_REMOTE_TARGET_DIR:-${REMOTE_SCRATCH_ROOT}/cargo-target}"
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|running locally'
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
 BENCH_RCH_STEP_TIMEOUT_SECS="${BENCH_RCH_STEP_TIMEOUT_SECS:-1800}"
 TIMEOUT_BIN=""
@@ -37,6 +37,7 @@ export RCH_BUILD_TIMEOUT_SEC="${RCH_BUILD_TIMEOUT_SEC:-1200}"
 # harness reaches its real validation path.
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "nu4_4_3_2"
 ensure_rch_ready
@@ -194,7 +195,7 @@ run_rch_guarded() {
     if declare -F "$1" >/dev/null 2>&1; then
       local shell_fn="$1"
       shift
-      export -f "${shell_fn}"
+      export -f "${shell_fn?}"
       export REMOTE_TMPDIR REMOTE_TARGET_DIR
       local shell_cmd
       printf -v shell_cmd '%q ' "${shell_fn}" "$@"

@@ -65,7 +65,7 @@ log_structured() {
         | tee -a "$LOG_DIR/results.jsonl"
 }
 
-RCH_FAIL_OPEN_REGEX='\[RCH\] local|running locally'
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_PROBE_LOG="$LOG_DIR/rch_probe.log"
 RCH_SMOKE_LOG="$LOG_DIR/rch_smoke.log"
 
