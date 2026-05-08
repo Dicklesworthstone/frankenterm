@@ -25,10 +25,21 @@ SKIP_COUNT=0
 
 mkdir -p "$LOG_DIR"
 
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "dr6zv_1_3_3_rrf_weights"
-ensure_rch_ready
+# Preflight: resolve cargo and target dir
+CARGO="${CARGO:-cargo}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-dr6zv-133-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+    TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+    TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR="$TARGET_DIR"
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is required for rch metadata artifacts." >&2
+    exit 1
+fi
 
 json_escape() {
     local value="$1"
@@ -57,15 +68,31 @@ log_event() {
         >> "$LOG_FILE"
 }
 
-# Preflight: resolve cargo and target dir
-CARGO="${CARGO:-cargo}"
-TARGET_DIR="${CARGO_TARGET_DIR:-target-e2e-dr6zv-133}"
-export CARGO_TARGET_DIR="$TARGET_DIR"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "dr6zv_1_3_3_rrf_weights"
+ensure_rch_ready
+
+run_cargo_logged() {
+    local output_file="$1"
+    shift
+    run_rch_cargo_logged "${output_file}" \
+        env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+        "${CARGO}" "$@"
+}
+
+cargo_tail_ok() {
+    local output_file="$1"
+    shift
+    run_cargo_logged "${output_file}" "$@" \
+        && tail -1 "${output_file}" | grep -q "test result: ok"
+}
 
 log_event "preflight" "start" "info" "" "target_dir=$TARGET_DIR"
 
 # Check build
-if ! $CARGO check -p frankenterm-core --lib 2>/dev/null; then
+if ! run_cargo_logged "${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_cargo_check.log" \
+    check -p frankenterm-core --lib; then
     log_event "preflight" "cargo_check" "fail" "build_failure" "frankenterm-core lib check failed"
     echo "FAIL: cargo check failed"
     exit 1
@@ -76,7 +103,8 @@ log_event "preflight" "cargo_check" "pass" "" ""
 SCENARIO="unit_tests"
 log_event "$SCENARIO" "start" "info" "" ""
 
-if $CARGO test -p frankenterm-core --lib -- hybrid_search 2>&1 | tail -1 | grep -q "test result: ok"; then
+if cargo_tail_ok "${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_${SCENARIO}.log" \
+    test -p frankenterm-core --lib -- hybrid_search; then
     PASS_COUNT=$((PASS_COUNT + 1))
     log_event "$SCENARIO" "done" "pass" "" "all hybrid_search unit tests pass"
 else
@@ -88,7 +116,8 @@ fi
 SCENARIO="orchestrator_tests"
 log_event "$SCENARIO" "start" "info" "" ""
 
-if $CARGO test -p frankenterm-core --lib -- search::orchestrator 2>&1 | tail -1 | grep -q "test result: ok"; then
+if cargo_tail_ok "${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_${SCENARIO}.log" \
+    test -p frankenterm-core --lib -- search::orchestrator; then
     PASS_COUNT=$((PASS_COUNT + 1))
     log_event "$SCENARIO" "done" "pass" "" "all orchestrator unit tests pass"
 else
@@ -100,7 +129,8 @@ fi
 SCENARIO="proptest_hybrid"
 log_event "$SCENARIO" "start" "info" "" ""
 
-if $CARGO test -p frankenterm-core --test proptest_hybrid_search 2>&1 | tail -1 | grep -q "test result: ok"; then
+if cargo_tail_ok "${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_${SCENARIO}.log" \
+    test -p frankenterm-core --test proptest_hybrid_search; then
     PASS_COUNT=$((PASS_COUNT + 1))
     log_event "$SCENARIO" "done" "pass" "" "proptest hybrid search suite passes"
 else
@@ -112,7 +142,8 @@ fi
 SCENARIO="contract_freeze"
 log_event "$SCENARIO" "start" "info" "" ""
 
-if $CARGO test -p frankenterm-core --test search_api_contract_freeze 2>&1 | tail -1 | grep -q "test result: ok"; then
+if cargo_tail_ok "${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_${SCENARIO}.log" \
+    test -p frankenterm-core --test search_api_contract_freeze; then
     PASS_COUNT=$((PASS_COUNT + 1))
     log_event "$SCENARIO" "done" "pass" "" "search API contract preserved (no regression)"
 else
@@ -124,7 +155,8 @@ fi
 SCENARIO="proptest_orchestrator"
 log_event "$SCENARIO" "start" "info" "" ""
 
-if $CARGO test -p frankenterm-core --test proptest_search_orchestrator 2>&1 | tail -1 | grep -q "test result: ok"; then
+if cargo_tail_ok "${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_${SCENARIO}.log" \
+    test -p frankenterm-core --test proptest_search_orchestrator; then
     PASS_COUNT=$((PASS_COUNT + 1))
     log_event "$SCENARIO" "done" "pass" "" "proptest orchestrator suite passes"
 else
@@ -136,7 +168,8 @@ fi
 SCENARIO="integration_hybrid_fusion"
 log_event "$SCENARIO" "start" "info" "" ""
 
-if $CARGO test -p frankenterm-core --test hybrid_fusion_tests 2>&1 | tail -1 | grep -q "test result: ok"; then
+if cargo_tail_ok "${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_${SCENARIO}.log" \
+    test -p frankenterm-core --test hybrid_fusion_tests; then
     PASS_COUNT=$((PASS_COUNT + 1))
     log_event "$SCENARIO" "done" "pass" "" "hybrid fusion integration tests pass"
 else
@@ -148,10 +181,13 @@ fi
 SCENARIO="determinism_repeat"
 log_event "$SCENARIO" "start" "info" "" ""
 
-RESULT1=$($CARGO test -p frankenterm-core --lib -- frankensearch_rrf_unit_weights_match_local_rrf 2>&1 | tail -1)
-RESULT2=$($CARGO test -p frankenterm-core --lib -- frankensearch_rrf_unit_weights_match_local_rrf 2>&1 | tail -1)
+DETERMINISM_LOG_1="${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_${SCENARIO}_1.log"
+DETERMINISM_LOG_2="${LOG_DIR}/${BEAD_ID//./_}_${RUN_ID}_${SCENARIO}_2.log"
 
-if echo "$RESULT1" | grep -q "test result: ok" && echo "$RESULT2" | grep -q "test result: ok"; then
+if cargo_tail_ok "${DETERMINISM_LOG_1}" \
+    test -p frankenterm-core --lib -- frankensearch_rrf_unit_weights_match_local_rrf \
+    && cargo_tail_ok "${DETERMINISM_LOG_2}" \
+        test -p frankenterm-core --lib -- frankensearch_rrf_unit_weights_match_local_rrf; then
     PASS_COUNT=$((PASS_COUNT + 1))
     log_event "$SCENARIO" "done" "pass" "" "deterministic across 2 runs"
 else
