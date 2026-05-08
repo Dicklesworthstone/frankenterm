@@ -35,16 +35,39 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "ft-94juo guard: cargo not found on PATH; cannot inspect workspace metadata." >&2
+RUN_ID="${FT_WORKSPACE_CYCLES_RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
+ARTIFACT_DIR="${FT_WORKSPACE_CYCLES_ARTIFACT_DIR:-target/workspace-cycle-guard}"
+DEFAULT_TARGET_DIR="target/rch-workspace-cycles-${RUN_ID}"
+REQUESTED_TARGET_DIR="${FT_WORKSPACE_CYCLES_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+    RCH_CARGO_TARGET_DIR="${REQUESTED_TARGET_DIR}"
+else
+    RCH_CARGO_TARGET_DIR="${DEFAULT_TARGET_DIR}"
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ft-94juo guard: jq not found on PATH; RCH metadata artifacts require it." >&2
     exit 2
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "ft-94juo guard: python3 not found on PATH; the cycle detector needs it." >&2
-    exit 2
-fi
+mkdir -p "${ARTIFACT_DIR}"
+
+RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
+RCH_STEP_TIMEOUT_SECS="${FT_WORKSPACE_CYCLES_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-600}}"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${REPO_ROOT}/tests/e2e/lib_rch_guards.sh"
+rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "workspace_cycles" "${REPO_ROOT}"
+ensure_rch_ready
 
 # `--no-deps` keeps the metadata small (workspace members only, no
 # transitive dep graph). The DFS only needs intra-workspace edges.
-cargo metadata --format-version=1 --no-deps | python3 "${SCRIPT_DIR}/check_workspace_cycles.py"
+cycle_log="${ARTIFACT_DIR}/workspace-cycles-${RUN_ID}.rch.log"
+set +e
+run_rch_cargo_logged "${cycle_log}" \
+    env CARGO_TARGET_DIR="${RCH_CARGO_TARGET_DIR}" \
+    bash -lc 'cargo metadata --format-version=1 --no-deps | python3 scripts/check_workspace_cycles.py'
+rc=$?
+set -e
+
+cat "${cycle_log}"
+exit "${rc}"
