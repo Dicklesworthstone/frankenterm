@@ -10,11 +10,11 @@ SCENARIO_ID="ft_1i2ge_3_2_dispatch_adapter"
 CORRELATION_ID="ft-1i2ge.3.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_3_2_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_3_2_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_3_2_${RUN_ID}.probe.log"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 # shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_3_2"
 ensure_rch_ready
 
@@ -66,74 +66,38 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission dispatch adapter contract validation (target resolution + dry-run/live normalization)"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required_missing" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for cargo execution in this scenario"
-  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_workers_unhealthy" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "rch workers probe failed; refusing local fallback"
-  echo "rch workers are unavailable; refusing local cargo execution." >&2
-  exit 1
-fi
-
-cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-3-2"
-emit_log \
-  "running" \
-  "execution_preflight" \
-  "rch_workers_healthy" \
-  "none" \
-  "$(basename "${PROBE_FILE}")" \
-  "offloading tests through rch workers"
-
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_dispatch_contract_maps_candidate_to_robot_and_coordination_primitives -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_contract_maps_wait_for_to_robot_wait_for -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_adapter_resolves_target_with_pane_agent_and_thread -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_adapter_wait_for_target_resolves_pane_from_condition -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_adapter_rejects_unknown_assignment -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_adapter_dry_run_normalizes_success_outcome -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_adapter_live_success_defaults_reason_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_adapter_live_failure_normalizes_reason_and_error_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_adapter_live_failure_rejects_unknown_reason_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_dispatch_adapter_live_failure_rejects_mismatched_error_code -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-3-2"
+TEST_FILTERS=(
+  "mission_dispatch_contract_maps_candidate_to_robot_and_coordination_primitives"
+  "mission_dispatch_contract_maps_wait_for_to_robot_wait_for"
+  "mission_dispatch_adapter_resolves_target_with_pane_agent_and_thread"
+  "mission_dispatch_adapter_wait_for_target_resolves_pane_from_condition"
+  "mission_dispatch_adapter_rejects_unknown_assignment"
+  "mission_dispatch_adapter_dry_run_normalizes_success_outcome"
+  "mission_dispatch_adapter_live_success_defaults_reason_code"
+  "mission_dispatch_adapter_live_failure_normalizes_reason_and_error_code"
+  "mission_dispatch_adapter_live_failure_rejects_unknown_reason_code"
+  "mission_dispatch_adapter_live_failure_rejects_mismatched_error_code"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_3_2_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture)
   decision_path="contract_surface"
   reason_code="none"
-  if [[ "${test_cmd}" == *"rejects_"* ]]; then
+  if [[ "${test_filter}" == *"rejects_"* ]]; then
     decision_path="failure_injection_path"
     reason_code="dispatch_failure_contract_checks"
-  elif [[ "${test_cmd}" == *"dry_run"* ]]; then
+  elif [[ "${test_filter}" == *"dry_run"* ]]; then
     decision_path="dry_run_path"
     reason_code="dry_run_normalization"
-  elif [[ "${test_cmd}" == *"live_success"* ]] || [[ "${test_cmd}" == *"normalizes_reason_and_error_code"* ]]; then
+  elif [[ "${test_filter}" == *"live_success"* ]] || [[ "${test_filter}" == *"normalizes_reason_and_error_code"* ]]; then
     decision_path="live_dispatch_path"
     reason_code="live_outcome_normalization"
-  elif [[ "${test_cmd}" == *"wait_for"* ]] || [[ "${test_cmd}" == *"resolves_target"* ]]; then
+  elif [[ "${test_filter}" == *"wait_for"* ]] || [[ "${test_filter}" == *"resolves_target"* ]]; then
     decision_path="target_resolution_path"
     reason_code="target_resolution_validation"
   fi
@@ -144,15 +108,13 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: ${cmd_prefix} ${test_cmd}"
+    "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${cmd_prefix} ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -161,7 +123,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
+      "exit=${status}; command=${test_cmd[*]}"
     exit "${status}"
   fi
 done
