@@ -1319,8 +1319,15 @@ impl StorageHandle {
                 Self::checkpoint_storage_open(cx, "before database open")?;
             }
 
-            let conn = Connection::open(&db_path_owned)
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            let open_config = crate::storage_backend_trait::OpenConfig {
+                // Preserve the old Connection::open ordering: WAL mode is
+                // established by schema initialization/migrations below.
+                wal_mode: false,
+                ..crate::storage_backend_trait::OpenConfig::default()
+            };
+            let conn = RusqliteBackend::open_path(Path::new(&db_path_owned), &open_config)
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?
+                .into_connection();
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after database open")?;
