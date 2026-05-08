@@ -5,8 +5,8 @@
 `151bde5fe`).
 **Status:** Foundation slice shipped. Per-compositor
 verification matrix contract + harness scaffold + ft doctor
-exposure surface + Linux integration test slot all live; the
-actual Wayland driver wiring (calling production
+exposure surface + ignored Linux manual evidence verifier all
+live; the actual Wayland driver wiring (calling production
 `frame_callback_chain_depth_peak()` from a real `ft` window
 running on each Tier-1 compositor) is the integration
 follow-on — gated on a Linux Wayland CI runner being
@@ -51,7 +51,8 @@ Default parameters (`ResizeStormConfig::default`):
 The operator drives the reproducer manually via `ydotool`, an
 input synthesizer, or a `WAYLAND_DEBUG=1` simulation. The
 resulting `chain_depth_peak()` reading is fed to the matrix
-via `verify_compositor`.
+via the ignored Linux evidence test, which calls
+`verify_compositor`.
 
 ## Acceptance bounds
 
@@ -131,7 +132,7 @@ checklist.
 #   - Wayland session active
 #
 # Output:
-#   - chain_depth_peak printed at exit
+#   - verification JSON printed by the ignored Linux test
 #   - exit code 0 on pass (peak ≤ 1), nonzero on fail.
 
 # 1. Launch ft in a known-size window.
@@ -152,19 +153,22 @@ done
 PEAK=$(ft doctor --json | jq '.frame_callback.chain_depth_peak')
 kill $FT_PID
 
-# 4. Assert pre-fix bound.
-if [ "$PEAK" -gt 1 ]; then
-    echo "FAIL: chain_depth_peak=$PEAK > 1 on $XDG_CURRENT_DESKTOP"
-    exit 1
-fi
-echo "PASS: chain_depth_peak=$PEAK on $XDG_CURRENT_DESKTOP"
+# 4. Feed the evidence into the ignored Linux verifier.
+#    Supported slugs: mutter, kwin, sway, hyprland, wayfire, weston.
+FT_WAYLAND_RESIZE_STORM_COMPOSITOR=mutter \
+FT_WAYLAND_RESIZE_STORM_VERSION="$(mutter --version)" \
+FT_WAYLAND_RESIZE_STORM_CHAIN_DEPTH_PEAK="$PEAK" \
+cargo test -p frankenterm-core --test wayland_resize_storm \
+    --no-default-features \
+    linux_resize_storm_against_running_ft_window \
+    -- --ignored --nocapture
 ```
 
 ## Bead acceptance status
 
 | Item | Status |
 |---|---|
-| Linux integration test exists | ✓ scaffold + harness contract + ignored Linux-only stub |
+| Linux integration test exists | ✓ scaffold + harness contract + ignored Linux-only manual evidence verifier |
 | Per-Tier-1-compositor manual verification documented | ✓ this doc + reproducer script |
 | ft doctor reports frame_callback_chain_depth_peak | ✓ `FrameCallbackHealth` contract; operator wires the production accessor in the integration follow-on |
 | Reorder fix shipped iff chain depth > 1 observed | ⏳ no failing reproducer yet — the structural guards hold by inspection |

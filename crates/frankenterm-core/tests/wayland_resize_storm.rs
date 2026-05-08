@@ -28,16 +28,16 @@
 //! the observed peak and append the result to
 //! `docs/security/wayland-frame-pacing-validation.md`.
 //!
-//! ## Future Linux-only test
+//! ## Linux-only manual evidence test
 //!
-//! When CI grows a Wayland-capable runner (Ubuntu 24.04 +
-//! `weston --headless`, mutter via `gnome-shell --headless`,
-//! or sway via a virtual seat), the `#[cfg(target_os =
-//! "linux")]` block below extends to actually drive ft and
-//! assert the chain_depth_peak ≤ 1 bound at the end. Today
-//! the test is target-agnostic: it validates the contract +
-//! harness shape on every PR and serves as the slot the
-//! Linux driver plugs into.
+//! The `#[cfg(target_os = "linux")]` block below consumes
+//! operator-captured evidence from a real Wayland session and
+//! asserts the `chain_depth_peak <= 1` bound. When CI grows a
+//! Wayland-capable runner (Ubuntu 24.04 + `weston --headless`,
+//! mutter via `gnome-shell --headless`, or sway via a virtual
+//! seat), that test can grow from evidence consumption into
+//! driving the ft window directly. Today the always-on tests
+//! validate the contract + harness shape on every PR.
 
 use frankenterm_core::wayland_compositor_matrix::{
     ChainDepthBound, CompositorIdentity, CompositorMatrixSnapshot, CompositorTier,
@@ -127,6 +127,78 @@ fn verify_compositor(
     VerificationResult::observed(compositor, version, config, bound, chain_depth_peak)
 }
 
+fn compositor_slug_list() -> String {
+    CompositorIdentity::ALL
+        .iter()
+        .map(|c| c.slug())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_compositor_identity(raw: &str) -> Result<CompositorIdentity, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "empty compositor slug; expected one of: {}",
+            compositor_slug_list()
+        ));
+    }
+
+    let slug = trimmed.to_ascii_lowercase();
+    CompositorIdentity::from_slug(&slug).ok_or_else(|| {
+        format!(
+            "unsupported compositor slug `{trimmed}`; expected one of: {}",
+            compositor_slug_list()
+        )
+    })
+}
+
+fn parse_chain_depth_peak(raw: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    trimmed
+        .parse::<u32>()
+        .map_err(|err| format!("invalid chain depth peak `{trimmed}`: {err}"))
+}
+
+fn parse_chain_depth_bound(raw: Option<&str>) -> Result<ChainDepthBound, String> {
+    let Some(raw) = raw else {
+        return Ok(ChainDepthBound::PRE_FIX);
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(ChainDepthBound::PRE_FIX);
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
+        "pre_fix" | "pre-fix" | "pre" | "1" => Ok(ChainDepthBound::PRE_FIX),
+        "post_fix" | "post-fix" | "post" | "2" => Ok(ChainDepthBound::POST_FIX),
+        other => {
+            let peak_max = other.strip_prefix("peak_max=").unwrap_or(other);
+            peak_max
+                .parse::<u32>()
+                .map(|peak_max| ChainDepthBound { peak_max })
+                .map_err(|err| {
+                    format!(
+                        "unsupported chain depth bound `{trimmed}`: {err}; \
+                         use pre_fix, post_fix, or peak_max=N"
+                    )
+                })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn required_env(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) => panic!("{name} must not be empty for the Wayland resize-storm evidence test"),
+        Err(err) => {
+            panic!("{name} is required for the ignored Linux resize-storm evidence test: {err}");
+        }
+    }
+}
+
 #[test]
 fn verify_compositor_reports_pass_at_pre_fix_bound_zero_peak() {
     let r = verify_compositor(
@@ -197,6 +269,54 @@ fn assert_chain_depth_safe_fails_above_bound() {
     assert!(!h.is_safe(ChainDepthBound::POST_FIX));
 }
 
+#[test]
+fn parse_compositor_identity_accepts_case_and_spacing() {
+    assert_eq!(
+        parse_compositor_identity(" Mutter "),
+        Ok(CompositorIdentity::Mutter)
+    );
+    assert_eq!(
+        parse_compositor_identity("SWAY"),
+        Ok(CompositorIdentity::Sway)
+    );
+}
+
+#[test]
+fn parse_compositor_identity_rejects_unknown_slug() {
+    let err = parse_compositor_identity("gnome").expect_err("gnome is not a matrix slug");
+    assert!(err.contains("unsupported compositor slug"));
+    assert!(err.contains("mutter"));
+}
+
+#[test]
+fn parse_chain_depth_peak_accepts_only_unsigned_integers() {
+    assert_eq!(parse_chain_depth_peak(" 1 "), Ok(1));
+    assert!(parse_chain_depth_peak("-1").is_err());
+    assert!(parse_chain_depth_peak("1.5").is_err());
+}
+
+#[test]
+fn parse_chain_depth_bound_defaults_to_pre_fix() {
+    assert_eq!(parse_chain_depth_bound(None), Ok(ChainDepthBound::PRE_FIX));
+    assert_eq!(
+        parse_chain_depth_bound(Some("")),
+        Ok(ChainDepthBound::PRE_FIX)
+    );
+}
+
+#[test]
+fn parse_chain_depth_bound_accepts_named_and_numeric_forms() {
+    assert_eq!(
+        parse_chain_depth_bound(Some("post-fix")),
+        Ok(ChainDepthBound::POST_FIX)
+    );
+    assert_eq!(
+        parse_chain_depth_bound(Some("peak_max=7")),
+        Ok(ChainDepthBound { peak_max: 7 })
+    );
+    assert!(parse_chain_depth_bound(Some("wide-open")).is_err());
+}
+
 // ----------------------------------------------------------------------------
 // Matrix shape — the per-release JSON artifact contract
 // ----------------------------------------------------------------------------
@@ -242,9 +362,9 @@ fn matrix_snapshot_serializes_to_per_release_artifact_shape() {
 }
 
 // ----------------------------------------------------------------------------
-// Linux-only driver hook (compile-only when target_os = "linux";
-// no actual driver yet — the integration follow-on populates
-// this).
+// Linux-only manual evidence hook. This is ignored because it requires a real
+// Wayland compositor and ft window, but the test itself is executable today:
+// operators feed it the observed chain-depth peak after running the storm.
 // ----------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -252,33 +372,59 @@ fn matrix_snapshot_serializes_to_per_release_artifact_shape() {
 #[ignore = "requires Wayland compositor + ft binary; manual operator runs this"]
 fn linux_resize_storm_against_running_ft_window() {
     // Operator-driven: the bead's manual verification matrix
-    // calls this with a real ft window present. The test is
-    // #[ignore]'d so it doesn't run in headless CI; an
-    // operator runs it explicitly:
+    // calls this after sampling a real ft window. The test is
+    // #[ignore]'d so it doesn't run in headless CI. An operator
+    // runs it explicitly with evidence captured from the
+    // release host:
     //
-    //     CARGO_TARGET_DIR=... \
+    //     FT_WAYLAND_RESIZE_STORM_COMPOSITOR=mutter \
+    //     FT_WAYLAND_RESIZE_STORM_VERSION="$(mutter --version)" \
+    //     FT_WAYLAND_RESIZE_STORM_CHAIN_DEPTH_PEAK="$PEAK" \
     //     cargo test -p frankenterm-core --test wayland_resize_storm \
+    //         --no-default-features \
     //         linux_resize_storm_against_running_ft_window \
-    //         --features asupersync-runtime --no-default-features \
-    //         -- --ignored
+    //         -- --ignored --nocapture
     //
-    // The driver:
-    // 1. Spawn `ft` (or attach to a running instance via the
-    //    GUI IPC seam).
-    // 2. Read the compositor identity from `WAYLAND_COMPOSITOR`
-    //    or `XDG_CURRENT_DESKTOP`.
-    // 3. Run the resize-storm reproducer (vary window dim
-    //    every ~17ms for 5s).
-    // 4. Sample `frame_callback_chain_depth_peak()` from the
-    //    GUI process via the doctor seam.
-    // 5. Call verify_compositor; append to the matrix
-    //    snapshot.
-    //
-    // This stub is the slot; the actual driver lands in the
-    // integration follow-on bead (when the Linux Wayland CI
-    // runner is provisioned).
+    // Optional: set FT_WAYLAND_RESIZE_STORM_BOUND=post_fix,
+    // pre_fix, or peak_max=N. Unset defaults to pre_fix.
 
-    panic!("Linux Wayland resize-storm driver not yet implemented; see ft-28opz follow-on");
+    let compositor_raw = required_env("FT_WAYLAND_RESIZE_STORM_COMPOSITOR");
+    let version = required_env("FT_WAYLAND_RESIZE_STORM_VERSION");
+    let peak_raw = required_env("FT_WAYLAND_RESIZE_STORM_CHAIN_DEPTH_PEAK");
+    let bound_raw = std::env::var("FT_WAYLAND_RESIZE_STORM_BOUND").ok();
+
+    let compositor = match parse_compositor_identity(&compositor_raw) {
+        Ok(compositor) => compositor,
+        Err(message) => panic!("{message}"),
+    };
+    let chain_depth_peak = match parse_chain_depth_peak(&peak_raw) {
+        Ok(chain_depth_peak) => chain_depth_peak,
+        Err(message) => panic!("{message}"),
+    };
+    let bound = match parse_chain_depth_bound(bound_raw.as_deref()) {
+        Ok(bound) => bound,
+        Err(message) => panic!("{message}"),
+    };
+
+    let result = verify_compositor(
+        compositor,
+        &version,
+        ResizeStormConfig::default(),
+        bound,
+        chain_depth_peak,
+    );
+    let result_json =
+        serde_json::to_string_pretty(&result).expect("verification result serializes");
+    println!("{result_json}");
+
+    assert!(
+        result.passed,
+        "resize-storm evidence failed for {} {}: chain_depth_peak={} exceeds bound peak_max={}",
+        result.compositor.slug(),
+        result.version,
+        result.chain_depth_peak,
+        result.bound.peak_max
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
