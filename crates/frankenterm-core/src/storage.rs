@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{
@@ -1071,11 +1072,17 @@ fn ensure_db_permissions(_path: &Path, _is_new: bool) -> Result<()> {
 #[derive(Clone)]
 struct WriteCommandSender {
     inner: mpsc::Sender<WriteCommand>,
+    queued_depth: Arc<AtomicUsize>,
+    max_capacity: usize,
 }
 
 impl WriteCommandSender {
-    fn new(inner: mpsc::Sender<WriteCommand>) -> Self {
-        Self { inner }
+    fn new(inner: mpsc::Sender<WriteCommand>, max_capacity: usize) -> Self {
+        Self {
+            inner,
+            queued_depth: Arc::new(AtomicUsize::new(0)),
+            max_capacity,
+        }
     }
 
     async fn send(
@@ -1083,7 +1090,13 @@ impl WriteCommandSender {
         command: WriteCommand,
     ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
         let cx = crate::cx::for_request();
-        self.inner.send(&cx, command).await
+        self.send_with_cx(&cx, command).await
+    }
+
+    fn mark_command_dequeued(counter: &AtomicUsize) {
+        let _ = counter.fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |depth| {
+            depth.checked_sub(1)
+        });
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`WriteCommandSender::send`].
@@ -1092,10 +1105,10 @@ impl WriteCommandSender {
     /// path: the legacy `send` uses `crate::cx::for_request()` for
     /// its inner mpsc reserve wait, severing the cancellation
     /// chain from every storage `_with_cx` caller. This sibling
-    /// threads the caller's cx all the way into
-    /// `self.inner.send(cx, command)` so a full writer queue
-    /// under a cancelled parent cx releases immediately rather
-    /// than waiting for backpressure to drain.
+    /// threads the caller's cx all the way into the inner mpsc
+    /// reserve path so a full writer queue under a cancelled parent
+    /// cx releases immediately rather than waiting for backpressure
+    /// to drain.
     ///
     /// Per-call-site migration is incremental; this tick wires
     /// the 6 event-annotation writes from tick 136. Future ticks
@@ -1107,15 +1120,35 @@ impl WriteCommandSender {
         cx: &crate::cx::Cx,
         command: WriteCommand,
     ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
-        self.inner.send(cx, command).await
+        let permit = match self.inner.reserve(cx).await {
+            Ok(permit) => permit,
+            Err(mpsc::SendError::Disconnected(())) => {
+                return Err(mpsc::SendError::Disconnected(command));
+            }
+            Err(mpsc::SendError::Full(())) => return Err(mpsc::SendError::Full(command)),
+            Err(mpsc::SendError::Cancelled(())) => return Err(mpsc::SendError::Cancelled(command)),
+        };
+
+        self.queued_depth.fetch_add(1, AtomicOrdering::AcqRel);
+        match permit.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                Self::mark_command_dequeued(&self.queued_depth);
+                Err(err)
+            }
+        }
     }
 
     fn max_capacity(&self) -> usize {
-        self.inner.capacity()
+        self.max_capacity
     }
 
     fn capacity(&self) -> usize {
-        self.inner.capacity()
+        self.max_capacity.saturating_sub(
+            self.queued_depth
+                .load(AtomicOrdering::Acquire)
+                .min(self.max_capacity),
+        )
     }
 
     fn is_closed(&self) -> bool {
@@ -1633,7 +1666,9 @@ impl StorageHandle {
         }
 
         // Create bounded channel for write commands
-        let (write_tx, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
+        let (write_tx_raw, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
+        let write_tx = WriteCommandSender::new(write_tx_raw, config.write_queue_size);
+        let queued_depth_for_writer = Arc::clone(&write_tx.queued_depth);
         let mmap_runtime_for_writer = mmap_runtime.clone();
 
         // Spawn writer thread
@@ -1642,14 +1677,19 @@ impl StorageHandle {
             .spawn(move || {
                 let backend = init_result;
                 let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
-                writer_loop(backend.as_ref(), &mut write_rx, &mut mmap_mirror);
+                writer_loop(
+                    backend.as_ref(),
+                    &mut write_rx,
+                    &mut mmap_mirror,
+                    &queued_depth_for_writer,
+                );
             })
             .map_err(|e| {
                 StorageError::Database(format!("Failed to spawn storage writer thread: {e}"))
             })?;
 
         let handle = Self {
-            write_tx: WriteCommandSender::new(write_tx),
+            write_tx,
             db_path: Arc::new(db_path.to_string()),
             backend_provider,
             mmap_mirror_dir: mmap_runtime.map(|runtime| Arc::new(runtime.base_dir)),
@@ -7749,6 +7789,7 @@ fn writer_loop(
     backend: &dyn StorageBackend,
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    queued_depth: &AtomicUsize,
 ) {
     let mut segment_redactors = HashMap::<u64, StreamingRedactor>::new();
     let mut io_gate = StorageIoWriterGate::default();
@@ -7771,6 +7812,7 @@ fn writer_loop(
     'main: loop {
         match rx.try_recv() {
             Ok(first_cmd) => {
+                WriteCommandSender::mark_command_dequeued(queued_depth);
                 let mut should_break = false;
                 let mut batch = VecDeque::with_capacity(WRITER_BATCH_CAP);
                 batch.push_back(first_cmd);
@@ -7779,6 +7821,7 @@ fn writer_loop(
                     let Ok(cmd) = rx.try_recv() else {
                         break;
                     };
+                    WriteCommandSender::mark_command_dequeued(queued_depth);
                     batch.push_back(cmd);
                 }
 
@@ -20798,6 +20841,49 @@ fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
 #[cfg(test)]
 use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
 
+#[cfg(test)]
+mod write_command_sender_tests {
+    use super::{WriteCommand, WriteCommandSender, run_storage_async_test};
+    use crate::runtime_async::{mpsc, oneshot};
+
+    #[test]
+    fn write_command_sender_capacity_tracks_reserved_depth_ft_3hfif() {
+        run_storage_async_test(async {
+            let (tx, _rx) = mpsc::channel::<WriteCommand>(2);
+            let sender = WriteCommandSender::new(tx, 2);
+
+            assert_eq!(sender.max_capacity(), 2);
+            assert_eq!(sender.capacity(), 2);
+            assert_eq!(sender.max_capacity() - sender.capacity(), 0);
+
+            let (respond, _respond_rx) = oneshot::channel();
+            sender
+                .send(WriteCommand::Shutdown { respond })
+                .await
+                .expect("queue shutdown command");
+
+            assert_eq!(sender.max_capacity(), 2);
+            assert_eq!(
+                sender.capacity(),
+                1,
+                "queued command should consume one sender capacity slot"
+            );
+            assert_eq!(
+                sender.max_capacity() - sender.capacity(),
+                1,
+                "write queue depth must reflect reserved queued commands"
+            );
+
+            WriteCommandSender::mark_command_dequeued(&sender.queued_depth);
+            assert_eq!(
+                sender.capacity(),
+                2,
+                "writer dequeue should release the tracked depth slot"
+            );
+        });
+    }
+}
+
 // =============================================================================
 // br-ft-rvt1z: PooledReadConn telemetry tests (ft-q4udk follow-up)
 // =============================================================================
@@ -21146,6 +21232,141 @@ mod pool_telemetry_tests {
             .expect("registered provider should lend a backend");
 
         assert_eq!(backend_name, "mock");
+    }
+
+    fn parity_pane(pane_id: u64) -> super::PaneRecord {
+        super::PaneRecord {
+            pane_id,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some(format!("rusqlite-parity-{pane_id}")),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }
+    }
+
+    #[test]
+    fn storage_handle_default_rusqlite_provider_roundtrip_and_pool_parity_ft_3hfif() {
+        run_storage_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = temp_dir.path().join("rusqlite_provider_parity_ft_3hfif.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+
+            let mut storage =
+                StorageHandle::with_config(&db_path_str, super::StorageConfig::default())
+                    .await
+                    .expect("construct default rusqlite storage handle");
+            storage.mmap_mirror_dir = None;
+
+            assert_eq!(
+                storage.backend_provider.provider_name(),
+                "rusqlite",
+                "default StorageHandle path must use the rusqlite provider"
+            );
+
+            let missing_pane_error = storage
+                .append_segment(404_404, "must fail before pane upsert", None)
+                .await
+                .expect_err("writer must enforce output_segments pane foreign key");
+            assert!(
+                missing_pane_error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("foreign key"),
+                "missing-pane append should fail through sqlite FK enforcement, got {missing_pane_error}"
+            );
+
+            storage
+                .upsert_pane(parity_pane(9))
+                .await
+                .expect("upsert pane through default rusqlite writer");
+            let segment = storage
+                .append_segment(9, "rusqlite parity segment", Some("hash-9".to_string()))
+                .await
+                .expect("append segment through default rusqlite writer");
+            assert_eq!(segment.pane_id, 9);
+            assert_eq!(segment.seq, 0);
+            assert_eq!(segment.content, "rusqlite parity segment");
+            assert_eq!(segment.content_hash.as_deref(), Some("hash-9"));
+
+            let journal_mode = pooled_backend(&db_path_str, |backend| {
+                let row = backend
+                    .query_row_typed("PRAGMA journal_mode", &[])
+                    .map_err(|err| super::storage_backend_error("journal mode parity", err))?
+                    .expect("journal mode row");
+                Ok(row.first().cloned().expect("journal mode column"))
+            })
+            .expect("query journal mode through pooled backend");
+            assert_eq!(
+                journal_mode.to_ascii_lowercase(),
+                "wal",
+                "default rusqlite open path must leave the database in WAL mode"
+            );
+
+            let trigger_count = pooled_backend(&db_path_str, |backend| {
+                let row = backend
+                    .query_row_typed(
+                        "SELECT COUNT(*) FROM sqlite_master \
+                         WHERE type = 'trigger' \
+                         AND name IN ('output_segments_ai', 'output_segments_ad', 'output_segments_au')",
+                        &[],
+                    )
+                    .map_err(|err| super::storage_backend_error("fts trigger parity", err))?
+                    .expect("trigger count row");
+                Ok(row.first().cloned().expect("trigger count column"))
+            })
+            .expect("query FTS trigger state through pooled backend");
+            assert_eq!(
+                trigger_count, "3",
+                "default rusqlite open path must preserve output_segments FTS triggers"
+            );
+
+            let start = {
+                let _guard = pool_counter_test_lock()
+                    .lock()
+                    .expect("pool telemetry test lock should not be poisoned");
+                baseline()
+            };
+            for _ in 0..2 {
+                let segments = storage
+                    .get_segments(9, 10)
+                    .await
+                    .expect("read segments through StorageHandle pooled backend");
+                assert_eq!(segments.len(), 1);
+                assert_eq!(segments[0].content, "rusqlite parity segment");
+            }
+            let end = {
+                let _guard = pool_counter_test_lock()
+                    .lock()
+                    .expect("pool telemetry test lock should not be poisoned");
+                baseline()
+            };
+            let d = delta(start, end);
+            assert!(
+                d.hits + d.misses >= 2,
+                "StorageHandle get_segments must acquire pooled read backends; got hits={} misses={}",
+                d.hits,
+                d.misses
+            );
+            assert!(
+                d.hits >= 1,
+                "second StorageHandle get_segments read should reuse the pooled backend; got hits={} misses={}",
+                d.hits,
+                d.misses
+            );
+
+            storage
+                .shutdown()
+                .await
+                .expect("shutdown default rusqlite storage handle");
+        });
     }
 
     #[test]

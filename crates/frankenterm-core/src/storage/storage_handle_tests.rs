@@ -6,7 +6,7 @@ use super::*;
 use rusqlite::Connection;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // Counter for unique temp DB paths
 
@@ -870,7 +870,8 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
     drop(tx);
 
     let backend = RusqliteBackend::new(conn);
-    writer_loop(&backend, &mut rx, &mut mmap_mirror);
+    let queued_depth = AtomicUsize::new(3);
+    writer_loop(&backend, &mut rx, &mut mmap_mirror, &queued_depth);
     let conn = backend.into_connection();
 
     let segment_count: i64 = conn
