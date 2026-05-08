@@ -48,7 +48,6 @@ TESTS_SKIPPED=0
 # Configuration
 FT_BIN=""
 VERBOSE=false
-HAS_WEZTERM=false
 
 # Temp workspaces (cleaned up at exit)
 declare -a TEMP_DIRS=()
@@ -285,10 +284,8 @@ check_prerequisites() {
 
     # Check WezTerm availability (optional)
     if command -v wezterm &>/dev/null && wezterm cli list-clients &>/dev/null 2>&1; then
-        HAS_WEZTERM=true
         log_pass "P.4: WezTerm mux server available"
     else
-        HAS_WEZTERM=false
         log_skip "P.4: WezTerm mux server not available (some tests will be skipped)"
     fi
 }
