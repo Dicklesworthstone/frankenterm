@@ -13,7 +13,13 @@ raw_dir="$LOG_DIR/${run_id}_raw"
 mkdir -p "$raw_dir"
 
 cargo_home="/tmp/cargo-home-replay-artifact-reader"
-cargo_target_dir="$ROOT_DIR/target-replay-artifact-reader"
+default_cargo_target_dir="target/rch-e2e-replay-artifact-reader-${run_id}"
+requested_cargo_target_dir="${CARGO_TARGET_DIR:-}"
+if [[ -n "${requested_cargo_target_dir}" && "${requested_cargo_target_dir}" != /* ]]; then
+  cargo_target_dir="${requested_cargo_target_dir}"
+else
+  cargo_target_dir="${default_cargo_target_dir}"
+fi
 
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
 
