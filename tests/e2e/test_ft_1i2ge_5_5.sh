@@ -19,13 +19,13 @@ LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
 # shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_5"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required for structured logging" >&2
   exit 1
 fi
 
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_5"
 ensure_rch_ready
 
 emit_log() {
@@ -81,38 +81,62 @@ assert_jq_true() {
   exit 1
 }
 
+extract_marked_stdout() {
+  local combined_file="$1"
+  local stdout_file="$2"
+
+  awk '
+    $0 == "__FT_STDOUT_BEGIN__" { capture = 1; found = 1; next }
+    $0 == "__FT_STDOUT_END__" { capture = 0; done = 1; exit }
+    capture && $0 !~ /^__FT_STDERR__/ && $0 !~ /^\[RCH\]/ { print }
+    END { if (!found || !done) exit 1 }
+  ' "${combined_file}" >"${stdout_file}"
+}
+
+extract_prefixed_stderr() {
+  local combined_file="$1"
+  local stderr_file="$2"
+
+  sed -n 's/^__FT_STDERR__//p' "${combined_file}" >"${stderr_file}"
+}
+
 run_mission_json() {
   local label="$1"
   shift
   local stdout_file="${LOG_DIR}/ft_1i2ge_5_5_${RUN_ID}.${label}.stdout.json"
   local stderr_file="${LOG_DIR}/ft_1i2ge_5_5_${RUN_ID}.${label}.stderr.log"
+  local combined_file="${LOG_DIR}/ft_1i2ge_5_5_${RUN_ID}.${label}.rch.log"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    run_rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" \
-      cargo run -q -p frankenterm --bin ft -- \
-      --workspace "${WORKSPACE_REL_DIR}" \
-      mission \
-      -f json \
-      "$@"
-  ) >"${stdout_file}" 2>"${stderr_file}"
+  # shellcheck disable=SC2016
+  run_rch_cargo_logged "${combined_file}" \
+    env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    bash -lc '
+      printf "%s\n" "__FT_STDOUT_BEGIN__"
+      cargo run -q -p frankenterm --bin ft -- "$@" 2> >(sed "s/^/__FT_STDERR__/" >&2)
+      rc=$?
+      printf "%s\n" "__FT_STDOUT_END__"
+      exit "${rc}"
+    ' bash \
+    --workspace "${WORKSPACE_REL_DIR}" \
+    mission \
+    -f json \
+    "$@"
   local rc=$?
   set -e
 
-  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${stdout_file}" "${stderr_file}" 2>/dev/null; then
-    emit_log \
-      "failed" \
-      "rch_offload_policy" \
-      "rch_local_fallback_detected" \
-      "RCH-LOCAL-FALLBACK" \
-      "$(basename "${stderr_file}")" \
-      "rch emitted local fallback marker for label=${label}; refusing local execution"
-    exit 3
-  fi
-
   LAST_STDOUT_FILE="${stdout_file}"
   LAST_STDERR_FILE="${stderr_file}"
+
+  if ! extract_marked_stdout "${combined_file}" "${stdout_file}"; then
+    emit_log "failed" "rch_output_capture" "stdout_marker_missing" "RCH-OUTPUT-MARKER" \
+      "$(basename "${combined_file}")" "could not extract mission JSON stdout for ${label}"
+    echo "Could not extract mission JSON stdout for ${label}" >&2
+    echo "Combined output: ${combined_file}" >&2
+    exit 3
+  fi
+  extract_prefixed_stderr "${combined_file}" "${stderr_file}"
+
   return "${rc}"
 }
 
