@@ -9,11 +9,14 @@ RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_3681t_7_3_capacity_governor"
 CORRELATION_ID="ft-3681t.7.3-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_3681t_7_3_capacity_governor_${RUN_ID}.jsonl"
-TARGET_DIR="target-rch-ft-3681t-7-3"
-
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_7_3_capacity_governor"
-ensure_rch_ready
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-3681t-7-3-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 emit_log() {
   local outcome="$1"
@@ -52,83 +55,71 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
-run_step() {
+run_guarded_cargo_step() {
   local scenario="$1"
   local decision_path="$2"
   local input_summary="$3"
   shift 3
 
-  emit_log "running" "${scenario}" "${decision_path}" "none" "none" "$(basename "${LOG_FILE}")" "${input_summary}"
-  if "$@"; then
-    emit_log "passed" "${scenario}" "${decision_path}" "step_passed" "none" "$(basename "${LOG_FILE}")" "${input_summary}"
-    return 0
-  fi
+  local output_file="${LOG_DIR}/ft_3681t_7_3_capacity_governor_${RUN_ID}.${scenario}.stdout.log"
+  emit_log "running" "${scenario}" "${decision_path}" "none" "none" "$(basename "${output_file}")" "${input_summary}"
 
-  emit_log "failed" "${scenario}" "${decision_path}" "step_failed" "command_failed" "$(basename "${LOG_FILE}")" "${input_summary}"
-  return 1
-}
-
-run_rch_step() {
-  local scenario="$1"
-  local decision_path="$2"
-  local input_summary="$3"
-  shift 3
-
-  local tmp_output
-  tmp_output="$(mktemp)"
-  emit_log "running" "${scenario}" "${decision_path}" "none" "none" "$(basename "${LOG_FILE}")" "${input_summary}"
-
-  if ! "$@" >"${tmp_output}" 2>&1; then
-    cat "${tmp_output}" >> "${LOG_FILE}"
-    emit_log "failed" "${scenario}" "${decision_path}" "rch_command_failed" "command_failed" "$(basename "${LOG_FILE}")" "${input_summary}"
-    rm -f "${tmp_output}"
+  if ! run_rch_cargo_logged "${output_file}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" "$@"; then
+    cat "${output_file}" >> "${LOG_FILE}"
+    emit_log "failed" "${scenario}" "${decision_path}" "rch_command_failed" "command_failed" "$(basename "${output_file}")" "${input_summary}"
     return 1
   fi
 
-  cat "${tmp_output}" >> "${LOG_FILE}"
-  if rg -q '^\[RCH\] local' "${tmp_output}"; then
-    emit_log "failed" "${scenario}" "${decision_path}" "rch_fell_open_local" "rch_local_fallback" "$(basename "${LOG_FILE}")" "${input_summary}"
-    rm -f "${tmp_output}"
-    return 1
-  fi
-
-  emit_log "passed" "${scenario}" "${decision_path}" "step_passed" "none" "$(basename "${LOG_FILE}")" "${input_summary}"
-  rm -f "${tmp_output}"
+  cat "${output_file}" >> "${LOG_FILE}"
+  emit_log "passed" "${scenario}" "${decision_path}" "step_passed" "none" "$(basename "${output_file}")" "${input_summary}"
   return 0
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logs and shared rch metadata" >&2
+  exit 1
+fi
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_7_3_capacity_governor"
+ensure_rch_ready
+
 emit_log "started" "suite_init" "script_init" "none" "none" "$(basename "${LOG_FILE}")" "ft-3681t.7.3 capacity governor validation"
 
-for tool in jq rg rch cargo; do
-  if ! command -v "${tool}" >/dev/null 2>&1; then
-    emit_log "failed" "suite_init" "preflight_tools" "missing_tool" "${tool}_not_found" "$(basename "${LOG_FILE}")" "${tool} is required"
-    exit 1
-  fi
-done
+emit_log "passed" \
+  "rch_workers" \
+  "preflight_workers" \
+  "shared_rch_probe_passed" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared guard reported reachable workers"
 
-run_rch_step \
+emit_log "passed" \
   "rch_remote_smoke" \
   "preflight_remote_exec" \
-  "rch exec -- cargo check --help" \
-  rch exec -- cargo check --help
+  "shared_rch_smoke_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "shared guard verified fail-closed remote cargo execution"
 
-run_rch_step \
+run_guarded_cargo_step \
   "unit_zero_workers" \
   "cargo_test_lib" \
-  "rch exec -- cargo test -p frankenterm-core --lib zero_rch_workers_throttle_instead_of_offload_at_concurrency_limit -- --exact --nocapture" \
-  rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" cargo test -p frankenterm-core --lib zero_rch_workers_throttle_instead_of_offload_at_concurrency_limit -- --exact --nocapture
+  "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib zero_rch_workers_throttle_instead_of_offload_at_concurrency_limit -- --exact --nocapture" \
+  cargo test -p frankenterm-core --lib zero_rch_workers_throttle_instead_of_offload_at_concurrency_limit -- --exact --nocapture
 
-run_rch_step \
+run_guarded_cargo_step \
   "integration_policy_and_offload" \
   "cargo_test_integration" \
-  "rch exec -- cargo test -p frankenterm-core --test capacity_governor_integration -- --nocapture" \
-  rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" cargo test -p frankenterm-core --test capacity_governor_integration -- --nocapture
+  "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --test capacity_governor_integration -- --nocapture" \
+  cargo test -p frankenterm-core --test capacity_governor_integration -- --nocapture
 
-run_rch_step \
+run_guarded_cargo_step \
   "proptest_zero_workers" \
   "cargo_test_proptest" \
-  "rch exec -- cargo test -p frankenterm-core --test proptest_capacity_governor zero_workers_prevent_rch_offload_even_when_rch_flagged -- --exact --nocapture" \
-  rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" cargo test -p frankenterm-core --test proptest_capacity_governor zero_workers_prevent_rch_offload_even_when_rch_flagged -- --exact --nocapture
+  "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --test proptest_capacity_governor zero_workers_prevent_rch_offload_even_when_rch_flagged -- --exact --nocapture" \
+  cargo test -p frankenterm-core --test proptest_capacity_governor zero_workers_prevent_rch_offload_even_when_rch_flagged -- --exact --nocapture
 
 emit_log "passed" "suite_complete" "script_complete" "all_steps_passed" "none" "$(basename "${LOG_FILE}")" "ft-3681t.7.3 capacity governor validation complete"
 printf 'wrote structured log: %s\n' "${LOG_FILE}"
