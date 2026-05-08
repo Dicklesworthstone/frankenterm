@@ -1065,6 +1065,7 @@ impl PipelineExecutor {
                 &mut execution,
                 step_time,
                 total_steps,
+                &completed_labels,
             );
             execution
                 .step_outcomes
@@ -1142,6 +1143,7 @@ impl PipelineExecutor {
         execution: &mut PipelineExecution,
         now_ms: u64,
         total_steps: usize,
+        completed_labels: &HashSet<String>,
     ) -> StepOutcome {
         let recovery = &step.recovery;
         let mut attempts = 0u32;
@@ -1172,7 +1174,22 @@ impl PipelineExecutor {
         // Attempt the step action.
         loop {
             attempts += 1;
-            let result = execute_step_action(&step.action, &execution.metadata);
+            let elapsed_ms = match &step.action {
+                StepAction::WaitForCondition {
+                    poll_interval_ms, ..
+                } => now_ms
+                    .saturating_sub(execution.started_at_ms)
+                    .saturating_add(
+                        poll_interval_ms.saturating_mul(u64::from(attempts.saturating_sub(1))),
+                    ),
+                _ => now_ms.saturating_sub(execution.started_at_ms),
+            };
+            let result = execute_step_action(
+                &step.action,
+                &execution.metadata,
+                completed_labels,
+                elapsed_ms,
+            );
 
             match result {
                 Ok(()) => {
@@ -1463,7 +1480,9 @@ impl Default for PipelineExecutor {
 /// Execute a step action. Returns Ok(()) on success, Err(message) on failure.
 fn execute_step_action(
     action: &StepAction,
-    _metadata: &HashMap<String, String>,
+    metadata: &HashMap<String, String>,
+    completed_labels: &HashSet<String>,
+    elapsed_ms: u64,
 ) -> Result<(), String> {
     match action {
         StepAction::Noop => Ok(()),
@@ -1484,14 +1503,48 @@ fn execute_step_action(
         }
         StepAction::WaitForCondition { condition, .. } => match condition {
             PipelineCondition::Timeout { after_ms } => {
-                if *after_ms == 0 {
+                if elapsed_ms >= *after_ms {
                     Ok(())
                 } else {
-                    // In a real implementation, this would poll.
-                    Ok(())
+                    Err(format!(
+                        "elapsed {elapsed_ms}ms has not reached timeout threshold {after_ms}ms"
+                    ))
                 }
             }
-            _ => Ok(()),
+            PipelineCondition::MetadataEquals { key, value } => match metadata.get(key) {
+                Some(actual) if actual == value => Ok(()),
+                Some(actual) => Err(format!(
+                    "metadata '{key}' value '{actual}' does not equal required '{value}'"
+                )),
+                None => Err(format!("metadata '{key}' not present")),
+            },
+            PipelineCondition::AllStepsComplete { step_labels } => {
+                let missing: Vec<&str> = step_labels
+                    .iter()
+                    .filter(|label| !completed_labels.contains(*label))
+                    .map(String::as_str)
+                    .collect();
+                if missing.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!("steps not complete: {}", missing.join(", ")))
+                }
+            }
+            PipelineCondition::WorkItemStatus {
+                work_item_id,
+                target_status,
+            } => {
+                let status_key = format!("work_item.{work_item_id}.status");
+                match metadata.get(&status_key) {
+                    Some(actual) if actual == target_status => Ok(()),
+                    Some(actual) => Err(format!(
+                        "work item '{work_item_id}' status '{actual}' does not equal required '{target_status}'"
+                    )),
+                    None => Err(format!(
+                        "work item '{work_item_id}' status metadata '{status_key}' not present"
+                    )),
+                }
+            }
         },
         StepAction::SubPipeline { pipeline_name } => {
             if pipeline_name.is_empty() {
@@ -1813,6 +1866,125 @@ mod tests {
         let mut p = simple_pipeline("precond-ok", vec![step]);
         p.metadata
             .insert("required_key".to_string(), "present".to_string());
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&p, 1000).unwrap();
+        assert_eq!(result.status, PipelineStatus::Succeeded);
+    }
+
+    #[test]
+    fn wait_condition_metadata_equals_uses_pipeline_metadata() {
+        let mut step = noop_step("wait-env");
+        step.action = StepAction::WaitForCondition {
+            condition: PipelineCondition::MetadataEquals {
+                key: "env".to_string(),
+                value: "prod".to_string(),
+            },
+            poll_interval_ms: 10,
+        };
+        step.recovery.max_retries = 0;
+
+        let p = simple_pipeline("wait-env-missing", vec![step.clone()]);
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&p, 1000).unwrap();
+        assert!(matches!(result.status, PipelineStatus::Failed { .. }));
+        let failed = result.step_outcomes.get(&0).unwrap();
+        match &failed.status {
+            StepStatus::Failed { error } => assert!(error.contains("metadata 'env' not present")),
+            other => panic!("expected metadata wait failure, got {other:?}"),
+        }
+
+        let mut p = simple_pipeline("wait-env-present", vec![step]);
+        p.metadata.insert("env".to_string(), "prod".to_string());
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&p, 1000).unwrap();
+        assert_eq!(result.status, PipelineStatus::Succeeded);
+    }
+
+    #[test]
+    fn wait_condition_work_item_status_uses_metadata_status_key() {
+        let mut step = noop_step("wait-work");
+        step.action = StepAction::WaitForCondition {
+            condition: PipelineCondition::WorkItemStatus {
+                work_item_id: "item-7".to_string(),
+                target_status: "done".to_string(),
+            },
+            poll_interval_ms: 10,
+        };
+        step.recovery.max_retries = 0;
+
+        let mut p = simple_pipeline("wait-work-done", vec![step.clone()]);
+        p.metadata
+            .insert("work_item.item-7.status".to_string(), "done".to_string());
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&p, 1000).unwrap();
+        assert_eq!(result.status, PipelineStatus::Succeeded);
+
+        let mut p = simple_pipeline("wait-work-pending", vec![step]);
+        p.metadata
+            .insert("work_item.item-7.status".to_string(), "pending".to_string());
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&p, 1000).unwrap();
+        assert!(matches!(result.status, PipelineStatus::Failed { .. }));
+        let failed = result.step_outcomes.get(&0).unwrap();
+        match &failed.status {
+            StepStatus::Failed { error } => {
+                assert!(error.contains("status 'pending' does not equal required 'done'"));
+            }
+            other => panic!("expected work status wait failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_condition_all_steps_complete_uses_completed_labels() {
+        let first = noop_step("prepare");
+        let mut wait = noop_step("wait-prepare");
+        wait.action = StepAction::WaitForCondition {
+            condition: PipelineCondition::AllStepsComplete {
+                step_labels: vec!["prepare".to_string()],
+            },
+            poll_interval_ms: 10,
+        };
+        wait.depends_on = vec!["prepare".to_string()];
+        wait.recovery.max_retries = 0;
+
+        let p = simple_pipeline("wait-completed", vec![first, wait]);
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&p, 1000).unwrap();
+        assert_eq!(result.status, PipelineStatus::Succeeded);
+    }
+
+    #[test]
+    fn wait_condition_timeout_uses_elapsed_pipeline_time() {
+        let mut step = noop_step("wait-too-soon");
+        step.action = StepAction::WaitForCondition {
+            condition: PipelineCondition::Timeout { after_ms: 5 },
+            poll_interval_ms: 10,
+        };
+        step.recovery.max_retries = 0;
+
+        let p = simple_pipeline("wait-timeout-too-soon", vec![step]);
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&p, 1000).unwrap();
+        assert!(matches!(result.status, PipelineStatus::Failed { .. }));
+
+        let mut step = noop_step("wait-ready");
+        step.action = StepAction::WaitForCondition {
+            condition: PipelineCondition::Timeout { after_ms: 1 },
+            poll_interval_ms: 10,
+        };
+        step.recovery.max_retries = 0;
+        let p = simple_pipeline("wait-timeout-ready", vec![step]);
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&p, 1000).unwrap();
+        assert_eq!(result.status, PipelineStatus::Succeeded);
+
+        let mut step = noop_step("wait-after-retry");
+        step.action = StepAction::WaitForCondition {
+            condition: PipelineCondition::Timeout { after_ms: 11 },
+            poll_interval_ms: 10,
+        };
+        step.recovery.max_retries = 1;
+        let p = simple_pipeline("wait-timeout-after-retry", vec![step]);
         let mut executor = PipelineExecutor::new();
         let result = executor.execute(&p, 1000).unwrap();
         assert_eq!(result.status, PipelineStatus::Succeeded);
