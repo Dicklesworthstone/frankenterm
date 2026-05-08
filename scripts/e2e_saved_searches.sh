@@ -20,14 +20,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 FT_BINARY="${FT_BINARY:-}"
 
 require_cmd() {
-  local cmd="$1"
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "Missing prerequisite: $cmd" >&2
+  local required_command="$1"
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    echo "Missing prerequisite: $required_command" >&2
     return 1
   fi
 }
@@ -74,12 +75,12 @@ find_ft_binary() {
 wait_for_json_condition() {
   local desc="$1"
   local timeout_secs="$2"
-  local cmd="$3"
+  local condition_command="$3"
 
   local start
   start=$(date +%s)
   while true; do
-    if bash -lc "$cmd" >/dev/null 2>&1; then
+    if bash -lc "$condition_command" >/dev/null 2>&1; then
       echo "OK: $desc"
       return 0
     fi
