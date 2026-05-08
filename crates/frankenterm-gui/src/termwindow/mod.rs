@@ -565,6 +565,11 @@ pub struct TermWindow {
     pub window_state: WindowState,
     pub resizes_pending: usize,
     is_repaint_pending: bool,
+    /// Coalesces bursty `update_title()` invocations triggered by high-rate
+    /// mux Alerts (Progress, CurrentWorkingDirectoryChanged, OutputSinceFocusLost).
+    /// When true, an `Apply` notification is already in flight that will run
+    /// `update_title` on the next frame and clear this flag. See ft-9d60d.
+    pending_update_title: bool,
     pending_scale_changes: LinkedList<resize::ScaleChange>,
     /// Terminal dimensions
     terminal_size: TerminalSize,
@@ -1754,6 +1759,7 @@ impl TermWindow {
             window_state: WindowState::default(),
             resizes_pending: 0,
             is_repaint_pending: false,
+            pending_update_title: false,
             pending_scale_changes: LinkedList::new(),
             terminal_size,
             render_state,
@@ -2329,7 +2335,10 @@ impl TermWindow {
                         | Alert::Progress(_),
                     ..
                 } => {
-                    self.update_title();
+                    // Coalesce: agents emitting OSC 7 / OSC 9;4 across multiple
+                    // attached muxes can fire dozens of these per second.
+                    // Schedule one frame-bounded update_title instead. ft-9d60d.
+                    self.schedule_update_title();
                 }
                 MuxNotification::Alert {
                     alert: Alert::PaletteChanged,
@@ -3370,6 +3379,42 @@ impl TermWindow {
                 })
                 .detach();
             }
+        }
+    }
+
+    /// Schedule a coalesced `update_title()` at most once per ~16 ms frame.
+    ///
+    /// Multiple mux subscribers (one per attached domain) re-emit Alerts like
+    /// `Progress`, `CurrentWorkingDirectoryChanged`, and `OutputSinceFocusLost`
+    /// at high frequency under active agent output. Calling `update_title()`
+    /// directly per Alert produces O(N_tabs × N_panes × Lua_roundtrip)
+    /// allocation churn per call, dozens of times per second — the dominant
+    /// driver of the wezterm-gui RSS leak observed in production. Coalescing
+    /// to one frame caps the call rate at ~60/sec independent of fanout.
+    /// See ft-9d60d.
+    fn schedule_update_title(&mut self) {
+        if self.pending_update_title {
+            metrics::histogram!("update_title.coalesced").record(1.);
+            return;
+        }
+        self.pending_update_title = true;
+        metrics::histogram!("update_title.scheduled").record(1.);
+
+        if let Some(window) = self.window.as_ref() {
+            let window = window.clone();
+            promise::spawn::spawn(async move {
+                // ~one frame at 60 Hz. Imperceptible delay for OSC-driven UI.
+                sleep(Duration::from_millis(16)).await;
+                window.notify(TermWindowNotif::Apply(Box::new(|tw| {
+                    tw.pending_update_title = false;
+                    tw.update_title();
+                })));
+            })
+            .detach();
+        } else {
+            // Window already dropped; clear the flag so a future call can
+            // re-arm once the window is recreated.
+            self.pending_update_title = false;
         }
     }
 

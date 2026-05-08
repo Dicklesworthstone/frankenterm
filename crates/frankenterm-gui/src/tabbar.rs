@@ -138,6 +138,7 @@ fn compute_tab_title(
     hover: bool,
     tab_max_width: usize,
 ) -> TitleText {
+    metrics::histogram!("compute_tab_title.calls").record(1.);
     let title = call_format_tab_title(tab, tab_info, pane_info, config, hover, tab_max_width);
 
     match title {
@@ -457,16 +458,26 @@ impl TabBarState {
             let active = tab_idx == active_tab_no;
             let hover = !active && is_tab_hover(mouse_x, x, tab_title_len);
 
-            // Recompute the title so that it factors in both the hover state
-            // and the adjusted maximum tab width based on available space.
-            let tab_title = compute_tab_title(
-                &tab_info[tab_idx],
-                tab_info,
-                pane_info,
-                config,
-                hover,
-                tab_title_len,
-            );
+            // Recompute the title only when the inputs differ from the first pass
+            // (which used hover=false, max=config.tab_max_width). Skipping when
+            // possible avoids a Lua roundtrip plus tab/pane HashMap clones per
+            // tab on every update_title. See ft-ke3u9.
+            let recomputed_title;
+            let tab_title: &TitleText = if hover || tab_title_len != config.tab_max_width {
+                metrics::histogram!("compute_tab_title.second_pass.recomputed").record(1.);
+                recomputed_title = compute_tab_title(
+                    &tab_info[tab_idx],
+                    tab_info,
+                    pane_info,
+                    config,
+                    hover,
+                    tab_title_len,
+                );
+                &recomputed_title
+            } else {
+                metrics::histogram!("compute_tab_title.second_pass.cached").record(1.);
+                tab_title
+            };
 
             let cell_attrs = if active {
                 &active_cell_attrs

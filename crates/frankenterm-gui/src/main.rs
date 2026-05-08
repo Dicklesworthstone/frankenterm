@@ -14,6 +14,8 @@ use clap::builder::ValueParser;
 use clap::{Parser, ValueHint};
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
+#[cfg(feature = "jemalloc")]
+use frankenterm_alloc as _;
 use frankenterm_client::domain::ClientDomain;
 use frankenterm_core::macos_backend_select::{
     BackendOverride, BackendSelectionInputs, BackendSelectionResult, MacosArch, MacosVersion,
@@ -86,6 +88,18 @@ mod utilsprites;
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
+
+// `dhat-heap` and `jemalloc` each define a `#[global_allocator]` — having
+// both active produces a duplicate-static link error. Default builds enable
+// `jemalloc`; profile with dhat by passing
+//   --no-default-features --features dhat-heap.
+// See ft-tkxpi.
+#[cfg(all(feature = "dhat-heap", feature = "jemalloc"))]
+compile_error!(
+    "Features `dhat-heap` and `jemalloc` are mutually exclusive: \
+     each defines #[global_allocator]. \
+     Use `cargo build --no-default-features --features dhat-heap` to profile with dhat."
+);
 
 pub use selection::SelectionMode;
 pub use termwindow::{ICON_DATA, TermWindow, set_window_class, set_window_position};

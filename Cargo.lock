@@ -3980,6 +3980,7 @@ dependencies = [
  "filedescriptor 0.8.3",
  "finl_unicode 1.3.0",
  "flume",
+ "frankenterm-alloc",
  "frankenterm-bidi",
  "frankenterm-blob-leases",
  "frankenterm-client",

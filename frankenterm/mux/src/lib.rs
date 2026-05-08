@@ -63,14 +63,14 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -91,7 +91,7 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -170,6 +170,27 @@ struct PendingPaneOutputNotifications {
     queued: HashSet<PaneId>,
 }
 
+/// Discriminant key for the high-rate Alert variants we dedupe per pane.
+///
+/// `Progress` (OSC 9;4) and `CurrentWorkingDirectoryChanged` (OSC 7) re-emit
+/// on every shell prompt under active agent output; `OutputSinceFocusLost`
+/// re-emits on every seqno bump to an unfocused pane. Across N attached muxes
+/// these saturate the notify path with thousands of clones+box allocations
+/// per second. See ft-18xgy.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum HighRateAlertKind {
+    Progress,
+    CurrentWorkingDirectoryChanged,
+    OutputSinceFocusLost,
+}
+
+/// Window during which a `(pane_id, kind)` repeat is dropped at the mux
+/// fanout layer. ~1 frame at 60 Hz; below human perception for shell-prompt UI.
+const HIGH_RATE_ALERT_DEDUPE_WINDOW: Duration = Duration::from_millis(16);
+/// Stale entries older than this are pruned on each insert to keep the dedupe
+/// map bounded regardless of pane churn.
+const HIGH_RATE_ALERT_PRUNE_AFTER: Duration = Duration::from_secs(1);
+
 pub struct Mux {
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
@@ -186,6 +207,10 @@ pub struct Mux {
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
     main_thread_id: std::thread::ThreadId,
     agent: Option<AgentProxy>,
+    /// Per-(pane, alert-kind) timestamp of the most recently dispatched
+    /// high-rate Alert. Used by `notify` to drop duplicate repeats within
+    /// `HIGH_RATE_ALERT_DEDUPE_WINDOW`. ft-18xgy.
+    last_high_rate_alert: Mutex<HashMap<(PaneId, HighRateAlertKind), Instant>>,
 }
 
 fn mux_socket_buffer_size() -> usize {
@@ -625,6 +650,7 @@ impl Mux {
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
             agent,
+            last_high_rate_alert: Mutex::new(HashMap::new()),
         }
     }
 
@@ -882,6 +908,39 @@ impl Mux {
     }
 
     pub fn notify(&self, notification: MuxNotification) {
+        // Dedupe high-rate Alert variants per (pane, kind) within
+        // HIGH_RATE_ALERT_DEDUPE_WINDOW. Saves N_subscribers × clone +
+        // box-allocation per dropped notification under bursty agent output.
+        // See ft-18xgy.
+        if let MuxNotification::Alert { pane_id, alert } = &notification {
+            let kind = match alert {
+                frankenterm_term::Alert::Progress(_) => Some(HighRateAlertKind::Progress),
+                frankenterm_term::Alert::CurrentWorkingDirectoryChanged => {
+                    Some(HighRateAlertKind::CurrentWorkingDirectoryChanged)
+                }
+                frankenterm_term::Alert::OutputSinceFocusLost => {
+                    Some(HighRateAlertKind::OutputSinceFocusLost)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let now = Instant::now();
+                let key = (*pane_id, kind);
+                let mut last = self.last_high_rate_alert.lock();
+                // Best-effort prune: keep map size bounded by clearing entries
+                // older than the prune horizon on each insert. With <100 panes
+                // per host this stays trivially small.
+                last.retain(|_, ts| now.duration_since(*ts) < HIGH_RATE_ALERT_PRUNE_AFTER);
+                if let Some(prev) = last.get(&key) {
+                    if now.duration_since(*prev) < HIGH_RATE_ALERT_DEDUPE_WINDOW {
+                        histogram!("mux.notifications.high_rate_alert.deduped").record(1.);
+                        return;
+                    }
+                }
+                last.insert(key, now);
+            }
+        }
+
         match notification {
             MuxNotification::PaneOutput(pane_id) => self.enqueue_pane_output_notification(pane_id),
             notification => self.dispatch_notification(notification),
@@ -1810,8 +1869,8 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -2052,6 +2111,56 @@ mod tests {
             second_notifications.load(Ordering::Relaxed),
             1,
             "unsubscribe during callback should remove the subscriber for future notifications",
+        );
+    }
+
+    #[test]
+    fn high_rate_alert_notifications_dedupe_per_pane_and_kind() {
+        let mux = Mux::new(None);
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::Alert { .. }) {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        });
+
+        let progress = MuxNotification::Alert {
+            pane_id: 7,
+            alert: frankenterm_term::Alert::Progress(frankenterm_term::Progress::Percentage(42)),
+        };
+        mux.notify(progress.clone());
+        mux.notify(progress.clone());
+        assert_eq!(
+            notifications.load(Ordering::Relaxed),
+            1,
+            "same-pane same-kind high-rate alerts should dedupe inside the frame window",
+        );
+
+        mux.notify(MuxNotification::Alert {
+            pane_id: 7,
+            alert: frankenterm_term::Alert::CurrentWorkingDirectoryChanged,
+        });
+        assert_eq!(
+            notifications.load(Ordering::Relaxed),
+            2,
+            "different high-rate alert kinds should not dedupe each other",
+        );
+
+        {
+            let mut last = mux.last_high_rate_alert.lock();
+            *last
+                .get_mut(&(7, HighRateAlertKind::Progress))
+                .expect("first progress alert should populate the dedupe map") = Instant::now()
+                .checked_sub(HIGH_RATE_ALERT_DEDUPE_WINDOW + Duration::from_millis(1))
+                .expect("test duration is small enough to subtract from now");
+        }
+        mux.notify(progress);
+        assert_eq!(
+            notifications.load(Ordering::Relaxed),
+            3,
+            "same-pane same-kind alert should dispatch again after the dedupe window",
         );
     }
 

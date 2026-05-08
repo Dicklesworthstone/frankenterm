@@ -24,7 +24,14 @@ path = "tests/gpu_regression.rs"
 harness = false
 
 [features]
-default = []
+# `jemalloc` ships in the default set so release builds get the same
+# fragmentation-resistant allocator as `frankenterm` and `frankenterm-mux-server`.
+# Heap-profiling builds with `dhat-heap` MUST disable jemalloc explicitly:
+#   cargo build --no-default-features --features dhat-heap
+# A compile_error! in main.rs enforces that both features cannot be on at once
+# (each defines a `#[global_allocator]`). See ft-tkxpi.
+default = ["jemalloc"]
+jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
 wayland = ["window/wayland"]
 headless-render = []
 dhat-heap = ["dep:dhat"]
@@ -39,6 +46,10 @@ anyhow.workspace = true
 [dependencies]
 # Core library
 frankenterm-core = { workspace = true, features = ["native-wezterm"] }
+
+# Allocator wiring (jemalloc by default for release builds; gated behind the
+# `jemalloc` feature so dhat-heap builds can opt out). ft-tkxpi.
+frankenterm-alloc = { workspace = true, optional = true }
 
 # Vendored FrankenTerm crates (ex-WezTerm)
 codec = { workspace = true, features = ["async-asupersync"] }
