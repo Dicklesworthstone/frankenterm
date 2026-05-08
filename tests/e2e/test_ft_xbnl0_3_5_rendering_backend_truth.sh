@@ -21,6 +21,7 @@ SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
 exec > >(tee -a "${STDOUT_FILE}")
 exec 2> >(tee -a "${STDERR_FILE}" >&2)
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
 rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "${HARNESS_NAME}" "${ROOT_DIR}"
 RCH_SKIP_SMOKE_PREFLIGHT=1
@@ -28,7 +29,13 @@ RCH_SKIP_SMOKE_PREFLIGHT=1
 PASS=0
 FAIL=0
 TOTAL=0
-REMOTE_TARGET_DIR="/tmp/ft-$(whoami)-target"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-xbnl0-3-5-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+    REMOTE_TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+    REMOTE_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
 
 record_command() {
     printf '%s\n' "$*" >> "${COMMANDS_FILE}"
@@ -106,7 +113,10 @@ record_result() {
 require_cmd() {
     local cmd="$1"
     if ! command -v "${cmd}" >/dev/null 2>&1; then
-        emit_log "preflight:${cmd}" "failed" 0 "missing command ${cmd}"
+        if command -v jq >/dev/null 2>&1; then
+            emit_log "preflight:${cmd}" "failed" 0 "missing command ${cmd}"
+        fi
+        printf 'missing required command: %s\n' "${cmd}" >&2
         exit 1
     fi
 }
@@ -136,7 +146,7 @@ run_rch_step() {
     shift 2
     local start_ns end_ns duration_ms
     start_ns="$(date +%s%N)"
-    record_command "rch exec -- $*"
+    record_command "run_rch_cargo_logged ${log_file} $*"
     if run_rch_cargo_logged "${log_file}" "$@"; then
         end_ns="$(date +%s%N)"
         duration_ms="$(((end_ns - start_ns) / 1000000))"
