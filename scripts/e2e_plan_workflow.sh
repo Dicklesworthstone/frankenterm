@@ -20,6 +20,7 @@ set -euo pipefail
 # Source E2E artifacts library
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 # Colors (disabled when piped)
@@ -77,6 +78,7 @@ run_wa_timeout() {
 
     # Strip ANSI codes and extract JSON
     local stripped
+    # shellcheck disable=SC2001
     stripped=$(echo "$raw_output" | sed 's/\x1b\[[0-9;]*m//g')
 
     # Extract JSON from output (skip INFO lines)
@@ -110,7 +112,8 @@ ensure_test_pane() {
         return 0
     fi
 
-    local marker="PLAN_WORKFLOW_E2E_$(date +%s%N)"
+    local marker
+    marker="PLAN_WORKFLOW_E2E_$(date +%s%N)"
     local dummy_script="$PROJECT_ROOT/fixtures/e2e/dummy_print.sh"
     if [[ ! -x "$dummy_script" ]]; then
         log_skip "dummy script missing: $dummy_script"
