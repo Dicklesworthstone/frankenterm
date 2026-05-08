@@ -9,10 +9,11 @@ RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_1i2ge_2_1_readiness_resolver"
 CORRELATION_ID="ft-1i2ge.2.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_2_1_${RUN_ID}.jsonl"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_2_1_${RUN_ID}.probe.log"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_2_1_${RUN_ID}.stdout.log"
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_2_1"
 ensure_rch_ready
 
@@ -59,60 +60,34 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "beads DAG ingestion + readiness resolver validation"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log "failed" "preflight_rch" "rch_missing" "rch_not_found" "$(basename "${LOG_FILE}")" "rch required"
-  exit 1
-fi
-
 if ! command -v jq >/dev/null 2>&1; then
   emit_log "failed" "preflight_jq" "jq_missing" "jq_not_found" "$(basename "${LOG_FILE}")" "jq required"
   exit 1
 fi
 
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -ne 0 ]] || ! grep -q "✓" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "preflight_rch_workers" \
-    "rch_workers_unreachable" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "No healthy remote RCH worker available"
-  exit 1
-fi
-
-TEST_CMDS=(
-  "rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-2-1 cargo test -p frankenterm-core beads_readiness_ -- --nocapture"
-  "rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-2-1 cargo test -p frankenterm-core test_readiness_report_ -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-2-1"
+TEST_FILTERS=(
+  "beads_readiness_"
+  "test_readiness_report_"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
-  emit_log "running" "cargo_test" "none" "none" "$(basename "${STDOUT_FILE}")" "Executing: ${test_cmd}"
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_2_1_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core "${test_filter}" -- --nocapture)
+  emit_log "running" "cargo_test" "none" "none" "$(basename "${STDOUT_FILE}")" "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
-
-  if grep -q "\[RCH\] local" "${STDOUT_FILE}"; then
-    emit_log "failed" "cargo_test" "rch_fallback_local" "offload_contract_violation" "$(basename "${STDOUT_FILE}")" "rch fell back to local execution"
-    exit 1
-  fi
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log "failed" "cargo_test" "test_failure" "cargo_test_failed" "$(basename "${STDOUT_FILE}")" "exit=${status}"
-    exit ${status}
+    exit "${status}"
   fi
 
 done
