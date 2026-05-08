@@ -18,15 +18,18 @@ mkdir -p "${LOG_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_3681t_3_5_swarm_pipeline_recovery"
 CORRELATION_ID="ft-3681t.3.5-${RUN_ID}"
-CARGO_TARGET_DIR_OVERRIDE="${FT_CARGO_TARGET_DIR:-target-rch-ft3681t35-e2e}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-3681t-3-5-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 LOG_FILE="${LOG_DIR}/ft_3681t_3_5_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_3681t_3_5_${RUN_ID}.stdout.log"
 STDERR_FILE="${LOG_DIR}/ft_3681t_3_5_${RUN_ID}.stderr.log"
-
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_3_5_swarm_pipeline_recovery"
-ensure_rch_ready
 
 emit_log() {
   local outcome="$1"
@@ -63,6 +66,16 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured e2e logging and shared rch metadata" >&2
+  exit 1
+fi
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_3_5_swarm_pipeline_recovery"
+ensure_rch_ready
+
 emit_log \
   "started" \
   "suite_init" \
@@ -71,16 +84,21 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "ft-3681t.3.5 integration/e2e swarm pipeline recovery scenario"
 
-if ! command -v jq >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "preflight" \
-    "jq_missing" \
-    "jq_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "jq is required for structured e2e logging"
-  exit 1
-fi
+emit_log \
+  "passed" \
+  "preflight_rch_workers" \
+  "rch_shared_guard_passed" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared rch guard reported reachable workers"
+
+emit_log \
+  "passed" \
+  "preflight_rch_remote_smoke" \
+  "rch_remote_smoke_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "shared rch guard verified fail-closed remote cargo execution"
 
 emit_log \
   "running" \
@@ -88,13 +106,14 @@ emit_log \
   "none" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR_OVERRIDE} cargo test -p frankenterm-core --test swarm_pipeline_integration -- --nocapture"
+  "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --test swarm_pipeline_integration -- --nocapture"
 
 set +e
-rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR_OVERRIDE}" cargo test -p frankenterm-core --test swarm_pipeline_integration -- --nocapture \
-  >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
+run_rch_cargo_logged "${STDOUT_FILE}" \
+  env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test swarm_pipeline_integration -- --nocapture
 rc=$?
 set -e
+: >"${STDERR_FILE}"
 
 if [[ ${rc} -ne 0 ]]; then
   emit_log \
@@ -102,9 +121,9 @@ if [[ ${rc} -ne 0 ]]; then
     "rch_exec_cargo_test_integration" \
     "cargo_test_failed" \
     "non_zero_exit" \
-    "$(basename "${STDERR_FILE}")" \
+    "$(basename "${STDOUT_FILE}")" \
     "integration test execution failed with exit ${rc}"
-  echo "ft-3681t.3.5 e2e failed; inspect ${STDERR_FILE}" >&2
+  echo "ft-3681t.3.5 e2e failed; inspect ${STDOUT_FILE}" >&2
   exit "${rc}"
 fi
 

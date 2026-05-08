@@ -9,12 +9,15 @@ RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_tkpgy_4_2_blast_radius_controller"
 CORRELATION_ID="ft-tkpgy.4.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_tkpgy_4_2_${RUN_ID}.jsonl"
-PROBE_FILE="${LOG_DIR}/ft_tkpgy_4_2_${RUN_ID}.probe.log"
 STDOUT_FILE="${LOG_DIR}/ft_tkpgy_4_2_${RUN_ID}.stdout.log"
-
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "tkpgy_4_2"
-ensure_rch_ready
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-tkpgy-4-2-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 emit_log() {
   local outcome="$1"
@@ -51,6 +54,16 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logs and shared rch metadata" >&2
+  exit 1
+fi
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "tkpgy_4_2"
+ensure_rch_ready
+
 emit_log \
   "started" \
   "script_init" \
@@ -59,58 +72,41 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "ARS token-bucket blast-radius controller verification"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log "failed" "preflight_rch" "rch_missing" "rch_not_found" "$(basename "${LOG_FILE}")" "rch required"
-  exit 1
-fi
+emit_log \
+  "passed" \
+  "preflight_rch_workers" \
+  "rch_shared_guard_passed" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared rch guard reported reachable workers"
 
-if ! command -v jq >/dev/null 2>&1; then
-  emit_log "failed" "preflight_jq" "jq_missing" "jq_not_found" "$(basename "${LOG_FILE}")" "jq required"
-  exit 1
-fi
+emit_log \
+  "passed" \
+  "preflight_rch_remote_smoke" \
+  "rch_remote_smoke_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "shared rch guard verified fail-closed remote cargo execution"
 
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -ne 0 ]] || ! grep -q "✓" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "preflight_rch_workers" \
-    "rch_workers_unreachable" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "No healthy remote RCH worker available"
-  exit 1
-fi
-
-TEST_CMDS=(
-  "rch exec -- env CARGO_TARGET_DIR=target-rch-ft-tkpgy-4-2 cargo test -p frankenterm-core decide_fallback_on_blast_radius_limit -- --nocapture"
-  "rch exec -- env CARGO_TARGET_DIR=target-rch-ft-tkpgy-4-2 cargo test -p frankenterm-core swarm_blast_radius_allows_exactly_five_of_fifty -- --nocapture"
-  "rch exec -- env CARGO_TARGET_DIR=target-rch-ft-tkpgy-4-2 cargo test -p frankenterm-core intercept_stats_render_prometheus_includes_ars_rate_limited_metric -- --nocapture"
-  "rch exec -- env CARGO_TARGET_DIR=target-rch-ft-tkpgy-4-2 cargo test -p frankenterm-core rate_replenishes_over_time -- --nocapture"
+TEST_FILTERS=(
+  "decide_fallback_on_blast_radius_limit"
+  "swarm_blast_radius_allows_exactly_five_of_fifty"
+  "intercept_stats_render_prometheus_includes_ars_rate_limited_metric"
+  "rate_replenishes_over_time"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
-  emit_log "running" "cargo_test" "none" "none" "$(basename "${STDOUT_FILE}")" "Executing: ${test_cmd}"
+for test_filter in "${TEST_FILTERS[@]}"; do
+  step_log="${LOG_DIR}/ft_tkpgy_4_2_${RUN_ID}.${test_filter}.stdout.log"
+  emit_log "running" "cargo_test" "none" "none" "$(basename "${STDOUT_FILE}")" \
+    "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core ${test_filter} -- --nocapture"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_log}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core "${test_filter}" -- --nocapture
+  status=$?
   set -e
-
-  if grep -q "\[RCH\] local" "${STDOUT_FILE}"; then
-    emit_log "failed" "cargo_test" "rch_fallback_local" "offload_contract_violation" "$(basename "${STDOUT_FILE}")" "rch fell back to local execution"
-    exit 1
-  fi
+  tee -a "${STDOUT_FILE}" <"${step_log}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log "failed" "cargo_test" "test_failure" "cargo_test_failed" "$(basename "${STDOUT_FILE}")" "exit=${status}"
