@@ -22,6 +22,18 @@ SCENARIO="input_preserving_backpressure_guardrails"
 ARTIFACT_DIR=$(setup_artifact_dir "$SCENARIO")
 DECISIONS_JSONL="${ARTIFACT_DIR}/guardrail_decisions.jsonl"
 TRACE_JSONL="${ARTIFACT_DIR}/guardrail_trace.jsonl"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-rio-input-guardrails-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${SCRIPT_DIR}/../lib_rch_guards.sh"
+rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "rio_input_preserving_backpressure_guardrails" "${PROJECT_ROOT}"
 
 scenario_header "Input-Preserving Backpressure Guardrails"
 
@@ -76,28 +88,28 @@ log_jsonl "$DECISIONS_JSONL" "$SCENARIO" "anchor_verification" "$phase1_outcome"
 # ── Phase 2: Targeted test execution ───────────────────────────
 echo "[Phase 2] Running targeted guardrail tests (rch-offloaded via harness)..."
 
+for required_cmd in jq rg rch; do
+  if ! command -v "${required_cmd}" >/dev/null 2>&1; then
+    echo "  FAIL: missing required command: ${required_cmd}" >&2
+    exit 1
+  fi
+done
+ensure_rch_ready
+
 run_targeted_guardrail_test() {
   local label="$1"
   shift
   local tmp_log="${ARTIFACT_DIR}/.${label}.tmp.log"
   local rc=0
 
-  if command -v rch &>/dev/null; then
-    if ! TMPDIR=/tmp rch exec -- cargo test -p frankenterm-core "$@" >"$tmp_log" 2>&1; then
-      rc=$?
-    fi
-  else
-    if ! env CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/ft-target}" \
-      cargo test -p frankenterm-core "$@" >"$tmp_log" 2>&1; then
-      rc=$?
-    fi
+  if ! run_rch_cargo_logged \
+    "${tmp_log}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+      cargo test -p frankenterm-core "$@"; then
+    rc=$?
   fi
 
   cat "$tmp_log" >> "${ARTIFACT_DIR}/guardrail_test_output.txt"
-  if rg -q "\\[RCH\\] local" "${ARTIFACT_DIR}/guardrail_test_output.txt"; then
-    echo "  FAIL: local fallback detected during ${label}"
-    return 97
-  fi
   return "$rc"
 }
 
