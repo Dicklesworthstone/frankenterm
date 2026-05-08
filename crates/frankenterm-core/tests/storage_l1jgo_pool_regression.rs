@@ -1,8 +1,8 @@
-//! Regression-doc placeholder for br-ft-3twzm.
+//! Regression coverage for br-ft-3twzm / ft-l1jgo read-pool migration.
 //!
 //! The br-ft-3twzm fix migrates 9 reader paths in storage.rs to
-//! `pooled_rusqlite_backend`, restoring the connection-pool
-//! contract ft-bhyxz introduced. Direct in-process verification
+//! `pooled_backend`, restoring the connection-pool contract ft-bhyxz
+//! introduced. Direct in-process verification
 //! that "the pool is hit, not RusqliteBackend::open" requires
 //! either:
 //!   - Instrumenting `rusqlite::Connection::open` (not exposed to
@@ -21,20 +21,34 @@
 //!     covered by storage's reader-path tests.
 //!
 //! All those tests pass after the migration because the closure
-//! body inside each `pooled_rusqlite_backend` call is byte-identical
+//! body inside each `pooled_backend` call is byte-identical
 //! to the pre-migration body — only the backend acquisition path
 //! changed.
 //!
-//! The structural verification this file would have shipped (no
-//! `open_rusqlite_backend` callers remain in storage.rs) is a
-//! grep at commit time:
-//!
-//! ```text
-//! $ grep -c 'open_rusqlite_backend' crates/frankenterm-core/src/storage.rs
-//! 1   # only the helper definition remains; all 9 call sites
-//!     # migrated to pooled_rusqlite_backend
-//! ```
-//!
-//! See br-ft-3twzm for the full fix description; this stub file
-//! exists so a future agent searching the test suite for the bead
-//! ID finds the cross-reference.
+//! The structural verification below keeps the ft-l1jgo acceptance
+//! invariant pinned: `storage.rs` must not grow direct
+//! `rusqlite::Connection` references again.
+
+use std::fs;
+
+#[test]
+fn storage_rs_keeps_direct_connection_refs_out_of_handle_surface() {
+    let storage_path = format!("{}/src/storage.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(&storage_path)
+        .unwrap_or_else(|err| panic!("read {storage_path}: {err}"));
+
+    for forbidden in [
+        "rusqlite::Connection",
+        "rusqlite::{Connection",
+        "Connection::open",
+        "Connection::open_in_memory",
+        "&Connection",
+        "&mut Connection",
+        "Deref<Target = Connection>",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "storage.rs must route direct Connection access through StorageBackend; found {forbidden:?}"
+        );
+    }
+}

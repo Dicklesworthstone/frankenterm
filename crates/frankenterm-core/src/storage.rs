@@ -10438,9 +10438,9 @@ impl PooledReadConn {
     }
 
     /// br-ft-3twzm: lend the pooled `RusqliteBackend` to the closure.
-    /// Used by the `pooled_rusqlite_backend` helper so storage.rs's
-    /// br-ft-l1jgo migration sites can call typed `StorageBackend`
-    /// trait methods without bypassing the connection pool.
+    /// Used by the pooled backend helpers so storage.rs's br-ft-l1jgo
+    /// migration sites can call typed `StorageBackend` trait methods
+    /// without bypassing the connection pool.
     ///
     /// The dance: `PooledReadConn` owns the backend in an `Option`.
     /// We `take()` it out, run the closure, then move the backend back

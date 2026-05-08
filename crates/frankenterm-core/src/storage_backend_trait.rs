@@ -26,7 +26,7 @@
 //!   without committing to a specific signature for each.
 //! - A skeleton `RusqliteBackend` newtype wrapping
 //!   `rusqlite::Connection` to demonstrate the boundary fits the
-//!   current implementation. Not used by storage.rs today.
+//!   current implementation.
 //! - A `cfg(test)` `MockBackend` for unit tests.
 //! - 6 unit tests proving the trait is dyn-safe and the mock
 //!   round-trips a basic op flow.
@@ -34,11 +34,13 @@
 //! # Wired-pass scope (named follow-ups)
 //!
 //! - `wa-2l27x.8.cont.extract`: refactor storage.rs to consume
-//!   the trait via dependency injection. Today storage.rs uses
-//!   `rusqlite::Connection` directly throughout (~600 call sites
-//!   per a quick `grep -c rusqlite crates/frankenterm-core/src/storage.rs`).
-//!   The extraction is a multi-week refactor that the trait
-//!   substrate makes tractable.
+//!   the trait via dependency injection. StorageHandle writer and
+//!   read-pool paths now flow through `RusqliteBackend` /
+//!   `StorageBackend`; remaining direct rusqlite connection work is
+//!   isolated to explicit backend, migration, health, sql-helper, and
+//!   test modules. The extraction remains a multi-week refactor, but
+//!   `storage.rs` itself is guarded against direct `Connection`
+//!   regressions by `storage_l1jgo_pool_regression`.
 //! - `wa-2l27x.8.cont.frankensqlite`: implement the trait against
 //!   frankensqlite. Blocked on frankensqlite Phase 5+ shipping.
 //! - `wa-2l27x.8.cont.benchmarks`: bench the two backends side by
@@ -48,15 +50,15 @@
 //!
 //! # Why a minimal trait shape
 //!
-//! Storage.rs is ~26K lines and uses rusqlite's full surface.
+//! Storage.rs is large and historically used rusqlite's full surface.
 //! The trait below names the *operations* storage.rs performs
 //! conceptually — execute / query_one / query_many / transaction
 //! / schema_migrations — without dictating exact type signatures.
 //! Implementations will need to carry their own concrete types
 //! (rusqlite's `Connection`, frankensqlite's equivalent). The
-//! cont.extract bead's job is to thread one concrete type through
-//! storage.rs uniformly; this trait is the contract that
-//! extraction follows.
+//! cont.extract bead's job is to keep storage call sites on this
+//! contract while backend-specific code stays inside backend or
+//! explicitly scoped storage submodules.
 //!
 //! # What this is NOT
 //!
@@ -81,8 +83,8 @@ use serde::{Deserialize, Serialize};
 /// Capability the storage layer needs from its backing engine.
 ///
 /// Each production implementor (rusqlite today, frankensqlite
-/// tomorrow) exposes the same surface. Storage.rs
-/// is parameterized over this trait under cont.extract.
+/// tomorrow) exposes the same surface. Storage.rs read/write paths
+/// use this trait under cont.extract.
 ///
 /// The trait is **object-safe** so callers can use
 /// `Box<dyn StorageBackend>` to defer the choice at runtime
