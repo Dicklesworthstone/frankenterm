@@ -9,9 +9,19 @@ mkdir -p "${LOG_DIR}" "${METRICS_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="mission_tx_chaos_perf"
 CORRELATION_ID="ft-1i2ge.8.12-${RUN_ID}"
-TARGET_DIR="target-rch-mission-tx-chaos-perf-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/mission_tx_chaos_perf_${RUN_ID}.jsonl"
 METRICS_FILE="${METRICS_DIR}/mission_tx_rollout_readiness.json"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-mission-tx-chaos-perf-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 emit_log() {
   local outcome="$1"
@@ -64,24 +74,16 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v rch >/dev/null 2>&1; then
-  echo "rch is required; refusing local cargo execution" >&2
-  exit 1
-fi
-
 emit_log "started" "script_init" "none" "none" "$(basename "${LOG_FILE}")" \
   "run tx chaos/perf validation and rollout-readiness evidence generation"
 
-if rch workers probe --all --json \
-  | jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-    >/dev/null 2>&1; then
-  emit_log "passed" "preflight_rch_workers" "workers_available" "none" \
-    "$(basename "${LOG_FILE}")" "at least one healthy rch worker is available"
-else
-  emit_log "degraded" "preflight_rch_workers" "rch_fail_open_mode" "remote_worker_unavailable" \
-    "$(basename "${LOG_FILE}")" \
-    "no healthy remote workers; proceeding with rch exec fail-open semantics"
-fi
+rch_init "${LOG_DIR}" "${RUN_ID}" "mission_tx_chaos_perf"
+ensure_rch_ready
+
+emit_log "passed" "preflight_rch_workers" "workers_available" "none" \
+  "$(basename "$(rch_probe_log_path)")" "shared rch guard reported reachable workers"
+emit_log "passed" "preflight_rch_remote_smoke" "remote_exec_available" "none" \
+  "$(basename "$(rch_smoke_log_path)")" "shared rch guard verified fail-closed remote cargo execution"
 
 run_suite() {
   local suite_key="$1"
@@ -101,18 +103,17 @@ run_suite() {
 
   start_epoch="$(date +%s)"
   set +e
-  (
-    cd "${ROOT_DIR}"
-    rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"
-  ) >"${stdout_file}" 2>"${stderr_file}"
+  run_rch_cargo_logged "${stdout_file}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" "$@"
   local rc=$?
   set -e
+  : >"${stderr_file}"
   end_epoch="$(date +%s)"
   duration_secs=$((end_epoch - start_epoch))
 
   if [[ ${rc} -ne 0 ]]; then
     fail_now "${decision_path}" "suite_failed" "cargo_test_failed" \
-      "$(basename "${stderr_file}")" "$* (exit=${rc})"
+      "$(basename "${stdout_file}")" "$* (exit=${rc})"
   fi
 
   pass_count="$(awk '/^test .+ \.\.\. ok$/ { count++ } END { print count + 0 }' "${stdout_file}")"

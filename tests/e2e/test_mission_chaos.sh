@@ -11,10 +11,19 @@ SCENARIO_ID="mission_chaos"
 CORRELATION_ID="ft-1i2ge.7.6-chaos-${RUN_ID}"
 TX_ID="tx-chaos-${RUN_ID}"
 FIXED_SEED="1706001"
-TARGET_DIR="target-rch-mission-e2e"
 LOG_FILE="${LOG_DIR}/mission_chaos_${RUN_ID}.jsonl"
-PROBE_FILE="${LOG_DIR}/mission_chaos_${RUN_ID}.rch_probe.json"
 REPORT_FILE="${METRICS_DIR}/mission_chaos_evidence.json"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-mission-chaos-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 emit_log() {
   local outcome="$1"
@@ -82,23 +91,22 @@ run_suite() {
 
   start_epoch="$(date +%s)"
   set +e
-  (
-    cd "${ROOT_DIR}"
-    rch exec -- env \
-      CARGO_TARGET_DIR="${TARGET_DIR}" \
+  run_rch_cargo_logged "${stdout_file}" \
+    env \
+      CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
       FT_MISSION_TEST_SEED="${FIXED_SEED}" \
       PROPTEST_CASES=40 \
       RUST_TEST_THREADS=1 \
       "$@"
-  ) >"${stdout_file}" 2>"${stderr_file}"
   local rc=$?
   set -e
+  : >"${stderr_file}"
   end_epoch="$(date +%s)"
   duration_secs=$((end_epoch - start_epoch))
 
   if [[ ${rc} -ne 0 ]]; then
     fail_now "${decision_path}" "suite_failed" "cargo_test_failed" \
-      "$(basename "${stderr_file}")" "$* (exit=${rc})"
+      "$(basename "${stdout_file}")" "$* (exit=${rc})"
   fi
 
   pass_count="$(awk '/^test .+ \.\.\. ok$/ { count++ } END { print count + 0 }' "${stdout_file}" "${stderr_file}")"
@@ -135,23 +143,16 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v rch >/dev/null 2>&1; then
-  echo "rch is required; refusing local cargo execution" >&2
-  exit 1
-fi
-
 emit_log "started" "script_init" "none" "none" "$(basename "${LOG_FILE}")" \
   "chaos burn-in campaign with fixed-seed rollback storm + recovery checks"
 
-if rch workers probe --all --json >"${PROBE_FILE}" 2>&1 \
-  && jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-    "${PROBE_FILE}" >/dev/null 2>&1; then
-  emit_log "passed" "preflight_rch_workers" "workers_available" "none" \
-    "$(basename "${PROBE_FILE}")" "healthy rch workers available"
-else
-  emit_log "degraded" "preflight_rch_workers" "rch_fail_open_mode" "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" "no healthy remote workers; rch fail-open may execute locally"
-fi
+rch_init "${LOG_DIR}" "${RUN_ID}" "mission_chaos"
+ensure_rch_ready
+
+emit_log "passed" "preflight_rch_workers" "workers_available" "none" \
+  "$(basename "$(rch_probe_log_path)")" "shared rch guard reported reachable workers"
+emit_log "passed" "preflight_rch_remote_smoke" "remote_exec_available" "none" \
+  "$(basename "$(rch_smoke_log_path)")" "shared rch guard verified fail-closed remote cargo execution"
 
 chaos_result="$(run_suite \
   "chaos_planner_dispatcher" \
