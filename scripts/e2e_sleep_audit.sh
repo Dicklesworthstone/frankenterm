@@ -20,6 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 # Colors (disabled when piped)
@@ -185,12 +186,13 @@ scenario_no_bare_sleeps() {
                 fi
             fi
 
+            local trimmed_content="${content#"${content%%[![:space:]]*}"}"
             if [[ "$justified" == "true" ]]; then
                 ((justified_sleeps++)) || true
-                log_info "  $basename:$lineno — justified ($reason): $(echo "$content" | sed 's/^[[:space:]]*//')"
+                log_info "  $basename:$lineno — justified ($reason): $trimmed_content"
             else
                 ((unjustified_sleeps++)) || true
-                unjustified_details="${unjustified_details}    $basename:$lineno: $(echo "$content" | sed 's/^[[:space:]]*//')\n"
+                unjustified_details="${unjustified_details}    $basename:$lineno: $trimmed_content\n"
             fi
 
         done <<< "$sleep_lines"
@@ -294,6 +296,8 @@ scenario_bounded_timeouts() {
     local total_direct_waits=0
     local with_timeout=0
     local wrapper_functions=0
+    # shellcheck disable=SC2016
+    local timeout_pattern='[0-9]+\s*;?\s*$|[0-9]+\s*\)|"\$\{?wait_timeout|"\$timeout'
 
     for script in "$scripts_dir"/e2e_*.sh; do
         [[ -f "$script" ]] || continue
@@ -320,7 +324,7 @@ scenario_bounded_timeouts() {
             ((total_direct_waits++)) || true
 
             # Check for timeout parameter (numeric or variable on same or continuation line)
-            if echo "$content" | command grep -qE '[0-9]+\s*;?\s*$|[0-9]+\s*\)|"\$\{?wait_timeout|"\$timeout'; then
+            if echo "$content" | command grep -qE "$timeout_pattern"; then
                 ((with_timeout++)) || true
             else
                 log_info "  Check timeout: $basename:$lineno"
