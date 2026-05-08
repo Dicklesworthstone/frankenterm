@@ -18,7 +18,13 @@ scenarios_fail=0
 component="replay_capture_pipeline"
 local_tmpdir="${FT_REPLAY_CAPTURE_LOCAL_TMPDIR:-${TMPDIR:-/tmp}}"
 remote_tmpdir="${FT_REPLAY_CAPTURE_REMOTE_TMPDIR:-/home/ubuntu}"
-shared_remote_target_dir="${FT_REPLAY_CAPTURE_TARGET_DIR:-$remote_tmpdir/target-replay-capture-pipeline-${run_id}}"
+default_remote_target_dir="target/rch-e2e-replay-capture-pipeline-${run_id}"
+requested_remote_target_dir="${FT_REPLAY_CAPTURE_TARGET_DIR:-}"
+if [[ -n "${requested_remote_target_dir}" && "${requested_remote_target_dir}" != /* ]]; then
+  shared_remote_target_dir="${requested_remote_target_dir}"
+else
+  shared_remote_target_dir="${default_remote_target_dir}"
+fi
 RCH_DAEMON_STATUS_LOG="${LOG_DIR}/${run_id}.rch_daemon_status.json"
 RCH_DAEMON_START_LOG="${LOG_DIR}/${run_id}.rch_daemon_start.json"
 
