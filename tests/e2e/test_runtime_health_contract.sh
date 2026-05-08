@@ -26,42 +26,10 @@ TOTAL=0
 
 # ── rch infrastructure ──────────────────────────────────────────────────────
 RCH_TARGET_DIR="target/rch-e2e-runtime-health-${RUN_ID}"
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="${LOG_DIR}/runtime_health_${RUN_ID}.probe.log"
-RCH_SMOKE_LOG="${LOG_DIR}/runtime_health_${RUN_ID}.smoke.log"
-
-fatal() { echo "FATAL: $1" >&2; exit 1; }
-run_rch() { TMPDIR=/tmp rch "$@"; }
-run_rch_cargo() { run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"; }
-probe_has_reachable_workers() { grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"; }
-
-check_rch_fallback() {
-    local output_file="$1"
-    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
-        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
-    fi
-}
-
-run_rch_cargo_logged() {
-    local output_file="$1"; shift
-    set +e; ( cd "${ROOT_DIR}"; run_rch_cargo "$@" ) >"${output_file}" 2>&1; local rc=$?; set -e
-    check_rch_fallback "${output_file}"; return "${rc}"
-}
-
-ensure_rch_ready() {
-    if ! command -v rch >/dev/null 2>&1; then
-        fatal "rch is required for this e2e harness; refusing local cargo execution."
-    fi
-    set +e; run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1; local probe_rc=$?; set -e
-    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
-        fatal "rch workers unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
-    fi
-    set +e; run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1; local smoke_rc=$?; set -e
-    check_rch_fallback "${RCH_SMOKE_LOG}"
-    if [[ ${smoke_rc} -ne 0 ]]; then
-        fatal "rch remote smoke preflight failed. See ${RCH_SMOKE_LOG}"
-    fi
-}
+GUARD_LIB="${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
+rch_init "${LOG_DIR}" "${RUN_ID}" "runtime_health" "${ROOT_DIR}"
 
 emit_log() {
   local outcome="$1" scenario="$2" decision_path="$3" reason_code="$4"
@@ -118,7 +86,7 @@ ensure_rch_ready
 # Scenario 1: Unit tests compile and pass
 echo ""; echo "--- Scenario 1: Unit tests compile and pass ---"
 step1_log="${LOG_DIR}/runtime_health_${RUN_ID}.unit.log"
-if run_rch_cargo_logged "${step1_log}" test -p frankenterm-core --lib runtime_health -- --nocapture; then
+if run_rch_cargo_logged "${step1_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib runtime_health -- --nocapture; then
   test_count=$(count_matches 'test runtime_health::tests::' "${step1_log}")
   record_result "unit_tests_pass" "true"
   echo "    ${test_count} tests passed"
@@ -129,7 +97,7 @@ fi
 # Scenario 2: Proptest suite compiles and passes
 echo ""; echo "--- Scenario 2: Proptest suite compiles and passes ---"
 step2_log="${LOG_DIR}/runtime_health_${RUN_ID}.proptest.log"
-if run_rch_cargo_logged "${step2_log}" test -p frankenterm-core --test proptest_runtime_health -- --nocapture; then
+if run_rch_cargo_logged "${step2_log}" env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --test proptest_runtime_health -- --nocapture; then
   record_result "proptests_pass" "true"
 else
   record_result "proptests_pass" "false" "assertion_failed" "assertion_failed" "see ${step2_log}"
