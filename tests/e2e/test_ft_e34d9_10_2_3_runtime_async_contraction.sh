@@ -232,7 +232,6 @@ cd "${ROOT_DIR}"
 require_cmd jq
 require_cmd rg
 require_cmd rch
-require_cmd cargo
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 emit_log "preflight" "target_dir" "cargo_target_dir=${CARGO_TARGET_DIR}" "configured" "none" "none" "$(basename "${LOG_FILE}")"
