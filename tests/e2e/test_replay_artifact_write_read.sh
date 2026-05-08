@@ -29,6 +29,20 @@ now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
+json_string() {
+  printf '"%s"' "$(json_escape "$1")"
+}
+
 log_json() {
   local payload="$1"
   jq -cn \
@@ -271,8 +285,14 @@ emit_event_line() {
   local sequence="$4"
   local text="$5"
 
-  printf '{"schema_version":"ft.recorder.event.v1","event_id":"%s","pane_id":%s,"session_id":"sess-%s","workflow_id":null,"correlation_id":null,"source":"wezterm_mux","occurred_at_ms":%s,"recorded_at_ms":%s,"sequence":%s,"causality":{"parent_event_id":null,"trigger_event_id":null,"root_event_id":null},"event_type":"egress_output","text":"%s","encoding":"utf8","redaction":"none","segment_kind":"delta","is_gap":false}\n' \
-    "$event_id" "$pane_id" "$pane_id" $((1700000000000 + sequence)) $((1700000000000 + sequence)) "$sequence" "$text" >>"$file"
+  printf '{"schema_version":"ft.recorder.event.v1","event_id":%s,"pane_id":%s,"session_id":%s,"workflow_id":null,"correlation_id":null,"source":"wezterm_mux","occurred_at_ms":%s,"recorded_at_ms":%s,"sequence":%s,"causality":{"parent_event_id":null,"trigger_event_id":null,"root_event_id":null},"event_type":"egress_output","text":%s,"encoding":"utf8","redaction":"none","segment_kind":"delta","is_gap":false}\n' \
+    "$(json_string "$event_id")" \
+    "$pane_id" \
+    "$(json_string "sess-$pane_id")" \
+    $((1700000000000 + sequence)) \
+    $((1700000000000 + sequence)) \
+    "$sequence" \
+    "$(json_string "$text")" >>"$file"
 }
 
 emit_decision_line() {
@@ -280,8 +300,11 @@ emit_decision_line() {
   local event_id="$2"
   local sequence="$3"
 
-  printf '{"schema_version":"ft.recorder.event.v1","event_id":"%s","pane_id":1,"session_id":"sess-incident","workflow_id":"wf-1","correlation_id":"corr-1","source":"workflow_engine","occurred_at_ms":%s,"recorded_at_ms":%s,"sequence":%s,"causality":{"parent_event_id":null,"trigger_event_id":null,"root_event_id":null},"event_type":"control_marker","control_marker_type":"policy_decision","details":{"decision":"allow","reason":"fixture","rule_id":"policy.default.allow_non_alt","action_kind":"send_text"}}\n' \
-    "$event_id" $((1700000010000 + sequence)) $((1700000010000 + sequence)) "$sequence" >>"$file"
+  printf '{"schema_version":"ft.recorder.event.v1","event_id":%s,"pane_id":1,"session_id":"sess-incident","workflow_id":"wf-1","correlation_id":"corr-1","source":"workflow_engine","occurred_at_ms":%s,"recorded_at_ms":%s,"sequence":%s,"causality":{"parent_event_id":null,"trigger_event_id":null,"root_event_id":null},"event_type":"control_marker","control_marker_type":"policy_decision","details":{"decision":"allow","reason":"fixture","rule_id":"policy.default.allow_non_alt","action_kind":"send_text"}}\n' \
+    "$(json_string "$event_id")" \
+    $((1700000010000 + sequence)) \
+    $((1700000010000 + sequence)) \
+    "$sequence" >>"$file"
 }
 
 write_fixture() {
