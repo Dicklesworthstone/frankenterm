@@ -67,7 +67,7 @@ impl SftpWrap {
             Self::Ssh2(sftp) => Ok(sftp.symlink(path.as_std_path(), target.as_std_path())?),
 
             #[cfg(feature = "libssh-rs")]
-            Self::LibSsh(sftp) => Ok(sftp.symlink(path.as_str(), target.as_str())?),
+            Self::LibSsh(sftp) => Ok(sftp.symlink(target.as_str(), path.as_str())?),
         }
     }
 
