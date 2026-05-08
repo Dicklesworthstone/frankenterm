@@ -25,6 +25,8 @@ CANARY="CANARY_$(date +%s)_$$"
 PASS=0
 FAIL=0
 
+# Invoked through the EXIT trap below.
+# shellcheck disable=SC2329
 cleanup() {
     echo "[cleanup] Stopping processes..."
     [ -n "${GUI_PID:-}" ] && kill "$GUI_PID" 2>/dev/null || true

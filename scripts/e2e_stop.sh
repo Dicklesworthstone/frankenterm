@@ -26,6 +26,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
@@ -140,6 +141,8 @@ setup_temp_workspace() {
 }
 
 # Cleanup temp workspace
+# Invoked through the EXIT trap in main.
+# shellcheck disable=SC2329
 cleanup_temp_workspace() {
     if [[ -n "$TEMP_WORKSPACE" && -d "$TEMP_WORKSPACE" ]]; then
         rm -rf "$TEMP_WORKSPACE"
