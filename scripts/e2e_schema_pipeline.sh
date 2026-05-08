@@ -19,6 +19,7 @@ set -euo pipefail
 # Source E2E artifacts library
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
 # Colors (disabled when piped)
@@ -78,6 +79,7 @@ run_wa_timeout() {
     # Strip ANSI codes and find JSON object
     # First, remove ANSI escape sequences
     local stripped
+    # shellcheck disable=SC2001
     stripped=$(echo "$raw_output" | sed 's/\x1b\[[0-9;]*m//g')
 
     # Try to extract JSON: find the first { and everything after
@@ -262,7 +264,9 @@ test_envelope_schema() {
 
     for cmd in "${commands[@]}"; do
         local output
-        output=$(run_wa_timeout 5 $cmd)
+        local -a cmd_args=()
+        read -r -a cmd_args <<< "$cmd"
+        output=$(run_wa_timeout 5 "${cmd_args[@]}")
         local cmd_name="${cmd//[[:space:]]/_}"
 
         if ! is_valid_json "$output"; then
@@ -314,7 +318,9 @@ test_command_schemas() {
         fi
 
         local output
-        output=$(run_wa_timeout 5 $cmd)
+        local -a cmd_args=()
+        read -r -a cmd_args <<< "$cmd"
+        output=$(run_wa_timeout 5 "${cmd_args[@]}")
 
         if ! is_valid_json "$output"; then
             log_fail "$cmd: not valid JSON"
