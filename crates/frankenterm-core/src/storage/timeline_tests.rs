@@ -3,6 +3,7 @@
 //! `crate::storage::*`.
 
 use super::*;
+use rusqlite::Connection;
 
 /// Helper to create a pane
 fn insert_test_pane(conn: &Connection, pane_id: u64, domain: &str) {

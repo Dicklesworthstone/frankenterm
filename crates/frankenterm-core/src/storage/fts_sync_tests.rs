@@ -3,6 +3,7 @@
 //! `crate::storage::*`.
 
 use super::*;
+use rusqlite::Connection;
 
 fn with_fts_backend<F, R>(conn: &mut Connection, f: F) -> Result<R>
 where

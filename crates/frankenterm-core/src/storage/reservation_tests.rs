@@ -3,6 +3,7 @@
 //! `crate::storage::*`.
 
 use super::*;
+use rusqlite::Connection;
 
 fn setup_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();

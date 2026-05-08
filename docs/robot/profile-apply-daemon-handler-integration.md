@@ -29,6 +29,7 @@ use frankenterm_core::robot_profile_handler::{
 use frankenterm_core::storage::profiles_applied_log_sql::{
     insert_apply_receipt, get_apply_receipt,
 };
+use frankenterm_core::storage_backend_trait::StorageBackend;
 use frankenterm_core::robot_ntm_surface::{
     ProfileApplyData, ProfileApplyRequest,
 };
@@ -36,7 +37,7 @@ use frankenterm_core::robot_ntm_surface::{
 fn handle_apply_non_dry_run(
     request: &ProfileApplyRequest,
     profile: &AgentProfile,
-    storage: &Connection,
+    storage: &dyn StorageBackend,
     mux: &mut MuxClient,
 ) -> Result<ProfileApplyData, ProfileHandlerError> {
     // Step 1: compute content_hash from the canonical inputs.

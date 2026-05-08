@@ -3,6 +3,7 @@
 //! `crate::storage::*`.
 
 use super::*;
+use rusqlite::Connection;
 
 fn create_test_event(
     id: i64,

@@ -3,6 +3,7 @@
 //! `crate::storage::*`.
 
 use super::*;
+use rusqlite::Connection;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static DB_CHECK_COUNTER: AtomicU64 = AtomicU64::new(0);

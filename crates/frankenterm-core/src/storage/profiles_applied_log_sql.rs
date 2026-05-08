@@ -1,8 +1,8 @@
-//! SQLite CRUD primitives for the `profiles_applied_log` table
+//! StorageBackend CRUD primitives for the `profiles_applied_log` table
 //! (br-ft-4iz0q substrate-pass).
 //!
 //! Synchronous handlers callable from the storage writer thread
-//! (or from tests via in-memory SQLite). The async StorageHandle
+//! (or from tests via an in-memory backend). The async StorageHandle
 //! wrappers + WriteCommand variants are a separate slice — this
 //! module ships the actual SQL so a future commit can plug them
 //! into the writer-loop dispatch table without re-litigating
@@ -41,15 +41,18 @@
 //! - substrate types: crates/frankenterm-core/src/robot_profile_handler.rs
 //!   (ApplyReceipt struct + compute_apply_content_hash).
 
-use rusqlite::{Connection, OptionalExtension, params};
-
 use crate::robot_profile_handler::ApplyReceipt;
+use crate::storage_backend_helpers::execute_typed;
+use crate::storage_backend_row_helpers::RowReader;
+use crate::storage_backend_trait::{BackendError, StorageBackend, ToSqlValue};
+#[cfg(test)]
+use crate::storage_backend_trait::{OpenConfig, RusqliteBackend};
 
 /// Error type for the profiles_applied_log SQL primitives.
 #[derive(Debug)]
 pub enum ProfilesAppliedLogSqlError {
-    /// Underlying SQLite call failed.
-    Sqlite(rusqlite::Error),
+    /// Underlying storage backend call failed.
+    Backend(BackendError),
     /// A JSON-encoded TEXT column (panes_spawned_json) failed to
     /// decode. Carries the column name + serde_json error
     /// message for operator diagnosis. Indicates DB corruption.
@@ -62,7 +65,7 @@ pub enum ProfilesAppliedLogSqlError {
 impl std::fmt::Display for ProfilesAppliedLogSqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Sqlite(e) => write!(f, "profiles_applied_log SQLite error: {e}"),
+            Self::Backend(e) => write!(f, "profiles_applied_log storage backend error: {e}"),
             Self::Decode { column, msg } => {
                 write!(
                     f,
@@ -76,10 +79,43 @@ impl std::fmt::Display for ProfilesAppliedLogSqlError {
 
 impl std::error::Error for ProfilesAppliedLogSqlError {}
 
-impl From<rusqlite::Error> for ProfilesAppliedLogSqlError {
-    fn from(err: rusqlite::Error) -> Self {
-        Self::Sqlite(err)
+impl From<BackendError> for ProfilesAppliedLogSqlError {
+    fn from(err: BackendError) -> Self {
+        Self::Backend(err)
     }
+}
+
+fn validate_content_hash(content_hash: &str) -> Result<(), ProfilesAppliedLogSqlError> {
+    if content_hash.len() != 64
+        || !content_hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+    {
+        return Err(ProfilesAppliedLogSqlError::Invalid(format!(
+            "content_hash must be 64 lowercase-hex chars, got `{}` ({} chars)",
+            content_hash,
+            content_hash.len(),
+        )));
+    }
+    Ok(())
+}
+
+fn decode_apply_receipt_row(row: &[String]) -> Result<ApplyReceipt, ProfilesAppliedLogSqlError> {
+    let reader = RowReader::new(row);
+    let panes_json = reader.string(4)?;
+    let panes_spawned: Vec<u64> =
+        serde_json::from_str(&panes_json).map_err(|e| ProfilesAppliedLogSqlError::Decode {
+            column: "panes_spawned_json",
+            msg: e.to_string(),
+        })?;
+    Ok(ApplyReceipt {
+        content_hash: reader.string(0)?,
+        profile_name: reader.string(1)?,
+        profile_updated_at_ms: reader.i64(2)?,
+        count: reader.u32(3)?,
+        panes_spawned,
+        recorded_at_ms: reader.i64(5)?,
+    })
 }
 
 /// Insert a new apply receipt. Caller has already computed the
@@ -88,41 +124,36 @@ impl From<rusqlite::Error> for ProfilesAppliedLogSqlError {
 /// (i.e. the lookup via [`get_apply_receipt`] returned `None`
 /// before the spawn loop ran).
 ///
-/// Returns `Err(ProfilesAppliedLogSqlError::Sqlite)` with a
+/// Returns `Err(ProfilesAppliedLogSqlError::Backend)` with a
 /// UNIQUE constraint violation if a row with the same
 /// content_hash already exists — the daemon-side handler
 /// should treat that as a race-loser signal and re-read the
 /// existing receipt.
 pub fn insert_apply_receipt(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     receipt: &ApplyReceipt,
 ) -> Result<(), ProfilesAppliedLogSqlError> {
-    if receipt.content_hash.len() != 64
-        || !receipt.content_hash.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        return Err(ProfilesAppliedLogSqlError::Invalid(format!(
-            "content_hash must be 64 lowercase-hex chars, got `{}` ({} chars)",
-            receipt.content_hash,
-            receipt.content_hash.len(),
-        )));
-    }
+    validate_content_hash(&receipt.content_hash)?;
 
     let panes_json =
         serde_json::to_string(&receipt.panes_spawned).expect("Vec<u64> to JSON is infallible");
 
-    conn.execute(
+    let params = [
+        ToSqlValue::Text(receipt.content_hash.as_str()),
+        ToSqlValue::Text(receipt.profile_name.as_str()),
+        ToSqlValue::Integer(receipt.profile_updated_at_ms),
+        ToSqlValue::Integer(i64::from(receipt.count)),
+        ToSqlValue::OwnedText(panes_json),
+        ToSqlValue::Integer(receipt.recorded_at_ms),
+    ];
+
+    execute_typed(
+        backend,
         "INSERT INTO profiles_applied_log \
          (content_hash, profile_name, profile_updated_at_ms, count, \
           panes_spawned_json, recorded_at_ms) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            receipt.content_hash,
-            receipt.profile_name,
-            receipt.profile_updated_at_ms,
-            receipt.count,
-            panes_json,
-            receipt.recorded_at_ms,
-        ],
+        &params,
     )?;
     Ok(())
 }
@@ -132,45 +163,19 @@ pub fn insert_apply_receipt(
 /// before issuing real mux spawn calls + short-circuits to the
 /// recorded `panes_spawned` when a row exists.
 pub fn get_apply_receipt(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     content_hash: &str,
 ) -> Result<Option<ApplyReceipt>, ProfilesAppliedLogSqlError> {
-    let row = conn
-        .query_row(
-            "SELECT content_hash, profile_name, profile_updated_at_ms, \
-                    count, panes_spawned_json, recorded_at_ms \
-             FROM profiles_applied_log \
-             WHERE content_hash = ?1",
-            params![content_hash],
-            |row| {
-                let hash: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                let updated_at: i64 = row.get(2)?;
-                let count: u32 = row.get(3)?;
-                let panes_json: String = row.get(4)?;
-                let recorded_at: i64 = row.get(5)?;
-                Ok((hash, name, updated_at, count, panes_json, recorded_at))
-            },
-        )
-        .optional()?;
+    let row = backend.query_row_typed(
+        "SELECT content_hash, profile_name, profile_updated_at_ms, \
+                count, panes_spawned_json, recorded_at_ms \
+         FROM profiles_applied_log \
+         WHERE content_hash = ?1",
+        &[ToSqlValue::Text(content_hash)],
+    )?;
     match row {
         None => Ok(None),
-        Some((hash, name, updated_at, count, panes_json, recorded_at)) => {
-            let panes_spawned: Vec<u64> = serde_json::from_str(&panes_json).map_err(|e| {
-                ProfilesAppliedLogSqlError::Decode {
-                    column: "panes_spawned_json",
-                    msg: e.to_string(),
-                }
-            })?;
-            Ok(Some(ApplyReceipt {
-                content_hash: hash,
-                profile_name: name,
-                profile_updated_at_ms: updated_at,
-                count,
-                panes_spawned,
-                recorded_at_ms: recorded_at,
-            }))
-        }
+        Some(row) => Ok(Some(decode_apply_receipt_row(&row)?)),
     }
 }
 
@@ -178,42 +183,25 @@ pub fn get_apply_receipt(
 /// descending order. Used by `ft profile history` style
 /// operator queries (wired-pass extension).
 pub fn list_apply_receipts_for_profile(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     profile_name: &str,
     limit: u32,
 ) -> Result<Vec<ApplyReceipt>, ProfilesAppliedLogSqlError> {
-    let mut stmt = conn.prepare(
+    let rows = backend.query_map_typed(
         "SELECT content_hash, profile_name, profile_updated_at_ms, \
                 count, panes_spawned_json, recorded_at_ms \
          FROM profiles_applied_log \
          WHERE profile_name = ?1 \
          ORDER BY recorded_at_ms DESC \
          LIMIT ?2",
+        &[
+            ToSqlValue::Text(profile_name),
+            ToSqlValue::Integer(i64::from(limit)),
+        ],
     )?;
-    let mut rows = stmt.query(params![profile_name, limit])?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        let hash: String = row.get(0)?;
-        let name: String = row.get(1)?;
-        let updated_at: i64 = row.get(2)?;
-        let count: u32 = row.get(3)?;
-        let panes_json: String = row.get(4)?;
-        let recorded_at: i64 = row.get(5)?;
-        let panes_spawned: Vec<u64> =
-            serde_json::from_str(&panes_json).map_err(|e| ProfilesAppliedLogSqlError::Decode {
-                column: "panes_spawned_json",
-                msg: e.to_string(),
-            })?;
-        out.push(ApplyReceipt {
-            content_hash: hash,
-            profile_name: name,
-            profile_updated_at_ms: updated_at,
-            count,
-            panes_spawned,
-            recorded_at_ms: recorded_at,
-        });
-    }
-    Ok(out)
+    rows.iter()
+        .map(|row| decode_apply_receipt_row(row))
+        .collect()
 }
 
 /// Delete a receipt by content_hash. Returns the number of rows
@@ -221,23 +209,32 @@ pub fn list_apply_receipts_for_profile(
 /// for clearing stale receipts; the daemon-side handler does
 /// not normally invoke this.
 pub fn delete_apply_receipt(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     content_hash: &str,
 ) -> Result<usize, ProfilesAppliedLogSqlError> {
-    Ok(conn.execute(
-        "DELETE FROM profiles_applied_log WHERE content_hash = ?1",
-        params![content_hash],
-    )?)
+    let row = backend.query_row_typed(
+        "DELETE FROM profiles_applied_log WHERE content_hash = ?1 RETURNING 1",
+        &[ToSqlValue::Text(content_hash)],
+    )?;
+    Ok(usize::from(row.is_some()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fresh_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE profiles_applied_log (
+    fn fresh_db() -> RusqliteBackend {
+        let backend = RusqliteBackend::open(
+            ":memory:",
+            &OpenConfig {
+                wal_mode: false,
+                ..OpenConfig::default()
+            },
+        )
+        .unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE profiles_applied_log (
                 content_hash         TEXT PRIMARY KEY NOT NULL,
                 profile_name         TEXT NOT NULL,
                 profile_updated_at_ms INTEGER NOT NULL,
@@ -247,9 +244,9 @@ mod tests {
             );
             CREATE INDEX profiles_applied_log_profile_name_idx
                 ON profiles_applied_log(profile_name);",
-        )
-        .unwrap();
-        conn
+            )
+            .unwrap();
+        backend
     }
 
     fn sample_receipt() -> ApplyReceipt {
@@ -307,9 +304,20 @@ mod tests {
         insert_apply_receipt(&conn, &receipt).unwrap();
         let err = insert_apply_receipt(&conn, &receipt).unwrap_err();
         match err {
-            ProfilesAppliedLogSqlError::Sqlite(rusqlite::Error::SqliteFailure(_, _)) => {}
-            other => panic!("expected Sqlite UNIQUE constraint, got {other:?}"),
+            ProfilesAppliedLogSqlError::Backend(BackendError::Query(msg)) => {
+                assert!(msg.contains("UNIQUE"));
+            }
+            other => panic!("expected backend UNIQUE constraint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn insert_rejects_uppercase_content_hash() {
+        let conn = fresh_db();
+        let mut receipt = sample_receipt();
+        receipt.content_hash = "A".repeat(64);
+        let err = insert_apply_receipt(&conn, &receipt).unwrap_err();
+        assert!(matches!(err, ProfilesAppliedLogSqlError::Invalid(_)));
     }
 
     #[test]
