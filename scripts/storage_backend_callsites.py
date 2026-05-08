@@ -12,7 +12,7 @@ submodule at a time" guidance).
 The analyzer is read-only — it does NOT touch storage.rs. It
 accelerates the migration by:
 
-1. Counting each known rusqlite pattern in storage.rs.
+1. Counting each known raw-rusqlite pattern in storage.rs.
 2. Mapping each pattern to its substrate replacement (helpers from
    storage_backend_helpers / storage_backend_row_helpers /
    storage_backend_cells).
@@ -99,10 +99,10 @@ PATTERNS: list[tuple[str, str, str | None, str | None, str]] = [
     ),
     (
         "conn_execute_batch",
-        r"\.execute_batch\s*\(",
+        r"\bconn(?:ection)?\.execute_batch\s*\(",
         "execute_batch",
         "storage_backend_trait",
-        "DDL / multi-statement execution. Trait method already covers this.",
+        "Raw Connection DDL / multi-statement execution. Trait method already covers this.",
     ),
     (
         "conn_execute",
@@ -191,6 +191,13 @@ PATTERNS: list[tuple[str, str, str | None, str | None, str]] = [
 ]
 
 
+def strip_full_line_rust_comments(source: str) -> str:
+    """Drop full-line Rust comments so examples do not count as callsites."""
+    return "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("//")
+    )
+
+
 def count_pattern(source: str, regex: str) -> int:
     return len(re.findall(regex, source))
 
@@ -200,6 +207,7 @@ def build_plan(source_path: Path) -> dict:
         raise FileNotFoundError(f"source file not found: {source_path}")
     text = source_path.read_text(encoding="utf-8")
     line_count = text.count("\n") + 1
+    scan_text = strip_full_line_rust_comments(text)
 
     pattern_rows: list[dict] = []
     for name, regex, replacement, module, notes in PATTERNS:
@@ -207,7 +215,7 @@ def build_plan(source_path: Path) -> dict:
             {
                 "name": name,
                 "regex": regex,
-                "occurrences": count_pattern(text, regex),
+                "occurrences": count_pattern(scan_text, regex),
                 "replacement": replacement,
                 "replacement_module": module,
                 "notes": notes,

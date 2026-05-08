@@ -1,10 +1,7 @@
 {
   "bead": "ft-l1jgo",
-  "generated_at_utc": "2026-05-08T20:26:50Z",
-  "migration_priority": [
-    "conn_execute_batch",
-    "row_get_typed"
-  ],
+  "generated_at_utc": "2026-05-08T20:47:42Z",
+  "migration_priority": [],
   "missing_substrate": [],
   "patterns": [
     {
@@ -25,9 +22,9 @@
     },
     {
       "name": "conn_execute_batch",
-      "notes": "DDL / multi-statement execution. Trait method already covers this.",
-      "occurrences": 10,
-      "regex": "\\.execute_batch\\s*\\(",
+      "notes": "Raw Connection DDL / multi-statement execution. Trait method already covers this.",
+      "occurrences": 0,
+      "regex": "\\bconn(?:ection)?\\.execute_batch\\s*\\(",
       "replacement": "execute_batch",
       "replacement_module": "storage_backend_trait"
     },
@@ -98,7 +95,7 @@
     {
       "name": "row_get_typed",
       "notes": "Per-column typed reads inside a query_map closure \u2014 RowReader bundles them.",
-      "occurrences": 1,
+      "occurrences": 0,
       "regex": "row\\.get(?:_unwrap)?::\\s*<",
       "replacement": "RowReader",
       "replacement_module": "storage_backend_row_helpers"
@@ -131,5 +128,5 @@
   "schema_version": 1,
   "source": "crates/frankenterm-core/src/storage.rs",
   "source_line_count": 20936,
-  "total_callsites": 11
+  "total_callsites": 0
 }
