@@ -18,11 +18,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")-$$"
 ARTIFACT_DIR="${FT_RECORDER_VALIDATION_ARTIFACT_DIR:-target/recorder-validation-gates}"
-TARGET_DIR="${FT_RECORDER_VALIDATION_TARGET_DIR:-target/recorder-validation-gates/cargo-target}"
+DEFAULT_TARGET_DIR="target/rch-recorder-validation-gates-${RUN_ID}"
+REQUESTED_TARGET_DIR="${FT_RECORDER_VALIDATION_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "$REQUESTED_TARGET_DIR" && "$REQUESTED_TARGET_DIR" != /* ]]; then
+    TARGET_DIR="$REQUESTED_TARGET_DIR"
+else
+    TARGET_DIR="$DEFAULT_TARGET_DIR"
+fi
 RUN_LOAD_BENCH="${FT_RECORDER_GATE_RUN_LOAD_BENCH:-0}"
 
 mkdir -p "$ARTIFACT_DIR"
+
+RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
+RCH_STEP_TIMEOUT_SECS="${FT_RECORDER_VALIDATION_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-1800}}"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+rch_init "$ARTIFACT_DIR" "$RUN_ID" "recorder_validation_gates" "$PROJECT_ROOT"
+ensure_rch_ready
 
 # Explicit gate thresholds
 MIN_CHAOS_SUMMARY_ARTIFACTS=1
@@ -46,10 +60,17 @@ run_step() {
     shift 2
 
     local log_file="$ARTIFACT_DIR/${step_name}.log"
+    local rch_log_file="$ARTIFACT_DIR/${step_name}.rch.log"
     echo "[recorder-gates] === ${step_name} ==="
     echo "[recorder-gates] cmd: $*" > "$log_file"
 
-    if "$@" 2>&1 | tee -a "$log_file"; then
+    set +e
+    run_rch_cargo_logged "$rch_log_file" "$@"
+    local rc=$?
+    set -e
+    cat "$rch_log_file" | tee -a "$log_file"
+
+    if [[ "$rc" -eq 0 ]]; then
         printf -v "$status_var" '%s' "pass"
         PASS=$((PASS + 1))
     else
