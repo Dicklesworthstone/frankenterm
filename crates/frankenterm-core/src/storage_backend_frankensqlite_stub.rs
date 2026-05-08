@@ -152,6 +152,10 @@ impl StorageBackend for FrankenSQLiteBackend {
         Err(BackendError::Other(NOT_WIRED_HINT.to_string()))
     }
 
+    fn set_busy_timeout(&self, _timeout: std::time::Duration) -> Result<(), BackendError> {
+        Err(BackendError::Other(NOT_WIRED_HINT.to_string()))
+    }
+
     fn query_scalar(&self, _sql: &str) -> Result<Option<String>, BackendError> {
         Err(BackendError::Other(NOT_WIRED_HINT.to_string()))
     }
@@ -249,6 +253,16 @@ mod tests {
         assert!(
             backend
                 .execute_batch("CREATE TABLE foo (id INTEGER)")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn set_busy_timeout_returns_not_wired() {
+        let backend = FrankenSQLiteBackend::for_stub_tests("/tmp/x.db");
+        assert!(
+            backend
+                .set_busy_timeout(std::time::Duration::from_secs(5))
                 .is_err()
         );
     }

@@ -1348,7 +1348,6 @@ impl StorageHandle {
             };
             let backend = RusqliteBackend::open_path(Path::new(&db_path_owned), &open_config)
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-            let conn = backend.into_connection();
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after database open")?;
@@ -1364,12 +1363,10 @@ impl StorageHandle {
             // be applied here on every connection-open path. The discard
             // is intentional — failure to apply busy_timeout is non-fatal,
             // just makes the writer more contention-sensitive.
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+            let _ = backend.set_busy_timeout(std::time::Duration::from_secs(5));
 
             // Check for and recover from unclean shutdown (wa-o8j)
-            let backend = RusqliteBackend::new(conn);
             check_and_recover_wal(&backend, &db_path_owned)?;
-            let conn = backend.into_connection();
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after WAL recovery")?;
@@ -1388,12 +1385,14 @@ impl StorageHandle {
             // prune_session_checkpoints_sync leaves orphan mux_pane_state
             // rows across restarts. Enforce FKs unconditionally on every
             // connection open — idempotent, O(1).
-            conn.pragma_update(None, "foreign_keys", true)
+            backend
+                .execute_batch("PRAGMA foreign_keys = ON")
                 .map_err(|e| {
                     StorageError::Database(format!(
                         "Failed to enable foreign_keys PRAGMA (ft-s4myu): {e}"
                     ))
                 })?;
+            let conn = backend.into_connection();
 
             if let Some(cx) = init_cx.as_ref() {
                 Self::checkpoint_storage_open(cx, "after foreign key setup")?;
@@ -10153,11 +10152,10 @@ fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
         wal_mode: false,
         ..crate::storage_backend_trait::OpenConfig::default()
     };
-    let conn = RusqliteBackend::open(db_path, &config)
-        .map_err(|err| StorageError::Database(format!("Failed to open read connection: {err}")))?
-        .into_connection();
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-    Ok(conn)
+    let backend = RusqliteBackend::open(db_path, &config)
+        .map_err(|err| StorageError::Database(format!("Failed to open read connection: {err}")))?;
+    let _ = backend.set_busy_timeout(std::time::Duration::from_secs(5));
+    Ok(backend.into_connection())
 }
 
 fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
@@ -10887,19 +10885,17 @@ pub fn record_policy_denial_audit_blocking(
         wal_mode: false,
         ..crate::storage_backend_trait::OpenConfig::default()
     };
-    let conn = RusqliteBackend::open_path(db_path, &config)
-        .map_err(|e| {
-            StorageError::Database(format!(
-                "open {} for policy_denied_audit: {e}",
-                db_path.display()
-            ))
-        })?
-        .into_connection();
-    conn.busy_timeout(std::time::Duration::from_secs(5))
+    let backend = RusqliteBackend::open_path(db_path, &config).map_err(|e| {
+        StorageError::Database(format!(
+            "open {} for policy_denied_audit: {e}",
+            db_path.display()
+        ))
+    })?;
+    backend
+        .set_busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| {
             StorageError::Database(format!("set busy_timeout for policy_denied_audit: {e}"))
         })?;
-    let backend = RusqliteBackend::new(conn);
     record_policy_denial_audit_backend(&backend, record)
 }
 

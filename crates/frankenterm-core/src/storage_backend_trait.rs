@@ -100,6 +100,15 @@ pub trait StorageBackend: Send + Sync {
     /// Used for schema migrations.
     fn execute_batch(&self, sql: &str) -> Result<(), BackendError>;
 
+    /// Configure the backend connection's busy timeout.
+    ///
+    /// SQLite uses this to wait for a contended lock instead of
+    /// returning `SQLITE_BUSY` immediately. Backends that do not
+    /// expose an equivalent should treat this as a best-effort
+    /// connection knob and return an error only when the requested
+    /// configuration is known to be invalid or failed.
+    fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<(), BackendError>;
+
     /// Run a query that returns at most one row, returning
     /// the row's first column value as a string. (The
     /// minimal-trait substrate uses string round-tripping;
@@ -848,6 +857,15 @@ impl StorageBackend for MockBackend {
         Ok(())
     }
 
+    fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<(), BackendError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .executed
+            .push(format!("busy_timeout_ms: {}", timeout.as_millis()));
+        Ok(())
+    }
+
     fn query_scalar(&self, _sql: &str) -> Result<Option<String>, BackendError> {
         // The mock doesn't run real queries; tests that need a
         // specific answer should use a custom backend impl.
@@ -1032,6 +1050,12 @@ impl StorageBackend for RusqliteBackend {
         let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
         conn.execute_batch(sql)
             .map_err(|e| BackendError::Query(e.to_string()))
+    }
+
+    fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<(), BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        conn.busy_timeout(timeout)
+            .map_err(|e| BackendError::Query(format!("busy_timeout: {e}")))
     }
 
     fn query_scalar(&self, sql: &str) -> Result<Option<String>, BackendError> {
@@ -1685,6 +1709,16 @@ mod tests {
         assert_eq!(backend.user_version().unwrap(), 7);
         backend.set_user_version(13).unwrap();
         assert_eq!(backend.user_version().unwrap(), 13);
+    }
+
+    #[test]
+    fn rusqlite_backend_busy_timeout_round_trips() {
+        let backend = open_memory();
+        backend
+            .set_busy_timeout(std::time::Duration::from_millis(1234))
+            .unwrap();
+        let got = backend.query_scalar("PRAGMA busy_timeout").unwrap();
+        assert_eq!(got.as_deref(), Some("1234"));
     }
 
     #[test]
