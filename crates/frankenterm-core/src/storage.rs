@@ -42,7 +42,6 @@ use std::{
 
 use crate::runtime_async::oneshot;
 use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
-use rusqlite::types::Value as SqlValue;
 #[cfg(test)]
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -11761,35 +11760,35 @@ fn purge_usage_metrics_backend(backend: &dyn StorageBackend, before_ts: i64) -> 
     Ok(deleted.len())
 }
 
-fn build_usage_metrics_query(query: &MetricQuery) -> (String, Vec<SqlValue>) {
+fn build_usage_metrics_query(query: &MetricQuery) -> (String, Vec<ToSqlValue<'static>>) {
     let mut sql = String::from(
         "SELECT id, timestamp, metric_type, pane_id, agent_type, account_id, workflow_id, count, amount, tokens, metadata, created_at FROM usage_metrics WHERE 1=1",
     );
     let mut param_values = Vec::new();
 
     if let Some(ref mt) = query.metric_type {
-        param_values.push(SqlValue::Text(mt.as_str().to_string()));
+        param_values.push(ToSqlValue::OwnedText(mt.as_str().to_string()));
         sql.push_str(&format!(" AND metric_type = ?{}", param_values.len()));
     }
     if let Some(ref agent) = query.agent_type {
-        param_values.push(SqlValue::Text(agent.clone()));
+        param_values.push(ToSqlValue::OwnedText(agent.clone()));
         sql.push_str(&format!(" AND agent_type = ?{}", param_values.len()));
     }
     if let Some(ref account) = query.account_id {
-        param_values.push(SqlValue::Text(account.clone()));
+        param_values.push(ToSqlValue::OwnedText(account.clone()));
         sql.push_str(&format!(" AND account_id = ?{}", param_values.len()));
     }
     if let Some(since) = query.since {
-        param_values.push(SqlValue::Integer(since));
+        param_values.push(ToSqlValue::Integer(since));
         sql.push_str(&format!(" AND timestamp >= ?{}", param_values.len()));
     }
     if let Some(until) = query.until {
-        param_values.push(SqlValue::Integer(until));
+        param_values.push(ToSqlValue::Integer(until));
         sql.push_str(&format!(" AND timestamp < ?{}", param_values.len()));
     }
     sql.push_str(" ORDER BY timestamp DESC");
     if let Some(limit) = query.limit {
-        param_values.push(SqlValue::Integer(limit as i64));
+        param_values.push(ToSqlValue::Integer(limit as i64));
         sql.push_str(&format!(" LIMIT ?{}", param_values.len()));
     }
 
@@ -11861,8 +11860,7 @@ fn query_usage_metrics_backend(
     backend: &dyn StorageBackend,
     query: &MetricQuery,
 ) -> Result<Vec<UsageMetricRecord>> {
-    let (sql, param_values) = build_usage_metrics_query(query);
-    let params = sql_values_to_backend_params(&param_values);
+    let (sql, params) = build_usage_metrics_query(query);
     let rows = backend
         .query_map_typed(&sql, &params)
         .map_err(|err| storage_backend_error("Failed to query metrics", err))?;
@@ -12134,14 +12132,13 @@ fn count_events_by_tier_backend(
     event_types: &[String],
     handled: Option<bool>,
 ) -> Result<usize> {
-    let (sql, param_values) = build_tier_query(
+    let (sql, params) = build_tier_query(
         "SELECT COUNT(*) FROM events",
         before_ts,
         severities,
         event_types,
         handled,
     );
-    let params = sql_values_to_backend_params(&param_values);
     let row = backend
         .query_row_typed(&sql, &params)
         .map_err(|err| storage_backend_error("Failed to count events by tier", err))?
@@ -12238,7 +12235,7 @@ fn delete_events_by_tier_backend(
         return Ok(0);
     }
 
-    let (inner_query, param_values) = build_tier_query(
+    let (inner_query, params) = build_tier_query(
         "SELECT id FROM events",
         before_ts,
         severities,
@@ -12247,7 +12244,6 @@ fn delete_events_by_tier_backend(
     );
     let delete_sql =
         format!("DELETE FROM events WHERE id IN ({inner_query} LIMIT {batch_size}) RETURNING 1");
-    let params = sql_values_to_backend_params(&param_values);
 
     let mut total_deleted = 0usize;
     loop {
@@ -12270,15 +12266,15 @@ fn build_tier_query(
     severities: &[String],
     event_types: &[String],
     handled: Option<bool>,
-) -> (String, Vec<SqlValue>) {
+) -> (String, Vec<ToSqlValue<'static>>) {
     let mut sql = format!("{select_prefix} WHERE detected_at < ?");
-    let mut params: Vec<SqlValue> = vec![SqlValue::Integer(before_ts)];
+    let mut params: Vec<ToSqlValue<'static>> = vec![ToSqlValue::Integer(before_ts)];
 
     if !severities.is_empty() {
         let placeholders: Vec<String> = severities.iter().map(|_| "?".to_string()).collect();
         sql.push_str(&format!(" AND severity IN ({})", placeholders.join(",")));
         for s in severities {
-            params.push(SqlValue::Text(s.clone()));
+            params.push(ToSqlValue::OwnedText(s.clone()));
         }
     }
 
@@ -12289,7 +12285,7 @@ fn build_tier_query(
             .collect();
         sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
         for et in event_types {
-            params.push(SqlValue::Text(format!("{et}%")));
+            params.push(ToSqlValue::OwnedText(format!("{et}%")));
         }
     }
 
@@ -12302,19 +12298,6 @@ fn build_tier_query(
     }
 
     (sql, params)
-}
-
-fn sql_values_to_backend_params(values: &[SqlValue]) -> Vec<ToSqlValue<'_>> {
-    values
-        .iter()
-        .map(|value| match value {
-            SqlValue::Null => ToSqlValue::Null,
-            SqlValue::Integer(value) => ToSqlValue::Integer(*value),
-            SqlValue::Real(value) => ToSqlValue::Real(*value),
-            SqlValue::Text(value) => ToSqlValue::Text(value.as_str()),
-            SqlValue::Blob(value) => ToSqlValue::Blob(value.as_slice()),
-        })
-        .collect()
 }
 
 fn notification_history_record_from_backend_row(
@@ -12373,7 +12356,9 @@ fn notification_history_record_from_backend_row(
     })
 }
 
-fn build_notification_history_query(query: &NotificationHistoryQuery) -> (String, Vec<SqlValue>) {
+fn build_notification_history_query(
+    query: &NotificationHistoryQuery,
+) -> (String, Vec<ToSqlValue<'static>>) {
     let mut sql = String::from(
         "SELECT id, timestamp, event_id, channel, title, body, severity,
                 status, error_message, acknowledged_at, acknowledged_by,
@@ -12383,30 +12368,30 @@ fn build_notification_history_query(query: &NotificationHistoryQuery) -> (String
     let mut params = Vec::new();
 
     if let Some(since) = query.since {
-        params.push(SqlValue::Integer(since));
+        params.push(ToSqlValue::Integer(since));
         sql.push_str(&format!(" AND timestamp >= ?{}", params.len()));
     }
     if let Some(until) = query.until {
-        params.push(SqlValue::Integer(until));
+        params.push(ToSqlValue::Integer(until));
         sql.push_str(&format!(" AND timestamp <= ?{}", params.len()));
     }
     if let Some(ref channel) = query.channel {
-        params.push(SqlValue::Text(channel.clone()));
+        params.push(ToSqlValue::OwnedText(channel.clone()));
         sql.push_str(&format!(" AND channel = ?{}", params.len()));
     }
     if let Some(status) = query.status {
-        params.push(SqlValue::Text(status.as_str().to_string()));
+        params.push(ToSqlValue::OwnedText(status.as_str().to_string()));
         sql.push_str(&format!(" AND status = ?{}", params.len()));
     }
     if let Some(event_id) = query.event_id {
-        params.push(SqlValue::Integer(event_id));
+        params.push(ToSqlValue::Integer(event_id));
         sql.push_str(&format!(" AND event_id = ?{}", params.len()));
     }
 
     sql.push_str(" ORDER BY timestamp DESC");
 
     let limit = query.limit.unwrap_or(100);
-    params.push(SqlValue::Integer(limit as i64));
+    params.push(ToSqlValue::Integer(limit as i64));
     sql.push_str(&format!(" LIMIT ?{}", params.len()));
 
     (sql, params)
@@ -12416,8 +12401,7 @@ fn query_notification_history_backend(
     backend: &dyn StorageBackend,
     query: &NotificationHistoryQuery,
 ) -> Result<Vec<NotificationHistoryRecord>> {
-    let (sql, param_values) = build_notification_history_query(query);
-    let params = sql_values_to_backend_params(&param_values);
+    let (sql, params) = build_notification_history_query(query);
     let rows = backend
         .query_map_typed(&sql, &params)
         .map_err(|err| storage_backend_error("Failed to query notification history", err))?;
