@@ -32,6 +32,21 @@ log_json() { echo "$1" >>"$json_log"; }
 
 fatal() { echo "FATAL: $1" >&2; exit 1; }
 
+count_matches() {
+    local pattern="$1"
+    local file="$2"
+    local count
+    count=$(grep -c -- "$pattern" "$file") || {
+        local rc=$?
+        if [[ ${rc} -eq 1 ]]; then
+            count=0
+        else
+            return "${rc}"
+        fi
+    }
+    printf '%s\n' "$count"
+}
+
 run_rch() {
     TMPDIR=/tmp rch "$@"
 }
@@ -101,7 +116,7 @@ rc=$?
 set -e
 
 if [ $rc -eq 0 ]; then
-  test_count=$(grep -c 'test aegis_diagnostics::tests::' "$raw_dir/${scenario}.stdout.log" || echo "0")
+  test_count=$(count_matches 'test aegis_diagnostics::tests::' "$raw_dir/${scenario}.stdout.log")
   log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"aegis_diagnostics\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"pass\",\"outcome\":\"pass\",\"tests_passed\":$test_count}"
   scenarios_pass=$((scenarios_pass + 1))
 else
