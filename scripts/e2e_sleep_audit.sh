@@ -23,6 +23,19 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
 
+RUN_ID="${RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")-$$}"
+DEFAULT_RCH_TARGET_DIR="target/rch-e2e-sleep-audit-${RUN_ID}"
+REQUESTED_RCH_TARGET_DIR="${E2E_SLEEP_AUDIT_RCH_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "$REQUESTED_RCH_TARGET_DIR" && "$REQUESTED_RCH_TARGET_DIR" != /* ]]; then
+    RCH_TARGET_DIR="$REQUESTED_RCH_TARGET_DIR"
+else
+    RCH_TARGET_DIR="$DEFAULT_RCH_TARGET_DIR"
+fi
+RCH_READY=0
+RCH_SKIP_SMOKE_PREFLIGHT="${E2E_SLEEP_AUDIT_RCH_SKIP_SMOKE_PREFLIGHT:-${RCH_SKIP_SMOKE_PREFLIGHT:-1}}"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
@@ -94,6 +107,24 @@ log_info() {
     if [[ "$VERBOSE" == "true" ]]; then
         echo -e "       $*"
     fi
+}
+
+ensure_rch_for_cargo_tests() {
+    if [[ "$RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    if [[ -z "${E2E_RUN_DIR:-}" ]]; then
+        echo "ERROR: E2E artifacts must be initialized before RCH setup" >&2
+        return 1
+    fi
+
+    local rch_log_dir="$E2E_RUN_DIR/rch"
+    mkdir -p "$rch_log_dir"
+
+    rch_init "$rch_log_dir" "$RUN_ID" "sleep_audit" "$PROJECT_ROOT"
+    ensure_rch_ready
+    RCH_READY=1
 }
 
 # ==============================================================================
@@ -411,14 +442,16 @@ scenario_rust_test_infrastructure() {
     log_test "Scenario 5: Deterministic-time Rust test infrastructure"
 
     local test_output exit_code
-    test_output=$(mktemp)
+    test_output="$E2E_SCENARIOS_DIR/$E2E_CURRENT_SCENARIO/rust_timing_tests.rch.log"
     exit_code=0
+    ensure_rch_for_cargo_tests
 
     # Verify Rust tests don't use thread::sleep (they use tokio::time or instant mocking)
     # Run a subset of timing-sensitive tests
-    cargo test -p frankenterm-core 'scheduler_per_pane_window_resets' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_rch_cargo_logged "$test_output" \
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+        cargo test -p frankenterm-core 'scheduler_per_pane_window_resets' \
+            --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "rust_timing_tests.log" "$(cat "$test_output")"
 
@@ -439,7 +472,6 @@ scenario_rust_test_infrastructure() {
         log_skip "S5.2: No quiescence helpers in Rust source (may use test harness directly)"
     fi
 
-    rm -f "$test_output"
 }
 
 # ==============================================================================
