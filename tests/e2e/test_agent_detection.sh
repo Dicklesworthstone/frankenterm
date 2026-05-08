@@ -8,7 +8,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
-LOG_FILE="${LOG_DIR}/test_agent_detection_$(date +%Y%m%dT%H%M%S).jsonl"
+RUN_ID="$(date +%Y%m%dT%H%M%S)"
+LOG_FILE="${LOG_DIR}/test_agent_detection_${RUN_ID}.jsonl"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-agent-detection-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+    CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+    CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 PASS=0
 FAIL=0
 SKIP=0
@@ -37,6 +46,33 @@ log_json() {
         "$(json_escape "$detail")" >> "$LOG_FILE"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is required for shared rch metadata" >&2
+    exit 1
+fi
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${SCRIPT_DIR}/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "agent_detection"
+ensure_rch_ready
+
+run_cargo_test() {
+    local step="$1"
+    shift
+    local output_file="${LOG_DIR}/test_agent_detection_${RUN_ID}.${step}.stdout.log"
+    local status
+
+    if run_rch_cargo_logged "${output_file}" \
+        env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+
+    cat "${output_file}"
+    return "${status}"
+}
+
 # ---- Setup: Create mock agent installations in tempdir ----
 TEST_HOME="$(mktemp -d)"
 trap 'rm -rf "$TEST_HOME"' EXIT
@@ -62,7 +98,8 @@ log_json "setup" "setup" "pass" "Created fixtures for ${#INSTALLED_SLUGS[@]} age
 echo "=== Test 1: Running cargo test for agent detection filesystem tests ==="
 log_json "filesystem_detection_tests" "detect" "running" "Starting cargo test"
 
-if rch exec -- cargo test -p frankenterm-core e2e_agent_detection_filesystem --features agent-detection --no-default-features -- --nocapture 2>&1; then
+if run_cargo_test filesystem_detection_tests \
+    -p frankenterm-core e2e_agent_detection_filesystem --features agent-detection --no-default-features -- --nocapture; then
     log_json "filesystem_detection_tests" "detect" "pass" "All filesystem detection tests passed"
     PASS=$((PASS + 1))
 else
@@ -74,7 +111,8 @@ fi
 echo "=== Test 2: Running cargo test for agent detection integration tests ==="
 log_json "integration_tests" "detect" "running" "Starting integration tests"
 
-if rch exec -- cargo test -p frankenterm-core integration_agent_detection --no-default-features -- --nocapture 2>&1; then
+if run_cargo_test integration_tests \
+    -p frankenterm-core integration_agent_detection --no-default-features -- --nocapture; then
     log_json "integration_tests" "detect" "pass" "All integration tests passed"
     PASS=$((PASS + 1))
 else
@@ -86,7 +124,8 @@ fi
 echo "=== Test 3: Running cargo test for autoconfig integration tests ==="
 log_json "autoconfig_tests" "detect" "running" "Starting autoconfig tests"
 
-if rch exec -- cargo test -p frankenterm-core integration_agent_autoconfig --no-default-features -- --nocapture 2>&1; then
+if run_cargo_test autoconfig_tests \
+    -p frankenterm-core integration_agent_autoconfig --no-default-features -- --nocapture; then
     log_json "autoconfig_tests" "detect" "pass" "All autoconfig tests passed"
     PASS=$((PASS + 1))
 else
@@ -98,7 +137,8 @@ fi
 echo "=== Test 4: Running cargo test for detection enrichment tests ==="
 log_json "enrichment_tests" "detect" "running" "Starting enrichment tests"
 
-if rch exec -- cargo test -p frankenterm-core integration_agent_detection_enrichment --no-default-features -- --nocapture 2>&1; then
+if run_cargo_test enrichment_tests \
+    -p frankenterm-core integration_agent_detection_enrichment --no-default-features -- --nocapture; then
     log_json "enrichment_tests" "detect" "pass" "All enrichment tests passed"
     PASS=$((PASS + 1))
 else

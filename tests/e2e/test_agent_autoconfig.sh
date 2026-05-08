@@ -9,7 +9,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
-LOG_FILE="${LOG_DIR}/test_agent_autoconfig_$(date +%Y%m%dT%H%M%S).jsonl"
+RUN_ID="$(date +%Y%m%dT%H%M%S)"
+LOG_FILE="${LOG_DIR}/test_agent_autoconfig_${RUN_ID}.jsonl"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-agent-autoconfig-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+    CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+    CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 PASS=0
 FAIL=0
 
@@ -37,11 +46,39 @@ log_json() {
         "$(json_escape "$detail")" >> "$LOG_FILE"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is required for shared rch metadata" >&2
+    exit 1
+fi
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${SCRIPT_DIR}/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "agent_autoconfig"
+ensure_rch_ready
+
+run_cargo_test() {
+    local step="$1"
+    shift
+    local output_file="${LOG_DIR}/test_agent_autoconfig_${RUN_ID}.${step}.stdout.log"
+    local status
+
+    if run_rch_cargo_logged "${output_file}" \
+        env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+
+    cat "${output_file}"
+    return "${status}"
+}
+
 # ---- Test: Autoconfig integration tests via cargo ----
 echo "=== Running autoconfig integration tests ==="
 log_json "autoconfig_integration" "detect" "running" "Starting cargo test for autoconfig"
 
-if rch exec -- cargo test -p frankenterm-core integration_agent_autoconfig --no-default-features -- --nocapture 2>&1; then
+if run_cargo_test autoconfig_integration \
+    -p frankenterm-core integration_agent_autoconfig --no-default-features -- --nocapture; then
     log_json "autoconfig_integration" "assert" "pass" "All autoconfig integration tests passed"
     PASS=$((PASS + 1))
 else
@@ -53,7 +90,8 @@ fi
 echo "=== Running inline config template tests ==="
 log_json "config_templates_inline" "detect" "running" "Starting inline tests"
 
-if rch exec -- cargo test -p frankenterm-core agent_config_templates --no-default-features -- --nocapture 2>&1; then
+if run_cargo_test config_templates_inline \
+    -p frankenterm-core agent_config_templates --no-default-features -- --nocapture; then
     log_json "config_templates_inline" "assert" "pass" "All inline config template tests passed"
     PASS=$((PASS + 1))
 else
@@ -65,7 +103,8 @@ fi
 echo "=== Running proptest config template tests ==="
 log_json "config_templates_proptest" "detect" "running" "Starting proptest suite"
 
-if rch exec -- cargo test -p frankenterm-core proptest_agent_config_templates --no-default-features -- --nocapture 2>&1; then
+if run_cargo_test config_templates_proptest \
+    -p frankenterm-core proptest_agent_config_templates --no-default-features -- --nocapture; then
     log_json "config_templates_proptest" "assert" "pass" "All proptest config template tests passed"
     PASS=$((PASS + 1))
 else
