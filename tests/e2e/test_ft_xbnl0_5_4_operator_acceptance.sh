@@ -16,10 +16,16 @@ STRUCTURED_LOG="${ARTIFACT_DIR}/structured.log"
 STDOUT_FILE="${ARTIFACT_DIR}/stdout.txt"
 STDERR_FILE="${ARTIFACT_DIR}/stderr.txt"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
-REMOTE_TARGET_DIR="/tmp/ft-cod2-target"
-LOCAL_FT_BIN="${REMOTE_TARGET_DIR}/debug/ft"
-EXACT_RECIPE_LOG="${ARTIFACT_DIR}/frankenterm_check_exact_recipe.log"
-FALLBACK_CHECK_LOG="${ARTIFACT_DIR}/frankenterm_check_fallback.log"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-xbnl0-5-4-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+  REMOTE_TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+  REMOTE_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+LOCAL_FT_BIN="${ROOT_DIR}/${REMOTE_TARGET_DIR}/debug/ft"
+EXACT_RECIPE_LOG="${ARTIFACT_DIR}/frankenterm_build_exact_recipe.log"
+FALLBACK_BUILD_LOG="${ARTIFACT_DIR}/frankenterm_build_fallback.log"
 UNIT_TEST_LOG="${ARTIFACT_DIR}/frankenterm_operator_guidance_tests.log"
 REMOTE_SCENARIO_LOG="${ARTIFACT_DIR}/operator_acceptance_remote.log"
 REMOTE_REPORT_JSON="${ARTIFACT_DIR}/operator_acceptance_remote_report.json"
@@ -27,6 +33,7 @@ REMOTE_REPORT_JSON="${ARTIFACT_DIR}/operator_acceptance_remote_report.json"
 exec > >(tee -a "${STDOUT_FILE}")
 exec 2> >(tee -a "${STDERR_FILE}" >&2)
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
 RCH_SKIP_SMOKE_PREFLIGHT=1
 rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "ft_xbnl0_5_4_operator_acceptance"
@@ -105,6 +112,17 @@ record_result() {
   fi
 }
 
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    if command -v jq >/dev/null 2>&1; then
+      emit_log "preflight:${cmd}" "failed" 0 "missing command ${cmd}"
+    fi
+    printf 'missing required command: %s\n' "${cmd}" >&2
+    exit 1
+  fi
+}
+
 run_checked() {
   local step="$1"
   local log_file="$2"
@@ -130,7 +148,7 @@ run_rch_step() {
   shift 2
   local start_ns end_ns duration_ms
   start_ns="$(date +%s%N)"
-  record_command "rch exec -- $*"
+  record_command "run_rch_cargo_logged ${log_file} $*"
   if run_rch_cargo_logged "${log_file}" "$@"; then
     end_ns="$(date +%s%N)"
     duration_ms="$(((end_ns - start_ns) / 1000000))"
@@ -147,41 +165,22 @@ run_rch_exact_recipe_check() {
   local log_file="$1"
   local start_ns end_ns duration_ms rc
   start_ns="$(date +%s%N)"
-  record_command "rch exec -- env CARGO_TARGET_DIR=${REMOTE_TARGET_DIR} cargo check -p frankenterm"
+  record_command "run_rch_cargo_logged ${log_file} env CARGO_TARGET_DIR=${REMOTE_TARGET_DIR} cargo build -p frankenterm"
 
-  if [[ -z "${TIMEOUT_BIN:-}" ]]; then
-    resolve_timeout_bin
+  if run_rch_cargo_logged "${log_file}" env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo build -p frankenterm; then
+    end_ns="$(date +%s%N)"
+    duration_ms="$(((end_ns - start_ns) / 1000000))"
+    EXACT_RECIPE_RESULT="passed"
+    record_result "frankenterm_build_exact_recipe" "true" "${duration_ms}" "${log_file}"
+    return 0
+  else
+    rc=$?
   fi
-  if [[ -z "${TIMEOUT_BIN:-}" ]]; then
-    echo "timeout or gtimeout is required" >&2
-    return 2
-  fi
-
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    exec env TMPDIR=/tmp \
-      CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-      "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
-      rch exec -- env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo check -p frankenterm
-  ) > "${log_file}" 2>&1
-  rc=$?
-  set -e
-
-  check_rch_fallback "${log_file}"
-  rch_write_meta_json "${log_file}" "${rc}"
 
   end_ns="$(date +%s%N)"
   duration_ms="$(((end_ns - start_ns) / 1000000))"
-
-  if [[ ${rc} -eq 0 ]]; then
-    EXACT_RECIPE_RESULT="passed"
-    record_result "frankenterm_check_exact_recipe" "true" "${duration_ms}" "${log_file}"
-    return 0
-  fi
-
   EXACT_RECIPE_RESULT="failed"
-  record_result "frankenterm_check_exact_recipe" "false" "${duration_ms}" "${log_file}"
+  record_result "frankenterm_build_exact_recipe" "false" "${duration_ms}" "${log_file}"
   return "${rc}"
 }
 
@@ -237,32 +236,6 @@ out_path.write_text(payload)
 PY
 }
 
-reuse_prior_exact_recipe_artifact() {
-  local current_dir="$1"
-  local meta_path log_path found=""
-  while IFS= read -r meta_path; do
-    [[ "${meta_path}" == "${current_dir}/frankenterm_check_exact_recipe.log.rch_meta.json" ]] && continue
-    if jq -e '.remote_exit_code == 0' "${meta_path}" >/dev/null 2>&1; then
-      found="${meta_path}"
-      break
-    fi
-  done < <(find "${ROOT_DIR}/tests/e2e/artifacts/goal-line/${BEAD_ID}/${SCENARIO_ID}" \
-    -name 'frankenterm_check_exact_recipe.log.rch_meta.json' -print | sort -r)
-
-  if [[ -z "${found}" ]]; then
-    return 1
-  fi
-
-  log_path="${found%.rch_meta.json}"
-  cp "${log_path}" "${EXACT_RECIPE_LOG}"
-  cp "${found}" "$(rch_log_meta_path "${EXACT_RECIPE_LOG}")"
-  EXACT_RECIPE_RESULT="passed"
-  emit_log "frankenterm_check_exact_recipe_reused" "passed" 0 "${log_path}"
-  PASS=$((PASS + 1))
-  TOTAL=$((TOTAL + 1))
-  return 0
-}
-
 reuse_prior_unit_test_artifact() {
   local current_dir="$1"
   local meta_path log_path found=""
@@ -290,9 +263,10 @@ reuse_prior_unit_test_artifact() {
 
 echo "=== ${BEAD_ID} operator acceptance ==="
 write_env
-command -v jq >/dev/null 2>&1
-command -v rch >/dev/null 2>&1
-command -v python3 >/dev/null 2>&1
+require_cmd jq
+require_cmd rch
+require_cmd python3
+require_cmd rg
 record_command "ensure_rch_ready (RCH_SKIP_SMOKE_PREFLIGHT=${RCH_SKIP_SMOKE_PREFLIGHT})"
 ensure_rch_ready
 
@@ -326,20 +300,18 @@ run_checked \
   bash "${ROOT_DIR}/scripts/check_ft_xbnl0_5_4_operator_acceptance.sh" \
     --output "${ARTIFACT_DIR}/operator_acceptance_contract_report.json"
 
-if ! reuse_prior_exact_recipe_artifact "${ARTIFACT_DIR}"; then
-  run_rch_exact_recipe_check "${EXACT_RECIPE_LOG}" || :
-fi
+run_rch_exact_recipe_check "${EXACT_RECIPE_LOG}" || :
 
 if [[ "${EXACT_RECIPE_RESULT}" != "passed" ]]; then
   if ! run_rch_step \
-    "frankenterm_check_fallback" \
-    "${FALLBACK_CHECK_LOG}" \
+    "frankenterm_build_fallback" \
+    "${FALLBACK_BUILD_LOG}" \
     env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-      cargo check -p frankenterm
+      cargo build -p frankenterm
   then
     :
   fi
-  rch_write_meta_json "${FALLBACK_CHECK_LOG}"
+  rch_write_meta_json "${FALLBACK_BUILD_LOG}"
 fi
 
 if ! reuse_prior_unit_test_artifact "${ARTIFACT_DIR}"; then
@@ -703,8 +675,8 @@ jq -cn \
   --arg contract_json "${ARTIFACT_DIR}/operator_acceptance_contract_report.json" \
   --arg exact_recipe_log "${EXACT_RECIPE_LOG}" \
   --arg exact_recipe_meta "$(rch_log_meta_path "${EXACT_RECIPE_LOG}")" \
-  --arg fallback_check_log "${FALLBACK_CHECK_LOG}" \
-  --arg fallback_check_meta "$(rch_log_meta_path "${FALLBACK_CHECK_LOG}")" \
+  --arg fallback_build_log "${FALLBACK_BUILD_LOG}" \
+  --arg fallback_build_meta "$(rch_log_meta_path "${FALLBACK_BUILD_LOG}")" \
   --arg unit_test_log "${UNIT_TEST_LOG}" \
   --arg unit_test_meta "$(rch_log_meta_path "${UNIT_TEST_LOG}")" \
   --arg remote_scenario_log "${REMOTE_SCENARIO_LOG}" \
@@ -734,10 +706,10 @@ jq -cn \
       shell_syntax: $syntax_log,
       contract_check_log: $contract_log,
       contract_check_json: $contract_json,
-      frankenterm_check_exact_recipe: $exact_recipe_log,
-      frankenterm_check_exact_recipe_meta: $exact_recipe_meta,
-      frankenterm_check_fallback: $fallback_check_log,
-      frankenterm_check_fallback_meta: $fallback_check_meta,
+      frankenterm_build_exact_recipe: $exact_recipe_log,
+      frankenterm_build_exact_recipe_meta: $exact_recipe_meta,
+      frankenterm_build_fallback: $fallback_build_log,
+      frankenterm_build_fallback_meta: $fallback_build_meta,
       frankenterm_operator_guidance_tests: $unit_test_log,
       frankenterm_operator_guidance_tests_meta: $unit_test_meta,
       operator_acceptance_remote_log: $remote_scenario_log,

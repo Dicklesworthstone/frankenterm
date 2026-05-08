@@ -36,12 +36,12 @@ Use these exact commands when replaying this bead:
 ```bash
 bash scripts/check_ft_xbnl0_5_4_operator_acceptance.sh --output docs/ft-xbnl0-5-4-operator-acceptance-validation.json
 bash tests/e2e/test_ft_xbnl0_5_4_operator_acceptance.sh
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod2-target cargo check -p frankenterm
 ```
 
-If the remote worker exits 143 or the RCH fleet is unavailable, use the local
-fallback from AGENTS.md:
-`scripts/cargo-local.sh check -p frankenterm-core --lib`.
+The E2E harness owns the remote `cargo build -p frankenterm` proof step via the
+shared fail-closed `run_rch_cargo_logged` guard and a relative per-run
+`CARGO_TARGET_DIR`. Do not substitute a local cargo run for this acceptance
+proof.
 
 ## Scenario Matrix
 
