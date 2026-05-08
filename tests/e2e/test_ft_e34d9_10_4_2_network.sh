@@ -16,12 +16,25 @@ HARNESS_REPORT="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.harness_contract.json"
 FAILURE_REPORT="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.failure_injection.json"
 RECOVERY_REPORT="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.recovery_contract.json"
 
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/rch-e2e-ft-e34d9-10-4-2-network}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-e34d9-10-4-2-network-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
 export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging" >&2
+  exit 1
+fi
+
 rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_4_2_network"
 ensure_rch_ready
 
@@ -61,15 +74,16 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
-run_step() {
+run_rch_step() {
   local label="$1"
   shift
 
   LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
   set +e
-  "$@" 2>&1 | tee "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
-  local rc=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${LAST_STEP_LOG}" "$@"
+  local rc=$?
   set -e
+  tee -a "${STDOUT_FILE}" < "${LAST_STEP_LOG}"
   return ${rc}
 }
 
@@ -79,14 +93,6 @@ require_cmd() {
     emit_log "preflight" "prereq_check" "missing:${cmd}" "failed" "missing_prerequisite" "E2E-PREREQ" "${cmd}"
     echo "missing required command: ${cmd}" >&2
     exit 1
-  fi
-}
-
-ensure_no_local_fallback() {
-  if grep -q "\[RCH\] local" "${LAST_STEP_LOG}"; then
-    emit_log "validation" "rch_offload_policy" "remote_exec_required" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
-    echo "rch fell back to local execution; failing per offload-only policy" >&2
-    exit 3
   fi
 }
 
@@ -129,27 +135,6 @@ require_cmd cargo
 require_cmd python3
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
-
-probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"
-set +e
-rch workers probe --all --json > "${probe_log}" 2>>"${STDOUT_FILE}"
-probe_rc=$?
-set -e
-
-if [[ ${probe_rc} -ne 0 ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_probe_failed" "RCH-E100" "$(basename "${probe_log}")"
-  echo "rch workers probe failed" >&2
-  exit 2
-fi
-
-healthy_workers=$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${probe_log}")
-if [[ "${healthy_workers}" -lt 1 ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_workers_unreachable" "RCH-E100" "$(basename "${probe_log}")"
-  echo "no reachable rch workers; refusing local fallback" >&2
-  exit 2
-fi
-
-emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
 
 RUNTIME_SOURCE="${ROOT_DIR}/crates/frankenterm-core/src/runtime_async.rs"
 WEB_TEST_SOURCE="${ROOT_DIR}/crates/frankenterm-core/tests/web.rs"
@@ -194,12 +179,11 @@ else
 fi
 
 emit_log "validation" "nominal_path" "web_timeout_test_remote" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-if run_step web_timeout_test \
-  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test web --features web stream_fetch_prefix_times_out_on_stalled_body -- --nocapture; then
-  ensure_no_local_fallback
+if run_rch_step web_timeout_test \
+  env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+  cargo test -p frankenterm-core --test web --features web stream_fetch_prefix_times_out_on_stalled_body -- --nocapture; then
   emit_log "validation" "nominal_path" "web_timeout_test_remote" "passed" "web_timeout_test_passed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
-  ensure_no_local_fallback
   emit_log "validation" "nominal_path" "web_timeout_test_remote" "failed" "web_timeout_test_failed" "CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
   exit 1
 fi
