@@ -32,10 +32,7 @@ else
 fi
 export CARGO_TARGET_DIR
 
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${TIMESTAMP}" "3hbv9"
-ensure_rch_ready
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 # ── Structured log helper ──────────────────────────────────────────────────
 json_escape() {
@@ -67,44 +64,11 @@ log_event() {
         "$(json_escape "$error_code")" >> "$LOG_FILE"
 }
 
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_probe.log"
-RCH_SMOKE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_smoke.log"
-
-run_rch() {
-    TMPDIR=/tmp rch "$@"
-}
-
-run_rch_cargo() {
-    run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
-}
-
-probe_has_reachable_workers() {
-    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
-}
-
-check_rch_fallback_in_logs() {
-    local label="$1"
+run_cargo_step() {
     shift
-
-    if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
-        log_event "rch_offload" "cargo_step" "$label" "fail" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK"
-        echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
-        exit 3
-    fi
-}
-
-run_rch_cargo_logged() {
-    local label="$1"
-    local output_file="$2"
-    shift 2
-
-    set +e
-    run_rch_cargo "$@" 2>&1 | tee "$output_file"
-    local rc=${PIPESTATUS[0]}
-    set -e
-    check_rch_fallback_in_logs "$label" "$output_file"
-    return "$rc"
+    local output_file="$1"
+    shift
+    run_rch_cargo_logged "${output_file}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
 }
 
 count_matches() {
@@ -125,32 +89,16 @@ count_matches() {
 # ── Preflight ──────────────────────────────────────────────────────────────
 log_event "preflight" "startup" "checking_rch" "started"
 
-if ! command -v rch &>/dev/null; then
-    log_event "preflight" "startup" "rch_binary_missing" "fail" "rch_required_missing" "RCH-E001"
-    echo "rch is required; refusing local cargo execution." >&2
+if ! command -v jq >/dev/null 2>&1; then
+    log_event "preflight" "startup" "jq_missing" "fail" "jq_required_missing" "JQ-E001"
+    echo "jq is required for rch metadata and structured logging" >&2
     exit 1
 fi
 
-set +e
-run_rch --json workers probe --all >"$RCH_PROBE_LOG" 2>&1
-probe_rc=$?
-set -e
-if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
-    log_event "preflight" "startup" "rch_workers_probe" "fail" "rch_workers_unhealthy" "RCH-E100"
-    echo "rch workers are unavailable; refusing local cargo execution." >&2
-    exit 1
-fi
-
-set +e
-run_rch_cargo check --help >"$RCH_SMOKE_LOG" 2>&1
-smoke_rc=$?
-set -e
-check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
-if [[ $smoke_rc -ne 0 ]]; then
-    log_event "preflight" "startup" "cargo_check_help" "fail" "rch_remote_smoke_failed" "RCH-E101"
-    echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
-    exit 1
-fi
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
+rch_init "${LOG_DIR}" "${TIMESTAMP}" "3hbv9"
+ensure_rch_ready
 
 cd "$PROJECT_ROOT"
 
@@ -167,7 +115,7 @@ log_event "harness" "nominal_path" "steps=$TOTAL_STEPS" "started"
 # ── Step 1: Compile check ─────────────────────────────────────────────────
 echo "[1/$TOTAL_STEPS] Compile check (frankenterm-core)..."
 COMPILE_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_compile.log"
-if run_rch_cargo_logged "dashboard_compile" "$COMPILE_OUTPUT" check -p frankenterm-core --lib; then
+if run_cargo_step "dashboard_compile" "$COMPILE_OUTPUT" check -p frankenterm-core --lib; then
     log_event "compile" "nominal_path" "cargo_check" "pass"
     echo "  ✓ Compile check passed"
     PASSED=$((PASSED + 1))
@@ -182,7 +130,7 @@ fi
 # ── Step 2: dashboard unit tests ──────────────────────────────────────────
 echo "[2/$TOTAL_STEPS] Testing dashboard module..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_unit.log"
-if run_rch_cargo_logged "dashboard_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- dashboard::tests; then
+if run_cargo_step "dashboard_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- dashboard::tests; then
     test_count=$(count_matches "test result: ok" "$TEST_OUTPUT")
     log_event "unit_tests" "nominal_path" "dashboard" "pass" "tests_ok=$test_count"
     echo "  ✓ dashboard tests passed"
@@ -196,7 +144,7 @@ fi
 # ── Step 3: cost_tracker unit tests (dependency) ─────────────────────────
 echo "[3/$TOTAL_STEPS] Testing cost_tracker module..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_cost_tracker.log"
-if run_rch_cargo_logged "cost_tracker_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- cost_tracker::tests; then
+if run_cargo_step "cost_tracker_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- cost_tracker::tests; then
     log_event "unit_tests" "nominal_path" "cost_tracker" "pass"
     echo "  ✓ cost_tracker tests passed"
     PASSED=$((PASSED + 1))
@@ -209,7 +157,7 @@ fi
 # ── Step 4: quota_gate unit tests (dependency) ───────────────────────────
 echo "[4/$TOTAL_STEPS] Testing quota_gate module..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_quota_gate.log"
-if run_rch_cargo_logged "quota_gate_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- quota_gate::tests; then
+if run_cargo_step "quota_gate_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- quota_gate::tests; then
     log_event "unit_tests" "nominal_path" "quota_gate" "pass"
     echo "  ✓ quota_gate tests passed"
     PASSED=$((PASSED + 1))
@@ -222,7 +170,7 @@ fi
 # ── Step 5: backpressure unit tests (dependency) ─────────────────────────
 echo "[5/$TOTAL_STEPS] Testing backpressure module..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_backpressure.log"
-if run_rch_cargo_logged "backpressure_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- backpressure::tests; then
+if run_cargo_step "backpressure_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- backpressure::tests; then
     log_event "unit_tests" "nominal_path" "backpressure" "pass"
     echo "  ✓ backpressure tests passed"
     PASSED=$((PASSED + 1))
@@ -235,7 +183,7 @@ fi
 # ── Step 6: rate_limit_tracker unit tests (dependency) ───────────────────
 echo "[6/$TOTAL_STEPS] Testing rate_limit_tracker module..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rate_limit.log"
-if run_rch_cargo_logged "rate_limit_tracker_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- rate_limit_tracker::tests; then
+if run_cargo_step "rate_limit_tracker_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- rate_limit_tracker::tests; then
     log_event "unit_tests" "nominal_path" "rate_limit_tracker" "pass"
     echo "  ✓ rate_limit_tracker tests passed"
     PASSED=$((PASSED + 1))
@@ -248,7 +196,7 @@ fi
 # ── Step 7: dashboard property tests ─────────────────────────────────────
 echo "[7/$TOTAL_STEPS] Running dashboard property tests..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_proptest.log"
-if run_rch_cargo_logged "dashboard_proptests" "$TEST_OUTPUT" test -p frankenterm-core --test proptest_dashboard; then
+if run_cargo_step "dashboard_proptests" "$TEST_OUTPUT" test -p frankenterm-core --test proptest_dashboard; then
     test_count=$(grep "test result:" "$TEST_OUTPUT" | head -1 | grep -o '[0-9]* passed' || echo "? passed")
     log_event "proptest" "nominal_path" "dashboard_proptests" "pass" "tests=$test_count"
     echo "  ✓ Property tests passed"
@@ -262,7 +210,7 @@ fi
 # ── Step 8: dashboard adapter property tests (requires tui/ftui feature) ──
 echo "[8/$TOTAL_STEPS] Running dashboard adapter property tests..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_adapter_proptest.log"
-if run_rch_cargo_logged "dashboard_adapter_proptests" "$TEST_OUTPUT" test -p frankenterm-core --test proptest_dashboard_adapter; then
+if run_cargo_step "dashboard_adapter_proptests" "$TEST_OUTPUT" test -p frankenterm-core --test proptest_dashboard_adapter; then
     test_count=$(grep "test result:" "$TEST_OUTPUT" | head -1 | grep -o '[0-9]* passed' || echo "? passed")
     log_event "proptest" "nominal_path" "dashboard_adapter_proptests" "pass" "tests=$test_count"
     echo "  ✓ Adapter property tests passed"
