@@ -63,13 +63,61 @@ Cross-references:
 EOF
 }
 
+die_usage() {
+    echo "error: $1" >&2
+    usage >&2
+    exit 1
+}
+
+require_option_value() {
+    local option="$1"
+    local value="${2-}"
+    if [ -z "$value" ]; then
+        die_usage "$option requires a value"
+    fi
+}
+
+require_non_negative_int() {
+    local option="$1"
+    local value="$2"
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        die_usage "$option must be a non-negative integer"
+    fi
+}
+
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
+json_string() {
+    printf '"%s"' "$(json_escape "$1")"
+}
+
+count_lines_matching() {
+    local value="$1"
+    local pattern="$2"
+    { grep -E "$pattern" <<<"$value" || true; } | wc -l | tr -d ' '
+}
+
+count_occurrences() {
+    local value="$1"
+    local pattern="$2"
+    { grep -oE "$pattern" <<<"$value" || true; } | wc -l | tr -d ' '
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --json)        JSON_MODE=true; shift ;;
-        --since)       SINCE="$2"; shift 2 ;;
-        --min-panes)   MIN_PANES="$2"; shift 2 ;;
+        --since)       require_option_value "$1" "${2-}"; SINCE="$2"; shift 2 ;;
+        --min-panes)   require_option_value "$1" "${2-}"; require_non_negative_int "$1" "$2"; MIN_PANES="$2"; shift 2 ;;
         -h|--help)     usage; exit 0 ;;
-        *)             echo "unknown argument: $1" >&2; usage >&2; exit 1 ;;
+        *)             die_usage "unknown argument: $1" ;;
     esac
 done
 
@@ -96,7 +144,7 @@ record_check() {
 # 1. Pane count
 panes_output=$(ft status --format toon 2>/dev/null) || panes_output=""
 if [ -n "$panes_output" ]; then
-    pane_count=$(echo "$panes_output" | grep -cE '^[[:space:]]*[a-zA-Z_-]+' || echo 0)
+    pane_count=$(count_lines_matching "$panes_output" '^[[:space:]]*[a-zA-Z_-]+')
     if [ "$pane_count" -ge "$MIN_PANES" ]; then
         record_check "panes_alive" "pass" "$pane_count panes" "$MIN_PANES" "$pane_count"
     else
@@ -107,8 +155,8 @@ else
 fi
 
 # 2. Rate-limit events
-rate_limit_count=$(ft robot events --filter rate_limit --json 2>/dev/null \
-    | grep -oE '"event"' | wc -l | tr -d ' ' || echo 0)
+rate_limit_output=$(ft robot events --filter rate_limit --json 2>/dev/null) || rate_limit_output=""
+rate_limit_count=$(count_occurrences "$rate_limit_output" '"event"')
 if [ "$rate_limit_count" -ge "$MIN_RATE_LIMIT_EVENTS" ]; then
     record_check "rate_limit_events" "pass" "$rate_limit_count events" "$MIN_RATE_LIMIT_EVENTS" "$rate_limit_count"
 else
@@ -116,8 +164,8 @@ else
 fi
 
 # 3. Workflow recovery
-workflow_count=$(ft robot workflow recent --filter rate_limit_recovery --json 2>/dev/null \
-    | grep -oE '"workflow"' | wc -l | tr -d ' ' || echo 0)
+workflow_output=$(ft robot workflow recent --filter rate_limit_recovery --json 2>/dev/null) || workflow_output=""
+workflow_count=$(count_occurrences "$workflow_output" '"workflow"')
 if [ "$workflow_count" -ge "$MIN_WORKFLOW_RECOVERY" ]; then
     record_check "rate_limit_workflow" "pass" "$workflow_count workflow runs" "$MIN_WORKFLOW_RECOVERY" "$workflow_count"
 else
@@ -125,8 +173,8 @@ else
 fi
 
 # 4. Search recovery
-search_count=$(ft search 'Connection refused' --since "$SINCE" --format json 2>/dev/null \
-    | grep -oE '"hit"' | wc -l | tr -d ' ' || echo 0)
+search_output=$(ft search 'Connection refused' --since "$SINCE" --format json 2>/dev/null) || search_output=""
+search_count=$(count_occurrences "$search_output" '"hit"')
 if [ "$search_count" -ge "$MIN_SEARCH_HITS" ]; then
     record_check "search_recovery" "pass" "$search_count hits" "$MIN_SEARCH_HITS" "$search_count"
 else
@@ -134,8 +182,8 @@ else
 fi
 
 # 5. Robot missions with TX log
-mission_count=$(ft robot mission list --json 2>/dev/null \
-    | grep -oE '"tx_log"' | wc -l | tr -d ' ' || echo 0)
+mission_output=$(ft robot mission list --json 2>/dev/null) || mission_output=""
+mission_count=$(count_occurrences "$mission_output" '"tx_log"')
 if [ "$mission_count" -ge "$MIN_MISSIONS" ]; then
     record_check "missions_with_tx" "pass" "$mission_count missions with TX log" "$MIN_MISSIONS" "$mission_count"
 else
@@ -156,20 +204,20 @@ if $JSON_MODE; then
     printf '{\n'
     printf '  "bead": "ft-xl2kc.1",\n'
     printf '  "schema_version": 1,\n'
-    printf '  "since": "%s",\n' "$SINCE"
-    printf '  "overall_status": "%s",\n' "$overall"
+    printf '  "since": %s,\n' "$(json_string "$SINCE")"
+    printf '  "overall_status": %s,\n' "$(json_string "$overall")"
     printf '  "fail_count": %d,\n' "$fail_count"
     printf '  "checks": [\n'
     last_idx=$((${#CHECK_NAMES[@]} - 1))
     for i in "${!CHECK_NAMES[@]}"; do
         sep=","
         if [ "$i" -eq "$last_idx" ]; then sep=""; fi
-        printf '    {"name":"%s","status":"%s","threshold":%s,"observed":%s,"detail":"%s"}%s\n' \
-            "${CHECK_NAMES[$i]}" \
-            "${CHECK_STATUS[$i]}" \
+        printf '    {"name":%s,"status":%s,"threshold":%s,"observed":%s,"detail":%s}%s\n' \
+            "$(json_string "${CHECK_NAMES[$i]}")" \
+            "$(json_string "${CHECK_STATUS[$i]}")" \
             "${CHECK_THRESHOLDS[$i]}" \
             "${CHECK_OBSERVED[$i]}" \
-            "${CHECK_DETAILS[$i]//\"/\\\"}" \
+            "$(json_string "${CHECK_DETAILS[$i]}")" \
             "$sep"
     done
     printf '  ]\n'
@@ -182,7 +230,7 @@ else
         done
     } >&2
     if [ "$overall" = "pass" ]; then
-        echo "PASS: all $fail_count preconditions met; safe to run vhs scripts/demo-full.tape"
+        echo "PASS: all ${#CHECK_NAMES[@]} preconditions met; safe to run vhs scripts/demo-full.tape"
     else
         echo "FAIL: $fail_count of ${#CHECK_NAMES[@]} preconditions unmet"
     fi
