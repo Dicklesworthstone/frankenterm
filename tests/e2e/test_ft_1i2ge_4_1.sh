@@ -10,11 +10,11 @@ SCENARIO_ID="ft_1i2ge_4_1_policy_preflight"
 CORRELATION_ID="ft-1i2ge.4.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.probe.log"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 # shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_4_1"
 ensure_rch_ready
 
@@ -66,64 +66,28 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required_missing" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for cargo execution in this scenario"
-  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_workers_unhealthy" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "rch workers probe failed; refusing local fallback"
-  echo "rch workers are unavailable; refusing local cargo execution." >&2
-  exit 1
-fi
-
-cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-4-1"
-emit_log \
-  "running" \
-  "execution_preflight" \
-  "rch_workers_healthy" \
-  "none" \
-  "$(basename "${PROBE_FILE}")" \
-  "offloading tests through rch workers"
-
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_requires_assignment_reference -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_rejects_assignment_candidate_mismatch -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_require_approval_requires_canonical_reason -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_rejects_unknown_reason_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-4-1"
+TEST_FILTERS=(
+  "mission_policy_preflight_plan_time_surfaces_structured_allow_and_deny_reasons"
+  "mission_policy_preflight_dispatch_time_requires_assignment_reference"
+  "mission_policy_preflight_dispatch_time_rejects_assignment_candidate_mismatch"
+  "mission_policy_preflight_require_approval_requires_canonical_reason"
+  "mission_policy_preflight_rejects_unknown_reason_code"
+  "mission_policy_preflight_dispatch_time_accepts_assignment_bound_denial_and_feedback"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_4_1_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture)
   decision_path="contract_surface"
   reason_code="none"
-  if [[ "${test_cmd}" == *"rejects_"* ]] || [[ "${test_cmd}" == *"requires_"* ]]; then
+  if [[ "${test_filter}" == *"rejects_"* ]] || [[ "${test_filter}" == *"requires_"* ]]; then
     decision_path="failure_injection_path"
     reason_code="policy_preflight_rejection_checks"
-  elif [[ "${test_cmd}" == *"accepts_assignment_bound_denial_and_feedback"* ]]; then
+  elif [[ "${test_filter}" == *"accepts_assignment_bound_denial_and_feedback"* ]]; then
     decision_path="recovery_path"
     reason_code="dispatch_feedback_validation"
   fi
@@ -134,15 +98,13 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: ${cmd_prefix} ${test_cmd}"
+    "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${cmd_prefix} ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -151,7 +113,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
+      "exit=${status}; command=${test_cmd[*]}"
     exit "${status}"
   fi
 done
