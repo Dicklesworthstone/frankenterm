@@ -28,6 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
@@ -55,7 +56,13 @@ FT_BIN=""
 
 # RCH cargo offload state
 E2E_RCH_RUN_ID="${E2E_RCH_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
-E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-/tmp/ft-e2e-stop-${E2E_RCH_RUN_ID}}"
+DEFAULT_E2E_RCH_TARGET_DIR="target/rch-e2e-stop-${E2E_RCH_RUN_ID}"
+REQUESTED_E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_E2E_RCH_TARGET_DIR" && "$REQUESTED_E2E_RCH_TARGET_DIR" != /* ]]; then
+    E2E_RCH_TARGET_DIR="$REQUESTED_E2E_RCH_TARGET_DIR"
+else
+    E2E_RCH_TARGET_DIR="$DEFAULT_E2E_RCH_TARGET_DIR"
+fi
 E2E_RCH_READY=0
 
 # Temp workspace for isolation

@@ -52,7 +52,13 @@ FT_BIN=""
 
 # RCH cargo offload state
 E2E_RCH_RUN_ID="${E2E_RCH_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
-E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-/tmp/ft-e2e-secret-redaction-${E2E_RCH_RUN_ID}}"
+DEFAULT_E2E_RCH_TARGET_DIR="target/rch-e2e-secret-redaction-${E2E_RCH_RUN_ID}"
+REQUESTED_E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_E2E_RCH_TARGET_DIR" && "$REQUESTED_E2E_RCH_TARGET_DIR" != /* ]]; then
+    E2E_RCH_TARGET_DIR="$REQUESTED_E2E_RCH_TARGET_DIR"
+else
+    E2E_RCH_TARGET_DIR="$DEFAULT_E2E_RCH_TARGET_DIR"
+fi
 E2E_RCH_READY=0
 
 # Fake secrets used throughout the tests.  These MUST NOT appear in any artifact.
