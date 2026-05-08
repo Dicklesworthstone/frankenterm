@@ -13,7 +13,7 @@
 #   - Integration: retry+circuit, degradation+chaos
 #
 # Requirements:
-#   - cargo (Rust toolchain)
+#   - rch for remote Cargo test execution
 #   - jq for JSON manipulation
 # =============================================================================
 
@@ -23,6 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/e2e_artifacts.sh
 source "$SCRIPT_DIR/lib/e2e_artifacts.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
 
 # Colors (disabled when piped)
 if [[ -t 1 ]]; then
@@ -47,6 +49,18 @@ TESTS_SKIPPED=0
 
 # Configuration
 VERBOSE=false
+
+# RCH cargo offload state
+E2E_RCH_RUN_ID="${E2E_RCH_RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")-$$}"
+DEFAULT_E2E_RCH_TARGET_DIR="target/rch-e2e-reliability-hardening-${E2E_RCH_RUN_ID}"
+REQUESTED_E2E_RCH_TARGET_DIR="${E2E_RCH_TARGET_DIR:-}"
+if [[ -n "$REQUESTED_E2E_RCH_TARGET_DIR" && "$REQUESTED_E2E_RCH_TARGET_DIR" != /* ]]; then
+    E2E_RCH_TARGET_DIR="$REQUESTED_E2E_RCH_TARGET_DIR"
+else
+    E2E_RCH_TARGET_DIR="$DEFAULT_E2E_RCH_TARGET_DIR"
+fi
+RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
+E2E_RCH_READY=0
 
 # ==============================================================================
 # Argument parsing
@@ -97,6 +111,41 @@ log_info() {
     fi
 }
 
+ensure_rch_for_cargo_tests() {
+    if [[ "$E2E_RCH_READY" -eq 1 ]]; then
+        return 0
+    fi
+
+    local rch_log_dir="${E2E_RUN_DIR:-$PROJECT_ROOT/e2e-artifacts/rch-reliability-${E2E_RCH_RUN_ID}}"
+    mkdir -p "$rch_log_dir"
+    rch_init "$rch_log_dir" "$E2E_RCH_RUN_ID" "reliability_hardening" "$PROJECT_ROOT"
+    ensure_rch_ready
+    E2E_RCH_READY=1
+}
+
+run_core_cargo_test() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+
+    ensure_rch_for_cargo_tests
+
+    set +e
+    if [[ "$timeout_secs" -gt 0 ]]; then
+        run_rch_cargo_logged_with_timeout "$timeout_secs" "$output_file" \
+            env CARGO_TARGET_DIR="$E2E_RCH_TARGET_DIR" \
+            cargo "$@"
+    else
+        run_rch_cargo_logged "$output_file" \
+            env CARGO_TARGET_DIR="$E2E_RCH_TARGET_DIR" \
+            cargo "$@"
+    fi
+    local rc=$?
+    set -e
+
+    return "$rc"
+}
+
 # ==============================================================================
 # Prerequisites
 # ==============================================================================
@@ -104,17 +153,14 @@ log_info() {
 check_prerequisites() {
     log_test "Prerequisites"
 
-    if ! command -v cargo &>/dev/null; then
-        echo -e "${RED}ERROR:${NC} cargo not found. Install Rust toolchain." >&2
-        exit 5
-    fi
-    log_pass "cargo available"
-
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}ERROR:${NC} jq not found. Install: sudo apt install jq" >&2
         exit 5
     fi
     log_pass "jq available"
+
+    ensure_rch_for_cargo_tests
+    log_pass "rch cargo offload available"
 }
 
 # ==============================================================================
@@ -128,9 +174,9 @@ scenario_circuit_breaker() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'circuit_breaker::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'circuit_breaker::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "circuit_breaker.log" "$(cat "$test_output")"
 
@@ -162,9 +208,9 @@ scenario_retry_logic() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'retry::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'retry::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "retry_logic.log" "$(cat "$test_output")"
 
@@ -196,9 +242,9 @@ scenario_graceful_degradation() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'degradation::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'degradation::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "graceful_degradation.log" "$(cat "$test_output")"
 
@@ -246,9 +292,9 @@ scenario_fault_injection() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'chaos::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'chaos::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "fault_injection.log" "$(cat "$test_output")"
 
@@ -306,9 +352,9 @@ scenario_health_monitoring() {
     test_output=$(mktemp)
     exit_code=0
 
-    cargo test -p frankenterm-core 'watchdog::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'watchdog::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "health_monitoring.log" "$(cat "$test_output")"
 
@@ -341,9 +387,9 @@ scenario_cross_module_integration() {
     exit_code=0
 
     # Run retry+circuit integration and global injector lifecycle
-    cargo test -p frankenterm-core 'circuit_breaker_integration\|global_injector_lifecycle\|free_functions_fail_open' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 0 "$test_output" \
+        test -p frankenterm-core 'circuit_breaker_integration\|global_injector_lifecycle\|free_functions_fail_open' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     e2e_add_file "cross_module_integration.log" "$(cat "$test_output")"
 
@@ -359,9 +405,9 @@ scenario_cross_module_integration() {
     if [[ "$passed_count" -eq 0 ]]; then
         # Cargo test doesn't support \| — run a broader filter
         exit_code=0
-        cargo test -p frankenterm-core 'circuit_breaker_integration' \
-            --no-fail-fast -- --nocapture \
-            >"$test_output" 2>&1 || exit_code=$?
+        run_core_cargo_test 0 "$test_output" \
+            test -p frankenterm-core 'circuit_breaker_integration' \
+            --no-fail-fast -- --nocapture || exit_code=$?
     fi
 
     if [[ $exit_code -eq 0 ]]; then
@@ -394,9 +440,9 @@ scenario_bounded_execution() {
     exit_code=0
 
     # Run all 5 reliability modules together
-    timeout 120 cargo test -p frankenterm-core 'circuit_breaker::tests\|retry::tests\|degradation::tests\|chaos::tests\|watchdog::tests' \
-        --no-fail-fast -- --nocapture \
-        >"$test_output" 2>&1 || exit_code=$?
+    run_core_cargo_test 120 "$test_output" \
+        test -p frankenterm-core 'circuit_breaker::tests\|retry::tests\|degradation::tests\|chaos::tests\|watchdog::tests' \
+        --no-fail-fast -- --nocapture || exit_code=$?
 
     # If the \| filter didn't work, run a broader match
     local passed_count=0
@@ -413,9 +459,9 @@ scenario_bounded_execution() {
             local mod_output mod_exit
             mod_output=$(mktemp)
             mod_exit=0
-            timeout 30 cargo test -p frankenterm-core "$module" \
-                --no-fail-fast -- --nocapture \
-                >"$mod_output" 2>&1 || mod_exit=$?
+            run_core_cargo_test 30 "$mod_output" \
+                test -p frankenterm-core "$module" \
+                --no-fail-fast -- --nocapture || mod_exit=$?
 
             local mp=0
             while IFS= read -r line; do
