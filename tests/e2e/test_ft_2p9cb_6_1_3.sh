@@ -10,11 +10,24 @@ SCENARIO_ID="ft_2p9cb_6_1_3_fault_isolation_verify"
 CORRELATION_ID="ft-2p9cb.6.1.3-${RUN_ID}"
 JSON_LOG="${LOG_DIR}/${RUN_ID}.jsonl"
 RAW_DIR="${LOG_DIR}/${RUN_ID}_raw"
-TARGET_DIR="target-rch-ft-2p9cb-6-1-3"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-2p9cb-6-1-3-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR="${TARGET_DIR}"
 mkdir -p "${RAW_DIR}"
 
 # shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logs" >&2
+  exit 1
+fi
+
 rch_init "${LOG_DIR}" "${RUN_ID}" "2p9cb_6_1_3"
 ensure_rch_ready
 
@@ -73,11 +86,6 @@ emit_log() {
     }' >> "${JSON_LOG}"
 }
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required for structured logs" >&2
-  exit 1
-fi
-
 emit_log \
   "start" \
   "running" \
@@ -90,52 +98,6 @@ emit_log \
   "ft-2p9cb.6.1.3 verification harness start" \
   0
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "preflight.rch" \
-    "fail" \
-    "fail" \
-    "verify.preflight" \
-    "rch_missing" \
-    "rch_not_found" \
-    "none" \
-    "${JSON_LOG#"${ROOT_DIR}"/}" \
-    "rch binary not found" \
-    0
-  exit 1
-fi
-
-PROBE_LOG="${RAW_DIR}/rch_workers_probe.log"
-set +e
-(cd "${ROOT_DIR}" && rch workers probe --all) >"${PROBE_LOG}" 2>&1
-probe_status=$?
-set -e
-if [[ ${probe_status} -eq 0 ]]; then
-  emit_log \
-    "preflight.rch_workers" \
-    "pass" \
-    "pass" \
-    "verify.preflight" \
-    "workers_probe_ok" \
-    "none" \
-    "remote_probe" \
-    "${PROBE_LOG#"${ROOT_DIR}"/}" \
-    "rch workers probe succeeded" \
-    0
-else
-  emit_log \
-    "preflight.rch_workers" \
-    "warn" \
-    "warn" \
-    "verify.preflight" \
-    "workers_probe_failed" \
-    "remote_worker_probe_failed" \
-    "unknown" \
-    "${PROBE_LOG#"${ROOT_DIR}"/}" \
-    "rch workers probe failed; proceeding with fallback-aware execution" \
-    0
-fi
-
 declare -a TEST_NAMES=(
   "fault_isolation_unit"
   "blast_radius_unit"
@@ -143,11 +105,11 @@ declare -a TEST_NAMES=(
   "fault_isolation_property"
 )
 
-declare -a TEST_CMDS=(
-  "rch exec -- env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR=${TARGET_DIR} cargo test -p frankenterm-core --lib fault_isolation -- --nocapture"
-  "rch exec -- env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR=${TARGET_DIR} cargo test -p frankenterm-core --lib blast_radius -- --nocapture"
-  "rch exec -- env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR=${TARGET_DIR} cargo test -p frankenterm-core --lib transition_log -- --nocapture"
-  "rch exec -- env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR=${TARGET_DIR} cargo test -p frankenterm-core --test proptest_latency_stages fault_isolation -- --nocapture"
+declare -a TEST_INPUT_SUMMARIES=(
+  "cargo test -p frankenterm-core --lib fault_isolation -- --nocapture"
+  "cargo test -p frankenterm-core --lib blast_radius -- --nocapture"
+  "cargo test -p frankenterm-core --lib transition_log -- --nocapture"
+  "cargo test -p frankenterm-core --test proptest_latency_stages fault_isolation -- --nocapture"
 )
 
 declare -a REQUIRED_MARKERS=(
@@ -157,16 +119,47 @@ declare -a REQUIRED_MARKERS=(
   "fault_isolation_snapshot_serde ... ok"
 )
 
+run_fault_test() {
+  local name="$1"
+  local stdout_file="$2"
+
+  case "${name}" in
+    fault_isolation_unit)
+      run_rch_cargo_logged "${stdout_file}" \
+        env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR="${TARGET_DIR}" \
+        cargo test -p frankenterm-core --lib fault_isolation -- --nocapture
+      ;;
+    blast_radius_unit)
+      run_rch_cargo_logged "${stdout_file}" \
+        env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR="${TARGET_DIR}" \
+        cargo test -p frankenterm-core --lib blast_radius -- --nocapture
+      ;;
+    transition_log_unit)
+      run_rch_cargo_logged "${stdout_file}" \
+        env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR="${TARGET_DIR}" \
+        cargo test -p frankenterm-core --lib transition_log -- --nocapture
+      ;;
+    fault_isolation_property)
+      run_rch_cargo_logged "${stdout_file}" \
+        env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR="${TARGET_DIR}" \
+        cargo test -p frankenterm-core --test proptest_latency_stages fault_isolation -- --nocapture
+      ;;
+    *)
+      echo "unknown fault-isolation test case: ${name}" >&2
+      return 2
+      ;;
+  esac
+}
+
 pass_count=0
 fail_count=0
 local_fallback_count=0
 
 for i in "${!TEST_NAMES[@]}"; do
   name="${TEST_NAMES[$i]}"
-  cmd="${TEST_CMDS[$i]}"
+  input_summary="${TEST_INPUT_SUMMARIES[$i]}"
   marker="${REQUIRED_MARKERS[$i]}"
   stdout_file="${RAW_DIR}/${name}.stdout.log"
-  stderr_file="${RAW_DIR}/${name}.stderr.log"
   started_ms="$(now_ms)"
 
   emit_log \
@@ -178,11 +171,11 @@ for i in "${!TEST_NAMES[@]}"; do
     "none" \
     "unknown" \
     "${stdout_file#"${ROOT_DIR}"/}" \
-    "Executing: ${cmd}" \
+    "Executing via rch: ${input_summary}" \
     0
 
   set +e
-  (cd "${ROOT_DIR}" && eval "${cmd}") >"${stdout_file}" 2>"${stderr_file}"
+  run_fault_test "${name}" "${stdout_file}"
   status=$?
   set -e
 
@@ -190,10 +183,6 @@ for i in "${!TEST_NAMES[@]}"; do
   duration_ms=$((ended_ms - started_ms))
 
   rch_mode="remote_offload"
-  if grep -Fq "[RCH] local" "${stdout_file}" || grep -Fq "[RCH] local" "${stderr_file}"; then
-    rch_mode="local_fallback"
-    local_fallback_count=$((local_fallback_count + 1))
-  fi
 
   if [[ ${status} -ne 0 ]]; then
     fail_count=$((fail_count + 1))
@@ -205,10 +194,10 @@ for i in "${!TEST_NAMES[@]}"; do
       "cargo_test_failed" \
       "nonzero_exit" \
       "${rch_mode}" \
-      "${stderr_file#"${ROOT_DIR}"/}" \
+      "${stdout_file#"${ROOT_DIR}"/}" \
       "Command failed with exit=${status}" \
       "${duration_ms}"
-    tail -n 120 "${stderr_file}" >&2 || true
+    tail -n 120 "${stdout_file}" >&2 || true
     exit ${status}
   fi
 
