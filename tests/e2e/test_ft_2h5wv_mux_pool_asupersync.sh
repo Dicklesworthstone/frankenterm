@@ -19,6 +19,7 @@ RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
 TIMEOUT_BIN=""
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "2h5wv_mux_pool_asupersync"
 ensure_rch_ready
@@ -123,13 +124,6 @@ resolve_timeout_bin() {
   fi
 }
 
-run_with_timeout() {
-  local timeout_secs="$1"
-  shift
-
-  "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" bash -lc "$*"
-}
-
 step_timed_out() {
   local rc="$1"
   [[ "${rc}" -eq 124 || "${rc}" -eq 137 ]]
@@ -147,50 +141,33 @@ status_has_remote_capacity() {
     "${status_log}" >/dev/null
 }
 
-rch_remote_exec() {
-  env TMPDIR=/tmp \
-    rch exec -- \
-    env TMPDIR="${REMOTE_TMPDIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-    "$@"
-}
-
 run_rch_guarded() {
-  local scenario="$1"
+  local _scenario="$1"
   local decision_path="$2"
   local success_reason="$3"
   local failure_reason="$4"
   local failure_code="$5"
   local output_log="$6"
   local queue_log=""
-  local fail_open_flag="${output_log}.fail_open_detected"
-  local pid_file="${output_log}.pid"
+  local meta_log=""
   shift 6
 
-  rm -f "${fail_open_flag}" "${pid_file}"
   set +e
   (
     cd "${ROOT_DIR}"
-    run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "$@"
-  ) > >(
-    tee "${output_log}" | while IFS= read -r line; do
-      printf '%s\n' "${line}"
-      if printf '%s\n' "${line}" | grep -Eq "${RCH_FAIL_OPEN_REGEX}"; then
-        : > "${fail_open_flag}"
-        if [[ -f "${pid_file}" ]]; then
-          kill -TERM "$(cat "${pid_file}")" 2>/dev/null || true
-        fi
-      fi
-    done
-  ) 2>&1 &
-  local cmd_pid=$!
-  printf '%s\n' "${cmd_pid}" > "${pid_file}"
-  wait "${cmd_pid}"
+    run_rch_cargo_logged_with_timeout \
+      "${RCH_STEP_TIMEOUT_SECS}" \
+      "${output_log}" \
+      env TMPDIR="${REMOTE_TMPDIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
+      "$@"
+  )
   local cmd_status=$?
   set -e
-  rm -f "${pid_file}"
+  if [[ -f "${output_log}" ]]; then
+    cat "${output_log}"
+  fi
 
-  if [[ -f "${fail_open_flag}" ]] || grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_log}"; then
-    rm -f "${fail_open_flag}"
+  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_log}" 2>/dev/null; then
     RCH_RUNTIME_BLOCKED="true"
     RCH_RUNTIME_BLOCK_REASON="rch_local_fallback"
     emit_log \
@@ -202,12 +179,12 @@ run_rch_guarded() {
       "rch fell back to local execution; refusing local CPU-intensive run"
     return 1
   fi
-  rm -f "${fail_open_flag}"
 
-  if step_timed_out "${cmd_status}"; then
+  meta_log="$(rch_log_meta_path "${output_log}")"
+  if step_timed_out "${cmd_status}" || { [[ -f "${meta_log}" ]] && jq -e '.timed_out == true' "${meta_log}" >/dev/null 2>&1; }; then
     queue_log="${output_log%.log}.rch_queue_timeout.log"
-    if ! rch queue > "${queue_log}" 2>&1; then
-      queue_log="${output_log}"
+    if [[ ! -f "${queue_log}" ]]; then
+      queue_log="${meta_log}"
     fi
     RCH_RUNTIME_BLOCKED="true"
     RCH_RUNTIME_BLOCK_REASON="rch_remote_step_timeout"
@@ -258,7 +235,6 @@ fi
 
 export REMOTE_TMPDIR
 export REMOTE_TARGET_DIR
-export -f rch_remote_exec
 
 emit_log "started" "stall_guard_config" "timeout_guard_enabled" "none" "$(basename "${LOG_FILE}")" \
   "rch_step_timeout_secs=${RCH_STEP_TIMEOUT_SECS}; timeout_bin=${TIMEOUT_BIN}"
@@ -406,8 +382,7 @@ if run_rch_guarded \
   "health_check_with_cx_tests_failed" \
   "cargo_test_failed" \
   "${HEALTH_CHECK_LOG}" \
-  rch_remote_exec \
-  'cargo test -p frankenterm-core --features vendored,asupersync-runtime pool_health_check_with_cx_ -- --nocapture'; then
+  cargo test -p frankenterm-core --features vendored,asupersync-runtime pool_health_check_with_cx_ -- --nocapture; then
   echo "PASS"
   PASS=$((PASS + 1))
 else
@@ -430,8 +405,7 @@ else
     "batch_fallback_with_cx_tests_failed" \
     "cargo_test_failed" \
     "${BATCH_FALLBACK_LOG}" \
-    rch_remote_exec \
-    'cargo test -p frankenterm-core --features vendored,asupersync-runtime pool_batch_render_with_cx_ -- --nocapture'; then
+    cargo test -p frankenterm-core --features vendored,asupersync-runtime pool_batch_render_with_cx_ -- --nocapture; then
     echo "PASS"
     PASS=$((PASS + 1))
   else
