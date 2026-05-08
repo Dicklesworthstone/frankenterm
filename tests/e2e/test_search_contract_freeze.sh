@@ -24,6 +24,17 @@ RUN_ID="${run_id}"
 now_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log_json() { echo "$1" >>"$json_log"; }
 
+count_matches() {
+  local pattern="$1"
+  local file="$2"
+  local count
+  count=$(grep -c -- "${pattern}" "${file}" 2>/dev/null || true)
+  if [[ -z "${count}" ]]; then
+    count=0
+  fi
+  printf '%s\n' "${count}"
+}
+
 # ── rch infrastructure ──────────────────────────────────────────────────────
 RCH_TARGET_DIR="target/rch-e2e-search-contract-${RUN_ID}"
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
@@ -78,11 +89,11 @@ rc=$?
 set -e
 
 if [ $rc -eq 0 ]; then
-  test_count=$(grep -c '^\s*test .* ok$' "$cargo_out" || echo "0")
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"pass\",\"outcome\":\"pass\",\"inputs\":{\"test\":\"search_api_contract_freeze\"},\"reason_code\":null,\"error_code\":null,\"tests_passed\":$test_count,\"artifact_path\":\"${cargo_out#$ROOT_DIR/}\"}"
+  test_count=$(count_matches '^\s*test .* ok$' "$cargo_out")
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"pass\",\"outcome\":\"pass\",\"inputs\":{\"test\":\"search_api_contract_freeze\"},\"reason_code\":null,\"error_code\":null,\"tests_passed\":$test_count,\"artifact_path\":\"${cargo_out#"$ROOT_DIR"/}\"}"
   scenarios_pass=$((scenarios_pass + 1))
 else
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"fail\",\"outcome\":\"fail\",\"inputs\":{\"test\":\"search_api_contract_freeze\"},\"reason_code\":\"test_failure\",\"error_code\":\"exit_$rc\",\"artifact_path\":\"${cargo_out#$ROOT_DIR/}\"}"
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"fail\",\"outcome\":\"fail\",\"inputs\":{\"test\":\"search_api_contract_freeze\"},\"reason_code\":\"test_failure\",\"error_code\":\"exit_$rc\",\"artifact_path\":\"${cargo_out#"$ROOT_DIR"/}\"}"
   scenarios_fail=$((scenarios_fail + 1))
 fi
 

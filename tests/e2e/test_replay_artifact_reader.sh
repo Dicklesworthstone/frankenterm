@@ -120,9 +120,9 @@ run_reader_test() {
     CARGO_HOME="$cargo_home" \
     CARGO_TARGET_DIR="$cargo_target_dir" \
     cargo test -p frankenterm-core --lib "$test_filter" -- --nocapture; then
-    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_artifact_reader\",\"scenario_id\":\"${scenario}\",\"step\":\"run_test\",\"status\":\"pass\",\"run_id\":\"$run_id\",\"test\":\"artifact_reader\",\"version\":\"ftreplay.v1\",\"integrity\":\"pass\",\"compression\":\"none|gzip|zstd\",\"artifact_path\":\"${combined_file#$ROOT_DIR/}\"}"
+    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_artifact_reader\",\"scenario_id\":\"${scenario}\",\"step\":\"run_test\",\"status\":\"pass\",\"run_id\":\"$run_id\",\"test\":\"artifact_reader\",\"version\":\"ftreplay.v1\",\"integrity\":\"pass\",\"compression\":\"none|gzip|zstd\",\"artifact_path\":\"${combined_file#"$ROOT_DIR"/}\"}"
   else
-    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_artifact_reader\",\"scenario_id\":\"${scenario}\",\"step\":\"run_test\",\"status\":\"fail\",\"run_id\":\"$run_id\",\"test\":\"artifact_reader\",\"version\":\"ftreplay.v1\",\"integrity\":\"fail\",\"reason_code\":\"test_failure\",\"artifact_path\":\"${combined_file#$ROOT_DIR/}\"}"
+    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_artifact_reader\",\"scenario_id\":\"${scenario}\",\"step\":\"run_test\",\"status\":\"fail\",\"run_id\":\"$run_id\",\"test\":\"artifact_reader\",\"version\":\"ftreplay.v1\",\"integrity\":\"fail\",\"reason_code\":\"test_failure\",\"artifact_path\":\"${combined_file#"$ROOT_DIR"/}\"}"
     tail -n 120 "$combined_file" >&2 || true
     exit 1
   fi
@@ -146,4 +146,4 @@ run_reader_test "4" "replay_fixture_harvest::tests::artifact_reader_open_rejects
 
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_artifact_reader\",\"scenario_id\":\"$scenario_id\",\"step\":\"complete\",\"status\":\"pass\",\"run_id\":\"$run_id\"}"
 
-echo "Replay artifact reader e2e passed. Logs: ${json_log#$ROOT_DIR/}"
+echo "Replay artifact reader e2e passed. Logs: ${json_log#"$ROOT_DIR"/}"
