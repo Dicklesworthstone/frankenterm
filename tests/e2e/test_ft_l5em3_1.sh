@@ -9,12 +9,15 @@ RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_l5em3_1_spmc_ring_buffer"
 CORRELATION_ID="ft-l5em3.1-${RUN_ID}"
 PANE_ID=0
-TARGET_DIR="target-rch-ft-l5em3-1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_l5em3_1_${RUN_ID}.jsonl"
-
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "l5em3_1"
-ensure_rch_ready
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-l5em3-1-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 emit_log() {
   local status="$1"
@@ -66,12 +69,6 @@ run_test_step() {
   local success_reason="$4"
 
   local stdout_file="${LOG_DIR}/ft_l5em3_1_${RUN_ID}_${step}.stdout.log"
-  local cmd=(
-    env TMPDIR=/tmp
-    rch exec --
-    env CARGO_TARGET_DIR="${TARGET_DIR}"
-    cargo test -p frankenterm-core --lib "${test_name}" -- --nocapture
-  )
 
   emit_log \
     "running" \
@@ -80,14 +77,13 @@ run_test_step() {
     "none" \
     "none" \
     "$(basename "${stdout_file}")" \
-    "Executing: ${cmd[*]}"
+    "Executing via rch: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib ${test_name} -- --nocapture"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    "${cmd[@]}"
-  ) 2>&1 | tee "${stdout_file}"
-  local status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${stdout_file}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+      cargo test -p frankenterm-core --lib "${test_name}" -- --nocapture
+  local status=$?
   set -e
 
   if grep -q "\\[RCH\\] local" "${stdout_file}"; then
@@ -136,6 +132,15 @@ run_test_step() {
     "test=${test_name}"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logs" >&2
+  exit 1
+fi
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "l5em3_1"
+
 emit_log \
   "started" \
   "suite_init" \
@@ -145,22 +150,25 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "steps=4"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "suite_init" \
-    "preflight_rch" \
-    "rch_missing" \
-    "rch_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "rch must be available for offloaded cargo execution"
-  exit 1
-fi
+ensure_rch_ready
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required for structured logs" >&2
-  exit 1
-fi
+emit_log \
+  "passed" \
+  "rch_preflight" \
+  "remote_execution_ready" \
+  "rch_shared_guard_passed" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared rch guard reported reachable workers"
+
+emit_log \
+  "passed" \
+  "rch_smoke" \
+  "remote_execution_ready" \
+  "rch_remote_smoke_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "shared rch guard verified fail-closed remote cargo execution"
 
 run_test_step \
   "backpressure_wait" \
