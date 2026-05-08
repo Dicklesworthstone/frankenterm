@@ -136,7 +136,6 @@ run_rch_phase() {
 }
 
 require_cmd jq
-require_cmd cargo
 require_cmd rg
 
 TEST_FILE="${ROOT_DIR}/crates/frankenterm-core/tests/mux_migration_completion.rs"

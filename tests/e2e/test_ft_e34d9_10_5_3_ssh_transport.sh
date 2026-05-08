@@ -153,7 +153,6 @@ assert_output_contains() {
 }
 
 require_cmd jq
-require_cmd cargo
 require_cmd rg
 
 EXEC_FILE="${ROOT_DIR}/frankenterm/ssh/tests/e2e/exec.rs"

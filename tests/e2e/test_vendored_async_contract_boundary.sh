@@ -116,7 +116,6 @@ run_rch_phase() {
 }
 
 require_cmd jq
-require_cmd cargo
 
 echo "=== Preflight: rch remote-only execution ==="
 emit_log "start" "rch_preflight" "rch_preflight_start" "begin" "none" "${ARTIFACT_DIR}/rch_preflight_${RUN_ID}.log" "ensure_rch_ready"

@@ -172,7 +172,6 @@ cd "${ROOT_DIR}"
 
 require_cmd jq
 require_cmd rch
-require_cmd cargo
 require_cmd python3
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"

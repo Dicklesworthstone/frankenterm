@@ -144,7 +144,6 @@ cd "${ROOT_DIR}"
 require_cmd jq
 require_cmd python3
 require_cmd rch
-require_cmd cargo
 
 VALIDATOR="${ROOT_DIR}/scripts/validate_asupersync_cutover_runtime_guards.sh"
 POLICY="${ROOT_DIR}/docs/asupersync-cutover-runtime-guardrails.json"
