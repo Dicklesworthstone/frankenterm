@@ -13,7 +13,14 @@ raw_dir="$LOG_DIR/${run_id}_raw"
 mkdir -p "$raw_dir"
 
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-cargo_target_dir="${CARGO_TARGET_DIR:-$ROOT_DIR/target-replay-performance}-${run_id}"
+default_cargo_target_base="target/rch-e2e-replay-performance"
+requested_cargo_target_dir="${CARGO_TARGET_DIR:-}"
+if [[ -n "${requested_cargo_target_dir}" && "${requested_cargo_target_dir}" != /* ]]; then
+  cargo_target_base="${requested_cargo_target_dir%/}"
+else
+  cargo_target_base="${default_cargo_target_base}"
+fi
+cargo_target_dir="${cargo_target_base}-${run_id}"
 mkdir -p "$cargo_home" "$cargo_target_dir"
 
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
