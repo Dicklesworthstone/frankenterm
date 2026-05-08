@@ -393,13 +393,14 @@ capture_remote_service() {
 remote_file_exists() {
     local alias="$1"
     local path="$2"
+    # shellcheck disable=SC2029
     ssh "$alias" "test -f $path" >/dev/null 2>&1
 }
 
 capture_remote_service_if_present() {
     local alias="$1"
     local out_file="$2"
-    if remote_file_exists "$alias" "~/.config/systemd/user/frankenterm-mux-server.service"; then
+    if remote_file_exists "$alias" "\$HOME/.config/systemd/user/frankenterm-mux-server.service"; then
         capture_remote_service "$alias" "$out_file"
     else
         printf '# service unit absent on remote host %s\n' "$alias" > "$out_file"
@@ -425,16 +426,16 @@ capture_remote_state_report() {
     local failure_injected="false"
     local service_unit_present="false"
 
-    if remote_file_exists "$alias" "~/.ft-e2e-state/service-enabled"; then
+    if remote_file_exists "$alias" "\$HOME/.ft-e2e-state/service-enabled"; then
         service_enabled="true"
     fi
-    if remote_file_exists "$alias" "~/.ft-e2e-state/linger-enabled"; then
+    if remote_file_exists "$alias" "\$HOME/.ft-e2e-state/linger-enabled"; then
         linger_enabled="true"
     fi
-    if remote_file_exists "$alias" "~/.ft-e2e-state/fail-enable"; then
+    if remote_file_exists "$alias" "\$HOME/.ft-e2e-state/fail-enable"; then
         failure_injected="true"
     fi
-    if remote_file_exists "$alias" "~/.config/systemd/user/frankenterm-mux-server.service"; then
+    if remote_file_exists "$alias" "\$HOME/.config/systemd/user/frankenterm-mux-server.service"; then
         service_unit_present="true"
     fi
 
@@ -458,7 +459,7 @@ capture_remote_snapshot() {
 
 assert_failure_rollback_state() {
     local alias="$1"
-    if remote_file_exists "$alias" "~/.ft-e2e-state/service-enabled"; then
+    if remote_file_exists "$alias" "\$HOME/.ft-e2e-state/service-enabled"; then
         die "Failure injection left frankenterm-mux-server enabled on $alias"
     fi
 }
