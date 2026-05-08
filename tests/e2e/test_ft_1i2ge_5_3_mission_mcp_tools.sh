@@ -15,13 +15,11 @@ CORRELATION_ID="ft-1i2ge.5.3-${RUN_ID}"
 TARGET_DIR="target-rch-mission-mcp-tools-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/mission_mcp_tools_${RUN_ID}.jsonl"
 STDOUT_BASENAME="mission_mcp_tools_${RUN_ID}"
-WORKSPACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ft-mission-mcp-tools.XXXXXX")"
-MISSION_PATH="${WORKSPACE_DIR}/.ft/mission/active.json"
-
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_3_mission_mcp_tools"
-ensure_rch_ready
+WORKSPACE_REL_DIR="tests/e2e/tmp/${SCENARIO_ID}_${RUN_ID}"
+WORKSPACE_DIR="${ROOT_DIR}/${WORKSPACE_REL_DIR}"
+MISSION_PATH="${WORKSPACE_REL_DIR}/.ft/mission/active.json"
+LOCAL_MISSION_PATH="${ROOT_DIR}/${MISSION_PATH}"
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 
 emit_log() {
   local outcome="$1"
@@ -63,10 +61,10 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v rch >/dev/null 2>&1; then
-  echo "rch is required; refusing local cargo execution" >&2
-  exit 1
-fi
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_3_mission_mcp_tools"
+ensure_rch_ready
 
 emit_log \
   "started" \
@@ -76,22 +74,9 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "validate ft mission lifecycle commands (status, explain, pause, resume, abort)"
 
-if ! rch workers probe --all --json \
-  | jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-    >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "preflight_rch_workers" \
-    "rch_workers_unreachable" \
-    "remote_worker_unavailable" \
-    "$(basename "${LOG_FILE}")" \
-    "no healthy rch workers available"
-  exit 1
-fi
-
 # Create mission fixture: Running state with 2 assignments (1 succeeded, 1 pending)
-mkdir -p "$(dirname "${MISSION_PATH}")"
-cat >"${MISSION_PATH}" <<'JSON'
+mkdir -p "$(dirname "${LOCAL_MISSION_PATH}")"
+cat >"${LOCAL_MISSION_PATH}" <<'JSON'
 {
   "mission_version": 1,
   "mission_id": "m-e2e-mcp-tools",
@@ -156,9 +141,9 @@ run_mission_json() {
   set +e
   (
     cd "${ROOT_DIR}"
-    rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    run_rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" \
       cargo run -q -p frankenterm --bin ft -- \
-      --workspace "${WORKSPACE_DIR}" \
+      --workspace "${WORKSPACE_REL_DIR}" \
       mission \
       -f json \
       "$@"
@@ -168,6 +153,16 @@ run_mission_json() {
 
   LAST_STDOUT_FILE="${stdout_file}"
   LAST_STDERR_FILE="${stderr_file}"
+
+  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${stdout_file}" "${stderr_file}" 2>/dev/null; then
+    emit_log "failed" "rch_offload_policy" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" \
+      "$(basename "${stderr_file}")" "rch emitted local fallback marker for ${label}; refusing local execution"
+    echo "RCH local fallback detected for ${label}; refusing local execution" >&2
+    echo "Stdout: ${stdout_file}" >&2
+    echo "Stderr: ${stderr_file}" >&2
+    exit 3
+  fi
+
   return "${rc}"
 }
 
@@ -326,7 +321,7 @@ emit_log "running" "recovery_full_cycle" "command_execution" "none" \
   "$(basename "${LOG_FILE}")" "fresh mission: status → pause → resume → abort (full lifecycle)"
 
 # Write fresh Running mission
-cat >"${MISSION_PATH}" <<'JSON'
+cat >"${LOCAL_MISSION_PATH}" <<'JSON'
 {
   "mission_version": 1,
   "mission_id": "m-e2e-recovery",
@@ -363,7 +358,7 @@ emit_log "running" "missing_file_error" "command_execution" "none" \
   "$(basename "${LOG_FILE}")" "ft mission status with nonexistent mission file"
 
 set +e
-run_mission_json "missing_file" status --mission-file "${WORKSPACE_DIR}/.ft/mission/nonexistent.json"
+run_mission_json "missing_file" status --mission-file "${WORKSPACE_REL_DIR}/.ft/mission/nonexistent.json"
 MISSING_RC=$?
 set -e
 
@@ -377,8 +372,9 @@ else
   exit 1
 fi
 
-# ── Cleanup ────────────────────────────────────────────────────────────
-rm -rf "${WORKSPACE_DIR}"
+# ── Artifact retention ─────────────────────────────────────────────────
+# Leave the synced workspace fixture available for post-failure inspection.
+echo "Mission workspace fixture: ${WORKSPACE_DIR#"${ROOT_DIR}"/}"
 
 emit_log \
   "passed" \
