@@ -196,7 +196,7 @@ run_bench() {
   set -e
 
   if [[ $rc -ne 0 ]]; then
-    emit_metric_log "$scenario" "${bench_name}_execution" "0" "1" "false" "fail" "cargo_bench_failed" "${combined_file#$ROOT_DIR/}"
+    emit_metric_log "$scenario" "${bench_name}_execution" "0" "1" "false" "fail" "cargo_bench_failed" "${combined_file#"$ROOT_DIR"/}"
     tail -n 120 "$combined_file" >&2 || true
     suite_status=1
     fail_count=$((fail_count + 1))
@@ -228,9 +228,9 @@ if run_bench 1 "replay_capture"; then
     else
       pass_count=$((pass_count + 1))
     fi
-    emit_metric_log "1" "capture_overhead_ms" "$capture_ms" "1.0" "$within_budget" "$status" "$reason_code" "${capture_estimate#$ROOT_DIR/}"
+    emit_metric_log "1" "capture_overhead_ms" "$capture_ms" "1.0" "$within_budget" "$status" "$reason_code" "${capture_estimate#"$ROOT_DIR"/}"
   else
-    emit_metric_log "1" "capture_overhead_ms" "0" "1.0" "false" "fail" "missing_estimate" "${capture_estimate#$ROOT_DIR/}"
+    emit_metric_log "1" "capture_overhead_ms" "0" "1.0" "false" "fail" "missing_estimate" "${capture_estimate#"$ROOT_DIR"/}"
     suite_status=1
     fail_count=$((fail_count + 1))
   fi
@@ -253,9 +253,9 @@ if run_bench 2 "replay_kernel"; then
     else
       pass_count=$((pass_count + 1))
     fi
-    emit_metric_log "2" "replay_throughput_eps" "$replay_eps" "100000.0" "$within_budget" "$status" "$reason_code" "${kernel_estimate#$ROOT_DIR/}"
+    emit_metric_log "2" "replay_throughput_eps" "$replay_eps" "100000.0" "$within_budget" "$status" "$reason_code" "${kernel_estimate#"$ROOT_DIR"/}"
   else
-    emit_metric_log "2" "replay_throughput_eps" "0" "100000.0" "false" "fail" "missing_estimate" "${kernel_estimate#$ROOT_DIR/}"
+    emit_metric_log "2" "replay_throughput_eps" "0" "100000.0" "false" "fail" "missing_estimate" "${kernel_estimate#"$ROOT_DIR"/}"
     suite_status=1
     fail_count=$((fail_count + 1))
   fi
@@ -278,9 +278,9 @@ if run_bench 3 "replay_diff"; then
     else
       pass_count=$((pass_count + 1))
     fi
-    emit_metric_log "3" "diff_latency_ms" "$diff_ms" "1000.0" "$within_budget" "$status" "$reason_code" "${diff_estimate#$ROOT_DIR/}"
+    emit_metric_log "3" "diff_latency_ms" "$diff_ms" "1000.0" "$within_budget" "$status" "$reason_code" "${diff_estimate#"$ROOT_DIR"/}"
   else
-    emit_metric_log "3" "diff_latency_ms" "0" "1000.0" "false" "fail" "missing_estimate" "${diff_estimate#$ROOT_DIR/}"
+    emit_metric_log "3" "diff_latency_ms" "0" "1000.0" "false" "fail" "missing_estimate" "${diff_estimate#"$ROOT_DIR"/}"
     suite_status=1
     fail_count=$((fail_count + 1))
   fi
@@ -302,7 +302,7 @@ scenario4_rc=$?
 set -e
 
 if [[ $scenario4_rc -ne 0 ]]; then
-  emit_metric_log "4" "baseline_regression_gate" "1" "0" "false" "fail" "blocking_regression" "${scenario4_stderr#$ROOT_DIR/}"
+  emit_metric_log "4" "baseline_regression_gate" "1" "0" "false" "fail" "blocking_regression" "${scenario4_stderr#"$ROOT_DIR"/}"
   suite_status=1
   fail_count=$((fail_count + 1))
 else
@@ -316,10 +316,10 @@ else
     if [[ "$overall_status" == "warning" ]]; then
       reason_code="baseline_compare_warning"
     fi
-    emit_metric_log "4" "baseline_regression_gate" "$warning_count" "0" "$within_budget" "$status" "$reason_code" "${report_file#$ROOT_DIR/}"
+    emit_metric_log "4" "baseline_regression_gate" "$warning_count" "0" "$within_budget" "$status" "$reason_code" "${report_file#"$ROOT_DIR"/}"
     pass_count=$((pass_count + 1))
   else
-    emit_metric_log "4" "baseline_regression_gate" "0" "0" "false" "fail" "missing_gate_report" "${scenario4_dir#$ROOT_DIR/}"
+    emit_metric_log "4" "baseline_regression_gate" "0" "0" "false" "fail" "missing_gate_report" "${scenario4_dir#"$ROOT_DIR"/}"
     suite_status=1
     fail_count=$((fail_count + 1))
   fi

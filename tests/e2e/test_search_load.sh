@@ -120,6 +120,46 @@ export FT_BIN
 export RESULTS_JSONL
 export LOAD_QUERY
 
+run_search_load_request() {
+    local req_id="$1"
+    local start_ms end_ms latency_ms
+    local out ok hits status
+
+    start_ms="$(timestamp_ms)"
+    if out=$("$FT_BIN" robot --format json search "$LOAD_QUERY" --limit 1 2>/dev/null); then
+        ok=$(printf "%s" "$out" | jq -r ".ok // false" 2>/dev/null || echo "false")
+        hits=$(printf "%s" "$out" | jq -r ".data.total_hits // 0" 2>/dev/null || echo "0")
+        status="pass"
+        if [[ "$ok" != "true" ]]; then
+            status="fail"
+        fi
+    else
+        hits=0
+        status="error"
+    fi
+
+    end_ms="$(timestamp_ms)"
+    latency_ms=$((end_ms - start_ms))
+    jq -nc \
+        --argjson request_id "$req_id" \
+        --arg status "$status" \
+        --argjson timestamp_ms "$end_ms" \
+        --argjson latency_ms "$latency_ms" \
+        --argjson hits "$hits" \
+        --arg query "$LOAD_QUERY" \
+        '{
+            request_id: $request_id,
+            timestamp_ms: $timestamp_ms,
+            latency_ms: $latency_ms,
+            status: $status,
+            hits: $hits,
+            query: $query
+        }' >>"$RESULTS_JSONL"
+}
+
+export -f timestamp_ms
+export -f run_search_load_request
+
 finish() {
     trap - EXIT
     local prior_exit="$?"
@@ -242,47 +282,10 @@ TOTAL_REQS=$((DURATION_SECS * TARGET_QPS))
 : >"$RESULTS_JSONL"
 load_start="$(timestamp_ms)"
 
+# shellcheck disable=SC2016
 seq 1 "$TOTAL_REQS" | xargs -P "$PARALLELISM" -I {} bash -c '
-req_id="$1"
-start_ms=$(python3 - <<'"'"'PY'"'"'
-import time
-print(int(time.time() * 1000))
-PY
-)
-if out=$("$FT_BIN" robot --format json search "$LOAD_QUERY" --limit 1 2>/dev/null); then
-    ok=$(printf "%s" "$out" | jq -r ".ok // false" 2>/dev/null || echo "false")
-    hits=$(printf "%s" "$out" | jq -r ".data.total_hits // 0" 2>/dev/null || echo "0")
-    status="pass"
-    if [[ "$ok" != "true" ]]; then
-        status="fail"
-    fi
-else
-    ok="false"
-    hits=0
-    status="error"
-fi
-end_ms=$(python3 - <<'"'"'PY'"'"'
-import time
-print(int(time.time() * 1000))
-PY
-)
-latency_ms=$((end_ms - start_ms))
-jq -nc \
-    --argjson request_id "$req_id" \
-    --arg status "$status" \
-    --argjson timestamp_ms "$end_ms" \
-    --argjson latency_ms "$latency_ms" \
-    --argjson hits "$hits" \
-    --arg query "$LOAD_QUERY" \
-    '{
-        request_id: $request_id,
-        timestamp_ms: $timestamp_ms,
-        latency_ms: $latency_ms,
-        status: $status,
-        hits: $hits,
-        query: $query
-    }' >> "$RESULTS_JSONL"
-exit 0
+set -uo pipefail
+run_search_load_request "$1"
 ' _ {}
 
 load_end="$(timestamp_ms)"

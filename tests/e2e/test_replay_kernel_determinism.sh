@@ -173,7 +173,7 @@ run_kernel_test() {
   if [[ $rc -eq 0 ]]; then
     rch_mode="remote_offload"
     pass_scenarios=$((pass_scenarios + 1))
-    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"pass\",\"decision_path\":\"${decision_path}\",\"outcome\":\"pass\",\"reason_code\":\"assertions_satisfied\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifacts\":{\"combined\":\"${combined_log#$ROOT_DIR/}\"}}"
+    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"pass\",\"decision_path\":\"${decision_path}\",\"outcome\":\"pass\",\"reason_code\":\"assertions_satisfied\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifacts\":{\"combined\":\"${combined_log#"$ROOT_DIR"/}\"}}"
   else
     if grep -Fq "No space left on device" "$combined_log"; then
       reason_code="disk_exhausted"
@@ -191,7 +191,7 @@ run_kernel_test() {
 
     rch_mode="remote_offload"
     fail_scenarios=$((fail_scenarios + 1))
-    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"fail\",\"decision_path\":\"${decision_path}\",\"outcome\":\"fail\",\"reason_code\":\"${reason_code}\",\"error_code\":\"${error_code}\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifacts\":{\"combined\":\"${combined_log#$ROOT_DIR/}\"}}"
+    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"fail\",\"decision_path\":\"${decision_path}\",\"outcome\":\"fail\",\"reason_code\":\"${reason_code}\",\"error_code\":\"${error_code}\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifacts\":{\"combined\":\"${combined_log#"$ROOT_DIR"/}\"}}"
     tail -n 120 "$combined_log" >&2 || true
     return 1
   fi
@@ -223,7 +223,7 @@ if [[ $suite_status -ne 0 ]]; then
 fi
 
 summary_json="{\"test\":\"replay_kernel\",\"scenarios\":${total_scenarios},\"pass\":${pass_scenarios},\"fail\":${fail_scenarios},\"status\":\"${status}\"}"
-log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"$scenario_id\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"complete\",\"status\":\"${status}\",\"decision_path\":\"kernel_complete\",\"outcome\":\"${status}\",\"reason_code\":\"${reason_code}\",\"duration_ms\":$((suite_ended_ms - suite_started_ms)),\"artifacts\":{\"json_log\":\"${json_log#$ROOT_DIR/}\",\"raw_dir\":\"${raw_dir#$ROOT_DIR/}\"},\"summary\":${summary_json}}"
+log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"$scenario_id\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"complete\",\"status\":\"${status}\",\"decision_path\":\"kernel_complete\",\"outcome\":\"${status}\",\"reason_code\":\"${reason_code}\",\"duration_ms\":$((suite_ended_ms - suite_started_ms)),\"artifacts\":{\"json_log\":\"${json_log#"$ROOT_DIR"/}\",\"raw_dir\":\"${raw_dir#"$ROOT_DIR"/}\"},\"summary\":${summary_json}}"
 
 echo "${summary_json}"
 

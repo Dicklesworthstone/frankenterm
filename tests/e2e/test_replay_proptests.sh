@@ -174,7 +174,7 @@ run_prop_suite() {
   local reason_code
 
   started_ms="$(now_ms)"
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases},\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\"},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${combined_file#$ROOT_DIR/}\"}"
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases},\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\"},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${combined_file#"$ROOT_DIR"/}\"}"
 
   set +e
   run_rch_cargo_logged "${combined_file}" test -p frankenterm-core --test "${test_target}" -- --nocapture
@@ -186,7 +186,7 @@ run_prop_suite() {
 
   if [[ $rc -eq 0 ]]; then
     pass_properties=$((pass_properties + property_count))
-    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases}},\"outcome\":\"pass\",\"reason_code\":\"assertions_satisfied\",\"error_code\":null,\"duration_ms\":${duration_ms},\"rch_mode\":\"remote_offload\",\"artifact_path\":\"${combined_file#$ROOT_DIR/}\"}"
+    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases}},\"outcome\":\"pass\",\"reason_code\":\"assertions_satisfied\",\"error_code\":null,\"duration_ms\":${duration_ms},\"rch_mode\":\"remote_offload\",\"artifact_path\":\"${combined_file#"$ROOT_DIR"/}\"}"
     return 0
   fi
 
@@ -196,7 +196,7 @@ run_prop_suite() {
   if [[ ! -s "${seed_file}" ]]; then
     echo "no_proptest_seed_detected" >"${seed_file}"
   fi
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases}},\"outcome\":\"fail\",\"reason_code\":\"${reason_code}\",\"error_code\":\"cargo_test_failed\",\"duration_ms\":${duration_ms},\"rch_mode\":\"remote_offload\",\"artifact_path\":\"${combined_file#$ROOT_DIR/}\",\"seed_artifact_path\":\"${seed_file#$ROOT_DIR/}\"}"
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases}},\"outcome\":\"fail\",\"reason_code\":\"${reason_code}\",\"error_code\":\"cargo_test_failed\",\"duration_ms\":${duration_ms},\"rch_mode\":\"remote_offload\",\"artifact_path\":\"${combined_file#"$ROOT_DIR"/}\",\"seed_artifact_path\":\"${seed_file#"$ROOT_DIR"/}\"}"
   tail -n 120 "${combined_file}" >&2 || true
   return "$rc"
 }
@@ -204,7 +204,7 @@ run_prop_suite() {
 ensure_rch_ready
 
 suite_started_ms="$(now_ms)"
-log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${scenario_id}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"suite.start\",\"inputs\":{\"total_properties\":${total_properties},\"prop_cases\":${prop_cases}},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${json_log#$ROOT_DIR/}\"}"
+log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${scenario_id}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"suite.start\",\"inputs\":{\"total_properties\":${total_properties},\"prop_cases\":${prop_cases}},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${json_log#"$ROOT_DIR"/}\"}"
 
 run_prop_suite "determinism" "proptest_replay_determinism" "${determinism_properties}" "suite.determinism" || suite_status=1
 run_prop_suite "diff" "proptest_replay_diff" "${diff_properties}" "suite.diff" || suite_status=1
@@ -219,7 +219,7 @@ fi
 summary_json="{\"test\":\"proptests\",\"properties\":${total_properties},\"pass\":${pass_properties},\"fail\":${fail_properties},\"total_cases\":${total_cases},\"status\":\"${status}\"}"
 
 suite_ended_ms="$(now_ms)"
-log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${scenario_id}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"suite.complete\",\"inputs\":{\"total_properties\":${total_properties},\"pass\":${pass_properties},\"fail\":${fail_properties},\"total_cases\":${total_cases}},\"outcome\":\"${status}\",\"reason_code\":\"${reason_code}\",\"error_code\":null,\"duration_ms\":$((suite_ended_ms - suite_started_ms)),\"artifact_path\":\"${json_log#$ROOT_DIR/}\",\"summary\":${summary_json}}"
+log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${scenario_id}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"suite.complete\",\"inputs\":{\"total_properties\":${total_properties},\"pass\":${pass_properties},\"fail\":${fail_properties},\"total_cases\":${total_cases}},\"outcome\":\"${status}\",\"reason_code\":\"${reason_code}\",\"error_code\":null,\"duration_ms\":$((suite_ended_ms - suite_started_ms)),\"artifact_path\":\"${json_log#"$ROOT_DIR"/}\",\"summary\":${summary_json}}"
 
 echo "${summary_json}"
 

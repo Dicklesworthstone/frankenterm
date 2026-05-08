@@ -29,6 +29,17 @@ RCH_SMOKE_LOG="${LOG_DIR}/replay_side_effect_isolation_${RUN_ID}.smoke.log"
 now_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log_json() { echo "$1" >>"$json_log"; }
 
+count_matches() {
+  local pattern="$1"
+  local file="$2"
+  local count
+  count=$(grep -c -- "${pattern}" "${file}" 2>/dev/null || true)
+  if [[ -z "${count}" ]]; then
+    count=0
+  fi
+  printf '%s\n' "${count}"
+}
+
 fatal() { echo "FATAL: $1" >&2; exit 1; }
 
 run_rch() {
@@ -103,7 +114,7 @@ rc=$?
 set -e
 
 if [ $rc -eq 0 ]; then
-  test_count=$(grep -c 'test replay_side_effect_barrier::tests::' "$raw_dir/${scenario}.stdout.log" || echo "0")
+  test_count=$(count_matches 'test replay_side_effect_barrier::tests::' "$raw_dir/${scenario}.stdout.log")
   log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_side_effect_isolation\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"pass\",\"outcome\":\"pass\",\"tests_passed\":$test_count}"
   scenarios_pass=$((scenarios_pass + 1))
 else
