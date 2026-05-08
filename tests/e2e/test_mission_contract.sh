@@ -129,7 +129,7 @@ for test_filter in "${MISSION_TEST_FILTERS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing with PROPTEST_CASES=${PROPTEST_CASES_VALUE} PROPTEST_RNG_SEED=${PROPTEST_RNG_SEED_VALUE}: rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib ${test_filter} -- --nocapture"
+    "Executing via shared rch guard with PROPTEST_CASES=${PROPTEST_CASES_VALUE} PROPTEST_RNG_SEED=${PROPTEST_RNG_SEED_VALUE}: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib ${test_filter} -- --nocapture"
 
   set +e
   run_rch_cargo_logged "${step_log}" \

@@ -136,7 +136,7 @@ for test_filter in "${MISSION_TX_TEST_FILTERS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib ${test_filter} -- --nocapture"
+    "Executing via shared rch guard: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib ${test_filter} -- --nocapture"
 
   set +e
   run_rch_cargo_logged "${step_log}" \
