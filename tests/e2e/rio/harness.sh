@@ -49,6 +49,7 @@ setup_artifact_dir() {
     ARTIFACT_DIR="${ARTIFACT_BASE}/${scenario}/${RUN_ID}"
     mkdir -p "${ARTIFACT_DIR}"
     rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "rio_${scenario}" "${PROJECT_ROOT}"
+    RCH_PREFLIGHT_READY=0
     echo "${ARTIFACT_DIR}"
 }
 
@@ -269,6 +270,7 @@ ft_bin() {
 }
 
 CARGO_TEST_SKIPPED=0
+RCH_PREFLIGHT_READY=0
 
 cargo_test() {
     local filter="${1:-}"
@@ -279,6 +281,10 @@ cargo_test() {
         SKIP_COUNT=$((SKIP_COUNT + 1))
         echo "  SKIP: cargo test (quick mode, filter=$filter)"
         return 0
+    fi
+    if [[ "${RCH_PREFLIGHT_READY}" -ne 1 ]]; then
+        ensure_rch_ready
+        RCH_PREFLIGHT_READY=1
     fi
     local timeout_sec="${CARGO_TEST_TIMEOUT:-120}"
     local target_dir="${CARGO_TARGET_DIR:-target/rch-e2e-rio-${RUN_ID}}"
