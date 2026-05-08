@@ -8,12 +8,15 @@ mkdir -p "${LOG_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_l5em3_2_simd_scan"
 CORRELATION_ID="ft-l5em3.2-${RUN_ID}"
-TARGET_DIR="target-rch-ft-l5em3-2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_l5em3_2_${RUN_ID}.jsonl"
-
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "l5em3_2"
-ensure_rch_ready
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-l5em3-2-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 emit_log() {
   local status="$1"
@@ -71,14 +74,12 @@ run_step() {
     "none" \
     "none" \
     "$(basename "${stdout_file}")" \
-    "Executing: ${cmd[*]}"
+    "Executing via rch: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} ${cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    "${cmd[@]}"
-  ) 2>&1 | tee "${stdout_file}"
-  local status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${stdout_file}" \
+    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" "${cmd[@]}"
+  local status=$?
   set -e
 
   if grep -q "\\[RCH\\] local" "${stdout_file}"; then
@@ -115,6 +116,15 @@ run_step() {
     "ok"
 }
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logs" >&2
+  exit 1
+fi
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "l5em3_2"
+
 emit_log \
   "started" \
   "suite_init" \
@@ -124,85 +134,72 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "steps=8"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "suite_init" \
-    "preflight_rch" \
-    "rch_missing" \
-    "rch_not_found" \
-    "$(basename "${LOG_FILE}")" \
-    "rch must be available for offloaded cargo execution"
-  exit 1
-fi
+ensure_rch_ready
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required for structured logs" >&2
-  exit 1
-fi
+emit_log \
+  "passed" \
+  "rch_preflight" \
+  "remote_execution_ready" \
+  "rch_shared_guard_passed" \
+  "none" \
+  "$(basename "$(rch_probe_log_path)")" \
+  "shared rch guard reported reachable workers"
+
+emit_log \
+  "passed" \
+  "rch_smoke" \
+  "remote_execution_ready" \
+  "rch_remote_smoke_passed" \
+  "none" \
+  "$(basename "$(rch_smoke_log_path)")" \
+  "shared rch guard verified fail-closed remote cargo execution"
 
 run_step \
   "escape_boundary_unit" \
   "stateful_unit_escape_boundary" \
   "escape_carry_state_preserved" \
-  env TMPDIR=/tmp rch exec -- \
-  env CARGO_TARGET_DIR="${TARGET_DIR}" \
   cargo test -p frankenterm-core --lib stateful_scan_tracks_escape_across_chunk_boundary -- --nocapture
 
 run_step \
   "utf8_boundary_unit" \
   "stateful_unit_utf8_boundary" \
   "utf8_carry_state_preserved" \
-  env TMPDIR=/tmp rch exec -- \
-  env CARGO_TARGET_DIR="${TARGET_DIR}" \
   cargo test -p frankenterm-core --lib stateful_scan_tracks_partial_utf8_across_chunks -- --nocapture
 
 run_step \
   "streaming_split_proptest" \
   "proptest_streaming_equivalence" \
   "streaming_equals_full_scan" \
-  env TMPDIR=/tmp rch exec -- \
-  env CARGO_TARGET_DIR="${TARGET_DIR}" \
   cargo test -p frankenterm-core --test proptest_simd_scan streaming_scan_matches_full_scan_on_arbitrary_chunks -- --nocapture
 
 run_step \
   "ansi_split_proptest" \
   "proptest_ansi_boundary_equivalence" \
   "ansi_split_metrics_preserved" \
-  env TMPDIR=/tmp rch exec -- \
-  env CARGO_TARGET_DIR="${TARGET_DIR}" \
   cargo test -p frankenterm-core --test proptest_simd_scan ansi_boundary_splits_preserve_metrics -- --nocapture
 
 run_step \
   "stateful_parity_proptest" \
   "proptest_stateful_fast_vs_scalar_parity" \
   "stateful_fast_path_matches_scalar" \
-  env TMPDIR=/tmp rch exec -- \
-  env CARGO_TARGET_DIR="${TARGET_DIR}" \
   cargo test -p frankenterm-core --lib stateful_fast_path_matches_scalar_for_random_bytes_and_state -- --nocapture
 
 run_step \
   "bocpd_chunk_escape_state" \
   "bocpd_chunked_scan_state_carry" \
   "bocpd_chunk_observe_preserves_escape_carry" \
-  env TMPDIR=/tmp rch exec -- \
-  env CARGO_TARGET_DIR="${TARGET_DIR}" \
   cargo test -p frankenterm-core --lib pane_bocpd_observe_text_chunk_preserves_escape_state_across_chunks -- --nocapture
 
 run_step \
   "bocpd_manager_chunk_auto_register" \
   "bocpd_manager_chunked_auto_register" \
   "bocpd_manager_observe_text_chunk_works" \
-  env TMPDIR=/tmp rch exec -- \
-  env CARGO_TARGET_DIR="${TARGET_DIR}" \
   cargo test -p frankenterm-core --lib manager_observe_text_chunk_auto_registers_and_uses_scan_carry -- --nocapture
 
 run_step \
   "dense_logs_benchmark" \
   "criterion_dense_logs_throughput" \
   "benchmark_collected" \
-  env TMPDIR=/tmp rch exec -- \
-  env CARGO_TARGET_DIR="${TARGET_DIR}" \
   cargo bench -p frankenterm-core --bench simd_scan -- \
   simd_scan_chunked_stateful --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5 --noplot
 
