@@ -20,20 +20,32 @@ STDOUT_FILE="${LOG_DIR}/traceability_matrix_${RUN_ID}.stdout.log"
 REPORT_OK="${LOG_DIR}/traceability_matrix_${RUN_ID}.report.ok.json"
 REPORT_FAIL="${LOG_DIR}/traceability_matrix_${RUN_ID}.report.fail.json"
 REPORT_INCOMPLETE="${LOG_DIR}/traceability_matrix_${RUN_ID}.report.incomplete.json"
-RCH_PROBE_FILE="${LOG_DIR}/traceability_matrix_${RUN_ID}.rch_probe.json"
 BAD_MATRIX_FILE="${LOG_DIR}/traceability_matrix_${RUN_ID}.bad_matrix.json"
-TARGET_DIR="${CARGO_TARGET_DIR:-${ROOT_DIR}/.cargo-ft-3681t-1-5-1/target}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-3681t-1-5-1-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR="${TARGET_DIR}"
 BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 INCOMPLETE_COUNT=0
-RCH_PREFLIGHT_DONE=0
-RCH_REMOTE_READY=0
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging" >&2
+  exit 1
+fi
+
 rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_1_5_1_traceability_matrix"
+RCH_PROBE_FILE="$(rch_probe_log_path)"
 ensure_rch_ready
 
 emit_log() {
@@ -73,53 +85,18 @@ emit_log() {
 
 pass() { PASS_COUNT=$((PASS_COUNT + 1)); }
 fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); }
-skip() { SKIP_COUNT=$((SKIP_COUNT + 1)); }
-incomplete() { INCOMPLETE_COUNT=$((INCOMPLETE_COUNT + 1)); }
 
-rch_preflight() {
-  if [ "${RCH_PREFLIGHT_DONE}" -eq 1 ]; then
-    [ "${RCH_REMOTE_READY}" -eq 1 ]
-    return
-  fi
+run_rch_step() {
+  local label="$1"
+  shift
+  local step_log="${LOG_DIR}/traceability_matrix_${RUN_ID}.${label}.log"
 
-  RCH_PREFLIGHT_DONE=1
-
-  if ! command -v rch >/dev/null 2>&1; then
-    emit_log "SKIP" "rch_preflight" "RCH_NOT_FOUND" "E-TM-005" "" "rch required for remote cargo offload"
-    echo "  SKIP: rch not found; remote-only cargo scenarios cannot run"
-    skip
-    incomplete
-    RCH_REMOTE_READY=0
-    return 1
-  fi
-
-  if ! rch workers probe --json --all > "${RCH_PROBE_FILE}" 2>> "${STDOUT_FILE}"; then
-    emit_log "SKIP" "rch_preflight" "RCH_PROBE_FAILED" "E-TM-006" "${RCH_PROBE_FILE}" "worker probe command failed"
-    echo "  SKIP: rch worker probe failed; refusing cargo execution"
-    skip
-    incomplete
-    RCH_REMOTE_READY=0
-    return 1
-  fi
-
-  if jq -e '
-      .success == true
-      and (.data | type == "array")
-      and any(.data[]?; (.status // "") | ascii_downcase | test("^(healthy|ok|ready|reachable|success)$"))
-    ' "${RCH_PROBE_FILE}" >/dev/null; then
-    emit_log "PASS" "rch_preflight" "RCH_WORKERS_READY" "" "${RCH_PROBE_FILE}" "at least one worker reachable"
-    echo "  PASS: at least one rch worker is reachable"
-    pass
-    RCH_REMOTE_READY=1
-    return 0
-  fi
-
-  emit_log "SKIP" "rch_preflight" "RCH_NO_REACHABLE_WORKERS" "E-TM-007" "${RCH_PROBE_FILE}" "no reachable workers in probe output"
-  echo "  SKIP: no reachable rch workers; refusing cargo execution"
-  skip
-  incomplete
-  RCH_REMOTE_READY=0
-  return 1
+  set +e
+  run_rch_cargo_logged "${step_log}" "$@"
+  local status=$?
+  set -e
+  tee -a "${STDOUT_FILE}" < "${step_log}"
+  return "${status}"
 }
 
 echo "=== ft-3681t.1.5.1: Traceability Matrix E2E ==="
@@ -215,23 +192,19 @@ fi
 echo ""
 echo "--- Scenario 2: Rust validation tests ---"
 
-if ! rch_preflight; then
-  emit_log "SKIP" "rust_tests" "RCH_REMOTE_UNAVAILABLE" "E-TM-008" "${RCH_PROBE_FILE}" "remote cargo validation blocked by preflight"
-  echo "  SKIP: remote cargo validation blocked by rch preflight"
-  skip
-  incomplete
+echo "  Running: rch exec -- env CARGO_TARGET_DIR=${TARGET_DIR} CARGO_BUILD_JOBS=${BUILD_JOBS} cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture"
+if run_rch_step \
+  "rust_tests" \
+  env CARGO_TARGET_DIR="${TARGET_DIR}" CARGO_BUILD_JOBS="${BUILD_JOBS}" \
+  cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture; then
+  emit_log "PASS" "rust_tests" "TESTS_PASS" "" "${STDOUT_FILE}" "matrix integration tests"
+  echo "  PASS: matrix integration tests succeeded"
+  pass
 else
-  echo "  Running: rch exec -- env CARGO_TARGET_DIR=${TARGET_DIR} CARGO_BUILD_JOBS=${BUILD_JOBS} cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture"
-  if rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" CARGO_BUILD_JOBS="${BUILD_JOBS}" cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture >> "${STDOUT_FILE}" 2>&1; then
-    emit_log "PASS" "rust_tests" "TESTS_PASS" "" "${STDOUT_FILE}" "matrix integration tests"
-    echo "  PASS: matrix integration tests succeeded"
-    pass
-  else
-    exit_code=$?
-    emit_log "FAIL" "rust_tests" "TESTS_FAIL" "E-TM-010" "${STDOUT_FILE}" "exit ${exit_code}"
-    echo "  FAIL: matrix integration tests failed (exit ${exit_code})"
-    fail
-  fi
+  exit_code=$?
+  emit_log "FAIL" "rust_tests" "TESTS_FAIL" "E-TM-010" "${STDOUT_FILE}" "exit ${exit_code}"
+  echo "  FAIL: matrix integration tests failed (exit ${exit_code})"
+  fail
 fi
 
 # ---------------------------------------------------------------------------
@@ -244,17 +217,15 @@ if [ ! -f "${MATRIX_FILE}" ]; then
   emit_log "FAIL" "failure_injection_setup" "MATRIX_MISSING" "E-TM-021" "${MATRIX_FILE}" "cannot synthesize invalid matrix"
   echo "  FAIL: matrix file missing; cannot execute failure-injection scenario"
   fail
-elif ! rch_preflight; then
-  emit_log "SKIP" "failure_injection" "RCH_REMOTE_UNAVAILABLE" "E-TM-022" "${RCH_PROBE_FILE}" "failure injection blocked by rch preflight"
-  echo "  SKIP: remote failure-injection validation blocked by rch preflight"
-  skip
-  incomplete
 else
   jq '(.entries[0].status = "gap") | (.entries[0].gap_severity = "high") | (.entries[0].mapped_bead_ids = [])' \
     "${MATRIX_FILE}" > "${BAD_MATRIX_FILE}"
 
   echo "  Running failure-injection command (expected failure): rch exec -- env FT_TRACEABILITY_MATRIX_PATH=${BAD_MATRIX_FILE} CARGO_TARGET_DIR=${TARGET_DIR} CARGO_BUILD_JOBS=${BUILD_JOBS} cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features traceability_matrix_schema_is_valid -- --exact --nocapture"
-  if rch exec -- env FT_TRACEABILITY_MATRIX_PATH="${BAD_MATRIX_FILE}" CARGO_TARGET_DIR="${TARGET_DIR}" CARGO_BUILD_JOBS="${BUILD_JOBS}" cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features traceability_matrix_schema_is_valid -- --exact --nocapture >> "${STDOUT_FILE}" 2>&1; then
+  if run_rch_step \
+    "failure_injection" \
+    env FT_TRACEABILITY_MATRIX_PATH="${BAD_MATRIX_FILE}" CARGO_TARGET_DIR="${TARGET_DIR}" CARGO_BUILD_JOBS="${BUILD_JOBS}" \
+    cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features traceability_matrix_schema_is_valid -- --exact --nocapture; then
     emit_log "FAIL" "failure_injection" "UNEXPECTED_PASS" "E-TM-020" "${STDOUT_FILE}" "invalid matrix unexpectedly validated"
     echo "  FAIL: invalid matrix unexpectedly passed validation"
     fail
