@@ -8,7 +8,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 LOG_DIR="${TMPDIR:-/tmp}/ft_dr6zv_D1_logs"
 mkdir -p "$LOG_DIR"
@@ -16,55 +15,35 @@ mkdir -p "$LOG_DIR"
 RUN_ID="$(date -u +"%Y%m%d_%H%M%S")"
 
 # ── rch infrastructure ──────────────────────────────────────────────────────
-RCH_TARGET_DIR="target/rch-e2e-dr6zv-d1-${RUN_ID}"
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-RCH_PROBE_LOG="${LOG_DIR}/dr6zv_d1_${RUN_ID}.probe.log"
-RCH_SMOKE_LOG="${LOG_DIR}/dr6zv_d1_${RUN_ID}.smoke.log"
+CARGO_TARGET_DIR="target/rch-e2e-dr6zv-d1-${RUN_ID}"
+GUARD_LIB="${SCRIPT_DIR}/lib_rch_guards.sh"
 
-fatal() { echo "FATAL: $1" >&2; exit 1; }
-run_rch() { TMPDIR=/tmp rch "$@"; }
-run_rch_cargo() { run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"; }
-probe_has_reachable_workers() { grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"; }
-
-check_rch_fallback() {
+run_cargo_step() {
     local output_file="$1"
-    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
-        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
-    fi
+    shift
+    run_rch_cargo_logged "${output_file}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
 }
 
-run_rch_cargo_logged() {
-    local output_file="$1"; shift
-    set +e; ( cd "${PROJECT_ROOT}"; run_rch_cargo "$@" ) >"${output_file}" 2>&1; local rc=$?; set -e
-    check_rch_fallback "${output_file}"; return "${rc}"
-}
-
-ensure_rch_ready() {
-    if ! command -v rch >/dev/null 2>&1; then
-        fatal "rch is required for this e2e harness; refusing local cargo execution."
-    fi
-    set +e; run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1; local probe_rc=$?; set -e
-    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
-        fatal "rch workers unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
-    fi
-    set +e; run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1; local smoke_rc=$?; set -e
-    check_rch_fallback "${RCH_SMOKE_LOG}"
-    if [[ ${smoke_rc} -ne 0 ]]; then
-        fatal "rch remote smoke preflight failed. See ${RCH_SMOKE_LOG}"
-    fi
-}
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 
 # ── preflight ───────────────────────────────────────────────────────────────
 echo "=== ft-dr6zv.1.3.D1 E2E: MigrationController + RetirementGate ==="
 echo "Log directory: $LOG_DIR"
 echo ""
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for rch metadata artifacts" >&2
+  exit 1
+fi
+
+rch_init "${LOG_DIR}" "${RUN_ID}" "dr6zv_d1"
 ensure_rch_ready
 
 # Step 1: Unit tests for migration_controller
 echo "[1/4] Running migration_controller unit tests..."
 step1_log="${LOG_DIR}/dr6zv_d1_${RUN_ID}.unit.log"
-if run_rch_cargo_logged "${step1_log}" test --package frankenterm-core --lib \
+if run_cargo_step "${step1_log}" test --package frankenterm-core --lib \
   -- search::migration_controller --nocapture; then
   echo "  PASS"
 else
@@ -76,7 +55,7 @@ echo ""
 # Step 2: Proptest suite
 echo "[2/4] Running proptest suite..."
 step2_log="${LOG_DIR}/dr6zv_d1_${RUN_ID}.proptest.log"
-if run_rch_cargo_logged "${step2_log}" test --package frankenterm-core \
+if run_cargo_step "${step2_log}" test --package frankenterm-core \
   --test proptest_migration_controller -- --nocapture; then
   echo "  PASS"
 else
@@ -88,7 +67,7 @@ echo ""
 # Step 3: C1 + C2 regression check
 echo "[3/4] Running C1 regression check (facade + schema gate)..."
 step3_log="${LOG_DIR}/dr6zv_d1_${RUN_ID}.c1_regression.log"
-if run_rch_cargo_logged "${step3_log}" test --package frankenterm-core --lib \
+if run_cargo_step "${step3_log}" test --package frankenterm-core --lib \
   -- search::facade search::schema_gate --nocapture; then
   echo "  PASS"
 else
@@ -99,7 +78,7 @@ echo ""
 
 echo "[4/4] Running C2 regression check (regression_diff)..."
 step4_log="${LOG_DIR}/dr6zv_d1_${RUN_ID}.c2_regression.log"
-if run_rch_cargo_logged "${step4_log}" test --package frankenterm-core --lib \
+if run_cargo_step "${step4_log}" test --package frankenterm-core --lib \
   -- search::regression_diff --nocapture; then
   echo "  PASS"
 else
