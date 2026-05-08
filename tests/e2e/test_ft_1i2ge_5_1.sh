@@ -10,11 +10,11 @@ SCENARIO_ID="ft_1i2ge_5_1_mission_cli_command_surface"
 CORRELATION_ID="ft-1i2ge.5.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_5_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_5_1_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_5_1_${RUN_ID}.probe.log"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 # shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_1"
 ensure_rch_ready
 
@@ -66,66 +66,30 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "mission CLI command surface validation (plan/run/status/explain/pause/resume/abort)"
 
-if ! command -v rch >/dev/null 2>&1; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_required_missing" \
-    "rch_not_installed" \
-    "$(basename "${LOG_FILE}")" \
-    "rch is required for cargo execution in this scenario"
-  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
-  exit 1
-fi
-
-set +e
-(
-  cd "${ROOT_DIR}"
-  rch workers probe --all
-) >"${PROBE_FILE}" 2>&1
-probe_status=$?
-set -e
-
-if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_workers_unhealthy" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "rch workers probe failed; refusing local fallback"
-  echo "rch workers are unavailable; refusing local cargo execution." >&2
-  exit 1
-fi
-
-cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-5-1"
-emit_log \
-  "running" \
-  "execution_preflight" \
-  "rch_workers_healthy" \
-  "none" \
-  "$(basename "${PROBE_FILE}")" \
-  "offloading tests through rch workers"
-
-TEST_CMDS=(
-  "cargo test -p frankenterm --bin ft mission_cli_command_family_parses_all_subcommands -- --nocapture"
-  "cargo test -p frankenterm --bin ft mission_cli_run_transition_plan_matches_contract -- --nocapture"
-  "cargo test -p frankenterm --bin ft mission_cli_pause_resume_abort_transition_contract -- --nocapture"
-  "cargo test -p frankenterm --bin ft mission_cli_status_and_explain_helpers_report_expected_contract_state -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-5-1"
+TEST_FILTERS=(
+  "mission_cli_command_family_parses_all_subcommands"
+  "mission_cli_run_transition_plan_matches_contract"
+  "mission_cli_pause_resume_abort_transition_contract"
+  "mission_cli_status_and_explain_helpers_report_expected_contract_state"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_5_1_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm --bin ft "${test_filter}" -- --nocapture)
   decision_path="command_surface_validation"
   reason_code="mission_cli_contract_validation"
 
-  if [[ "${test_cmd}" == *"run_transition"* ]]; then
+  if [[ "${test_filter}" == *"run_transition"* ]]; then
     decision_path="run_transition_path"
     reason_code="run_transition_contract"
-  elif [[ "${test_cmd}" == *"pause_resume_abort"* ]]; then
+  elif [[ "${test_filter}" == *"pause_resume_abort"* ]]; then
     decision_path="control_transition_path"
     reason_code="pause_resume_abort_contract"
-  elif [[ "${test_cmd}" == *"status_and_explain"* ]]; then
+  elif [[ "${test_filter}" == *"status_and_explain"* ]]; then
     decision_path="status_explain_path"
     reason_code="status_explain_contract"
   fi
@@ -136,15 +100,13 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: ${cmd_prefix} ${test_cmd}"
+    "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${cmd_prefix} ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -153,7 +115,7 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
+      "exit=${status}; command=${test_cmd[*]}"
     exit "${status}"
   fi
 done
