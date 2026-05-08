@@ -34,19 +34,10 @@ PASS=0
 FAIL=0
 TOTAL=0
 LAST_STEP_LOG=""
-LAST_STEP_QUEUE_LOG=""
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
-LOCAL_RCH_TMPDIR_OVERRIDE=""
-RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
-TIMEOUT_BIN=""
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
-fi
-
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_5_4_runtime_surface_guard"
-ensure_rch_ready
 
 emit_log() {
   local outcome="$1"
@@ -191,106 +182,6 @@ validate_runtime_async_helper_callsites() {
   [[ ! -s "${output_file}" ]]
 }
 
-run_step() {
-  local label="$1"
-  shift
-
-  LAST_STEP_LOG="${ARTIFACT_DIR}/${RUN_ID}_${label}.log"
-  LAST_STEP_QUEUE_LOG=""
-  set +e
-  run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "$@" 2>&1 | tee "${LAST_STEP_LOG}"
-  local rc=${PIPESTATUS[0]}
-  set -e
-  if step_timed_out "${rc}"; then
-    LAST_STEP_QUEUE_LOG="${ARTIFACT_DIR}/${RUN_ID}_${label}.queue.log"
-    if ! run_rch queue > "${LAST_STEP_QUEUE_LOG}" 2>&1; then
-      LAST_STEP_QUEUE_LOG=""
-    fi
-  fi
-  return "${rc}"
-}
-
-run_rch() {
-  if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
-    env TMPDIR="${LOCAL_RCH_TMPDIR_OVERRIDE}" rch "$@"
-  else
-    rch "$@"
-  fi
-}
-
-resolve_timeout_bin() {
-  if command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_BIN="timeout"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_BIN="gtimeout"
-  else
-    TIMEOUT_BIN=""
-  fi
-}
-
-run_with_timeout() {
-  local timeout_secs="$1"
-  shift
-
-  if [[ -n "${TIMEOUT_BIN}" ]]; then
-    "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" "$@"
-  else
-    "$@"
-  fi
-}
-
-step_timed_out() {
-  local rc="$1"
-  [[ "${rc}" -eq 124 || "${rc}" -eq 137 ]]
-}
-
-step_timeout_artifact() {
-  if [[ -n "${LAST_STEP_QUEUE_LOG}" ]]; then
-    printf '%s\n' "${LAST_STEP_QUEUE_LOG}"
-  else
-    printf '%s\n' "${LAST_STEP_LOG}"
-  fi
-}
-
-check_rch_fallback_in_logs() {
-  local scenario="$1"
-  local decision_path="$2"
-  local input_summary="$3"
-
-  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${LAST_STEP_LOG}" 2>/dev/null; then
-    emit_log "failed" "${scenario}" "${decision_path}" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "${LAST_STEP_LOG}" "${input_summary}"
-    echo "rch fell back to local execution; failing per offload-only policy" >&2
-    exit 3
-  fi
-}
-
-run_rch_remote_smoke_preflight() {
-  local label="$1"
-  local smoke_command="cargo check --help"
-  local rc
-
-  emit_log "running" "${label}" "rch_preflight" "started" "none" "${LAST_STEP_LOG}" "${smoke_command}"
-  set +e
-  run_step "${label}" run_rch exec -- cargo check --help
-  rc=$?
-  set -e
-
-  check_rch_fallback_in_logs "${label}" "rch_preflight" "${smoke_command}"
-
-  if step_timed_out "${rc}"; then
-    emit_log "failed" "${label}" "rch_preflight" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)" "${smoke_command};timeout_secs=${RCH_STEP_TIMEOUT_SECS}"
-    return 1
-  fi
-
-  if [[ "${rc}" -eq 0 ]]; then
-    emit_log "passed" "${label}" "rch_preflight" "rch_remote_smoke_ok" "none" "${LAST_STEP_LOG}" "${smoke_command}"
-    return 0
-  fi
-
-  emit_log "failed" "${label}" "rch_preflight" "rch_remote_smoke_failed" "RCH-E101" "${LAST_STEP_LOG}" "${smoke_command}"
-  return 1
-}
-
 run_rch_test_step() {
   local label="$1"
   local test_name="$2"
@@ -298,20 +189,39 @@ run_rch_test_step() {
   local rc
 
   emit_log "running" "${label}" "rch_test" "started" "none" "${LAST_STEP_LOG}" "${test_name}"
+  LAST_STEP_LOG="${ARTIFACT_DIR}/${RUN_ID}_${label}.log"
   set +e
-  run_step "${label}" run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" "$@"
+  run_rch_cargo_logged "${LAST_STEP_LOG}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" "$@"
   rc=$?
   set -e
 
-  check_rch_fallback_in_logs "${label}" "rch_test" "${test_name}"
+  if [[ -f "${LAST_STEP_LOG}" ]]; then
+    cat "${LAST_STEP_LOG}"
+  fi
 
-  if step_timed_out "${rc}"; then
-    record_result "${label}" "false" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "${test_name};timeout_secs=${RCH_STEP_TIMEOUT_SECS};artifact=$(basename "$(step_timeout_artifact)")"
-  elif [[ "${rc}" -eq 0 ]]; then
+  if [[ "${rc}" -eq 0 ]]; then
     record_result "${label}" "true"
   else
     record_result "${label}" "false" "cargo_test_failed" "CARGO-TEST-FAIL" "${test_name}"
   fi
+}
+
+run_shared_rch_preflight() {
+  local rc=0
+
+  set +e
+  ( ensure_rch_ready )
+  rc=$?
+  set -e
+
+  if [[ "${rc}" -eq 0 ]]; then
+    emit_log "passed" "rch_probe" "rch_preflight" "rch_workers_probe_ok" "none" "$(rch_probe_log_path)" "workers_probe"
+    emit_log "passed" "rch_remote_smoke" "rch_preflight" "rch_remote_smoke_ok" "none" "$(rch_smoke_log_path)" "cargo check --help"
+    return 0
+  fi
+
+  emit_log "failed" "rch_preflight" "rch_preflight" "rch_preflight_failed" "RCH-E100" "$(rch_smoke_log_path)" "ensure_rch_ready"
+  return "${rc}"
 }
 
 echo "=== Runtime Surface Guard E2E (ft-e34d9.10.5.4.1) ==="
@@ -321,10 +231,6 @@ require_cmd jq
 require_cmd rg
 require_cmd rch
 require_cmd cargo
-resolve_timeout_bin
-if [[ -z "${TIMEOUT_BIN}" ]]; then
-  emit_log "running" "preflight" "timeout_resolution" "timeout_guard_unavailable" "none" "${LOG_FILE}" "timeout/gtimeout not installed; continuing without external timeout wrapper"
-fi
 
 echo ""
 echo "--- Scenario 1: nominal tokio runtime allowlist ---"
@@ -363,46 +269,8 @@ else
 fi
 
 echo ""
-echo "--- Preflight: rch health and remote worker availability ---"
-RCH_CHECK_LOG="${ARTIFACT_DIR}/rch_check_${RUN_ID}.log"
-RCH_PROBE_LOG="${ARTIFACT_DIR}/rch_workers_probe_${RUN_ID}.json"
-RCH_STATUS_LOG="${ARTIFACT_DIR}/rch_status_${RUN_ID}.json"
-set +e
-run_rch check > "${RCH_CHECK_LOG}" 2>&1
-RCH_CHECK_RC=$?
-set -e
-if [[ ${RCH_CHECK_RC} -eq 0 ]]; then
-  emit_log "passed" "rch_check" "rch_preflight" "rch_check_ready" "none" "${RCH_CHECK_LOG}" "rch check"
-else
-  emit_log "failed" "rch_check" "rch_preflight" "rch_check_failed" "RCH-E000" "${RCH_CHECK_LOG}" "rch check"
-fi
-
-set +e
-run_rch workers probe --all --json > "${RCH_PROBE_LOG}" 2>>"${RCH_CHECK_LOG}"
-RCH_PROBE_RC=$?
-set -e
-
-RCH_REACHABLE="false"
-if [[ ${RCH_PROBE_RC} -eq 0 ]]; then
-  HEALTHY_WORKERS="$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${RCH_PROBE_LOG}")"
-  if [[ "${HEALTHY_WORKERS}" -ge 1 ]]; then
-    RCH_REACHABLE="true"
-  fi
-fi
-
-if run_rch --json status --workers --jobs > "${RCH_STATUS_LOG}" 2>>"${RCH_CHECK_LOG}"; then
-  if [[ "${RCH_REACHABLE}" == "true" ]]; then
-    emit_log "passed" "rch_probe" "rch_preflight" "rch_workers_probe_ok" "none" "${RCH_PROBE_LOG}" "workers_probe"
-  else
-    emit_log "failed" "rch_probe" "rch_preflight" "rch_workers_unreachable_probe" "RCH-E100" "${RCH_STATUS_LOG}" "workers_probe"
-  fi
-else
-  emit_log "failed" "rch_probe" "rch_preflight" "rch_status_unavailable" "RCH-E100" "${RCH_CHECK_LOG}" "workers_probe"
-fi
-
-echo ""
 echo "--- Scenario 5: rch remote-only smoke preflight ---"
-if ! run_rch_remote_smoke_preflight "rch_remote_smoke"; then
+if ! run_shared_rch_preflight; then
   echo "rch remote smoke preflight failed; refusing local fallback" >&2
   exit 2
 fi
