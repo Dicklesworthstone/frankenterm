@@ -10,9 +10,10 @@ SCENARIO_ID="ft_1i2ge_1_3_failure_taxonomy"
 CORRELATION_ID="ft-1i2ge.1.3-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_1_3_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_1_3_${RUN_ID}.stdout.log"
-PROBE_FILE="${LOG_DIR}/ft_1i2ge_1_3_${RUN_ID}.probe.log"
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+GUARD_LIB="$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${GUARD_LIB}"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_1_3"
 ensure_rch_ready
 
@@ -64,61 +65,28 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-cmd_prefix="env CARGO_TARGET_DIR=target-ft-1i2ge-1-3"
-if command -v rch >/dev/null 2>&1; then
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    rch workers probe --all
-  ) >"${PROBE_FILE}" 2>&1
-  probe_status=$?
-  set -e
-
-  if [[ ${probe_status} -eq 0 ]] && grep -q "✓" "${PROBE_FILE}"; then
-    cmd_prefix="rch exec -- env CARGO_TARGET_DIR=target-rch-ft-1i2ge-1-3"
-    emit_log \
-      "running" \
-      "execution_preflight" \
-      "rch_workers_healthy" \
-      "none" \
-      "$(basename "${PROBE_FILE}")" \
-      "offloading tests through rch workers"
-  else
-    emit_log \
-      "running" \
-      "execution_preflight" \
-      "rch_workers_unreachable_local_fallback" \
-      "remote_worker_unavailable" \
-      "$(basename "${PROBE_FILE}")" \
-      "falling back to local execution for this e2e run"
-  fi
-else
-  emit_log \
-    "running" \
-    "execution_preflight" \
-    "rch_not_installed_local_fallback" \
-    "none" \
-    "$(basename "${LOG_FILE}")" \
-    "rch unavailable; running tests locally"
-fi
-
-TEST_CMDS=(
-  "cargo test -p frankenterm-core --lib mission_failure_taxonomy_ -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_validate_rejects_unknown_failure_reason_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_validate_rejects_mismatched_failure_error_code -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_validate_accepts_recoverable_failure_contract -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_validate_requires_canonical_approval_ -- --nocapture"
-  "cargo test -p frankenterm-core --lib mission_validate_rejects_escalation_error_without_canonical_reason -- --nocapture"
+RCH_TARGET_DIR="target-rch-ft-1i2ge-1-3"
+TEST_FILTERS=(
+  "mission_failure_taxonomy_"
+  "mission_validate_rejects_unknown_failure_reason_code"
+  "mission_validate_rejects_mismatched_failure_error_code"
+  "mission_validate_accepts_recoverable_failure_contract"
+  "mission_validate_requires_canonical_approval_"
+  "mission_validate_rejects_escalation_error_without_canonical_reason"
 )
 
 : >"${STDOUT_FILE}"
-for test_cmd in "${TEST_CMDS[@]}"; do
+command_index=0
+for test_filter in "${TEST_FILTERS[@]}"; do
+  command_index=$((command_index + 1))
+  step_stdout="${LOG_DIR}/ft_1i2ge_1_3_${RUN_ID}.step_${command_index}.stdout.log"
+  test_cmd=(env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture)
   decision_path="contract_surface"
   reason_code="none"
-  if [[ "${test_cmd}" == *"rejects_"* ]]; then
+  if [[ "${test_filter}" == *"rejects_"* ]]; then
     decision_path="failure_injection_path"
     reason_code="failure_contract_rejection_checks"
-  elif [[ "${test_cmd}" == *"accepts_recoverable"* ]]; then
+  elif [[ "${test_filter}" == *"accepts_recoverable"* ]]; then
     decision_path="recovery_path"
     reason_code="recoverable_contract_acceptance"
   fi
@@ -129,15 +97,13 @@ for test_cmd in "${TEST_CMDS[@]}"; do
     "${reason_code}" \
     "none" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing: ${cmd_prefix} ${test_cmd}"
+    "Executing through rch: ${test_cmd[*]}"
 
   set +e
-  (
-    cd "${ROOT_DIR}"
-    eval "${cmd_prefix} ${test_cmd}"
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
-  status=${PIPESTATUS[0]}
+  run_rch_cargo_logged "${step_stdout}" "${test_cmd[@]}"
+  status=$?
   set -e
+  cat "${step_stdout}" >>"${STDOUT_FILE}"
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -146,8 +112,8 @@ for test_cmd in "${TEST_CMDS[@]}"; do
       "test_failure" \
       "cargo_test_failed" \
       "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; command=${test_cmd}"
-    exit ${status}
+      "exit=${status}; command=${test_cmd[*]}"
+    exit "${status}"
   fi
 done
 
