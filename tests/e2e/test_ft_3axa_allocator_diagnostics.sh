@@ -11,12 +11,18 @@ CORRELATION_ID="ft-3axa-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.stdout.log"
 SUMMARY_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.summary.json"
-TARGET_DIR="${FT_3AXA_TARGET_DIR:-/tmp/target-rch-ft-3axa}-${RUN_ID}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-3axa-${RUN_ID}"
+REQUESTED_CARGO_TARGET_DIR="${FT_3AXA_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+if [[ -n "${REQUESTED_CARGO_TARGET_DIR}" && "${REQUESTED_CARGO_TARGET_DIR}" != /* ]]; then
+    TARGET_DIR="${REQUESTED_CARGO_TARGET_DIR}"
+else
+    TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
 FT_3AXA_CORE_STEP_TIMEOUT_SECS="${FT_3AXA_CORE_STEP_TIMEOUT_SECS:-1800}"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "ft_3axa_allocator_diagnostics"
-ensure_rch_ready
 
 emit_log() {
     local component="$1"
@@ -60,15 +66,17 @@ emit_log() {
 require_cmd() {
     local cmd="$1"
     if ! command -v "${cmd}" >/dev/null 2>&1; then
-        emit_log \
-            "preflight" \
-            "dependency_check" \
-            "preflight.commands" \
-            "missing:${cmd}" \
-            "failed" \
-            "missing_prerequisite" \
-            "E2E-PREREQ" \
-            "${cmd}"
+        if command -v jq >/dev/null 2>&1; then
+            emit_log \
+                "preflight" \
+                "dependency_check" \
+                "preflight.commands" \
+                "missing:${cmd}" \
+                "failed" \
+                "missing_prerequisite" \
+                "E2E-PREREQ" \
+                "${cmd}"
+        fi
         echo "missing required command: ${cmd}" >&2
         exit 1
     fi
@@ -124,6 +132,9 @@ run_rch_step_with_timeout() {
 }
 
 : > "${STDOUT_FILE}"
+require_cmd jq
+require_cmd rch
+require_cmd cargo
 emit_log \
     "preflight" \
     "scenario_start" \
@@ -133,10 +144,7 @@ emit_log \
     "none" \
     "none" \
     "$(basename "${LOG_FILE}")"
-
-require_cmd jq
-require_cmd rch
-require_cmd cargo
+ensure_rch_ready
 
 run_rch_step \
     "allocator_backend_jemalloc" \
