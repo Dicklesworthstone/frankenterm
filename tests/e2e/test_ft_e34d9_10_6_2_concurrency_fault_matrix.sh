@@ -21,12 +21,27 @@ LOG_FILE="${LOG_DIR}/concurrency_fault_matrix_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/concurrency_fault_matrix_${RUN_ID}.stdout.log"
 REPORT_OK="${LOG_DIR}/concurrency_fault_matrix_${RUN_ID}.report.ok.json"
 REPORT_FAIL="${LOG_DIR}/concurrency_fault_matrix_${RUN_ID}.report.fail.json"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-e34d9-10-6-2-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging and rch metadata artifacts" >&2
+  exit 1
+fi
+
 rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_6_2_concurrency_fault_matrix"
 ensure_rch_ready
 
@@ -67,7 +82,19 @@ emit_log() {
 
 pass() { PASS_COUNT=$((PASS_COUNT + 1)); }
 fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); }
-skip() { SKIP_COUNT=$((SKIP_COUNT + 1)); }
+
+run_rch_step() {
+  local label="$1"
+  shift
+  local step_log="${LOG_DIR}/concurrency_fault_matrix_${RUN_ID}.${label}.log"
+
+  set +e
+  run_rch_cargo_logged "${step_log}" env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" "$@"
+  local status=$?
+  set -e
+  tee -a "${STDOUT_FILE}" < "${step_log}"
+  return "${status}"
+}
 
 echo "=== ft-e34d9.10.6.2: Concurrency Fault Matrix E2E ==="
 echo "Run ID:         ${RUN_ID}"
@@ -144,16 +171,10 @@ fi
 echo ""
 echo "--- Scenario 2: Compilation check ---"
 
-CARGO_CMD="cargo check -p frankenterm-core --features asupersync-runtime --test concurrency_fault_matrix"
-
-if command -v rch &>/dev/null; then
-  COMPILE_CMD="rch exec -- ${CARGO_CMD}"
-else
-  COMPILE_CMD="${CARGO_CMD}"
-fi
-
-echo "  Running: ${COMPILE_CMD}"
-if eval "${COMPILE_CMD}" >> "${STDOUT_FILE}" 2>&1; then
+echo "  Running via shared rch guard: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo check -p frankenterm-core --features asupersync-runtime --test concurrency_fault_matrix"
+if run_rch_step \
+  "compile" \
+  cargo check -p frankenterm-core --features asupersync-runtime --test concurrency_fault_matrix; then
   emit_log "PASS" "compile" "COMPILE_OK" "" "${STDOUT_FILE}" "cargo check --test concurrency_fault_matrix"
   echo "  PASS: compilation succeeded"
   pass
@@ -171,16 +192,10 @@ fi
 echo ""
 echo "--- Scenario 3: Test execution ---"
 
-TEST_CMD="cargo test -p frankenterm-core --features asupersync-runtime --test concurrency_fault_matrix -- --test-threads=1"
-
-if command -v rch &>/dev/null; then
-  RUN_CMD="rch exec -- ${TEST_CMD}"
-else
-  RUN_CMD="${TEST_CMD}"
-fi
-
-echo "  Running: ${RUN_CMD}"
-if eval "${RUN_CMD}" >> "${STDOUT_FILE}" 2>&1; then
+echo "  Running via shared rch guard: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --features asupersync-runtime --test concurrency_fault_matrix -- --test-threads=1"
+if run_rch_step \
+  "test_run" \
+  cargo test -p frankenterm-core --features asupersync-runtime --test concurrency_fault_matrix -- --test-threads=1; then
   emit_log "PASS" "test_run" "ALL_TESTS_PASS" "" "${STDOUT_FILE}" "concurrency_fault_matrix tests"
   echo "  PASS: all tests passed"
   pass
@@ -197,16 +212,12 @@ fi
 echo ""
 echo "--- Scenario 4: Determinism verification ---"
 
-DET_CMD="cargo test -p frankenterm-core --features asupersync-runtime --test concurrency_fault_matrix cfm_determinism -- --exact"
-
-if command -v rch &>/dev/null; then
-  DET_CMD="rch exec -- ${DET_CMD}"
-fi
-
 DETERMINISM_PASS=true
 for run in 1 2; do
   echo "  Determinism run ${run}/2..."
-  if ! eval "${DET_CMD}" >> "${STDOUT_FILE}" 2>&1; then
+  if ! run_rch_step \
+    "determinism_${run}" \
+    cargo test -p frankenterm-core --features asupersync-runtime --test concurrency_fault_matrix cfm_determinism -- --exact; then
     DETERMINISM_PASS=false
     break
   fi
