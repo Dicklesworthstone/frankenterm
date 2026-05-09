@@ -716,10 +716,11 @@ ft robot --format json fleet agents --program codex --state idle
 ft robot --format json fleet scale codex 1 --dry-run
 ```
 
-Remaining fleet mutation work is tracked under `ft-bs9uh` (Robot NTM-gap
-implementation epic). File an issue if a typed capability-unavailable envelope
-for your use case does not identify the missing native control-plane
-capability.
+Remaining daemon-mediated fleet mutation work is tracked under `ft-02m3k`.
+The live scale and rebalance implementation slices are `ft-2jlme` and
+`ft-v07yg` respectively; until those land, typed
+`robot.fleet.capability_unavailable` envelopes remain the honest contract for
+missing native control-plane mutation capability.
 
 #### Profile management
 
