@@ -927,16 +927,21 @@ impl Mux {
                 let now = Instant::now();
                 let key = (*pane_id, kind);
                 let mut last = self.last_high_rate_alert.lock();
-                // Best-effort prune: keep map size bounded by clearing entries
-                // older than the prune horizon on each insert. With <100 panes
-                // per host this stays trivially small.
-                last.retain(|_, ts| now.duration_since(*ts) < HIGH_RATE_ALERT_PRUNE_AFTER);
+                // Dedup check first so the deduped path doesn't pay the
+                // O(map_size) prune cost. `saturating_duration_since` keeps
+                // the comparison safe under non-monotonic clock anomalies
+                // (rare, but Instant on Windows isn't strictly monotonic).
                 if let Some(prev) = last.get(&key) {
-                    if now.duration_since(*prev) < HIGH_RATE_ALERT_DEDUPE_WINDOW {
+                    if now.saturating_duration_since(*prev) < HIGH_RATE_ALERT_DEDUPE_WINDOW {
                         histogram!("mux.notifications.high_rate_alert.deduped").record(1.);
                         return;
                     }
                 }
+                // Only on the insert path: best-effort prune of stale entries.
+                // With <100 panes per host the map stays trivially small.
+                last.retain(|_, ts| {
+                    now.saturating_duration_since(*ts) < HIGH_RATE_ALERT_PRUNE_AFTER
+                });
                 last.insert(key, now);
             }
         }
