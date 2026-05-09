@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -293,6 +294,12 @@ pub struct LocalPane {
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
     proc_list: Mutex<Option<CachedProcInfo>>,
+    /// Single-flight guard for the background warm task that
+    /// `can_close_without_prompting` spawns when its cache-only fast path
+    /// misses. Prevents stacking N warm tasks if the user closes N tabs in a
+    /// burst — one warm runs, the rest just see the in-progress flag and
+    /// rely on it populating proc_list. See ft-qhwpq.
+    proc_list_warm_pending: AtomicBool,
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
@@ -733,92 +740,117 @@ impl Pane for LocalPane {
     }
 
     fn can_close_without_prompting(&self, _reason: CloseReason) -> bool {
-        if let Some(info) = self.divine_process_list(CachePolicy::FetchImmediate) {
-            log::trace!(
-                "can_close_without_prompting? procs in pane {:#?}",
-                info.root
-            );
+        // Fast path: read the proc_list cache without invoking the
+        // O(N_system_processes) `proc_listallpids` walk that
+        // `divine_process_list(FetchImmediate)` would trigger. On a host
+        // with hundreds of processes (active agent swarm) the synchronous
+        // walk routinely takes 1-2+ seconds and beach-balls the GUI on the
+        // close-tab path. See ft-qhwpq.
+        //
+        // On cache miss we conservatively return false (user gets a
+        // confirmation prompt — safe) and kick off a single-flight
+        // background warm so the *next* close attempt has a fresh cache and
+        // can render the no-prompt fast path.
+        let cached_root = {
+            let proc_list = self.proc_list.lock();
+            proc_list.as_ref().and_then(|info| {
+                if info.updated.elapsed() < PROC_INFO_CACHE_TTL {
+                    Some(info.root.clone())
+                } else {
+                    None
+                }
+            })
+        };
 
-            let hook_result = {
-                #[cfg(feature = "lua")]
+        let info_root = match cached_root {
+            Some(root) => root,
+            None => {
+                self.spawn_proc_list_warm();
+                // Fallback: prefer a cheap process_group_leader probe so a
+                // dead PTY can still close without prompting, matching the
+                // previous behavior of the FetchImmediate-None branch.
+                #[cfg(unix)]
                 {
-                    config::run_immediate_with_lua_config(|lua| {
-                        let lua = match lua {
-                            Some(lua) => lua,
-                            None => return Ok(None),
-                        };
-                        let v = config::lua::emit_sync_callback(
-                            &*lua,
-                            ("mux-is-process-stateful".to_string(), (info.root.clone())),
-                        )?;
-                        match v {
-                            mlua::Value::Nil => Ok(None),
-                            mlua::Value::Boolean(v) => Ok(Some(v)),
-                            _ => Ok(None),
-                        }
-                    })
+                    if self.pty.lock().process_group_leader().is_none() {
+                        return true;
+                    }
                 }
-                #[cfg(not(feature = "lua"))]
-                {
-                    Ok::<Option<bool>, Error>(None)
-                }
-            };
-
-            fn default_stateful_check(proc_list: &LocalProcessInfo) -> bool {
-                // Fig uses `figterm` a pseudo terminal for a lot of functionality, it runs between
-                // the shell and terminal. Unfortunately it is typically named `<shell> (figterm)`,
-                // which prevents the statuful check from passing. This strips the suffix from the
-                // process name to allow the check to pass.
-                let names = proc_list
-                    .flatten_to_exe_names()
-                    .into_iter()
-                    .map(|s| match s.strip_suffix(" (figterm)") {
-                        Some(s) => s.into(),
-                        None => s,
-                    })
-                    .collect::<HashSet<_>>();
-
-                let skip = configuration()
-                    .skip_close_confirmation_for_processes_named
-                    .iter()
-                    .cloned()
-                    .collect::<HashSet<_>>();
-
-                if !names.is_subset(&skip) {
-                    // There are other processes running than are listed,
-                    // so we consider this to be stateful
-                    return true;
-                }
-                false
+                return false;
             }
+        };
 
-            let is_stateful = match hook_result {
-                Ok(None) => default_stateful_check(&info.root),
-                Ok(Some(s)) => s,
-                Err(err) => {
-                    log::error!(
-                        "Error while running mux-is-process-stateful \
-                         hook: {:#}, falling back to default behavior",
-                        err
-                    );
-                    default_stateful_check(&info.root)
-                }
-            };
+        log::trace!(
+            "can_close_without_prompting? procs in pane {:#?}",
+            info_root
+        );
 
-            !is_stateful
-        } else {
-            #[cfg(unix)]
+        let hook_result = {
+            #[cfg(feature = "lua")]
             {
-                // If the process is dead but exit_behavior is holding the
-                // window, we don't need to prompt to confirm closing.
-                // That is detectable as no longer having a process group leader.
-                if self.pty.lock().process_group_leader().is_none() {
-                    return true;
-                }
+                config::run_immediate_with_lua_config(|lua| {
+                    let lua = match lua {
+                        Some(lua) => lua,
+                        None => return Ok(None),
+                    };
+                    let v = config::lua::emit_sync_callback(
+                        &*lua,
+                        ("mux-is-process-stateful".to_string(), (info_root.clone())),
+                    )?;
+                    match v {
+                        mlua::Value::Nil => Ok(None),
+                        mlua::Value::Boolean(v) => Ok(Some(v)),
+                        _ => Ok(None),
+                    }
+                })
             }
+            #[cfg(not(feature = "lua"))]
+            {
+                Ok::<Option<bool>, Error>(None)
+            }
+        };
 
+        fn default_stateful_check(proc_list: &LocalProcessInfo) -> bool {
+            // Fig uses `figterm` a pseudo terminal for a lot of functionality, it runs between
+            // the shell and terminal. Unfortunately it is typically named `<shell> (figterm)`,
+            // which prevents the statuful check from passing. This strips the suffix from the
+            // process name to allow the check to pass.
+            let names = proc_list
+                .flatten_to_exe_names()
+                .into_iter()
+                .map(|s| match s.strip_suffix(" (figterm)") {
+                    Some(s) => s.into(),
+                    None => s,
+                })
+                .collect::<HashSet<_>>();
+
+            let skip = configuration()
+                .skip_close_confirmation_for_processes_named
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+
+            if !names.is_subset(&skip) {
+                // There are other processes running than are listed,
+                // so we consider this to be stateful
+                return true;
+            }
             false
         }
+
+        let is_stateful = match hook_result {
+            Ok(None) => default_stateful_check(&info_root),
+            Ok(Some(s)) => s,
+            Err(err) => {
+                log::error!(
+                    "Error while running mux-is-process-stateful \
+                     hook: {:#}, falling back to default behavior",
+                    err
+                );
+                default_stateful_check(&info_root)
+            }
+        };
+
+        !is_stateful
     }
 
     fn get_semantic_zones(&self) -> anyhow::Result<Vec<SemanticZone>> {
@@ -1551,6 +1583,7 @@ impl LocalPane {
             domain_id,
             tmux_domain: Mutex::new(None),
             proc_list: Mutex::new(None),
+            proc_list_warm_pending: AtomicBool::new(false),
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
@@ -1685,6 +1718,70 @@ impl LocalPane {
         } else {
             None
         }
+    }
+
+    /// Single-flight background warm of `proc_list`. Spawns a worker thread
+    /// that does the slow `proc_listallpids` walk off the main thread,
+    /// writing the result into the cache so the next
+    /// `can_close_without_prompting` call hits the fast path. No-op when a
+    /// warm is already in flight or when the pane has no live process.
+    /// See ft-qhwpq.
+    fn spawn_proc_list_warm(&self) {
+        // Single-flight: bail if a previous warm is still running. The
+        // compare_exchange on AtomicBool is the gate; the spawned thread
+        // clears the flag at the end.
+        if self
+            .proc_list_warm_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let pid = match &*self.process.lock() {
+            ProcessState::Running { pid: Some(pid), .. } => *pid,
+            _ => {
+                self.proc_list_warm_pending.store(false, Ordering::Release);
+                return;
+            }
+        };
+
+        let pane_id = self.pane_id;
+        std::thread::spawn(move || {
+            let root = LocalProcessInfo::with_root_pid(pid);
+            // Re-look up the pane: between dispatch and now the pane might
+            // have been removed, in which case we drop the result. Using
+            // Mux::try_get + downcast avoids having to hold an
+            // Arc<LocalPane> across the thread boundary.
+            if let (Some(root), Some(mux)) = (root, Mux::try_get()) {
+                if let Some(pane) = mux.get_pane(pane_id) {
+                    if let Some(local) = pane.downcast_ref::<LocalPane>() {
+                        let mut foreground = root.clone();
+                        foreground.children.clear();
+                        local.proc_list.lock().replace(CachedProcInfo {
+                            root,
+                            foreground,
+                            updated: Instant::now(),
+                        });
+                        local
+                            .proc_list_warm_pending
+                            .store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+            // Pane gone or proc walk failed — clear the in-flight flag so a
+            // later attempt can retry.
+            if let Some(mux) = Mux::try_get() {
+                if let Some(pane) = mux.get_pane(pane_id) {
+                    if let Some(local) = pane.downcast_ref::<LocalPane>() {
+                        local
+                            .proc_list_warm_pending
+                            .store(false, Ordering::Release);
+                    }
+                }
+            }
+        });
     }
 }
 
