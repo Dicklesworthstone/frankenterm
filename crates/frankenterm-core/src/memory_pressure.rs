@@ -160,6 +160,695 @@ pub struct PaneMemoryInfo {
 }
 
 // =============================================================================
+// macOS heap-vs-residency classifier
+// =============================================================================
+
+/// macOS residency bucket used by the resource-pressure cockpit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacosResidencyBucket {
+    /// Allocator-owned heap and long-lived Rust structures.
+    RustHeap,
+    /// File-backed mappings, dylibs, mmap-backed indexes, and mapped data.
+    MmapFileBacked,
+    /// SQLite page cache, WAL, or SQLite-owned mappings.
+    SqlitePageCache,
+    /// GPU, image, font, video, or render/media residency.
+    GraphicsMedia,
+    /// Hot/warm terminal scrollback and terminal cache residency.
+    ScrollbackCache,
+    /// Child process RSS attributed to the same run.
+    ChildProcesses,
+    /// Resident bytes that could not be attributed.
+    Unknown,
+}
+
+impl MacosResidencyBucket {
+    const ALL: [Self; 7] = [
+        Self::RustHeap,
+        Self::MmapFileBacked,
+        Self::SqlitePageCache,
+        Self::GraphicsMedia,
+        Self::ScrollbackCache,
+        Self::ChildProcesses,
+        Self::Unknown,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::RustHeap => 0,
+            Self::MmapFileBacked => 1,
+            Self::SqlitePageCache => 2,
+            Self::GraphicsMedia => 3,
+            Self::ScrollbackCache => 4,
+            Self::ChildProcesses => 5,
+            Self::Unknown => 6,
+        }
+    }
+}
+
+/// Trust state for one macOS residency evidence source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacosResidencyEvidenceState {
+    /// Parsed from the live host/process run represented by the caller.
+    Measured,
+    /// Generated from a fixture, replay, or dry-run.
+    Simulated,
+    /// The source was missing, unreadable, or not wired.
+    Unavailable,
+    /// The source is older than the caller's freshness budget.
+    Stale,
+    /// The final report combines sources with different states.
+    Mixed,
+}
+
+/// Apple-native evidence source used by the classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacosResidencyEvidenceTool {
+    /// `ps -o rss=` or equivalent process RSS.
+    ProcessRss,
+    /// `vmmap <pid>` output.
+    Vmmap,
+    /// `heap <pid>` output.
+    Heap,
+    /// `/usr/bin/sample <pid> ...` output.
+    Sample,
+    /// Child-process RSS attribution.
+    ChildProcesses,
+}
+
+/// Status for one evidence source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacosResidencyEvidenceStatus {
+    /// Evidence source.
+    pub tool: MacosResidencyEvidenceTool,
+    /// Evidence trust state.
+    pub state: MacosResidencyEvidenceState,
+    /// Stable reason code for the source status.
+    pub reason_code: String,
+    /// Short operator detail.
+    pub detail: String,
+}
+
+/// Classified residency row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacosResidencyBucketSummary {
+    /// Residency bucket.
+    pub bucket: MacosResidencyBucket,
+    /// Attributed bytes, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Confidence from 0 to 100.
+    pub confidence: u8,
+    /// Stable reason codes that contributed to this row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+}
+
+impl MacosResidencyBucketSummary {
+    fn new(bucket: MacosResidencyBucket) -> Self {
+        Self {
+            bucket,
+            bytes: None,
+            confidence: 0,
+            reason_codes: Vec::new(),
+        }
+    }
+}
+
+/// Borrowed inputs for the pure macOS residency classifier.
+///
+/// The classifier intentionally does not invoke `vmmap`, `heap`, `sample`, or
+/// `ps`. Live collection belongs in a bounded caller that can enforce timeout,
+/// authorization, and artifact retention. Tests pass fixture strings here.
+#[derive(Debug, Clone, Default)]
+pub struct MacosResidencyClassifierInput<'a> {
+    /// Process RSS in bytes from `ps -o rss=` or an equivalent source.
+    pub process_rss_bytes: Option<u64>,
+    /// Raw `vmmap <pid>` output.
+    pub vmmap_output: Option<&'a str>,
+    /// Raw `heap <pid>` output.
+    pub heap_output: Option<&'a str>,
+    /// Raw `/usr/bin/sample <pid> ...` output.
+    pub sample_output: Option<&'a str>,
+    /// Sum of child-process RSS bytes attributed to this run.
+    pub child_process_rss_bytes: Option<u64>,
+}
+
+/// macOS heap-vs-residency classification for resource cockpit diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacosResidencyClassification {
+    /// Top-level evidence state synthesized from all sources.
+    pub evidence_state: MacosResidencyEvidenceState,
+    /// Process RSS in bytes, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_rss_bytes: Option<u64>,
+    /// Sum of non-unknown attributed bytes.
+    pub known_bytes: u64,
+    /// RSS bytes that remain unattributed after known buckets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_bytes: Option<u64>,
+    /// Largest bucket by attributed bytes, falling back to `unknown`.
+    pub dominant_bucket: MacosResidencyBucket,
+    /// Bucket summaries in the resource cockpit order.
+    pub buckets: Vec<MacosResidencyBucketSummary>,
+    /// Per-tool evidence status.
+    pub evidence: Vec<MacosResidencyEvidenceStatus>,
+    /// Report-level reason codes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MacosResidencyBucketMerge {
+    Sum,
+    Max,
+}
+
+/// Classify macOS heap, file-backed, graphics/media, scrollback, child-process,
+/// and unknown residency from Apple-native evidence strings.
+#[must_use]
+pub fn classify_macos_residency(
+    input: &MacosResidencyClassifierInput<'_>,
+) -> MacosResidencyClassification {
+    let mut buckets = MacosResidencyBucket::ALL
+        .iter()
+        .copied()
+        .map(MacosResidencyBucketSummary::new)
+        .collect::<Vec<_>>();
+    let mut evidence = Vec::new();
+
+    record_rss_evidence(input.process_rss_bytes, &mut evidence);
+    classify_vmmap_output(input.vmmap_output, &mut buckets, &mut evidence);
+    classify_heap_output(input.heap_output, &mut buckets, &mut evidence);
+    classify_sample_output(input.sample_output, &mut buckets, &mut evidence);
+    classify_child_processes(input.child_process_rss_bytes, &mut buckets, &mut evidence);
+
+    let known_bytes = buckets
+        .iter()
+        .filter(|row| row.bucket != MacosResidencyBucket::Unknown)
+        .filter_map(|row| row.bytes)
+        .fold(0_u64, u64::saturating_add);
+
+    let unknown_bytes = input.process_rss_bytes.map(|rss| {
+        let unattributed = rss.saturating_sub(known_bytes);
+        if unattributed > 0 {
+            add_bucket_bytes(
+                &mut buckets,
+                MacosResidencyBucket::Unknown,
+                unattributed,
+                60,
+                "resource.memory.unknown_residency",
+                MacosResidencyBucketMerge::Max,
+            );
+        }
+        unattributed
+    });
+
+    let dominant_bucket = buckets
+        .iter()
+        .filter_map(|row| row.bytes.map(|bytes| (row.bucket, bytes)))
+        .max_by_key(|(_, bytes)| *bytes)
+        .map_or(MacosResidencyBucket::Unknown, |(bucket, _)| bucket);
+
+    let evidence_state = synthesize_macos_residency_state(&evidence);
+    let mut reason_codes = Vec::new();
+    for status in &evidence {
+        push_reason_code(&mut reason_codes, &status.reason_code);
+    }
+    match evidence_state {
+        MacosResidencyEvidenceState::Unavailable => {
+            push_reason_code(&mut reason_codes, "resource.telemetry.unavailable");
+        }
+        MacosResidencyEvidenceState::Mixed => {
+            push_reason_code(&mut reason_codes, "resource.telemetry.mixed");
+        }
+        MacosResidencyEvidenceState::Measured
+        | MacosResidencyEvidenceState::Simulated
+        | MacosResidencyEvidenceState::Stale => {}
+    }
+
+    MacosResidencyClassification {
+        evidence_state,
+        process_rss_bytes: input.process_rss_bytes,
+        known_bytes,
+        unknown_bytes,
+        dominant_bucket,
+        buckets,
+        evidence,
+        reason_codes,
+    }
+}
+
+fn record_rss_evidence(
+    process_rss_bytes: Option<u64>,
+    evidence: &mut Vec<MacosResidencyEvidenceStatus>,
+) {
+    match process_rss_bytes {
+        Some(bytes) => evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::ProcessRss,
+            state: MacosResidencyEvidenceState::Measured,
+            reason_code: "resource.memory.rss_measured".to_string(),
+            detail: format!("process rss bytes={bytes}"),
+        }),
+        None => evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::ProcessRss,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.telemetry.unavailable".to_string(),
+            detail: "process RSS was not provided".to_string(),
+        }),
+    }
+}
+
+fn classify_vmmap_output(
+    output: Option<&str>,
+    buckets: &mut [MacosResidencyBucketSummary],
+    evidence: &mut Vec<MacosResidencyEvidenceStatus>,
+) {
+    let Some(output) = output else {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Vmmap,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.telemetry.unavailable".to_string(),
+            detail: "vmmap output was not provided".to_string(),
+        });
+        return;
+    };
+
+    if output.trim().is_empty() {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Vmmap,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.memory.vmmap_malformed".to_string(),
+            detail: "vmmap output was empty".to_string(),
+        });
+        return;
+    }
+
+    let mut classified_lines = 0_u64;
+    for line in output.lines() {
+        let Some(bytes) = parse_first_size_bytes(line) else {
+            continue;
+        };
+        if bytes == 0 {
+            continue;
+        }
+        let bucket = classify_vmmap_line(line);
+        let reason = reason_code_for_macos_bucket(bucket);
+        add_bucket_bytes(
+            buckets,
+            bucket,
+            bytes,
+            80,
+            reason,
+            MacosResidencyBucketMerge::Sum,
+        );
+        classified_lines = classified_lines.saturating_add(1);
+    }
+
+    if classified_lines == 0 {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Vmmap,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.memory.vmmap_malformed".to_string(),
+            detail: "vmmap output did not contain parseable region sizes".to_string(),
+        });
+    } else {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Vmmap,
+            state: MacosResidencyEvidenceState::Measured,
+            reason_code: "resource.memory.vmmap_residency".to_string(),
+            detail: format!("classified vmmap region lines={classified_lines}"),
+        });
+    }
+}
+
+fn classify_heap_output(
+    output: Option<&str>,
+    buckets: &mut [MacosResidencyBucketSummary],
+    evidence: &mut Vec<MacosResidencyEvidenceStatus>,
+) {
+    let Some(output) = output else {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Heap,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.telemetry.unavailable".to_string(),
+            detail: "heap output was not provided".to_string(),
+        });
+        return;
+    };
+
+    if output.trim().is_empty() {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Heap,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.memory.heap_malformed".to_string(),
+            detail: "heap output was empty".to_string(),
+        });
+        return;
+    }
+
+    let heap_bytes = output
+        .lines()
+        .filter(|line| line_mentions_any(line, &["all zones", "total", "malloc", "heap"]))
+        .filter_map(parse_first_size_bytes)
+        .max();
+
+    if let Some(bytes) = heap_bytes {
+        add_bucket_bytes(
+            buckets,
+            MacosResidencyBucket::RustHeap,
+            bytes,
+            90,
+            "resource.memory.heap_growth",
+            MacosResidencyBucketMerge::Max,
+        );
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Heap,
+            state: MacosResidencyEvidenceState::Measured,
+            reason_code: "resource.memory.heap_growth".to_string(),
+            detail: format!("heap attributed bytes={bytes}"),
+        });
+    } else {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Heap,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.memory.heap_malformed".to_string(),
+            detail: "heap output did not contain a parseable heap total".to_string(),
+        });
+    }
+}
+
+fn classify_sample_output(
+    output: Option<&str>,
+    buckets: &mut [MacosResidencyBucketSummary],
+    evidence: &mut Vec<MacosResidencyEvidenceStatus>,
+) {
+    let Some(output) = output else {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Sample,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.telemetry.unavailable".to_string(),
+            detail: "sample output was not provided".to_string(),
+        });
+        return;
+    };
+
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::Sample,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.memory.sample_malformed".to_string(),
+            detail: "sample output was empty".to_string(),
+        });
+        return;
+    }
+
+    let mut signals = 0_u64;
+    for line in trimmed.lines() {
+        if line_mentions_any(line, &["malloc", "rust_alloc", "alloc::", "heap"]) {
+            add_bucket_signal(
+                buckets,
+                MacosResidencyBucket::RustHeap,
+                55,
+                "resource.memory.heap_stack_signal",
+            );
+            signals = signals.saturating_add(1);
+        } else if line_mentions_any(line, &["sqlite", "wal", "page cache"]) {
+            add_bucket_signal(
+                buckets,
+                MacosResidencyBucket::SqlitePageCache,
+                55,
+                "resource.memory.sqlite_stack_signal",
+            );
+            signals = signals.saturating_add(1);
+        } else if line_mentions_any(
+            line,
+            &[
+                "iosurface",
+                "metal",
+                "coregraphics",
+                "cg raster",
+                "imageio",
+                "font",
+                "gpu",
+                "video",
+                "media",
+            ],
+        ) {
+            add_bucket_signal(
+                buckets,
+                MacosResidencyBucket::GraphicsMedia,
+                55,
+                "resource.memory.graphics_stack_signal",
+            );
+            signals = signals.saturating_add(1);
+        } else if line_mentions_any(line, &["scrollback", "terminal history"]) {
+            add_bucket_signal(
+                buckets,
+                MacosResidencyBucket::ScrollbackCache,
+                55,
+                "resource.memory.scrollback_stack_signal",
+            );
+            signals = signals.saturating_add(1);
+        } else if line_mentions_any(line, &["mmap", "mapped file", "mmap_file"]) {
+            add_bucket_signal(
+                buckets,
+                MacosResidencyBucket::MmapFileBacked,
+                50,
+                "resource.memory.mmap_stack_signal",
+            );
+            signals = signals.saturating_add(1);
+        }
+    }
+
+    evidence.push(MacosResidencyEvidenceStatus {
+        tool: MacosResidencyEvidenceTool::Sample,
+        state: MacosResidencyEvidenceState::Measured,
+        reason_code: if signals == 0 {
+            "resource.memory.sample_no_residency_signal".to_string()
+        } else {
+            "resource.memory.sample_residency_signal".to_string()
+        },
+        detail: format!("sample residency signals={signals}"),
+    });
+}
+
+fn classify_child_processes(
+    child_process_rss_bytes: Option<u64>,
+    buckets: &mut [MacosResidencyBucketSummary],
+    evidence: &mut Vec<MacosResidencyEvidenceStatus>,
+) {
+    match child_process_rss_bytes {
+        Some(bytes) => {
+            if bytes > 0 {
+                add_bucket_bytes(
+                    buckets,
+                    MacosResidencyBucket::ChildProcesses,
+                    bytes,
+                    85,
+                    "resource.memory.child_process_rss",
+                    MacosResidencyBucketMerge::Max,
+                );
+            }
+            evidence.push(MacosResidencyEvidenceStatus {
+                tool: MacosResidencyEvidenceTool::ChildProcesses,
+                state: MacosResidencyEvidenceState::Measured,
+                reason_code: "resource.memory.child_process_rss".to_string(),
+                detail: format!("child process rss bytes={bytes}"),
+            });
+        }
+        None => evidence.push(MacosResidencyEvidenceStatus {
+            tool: MacosResidencyEvidenceTool::ChildProcesses,
+            state: MacosResidencyEvidenceState::Unavailable,
+            reason_code: "resource.telemetry.unavailable".to_string(),
+            detail: "child-process RSS was not provided".to_string(),
+        }),
+    }
+}
+
+fn classify_vmmap_line(line: &str) -> MacosResidencyBucket {
+    if line_mentions_any(line, &["scrollback", "terminal history"]) {
+        MacosResidencyBucket::ScrollbackCache
+    } else if line_mentions_any(line, &["sqlite", "wal", "page cache"]) {
+        MacosResidencyBucket::SqlitePageCache
+    } else if line_mentions_any(
+        line,
+        &[
+            "iosurface",
+            "metal",
+            "coregraphics",
+            "cg raster",
+            "imageio",
+            "font",
+            "gpu",
+            "opengl",
+            "video",
+            "media",
+        ],
+    ) {
+        MacosResidencyBucket::GraphicsMedia
+    } else if line_mentions_any(line, &["malloc", "heap", "nanov2", "default_malloc_zone"]) {
+        MacosResidencyBucket::RustHeap
+    } else if line_mentions_any(
+        line,
+        &[
+            "mapped file",
+            "mapped_file",
+            "mmap",
+            "__text",
+            "__data",
+            "shared memory",
+            "file-backed",
+        ],
+    ) {
+        MacosResidencyBucket::MmapFileBacked
+    } else {
+        MacosResidencyBucket::Unknown
+    }
+}
+
+fn reason_code_for_macos_bucket(bucket: MacosResidencyBucket) -> &'static str {
+    match bucket {
+        MacosResidencyBucket::RustHeap => "resource.memory.heap_growth",
+        MacosResidencyBucket::MmapFileBacked => "resource.memory.mmap_residency",
+        MacosResidencyBucket::SqlitePageCache => "resource.memory.sqlite_page_cache",
+        MacosResidencyBucket::GraphicsMedia => "resource.memory.graphics_media",
+        MacosResidencyBucket::ScrollbackCache => "resource.memory.scrollback_cache",
+        MacosResidencyBucket::ChildProcesses => "resource.memory.child_process_rss",
+        MacosResidencyBucket::Unknown => "resource.memory.unknown_residency",
+    }
+}
+
+fn add_bucket_bytes(
+    buckets: &mut [MacosResidencyBucketSummary],
+    bucket: MacosResidencyBucket,
+    bytes: u64,
+    confidence: u8,
+    reason_code: &str,
+    merge: MacosResidencyBucketMerge,
+) {
+    let row = &mut buckets[bucket.index()];
+    row.bytes = Some(match (row.bytes, merge) {
+        (Some(existing), MacosResidencyBucketMerge::Sum) => existing.saturating_add(bytes),
+        (Some(existing), MacosResidencyBucketMerge::Max) => existing.max(bytes),
+        (None, _) => bytes,
+    });
+    row.confidence = row.confidence.max(confidence.min(100));
+    push_reason_code(&mut row.reason_codes, reason_code);
+}
+
+fn add_bucket_signal(
+    buckets: &mut [MacosResidencyBucketSummary],
+    bucket: MacosResidencyBucket,
+    confidence: u8,
+    reason_code: &str,
+) {
+    let row = &mut buckets[bucket.index()];
+    row.confidence = row.confidence.max(confidence.min(100));
+    push_reason_code(&mut row.reason_codes, reason_code);
+}
+
+fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &str) {
+    if !reason_codes.iter().any(|existing| existing == reason_code) {
+        reason_codes.push(reason_code.to_string());
+    }
+}
+
+fn synthesize_macos_residency_state(
+    evidence: &[MacosResidencyEvidenceStatus],
+) -> MacosResidencyEvidenceState {
+    let mut states = evidence.iter().map(|status| status.state);
+    let Some(first) = states.next() else {
+        return MacosResidencyEvidenceState::Unavailable;
+    };
+    if states.all(|state| state == first) {
+        first
+    } else {
+        MacosResidencyEvidenceState::Mixed
+    }
+}
+
+fn line_mentions_any(line: &str, needles: &[&str]) -> bool {
+    let lower = line.to_ascii_lowercase();
+    needles.iter().any(|needle| lower.contains(needle))
+}
+
+fn parse_first_size_bytes(line: &str) -> Option<u64> {
+    let tokens = line
+        .split_whitespace()
+        .map(clean_size_token)
+        .collect::<Vec<_>>();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if let Some(bytes) = parse_size_token_with_suffix(token) {
+            return Some(bytes);
+        }
+        if let Some(unit) = tokens.get(idx.saturating_add(1)) {
+            if let Some(bytes) = parse_size_token_with_separate_unit(token, unit) {
+                return Some(bytes);
+            }
+        }
+    }
+
+    None
+}
+
+fn clean_size_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| {
+            matches!(c, ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '=')
+        })
+        .replace(',', "")
+}
+
+fn parse_size_token_with_suffix(token: &str) -> Option<u64> {
+    let lower = token.to_ascii_lowercase();
+    for (suffix, multiplier) in [
+        ("bytes", 1_u64),
+        ("byte", 1),
+        ("gb", 1024_u64 * 1024 * 1024),
+        ("g", 1024_u64 * 1024 * 1024),
+        ("mb", 1024_u64 * 1024),
+        ("m", 1024_u64 * 1024),
+        ("kb", 1024),
+        ("k", 1024),
+    ] {
+        if let Some(number) = lower.strip_suffix(suffix) {
+            return parse_decimal_size(number, multiplier);
+        }
+    }
+    None
+}
+
+fn parse_size_token_with_separate_unit(number: &str, unit: &str) -> Option<u64> {
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "bytes" | "byte" => 1,
+        "gb" | "g" => 1024_u64 * 1024 * 1024,
+        "mb" | "m" => 1024_u64 * 1024,
+        "kb" | "k" => 1024,
+        _ => return None,
+    };
+    parse_decimal_size(number, multiplier)
+}
+
+fn parse_decimal_size(number: &str, multiplier: u64) -> Option<u64> {
+    let value = number.parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let bytes = value * multiplier as f64;
+    if bytes > u64::MAX as f64 {
+        Some(u64::MAX)
+    } else {
+        Some(bytes.round() as u64)
+    }
+}
+
+// =============================================================================
 // Monitor
 // =============================================================================
 
@@ -626,6 +1315,208 @@ mod tests {
         let parsed: PaneMemoryInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.pane_id, 42);
         assert_eq!(parsed.rss_kb, 500_000);
+    }
+
+    fn residency_bucket(
+        report: &MacosResidencyClassification,
+        bucket: MacosResidencyBucket,
+    ) -> &MacosResidencyBucketSummary {
+        report
+            .buckets
+            .iter()
+            .find(|row| row.bucket == bucket)
+            .expect("bucket row should be present")
+    }
+
+    #[test]
+    fn macos_residency_classifier_separates_heap_mmap_graphics_scrollback_child_and_unknown() {
+        let mib = 1024_u64 * 1024;
+        let input = MacosResidencyClassifierInput {
+            process_rss_bytes: Some(900 * mib),
+            vmmap_output: Some(
+                "\
+MALLOC_SMALL                      128M
+MAPPED_FILE /tmp/frankenterm.tantivy 256M
+SQLite page cache                 64M
+IOSurface CoreGraphics atlas      32M
+frankenterm scrollback cache      96M
+",
+            ),
+            heap_output: Some("Process 42: All zones: 192M total allocated\n"),
+            sample_output: Some(
+                "\
+Call graph:
+  rust_alloc::alloc
+  CoreGraphics render atlas
+  terminal history scrollback lookup
+",
+            ),
+            child_process_rss_bytes: Some(48 * mib),
+        };
+
+        let report = classify_macos_residency(&input);
+
+        assert_eq!(report.evidence_state, MacosResidencyEvidenceState::Measured);
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::RustHeap).bytes,
+            Some(192 * mib)
+        );
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::MmapFileBacked).bytes,
+            Some(256 * mib)
+        );
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::SqlitePageCache).bytes,
+            Some(64 * mib)
+        );
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::GraphicsMedia).bytes,
+            Some(32 * mib)
+        );
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::ScrollbackCache).bytes,
+            Some(96 * mib)
+        );
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::ChildProcesses).bytes,
+            Some(48 * mib)
+        );
+        assert_eq!(report.unknown_bytes, Some(212 * mib));
+        assert_eq!(report.dominant_bucket, MacosResidencyBucket::MmapFileBacked);
+    }
+
+    #[test]
+    fn macos_residency_classifier_missing_sources_are_unavailable_not_green() {
+        let report = classify_macos_residency(&MacosResidencyClassifierInput::default());
+
+        assert_eq!(
+            report.evidence_state,
+            MacosResidencyEvidenceState::Unavailable
+        );
+        assert!(report.process_rss_bytes.is_none());
+        assert!(report.unknown_bytes.is_none());
+        assert_eq!(report.dominant_bucket, MacosResidencyBucket::Unknown);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|status| status.state == MacosResidencyEvidenceState::Unavailable)
+        );
+        assert!(
+            report
+                .reason_codes
+                .iter()
+                .any(|code| code == "resource.telemetry.unavailable")
+        );
+    }
+
+    #[test]
+    fn macos_residency_classifier_malformed_tool_outputs_fail_visible() {
+        let report = classify_macos_residency(&MacosResidencyClassifierInput {
+            process_rss_bytes: Some(100),
+            vmmap_output: Some("VM Map of process 42 with no region totals"),
+            heap_output: Some("heap report truncated before totals"),
+            sample_output: Some(""),
+            child_process_rss_bytes: Some(0),
+        });
+
+        assert_eq!(report.evidence_state, MacosResidencyEvidenceState::Mixed);
+        assert_eq!(report.unknown_bytes, Some(100));
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|status| status.tool == MacosResidencyEvidenceTool::Vmmap
+                    && status.state == MacosResidencyEvidenceState::Unavailable
+                    && status.reason_code == "resource.memory.vmmap_malformed")
+        );
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|status| status.tool == MacosResidencyEvidenceTool::Heap
+                    && status.state == MacosResidencyEvidenceState::Unavailable
+                    && status.reason_code == "resource.memory.heap_malformed")
+        );
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|status| status.tool == MacosResidencyEvidenceTool::Sample
+                    && status.state == MacosResidencyEvidenceState::Unavailable
+                    && status.reason_code == "resource.memory.sample_malformed")
+        );
+    }
+
+    #[test]
+    fn macos_residency_classifier_parses_unknown_and_decimal_region_sizes() {
+        let mib = 1024_u64 * 1024;
+        let gib = 1024_u64 * mib;
+        let report = classify_macos_residency(&MacosResidencyClassifierInput {
+            process_rss_bytes: Some(2 * gib),
+            vmmap_output: Some(
+                "\
+MALLOC_LARGE       1.5GB
+MYSTERY_REGION     512 MB
+",
+            ),
+            heap_output: None,
+            sample_output: None,
+            child_process_rss_bytes: None,
+        });
+
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::RustHeap).bytes,
+            Some(gib + (512 * mib))
+        );
+        assert_eq!(report.unknown_bytes, Some(512 * mib));
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::Unknown).bytes,
+            Some(512 * mib)
+        );
+    }
+
+    #[test]
+    fn macos_residency_classifier_sample_signals_do_not_forge_bytes() {
+        let report = classify_macos_residency(&MacosResidencyClassifierInput {
+            process_rss_bytes: None,
+            vmmap_output: None,
+            heap_output: None,
+            sample_output: Some(
+                "\
+Call graph:
+  malloc_zone_malloc
+  mmap_file_read
+  IOSurfaceAccelerator
+  frankenterm scrollback lookup
+",
+            ),
+            child_process_rss_bytes: None,
+        });
+
+        assert_eq!(report.evidence_state, MacosResidencyEvidenceState::Mixed);
+        assert_eq!(
+            residency_bucket(&report, MacosResidencyBucket::RustHeap).bytes,
+            None
+        );
+        assert!(
+            residency_bucket(&report, MacosResidencyBucket::RustHeap)
+                .reason_codes
+                .iter()
+                .any(|code| code == "resource.memory.heap_stack_signal")
+        );
+        assert!(
+            residency_bucket(&report, MacosResidencyBucket::GraphicsMedia)
+                .reason_codes
+                .iter()
+                .any(|code| code == "resource.memory.graphics_stack_signal")
+        );
+        assert!(
+            residency_bucket(&report, MacosResidencyBucket::ScrollbackCache)
+                .reason_codes
+                .iter()
+                .any(|code| code == "resource.memory.scrollback_stack_signal")
+        );
     }
 
     #[cfg(target_os = "macos")]
