@@ -402,6 +402,134 @@ expect_validation_failure \
   "local_fallback_detection" \
   "wrapper-emitted local fallback record must not validate as passing proof"
 
+strict_rch_dir="${tmp_dir}/strict-remote-bin"
+strict_rch_env_log="${tmp_dir}/strict-remote-env.log"
+strict_rch_output_log="${tmp_dir}/strict-remote-wrapper.log"
+strict_rch_error_log="${tmp_dir}/strict-remote-wrapper.stderr.log"
+mkdir -p "${strict_rch_dir}"
+cat >"${strict_rch_dir}/rch" <<'FAKE_RCH'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${STRICT_RCH_ENV_LOG:?}"
+{
+  printf 'RCH_REQUIRE_REMOTE=%s\n' "${RCH_REQUIRE_REMOTE:-}"
+  printf 'RCH_BUILD_SLOTS=%s\n' "${RCH_BUILD_SLOTS:-}"
+  printf 'RCH_TEST_SLOTS=%s\n' "${RCH_TEST_SLOTS:-}"
+  printf 'RCH_CHECK_SLOTS=%s\n' "${RCH_CHECK_SLOTS:-}"
+  printf 'args=%s\n' "$*"
+} >>"${STRICT_RCH_ENV_LOG}"
+
+if [[ "${1:-}" == "exec" ]]; then
+  printf '%s\n' "[RCH] local (selection error: queue_timeout)"
+  printf '%s\n' "[RCH] remote required; refusing local fallback (no worker assigned)"
+  exit 1
+fi
+
+printf 'unexpected fake rch invocation: %s\n' "$*" >&2
+exit 64
+FAKE_RCH
+chmod +x "${strict_rch_dir}/rch"
+
+set +e
+(
+  PATH="${strict_rch_dir}:${PATH}" \
+    STRICT_RCH_ENV_LOG="${strict_rch_env_log}" \
+    RCH_BUILD_SLOTS=8 \
+    RCH_TEST_SLOTS=8 \
+    RCH_CHECK_SLOTS=2 \
+    run_rch_cargo_logged \
+      "${strict_rch_output_log}" \
+      env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace
+) >/dev/null 2>"${strict_rch_error_log}"
+strict_rch_rc=$?
+set -e
+
+if [[ "${strict_rch_rc}" -eq 0 ]] \
+  || ! grep -Fxq "RCH_REQUIRE_REMOTE=1" "${strict_rch_env_log}" \
+  || ! grep -Fxq "RCH_BUILD_SLOTS=8" "${strict_rch_env_log}" \
+  || ! grep -Fxq "RCH_TEST_SLOTS=8" "${strict_rch_env_log}" \
+  || ! grep -Fxq "RCH_CHECK_SLOTS=2" "${strict_rch_env_log}" \
+  || ! grep -Fq "remote required; refusing local fallback" "${strict_rch_output_log}" \
+  || ! grep -Fq "refusing offload policy violation" "${strict_rch_error_log}"; then
+  emit_log \
+    "failed" \
+    "wrapper_guard" \
+    "strict_remote_env" \
+    "strict_remote_not_enforced" \
+    "wrapper_failed_open" \
+    "$(basename "${strict_rch_output_log}")" \
+    "run_rch_cargo_logged must pass RCH_REQUIRE_REMOTE=1 plus slot envs and fail before local cargo fallback"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "wrapper_guard" \
+  "strict_remote_env" \
+  "strict_remote_enforced" \
+  "none" \
+  "$(basename "${strict_rch_output_log}")" \
+  "run_rch_cargo_logged passes RCH_REQUIRE_REMOTE=1 plus slot envs and fails closed on fake queue_timeout fallback"
+
+nonzero_rch_dir="${tmp_dir}/nonzero-remote-bin"
+nonzero_rch_output_log="${tmp_dir}/nonzero-remote-wrapper.log"
+nonzero_rch_error_log="${tmp_dir}/nonzero-remote-wrapper.stderr.log"
+nonzero_rch_marker="${tmp_dir}/nonzero-remote-after.marker"
+mkdir -p "${nonzero_rch_dir}"
+cat >"${nonzero_rch_dir}/rch" <<'FAKE_RCH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "exec" ]]; then
+  printf '%s\n' "Selected worker: fake-worker at ubuntu@127.0.0.1 (0 slots, speed 1.0)"
+  printf '%s\n' "Remote command finished: exit=101 in 42ms"
+  exit 101
+fi
+
+printf 'unexpected fake rch invocation: %s\n' "$*" >&2
+exit 64
+FAKE_RCH
+chmod +x "${nonzero_rch_dir}/rch"
+
+set +e
+(
+  PATH="${nonzero_rch_dir}:${PATH}" \
+    RCH_PROOF_LEDGER_FILE="${wrapper_ledger}" \
+    RCH_PROOF_LEDGER_BEAD_ID="ft-kvs1e" \
+    RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
+    run_rch_cargo_logged \
+      "${nonzero_rch_output_log}" \
+      env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace
+  nonzero_inner_rc=$?
+  printf 'after:%s\n' "${nonzero_inner_rc}" >"${nonzero_rch_marker}"
+  exit "${nonzero_inner_rc}"
+) >/dev/null 2>"${nonzero_rch_error_log}"
+nonzero_rch_rc=$?
+set -e
+
+if [[ "${nonzero_rch_rc}" -ne 101 ]] \
+  || ! grep -Fxq "after:101" "${nonzero_rch_marker}" \
+  || ! grep -Fq "Remote command finished: exit=101" "${nonzero_rch_output_log}"; then
+  emit_log \
+    "failed" \
+    "wrapper_guard" \
+    "nonzero_capture" \
+    "errexit_state_leaked" \
+    "post_failure_block_not_reached" \
+    "$(basename "${nonzero_rch_output_log}")" \
+    "run_rch_cargo_logged must preserve set +e callers so harnesses can record failure JSON"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "wrapper_guard" \
+  "nonzero_capture" \
+  "errexit_state_preserved" \
+  "none" \
+  "$(basename "${nonzero_rch_output_log}")" \
+  "run_rch_cargo_logged preserves set +e callers after non-fallback remote failures"
+
 timeout_log="${tmp_dir}/timeout.log"
 printf '%s\n' "Remote command still running" >"${timeout_log}"
 rch_write_meta_json "${timeout_log}" "124"

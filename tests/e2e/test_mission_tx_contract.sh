@@ -7,9 +7,10 @@ mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="mission_tx_contract"
-CORRELATION_ID="ft-1i2ge.8.1-${RUN_ID}"
+CORRELATION_ID="ft-3yptk-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/mission_tx_contract_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/mission_tx_contract_${RUN_ID}.stdout.log"
+PROOF_LEDGER_FILE="${LOG_DIR}/mission_tx_contract_${RUN_ID}.proof-ledger.jsonl"
 
 DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-mission-tx-contract-${RUN_ID}"
 INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
@@ -18,7 +19,18 @@ if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /
 else
   CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
 fi
+CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
+CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+RUSTFLAGS="${RUSTFLAGS:--Cdebuginfo=0}"
 export CARGO_TARGET_DIR
+export CARGO_PROFILE_DEV_DEBUG
+export CARGO_PROFILE_TEST_DEBUG
+export CARGO_INCREMENTAL
+export RUSTFLAGS
+export RCH_PROOF_LEDGER_FILE="${PROOF_LEDGER_FILE}"
+export RCH_PROOF_LEDGER_BEAD_ID="ft-3yptk"
+export RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}"
 
 # shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
@@ -96,83 +108,66 @@ emit_log \
   "$(basename "$(rch_smoke_log_path)")" \
   "verified remote rch exec path before mission tx contract tests"
 
-MISSION_TX_TEST_FILTERS=(
-  "mission_tx_failure_taxonomy_has_unique_reason_and_error_codes"
-  "mission_tx_transition_table_rejects_illegal_edges"
-  "mission_tx_contract_accepts_happy_path"
-  "mission_tx_contract_accepts_recovery_path_with_compensation"
-  "mission_tx_contract_rejects_non_monotonic_receipts"
-  "mission_tx_contract_rejects_commit_without_prepared_receipt"
-  "mission_tx_contract_rejects_double_commit_markers"
-  "mission_tx_contract_rejects_compensation_without_commit_failure_marker"
-  "mission_tx_contract_rejects_outcome_state_mismatch"
-  "mission_tx_transition_log_enforces_structured_contract"
-  "mission_tx_contract_property_"
-)
+emit_log \
+  "running" \
+  "proof_ledger_config" \
+  "proof_ledger_enabled" \
+  "none" \
+  "$(basename "${PROOF_LEDGER_FILE}")" \
+  "proof-ledger enabled for bead=${RCH_PROOF_LEDGER_BEAD_ID}; scenario=${RCH_PROOF_LEDGER_SCENARIO_ID}"
 
 : >"${STDOUT_FILE}"
-for test_filter in "${MISSION_TX_TEST_FILTERS[@]}"; do
-  decision_path="contract_surface"
-  reason_code="none"
-  if [[ "${test_filter}" == *"accepts_happy_path"* ]]; then
-    decision_path="nominal_path"
-    reason_code="nominal_contract_path"
-  elif [[ "${test_filter}" == *"accepts_recovery_path"* ]]; then
-    decision_path="recovery_path"
-    reason_code="compensation_recovery_path"
-  elif [[ "${test_filter}" == *"rejects_"* ]]; then
-    decision_path="failure_injection_path"
-    reason_code="invariant_violation_rejected"
-  elif [[ "${test_filter}" == *"property_"* ]]; then
-    decision_path="determinism_property_path"
-    reason_code="property_invariant_validation"
-  fi
-  step_slug="${test_filter//[^A-Za-z0-9_]/_}"
-  step_log="${LOG_DIR}/mission_tx_contract_${RUN_ID}.${step_slug}.log"
+test_target="tx_correctness_suite"
+step_log="${LOG_DIR}/mission_tx_contract_${RUN_ID}.${test_target}.log"
 
+emit_log \
+  "running" \
+  "nominal_path|failure_injection_path|recovery_path|determinism_property_path" \
+  "representative_mission_tx_bundle" \
+  "none" \
+  "$(basename "${STDOUT_FILE}")" \
+  "Executing via shared rch guard: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --test ${test_target} -- --nocapture"
+
+set +e
+run_rch_cargo_logged "${step_log}" \
+  env CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG}" \
+    CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG}" \
+    CARGO_INCREMENTAL="${CARGO_INCREMENTAL}" \
+    RUSTFLAGS="${RUSTFLAGS}" \
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
+    cargo test -p frankenterm-core --test "${test_target}" -- --nocapture
+status=$?
+set -e
+tee -a "${STDOUT_FILE}" <"${step_log}"
+
+if [[ ${status} -ne 0 ]]; then
   emit_log \
-    "running" \
-    "${decision_path}" \
-    "${reason_code}" \
-    "none" \
+    "failed" \
+    "nominal_path|failure_injection_path|recovery_path|determinism_property_path" \
+    "test_failure" \
+    "cargo_test_failed" \
     "$(basename "${STDOUT_FILE}")" \
-    "Executing via shared rch guard: env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} cargo test -p frankenterm-core --lib ${test_filter} -- --nocapture"
-
-  set +e
-  run_rch_cargo_logged "${step_log}" \
-    env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" \
-      cargo test -p frankenterm-core --lib "${test_filter}" -- --nocapture
-  status=$?
-  set -e
-  tee -a "${STDOUT_FILE}" <"${step_log}"
-
-  if [[ ${status} -ne 0 ]]; then
-    emit_log \
-      "failed" \
-      "${decision_path}" \
-      "test_failure" \
-      "cargo_test_failed" \
-      "$(basename "${STDOUT_FILE}")" \
-      "exit=${status}; test_filter=${test_filter}"
-    exit ${status}
-  fi
-done
+    "exit=${status}; test_target=${test_target}"
+  exit ${status}
+fi
 
 required_markers=(
-  "mission_tx_failure_taxonomy_has_unique_reason_and_error_codes ... ok"
-  "mission_tx_transition_table_rejects_illegal_edges ... ok"
-  "mission_tx_contract_accepts_happy_path ... ok"
-  "mission_tx_contract_accepts_recovery_path_with_compensation ... ok"
-  "mission_tx_contract_rejects_non_monotonic_receipts ... ok"
-  "mission_tx_contract_rejects_commit_without_prepared_receipt ... ok"
-  "mission_tx_contract_rejects_double_commit_markers ... ok"
-  "mission_tx_contract_rejects_compensation_without_commit_failure_marker ... ok"
-  "mission_tx_contract_rejects_outcome_state_mismatch ... ok"
-  "mission_tx_transition_log_enforces_structured_contract ... ok"
-  "mission_tx_contract_property_rejects_non_monotonic_receipt_suffix ... ok"
-  "mission_tx_contract_property_rejects_duplicate_commit_markers ... ok"
-  "mission_tx_contract_property_enforces_single_terminal_outcome ... ok"
-  "mission_tx_contract_property_rejects_compensation_without_commit_partial_marker ... ok"
+  "sm_commit_requires_prepared_or_committing ... ok"
+  "sm_commit_accepts_prepared ... ok"
+  "pipeline_full_commit_then_full_rollback ... ok"
+  "pipeline_partial_commit_then_partial_rollback ... ok"
+  "receipts_monotonic_through_commit ... ok"
+  "receipts_continue_sequence_from_prior ... ok"
+  "idempotency_full_lifecycle_fresh_commit_then_duplicate ... ok"
+  "idempotency_resume_after_crash_mid_commit ... ok"
+  "deterministic_replay_same_inputs_same_results ... ok"
+  "reason_codes_on_failure ... ok"
+  "commit_step_results_in_ordinal_order ... ok"
+  "compensation_step_results_in_reverse_ordinal_order ... ok"
+  "concurrent_commit_determinism ... ok"
+  "concurrent_mixed_tx_non_interference ... ok"
+  "pipeline_kill_switch_safe_mode_blocks_commit ... ok"
+  "pipeline_pause_suspends_commit_then_resume_idempotent ... ok"
 )
 
 for marker in "${required_markers[@]}"; do
@@ -187,6 +182,24 @@ for marker in "${required_markers[@]}"; do
     exit 1
   fi
 done
+
+emit_log \
+  "running" \
+  "proof_ledger_validation" \
+  "validator_started" \
+  "none" \
+  "$(basename "${PROOF_LEDGER_FILE}")" \
+  "validating every proof-ledger JSONL entry emitted by shared rch guard"
+
+validation_dir="$(rch_validate_proof_ledger_file "${PROOF_LEDGER_FILE}")"
+
+emit_log \
+  "passed" \
+  "proof_ledger_validation" \
+  "proof_ledger_validated" \
+  "none" \
+  "$(basename "${PROOF_LEDGER_FILE}")" \
+  "proof-ledger entries validated; validation_dir=${validation_dir#"${ROOT_DIR}"/}"
 
 emit_log \
   "passed" \

@@ -28,6 +28,7 @@ RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
 RCH_SMOKE_TIMEOUT_SECS="${RCH_SMOKE_TIMEOUT_SECS:-600}"
 RCH_LOCAL_TMPDIR="${RCH_LOCAL_TMPDIR:-/tmp}"
+RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
 # Set this to 1 for harnesses whose first material verification steps already
 # run through `run_rch_cargo_logged`. That keeps remote execution fail-closed
 # without paying a duplicate full-repo sync for a cargo smoke command.
@@ -286,6 +287,40 @@ rch_emit_proof_ledger_entry() {
         }' >>"${RCH_PROOF_LEDGER_FILE}"
 }
 
+rch_validate_proof_ledger_file() {
+    local ledger_file="$1"
+    local validator validation_dir line_no entry_count entry entry_file validation_log
+
+    rch_proof_ledger_require_config
+    validator="$(rch_proof_ledger_validator)"
+
+    [[ -f "${ledger_file}" ]] || rch_fatal "proof-ledger file does not exist: ${ledger_file}"
+
+    validation_dir="${ledger_file}.validation"
+    mkdir -p "${validation_dir}"
+
+    line_no=0
+    entry_count=0
+    entry=""
+    while IFS= read -r entry || [[ -n "${entry}" ]]; do
+        line_no=$((line_no + 1))
+        [[ -n "${entry}" ]] || continue
+
+        entry_count=$((entry_count + 1))
+        entry_file="${validation_dir}/entry_${line_no}.json"
+        validation_log="${entry_file}.validation.log"
+        printf '%s\n' "${entry}" >"${entry_file}"
+
+        if ! "${validator}" --validate-evidence "${entry_file}" >"${validation_log}" 2>&1; then
+            cat "${validation_log}" >&2
+            rch_fatal "proof-ledger validation failed for ${ledger_file} line ${line_no}; see ${validation_log}"
+        fi
+    done <"${ledger_file}"
+
+    [[ "${entry_count}" -gt 0 ]] || rch_fatal "proof-ledger file had no JSONL entries: ${ledger_file}"
+    printf '%s\n' "${validation_dir}"
+}
+
 rch_write_meta_json() {
     local log_file="$1"
     local wrapper_exit_code="${2:-}"
@@ -435,8 +470,10 @@ rch_log_has_remote_execution_marker() {
 
 rch_log_has_remote_mirror_missing_file() {
     local output_file="$1"
-    grep -Eq "error: couldn't read .+: No such file or directory \\(os error 2\\)" "${output_file}" 2>/dev/null \
-        && rch_log_has_remote_execution_marker "${output_file}"
+    rch_log_has_remote_execution_marker "${output_file}" || return 1
+    grep -Eq \
+        "error: couldn't read .+: No such file or directory \\(os error 2\\)|error: can't find lib .+ at path .+" \
+        "${output_file}" 2>/dev/null
 }
 
 rch_extract_failure_reason_code() {
@@ -454,6 +491,10 @@ rch_extract_failure_reason_code() {
         printf '%s\n' "RCH-PKG-CONFIG-DEPENDENCY-MISSING"
     elif grep -Fq "Error building OpenSSL:" "${output_file}" 2>/dev/null; then
         printf '%s\n' "RCH-VENDORED-OPENSSL-BUILD-FAILED"
+    elif grep -Eq "signal: 9, SIGKILL: kill|SIGKILL" "${output_file}" 2>/dev/null; then
+        printf '%s\n' "RCH-REMOTE-PROCESS-SIGKILL"
+    elif grep -Eq "RCH-E104|SSH command timed out" "${output_file}" 2>/dev/null; then
+        printf '%s\n' "RCH-SSH-COMMAND-TIMEOUT"
     elif rch_log_has_remote_mirror_missing_file "${output_file}"; then
         printf '%s\n' "RCH-REMOTE-MIRROR-MISSING-FILE"
     fi
@@ -474,8 +515,14 @@ rch_extract_failure_reason_detail() {
         grep -E "was not found in the pkg-config search path|No package '.*' found" "${output_file}" 2>/dev/null | head -n 1
     elif grep -Fq "Error building OpenSSL:" "${output_file}" 2>/dev/null; then
         grep -F "Error building OpenSSL:" "${output_file}" 2>/dev/null | tail -n 1
+    elif grep -Eq "signal: 9, SIGKILL: kill|SIGKILL" "${output_file}" 2>/dev/null; then
+        grep -E "signal: 9, SIGKILL: kill|SIGKILL" "${output_file}" 2>/dev/null | tail -n 1
+    elif grep -Eq "RCH-E104|SSH command timed out" "${output_file}" 2>/dev/null; then
+        grep -E "RCH-E104|SSH command timed out" "${output_file}" 2>/dev/null | tail -n 1
     elif rch_log_has_remote_mirror_missing_file "${output_file}"; then
-        grep -E "error: couldn't read .+: No such file or directory \\(os error 2\\)" "${output_file}" 2>/dev/null | head -n 1
+        grep -E \
+            "error: couldn't read .+: No such file or directory \\(os error 2\\)|error: can't find lib .+ at path .+" \
+            "${output_file}" 2>/dev/null | head -n 1
     fi
 }
 
@@ -568,8 +615,13 @@ run_rch_cargo_logged_with_timeout() {
     local timeout_secs="$1"
     local output_file="$2"
     shift 2
+    local caller_had_errexit="false"
     local runner_pid=""
     local monitor_pid=""
+
+    if [[ $- == *e* ]]; then
+        caller_had_errexit="true"
+    fi
 
     if [[ -z "${TIMEOUT_BIN}" ]]; then
         resolve_timeout_bin
@@ -579,11 +631,27 @@ run_rch_cargo_logged_with_timeout() {
     fi
 
     : >"${output_file}"
+    local rch_env=(
+        "TMPDIR=${RCH_LOCAL_TMPDIR}"
+        "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}"
+        "RCH_BUILD_TIMEOUT_SEC=${RCH_BUILD_TIMEOUT_SEC:-${timeout_secs}}"
+        "RCH_TEST_TIMEOUT_SEC=${RCH_TEST_TIMEOUT_SEC:-${timeout_secs}}"
+    )
+    if [[ -n "${RCH_BUILD_SLOTS:-}" ]]; then
+        rch_env+=("RCH_BUILD_SLOTS=${RCH_BUILD_SLOTS}")
+    fi
+    if [[ -n "${RCH_TEST_SLOTS:-}" ]]; then
+        rch_env+=("RCH_TEST_SLOTS=${RCH_TEST_SLOTS}")
+    fi
+    if [[ -n "${RCH_CHECK_SLOTS:-}" ]]; then
+        rch_env+=("RCH_CHECK_SLOTS=${RCH_CHECK_SLOTS}")
+    fi
 
     set +e
     (
         cd "${_RCH_REPO_ROOT}"
-        exec env TMPDIR="${RCH_LOCAL_TMPDIR}" "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" \
+        exec env "${rch_env[@]}" \
+            "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" \
             rch exec -- "$@"
     ) >"${output_file}" 2>&1 &
     runner_pid="$!"
@@ -617,6 +685,9 @@ run_rch_cargo_logged_with_timeout() {
         local reason_code
         reason_code="$(rch_timeout_reason_code "${output_file}")"
         rch_fatal "${reason_code}: $(rch_timeout_reason_message "${reason_code}" "${timeout_secs}"). See ${queue_log}"
+    fi
+    if [[ "${caller_had_errexit}" == "false" ]]; then
+        set +e
     fi
     return "${rc}"
 }

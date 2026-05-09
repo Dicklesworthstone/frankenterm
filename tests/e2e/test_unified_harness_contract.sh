@@ -156,6 +156,7 @@ echo ""; echo "--- Scenario 5: Shared rch guard coverage ---"
 BAD_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_fail_open_${RUN_ID}.log"
 GOOD_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_clean_${RUN_ID}.log"
 MISSING_FILE_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_remote_mirror_missing_file_${RUN_ID}.log"
+MISSING_LIB_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_remote_mirror_missing_lib_${RUN_ID}.log"
 BAD_GUARD_ERR="${ARTIFACT_DIR}/shared_guard_fail_open_${RUN_ID}.stderr.log"
 GOOD_GUARD_ERR="${ARTIFACT_DIR}/shared_guard_clean_${RUN_ID}.stderr.log"
 printf '%s\n' '[RCH] local: Remote execution failed: ssh transport unavailable; running locally' > "${BAD_GUARD_LOG}"
@@ -165,6 +166,11 @@ printf '%s\n' \
   'Sync complete: 4812 files in 928ms' \
   "error: couldn't read crates/frankenterm-core-fleet/src/lib.rs: No such file or directory (os error 2)" \
   > "${MISSING_FILE_GUARD_LOG}"
+printf '%s\n' \
+  'Selected worker: vmi1227854 at 100.64.0.12' \
+  'Sync complete: 25817 files, 13009434 bytes in 134270ms' \
+  "error: can't find lib \`frankenterm_core\` at path \`/data/projects/frankenterm/crates/frankenterm-core/src/lib.rs\`" \
+  > "${MISSING_LIB_GUARD_LOG}"
 set +e
 (check_rch_fallback "${BAD_GUARD_LOG}") >/dev/null 2>"${BAD_GUARD_ERR}"
 BAD_GUARD_RC=$?
@@ -173,6 +179,8 @@ GOOD_GUARD_RC=$?
 set -e
 MISSING_FILE_REASON_CODE="$(rch_extract_failure_reason_code "${MISSING_FILE_GUARD_LOG}")"
 MISSING_FILE_REASON_DETAIL="$(rch_extract_failure_reason_detail "${MISSING_FILE_GUARD_LOG}")"
+MISSING_LIB_REASON_CODE="$(rch_extract_failure_reason_code "${MISSING_LIB_GUARD_LOG}")"
+MISSING_LIB_REASON_DETAIL="$(rch_extract_failure_reason_detail "${MISSING_LIB_GUARD_LOG}")"
 
 GUARD_SURFACE_OK="true"
 for token in \
@@ -180,6 +188,7 @@ for token in \
   "Remote execution failed: .*running locally" \
   "Failed to connect to ubuntu@" \
   "too long for Unix domain socket" \
+  "RCH_REQUIRE_REMOTE" \
   "RCH-REMOTE-MIRROR-MISSING-FILE" \
   "check_rch_fallback" \
   "rch_init" \
@@ -193,10 +202,12 @@ if [ "${BAD_GUARD_RC}" -ne 0 ] \
   && [ "${GOOD_GUARD_RC}" -eq 0 ] \
   && [ "${MISSING_FILE_REASON_CODE}" = "RCH-REMOTE-MIRROR-MISSING-FILE" ] \
   && [[ "${MISSING_FILE_REASON_DETAIL}" == *"couldn't read crates/frankenterm-core-fleet/src/lib.rs"* ]] \
+  && [ "${MISSING_LIB_REASON_CODE}" = "RCH-REMOTE-MIRROR-MISSING-FILE" ] \
+  && [[ "${MISSING_LIB_REASON_DETAIL}" == *"can't find lib \`frankenterm_core\` at path"* ]] \
   && [ "${GUARD_SURFACE_OK}" = "true" ]; then
   record_result "shared_rch_guard_coverage" "true"
 else
-  echo "    bad_guard_rc=${BAD_GUARD_RC} good_guard_rc=${GOOD_GUARD_RC} missing_file_reason_code=${MISSING_FILE_REASON_CODE}"
+  echo "    bad_guard_rc=${BAD_GUARD_RC} good_guard_rc=${GOOD_GUARD_RC} missing_file_reason_code=${MISSING_FILE_REASON_CODE} missing_lib_reason_code=${MISSING_LIB_REASON_CODE}"
   record_result "shared_rch_guard_coverage" "false" "precondition_failed" "config" "shared guard missing local-fallback or remote-mirror coverage"
 fi
 

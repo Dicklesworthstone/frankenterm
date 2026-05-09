@@ -271,6 +271,8 @@ pub struct AegisEngine {
     log_buffer: VecDeque<AegisLogEvent>,
     /// Max log entries to buffer.
     max_log_entries: usize,
+    /// Stable timestamp used for deterministic diagnostic dumps.
+    dump_timestamp: String,
 }
 
 impl AegisEngine {
@@ -286,6 +288,7 @@ impl AegisEngine {
             max_interventions: 100,
             log_buffer: VecDeque::new(),
             max_log_entries: 500,
+            dump_timestamp: format_timestamp(),
         }
     }
 
@@ -462,7 +465,7 @@ impl AegisEngine {
     /// Generate the full diagnostic dump for `ft debug dump-aegis`.
     pub fn dump(&self) -> AegisDump {
         AegisDump {
-            timestamp: format_timestamp(),
+            timestamp: self.dump_timestamp.clone(),
             schema_version: 1,
             backpressure: self.backpressure.snapshot(),
             entropy_anomaly_panes: self.entropy.all_snapshots(),
@@ -742,6 +745,12 @@ mod tests {
         assert!(parsed.get("schema_version").is_some());
         assert!(parsed.get("backpressure").is_some());
         assert!(parsed.get("config").is_some());
+    }
+
+    #[test]
+    fn engine_dump_json_is_deterministic() {
+        let engine = AegisEngine::with_defaults();
+        assert_eq!(engine.dump_json(), engine.dump_json());
     }
 
     #[test]
