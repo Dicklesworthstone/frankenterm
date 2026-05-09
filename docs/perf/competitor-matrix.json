@@ -1,0 +1,240 @@
+{
+  "category": "perf/competitor-matrix",
+  "schema_version": "ft.competitor.matrix.recovery.v1",
+  "release_version": "ft-e87u6.9-recovery",
+  "generated_at": "2026-05-09T00:00:00Z",
+  "produced_by_bead": "ft-e87u6.9",
+  "artifact_basis": {
+    "data_origin": "deterministic recovery fixture from scripts/competitor-bench.sh --simulate",
+    "live_benchmark": false,
+    "source_beads": [
+      "ft-syqcz.5",
+      "ft-t101b"
+    ],
+    "live_publish_contract": "scripts/competitor-bench.sh --input-dir <raw-json-dir> --release-version <version> --baseline <hardware-baseline>",
+    "snapshot_schema": "docs/perf/competitor-resize-schema.json"
+  },
+  "attestation_manifest_slot": {
+    "category": "perf/competitor-matrix",
+    "media_type": "application/json",
+    "current_null_slot_produced_by_bead": "ft-syqcz.4",
+    "recommended_path": "docs/perf/competitor-matrix.json",
+    "recommended_produced_by_bead": "ft-e87u6.9",
+    "manifest_wiring_owner": "ft-e87u6.2"
+  },
+  "workload": {
+    "terminal_count": 4,
+    "panes_per_terminal": 50,
+    "duration_seconds": 5,
+    "corpus": "/usr/share/dict/words",
+    "resize_gesture": "5s resize storm",
+    "hardware_baseline": "github-actions-runner",
+    "runner_sku": "artifact-recovery-smoke"
+  },
+  "competitor_sets": {
+    "g3_requested": [
+      "wezterm",
+      "zellij",
+      "ghostty"
+    ],
+    "ft_t101b_harness": [
+      "wezterm",
+      "ghostty",
+      "rio"
+    ],
+    "coverage_note": "The checked-in ft-t101b resize harness uses Rio for the fourth terminal. Add a Zellij raw source before treating this artifact as full G3 live competitor coverage."
+  },
+  "regression_policy": {
+    "delta_pct_regression_threshold": -10.0,
+    "state_machine": [
+      "clean",
+      "single_regression",
+      "consecutive_regression"
+    ],
+    "p1_trigger": "second consecutive regressed release",
+    "p1_regressions": []
+  },
+  "metrics": [
+    "fps_p50",
+    "fps_p95",
+    "fps_p99",
+    "frame_time_p95_ms",
+    "gpu_memory_peak_mb",
+    "cpu_peak_pct"
+  ],
+  "samples": {
+    "ft": {
+      "fps_p50": 96.0,
+      "fps_p95": 88.0,
+      "fps_p99": 82.0,
+      "frame_time_p95_ms": 13.2,
+      "gpu_memory_peak_mb": 620.0,
+      "cpu_peak_pct": 118.0
+    },
+    "wezterm": {
+      "fps_p50": 98.0,
+      "fps_p95": 90.0,
+      "fps_p99": 84.0,
+      "frame_time_p95_ms": 12.9,
+      "gpu_memory_peak_mb": 640.0,
+      "cpu_peak_pct": 121.0
+    },
+    "ghostty": {
+      "fps_p50": 116.0,
+      "fps_p95": 108.0,
+      "fps_p99": 101.0,
+      "frame_time_p95_ms": 10.8,
+      "gpu_memory_peak_mb": 590.0,
+      "cpu_peak_pct": 109.0
+    },
+    "rio": {
+      "fps_p50": 114.0,
+      "fps_p95": 106.0,
+      "fps_p99": 99.0,
+      "frame_time_p95_ms": 11.0,
+      "gpu_memory_peak_mb": 600.0,
+      "cpu_peak_pct": 111.0
+    }
+  },
+  "deltas": {
+    "wezterm": {
+      "fps_p50": {
+        "ft_value": 96.0,
+        "competitor_value": 98.0,
+        "delta_pct": -2.0408163265306123,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      },
+      "fps_p95": {
+        "ft_value": 88.0,
+        "competitor_value": 90.0,
+        "delta_pct": -2.2222222222222223,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      },
+      "fps_p99": {
+        "ft_value": 82.0,
+        "competitor_value": 84.0,
+        "delta_pct": -2.380952380952381,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      },
+      "frame_time_p95_ms": {
+        "ft_value": 13.2,
+        "competitor_value": 12.9,
+        "delta_pct": -2.325581395348829,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      },
+      "gpu_memory_peak_mb": {
+        "ft_value": 620.0,
+        "competitor_value": 640.0,
+        "delta_pct": 3.125,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      },
+      "cpu_peak_pct": {
+        "ft_value": 118.0,
+        "competitor_value": 121.0,
+        "delta_pct": 2.479338842975207,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      }
+    },
+    "ghostty": {
+      "fps_p50": {
+        "ft_value": 96.0,
+        "competitor_value": 116.0,
+        "delta_pct": -17.24137931034483,
+        "regression_class": "regressed",
+        "regression_state": "single_regression"
+      },
+      "fps_p95": {
+        "ft_value": 88.0,
+        "competitor_value": 108.0,
+        "delta_pct": -18.51851851851852,
+        "regression_class": "regressed",
+        "regression_state": "single_regression"
+      },
+      "fps_p99": {
+        "ft_value": 82.0,
+        "competitor_value": 101.0,
+        "delta_pct": -18.81188118811881,
+        "regression_class": "regressed",
+        "regression_state": "single_regression"
+      },
+      "frame_time_p95_ms": {
+        "ft_value": 13.2,
+        "competitor_value": 10.8,
+        "delta_pct": -22.222222222222207,
+        "regression_class": "regressed",
+        "regression_state": "single_regression"
+      },
+      "gpu_memory_peak_mb": {
+        "ft_value": 620.0,
+        "competitor_value": 590.0,
+        "delta_pct": -5.084745762711865,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      },
+      "cpu_peak_pct": {
+        "ft_value": 118.0,
+        "competitor_value": 109.0,
+        "delta_pct": -8.256880733944955,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      }
+    },
+    "rio": {
+      "fps_p50": {
+        "ft_value": 96.0,
+        "competitor_value": 114.0,
+        "delta_pct": -15.789473684210526,
+        "regression_class": "regressed",
+        "regression_state": "single_regression"
+      },
+      "fps_p95": {
+        "ft_value": 88.0,
+        "competitor_value": 106.0,
+        "delta_pct": -16.9811320754717,
+        "regression_class": "regressed",
+        "regression_state": "single_regression"
+      },
+      "fps_p99": {
+        "ft_value": 82.0,
+        "competitor_value": 99.0,
+        "delta_pct": -17.17171717171717,
+        "regression_class": "regressed",
+        "regression_state": "single_regression"
+      },
+      "frame_time_p95_ms": {
+        "ft_value": 13.2,
+        "competitor_value": 11.0,
+        "delta_pct": -19.999999999999993,
+        "regression_class": "regressed",
+        "regression_state": "single_regression"
+      },
+      "gpu_memory_peak_mb": {
+        "ft_value": 620.0,
+        "competitor_value": 600.0,
+        "delta_pct": -3.3333333333333335,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      },
+      "cpu_peak_pct": {
+        "ft_value": 118.0,
+        "competitor_value": 111.0,
+        "delta_pct": -6.306306306306306,
+        "regression_class": "clean",
+        "regression_state": "clean"
+      }
+    }
+  },
+  "source_documents": [
+    "docs/perf/competitor-bench.md",
+    "docs/perf/competitor-resize-schema.json",
+    "scripts/competitor-bench.sh",
+    "scripts/competitor-bench-state.py",
+    "README.md#how-ft-compares"
+  ]
+}
