@@ -328,12 +328,20 @@ fn real_profile_handler(action: &str, params: &Value) -> Value {
     use frankenterm_core::agent_profiles::AgentProfile;
     use frankenterm_core::robot_profile_handler::handle_profile_command;
     use frankenterm_core::storage::agent_profiles_sql::insert_agent_profile;
-    use rusqlite::Connection;
+    use frankenterm_core::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend};
     use std::collections::HashMap;
 
-    let conn = Connection::open_in_memory().expect("in-memory DB");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS agent_profiles (
+    let backend = RusqliteBackend::open(
+        ":memory:",
+        &OpenConfig {
+            wal_mode: false,
+            ..OpenConfig::default()
+        },
+    )
+    .expect("in-memory DB");
+    backend
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_profiles (
             name           TEXT PRIMARY KEY NOT NULL,
             role           TEXT NOT NULL DEFAULT '',
             tags           TEXT NOT NULL DEFAULT '[]',
@@ -346,10 +354,10 @@ fn real_profile_handler(action: &str, params: &Value) -> Value {
         );
         CREATE INDEX IF NOT EXISTS agent_profiles_role_idx
             ON agent_profiles(role);",
-    )
-    .expect("schema");
+        )
+        .expect("schema");
     insert_agent_profile(
-        &conn,
+        &backend,
         &AgentProfile {
             name: "default".to_string(),
             role: "default".to_string(),
@@ -375,7 +383,7 @@ fn real_profile_handler(action: &str, params: &Value) -> Value {
         params.clone()
     };
 
-    handle_profile_command(action, &effective_params, &conn)
+    handle_profile_command(action, &effective_params, &backend)
         .unwrap_or_else(|err| panic!("real_profile_handler({action}) returned error: {err}"))
 }
 

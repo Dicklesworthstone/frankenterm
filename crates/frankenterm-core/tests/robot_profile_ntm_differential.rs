@@ -9,10 +9,10 @@ use frankenterm_core::robot_family_contract::{
 use frankenterm_core::robot_ntm_differential::{DifferentialHarness, NtmInvoker};
 use frankenterm_core::robot_profile_handler::handle_profile_command;
 use frankenterm_core::storage::agent_profiles_sql::insert_agent_profile;
+use frankenterm_core::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
-use rusqlite::Connection;
 use serde_json::{Value, json};
 
 const PROFILE_DIFFERENTIAL_CASES: usize = 1_000;
@@ -31,8 +31,8 @@ impl NtmInvoker for ProfileNtmMirror {
 }
 
 fn profile_response_envelope(action: &str, request: &Value) -> Value {
-    let conn = seeded_profile_conn();
-    match handle_profile_command(action, request, &conn) {
+    let backend = seeded_profile_backend();
+    match handle_profile_command(action, request, &backend) {
         Ok(data) => json!({
             "ok": true,
             "data": data,
@@ -45,22 +45,30 @@ fn profile_response_envelope(action: &str, request: &Value) -> Value {
     }
 }
 
-fn seeded_profile_conn() -> Connection {
-    let conn = Connection::open_in_memory().expect("open in-memory profile DB");
-    conn.execute_batch(&format!(
-        "{AGENT_PROFILES_SCHEMA};\n{AGENT_PROFILES_ROLE_INDEX};"
-    ))
-    .expect("agent_profiles schema");
+fn seeded_profile_backend() -> RusqliteBackend {
+    let backend = RusqliteBackend::open(
+        ":memory:",
+        &OpenConfig {
+            wal_mode: false,
+            ..OpenConfig::default()
+        },
+    )
+    .expect("open in-memory profile DB");
+    backend
+        .execute_batch(&format!(
+            "{AGENT_PROFILES_SCHEMA};\n{AGENT_PROFILES_ROLE_INDEX};"
+        ))
+        .expect("agent_profiles schema");
 
     for profile in [
         profile("default", "worker", &["stable", "default"]),
         profile("ops", "operator", &["stable", "ops"]),
         profile("empty-tags", "worker", &[]),
     ] {
-        insert_agent_profile(&conn, &profile).expect("seed profile");
+        insert_agent_profile(&backend, &profile).expect("seed profile");
     }
 
-    conn
+    backend
 }
 
 fn profile(name: &str, role: &str, tags: &[&str]) -> AgentProfile {

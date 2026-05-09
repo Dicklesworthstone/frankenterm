@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use proptest::prelude::*;
-use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use frankenterm_core::agent_profiles::{
@@ -9,14 +8,23 @@ use frankenterm_core::agent_profiles::{
 };
 use frankenterm_core::robot_profile_handler::{ProfileHandlerError, handle_profile_command};
 use frankenterm_core::storage::agent_profiles_sql::insert_agent_profile;
+use frankenterm_core::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend};
 
-fn fresh_conn() -> Connection {
-    let conn = Connection::open_in_memory().expect("open in-memory DB");
-    conn.execute_batch(&format!(
-        "{AGENT_PROFILES_SCHEMA};\n{AGENT_PROFILES_ROLE_INDEX};"
-    ))
-    .expect("agent_profiles schema");
-    conn
+fn fresh_backend() -> RusqliteBackend {
+    let backend = RusqliteBackend::open(
+        ":memory:",
+        &OpenConfig {
+            wal_mode: false,
+            ..OpenConfig::default()
+        },
+    )
+    .expect("open in-memory DB");
+    backend
+        .execute_batch(&format!(
+            "{AGENT_PROFILES_SCHEMA};\n{AGENT_PROFILES_ROLE_INDEX};"
+        ))
+        .expect("agent_profiles schema");
+    backend
 }
 
 fn profile(name: &str, role: &str, tags: Vec<String>) -> AgentProfile {
@@ -88,8 +96,8 @@ proptest! {
         action in prop::sample::select(vec!["show", "apply", "validate"]),
         params in non_string_name_param(),
     ) {
-        let conn = fresh_conn();
-        let err = handle_profile_command(action, &params, &conn).unwrap_err();
+        let backend = fresh_backend();
+        let err = handle_profile_command(action, &params, &backend).unwrap_err();
 
         prop_assert!(matches!(err, ProfileHandlerError::BadParams(_)));
         prop_assert_eq!(err.error_code(), "robot.profile.bad_params");
@@ -103,14 +111,14 @@ proptest! {
         target_tag in valid_tag(),
         other_tag in valid_tag(),
     ) {
-        let conn = fresh_conn();
+        let backend = fresh_backend();
         insert_agent_profile(
-            &conn,
+            &backend,
             &profile("target_profile", &target_role, vec![target_tag.clone()]),
         )
         .expect("insert target");
         insert_agent_profile(
-            &conn,
+            &backend,
             &profile("other_profile", &other_role, vec![other_tag.clone()]),
         )
         .expect("insert other");
@@ -118,7 +126,7 @@ proptest! {
         let listed = handle_profile_command(
             "list",
             &json!({"role_filter": target_role.clone(), "tag_filter": target_tag.clone()}),
-            &conn,
+            &backend,
         )
         .expect("list succeeds");
         let profiles = listed["profiles"].as_array().expect("profiles array");
@@ -142,7 +150,7 @@ proptest! {
         env in small_string_map(),
         metadata in small_string_map(),
     ) {
-        let conn = fresh_conn();
+        let backend = fresh_backend();
         let profile = named_profile(
             &name,
             &role,
@@ -151,9 +159,9 @@ proptest! {
             env.clone(),
             metadata.clone(),
         );
-        insert_agent_profile(&conn, &profile).expect("insert profile");
+        insert_agent_profile(&backend, &profile).expect("insert profile");
 
-        let shown = handle_profile_command("show", &json!({"name": name.clone()}), &conn)
+        let shown = handle_profile_command("show", &json!({"name": name.clone()}), &backend)
             .expect("show succeeds");
 
         prop_assert_eq!(shown["name"].as_str(), Some(name.as_str()));
@@ -175,9 +183,9 @@ proptest! {
     fn proptest_robot_profile_handler_validate_missing_profile_is_successful_invalid_response(
         missing_name in valid_word(),
     ) {
-        let conn = fresh_conn();
+        let backend = fresh_backend();
         let response =
-            handle_profile_command("validate", &json!({"name": missing_name.clone()}), &conn)
+            handle_profile_command("validate", &json!({"name": missing_name.clone()}), &backend)
                 .expect("validate missing profile returns data");
 
         prop_assert_eq!(response["name"].as_str(), Some(missing_name.as_str()));
@@ -195,14 +203,14 @@ proptest! {
         name in valid_word(),
         requested_count in any::<u64>(),
     ) {
-        let conn = fresh_conn();
-        insert_agent_profile(&conn, &profile(&name, "worker", Vec::new()))
+        let backend = fresh_backend();
+        insert_agent_profile(&backend, &profile(&name, "worker", Vec::new()))
             .expect("insert profile");
 
         let dry_run = handle_profile_command(
             "apply",
             &json!({"name": name.clone(), "count": requested_count, "dry_run": true}),
-            &conn,
+            &backend,
         )
         .expect("dry-run apply succeeds");
         prop_assert_eq!(dry_run["profile_name"].as_str(), Some(name.as_str()));
@@ -215,7 +223,7 @@ proptest! {
         let err = handle_profile_command(
             "apply",
             &json!({"name": name.clone(), "count": requested_count, "dry_run": false}),
-            &conn,
+            &backend,
         )
         .unwrap_err();
         match err {

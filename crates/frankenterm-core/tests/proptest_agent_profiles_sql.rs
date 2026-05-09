@@ -1,7 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
 use proptest::prelude::*;
-use rusqlite::{Connection, params};
 
 use frankenterm_core::agent_profiles::{
     AGENT_PROFILES_ROLE_INDEX, AGENT_PROFILES_SCHEMA, AgentProfile,
@@ -10,14 +9,26 @@ use frankenterm_core::storage::agent_profiles_sql::{
     AgentProfileSqlError, delete_agent_profile, get_agent_profile, insert_agent_profile,
     list_agent_profiles,
 };
+use frankenterm_core::storage_backend_helpers::execute_typed;
+use frankenterm_core::storage_backend_trait::{
+    OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+};
 
-fn fresh_conn() -> Connection {
-    let conn = Connection::open_in_memory().expect("open in-memory DB");
-    conn.execute_batch(&format!(
-        "{AGENT_PROFILES_SCHEMA};\n{AGENT_PROFILES_ROLE_INDEX};"
-    ))
-    .expect("agent_profiles schema");
-    conn
+fn fresh_backend() -> RusqliteBackend {
+    let backend = RusqliteBackend::open(
+        ":memory:",
+        &OpenConfig {
+            wal_mode: false,
+            ..OpenConfig::default()
+        },
+    )
+    .expect("open in-memory DB");
+    backend
+        .execute_batch(&format!(
+            "{AGENT_PROFILES_SCHEMA};\n{AGENT_PROFILES_ROLE_INDEX};"
+        ))
+        .expect("agent_profiles schema");
+    backend
 }
 
 fn valid_word() -> impl Strategy<Value = String> {
@@ -77,11 +88,11 @@ proptest! {
         env in small_string_map(),
         metadata in small_string_map(),
     ) {
-        let conn = fresh_conn();
+        let backend = fresh_backend();
         let expected = profile(name.clone(), role, tags, command, env, metadata);
 
-        let inserted_name = insert_agent_profile(&conn, &expected).expect("insert profile");
-        let actual = get_agent_profile(&conn, &name)
+        let inserted_name = insert_agent_profile(&backend, &expected).expect("insert profile");
+        let actual = get_agent_profile(&backend, &name)
             .expect("get profile")
             .expect("inserted profile exists");
 
@@ -96,7 +107,7 @@ proptest! {
         target_tag in valid_tag(),
         other_tag in valid_tag(),
     ) {
-        let conn = fresh_conn();
+        let backend = fresh_backend();
         let profiles = [
             profile(
                 "target_b".to_string(),
@@ -124,10 +135,10 @@ proptest! {
             ),
         ];
         for profile in &profiles {
-            insert_agent_profile(&conn, profile).expect("insert profile");
+            insert_agent_profile(&backend, profile).expect("insert profile");
         }
 
-        let all_names: Vec<_> = list_agent_profiles(&conn, None)
+        let all_names: Vec<_> = list_agent_profiles(&backend, None)
             .expect("list all")
             .into_iter()
             .map(|profile| profile.name)
@@ -136,7 +147,7 @@ proptest! {
         sorted_names.sort();
         prop_assert_eq!(all_names, sorted_names);
 
-        let filtered = list_agent_profiles(&conn, Some(&target_role)).expect("list by role");
+        let filtered = list_agent_profiles(&backend, Some(&target_role)).expect("list by role");
         let filtered_names: BTreeSet<_> = filtered.iter().map(|profile| profile.name.as_str()).collect();
 
         prop_assert!(filtered.iter().all(|profile| profile.role == target_role));
@@ -149,7 +160,7 @@ proptest! {
         name in valid_word(),
         role in valid_word(),
     ) {
-        let conn = fresh_conn();
+        let backend = fresh_backend();
         let expected = profile(
             name.clone(),
             role,
@@ -158,11 +169,11 @@ proptest! {
             HashMap::new(),
             HashMap::new(),
         );
-        insert_agent_profile(&conn, &expected).expect("insert profile");
+        insert_agent_profile(&backend, &expected).expect("insert profile");
 
-        prop_assert!(delete_agent_profile(&conn, &name).expect("first delete succeeds"));
-        prop_assert!(get_agent_profile(&conn, &name).expect("get after delete").is_none());
-        prop_assert!(!delete_agent_profile(&conn, &name).expect("second delete succeeds"));
+        prop_assert!(delete_agent_profile(&backend, &name).expect("first delete succeeds"));
+        prop_assert!(get_agent_profile(&backend, &name).expect("get after delete").is_none());
+        prop_assert!(!delete_agent_profile(&backend, &name).expect("second delete succeeds"));
     }
 
     #[test]
@@ -170,7 +181,7 @@ proptest! {
         name in invalid_name(),
         role in valid_word(),
     ) {
-        let conn = fresh_conn();
+        let backend = fresh_backend();
         let invalid = profile(
             name,
             role,
@@ -180,40 +191,41 @@ proptest! {
             HashMap::new(),
         );
 
-        let err = insert_agent_profile(&conn, &invalid).unwrap_err();
+        let err = insert_agent_profile(&backend, &invalid).unwrap_err();
 
         prop_assert!(matches!(err, AgentProfileSqlError::Invalid(_)));
-        prop_assert!(list_agent_profiles(&conn, None).expect("list profiles").is_empty());
+        prop_assert!(list_agent_profiles(&backend, None).expect("list profiles").is_empty());
     }
 
     #[test]
     fn proptest_agent_profiles_sql_decode_errors_name_corrupt_json_column(
         column in prop::sample::select(vec!["tags", "env", "metadata"]),
     ) {
-        let conn = fresh_conn();
+        let backend = fresh_backend();
         let tags = if column == "tags" { "not-json" } else { "[]" };
         let env = if column == "env" { "not-json" } else { "{}" };
         let metadata = if column == "metadata" { "not-json" } else { "{}" };
 
-        conn.execute(
+        execute_typed(
+            &backend,
             "INSERT INTO agent_profiles
              (name, role, tags, shell, command, env, metadata, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                "corrupt",
-                "role",
-                tags,
-                "/bin/sh",
-                Option::<&str>::None,
-                env,
-                metadata,
-                0_i64,
-                0_i64,
+            &[
+                ToSqlValue::Text("corrupt"),
+                ToSqlValue::Text("role"),
+                ToSqlValue::Text(tags),
+                ToSqlValue::Text("/bin/sh"),
+                ToSqlValue::Null,
+                ToSqlValue::Text(env),
+                ToSqlValue::Text(metadata),
+                ToSqlValue::Integer(0_i64),
+                ToSqlValue::Integer(0_i64),
             ],
         )
         .expect("insert corrupt row");
 
-        let err = get_agent_profile(&conn, "corrupt").unwrap_err();
+        let err = get_agent_profile(&backend, "corrupt").unwrap_err();
 
         match err {
             AgentProfileSqlError::Decode { column: observed, .. } => {
