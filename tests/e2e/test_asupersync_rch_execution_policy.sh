@@ -6,8 +6,8 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_emjsg_proof_ledger_policy"
-CORRELATION_ID="ft-emjsg-${RUN_ID}"
+SCENARIO_ID="ft_54ut8_proof_ledger_redaction_policy"
+CORRELATION_ID="ft-54ut8-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/proof_ledger_policy_${RUN_ID}.jsonl"
 
 VALIDATOR="${ROOT_DIR}/scripts/validate_asupersync_rch_execution_policy.sh"
@@ -88,6 +88,34 @@ expect_validation_failure() {
     "invalid evidence correctly rejected"
 }
 
+fingerprint_text() {
+  local text="$1"
+  local digest
+
+  if command -v shasum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${text}" | shasum -a 256 | awk '{print $1}')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${text}" | sha256sum | awk '{print $1}')"
+  else
+    emit_log \
+      "failed" \
+      "suite_init" \
+      "preflight_sha256" \
+      "sha256_missing" \
+      "sha256_not_found" \
+      "$(basename "${LOG_FILE}")" \
+      "shasum or sha256sum is required"
+    exit 1
+  fi
+
+  printf 'sha256:%s' "${digest}"
+}
+
+artifact_paths_fingerprint() {
+  local artifact_path="$1"
+  fingerprint_text "$(jq -cn --arg path "${artifact_path}" '[$path]')"
+}
+
 emit_log \
   "started" \
   "suite_init" \
@@ -95,7 +123,7 @@ emit_log \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "ft-emjsg repository proof-ledger policy validation"
+  "ft-54ut8 repository proof-ledger redaction policy validation"
 
 if ! command -v jq >/dev/null 2>&1; then
   emit_log \
@@ -234,6 +262,7 @@ emit_log \
 tmp_dir="${LOG_DIR}/asupersync_rch_policy_${RUN_ID}_evidence"
 mkdir -p "${tmp_dir}"
 mock_artifact="${tmp_dir}/mock_rch_policy.jsonl"
+mock_artifact_rel="${mock_artifact#"${ROOT_DIR}"/}"
 printf '{"mock":true}\n' > "${mock_artifact}"
 
 tmp_valid="${tmp_dir}/valid.json"
@@ -243,61 +272,135 @@ tmp_sync_chatter="${tmp_dir}/sync-chatter.json"
 tmp_shell_wrapper="${tmp_dir}/shell-wrapper.json"
 tmp_missing_artifact="${tmp_dir}/missing-artifact.json"
 tmp_missing_is_heavy="${tmp_dir}/missing-is-heavy.json"
+tmp_secret_command="${tmp_dir}/secret-command.json"
+tmp_secret_path="${tmp_dir}/secret-path.json"
 tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
 
+secret_fixture="API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz012345 cargo test -p frankenterm-core --header 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345' --path /Users/jemanuel/.ssh/id_ed25519 --safe crates/frankenterm"
+redaction_json="$("${VALIDATOR}" --redact-text "${secret_fixture}")"
+redacted_summary="$(jq -r '.redacted' <<<"${redaction_json}")"
+redaction_fingerprint="$(jq -r '.fingerprint' <<<"${redaction_json}")"
+if [[ "${redacted_summary}" == *"sk-proj-"* || "${redacted_summary}" == *"Bearer abcdef"* || "${redacted_summary}" == *"/Users/jemanuel"* ]]; then
+  emit_log \
+    "failed" \
+    "redaction_helper" \
+    "redact_text" \
+    "secret_leaked" \
+    "redaction_failed" \
+    "$(basename "${VALIDATOR}")" \
+    "redaction helper leaked fixture"
+  exit 1
+fi
+if [[ "${redacted_summary}" != *"cargo test -p frankenterm-core"* || "${redacted_summary}" != *"crates/frankenterm"* ]]; then
+  emit_log \
+    "failed" \
+    "redaction_helper" \
+    "redact_text" \
+    "structure_lost" \
+    "redaction_overapplied" \
+    "$(basename "${VALIDATOR}")" \
+    "redaction helper removed non-sensitive structure"
+  exit 1
+fi
+if [[ ! "${redaction_fingerprint}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+  emit_log \
+    "failed" \
+    "redaction_helper" \
+    "fingerprint_shape" \
+    "bad_fingerprint" \
+    "invalid_fingerprint" \
+    "$(basename "${VALIDATOR}")" \
+    "redaction helper emitted invalid fingerprint"
+  exit 1
+fi
+emit_log \
+  "passed" \
+  "redaction_helper" \
+  "redact_text" \
+  "secret_redacted_structure_preserved" \
+  "none" \
+  "$(basename "${VALIDATOR}")" \
+  "${redacted_summary}"
+
+remote_cmd="rch exec -- cargo check --workspace --all-targets"
+remote_worker="worker=contabo-2"
+remote_target="/tmp/ft-54ut8-rch-target"
+wrapped_cmd="run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace"
+wrapped_target="target/rch-proof"
+light_cmd_value="cargo fmt --check"
+light_worker="local"
+light_target="not_applicable"
+artifact_paths_fp="$(artifact_paths_fingerprint "${mock_artifact_rel}")"
+empty_fp="$(fingerprint_text "")"
+
 cat > "${tmp_valid}" <<JSON
 {
-  "schema_version": 2,
-  "bead_id": "ft-emjsg",
-  "policy_version": "2.0.0",
+  "schema_version": 3,
+  "bead_id": "ft-54ut8",
+  "policy_version": "3.0.0",
   "runs": [
     {
       "timestamp": "2026-02-25T00:00:00Z",
-      "command": "rch exec -- cargo check --workspace --all-targets",
+      "command": "${remote_cmd}",
+      "command_fingerprint": "$(fingerprint_text "${remote_cmd}")",
       "command_class": "heavy",
       "is_heavy": true,
       "used_rch": true,
-      "worker_context": "worker=contabo-2",
+      "worker_context": "${remote_worker}",
+      "worker_context_fingerprint": "$(fingerprint_text "${remote_worker}")",
       "execution_mode": "remote_rch",
-      "target_dir": "/tmp/ft-emjsg-rch-target",
+      "target_dir": "${remote_target}",
+      "target_dir_fingerprint": "$(fingerprint_text "${remote_target}")",
       "target_dir_lifecycle": "retained",
-      "artifact_paths": ["${mock_artifact}"],
+      "artifact_paths": ["${mock_artifact_rel}"],
+      "artifact_paths_fingerprint": "${artifact_paths_fp}",
       "elapsed_seconds": 31.4,
       "exit_status": 0,
       "residual_risk_notes": "",
+      "residual_risk_notes_fingerprint": "${empty_fp}",
       "validation_status": "valid"
     },
     {
       "timestamp": "2026-02-25T00:01:00Z",
-      "command": "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace",
+      "command": "${wrapped_cmd}",
+      "command_fingerprint": "$(fingerprint_text "${wrapped_cmd}")",
       "command_class": "heavy",
       "is_heavy": true,
       "used_rch": true,
-      "worker_context": "worker=contabo-2",
+      "worker_context": "${remote_worker}",
+      "worker_context_fingerprint": "$(fingerprint_text "${remote_worker}")",
       "execution_mode": "remote_rch",
-      "target_dir": "target/rch-proof",
+      "target_dir": "${wrapped_target}",
+      "target_dir_fingerprint": "$(fingerprint_text "${wrapped_target}")",
       "target_dir_lifecycle": "retained",
-      "artifact_paths": ["${mock_artifact}"],
+      "artifact_paths": ["${mock_artifact_rel}"],
+      "artifact_paths_fingerprint": "${artifact_paths_fp}",
       "elapsed_seconds": 11.1,
       "exit_status": 0,
       "residual_risk_notes": "",
+      "residual_risk_notes_fingerprint": "${empty_fp}",
       "validation_status": "valid"
     },
     {
       "timestamp": "2026-02-25T00:02:00Z",
-      "command": "cargo fmt --check",
+      "command": "${light_cmd_value}",
+      "command_fingerprint": "$(fingerprint_text "${light_cmd_value}")",
       "command_class": "light",
       "is_heavy": false,
       "used_rch": false,
-      "worker_context": "local",
+      "worker_context": "${light_worker}",
+      "worker_context_fingerprint": "$(fingerprint_text "${light_worker}")",
       "execution_mode": "local_light",
-      "target_dir": "not_applicable",
+      "target_dir": "${light_target}",
+      "target_dir_fingerprint": "$(fingerprint_text "${light_target}")",
       "target_dir_lifecycle": "not_applicable",
-      "artifact_paths": ["${mock_artifact}"],
+      "artifact_paths": ["${mock_artifact_rel}"],
+      "artifact_paths_fingerprint": "${artifact_paths_fp}",
       "elapsed_seconds": 0.6,
       "exit_status": 0,
       "residual_risk_notes": "",
+      "residual_risk_notes_fingerprint": "${empty_fp}",
       "validation_status": "valid"
     }
   ]
@@ -334,9 +437,15 @@ emit_log \
   "$(basename "${tmp_valid}")" \
   "valid evidence accepted"
 
-jq '.runs[0].command = "cargo test --workspace" |
+jq --arg cmd "cargo test --workspace" \
+  --arg cmd_fp "$(fingerprint_text "cargo test --workspace")" \
+  --arg worker "local" \
+  --arg worker_fp "$(fingerprint_text "local")" \
+  '.runs[0].command = $cmd |
+    .runs[0].command_fingerprint = $cmd_fp |
     .runs[0].used_rch = false |
-    .runs[0].worker_context = "local" |
+    .runs[0].worker_context = $worker |
+    .runs[0].worker_context_fingerprint = $worker_fp |
     .runs[0].execution_mode = "remote_rch"' \
   "${tmp_valid}" > "${tmp_invalid}"
 
@@ -383,7 +492,10 @@ emit_log \
   "$(basename "${tmp_recovery}")" \
   "recovery evidence accepted with fallback metadata"
 
-jq '.runs[0].command = "rch status && cargo test --workspace" |
+jq --arg cmd "rch status && cargo test --workspace" \
+  --arg cmd_fp "$(fingerprint_text "rch status && cargo test --workspace")" \
+  '.runs[0].command = $cmd |
+    .runs[0].command_fingerprint = $cmd_fp |
     .runs[0].used_rch = true |
     .runs[0].execution_mode = "remote_rch"' \
   "${tmp_valid}" > "${tmp_sync_chatter}"
@@ -393,7 +505,10 @@ expect_validation_failure \
   "sync_chatter_false_proof" \
   "RCH status/setup chatter must not count as remote Cargo proof"
 
-jq '.runs[0].command = "bash -lc '\''echo rch exec -- cargo test; cargo test --workspace'\''" |
+jq --arg cmd "bash -lc 'echo rch exec -- cargo test; cargo test --workspace'" \
+  --arg cmd_fp "$(fingerprint_text "bash -lc 'echo rch exec -- cargo test; cargo test --workspace'")" \
+  '.runs[0].command = $cmd |
+    .runs[0].command_fingerprint = $cmd_fp |
     .runs[0].used_rch = true |
     .runs[0].execution_mode = "remote_rch"' \
   "${tmp_valid}" > "${tmp_shell_wrapper}"
@@ -403,7 +518,11 @@ expect_validation_failure \
   "shell_wrapper_false_proof" \
   "shell wrapper that only mentions RCH must not validate as RCH proof"
 
-jq --arg missing "${tmp_dir}/missing.jsonl" '.runs[0].artifact_paths = [$missing]' \
+missing_artifact_rel="${mock_artifact_rel%/*}/missing.jsonl"
+jq --arg missing "${missing_artifact_rel}" \
+  --arg artifact_fp "$(artifact_paths_fingerprint "${missing_artifact_rel}")" \
+  '.runs[0].artifact_paths = [$missing] |
+    .runs[0].artifact_paths_fingerprint = $artifact_fp' \
   "${tmp_valid}" > "${tmp_missing_artifact}"
 expect_validation_failure \
   "${tmp_missing_artifact}" \
@@ -417,6 +536,51 @@ expect_validation_failure \
   "failure_injection" \
   "missing_is_heavy" \
   "missing is_heavy must fail validation"
+
+jq --arg cmd "API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz rch exec -- cargo test --workspace" \
+  --arg cmd_fp "$(fingerprint_text "API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz rch exec -- cargo test --workspace")" \
+  '.runs[0].command = $cmd |
+    .runs[0].command_fingerprint = $cmd_fp' \
+  "${tmp_valid}" > "${tmp_secret_command}"
+emit_log \
+  "running" \
+  "failure_injection" \
+  "unredacted_command_secret" \
+  "none" \
+  "none" \
+  "$(basename "${tmp_secret_command}")" \
+  "unredacted secret-bearing command must fail validation"
+secret_error="$("${VALIDATOR}" --validate-evidence "${tmp_secret_command}" 2>&1 >/dev/null || true)"
+if [[ -z "${secret_error}" || "${secret_error}" == *"sk-proj-"* ]]; then
+  emit_log \
+    "failed" \
+    "failure_injection" \
+    "unredacted_command_secret" \
+    "secret_error_leaked_or_missing" \
+    "redaction_error_contract_failed" \
+    "$(basename "${tmp_secret_command}")" \
+    "validator error failed the no-secret-leak contract"
+  exit 1
+fi
+emit_log \
+  "passed" \
+  "failure_injection" \
+  "unredacted_command_secret" \
+  "negative_guardrail_enforced" \
+  "none" \
+  "$(basename "${tmp_secret_command}")" \
+  "validator rejected secret-bearing command without echoing the raw secret"
+
+jq --arg path "${tmp_dir}/.ssh/id_ed25519" \
+  --arg path_fp "$(fingerprint_text "${tmp_dir}/.ssh/id_ed25519")" \
+  '.runs[0].target_dir = $path |
+    .runs[0].target_dir_fingerprint = $path_fp' \
+  "${tmp_valid}" > "${tmp_secret_path}"
+expect_validation_failure \
+  "${tmp_secret_path}" \
+  "failure_injection" \
+  "ssh_secret_path" \
+  "SSH-style secret paths must fail validation"
 
 jq '.bead_id = "wa-old.1"' "${tmp_valid}" > "${tmp_malformed_bead}"
 expect_validation_failure \
@@ -465,6 +629,18 @@ rg -q "validate_asupersync_rch_execution_policy.sh" "${POLICY_DOC}" || {
   exit 1
 }
 
+if rg -q "sk-proj-|Bearer abcdef|/Users/jemanuel" "${LOG_FILE}"; then
+  emit_log \
+    "failed" \
+    "redaction_helper" \
+    "aggregate_log_scan" \
+    "secret_leaked" \
+    "aggregate_output_leak" \
+    "$(basename "${LOG_FILE}")" \
+    "aggregate E2E log contains a raw fixture secret"
+  exit 1
+fi
+
 emit_log \
   "passed" \
   "doc_wiring" \
@@ -481,6 +657,6 @@ emit_log \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "ft-emjsg proof-ledger policy validation passed"
+  "ft-54ut8 proof-ledger policy validation passed"
 
-echo "ft-emjsg proof-ledger policy e2e validation passed. Log: ${LOG_FILE}"
+echo "ft-54ut8 proof-ledger policy e2e validation passed. Log: ${LOG_FILE}"

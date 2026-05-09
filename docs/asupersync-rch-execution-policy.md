@@ -1,7 +1,7 @@
 # RCH Proof Ledger Execution Policy
 
-**Bead:** `ft-emjsg`
-**Version:** `2.0.0`
+**Bead:** `ft-54ut8`
+**Version:** `3.0.0`
 **Status:** Active proof-ledger foundation
 
 ## Purpose
@@ -83,19 +83,24 @@ Every proof-ledger run must be logged with fields:
 
 1. `timestamp`
 2. `command`
-3. `command_class` (`heavy` or `light`)
-4. `is_heavy`
-5. `used_rch`
-6. `worker_context`
-7. `execution_mode` (`remote_rch`, `local_light`, or `approved_local_fallback`)
-8. `target_dir`
-9. `target_dir_lifecycle` (`not_applicable`, `retained`, `inventory_only`, or `cleanup_approved`)
-10. `artifact_paths` (each path must exist when evidence is validated)
-11. `elapsed_seconds`
-12. `exit_status`
-13. `residual_risk_notes`
-14. `validation_status` (`valid` or `approved_fallback`)
-15. Optional fallback fields when a heavy run is not confirmed as remote RCH:
+3. `command_fingerprint`
+4. `command_class` (`heavy` or `light`)
+5. `is_heavy`
+6. `used_rch`
+7. `worker_context`
+8. `worker_context_fingerprint`
+9. `execution_mode` (`remote_rch`, `local_light`, or `approved_local_fallback`)
+10. `target_dir`
+11. `target_dir_fingerprint`
+12. `target_dir_lifecycle` (`not_applicable`, `retained`, `inventory_only`, or `cleanup_approved`)
+13. `artifact_paths` (each path must exist when evidence is validated)
+14. `artifact_paths_fingerprint`
+15. `elapsed_seconds`
+16. `exit_status`
+17. `residual_risk_notes`
+18. `residual_risk_notes_fingerprint`
+19. `validation_status` (`valid` or `approved_fallback`)
+20. Optional fallback fields when a heavy run is not confirmed as remote RCH:
    - `fallback_reason_code`
    - `fallback_approved_by`
 
@@ -103,9 +108,16 @@ Heavy runs must include a real `target_dir` and a non-`not_applicable`
 `target_dir_lifecycle`. Light local checks should use `target_dir:
 "not_applicable"` and `target_dir_lifecycle: "not_applicable"`.
 
+Ledger-visible fields must already be redacted before they are written or
+cited. The validator rejects known provider tokens, bearer/JWT-like secrets,
+credential-looking key/value pairs, and SSH private-key paths in command,
+worker context, target-dir, artifact-path, and residual-risk fields. The
+`*_fingerprint` fields preserve stable correlation without requiring agents to
+print raw sensitive values.
+
 Machine-readable schema:
 
-- `docs/asupersync-rch-evidence-schema.json` (`schema_version: 2`)
+- `docs/asupersync-rch-evidence-schema.json` (`schema_version: 3`)
 
 ## Validation Tooling
 
@@ -114,6 +126,7 @@ Policy validator:
 ```bash
 bash scripts/validate_asupersync_rch_execution_policy.sh --self-test
 bash scripts/validate_asupersync_rch_execution_policy.sh --classify "cargo test --workspace"
+bash scripts/validate_asupersync_rch_execution_policy.sh --redact-text "API_KEY=... cargo test"
 bash scripts/validate_asupersync_rch_execution_policy.sh --validate-evidence <path-to-evidence.json>
 ```
 
@@ -125,7 +138,8 @@ bash tests/e2e/test_asupersync_rch_execution_policy.sh
 
 The self-test and E2E cover accepted remote proof, rejected local-heavy proof,
 accepted human-approved fallback, light local commands, stale schema versions,
-malformed bead IDs, missing artifacts, RCH setup chatter, and shell wrappers
+malformed bead IDs, missing artifacts, missing required booleans, unredacted
+provider tokens, SSH-style secret paths, RCH setup chatter, and shell wrappers
 that mention RCH while running Cargo locally.
 
 ## User Impact

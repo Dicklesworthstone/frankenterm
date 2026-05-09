@@ -3,13 +3,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCHEMA_FILE="${ROOT_DIR}/docs/asupersync-rch-evidence-schema.json"
-SCHEMA_VERSION=2
-POLICY_VERSION="2.0.0"
+SCHEMA_VERSION=3
+POLICY_VERSION="3.0.0"
+REDACTION_POLICY_VERSION="frankenterm.redactor.v1"
 
 usage() {
   cat <<'EOF'
 Usage:
   validate_asupersync_rch_execution_policy.sh --classify "<command>"
+  validate_asupersync_rch_execution_policy.sh --redact-text "<text>"
   validate_asupersync_rch_execution_policy.sh --validate-evidence <path>
   validate_asupersync_rch_execution_policy.sh --self-test
 EOF
@@ -102,6 +104,111 @@ artifact_path_exists() {
   fi
 }
 
+fingerprint_text() {
+  local text="$1"
+  local digest
+
+  if command -v shasum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${text}" | shasum -a 256 | awk '{print $1}')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${text}" | sha256sum | awk '{print $1}')"
+  else
+    echo "sha256 tool not found; install shasum or sha256sum" >&2
+    return 1
+  fi
+
+  printf 'sha256:%s' "${digest}"
+}
+
+fingerprint_artifact_paths() {
+  local run="$1"
+  local canonical
+  canonical="$(jq -c '.artifact_paths' <<<"${run}")"
+  fingerprint_text "${canonical}"
+}
+
+fingerprint_is_valid() {
+  [[ "$1" =~ ^sha256:[a-f0-9]{64}$ ]]
+}
+
+redact_proof_ledger_text() {
+  local text="$1"
+
+  perl -0pe '
+    s/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----/[REDACTED]/gs;
+    s/\bsk-ant-[A-Za-z0-9_-]{40,}/[REDACTED]/g;
+    s/\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{16,}/[REDACTED]/g;
+    s/\bgh[pousr]_[A-Za-z0-9]{20,}/[REDACTED]/g;
+    s/\bgithub_pat_[A-Za-z0-9_]{20,}/[REDACTED]/g;
+    s/\bAKIA[0-9A-Z]{16}\b/[REDACTED]/g;
+    s/\bAIza[0-9A-Za-z_-]{20,}/[REDACTED]/g;
+    s/\bya29\.[0-9A-Za-z_-]{20,}/[REDACTED]/g;
+    s/\bBearer\s+[A-Za-z0-9._\/+=-]{16,}/Bearer [REDACTED]/gi;
+    s#([?&](?:access_token|code|token)=)[^&\s"\x27]+#${1}[REDACTED]#gi;
+    s#(?i)\b(?:postgres|mysql|mongodb|redis)(?:ql)?://[^\s:]+:[^@\s]+@#[REDACTED]#g;
+    s/\b(aws_secret_access_key|api[_-]?key|apikey|access[_-]?token|token|password|secret)\s*[:=]\s*["\x27]?[^\s"\x27]{8,}/$1=[REDACTED]/gi;
+    s#(^|[^A-Za-z0-9_.-])(?:/Users|/home)/[^\s"\x27]+#${1}[REDACTED:filesystem_path]#g;
+    s#(^|[^A-Za-z0-9_.-])~/(?:\.ssh|\.config|\.aws|\.cargo)/[^\s"\x27]+#${1}[REDACTED:filesystem_path]#g;
+    s#(^|[^A-Za-z0-9_.-])/[^[:space:]"\x27]*/\.ssh/[^\s"\x27]+#${1}[REDACTED:filesystem_path]#g;
+    s#(^|[^A-Za-z0-9_.-])/[^[:space:]"\x27]*/id_(?:rsa|ed25519|ecdsa)(?:[^[:alnum:]_]|\z)#${1}[REDACTED:filesystem_path]#g;
+  ' <<<"${text}"
+}
+
+redact_text_json() {
+  local text="$1"
+  local redacted fingerprint
+
+  redacted="$(redact_proof_ledger_text "${text}")"
+  fingerprint="$(fingerprint_text "${text}")"
+
+  jq -cn \
+    --arg redaction_policy_version "${REDACTION_POLICY_VERSION}" \
+    --arg redacted "${redacted}" \
+    --arg fingerprint "${fingerprint}" \
+    '{
+      redaction_policy_version: $redaction_policy_version,
+      redacted: $redacted,
+      fingerprint: $fingerprint
+    }'
+}
+
+contains_sensitive_text() {
+  local text="$1"
+  local redacted
+
+  redacted="$(redact_proof_ledger_text "${text}")"
+  if [[ "${redacted}" != "${text}" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+require_no_sensitive_text() {
+  local label="$1"
+  local text="$2"
+
+  if contains_sensitive_text "${text}"; then
+    echo "${label} contains unredacted sensitive text; use redacted text plus fingerprint $(fingerprint_text "${text}")" >&2
+    return 1
+  fi
+}
+
+require_fingerprint() {
+  local label="$1"
+  local actual="$2"
+  local expected="$3"
+
+  fingerprint_is_valid "${actual}" || {
+    echo "${label} must be sha256:<64 lowercase hex chars>" >&2
+    return 1
+  }
+  [[ "${actual}" == "${expected}" ]] || {
+    echo "${label} mismatch: declared=${actual}, expected=${expected}" >&2
+    return 1
+  }
+}
+
 validate_evidence_file() {
   local evidence_file="$1"
 
@@ -140,19 +247,28 @@ validate_evidence_file() {
 
   local i
   for ((i = 0; i < runs_count; i++)); do
-    local run cmd declared_command_class declared_is_heavy declared_used_rch worker_context target_dir target_dir_lifecycle elapsed exit_status
+    local run cmd command_fingerprint declared_command_class declared_is_heavy declared_used_rch
+    local worker_context worker_context_fingerprint target_dir target_dir_fingerprint
+    local target_dir_lifecycle artifact_paths_fingerprint elapsed exit_status
+    local residual_risk_notes residual_risk_notes_fingerprint
     local fallback_reason fallback_approved execution_mode validation_status
 
     run="$(jq -c ".runs[${i}]" "${evidence_file}")"
     cmd="$(jq -r '.command' <<<"${run}")"
+    command_fingerprint="$(jq -r '.command_fingerprint // ""' <<<"${run}")"
     declared_command_class="$(jq -r '.command_class // ""' <<<"${run}")"
     declared_is_heavy="$(jq -r 'if has("is_heavy") then (.is_heavy | tostring) else "" end' <<<"${run}")"
     declared_used_rch="$(jq -r '.used_rch' <<<"${run}")"
     worker_context="$(jq -r '.worker_context' <<<"${run}")"
+    worker_context_fingerprint="$(jq -r '.worker_context_fingerprint // ""' <<<"${run}")"
     target_dir="$(jq -r '.target_dir // ""' <<<"${run}")"
+    target_dir_fingerprint="$(jq -r '.target_dir_fingerprint // ""' <<<"${run}")"
     target_dir_lifecycle="$(jq -r '.target_dir_lifecycle // ""' <<<"${run}")"
+    artifact_paths_fingerprint="$(jq -r '.artifact_paths_fingerprint // ""' <<<"${run}")"
     elapsed="$(jq -r '.elapsed_seconds' <<<"${run}")"
     exit_status="$(jq -r '.exit_status' <<<"${run}")"
+    residual_risk_notes="$(jq -r '.residual_risk_notes // ""' <<<"${run}")"
+    residual_risk_notes_fingerprint="$(jq -r '.residual_risk_notes_fingerprint // ""' <<<"${run}")"
     fallback_reason="$(jq -r '.fallback_reason_code // ""' <<<"${run}")"
     fallback_approved="$(jq -r '.fallback_approved_by // ""' <<<"${run}")"
     execution_mode="$(jq -r '.execution_mode // ""' <<<"${run}")"
@@ -162,6 +278,14 @@ validate_evidence_file() {
       echo "run[$i] command must be non-empty" >&2
       return 1
     }
+    require_no_sensitive_text "run[$i] command" "${cmd}" || return 1
+    require_no_sensitive_text "run[$i] worker_context" "${worker_context}" || return 1
+    require_no_sensitive_text "run[$i] target_dir" "${target_dir}" || return 1
+    require_no_sensitive_text "run[$i] residual_risk_notes" "${residual_risk_notes}" || return 1
+    require_fingerprint "run[$i] command_fingerprint" "${command_fingerprint}" "$(fingerprint_text "${cmd}")" || return 1
+    require_fingerprint "run[$i] worker_context_fingerprint" "${worker_context_fingerprint}" "$(fingerprint_text "${worker_context}")" || return 1
+    require_fingerprint "run[$i] target_dir_fingerprint" "${target_dir_fingerprint}" "$(fingerprint_text "${target_dir}")" || return 1
+    require_fingerprint "run[$i] residual_risk_notes_fingerprint" "${residual_risk_notes_fingerprint}" "$(fingerprint_text "${residual_risk_notes}")" || return 1
     [[ "${declared_command_class}" =~ ^(heavy|light)$ ]] || {
       echo "run[$i] command_class must be heavy or light" >&2
       return 1
@@ -195,11 +319,13 @@ validate_evidence_file() {
         echo "run[$i] artifact_paths[$j] must be non-empty" >&2
         return 1
       }
+      require_no_sensitive_text "run[$i] artifact_paths[$j]" "${artifact_path}" || return 1
       artifact_path_exists "${artifact_path}" || {
-        echo "run[$i] artifact_paths[$j] does not exist: ${artifact_path}" >&2
+        echo "run[$i] artifact_paths[$j] does not exist: $(redact_proof_ledger_text "${artifact_path}")" >&2
         return 1
       }
     done
+    require_fingerprint "run[$i] artifact_paths_fingerprint" "${artifact_paths_fingerprint}" "$(fingerprint_artifact_paths "${run}")" || return 1
     jq -e '.residual_risk_notes | type == "string"' <<<"${run}" >/dev/null || {
       echo "run[$i] residual_risk_notes must be string" >&2
       return 1
@@ -384,49 +510,77 @@ run_self_test() {
     return 1
   }
 
-  local tmp_dir tmp_evidence tmp_artifact
+  local tmp_dir tmp_evidence tmp_artifact tmp_artifact_rel
   tmp_dir="${ROOT_DIR}/target/rch-policy-self-test/$(date -u +%Y%m%d_%H%M%S)-$$"
   mkdir -p "${tmp_dir}"
   tmp_artifact="${tmp_dir}/mock.jsonl"
+  tmp_artifact_rel="${tmp_artifact#"${ROOT_DIR}"/}"
   printf '{"mock":true}\n' > "${tmp_artifact}"
   tmp_evidence="${tmp_dir}/valid-evidence.json"
+  local remote_cmd remote_worker remote_target light_cmd_value light_worker light_target
+  local remote_cmd_fp remote_worker_fp remote_target_fp light_cmd_fp light_worker_fp light_target_fp
+  local artifact_paths_fp empty_fp
+  remote_cmd="rch exec -- cargo test --workspace"
+  remote_worker="worker=mock-1"
+  remote_target="/tmp/ft-54ut8-rch-target"
+  light_cmd_value="cargo fmt --check"
+  light_worker="local"
+  light_target="not_applicable"
+  remote_cmd_fp="$(fingerprint_text "${remote_cmd}")"
+  remote_worker_fp="$(fingerprint_text "${remote_worker}")"
+  remote_target_fp="$(fingerprint_text "${remote_target}")"
+  light_cmd_fp="$(fingerprint_text "${light_cmd_value}")"
+  light_worker_fp="$(fingerprint_text "${light_worker}")"
+  light_target_fp="$(fingerprint_text "${light_target}")"
+  artifact_paths_fp="$(fingerprint_text "$(jq -cn --arg path "${tmp_artifact_rel}" '[$path]')")"
+  empty_fp="$(fingerprint_text "")"
 
   cat > "${tmp_evidence}" <<JSON
 {
   "schema_version": ${SCHEMA_VERSION},
-  "bead_id": "ft-emjsg",
+  "bead_id": "ft-54ut8",
   "policy_version": "${POLICY_VERSION}",
   "runs": [
     {
       "timestamp": "2026-02-25T00:00:00Z",
-      "command": "rch exec -- cargo test --workspace",
+      "command": "${remote_cmd}",
+      "command_fingerprint": "${remote_cmd_fp}",
       "command_class": "heavy",
       "is_heavy": true,
       "used_rch": true,
-      "worker_context": "worker=mock-1",
+      "worker_context": "${remote_worker}",
+      "worker_context_fingerprint": "${remote_worker_fp}",
       "execution_mode": "remote_rch",
-      "target_dir": "/tmp/ft-emjsg-rch-target",
+      "target_dir": "${remote_target}",
+      "target_dir_fingerprint": "${remote_target_fp}",
       "target_dir_lifecycle": "retained",
-      "artifact_paths": ["${tmp_artifact}"],
+      "artifact_paths": ["${tmp_artifact_rel}"],
+      "artifact_paths_fingerprint": "${artifact_paths_fp}",
       "elapsed_seconds": 12.2,
       "exit_status": 0,
       "residual_risk_notes": "",
+      "residual_risk_notes_fingerprint": "${empty_fp}",
       "validation_status": "valid"
     },
     {
       "timestamp": "2026-02-25T00:01:00Z",
-      "command": "cargo fmt --check",
+      "command": "${light_cmd_value}",
+      "command_fingerprint": "${light_cmd_fp}",
       "command_class": "light",
       "is_heavy": false,
       "used_rch": false,
-      "worker_context": "local",
+      "worker_context": "${light_worker}",
+      "worker_context_fingerprint": "${light_worker_fp}",
       "execution_mode": "local_light",
-      "target_dir": "not_applicable",
+      "target_dir": "${light_target}",
+      "target_dir_fingerprint": "${light_target_fp}",
       "target_dir_lifecycle": "not_applicable",
-      "artifact_paths": ["${tmp_artifact}"],
+      "artifact_paths": ["${tmp_artifact_rel}"],
+      "artifact_paths_fingerprint": "${artifact_paths_fp}",
       "elapsed_seconds": 0.4,
       "exit_status": 0,
       "residual_risk_notes": "",
+      "residual_risk_notes_fingerprint": "${empty_fp}",
       "validation_status": "valid"
     }
   ]
@@ -435,18 +589,54 @@ JSON
 
   validate_evidence_file "${tmp_evidence}" >/dev/null
 
+  local redaction_probe redaction_probe_json redaction_probe_text redaction_probe_fingerprint
+  redaction_probe="API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz012345 cargo test -p frankenterm-core --manifest-path crates/frankenterm/Cargo.toml --header 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345' --ssh '-----BEGIN OPENSSH PRIVATE KEY-----abc-----END OPENSSH PRIVATE KEY-----' --path /Users/jemanuel/.ssh/id_ed25519 --safe crates/frankenterm"
+  redaction_probe_json="$(redact_text_json "${redaction_probe}")"
+  redaction_probe_text="$(jq -r '.redacted' <<<"${redaction_probe_json}")"
+  redaction_probe_fingerprint="$(jq -r '.fingerprint' <<<"${redaction_probe_json}")"
+  [[ "${redaction_probe_text}" == *"cargo test -p frankenterm-core"* ]] || {
+    echo "self-test failed: redaction must preserve non-sensitive command structure" >&2
+    return 1
+  }
+  [[ "${redaction_probe_text}" == *"crates/frankenterm"* ]] || {
+    echo "self-test failed: redaction must preserve innocuous repo-relative paths" >&2
+    return 1
+  }
+  [[ "${redaction_probe_text}" == *"[REDACTED]"* && "${redaction_probe_text}" == *"[REDACTED:filesystem_path]"* ]] || {
+    echo "self-test failed: redaction must mark secrets and sensitive filesystem paths" >&2
+    return 1
+  }
+  [[ "${redaction_probe_text}" != *"sk-proj-"* && "${redaction_probe_text}" != *"Bearer abcdef"* && "${redaction_probe_text}" != *"/Users/jemanuel"* ]] || {
+    echo "self-test failed: redaction leaked a fixture secret" >&2
+    return 1
+  }
+  fingerprint_is_valid "${redaction_probe_fingerprint}" || {
+    echo "self-test failed: redaction helper must emit a stable sha256 fingerprint" >&2
+    return 1
+  }
+
   local tmp_fail_open tmp_fail_open_recovered tmp_sync_chatter tmp_shell_wrapper
-  local tmp_missing_artifact tmp_missing_is_heavy tmp_malformed_bead tmp_stale_schema
+  local tmp_missing_artifact tmp_missing_is_heavy tmp_secret_command tmp_secret_path
+  local tmp_malformed_bead tmp_stale_schema
   tmp_fail_open="${tmp_dir}/fail-open.json"
   tmp_fail_open_recovered="${tmp_dir}/fail-open-recovered.json"
   tmp_sync_chatter="${tmp_dir}/sync-chatter.json"
   tmp_shell_wrapper="${tmp_dir}/shell-wrapper.json"
   tmp_missing_artifact="${tmp_dir}/missing-artifact.json"
   tmp_missing_is_heavy="${tmp_dir}/missing-is-heavy.json"
+  tmp_secret_command="${tmp_dir}/secret-command.json"
+  tmp_secret_path="${tmp_dir}/secret-path.json"
   tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
   tmp_stale_schema="${tmp_dir}/stale-schema.json"
 
-  jq '.runs[0].worker_context = "local_fallback" | .runs[0].execution_mode = "remote_rch"' \
+  local local_fallback_worker local_fallback_worker_fp
+  local_fallback_worker="local_fallback"
+  local_fallback_worker_fp="$(fingerprint_text "${local_fallback_worker}")"
+  jq --arg worker "${local_fallback_worker}" \
+    --arg worker_fp "${local_fallback_worker_fp}" \
+    '.runs[0].worker_context = $worker |
+      .runs[0].worker_context_fingerprint = $worker_fp |
+      .runs[0].execution_mode = "remote_rch"' \
     "${tmp_evidence}" > "${tmp_fail_open}"
 
   if validate_evidence_file "${tmp_fail_open}" >/dev/null 2>&1; then
@@ -461,7 +651,13 @@ JSON
     "${tmp_fail_open}" > "${tmp_fail_open_recovered}"
   validate_evidence_file "${tmp_fail_open_recovered}" >/dev/null
 
-  jq '.runs[0].command = "rch status && cargo test --workspace" |
+  local sync_chatter_cmd sync_chatter_cmd_fp
+  sync_chatter_cmd="rch status && cargo test --workspace"
+  sync_chatter_cmd_fp="$(fingerprint_text "${sync_chatter_cmd}")"
+  jq --arg cmd "${sync_chatter_cmd}" \
+    --arg cmd_fp "${sync_chatter_cmd_fp}" \
+    '.runs[0].command = $cmd |
+      .runs[0].command_fingerprint = $cmd_fp |
       .runs[0].used_rch = true |
       .runs[0].execution_mode = "remote_rch"' \
     "${tmp_evidence}" > "${tmp_sync_chatter}"
@@ -470,7 +666,13 @@ JSON
     return 1
   fi
 
-  jq '.runs[0].command = "bash -lc '\''echo rch exec -- cargo test; cargo test --workspace'\''" |
+  local shell_wrapper_cmd shell_wrapper_cmd_fp
+  shell_wrapper_cmd="bash -lc 'echo rch exec -- cargo test; cargo test --workspace'"
+  shell_wrapper_cmd_fp="$(fingerprint_text "${shell_wrapper_cmd}")"
+  jq --arg cmd "${shell_wrapper_cmd}" \
+    --arg cmd_fp "${shell_wrapper_cmd_fp}" \
+    '.runs[0].command = $cmd |
+      .runs[0].command_fingerprint = $cmd_fp |
       .runs[0].used_rch = true |
       .runs[0].execution_mode = "remote_rch"' \
     "${tmp_evidence}" > "${tmp_shell_wrapper}"
@@ -479,7 +681,13 @@ JSON
     return 1
   fi
 
-  jq --arg missing "${tmp_dir}/missing.jsonl" '.runs[0].artifact_paths = [$missing]' \
+  local missing_artifact_path missing_artifact_fp
+  missing_artifact_path="${tmp_artifact_rel%/*}/missing.jsonl"
+  missing_artifact_fp="$(fingerprint_text "$(jq -cn --arg path "${missing_artifact_path}" '[$path]')")"
+  jq --arg missing "${missing_artifact_path}" \
+    --arg artifact_fp "${missing_artifact_fp}" \
+    '.runs[0].artifact_paths = [$missing] |
+      .runs[0].artifact_paths_fingerprint = $artifact_fp' \
     "${tmp_evidence}" > "${tmp_missing_artifact}"
   if validate_evidence_file "${tmp_missing_artifact}" >/dev/null 2>&1; then
     echo "self-test failed: missing artifact paths must be rejected" >&2
@@ -489,6 +697,36 @@ JSON
   jq 'del(.runs[0].is_heavy)' "${tmp_evidence}" > "${tmp_missing_is_heavy}"
   if validate_evidence_file "${tmp_missing_is_heavy}" >/dev/null 2>&1; then
     echo "self-test failed: missing is_heavy must be rejected" >&2
+    return 1
+  fi
+
+  local secret_cmd secret_cmd_fp secret_path secret_path_fp
+  secret_cmd="API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz rch exec -- cargo test --workspace"
+  secret_cmd_fp="$(fingerprint_text "${secret_cmd}")"
+  jq --arg cmd "${secret_cmd}" \
+    --arg cmd_fp "${secret_cmd_fp}" \
+    '.runs[0].command = $cmd |
+      .runs[0].command_fingerprint = $cmd_fp' \
+    "${tmp_evidence}" > "${tmp_secret_command}"
+  local secret_error
+  if secret_error="$(validate_evidence_file "${tmp_secret_command}" 2>&1 >/dev/null)"; then
+    echo "self-test failed: unredacted secret-bearing command must be rejected" >&2
+    return 1
+  fi
+  [[ "${secret_error}" != *"sk-proj-"* ]] || {
+    echo "self-test failed: validator error leaked the raw command secret" >&2
+    return 1
+  }
+
+  secret_path="${tmp_dir}/.ssh/id_ed25519"
+  secret_path_fp="$(fingerprint_text "${secret_path}")"
+  jq --arg path "${secret_path}" \
+    --arg path_fp "${secret_path_fp}" \
+    '.runs[0].target_dir = $path |
+      .runs[0].target_dir_fingerprint = $path_fp' \
+    "${tmp_evidence}" > "${tmp_secret_path}"
+  if validate_evidence_file "${tmp_secret_path}" >/dev/null 2>&1; then
+    echo "self-test failed: SSH-style secret path must be rejected" >&2
     return 1
   fi
 
@@ -520,6 +758,14 @@ case "$1" in
       exit 1
     fi
     classify_command_json "$1"
+    ;;
+  --redact-text)
+    shift
+    if [[ $# -ne 1 ]]; then
+      usage
+      exit 1
+    fi
+    redact_text_json "$1"
     ;;
   --validate-evidence)
     shift

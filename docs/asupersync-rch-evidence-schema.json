@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "ft.rch.proof-ledger.evidence.schema.v2",
+  "$id": "ft.rch.proof-ledger.evidence.schema.v3",
   "title": "FrankenTerm RCH Proof Ledger Evidence Schema",
   "type": "object",
   "required": [
@@ -12,7 +12,7 @@
   "properties": {
     "schema_version": {
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "bead_id": {
       "type": "string",
@@ -30,17 +30,22 @@
         "required": [
           "timestamp",
           "command",
+          "command_fingerprint",
           "command_class",
           "is_heavy",
           "used_rch",
           "worker_context",
+          "worker_context_fingerprint",
           "execution_mode",
           "target_dir",
+          "target_dir_fingerprint",
           "target_dir_lifecycle",
           "artifact_paths",
+          "artifact_paths_fingerprint",
           "elapsed_seconds",
           "exit_status",
           "residual_risk_notes",
+          "residual_risk_notes_fingerprint",
           "validation_status"
         ],
         "properties": {
@@ -51,6 +56,10 @@
           "command": {
             "type": "string",
             "minLength": 1
+          },
+          "command_fingerprint": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
           },
           "command_class": {
             "type": "string",
@@ -69,6 +78,10 @@
             "type": "string",
             "minLength": 1
           },
+          "worker_context_fingerprint": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
           "execution_mode": {
             "type": "string",
             "enum": [
@@ -80,6 +93,10 @@
           "target_dir": {
             "type": "string",
             "minLength": 1
+          },
+          "target_dir_fingerprint": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
           },
           "target_dir_lifecycle": {
             "type": "string",
@@ -98,6 +115,10 @@
               "minLength": 1
             }
           },
+          "artifact_paths_fingerprint": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
           "elapsed_seconds": {
             "type": "number",
             "minimum": 0
@@ -107,6 +128,10 @@
           },
           "residual_risk_notes": {
             "type": "string"
+          },
+          "residual_risk_notes_fingerprint": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
           },
           "validation_status": {
             "type": "string",
