@@ -143,7 +143,11 @@ Allowed during worker-specific RCH incidents:
   inspection.
 - A material proof command through `rch exec -- ...` or a fail-closed harness.
 - A read-only mirror attestation that checks HEAD and tracked file presence on
-  the selected worker.
+  the selected worker. Use `scripts/attest_rch_worker_mirror.sh --worker <id>
+  --path <tracked-file> ...` for this static-only evidence; it emits
+  `kind: "rch_selected_worker_mirror_attestation"` with reason codes such as
+  `rch_mirror.project_path_absent`, `rch_mirror.head_mismatch`,
+  `rch_mirror.missing_tracked_file`, and `rch_mirror.worker_unreachable`.
 - Reopening or blocking a bead with exact artifact paths and reason codes when
   the worker-specific proof cannot be trusted.
 
