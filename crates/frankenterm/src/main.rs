@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Cursor, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -8403,6 +8403,29 @@ fn robot_fleet_claimed_work_counts(
     (counts, None)
 }
 
+#[derive(Debug, Clone)]
+struct RobotFleetRebalanceAgent {
+    pane_id: u64,
+    agent_id: String,
+    program: String,
+    state: String,
+    state_bucket: &'static str,
+    load: usize,
+}
+
+impl RobotFleetRebalanceAgent {
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "pane_id": self.pane_id,
+            "agent_id": self.agent_id,
+            "program": self.program,
+            "state": self.state,
+            "state_bucket": self.state_bucket,
+            "claimed_work_count": self.load,
+        })
+    }
+}
+
 fn robot_fleet_normalized_program_slug(program: &str) -> String {
     frankenterm_core::agent_provider::AgentProvider::from_slug(program.trim())
         .canonical_slug()
@@ -8797,13 +8820,783 @@ fn robot_fleet_scale_failure(
     None
 }
 
+fn robot_fleet_rebalance_strategy_name(strategy: &str) -> Result<&'static str, String> {
+    match strategy
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "" | "load" | "load_based" => Ok("load_based"),
+        "capability" | "capability_based" => Ok("capability_based"),
+        "round" | "round_robin" | "roundrobin" => Ok("round_robin"),
+        other => Err(format!(
+            "unsupported fleet rebalance strategy `{other}`; expected load_based, capability_based, or round_robin"
+        )),
+    }
+}
+
+fn robot_fleet_rebalance_work_rows(db_path: &str) -> (Vec<RobotWorkRow>, Option<String>) {
+    let conn = match robot_work_open_conn(db_path) {
+        Ok(conn) => conn,
+        Err(err) => return (Vec::new(), Some(err.to_string())),
+    };
+
+    let mut stmt = match conn.prepare(
+        r"
+        SELECT claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
+               claimed_at_ms, completed_at_ms, summary, evidence_json, blocked_by_count,
+               unblocks_count, last_reason
+        FROM work_claims
+        ORDER BY priority ASC, claim_id ASC
+        ",
+    ) {
+        Ok(stmt) => stmt,
+        Err(err) => return (Vec::new(), Some(err.to_string())),
+    };
+
+    let rows = match stmt.query_map([], robot_work_row_from_sql) {
+        Ok(rows) => rows,
+        Err(err) => return (Vec::new(), Some(err.to_string())),
+    };
+
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            Ok(row) => out.push(row),
+            Err(err) => return (Vec::new(), Some(err.to_string())),
+        }
+    }
+    (out, None)
+}
+
+fn robot_fleet_rebalance_agents(
+    running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    rows: &[RobotWorkRow],
+) -> (
+    Vec<RobotFleetRebalanceAgent>,
+    BTreeSet<String>,
+    BTreeMap<String, &'static str>,
+) {
+    let mut all_agent_ids = BTreeSet::new();
+    let mut state_by_agent = BTreeMap::new();
+    let mut agents = Vec::new();
+
+    for (pane_id, entry) in running_agents {
+        let agent_id = robot_fleet_agent_id(*pane_id, entry);
+        let state_bucket = robot_fleet_state_bucket(&entry.state);
+        all_agent_ids.insert(agent_id.clone());
+        state_by_agent.insert(agent_id.clone(), state_bucket);
+        if state_bucket != "stalled" {
+            agents.push(RobotFleetRebalanceAgent {
+                pane_id: *pane_id,
+                agent_id,
+                program: entry.slug.clone(),
+                state: entry.state.clone(),
+                state_bucket,
+                load: 0,
+            });
+        }
+    }
+
+    agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+    let index_by_agent = agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| (agent.agent_id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    for row in rows {
+        if row.state == "claimed"
+            && let Some(owner) = row.owner.as_deref()
+            && let Some(index) = index_by_agent.get(owner).copied()
+            && let Some(agent) = agents.get_mut(index)
+        {
+            agent.load = agent.load.saturating_add(1);
+        }
+    }
+
+    (agents, all_agent_ids, state_by_agent)
+}
+
+fn robot_fleet_rebalance_marker_contains(row: &RobotWorkRow, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    robot_work_parse_string_array(&row.labels_json)
+        .iter()
+        .any(|label| label.to_ascii_lowercase().contains(&needle))
+        || row
+            .last_reason
+            .as_deref()
+            .is_some_and(|reason| reason.to_ascii_lowercase().contains(&needle))
+}
+
+fn robot_fleet_rebalance_skip_item(
+    row: &RobotWorkRow,
+    reason_code: &str,
+    message: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "item_id": row.claim_id,
+        "from_agent": row.owner,
+        "state": row.state,
+        "priority": robot_work_priority(row.priority),
+        "blocked_by_count": robot_work_count(row.blocked_by_count),
+        "labels": robot_work_parse_string_array(&row.labels_json),
+        "reason_code": reason_code,
+        "message": message,
+        "policy_decision": "skip",
+    })
+}
+
+fn robot_fleet_rebalance_ineligible_skip(
+    row: &RobotWorkRow,
+    all_agent_ids: &BTreeSet<String>,
+    state_by_agent: &BTreeMap<String, &'static str>,
+) -> Option<serde_json::Value> {
+    if row.state == "completed" {
+        return Some(robot_fleet_rebalance_skip_item(
+            row,
+            "completed_work_item",
+            "completed work is durable and cannot be reassigned",
+        ));
+    }
+
+    if robot_fleet_rebalance_marker_contains(row, "approval") {
+        return Some(robot_fleet_rebalance_skip_item(
+            row,
+            "approval_blocked_work_item",
+            "work item carries approval-blocking metadata",
+        ));
+    }
+
+    if robot_fleet_rebalance_marker_contains(row, "reserved")
+        || robot_fleet_rebalance_marker_contains(row, "reservation")
+    {
+        return Some(robot_fleet_rebalance_skip_item(
+            row,
+            "reserved_work_item",
+            "reserved work requires the current owner to release it first",
+        ));
+    }
+
+    if row.blocked_by_count > 0 {
+        return Some(robot_fleet_rebalance_skip_item(
+            row,
+            "blocked_dependencies_present",
+            "blocked work cannot be reassigned by fleet rebalance",
+        ));
+    }
+
+    if row.state != "claimed" {
+        return Some(robot_fleet_rebalance_skip_item(
+            row,
+            "not_claimed",
+            "fleet rebalance only moves currently claimed work",
+        ));
+    }
+
+    let Some(owner) = row.owner.as_deref() else {
+        return Some(robot_fleet_rebalance_skip_item(
+            row,
+            "missing_owner",
+            "claimed work has no owner to rebalance from",
+        ));
+    };
+
+    if !all_agent_ids.contains(owner) {
+        return Some(robot_fleet_rebalance_skip_item(
+            row,
+            "externally_owned_work_item",
+            "work owner is not a currently running fleet agent",
+        ));
+    }
+
+    if state_by_agent.get(owner).copied() == Some("stalled") {
+        return Some(robot_fleet_rebalance_skip_item(
+            row,
+            "owner_requires_inspection",
+            "owner is stalled or approval-waiting; inspect before moving work",
+        ));
+    }
+
+    None
+}
+
+fn robot_fleet_rebalance_agent_index(
+    agents: &[RobotFleetRebalanceAgent],
+    agent_id: &str,
+) -> Option<usize> {
+    agents.iter().position(|agent| agent.agent_id == agent_id)
+}
+
+fn robot_fleet_rebalance_min_load_agent(
+    agents: &[RobotFleetRebalanceAgent],
+    excluded_index: usize,
+) -> Option<usize> {
+    agents
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != excluded_index)
+        .min_by(|(_, left), (_, right)| {
+            left.load
+                .cmp(&right.load)
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        })
+        .map(|(index, _)| index)
+}
+
+fn robot_fleet_rebalance_capability_rank(agent: &RobotFleetRebalanceAgent) -> usize {
+    match agent.state_bucket {
+        "idle" => 0,
+        "active" => 1,
+        _ => 2,
+    }
+}
+
+fn robot_fleet_rebalance_capability_agent(
+    agents: &[RobotFleetRebalanceAgent],
+    excluded_index: usize,
+) -> Option<usize> {
+    agents
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != excluded_index)
+        .min_by(|(_, left), (_, right)| {
+            robot_fleet_rebalance_capability_rank(left)
+                .cmp(&robot_fleet_rebalance_capability_rank(right))
+                .then_with(|| left.load.cmp(&right.load))
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        })
+        .map(|(index, _)| index)
+}
+
+fn robot_fleet_rebalance_round_robin_agent(
+    agents: &[RobotFleetRebalanceAgent],
+    excluded_index: usize,
+    cursor: &mut usize,
+) -> Option<usize> {
+    if agents.len() < 2 {
+        return None;
+    }
+
+    for offset in 0..agents.len() {
+        let index = (*cursor + offset) % agents.len();
+        if index != excluded_index {
+            *cursor = (index + 1) % agents.len();
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn robot_fleet_rebalance_target_index(
+    strategy_name: &str,
+    agents: &[RobotFleetRebalanceAgent],
+    from_index: usize,
+    round_robin_cursor: &mut usize,
+) -> Option<usize> {
+    match strategy_name {
+        "round_robin" => {
+            robot_fleet_rebalance_round_robin_agent(agents, from_index, round_robin_cursor)
+        }
+        "capability_based" => {
+            let target_index = robot_fleet_rebalance_capability_agent(agents, from_index)?;
+            let from = &agents[from_index];
+            let target = &agents[target_index];
+            let target_has_better_state = robot_fleet_rebalance_capability_rank(target)
+                < robot_fleet_rebalance_capability_rank(from);
+            if target.load.saturating_add(1) < from.load
+                || (target_has_better_state && target.load < from.load)
+            {
+                Some(target_index)
+            } else {
+                None
+            }
+        }
+        _ => {
+            let target_index = robot_fleet_rebalance_min_load_agent(agents, from_index)?;
+            if agents[target_index].load.saturating_add(1) < agents[from_index].load {
+                Some(target_index)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn robot_fleet_rebalance_step(
+    step_id: String,
+    row: &RobotWorkRow,
+    from_agent: &str,
+    to_agent: &str,
+    reason: &str,
+) -> frankenterm_core::fleet_mutation::FleetMutationStep {
+    frankenterm_core::fleet_mutation::FleetMutationStep {
+        step_id,
+        action: frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork {
+            work_item_id: row.claim_id.clone(),
+            from_agent: Some(from_agent.to_string()),
+            to_agent: to_agent.to_string(),
+            reason: reason.to_string(),
+        },
+        policy: frankenterm_core::fleet_mutation::FleetMutationPolicyDecision::Allow,
+        compensation: Some(
+            frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork {
+                work_item_id: row.claim_id.clone(),
+                from_agent: Some(to_agent.to_string()),
+                to_agent: from_agent.to_string(),
+                reason: format!("rollback {reason}"),
+            },
+        ),
+    }
+}
+
+fn robot_fleet_rebalance_plan(
+    strategy: &str,
+    dry_run: bool,
+    running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    running_error: Option<String>,
+    work_rows: &[RobotWorkRow],
+    work_queue_error: Option<String>,
+) -> (
+    serde_json::Value,
+    Option<frankenterm_core::fleet_mutation::FleetMutationPlan>,
+) {
+    use frankenterm_core::fleet_mutation::FleetMutationPlan;
+
+    let (strategy_name, strategy_error) = match robot_fleet_rebalance_strategy_name(strategy) {
+        Ok(strategy_name) => (strategy_name, None),
+        Err(err) => ("invalid", Some(err)),
+    };
+    let mut data = serde_json::json!({
+        "family": "fleet",
+        "action": "rebalance",
+        "backend": "native_agent_inventory",
+        "mutation_backend": "fleet_mutation_substrate",
+        "live_cli_contract": "status_scale_rebalance_agents",
+        "requested": {
+            "strategy": strategy,
+            "strategy_normalized": strategy_name,
+            "dry_run": dry_run,
+        },
+        "status": "not_started",
+        "strategy": strategy_name,
+        "dry_run": dry_run,
+        "items_reassigned": 0usize,
+        "reassignments": [],
+        "skipped_work_items": [],
+        "agent_loads_before": [],
+        "agent_loads_after": [],
+        "running_inventory": {
+            "ok": running_error.is_none(),
+            "error": running_error,
+            "count": running_agents.len(),
+        },
+        "work_queue": {
+            "ok": work_queue_error.is_none(),
+            "error": work_queue_error,
+            "storage_table": "work_claims",
+            "owner_convention": "<program_slug>:<pane_id>",
+            "rows_scanned": work_rows.len(),
+        },
+        "plan": null,
+        "receipt": null,
+    });
+
+    if let Some(err) = strategy_error {
+        data["status"] = serde_json::json!("invalid_strategy");
+        data["reason_code"] = serde_json::json!("invalid_strategy");
+        data["error"] = serde_json::json!(err);
+        return (data, None);
+    }
+
+    if running_error.is_some() {
+        data["status"] = serde_json::json!("running_inventory_unavailable");
+        data["reason_code"] = serde_json::json!("running_inventory_unavailable");
+        return (data, None);
+    }
+
+    if work_queue_error.is_some() {
+        data["status"] = serde_json::json!("work_queue_unavailable");
+        data["reason_code"] = serde_json::json!("work_queue_unavailable");
+        return (data, None);
+    }
+
+    let (mut agents, all_agent_ids, state_by_agent) =
+        robot_fleet_rebalance_agents(running_agents, work_rows);
+    let agent_loads_before = agents
+        .iter()
+        .map(RobotFleetRebalanceAgent::as_json)
+        .collect::<Vec<_>>();
+    data["agent_loads_before"] = serde_json::json!(agent_loads_before);
+
+    if agents.len() < 2 {
+        data["status"] = serde_json::json!("no_eligible_agents");
+        data["reason_code"] = serde_json::json!("no_eligible_agents");
+        data["agent_loads_after"] = serde_json::json!(
+            agents
+                .iter()
+                .map(RobotFleetRebalanceAgent::as_json)
+                .collect::<Vec<_>>()
+        );
+        return (data, None);
+    }
+
+    let mut steps = Vec::new();
+    let mut reassignments = Vec::new();
+    let mut skipped_work_items = Vec::new();
+    let mut round_robin_cursor = 0usize;
+    let mut ordered_rows = work_rows.iter().collect::<Vec<_>>();
+    ordered_rows.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.claim_id.cmp(&right.claim_id))
+    });
+
+    for row in ordered_rows {
+        if let Some(skip) =
+            robot_fleet_rebalance_ineligible_skip(row, &all_agent_ids, &state_by_agent)
+        {
+            skipped_work_items.push(skip);
+            continue;
+        }
+
+        let Some(from_agent) = row.owner.as_deref() else {
+            skipped_work_items.push(robot_fleet_rebalance_skip_item(
+                row,
+                "missing_owner",
+                "claimed work has no owner to rebalance from",
+            ));
+            continue;
+        };
+        let Some(from_index) = robot_fleet_rebalance_agent_index(&agents, from_agent) else {
+            skipped_work_items.push(robot_fleet_rebalance_skip_item(
+                row,
+                "owner_not_reassignable",
+                "current owner is not an eligible rebalance source",
+            ));
+            continue;
+        };
+        let Some(target_index) = robot_fleet_rebalance_target_index(
+            strategy_name,
+            &agents,
+            from_index,
+            &mut round_robin_cursor,
+        ) else {
+            skipped_work_items.push(robot_fleet_rebalance_skip_item(
+                row,
+                "already_balanced",
+                "strategy did not find a safer target for this item",
+            ));
+            continue;
+        };
+
+        let from_load_before = agents[from_index].load;
+        let to_load_before = agents[target_index].load;
+        let to_agent = agents[target_index].agent_id.clone();
+        let reason = format!(
+            "{strategy_name}: {} load {from_load_before} -> {} load {to_load_before}",
+            from_agent, to_agent
+        );
+        let step_id = format!("reassign-{strategy_name}-{}", steps.len() + 1);
+        let step = robot_fleet_rebalance_step(step_id.clone(), row, from_agent, &to_agent, &reason);
+        agents[from_index].load = agents[from_index].load.saturating_sub(1);
+        agents[target_index].load = agents[target_index].load.saturating_add(1);
+        reassignments.push(serde_json::json!({
+            "operation": "reassign_work",
+            "step_id": step_id,
+            "item_id": row.claim_id,
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+            "reason": reason,
+            "policy_decision": "allow",
+        }));
+        steps.push(step);
+    }
+
+    data["items_reassigned"] = serde_json::json!(steps.len());
+    data["reassignments"] = serde_json::json!(reassignments);
+    data["skipped_work_items"] = serde_json::json!(skipped_work_items);
+    data["agent_loads_after"] = serde_json::json!(
+        agents
+            .iter()
+            .map(RobotFleetRebalanceAgent::as_json)
+            .collect::<Vec<_>>()
+    );
+
+    if steps.is_empty() {
+        data["status"] = serde_json::json!("no_eligible_reassignments");
+        data["reason_code"] = serde_json::json!("no_eligible_reassignments");
+        return (data, None);
+    }
+
+    data["status"] = serde_json::json!("rebalance_plan_created");
+    let plan_id = format!("fleet-rebalance:{strategy_name}:{}-items", work_rows.len());
+    let plan = FleetMutationPlan::new(plan_id, dry_run, steps);
+    data["plan"] = serde_json::to_value(&plan).unwrap_or_else(|err| {
+        serde_json::json!({
+            "serialization_error": err.to_string(),
+        })
+    });
+    (data, Some(plan))
+}
+
+fn robot_fleet_rebalance_data_with_executor<
+    E: frankenterm_core::fleet_mutation::FleetMutationExecutor,
+>(
+    strategy: &str,
+    dry_run: bool,
+    running_agents: BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    running_error: Option<String>,
+    work_rows: Vec<RobotWorkRow>,
+    work_queue_error: Option<String>,
+    ledger: &mut frankenterm_core::fleet_mutation::FleetMutationLedger,
+    executor: &mut E,
+) -> Result<serde_json::Value, frankenterm_core::fleet_mutation::FleetMutationPlanError> {
+    let (mut data, plan) = robot_fleet_rebalance_plan(
+        strategy,
+        dry_run,
+        &running_agents,
+        running_error,
+        &work_rows,
+        work_queue_error,
+    );
+
+    if let Some(plan) = plan {
+        let receipt = ledger.execute_plan(&plan, executor)?;
+        data["receipt"] = serde_json::to_value(&receipt).unwrap_or_else(|err| {
+            serde_json::json!({
+                "serialization_error": err.to_string(),
+            })
+        });
+    }
+
+    Ok(data)
+}
+
+fn robot_fleet_rebalance_failure(
+    data: &serde_json::Value,
+    dry_run: bool,
+) -> Option<(&'static str, String, Option<String>)> {
+    let status = data
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match status {
+        "invalid_strategy" => {
+            return Some((
+                ROBOT_ERR_INVALID_ARGS,
+                data.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("invalid fleet rebalance strategy")
+                    .to_string(),
+                Some("Use --strategy load_based, capability_based, or round_robin.".to_string()),
+            ));
+        }
+        "running_inventory_unavailable" => {
+            return Some((
+                "robot.fleet.inventory_unavailable",
+                "ft robot fleet rebalance cannot choose safe targets because running agent inventory is unavailable".to_string(),
+                Some("Retry after the terminal inventory backend is reachable; no fleet mutation was attempted.".to_string()),
+            ));
+        }
+        "work_queue_unavailable" => {
+            return Some((
+                "robot.fleet.work_queue_unavailable",
+                "ft robot fleet rebalance cannot inspect durable work assignments".to_string(),
+                Some("Check the workspace database path and permissions; no fleet mutation was attempted.".to_string()),
+            ));
+        }
+        _ => {}
+    }
+
+    if dry_run {
+        return None;
+    }
+
+    let receipt_status = data
+        .get("receipt")
+        .and_then(|receipt| receipt.get("status"))
+        .and_then(serde_json::Value::as_str);
+    match receipt_status {
+        Some("denied") => Some((
+            "robot.fleet.policy_denied",
+            "ft robot fleet rebalance was denied by policy before any side effect".to_string(),
+            Some("Inspect data.receipt.steps[].policy for the denial reason.".to_string()),
+        )),
+        Some("approval_required") => Some((
+            "robot.fleet.approval_required",
+            "ft robot fleet rebalance requires approval before any side effect".to_string(),
+            Some("Inspect data.receipt.steps[].policy for the approval request.".to_string()),
+        )),
+        Some("failed") | Some("compensated") | Some("compensation_failed") => Some((
+            "robot.fleet.mutation_failed",
+            "ft robot fleet rebalance mutation did not complete successfully".to_string(),
+            Some("Inspect data.receipt for completed, failed, and compensated steps.".to_string()),
+        )),
+        _ => None,
+    }
+}
+
+fn robot_fleet_reassign_work(
+    db_path: &str,
+    work_item_id: &str,
+    from_agent: Option<&str>,
+    to_agent: &str,
+    reason: &str,
+) -> Result<
+    frankenterm_core::fleet_mutation::FleetMutationStepOutput,
+    frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+> {
+    if work_item_id.trim().is_empty() || to_agent.trim().is_empty() {
+        return Err(
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.validation_failed",
+                "work item id and target agent must not be empty",
+            ),
+        );
+    }
+
+    let mut conn = robot_work_open_conn(db_path).map_err(|err| {
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+            "robot.fleet.work_queue_unavailable",
+            format!("failed to open work queue for rebalance: {err}"),
+        )
+    })?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| {
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.work_queue_unavailable",
+                format!("failed to lock work queue for rebalance: {err}"),
+            )
+        })?;
+
+    let row = robot_work_fetch_row_tx(&tx, work_item_id)
+        .map_err(|err| {
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.work_queue_unavailable",
+                format!("failed to read work item `{work_item_id}`: {err}"),
+            )
+        })?
+        .ok_or_else(|| {
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.work_item_not_found",
+                format!("work item `{work_item_id}` was not found"),
+            )
+        })?;
+
+    if row.state == "completed" {
+        return Err(
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.work_item_completed",
+                format!("completed work item `{work_item_id}` cannot be reassigned"),
+            ),
+        );
+    }
+    if row.blocked_by_count > 0 {
+        return Err(
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.work_item_blocked",
+                format!("blocked work item `{work_item_id}` cannot be reassigned"),
+            ),
+        );
+    }
+    if robot_fleet_rebalance_marker_contains(&row, "approval") {
+        return Err(
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.work_item_approval_blocked",
+                format!("approval-blocked work item `{work_item_id}` cannot be reassigned"),
+            ),
+        );
+    }
+    if robot_fleet_rebalance_marker_contains(&row, "reserved")
+        || robot_fleet_rebalance_marker_contains(&row, "reservation")
+    {
+        return Err(
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.work_item_reserved",
+                format!("reserved work item `{work_item_id}` cannot be reassigned"),
+            ),
+        );
+    }
+
+    match (from_agent, row.owner.as_deref()) {
+        (Some(expected), Some(current)) if expected == current => {}
+        (Some(expected), current) => {
+            return Err(
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.reassign_conflict",
+                    format!(
+                        "work item `{work_item_id}` owner changed before rebalance commit (expected {expected}, found {})",
+                        current.unwrap_or("<unclaimed>")
+                    ),
+                ),
+            );
+        }
+        (None, None) => {}
+        (None, Some(current)) => {
+            return Err(
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.reassign_conflict",
+                    format!(
+                        "work item `{work_item_id}` is already owned by {current}; a source owner is required"
+                    ),
+                ),
+            );
+        }
+    }
+
+    let now_ms = now_ms_i64();
+    tx.execute(
+        "UPDATE work_claims
+         SET state = 'claimed', owner = ?2, claimed_at_ms = COALESCE(claimed_at_ms, ?3),
+             updated_at_ms = ?3, assign_strategy = 'fleet_rebalance', last_reason = ?4
+         WHERE claim_id = ?1",
+        rusqlite::params![work_item_id, to_agent, now_ms, reason],
+    )
+    .map_err(|err| {
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+            "robot.fleet.reassign_failed",
+            format!("failed to reassign work item `{work_item_id}`: {err}"),
+        )
+    })?;
+    tx.commit().map_err(|err| {
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+            "robot.fleet.reassign_failed",
+            format!("failed to commit reassignment for `{work_item_id}`: {err}"),
+        )
+    })?;
+
+    let mut output = frankenterm_core::fleet_mutation::FleetMutationStepOutput {
+        work_item_id: Some(work_item_id.to_string()),
+        ..frankenterm_core::fleet_mutation::FleetMutationStepOutput::default()
+    };
+    if let Some(from_agent) = from_agent {
+        output
+            .details
+            .insert("from_agent".to_string(), from_agent.to_string());
+    }
+    output
+        .details
+        .insert("to_agent".to_string(), to_agent.to_string());
+    output
+        .details
+        .insert("reason".to_string(), reason.to_string());
+    Ok(output)
+}
+
 struct RobotFleetMuxExecutor {
     mux: frankenterm_core::wezterm::MuxHandle,
+    db_path: String,
 }
 
 impl RobotFleetMuxExecutor {
-    fn new(mux: frankenterm_core::wezterm::MuxHandle) -> Self {
-        Self { mux }
+    fn new(mux: frankenterm_core::wezterm::MuxHandle, db_path: impl Into<String>) -> Self {
+        Self {
+            mux,
+            db_path: db_path.into(),
+        }
     }
 
     fn runtime() -> Result<
@@ -8906,6 +9699,19 @@ impl RobotFleetMuxExecutor {
             .insert("reason".to_string(), reason.to_string());
         Ok(output)
     }
+
+    fn reassign_work(
+        &self,
+        work_item_id: &str,
+        from_agent: Option<&str>,
+        to_agent: &str,
+        reason: &str,
+    ) -> Result<
+        frankenterm_core::fleet_mutation::FleetMutationStepOutput,
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+    > {
+        robot_fleet_reassign_work(&self.db_path, work_item_id, from_agent, to_agent, reason)
+    }
 }
 
 impl frankenterm_core::fleet_mutation::FleetMutationExecutor for RobotFleetMuxExecutor {
@@ -8934,21 +9740,18 @@ impl frankenterm_core::fleet_mutation::FleetMutationExecutor for RobotFleetMuxEx
                 pane_id,
                 reason,
             } => self.stop_agent(*pane_id, reason),
-            frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork { .. } => Err(
-                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
-                    "robot.fleet.unsupported_action",
-                    format!(
-                        "ft robot fleet scale cannot execute {} actions",
-                        step.action.family()
-                    ),
-                ),
-            ),
+            frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork {
+                work_item_id,
+                from_agent,
+                to_agent,
+                reason,
+            } => self.reassign_work(work_item_id, from_agent.as_deref(), to_agent, reason),
         }
     }
 
     fn compensate_step(
         &mut self,
-        original: &frankenterm_core::fleet_mutation::FleetMutationStep,
+        _original: &frankenterm_core::fleet_mutation::FleetMutationStep,
         compensation: &frankenterm_core::fleet_mutation::FleetMutationAction,
     ) -> Result<
         frankenterm_core::fleet_mutation::FleetMutationStepOutput,
@@ -8972,17 +9775,12 @@ impl frankenterm_core::fleet_mutation::FleetMutationExecutor for RobotFleetMuxEx
                 pane_id,
                 reason,
             } => self.stop_agent(*pane_id, reason),
-            frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork { .. } => Err(
-                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
-                    "robot.fleet.unsupported_compensation",
-                    format!(
-                        "ft robot fleet scale cannot compensate {} on {} with {}",
-                        original.action.family(),
-                        original.action.target_id(),
-                        compensation.family()
-                    ),
-                ),
-            ),
+            frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork {
+                work_item_id,
+                from_agent,
+                to_agent,
+                reason,
+            } => self.reassign_work(work_item_id, from_agent.as_deref(), to_agent, reason),
         }
     }
 }
@@ -9121,9 +9919,9 @@ fn robot_fleet_status_data(
         "work_queue": robot_fleet_work_queue_summary(db_path),
         "mutating_capabilities": {
             "scale": "fleet_mutation_substrate",
-            "rebalance": "capability_unavailable",
+            "rebalance": "fleet_mutation_substrate",
             "scale_reason": "ft robot fleet scale computes native plans and executes commit receipts through the mux-backed fleet mutation substrate",
-            "rebalance_reason": "daemon-side fleet rebalance mutation is not wired to native Robot Mode yet",
+            "rebalance_reason": "ft robot fleet rebalance computes native work assignment plans and executes commit receipts through the work-queue mutation substrate",
         },
     });
 
@@ -9196,34 +9994,6 @@ fn robot_fleet_error_with_data(
     }
 }
 
-fn robot_fleet_capability_unavailable(
-    action: &str,
-    requested: serde_json::Value,
-    elapsed_ms: u64,
-) -> RobotResponse<serde_json::Value> {
-    robot_fleet_error_with_data(
-        "robot.fleet.capability_unavailable",
-        format!("ft robot fleet {action} is parsed natively but daemon-side fleet mutation is not available yet."),
-        Some(
-            "Use read-only `ft robot fleet status` / `ft robot fleet agents`, or use the existing NTM operator flow for mutating fleet control."
-                .to_string(),
-        ),
-        serde_json::json!({
-            "family": "fleet",
-            "action": action,
-            "backend": "native_agent_inventory",
-            "capability_available": false,
-            "capability": "daemon_side_fleet_mutation",
-            "requested": requested,
-            "audit": {
-                "event": format!("fleet.{action}.denied"),
-                "reason": "capability_unavailable",
-            },
-        }),
-        elapsed_ms,
-    )
-}
-
 async fn robot_fleet_command_response(
     db_path: &str,
     config: &frankenterm_core::config::Config,
@@ -9271,7 +10041,7 @@ async fn robot_fleet_command_response(
                 robot_fleet_claimed_work_counts(db_path, &running_agents);
             let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
             let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
-            let mut executor = RobotFleetMuxExecutor::new(mux);
+            let mut executor = RobotFleetMuxExecutor::new(mux, db_path);
             match robot_fleet_scale_data_with_executor(
                 program,
                 *target_count,
@@ -9310,14 +10080,54 @@ async fn robot_fleet_command_response(
                 ),
             }
         }
-        RobotFleetCommands::Rebalance { strategy, dry_run } => robot_fleet_capability_unavailable(
-            "rebalance",
-            serde_json::json!({
-                "strategy": strategy,
-                "dry_run": dry_run,
-            }),
-            elapsed_ms,
-        ),
+        RobotFleetCommands::Rebalance { strategy, dry_run } => {
+            let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
+            let (work_rows, work_queue_error) = robot_fleet_rebalance_work_rows(db_path);
+            let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+            let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+            let mut executor = RobotFleetMuxExecutor::new(mux, db_path);
+            match robot_fleet_rebalance_data_with_executor(
+                strategy,
+                *dry_run,
+                running_agents,
+                running_error,
+                work_rows,
+                work_queue_error,
+                &mut ledger,
+                &mut executor,
+            ) {
+                Ok(data) => {
+                    if let Some((code, message, hint)) =
+                        robot_fleet_rebalance_failure(&data, *dry_run)
+                    {
+                        robot_fleet_error_with_data(code, message, hint, data, elapsed_ms)
+                    } else {
+                        RobotResponse::success(data, elapsed_ms)
+                    }
+                }
+                Err(err) => robot_fleet_error_with_data(
+                    "robot.fleet.plan_error",
+                    format!(
+                        "ft robot fleet rebalance could not construct a valid mutation plan: {err}"
+                    ),
+                    Some(
+                        "Inspect the request and retry with a fresh idempotency key if this was a replay collision."
+                            .to_string(),
+                    ),
+                    serde_json::json!({
+                        "family": "fleet",
+                        "action": "rebalance",
+                        "backend": "native_agent_inventory",
+                        "requested": {
+                            "strategy": strategy,
+                            "dry_run": dry_run,
+                        },
+                        "error": err,
+                    }),
+                    elapsed_ms,
+                ),
+            }
+        }
     }
 }
 
@@ -12386,6 +13196,66 @@ mod robot_work_backend_tests {
             robot_work_release_data(&db_path, "ft-ready-a", None, 0),
             ROBOT_ERR_WORK_ITEM_CONFLICT,
         );
+    }
+
+    #[test]
+    fn fleet_reassign_work_updates_owner_and_can_compensate_back() {
+        let (_dir, db_path) = temp_work_db();
+        expect_ok(robot_work_assign_data(
+            &db_path,
+            "ft-rebalance-a",
+            "codex:1",
+            Some("seed"),
+            0,
+        ));
+
+        let moved = robot_fleet_reassign_work(
+            &db_path,
+            "ft-rebalance-a",
+            Some("codex:1"),
+            "codex:2",
+            "load_based",
+        )
+        .expect("reassign work");
+        assert_eq!(moved.work_item_id.as_deref(), Some("ft-rebalance-a"));
+        assert_eq!(
+            moved.details.get("from_agent").map(String::as_str),
+            Some("codex:1")
+        );
+        assert_eq!(
+            moved.details.get("to_agent").map(String::as_str),
+            Some("codex:2")
+        );
+
+        let moved_list = expect_ok(robot_work_list_data(
+            &db_path,
+            Some("claimed"),
+            Some("codex:2"),
+            None,
+            10,
+            0,
+        ));
+        assert_eq!(moved_list["total"], 1);
+        assert_eq!(moved_list["items"][0]["assigned_to"], "codex:2");
+
+        robot_fleet_reassign_work(
+            &db_path,
+            "ft-rebalance-a",
+            Some("codex:2"),
+            "codex:1",
+            "rollback load_based",
+        )
+        .expect("compensate reassignment");
+        let restored = expect_ok(robot_work_list_data(
+            &db_path,
+            Some("claimed"),
+            Some("codex:1"),
+            None,
+            10,
+            0,
+        ));
+        assert_eq!(restored["total"], 1);
+        assert_eq!(restored["items"][0]["assigned_to"], "codex:1");
     }
 
     #[test]
@@ -62335,17 +63205,34 @@ log_level = "debug"
 
             self.executed_steps.push(step.step_id.clone());
             let mut output = frankenterm_core::fleet_mutation::FleetMutationStepOutput::default();
-            if matches!(
-                step.action,
-                frankenterm_core::fleet_mutation::FleetMutationAction::SpawnAgent { .. }
-            ) {
-                let pane_id = if self.next_pane_id == 0 {
-                    900
-                } else {
-                    self.next_pane_id
-                };
-                output.pane_id = Some(pane_id);
-                self.next_pane_id = pane_id.saturating_add(1);
+            match &step.action {
+                frankenterm_core::fleet_mutation::FleetMutationAction::SpawnAgent { .. } => {
+                    let pane_id = if self.next_pane_id == 0 {
+                        900
+                    } else {
+                        self.next_pane_id
+                    };
+                    output.pane_id = Some(pane_id);
+                    self.next_pane_id = pane_id.saturating_add(1);
+                }
+                frankenterm_core::fleet_mutation::FleetMutationAction::StopAgent { .. } => {}
+                frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork {
+                    work_item_id,
+                    from_agent,
+                    to_agent,
+                    reason,
+                } => {
+                    output.work_item_id = Some(work_item_id.clone());
+                    if let Some(from_agent) = from_agent {
+                        output
+                            .details
+                            .insert("from_agent".to_string(), from_agent.clone());
+                    }
+                    output
+                        .details
+                        .insert("to_agent".to_string(), to_agent.clone());
+                    output.details.insert("reason".to_string(), reason.clone());
+                }
             }
             Ok(output)
         }
@@ -62368,7 +63255,26 @@ log_level = "debug"
             }
 
             self.compensated_steps.push(original.step_id.clone());
-            Ok(frankenterm_core::fleet_mutation::FleetMutationStepOutput::default())
+            let mut output = frankenterm_core::fleet_mutation::FleetMutationStepOutput::default();
+            if let frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork {
+                work_item_id,
+                from_agent,
+                to_agent,
+                reason,
+            } = _compensation
+            {
+                output.work_item_id = Some(work_item_id.clone());
+                if let Some(from_agent) = from_agent {
+                    output
+                        .details
+                        .insert("from_agent".to_string(), from_agent.clone());
+                }
+                output
+                    .details
+                    .insert("to_agent".to_string(), to_agent.clone());
+                output.details.insert("reason".to_string(), reason.clone());
+            }
+            Ok(output)
         }
     }
 
@@ -62396,6 +63302,57 @@ log_level = "debug"
             executor,
         )
         .expect("scale data")
+    }
+
+    fn robot_fleet_test_work_row(
+        claim_id: &str,
+        state: &str,
+        owner: Option<&str>,
+        priority: i64,
+        labels: &[&str],
+        blocked_by_count: i64,
+        last_reason: Option<&str>,
+    ) -> RobotWorkRow {
+        RobotWorkRow {
+            claim_id: claim_id.to_string(),
+            state: state.to_string(),
+            owner: owner.map(str::to_string),
+            priority,
+            labels_json: serde_json::to_string(labels).expect("labels json"),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            claimed_at_ms: (state == "claimed").then_some(1),
+            completed_at_ms: (state == "completed").then_some(1),
+            summary: None,
+            evidence_json: "[]".to_string(),
+            blocked_by_count,
+            unblocks_count: 0,
+            last_reason: last_reason.map(str::to_string),
+        }
+    }
+
+    fn robot_fleet_test_rebalance_data(
+        strategy: &str,
+        dry_run: bool,
+        running_agents: BTreeMap<
+            u64,
+            frankenterm_core::agent_correlator::RunningAgentInventoryEntry,
+        >,
+        work_rows: Vec<RobotWorkRow>,
+        ledger: &mut frankenterm_core::fleet_mutation::FleetMutationLedger,
+        executor: &mut RobotFleetTestExecutor,
+    ) -> serde_json::Value {
+        robot_fleet_rebalance_data_with_executor(
+            strategy,
+            dry_run,
+            running_agents,
+            None,
+            work_rows,
+            None,
+            ledger,
+            executor,
+        )
+        .expect("rebalance data")
     }
 
     #[test]
@@ -62589,6 +63546,246 @@ log_level = "debug"
     }
 
     #[test]
+    fn test_robot_fleet_rebalance_load_based_dry_run_moves_overloaded_owner() {
+        let running_agents =
+            robot_fleet_test_running_agents(&[(1, "codex", "active"), (2, "codex", "idle")]);
+        let work_rows = vec![
+            robot_fleet_test_work_row("ft-b", "claimed", Some("codex:1"), 2, &[], 0, None),
+            robot_fleet_test_work_row("ft-a", "claimed", Some("codex:1"), 1, &[], 0, None),
+            robot_fleet_test_work_row("ft-c", "claimed", Some("codex:1"), 3, &[], 0, None),
+        ];
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let data = robot_fleet_test_rebalance_data(
+            "load_based",
+            true,
+            running_agents,
+            work_rows,
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "rebalance_plan_created");
+        assert_eq!(data["items_reassigned"].as_u64(), Some(1));
+        assert_eq!(data["reassignments"][0]["item_id"], "ft-a");
+        assert_eq!(data["reassignments"][0]["from_agent"], "codex:1");
+        assert_eq!(data["reassignments"][0]["to_agent"], "codex:2");
+        assert_eq!(data["receipt"]["status"], "dry_run");
+        assert!(executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_rebalance_capability_based_prefers_idle_targets() {
+        let running_agents =
+            robot_fleet_test_running_agents(&[(1, "codex", "active"), (2, "codex", "idle")]);
+        let work_rows = vec![
+            robot_fleet_test_work_row("ft-a", "claimed", Some("codex:1"), 1, &[], 0, None),
+            robot_fleet_test_work_row("ft-b", "claimed", Some("codex:1"), 2, &[], 0, None),
+        ];
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let data = robot_fleet_test_rebalance_data(
+            "capability_based",
+            false,
+            running_agents,
+            work_rows,
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "rebalance_plan_created");
+        assert_eq!(data["items_reassigned"].as_u64(), Some(1));
+        assert_eq!(data["reassignments"][0]["to_agent"], "codex:2");
+        assert_eq!(data["receipt"]["status"], "succeeded");
+        assert_eq!(data["receipt"]["completed_count"].as_u64(), Some(1));
+        assert!(robot_fleet_rebalance_failure(&data, false).is_none());
+    }
+
+    #[test]
+    fn test_robot_fleet_rebalance_round_robin_spreads_multiple_moves() {
+        let running_agents = robot_fleet_test_running_agents(&[
+            (1, "codex", "active"),
+            (2, "codex", "active"),
+            (3, "codex", "active"),
+        ]);
+        let work_rows = vec![
+            robot_fleet_test_work_row("ft-a", "claimed", Some("codex:1"), 1, &[], 0, None),
+            robot_fleet_test_work_row("ft-b", "claimed", Some("codex:1"), 2, &[], 0, None),
+        ];
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let data = robot_fleet_test_rebalance_data(
+            "round_robin",
+            false,
+            running_agents,
+            work_rows,
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["items_reassigned"].as_u64(), Some(2));
+        assert_eq!(data["reassignments"][0]["to_agent"], "codex:2");
+        assert_eq!(data["reassignments"][1]["to_agent"], "codex:3");
+        assert_eq!(
+            executor.executed_steps,
+            vec![
+                "reassign-round_robin-1".to_string(),
+                "reassign-round_robin-2".to_string()
+            ]
+        );
+        assert_eq!(data["receipt"]["status"], "succeeded");
+    }
+
+    #[test]
+    fn test_robot_fleet_rebalance_skips_ineligible_work_with_reason_codes() {
+        let running_agents = robot_fleet_test_running_agents(&[
+            (1, "codex", "active"),
+            (2, "codex", "active"),
+            (9, "codex", "waiting_approval"),
+        ]);
+        let work_rows = vec![
+            robot_fleet_test_work_row("ft-done", "completed", Some("codex:1"), 1, &[], 0, None),
+            robot_fleet_test_work_row(
+                "ft-external",
+                "claimed",
+                Some("external:agent"),
+                2,
+                &[],
+                0,
+                None,
+            ),
+            robot_fleet_test_work_row(
+                "ft-approval",
+                "claimed",
+                Some("codex:1"),
+                3,
+                &["requires_approval"],
+                0,
+                None,
+            ),
+            robot_fleet_test_work_row(
+                "ft-reserved",
+                "claimed",
+                Some("codex:1"),
+                4,
+                &[],
+                0,
+                Some("reserved for handoff"),
+            ),
+            robot_fleet_test_work_row("ft-blocked", "claimed", Some("codex:1"), 5, &[], 1, None),
+            robot_fleet_test_work_row("ft-stalled", "claimed", Some("codex:9"), 6, &[], 0, None),
+        ];
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let data = robot_fleet_test_rebalance_data(
+            "load_based",
+            false,
+            running_agents,
+            work_rows,
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "no_eligible_reassignments");
+        let reason_codes = data["skipped_work_items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["reason_code"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(reason_codes.contains("completed_work_item"));
+        assert!(reason_codes.contains("externally_owned_work_item"));
+        assert!(reason_codes.contains("approval_blocked_work_item"));
+        assert!(reason_codes.contains("reserved_work_item"));
+        assert!(reason_codes.contains("blocked_dependencies_present"));
+        assert!(reason_codes.contains("owner_requires_inspection"));
+        assert_eq!(data["receipt"], serde_json::Value::Null);
+        assert!(executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_rebalance_idempotent_retry_replays_receipt() {
+        let running_agents =
+            robot_fleet_test_running_agents(&[(1, "codex", "active"), (2, "codex", "idle")]);
+        let work_rows = vec![
+            robot_fleet_test_work_row("ft-a", "claimed", Some("codex:1"), 1, &[], 0, None),
+            robot_fleet_test_work_row("ft-b", "claimed", Some("codex:1"), 2, &[], 0, None),
+        ];
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let first = robot_fleet_test_rebalance_data(
+            "capability_based",
+            false,
+            running_agents.clone(),
+            work_rows.clone(),
+            &mut ledger,
+            &mut executor,
+        );
+        let second = robot_fleet_test_rebalance_data(
+            "capability_based",
+            false,
+            running_agents,
+            work_rows,
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(first["receipt"]["status"], "succeeded");
+        assert_eq!(second["receipt"]["status"], "succeeded");
+        assert_eq!(second["receipt"]["idempotent_replay"].as_bool(), Some(true));
+        assert_eq!(
+            executor.executed_steps,
+            vec!["reassign-capability_based-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_robot_fleet_rebalance_partial_failure_compensates_prior_moves() {
+        let running_agents = robot_fleet_test_running_agents(&[
+            (1, "codex", "active"),
+            (2, "codex", "active"),
+            (3, "codex", "active"),
+        ]);
+        let work_rows = vec![
+            robot_fleet_test_work_row("ft-a", "claimed", Some("codex:1"), 1, &[], 0, None),
+            robot_fleet_test_work_row("ft-b", "claimed", Some("codex:1"), 2, &[], 0, None),
+        ];
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor {
+            fail_on_step: Some("reassign-round_robin-2".to_string()),
+            ..RobotFleetTestExecutor::default()
+        };
+
+        let data = robot_fleet_test_rebalance_data(
+            "round_robin",
+            false,
+            running_agents,
+            work_rows,
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["receipt"]["status"], "compensated");
+        assert_eq!(data["receipt"]["steps"][0]["status"], "compensated");
+        assert_eq!(data["receipt"]["steps"][1]["status"], "failed");
+        assert_eq!(
+            executor.compensated_steps,
+            vec!["reassign-round_robin-1".to_string()]
+        );
+        assert_eq!(
+            data["receipt"]["steps"][0]["compensation"]["output"]["details"]["to_agent"],
+            "codex:1"
+        );
+        let (code, _, _) = robot_fleet_rebalance_failure(&data, false).expect("rebalance failure");
+        assert_eq!(code, "robot.fleet.mutation_failed");
+    }
+
+    #[test]
     fn test_robot_fleet_launch_script_quotes_program_and_env() {
         let mut env = BTreeMap::new();
         env.insert("FT_LABEL".to_string(), "fleet's edge".to_string());
@@ -62650,34 +63847,35 @@ log_level = "debug"
             Some(1.0)
         );
 
-        let unavailable_resp = robot_fleet_capability_unavailable(
-            "rebalance",
-            serde_json::json!({
-                "strategy": "load_based",
-                "dry_run": true,
-            }),
-            12,
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+        let rebalance_data = robot_fleet_test_rebalance_data(
+            "load_based",
+            true,
+            robot_fleet_test_running_agents(&[(1, "codex", "active"), (2, "codex", "idle")]),
+            vec![
+                robot_fleet_test_work_row("ft-a", "claimed", Some("codex:1"), 1, &[], 0, None),
+                robot_fleet_test_work_row("ft-b", "claimed", Some("codex:1"), 2, &[], 0, None),
+            ],
+            &mut ledger,
+            &mut executor,
         );
-        let unavailable_json =
-            serde_json::to_value(&unavailable_resp).expect("fleet unavailable json");
-        let unavailable_toon = toon_rust::encode(unavailable_json, None);
-        let decoded_unavailable =
-            toon_rust::try_decode(&unavailable_toon, None).expect("decode fleet error toon");
-        let decoded_unavailable_json =
-            toon_rust::cli::json_stringify::json_stringify_lines(&decoded_unavailable, 0)
-                .join("\n");
-        let unavailable_roundtrip: serde_json::Value =
-            serde_json::from_str(&decoded_unavailable_json).expect("fleet error json parse");
-        assert_eq!(unavailable_roundtrip["ok"].as_bool(), Some(false));
+        let rebalance_resp = RobotResponse::success(rebalance_data, 12);
+        let rebalance_json = serde_json::to_value(&rebalance_resp).expect("fleet rebalance json");
+        let rebalance_toon = toon_rust::encode(rebalance_json, None);
+        let decoded_rebalance =
+            toon_rust::try_decode(&rebalance_toon, None).expect("decode fleet rebalance toon");
+        let decoded_rebalance_json =
+            toon_rust::cli::json_stringify::json_stringify_lines(&decoded_rebalance, 0).join("\n");
+        let rebalance_roundtrip: serde_json::Value =
+            serde_json::from_str(&decoded_rebalance_json).expect("fleet rebalance json parse");
+        assert_eq!(rebalance_roundtrip["ok"].as_bool(), Some(true));
+        assert_eq!(rebalance_roundtrip["data"]["family"], "fleet");
+        assert_eq!(rebalance_roundtrip["data"]["action"], "rebalance");
+        assert_eq!(rebalance_roundtrip["data"]["receipt"]["status"], "dry_run");
         assert_eq!(
-            unavailable_roundtrip["error_code"],
-            "robot.fleet.capability_unavailable"
-        );
-        assert_eq!(unavailable_roundtrip["data"]["family"], "fleet");
-        assert_eq!(unavailable_roundtrip["data"]["action"], "rebalance");
-        assert_eq!(
-            unavailable_roundtrip["data"]["capability_available"].as_bool(),
-            Some(false)
+            rebalance_roundtrip["data"]["items_reassigned"].as_f64(),
+            Some(1.0)
         );
     }
 
