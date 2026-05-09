@@ -1,0 +1,189 @@
+{
+  "category": "tui/render-parity",
+  "schema_version": "ft.tui.render_parity_attestation.v1",
+  "release_version": "ft-e87u6.10-recovery",
+  "generated_at": "2026-05-09T00:00:00Z",
+  "produced_by_bead": "ft-e87u6.10",
+  "source_beads": [
+    "ft-35yac.1",
+    "ft-35yac.1.2",
+    "ft-35yac.2"
+  ],
+  "attestation_manifest_slot": {
+    "category": "tui/render-parity",
+    "media_type": "application/json",
+    "current_null_slot_produced_by_bead": "ft-35yac.2",
+    "recommended_path": "docs/attestations/tui/render-parity.json",
+    "manifest_wiring_owner": "ft-e87u6.2"
+  },
+  "scope": {
+    "kind": "ratatui-ftui-byte-level-render-parity",
+    "summary": "Machine-readable recovery artifact for the full ratatui to ftui differential render-parity surface.",
+    "gpu_adjunct": "docs/attestations/tui/render-parity-gpu.json",
+    "backend_driver_integration": "follow_on_not_in_this_foundation_artifact",
+    "live_release_driver_run": false
+  },
+  "artifacts": {
+    "contract_module": "crates/frankenterm-core/src/tui_parity_oracle.rs",
+    "property_test_harness": "crates/frankenterm-core/tests/tui_parity_oracle.rs",
+    "audit_doc": "docs/security/tui-render-parity.md",
+    "gpu_adjunct_contract": "docs/attestations/tui/render-parity-gpu.json",
+    "gpu_runtime_writer": "scripts/test-gpu-harness.sh"
+  },
+  "oracle_contract": {
+    "reference_backend": "ratatui",
+    "migration_backend": "ftui",
+    "cell_type": "RenderCell",
+    "frame_type": "RenderFrame",
+    "diff_type": "FrameDiff",
+    "event_type": "EventScript",
+    "keymap_action_variants": 32,
+    "headline_rule": "Drive both backends with the same input event stream and assert byte-identical normalized RenderFrame output.",
+    "comparison_properties": [
+      "reflexive: compute_diff(f, f).is_clean()",
+      "symmetric divergent-cell count",
+      "cell-wise divergent count equals manual structural comparison",
+      "dimension-strict mismatch flag",
+      "continuation flag does not affect structural equality",
+      "insta-style render_summary for divergent frames"
+    ]
+  },
+  "oracle_health_contract": {
+    "type": "OracleHealth",
+    "fields": [
+      "frames_compared_total",
+      "clean_frames_total",
+      "diverged_frames_total",
+      "dimension_mismatch_total",
+      "max_diverged_cells_in_run"
+    ],
+    "safe_condition": "frames_compared_total > 0 && diverged_frames_total == 0 && dimension_mismatch_total == 0",
+    "cold_baseline_safe": false,
+    "divergence_rate": "diverged_frames_total / frames_compared_total, or 0.0 when frames_compared_total is 0"
+  },
+  "representative_clean_health_snapshot": {
+    "source": "contract-level clean self-compare shape exercised by tui_parity_oracle module tests",
+    "frames_compared_total": 1,
+    "clean_frames_total": 1,
+    "diverged_frames_total": 0,
+    "dimension_mismatch_total": 0,
+    "max_diverged_cells_in_run": 0,
+    "is_safe": true
+  },
+  "synthesized_event_corpus": {
+    "script_count": 12,
+    "action_kind_count": 32,
+    "covered_action_kinds": 30,
+    "explicitly_omitted_action_kinds": [
+      "prev_tab",
+      "apply_ruleset_profile"
+    ],
+    "omission_rationale": {
+      "prev_tab": "covered indirectly by NextTab plus symmetry",
+      "apply_ruleset_profile": "rare action sharing the CycleRulesetProfile code path"
+    },
+    "scripts": [
+      {
+        "name": "smoke_quit_from_home",
+        "dimensions": "80x24"
+      },
+      {
+        "name": "tab_cycle_all_views",
+        "dimensions": "80x24"
+      },
+      {
+        "name": "goto_view_jumps",
+        "dimensions": "80x24"
+      },
+      {
+        "name": "panes_filter_toggle",
+        "dimensions": "100x30"
+      },
+      {
+        "name": "search_filter_text_entry",
+        "dimensions": "80x24"
+      },
+      {
+        "name": "events_digit_filter",
+        "dimensions": "80x24"
+      },
+      {
+        "name": "triage_numbered_actions",
+        "dimensions": "80x24"
+      },
+      {
+        "name": "history_undoable_filter",
+        "dimensions": "80x24"
+      },
+      {
+        "name": "search_saved_cycle",
+        "dimensions": "100x30"
+      },
+      {
+        "name": "timeline_zoom_scroll",
+        "dimensions": "120x30"
+      },
+      {
+        "name": "show_help_overlay_then_dismiss",
+        "dimensions": "80x24"
+      },
+      {
+        "name": "small_terminal_dimensions",
+        "dimensions": "40x12"
+      }
+    ]
+  },
+  "property_test_contract": {
+    "proptest_cases_per_property": 256,
+    "comparator_properties": [
+      "diff_self_is_clean_property",
+      "diff_is_symmetric_in_count_property",
+      "diff_count_matches_manual_count",
+      "dimension_mismatch_flag_correctness",
+      "triangle_inequality_on_diverged_cells",
+      "continuation_flag_does_not_affect_diff"
+    ],
+    "input_alphabet_properties": [
+      "keymap_action_kind_is_stable",
+      "event_script_serde_roundtrip"
+    ],
+    "corpus_invariant_tests": [
+      "every_synthesized_script_is_well_formed",
+      "every_keymap_action_kind_appears_in_corpus_or_is_explicitly_omitted"
+    ],
+    "historical_doc_validation": {
+      "library_tests": "20 passed",
+      "property_test_harness": "11 passed",
+      "source": "docs/security/tui-render-parity.md"
+    }
+  },
+  "gpu_visual_adjunct": {
+    "path": "docs/attestations/tui/render-parity-gpu.json",
+    "kind": "headless-gpu-renderer-parity-contract",
+    "produced_by_bead": "ft-35yac.1.2",
+    "default_thresholds": {
+      "min_ssim": 0.99,
+      "max_l_inf": 8,
+      "max_changed_pixel_fraction": 0.001,
+      "source": "crates/frankenterm-gui/src/gpu_regression.rs::Thresholds::default"
+    },
+    "hard_gate_job": "gpu-regression-macos",
+    "soft_pilot_job": "gpu-linux-llvmpipe-pilot"
+  },
+  "targeted_validation": {
+    "cargo_status": "not_run_for_recovery_artifact",
+    "reason": "This bead publishes the missing JSON artifact from existing checked-in docs and contracts; no source code changed.",
+    "static_checks": [
+      "jq empty docs/attestations/tui/render-parity.json",
+      "jq invariant check for category/producer/corpus/property/GPU adjunct fields",
+      "git diff --check -- docs/attestations/tui/render-parity.json"
+    ]
+  },
+  "source_documents": [
+    "docs/security/tui-render-parity.md",
+    "docs/attestations/tui/render-parity-gpu.json",
+    "crates/frankenterm-core/src/tui_parity_oracle.rs",
+    "crates/frankenterm-core/tests/tui_parity_oracle.rs",
+    "scripts/test-gpu-harness.sh"
+  ]
+}
