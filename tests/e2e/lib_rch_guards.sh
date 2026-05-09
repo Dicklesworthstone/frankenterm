@@ -13,6 +13,7 @@
 # Provides:
 #   rch_init()                 - Set up variables (call once at start)
 #   ensure_rch_ready()         - Preflight: probe workers + smoke cargo check
+#   ensure_rch_remote_only_preflight() - Queue-aware remote-only proof preflight
 #   run_rch_cargo_logged()     - Timeout-wrapped rch cargo with stall/fallback detection
 #   rch_write_meta_json()      - Persist worker/exit/timing metadata for an rch log
 #   rch_emit_proof_ledger_entry() - Optional proof-ledger JSONL emission
@@ -33,10 +34,16 @@ RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
 # run through `run_rch_cargo_logged`. That keeps remote execution fail-closed
 # without paying a duplicate full-repo sync for a cargo smoke command.
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-0}"
+RCH_SKIP_QUEUE_PREFLIGHT="${RCH_SKIP_QUEUE_PREFLIGHT:-0}"
+RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS:-}"
+RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
 
 # Populated by rch_init().
 _RCH_PROBE_LOG=""
+_RCH_QUEUE_LOG=""
 _RCH_SMOKE_LOG=""
+_RCH_REMOTE_PREFLIGHT_LOG=""
+_RCH_MIRROR_PREFLIGHT_LOG=""
 _RCH_SMOKE_TARGET_DIR=""
 _RCH_REPO_ROOT=""
 TIMEOUT_BIN=""
@@ -68,8 +75,43 @@ rch_smoke_log_path() {
     printf '%s\n' "${_RCH_SMOKE_LOG}"
 }
 
+rch_queue_log_path() {
+    printf '%s\n' "${_RCH_QUEUE_LOG}"
+}
+
+rch_remote_preflight_log_path() {
+    printf '%s\n' "${_RCH_REMOTE_PREFLIGHT_LOG}"
+}
+
+rch_mirror_preflight_log_path() {
+    printf '%s\n' "${_RCH_MIRROR_PREFLIGHT_LOG}"
+}
+
 rch_log_meta_path() {
     printf '%s.rch_meta.json\n' "$1"
+}
+
+rch_json_bool() {
+    if [[ "$1" == "true" ]]; then
+        printf 'true\n'
+    else
+        printf 'false\n'
+    fi
+}
+
+rch_is_unsigned_int() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+rch_truthy() {
+    case "$1" in
+        1|true|TRUE|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+rch_remote_only_required() {
+    rch_truthy "${RCH_REQUIRE_REMOTE}"
 }
 
 rch_proof_ledger_enabled() {
@@ -629,6 +671,295 @@ probe_has_reachable_workers() {
     grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
 }
 
+rch_write_remote_preflight_json() {
+    local probe_log="$1"
+    local queue_log="$2"
+    local queue_rc="${3:-0}"
+    local output_file="$4"
+    local generated_at probe_worker_ids_raw probe_worker_ids_json probe_worker_count
+    local reachable_workers_detected remote_only_required queue_valid queue_success queue_has_scheduler_fields
+    local slots_available slots_total workers_available workers_healthy workers_offline workers_total
+    local queue_depth active_build_count queued_build_count status reason_code worker_queue_state detail
+
+    command -v jq >/dev/null 2>&1 || rch_fatal "jq is required to write rch remote preflight artifacts."
+
+    generated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    probe_worker_ids_raw="$(rch_extract_probe_worker_ids "${probe_log}")"
+    probe_worker_count="$(printf '%s\n' "${probe_worker_ids_raw}" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [[ -n "${probe_worker_ids_raw}" ]]; then
+        probe_worker_ids_json="$(printf '%s\n' "${probe_worker_ids_raw}" | sed '/^$/d' | jq -R . | jq -s .)"
+    else
+        probe_worker_ids_json="[]"
+    fi
+
+    reachable_workers_detected="false"
+    if probe_has_reachable_workers "${probe_log}"; then
+        reachable_workers_detected="true"
+    fi
+
+    remote_only_required="false"
+    if rch_remote_only_required; then
+        remote_only_required="true"
+    fi
+
+    queue_valid="false"
+    queue_success=""
+    queue_has_scheduler_fields="false"
+    slots_available=""
+    slots_total=""
+    workers_available=""
+    workers_healthy=""
+    workers_offline=""
+    workers_total=""
+    queue_depth=""
+    active_build_count=""
+    queued_build_count=""
+    if [[ -f "${queue_log}" ]] && jq -e . "${queue_log}" >/dev/null 2>&1; then
+        queue_valid="true"
+        queue_success="$(jq -r '(.success // .ok // true) | tostring' "${queue_log}" 2>/dev/null || true)"
+        queue_has_scheduler_fields="$(jq -r '
+            (.data? // .) as $d
+            | (($d | has("workers_healthy"))
+               or ($d | has("workers_available"))
+               or ($d | has("slots_available"))
+               or ($d | has("queue_depth")))
+        ' "${queue_log}" 2>/dev/null || printf 'false')"
+        slots_available="$(jq -r '(.data? // .) as $d | $d.slots_available // empty' "${queue_log}" 2>/dev/null || true)"
+        slots_total="$(jq -r '(.data? // .) as $d | $d.slots_total // empty' "${queue_log}" 2>/dev/null || true)"
+        workers_available="$(jq -r '(.data? // .) as $d | $d.workers_available // empty' "${queue_log}" 2>/dev/null || true)"
+        workers_healthy="$(jq -r '(.data? // .) as $d | $d.workers_healthy // empty' "${queue_log}" 2>/dev/null || true)"
+        workers_offline="$(jq -r '(.data? // .) as $d | $d.workers_offline // empty' "${queue_log}" 2>/dev/null || true)"
+        workers_total="$(jq -r '(.data? // .) as $d | $d.workers_total // empty' "${queue_log}" 2>/dev/null || true)"
+        queue_depth="$(jq -r '(.data? // .) as $d | $d.queue_depth // empty' "${queue_log}" 2>/dev/null || true)"
+        active_build_count="$(jq -r '(.data? // .) as $d | ($d.active_builds // [] | length)' "${queue_log}" 2>/dev/null || true)"
+        queued_build_count="$(jq -r '(.data? // .) as $d | ($d.queued_builds // [] | length)' "${queue_log}" 2>/dev/null || true)"
+    fi
+
+    status="passed"
+    reason_code="remote_ready"
+    worker_queue_state="ready"
+    detail="remote-only RCH preflight passed with worker capacity available"
+    if [[ "${remote_only_required}" != "true" ]]; then
+        status="blocked"
+        reason_code="local_fallback_forbidden"
+        worker_queue_state="unsupported_worker_selection"
+        detail="RCH_REQUIRE_REMOTE must be enabled for remote-only proof lanes"
+    elif [[ "${reachable_workers_detected}" != "true" ]]; then
+        status="blocked"
+        reason_code="no_healthy_workers"
+        worker_queue_state="unhealthy"
+        detail="worker probe did not report any reachable workers"
+    elif [[ "${queue_rc}" != "0" || "${queue_valid}" != "true" || "${queue_success}" == "false" || "${queue_has_scheduler_fields}" != "true" ]]; then
+        status="warning"
+        reason_code="unsupported_worker_selection"
+        worker_queue_state="unsupported_worker_selection"
+        detail="RCH queue output did not expose enough scheduler state; heavy command remains fail-closed"
+    elif rch_is_unsigned_int "${workers_healthy}" && [[ "${workers_healthy}" -eq 0 ]]; then
+        status="blocked"
+        reason_code="no_healthy_workers"
+        worker_queue_state="unhealthy"
+        detail="RCH queue reported zero healthy workers"
+    elif rch_is_unsigned_int "${workers_available}" && [[ "${workers_available}" -eq 0 ]]; then
+        status="blocked"
+        reason_code="remote_busy_wait"
+        worker_queue_state="busy_wait"
+        detail="RCH queue reported zero available workers"
+    elif rch_is_unsigned_int "${slots_available}" && [[ "${slots_available}" -eq 0 ]]; then
+        status="blocked"
+        reason_code="remote_busy_wait"
+        worker_queue_state="busy_wait"
+        detail="RCH queue reported zero available slots"
+    elif rch_is_unsigned_int "${queue_depth}" && [[ "${queue_depth}" -gt 0 ]]; then
+        status="blocked"
+        reason_code="remote_busy_wait"
+        worker_queue_state="busy_wait"
+        detail="RCH queue already has waiting builds"
+    fi
+
+    mkdir -p "$(dirname "${output_file}")"
+    jq -cn \
+        --argjson schema_version 1 \
+        --arg kind "rch_remote_only_preflight" \
+        --arg generated_at "${generated_at}" \
+        --arg status "${status}" \
+        --arg reason_code "${reason_code}" \
+        --arg worker_queue_state "${worker_queue_state}" \
+        --arg detail "${detail}" \
+        --arg probe_log "$(rch_repo_relative_path "${probe_log}")" \
+        --arg queue_log "$(rch_repo_relative_path "${queue_log}")" \
+        --argjson remote_only_required "$(rch_json_bool "${remote_only_required}")" \
+        --argjson reachable_workers_detected "$(rch_json_bool "${reachable_workers_detected}")" \
+        --argjson queue_checked "$(rch_json_bool "${queue_valid}")" \
+        --argjson queue_success "$(rch_json_bool "${queue_success}")" \
+        --argjson queue_has_scheduler_fields "$(rch_json_bool "${queue_has_scheduler_fields}")" \
+        --arg queue_rc "${queue_rc}" \
+        --arg probe_worker_count "${probe_worker_count}" \
+        --argjson probe_worker_ids "${probe_worker_ids_json}" \
+        --arg slots_available "${slots_available}" \
+        --arg slots_total "${slots_total}" \
+        --arg workers_available "${workers_available}" \
+        --arg workers_healthy "${workers_healthy}" \
+        --arg workers_offline "${workers_offline}" \
+        --arg workers_total "${workers_total}" \
+        --arg queue_depth "${queue_depth}" \
+        --arg active_build_count "${active_build_count}" \
+        --arg queued_build_count "${queued_build_count}" \
+        'def num_or_null($v): if $v == "" then null else ($v | tonumber) end;
+        {
+          schema_version: $schema_version,
+          kind: $kind,
+          generated_at: $generated_at,
+          status: $status,
+          reason_code: $reason_code,
+          worker_queue_state: $worker_queue_state,
+          detail: $detail,
+          remote_only_required: $remote_only_required,
+          checks: {
+            local_fallback_allowed: false,
+            reachable_workers_detected: $reachable_workers_detected,
+            scheduler_queue_checked: $queue_checked,
+            queue_success: $queue_success,
+            queue_has_scheduler_fields: $queue_has_scheduler_fields,
+            heavy_cargo_started: false
+          },
+          workers: {
+            probe_worker_count: num_or_null($probe_worker_count),
+            probe_worker_ids: $probe_worker_ids
+          },
+          queue: {
+            exit_status: num_or_null($queue_rc),
+            slots_available: num_or_null($slots_available),
+            slots_total: num_or_null($slots_total),
+            workers_available: num_or_null($workers_available),
+            workers_healthy: num_or_null($workers_healthy),
+            workers_offline: num_or_null($workers_offline),
+            workers_total: num_or_null($workers_total),
+            queue_depth: num_or_null($queue_depth),
+            active_build_count: num_or_null($active_build_count),
+            queued_build_count: num_or_null($queued_build_count)
+          },
+          artifacts: {
+            probe_log: $probe_log,
+            queue_log: $queue_log
+          }
+        }' >"${output_file}"
+}
+
+ensure_rch_remote_only_preflight() {
+    if [[ "${RCH_SKIP_QUEUE_PREFLIGHT}" == "1" ]]; then
+        printf '%s\n' "Queue preflight skipped because RCH_SKIP_QUEUE_PREFLIGHT=1" >"${_RCH_REMOTE_PREFLIGHT_LOG}"
+        return 0
+    fi
+
+    set +e
+    run_rch --json queue >"${_RCH_QUEUE_LOG}" 2>&1
+    local queue_rc=$?
+    set -e
+    rch_write_meta_json "${_RCH_QUEUE_LOG}" "${queue_rc}"
+    rch_emit_proof_ledger_entry \
+        "rch --json queue" \
+        "${_RCH_QUEUE_LOG}" \
+        "${queue_rc}" \
+        "not_applicable" \
+        "not_applicable" \
+        ""
+
+    rch_write_remote_preflight_json "${_RCH_PROBE_LOG}" "${_RCH_QUEUE_LOG}" "${queue_rc}" "${_RCH_REMOTE_PREFLIGHT_LOG}"
+    local status reason_code
+    status="$(jq -r '.status // ""' "${_RCH_REMOTE_PREFLIGHT_LOG}")"
+    reason_code="$(jq -r '.reason_code // "unknown"' "${_RCH_REMOTE_PREFLIGHT_LOG}")"
+    if [[ "${status}" == "blocked" ]]; then
+        rch_fatal "rch remote-only preflight blocked: ${reason_code}. See ${_RCH_REMOTE_PREFLIGHT_LOG}"
+    fi
+}
+
+rch_mirror_required_paths() {
+    [[ -n "${RCH_MIRROR_REQUIRED_PATHS}" ]] || return 0
+    printf '%s\n' "${RCH_MIRROR_REQUIRED_PATHS}" \
+        | tr ',:' '\n' \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+        | sed '/^$/d'
+}
+
+ensure_rch_mirror_preflight() {
+    local required_paths=()
+    local path
+    while IFS= read -r path; do
+        required_paths+=("--path" "${path}")
+    done < <(rch_mirror_required_paths)
+    [[ "${#required_paths[@]}" -gt 0 ]] || return 0
+
+    local attest_script="${_RCH_REPO_ROOT}/scripts/attest_rch_worker_mirror.sh"
+    [[ -x "${attest_script}" ]] || rch_fatal "mirror attestation script is not executable: ${attest_script}"
+
+    local worker_ids worker_id worker_dir worker_json worker_rc failures total bead_arg=()
+    local block_on_stale_head="false"
+    worker_ids="$(rch_extract_probe_worker_ids "${_RCH_PROBE_LOG}")"
+    [[ -n "${worker_ids}" ]] || rch_fatal "mirror preflight requested but worker probe did not expose worker ids. See ${_RCH_PROBE_LOG}"
+
+    worker_dir="${_RCH_MIRROR_PREFLIGHT_LOG%.json}.workers"
+    mkdir -p "${worker_dir}"
+    failures=0
+    total=0
+    if [[ -n "${RCH_PROOF_LEDGER_BEAD_ID:-}" ]]; then
+        bead_arg=("--bead" "${RCH_PROOF_LEDGER_BEAD_ID}")
+    fi
+    if rch_truthy "${RCH_MIRROR_BLOCK_ON_STALE_HEAD}"; then
+        block_on_stale_head="true"
+    fi
+
+    while IFS= read -r worker_id; do
+        [[ -n "${worker_id}" ]] || continue
+        worker_json="${worker_dir}/${worker_id}.json"
+        set +e
+        "${attest_script}" \
+            --worker "${worker_id}" \
+            "${bead_arg[@]}" \
+            "${required_paths[@]}" \
+            --command "remote-only preflight mirror attestation" \
+            --json >"${worker_json}"
+        worker_rc=$?
+        set -e
+        total=$((total + 1))
+        if [[ "${worker_rc}" -ne 0 ]]; then
+            failures=$((failures + 1))
+        fi
+    done <<<"${worker_ids}"
+
+    jq -s \
+        --argjson schema_version 1 \
+        --arg kind "rch_worker_pool_mirror_preflight" \
+        --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --argjson total "${total}" \
+        --argjson failures "${failures}" \
+        --argjson block_on_stale_head "$(rch_json_bool "${block_on_stale_head}")" \
+        --arg probe_log "$(rch_repo_relative_path "${_RCH_PROBE_LOG}")" \
+        'def blocking_failure($block_on_stale_head):
+          .status != "passed"
+          and ($block_on_stale_head or .reason_code != "rch_mirror.head_mismatch");
+        ([.[] | select(blocking_failure($block_on_stale_head))] | length) as $blocking_failures
+        | {
+          schema_version: $schema_version,
+          kind: $kind,
+          generated_at: $generated_at,
+          status: (if $blocking_failures == 0 then "passed" else "blocked" end),
+          reason_code: (if $blocking_failures == 0 then "source_mirror_ready" else "source_mirror_blocked" end),
+          detail: (if $blocking_failures == 0 then "all blocking source mirror checks passed; stale complete mirrors are recorded separately" else "at least one probed worker failed a blocking source mirror attestation" end),
+          total_workers_checked: $total,
+          failed_workers: $failures,
+          blocking_failed_workers: $blocking_failures,
+          block_on_stale_head: $block_on_stale_head,
+          artifacts: {probe_log: $probe_log},
+          worker_results: .
+        }' "${worker_dir}"/*.json >"${_RCH_MIRROR_PREFLIGHT_LOG}"
+
+    local blocking_failures
+    blocking_failures="$(jq -r '.blocking_failed_workers // 0' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
+    if [[ "${blocking_failures}" -ne 0 ]]; then
+        rch_fatal "rch source mirror preflight blocked: ${blocking_failures}/${total} workers failed blocking attestation. See ${_RCH_MIRROR_PREFLIGHT_LOG}"
+    fi
+}
+
 check_rch_fallback() {
     local output_file="$1"
     if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
@@ -809,7 +1140,10 @@ rch_init() {
     _RCH_REPO_ROOT="${4:-$(cd "$(dirname "${BASH_SOURCE[1]}")/../.." && pwd)}"
 
     _RCH_PROBE_LOG="${log_dir}/${harness_name}_${run_id}.rch_probe.log"
+    _RCH_QUEUE_LOG="${log_dir}/${harness_name}_${run_id}.rch_queue.log"
     _RCH_SMOKE_LOG="${log_dir}/${harness_name}_${run_id}.rch_smoke.log"
+    _RCH_REMOTE_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_preflight.json"
+    _RCH_MIRROR_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_mirror_preflight.json"
     _RCH_SMOKE_TARGET_DIR="target/rch-smoke/${harness_name}/${run_id}"
     mkdir -p "${_RCH_SMOKE_TARGET_DIR}"
 }
@@ -840,6 +1174,9 @@ ensure_rch_ready() {
     if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${_RCH_PROBE_LOG}"; then
         rch_fatal "rch workers are unavailable; refusing local cargo execution. See ${_RCH_PROBE_LOG}"
     fi
+
+    ensure_rch_remote_only_preflight
+    ensure_rch_mirror_preflight
 
     if [[ "${RCH_SKIP_SMOKE_PREFLIGHT}" == "1" ]]; then
         printf '%s\n' "Smoke preflight skipped because RCH_SKIP_SMOKE_PREFLIGHT=1" >"${_RCH_SMOKE_LOG}"

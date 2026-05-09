@@ -5,6 +5,8 @@
 //!   `~/.local/share/wezterm/pid` from the user's interactive session
 //!   does NOT block test invocations.
 //! - A unix domain socket inside that TempDir.
+//! - A generated `wezterm.lua` inside that TempDir so the subprocess has
+//!   a single, explicit config source.
 //! - A persistent `default_prog` loop so the default pane and spawned
 //!   default-program panes stay alive across follow-up `list_panes` calls.
 //! - A mux-server binary selected from the current ft build when available
@@ -134,19 +136,13 @@ impl WeztermSubprocessFixture {
         let socket_path = home.path().join("mux.sock");
         let stdout_path = home.path().join("mux-server.stdout.log");
         let stderr_path = home.path().join("mux-server.stderr.log");
-        let socket_str = socket_path.display().to_string();
-
-        // wezterm config snippets passed via --config. Keep them minimal:
-        // - One unix domain at our hermetic socket.
-        // - A persistent default_prog so list_panes returns >=1 pane and
-        //   spawn-created default-program panes do not exit before the
-        //   follow-up listing observes them.
-        // - skip_permissions_check because the temp dir mode varies.
-        let domain_cfg = format!(
-            "unix_domains={{{{name='ft-test',socket_path='{socket_str}',skip_permissions_check=true}}}}"
+        let config_path = home.path().join("wezterm.lua");
+        let config_lua = format!(
+            "return {{\n  unix_domains = {{\n    {{ name = \"ft-test\", socket_path = {}, skip_permissions_check = true }},\n  }},\n  default_domain = \"ft-test\",\n  default_prog = {},\n}}\n",
+            lua_string_literal(&socket_path.display().to_string()),
+            lua_string_array(default_prog),
         );
-        let prog_cfg = format!("default_prog={}", lua_string_array(default_prog));
-        let domain_default_cfg = "default_domain='ft-test'".to_string();
+        fs::write(&config_path, config_lua).map_err(FixtureError::SpawnFailed)?;
 
         let mut cmd = Command::new(&bin);
         cmd.env("HOME", home.path())
@@ -155,13 +151,8 @@ impl WeztermSubprocessFixture {
             // interactive session.
             .env_remove("WEZTERM_UNIX_SOCKET")
             .env_remove("WEZTERM_PANE")
-            .arg("--skip-config")
-            .arg("--config")
-            .arg(&domain_cfg)
-            .arg("--config")
-            .arg(&prog_cfg)
-            .arg("--config")
-            .arg(&domain_default_cfg)
+            .arg("--config-file")
+            .arg(&config_path)
             .stdout(Stdio::from(
                 File::create(&stdout_path).map_err(FixtureError::SpawnFailed)?,
             ))
@@ -269,6 +260,10 @@ fn lua_string_array(values: &[&str]) -> String {
     }
     out.push('}');
     out
+}
+
+fn lua_string_literal(value: &str) -> String {
+    serde_json::to_string(value).expect("serialize lua string literal")
 }
 
 fn read_child_output(stdout_path: &Path, stderr_path: &Path) -> (String, String) {

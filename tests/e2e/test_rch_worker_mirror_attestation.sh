@@ -32,6 +32,10 @@ HEAD_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
 WORKERS_JSON="${LOG_DIR}/workers.json"
 FAKE_SSH="${LOG_DIR}/fake_ssh.sh"
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "fixture" "rch_worker_mirror_attestation" "${ROOT_DIR}"
+
 cat >"${WORKERS_JSON}" <<JSON
 {
   "success": true,
@@ -208,6 +212,154 @@ else
         record_result "untracked_required_path_fixture" "false" "unexpected JSON shape"
     fi
 fi
+
+write_preflight_probe_fixture() {
+    local output_file="$1"
+    local status="$2"
+
+    cat >"${output_file}" <<JSON
+{
+  "success": true,
+  "data": {
+    "results": [
+      {
+        "id": "worker-a",
+        "host": "203.0.113.10",
+        "status": "${status}",
+        "latency_ms": 12
+      }
+    ],
+    "summary": {
+      "total": 1,
+      "healthy": 1,
+      "unhealthy": 0,
+      "failed": 0
+    }
+  }
+}
+JSON
+}
+
+write_preflight_queue_fixture() {
+    local output_file="$1"
+    local mode="$2"
+
+    case "${mode}" in
+      ready)
+        cat >"${output_file}" <<'JSON'
+{
+  "success": true,
+  "data": {
+    "queue_depth": 0,
+    "queued_builds": [],
+    "active_builds": [],
+    "slots_available": 4,
+    "slots_total": 8,
+    "workers_available": 1,
+    "workers_busy": 0,
+    "workers_healthy": 1,
+    "workers_offline": 0,
+    "workers_total": 1
+  }
+}
+JSON
+        ;;
+      busy)
+        cat >"${output_file}" <<'JSON'
+{
+  "success": true,
+  "data": {
+    "queue_depth": 2,
+    "queued_builds": [{"id": 1}, {"id": 2}],
+    "active_builds": [{"id": 3}],
+    "slots_available": 0,
+    "slots_total": 8,
+    "workers_available": 0,
+    "workers_busy": 1,
+    "workers_healthy": 1,
+    "workers_offline": 0,
+    "workers_total": 1
+  }
+}
+JSON
+        ;;
+      unhealthy)
+        cat >"${output_file}" <<'JSON'
+{
+  "success": true,
+  "data": {
+    "queue_depth": 0,
+    "queued_builds": [],
+    "active_builds": [],
+    "slots_available": 0,
+    "slots_total": 8,
+    "workers_available": 0,
+    "workers_busy": 0,
+    "workers_healthy": 0,
+    "workers_offline": 1,
+    "workers_total": 1
+  }
+}
+JSON
+        ;;
+      unsupported)
+        printf '%s\n' 'not-json' >"${output_file}"
+        ;;
+      *)
+        printf 'unknown preflight queue fixture mode: %s\n' "${mode}" >&2
+        return 2
+        ;;
+    esac
+}
+
+run_preflight_fixture() {
+    local name="$1"
+    local probe_status="$2"
+    local queue_mode="$3"
+    local remote_required="$4"
+    local expected_status="$5"
+    local expected_reason="$6"
+    local expected_queue_state="$7"
+    local probe_file="${LOG_DIR}/${name}_probe.json"
+    local queue_file="${LOG_DIR}/${name}_queue.json"
+    local output_file="${LOG_DIR}/${name}_preflight.json"
+    local queue_rc=0
+
+    write_preflight_probe_fixture "${probe_file}" "${probe_status}"
+    write_preflight_queue_fixture "${queue_file}" "${queue_mode}"
+    if [[ "${queue_mode}" == "unsupported" ]]; then
+        queue_rc=2
+    fi
+
+    RCH_REQUIRE_REMOTE="${remote_required}" \
+      rch_write_remote_preflight_json "${probe_file}" "${queue_file}" "${queue_rc}" "${output_file}"
+
+    if jq -e \
+        --arg status "${expected_status}" \
+        --arg reason "${expected_reason}" \
+        --arg queue_state "${expected_queue_state}" \
+        '.status == $status
+         and .reason_code == $reason
+         and .worker_queue_state == $queue_state
+         and .checks.local_fallback_allowed == false
+         and .checks.heavy_cargo_started == false' \
+        "${output_file}" >/dev/null; then
+        record_result "${name}" "true"
+    else
+        record_result "${name}" "false" "unexpected preflight JSON shape"
+    fi
+}
+
+run_preflight_fixture "remote_preflight_ready_fixture" "ok" "ready" "1" \
+    "passed" "remote_ready" "ready"
+run_preflight_fixture "remote_preflight_busy_fixture" "ok" "busy" "1" \
+    "blocked" "remote_busy_wait" "busy_wait"
+run_preflight_fixture "remote_preflight_unhealthy_fixture" "failed" "unhealthy" "1" \
+    "blocked" "no_healthy_workers" "unhealthy"
+run_preflight_fixture "remote_preflight_unsupported_fixture" "ok" "unsupported" "1" \
+    "warning" "unsupported_worker_selection" "unsupported_worker_selection"
+run_preflight_fixture "remote_preflight_local_fallback_fixture" "ok" "ready" "0" \
+    "blocked" "local_fallback_forbidden" "unsupported_worker_selection"
 
 jq -cn \
   --arg test "rch_worker_mirror_attestation" \
