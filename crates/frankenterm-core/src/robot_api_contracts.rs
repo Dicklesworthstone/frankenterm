@@ -1366,10 +1366,10 @@ mod tests {
 
         let (covered, total) = matrix.surface_coverage();
         assert_eq!(covered, 1);
-        assert_eq!(total, 35);
+        assert_eq!(total, 36);
 
         let uncovered = matrix.uncovered_surfaces();
-        assert_eq!(uncovered.len(), 34);
+        assert_eq!(uncovered.len(), 35);
     }
 
     // ---- Standard matrix ----
