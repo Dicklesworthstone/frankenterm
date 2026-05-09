@@ -29,8 +29,8 @@ concurrency:
 
 jobs:
   notify-acfs:
-    # Only notify on push to main, not PRs
-    if: github.event_name == 'push'
+    # Only notify on upstream pushes to main, not forks or PRs
+    if: github.event_name == 'push' && github.repository == 'Dicklesworthstone/frankenterm'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
