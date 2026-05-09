@@ -194,6 +194,99 @@ Required reopen triggers:
   selected worker or repo snapshot.
 - Local fallback markers appear in a proof cited as remote RCH evidence.
 
+### Worker-Specific Incident Closeout Workflow
+
+Use this workflow when a bead is about an RCH worker, selected-worker source
+mirror, remote target directory, queue/preflight result, or worker-specific
+failure code. It is the canonical handoff from an observed worker incident to a
+Beads closeout decision.
+
+1. Identify the material claim.
+   - Source/test behavior claims need the material command log, proof-ledger
+     JSONL, aggregate report, and metadata sidecar.
+   - Mirror or queue claims may use static-only attestation, but must say that
+     no material Cargo proof ran.
+   - Operator/runbook claims may close on docs/static proof only when the bead
+     scope is explicitly documentation or policy wiring.
+2. Classify the evidence before deciding status.
+   - Close as clean only for `target_worker_remote_proof` on the intended
+     worker, or for non-worker-specific source/test claims with
+     `proven_remote` and a named selected worker.
+   - Block or keep open for `target_worker_mirror_attestation` with
+     `source_mirror_status` of `missing`, `stale`, or `unreachable`.
+   - Defer with residual risk for `scheduler_selected_remote_proof` when the
+     scheduler selected a worker but the command was not target-worker
+     enforced.
+   - Reopen for `rejected_local_heavy`, `missing_artifact`, `malformed`,
+     `inconclusive_worker_evidence`, local fallback markers without approval,
+     or sync/transfer/self-test-only evidence cited as source proof.
+3. Record the decision in Beads using exact artifacts.
+   - Include bead id, scenario id, command, worker id, queue state if known,
+     `worker_evidence_confidence`, `source_mirror_status`,
+     `source_mirror_reason_code`, target-dir lifecycle, metadata sidecar,
+     proof-ledger JSONL, aggregate report, and residual-risk note.
+   - If Agent Mail is unavailable, put the same content in a Beads comment and
+     do not attempt service repair.
+4. Keep the action proportional.
+   - Do not repair, restart, drain, or mutate shared services/workers unless the
+     operator explicitly approves that exact action.
+   - Do not delete local or remote files to create a negative fixture.
+   - Do not describe RCH setup, queue placement, sync chatter, transfer logs,
+     worker health, or smoke preflight as a source/test pass.
+   - Do not run local heavy Cargo unless the evidence is explicitly
+     `approved_local_fallback`.
+
+Close a worker-specific source/mirror blocker only with a comment shaped like:
+
+```toon
+worker_specific_closeout{
+  bead_id: ft-example.2
+  decision: close
+  claim: "loopback verifier reached and passed on intended worker"
+  command: "run_rch_cargo_logged ... cargo test ..."
+  worker_evidence_confidence: target_worker_remote_proof
+  intended_worker_id: vmi1152480
+  selected_worker_id: vmi1152480
+  worker_queue_state: ready
+  source_mirror_status: present
+  source_mirror_reason_code: none
+  target_dir_lifecycle: retained
+  metadata_sidecar: tests/e2e/logs/.../loopback_test.log.rch_meta.json
+  proof_ledger: tests/e2e/logs/.../proof-ledger.jsonl
+  aggregate_report: tests/e2e/logs/.../proof-ledger-aggregate.json
+  residual_risk: "none"
+}
+```
+
+Block or reopen when the retained evidence says the worker substrate failed:
+
+```toon
+worker_specific_closeout{
+  bead_id: ft-example.2
+  decision: block
+  reason_code: RCH-REMOTE-MIRROR-MISSING-FILE
+  worker_evidence_confidence: target_worker_mirror_attestation
+  selected_worker_id: vmi1153651
+  source_mirror_status: missing
+  source_mirror_reason_code: rch_mirror.missing_tracked_file
+  artifact: tests/e2e/logs/.../rch_mirror_preflight.json
+  action: "keep source/test bead open; fix mirror or rerun on an attested worker"
+}
+```
+
+Use residual-risk wording when evidence is useful but weaker than the claim:
+
+```toon
+worker_specific_closeout{
+  bead_id: ft-example.3
+  decision: defer_with_residual_risk
+  worker_evidence_confidence: scheduler_selected_remote_proof
+  selected_worker_id: vmi1293453
+  source_mirror_status: present
+  residual_risk: "RCH scheduler selected the worker; the proof was not target-worker-enforced."
+}
+```
+
 ## Local Fallback Rule
 
 Local fallback for heavy commands is allowed only when all are true:

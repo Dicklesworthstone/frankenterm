@@ -125,7 +125,11 @@ worker-specific closeout needs `target_worker_remote_proof`; a generic remote
 test lane may use `scheduler_selected_remote_proof` with the selected worker
 named. Mirror-only evidence, including a `source_mirror_status` of `missing`,
 `stale`, or `unreachable`, is diagnostic or blocking evidence rather than a
-material Cargo/test pass.
+material Cargo/test pass. For close, block, reopen, defer, and residual-risk
+decisions, use the "Worker-Specific Incident Closeout Workflow" in
+`docs/asupersync-rch-execution-policy.md`; do not rely on RCH sync chatter,
+worker health, queue placement, smoke preflight, or unapproved local heavy
+Cargo as finish-line proof.
 
 The minimum remote-verification profile is:
 
