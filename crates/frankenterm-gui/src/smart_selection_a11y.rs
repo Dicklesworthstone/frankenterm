@@ -38,6 +38,7 @@ use frankenterm_core::smart_selection_a11y_recorder::RecorderHandle;
 /// callers should then skip the announcement rather than risking a
 /// misleading screen-reader message.
 #[must_use]
+#[allow(dead_code)]
 pub fn smart_selection_a11y_message(
     line_text: &str,
     selection: SelectionMatch,
@@ -52,6 +53,7 @@ pub fn smart_selection_a11y_message(
 /// Convert a picked smart-selection span into an AT-tree announcement
 /// event without recording it.
 #[must_use]
+#[allow(dead_code)]
 pub fn smart_selection_announcement_event(
     line_text: &str,
     selection: SelectionMatch,
@@ -67,6 +69,7 @@ pub fn smart_selection_announcement_event(
 ///
 /// Production callers pass the recorder backing NSAccessibility /
 /// AT-SPI; tests pass the in-memory contract recorder.
+#[allow(dead_code)]
 pub fn record_smart_selection_announcement<R: AccessibilityRecorder + ?Sized>(
     recorder: &mut R,
     line_text: &str,

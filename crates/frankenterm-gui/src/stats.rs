@@ -268,6 +268,7 @@ impl Inner {
     }
 }
 
+#[allow(dead_code)]
 fn make_inner() -> Arc<Mutex<Inner>> {
     Arc::new(Mutex::new(Inner {
         histograms: HashMap::new(),

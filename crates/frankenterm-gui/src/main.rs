@@ -238,6 +238,7 @@ fn detect_gui_macos_version() -> MacosVersion {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_macos_version(version: &str) -> Option<MacosVersion> {
     let mut parts = version.trim().split('.');
     let major = parts.next()?.parse().ok()?;

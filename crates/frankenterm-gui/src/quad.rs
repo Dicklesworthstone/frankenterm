@@ -70,6 +70,7 @@ impl Vertex {
 
 /// Shared index buffer for the instanced renderer. The vertex shader
 /// can use these six corner indices for every instance in the frame.
+#[allow(dead_code)]
 pub const INSTANCED_QUAD_INDICES: [u16; 6] = [
     V_TOP_LEFT as u16,
     V_TOP_RIGHT as u16,
@@ -195,6 +196,9 @@ const _: () = {
     assert!(std::mem::size_of::<GpuCellInstance>() == INSTANCE_BYTES_PER_CELL);
 };
 
+// ft-6flqa: the differential upload substrate is intentionally kept compiled
+// before the WebGPU paint path is switched over to it.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellDeltaFrameKind {
     /// Uploads the entire visible cell grid. Used for startup,
@@ -206,12 +210,14 @@ pub enum CellDeltaFrameKind {
     DeltaStream,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellDeltaStreamError {
     FrameSizeMismatch { expected: usize, actual: usize },
     RingTooSmall { capacity: usize, needed: usize },
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellDeltaFrame {
     pub kind: CellDeltaFrameKind,
@@ -224,6 +230,7 @@ pub struct CellDeltaFrame {
     pub uploaded_bytes: usize,
 }
 
+#[allow(dead_code)]
 impl CellDeltaFrame {
     #[inline]
     pub fn is_full_rewrite(&self) -> bool {
@@ -239,6 +246,7 @@ impl CellDeltaFrame {
 /// shader side reads the same 32-byte cell payload as the instanced
 /// renderer; unchanged cells remain resident until the periodic full
 /// compaction rewrite refreshes the ring.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DifferentialCellStream {
     rows: usize,
@@ -251,6 +259,7 @@ pub struct DifferentialCellStream {
     initialized: bool,
 }
 
+#[allow(dead_code)]
 impl DifferentialCellStream {
     pub fn new(
         rows: usize,
@@ -421,6 +430,7 @@ impl DifferentialCellStream {
     }
 }
 
+#[allow(dead_code)]
 pub fn apply_cell_delta_records(
     grid: &mut [GpuCellInstance],
     cols: usize,

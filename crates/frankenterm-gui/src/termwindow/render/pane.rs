@@ -42,6 +42,7 @@ pub struct TiledGridLayer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct TiledGridLayerGeometry {
     pub origin_x_px: i32,
     pub origin_y_px: i32,
@@ -51,6 +52,7 @@ pub struct TiledGridLayerGeometry {
     pub cell_height_px: u32,
 }
 
+#[allow(dead_code)]
 impl TiledGridLayer {
     #[must_use]
     pub fn from_dirty_lines(
@@ -133,6 +135,7 @@ impl Layer for TiledGridLayer {
 }
 
 #[must_use]
+#[allow(dead_code)]
 fn tiled_grid_full_rect(
     pane_origin_x_px: i32,
     pane_origin_y_px: i32,
@@ -150,6 +153,7 @@ fn tiled_grid_full_rect(
 }
 
 #[must_use]
+#[allow(dead_code)]
 fn tiled_grid_dirty_rect_from_bitmap(
     pane_origin_x_px: i32,
     pane_origin_y_px: i32,

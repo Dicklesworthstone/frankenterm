@@ -36,6 +36,9 @@ const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL: &str = "wgpu-25.0.2";
 const WEBGPU_SHADER_SOURCE: &str = include_str!("../shader.wgsl");
 
+// ft-6flqa: these presentation/scanout decision probes are kept compiled
+// ahead of the runtime WebGPU present-path handoff.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebGpuDisplaySession {
     Wayland {
@@ -49,6 +52,7 @@ pub enum WebGpuDisplaySession {
     Unknown,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct WebGpuPresentProbeInputs<'a> {
     pub probe: &'a DisplayProbeResult,
@@ -60,12 +64,14 @@ pub struct WebGpuPresentProbeInputs<'a> {
     pub post_layout_change: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebGpuTearingFreeMode {
     Vsync,
     ImmediateTearingAllowed,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebGpuTearingFreeReason {
     InputLatencyCritical,
@@ -78,6 +84,7 @@ pub enum WebGpuTearingFreeReason {
     DedupSkipped,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebGpuTearingFreeDecision {
     pub action: PresentAction,
@@ -85,6 +92,7 @@ pub struct WebGpuTearingFreeDecision {
     pub reason: WebGpuTearingFreeReason,
 }
 
+#[allow(dead_code)]
 impl WebGpuTearingFreeDecision {
     #[must_use]
     pub fn uses_immediate_present(self) -> bool {
@@ -92,6 +100,7 @@ impl WebGpuTearingFreeDecision {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct WebGpuTearingFreeInputs<'a> {
     pub present: WebGpuPresentProbeInputs<'a>,
@@ -99,6 +108,7 @@ pub struct WebGpuTearingFreeInputs<'a> {
     pub latency_critical_window: Duration,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct WebGpuDirectScanoutInputs<'a> {
     pub probe: &'a DisplayProbeResult,
@@ -111,12 +121,14 @@ pub struct WebGpuDirectScanoutInputs<'a> {
     pub compositor_advertised: &'a [DirectScanoutBufferFormat],
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebGpuDirectScanoutDecision {
     pub direct_scanout: DirectScanoutDecision,
     pub present_scanout: ScanoutEligibility,
 }
 
+#[allow(dead_code)]
 impl WebGpuDirectScanoutDecision {
     #[must_use]
     pub fn should_submit_dmabuf(self) -> bool {
@@ -144,6 +156,7 @@ pub struct WebGpuSparseAtlasStartupProbe {
 }
 
 #[must_use]
+#[allow(dead_code)]
 pub fn decide_webgpu_present_from_probe(inputs: WebGpuPresentProbeInputs<'_>) -> PresentAction {
     let (platform, wayland_compositor, x11_present_available) =
         webgpu_vrr_probe_inputs(inputs.probe.platform, inputs.session);
@@ -159,6 +172,7 @@ pub fn decide_webgpu_present_from_probe(inputs: WebGpuPresentProbeInputs<'_>) ->
 }
 
 #[must_use]
+#[allow(dead_code)]
 pub fn decide_webgpu_tearing_free_present(
     inputs: WebGpuTearingFreeInputs<'_>,
 ) -> WebGpuTearingFreeDecision {
@@ -246,6 +260,7 @@ pub fn decide_webgpu_tearing_free_present(
 }
 
 #[must_use]
+#[allow(dead_code)]
 pub fn decide_webgpu_direct_scanout(
     inputs: WebGpuDirectScanoutInputs<'_>,
 ) -> WebGpuDirectScanoutDecision {
@@ -274,6 +289,7 @@ pub fn decide_webgpu_direct_scanout(
 }
 
 #[must_use]
+#[allow(dead_code)]
 fn webgpu_vrr_probe_inputs(
     platform: PlatformOs,
     session: WebGpuDisplaySession,
@@ -298,6 +314,7 @@ fn webgpu_vrr_probe_inputs(
 }
 
 #[must_use]
+#[allow(dead_code)]
 fn webgpu_direct_scanout_compositor(
     platform: PlatformOs,
     session: WebGpuDisplaySession,
@@ -327,6 +344,7 @@ fn webgpu_direct_scanout_compositor(
 }
 
 #[must_use]
+#[allow(dead_code)]
 fn webgpu_present_scanout_eligibility(
     probe: &DisplayProbeResult,
     direct_scanout: DirectScanoutDecision,
