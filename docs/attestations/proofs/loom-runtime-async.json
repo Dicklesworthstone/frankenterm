@@ -1,0 +1,259 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "runtime-async-loom-proof-attestation",
+  "category": "proofs/loom-runtime-async",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-09T23:03:03Z",
+  "produced_by_bead": "ft-e87u6.12",
+  "foundation_bead": "ft-syqcz.6",
+  "proof_bead": "ft-syqcz.7",
+  "status": "pass",
+  "scope": "Machine-readable attestation for the runtime_async Loom proof corpus and its Mazurkiewicz trace catalog.",
+  "proof_model": {
+    "mode": "contract_model",
+    "summary": "Loom cannot instrument asupersync internals directly, so the proof corpus models the contracts that runtime_async primitives must preserve using loom-native synchronization and scheduling primitives.",
+    "instrumented_runtime": false,
+    "modeled_contracts": [
+      "mutual exclusion",
+      "reader-writer exclusion",
+      "permit capacity and release",
+      "FIFO or total-order delivery where the primitive declares it",
+      "close-after-drain semantics",
+      "single-delivery and idempotent terminal receives",
+      "lost-wake rejection",
+      "sticky close and version monotonicity"
+    ]
+  },
+  "source_documents": [
+    "docs/runtime/loom-conventions.md",
+    "docs/runtime/mazurkiewicz-traces.md"
+  ],
+  "proof_files": [
+    "crates/frankenterm-core/tests/loom_oneshot.rs",
+    "crates/frankenterm-core/tests/loom_notify.rs",
+    "crates/frankenterm-core/tests/loom_broadcast.rs",
+    "crates/frankenterm-core/tests/loom_watch.rs",
+    "crates/frankenterm-core/tests/loom_mpsc.rs",
+    "crates/frankenterm-core/tests/loom_sync.rs"
+  ],
+  "primitive_coverage": [
+    {
+      "primitive": "runtime_async::oneshot",
+      "bead": "ft-zzw3s",
+      "test_path": "crates/frankenterm-core/tests/loom_oneshot.rs",
+      "mazurkiewicz_section": "docs/runtime/mazurkiewicz-traces.md#oneshot",
+      "named_proof_count": 6,
+      "representative_proofs": [
+        "loom_oneshot_delivers_value_exactly_once",
+        "loom_oneshot_send_close_race_one_outcome",
+        "loom_oneshot_recv_idempotent_after_terminal",
+        "loom_oneshot_send_during_receiver_drop_no_panic"
+      ],
+      "anti_patterns_rejected": [
+        "double-delivery",
+        "lost-update",
+        "sender panic on receiver drop"
+      ],
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::notify::Notify",
+      "bead": "ft-kpmej",
+      "test_path": "crates/frankenterm-core/tests/loom_notify.rs",
+      "mazurkiewicz_section": "docs/runtime/mazurkiewicz-traces.md#notify",
+      "named_proof_count": 6,
+      "representative_proofs": [
+        "loom_notify_one_wakes_one_waiter",
+        "loom_notify_waiters_wakes_currently_parked",
+        "loom_notify_one_permit_caps_at_one",
+        "loom_notify_waiters_does_not_accumulate"
+      ],
+      "anti_patterns_rejected": [
+        "permit-stack overflow",
+        "notify_waiters permit-leak",
+        "spurious double-wake"
+      ],
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::broadcast",
+      "bead": "ft-bpfb7",
+      "test_path": "crates/frankenterm-core/tests/loom_broadcast.rs",
+      "mazurkiewicz_section": "docs/runtime/mazurkiewicz-traces.md#broadcast",
+      "named_proof_count": 5,
+      "representative_proofs": [
+        "loom_broadcast_preserves_total_order_across_receivers",
+        "loom_broadcast_concurrent_sends_serialize",
+        "loom_broadcast_close_after_sends_drains_then_closes",
+        "loom_broadcast_late_receiver_sees_historical_log"
+      ],
+      "anti_patterns_rejected": [
+        "out-of-order delivery",
+        "premature close hides buffered message",
+        "lost wake on close"
+      ],
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::watch",
+      "bead": "ft-r51h4",
+      "test_path": "crates/frankenterm-core/tests/loom_watch.rs",
+      "mazurkiewicz_section": "docs/runtime/mazurkiewicz-traces.md#watch",
+      "named_proof_count": 6,
+      "representative_proofs": [
+        "loom_watch_preserves_version_monotonicity",
+        "loom_watch_close_observed_after_drop",
+        "loom_watch_concurrent_writers_no_torn_reads",
+        "loom_watch_reader_sees_monotonic_versions_across_snapshots"
+      ],
+      "anti_patterns_rejected": [
+        "torn read",
+        "version regression",
+        "close unstick after late send"
+      ],
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::mpsc",
+      "bead": "ft-ue7sr",
+      "test_path": "crates/frankenterm-core/tests/loom_mpsc.rs",
+      "mazurkiewicz_section": "docs/runtime/mazurkiewicz-traces.md#mpsc",
+      "named_proof_count": 5,
+      "representative_proofs": [
+        "loom_mpsc_preserves_capacity_and_delivery",
+        "loom_mpsc_single_producer_fifo_preserved",
+        "loom_mpsc_close_drains_then_observes_none",
+        "loom_mpsc_full_queue_unblocks_after_recv"
+      ],
+      "anti_patterns_rejected": [
+        "capacity overflow",
+        "FIFO inversion",
+        "close loses buffered message",
+        "send after close succeeds"
+      ],
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::Mutex",
+      "bead": "ft-e2usk",
+      "test_path": "crates/frankenterm-core/tests/loom_sync.rs",
+      "mazurkiewicz_section": "docs/runtime/mazurkiewicz-traces.md#mutex",
+      "named_proof_count": 4,
+      "representative_proofs": [
+        "loom_mutex_preserves_mutual_exclusion",
+        "loom_mutex_no_lost_updates_under_contention",
+        "loom_mutex_drop_releases_for_next_acquirer",
+        "loom_mutex_try_lock_succeeds_when_free"
+      ],
+      "anti_patterns_rejected": [
+        "mutual-exclusion violation",
+        "lost update",
+        "drop leak",
+        "try_lock false-negative on free"
+      ],
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::Semaphore",
+      "bead": "ft-5fbkx",
+      "test_path": "crates/frankenterm-core/tests/loom_sync.rs",
+      "mazurkiewicz_section": "docs/runtime/mazurkiewicz-traces.md#semaphore",
+      "named_proof_count": 5,
+      "representative_proofs": [
+        "loom_semaphore_never_exceeds_capacity",
+        "loom_semaphore_honors_fifo_waiter_order",
+        "loom_semaphore_drop_permit_restores_count",
+        "loom_semaphore_release_wakes_blocked_acquirer"
+      ],
+      "anti_patterns_rejected": [
+        "capacity overflow",
+        "permit leak",
+        "lost wake on release",
+        "FIFO violation"
+      ],
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::RwLock",
+      "bead": "ft-5omg9",
+      "test_path": "crates/frankenterm-core/tests/loom_sync.rs",
+      "mazurkiewicz_section": "docs/runtime/mazurkiewicz-traces.md#rwlock",
+      "named_proof_count": 4,
+      "representative_proofs": [
+        "loom_rwlock_preserves_reader_writer_invariant",
+        "loom_rwlock_concurrent_readers_observe_consistent_value",
+        "loom_rwlock_drop_writer_releases_for_reader",
+        "loom_rwlock_no_lost_writes_under_writer_contention"
+      ],
+      "anti_patterns_rejected": [
+        "reader-writer overlap",
+        "reader-reader serialization",
+        "lost write",
+        "lock leak after drop"
+      ],
+      "status": "pass"
+    }
+  ],
+  "coverage_summary": {
+    "runtime_async_primitives_covered": 8,
+    "proof_files": 6,
+    "named_loom_proof_tests": 41,
+    "mazurkiewicz_sections": 8,
+    "source_inventory_command": "rg -n '^fn loom_' crates/frankenterm-core/tests/loom_oneshot.rs crates/frankenterm-core/tests/loom_notify.rs crates/frankenterm-core/tests/loom_broadcast.rs crates/frankenterm-core/tests/loom_watch.rs crates/frankenterm-core/tests/loom_mpsc.rs crates/frankenterm-core/tests/loom_sync.rs"
+  },
+  "loom_run_contract": {
+    "single_target_template": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-loom-runtime-async-target LOOM_MAX_BRANCHES=4000 LOOM_MAX_DURATION_SECS=1500 RUSTFLAGS='--cfg loom' cargo test -p frankenterm-core --test <loom_target> -- --nocapture",
+    "targets": [
+      "loom_oneshot",
+      "loom_notify",
+      "loom_broadcast",
+      "loom_watch",
+      "loom_mpsc",
+      "loom_sync"
+    ],
+    "nightly_workflow": ".github/workflows/loom.yml",
+    "coverage_guard": "scripts/check_loom_skeleton_coverage.sh",
+    "current_recovery_artifact_rerun": {
+      "status": "not_run",
+      "reason": "This recovery bead only publishes the missing JSON attestation for the already-closed ft-syqcz.7 proof program; no Rust source changed in this bead."
+    }
+  },
+  "source_bead_status": {
+    "ft-syqcz.6": {
+      "status": "closed",
+      "close_summary": "Loom dev-dep, skeleton files, and conventions doc shipped."
+    },
+    "ft-syqcz.7": {
+      "status": "closed",
+      "close_summary": "8 primitive proof sub-beads plus the Mazurkiewicz trace catalog closed; close reason records 9/9 sub-beads complete."
+    }
+  },
+  "validation": [
+    {
+      "command": "jq empty docs/attestations/proofs/loom-runtime-async.json",
+      "status": "pass"
+    },
+    {
+      "command": "jq -e '.status == \"pass\" and (.primitive_coverage | length == 8) and (.coverage_summary.named_loom_proof_tests == 41)' docs/attestations/proofs/loom-runtime-async.json",
+      "status": "pass"
+    },
+    {
+      "command": "rg -n '^fn loom_' crates/frankenterm-core/tests/loom_oneshot.rs crates/frankenterm-core/tests/loom_notify.rs crates/frankenterm-core/tests/loom_broadcast.rs crates/frankenterm-core/tests/loom_watch.rs crates/frankenterm-core/tests/loom_mpsc.rs crates/frankenterm-core/tests/loom_sync.rs",
+      "status": "pass",
+      "result": "41 named Loom proof tests found"
+    }
+  ],
+  "attestation_manifest_slot": {
+    "category": "proofs/loom-runtime-async",
+    "media_type": "application/json",
+    "current_null_slot_produced_by_bead": "ft-syqcz.6",
+    "recommended_path": "docs/attestations/proofs/loom-runtime-async.json",
+    "recommended_produced_by_bead": "ft-e87u6.12",
+    "manifest_wiring_owner": "ft-e87u6.2"
+  },
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-e87u6.2",
+    "reason": "ft-e87u6.2 owns docs/attestations/manifest.json and docs/attestations/schema.json in the active BluePike lane."
+  }
+}
