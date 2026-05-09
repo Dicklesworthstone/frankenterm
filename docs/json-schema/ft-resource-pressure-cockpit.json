@@ -1,0 +1,900 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-resource-pressure-cockpit.json",
+  "title": "FrankenTerm Resource Pressure Cockpit",
+  "description": "Versioned operator-facing contract for resource pressure, admission decisions, evidence freshness, and action receipts.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source",
+    "status",
+    "proof_gate",
+    "evidence_state",
+    "summary",
+    "next_operator_move",
+    "run_identity",
+    "domains",
+    "memory_tiers",
+    "residency_buckets",
+    "queue_backpressure",
+    "admission_decisions",
+    "action_receipts",
+    "mitigation_history",
+    "drilldowns",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Matches SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION for this contract slice."
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.resource_pressure_cockpit.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "$ref": "#/$defs/operator_status"
+    },
+    "proof_gate": {
+      "$ref": "#/$defs/proof_gate"
+    },
+    "evidence_state": {
+      "$ref": "#/$defs/evidence_state"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "next_operator_move": {
+      "type": "string",
+      "minLength": 1
+    },
+    "run_identity": {
+      "$ref": "#/$defs/run_identity"
+    },
+    "domains": {
+      "type": "object",
+      "required": [
+        "memory",
+        "rss_residency",
+        "pane_budget",
+        "queue_backpressure",
+        "storage_io",
+        "worker_pool",
+        "capacity_admission",
+        "resource_admission",
+        "action_receipts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "memory": {
+          "$ref": "#/$defs/domain"
+        },
+        "rss_residency": {
+          "$ref": "#/$defs/domain"
+        },
+        "pane_budget": {
+          "$ref": "#/$defs/domain"
+        },
+        "queue_backpressure": {
+          "$ref": "#/$defs/domain"
+        },
+        "storage_io": {
+          "$ref": "#/$defs/domain"
+        },
+        "worker_pool": {
+          "$ref": "#/$defs/domain"
+        },
+        "capacity_admission": {
+          "$ref": "#/$defs/domain"
+        },
+        "resource_admission": {
+          "$ref": "#/$defs/domain"
+        },
+        "action_receipts": {
+          "$ref": "#/$defs/domain"
+        }
+      }
+    },
+    "memory_tiers": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/memory_tier"
+      }
+    },
+    "residency_buckets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/residency_bucket"
+      }
+    },
+    "queue_backpressure": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/queue_backpressure"
+      }
+    },
+    "storage_io": {
+      "$ref": "#/$defs/storage_io"
+    },
+    "worker_pool": {
+      "$ref": "#/$defs/worker_pool"
+    },
+    "admission_decisions": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/admission_decision"
+      }
+    },
+    "action_receipts": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/action_receipt"
+      }
+    },
+    "mitigation_history": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/drilldown"
+      }
+    },
+    "drilldowns": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/drilldown"
+      }
+    },
+    "artifact_paths": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifact_path"
+      }
+    }
+  },
+  "$defs": {
+    "operator_status": {
+      "enum": ["ready", "watch", "violated", "unknown", "unavailable"]
+    },
+    "proof_gate": {
+      "enum": ["healthy", "pressured", "degraded", "skipped_proof"]
+    },
+    "evidence_state": {
+      "enum": ["measured", "simulated", "unavailable", "stale", "mixed"]
+    },
+    "evidence_level": {
+      "enum": [
+        "local_static",
+        "local_reduced",
+        "remote_reduced",
+        "target_hardware",
+        "skipped_not_proven"
+      ]
+    },
+    "proof_status": {
+      "enum": [
+        "proven_predicate_met",
+        "skipped_not_proven",
+        "unavailable",
+        "stale"
+      ]
+    },
+    "pressure_tier": {
+      "enum": [
+        "normal",
+        "elevated",
+        "critical",
+        "emergency",
+        "green",
+        "yellow",
+        "orange",
+        "red",
+        "black",
+        "unknown"
+      ]
+    },
+    "resource_admission_action": {
+      "enum": ["admit", "defer", "degrade", "shed"]
+    },
+    "storage_admission_outcome": {
+      "enum": ["admit", "batch", "defer", "degrade", "shed", "fail_closed"]
+    },
+    "action_receipt_status": {
+      "enum": [
+        "planned",
+        "skipped",
+        "dry_run",
+        "applied",
+        "succeeded",
+        "blocked",
+        "denied",
+        "approval_required",
+        "failed",
+        "compensated",
+        "compensation_failed",
+        "rollback_required"
+      ]
+    },
+    "policy_decision": {
+      "enum": ["allow", "deny", "require_approval", "not_checked"]
+    },
+    "reason_code": {
+      "type": "string",
+      "pattern": "^[a-z0-9_]+(?:[.][a-z0-9_]+)*$"
+    },
+    "artifact_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullable_nonnegative_integer": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "nullable_number": {
+      "type": ["number", "null"]
+    },
+    "metric_value": {
+      "type": ["number", "integer", "string", "boolean", "null"]
+    },
+    "evidence_freshness": {
+      "type": "object",
+      "required": [
+        "state",
+        "source",
+        "generated_at_ms",
+        "freshness_ms",
+        "max_age_ms",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "generated_at_ms": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "freshness_ms": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "max_age_ms": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        }
+      }
+    },
+    "run_identity": {
+      "type": "object",
+      "required": [
+        "run_id",
+        "evidence_level",
+        "artifact_paths",
+        "hardware_predicate"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_level": {
+          "$ref": "#/$defs/evidence_level"
+        },
+        "git_head": {
+          "type": ["string", "null"]
+        },
+        "repo_snapshot_head": {
+          "type": ["string", "null"]
+        },
+        "artifact_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact_path"
+          }
+        },
+        "hardware_predicate": {
+          "type": "object",
+          "required": [
+            "logical_cpus",
+            "memory_gib",
+            "target_class",
+            "proof_status"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "logical_cpus": {
+              "$ref": "#/$defs/nullable_nonnegative_integer"
+            },
+            "memory_gib": {
+              "$ref": "#/$defs/nullable_nonnegative_integer"
+            },
+            "target_class": {
+              "type": "boolean"
+            },
+            "proof_status": {
+              "$ref": "#/$defs/proof_status"
+            }
+          }
+        }
+      }
+    },
+    "domain": {
+      "type": "object",
+      "required": [
+        "name",
+        "evidence_state",
+        "pressure_tier",
+        "summary",
+        "operator_action",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "enum": [
+            "memory",
+            "rss_residency",
+            "pane_budget",
+            "queue_backpressure",
+            "storage_io",
+            "worker_pool",
+            "capacity_admission",
+            "resource_admission",
+            "action_receipts"
+          ]
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "pressure_tier": {
+          "$ref": "#/$defs/pressure_tier"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operator_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        },
+        "freshness": {
+          "$ref": "#/$defs/evidence_freshness"
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/metric_value"
+          }
+        }
+      }
+    },
+    "memory_tier": {
+      "type": "object",
+      "required": [
+        "tier",
+        "resident",
+        "evidence_state",
+        "budget_bytes",
+        "actual_bytes",
+        "over_budget_bytes",
+        "remaining_budget_bytes",
+        "reclaimable_bytes",
+        "reclaimed_bytes",
+        "evicted_bytes",
+        "refused_bytes",
+        "has_pressure",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tier": {
+          "enum": [
+            "hot_resident",
+            "warm_compressed",
+            "cold_disk",
+            "search_index_cache",
+            "render_cache",
+            "transient_ingestion",
+            "allocator_pools"
+          ]
+        },
+        "resident": {
+          "type": "boolean"
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "budget_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actual_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "over_budget_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "remaining_budget_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reclaimable_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reclaimed_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evicted_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "refused_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "has_pressure": {
+          "type": "boolean"
+        },
+        "reclamation_action": {
+          "type": ["string", "null"]
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        }
+      }
+    },
+    "residency_bucket": {
+      "type": "object",
+      "required": [
+        "bucket",
+        "evidence_state",
+        "bytes",
+        "pressure_tier",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bucket": {
+          "enum": [
+            "rust_heap",
+            "mmap_file_backed",
+            "sqlite_page_cache",
+            "graphics_media",
+            "scrollback_cache",
+            "child_processes",
+            "allocator_pools",
+            "unknown"
+          ]
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "bytes": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "pressure_tier": {
+          "$ref": "#/$defs/pressure_tier"
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        }
+      }
+    },
+    "queue_backpressure": {
+      "type": "object",
+      "required": [
+        "queue",
+        "evidence_state",
+        "tier",
+        "depth",
+        "capacity",
+        "utilization",
+        "operator_action",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "queue": {
+          "enum": [
+            "capture",
+            "write",
+            "persistence",
+            "event_bus",
+            "search_indexing",
+            "cold_tier_hydration",
+            "resource_admission"
+          ]
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "tier": {
+          "enum": ["green", "yellow", "red", "black", "unknown"]
+        },
+        "depth": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "capacity": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "utilization": {
+          "$ref": "#/$defs/nullable_number"
+        },
+        "oldest_queued_age_ms": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "operator_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        }
+      }
+    },
+    "storage_io": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "pressure_domain",
+        "io_pressure_tier",
+        "io_pressure_reason",
+        "operator_action",
+        "aggregate_queue_depth",
+        "aggregate_bytes_pending",
+        "durability_pending_total",
+        "search_lag_segments",
+        "hydration_lag_pages",
+        "audit_fail_closed_total",
+        "write_error_total"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pressure_domain": {
+          "const": "storage_io"
+        },
+        "io_pressure_tier": {
+          "enum": ["green", "yellow", "red", "black"]
+        },
+        "io_pressure_reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operator_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "aggregate_queue_depth": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "aggregate_bytes_pending": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "oldest_queued_age_ms": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "durability_pending_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "search_lag_segments": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hydration_lag_pages": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "audit_fail_closed_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "write_error_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dominant_class": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "class": {
+              "type": "string",
+              "minLength": 1
+            },
+            "class_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "queue_depth": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes_pending": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "oldest_queued_age_ms": {
+              "$ref": "#/$defs/nullable_nonnegative_integer"
+            },
+            "fail_closed_total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "write_error_total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reason_code": {
+              "type": ["string", "null"]
+            }
+          }
+        }
+      }
+    },
+    "worker_pool": {
+      "type": "object",
+      "required": [
+        "evidence_state",
+        "pressure_tier",
+        "total_workers",
+        "healthy_workers",
+        "busy_workers",
+        "waiting_workers",
+        "queue_depth",
+        "local_fallback_allowed",
+        "operator_action",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "pressure_tier": {
+          "$ref": "#/$defs/pressure_tier"
+        },
+        "total_workers": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "healthy_workers": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "busy_workers": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "waiting_workers": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "degraded_workers": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "queue_depth": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "oldest_queued_age_ms": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "local_fallback_allowed": {
+          "type": ["boolean", "null"]
+        },
+        "operator_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        }
+      }
+    },
+    "admission_decision": {
+      "type": "object",
+      "required": ["source", "action", "reason_codes", "counters"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "enum": ["capacity_admission", "resource_admission"]
+        },
+        "action": {
+          "$ref": "#/$defs/resource_admission_action"
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        },
+        "counters": {
+          "type": "object",
+          "required": ["admitted", "deferred", "degraded", "shed"],
+          "additionalProperties": false,
+          "properties": {
+            "admitted": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "deferred": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "degraded": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "shed": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "raw_pressure_severity": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "effective_pressure_severity": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "priority_protection_units": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "queue_utilization": {
+          "$ref": "#/$defs/nullable_number"
+        },
+        "pending_items": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "fleet_pressure": {
+          "type": ["string", "null"],
+          "enum": ["normal", "elevated", "critical", "emergency", null]
+        },
+        "memory_tier_pressure": {
+          "type": ["string", "null"],
+          "enum": ["normal", "elevated", "critical", "emergency", null]
+        },
+        "max_latency_over_budget_ratio": {
+          "$ref": "#/$defs/nullable_number"
+        }
+      }
+    },
+    "action_receipt": {
+      "type": "object",
+      "required": [
+        "receipt_id",
+        "action",
+        "target_domain",
+        "requested_at_ms",
+        "status",
+        "dry_run",
+        "policy_decision",
+        "evidence_state",
+        "reason_codes",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "receipt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_domain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed_at_ms": {
+          "$ref": "#/$defs/nullable_nonnegative_integer"
+        },
+        "status": {
+          "$ref": "#/$defs/action_receipt_status"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "policy_decision": {
+          "$ref": "#/$defs/policy_decision"
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reason_code"
+          }
+        },
+        "artifact_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact_path"
+          }
+        }
+      }
+    },
+    "drilldown": {
+      "type": "object",
+      "required": ["subject", "reason_code", "detail"],
+      "additionalProperties": false,
+      "properties": {
+        "subject": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reason_code"
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "artifact_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact_path"
+          }
+        }
+      }
+    }
+  }
+}
