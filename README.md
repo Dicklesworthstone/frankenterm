@@ -690,7 +690,7 @@ limits instead of the generic `robot.not_implemented` fallback.
 | `ft robot context`       | status / rotate / history                 | ✅ native SQLite context registry; rotation receipts are durable and raw context content is not stored |
 | `ft robot work`          | claim / release / complete / list / ready / assign | ✅ native SQLite `work_claims` queue |
 | `ft robot fleet`         | status / scale / rebalance / agents       | ✅ native read paths for status/agents; scale/rebalance parse natively and return typed `robot.fleet.capability_unavailable` until daemon-side mutation is wired |
-| `ft robot profile`       | list / show / validate / dry-run apply    | ✅ shipped for read paths and dry-run apply; non-dry-run apply returns typed `robot.profile.spawn_failed` until daemon spawn RPC lands |
+| `ft robot profile`       | list / show / validate / apply            | ✅ shipped for read paths, dry-run apply, and mux-backed non-dry-run apply with durable receipts |
 
 Examples for the graduated NTM-gap families:
 
@@ -797,23 +797,36 @@ $ ft robot --format json profile apply codex_ws --count 3 --dry-run
 ```
 
 **Implementation status**: the CLI surface, argument parsing,
-contract DSL, DB-backed `list` / `show` / `validate`, and dry-run
-`apply` path ship live. The substrate at
+contract DSL, DB-backed `list` / `show` / `validate`, dry-run
+`apply`, and mux-backed non-dry-run `apply` paths ship live. The substrate at
 `crates/frankenterm-core/src/robot_family_contract.rs` includes the
 state-space proof + conformance coverage at
 `tests/robot_family_conformance.rs`, and the live handler is
 `crates/frankenterm-core/src/robot_profile_handler.rs`. Non-dry-run
-`apply` still requires daemon-mediated pane spawning and currently
-returns a typed error envelope instead of spawning panes:
+`apply` routes through the shared fleet mutation executor, spawns panes
+through the mux bridge, persists `profiles_applied_log` receipts, and
+rolls back panes on mid-apply failure:
 
 ```json
 $ ft robot --format json profile apply codex_ws --count 3
 {
-  "ok": false,
-  "error": {
-    "code": "robot.profile.spawn_failed",
-    "message": "profile apply spawn failed: profile `codex_ws` apply (count=3) requires daemon-mediated pane spawning; daemon apply RPC is not connected in this process"
-  }
+  "ok": true,
+  "data": {
+    "profile_name": "codex_ws",
+    "panes_spawned": [10, 11, 12],
+    "dry_run": false,
+    "requested_agents": 3,
+    "spawned_agents": 3,
+    "skipped_existing_agents": 0,
+    "idempotency_key": "<profiles_applied_log content_hash>",
+    "mutation_idempotency_key": "<fleet mutation key>",
+    "rollback_status": "succeeded",
+    "idempotent_replay": false,
+    "mutation_receipt": {
+      "...": "full fleet mutation receipt"
+    }
+  },
+  "elapsed_ms": 37
 }
 ```
 
