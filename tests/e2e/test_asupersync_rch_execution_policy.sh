@@ -280,11 +280,17 @@ tmp_timeout_record="${tmp_dir}/timeout.json"
 tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
 tmp_missing_worker_id="${tmp_dir}/missing-worker-id.json"
+tmp_target_worker_mismatch="${tmp_dir}/target-worker-mismatch.json"
+tmp_target_worker_mismatch_ledger="${tmp_dir}/target-worker-mismatch-ledger.jsonl"
+tmp_target_worker_mismatch_report="${tmp_dir}/target-worker-mismatch-report.json"
 tmp_missing_repo_snapshot="${tmp_dir}/missing-repo-snapshot.json"
 tmp_bad_target_mirror_status="${tmp_dir}/bad-target-mirror-status.json"
 tmp_mirror_failed_attestation="${tmp_dir}/mirror-failed-attestation.json"
 tmp_mirror_failed_ledger="${tmp_dir}/mirror-failed-ledger.jsonl"
 tmp_mirror_failed_report="${tmp_dir}/mirror-failed-ledger-report.json"
+tmp_worker_self_test="${tmp_dir}/worker-self-test-only.json"
+tmp_worker_self_test_ledger="${tmp_dir}/worker-self-test-only-ledger.jsonl"
+tmp_worker_self_test_report="${tmp_dir}/worker-self-test-only-report.json"
 tmp_light_local="${tmp_dir}/light-local.json"
 tmp_residual_risk="${tmp_dir}/residual-risk.json"
 tmp_mixed_ledger_a="${tmp_dir}/mixed-ledger-a.jsonl"
@@ -812,6 +818,56 @@ expect_validation_failure \
   "target_worker_missing_selected_worker" \
   "target-worker proof without selected worker id must fail validation"
 
+jq '.runs[0].worker_evidence_confidence = "target_worker_remote_proof" |
+    .runs[0].intended_worker_id = "contabo-2" |
+    .runs[0].selected_worker_id = "contabo-3" |
+    .runs[0].worker_context = "worker=contabo-3" |
+    .runs[0].worker_context_fingerprint = "'"$(fingerprint_text "worker=contabo-3")"'"' \
+  "${tmp_valid}" > "${tmp_target_worker_mismatch}"
+expect_validation_failure \
+  "${tmp_target_worker_mismatch}" \
+  "failure_injection" \
+  "target_worker_selected_mismatch" \
+  "target-worker proof must reject scheduler-selected worker mismatch"
+
+jq -c . "${tmp_target_worker_mismatch}" > "${tmp_target_worker_mismatch_ledger}"
+set +e
+"${VALIDATOR}" --aggregate-ledger "${tmp_target_worker_mismatch_ledger}" > "${tmp_target_worker_mismatch_report}" 2>/dev/null
+aggregate_target_mismatch_rc=$?
+set -e
+if [[ "${aggregate_target_mismatch_rc}" -eq 0 ]]; then
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "target_worker_selected_mismatch" \
+    "negative_guardrail_not_enforced" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_target_worker_mismatch_report}")" \
+    "aggregate gate must reject target-worker evidence when the selected worker differs"
+  exit 1
+fi
+
+jq -e \
+  --arg scenario "${SCENARIO_ID}" \
+  '.quality_gate_passed == false and
+   .blocking_failure_count == 1 and
+   .entries[0].bead_id == "ft-kvs1e" and
+   .entries[0].scenario_id == $scenario and
+   .entries[0].worker_context == "worker=contabo-3" and
+   .entries[0].artifact_path != "unknown" and
+   (.entries[0].reason_detail | contains("target_worker_remote_proof requires intended_worker_id to match selected_worker_id"))' \
+  "${tmp_target_worker_mismatch_report}" >/dev/null || {
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "target_worker_selected_mismatch" \
+    "missing_operator_fields" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_target_worker_mismatch_report}")" \
+    "rejected target-worker aggregate entry must name bead, scenario, worker, artifact, and mismatch reason"
+  exit 1
+}
+
 jq '.runs[0].worker_evidence_confidence = "scheduler_selected_remote_proof" |
     .runs[0].repo_snapshot_head = null' \
   "${tmp_valid}" > "${tmp_missing_repo_snapshot}"
@@ -911,6 +967,89 @@ jq -e '
     "aggregate_report_mismatch" \
     "$(basename "${tmp_mirror_failed_report}")" \
     "mirror-failed aggregate must expose worker-evidence confidence and mirror status"
+  exit 1
+}
+
+self_test_cmd="rch exec -- rch check"
+self_test_worker="worker=contabo-2"
+self_test_residual="worker self-test only; material proof command did not run"
+jq --arg cmd "${self_test_cmd}" \
+  --arg cmd_fp "$(fingerprint_text "${self_test_cmd}")" \
+  --arg worker "${self_test_worker}" \
+  --arg worker_fp "$(fingerprint_text "${self_test_worker}")" \
+  --arg target "not_applicable" \
+  --arg target_fp "$(fingerprint_text "not_applicable")" \
+  --arg residual "${self_test_residual}" \
+  --arg residual_fp "$(fingerprint_text "${self_test_residual}")" \
+  '.runs[0].command = $cmd |
+    .runs[0].command_fingerprint = $cmd_fp |
+    .runs[0].command_class = "light" |
+    .runs[0].is_heavy = false |
+    .runs[0].used_rch = true |
+    .runs[0].worker_context = $worker |
+    .runs[0].worker_context_fingerprint = $worker_fp |
+    .runs[0].execution_mode = "remote_rch" |
+    .runs[0].target_dir = $target |
+    .runs[0].target_dir_fingerprint = $target_fp |
+    .runs[0].target_dir_lifecycle = "not_applicable" |
+    .runs[0].residual_risk_notes = $residual |
+    .runs[0].residual_risk_notes_fingerprint = $residual_fp |
+    .runs[0].worker_evidence_confidence = "worker_self_test_only" |
+    .runs[0].intended_worker_id = null |
+    .runs[0].selected_worker_id = "contabo-2" |
+    .runs[0].worker_queue_state = "ready" |
+    .runs[0].repo_snapshot_head = "unknown" |
+    .runs[0].source_mirror_status = "not_checked" |
+    .runs[0].source_mirror_reason_code = null |
+    .runs[0].remote_cargo_reached = false |
+    .runs[0].remote_rustc_reached = false |
+    .runs[0].test_binary_reached = false |
+    .runs[0].validation_status = "valid"' \
+  "${tmp_valid}" > "${tmp_worker_self_test}"
+
+if ! "${VALIDATOR}" --validate-evidence "${tmp_worker_self_test}" >/dev/null; then
+  emit_log \
+    "failed" \
+    "worker_evidence" \
+    "worker_self_test_only" \
+    "unexpected_self_test_reject" \
+    "validator_rejected_self_test_only" \
+    "$(basename "${tmp_worker_self_test}")" \
+    "worker self-test evidence should validate only as diagnostic evidence"
+  exit 1
+fi
+
+jq -c . "${tmp_worker_self_test}" > "${tmp_worker_self_test_ledger}"
+if ! "${VALIDATOR}" --aggregate-ledger "${tmp_worker_self_test_ledger}" > "${tmp_worker_self_test_report}"; then
+  emit_log \
+    "failed" \
+    "worker_evidence" \
+    "worker_self_test_only_aggregate" \
+    "aggregate_unexpected_fail" \
+    "aggregate_report_failed" \
+    "$(basename "${tmp_worker_self_test_report}")" \
+    "worker self-test aggregate should pass as residual-risk-only evidence"
+  exit 1
+fi
+
+jq -e '
+  .overall_verdict == "partial_risk" and
+  .quality_gate_passed == true and
+  .counts.residual_risk_only == 1 and
+  .worker_evidence_counts.worker_self_test_only == 1 and
+  .entries[0].worker_evidence_confidence == "worker_self_test_only" and
+  .entries[0].worker_evidence_category == "worker_self_test_only" and
+  .entries[0].remote_cargo_reached == false and
+  .entries[0].test_binary_reached == false
+' "${tmp_worker_self_test_report}" >/dev/null || {
+  emit_log \
+    "failed" \
+    "worker_evidence" \
+    "worker_self_test_only_aggregate" \
+    "missing_worker_fields" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_worker_self_test_report}")" \
+    "worker self-test aggregate must remain diagnostic and never count as material proof"
   exit 1
 }
 
