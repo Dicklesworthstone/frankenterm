@@ -57,6 +57,14 @@ struct CachedProcInfo {
     root: LocalProcessInfo,
     updated: Instant,
     foreground: LocalProcessInfo,
+    /// Memoized "is this pane's process tree stateful?" decision.
+    /// `None` until the first `can_close_without_prompting` consumer evaluates
+    /// it; `Some(b)` afterward — reused for subsequent close attempts within
+    /// the cache TTL so the synchronous `mux-is-process-stateful` Lua hook
+    /// runs at most once per refresh, not once per close attempt. Reset
+    /// implicitly to `None` when the warm worker replaces the whole struct.
+    /// See ft-qhwpq.
+    cached_is_stateful: Option<bool>,
 }
 
 /// This is a bit horrible; it can take 700us to tcgetpgrp, so if we have
@@ -751,19 +759,32 @@ impl Pane for LocalPane {
         // confirmation prompt — safe) and kick off a single-flight
         // background warm so the *next* close attempt has a fresh cache and
         // can render the no-prompt fast path.
-        let cached_root = {
+        //
+        // Inner Option is the memoized stateful decision: hit it directly
+        // and we skip the synchronous `mux-is-process-stateful` Lua hook +
+        // `default_stateful_check` HashSet build. The Lua hook still runs
+        // on cold-decision attempts but is then memoized for the rest of
+        // this cache TTL window.
+        //
+        // `entry_generation` is the cache entry's `updated: Instant`,
+        // captured at read time. We use it below to detect whether the
+        // warm worker raced ahead and replaced the entry between our read
+        // and our write-back of the computed decision — if so, dropping
+        // the write-back avoids labeling the new entry with a decision
+        // computed from the old proc tree.
+        let cached: Option<(LocalProcessInfo, Option<bool>, Instant)> = {
             let proc_list = self.proc_list.lock();
             proc_list.as_ref().and_then(|info| {
                 if info.updated.elapsed() < PROC_INFO_CACHE_TTL {
-                    Some(info.root.clone())
+                    Some((info.root.clone(), info.cached_is_stateful, info.updated))
                 } else {
                     None
                 }
             })
         };
 
-        let info_root = match cached_root {
-            Some(root) => root,
+        let (info_root, cached_decision, entry_generation) = match cached {
+            Some(triple) => triple,
             None => {
                 self.spawn_proc_list_warm();
                 // Fallback: prefer a cheap process_group_leader probe so a
@@ -778,6 +799,12 @@ impl Pane for LocalPane {
                 return false;
             }
         };
+
+        // Hot path: previously decided. No Lua, no HashSet build, no clone
+        // of `LocalProcessInfo` for the hook payload.
+        if let Some(is_stateful) = cached_decision {
+            return !is_stateful;
+        }
 
         log::trace!(
             "can_close_without_prompting? procs in pane {:#?}",
@@ -849,6 +876,21 @@ impl Pane for LocalPane {
                 default_stateful_check(&info_root)
             }
         };
+
+        // Memoize so other close attempts within the cache TTL skip the
+        // Lua hook + HashSet build. Guarded against the cache having been
+        // replaced by the warm worker between our read and write: the
+        // generation check (`info.updated == entry_generation`) ensures we
+        // only overwrite the entry we computed our decision against, never
+        // a fresher entry whose proc tree is different.
+        {
+            let mut proc_list = self.proc_list.lock();
+            if let Some(info) = proc_list.as_mut() {
+                if info.updated == entry_generation {
+                    info.cached_is_stateful = Some(is_stateful);
+                }
+            }
+        }
 
         !is_stateful
     }
@@ -1568,7 +1610,12 @@ impl LocalPane {
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
 
-        Self {
+        // Capture pid before it moves into the ProcessState. Used below to
+        // schedule a delayed cache prime so the first user-driven close
+        // attempt has warm proc_list data and skips the prompt — see ft-qhwpq.
+        let pid_for_prime = pid;
+
+        let pane = Self {
             pane_id,
             terminal: Arc::new(Mutex::new(terminal)),
             process: Mutex::new(ProcessState::Running {
@@ -1587,7 +1634,27 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+        };
+
+        // Prime the proc_list cache asynchronously. The 250 ms delay gives
+        // `Mux::add_pane` time to register this pane (so the worker's
+        // `Mux::try_get + get_pane` lookup succeeds) and gives the spawned
+        // shell a moment to fork its initial subprocesses (so the cache
+        // reflects something close to steady-state).
+        //
+        // Caveat: if the user spawns a long-lived agent AFTER the prime
+        // window, the cache will be stale by the close-attempt time and
+        // they'll fall back to the cache-miss path (prompt + spawn warm).
+        // That's acceptable — the prime is opportunistic, not load-bearing.
+        // See ft-qhwpq.
+        if let Some(pid_for_prime) = pid_for_prime {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                Self::warm_proc_cache(pane_id, pid_for_prime, /*clear_flag=*/ false);
+            });
         }
+
+        pane
     }
 
     #[cfg(unix)]
@@ -1702,6 +1769,7 @@ impl LocalPane {
                     root,
                     foreground,
                     updated: Instant::now(),
+                    cached_is_stateful: None,
                 });
                 log::trace!("CachedProcInfo updated");
             }
@@ -1725,11 +1793,12 @@ impl LocalPane {
     /// writing the result into the cache so the next
     /// `can_close_without_prompting` call hits the fast path. No-op when a
     /// warm is already in flight or when the pane has no live process.
+    /// The actual work runs in `Self::warm_proc_cache`.
     /// See ft-qhwpq.
     fn spawn_proc_list_warm(&self) {
         // Single-flight: bail if a previous warm is still running. The
-        // compare_exchange on AtomicBool is the gate; the spawned thread
-        // clears the flag at the end.
+        // compare_exchange on AtomicBool is the gate; `warm_proc_cache`
+        // clears the flag at the end (success and fallback paths).
         if self
             .proc_list_warm_pending
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1738,7 +1807,7 @@ impl LocalPane {
             return;
         }
 
-        let pid = match &*self.process.lock() {
+        let pid_walked = match &*self.process.lock() {
             ProcessState::Running { pid: Some(pid), .. } => *pid,
             _ => {
                 self.proc_list_warm_pending.store(false, Ordering::Release);
@@ -1748,36 +1817,71 @@ impl LocalPane {
 
         let pane_id = self.pane_id;
         std::thread::spawn(move || {
-            let root = LocalProcessInfo::with_root_pid(pid);
-            // Re-look up the pane: between dispatch and now the pane might
-            // have been removed, in which case we drop the result. Using
-            // Mux::try_get + downcast avoids having to hold an
-            // Arc<LocalPane> across the thread boundary.
-            if let (Some(root), Some(mux)) = (root, Mux::try_get()) {
-                if let Some(pane) = mux.get_pane(pane_id) {
-                    if let Some(local) = pane.downcast_ref::<LocalPane>() {
+            Self::warm_proc_cache(pane_id, pid_walked, /*clear_flag=*/ true);
+        });
+    }
+
+    /// Off-main-thread proc-tree walk + cache write for a specific pane.
+    ///
+    /// Re-resolves the pane via `Mux::try_get + downcast_ref` (a since-
+    /// dropped pane is a no-op) and verifies the pane's *current* pid
+    /// still matches `pid_walked`. If the pid has changed (process
+    /// re-spawn, or the unlikely PaneId reuse with a recycled `usize`) we
+    /// drop the result — caching it would mislabel the new process tree.
+    ///
+    /// `clear_flag=true` is for `spawn_proc_list_warm` callers (which set
+    /// the single-flight `proc_list_warm_pending` flag and need it
+    /// released regardless of success). `clear_flag=false` is for the
+    /// creation-time priming path, which never sets the flag and should
+    /// not race with a concurrent close-time warm by clearing it.
+    /// See ft-qhwpq.
+    fn warm_proc_cache(pane_id: PaneId, pid_walked: u32, clear_flag: bool) {
+        let root = LocalProcessInfo::with_root_pid(pid_walked);
+        if let (Some(root), Some(mux)) = (root, Mux::try_get()) {
+            if let Some(pane) = mux.get_pane(pane_id) {
+                if let Some(local) = pane.downcast_ref::<LocalPane>() {
+                    let pid_now = match &*local.process.lock() {
+                        ProcessState::Running { pid: Some(p), .. } => Some(*p),
+                        _ => None,
+                    };
+                    if pid_now == Some(pid_walked) {
                         let mut foreground = root.clone();
                         foreground.children.clear();
                         local.proc_list.lock().replace(CachedProcInfo {
                             root,
                             foreground,
                             updated: Instant::now(),
+                            cached_is_stateful: None,
                         });
-                        local.proc_list_warm_pending.store(false, Ordering::Release);
-                        return;
+                    } else {
+                        log::trace!(
+                            "warm_proc_cache: pid changed \
+                             ({pid_walked} -> {pid_now:?}) for pane \
+                             {pane_id}; dropping cache write"
+                        );
                     }
+                    if clear_flag {
+                        local
+                            .proc_list_warm_pending
+                            .store(false, Ordering::Release);
+                    }
+                    return;
                 }
             }
-            // Pane gone or proc walk failed — clear the in-flight flag so a
-            // later attempt can retry.
+        }
+        // Pane gone or proc walk failed — only worry about the flag if the
+        // caller asked us to manage it.
+        if clear_flag {
             if let Some(mux) = Mux::try_get() {
                 if let Some(pane) = mux.get_pane(pane_id) {
                     if let Some(local) = pane.downcast_ref::<LocalPane>() {
-                        local.proc_list_warm_pending.store(false, Ordering::Release);
+                        local
+                            .proc_list_warm_pending
+                            .store(false, Ordering::Release);
                     }
                 }
             }
-        });
+        }
     }
 }
 
