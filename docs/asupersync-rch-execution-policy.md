@@ -128,7 +128,7 @@ bash scripts/validate_asupersync_rch_execution_policy.sh --self-test
 bash scripts/validate_asupersync_rch_execution_policy.sh --classify "cargo test --workspace"
 bash scripts/validate_asupersync_rch_execution_policy.sh --redact-text "API_KEY=... cargo test"
 bash scripts/validate_asupersync_rch_execution_policy.sh --validate-evidence <path-to-evidence.json>
-bash scripts/validate_asupersync_rch_execution_policy.sh --aggregate-ledger <path-to-ledger.jsonl>
+bash scripts/validate_asupersync_rch_execution_policy.sh --aggregate-ledger <path-to-ledger.jsonl> [more-ledgers.jsonl ...]
 ```
 
 E2E policy validation:
@@ -155,8 +155,8 @@ produce entries that are intentionally not valid proof.
 
 Aggregate quality gate:
 
-- `--aggregate-ledger` scans a proof-ledger JSONL file, validates every run in
-  every retained evidence object, and emits an operator report.
+- `--aggregate-ledger` scans one or more proof-ledger JSONL files, validates
+  every run in every retained evidence object, and emits an operator report.
 - Each row carries the bead ID, scenario ID, command, worker context, artifact
   path(s), category, and stable reason code so Beads and release-readiness
   comments can cite the exact proof shape.

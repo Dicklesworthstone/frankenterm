@@ -13,7 +13,7 @@ Usage:
   validate_asupersync_rch_execution_policy.sh --classify "<command>"
   validate_asupersync_rch_execution_policy.sh --redact-text "<text>"
   validate_asupersync_rch_execution_policy.sh --validate-evidence <path>
-  validate_asupersync_rch_execution_policy.sh --aggregate-ledger <jsonl-path>
+  validate_asupersync_rch_execution_policy.sh --aggregate-ledger <jsonl-path> [jsonl-path ...]
   validate_asupersync_rch_execution_policy.sh --self-test
 EOF
 }
@@ -490,13 +490,14 @@ aggregate_reason_for_valid_category() {
 }
 
 aggregate_run_entry_json() {
-  local line_no="$1"
-  local run_index="$2"
-  local evidence="$3"
-  local category="$4"
-  local reason_code="$5"
-  local reason_detail="${6:-}"
-  local validation_status="${7:-valid}"
+  local ledger_file="$1"
+  local line_no="$2"
+  local run_index="$3"
+  local evidence="$4"
+  local category="$5"
+  local reason_code="$6"
+  local reason_detail="${7:-}"
+  local validation_status="${8:-valid}"
   local run bead_id scenario_id command worker_context artifact_paths artifact_path
 
   run="$(jq -c ".runs[${run_index}]" <<<"${evidence}" 2>/dev/null || printf '{}')"
@@ -508,6 +509,7 @@ aggregate_run_entry_json() {
   artifact_path="$(jq -r 'if (.artifact_paths | type) == "array" and (.artifact_paths | length) > 0 then .artifact_paths[0] else "unknown" end' <<<"${run}" 2>/dev/null || printf 'unknown')"
 
   jq -cn \
+    --arg ledger_path "${ledger_file}" \
     --argjson line_no "${line_no}" \
     --argjson run_index "${run_index}" \
     --arg bead_id "${bead_id}" \
@@ -521,6 +523,7 @@ aggregate_run_entry_json() {
     --arg reason_detail "${reason_detail}" \
     --arg validation_status "${validation_status}" \
     '{
+      ledger_path: $ledger_path,
       line_no: $line_no,
       run_index: $run_index,
       bead_id: $bead_id,
@@ -537,13 +540,16 @@ aggregate_run_entry_json() {
 }
 
 aggregate_malformed_line_json() {
-  local line_no="$1"
-  local reason_detail="$2"
+  local ledger_file="$1"
+  local line_no="$2"
+  local reason_detail="$3"
 
   jq -cn \
+    --arg ledger_path "${ledger_file}" \
     --argjson line_no "${line_no}" \
     --arg reason_detail "${reason_detail}" \
     '{
+      ledger_path: $ledger_path,
       line_no: $line_no,
       run_index: null,
       bead_id: "unknown",
@@ -569,6 +575,7 @@ aggregate_ledger_file() {
 
   local rows="" line_no=0 line compact runs_count run_index single single_file validation_error
   local category reason_code reason_detail validation_status
+  local ledger_display_path="${ledger_file}"
   local validation_dir="${ledger_file}.aggregate-validation"
 
   mkdir -p "${validation_dir}"
@@ -578,18 +585,18 @@ aggregate_ledger_file() {
     [[ -n "${line}" ]] || continue
 
     if ! compact="$(jq -c . <<<"${line}" 2>/dev/null)"; then
-      rows+=$(aggregate_malformed_line_json "${line_no}" "line is not valid JSON")
+      rows+=$(aggregate_malformed_line_json "${ledger_display_path}" "${line_no}" "line is not valid JSON")
       rows+=$'\n'
       continue
     fi
 
     if ! runs_count="$(jq -r 'if (.runs | type) == "array" then (.runs | length) else -1 end' <<<"${compact}" 2>/dev/null)"; then
-      rows+=$(aggregate_malformed_line_json "${line_no}" "runs must be an array")
+      rows+=$(aggregate_malformed_line_json "${ledger_display_path}" "${line_no}" "runs must be an array")
       rows+=$'\n'
       continue
     fi
     if [[ ! "${runs_count}" =~ ^[0-9]+$ || "${runs_count}" -le 0 ]]; then
-      rows+=$(aggregate_malformed_line_json "${line_no}" "runs must be a non-empty array")
+      rows+=$(aggregate_malformed_line_json "${ledger_display_path}" "${line_no}" "runs must be a non-empty array")
       rows+=$'\n'
       continue
     fi
@@ -612,6 +619,7 @@ aggregate_ledger_file() {
       fi
 
       rows+=$(aggregate_run_entry_json \
+        "${ledger_display_path}" \
         "${line_no}" \
         "${run_index}" \
         "${single}" \
@@ -624,7 +632,7 @@ aggregate_ledger_file() {
   done <"${ledger_file}"
 
   if [[ -z "${rows}" ]]; then
-    rows="$(aggregate_malformed_line_json 0 "ledger file had no JSONL entries")"$'\n'
+    rows="$(aggregate_malformed_line_json "${ledger_display_path}" 0 "ledger file had no JSONL entries")"$'\n'
   fi
 
   printf '%s' "${rows}" | jq -s \
@@ -638,7 +646,74 @@ aggregate_ledger_file() {
         schema_version: ($schema_version | tonumber),
         generated_at: $generated_at,
         ledger_path: $ledger_path,
+        ledger_paths: [$ledger_path],
         validation_dir: $validation_dir,
+        validation_dirs: [$validation_dir],
+        entries: $entries,
+        counts: {
+          proven_remote: countcat("proven_remote"),
+          light_local: countcat("light_local"),
+          approved_fallback: countcat("approved_fallback"),
+          rejected_local_heavy: countcat("rejected_local_heavy"),
+          malformed: countcat("malformed"),
+          missing_artifact: countcat("missing_artifact"),
+          residual_risk_only: countcat("residual_risk_only")
+        }
+      }
+      | .blocking_failure_count = (
+          .counts.rejected_local_heavy + .counts.malformed + .counts.missing_artifact
+        )
+      | .risk_count = (.counts.approved_fallback + .counts.residual_risk_only)
+      | .quality_gate_passed = (.blocking_failure_count == 0)
+      | .overall_verdict = (
+          if .blocking_failure_count > 0 then "failed"
+          elif .risk_count > 0 then "partial_risk"
+          else "passed"
+          end
+        )'
+}
+
+aggregate_ledger_files() {
+  if [[ $# -lt 1 ]]; then
+    echo "at least one ledger file is required" >&2
+    return 1
+  fi
+
+  if [[ $# -eq 1 ]]; then
+    aggregate_ledger_file "$1"
+    return $?
+  fi
+
+  local rows="" ledger_paths_json="[]" validation_dirs_json="[]"
+  local ledger_file report validation_dir
+
+  for ledger_file in "$@"; do
+    if [[ ! -f "${ledger_file}" ]]; then
+      echo "ledger file not found: ${ledger_file}" >&2
+      return 1
+    fi
+    report="$(aggregate_ledger_file "${ledger_file}")"
+    rows+="$(jq -c '.entries[]' <<<"${report}")"
+    rows+=$'\n'
+    ledger_paths_json="$(jq -c --arg path "${ledger_file}" '. + [$path]' <<<"${ledger_paths_json}")"
+    validation_dir="$(jq -r '.validation_dir' <<<"${report}")"
+    validation_dirs_json="$(jq -c --arg path "${validation_dir}" '. + [$path]' <<<"${validation_dirs_json}")"
+  done
+
+  printf '%s' "${rows}" | jq -s \
+    --arg schema_version "1" \
+    --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --argjson ledger_paths "${ledger_paths_json}" \
+    --argjson validation_dirs "${validation_dirs_json}" \
+    'def countcat($name): map(select(.category == $name)) | length;
+     . as $entries
+     | {
+        schema_version: ($schema_version | tonumber),
+        generated_at: $generated_at,
+        ledger_path: null,
+        ledger_paths: $ledger_paths,
+        validation_dir: null,
+        validation_dirs: $validation_dirs,
         entries: $entries,
         counts: {
           proven_remote: countcat("proven_remote"),
@@ -1023,11 +1098,11 @@ case "$1" in
     ;;
   --aggregate-ledger)
     shift
-    if [[ $# -ne 1 ]]; then
+    if [[ $# -lt 1 ]]; then
       usage
       exit 1
     fi
-    aggregate_report="$(aggregate_ledger_file "$1")"
+    aggregate_report="$(aggregate_ledger_files "$@")"
     printf '%s\n' "${aggregate_report}"
     if [[ "$(jq -r '.quality_gate_passed' <<<"${aggregate_report}")" != "true" ]]; then
       exit 1

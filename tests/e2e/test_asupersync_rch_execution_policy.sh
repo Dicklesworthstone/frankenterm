@@ -280,7 +280,8 @@ tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
 tmp_light_local="${tmp_dir}/light-local.json"
 tmp_residual_risk="${tmp_dir}/residual-risk.json"
-tmp_mixed_ledger="${tmp_dir}/mixed-ledger.jsonl"
+tmp_mixed_ledger_a="${tmp_dir}/mixed-ledger-a.jsonl"
+tmp_mixed_ledger_b="${tmp_dir}/mixed-ledger-b.jsonl"
 tmp_mixed_report="${tmp_dir}/mixed-ledger-report.json"
 tmp_rejected_ledger="${tmp_dir}/rejected-ledger.jsonl"
 tmp_rejected_report="${tmp_dir}/rejected-ledger-report.json"
@@ -650,8 +651,8 @@ emit_log \
   "mixed_ledger_partial_risk" \
   "none" \
   "none" \
-  "$(basename "${tmp_mixed_ledger}")" \
-  "aggregate gate should classify remote, light local, approved fallback, and residual-risk-only records"
+  "$(basename "${tmp_mixed_report}")" \
+  "aggregate gate should classify remote, light local, approved fallback, and residual-risk-only records across multiple ledgers"
 
 light_command="cargo fmt --check"
 light_worker="local"
@@ -688,8 +689,9 @@ jq --arg residual "${residual_note}" \
     .runs[0].residual_risk_notes_fingerprint = $residual_fp' \
   "${tmp_valid}" > "${tmp_residual_risk}"
 
-jq -c . "${tmp_valid}" "${tmp_light_local}" "${tmp_recovery}" "${tmp_residual_risk}" > "${tmp_mixed_ledger}"
-if ! "${VALIDATOR}" --aggregate-ledger "${tmp_mixed_ledger}" > "${tmp_mixed_report}"; then
+jq -c . "${tmp_valid}" "${tmp_light_local}" > "${tmp_mixed_ledger_a}"
+jq -c . "${tmp_recovery}" "${tmp_residual_risk}" > "${tmp_mixed_ledger_b}"
+if ! "${VALIDATOR}" --aggregate-ledger "${tmp_mixed_ledger_a}" "${tmp_mixed_ledger_b}" > "${tmp_mixed_report}"; then
   emit_log \
     "failed" \
     "aggregate_quality_gate" \
@@ -719,6 +721,7 @@ jq -e '
   .counts.light_local == 1 and
   .counts.approved_fallback == 1 and
   .counts.residual_risk_only == 1 and
+  (.ledger_paths | length) == 2 and
   .blocking_failure_count == 0 and
   ([.entries[] | select(.bead_id == "ft-kvs1e" and .scenario_id != "unknown" and .command != "unknown" and .worker_context != "unknown" and .artifact_path != "unknown" and .reason_code != "")] | length) == 4
 ' "${tmp_mixed_report}" >/dev/null || {
