@@ -1,0 +1,173 @@
+# Robot SDK Transport Contract
+
+**Bead:** `ft-gzgfc.1`
+**Audience:** Agents implementing generated Robot Mode SDK clients.
+
+The generated Rust SDK is the only finish-line supported SDK target today.
+Python, TypeScript, and Go currently render template clients whose transport
+methods fail with `transport not wired`. That is intentional honesty, not a
+supported user workflow. A language may move from template-only to supported
+only after it satisfies this contract and its generated artifact no longer
+contains a placeholder transport.
+
+This document defines the shared transport behavior that non-Rust SDK targets
+must implement before changing `SdkLanguage::is_fully_supported`.
+
+## Support States
+
+Each SDK language has exactly one support state:
+
+| State | Meaning | Artifact rule |
+| --- | --- | --- |
+| `template_only` | The generated source is an example skeleton. The consumer must provide transport wiring. | The source must contain an explicit `transport not wired` marker, and docs must not advertise the language as supported. |
+| `supported_process_transport` | The generated source has a tested default transport that shells out to `ft robot`. | The source must not contain a placeholder marker, and tests must cover success and failure envelopes. |
+| `supported_daemon_transport` | The generated source has a tested default transport that talks to a future daemon IPC/API. | The source must not contain a placeholder marker, and tests must cover daemon unavailable and protocol failure. |
+| `supported_pluggable_transport` | The generated source ships a tested interface and a supported default implementation. | The default implementation must be real; an interface alone is still `template_only`. |
+
+Promotion rule: a language can return `true` from
+`SdkLanguage::is_fully_supported()` only when its generated source is in one of
+the `supported_*` states and the same change updates tests, artifact guards,
+and documentation.
+
+## Transport Shape
+
+The first supported non-Rust transport should prefer the process transport
+unless a daemon IPC surface is already available and proven. Process transport
+is less elegant, but it keeps the SDK contract aligned with the public CLI and
+avoids inventing a parallel protocol.
+
+A process transport call is:
+
+```text
+ft robot --format json <command> <args...>
+```
+
+The transport MUST:
+
+- locate the `ft` binary from explicit configuration first, then `PATH`;
+- pass Robot Mode arguments without shell interpolation;
+- request JSON output unless the language has a documented TOON parser;
+- parse stdout as a `RobotResponse` envelope;
+- treat nonzero exit, invalid JSON, timeout, and missing binary as transport
+  errors, not robot business errors;
+- preserve stderr as bounded diagnostic text and avoid logging pane content;
+- expose a configurable timeout per call;
+- keep an injectable transport seam for tests and advanced callers.
+
+The transport MUST NOT:
+
+- call local heavy Cargo or build FrankenTerm as part of a normal SDK call;
+- parse human CLI output;
+- silently convert transport failures into successful empty responses;
+- widen supported command coverage beyond what the generated method knows how
+  to encode and decode.
+
+## Envelope Handling
+
+All supported SDK transports decode the same Robot Mode envelope:
+
+```json
+{
+  "ok": true,
+  "data": {},
+  "elapsed_ms": 1
+}
+```
+
+For `ok: true`, return the decoded `data` payload in the language-native shape
+generated for that method.
+
+For `ok: false`, raise or return a robot error that preserves:
+
+- `error_code`;
+- `message`;
+- `hint`, if present;
+- `details`, if present;
+- `elapsed_ms`, if present.
+
+Robot errors are not transport errors. A policy denial, unsupported command, or
+capability-unavailable response is a successful transport exchange with a
+negative robot result.
+
+## Required Fixture Cases
+
+Every promoted language needs fixture-backed tests for these cases:
+
+| Case | Input | Expected result |
+| --- | --- | --- |
+| success envelope | stdout contains `{"ok":true,"data":...}` and exit status is 0 | method returns decoded data |
+| robot error envelope | stdout contains `{"ok":false,"error_code":"robot.policy_denied",...}` and exit status is 0 | method reports a robot error with code and hint preserved |
+| invalid payload | caller omits or mis-types a required method argument | SDK rejects before invoking `ft` when possible |
+| unsupported command | generated method asks for a command outside the transport allow-list | SDK reports unsupported command without invoking `ft` |
+| timeout | process does not complete before deadline | SDK reports transport timeout with bounded diagnostics |
+| missing binary | configured or PATH binary is absent | SDK reports transport unavailable |
+| invalid JSON | process exits 0 but stdout is malformed | SDK reports protocol decode failure |
+| stderr with success | process exits 0 and stdout is valid, stderr has warnings | method succeeds and preserves bounded diagnostics when exposed |
+| nonzero exit | process exits nonzero with or without JSON | SDK reports transport failure unless a valid robot envelope is explicitly documented for that path |
+
+Language-specific tests may use fake process runners instead of spawning a real
+binary. At least one repository proof lane must validate the generated source
+text and artifact bundle with RCH-backed Rust tests.
+
+## Language Requirements
+
+### Python
+
+The Python client should expose an async-friendly API, but the default
+transport may be sync internally if it runs in a bounded subprocess call. It
+must provide an injectable callable for tests. Robot errors should be distinct
+from transport errors.
+
+Promotion removes the generated `_call` method that raises
+`NotImplementedError("transport not wired")`.
+
+### TypeScript
+
+The TypeScript client must state whether the default process transport is
+Node-only. Browser support requires a separate daemon or fetch transport and
+must not be implied by a child-process implementation. The generated client
+should expose an interface that tests can satisfy without spawning a process.
+
+Promotion removes the generated `throw new Error("transport not wired...")`
+default.
+
+### Go
+
+The Go client should use `context.Context` for cancellation and timeout
+propagation. Robot errors and transport errors should be distinguishable, and
+generated code must be deterministic and `gofmt` compatible.
+
+Promotion removes the generated `panic("transport not wired")` default.
+
+## Artifact Guards
+
+When a language remains `template_only`, tests must assert that the marker is
+still present and the language is not included in the production artifact
+bundle as supported.
+
+When a language is promoted, tests must assert all of the following:
+
+- generated source for that language does not contain `transport not wired`;
+- `SdkLanguage::<Lang>.is_fully_supported()` returns true;
+- the contract artifact bundle includes the promoted source;
+- the promoted source includes a real default transport or a real default
+  transport factory;
+- README or SDK docs list the language as supported with proof links.
+
+The artifact bundle must never mix a `supported_*` language state with a
+placeholder transport marker.
+
+## Proof Requirements
+
+Implementation closeout for each language must include:
+
+- RCH-backed Rust tests for deterministic code generation and artifact bundle
+  guards;
+- language-level fixture tests for envelope and transport behavior;
+- `git diff --check` on touched files;
+- formatter checks for generated source where practical (`gofmt`, TypeScript
+  formatter or compiler, Python syntax check);
+- documentation updates that state remaining unsupported languages honestly.
+
+If a language-specific toolchain is unavailable, record that as an environment
+blocker and keep the language in `template_only`.

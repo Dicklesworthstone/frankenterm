@@ -28,6 +28,13 @@ that emits four things from one declaration:
    that the harness in `tests/robot_family_conformance/` enumerates and
    asserts against a real handler.
 
+Generated SDK clients consume the same Robot envelope truth, but SDK transport
+support is tracked separately from family completion. The shared promotion
+contract for Python, TypeScript, and Go lives in
+[`sdk-transports.md`](sdk-transports.md); a language remains template-only until
+that contract's transport, fixture, artifact-guard, and documentation evidence
+exists.
+
 The live CLI dispatch status for the retired NTM-gap families is tracked in
 `docs/robot-contracts/current-ntm-gap-dispatch.md` and guarded by
 `crates/frankenterm/tests/robot_ntm_gap_contract_tests.rs`. That harness is
