@@ -91,6 +91,10 @@ Local Cargo verification is not sufficient for finish-line closure unless the be
 ## RCH Worker Parity Profile
 
 Finish-line lanes that depend on remote Cargo verification must make the worker substrate itself auditable.
+When the closeout claim depends on a specific RCH worker or remote source
+mirror, also follow the worker-targeted proof contract in
+`docs/asupersync-rch-execution-policy.md`. Generic worker parity is not enough
+to close a worker-specific blocker.
 
 The minimum remote-verification profile is:
 
