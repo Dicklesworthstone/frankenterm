@@ -19,6 +19,8 @@
 #   - The agent-mail-fallback fixture is the schema-like compatibility gate
 #     for red-mail Beads/git coordination. It intentionally pins dirty-path
 #     risk categories and counts without adding a docs/json-schema robot file.
+#   - expected_handoff.md pins the read-only red-mail Beads handoff comment
+#     formatter; the script prints it but never posts it.
 #
 # Run:
 #   bats tests/swarm_tick_tests.bats
@@ -106,6 +108,31 @@ run_agent_mail_fallback_fixture() {
     log_event "compare" "actual=${TMP_DIR}/actual.json expected=${TMP_DIR}/expected.json"
 }
 
+run_agent_mail_handoff_fixture() {
+    local fixture="${FIXTURES_ROOT}/agent-mail-fallback"
+    [[ -d "$fixture" ]] || { echo "missing fixture: $fixture" >&2; return 2; }
+
+    log_event "setup" "fixture=agent-mail-fallback-handoff"
+
+    local raw="${TMP_DIR}/actual_handoff.md"
+    PATH="${STUBS_DIR}:$PATH" \
+        FIXTURE_DIR="$fixture" \
+        REPO_ROOT="$REPO_ROOT" \
+        FT_OPERATOR_NOW_ISO="2026-05-06T17:00:00Z" \
+        FT_OPERATOR_NOW_EPOCH="1778086800" \
+        bash "$SCRIPT" --agent-mail-handoff \
+            --bead ft-u45ni \
+            --touched-path scripts/swarm-tick.sh \
+            --touched-path docs/operator-runbook.md \
+            --avoided-path crates/frankenterm/src/main.rs \
+            --proof-command "bash -n scripts/swarm-tick.sh" \
+            --proof-command "shellcheck scripts/swarm-tick.sh" \
+            frankenterm > "$raw" 2>"${TMP_DIR}/stderr.log"
+
+    cp "${fixture}/expected_handoff.md" "${TMP_DIR}/expected_handoff.md"
+    log_event "compare" "actual=${TMP_DIR}/actual_handoff.md expected=${TMP_DIR}/expected_handoff.md"
+}
+
 # Assert that the running fixture's actual matches expected.
 assert_match() {
     if ! diff -u "${TMP_DIR}/expected.json" "${TMP_DIR}/actual.json" > "${TMP_DIR}/diff.txt"; then
@@ -114,6 +141,19 @@ assert_match() {
         cat "${TMP_DIR}/expected.json" >&2
         echo "--- actual" >&2
         cat "${TMP_DIR}/actual.json" >&2
+        echo "--- diff" >&2
+        cat "${TMP_DIR}/diff.txt" >&2
+        return 1
+    fi
+}
+
+assert_handoff_match() {
+    if ! diff -u "${TMP_DIR}/expected_handoff.md" "${TMP_DIR}/actual_handoff.md" > "${TMP_DIR}/diff.txt"; then
+        log_event "diff" "$(cat "${TMP_DIR}/diff.txt")"
+        echo "--- expected" >&2
+        cat "${TMP_DIR}/expected_handoff.md" >&2
+        echo "--- actual" >&2
+        cat "${TMP_DIR}/actual_handoff.md" >&2
         echo "--- diff" >&2
         cat "${TMP_DIR}/diff.txt" >&2
         return 1
@@ -159,6 +199,15 @@ assert_match() {
     [[ "$(jq -r '.beads.stale_reopen.candidates[] | select(.id == "ft-stale1") | .recommendation' "${TMP_DIR}/actual.json")" == "status_check_before_reopen" ]]
     [[ "$(jq -r '.beads.stale_reopen.candidates[] | select(.id == "ft-stale1") | .reopen_command' "${TMP_DIR}/actual.json")" == 'br update ft-stale1 --status open --assignee "" --actor <agent>' ]]
     [[ "$(jq -r '.beads.stale_reopen.dirty_overlap_unknown[] | select(.path == "crates/frankenterm-core/src/storage.rs") | .recommendation' "${TMP_DIR}/actual.json")" == "do_not_reopen_related_beads_until_owner_clear" ]]
+}
+
+@test "agent-mail handoff fixture: reviewed beads comment block → matches golden" {
+    run_agent_mail_handoff_fixture
+    assert_handoff_match
+    [[ "$(grep -c '^Touched paths:' "${TMP_DIR}/actual_handoff.md")" == "1" ]]
+    [[ "$(grep -c '^Avoided paths:' "${TMP_DIR}/actual_handoff.md")" == "1" ]]
+    [[ "$(grep -c '^Proof commands actually run:' "${TMP_DIR}/actual_handoff.md")" == "1" ]]
+    grep -F "Sync chatter, transfer logs, and code presence alone are not proof." "${TMP_DIR}/actual_handoff.md" >/dev/null
 }
 
 # ─── Schema invariants (run on healthy fixture) ──────────────────────────────

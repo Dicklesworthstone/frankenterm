@@ -105,6 +105,23 @@ Before sending the first marching order, verify the environment.
   br update <id> --status open --assignee "" --actor <agent>
   ```
 
+  To produce a reviewed Beads handoff/closeout block while Agent Mail is red,
+  use the read-only handoff formatter:
+  ```bash
+  scripts/swarm-tick.sh --agent-mail-handoff --bead <id> \
+    --touched-path scripts/swarm-tick.sh \
+    --avoided-path crates/frankenterm/src/main.rs \
+    --proof-command 'bash -n scripts/swarm-tick.sh' \
+    frankenterm
+  ```
+
+  The formatter prints Markdown only. It does not post comments, mutate Beads,
+  touch Agent Mail, or infer proof. Pass every touched path, intentionally
+  avoided path, and proof command explicitly, then review the block before:
+  ```bash
+  br comments add <id> --author <agent> --file <reviewed-handoff.md>
+  ```
+
   This is intentionally a script-local JSON contract, not a
   `docs/json-schema/wa-*` robot schema. The fallback is an operator script used
   when Agent Mail is unavailable; the golden fixture in

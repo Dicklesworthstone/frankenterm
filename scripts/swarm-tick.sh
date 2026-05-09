@@ -8,9 +8,13 @@
 # Usage:
 #   swarm-tick.sh [session]
 #   swarm-tick.sh --agent-mail-fallback [session]
+#   swarm-tick.sh --agent-mail-handoff --bead <id> [--touched-path PATH ...]
+#                 [--avoided-path PATH ...] [--proof-command CMD ...] [session]
 #
 # `--agent-mail-fallback` emits a read-only Beads/git coordination snapshot
 # for the AGENTS.md rule where Agent Mail is unavailable after one retry.
+# `--agent-mail-handoff` formats that snapshot as a Markdown Beads comment
+# block for human review; it never writes comments or mutates Beads itself.
 # Env overrides (mainly for tests):
 #   REPO_ROOT  — repo path to cd into (default: /Users/jemanuel/projects/frankenterm)
 #   DISK_VOL   — `df -h` target volume. Default branches on uname:
@@ -25,19 +29,64 @@ set -uo pipefail
 
 mode="tick"
 session="frankenterm"
+handoff_bead=""
+handoff_touched_paths=()
+handoff_avoided_paths=()
+handoff_proof_commands=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --agent-mail-fallback)
       mode="agent_mail_fallback"
       shift
       ;;
+    --agent-mail-handoff)
+      mode="agent_mail_handoff"
+      shift
+      ;;
+    --bead)
+      if [ "$#" -lt 2 ]; then
+        echo "--bead requires an issue id" >&2
+        exit 64
+      fi
+      handoff_bead="$2"
+      shift 2
+      ;;
+    --touched-path)
+      if [ "$#" -lt 2 ]; then
+        echo "--touched-path requires a path" >&2
+        exit 64
+      fi
+      handoff_touched_paths+=("$2")
+      shift 2
+      ;;
+    --avoided-path)
+      if [ "$#" -lt 2 ]; then
+        echo "--avoided-path requires a path" >&2
+        exit 64
+      fi
+      handoff_avoided_paths+=("$2")
+      shift 2
+      ;;
+    --proof-command)
+      if [ "$#" -lt 2 ]; then
+        echo "--proof-command requires a command string" >&2
+        exit 64
+      fi
+      handoff_proof_commands+=("$2")
+      shift 2
+      ;;
     --help|-h)
       cat <<'EOF'
 Usage:
   swarm-tick.sh [session]
   swarm-tick.sh --agent-mail-fallback [session]
+  swarm-tick.sh --agent-mail-handoff --bead <id> [--touched-path PATH ...]
+                [--avoided-path PATH ...] [--proof-command CMD ...] [session]
 
 Emit a read-only operator snapshot for the frankenterm swarm.
+
+`--agent-mail-handoff` prints a Markdown Beads comment block for review. It
+does not post the comment, repair Agent Mail, or mutate Beads.
 EOF
       exit 0
       ;;
@@ -156,6 +205,14 @@ git_dirty_paths_json() {
           path: (.[3:] | sub(" -> .*"; ""))
         })
   ' 2>/dev/null || printf '[]\n'
+}
+
+json_array_from_args() {
+  if [ "$#" -eq 0 ]; then
+    printf '[]\n'
+  else
+    printf '%s\n' "$@" | jq -R . | jq -s .
+  fi
 }
 
 emit_agent_mail_fallback_snapshot() {
@@ -405,9 +462,127 @@ emit_agent_mail_fallback_snapshot() {
     }'
 }
 
+emit_agent_mail_handoff_block() {
+  if [ -z "$handoff_bead" ]; then
+    echo "--agent-mail-handoff requires --bead <id>" >&2
+    return 64
+  fi
+
+  local snapshot_json touched_json avoided_json proof_json
+  snapshot_json="$(emit_agent_mail_fallback_snapshot)"
+  touched_json="$(json_array_from_args "${handoff_touched_paths[@]}")"
+  avoided_json="$(json_array_from_args "${handoff_avoided_paths[@]}")"
+  proof_json="$(json_array_from_args "${handoff_proof_commands[@]}")"
+
+  jq -r \
+    --arg bead "$handoff_bead" \
+    --argjson touched "$touched_json" \
+    --argjson avoided "$avoided_json" \
+    --argjson proof "$proof_json" \
+    '
+    def bullet_list($items):
+      if ($items | length) == 0 then
+        "- not provided"
+      else
+        ($items | map("- " + .) | join("\n"))
+      end;
+
+    def active_agent_lines:
+      if (.beads.active_agents | length) == 0 then
+        "- none"
+      else
+        .beads.active_agents
+        | map(
+            "- " + .assignee + ": " +
+            (.beads
+             | map(.id + " (" + (if .stale_over_2h then "stale_over_2h" else "active_not_stale" end) + ", age_seconds=" + (.age_seconds | tostring) + ")")
+             | join(", "))
+          )
+        | join("\n")
+      end;
+
+    def active_not_stale_lines:
+      if (.beads.stale_reopen.active_not_stale | length) == 0 then
+        "- none"
+      else
+        .beads.stale_reopen.active_not_stale
+        | map("- " + .id + ": " + .recommendation + " for " + .assignee + " (age_seconds=" + (.age_seconds | tostring) + ")")
+        | join("\n")
+      end;
+
+    def stale_candidate_lines:
+      if (.beads.stale_reopen.candidates | length) == 0 then
+        "- none"
+      else
+        .beads.stale_reopen.candidates
+        | map("- " + .id + ": " + .recommendation + " for " + .assignee + " (age_seconds=" + (.age_seconds | tostring) + ")")
+        | join("\n")
+      end;
+
+    def dirty_overlap_lines:
+      if (.beads.stale_reopen.dirty_overlap_unknown | length) == 0 then
+        "- none"
+      else
+        .beads.stale_reopen.dirty_overlap_unknown
+        | map("- " + .path + " [" + .category + "/" + .severity + "]: " + .recommendation)
+        | join("\n")
+      end;
+
+    [
+      "Red-mail Beads handoff for " + $bead,
+      "",
+      "Agent Mail: " + .agent_mail.status + " - " + .agent_mail.marker,
+      "Snapshot: " + .ts + " session=" + .session + " ready_count=" + (.beads.ready_count | tostring),
+      "",
+      "Active assignees:",
+      active_agent_lines,
+      "",
+      "Stale/non-stale classification:",
+      "- default_action: " + .beads.stale_reopen.default_action,
+      "- threshold_seconds: " + (.beads.stale_reopen.threshold_seconds | tostring),
+      "",
+      "Active, do not reopen:",
+      active_not_stale_lines,
+      "",
+      "Stale candidates requiring status check:",
+      stale_candidate_lines,
+      "",
+      "Dirty risk:",
+      "- risk_level: " + .git.risk_level,
+      "- risk_reason: " + .git.risk_reason,
+      "- tracked_dirty_count: " + (.git.tracked_dirty_count | tostring),
+      "- untracked_dirty_count: " + (.git.untracked_dirty_count | tostring),
+      "- high_risk_count: " + (.git.high_risk_count | tostring),
+      "",
+      "Dirty overlap unknown:",
+      dirty_overlap_lines,
+      "",
+      "Touched paths:",
+      bullet_list($touched),
+      "",
+      "Avoided paths:",
+      bullet_list($avoided),
+      "",
+      "Proof commands actually run:",
+      bullet_list($proof),
+      "",
+      "Closure basis: use only the proof commands above plus Beads state. Sync chatter, transfer logs, and code presence alone are not proof.",
+      "",
+      "Review this block before posting. Suggested command:",
+      "br comments add " + $bead + " --author <agent> --file <reviewed-handoff.md>"
+    ]
+    | join("\n")
+    ' <<< "$snapshot_json"
+}
+
 if [ "$mode" = "agent_mail_fallback" ]; then
   emit_agent_mail_fallback_snapshot
   exit 0
+fi
+
+if [ "$mode" = "agent_mail_handoff" ]; then
+  emit_agent_mail_handoff_block
+  exit $?
 fi
 
 git_commits_1h=$(cd "$repo_root" && git log --since="1 hour ago" --oneline 2>/dev/null | wc -l | tr -d ' ')
