@@ -693,9 +693,29 @@ mod tests {
                 ));
             }
             let mut output = FleetMutationStepOutput::default();
-            if matches!(step.action, FleetMutationAction::SpawnAgent { .. }) {
-                output.pane_id = Some(self.next_pane_id);
-                self.next_pane_id += 1;
+            match &step.action {
+                FleetMutationAction::SpawnAgent { .. } => {
+                    output.pane_id = Some(self.next_pane_id);
+                    self.next_pane_id += 1;
+                }
+                FleetMutationAction::StopAgent { .. } => {}
+                FleetMutationAction::ReassignWork {
+                    work_item_id,
+                    from_agent,
+                    to_agent,
+                    reason,
+                } => {
+                    output.work_item_id = Some(work_item_id.clone());
+                    if let Some(from_agent) = from_agent {
+                        output
+                            .details
+                            .insert("from_agent".to_string(), from_agent.clone());
+                    }
+                    output
+                        .details
+                        .insert("to_agent".to_string(), to_agent.clone());
+                    output.details.insert("reason".to_string(), reason.clone());
+                }
             }
             Ok(output)
         }
@@ -703,7 +723,7 @@ mod tests {
         fn compensate_step(
             &mut self,
             original: &FleetMutationStep,
-            _compensation: &FleetMutationAction,
+            compensation: &FleetMutationAction,
         ) -> Result<FleetMutationStepOutput, FleetMutationExecutionError> {
             self.calls.push(format!("compensate:{}", original.step_id));
             if self.fail_compensation_for.as_deref() == Some(original.step_id.as_str()) {
@@ -712,7 +732,26 @@ mod tests {
                     format!("compensation for {} failed", original.step_id),
                 ));
             }
-            Ok(FleetMutationStepOutput::default())
+            let mut output = FleetMutationStepOutput::default();
+            if let FleetMutationAction::ReassignWork {
+                work_item_id,
+                from_agent,
+                to_agent,
+                reason,
+            } = compensation
+            {
+                output.work_item_id = Some(work_item_id.clone());
+                if let Some(from_agent) = from_agent {
+                    output
+                        .details
+                        .insert("from_agent".to_string(), from_agent.clone());
+                }
+                output
+                    .details
+                    .insert("to_agent".to_string(), to_agent.clone());
+                output.details.insert("reason".to_string(), reason.clone());
+            }
+            Ok(output)
         }
     }
 
@@ -743,6 +782,32 @@ mod tests {
             },
             policy: FleetMutationPolicyDecision::Allow,
             compensation: None,
+        }
+    }
+
+    fn reassign_step(
+        step_id: &str,
+        work_item_id: &str,
+        from_agent: Option<&str>,
+        to_agent: &str,
+        reason: &str,
+    ) -> FleetMutationStep {
+        let compensation = from_agent.map(|from_agent| FleetMutationAction::ReassignWork {
+            work_item_id: work_item_id.to_string(),
+            from_agent: Some(to_agent.to_string()),
+            to_agent: from_agent.to_string(),
+            reason: format!("rollback {reason}"),
+        });
+        FleetMutationStep {
+            step_id: step_id.to_string(),
+            action: FleetMutationAction::ReassignWork {
+                work_item_id: work_item_id.to_string(),
+                from_agent: from_agent.map(str::to_string),
+                to_agent: to_agent.to_string(),
+                reason: reason.to_string(),
+            },
+            policy: FleetMutationPolicyDecision::Allow,
+            compensation,
         }
     }
 
@@ -805,6 +870,89 @@ mod tests {
             receipt.steps[0].policy,
             FleetMutationPolicyDecision::RequireApproval { .. }
         ));
+        assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn reassign_work_receipt_preserves_target_owner_and_reason() {
+        let plan = FleetMutationPlan::new(
+            "plan-reassign",
+            false,
+            vec![reassign_step(
+                "move-work-a",
+                "ft-work-a",
+                Some("agent-a"),
+                "agent-b",
+                "load_based",
+            )],
+        );
+        let mut ledger = FleetMutationLedger::new();
+        let mut executor = FakeExecutor::new();
+
+        let receipt = ledger
+            .execute_plan(&plan, &mut executor)
+            .expect("reassign receipt");
+
+        assert_eq!(receipt.status, FleetMutationReceiptStatus::Succeeded);
+        assert_eq!(receipt.completed_count, 1);
+        assert_eq!(executor.calls, vec!["execute:move-work-a"]);
+        let step = &receipt.steps[0];
+        assert_eq!(step.action.family(), "reassign_work");
+        assert_eq!(step.target_id, "work:ft-work-a");
+        let output = step.output.as_ref().expect("reassign output");
+        assert_eq!(output.work_item_id.as_deref(), Some("ft-work-a"));
+        assert_eq!(
+            output.details.get("from_agent").map(String::as_str),
+            Some("agent-a")
+        );
+        assert_eq!(
+            output.details.get("to_agent").map(String::as_str),
+            Some("agent-b")
+        );
+        assert_eq!(
+            output.details.get("reason").map(String::as_str),
+            Some("load_based")
+        );
+        assert!(receipt_has_no_orphan_compensation(&receipt));
+    }
+
+    #[test]
+    fn reassign_policy_denial_prevents_all_side_effects() {
+        let mut denied = reassign_step(
+            "move-denied",
+            "ft-work-denied",
+            Some("agent-a"),
+            "agent-b",
+            "capability_based",
+        );
+        denied.policy = FleetMutationPolicyDecision::Deny {
+            reason_code: "work.reserved".to_string(),
+            message: "reserved work cannot be reassigned".to_string(),
+        };
+        let plan = FleetMutationPlan::new(
+            "plan-reassign-denied",
+            false,
+            vec![
+                denied,
+                reassign_step(
+                    "move-later",
+                    "ft-work-later",
+                    Some("agent-c"),
+                    "agent-d",
+                    "round_robin",
+                ),
+            ],
+        );
+        let mut ledger = FleetMutationLedger::new();
+        let mut executor = FakeExecutor::new();
+
+        let receipt = ledger
+            .execute_plan(&plan, &mut executor)
+            .expect("denied reassign receipt");
+
+        assert_eq!(receipt.status, FleetMutationReceiptStatus::Denied);
+        assert_eq!(receipt.skipped_count, 2);
+        assert_eq!(receipt.steps[0].target_id, "work:ft-work-denied");
         assert!(executor.calls.is_empty());
     }
 
@@ -886,6 +1034,85 @@ mod tests {
                 "compensate:spawn-2",
                 "compensate:spawn-1",
             ]
+        );
+        assert!(receipt_has_no_orphan_compensation(&receipt));
+    }
+
+    #[test]
+    fn reassign_failure_compensates_prior_moves_in_reverse_order() {
+        let plan = FleetMutationPlan::new(
+            "plan-reassign-comp",
+            false,
+            vec![
+                reassign_step(
+                    "move-a",
+                    "ft-work-a",
+                    Some("agent-a"),
+                    "agent-b",
+                    "load_based",
+                ),
+                reassign_step(
+                    "move-b",
+                    "ft-work-b",
+                    Some("agent-c"),
+                    "agent-d",
+                    "capability_based",
+                ),
+                reassign_step(
+                    "move-fails",
+                    "ft-work-c",
+                    Some("agent-e"),
+                    "agent-f",
+                    "round_robin",
+                ),
+            ],
+        );
+        let mut ledger = FleetMutationLedger::new();
+        let mut executor = FakeExecutor::new();
+        executor.fail_step = Some("move-fails".to_string());
+
+        let receipt = ledger.execute_plan(&plan, &mut executor).expect("receipt");
+
+        assert_eq!(receipt.status, FleetMutationReceiptStatus::Compensated);
+        assert_eq!(receipt.failed_count, 1);
+        assert_eq!(receipt.compensated_count, 2);
+        assert_eq!(
+            executor.calls,
+            vec![
+                "execute:move-a",
+                "execute:move-b",
+                "execute:move-fails",
+                "compensate:move-b",
+                "compensate:move-a",
+            ]
+        );
+        assert_eq!(
+            receipt.steps[0].status,
+            FleetMutationStepStatus::Compensated
+        );
+        assert_eq!(
+            receipt.steps[1].status,
+            FleetMutationStepStatus::Compensated
+        );
+        assert_eq!(receipt.steps[2].status, FleetMutationStepStatus::Failed);
+        let compensation = receipt.steps[0]
+            .compensation
+            .as_ref()
+            .expect("move-a compensation");
+        assert_eq!(
+            compensation
+                .output
+                .as_ref()
+                .and_then(|out| out.work_item_id.as_deref()),
+            Some("ft-work-a")
+        );
+        assert_eq!(
+            compensation
+                .output
+                .as_ref()
+                .and_then(|out| out.details.get("to_agent"))
+                .map(String::as_str),
+            Some("agent-a")
         );
         assert!(receipt_has_no_orphan_compensation(&receipt));
     }
