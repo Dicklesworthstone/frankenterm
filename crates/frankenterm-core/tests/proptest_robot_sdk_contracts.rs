@@ -623,12 +623,17 @@ fn standard_contract_artifacts_render_successfully() {
     let bundle = standard_contract_artifacts().unwrap();
     assert_eq!(
         bundle.sdk_count(),
-        1,
-        "production bundle should only include fully-supported SDK languages"
+        2,
+        "production bundle should include every fully-supported SDK language"
     );
     assert!(!bundle.endpoint_specs_json.is_empty());
     assert!(!bundle.ntm_compat_markdown.is_empty());
     assert!(!bundle.replay_tests_json.is_empty());
+    assert!(
+        bundle
+            .sdk_sources
+            .contains_key("frankenterm_client_python.py")
+    );
     assert!(
         bundle
             .sdk_sources

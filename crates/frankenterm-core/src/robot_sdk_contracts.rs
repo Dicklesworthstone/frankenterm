@@ -241,16 +241,17 @@ pub struct ErrorCodeSpec {
 
 /// Language target for SDK generation.
 ///
-/// Only [`SdkLanguage::Rust`] is a fully-supported finish-line SDK target:
-/// its generated client wires through [`RustSdkTransport`] end-to-end. The
-/// `Python`, `TypeScript`, and `Go` variants render *template skeletons*
-/// whose transport methods raise/throw/panic with `transport not wired` and
-/// must be implemented by the consumer before use. Use
+/// [`SdkLanguage::Python`] and [`SdkLanguage::Rust`] are fully-supported
+/// finish-line SDK targets: Python wires Robot Mode through a bounded default
+/// process transport, and Rust wires through [`RustSdkTransport`] end-to-end.
+/// The `TypeScript` and `Go` variants still render *template skeletons*
+/// whose transport methods throw/panic with `transport not wired` and must be
+/// implemented by the consumer before use. Use
 /// [`SdkLanguage::is_fully_supported`] to gate any code path that requires a
 /// real, wired transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SdkLanguage {
-    /// Python SDK template. Transport stub: consumer must implement `_call`.
+    /// Python SDK with a default `ft robot --format json` process transport.
     Python,
     /// TypeScript/JavaScript SDK template. Transport stub: consumer must implement `call`.
     TypeScript,
@@ -284,14 +285,14 @@ impl SdkLanguage {
     }
 
     /// Returns `true` only for SDK targets whose generated client has a
-    /// fully-wired transport. Non-Rust targets currently emit template
+    /// fully-wired transport. TypeScript and Go currently emit template
     /// skeletons with `transport not wired` placeholders and must not be
     /// advertised as finish-line supported capabilities. Tracked for the
-    /// `ft-xbnl0` finish-line program in the
-    /// `ft-xbnl0.1.2` capability inventory.
+    /// `ft-xbnl0` finish-line program in the `ft-xbnl0.1.2` capability
+    /// inventory.
     #[must_use]
     pub fn is_fully_supported(&self) -> bool {
-        matches!(self, Self::Rust)
+        matches!(self, Self::Python | Self::Rust)
     }
 }
 
@@ -973,14 +974,148 @@ fn required_nonnegative_integer(
 }
 
 fn render_python_client(surface: &SdkSurface) -> String {
-    let mut out = String::from("from __future__ import annotations\n\nfrom typing import Any\n\n");
+    let mut out = String::from(
+        "from __future__ import annotations\n\nimport asyncio\nimport json\nimport os\nfrom collections.abc import Awaitable, Callable, Mapping, Sequence\nfrom dataclasses import dataclass\nfrom typing import Any\n\n",
+    );
 
     for return_type in unique_return_types(surface) {
         out.push_str(&format!("{return_type} = dict[str, Any]\n"));
     }
 
     out.push_str(
-        "\n\nclass FrankentermClient:\n    async def _call(self, command: str, payload: dict[str, Any]) -> Any:\n        raise NotImplementedError(\"transport not wired\")\n",
+        r#"
+
+_SUPPORTED_COMMANDS = ("get-text", "send-text", "state", "search")
+_STDERR_LIMIT = 4096
+
+
+@dataclass(frozen=True)
+class FrankentermProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+ProcessRunner = Callable[
+    [Sequence[str], Mapping[str, str] | None, float | None],
+    Awaitable[FrankentermProcessResult],
+]
+
+
+class FrankentermTransportError(RuntimeError):
+    pass
+
+
+class FrankentermUnsupportedCommandError(FrankentermTransportError):
+    def __init__(self, command: str) -> None:
+        supported = ", ".join(_SUPPORTED_COMMANDS)
+        super().__init__(f"unsupported robot SDK command {command!r} (supported: {supported})")
+        self.command = command
+
+
+class FrankentermRobotError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        code: str | None = None,
+        hint: str | None = None,
+        envelope: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.hint = hint
+        self.envelope = dict(envelope) if envelope is not None else None
+
+
+class FrankentermClient:
+    def __init__(
+        self,
+        ft_binary: str | None = None,
+        timeout: float | None = 30.0,
+        env: Mapping[str, str] | None = None,
+        runner: ProcessRunner | None = None,
+    ) -> None:
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive or None")
+        self._ft_binary = ft_binary or os.environ.get("FRANKENTERM_FT_BINARY", "ft")
+        self._timeout = timeout
+        self._env = dict(env) if env is not None else None
+        self._runner = runner or self._run_process
+
+    @classmethod
+    def supported_commands(cls) -> tuple[str, ...]:
+        return _SUPPORTED_COMMANDS
+
+    @classmethod
+    def supports_command(cls, command: str) -> bool:
+        return command in _SUPPORTED_COMMANDS
+
+    async def _call(self, command: str, payload: dict[str, Any]) -> Any:
+        if command not in _SUPPORTED_COMMANDS:
+            raise FrankentermUnsupportedCommandError(command)
+
+        clean_payload = {key: value for key, value in payload.items() if value is not None}
+        args = [self._ft_binary, "robot", "--format", "json"]
+        args.extend(_command_args(command, clean_payload))
+        result = await self._runner(args, self._env, self._timeout)
+
+        if result.returncode != 0:
+            raise FrankentermTransportError(
+                f"robot command exited {result.returncode}: {_stderr_tail(result.stderr)}"
+            )
+
+        envelope = _decode_envelope(result.stdout, command)
+        ok = envelope.get("ok")
+        if ok is True:
+            if "data" not in envelope:
+                raise FrankentermTransportError(
+                    f"robot command {command!r} returned ok=true without data"
+                )
+            return envelope["data"]
+        if ok is False:
+            raise _robot_error(envelope)
+
+        raise FrankentermTransportError(
+            f"robot command {command!r} returned malformed envelope: missing boolean ok"
+        )
+
+    @staticmethod
+    async def _run_process(
+        args: Sequence[str],
+        env: Mapping[str, str] | None,
+        timeout: float | None,
+    ) -> FrankentermProcessResult:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_merged_env(env),
+            )
+        except FileNotFoundError as exc:
+            raise FrankentermTransportError(f"ft binary not found: {args[0]}") from exc
+        except OSError as exc:
+            raise FrankentermTransportError(
+                f"failed to start robot command {_format_args(args)}: {exc}"
+            ) from exc
+
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise FrankentermTransportError(
+                f"robot command timed out after {timeout} seconds: {_format_args(args)}"
+            ) from exc
+
+        return FrankentermProcessResult(
+            returncode=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+"#,
     );
 
     for method in &surface.methods {
@@ -994,6 +1129,206 @@ fn render_python_client(surface: &SdkSurface) -> String {
             render_python_payload(&method.params),
         ));
     }
+
+    out.push_str(
+        r#"
+
+
+def _command_args(command: str, payload: Mapping[str, Any]) -> list[str]:
+    if command == "get-text":
+        args = ["get-text", str(_required_nonnegative_int(payload, command, "pane_id"))]
+        tail_lines = _optional_nonnegative_int(payload, command, "tail_lines")
+        if tail_lines is not None:
+            args.extend(["--tail", str(tail_lines)])
+        if _optional_bool(payload, command, "escapes") is True:
+            args.append("--escapes")
+        return args
+
+    if command == "send-text":
+        args = [
+            "send",
+            str(_required_nonnegative_int(payload, command, "pane_id")),
+            _required_str(payload, command, "text"),
+        ]
+        if _optional_bool(payload, command, "dry_run") is True:
+            args.append("--dry-run")
+        approval_code = _optional_str(payload, command, "approval_code")
+        if approval_code is not None:
+            args.extend(["--approval-code", approval_code])
+
+        wait_for = _optional_str(payload, command, "wait_for")
+        wait_for_regex = _optional_bool(payload, command, "wait_for_regex") is True
+        timeout_secs = _optional_nonnegative_int(payload, command, "timeout_secs")
+        if wait_for is None and wait_for_regex:
+            raise FrankentermTransportError("wait_for_regex requires wait_for")
+        if wait_for is None and timeout_secs is not None:
+            raise FrankentermTransportError("timeout_secs requires wait_for")
+
+        if wait_for is not None:
+            args.extend(["--wait-for", wait_for])
+            if timeout_secs is not None:
+                args.extend(["--timeout-secs", str(timeout_secs)])
+            if wait_for_regex:
+                args.append("--wait-for-regex")
+        return args
+
+    if command == "state":
+        args = ["state"]
+        include_text = _optional_bool(payload, command, "include_text") is True
+        tail = _optional_nonnegative_int(payload, command, "tail")
+        escapes = _optional_bool(payload, command, "escapes") is True
+        if include_text or tail is not None or escapes:
+            args.append("--include-text")
+            if tail is not None:
+                args.extend(["--tail", str(tail)])
+            if escapes:
+                args.append("--escapes")
+        return args
+
+    if command == "search":
+        args = ["search", _required_str(payload, command, "query")]
+        limit = _optional_nonnegative_int(payload, command, "limit")
+        if limit is not None:
+            args.extend(["--limit", str(limit)])
+        pane = _optional_nonnegative_int(payload, command, "pane")
+        if pane is not None:
+            args.extend(["--pane", str(pane)])
+        since = _optional_int(payload, command, "since")
+        if since is not None:
+            args.extend(["--since", str(since)])
+        until = _optional_int(payload, command, "until")
+        if until is not None:
+            args.extend(["--until", str(until)])
+        snippets = _optional_bool(payload, command, "snippets")
+        if snippets is not None:
+            args.append("--snippets" if snippets else "--snippets=false")
+        mode = _optional_str(payload, command, "mode")
+        if mode is not None:
+            if mode not in {"lexical", "semantic", "hybrid"}:
+                raise FrankentermTransportError("mode must be one of: lexical, semantic, hybrid")
+            args.extend(["--mode", mode])
+        return args
+
+    raise FrankentermUnsupportedCommandError(command)
+
+
+def _required_str(payload: Mapping[str, Any], command: str, field: str) -> str:
+    value = _required_value(payload, command, field)
+    if not isinstance(value, str):
+        raise FrankentermTransportError(
+            f"invalid payload for {command!r} field {field!r}: expected string"
+        )
+    return value
+
+
+def _optional_str(payload: Mapping[str, Any], command: str, field: str) -> str | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise FrankentermTransportError(
+            f"invalid payload for {command!r} field {field!r}: expected string"
+        )
+    return value
+
+
+def _optional_bool(payload: Mapping[str, Any], command: str, field: str) -> bool | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise FrankentermTransportError(
+            f"invalid payload for {command!r} field {field!r}: expected boolean"
+        )
+    return value
+
+
+def _optional_int(payload: Mapping[str, Any], command: str, field: str) -> int | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise FrankentermTransportError(
+            f"invalid payload for {command!r} field {field!r}: expected integer"
+        )
+    return value
+
+
+def _required_nonnegative_int(payload: Mapping[str, Any], command: str, field: str) -> int:
+    value = _optional_nonnegative_int(payload, command, field)
+    if value is None:
+        raise FrankentermTransportError(
+            f"invalid payload for {command!r} field {field!r}: missing required integer"
+        )
+    return value
+
+
+def _optional_nonnegative_int(payload: Mapping[str, Any], command: str, field: str) -> int | None:
+    value = _optional_int(payload, command, field)
+    if value is None:
+        return None
+    if value < 0:
+        raise FrankentermTransportError(
+            f"invalid payload for {command!r} field {field!r}: expected non-negative integer"
+        )
+    return value
+
+
+def _required_value(payload: Mapping[str, Any], command: str, field: str) -> Any:
+    value = payload.get(field)
+    if value is None:
+        raise FrankentermTransportError(
+            f"invalid payload for {command!r} field {field!r}: missing required value"
+        )
+    return value
+
+
+def _decode_envelope(stdout: bytes, command: str) -> Mapping[str, Any]:
+    try:
+        envelope = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FrankentermTransportError(
+            f"robot command {command!r} returned invalid JSON"
+        ) from exc
+    if not isinstance(envelope, Mapping):
+        raise FrankentermTransportError(
+            f"robot command {command!r} returned non-object JSON envelope"
+        )
+    return envelope
+
+
+def _robot_error(envelope: Mapping[str, Any]) -> FrankentermRobotError:
+    message = envelope.get("error")
+    if not isinstance(message, str) or not message:
+        message = "unknown robot error"
+    code = envelope.get("error_code")
+    if code is not None and not isinstance(code, str):
+        code = None
+    hint = envelope.get("hint")
+    if hint is not None and not isinstance(hint, str):
+        hint = None
+    return FrankentermRobotError(message, code=code, hint=hint, envelope=envelope)
+
+
+def _stderr_tail(stderr: bytes) -> str:
+    text = stderr.decode("utf-8", errors="replace").strip()
+    if not text:
+        return "stderr was empty"
+    return text[-_STDERR_LIMIT:]
+
+
+def _merged_env(env: Mapping[str, str] | None) -> Mapping[str, str] | None:
+    if env is None:
+        return None
+    merged = os.environ.copy()
+    merged.update(env)
+    return merged
+
+
+def _format_args(args: Sequence[str]) -> str:
+    return " ".join(str(part) for part in args)
+"#,
+    );
 
     out
 }
@@ -2281,7 +2616,7 @@ mod tests {
     #[test]
     fn contract_artifact_bundle_renders_deterministic_exports() {
         let bundle = standard_contract_artifacts().unwrap();
-        assert_eq!(bundle.sdk_count(), 1);
+        assert_eq!(bundle.sdk_count(), 2);
         assert!(
             bundle
                 .endpoint_specs_json
@@ -2301,7 +2636,7 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["frankenterm_client_rust.rs"]
+            vec!["frankenterm_client_python.py", "frankenterm_client_rust.rs"]
         );
         assert!(
             bundle
@@ -2321,6 +2656,24 @@ mod tests {
             .unwrap();
 
         assert!(rust.contains("\"pane_id\": pane_id"));
+    }
+
+    #[test]
+    fn contract_artifact_bundle_python_sdk_source_includes_process_transport() {
+        let bundle = standard_contract_artifacts().unwrap();
+        let python = bundle
+            .sdk_sources
+            .get("frankenterm_client_python.py")
+            .unwrap();
+
+        assert!(python.contains("asyncio.create_subprocess_exec"));
+        assert!(python.contains("[self._ft_binary, \"robot\", \"--format\", \"json\"]"));
+        assert!(python.contains("FrankentermRobotError"));
+        assert!(python.contains("FrankentermTransportError"));
+        assert!(python.contains("_SUPPORTED_COMMANDS"));
+        assert!(python.contains("wait_for_regex requires wait_for"));
+        assert!(!python.contains("transport not wired"));
+        assert!(!python.contains("NotImplementedError"));
     }
 
     #[test]
@@ -2426,18 +2779,218 @@ mod tests {
     }
 
     #[test]
-    fn ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported() {
-        // Truth-sweep guard for ft-xbnl0.3.6: the inventory excludes
-        // non-Rust SDK templates from the finish-line supported matrix
-        // because their generated transports are stubs. Lock that
-        // contract into a test so future agents cannot quietly widen
-        // the supported matrix without updating the inventory.
+    fn python_sdk_render_uses_real_transport_backend() {
+        let mut sdk = SdkSurface::new(SdkLanguage::Python, "frankenterm");
+        sdk.generate_from_specs(&core_endpoint_specs());
+        let source = sdk.render_client_source();
+
+        assert!(source.contains("asyncio.create_subprocess_exec"));
+        assert!(source.contains("FRANKENTERM_FT_BINARY"));
+        assert!(source.contains("FrankentermProcessResult"));
+        assert!(source.contains("FrankentermUnsupportedCommandError"));
+        assert!(source.contains("FrankentermRobotError"));
+        assert!(source.contains("FrankentermTransportError"));
+        assert!(source.contains("\"send\","));
+        assert!(source.contains("--snippets=false"));
+        assert!(source.contains("mode must be one of: lexical, semantic, hybrid"));
+        assert!(!source.contains("transport not wired"));
+        assert!(!source.contains("NotImplementedError"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_sdk_generated_transport_fixture_behaviors() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        if Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("python3 missing; skipping generated Python SDK behavior fixture");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create Python SDK fixture tempdir");
+        let sleep_binary = dir.path().join("ft-sleep");
+        let missing_binary = dir.path().join("missing-ft");
+        assert!(!missing_binary.exists());
+        std::fs::write(
+            &sleep_binary,
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(1)\n",
+        )
+        .expect("write timeout fixture binary");
+        let mut permissions = std::fs::metadata(&sleep_binary)
+            .expect("stat timeout fixture binary")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&sleep_binary, permissions).expect("chmod timeout fixture binary");
+
+        let mut sdk = SdkSurface::new(SdkLanguage::Python, "frankenterm");
+        sdk.generate_from_specs(&core_endpoint_specs());
+        let mut script = sdk.render_client_source();
+        script.push_str(
+            r#"
+
+import asyncio
+import json
+import os
+
+
+class FixtureRunner:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def __call__(self, args, env, timeout):
+        self.calls.append((list(args), env, timeout))
+        return self.result
+
+
+async def main():
+    success_runner = FixtureRunner(
+        FrankentermProcessResult(
+            0,
+            json.dumps(
+                {
+                    "ok": True,
+                    "data": {"pane_id": 7, "text": "hello", "tail_lines": 12},
+                    "elapsed_ms": 1,
+                    "version": "test",
+                    "now": 1,
+                    "schema_version": 1,
+                }
+            ).encode("utf-8"),
+            b"",
+        )
+    )
+    client = FrankentermClient(
+        ft_binary="/bin/ft-test",
+        timeout=12.0,
+        env={"FT_TEST": "1"},
+        runner=success_runner,
+    )
+    data = await client.get_text(7, tail_lines=12, escapes=True)
+    assert data["text"] == "hello"
+    assert success_runner.calls[0] == (
+        [
+            "/bin/ft-test",
+            "robot",
+            "--format",
+            "json",
+            "get-text",
+            "7",
+            "--tail",
+            "12",
+            "--escapes",
+        ],
+        {"FT_TEST": "1"},
+        12.0,
+    )
+
+    robot_error_runner = FixtureRunner(
+        FrankentermProcessResult(
+            0,
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "blocked by policy",
+                    "error_code": "robot.policy_denied",
+                    "hint": "request approval",
+                    "elapsed_ms": 1,
+                    "version": "test",
+                    "now": 1,
+                    "schema_version": 1,
+                }
+            ).encode("utf-8"),
+            b"",
+        )
+    )
+    try:
+        await FrankentermClient(runner=robot_error_runner).search("panic")
+    except FrankentermRobotError as exc:
+        assert exc.code == "robot.policy_denied"
+        assert exc.hint == "request approval"
+    else:
+        raise AssertionError("expected robot error")
+
+    try:
+        await client.get_text("not-an-int")
+    except FrankentermTransportError as exc:
+        assert "pane_id" in str(exc)
+    else:
+        raise AssertionError("expected invalid payload transport error")
+
+    try:
+        await client._call("events", {})
+    except FrankentermUnsupportedCommandError as exc:
+        assert exc.command == "events"
+    else:
+        raise AssertionError("expected unsupported command error")
+
+    try:
+        await FrankentermClient(ft_binary=os.environ["FT_MISSING_BINARY"]).state()
+    except FrankentermTransportError as exc:
+        assert "ft binary not found" in str(exc)
+    else:
+        raise AssertionError("expected missing binary transport error")
+
+    try:
+        await FrankentermClient(ft_binary=os.environ["FT_SLEEP_BINARY"], timeout=0.01).state()
+    except FrankentermTransportError as exc:
+        assert "timed out" in str(exc)
+    else:
+        raise AssertionError("expected timeout transport error")
+
+
+asyncio.run(main())
+"#,
+        );
+
+        let mut child = Command::new("python3")
+            .arg("-")
+            .env("FT_MISSING_BINARY", &missing_binary)
+            .env("FT_SLEEP_BINARY", &sleep_binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn generated Python SDK fixture");
+        child
+            .stdin
+            .as_mut()
+            .expect("open Python stdin")
+            .write_all(script.as_bytes())
+            .expect("write generated Python SDK fixture");
+        let output = child.wait_with_output().expect("wait for Python fixture");
+
+        assert!(
+            output.status.success(),
+            "generated Python SDK fixture failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn ft_xbnl0_3_6_python_and_rust_sdk_targets_are_finish_line_supported() {
+        // Truth-sweep guard for ft-xbnl0.3.6: Python and Rust now ship real
+        // generated transports, while TypeScript and Go remain excluded from
+        // the finish-line supported matrix until their template transports are
+        // replaced.
+        assert!(SdkLanguage::Python.is_fully_supported());
         assert!(SdkLanguage::Rust.is_fully_supported());
-        for lang in [
-            SdkLanguage::Python,
-            SdkLanguage::TypeScript,
-            SdkLanguage::Go,
-        ] {
+
+        for lang in [SdkLanguage::Python, SdkLanguage::Rust] {
+            let mut sdk = SdkSurface::new(lang, "frankenterm");
+            sdk.generate_from_specs(&core_endpoint_specs());
+            let source = sdk.render_client_source();
+            assert!(
+                !source.contains("transport not wired"),
+                "{} SDK is marked supported and must not emit a template stub",
+                lang.label()
+            );
+        }
+
+        for lang in [SdkLanguage::TypeScript, SdkLanguage::Go] {
             assert!(
                 !lang.is_fully_supported(),
                 "{} SDK template still emits a `transport not wired` stub; \
