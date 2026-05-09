@@ -146,55 +146,6 @@ fn optional_json_value(
     Ok(parse_export_json_column(&raw, label, column))
 }
 
-#[cfg(test)]
-mod export_json_parse_drop_tests {
-    use super::*;
-
-    fn parse_drop_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock()
-            .expect("export JSON parse-drop test lock should not be poisoned")
-    }
-
-    #[test]
-    fn well_formed_does_not_bump_ft_l3u5k() {
-        let _guard = parse_drop_test_lock();
-        reset_storage_export_json_parse_drop_count_for_test();
-        let v = parse_export_json_column(r#"{"k":"v"}"#, "test", 0);
-        assert!(v.is_some());
-        assert_eq!(crate::storage::storage_export_json_parse_drop_count(), 0);
-    }
-
-    #[test]
-    fn malformed_bumps_counter_ft_l3u5k() {
-        let _guard = parse_drop_test_lock();
-        // br-ft-l3u5k: a malformed JSON payload bumps the counter
-        // exactly once.
-        reset_storage_export_json_parse_drop_count_for_test();
-        let v = parse_export_json_column("{not json", "test", 5);
-        assert!(v.is_none());
-        assert_eq!(crate::storage::storage_export_json_parse_drop_count(), 1);
-
-        // Second malformed call bumps again — every event observable.
-        let _ = parse_export_json_column("[unclosed", "another", 7);
-        assert_eq!(crate::storage::storage_export_json_parse_drop_count(), 2);
-    }
-
-    #[test]
-    fn null_input_path_does_not_bump_ft_l3u5k() {
-        let _guard = parse_drop_test_lock();
-        // The NULL path (optional_string returning None) doesn't
-        // even reach this helper — the early return at
-        // optional_json_value handles it. Pin the contract via the
-        // helper directly: an empty-but-valid JSON shouldn't bump.
-        reset_storage_export_json_parse_drop_count_for_test();
-        let v = parse_export_json_column("null", "test", 0);
-        assert!(v.is_some());
-        assert_eq!(v.unwrap(), serde_json::Value::Null);
-        assert_eq!(crate::storage::storage_export_json_parse_drop_count(), 0);
-    }
-}
-
 fn optional_f64(reader: &RowReader<'_>, column: usize, label: &str) -> Result<Option<f64>> {
     let Some(raw) = reader
         .optional_string(column)
@@ -553,4 +504,53 @@ pub(super) fn query_export_reservations(
         "Query export reservations",
         pane_reservation_from_backend_row,
     )
+}
+
+#[cfg(test)]
+mod export_json_parse_drop_tests {
+    use super::*;
+
+    fn parse_drop_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .expect("export JSON parse-drop test lock should not be poisoned")
+    }
+
+    #[test]
+    fn well_formed_does_not_bump_ft_l3u5k() {
+        let _guard = parse_drop_test_lock();
+        reset_storage_export_json_parse_drop_count_for_test();
+        let v = parse_export_json_column(r#"{"k":"v"}"#, "test", 0);
+        assert!(v.is_some());
+        assert_eq!(crate::storage::storage_export_json_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn malformed_bumps_counter_ft_l3u5k() {
+        let _guard = parse_drop_test_lock();
+        // br-ft-l3u5k: a malformed JSON payload bumps the counter
+        // exactly once.
+        reset_storage_export_json_parse_drop_count_for_test();
+        let v = parse_export_json_column("{not json", "test", 5);
+        assert!(v.is_none());
+        assert_eq!(crate::storage::storage_export_json_parse_drop_count(), 1);
+
+        // Second malformed call bumps again — every event observable.
+        let _ = parse_export_json_column("[unclosed", "another", 7);
+        assert_eq!(crate::storage::storage_export_json_parse_drop_count(), 2);
+    }
+
+    #[test]
+    fn null_input_path_does_not_bump_ft_l3u5k() {
+        let _guard = parse_drop_test_lock();
+        // The NULL path (optional_string returning None) doesn't
+        // even reach this helper — the early return at
+        // optional_json_value handles it. Pin the contract via the
+        // helper directly: an empty-but-valid JSON shouldn't bump.
+        reset_storage_export_json_parse_drop_count_for_test();
+        let v = parse_export_json_column("null", "test", 0);
+        assert!(v.is_some());
+        assert_eq!(v.unwrap(), serde_json::Value::Null);
+        assert_eq!(crate::storage::storage_export_json_parse_drop_count(), 0);
+    }
 }
