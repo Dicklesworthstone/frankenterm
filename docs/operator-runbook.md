@@ -78,6 +78,33 @@ Before sending the first marching order, verify the environment.
   - `janitor_untracked` / `low`: untracked `.stash_janitor_workspace/*`
     artifacts.
 
+  Stale-bead reopen decisions while Agent Mail is red are conservative by
+  default. Use `.beads.stale_reopen`, not age alone:
+  - `default_action` is always `do_not_reopen`; an empty ready queue does not
+    weaken that default.
+  - `active_not_stale[]` means the Bead was updated inside the two-hour
+    threshold. Treat it as active, even if it blocks the work you wanted. In
+    the May 9 red-mail scenario, this is how recent `ft-269nf` and `ft-3yptk`
+    activity should be classified.
+  - `candidates[]` means the Bead crossed the two-hour threshold, but it still
+    requires a status check before reopening. Inspect recent comments and
+    handoffs with `br show <id> --json`, refresh the fallback snapshot, and
+    verify dirty paths do not overlap the Bead's likely files.
+  - `dirty_overlap_unknown[]` means tracked/shared or untracked-review paths
+    already exist in the worktree. Do not reopen related work until ownership
+    is clear.
+
+  Prefer a visible status-check comment before any reopen:
+  ```bash
+  br comments add <id> --author <agent> --message 'status check: still active? Agent Mail is unavailable; please comment if this bead is still owned.'
+  ```
+
+  Only after those checks show stale ownership and no dirty-path signal, reopen
+  explicitly:
+  ```bash
+  br update <id> --status open --assignee "" --actor <agent>
+  ```
+
   This is intentionally a script-local JSON contract, not a
   `docs/json-schema/wa-*` robot schema. The fallback is an operator script used
   when Agent Mail is unavailable; the golden fixture in

@@ -253,6 +253,67 @@ emit_agent_mail_fallback_snapshot() {
           })
         });
 
+    def stale_reopen_guidance($dirty_enriched; $risk_level; $high_risk_count):
+      map(enriched_issue) as $issues
+      | {
+          default_action: "do_not_reopen",
+          threshold_seconds: 7200,
+          dirty_risk_level: $risk_level,
+          high_risk_dirty_count: $high_risk_count,
+          dirty_tree_guard: "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+          manual_checks: [
+            "br show <id> --json: confirm no recent comments or ownership handoff",
+            "scripts/swarm-tick.sh --agent-mail-fallback frankenterm: confirm the bead remains stale in the latest snapshot",
+            "git status --short --untracked-files=all: confirm no dirty paths overlap expected files for the bead",
+            "If Agent Mail recovers, ask or acknowledge the assignee before reopening"
+          ],
+          active_not_stale: (
+            $issues
+            | map(select(.stale_over_2h | not)
+              | {
+                  id,
+                  title,
+                  assignee,
+                  updated_at,
+                  age_seconds,
+                  recommendation: "do_not_reopen",
+                  reason: "Updated inside the stale threshold; treat as active while Agent Mail is unavailable."
+                })
+          ),
+          candidates: (
+            $issues
+            | map(select(.stale_over_2h)
+              | {
+                  id,
+                  title,
+                  assignee,
+                  updated_at,
+                  age_seconds,
+                  recommendation: "status_check_before_reopen",
+                  reason: "Stale threshold exceeded, but red-mail mode cannot prove abandonment from age alone.",
+                  required_evidence: [
+                    "No recent br comments or handoff",
+                    "Latest fallback snapshot still marks the bead stale",
+                    "Dirty paths do not overlap expected files for the bead",
+                    "Assignee is unreachable or explicitly inactive"
+                  ],
+                  status_check_command: ("br comments add " + .id + " --author <agent> --message \"status check: still active? Agent Mail is unavailable; please comment if this bead is still owned.\""),
+                  reopen_command: ("br update " + .id + " --status open --assignee \"\" --actor <agent>")
+                })
+          ),
+          dirty_overlap_unknown: (
+            $dirty_enriched
+            | map(select(.severity == "high" or .severity == "medium")
+              | {
+                  path,
+                  status,
+                  category,
+                  severity,
+                  recommendation: "do_not_reopen_related_beads_until_owner_clear"
+                })
+          )
+        };
+
     ($dirty | map(enriched_dirty_path)) as $dirty_enriched
     | ($dirty_enriched | map(select(.severity == "high")) | length) as $high_risk_count
     | ($dirty_enriched | map(select(.severity == "medium")) | length) as $medium_risk_count
@@ -298,6 +359,7 @@ emit_agent_mail_fallback_snapshot() {
         ready_count: ($ready | length),
         active_agents: ($in_progress | active_agents),
         in_progress: ($in_progress | map(enriched_issue)),
+        stale_reopen: ($in_progress | stale_reopen_guidance($dirty_enriched; $risk_level; $high_risk_count)),
         ready: ($ready | map({
           id,
           title,
@@ -336,6 +398,7 @@ emit_agent_mail_fallback_snapshot() {
       next_actions: [
         "Use Beads status as the coordination source of truth until Agent Mail recovers.",
         "Before editing, compare dirty_paths and in_progress assignees with your intended files.",
+        "Use beads.stale_reopen before reopening any in-progress bead; default to do_not_reopen.",
         "Record this snapshot in the Beads comment when closing or handing off work."
       ],
       proof_doctor: "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed."

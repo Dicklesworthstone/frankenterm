@@ -63,6 +63,72 @@
       }
     ],
     "in_progress_count": 2,
+    "stale_reopen": {
+      "active_not_stale": [
+        {
+          "age_seconds": 1800,
+          "assignee": "RedTower",
+          "id": "ft-active1",
+          "recommendation": "do_not_reopen",
+          "reason": "Updated inside the stale threshold; treat as active while Agent Mail is unavailable.",
+          "title": "Storage call-site migration",
+          "updated_at": "2026-05-06T16:30:00Z"
+        }
+      ],
+      "candidates": [
+        {
+          "age_seconds": 9000,
+          "assignee": "BlueLake",
+          "id": "ft-stale1",
+          "reason": "Stale threshold exceeded, but red-mail mode cannot prove abandonment from age alone.",
+          "recommendation": "status_check_before_reopen",
+          "reopen_command": "br update ft-stale1 --status open --assignee \"\" --actor <agent>",
+          "required_evidence": [
+            "No recent br comments or handoff",
+            "Latest fallback snapshot still marks the bead stale",
+            "Dirty paths do not overlap expected files for the bead",
+            "Assignee is unreachable or explicitly inactive"
+          ],
+          "status_check_command": "br comments add ft-stale1 --author <agent> --message \"status check: still active? Agent Mail is unavailable; please comment if this bead is still owned.\"",
+          "title": "Dormant proof lane",
+          "updated_at": "2026-05-06T14:30:00Z"
+        }
+      ],
+      "default_action": "do_not_reopen",
+      "dirty_overlap_unknown": [
+        {
+          "category": "shared_tracker",
+          "path": ".beads/issues.jsonl",
+          "recommendation": "do_not_reopen_related_beads_until_owner_clear",
+          "severity": "high",
+          "status": " M"
+        },
+        {
+          "category": "tracked_overlap_risk",
+          "path": "crates/frankenterm-core/src/storage.rs",
+          "recommendation": "do_not_reopen_related_beads_until_owner_clear",
+          "severity": "high",
+          "status": " M"
+        },
+        {
+          "category": "untracked_review_required",
+          "path": "docs/robot-contracts/policy-recommendations.md",
+          "recommendation": "do_not_reopen_related_beads_until_owner_clear",
+          "severity": "medium",
+          "status": "??"
+        }
+      ],
+      "dirty_risk_level": "high",
+      "dirty_tree_guard": "Do not reopen a bead when dirty tracked/shared files may belong to that assignee or overlap the bead; comment for status first.",
+      "high_risk_dirty_count": 2,
+      "manual_checks": [
+        "br show <id> --json: confirm no recent comments or ownership handoff",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm: confirm the bead remains stale in the latest snapshot",
+        "git status --short --untracked-files=all: confirm no dirty paths overlap expected files for the bead",
+        "If Agent Mail recovers, ask or acknowledge the assignee before reopening"
+      ],
+      "threshold_seconds": 7200
+    },
     "ready": [
       {
         "assignee": "unassigned",
@@ -187,6 +253,7 @@
   "next_actions": [
     "Use Beads status as the coordination source of truth until Agent Mail recovers.",
     "Before editing, compare dirty_paths and in_progress assignees with your intended files.",
+    "Use beads.stale_reopen before reopening any in-progress bead; default to do_not_reopen.",
     "Record this snapshot in the Beads comment when closing or handing off work."
   ],
   "proof_doctor": "not applicable; coordination snapshot only; no Cargo/RCH proof lane claimed.",

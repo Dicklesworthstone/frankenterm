@@ -153,6 +153,12 @@ assert_match() {
     [[ "$(jq -r '.git.high_risk_count' "${TMP_DIR}/actual.json")" == "2" ]]
     [[ "$(jq -r '.git.conflict_hints[] | select(.path == ".beads/issues.jsonl") | .category' "${TMP_DIR}/actual.json")" == "shared_tracker" ]]
     [[ "$(jq -r '.git.conflict_hints[] | select(.path == ".stash_janitor_workspace/handoff_report.md") | .severity' "${TMP_DIR}/actual.json")" == "low" ]]
+    [[ "$(jq -r '.beads.stale_reopen.default_action' "${TMP_DIR}/actual.json")" == "do_not_reopen" ]]
+    [[ "$(jq -r '.beads.stale_reopen.threshold_seconds' "${TMP_DIR}/actual.json")" == "7200" ]]
+    [[ "$(jq -r '.beads.stale_reopen.active_not_stale[] | select(.id == "ft-active1") | .recommendation' "${TMP_DIR}/actual.json")" == "do_not_reopen" ]]
+    [[ "$(jq -r '.beads.stale_reopen.candidates[] | select(.id == "ft-stale1") | .recommendation' "${TMP_DIR}/actual.json")" == "status_check_before_reopen" ]]
+    [[ "$(jq -r '.beads.stale_reopen.candidates[] | select(.id == "ft-stale1") | .reopen_command' "${TMP_DIR}/actual.json")" == 'br update ft-stale1 --status open --assignee "" --actor <agent>' ]]
+    [[ "$(jq -r '.beads.stale_reopen.dirty_overlap_unknown[] | select(.path == "crates/frankenterm-core/src/storage.rs") | .recommendation' "${TMP_DIR}/actual.json")" == "do_not_reopen_related_beads_until_owner_clear" ]]
 }
 
 # ─── Schema invariants (run on healthy fixture) ──────────────────────────────
