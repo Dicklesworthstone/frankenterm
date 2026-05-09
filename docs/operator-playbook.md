@@ -161,6 +161,63 @@ ft diag bundle --output /tmp/ft-diag
 
 ---
 
+## Flow 3b: high memory / residency incident
+
+Use this when FrankenTerm or a mux process has high RSS, memory pressure, or
+unexpected growth. Do not call it a heap leak until the residency buckets below
+have evidence.
+
+1) Capture the ft-side state first:
+
+```bash
+ft triage -f json > /tmp/ft-memory-triage.json
+ft status --health > /tmp/ft-memory-status-health.txt
+ft doctor --json > /tmp/ft-memory-doctor.json
+ft robot events --limit 100 > /tmp/ft-memory-events.json
+ft diag bundle --output /tmp/ft-memory-diag
+```
+
+If the build exposes the resource-pressure cockpit, also capture:
+
+```bash
+ft robot capacity --level 2 > /tmp/ft-memory-cockpit.json
+```
+
+2) Identify the process tree and resident memory:
+
+```bash
+ps -axo pid,ppid,rss,vsz,comm | rg 'frankenterm|ft |wezterm'
+```
+
+For the suspected process, collect platform diagnostics:
+
+```bash
+# macOS native process evidence
+vmmap <pid> -summary > /tmp/frankenterm-<pid>.vmmap.txt
+/usr/bin/sample <pid> 5 -file /tmp/frankenterm-<pid>.sample.txt
+heap <pid> > /tmp/frankenterm-<pid>.heap.txt
+```
+
+3) Classify the bytes before choosing a fix:
+
+| Bucket | Evidence to look for | Next move |
+| --- | --- | --- |
+| Rust heap | `heap` growth, allocator buckets, long-lived Rust structures | File a heap-retention issue with sample + heap output. |
+| mmap/file-backed residency | `vmmap` file mappings, SQLite/Tantivy/cold-tier mappings | Check cache pressure and whether RSS is reclaimable file-backed memory. |
+| Graphics/media residency | GPU, image, font, or render/media segments | Use GUI/render runbooks before changing scrollback or heap code. |
+| Scrollback/cache growth | cockpit memory tiers, gap bursts, warm/cold tier pressure | Tune retention, capture cadence, or tier budgets with proof artifacts. |
+| Child processes | child RSS in `ps` tree | Attribute to the child before changing ft memory policy. |
+| Unknown | non-zero unknown cockpit row or unclassified `vmmap` regions | Add drilldown evidence; do not hide it under a generic leak label. |
+
+The resource-pressure cockpit contract is
+`docs/resource-pressure-cockpit-contract.md`. The first reduced RCH proof lane is
+`RCH_STEP_TIMEOUT_SECS=1800 tests/e2e/test_ft_p3457_4_resource_pressure_soak.sh`;
+it proves remote execution and artifact shape, but it deliberately leaves
+200-pane/high-scale claims as `skipped_not_proven` unless the host has at least
+64 logical CPUs and 256 GiB memory and a live cockpit artifact is retained.
+
+---
+
 ## Flow 4: triage → mute / noise control
 
 If an event is noisy but safe, reduce noise without losing observability.

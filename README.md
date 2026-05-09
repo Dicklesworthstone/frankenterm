@@ -85,9 +85,9 @@ Current implementation reality:
 | **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output |
 | **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
-| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; memory-envelope claims should be treated as benchmark-dependent until linked artifacts are published |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; memory-envelope claims are proof-gated by the resource-pressure cockpit contract and remain benchmark-dependent until live artifacts are published |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing; the shipped recorder backend is currently `append_log`, while `frankensqlite` remains rollout/test-only until live bootstrap support lands |
-| **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis |
+| **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis; high-scale claims must cite the cockpit proof artifacts in `docs/resource-pressure-cockpit-contract.md` |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning |
 
 ---
@@ -239,7 +239,7 @@ Multi-pane operations use a prepare/commit/compensate lifecycle borrowed from di
 
 ### 7. Defense in Depth for Memory
 
-The fleet memory controller synthesizes pressure signals from three independent subsystems: pipeline backpressure (queue depths), system memory utilization, and per-pane memory budgets. These feed a unified 4-tier pressure model (Normal, Elevated, Critical, Emergency) with asymmetric hysteresis that escalates fast and de-escalates slow. Actions range from throttling poll intervals to emergency warm-scrollback eviction.
+The fleet memory controller synthesizes pressure signals from three independent subsystems: pipeline backpressure (queue depths), system memory utilization, and per-pane memory budgets. These feed a unified 4-tier pressure model (Normal, Elevated, Critical, Emergency) with asymmetric hysteresis that escalates fast and de-escalates slow. Actions range from throttling poll intervals to emergency warm-scrollback eviction. During incidents, operators should use the resource-pressure cockpit contract to separate Rust heap growth, mmap/file-backed residency, graphics/media residency, scrollback/cache growth, child-process RSS, and unknown resident memory before calling anything a leak.
 
 ---
 
@@ -1378,11 +1378,21 @@ rm ~/.local/share/ft/watcher.lock
 
 ### High memory usage
 
-Delta extraction may be failing, falling back to full captures. Or too many panes are accumulating warm scrollback.
+First classify the residency source instead of assuming a heap leak. The
+resource-pressure cockpit contract separates Rust heap, mmap/file-backed
+residency, graphics/media residency, scrollback/cache growth, child-process RSS,
+and unknown resident bytes; see `docs/operator-playbook.md` for the collection
+flow and `docs/resource-pressure-cockpit-contract.md` for the proof gate.
+Delta extraction failures and excessive warm scrollback remain common causes,
+but they are only two rows in that incident matrix.
 
 ```bash
 # Check for gaps in capture
 ft robot events --event-type gap
+
+# Capture current health and cockpit data when available
+ft doctor --json > /tmp/ft-doctor-memory.json
+ft status --health > /tmp/ft-status-health.txt
 
 # Reduce poll interval
 # In ft.toml:
@@ -1518,7 +1528,10 @@ For 200 panes, stock terminal emulators keep all scrollback uncompressed in RAM 
 | **Warm** | zstd compressed (RAM) | Decompress on demand | ~40KB |
 | **Cold** | Evicted (re-fetch from SQLite) | Query on demand | 0KB |
 
-With default settings (1000 hot lines, 50MB warm cap per pane), 200 panes fit in under 1GB.
+The default settings are designed to keep hot scrollback small and shift older
+content into compressed or on-demand tiers. Treat any 200-pane memory envelope
+as hardware- and workload-dependent until the run cites a live cockpit artifact
+with the target hardware predicate from `docs/resource-pressure-cockpit-contract.md`.
 
 ### What agents does ft detect?
 

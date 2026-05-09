@@ -361,6 +361,35 @@ remains `skipped_not_proven` unless the remote host predicate is measured at
 64+ logical CPUs and 256+ GiB memory and a later live soak captures the runtime
 cockpit artifacts.
 
+### Memory Incident Artifact Checklist
+
+When an operator reports high memory or a possible leak, collect artifacts that
+preserve the cockpit's residency split instead of flattening everything into a
+single memory number:
+
+```bash
+ft triage -f json > /tmp/ft-memory-triage.json
+ft status --health > /tmp/ft-memory-status-health.txt
+ft doctor --json > /tmp/ft-memory-doctor.json
+ft robot events --limit 100 > /tmp/ft-memory-events.json
+ft diag bundle --output /tmp/ft-memory-diag
+ft robot capacity --level 2 > /tmp/ft-memory-cockpit.json
+ps -axo pid,ppid,rss,vsz,comm | rg 'frankenterm|ft |wezterm'
+```
+
+On macOS, add native process evidence for the suspected FrankenTerm or mux PID:
+
+```bash
+vmmap <pid> -summary > /tmp/frankenterm-<pid>.vmmap.txt
+/usr/bin/sample <pid> 5 -file /tmp/frankenterm-<pid>.sample.txt
+heap <pid> > /tmp/frankenterm-<pid>.heap.txt
+```
+
+The closing diagnosis must classify resident bytes as `rust_heap`,
+`mmap_file_backed`, `sqlite_cache`, `graphics_media`, `scrollback_tiers`,
+`child_processes`, or `unknown`. Non-zero `unknown` is an investigation result,
+not a bucket to hide in a leak summary.
+
 ## Minimal Example
 
 ```json
