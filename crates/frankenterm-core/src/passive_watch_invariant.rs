@@ -834,7 +834,7 @@ mod tests {
         // stamp behavior.
         let h = PassiveWatchHealth::baseline();
         assert!(!h.is_safe(), "cold baseline must be unsafe");
-        assert_eq!(h.detection_rate(), 0.0);
+        assert!(h.detection_rate().abs() <= f64::EPSILON);
 
         // After at least one iteration with no violations: safe.
         let h_clean = PassiveWatchHealth {

@@ -400,7 +400,7 @@ mod tests {
                     assert_eq!(p.workload_id, "replay-write-heavy-1k");
                 }
             }
-            _ => panic!("expected Frontier variant"),
+            PlannerReportRendering::DataNeeded { .. } => panic!("expected Frontier variant"),
         }
     }
 
@@ -413,7 +413,7 @@ mod tests {
                 assert!(!reasons.is_empty());
                 assert!(reasons[0].contains("at least 3"));
             }
-            _ => panic!("expected DataNeeded variant"),
+            PlannerReportRendering::Frontier { .. } => panic!("expected DataNeeded variant"),
         }
     }
 
@@ -513,7 +513,7 @@ mod tests {
         // must surface the SAME count in text and JSON — neither
         // path can diverge.
         assert!(
-            text_count >= 4 && text_count <= 12,
+            (4..=12).contains(&text_count),
             "text rendering should surface 4-12 occurrences (2 fields × frontier+dominated points); got {text_count}"
         );
         assert_eq!(

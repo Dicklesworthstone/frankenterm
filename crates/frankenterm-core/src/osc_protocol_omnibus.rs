@@ -1136,7 +1136,7 @@ mod tests {
         let uri = HyperlinkUri::new("https://github.com/owner/repo/pull/123".to_string());
         match registry.allocate(uri.clone()) {
             HyperlinkAllocOutcome::Allocated(_id) => telem.record_osc8_open(true),
-            _ => panic!("expected alloc"),
+            HyperlinkAllocOutcome::DeniedFull => panic!("expected alloc"),
         }
         let hover = osc8_hover_decision(&uri, Osc8HoverPolicy::WellKnownOnly);
         telem.record_osc8_hover(hover);

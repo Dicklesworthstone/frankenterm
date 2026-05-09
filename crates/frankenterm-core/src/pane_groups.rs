@@ -948,7 +948,7 @@ mod tests {
             &mut r,
             &GroupOp::Create {
                 id: 1,
-                name: "".to_string(),
+                name: String::new(),
             },
         );
         assert_eq!(
@@ -1035,7 +1035,7 @@ mod tests {
         apply_group_op(&mut r, &GroupOp::Add { group: 1, pane: 8 });
         let outcome = apply_group_op(&mut r, &GroupOp::KillAll { group: 1 });
         assert_eq!(outcome, GroupOpOutcome::Applied { panes_affected: 2 });
-        assert!(r.groups.get(&1).is_none());
+        assert!(!r.groups.contains_key(&1));
         assert_eq!(r.id_of("cc-agents"), None);
     }
 

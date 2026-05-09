@@ -9950,7 +9950,7 @@ mod workflow_plan_serde_drop_tests {
                 "{\"unknown\":42}".to_string(),
                 "{\"steps\":\"not an array\"}".to_string(),
                 "not json".to_string(),
-                "".to_string(),
+                String::new(),
                 "{".to_string(),
             ]),
         ) {

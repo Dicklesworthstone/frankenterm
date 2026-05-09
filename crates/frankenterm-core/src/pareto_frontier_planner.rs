@@ -420,7 +420,9 @@ mod tests {
         let report = plan(&[p1, p2]);
         match report {
             PlannerReport::DataNeeded { reasons } => assert!(!reasons.is_empty()),
-            other => panic!("expected DataNeeded, got {other:?}"),
+            other @ PlannerReport::Frontier { .. } => {
+                panic!("expected DataNeeded, got {other:?}")
+            }
         }
     }
 
@@ -440,7 +442,9 @@ mod tests {
                 assert_eq!(frontier.len(), 3);
                 assert!(dominated.is_empty());
             }
-            other => panic!("expected Frontier, got {other:?}"),
+            other @ PlannerReport::DataNeeded { .. } => {
+                panic!("expected Frontier, got {other:?}")
+            }
         }
     }
 
@@ -473,7 +477,9 @@ mod tests {
                         .any(|d| d == "token_output_quality_e3")
                 );
             }
-            other => panic!("expected Frontier, got {other:?}"),
+            other @ PlannerReport::DataNeeded { .. } => {
+                panic!("expected Frontier, got {other:?}")
+            }
         }
     }
 

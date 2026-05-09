@@ -879,7 +879,7 @@ mod tests {
         let s = String::from_utf8_lossy(&emitted);
         assert!(!s.contains("INJECTED"));
         // Envelope should be exactly one OSC sequence.
-        assert_eq!(emitted.iter().filter(|&&b| b == 0x1b).count(), 2);
+        assert_eq!(s.matches('\x1b').count(), 2);
     }
 
     #[test]
@@ -915,7 +915,7 @@ mod tests {
         assert!(!s.contains("BAD"));
         // Envelope ends cleanly — exactly two ESC bytes
         // (one for OSC start, one for ST end).
-        assert_eq!(emitted.iter().filter(|&&b| b == 0x1b).count(), 2);
+        assert_eq!(s.matches('\x1b').count(), 2);
     }
 
     #[test]

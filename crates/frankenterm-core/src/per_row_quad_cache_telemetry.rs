@@ -399,8 +399,8 @@ mod tests {
     fn baseline_is_safe_and_vacuously_perfect() {
         let h = PerRowQuadCacheHealth::baseline();
         assert!(h.is_safe());
-        assert_eq!(h.lifetime_hit_rate(), 1.0);
-        assert_eq!(h.lifetime_hit_rate_pct(), 100.0);
+        assert!((h.lifetime_hit_rate() - 1.0).abs() <= f64::EPSILON);
+        assert!((h.lifetime_hit_rate_pct() - 100.0).abs() <= f64::EPSILON);
     }
 
     #[test]

@@ -3881,16 +3881,16 @@ mod tests {
         // The legitimate pattern MUST produce at least one Ok match
         // on this large-but-realistic input.
         let results: Vec<_> = regex.captures_iter(&padding).collect();
-        let ok_matches: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
-        let err_matches: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let err_count = results.iter().filter(|r| r.is_err()).count();
         assert!(
-            !ok_matches.is_empty(),
+            ok_count > 0,
             "legitimate pattern must match the canonical anchor embedded in large input"
         );
         assert!(
-            err_matches.is_empty(),
+            err_count == 0,
             "legitimate pattern must not exhaust backtrack budget on realistic input; got {} errors",
-            err_matches.len()
+            err_count
         );
     }
 
@@ -4593,12 +4593,11 @@ rules:
             ),
         ] {
             let detections = engine.detect(text);
-            let rate_hits: Vec<_> = detections
+            let has_rate_hit = detections
                 .iter()
-                .filter(|d| d.event_type == "rate_limit.detected")
-                .collect();
+                .any(|d| d.event_type == "rate_limit.detected");
             assert!(
-                !rate_hits.is_empty(),
+                has_rate_hit,
                 "{label}: close-proximity rate-limit text must still fire. \
                  text={text:?} detections={detections:?}"
             );
@@ -4639,12 +4638,11 @@ rules:
             ),
         ] {
             let detections = engine.detect(text);
-            let rate_hits: Vec<_> = detections
+            let has_rate_hit = detections
                 .iter()
-                .filter(|d| d.event_type == "rate_limit.detected")
-                .collect();
+                .any(|d| d.event_type == "rate_limit.detected");
             assert!(
-                !rate_hits.is_empty(),
+                has_rate_hit,
                 "{label}: multi-line rate-limit text must fire — \
                  ft-y820u regression. text={text:?} detections={detections:?}"
             );
@@ -7888,11 +7886,8 @@ rules:
         assert_eq!(fancy_codes, std_codes);
 
         let aho = AhoCorasick::new([anchor]).expect("anchor reference matcher must compile");
-        let aho_spans: Vec<_> = aho
-            .find_overlapping_iter(text)
-            .map(|m| (m.start(), m.end()))
-            .collect();
-        assert_eq!(aho_spans.len(), std_codes.len());
+        let aho_span_count = aho.find_overlapping_iter(text).count();
+        assert_eq!(aho_span_count, std_codes.len());
 
         let direct = engine.detect(text);
         let mut context = DetectionContext::new();

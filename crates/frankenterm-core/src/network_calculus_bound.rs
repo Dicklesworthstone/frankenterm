@@ -462,8 +462,8 @@ mod tests {
     #[test]
     fn arrival_evaluate_is_zero_before_t0() {
         let a = ArrivalCurve::new(10.0, 100.0);
-        assert_eq!(a.evaluate(-1.0), 0.0);
-        assert_eq!(a.evaluate(-100.0), 0.0);
+        assert!(approx(a.evaluate(-1.0), 0.0));
+        assert!(approx(a.evaluate(-100.0), 0.0));
     }
 
     #[test]
@@ -492,9 +492,9 @@ mod tests {
     #[test]
     fn service_evaluate_is_zero_before_latency() {
         let s = ServiceCurve::new(100.0, 5.0);
-        assert_eq!(s.evaluate(0.0), 0.0);
-        assert_eq!(s.evaluate(4.99), 0.0);
-        assert_eq!(s.evaluate(5.0), 0.0);
+        assert!(approx(s.evaluate(0.0), 0.0));
+        assert!(approx(s.evaluate(4.99), 0.0));
+        assert!(approx(s.evaluate(5.0), 0.0));
     }
 
     #[test]
