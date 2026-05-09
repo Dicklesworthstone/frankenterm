@@ -2882,6 +2882,14 @@ enum RobotCommands {
         level: u8,
     },
 
+    /// Emit Agent Mail fallback Beads/git coordination-risk snapshot
+    #[command(visible_aliases = ["agent-mail-fallback", "red-mail"])]
+    CoordinationRisk {
+        /// Swarm session name passed to the fallback producer
+        #[arg(default_value = "frankenterm")]
+        session: String,
+    },
+
     /// Resource-control what-if simulation endpoints
     Resource {
         #[command(subcommand)]
@@ -4990,6 +4998,7 @@ const ROBOT_ERR_WORK_ITEM_NOT_FOUND: &str = "robot.work_item_not_found";
 const ROBOT_ERR_WORK_ITEM_CONFLICT: &str = "robot.work_item_conflict";
 const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
 const ROBOT_ERR_RESOURCE_WHAT_IF: &str = "robot.resource.what_if_error";
+const ROBOT_ERR_COORDINATION_RISK: &str = "robot.coordination_risk_unavailable";
 const ROBOT_APPROVAL_RECOVERY_HINT: &str = "Run `ft watch` so approvals can be issued, then validate any issued token with `ft approve <CODE>` before retrying.";
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE: &str =
     "Live get-text is unavailable for distributed panes";
@@ -6019,6 +6028,54 @@ fn print_proof_doctor_plain(payload: &serde_json::Value) {
             );
         }
     }
+}
+
+fn parse_coordination_risk_snapshot(raw: &[u8]) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|err| format!("invalid fallback JSON: {err}"))?;
+
+    let Some(mode) = value.get("mode").and_then(serde_json::Value::as_str) else {
+        return Err("fallback snapshot is missing the mode field".to_string());
+    };
+
+    if mode != "agent_mail_unavailable_beads_only" {
+        return Err(format!("unexpected fallback snapshot mode: {mode}"));
+    }
+
+    Ok(value)
+}
+
+fn load_coordination_risk_snapshot(
+    workspace_root: &Path,
+    session: &str,
+) -> Result<serde_json::Value, String> {
+    let script = workspace_root.join("scripts").join("swarm-tick.sh");
+    if !script.exists() {
+        return Err(format!(
+            "coordination fallback producer not found at {}",
+            script.display()
+        ));
+    }
+
+    let output = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("--agent-mail-fallback")
+        .arg(session)
+        .env("REPO_ROOT", workspace_root)
+        .output()
+        .map_err(|err| format!("failed to run {}: {err}", script.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(format!("coordination fallback producer failed: {detail}"));
+    }
+
+    parse_coordination_risk_snapshot(&output.stdout)
 }
 
 fn estimate_tokens(s: &str) -> usize {
@@ -15986,6 +16043,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Get swarm capacity certificate/controller summary",
             },
             RobotCommandInfo {
+                name: "coordination-risk",
+                description: "Emit Agent Mail fallback Beads/git coordination-risk snapshot",
+            },
+            RobotCommandInfo {
                 name: "resource what-if",
                 description: "Run a read-only resource-control digital-twin simulation",
             },
@@ -16358,6 +16419,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot capacity",
                     "ft robot --format toon capacity --level 2",
+                ],
+            },
+            QuickStartCommand {
+                name: "coordination-risk",
+                args: "[session]",
+                summary: "Read the Agent Mail fallback Beads/git coordination-risk snapshot",
+                examples: vec![
+                    "ft robot coordination-risk",
+                    "ft robot --format toon coordination-risk frankenterm",
                 ],
             },
             QuickStartCommand {
@@ -22941,6 +23011,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = RobotResponse::success(payload, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::CoordinationRisk { session } => {
+                    let response = match load_coordination_risk_snapshot(&workspace_root, &session)
+                    {
+                        Ok(snapshot) => RobotResponse::success(snapshot, elapsed_ms(start)),
+                        Err(err) => RobotResponse::<serde_json::Value>::error_with_code(
+                            ROBOT_ERR_COORDINATION_RISK,
+                            err,
+                            Some(
+                                "Run `scripts/swarm-tick.sh --agent-mail-fallback <session>` from the workspace to inspect the fallback producer directly."
+                                    .to_string(),
+                            ),
+                            elapsed_ms(start),
+                        ),
+                    };
+                    print_robot_response(&response, format, stats)?;
+                }
                 other => {
                     let ctx = match build_robot_context(&config, &workspace_root) {
                         Ok(ctx) => ctx,
@@ -29240,6 +29326,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::Help | RobotCommands::QuickStart => {
                             unreachable!("handled above")
                         }
+                        RobotCommands::CoordinationRisk { .. } => unreachable!("handled above"),
                         RobotCommands::ProofDoctor { .. } => unreachable!("handled above"),
                     }
                 }
@@ -58537,6 +58624,30 @@ log_level = "debug"
     }
 
     #[test]
+    fn coordination_risk_snapshot_accepts_agent_mail_fallback_fixture() {
+        let snapshot = parse_coordination_risk_snapshot(include_bytes!(
+            "../../../tests/fixtures/swarm-tick/agent-mail-fallback/expected.json"
+        ))
+        .expect("fallback fixture should match coordination-risk schema");
+
+        assert_eq!(
+            snapshot.get("mode").and_then(serde_json::Value::as_str),
+            Some("agent_mail_unavailable_beads_only")
+        );
+        assert!(snapshot.get("agent_mail").is_some());
+        assert!(snapshot.get("beads").is_some());
+        assert!(snapshot.get("git").is_some());
+    }
+
+    #[test]
+    fn coordination_risk_snapshot_rejects_unexpected_mode() {
+        let err = parse_coordination_risk_snapshot(br#"{"mode":"tick"}"#)
+            .expect_err("normal swarm tick output must not satisfy red-mail schema");
+
+        assert!(err.contains("unexpected fallback snapshot mode"));
+    }
+
+    #[test]
     fn send_dry_run_report_includes_wait_for_and_no_paste_warning() {
         let config = frankenterm_core::config::Config::default();
         let command_ctx = frankenterm_core::dry_run::CommandContext::new("ft send", true);
@@ -65305,6 +65416,38 @@ log_level = "debug"
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Capacity { level }) => assert_eq!(level, 3),
                 _ => panic!("expected RobotCommands::Capacity"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_coordination_risk_parses_default_session() {
+        let cli = Cli::try_parse_from(["ft", "robot", "coordination-risk"])
+            .expect("robot coordination-risk should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::CoordinationRisk { session }) => {
+                    assert_eq!(session, "frankenterm");
+                }
+                _ => panic!("expected RobotCommands::CoordinationRisk"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_coordination_risk_parses_alias_and_session() {
+        let cli = Cli::try_parse_from(["ft", "robot", "agent-mail-fallback", "staging"])
+            .expect("robot coordination-risk alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::CoordinationRisk { session }) => {
+                    assert_eq!(session, "staging");
+                }
+                _ => panic!("expected RobotCommands::CoordinationRisk"),
             },
             _ => panic!("expected Robot command"),
         }

@@ -153,7 +153,7 @@ mod tests {
         map_caut_error, map_mcp_error,
     };
     use crate::cass::CassError;
-    use crate::caut::{CautError, CautErrorRemediationExt};
+    use crate::caut::CautError;
     use crate::error::{Error, WeztermError};
     use proptest::prelude::*;
 
@@ -259,7 +259,8 @@ mod tests {
         assert_eq!(storage_err.message, "Storage unavailable");
         assert!(!storage_err.message.contains("/tmp/secret.db"));
 
-        let runtime = Error::Runtime("tokio worker panic: internal detail".into());
+        let runtime =
+            Error::runtime_backend("mcp test runtime", "tokio worker panic: internal detail");
         let runtime_err = McpToolError::from_error(runtime);
         assert_eq!(runtime_err.code, MCP_ERR_NOT_IMPLEMENTED);
         assert_eq!(runtime_err.message, "Internal error");
@@ -358,7 +359,7 @@ mod tests {
 
     #[test]
     fn map_error_runtime_falls_through() {
-        let err = Error::Runtime("unexpected".to_string());
+        let err = Error::runtime_backend("mcp test runtime", "unexpected");
         let (code, _) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_NOT_IMPLEMENTED);
     }

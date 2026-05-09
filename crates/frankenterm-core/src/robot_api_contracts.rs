@@ -121,6 +121,8 @@ pub enum ApiSurface {
     // Diagnostics
     /// health — live health, leak, and backpressure diagnostics.
     Health,
+    /// coordination-risk — Agent Mail fallback Beads/git coordination snapshot.
+    CoordinationRisk,
 
     // Meta
     /// quickstart — machine-readable quick-start guide.
@@ -166,6 +168,7 @@ impl ApiSurface {
         Self::ReplayDiff,
         Self::ReplayRegression,
         Self::Health,
+        Self::CoordinationRisk,
         Self::QuickStart,
         Self::Why,
         Self::Approve,
@@ -207,6 +210,7 @@ impl ApiSurface {
             Self::ReplayDiff => "replay-diff",
             Self::ReplayRegression => "replay-regression",
             Self::Health => "health",
+            Self::CoordinationRisk => "coordination-risk",
             Self::QuickStart => "quickstart",
             Self::Why => "why",
             Self::Approve => "approve",
@@ -265,7 +269,7 @@ impl ApiSurface {
             Self::MissionState | Self::MissionDecisions => "mission",
             Self::TxPlan | Self::TxRun | Self::TxRollback | Self::TxShow => "tx",
             Self::ReplayInspect | Self::ReplayDiff | Self::ReplayRegression => "replay",
-            Self::Health => "diagnostics",
+            Self::Health | Self::CoordinationRisk => "diagnostics",
             Self::QuickStart | Self::Why | Self::Approve => "meta",
         }
     }
@@ -1088,6 +1092,22 @@ pub fn standard_contract_matrix() -> ContractMatrix {
             "redacted_field_count",
         ]),
     );
+    matrix.register(
+        ContractCheck::new(
+            "schema-coordination-risk",
+            ApiSurface::CoordinationRisk,
+            CheckCategory::SchemaStability,
+            "coordination-risk response reuses the red-mail fallback snapshot fields",
+        )
+        .with_required_fields(&[
+            "mode",
+            "agent_mail",
+            "beads",
+            "git",
+            "next_actions",
+            "proof_doctor",
+        ]),
+    );
 
     // Determinism checks
     matrix.register(
@@ -1269,7 +1289,7 @@ mod tests {
 
     #[test]
     fn surface_count() {
-        assert_eq!(ApiSurface::ALL.len(), 35);
+        assert_eq!(ApiSurface::ALL.len(), 36);
     }
 
     // ---- ContractCheck ----

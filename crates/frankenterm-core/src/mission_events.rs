@@ -1720,9 +1720,9 @@ mod tests {
         );
     }
 
-    /// Property test: for any combination of (kind, stored_phase),
-    /// the post-deserialize event's phase MUST equal kind.phase()
-    /// regardless of what the JSON claimed.
+    // Property test: for any combination of (kind, stored_phase), the
+    // post-deserialize event's phase MUST equal kind.phase() regardless of
+    // what the JSON claimed.
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config {
             cases: 64,

@@ -55,6 +55,13 @@ Before sending the first marching order, verify the environment.
 - ntm pane missing → relaunch via the project's spawn script before the swarm tick begins.
 - Agent Mail red/unreachable → retry once after a few seconds; if it still fails, do not repair, restart, or kill the shared service. Continue with a Beads-only handoff snapshot:
   ```bash
+  ft robot coordination-risk
+  ```
+  This is the preferred robot-mode entry point for agents. It wraps the same
+  read-only fallback producer below and returns the existing snapshot under the
+  standard robot envelope. Operators can still run the producer directly when
+  debugging the script itself:
+  ```bash
   scripts/swarm-tick.sh --agent-mail-fallback frankenterm
   ```
   The snapshot includes the red-mail marker, active assignees from in-progress
@@ -122,13 +129,11 @@ Before sending the first marching order, verify the environment.
   br comments add <id> --author <agent> --file <reviewed-handoff.md>
   ```
 
-  This is intentionally a script-local JSON contract, not a
-  `docs/json-schema/wa-*` robot schema. The fallback is an operator script used
-  when Agent Mail is unavailable; the golden fixture in
+  The script fixture remains the producer-level compatibility gate:
   `tests/fixtures/swarm-tick/agent-mail-fallback/expected.json` and
-  `tests/swarm_tick_tests.bats` are the schema-like compatibility gate. If the
-  data later moves into `ft robot` or MCP, add a normal `docs/json-schema`
-  entry in that bead.
+  `tests/swarm_tick_tests.bats` pin the fallback payload. The robot wrapper's
+  data contract is `docs/json-schema/wa-robot-coordination-risk.json`; keep the
+  schema, fixture, and `ft robot coordination-risk` parser in sync.
 
 ## 2. Proof-Doctor Gate For Proof Lanes
 

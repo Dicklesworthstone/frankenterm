@@ -867,6 +867,7 @@ pub fn mcp_audit_deadline_overflow_count() -> u64 {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn reset_mcp_audit_deadline_overflow_count_for_test() {
     MCP_AUDIT_DEADLINE_OVERFLOW_COUNT.store(0, Ordering::Relaxed);
 }
@@ -3047,7 +3048,7 @@ mod tests {
 
     #[test]
     fn map_mcp_error_runtime_fallback() {
-        let err = crate::Error::Runtime("misc error".to_string());
+        let err = crate::Error::runtime_backend("mcp test runtime", "misc error");
         let (code, _) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_NOT_IMPLEMENTED);
     }
@@ -3133,9 +3134,10 @@ mod tests {
 
     #[test]
     fn mcp_tool_error_from_error() {
-        let err = McpToolError::from_error(crate::Error::Runtime("oops".to_string()));
+        let err =
+            McpToolError::from_error(crate::Error::runtime_backend("mcp test runtime", "oops"));
         assert_eq!(err.code, MCP_ERR_NOT_IMPLEMENTED);
-        assert!(err.message.contains("oops"));
+        assert_eq!(err.message, "Internal error");
     }
 
     #[test]

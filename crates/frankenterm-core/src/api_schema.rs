@@ -225,6 +225,16 @@ impl SchemaRegistry {
                     since: "0.1.0".into(),
                 },
                 EndpointMeta {
+                    id: "coordination_risk".into(),
+                    title: "Robot Coordination Risk".into(),
+                    description: "Expose the Agent Mail fallback Beads/git coordination-risk snapshot".into(),
+                    robot_command: Some("robot coordination-risk".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-coordination-risk.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
                     id: "state".into(),
                     title: "Pane State".into(),
                     description: "Get all observed panes as structured data".into(),
@@ -1064,6 +1074,7 @@ mod tests {
         let expected = [
             "wa-robot-help.json",
             "wa-robot-quickstart.json",
+            "wa-robot-coordination-risk.json",
             "wa-robot-state.json",
             "wa-robot-get-text.json",
             "wa-robot-send.json",
@@ -1131,6 +1142,14 @@ mod tests {
         assert_eq!(
             quickstart.robot_command.as_deref(),
             Some("robot quick-start")
+        );
+
+        let coordination_risk = reg
+            .get("coordination_risk")
+            .expect("coordination_risk endpoint exists");
+        assert_eq!(
+            coordination_risk.robot_command.as_deref(),
+            Some("robot coordination-risk")
         );
 
         let rules_show = reg.get("rules_show").expect("rules_show endpoint exists");

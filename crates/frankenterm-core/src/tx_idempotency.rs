@@ -1503,10 +1503,9 @@ mod tests {
         );
     }
 
-    /// br-ft-f4vta: a constructor-built key always serializes to
-    /// a form that round-trips through the strict Deserialize.
-    /// Pinned via proptest over arbitrary plan_id, step_id, and
-    /// action_fingerprint inputs.
+    // br-ft-f4vta: a constructor-built key always serializes to a form that
+    // round-trips through the strict Deserialize. Pinned via proptest over
+    // arbitrary plan_id, step_id, and action_fingerprint inputs.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
