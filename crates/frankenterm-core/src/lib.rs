@@ -279,6 +279,7 @@ pub mod frame_budget_signal_coupling;
 // ft-y0loj parent).
 pub mod fleet_launcher;
 pub mod fleet_memory_controller;
+pub mod fleet_mutation;
 pub mod fleet_scrollback_coordinator;
 pub mod font_features;
 pub mod forbidden_dep_guards;
