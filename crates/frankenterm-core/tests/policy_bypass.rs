@@ -1,6 +1,6 @@
 use frankenterm_core::config::{CommandGateConfig, DcgDenyPolicy, DcgMode};
 use frankenterm_core::policy::{
-    is_command_candidate, ActionKind, ActorKind, PaneCapabilities, PolicyEngine, PolicyInput,
+    ActionKind, ActorKind, PaneCapabilities, PolicyEngine, PolicyInput, is_command_candidate,
 };
 
 #[test]

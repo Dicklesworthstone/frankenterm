@@ -35,10 +35,7 @@ pub enum FleetMutationAction {
         env: BTreeMap<String, String>,
     },
     /// Stop an existing agent pane.
-    StopAgent {
-        pane_id: u64,
-        reason: String,
-    },
+    StopAgent { pane_id: u64, reason: String },
     /// Reassign one work item from one agent to another.
     ReassignWork {
         work_item_id: String,
@@ -124,6 +121,7 @@ impl FleetMutationStep {
 pub struct FleetMutationPlan {
     pub plan_id: String,
     pub idempotency_key: MutationKey,
+    pub payload_fingerprint: MutationKey,
     pub dry_run: bool,
     pub steps: Vec<FleetMutationStep>,
 }
@@ -134,14 +132,13 @@ impl FleetMutationPlan {
     #[must_use]
     pub fn new(plan_id: impl Into<String>, dry_run: bool, steps: Vec<FleetMutationStep>) -> Self {
         let plan_id = plan_id.into();
-        let fingerprint = stable_json(&steps);
-        let idempotency_key = MutationKey::derive(
-            "fleet_mutation_plan",
-            &format!("{plan_id}:dry_run={dry_run}:{fingerprint}"),
-        );
+        let payload_fingerprint = plan_payload_fingerprint(&plan_id, dry_run, &steps);
+        let idempotency_key =
+            MutationKey::derive("fleet_mutation_plan", payload_fingerprint.as_str());
         Self {
             plan_id,
             idempotency_key,
+            payload_fingerprint,
             dry_run,
             steps,
         }
@@ -155,9 +152,12 @@ impl FleetMutationPlan {
         steps: Vec<FleetMutationStep>,
         client_key: &str,
     ) -> Self {
+        let plan_id = plan_id.into();
+        let payload_fingerprint = plan_payload_fingerprint(&plan_id, dry_run, &steps);
         Self {
-            plan_id: plan_id.into(),
+            plan_id,
             idempotency_key: MutationKey::from_client("fleet_mutation_plan", client_key),
+            payload_fingerprint,
             dry_run,
             steps,
         }
@@ -272,6 +272,7 @@ pub struct FleetMutationStepReceipt {
 pub struct FleetMutationReceipt {
     pub plan_id: String,
     pub idempotency_key: MutationKey,
+    pub payload_fingerprint: MutationKey,
     pub dry_run: bool,
     pub status: FleetMutationReceiptStatus,
     pub idempotent_replay: bool,
@@ -302,6 +303,11 @@ pub enum FleetMutationPlanError {
         first_index: usize,
         duplicate_index: usize,
     },
+    IdempotencyKeyConflict {
+        idempotency_key: String,
+        existing_payload_fingerprint: String,
+        incoming_payload_fingerprint: String,
+    },
 }
 
 impl std::fmt::Display for FleetMutationPlanError {
@@ -309,7 +315,10 @@ impl std::fmt::Display for FleetMutationPlanError {
         match self {
             Self::EmptyPlan => f.write_str("fleet mutation plan must contain at least one step"),
             Self::EmptyStepId { step_index } => {
-                write!(f, "fleet mutation step at index {step_index} has an empty step_id")
+                write!(
+                    f,
+                    "fleet mutation step at index {step_index} has an empty step_id"
+                )
             }
             Self::DuplicateStepId {
                 step_id,
@@ -318,6 +327,15 @@ impl std::fmt::Display for FleetMutationPlanError {
             } => write!(
                 f,
                 "fleet mutation step_id `{step_id}` appears at indexes {first_index} and {duplicate_index}"
+            ),
+            Self::IdempotencyKeyConflict {
+                idempotency_key,
+                existing_payload_fingerprint,
+                incoming_payload_fingerprint,
+            } => write!(
+                f,
+                "fleet mutation idempotency key `{idempotency_key}` was reused for a different plan payload \
+                 (existing {existing_payload_fingerprint}, incoming {incoming_payload_fingerprint})"
             ),
         }
     }
@@ -360,6 +378,13 @@ impl FleetMutationLedger {
     ) -> Result<FleetMutationReceipt, FleetMutationPlanError> {
         validate_plan(plan)?;
         if let Some(receipt) = self.receipts.get(plan.idempotency_key.as_str()) {
+            if receipt.payload_fingerprint != plan.payload_fingerprint {
+                return Err(FleetMutationPlanError::IdempotencyKeyConflict {
+                    idempotency_key: plan.idempotency_key.as_str().to_string(),
+                    existing_payload_fingerprint: receipt.payload_fingerprint.as_str().to_string(),
+                    incoming_payload_fingerprint: plan.payload_fingerprint.as_str().to_string(),
+                });
+            }
             return Ok(receipt.clone().replay());
         }
 
@@ -471,7 +496,10 @@ fn commit_receipt<E: FleetMutationExecutor>(
                     .any(|receipt| compensation_failed(receipt.compensation.as_ref()))
                 {
                     FleetMutationReceiptStatus::CompensationFailed
-                } else if receipts.iter().any(|receipt| receipt.compensation.is_some()) {
+                } else if receipts
+                    .iter()
+                    .any(|receipt| receipt.compensation.is_some())
+                {
                     FleetMutationReceiptStatus::Compensated
                 } else {
                     FleetMutationReceiptStatus::Failed
@@ -575,6 +603,7 @@ fn receipt_with_counts(
     FleetMutationReceipt {
         plan_id: plan.plan_id.clone(),
         idempotency_key: plan.idempotency_key.clone(),
+        payload_fingerprint: plan.payload_fingerprint.clone(),
         dry_run: plan.dry_run,
         status,
         idempotent_replay,
@@ -594,6 +623,19 @@ fn stable_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|err| format!("serde-error:{err}"))
 }
 
+fn plan_payload_fingerprint(
+    plan_id: &str,
+    dry_run: bool,
+    steps: &[FleetMutationStep],
+) -> MutationKey {
+    let fingerprint = stable_json(&serde_json::json!({
+        "plan_id": plan_id,
+        "dry_run": dry_run,
+        "steps": steps,
+    }));
+    MutationKey::derive("fleet_mutation_plan_payload", &fingerprint)
+}
+
 /// Convenience assertion for callers reconstructing receipts from durable
 /// storage: every compensation must refer to a step that actually reached a
 /// side-effect state.
@@ -606,14 +648,15 @@ pub fn receipt_has_no_orphan_compensation(receipt: &FleetMutationReceipt) -> boo
             matches!(
                 step.status,
                 FleetMutationStepStatus::Succeeded | FleetMutationStepStatus::Compensated
-            ) || step.compensation.is_some()
+            )
         })
         .map(|step| step.step_id.as_str())
         .collect();
 
-    receipt.steps.iter().all(|step| {
-        step.compensation.is_none() || committed.contains(step.step_id.as_str())
-    })
+    receipt
+        .steps
+        .iter()
+        .all(|step| step.compensation.is_none() || committed.contains(step.step_id.as_str()))
 }
 
 #[cfg(test)]
@@ -740,6 +783,32 @@ mod tests {
     }
 
     #[test]
+    fn approval_required_prevents_all_side_effects() {
+        let mut pending = spawn_step("spawn-needs-approval");
+        pending.policy = FleetMutationPolicyDecision::RequireApproval {
+            approval_id: "appr-123".to_string(),
+            reason_code: "policy.approval_required".to_string(),
+            message: "operator approval required".to_string(),
+        };
+        let plan =
+            FleetMutationPlan::new("plan-approval", false, vec![pending, spawn_step("later")]);
+        let mut ledger = FleetMutationLedger::new();
+        let mut executor = FakeExecutor::new();
+
+        let receipt = ledger
+            .execute_plan(&plan, &mut executor)
+            .expect("approval-required receipt");
+
+        assert_eq!(receipt.status, FleetMutationReceiptStatus::ApprovalRequired);
+        assert_eq!(receipt.skipped_count, 2);
+        assert!(matches!(
+            receipt.steps[0].policy,
+            FleetMutationPolicyDecision::RequireApproval { .. }
+        ));
+        assert!(executor.calls.is_empty());
+    }
+
+    #[test]
     fn idempotent_replay_returns_cached_receipt_without_reexecution() {
         let plan = FleetMutationPlan::new("plan-replay", false, vec![spawn_step("spawn-1")]);
         let mut ledger = FleetMutationLedger::new();
@@ -752,6 +821,39 @@ mod tests {
         let replay = ledger.execute_plan(&plan, &mut executor).expect("replay");
         assert!(replay.idempotent_replay);
         assert_eq!(replay.steps, first.steps);
+        assert_eq!(executor.calls, vec!["execute:spawn-1"]);
+    }
+
+    #[test]
+    fn client_key_reuse_with_different_payload_is_rejected_without_execution() {
+        let first_plan = FleetMutationPlan::with_client_key(
+            "plan-client",
+            false,
+            vec![spawn_step("spawn-1")],
+            "client-key-1",
+        );
+        let conflicting_plan = FleetMutationPlan::with_client_key(
+            "plan-client",
+            false,
+            vec![spawn_step("spawn-2")],
+            "client-key-1",
+        );
+        let mut ledger = FleetMutationLedger::new();
+        let mut executor = FakeExecutor::new();
+
+        let first = ledger
+            .execute_plan(&first_plan, &mut executor)
+            .expect("first execution");
+        assert_eq!(first.status, FleetMutationReceiptStatus::Succeeded);
+
+        let err = ledger
+            .execute_plan(&conflicting_plan, &mut executor)
+            .expect_err("same client key with different payload must conflict");
+
+        assert!(matches!(
+            err,
+            FleetMutationPlanError::IdempotencyKeyConflict { .. }
+        ));
         assert_eq!(executor.calls, vec!["execute:spawn-1"]);
     }
 
@@ -790,8 +892,11 @@ mod tests {
 
     #[test]
     fn compensation_failure_is_explicit_in_plan_status() {
-        let plan =
-            FleetMutationPlan::new("plan-comp-fail", false, vec![spawn_step("spawn-1"), stop_step("fail", 7)]);
+        let plan = FleetMutationPlan::new(
+            "plan-comp-fail",
+            false,
+            vec![spawn_step("spawn-1"), stop_step("fail", 7)],
+        );
         let mut ledger = FleetMutationLedger::new();
         let mut executor = FakeExecutor::new();
         executor.fail_step = Some("fail".to_string());
@@ -799,12 +904,16 @@ mod tests {
 
         let receipt = ledger.execute_plan(&plan, &mut executor).expect("receipt");
 
-        assert_eq!(receipt.status, FleetMutationReceiptStatus::CompensationFailed);
+        assert_eq!(
+            receipt.status,
+            FleetMutationReceiptStatus::CompensationFailed
+        );
         let compensation = receipt.steps[0]
             .compensation
             .as_ref()
             .expect("compensation receipt");
         assert_eq!(compensation.status, FleetMutationCompensationStatus::Failed);
+        assert!(receipt_has_no_orphan_compensation(&receipt));
     }
 
     #[test]
@@ -836,10 +945,28 @@ mod tests {
         let receipt = ledger.execute_plan(&plan, &mut executor).expect("receipt");
 
         let encoded = serde_json::to_string(&receipt).expect("encode receipt");
-        let decoded: FleetMutationReceipt =
-            serde_json::from_str(&encoded).expect("decode receipt");
+        let decoded: FleetMutationReceipt = serde_json::from_str(&encoded).expect("decode receipt");
 
         assert_eq!(decoded, receipt);
         assert!(receipt_has_no_orphan_compensation(&decoded));
+    }
+
+    #[test]
+    fn orphan_compensation_on_uncommitted_step_is_rejected() {
+        let plan = FleetMutationPlan::new("plan-orphan", true, vec![spawn_step("spawn-1")]);
+        let mut ledger = FleetMutationLedger::new();
+        let mut executor = FakeExecutor::new();
+        let mut receipt = ledger
+            .execute_plan(&plan, &mut executor)
+            .expect("dry-run receipt");
+
+        receipt.steps[0].compensation = Some(FleetMutationCompensationReceipt {
+            status: FleetMutationCompensationStatus::NotAvailable,
+            action: None,
+            output: None,
+            error: None,
+        });
+
+        assert!(!receipt_has_no_orphan_compensation(&receipt));
     }
 }
