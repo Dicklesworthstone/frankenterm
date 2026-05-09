@@ -582,7 +582,13 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("runtime.rs", "join"),
     ("runtime.rs", "shutdown"),
     ("runtime.rs", "shutdown_with_summary"),
+    ("runtime.rs", "shutdown_with_timeout"),
     ("runtime.rs", "update_health_snapshot"),
+    # ft-e87u6.13: vendored mux geometry wrappers delegate through their
+    # explicit-Cx siblings, matching the rest of the DirectMuxClient
+    # ergonomic surface.
+    ("vendored/mux_client.rs", "resize"),
+    ("vendored/mux_client.rs", "adjust_pane_size"),
     # mcp_helpers.rs:
     ("mcp_helpers.rs", "derive_osc_state_from_storage"),
     ("mcp_helpers.rs", "fetch_pane_state_from_ipc"),

@@ -4273,6 +4273,18 @@ impl RuntimeHandle {
             .await
     }
 
+    /// ft-e87u6.13 Cx-first sibling of [`Self::shutdown_with_timeout`].
+    /// Pre-flight checkpoint only; once bounded shutdown begins, joins and
+    /// storage flushes use their own timeout budget and must run to completion.
+    pub async fn shutdown_with_timeout_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        shutdown_timeout: Duration,
+    ) -> ShutdownSummary {
+        let _ = cx.checkpoint();
+        self.shutdown_with_timeout(shutdown_timeout).await
+    }
+
     /// Request graceful shutdown with an explicit task-join timeout.
     ///
     /// This is the bounded shutdown primitive used by the default shutdown

@@ -557,12 +557,9 @@ impl DirectMuxClient {
         pane_id: u64,
         size: TerminalSize,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::Resize(Resize {
-            containing_tab_id: containing_tab_id as usize,
-            pane_id: pane_id as usize,
-            size,
-        }))
-        .await
+        let cx = ambient_mux_cx();
+        self.resize_with_cx(&cx, containing_tab_id, pane_id, size)
+            .await
     }
 
     /// Resize a pane through the mux session using an explicit capability context.
@@ -591,12 +588,9 @@ impl DirectMuxClient {
         direction: wezterm_config::keyassignment::PaneDirection,
         amount: usize,
     ) -> Result<UnitResponse, DirectMuxError> {
-        self.expect_unit_response(Pdu::AdjustPaneSize(AdjustPaneSize {
-            pane_id: pane_id as usize,
-            direction,
-            amount,
-        }))
-        .await
+        let cx = ambient_mux_cx();
+        self.adjust_pane_size_with_cx(&cx, pane_id, direction, amount)
+            .await
     }
 
     /// Adjust pane split geometry through the mux session using an explicit capability context.
