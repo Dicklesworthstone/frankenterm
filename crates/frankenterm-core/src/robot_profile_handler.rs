@@ -28,13 +28,18 @@
 //!   (mutating, transactional); this slice is the read-only-safe
 //!   subset of that contract.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
 use crate::agent_profiles::{AgentProfile, ProfileValidationError};
+use crate::fleet_mutation::{
+    FleetMutationAction, FleetMutationExecutionError, FleetMutationExecutor, FleetMutationLedger,
+    FleetMutationPlan, FleetMutationPlanError, FleetMutationPolicyDecision, FleetMutationReceipt,
+    FleetMutationReceiptStatus, FleetMutationStep, FleetMutationStepOutput,
+};
 
 // br-ft-iwg7x: bootstrap-commands metadata can hold malformed JSON.
 // `parse_bootstrap_commands` silently substituted Vec::new() on
@@ -79,6 +84,9 @@ use crate::robot_ntm_surface::{
 use crate::storage::agent_profiles_sql::{
     AgentProfileSqlError, get_agent_profile, list_agent_profiles,
 };
+use crate::storage::profiles_applied_log_sql::{
+    ProfilesAppliedLogSqlError, get_apply_receipt, insert_apply_receipt,
+};
 use crate::storage_backend_trait::StorageBackend;
 
 /// Failure modes the handler exposes to its caller. The wire-level
@@ -103,6 +111,22 @@ pub enum ProfileHandlerError {
     /// `apply` with `dry_run = false` failed before pane spawning
     /// completed.
     SpawnFailed { reason: String },
+    /// The stored profile or request-specific overrides failed
+    /// validation before any daemon/mux mutation was attempted.
+    ValidationFailed { name: String, issues: Vec<String> },
+    /// Daemon-side policy rejected the mutation before side effects.
+    PolicyDenied { reason: String },
+    /// Daemon-side policy requires a human approval before side effects.
+    ApprovalRequired { reason: String },
+    /// The mutation substrate failed before or during execution.
+    ApplyFailed { error_code: String, reason: String },
+    /// A post-spawn failure required rollback and rollback did not
+    /// complete cleanly.
+    CompensationFailed { reason: String },
+    /// The durable profile-apply receipt log failed.
+    ApplyLog(ProfilesAppliedLogSqlError),
+    /// The shared mutation plan substrate rejected the plan.
+    MutationPlan(FleetMutationPlanError),
 }
 
 impl std::fmt::Display for ProfileHandlerError {
@@ -113,6 +137,25 @@ impl std::fmt::Display for ProfileHandlerError {
             Self::NotFound { name } => write!(f, "profile `{name}` not found"),
             Self::Storage(e) => write!(f, "profile storage error: {e}"),
             Self::SpawnFailed { reason } => write!(f, "profile apply spawn failed: {reason}"),
+            Self::ValidationFailed { name, issues } => {
+                write!(
+                    f,
+                    "profile `{name}` failed validation: {}",
+                    issues.join("; ")
+                )
+            }
+            Self::PolicyDenied { reason } => write!(f, "profile apply policy denied: {reason}"),
+            Self::ApprovalRequired { reason } => {
+                write!(f, "profile apply requires approval: {reason}")
+            }
+            Self::ApplyFailed { error_code, reason } => {
+                write!(f, "profile apply failed ({error_code}): {reason}")
+            }
+            Self::CompensationFailed { reason } => {
+                write!(f, "profile apply compensation failed: {reason}")
+            }
+            Self::ApplyLog(e) => write!(f, "profile apply receipt log error: {e}"),
+            Self::MutationPlan(e) => write!(f, "profile apply mutation plan error: {e}"),
         }
     }
 }
@@ -123,14 +166,33 @@ impl ProfileHandlerError {
     /// Stable error code for the wire envelope. Matches the family of
     /// codes [`crate::robot_envelope`] uses for typed failures.
     #[must_use]
-    pub fn error_code(&self) -> &'static str {
+    pub fn error_code(&self) -> &str {
         match self {
             Self::UnknownAction(_) => "robot.profile.unknown_action",
             Self::BadParams(_) => "robot.profile.bad_params",
             Self::NotFound { .. } => "robot.profile.not_found",
             Self::Storage(_) => "robot.profile.storage",
             Self::SpawnFailed { .. } => "robot.profile.spawn_failed",
+            Self::ValidationFailed { .. } => "robot.profile.validation_failed",
+            Self::PolicyDenied { .. } => "robot.profile.policy_denied",
+            Self::ApprovalRequired { .. } => "robot.profile.require_approval",
+            Self::ApplyFailed { error_code, .. } => error_code.as_str(),
+            Self::CompensationFailed { .. } => "robot.profile.compensation_failed",
+            Self::ApplyLog(_) => "robot.profile.apply_log",
+            Self::MutationPlan(_) => "robot.profile.mutation_plan",
         }
+    }
+}
+
+impl From<ProfilesAppliedLogSqlError> for ProfileHandlerError {
+    fn from(err: ProfilesAppliedLogSqlError) -> Self {
+        Self::ApplyLog(err)
+    }
+}
+
+impl From<FleetMutationPlanError> for ProfileHandlerError {
+    fn from(err: FleetMutationPlanError) -> Self {
+        Self::MutationPlan(err)
     }
 }
 
@@ -292,6 +354,531 @@ fn handle_apply(
              daemon apply RPC is not connected in this process"
         ),
     })
+}
+
+/// Concrete spawn request derived from one profile-apply step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileApplySpawnSpec {
+    pub step_id: String,
+    pub profile_name: String,
+    pub ordinal: u32,
+    pub shell: String,
+    pub command: Option<String>,
+    pub working_directory: Option<String>,
+    pub domain: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub bootstrap_commands: Vec<String>,
+}
+
+/// Failure from the daemon/mux adapter while applying a profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileApplyExecutionError {
+    pub error_code: String,
+    pub message: String,
+}
+
+impl ProfileApplyExecutionError {
+    #[must_use]
+    pub fn new(error_code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            error_code: error_code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProfileApplyExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.error_code, self.message)
+    }
+}
+
+impl std::error::Error for ProfileApplyExecutionError {}
+
+/// Daemon/mux adapter used by live profile apply.
+///
+/// The production CLI adapter spawns panes through the mux bridge. Tests supply
+/// fakes so policy denial, idempotent replay, partial failure, and rollback
+/// semantics can be exercised without touching a real terminal session.
+pub trait ProfileApplyMutationExecutor {
+    fn policy_for_spawn(&self, _spec: &ProfileApplySpawnSpec) -> FleetMutationPolicyDecision {
+        FleetMutationPolicyDecision::Allow
+    }
+
+    fn spawn_agent(
+        &mut self,
+        spec: &ProfileApplySpawnSpec,
+    ) -> Result<u64, ProfileApplyExecutionError>;
+
+    fn stop_agent(&mut self, pane_id: u64, reason: &str) -> Result<(), ProfileApplyExecutionError>;
+}
+
+struct ProfileFleetMutationExecutor<'a, E: ProfileApplyMutationExecutor> {
+    executor: &'a mut E,
+    specs: BTreeMap<String, ProfileApplySpawnSpec>,
+    spawned_by_step: BTreeMap<String, u64>,
+}
+
+impl<'a, E: ProfileApplyMutationExecutor> ProfileFleetMutationExecutor<'a, E> {
+    fn new(executor: &'a mut E, specs: &[ProfileApplySpawnSpec]) -> Self {
+        Self {
+            executor,
+            specs: specs
+                .iter()
+                .map(|spec| (spec.step_id.clone(), spec.clone()))
+                .collect(),
+            spawned_by_step: BTreeMap::new(),
+        }
+    }
+
+    fn compensate_spawned_after_log_failure(&mut self) -> Result<(), ProfileApplyExecutionError> {
+        let spawned: Vec<(String, u64)> = self
+            .spawned_by_step
+            .iter()
+            .map(|(step_id, pane_id)| (step_id.clone(), *pane_id))
+            .collect();
+        for (step_id, pane_id) in spawned.into_iter().rev() {
+            self.executor.stop_agent(
+                pane_id,
+                "profile apply receipt logging failed; rolling back spawned pane",
+            )?;
+            self.spawned_by_step.remove(&step_id);
+        }
+        Ok(())
+    }
+}
+
+impl<E: ProfileApplyMutationExecutor> FleetMutationExecutor
+    for ProfileFleetMutationExecutor<'_, E>
+{
+    fn execute_step(
+        &mut self,
+        step: &FleetMutationStep,
+    ) -> Result<FleetMutationStepOutput, FleetMutationExecutionError> {
+        match &step.action {
+            FleetMutationAction::SpawnAgent { .. } => {
+                let spec = self.specs.get(&step.step_id).ok_or_else(|| {
+                    FleetMutationExecutionError::new(
+                        "robot.profile.internal_missing_spawn_spec",
+                        format!("missing spawn spec for step {}", step.step_id),
+                    )
+                })?;
+                let pane_id = self
+                    .executor
+                    .spawn_agent(spec)
+                    .map_err(profile_execution_to_fleet_error)?;
+                self.spawned_by_step.insert(step.step_id.clone(), pane_id);
+                let mut output = FleetMutationStepOutput {
+                    pane_id: Some(pane_id),
+                    ..FleetMutationStepOutput::default()
+                };
+                output
+                    .details
+                    .insert("profile_name".to_string(), spec.profile_name.clone());
+                output
+                    .details
+                    .insert("ordinal".to_string(), spec.ordinal.to_string());
+                if let Some(command) = &spec.command {
+                    output
+                        .details
+                        .insert("command".to_string(), command.clone());
+                }
+                if let Some(cwd) = &spec.working_directory {
+                    output.details.insert("cwd".to_string(), cwd.clone());
+                }
+                output.details.insert(
+                    "bootstrap_command_count".to_string(),
+                    spec.bootstrap_commands.len().to_string(),
+                );
+                Ok(output)
+            }
+            FleetMutationAction::StopAgent { pane_id, reason } => {
+                self.executor
+                    .stop_agent(*pane_id, reason)
+                    .map_err(profile_execution_to_fleet_error)?;
+                Ok(FleetMutationStepOutput::default())
+            }
+            FleetMutationAction::ReassignWork { .. } => Err(FleetMutationExecutionError::new(
+                "robot.profile.unsupported_mutation_action",
+                "profile apply executor cannot reassign work",
+            )),
+        }
+    }
+
+    fn compensate_step(
+        &mut self,
+        original: &FleetMutationStep,
+        compensation: &FleetMutationAction,
+    ) -> Result<FleetMutationStepOutput, FleetMutationExecutionError> {
+        let pane_id = self
+            .spawned_by_step
+            .get(&original.step_id)
+            .copied()
+            .or_else(|| match compensation {
+                FleetMutationAction::StopAgent { pane_id, .. } if *pane_id != 0 => Some(*pane_id),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                FleetMutationExecutionError::new(
+                    "robot.profile.compensation_missing_pane",
+                    format!("no spawned pane recorded for step {}", original.step_id),
+                )
+            })?;
+        let reason = match compensation {
+            FleetMutationAction::StopAgent { reason, .. } => reason.as_str(),
+            _ => "profile apply compensation",
+        };
+        self.executor
+            .stop_agent(pane_id, reason)
+            .map_err(profile_execution_to_fleet_error)?;
+        self.spawned_by_step.remove(&original.step_id);
+        let mut output = FleetMutationStepOutput {
+            pane_id: Some(pane_id),
+            ..FleetMutationStepOutput::default()
+        };
+        output
+            .details
+            .insert("compensated_step".to_string(), original.step_id.clone());
+        Ok(output)
+    }
+}
+
+fn profile_execution_to_fleet_error(
+    err: ProfileApplyExecutionError,
+) -> FleetMutationExecutionError {
+    FleetMutationExecutionError::new(err.error_code, err.message)
+}
+
+/// Live profile apply entry point for daemon/mux-aware callers.
+///
+/// `handle_profile_command` intentionally remains the storage-only handler for
+/// read paths and conformance harnesses. This function is the wired mutation
+/// path: it validates the stored profile, checks the durable apply log for
+/// idempotent replay, executes through the shared fleet mutation substrate, and
+/// writes the apply receipt only after all requested panes have spawned.
+pub fn handle_profile_apply_with_executor<E: ProfileApplyMutationExecutor>(
+    params: &Value,
+    backend: &dyn StorageBackend,
+    executor: &mut E,
+    now_ms: i64,
+) -> Result<Value, ProfileHandlerError> {
+    let name = require_str(params, "name")?;
+    let count = opt_u32(params, "count").unwrap_or(1);
+    let dry_run = opt_bool(params, "dry_run").unwrap_or(false);
+    let env_overrides = parse_env_overrides(params)?;
+
+    if count == 0 {
+        return Err(ProfileHandlerError::BadParams(
+            "`count` must be greater than zero".to_string(),
+        ));
+    }
+
+    let profile = get_agent_profile(backend, name)
+        .map_err(ProfileHandlerError::Storage)?
+        .ok_or_else(|| ProfileHandlerError::NotFound {
+            name: name.to_string(),
+        })?;
+
+    if let Err(err) = profile.validate() {
+        return Err(ProfileHandlerError::ValidationFailed {
+            name: name.to_string(),
+            issues: vec![format_validation_error(&err)],
+        });
+    }
+
+    let content_hash =
+        compute_apply_content_hash(&profile.name, profile.updated_at_ms, count, &env_overrides);
+    if !dry_run {
+        if let Some(existing) = get_apply_receipt(backend, &content_hash)? {
+            return profile_apply_replay_value(&existing);
+        }
+    }
+
+    let specs = profile_apply_spawn_specs(&profile, count, &env_overrides);
+    let plan = profile_apply_plan(&content_hash, dry_run, &specs, executor);
+    let mut ledger = FleetMutationLedger::new();
+    let mut fleet_executor = ProfileFleetMutationExecutor::new(executor, &specs);
+    let receipt = ledger.execute_plan(&plan, &mut fleet_executor)?;
+
+    match receipt.status {
+        FleetMutationReceiptStatus::DryRun => {
+            profile_apply_receipt_value(&profile.name, &content_hash, &receipt, Vec::new(), false)
+        }
+        FleetMutationReceiptStatus::Denied => Err(ProfileHandlerError::PolicyDenied {
+            reason: first_blocking_policy_reason(&receipt)
+                .unwrap_or_else(|| "profile apply denied by policy".to_string()),
+        }),
+        FleetMutationReceiptStatus::ApprovalRequired => {
+            Err(ProfileHandlerError::ApprovalRequired {
+                reason: first_blocking_policy_reason(&receipt)
+                    .unwrap_or_else(|| "profile apply requires approval".to_string()),
+            })
+        }
+        FleetMutationReceiptStatus::Succeeded => {
+            let panes_spawned = panes_from_receipt(&receipt);
+            let apply_receipt = ApplyReceipt {
+                content_hash: content_hash.clone(),
+                profile_name: profile.name.clone(),
+                profile_updated_at_ms: profile.updated_at_ms,
+                count,
+                panes_spawned: panes_spawned.clone(),
+                recorded_at_ms: now_ms,
+            };
+            match insert_apply_receipt(backend, &apply_receipt) {
+                Ok(()) => profile_apply_receipt_value(
+                    &profile.name,
+                    &content_hash,
+                    &receipt,
+                    panes_spawned,
+                    false,
+                ),
+                Err(ProfilesAppliedLogSqlError::Backend(_)) => {
+                    if let Some(existing) = get_apply_receipt(backend, &content_hash)? {
+                        fleet_executor
+                            .compensate_spawned_after_log_failure()
+                            .map_err(|err| ProfileHandlerError::CompensationFailed {
+                                reason: err.to_string(),
+                            })?;
+                        profile_apply_replay_value(&existing)
+                    } else {
+                        fleet_executor
+                            .compensate_spawned_after_log_failure()
+                            .map_err(|err| ProfileHandlerError::CompensationFailed {
+                                reason: err.to_string(),
+                            })?;
+                        Err(ProfileHandlerError::ApplyFailed {
+                            error_code: "robot.profile.apply_log".to_string(),
+                            reason: "profile apply spawned panes but durable receipt insert failed"
+                                .to_string(),
+                        })
+                    }
+                }
+                Err(err) => {
+                    fleet_executor
+                        .compensate_spawned_after_log_failure()
+                        .map_err(|err| ProfileHandlerError::CompensationFailed {
+                            reason: err.to_string(),
+                        })?;
+                    Err(ProfileHandlerError::ApplyLog(err))
+                }
+            }
+        }
+        FleetMutationReceiptStatus::Failed | FleetMutationReceiptStatus::Compensated => {
+            Err(ProfileHandlerError::ApplyFailed {
+                error_code: first_step_error_code(&receipt)
+                    .unwrap_or("robot.profile.spawn_failed")
+                    .to_string(),
+                reason: first_step_error_message(&receipt)
+                    .unwrap_or_else(|| "profile apply failed before all panes spawned".to_string()),
+            })
+        }
+        FleetMutationReceiptStatus::CompensationFailed => {
+            Err(ProfileHandlerError::CompensationFailed {
+                reason: first_step_error_message(&receipt).unwrap_or_else(|| {
+                    "profile apply failed and rollback compensation failed".to_string()
+                }),
+            })
+        }
+    }
+}
+
+fn parse_env_overrides(params: &Value) -> Result<HashMap<String, String>, ProfileHandlerError> {
+    let Some(value) = params.get("env_overrides") else {
+        return Ok(HashMap::new());
+    };
+    let object = value.as_object().ok_or_else(|| {
+        ProfileHandlerError::BadParams("`env_overrides` must be an object".to_string())
+    })?;
+    let mut env = HashMap::with_capacity(object.len());
+    for (key, value) in object {
+        let value = value.as_str().ok_or_else(|| {
+            ProfileHandlerError::BadParams(format!("`env_overrides.{key}` must be a string value"))
+        })?;
+        env.insert(key.clone(), value.to_string());
+    }
+    Ok(env)
+}
+
+fn profile_apply_spawn_specs<S: BuildHasher>(
+    profile: &AgentProfile,
+    count: u32,
+    env_overrides: &HashMap<String, String, S>,
+) -> Vec<ProfileApplySpawnSpec> {
+    let mut env: BTreeMap<String, String> = profile
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    for (key, value) in env_overrides {
+        env.insert(key.clone(), value.clone());
+    }
+    let bootstrap_commands = parse_bootstrap_commands(&profile.metadata);
+    let working_directory = profile.metadata.get("working_directory").cloned();
+    let domain = profile.metadata.get("domain").cloned();
+
+    (0..count)
+        .map(|index| ProfileApplySpawnSpec {
+            step_id: format!("spawn-{}", index + 1),
+            profile_name: profile.name.clone(),
+            ordinal: index + 1,
+            shell: profile.shell.clone(),
+            command: profile.command.clone(),
+            working_directory: working_directory.clone(),
+            domain: domain.clone(),
+            env: env.clone(),
+            bootstrap_commands: bootstrap_commands.clone(),
+        })
+        .collect()
+}
+
+fn profile_apply_plan<E: ProfileApplyMutationExecutor>(
+    content_hash: &str,
+    dry_run: bool,
+    specs: &[ProfileApplySpawnSpec],
+    executor: &E,
+) -> FleetMutationPlan {
+    let steps = specs
+        .iter()
+        .map(|spec| {
+            let program = spec
+                .command
+                .clone()
+                .filter(|command| !command.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if spec.shell.trim().is_empty() {
+                        "default-shell".to_string()
+                    } else {
+                        spec.shell.clone()
+                    }
+                });
+            FleetMutationStep {
+                step_id: spec.step_id.clone(),
+                action: FleetMutationAction::SpawnAgent {
+                    profile_name: spec.profile_name.clone(),
+                    program,
+                    cwd: spec.working_directory.clone(),
+                    domain: spec.domain.clone(),
+                    env: spec.env.clone(),
+                },
+                policy: executor.policy_for_spawn(spec),
+                compensation: Some(FleetMutationAction::StopAgent {
+                    pane_id: 0,
+                    reason: format!(
+                        "rollback profile `{}` apply step {}",
+                        spec.profile_name, spec.ordinal
+                    ),
+                }),
+            }
+        })
+        .collect();
+    FleetMutationPlan::with_client_key(
+        format!("profile-apply:{content_hash}"),
+        dry_run,
+        steps,
+        content_hash,
+    )
+}
+
+fn panes_from_receipt(receipt: &FleetMutationReceipt) -> Vec<u64> {
+    receipt
+        .steps
+        .iter()
+        .filter_map(|step| step.output.as_ref().and_then(|output| output.pane_id))
+        .collect()
+}
+
+fn first_blocking_policy_reason(receipt: &FleetMutationReceipt) -> Option<String> {
+    receipt.steps.iter().find_map(|step| match &step.policy {
+        FleetMutationPolicyDecision::Allow => None,
+        FleetMutationPolicyDecision::Deny { message, .. }
+        | FleetMutationPolicyDecision::RequireApproval { message, .. } => Some(message.clone()),
+    })
+}
+
+fn first_step_error_code(receipt: &FleetMutationReceipt) -> Option<&str> {
+    receipt.steps.iter().find_map(|step| {
+        step.error
+            .as_ref()
+            .map(|error| error.error_code.as_str())
+            .or_else(|| {
+                step.compensation
+                    .as_ref()
+                    .and_then(|comp| comp.error.as_ref())
+                    .map(|error| error.error_code.as_str())
+            })
+    })
+}
+
+fn first_step_error_message(receipt: &FleetMutationReceipt) -> Option<String> {
+    receipt.steps.iter().find_map(|step| {
+        step.error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .or_else(|| {
+                step.compensation
+                    .as_ref()
+                    .and_then(|comp| comp.error.as_ref())
+                    .map(|error| error.message.clone())
+            })
+    })
+}
+
+fn profile_apply_receipt_value(
+    profile_name: &str,
+    content_hash: &str,
+    receipt: &FleetMutationReceipt,
+    panes_spawned: Vec<u64>,
+    idempotent_replay: bool,
+) -> Result<Value, ProfileHandlerError> {
+    to_value(&serde_json::json!({
+        "profile_name": profile_name,
+        "panes_spawned": panes_spawned,
+        "dry_run": receipt.dry_run,
+        "requested_agents": receipt.steps.len(),
+        "spawned_agents": receipt.completed_count,
+        "skipped_existing_agents": if idempotent_replay { receipt.steps.len() } else { 0 },
+        "policy_decisions": receipt.steps.iter().map(|step| {
+            serde_json::json!({
+                "step_id": step.step_id,
+                "target_id": step.target_id,
+                "policy": step.policy,
+            })
+        }).collect::<Vec<_>>(),
+        "idempotency_key": content_hash,
+        "mutation_idempotency_key": receipt.idempotency_key.as_str(),
+        "rollback_status": mutation_status_label(receipt.status),
+        "idempotent_replay": idempotent_replay || receipt.idempotent_replay,
+        "mutation_receipt": receipt,
+    }))
+}
+
+fn mutation_status_label(status: FleetMutationReceiptStatus) -> &'static str {
+    match status {
+        FleetMutationReceiptStatus::DryRun => "dry_run",
+        FleetMutationReceiptStatus::Succeeded => "succeeded",
+        FleetMutationReceiptStatus::Denied => "denied",
+        FleetMutationReceiptStatus::ApprovalRequired => "approval_required",
+        FleetMutationReceiptStatus::Failed => "failed",
+        FleetMutationReceiptStatus::Compensated => "compensated",
+        FleetMutationReceiptStatus::CompensationFailed => "compensation_failed",
+    }
+}
+
+fn profile_apply_replay_value(receipt: &ApplyReceipt) -> Result<Value, ProfileHandlerError> {
+    to_value(&serde_json::json!({
+        "profile_name": receipt.profile_name,
+        "panes_spawned": receipt.panes_spawned,
+        "dry_run": false,
+        "requested_agents": receipt.count,
+        "spawned_agents": receipt.panes_spawned.len(),
+        "skipped_existing_agents": receipt.panes_spawned.len(),
+        "policy_decisions": [],
+        "idempotency_key": receipt.content_hash,
+        "mutation_idempotency_key": null,
+        "rollback_status": "idempotent_replay",
+        "idempotent_replay": true,
+        "recorded_at_ms": receipt.recorded_at_ms,
+    }))
 }
 
 /// Remove top-level fields whose serialized value is JSON `null`.
@@ -585,6 +1172,7 @@ mod tests {
     fn synth(name: &str, role: &str, tags: Vec<&str>) -> AgentProfile {
         let mut metadata = HashMap::new();
         metadata.insert("description".to_string(), format!("synth {name}"));
+        metadata.insert("working_directory".to_string(), "/repo".to_string());
         AgentProfile {
             name: name.to_string(),
             role: role.to_string(),
@@ -595,6 +1183,83 @@ mod tests {
             metadata,
             created_at_ms: 0,
             updated_at_ms: 0,
+        }
+    }
+
+    fn fresh_conn_with_apply_log() -> RusqliteBackend {
+        let backend = fresh_conn();
+        backend
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS profiles_applied_log (
+                content_hash          TEXT PRIMARY KEY NOT NULL,
+                profile_name          TEXT NOT NULL,
+                profile_updated_at_ms INTEGER NOT NULL,
+                count                 INTEGER NOT NULL,
+                panes_spawned_json    TEXT NOT NULL DEFAULT '[]',
+                recorded_at_ms        INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS profiles_applied_log_profile_name_idx
+                ON profiles_applied_log(profile_name);",
+            )
+            .expect("apply log schema");
+        backend
+    }
+
+    #[derive(Default)]
+    struct FakeApplyExecutor {
+        spawned: Vec<ProfileApplySpawnSpec>,
+        stopped: Vec<(u64, String)>,
+        next_pane_id: u64,
+        fail_on_ordinal: Option<u32>,
+        fail_stop: bool,
+        policy: Option<FleetMutationPolicyDecision>,
+    }
+
+    impl FakeApplyExecutor {
+        fn new() -> Self {
+            Self {
+                next_pane_id: 100,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl ProfileApplyMutationExecutor for FakeApplyExecutor {
+        fn policy_for_spawn(&self, _spec: &ProfileApplySpawnSpec) -> FleetMutationPolicyDecision {
+            self.policy
+                .clone()
+                .unwrap_or(FleetMutationPolicyDecision::Allow)
+        }
+
+        fn spawn_agent(
+            &mut self,
+            spec: &ProfileApplySpawnSpec,
+        ) -> Result<u64, ProfileApplyExecutionError> {
+            self.spawned.push(spec.clone());
+            if self.fail_on_ordinal == Some(spec.ordinal) {
+                return Err(ProfileApplyExecutionError::new(
+                    "robot.profile.mux_spawn_failed",
+                    format!("spawn {} failed", spec.ordinal),
+                ));
+            }
+            let pane_id = self.next_pane_id;
+            self.next_pane_id += 1;
+            Ok(pane_id)
+        }
+
+        fn stop_agent(
+            &mut self,
+            pane_id: u64,
+            reason: &str,
+        ) -> Result<(), ProfileApplyExecutionError> {
+            self.stopped.push((pane_id, reason.to_string()));
+            if self.fail_stop {
+                return Err(ProfileApplyExecutionError::new(
+                    "robot.profile.mux_compensation_failed",
+                    format!("failed to stop pane {pane_id}"),
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -728,6 +1393,156 @@ mod tests {
             }
             other => panic!("expected SpawnFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn live_apply_spawns_and_persists_receipt() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+
+        let v = handle_profile_apply_with_executor(
+            &json!({ "name": "ready", "count": 2, "dry_run": false }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .expect("live apply");
+
+        assert_eq!(v.get("profile_name").and_then(Value::as_str), Some("ready"));
+        assert_eq!(v.get("dry_run").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            v.get("panes_spawned").and_then(Value::as_array).unwrap(),
+            &vec![json!(100), json!(101)]
+        );
+        assert_eq!(executor.spawned.len(), 2);
+        assert!(executor.stopped.is_empty());
+        assert_eq!(v.get("spawned_agents").and_then(Value::as_u64), Some(2));
+    }
+
+    #[test]
+    fn live_apply_replays_existing_receipt_without_spawning() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+        let first = handle_profile_apply_with_executor(
+            &json!({ "name": "ready", "count": 1, "dry_run": false }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .expect("first apply");
+        assert_eq!(executor.spawned.len(), 1);
+
+        let mut replay_executor = FakeApplyExecutor::new();
+        let replay = handle_profile_apply_with_executor(
+            &json!({ "name": "ready", "count": 1, "dry_run": false }),
+            &conn,
+            &mut replay_executor,
+            1_700_000_000_100,
+        )
+        .expect("replay apply");
+
+        assert_eq!(
+            first.get("panes_spawned"),
+            replay.get("panes_spawned"),
+            "replay returns original pane ids"
+        );
+        assert_eq!(
+            replay.get("idempotent_replay").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(replay_executor.spawned.is_empty());
+    }
+
+    #[test]
+    fn live_apply_policy_denial_does_not_spawn() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+        executor.policy = Some(FleetMutationPolicyDecision::Deny {
+            reason_code: "blocked".to_string(),
+            message: "profile launches disabled".to_string(),
+        });
+
+        let err = handle_profile_apply_with_executor(
+            &json!({ "name": "ready", "count": 1, "dry_run": false }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ProfileHandlerError::PolicyDenied { .. }));
+        assert!(executor.spawned.is_empty());
+    }
+
+    #[test]
+    fn live_apply_partial_failure_compensates_prior_spawns() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+        executor.fail_on_ordinal = Some(2);
+
+        let err = handle_profile_apply_with_executor(
+            &json!({ "name": "ready", "count": 3, "dry_run": false }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap_err();
+
+        match err {
+            ProfileHandlerError::ApplyFailed { error_code, reason } => {
+                assert_eq!(error_code, "robot.profile.mux_spawn_failed");
+                assert!(reason.contains("spawn 2 failed"));
+            }
+            other => panic!("expected ApplyFailed, got {other:?}"),
+        }
+        assert_eq!(executor.spawned.len(), 2);
+        assert_eq!(executor.stopped.len(), 1);
+        assert_eq!(executor.stopped[0].0, 100);
+    }
+
+    #[test]
+    fn live_apply_compensation_failure_is_specific() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+        executor.fail_on_ordinal = Some(2);
+        executor.fail_stop = true;
+
+        let err = handle_profile_apply_with_executor(
+            &json!({ "name": "ready", "count": 2, "dry_run": false }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ProfileHandlerError::CompensationFailed { .. }
+        ));
+        assert_eq!(executor.stopped.len(), 1);
+    }
+
+    #[test]
+    fn live_apply_daemon_unavailable_surfaces_executor_code() {
+        let conn = fresh_conn_with_apply_log();
+        insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
+        let mut executor = FakeApplyExecutor::new();
+        executor.fail_on_ordinal = Some(1);
+
+        let err = handle_profile_apply_with_executor(
+            &json!({ "name": "ready", "count": 1, "dry_run": false }),
+            &conn,
+            &mut executor,
+            1_700_000_000_000,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "robot.profile.mux_spawn_failed");
     }
 
     #[test]

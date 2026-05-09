@@ -8618,6 +8618,158 @@ async fn robot_fleet_command_response(
     }
 }
 
+struct RobotProfileApplyMuxExecutor {
+    mux: frankenterm_core::wezterm::MuxHandle,
+}
+
+impl RobotProfileApplyMuxExecutor {
+    fn new(mux: frankenterm_core::wezterm::MuxHandle) -> Self {
+        Self { mux }
+    }
+
+    fn runtime() -> Result<
+        frankenterm_core::runtime_async::Runtime,
+        frankenterm_core::robot_profile_handler::ProfileApplyExecutionError,
+    > {
+        frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|err| {
+                frankenterm_core::robot_profile_handler::ProfileApplyExecutionError::new(
+                    "robot.profile.daemon_unavailable",
+                    format!("failed to build profile apply runtime: {err}"),
+                )
+            })
+    }
+
+    fn send_setup(
+        &self,
+        pane_id: u64,
+        spec: &frankenterm_core::robot_profile_handler::ProfileApplySpawnSpec,
+    ) -> Result<(), frankenterm_core::robot_profile_handler::ProfileApplyExecutionError> {
+        use frankenterm_core::runtime_async::CompatRuntime;
+
+        let mut lines = Vec::new();
+        let mut exports = Vec::new();
+        for (key, value) in &spec.env {
+            if !robot_profile_env_key_is_shell_identifier(key) {
+                return Err(
+                    frankenterm_core::robot_profile_handler::ProfileApplyExecutionError::new(
+                        "robot.profile.validation_failed",
+                        format!("environment key `{key}` is not a shell identifier"),
+                    ),
+                );
+            }
+            exports.push(format!("{key}={}", shell_single_quote(value)));
+        }
+        if !exports.is_empty() {
+            lines.push(format!("export {}", exports.join(" ")));
+        }
+        if let Some(command) = spec
+            .command
+            .as_ref()
+            .filter(|command| !command.trim().is_empty())
+        {
+            lines.push(command.clone());
+        }
+        lines.extend(spec.bootstrap_commands.iter().cloned());
+
+        if lines.is_empty() {
+            return Ok(());
+        }
+
+        let runtime = Self::runtime()?;
+        let text = format!("{}\n", lines.join("\n"));
+        runtime
+            .block_on(self.mux.send_text(pane_id, &text))
+            .map_err(|err| {
+                frankenterm_core::robot_profile_handler::ProfileApplyExecutionError::new(
+                    "robot.profile.bootstrap_failed",
+                    format!("failed to send profile setup to pane {pane_id}: {err}"),
+                )
+            })
+    }
+}
+
+impl frankenterm_core::robot_profile_handler::ProfileApplyMutationExecutor
+    for RobotProfileApplyMuxExecutor
+{
+    fn spawn_agent(
+        &mut self,
+        spec: &frankenterm_core::robot_profile_handler::ProfileApplySpawnSpec,
+    ) -> Result<u64, frankenterm_core::robot_profile_handler::ProfileApplyExecutionError> {
+        use frankenterm_core::runtime_async::CompatRuntime;
+
+        for key in spec.env.keys() {
+            if !robot_profile_env_key_is_shell_identifier(key) {
+                return Err(
+                    frankenterm_core::robot_profile_handler::ProfileApplyExecutionError::new(
+                        "robot.profile.validation_failed",
+                        format!("environment key `{key}` is not a shell identifier"),
+                    ),
+                );
+            }
+        }
+
+        let runtime = Self::runtime()?;
+        let pane_id = runtime
+            .block_on(
+                self.mux
+                    .spawn(spec.working_directory.as_deref(), spec.domain.as_deref()),
+            )
+            .map_err(|err| {
+                frankenterm_core::robot_profile_handler::ProfileApplyExecutionError::new(
+                    "robot.profile.daemon_unavailable",
+                    format!(
+                        "mux spawn failed for profile `{}`: {err}",
+                        spec.profile_name
+                    ),
+                )
+            })?;
+
+        if let Err(err) = self.send_setup(pane_id, spec) {
+            let _ = self.stop_agent(pane_id, "profile setup failed after spawn");
+            return Err(err);
+        }
+
+        Ok(pane_id)
+    }
+
+    fn stop_agent(
+        &mut self,
+        pane_id: u64,
+        reason: &str,
+    ) -> Result<(), frankenterm_core::robot_profile_handler::ProfileApplyExecutionError> {
+        use frankenterm_core::runtime_async::CompatRuntime;
+
+        let runtime = Self::runtime()?;
+        runtime
+            .block_on(self.mux.kill_pane(pane_id))
+            .map_err(|err| {
+                frankenterm_core::robot_profile_handler::ProfileApplyExecutionError::new(
+                    "robot.profile.compensation_failed",
+                    format!("failed to stop pane {pane_id} ({reason}): {err}"),
+                )
+            })
+    }
+}
+
+fn robot_profile_env_key_is_shell_identifier(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    if value.is_empty() {
+        "''".to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn redact_for_output(text: &str) -> String {
     static REDACTOR: LazyLock<frankenterm_core::policy::Redactor> =
         LazyLock::new(frankenterm_core::policy::Redactor::new);
@@ -27349,9 +27501,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             // the read paths (List / Show /
                             // Validate) ship complete, and the dry-run Apply
                             // path returns the contract's planned response
-                            // shape. Non-dry-run Apply requires daemon-side
-                            // pane spawning (filed as ft-b0g7g.cont.apply_spawn)
-                            // and is surfaced as a typed error envelope.
+                            // shape. Non-dry-run Apply now routes through the
+                            // mux-backed mutation executor below so profile
+                            // apply gets durable receipts and rollback-aware
+                            // failure envelopes.
                             let (action_name, params_value): (&str, serde_json::Value) =
                                 match &command {
                                     RobotProfileCommands::List { role, tag } => (
@@ -27421,11 +27574,67 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     return Ok(());
                                 }
                             };
-                            let response = match frankenterm_core::robot_profile_handler::handle_profile_command(
-                                action_name,
-                                &params_value,
-                                &backend,
-                            ) {
+                            let live_apply = matches!(
+                                &command,
+                                RobotProfileCommands::Apply { dry_run: false, .. }
+                            );
+                            let response = if live_apply {
+                                let mux =
+                                    frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                                let mut executor = RobotProfileApplyMuxExecutor::new(mux);
+                                match frankenterm_core::robot_profile_handler::handle_profile_apply_with_executor(
+                                    &params_value,
+                                    &backend,
+                                    &mut executor,
+                                    now_epoch_ms(),
+                                ) {
+                                    Ok(data) => RobotResponse::<serde_json::Value>::success(
+                                        data,
+                                        elapsed_ms(start),
+                                    ),
+                                    Err(err) => {
+                                        let code = err.error_code();
+                                        let hint = match &err {
+                                            frankenterm_core::robot_profile_handler::ProfileHandlerError::PolicyDenied { .. } => Some(
+                                                "Adjust the profile apply policy or rerun after the policy condition is cleared."
+                                                    .to_string(),
+                                            ),
+                                            frankenterm_core::robot_profile_handler::ProfileHandlerError::ApprovalRequired { .. } => Some(
+                                                "Submit or approve the requested profile apply before retrying the live mutation."
+                                                    .to_string(),
+                                            ),
+                                            frankenterm_core::robot_profile_handler::ProfileHandlerError::ApplyFailed { error_code, .. }
+                                                if error_code == "robot.profile.daemon_unavailable" =>
+                                            {
+                                                Some(
+                                                    "Ensure the active mux/daemon bridge is running, or rerun with --dry-run for the planning response."
+                                                        .to_string(),
+                                                )
+                                            }
+                                            frankenterm_core::robot_profile_handler::ProfileHandlerError::CompensationFailed { .. } => Some(
+                                                "Inspect the returned error and the live mux state; rollback did not complete cleanly."
+                                                    .to_string(),
+                                            ),
+                                            frankenterm_core::robot_profile_handler::ProfileHandlerError::NotFound { .. } => Some(
+                                                "Run `ft robot profile list` to see available names."
+                                                    .to_string(),
+                                            ),
+                                            _ => None,
+                                        };
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            code,
+                                            err.to_string(),
+                                            hint,
+                                            elapsed_ms(start),
+                                        )
+                                    }
+                                }
+                            } else {
+                                match frankenterm_core::robot_profile_handler::handle_profile_command(
+                                    action_name,
+                                    &params_value,
+                                    &backend,
+                                ) {
                                 Ok(data) => RobotResponse::<serde_json::Value>::success(
                                     data,
                                     elapsed_ms(start),
@@ -27450,6 +27659,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         hint,
                                         elapsed_ms(start),
                                     )
+                                }
                                 }
                             };
                             print_robot_response(&response, format, stats)?;

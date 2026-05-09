@@ -1,16 +1,19 @@
 # Robot Family Contract: `profile`
 
 **Bead:** [BR-RC-ROBOT-CONTRACT.1] / `ft-hac7w.2`.
-**Status:** Contract substrate and wired read/dry-run handler are live.
+**Status:** Contract substrate, wired read/dry-run handler, and live
+non-dry-run mux mutation path are live.
 Schema-DSL contract (under `profile_family_contract()` in
 `crates/frankenterm-core/src/robot_family_contract.rs`) plus state-space proof
 + conformance tests in `tests/robot_family_conformance.rs` are live.
 `RobotCommands::Profile` dispatches through
 `frankenterm_core::robot_profile_handler::handle_profile_command` against the
 workspace `agent_profiles` table. `list`, `show`, `validate`, and dry-run
-`apply` are wired; non-dry-run `apply` returns the typed
-`robot.profile.spawn_failed` envelope until daemon-mediated pane spawning is
-connected. The ntm differential test consumes the state-machine model + the
+`apply` are wired through the storage-only handler. Non-dry-run `apply` routes
+through `handle_profile_apply_with_executor`, which builds a shared fleet
+mutation plan, spawns through the mux bridge, persists `profiles_applied_log`
+receipts, and rolls back prior spawned panes on mid-apply failure. The ntm
+differential test consumes the state-machine model + the
 `crate::robot_ntm_differential::DifferentialHarness` from `ft-hac7w.1.1`.
 
 ## Family overview
@@ -126,11 +129,18 @@ different names are independent.
 
 ```json
 {
-  "name":           "<echo>",
-  "applied":        true,
-  "panes_spawned":  [ "<pane_id>", ... ],
-  "is_duplicate":   false,
-  "applied_at_ms":  1714560000000
+  "profile_name":              "<echo>",
+  "panes_spawned":             [ 10, 11 ],
+  "dry_run":                   false,
+  "requested_agents":          2,
+  "spawned_agents":            2,
+  "skipped_existing_agents":   0,
+  "policy_decisions":          [ ... ],
+  "idempotency_key":           "<profiles_applied_log content_hash>",
+  "mutation_idempotency_key":  "<fleet mutation key>",
+  "rollback_status":           "succeeded",
+  "idempotent_replay":         false,
+  "mutation_receipt":          { "...": "full fleet mutation receipt" }
 }
 ```
 
@@ -153,9 +163,19 @@ different names are independent.
    a non-existent profile returns `ProfileNotFound` with no
    side effects.
 6. `apply_dry_run_no_side_effects` (Custom) — `dry_run: true`
-   never mutates `agent_profiles` and never spawns panes; the
-   response is the same shape as a real apply but with
-   `applied: false`.
+   never mutates `agent_profiles` and never spawns panes.
+
+Specific failure envelopes:
+
+- `robot.profile.daemon_unavailable` when the mux bridge cannot spawn.
+- `robot.profile.policy_denied` when policy rejects the mutation preflight.
+- `robot.profile.require_approval` when policy requires approval.
+- `robot.profile.validation_failed` when the profile or env overrides are not
+  safe to execute.
+- `robot.profile.mux_spawn_failed` / `robot.profile.bootstrap_failed` for
+  live spawn/setup failures.
+- `robot.profile.compensation_failed` when rollback cannot close a pane that
+  was spawned before a later failure.
 
 ### `validate`
 
@@ -213,17 +233,6 @@ Verified by:
   schema-level conformance; the state-machine integration
   lands under the same suite as `state_machine_*_profile_*` tests).
 
-## What this contract is NOT
-
-- Not daemon-side pane spawning. The in-process handler deliberately fails
-  non-dry-run `apply` with `robot.profile.spawn_failed` because the actual pane
-  mutation must run through the mux service.
-- Not a guarantee that profile apply has an approval-aware live daemon RPC yet.
-  The handler pins the request/response contract and safe read/dry-run paths
-  while keeping real spawn unavailable instead of partially mutating.
-- Not the release attestation for a production profile-spawn daemon path. That
-  remains a follow-on once the mux-service mutation lane is wired.
-
 ## Substrate vs wired-pass scope
 
 Same substrate-pass / wired-pass split pattern as ft-2okh0.5,
@@ -245,8 +254,8 @@ ft-t9a6q.1 / .2 / .3:
 - `RobotCommands::Profile` routes to the DB-backed handler in
   `crates/frankenterm/src/main.rs`.
 - `list`, `show`, `validate`, and dry-run `apply` return typed data envelopes.
-- Non-dry-run `apply` returns `robot.profile.spawn_failed` until the daemon-side
-  mux mutation path exists.
+- Non-dry-run `apply` routes to the mux-backed mutation executor and writes
+  `profiles_applied_log` receipts after successful spawn.
 
 ## Cross-references
 
