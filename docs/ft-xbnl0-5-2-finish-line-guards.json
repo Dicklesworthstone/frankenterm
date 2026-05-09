@@ -45,7 +45,7 @@
     },
     {
       "guard_id": "supported_path_stub_markers",
-      "invariant": "Supported-path Rust sources must not contain active production todo!(), unimplemented!(), or panic-based stub markers outside classified test-only fakes and non-Rust SDK template markers.",
+      "invariant": "Supported-path Rust sources must not contain active production todo!(), unimplemented!(), or panic-based stub markers outside classified test-only fakes and unsupported SDK template markers.",
       "script": "scripts/check_supported_path_stub_markers.sh",
       "output_artifact": "docs/ft-xbnl0-3-6-supported-path-stub-markers-validation.json",
       "upstream_bead": "ft-g6lfc",

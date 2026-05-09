@@ -12,8 +12,23 @@ intentional honesty, not a supported user workflow. A language may move from
 template-only to supported only after it satisfies this contract and its
 generated artifact no longer contains a placeholder transport.
 
-This document defines the shared transport behavior that non-Rust SDK targets
-must implement before changing `SdkLanguage::is_fully_supported`.
+This document defines the shared transport behavior that SDK targets must
+implement before changing `SdkLanguage::is_fully_supported`.
+
+## Current Support Matrix
+
+| Language | Current state | Production artifact | Runtime constraint |
+| --- | --- | --- | --- |
+| Rust | `supported_daemon_transport` | `frankenterm_client_rust.rs` | Uses `RustSdkTransport` over watcher IPC. |
+| Python | `supported_process_transport` | `frankenterm_client_python.py` | Uses `asyncio.create_subprocess_exec` to run `ft robot --format json` without shell interpolation. |
+| TypeScript | `supported_process_transport` | `frankenterm_client_typescript.ts` | Node-only process transport using `node:child_process`; browser use requires a separate future transport. |
+| Go | `template_only` | Not included in the production bundle | The generated skeleton keeps `panic("transport not wired")` until a real default transport and tests land. |
+
+The checked fixture
+`crates/frankenterm-core/tests/fixtures/robot_sdk_supported_matrix.json`
+pins this table to `SdkLanguage::is_fully_supported()`,
+`standard_contract_artifacts()`, and the generated source markers for every
+language.
 
 ## Support States
 
@@ -33,10 +48,10 @@ and documentation.
 
 ## Transport Shape
 
-The first supported non-Rust transport should prefer the process transport
-unless a daemon IPC surface is already available and proven. Process transport
-is less elegant, but it keeps the SDK contract aligned with the public CLI and
-avoids inventing a parallel protocol.
+New supported SDK transports should prefer the process transport unless a
+daemon IPC surface is already available and proven. Process transport is less
+elegant, but it keeps the SDK contract aligned with the public CLI and avoids
+inventing a parallel protocol.
 
 A process transport call is:
 

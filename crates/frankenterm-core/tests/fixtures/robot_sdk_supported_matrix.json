@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "languages": [
+    {
+      "language": "Python",
+      "state": "supported_process_transport",
+      "artifact_filename": "frankenterm_client_python.py",
+      "fully_supported": true,
+      "included_in_production_bundle": true,
+      "runtime_note": "Uses asyncio.create_subprocess_exec to run ft robot --format json without shell interpolation.",
+      "required_source_markers": [
+        "asyncio.create_subprocess_exec",
+        "FrankentermRobotError",
+        "FrankentermTransportError"
+      ],
+      "forbidden_source_markers": [
+        "transport not wired",
+        "NotImplementedError"
+      ]
+    },
+    {
+      "language": "TypeScript",
+      "state": "supported_process_transport",
+      "artifact_filename": "frankenterm_client_typescript.ts",
+      "fully_supported": true,
+      "included_in_production_bundle": true,
+      "runtime_note": "Node-only process transport using node:child_process; browser support requires a separate future transport.",
+      "required_source_markers": [
+        "node:child_process",
+        "FrankentermRobotError",
+        "FrankentermTransportError",
+        "FrankentermUnsupportedCommandError"
+      ],
+      "forbidden_source_markers": [
+        "transport not wired"
+      ]
+    },
+    {
+      "language": "Rust",
+      "state": "supported_daemon_transport",
+      "artifact_filename": "frankenterm_client_rust.rs",
+      "fully_supported": true,
+      "included_in_production_bundle": true,
+      "runtime_note": "Uses RustSdkTransport over watcher IPC.",
+      "required_source_markers": [
+        "RustSdkTransport",
+        "RustSdkTransportError",
+        "pub struct FrankentermClient"
+      ],
+      "forbidden_source_markers": [
+        "transport not wired",
+        "unimplemented!"
+      ]
+    },
+    {
+      "language": "Go",
+      "state": "template_only",
+      "artifact_filename": "frankenterm_client_go.go",
+      "fully_supported": false,
+      "included_in_production_bundle": false,
+      "runtime_note": "Template-only skeleton; consumer must provide a real transport before promotion.",
+      "required_source_markers": [
+        "transport not wired"
+      ],
+      "forbidden_source_markers": []
+    }
+  ]
+}

@@ -5,6 +5,7 @@
 
 use frankenterm_core::robot_sdk_contracts::*;
 use proptest::prelude::*;
+use serde::Deserialize;
 
 // =============================================================================
 // Strategies
@@ -87,6 +88,34 @@ fn arb_endpoint_spec() -> impl Strategy<Value = EndpointSpec> {
             }
             spec
         })
+}
+
+#[derive(Debug, Deserialize)]
+struct SdkSupportMatrixFixture {
+    version: u32,
+    languages: Vec<SdkSupportMatrixEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SdkSupportMatrixEntry {
+    language: String,
+    state: String,
+    artifact_filename: String,
+    fully_supported: bool,
+    included_in_production_bundle: bool,
+    runtime_note: String,
+    required_source_markers: Vec<String>,
+    forbidden_source_markers: Vec<String>,
+}
+
+fn sdk_language_from_fixture_label(label: &str) -> SdkLanguage {
+    match label {
+        "Python" => SdkLanguage::Python,
+        "TypeScript" => SdkLanguage::TypeScript,
+        "Rust" => SdkLanguage::Rust,
+        "Go" => SdkLanguage::Go,
+        other => panic!("unknown SDK language in fixture: {other}"),
+    }
 }
 
 fn arb_ntm_compat_entry() -> impl Strategy<Value = NtmCompatEntry> {
@@ -658,6 +687,92 @@ fn standard_contract_artifacts_render_successfully() {
             filename
         );
     }
+}
+
+#[test]
+fn robot_sdk_supported_matrix_fixture_matches_generated_artifacts() {
+    let fixture: SdkSupportMatrixFixture =
+        serde_json::from_str(include_str!("fixtures/robot_sdk_supported_matrix.json"))
+            .expect("robot SDK support matrix fixture must be valid JSON");
+    assert_eq!(fixture.version, 1);
+    assert_eq!(fixture.languages.len(), 4);
+
+    let bundle = standard_contract_artifacts().unwrap();
+    let specs = core_endpoint_specs();
+    let mut supported_artifacts = Vec::new();
+
+    for entry in fixture.languages {
+        assert!(
+            !entry.state.is_empty(),
+            "SDK matrix entry for {} must declare a support state",
+            entry.language
+        );
+        assert!(
+            !entry.runtime_note.is_empty(),
+            "SDK matrix entry for {} must document its runtime constraint",
+            entry.language
+        );
+
+        let language = sdk_language_from_fixture_label(&entry.language);
+        assert_eq!(
+            language.is_fully_supported(),
+            entry.fully_supported,
+            "{} support gate must match the golden matrix",
+            entry.language
+        );
+
+        let mut sdk = SdkSurface::new(language, "frankenterm-client");
+        sdk.generate_from_specs(&specs);
+        let artifact_filename = sdk.artifact_filename();
+        let source = sdk.render_client_source();
+
+        assert_eq!(
+            artifact_filename, entry.artifact_filename,
+            "{} artifact filename drifted from the golden matrix",
+            entry.language
+        );
+        assert_eq!(
+            bundle.sdk_sources.contains_key(&artifact_filename),
+            entry.included_in_production_bundle,
+            "{} production bundle inclusion must match the golden matrix",
+            entry.language
+        );
+
+        for marker in &entry.required_source_markers {
+            assert!(
+                source.contains(marker),
+                "{} SDK source is missing required marker {marker:?}",
+                entry.language
+            );
+        }
+        for marker in &entry.forbidden_source_markers {
+            assert!(
+                !source.contains(marker),
+                "{} SDK source contains forbidden marker {marker:?}",
+                entry.language
+            );
+        }
+
+        if entry.included_in_production_bundle {
+            assert_eq!(
+                bundle.sdk_sources.get(&artifact_filename),
+                Some(&source),
+                "{} production artifact source must match direct rendering",
+                entry.language
+            );
+            supported_artifacts.push(artifact_filename);
+        }
+    }
+
+    supported_artifacts.sort();
+    assert_eq!(
+        supported_artifacts,
+        vec![
+            "frankenterm_client_python.py",
+            "frankenterm_client_rust.rs",
+            "frankenterm_client_typescript.ts",
+        ]
+    );
 }
 
 #[test]

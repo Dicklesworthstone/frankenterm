@@ -199,7 +199,7 @@ run_cargo_step "fmt_check" fmt --check
 # Inventory classification re-runs. Each pattern must still hit its
 # documented allow-list site so a future change cannot quietly delete
 # the marker without updating the sweep doc.
-run_grep_classification_step "transport_not_wired_python_template" \
+run_grep_classification_step "transport_not_wired_go_template" \
   'transport not wired' crates/frankenterm-core/src/robot_sdk_contracts.rs
 run_grep_classification_step "fakepane_test_only_pane" \
   '#\[cfg\(test\)\]' frankenterm/mux/src/pane.rs

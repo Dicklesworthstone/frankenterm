@@ -20,7 +20,7 @@ that emits four things from one declaration:
 1. **Proptest input strategies** — drive the fuzz corpus and
    property-based regressions.
 2. **JSON Schema** — validates the request envelope at the IPC boundary
-   and feeds downstream client codegen (TypeScript, Python).
+   and feeds downstream client codegen (Rust, Python, TypeScript).
 3. **MCP tool registration metadata** — name, description, input schema,
    idempotency hint — wired into the `mcp_framework.rs` seam so the
    `fastmcp` server can register the action with one descriptor object.
@@ -29,8 +29,8 @@ that emits four things from one declaration:
    asserts against a real handler.
 
 Generated SDK clients consume the same Robot envelope truth, but SDK transport
-support is tracked separately from family completion. The shared promotion
-contract for Python, TypeScript, and Go lives in
+support is tracked separately from family completion. The shared support matrix
+and promotion contract for Rust, Python, TypeScript, and Go lives in
 [`sdk-transports.md`](sdk-transports.md); a language remains template-only until
 that contract's transport, fixture, artifact-guard, and documentation evidence
 exists.

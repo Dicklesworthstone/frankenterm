@@ -39,7 +39,7 @@ against the inventory from `ft-xbnl0.1.2` using these decision rules:
 |-----------------|----------------|
 | Inside `#[cfg(test)]` / `#[cfg(all(test, ...))]` / `mod tests` | test-only — not finish-line scope |
 | Inside `#[cfg(not(any(target_os = "linux", target_os = "macos")))]` | unsupported-platform shim — out of scope per inventory |
-| Inside a non-Rust SDK template renderer | template-only — out of scope per inventory exclusion (Rust is the supported SDK) |
+| Inside an unsupported SDK template renderer (currently Go) | template-only — out of scope per inventory exclusion |
 | Anywhere else with a tracked `ft-xbnl0` / `ft-akx00` owner bead | acknowledged finish-line gap with a named owner |
 | Anywhere else with no tracked owner | new finding — must be filed as a follow-up bead before close |
 
@@ -66,7 +66,7 @@ map to:
 | `frankenterm/mux/src/tab.rs:4078-4170` | test-only `FakePane` (line 4004: `#[cfg(test)] mod test`) | inventory exclusion |
 | `frankenterm/termwiz/src/render/terminfo.rs:1177` | test-only `FakeTerm::waker` (line 991: `#[cfg(all(test, unix))] mod test`) | inventory exclusion |
 | `crates/frankenterm-mux-server-impl/src/sessionhandler.rs:1682` | test-only `FakePane::writer` (line 1510: `#[cfg(test)] mod tests`) | inventory exclusion |
-| `crates/frankenterm-core/src/robot_sdk_contracts.rs:2299/2318` | assertion guards — verify Rust SDK never re-introduces `unimplemented!(`/`transport not wired` markers | n/a (this sweep) |
+| `crates/frankenterm-core/src/robot_sdk_contracts.rs:2299/2318` | assertion guards — verify supported SDKs never re-introduce `unimplemented!(`/`transport not wired` markers | n/a (this sweep) |
 | `frankenterm/window/src/bitmaps/mod.rs:70` (`SrgbTexture2d::read`) | production gap (texture readback) | `ft-akx00.6.3` → `ft-xbnl0.3.5` (both open) |
 | `frankenterm/window/src/bitmaps/mod.rs:454` (`ImageTexture::read`) | production gap (texture readback) | `ft-akx00.6.3` → `ft-xbnl0.3.5` (both open) |
 | `crates/frankenterm-gui/src/termwindow/webgpu.rs:113` (`WebGpuTexture::read`) | production gap (texture readback) | `ft-akx00.6.3` → `ft-xbnl0.3.5` (both open) |
@@ -80,7 +80,7 @@ support discovery, real `ImageTexture` / `WebGpuTexture` readback where
 implemented, and an explicit unsupported error for `SrgbTexture2d`
 instead of `unimplemented!()`. The permanent CI guard
 `scripts/check_supported_path_stub_markers.sh` now re-runs the active
-marker scan and classifies only test-only fakes plus non-Rust SDK
+marker scan and classifies only test-only fakes plus unsupported SDK
 template markers as exclusions.
 
 The other renderer honesty gap that previously sat under
