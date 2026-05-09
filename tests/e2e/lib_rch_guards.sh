@@ -44,6 +44,7 @@ _RCH_QUEUE_LOG=""
 _RCH_SMOKE_LOG=""
 _RCH_REMOTE_PREFLIGHT_LOG=""
 _RCH_MIRROR_PREFLIGHT_LOG=""
+_RCH_SCHEDULER_WORKERS_LOG=""
 _RCH_SMOKE_TARGET_DIR=""
 _RCH_REPO_ROOT=""
 TIMEOUT_BIN=""
@@ -85,6 +86,10 @@ rch_remote_preflight_log_path() {
 
 rch_mirror_preflight_log_path() {
     printf '%s\n' "${_RCH_MIRROR_PREFLIGHT_LOG}"
+}
+
+rch_scheduler_workers_log_path() {
+    printf '%s\n' "${_RCH_SCHEDULER_WORKERS_LOG}"
 }
 
 rch_log_meta_path() {
@@ -894,8 +899,24 @@ ensure_rch_mirror_preflight() {
 
     local worker_ids worker_id worker_dir worker_json worker_rc failures total bead_arg=()
     local block_on_stale_head="false"
+    local scheduler_worker_ids scheduler_status_rc scheduler_filter_active="false"
     worker_ids="$(rch_extract_probe_worker_ids "${_RCH_PROBE_LOG}")"
     [[ -n "${worker_ids}" ]] || rch_fatal "mirror preflight requested but worker probe did not expose worker ids. See ${_RCH_PROBE_LOG}"
+
+    set +e
+    run_rch --json status --workers >"${_RCH_SCHEDULER_WORKERS_LOG}" 2>&1
+    scheduler_status_rc=$?
+    set -e
+    scheduler_worker_ids=""
+    if [[ "${scheduler_status_rc}" -eq 0 ]] && jq -e . "${_RCH_SCHEDULER_WORKERS_LOG}" >/dev/null 2>&1; then
+        scheduler_worker_ids="$(jq -r '
+            [.data.daemon.workers[]? | select((.status // "") == "healthy") | .id]
+            | .[]
+        ' "${_RCH_SCHEDULER_WORKERS_LOG}" 2>/dev/null || true)"
+        if [[ -n "${scheduler_worker_ids}" ]]; then
+            scheduler_filter_active="true"
+        fi
+    fi
 
     worker_dir="${_RCH_MIRROR_PREFLIGHT_LOG%.json}.workers"
     mkdir -p "${worker_dir}"
@@ -910,6 +931,10 @@ ensure_rch_mirror_preflight() {
 
     while IFS= read -r worker_id; do
         [[ -n "${worker_id}" ]] || continue
+        if [[ "${scheduler_filter_active}" == "true" ]] \
+            && ! grep -Fxq "${worker_id}" <<<"${scheduler_worker_ids}"; then
+            continue
+        fi
         worker_json="${worker_dir}/${worker_id}.json"
         set +e
         "${attest_script}" \
@@ -933,7 +958,9 @@ ensure_rch_mirror_preflight() {
         --argjson total "${total}" \
         --argjson failures "${failures}" \
         --argjson block_on_stale_head "$(rch_json_bool "${block_on_stale_head}")" \
+        --argjson scheduler_filter_active "$(rch_json_bool "${scheduler_filter_active}")" \
         --arg probe_log "$(rch_repo_relative_path "${_RCH_PROBE_LOG}")" \
+        --arg scheduler_workers_log "$(rch_repo_relative_path "${_RCH_SCHEDULER_WORKERS_LOG}")" \
         'def blocking_failure($block_on_stale_head):
           .status != "passed"
           and ($block_on_stale_head or .reason_code != "rch_mirror.head_mismatch");
@@ -944,12 +971,16 @@ ensure_rch_mirror_preflight() {
           generated_at: $generated_at,
           status: (if $blocking_failures == 0 then "passed" else "blocked" end),
           reason_code: (if $blocking_failures == 0 then "source_mirror_ready" else "source_mirror_blocked" end),
-          detail: (if $blocking_failures == 0 then "all blocking source mirror checks passed; stale complete mirrors are recorded separately" else "at least one probed worker failed a blocking source mirror attestation" end),
+          detail: (if $blocking_failures == 0 then "all blocking source mirror checks passed; Git metadata drift is recorded separately when required file hashes match" else "at least one probed worker failed a blocking source mirror attestation" end),
           total_workers_checked: $total,
           failed_workers: $failures,
           blocking_failed_workers: $blocking_failures,
           block_on_stale_head: $block_on_stale_head,
-          artifacts: {probe_log: $probe_log},
+          scheduler_filter_active: $scheduler_filter_active,
+          artifacts: {
+            probe_log: $probe_log,
+            scheduler_workers_log: $scheduler_workers_log
+          },
           worker_results: .
         }' "${worker_dir}"/*.json >"${_RCH_MIRROR_PREFLIGHT_LOG}"
 
@@ -1144,6 +1175,7 @@ rch_init() {
     _RCH_SMOKE_LOG="${log_dir}/${harness_name}_${run_id}.rch_smoke.log"
     _RCH_REMOTE_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_preflight.json"
     _RCH_MIRROR_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_mirror_preflight.json"
+    _RCH_SCHEDULER_WORKERS_LOG="${log_dir}/${harness_name}_${run_id}.rch_scheduler_workers.json"
     _RCH_SMOKE_TARGET_DIR="target/rch-smoke/${harness_name}/${run_id}"
     mkdir -p "${_RCH_SMOKE_TARGET_DIR}"
 }

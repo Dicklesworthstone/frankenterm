@@ -145,12 +145,19 @@ Allowed during worker-specific RCH incidents:
 - Read-only `rch status`, `rch check`, worker probe, Beads, git, and log
   inspection.
 - A material proof command through `rch exec -- ...` or a fail-closed harness.
-- A read-only mirror attestation that checks HEAD and tracked file presence on
-  the selected worker. Use `scripts/attest_rch_worker_mirror.sh --worker <id>
-  --path <tracked-file> ...` for this static-only evidence; it emits
+- A read-only mirror attestation that checks required tracked-file hashes and,
+  when available, HEAD metadata on the selected worker. RCH rsync mirrors may
+  have stale or non-verifiable Git metadata because object data is intentionally
+  excluded from transfer, so matching required-file hashes are the readiness
+  signal for mirror preflight; HEAD mismatch/unavailability is retained in the
+  artifact as residual context. Use
+  `scripts/attest_rch_worker_mirror.sh --worker <id> --path <tracked-file> ...`
+  for this static-only evidence; it emits
   `kind: "rch_selected_worker_mirror_attestation"` with reason codes such as
   `rch_mirror.project_path_absent`, `rch_mirror.head_mismatch`,
-  `rch_mirror.missing_tracked_file`, and `rch_mirror.worker_unreachable`.
+  `rch_mirror.missing_tracked_file`,
+  `rch_mirror.tracked_file_hash_mismatch`, and
+  `rch_mirror.worker_unreachable`.
 - Reopening or blocking a bead with exact artifact paths and reason codes when
   the worker-specific proof cannot be trusted.
 
@@ -171,7 +178,8 @@ Valid closeout evidence for a worker-specific blocker:
 
 - `target_worker_remote_proof` on the named worker.
 - Remote Cargo/rustc reached when the command class requires it.
-- Required tracked files were present on that worker at the intended HEAD.
+- Required tracked files matched local content on that worker; HEAD metadata is
+  corroborating context when the RCH mirror can verify it.
 - Proof artifacts validate, and the Beads closeout cites the exact command,
   worker, target dir, metadata sidecar, and ledger entry.
 

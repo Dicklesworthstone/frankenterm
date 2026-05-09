@@ -58,6 +58,17 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+file_sha256() {
+    local path="$1"
+    if command_exists shasum; then
+        shasum -a 256 -- "${path}" | awk '{print $1}'
+    elif command_exists sha256sum; then
+        sha256sum -- "${path}" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
 json_bool() {
     if [[ "$1" == "true" ]]; then
         printf 'true\n'
@@ -268,13 +279,13 @@ candidate_roots_json() {
 
 build_required_files_json() {
     local files_json="[]"
-    local path tracked local_present local_status
+    local path tracked local_present local_status local_sha256
 
     for path in "${REQUIRED_PATHS[@]}"; do
         case "${path}" in
             ""|/*|*..*|*$'\n'*|*$'\t'*)
                 jq -cn --argjson current "${files_json}" --arg path "${path}" \
-                    '$current + [{path:$path, tracked:false, local_present:false, local_status:"invalid_required_path", remote_status:"not_checked"}]'
+                    '$current + [{path:$path, tracked:false, local_present:false, local_status:"invalid_required_path", local_sha256:null, remote_status:"not_checked", remote_sha256:null, hash_matches:false}]'
                 return 0
                 ;;
         esac
@@ -282,11 +293,13 @@ build_required_files_json() {
         tracked="false"
         local_present="false"
         local_status="untracked"
+        local_sha256=""
         if git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
             tracked="true"
             if [[ -f "${path}" ]]; then
                 local_present="true"
                 local_status="present"
+                local_sha256="$(file_sha256 "${path}" || true)"
             else
                 local_status="missing_local"
             fi
@@ -298,12 +311,16 @@ build_required_files_json() {
             --argjson tracked "$(json_bool "${tracked}")" \
             --argjson local_present "$(json_bool "${local_present}")" \
             --arg local_status "${local_status}" \
+            --arg local_sha256 "${local_sha256}" \
             '$current + [{
                 path:$path,
                 tracked:$tracked,
                 local_present:$local_present,
                 local_status:$local_status,
-                remote_status:"not_checked"
+                local_sha256:(if $local_sha256 == "" then null else $local_sha256 end),
+                remote_status:"not_checked",
+                remote_sha256:null,
+                hash_matches:false
             }]')"
     done
 
@@ -417,6 +434,7 @@ emit_result() {
                 project_path_present:($remote_project_path != ""),
                 head_available:($remote_head != ""),
                 tracked_files_present:($remote_project_path != "" and ($required_files | all(.remote_status != "missing"))),
+                tracked_file_hashes_match:($remote_project_path != "" and ($required_files | all(.hash_matches == true))),
                 compiler_or_test_executed:false,
                 scheduler_queue_checked:false
             },
@@ -509,6 +527,17 @@ set +e
 "${SSH_BIN}" "${ssh_opts[@]}" "${ssh_target}" "bash -s -- '${payload_b64}'" >"${remote_stdout}" 2>"${remote_stderr}" <<'REMOTE_SCRIPT'
 set -euo pipefail
 
+file_sha256() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "${path}" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "${path}" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
 payload_b64="$1"
 payload="$(printf '%s' "${payload_b64}" | base64 -d 2>/dev/null || true)"
 local_head=""
@@ -526,6 +555,8 @@ done <<<"${payload}"
 selected_root=""
 first_existing_root=""
 first_all_present_root=""
+best_present_root=""
+best_present_count=-1
 shopt -s nullglob
 for root in "${roots[@]}"; do
     expanded_roots=()
@@ -547,12 +578,19 @@ for root in "${roots[@]}"; do
         fi
 
         all_present="true"
+        present_count=0
         for path in "${paths[@]}"; do
-            if [[ ! -f "${expanded_root}/${path}" ]]; then
+            if [[ -f "${expanded_root}/${path}" ]]; then
+                present_count=$((present_count + 1))
+            else
                 all_present="false"
-                break
             fi
         done
+
+        if [[ "${present_count}" -gt "${best_present_count}" ]]; then
+            best_present_count="${present_count}"
+            best_present_root="${expanded_root}"
+        fi
 
         if [[ "${all_present}" == "true" && -z "${first_all_present_root}" ]]; then
             first_all_present_root="${expanded_root}"
@@ -570,7 +608,7 @@ done
 shopt -u nullglob
 
 if [[ -z "${selected_root}" ]]; then
-    selected_root="${first_all_present_root:-${first_existing_root}}"
+    selected_root="${first_all_present_root:-${best_present_root:-${first_existing_root}}}"
 fi
 
 if [[ -z "${selected_root}" ]]; then
@@ -588,9 +626,13 @@ fi
 
 for path in "${paths[@]}"; do
     if [[ -f "${selected_root}/${path}" ]]; then
-        printf 'FILE\t%s\tpresent\n' "${path}"
+        if remote_hash="$(file_sha256 "${selected_root}/${path}" 2>/dev/null)"; then
+            printf 'FILE\t%s\tpresent\t%s\n' "${path}" "${remote_hash}"
+        else
+            printf 'FILE\t%s\tpresent\t\n' "${path}"
+        fi
     else
-        printf 'FILE\t%s\tmissing\n' "${path}"
+        printf 'FILE\t%s\tmissing\t\n' "${path}"
     fi
 done
 REMOTE_SCRIPT
@@ -607,7 +649,7 @@ fi
 remote_status=""
 remote_root=""
 remote_head=""
-while IFS=$'\t' read -r kind value extra; do
+while IFS=$'\t' read -r kind value extra rest; do
     case "${kind}" in
         STATUS) remote_status="${value}" ;;
         ROOT) remote_root="${value}" ;;
@@ -617,7 +659,16 @@ while IFS=$'\t' read -r kind value extra; do
                 --argjson current "${files_json}" \
                 --arg path "${value}" \
                 --arg remote_status "${extra}" \
-                '$current | map(if .path == $path then . + {remote_status:$remote_status} else . end)')"
+                --arg remote_sha256 "${rest}" \
+                '$current | map(
+                    if .path == $path then
+                        . + {
+                            remote_status:$remote_status,
+                            remote_sha256:(if $remote_sha256 == "" then null else $remote_sha256 end),
+                            hash_matches:(.local_sha256 != null and $remote_sha256 != "" and .local_sha256 == $remote_sha256)
+                        }
+                    else . end
+                )')"
             ;;
     esac
 done <"${remote_stdout}"
@@ -636,25 +687,39 @@ if [[ "${remote_status}" != "ok" || -z "${remote_root}" ]]; then
     exit 2
 fi
 
-if [[ -z "${remote_head}" ]]; then
-    emit_result "failed" "rch_mirror.head_unavailable" "source_mirror" "inconclusive_worker_evidence" \
-        "selected worker project path exists but HEAD could not be read" "${worker_json}" "${roots_json}" "${files_json}" \
-        "${remote_root}" "${remote_head}" "${local_head}" "${remote_stdout}" "${remote_stderr}" "${ssh_rc}"
-    exit 2
-fi
-
-if [[ "${remote_head}" != "${local_head}" ]]; then
-    emit_result "failed" "rch_mirror.head_mismatch" "source_mirror" "inconclusive_worker_evidence" \
-        "selected worker source mirror HEAD does not match local HEAD" "${worker_json}" "${roots_json}" "${files_json}" \
-        "${remote_root}" "${remote_head}" "${local_head}" "${remote_stdout}" "${remote_stderr}" "${ssh_rc}"
-    exit 2
-fi
-
 if jq -e 'any(.[]; .remote_status == "missing")' <<<"${files_json}" >/dev/null; then
     emit_result "failed" "rch_mirror.missing_tracked_file" "source_mirror" "inconclusive_worker_evidence" \
         "selected worker source mirror is missing at least one required tracked file" "${worker_json}" "${roots_json}" "${files_json}" \
         "${remote_root}" "${remote_head}" "${local_head}" "${remote_stdout}" "${remote_stderr}" "${ssh_rc}"
     exit 2
+fi
+
+if jq -e 'any(.[]; .local_sha256 == null or .remote_sha256 == null)' <<<"${files_json}" >/dev/null; then
+    emit_result "failed" "rch_mirror.hash_unavailable" "source_mirror" "inconclusive_worker_evidence" \
+        "selected worker source mirror could not hash at least one required tracked file" "${worker_json}" "${roots_json}" "${files_json}" \
+        "${remote_root}" "${remote_head}" "${local_head}" "${remote_stdout}" "${remote_stderr}" "${ssh_rc}"
+    exit 2
+fi
+
+if jq -e 'any(.[]; .hash_matches != true)' <<<"${files_json}" >/dev/null; then
+    emit_result "failed" "rch_mirror.tracked_file_hash_mismatch" "source_mirror" "inconclusive_worker_evidence" \
+        "selected worker source mirror required tracked file content differs from local snapshot" "${worker_json}" "${roots_json}" "${files_json}" \
+        "${remote_root}" "${remote_head}" "${local_head}" "${remote_stdout}" "${remote_stderr}" "${ssh_rc}"
+    exit 2
+fi
+
+if [[ -z "${remote_head}" ]]; then
+    emit_result "passed" "rch_mirror.required_files_ok_head_unavailable" "none" "target_worker_mirror_attestation" \
+        "selected worker required tracked files matched local content; Git HEAD could not be verified in the RCH rsync mirror" "${worker_json}" "${roots_json}" \
+        "${files_json}" "${remote_root}" "${remote_head}" "${local_head}" "${remote_stdout}" "${remote_stderr}" "${ssh_rc}"
+    exit 0
+fi
+
+if [[ "${remote_head}" != "${local_head}" ]]; then
+    emit_result "passed" "rch_mirror.required_files_ok_head_mismatch" "none" "target_worker_mirror_attestation" \
+        "selected worker required tracked files matched local content; Git metadata HEAD differs from the local snapshot" "${worker_json}" "${roots_json}" \
+        "${files_json}" "${remote_root}" "${remote_head}" "${local_head}" "${remote_stdout}" "${remote_stderr}" "${ssh_rc}"
+    exit 0
 fi
 
 emit_result "passed" "rch_mirror.ok" "none" "target_worker_mirror_attestation" \

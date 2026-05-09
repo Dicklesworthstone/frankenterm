@@ -28,7 +28,20 @@ record_result() {
     fi
 }
 
+fixture_sha256() {
+    local path="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "${path}" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "${path}" | awk '{print $1}'
+    else
+        printf 'missing-hash-tool\n'
+    fi
+}
+
 HEAD_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
+CARGO_TOML_SHA="$(fixture_sha256 "${ROOT_DIR}/Cargo.toml")"
+CORE_LIB_SHA="$(fixture_sha256 "${ROOT_DIR}/crates/frankenterm-core/src/lib.rs")"
 WORKERS_JSON="${LOG_DIR}/workers.json"
 FAKE_SSH="${LOG_DIR}/fake_ssh.sh"
 
@@ -66,22 +79,36 @@ case "${FAKE_RCH_MIRROR_MODE:-success}" in
     printf 'STATUS\tok\n'
     printf 'ROOT\t/data/projects/frankenterm\n'
     printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD:-0000000000000000000000000000000000000000}"
-    printf 'FILE\tCargo.toml\tpresent\n'
-    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\n'
+    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
+    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CORE_LIB_SHA}"
+    ;;
+  head_unavailable)
+    printf 'STATUS\tok\n'
+    printf 'ROOT\t/data/projects/frankenterm\n'
+    printf 'HEAD\t\n'
+    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
+    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CORE_LIB_SHA}"
+    ;;
+  hash_mismatch)
+    printf 'STATUS\tok\n'
+    printf 'ROOT\t/data/projects/frankenterm\n'
+    printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD}"
+    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
+    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\t0000000000000000000000000000000000000000000000000000000000000000\n'
     ;;
   missing_file)
     printf 'STATUS\tok\n'
     printf 'ROOT\t/data/projects/frankenterm\n'
     printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD}"
-    printf 'FILE\tCargo.toml\tpresent\n'
-    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tmissing\n'
+    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
+    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tmissing\t\n'
     ;;
   success)
     printf 'STATUS\tok\n'
     printf 'ROOT\t/data/projects/frankenterm\n'
     printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD}"
-    printf 'FILE\tCargo.toml\tpresent\n'
-    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\n'
+    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
+    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CORE_LIB_SHA}"
     ;;
   *)
     printf 'unknown fake mode: %s\n' "${FAKE_RCH_MIRROR_MODE:-}" >&2
@@ -100,6 +127,8 @@ run_fixture() {
     set +e
     FAKE_RCH_MIRROR_MODE="${mode}" \
     FAKE_RCH_MIRROR_REMOTE_HEAD="${remote_head}" \
+    FAKE_RCH_MIRROR_CARGO_TOML_SHA="${CARGO_TOML_SHA}" \
+    FAKE_RCH_MIRROR_CORE_LIB_SHA="${CORE_LIB_SHA}" \
     RCH_MIRROR_ATTEST_WORKERS_JSON="${WORKERS_JSON}" \
     RCH_MIRROR_ATTEST_SSH_BIN="${FAKE_SSH}" \
     "${SCRIPT}" \
@@ -123,7 +152,7 @@ if run_fixture success "${SUCCESS_JSON}"; then
         and .confidence == "target_worker_mirror_attestation"
         and .checks.compiler_or_test_executed == false
         and .checks.scheduler_queue_checked == false
-        and (.remote.required_files | all(.remote_status == "present"))
+        and (.remote.required_files | all(.remote_status == "present" and .hash_matches == true))
     ' "${SUCCESS_JSON}" >/dev/null; then
         record_result "success_fixture" "true"
     else
@@ -151,17 +180,51 @@ fi
 
 STALE_JSON="${LOG_DIR}/stale_head.json"
 if FAKE_RCH_MIRROR_REMOTE_HEAD="0000000000000000000000000000000000000000" run_fixture stale_head "${STALE_JSON}"; then
-    record_result "stale_head_fixture" "false" "script unexpectedly passed"
-else
     if jq -e '
-        .status == "failed"
-        and .reason_code == "rch_mirror.head_mismatch"
-        and .failure_domain == "source_mirror"
+        .status == "passed"
+        and .reason_code == "rch_mirror.required_files_ok_head_mismatch"
+        and .failure_domain == "none"
         and .remote.head_matches == false
+        and (.remote.required_files | all(.hash_matches == true))
     ' "${STALE_JSON}" >/dev/null; then
         record_result "stale_head_fixture" "true"
     else
         record_result "stale_head_fixture" "false" "unexpected JSON shape"
+    fi
+else
+    record_result "stale_head_fixture" "false" "script failed despite matching required-file hashes"
+fi
+
+HEAD_UNAVAILABLE_JSON="${LOG_DIR}/head_unavailable.json"
+if run_fixture head_unavailable "${HEAD_UNAVAILABLE_JSON}"; then
+    if jq -e '
+        .status == "passed"
+        and .reason_code == "rch_mirror.required_files_ok_head_unavailable"
+        and .failure_domain == "none"
+        and .checks.head_available == false
+        and (.remote.required_files | all(.hash_matches == true))
+    ' "${HEAD_UNAVAILABLE_JSON}" >/dev/null; then
+        record_result "head_unavailable_fixture" "true"
+    else
+        record_result "head_unavailable_fixture" "false" "unexpected JSON shape"
+    fi
+else
+    record_result "head_unavailable_fixture" "false" "script failed despite matching required-file hashes"
+fi
+
+HASH_MISMATCH_JSON="${LOG_DIR}/hash_mismatch.json"
+if run_fixture hash_mismatch "${HASH_MISMATCH_JSON}"; then
+    record_result "hash_mismatch_fixture" "false" "script unexpectedly passed"
+else
+    if jq -e '
+        .status == "failed"
+        and .reason_code == "rch_mirror.tracked_file_hash_mismatch"
+        and .failure_domain == "source_mirror"
+        and (.remote.required_files[] | select(.path == "crates/frankenterm-core/src/lib.rs") | .hash_matches == false)
+    ' "${HASH_MISMATCH_JSON}" >/dev/null; then
+        record_result "hash_mismatch_fixture" "true"
+    else
+        record_result "hash_mismatch_fixture" "false" "unexpected JSON shape"
     fi
 fi
 
