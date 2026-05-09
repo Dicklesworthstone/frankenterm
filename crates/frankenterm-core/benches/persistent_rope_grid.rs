@@ -26,6 +26,7 @@
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::persistent_rope_grid::{Cell, FlatGrid, Line, RopeGrid, TerminalGridOps};
+use std::hint::black_box;
 
 const COLS: usize = 80;
 
@@ -55,7 +56,7 @@ fn bench_snapshot_1000_lines(c: &mut Criterion) {
         let g = flat_with(1_000);
         b.iter(|| {
             let snap = g.clone();
-            criterion::black_box(snap);
+            black_box(snap);
         })
     });
 
@@ -63,7 +64,7 @@ fn bench_snapshot_1000_lines(c: &mut Criterion) {
         let g = rope_with(1_000);
         b.iter(|| {
             let snap = g.clone();
-            criterion::black_box(snap);
+            black_box(snap);
         })
     });
 
@@ -78,7 +79,7 @@ fn bench_snapshot_10k_lines(c: &mut Criterion) {
         let g = flat_with(10_000);
         b.iter(|| {
             let snap = g.clone();
-            criterion::black_box(snap);
+            black_box(snap);
         })
     });
 
@@ -86,7 +87,7 @@ fn bench_snapshot_10k_lines(c: &mut Criterion) {
         let g = rope_with(10_000);
         b.iter(|| {
             let snap = g.clone();
-            criterion::black_box(snap);
+            black_box(snap);
         })
     });
 
@@ -108,7 +109,7 @@ fn bench_full_reflow_1000_lines(c: &mut Criterion) {
                 for i in 0..g.line_count() {
                     g.set_line(i, line_of('b'));
                 }
-                criterion::black_box(g.line_count());
+                black_box(g.line_count());
             },
             criterion::BatchSize::SmallInput,
         )
@@ -121,7 +122,7 @@ fn bench_full_reflow_1000_lines(c: &mut Criterion) {
                 for i in 0..g.line_count() {
                     g.set_line(i, line_of('b'));
                 }
-                criterion::black_box(g.line_count());
+                black_box(g.line_count());
             },
             criterion::BatchSize::SmallInput,
         )
@@ -146,7 +147,7 @@ fn bench_mixed_1000_lines(c: &mut Criterion) {
                 g.set_line(i, line_of('c'));
             }
             let snap = g.clone();
-            criterion::black_box(snap);
+            black_box(snap);
         })
     });
 
@@ -158,7 +159,7 @@ fn bench_mixed_1000_lines(c: &mut Criterion) {
                 g.set_line(i, line_of('c'));
             }
             let snap = g.clone();
-            criterion::black_box(snap);
+            black_box(snap);
         })
     });
 

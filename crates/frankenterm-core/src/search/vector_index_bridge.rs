@@ -49,10 +49,10 @@ impl FsviAdapter {
     /// Open an existing FSVI index from disk.
     pub fn open(path: &Path) -> Result<Self, Error> {
         let index = VectorIndex::open(path).map_err(|e| {
-            Error::Runtime(format!(
-                "failed to open FSVI index at {}: {e}",
-                path.display()
-            ))
+            Error::runtime_backend(
+                "fsvi open",
+                format!("failed to open FSVI index at {}: {e}", path.display()),
+            )
         })?;
         Ok(Self {
             index,
@@ -63,16 +63,16 @@ impl FsviAdapter {
     /// Create a new empty FSVI index.
     pub fn create(path: &Path, embedder_id: &str, dimension: usize) -> Result<Self, Error> {
         let writer = VectorIndex::create(path, embedder_id, dimension).map_err(|e| {
-            Error::Runtime(format!(
-                "failed to create FSVI index at {}: {e}",
-                path.display()
-            ))
+            Error::runtime_backend(
+                "fsvi create",
+                format!("failed to create FSVI index at {}: {e}", path.display()),
+            )
         })?;
         writer.finish().map_err(|e| {
-            Error::Runtime(format!(
-                "failed to finish FSVI writer at {}: {e}",
-                path.display()
-            ))
+            Error::runtime_backend(
+                "fsvi finish",
+                format!("failed to finish FSVI writer at {}: {e}", path.display()),
+            )
         })?;
         Self::open(path)
     }
@@ -112,7 +112,7 @@ impl FsviAdapter {
         let doc_id = id.to_string();
         self.index
             .append(&doc_id, vector)
-            .map_err(|e| Error::Runtime(format!("FSVI append failed for id {id}: {e}")))
+            .map_err(|e| Error::runtime_backend("fsvi append", format!("id {id}: {e}")))
     }
 
     /// Append a batch of (id, vector) pairs.
@@ -123,7 +123,7 @@ impl FsviAdapter {
             .collect();
         self.index
             .append_batch(&string_entries)
-            .map_err(|e| Error::Runtime(format!("FSVI batch append failed: {e}")))
+            .map_err(|e| Error::runtime_backend("fsvi append_batch", e.to_string()))
     }
 
     /// Soft-delete a document by u64 ID.
@@ -131,14 +131,14 @@ impl FsviAdapter {
         let doc_id = id.to_string();
         self.index
             .soft_delete(&doc_id)
-            .map_err(|e| Error::Runtime(format!("FSVI soft_delete failed for id {id}: {e}")))
+            .map_err(|e| Error::runtime_backend("fsvi soft_delete", format!("id {id}: {e}")))
     }
 
     /// Compact the index (merge WAL, vacuum tombstones).
     pub fn compact(&mut self) -> Result<(), Error> {
         self.index
             .compact()
-            .map_err(|e| Error::Runtime(format!("FSVI compact failed: {e}")))?;
+            .map_err(|e| Error::runtime_backend("fsvi compact", e.to_string()))?;
         Ok(())
     }
 
@@ -189,20 +189,20 @@ pub fn convert_ftvi_to_fsvi(
     use super::vector_index::FtviIndex;
 
     let ftvi = FtviIndex::from_bytes(ftvi_data)
-        .map_err(|e| Error::Runtime(format!("failed to parse FTVI data: {e}")))?;
+        .map_err(|e| Error::runtime_backend("ftvi parse", e.to_string()))?;
 
     if ftvi.is_empty() {
         // Create an empty FSVI index
         let writer = VectorIndex::create(output_path, embedder_id, ftvi.dimension())
-            .map_err(|e| Error::Runtime(format!("failed to create FSVI index: {e}")))?;
+            .map_err(|e| Error::runtime_backend("fsvi create", e.to_string()))?;
         writer
             .finish()
-            .map_err(|e| Error::Runtime(format!("failed to finish FSVI writer: {e}")))?;
+            .map_err(|e| Error::runtime_backend("fsvi finish", e.to_string()))?;
         return Ok(0);
     }
 
     let mut writer = VectorIndex::create(output_path, embedder_id, ftvi.dimension())
-        .map_err(|e| Error::Runtime(format!("failed to create FSVI writer: {e}")))?;
+        .map_err(|e| Error::runtime_backend("fsvi create", e.to_string()))?;
 
     let count = ftvi.len();
     for i in 0..count {
@@ -211,12 +211,12 @@ pub fn convert_ftvi_to_fsvi(
         let doc_id = id.to_string();
         writer
             .write_record(&doc_id, vector)
-            .map_err(|e| Error::Runtime(format!("FSVI write_record failed for id {id}: {e}")))?;
+            .map_err(|e| Error::runtime_backend("fsvi write_record", format!("id {id}: {e}")))?;
     }
 
     writer
         .finish()
-        .map_err(|e| Error::Runtime(format!("failed to finish FSVI writer: {e}")))?;
+        .map_err(|e| Error::runtime_backend("fsvi finish", e.to_string()))?;
 
     Ok(count)
 }

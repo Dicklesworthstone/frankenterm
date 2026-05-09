@@ -130,7 +130,9 @@ impl EmbedClient {
         if elapsed >= timeout {
             return Err(self.timeout_error(operation));
         }
-        Ok(timeout - elapsed)
+        timeout
+            .checked_sub(elapsed)
+            .ok_or_else(|| self.timeout_error(operation))
     }
 
     fn enforce_timeout(

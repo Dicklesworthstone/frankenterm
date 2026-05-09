@@ -47,6 +47,11 @@ use frankenterm_core::error::{
 use frankenterm_core::error_codes::{ErrorCategory, get_error_code};
 use frankenterm_core::output::{ErrorRenderer, OutputFormat, get_code_for_error, render_error};
 
+#[allow(deprecated)]
+fn legacy_runtime_error(message: String) -> CoreError {
+    CoreError::Runtime(message)
+}
+
 // =============================================================================
 // Strategies
 // =============================================================================
@@ -140,7 +145,7 @@ fn arb_core_error() -> impl Strategy<Value = CoreError> {
         arb_workflow_error().prop_map(CoreError::Workflow),
         arb_config_error().prop_map(CoreError::Config),
         arb_nonempty_string().prop_map(CoreError::Policy),
-        arb_nonempty_string().prop_map(CoreError::Runtime),
+        arb_nonempty_string().prop_map(legacy_runtime_error),
         arb_nonempty_string().prop_map(CoreError::SetupError),
         arb_nonempty_string().prop_map(CoreError::Cancelled),
         arb_nonempty_string().prop_map(CoreError::Panicked),

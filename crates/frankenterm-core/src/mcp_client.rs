@@ -62,12 +62,14 @@ impl FtMcpClient {
         let start = Instant::now();
         let client = OutboundFrameworkClient::connect_stdio(&server, settings)
             .map_err(|err| map_mcp_error(&server.name, err))?;
+        let connect_timeout_ms = client.connect_timeout_ms();
 
         tracing::info!(
             target: LOG_TARGET,
             event = "mcp_client_connect",
             server = %server.name,
             command = %server.command,
+            connect_timeout_ms,
             elapsed_ms = start.elapsed().as_millis(),
             "Connected outbound MCP client"
         );
@@ -166,6 +168,11 @@ impl FtMcpClient {
     #[must_use]
     pub fn server_name(&self) -> &str {
         &self.server.name
+    }
+
+    /// Gracefully terminate the outbound MCP subprocess.
+    pub fn shutdown(self) {
+        self.client.shutdown();
     }
 }
 

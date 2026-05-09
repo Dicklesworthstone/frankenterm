@@ -3429,7 +3429,7 @@ pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(
 
     ftui::App::fullscreen(model)
         .run()
-        .map_err(|e| crate::Error::Runtime(format!("ftui runtime error: {e}")))?;
+        .map_err(|e| crate::Error::runtime_backend("ftui_tui_run", e.to_string()))?;
 
     Ok(())
 }

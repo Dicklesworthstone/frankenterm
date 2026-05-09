@@ -166,7 +166,7 @@ impl SoakHarness {
                     // Touch the snapshot so the compiler
                     // can't elide the acquire, then drop
                     // (auto-release).
-                    let _seq = guard.seqno;
+                    let _snapshot_marker = (guard.seqno, guard.cursor_x, guard.cursor_y);
                     drop(guard);
                 }
             }

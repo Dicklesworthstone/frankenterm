@@ -106,6 +106,11 @@ use mcp_missions::{
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
     mcp_tx_transition_info,
 };
+#[cfg(feature = "mcp-client")]
+pub use mcp_proxy::{
+    mcp_proxy_call_dispatch_failure_count, mcp_proxy_destructive_filtered_count,
+    mcp_proxy_mount_failure_count, mcp_proxy_unaudited_degraded_skip_count,
+};
 use mcp_resources::{
     WaAccountsByServiceTemplateResource, WaAccountsResource, WaEventsResource,
     WaEventsTemplateResource, WaEventsUnhandledTemplateResource, WaPanesResource,
@@ -120,6 +125,7 @@ use mcp_tools::{
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
 };
+pub use mcp_tools::{mcp_clock_anomaly_count, mcp_workflow_plan_serde_drop_count};
 #[cfg(feature = "fuzz")]
 use mcp_types::{
     AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams, CassViewParams,
@@ -1071,7 +1077,6 @@ fn record_mcp_audit_sync(
                             .is_some_and(|deadline| std::time::Instant::now() < deadline) =>
                     {
                         std::thread::sleep(std::time::Duration::from_millis(25));
-                        continue;
                     }
                     Err(e) => {
                         // br-ft-luav8: silent failure point #3

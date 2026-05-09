@@ -67,9 +67,10 @@ impl PaneTextSource for FakePaneSource {
             let map = texts.read().await;
             match map.get(&pane_id) {
                 Some(text) => Ok(text.clone()),
-                None => Err(frankenterm_core::Error::Runtime(format!(
-                    "pane {pane_id} not found"
-                ))),
+                None => Err(frankenterm_core::Error::runtime_backend(
+                    "fake_pane_source_get_text",
+                    format!("pane {pane_id} not found"),
+                )),
             }
         })
     }

@@ -44,10 +44,10 @@ fn snapshot_path() -> PathBuf {
 #[derive(Debug, Clone)]
 enum Json {
     Null,
-    Bool(bool),
+    Bool,
     Num(f64),
     Str(String),
-    Arr(Vec<Json>),
+    Arr,
     Obj(Vec<(String, Json)>),
 }
 
@@ -162,7 +162,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         if self.peek() == b']' {
             self.bump();
-            return Json::Arr(items);
+            return Json::Arr;
         }
         loop {
             let v = self.value();
@@ -174,7 +174,7 @@ impl<'a> Parser<'a> {
                 other => panic!("expected `,` or `]`, got `{}`", other as char),
             }
         }
-        Json::Arr(items)
+        Json::Arr
     }
     fn string(&mut self) -> String {
         self.expect(b'"');
@@ -202,10 +202,10 @@ impl<'a> Parser<'a> {
     fn bool(&mut self) -> Json {
         if self.src[self.pos..].starts_with(b"true") {
             self.pos += 4;
-            Json::Bool(true)
+            Json::Bool
         } else if self.src[self.pos..].starts_with(b"false") {
             self.pos += 5;
-            Json::Bool(false)
+            Json::Bool
         } else {
             panic!("expected bool at pos {}", self.pos)
         }

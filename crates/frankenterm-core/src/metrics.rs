@@ -448,10 +448,13 @@ impl MetricsServer {
 
     pub async fn start(self) -> Result<MetricsServerHandle> {
         if !is_localhost_bind(&self.bind) && !self.allow_public_bind {
-            return Err(crate::Error::Runtime(format!(
-                "refusing to bind metrics on public address '{}' — use --dangerous-bind-any to override",
-                self.bind
-            )));
+            return Err(crate::Error::runtime_backend(
+                "metrics bind validation",
+                format!(
+                    "refusing to bind metrics on public address '{}' — use --dangerous-bind-any to override",
+                    self.bind
+                ),
+            ));
         }
         if !is_localhost_bind(&self.bind) {
             warn!(
@@ -526,7 +529,7 @@ impl MetricsServer {
     /// promptly without waiting on the 250ms accept poll.
     ///
     /// Pre-flight: if `cx` is already cancelled on entry, the method
-    /// returns `Err(Error::Runtime(...))` without attempting to bind
+    /// returns `Err(Error::RuntimeOperation { .. })` without attempting to bind
     /// the TCP listener — an operator who has abandoned the metrics
     /// server should not leave a socket in LISTEN state.
     ///
@@ -534,16 +537,20 @@ impl MetricsServer {
     /// non-migrated callers; this is strictly additive.
     pub async fn start_with_cx(self, cx: &crate::cx::Cx) -> Result<MetricsServerHandle> {
         if cx.is_cancel_requested() {
-            return Err(crate::Error::Runtime(
-                "metrics server start aborted: capability context already cancelled".to_string(),
+            return Err(crate::Error::runtime_cancelled(
+                "metrics start",
+                "capability context already cancelled",
             ));
         }
 
         if !is_localhost_bind(&self.bind) && !self.allow_public_bind {
-            return Err(crate::Error::Runtime(format!(
-                "refusing to bind metrics on public address '{}' — use --dangerous-bind-any to override",
-                self.bind
-            )));
+            return Err(crate::Error::runtime_backend(
+                "metrics bind validation",
+                format!(
+                    "refusing to bind metrics on public address '{}' — use --dangerous-bind-any to override",
+                    self.bind
+                ),
+            ));
         }
         if !is_localhost_bind(&self.bind) {
             warn!(
@@ -605,7 +612,7 @@ impl MetricsServer {
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`handle_connection`].
 ///
-/// Pre-flight `cx.checkpoint()` folded into `crate::Error::Runtime`
+/// Pre-flight `cx.checkpoint()` folded into `crate::Error::RuntimeOperation`
 /// so a cancelled server shutdown interrupts the per-connection
 /// body before any TCP read. The read itself is not cx-aware
 /// (tokio/asupersync-compat `io::read` doesn't observe cx), but a
@@ -619,7 +626,7 @@ async fn handle_connection_with_cx(
     collector: Arc<dyn MetricsCollector>,
 ) -> Result<()> {
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!("metrics handle_connection cancelled: {err}"))
+        crate::Error::runtime_cancelled("metrics handle_connection", err.to_string())
     })?;
     let mut buf = [0_u8; 8192];
     let read_len = crate::runtime_async::io::read(&mut socket, &mut buf).await?;
@@ -627,9 +634,7 @@ async fn handle_connection_with_cx(
         return Ok(());
     }
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!(
-            "metrics handle_connection cancelled after read: {err}"
-        ))
+        crate::Error::runtime_cancelled("metrics handle_connection_after_read", err.to_string())
     })?;
     let request_bytes = buf[..read_len].to_vec();
     handle_connection_impl(socket, prefix, collector, request_bytes).await
@@ -1348,7 +1353,7 @@ mod tests {
 
     /// ft-xbnl0.2.3 Cx-first: `start_with_cx` with a pre-cancelled Cx
     /// must refuse to bind the TCP listener and surface an
-    /// `Error::Runtime` describing the cancellation. An operator who
+    /// `Error::RuntimeOperation` describing the cancellation. An operator who
     /// has already abandoned the server should not leave a socket in
     /// LISTEN state.
     #[test]

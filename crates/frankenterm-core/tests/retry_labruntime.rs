@@ -25,6 +25,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+fn retry_runtime_error(message: impl Into<String>) -> Error {
+    Error::runtime_backend("retry_labruntime", message)
+}
+
 // ===========================================================================
 // Section 1: Direct retry tests ported from tokio::test to RuntimeFixture
 //
@@ -77,7 +81,7 @@ fn retry_succeeds_after_failures() {
             async move {
                 let n = count.fetch_add(1, Ordering::SeqCst);
                 if n < 2 {
-                    Err(Error::Runtime("transient failure".into()))
+                    Err(retry_runtime_error("transient failure"))
                 } else {
                     Ok::<_, Error>(42)
                 }
@@ -109,7 +113,7 @@ fn retry_exhausts_attempts() {
             let count = Arc::clone(&call_count_clone);
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err(Error::Runtime("persistent failure".into()))
+                Err(retry_runtime_error("persistent failure"))
             }
         })
         .await;
@@ -140,7 +144,7 @@ fn retry_with_outcome_tracks_attempts() {
             async move {
                 let n = count.fetch_add(1, Ordering::SeqCst);
                 if n < 2 {
-                    Err(Error::Runtime("transient".into()))
+                    Err(retry_runtime_error("transient"))
                 } else {
                     Ok::<_, Error>(42)
                 }
@@ -166,7 +170,7 @@ fn retry_outcome_on_exhaustion_tracks_all_fields() {
         };
 
         let outcome: RetryOutcome<i32> = with_retry_outcome(&policy, || async {
-            Err::<i32, Error>(Error::Runtime("fail".into()))
+            Err::<i32, Error>(retry_runtime_error("fail"))
         })
         .await;
 
@@ -213,7 +217,7 @@ fn circuit_breaker_integration() {
         // First call fails and trips circuit
         let result: frankenterm_core::Result<i32> =
             with_retry_and_circuit(&policy, &mut circuit, || async {
-                Err(Error::Runtime("fail".into()))
+                Err(retry_runtime_error("fail"))
             })
             .await;
         assert!(result.is_err());
@@ -305,7 +309,7 @@ fn smart_retry_retries_retryable_errors() {
             async move {
                 let n = count.fetch_add(1, Ordering::SeqCst);
                 if n < 2 {
-                    Err(Error::Runtime("transient".into()))
+                    Err(retry_runtime_error("transient"))
                 } else {
                     Ok::<_, Error>(99)
                 }
@@ -337,7 +341,7 @@ fn smart_retry_exhausts_attempts_on_retryable_errors() {
             let count = Arc::clone(&call_count_clone);
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err(Error::Runtime("always fails".into()))
+                Err(retry_runtime_error("always fails"))
             }
         })
         .await;

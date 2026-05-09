@@ -43,7 +43,7 @@
 
 use std::sync::Once;
 
-use frankenterm_core::storage_backend_cells::{Row, RowCells, SqlCell, query_row_cells};
+use frankenterm_core::storage_backend_cells::{Row, SqlCell, query_row_cells};
 use frankenterm_core::storage_backend_trait::{
     OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
 };

@@ -43,7 +43,7 @@
 
 use std::sync::Once;
 
-use frankenterm_core::event_id::{RecorderMergeKey, StreamKind};
+use frankenterm_core::event_id::RecorderMergeKey;
 use frankenterm_core::recorder_replay::{ReplayConfig, ReplayDecisionRecord, ReplayScheduler};
 use frankenterm_core::recording::{RecorderEvent, RecorderEventCausality, RecorderEventPayload};
 use frankenterm_core_replay_types::recorder_metadata::{

@@ -28,7 +28,7 @@ use frankenterm_core::capability_passport::{
 };
 use frankenterm_core::capability_passport_store::{PassportKey, PassportStore};
 use frankenterm_core::capability_preflight::PreflightOutcome;
-use frankenterm_core::capability_probe::{ProbeRunner, ToolAvailabilityProbe};
+use frankenterm_core::capability_probe::ProbeRunner;
 use frankenterm_core::handoff_capsule::{CapsuleEndpoint, CapsuleSection, HandoffCapsule};
 use frankenterm_core::headless_mux_server::{
     HeadlessMuxServer, PassportExcerptDisposition, RemoteRequest, RemoteResponse, ServerConfig,

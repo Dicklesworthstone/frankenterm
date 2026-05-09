@@ -120,7 +120,7 @@ impl<'a> HandoffAwareResumePlan<'a> {
 }
 
 /// Recorded outcome for one capsule section's post-resume apply.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SectionApplyOutcome {
     pub section_index: usize,
     pub section_label: String,
@@ -144,7 +144,7 @@ pub enum SectionDisposition {
 }
 
 /// Summary of a complete handoff-aware resume cycle.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedHandoffSummary {
     pub session_id: String,
     pub target_provider_slug: String,

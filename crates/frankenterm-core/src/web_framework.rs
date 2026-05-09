@@ -67,7 +67,7 @@ impl FrameworkWebRuntime {
         app: App,
     ) -> Result<(SocketAddr, Self)> {
         cx.checkpoint()
-            .map_err(|err| Error::Runtime(format!("web start cancelled: {err}")))?;
+            .map_err(|err| Error::runtime_cancelled("web start", err.to_string()))?;
 
         match app.run_startup_hooks().await {
             StartupOutcome::Success => {}
@@ -75,15 +75,15 @@ impl FrameworkWebRuntime {
                 warn!(target: "wa.web", warnings, "web startup hooks had warnings");
             }
             StartupOutcome::Aborted(err) => {
-                return Err(Error::Runtime(format!(
-                    "web startup aborted: {}",
-                    err.message
-                )));
+                return Err(Error::runtime_backend(
+                    "web startup hooks",
+                    format!("web startup aborted: {}", err.message),
+                ));
             }
         }
 
         cx.checkpoint()
-            .map_err(|err| Error::Runtime(format!("web start cancelled before bind: {err}")))?;
+            .map_err(|err| Error::runtime_cancelled("web start before bind", err.to_string()))?;
 
         let app = Arc::new(app);
         let listener = TcpListener::bind(bind_addr.clone())
@@ -94,7 +94,7 @@ impl FrameworkWebRuntime {
         let server = Arc::new(TcpServer::new(ServerConfig::new(bind_addr)));
         let handler: Arc<dyn Handler> = Arc::clone(&app) as Arc<dyn Handler>;
         let runtime_handle = Runtime::current_handle()
-            .ok_or_else(|| Error::Runtime("web runtime unavailable during startup".to_string()))?;
+            .ok_or_else(|| Error::runtime_backend("web runtime", "unavailable during startup"))?;
 
         let join = {
             let server = Arc::clone(&server);
@@ -142,7 +142,7 @@ impl FrameworkWebRuntime {
             Ok(()) => {}
             Err(ServerError::Shutdown) => {}
             Err(err) => {
-                return Err(Error::Runtime(format!("web server error: {err}")));
+                return Err(Error::runtime_backend("web server", err.to_string()));
             }
         }
 
@@ -151,8 +151,9 @@ impl FrameworkWebRuntime {
             warn!(target: "wa.web", forced, "web server forced closed connections");
         }
         self.app.run_shutdown_hooks().await;
-        cx.checkpoint()
-            .map_err(|err| Error::Runtime(format!("web finish cancelled after shutdown: {err}")))?;
+        cx.checkpoint().map_err(|err| {
+            Error::runtime_cancelled("web finish after shutdown", err.to_string())
+        })?;
         Ok(())
     }
 }

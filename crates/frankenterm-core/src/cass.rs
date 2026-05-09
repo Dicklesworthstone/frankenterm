@@ -186,7 +186,7 @@ pub async fn export_sessions_with_cx(
     query: &CassExportQuery,
 ) -> crate::Result<Vec<CassExportSessionRecord>> {
     cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("cass export_sessions cancelled: {err}")))?;
+        .map_err(|err| crate::Error::runtime_cancelled("cass export_sessions", err.to_string()))?;
 
     let pane_workspaces: HashMap<u64, String> = storage
         .get_panes_with_cx(cx)
@@ -285,7 +285,7 @@ pub async fn export_content_with_cx(
     query: &CassContentExportQuery,
 ) -> crate::Result<Vec<CassExportContentChunk>> {
     cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("cass export_content cancelled: {err}")))?;
+        .map_err(|err| crate::Error::runtime_cancelled("cass export_content", err.to_string()))?;
 
     let session = resolve_export_session_with_cx(cx, storage, session_id).await?;
     let exported_session_id = export_session_identifier(&session);
@@ -837,9 +837,7 @@ async fn estimate_session_content_tokens_with_cx(
     session: &AgentSessionRecord,
 ) -> crate::Result<u64> {
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!(
-            "cass estimate_session_content_tokens cancelled: {err}"
-        ))
+        crate::Error::runtime_cancelled("cass estimate_session_content_tokens", err.to_string())
     })?;
     let segments = storage
         .export_segments_with_cx(
@@ -925,7 +923,7 @@ async fn resolve_export_session_with_cx(
     session_id: &str,
 ) -> crate::Result<AgentSessionRecord> {
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!("cass resolve_export_session cancelled: {err}"))
+        crate::Error::runtime_cancelled("cass resolve_export_session", err.to_string())
     })?;
     let requested_id = session_id.trim();
 

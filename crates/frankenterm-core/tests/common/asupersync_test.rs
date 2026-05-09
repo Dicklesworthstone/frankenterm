@@ -118,4 +118,5 @@ macro_rules! asupersync_test {
 
 // Re-export so a `use common::asupersync_test;` brings the bang-macro
 // into scope at the call site.
+#[allow(unused_imports)]
 pub use asupersync_test;

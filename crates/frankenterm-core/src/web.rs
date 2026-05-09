@@ -22,9 +22,13 @@ mod server;
 mod sse;
 mod websocket;
 
+pub use extractors::redact_depth_limit_hit_count;
 use server::poke_listener;
 pub use server::{run_web_server, start_web_server};
 pub use server::{run_web_server_with_cx, start_web_server_with_cx};
+pub use sse::{
+    epoch_clock_anomaly_count, sse_events_dropped_count, sse_streams_terminated_by_drop_cap_count,
+};
 
 #[cfg(test)]
 use crate::VERSION;
@@ -295,7 +299,7 @@ impl WebServerHandle {
         runtime.signal_shutdown();
         poke_listener(bound_addr);
         cx.checkpoint()
-            .map_err(|err| crate::Error::Runtime(format!("web shutdown cancelled: {err}")))?;
+            .map_err(|err| crate::Error::runtime_cancelled("web shutdown", err.to_string()))?;
         let result = runtime.join_handle_mut().await;
         runtime.finish_with_cx(cx, result).await
     }

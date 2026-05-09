@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// This list is the authoritative degraded-mode tool catalog; the
 /// regression tests below pin that no db-gated mutation surface leaks
 /// into the degraded build.
-pub(crate) const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
+pub const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
     "wa.state",
     "wa.wait_for",
     "wa.rules_list",
@@ -51,7 +51,7 @@ pub(crate) const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
 /// listed here even though the degraded catalog still exposes the same
 /// tool name, because the skipped registration is the audited/db-backed
 /// handler and degraded mode replaces it with a no-db handler.
-pub(crate) const DB_GATED_AUDITED_TOOL_NAMES: &[&str] = &[
+pub const DB_GATED_AUDITED_TOOL_NAMES: &[&str] = &[
     "wa.get_text",
     "wa.search",
     "wa.events",
@@ -80,7 +80,7 @@ pub(crate) const DB_GATED_AUDITED_TOOL_NAMES: &[&str] = &[
 /// unavailable, violating the br-ft-647cj degraded-mode expectation.
 /// Now gated to the `db_path = Some(_)` branch and wrapped in
 /// AuditedToolHandler so every mutation call is audit-recorded.
-pub(crate) const DB_GATED_MUTATING_TOOL_NAMES: &[&str] = &[
+pub const DB_GATED_MUTATING_TOOL_NAMES: &[&str] = &[
     "wa.tx_run",
     "wa.tx_rollback",
     "wa.mission_pause",
@@ -92,7 +92,7 @@ pub(crate) const DB_GATED_MUTATING_TOOL_NAMES: &[&str] = &[
 /// only in full mode. Keep this manifest in lockstep with the resource
 /// branch in `build_server_inner`; the skipped-entry counter derives
 /// from this list plus [`DB_GATED_AUDITED_TOOL_NAMES`].
-pub(crate) const DB_GATED_RESOURCE_URIS: &[&str] = &[
+pub const DB_GATED_RESOURCE_URIS: &[&str] = &[
     "wa://events",
     "wa://events/{limit}",
     "wa://events/unhandled/{limit}",
@@ -103,7 +103,7 @@ pub(crate) const DB_GATED_RESOURCE_URIS: &[&str] = &[
 ];
 
 #[must_use]
-pub(crate) fn mcp_bridge_degraded_mode_skipped_entries() -> u64 {
+pub fn mcp_bridge_degraded_mode_skipped_entries() -> u64 {
     (DB_GATED_AUDITED_TOOL_NAMES.len() + DB_GATED_RESOURCE_URIS.len()) as u64
 }
 

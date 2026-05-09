@@ -636,9 +636,9 @@ fn build_n_record_ledger_for_tamper(n: usize) -> TxExecutionLedger {
     ledger
 }
 
-/// br-ft-e9r75: tampering `risk` on any record after serde roundtrip
-/// must be detected. Pre-fix risk was excluded from the hash so this
-/// mutation slipped through silently.
+// br-ft-e9r75: tampering `risk` on any record after serde roundtrip
+// must be detected. Pre-fix risk was excluded from the hash so this
+// mutation slipped through silently.
 proptest! {
     #[test]
     fn ti_22_tamper_risk_field_detected_ft_e9r75(
@@ -676,9 +676,9 @@ proptest! {
     }
 }
 
-/// br-ft-e9r75: tampering `agent_id` on any record after serde roundtrip
-/// must be detected. Pre-fix agent_id was excluded from the hash so
-/// attribution mutations were invisible.
+// br-ft-e9r75: tampering `agent_id` on any record after serde roundtrip
+// must be detected. Pre-fix agent_id was excluded from the hash so
+// attribution mutations were invisible.
 proptest! {
     #[test]
     fn ti_23_tamper_agent_id_field_detected_ft_e9r75(
@@ -712,11 +712,11 @@ proptest! {
     }
 }
 
-/// br-ft-e9r75: tampering the FINAL record's outcome/timestamp/key after
-/// serde roundtrip must be detected. Pre-fix the chain walk only
-/// authenticated record[0..N-1] against record[N-1].prev_hash and never
-/// compared the recomputed tip against self.last_hash, so any mutation
-/// to the last record was invisible.
+// br-ft-e9r75: tampering the FINAL record's outcome/timestamp/key after
+// serde roundtrip must be detected. Pre-fix the chain walk only
+// authenticated record[0..N-1] against record[N-1].prev_hash and never
+// compared the recomputed tip against self.last_hash, so any mutation
+// to the last record was invisible.
 proptest! {
     #[test]
     fn ti_24_tamper_final_record_outcome_detected_ft_e9r75(n in 1usize..6) {
@@ -755,9 +755,9 @@ proptest! {
     }
 }
 
-/// br-ft-e9r75: untampered ledgers (post-serde-roundtrip) still verify
-/// clean. Vacuous-regression guard ensuring the new tip-authentication
-/// check doesn't false-positive on the legitimate happy path.
+// br-ft-e9r75: untampered ledgers (post-serde-roundtrip) still verify
+// clean. Vacuous-regression guard ensuring the new tip-authentication
+// check doesn't false-positive on the legitimate happy path.
 proptest! {
     #[test]
     fn ti_25_clean_ledger_after_serde_still_verifies_ft_e9r75(n in 1usize..15) {

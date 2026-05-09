@@ -237,6 +237,26 @@ pub enum Error {
 }
 
 impl Error {
+    /// Build a typed runtime-backend failure without using the deprecated
+    /// catch-all [`Error::Runtime`] variant.
+    #[must_use]
+    pub fn runtime_backend(operation: &'static str, detail: impl Into<String>) -> Self {
+        Self::RuntimeOperation {
+            operation,
+            source: RuntimeOperationSource::Backend(detail.into()),
+        }
+    }
+
+    /// Build a typed runtime-cancellation failure without using the deprecated
+    /// catch-all [`Error::Runtime`] variant.
+    #[must_use]
+    pub fn runtime_cancelled(operation: &'static str, detail: impl Into<String>) -> Self {
+        Self::RuntimeOperation {
+            operation,
+            source: RuntimeOperationSource::Cancelled(detail.into()),
+        }
+    }
+
     /// Return remediation guidance when available.
     #[allow(deprecated)]
     #[must_use]

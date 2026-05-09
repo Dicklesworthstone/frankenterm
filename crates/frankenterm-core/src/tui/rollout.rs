@@ -88,7 +88,7 @@ pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(
 
     match backend {
         TuiBackend::Ratatui => super::app::run_tui(query_client, config)
-            .map_err(|e| crate::Error::Runtime(format!("TUI (ratatui) error: {e}"))),
+            .map_err(|e| crate::Error::runtime_backend("ratatui_tui_run", e.to_string())),
         TuiBackend::Ftui => {
             // AppConfig is structurally identical in both backends but they are
             // distinct types.  Convert field-by-field for the ftui path.

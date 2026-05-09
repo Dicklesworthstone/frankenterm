@@ -20,6 +20,7 @@
 
 mod common;
 
+#[allow(unused_imports)]
 use common::asupersync_test;
 use common::fixtures::RuntimeFixture;
 

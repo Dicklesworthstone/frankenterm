@@ -50,7 +50,7 @@ pub async fn start_web_server_with_cx(
     use tracing::info;
 
     cx.checkpoint()
-        .map_err(|err| Error::Runtime(format!("start_web_server cancelled: {err}")))?;
+        .map_err(|err| Error::runtime_cancelled("start_web_server", err.to_string()))?;
 
     validate_bind_config(&config)?;
     let bind_addr = config.bind_addr();
@@ -106,10 +106,13 @@ fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
     } else {
         ""
     };
-    Err(Error::Runtime(format!(
-        "refusing to bind web server on non-localhost address '{}'{}: the current web API has no authentication boundary; bind to 127.0.0.1, ::1, or localhost until auth middleware lands",
-        config.host, override_note
-    )))
+    Err(Error::runtime_backend(
+        "web bind validation",
+        format!(
+            "refusing to bind web server on non-localhost address '{}'{}: the current web API has no authentication boundary; bind to 127.0.0.1, ::1, or localhost until auth middleware lands",
+            config.host, override_note
+        ),
+    ))
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`run_web_server`].
@@ -152,7 +155,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         use crate::runtime_async::signal::unix::SignalKind;
 
         let mut term = signal::unix::signal(SignalKind::terminate())
-            .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
+            .map_err(|e| Error::runtime_backend("web sigterm handler", e.to_string()))?;
 
         crate::runtime_async::select! {
             _ = signal::ctrl_c() => {}
@@ -164,7 +167,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     {
         signal::ctrl_c()
             .await
-            .map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
+            .map_err(|e| Error::runtime_backend("web ctrl_c handler", e.to_string()))?;
         Ok(())
     }
 }
@@ -184,10 +187,10 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use futures::pin_mut;
 
     cx.checkpoint()
-        .map_err(|err| Error::Runtime(format!("web shutdown wait cancelled: {err}")))?;
+        .map_err(|err| Error::runtime_cancelled("web shutdown wait", err.to_string()))?;
 
     let mut term = signal::unix::signal(SignalKind::terminate())
-        .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
+        .map_err(|e| Error::runtime_backend("web sigterm handler", e.to_string()))?;
 
     let cancel_fut = async {
         loop {
@@ -204,7 +207,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
 
     match select(select(ctrl_c, term_recv), cancel_fut).await {
         Either::Left((Either::Left((result, _)), _)) => {
-            result.map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
+            result.map_err(|e| Error::runtime_backend("web ctrl_c handler", e.to_string()))?;
         }
         Either::Left((Either::Right((_term, _)), _)) => {}
         Either::Right(((), _)) => {}
@@ -218,7 +221,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use futures::pin_mut;
 
     cx.checkpoint()
-        .map_err(|err| Error::Runtime(format!("web shutdown wait cancelled: {err}")))?;
+        .map_err(|err| Error::runtime_cancelled("web shutdown wait", err.to_string()))?;
 
     let cancel_fut = async {
         loop {
@@ -234,7 +237,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
 
     match select(ctrl_c, cancel_fut).await {
         Either::Left((result, _)) => {
-            result.map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
+            result.map_err(|e| Error::runtime_backend("web ctrl_c handler", e.to_string()))?;
         }
         Either::Right(((), _)) => {}
     }

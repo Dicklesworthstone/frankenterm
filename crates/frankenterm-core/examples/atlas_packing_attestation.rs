@@ -88,6 +88,7 @@ pub(crate) fn packer_label(kind: PackerKind) -> &'static str {
     }
 }
 
+#[cfg(not(test))]
 fn main() {
     let mut entries: Vec<String> = Vec::new();
     for (corpus_name, glyphs) in corpora() {

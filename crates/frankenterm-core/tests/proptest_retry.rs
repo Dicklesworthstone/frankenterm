@@ -320,6 +320,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
     #[test]
+    #[allow(deprecated)]
     fn runtime_errors_retryable(
         msg in "[a-z ]{5,50}",
     ) {

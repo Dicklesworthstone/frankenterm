@@ -35,6 +35,11 @@ fn arb_nonempty_string() -> impl Strategy<Value = String> {
         .prop_filter("must be non-empty", |s| !s.is_empty())
 }
 
+#[allow(deprecated)]
+fn legacy_runtime_error(message: String) -> CoreError {
+    CoreError::Runtime(message)
+}
+
 /// Arbitrary optional string for platform hints, learn_more links.
 fn arb_opt_string() -> impl Strategy<Value = Option<String>> {
     prop_oneof![Just(None), arb_nonempty_string().prop_map(Some),]
@@ -161,7 +166,7 @@ fn arb_core_error() -> impl Strategy<Value = CoreError> {
         arb_workflow_error().prop_map(CoreError::Workflow),
         arb_config_error().prop_map(CoreError::Config),
         arb_nonempty_string().prop_map(CoreError::Policy),
-        arb_nonempty_string().prop_map(CoreError::Runtime),
+        arb_nonempty_string().prop_map(legacy_runtime_error),
         arb_nonempty_string().prop_map(CoreError::SetupError),
         arb_nonempty_string().prop_map(CoreError::Cancelled),
         arb_nonempty_string().prop_map(CoreError::Panicked),
@@ -479,7 +484,7 @@ proptest! {
 
     #[test]
     fn error_display_contains_message_text_runtime(msg in arb_nonempty_string()) {
-        let err = CoreError::Runtime(msg.clone());
+        let err = legacy_runtime_error(msg.clone());
         let display = err.to_string();
         prop_assert!(display.contains(&msg), "Runtime display missing message: {}", display);
     }
@@ -772,7 +777,7 @@ proptest! {
 
     #[test]
     fn format_error_with_remediation_runtime(msg in arb_nonempty_string()) {
-        let err = CoreError::Runtime(msg.clone());
+        let err = legacy_runtime_error(msg.clone());
         let output = format_error_with_remediation(&err);
         prop_assert!(output.contains(&msg), "should contain runtime message: {}", output);
     }

@@ -514,7 +514,7 @@ impl<E: ProfileApplyMutationExecutor> FleetMutationExecutor
             .spawned_by_step
             .get(&original.step_id)
             .copied()
-            .or_else(|| match compensation {
+            .or(match compensation {
                 FleetMutationAction::StopAgent { pane_id, .. } if *pane_id != 0 => Some(*pane_id),
                 _ => None,
             })

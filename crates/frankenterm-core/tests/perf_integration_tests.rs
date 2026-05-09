@@ -813,10 +813,9 @@ fn pool_and_retry_integration() {
             let pool = pool_clone.clone();
             let ac = ac.clone();
             async move {
-                let guard = pool
-                    .acquire()
-                    .await
-                    .map_err(|e| frankenterm_core::Error::Runtime(e.to_string()))?;
+                let guard = pool.acquire().await.map_err(|e| {
+                    frankenterm_core::Error::runtime_backend("perf_pool_acquire", e.to_string())
+                })?;
                 ac.fetch_add(1, Ordering::SeqCst);
                 drop(guard);
                 Ok::<_, frankenterm_core::Error>(true)

@@ -25,7 +25,7 @@ use std::collections::{HashSet, VecDeque};
 
 use frankenterm_core::plan::{MissionKillSwitchLevel, MissionTxState};
 use frankenterm_core::tx_killswitch_model::{
-    KillSwitchAction, KillSwitchModelState, SafetyInvariant, apply, check_safety, enabled_actions,
+    KillSwitchAction, KillSwitchModelState, apply, check_safety, enabled_actions,
     hard_stop_admits_progress, is_drained,
 };
 use proptest::prelude::*;

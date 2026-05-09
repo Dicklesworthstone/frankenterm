@@ -143,7 +143,7 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
 /// valid bulk-input scenarios (paste of a long generated artifact,
 /// for instance), low enough to reject obvious DoS attempts before
 /// the payload reaches the injector / policy / wezterm pipeline.
-pub(crate) const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
 // br-ft-rnpuc: clock-anomaly observability for MCP tool audit
 // timestamps. mcp_tools.rs has 11 sites with the pattern
@@ -182,7 +182,7 @@ pub(crate) fn reset_mcp_clock_anomaly_count_for_test() {
 /// construction site so a hypothetical clock corruption gets
 /// observable, not silent. Same shape as policy.rs's
 /// `checked_now_ms_i64`.
-pub(crate) fn mcp_audit_ts_ms_from_u64(ts_ms: u64) -> i64 {
+pub fn mcp_audit_ts_ms_from_u64(ts_ms: u64) -> i64 {
     match i64::try_from(ts_ms) {
         Ok(v) => v,
         Err(_) => {
@@ -195,7 +195,7 @@ pub(crate) fn mcp_audit_ts_ms_from_u64(ts_ms: u64) -> i64 {
 /// Current MCP audit timestamp as signed milliseconds since the
 /// Unix epoch, with the same anomaly observability as
 /// [`mcp_audit_ts_ms_from_u64`].
-pub(crate) fn mcp_now_ms_i64() -> i64 {
+pub fn mcp_now_ms_i64() -> i64 {
     mcp_audit_ts_ms_from_u64(now_ms())
 }
 
@@ -222,8 +222,8 @@ static MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// represents one workflow_status response where the operator's
 /// stored plan record was schema-skewed and the response silently
 /// substituted `plan_step_name = None` + `total_steps = None`.
-/// > 0 means investigate the `workflow_action_plans` table for
-/// schema-bump or hand-edit corruption.
+/// A non-zero value means investigate the `workflow_action_plans`
+/// table for schema-bump or hand-edit corruption.
 #[must_use]
 pub fn mcp_workflow_plan_serde_drop_count() -> u64 {
     MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT.load(Ordering::Relaxed)
@@ -246,10 +246,7 @@ fn record_mcp_workflow_plan_serde_drop() {
 /// `serde_json::from_str::<ActionPlan>(&plan_json).ok()` pattern at
 /// `workflow_status_data` so plan-record corruption surfaces via
 /// metrics scrape AND log search.
-pub(crate) fn parse_workflow_plan_json(
-    plan_json: &str,
-    plan_id: &str,
-) -> Option<crate::plan::ActionPlan> {
+pub fn parse_workflow_plan_json(plan_json: &str, plan_id: &str) -> Option<crate::plan::ActionPlan> {
     match serde_json::from_str::<crate::plan::ActionPlan>(plan_json) {
         Ok(plan) => Some(plan),
         Err(err) => {
@@ -274,7 +271,7 @@ pub(crate) fn parse_workflow_plan_json(
 /// handlers backed by a current-thread runtime. Keep their operator-tunable
 /// wait window bounded so a malformed MCP client cannot pin a handler for
 /// hours or days.
-pub(crate) const MAX_MCP_WAIT_TIMEOUT_SECS: u64 = 600;
+pub const MAX_MCP_WAIT_TIMEOUT_SECS: u64 = 600;
 
 /// ft-<ux-audit>: shared hint string for every `MCP_ERR_POLICY` hard-deny
 /// response. Previously every deny site passed `None` as the hint,
@@ -285,7 +282,7 @@ pub(crate) const MAX_MCP_WAIT_TIMEOUT_SECS: u64 = 600;
 ///
 /// Kept as a single const so all 7 deny sites and the gate helper can
 /// diverge-by-accident-proof: one edit here, every hint updates.
-pub(crate) const POLICY_DENY_HINT: &str = "Hard policy deny: review `config.safety.rules` for the active deny list, \
+pub const POLICY_DENY_HINT: &str = "Hard policy deny: review `config.safety.rules` for the active deny list, \
      or query `policy_denied_audit` for the decision context (rule_id, reason). \
      Hard denies are not retryable without a policy change.";
 
@@ -312,8 +309,8 @@ fn validate_mcp_wait_timeout_secs(
 
 /// CASS timeout_secs schema bounds — single source of truth for
 /// `wa.cass_search`, `wa.cass_view`, and `wa.cass_status`.
-pub(crate) const CASS_TIMEOUT_SECS_MIN: u64 = 1;
-pub(crate) const CASS_TIMEOUT_SECS_MAX: u64 = 600;
+pub const CASS_TIMEOUT_SECS_MIN: u64 = 1;
+pub const CASS_TIMEOUT_SECS_MAX: u64 = 600;
 
 /// [ft-aylbh] Shared CASS timeout_secs guard used by `wa.cass_search`,
 /// `wa.cass_view`, and `wa.cass_status`. All three tool schemas declare
@@ -1604,6 +1601,7 @@ pub(super) struct WaGetTextTool {
 }
 
 impl WaGetTextTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -1868,6 +1866,7 @@ pub(super) struct WaWaitForTool {
 }
 
 impl WaWaitForTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -2202,6 +2201,7 @@ pub(super) struct WaSearchTool {
 }
 
 impl WaSearchTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -2814,6 +2814,7 @@ pub(super) struct WaSendTool {
 }
 
 impl WaSendTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::with_wezterm_handle_and_shared_rate_limiter(
@@ -3129,6 +3130,7 @@ pub(super) struct WaWorkflowRunTool {
 }
 
 impl WaWorkflowRunTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -3920,6 +3922,7 @@ pub(super) struct WaTxRunTool {
 }
 
 impl WaTxRunTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
@@ -4165,6 +4168,7 @@ pub(super) struct WaTxRollbackTool {
 }
 
 impl WaTxRollbackTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
@@ -4455,6 +4459,7 @@ pub(super) struct WaReserveTool {
 }
 
 impl WaReserveTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -4630,6 +4635,7 @@ pub(super) struct WaReleaseTool {
 }
 
 impl WaReleaseTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -4905,6 +4911,7 @@ pub(super) struct WaAccountsRefreshTool {
 }
 
 impl WaAccountsRefreshTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -5396,6 +5403,7 @@ pub(super) struct WaMissionPauseTool {
 }
 
 impl WaMissionPauseTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
@@ -5543,6 +5551,7 @@ pub(super) struct WaMissionResumeTool {
 }
 
 impl WaMissionResumeTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
@@ -5681,6 +5690,7 @@ pub(super) struct WaMissionAbortTool {
 }
 
 impl WaMissionAbortTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
@@ -5835,6 +5845,7 @@ pub(super) struct WaEventsAnnotateTool {
 }
 
 impl WaEventsAnnotateTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -6062,6 +6073,7 @@ pub(super) struct WaEventsTriageTool {
 }
 
 impl WaEventsTriageTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
@@ -6277,6 +6289,7 @@ pub(super) struct WaEventsLabelTool {
 }
 
 impl WaEventsLabelTool {
+    #[cfg(test)]
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
         let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
         Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)

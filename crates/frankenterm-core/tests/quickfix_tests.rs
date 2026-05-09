@@ -13,6 +13,11 @@ use frankenterm_core::explanations::{
 };
 use frankenterm_core::storage::StoredEvent;
 
+#[allow(deprecated)]
+fn legacy_runtime_error(message: &str) -> Error {
+    Error::Runtime(message.to_string())
+}
+
 // =========================================================================
 // 1. Template Interpolation Tests
 // =========================================================================
@@ -173,7 +178,7 @@ fn every_error_variant_has_remediation() {
         Error::Policy("denied".to_string()),
         Error::Io(std::io::Error::other("io")),
         Error::Json(json_err),
-        Error::Runtime("runtime".to_string()),
+        legacy_runtime_error("runtime"),
         Error::SetupError("setup failed".to_string()),
     ];
 
@@ -278,7 +283,7 @@ fn remediation_commands_have_no_smart_quotes() {
         Error::Policy("denied".to_string()),
         Error::Io(std::io::Error::other("io")),
         Error::Json(json_err),
-        Error::Runtime("runtime".to_string()),
+        legacy_runtime_error("runtime"),
         Error::SetupError("setup".to_string()),
     ];
 
@@ -535,7 +540,7 @@ fn error_renderer_maps_all_error_variants_to_catalog() {
         Error::Policy("denied".to_string()),
         Error::Io(std::io::Error::other("io")),
         Error::Json(json_err),
-        Error::Runtime("runtime".to_string()),
+        legacy_runtime_error("runtime"),
         Error::SetupError("setup".to_string()),
     ];
 

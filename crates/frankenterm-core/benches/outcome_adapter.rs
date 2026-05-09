@@ -101,7 +101,8 @@ fn bench_result_ext(c: &mut Criterion) {
 
     group.bench_function("into_outcome_err", |b| {
         b.iter(|| {
-            let r: frankenterm_core::Result<i32> = Err(Error::Runtime("fail".into()));
+            let r: frankenterm_core::Result<i32> =
+                Err(Error::runtime_backend("outcome_adapter_bench", "fail"));
             black_box(r.into_outcome())
         });
     });
@@ -126,7 +127,8 @@ fn bench_roundtrip(c: &mut Criterion) {
 
     group.bench_function("err_result_outcome_result", |b| {
         b.iter(|| {
-            let r: frankenterm_core::Result<i32> = Err(Error::Runtime("fail".into()));
+            let r: frankenterm_core::Result<i32> =
+                Err(Error::runtime_backend("outcome_adapter_bench", "fail"));
             let o = ft_result_to_outcome(r);
             black_box(ft_outcome_to_result(o))
         });
