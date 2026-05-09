@@ -849,6 +849,494 @@ fn parse_decimal_size(number: &str, multiplier: u64) -> Option<u64> {
 }
 
 // =============================================================================
+// Resource-pressure action receipts and attribution
+// =============================================================================
+
+/// Schema version for compact resource-pressure action receipts.
+pub const RESOURCE_PRESSURE_ACTION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+/// Cockpit domain an action receipt is intended to relieve or audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourcePressureDomain {
+    /// Host or process memory pressure.
+    Memory,
+    /// RSS residency classification and leak triage.
+    RssResidency,
+    /// Per-pane memory budget pressure.
+    PaneBudget,
+    /// Capture/write/persistence/search queue pressure.
+    QueueBackpressure,
+    /// SQLite, cold-tier, or target-dir IO pressure.
+    StorageIo,
+    /// RCH/worker-pool pressure.
+    WorkerPool,
+    /// Capacity-level admission decisions.
+    CapacityAdmission,
+    /// Resource-level admission decisions.
+    ResourceAdmission,
+    /// Health of the receipts themselves.
+    ActionReceipts,
+}
+
+impl ResourcePressureDomain {
+    const ALL: [Self; 9] = [
+        Self::Memory,
+        Self::RssResidency,
+        Self::PaneBudget,
+        Self::QueueBackpressure,
+        Self::StorageIo,
+        Self::WorkerPool,
+        Self::CapacityAdmission,
+        Self::ResourceAdmission,
+        Self::ActionReceipts,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Memory => 0,
+            Self::RssResidency => 1,
+            Self::PaneBudget => 2,
+            Self::QueueBackpressure => 3,
+            Self::StorageIo => 4,
+            Self::WorkerPool => 5,
+            Self::CapacityAdmission => 6,
+            Self::ResourceAdmission => 7,
+            Self::ActionReceipts => 8,
+        }
+    }
+}
+
+/// Mitigation or audit action represented by a resource-pressure receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourcePressureAction {
+    /// Observe and retain evidence only.
+    Observe,
+    /// Delay a non-critical admission.
+    DelayAdmission,
+    /// Degrade capture/search fidelity with an explicit receipt.
+    DegradeCapture,
+    /// Shed optional work.
+    ShedOptionalWork,
+    /// Compress scrollback.
+    CompressScrollback,
+    /// Evict scrollback or cold data to disk.
+    EvictScrollback,
+    /// Throttle a queue or worker lane.
+    ThrottleQueue,
+    /// Block admission because policy or telemetry requires fail-closed behavior.
+    BlockAdmission,
+    /// Roll back a prior pressure action.
+    Rollback,
+    /// Compensate after a failed or partial action.
+    Compensate,
+}
+
+/// Receipt lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourcePressureReceiptStatus {
+    /// Action is only planned.
+    Planned,
+    /// Caller intentionally performed no side effect.
+    DryRun,
+    /// Side effect was applied but not independently confirmed.
+    Applied,
+    /// Side effect was applied and confirmed.
+    Succeeded,
+    /// Action was blocked before side effects.
+    Blocked,
+    /// Action attempted and failed.
+    Failed,
+    /// Compensation ran after a partial or failed action.
+    Compensated,
+    /// Compensation failed.
+    CompensationFailed,
+    /// Rollback is required before more actions are safe.
+    RollbackRequired,
+}
+
+impl ResourcePressureReceiptStatus {
+    const fn is_failed(self) -> bool {
+        matches!(
+            self,
+            Self::Failed | Self::CompensationFailed | Self::RollbackRequired
+        )
+    }
+
+    const fn is_blocked(self) -> bool {
+        matches!(self, Self::Blocked)
+    }
+
+    const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Planned => "action_receipt.planned",
+            Self::DryRun => "action_receipt.dry_run",
+            Self::Applied | Self::Succeeded => "action_receipt.applied",
+            Self::Blocked => "action_receipt.blocked",
+            Self::Failed | Self::CompensationFailed => "action_receipt.failed",
+            Self::Compensated => "action_receipt.compensated",
+            Self::RollbackRequired => "action_receipt.rollback_required",
+        }
+    }
+}
+
+/// Policy outcome attached to an action receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourcePressurePolicyDecision {
+    /// Policy allowed the action.
+    Allow,
+    /// Policy denied the action.
+    Deny,
+    /// Policy requires operator approval.
+    RequireApproval,
+    /// No policy gate was checked.
+    NotChecked,
+}
+
+/// Trust state for resource-pressure action evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourcePressureEvidenceState {
+    /// Evidence came from a live measured run.
+    Measured,
+    /// Evidence came from a fixture, replay, dry-run, or simulator.
+    Simulated,
+    /// Telemetry was missing, unreadable, or intentionally not wired.
+    Unavailable,
+    /// Telemetry is older than the caller's freshness budget.
+    Stale,
+    /// The receipt combines sources with different freshness states.
+    Mixed,
+}
+
+/// Known subject attribution for one pressure action.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureAttribution {
+    /// Pane id affected by this action, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    /// Agent name affected by this action, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    /// Target directory or build/output root affected by this action, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_dir: Option<String>,
+    /// Queue or lane affected by this action, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_name: Option<String>,
+    /// Bytes affected, refused, evicted, compressed, or delayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected_bytes: Option<u64>,
+}
+
+impl ResourcePressureAttribution {
+    fn is_unknown(&self) -> bool {
+        self.pane_id.is_none()
+            && self.agent_name.is_none()
+            && self.target_dir.is_none()
+            && self.queue_name.is_none()
+            && self.affected_bytes.is_none()
+    }
+}
+
+/// Caller-supplied input for a pure resource-pressure receipt normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePressureActionReceiptInput {
+    /// Stable idempotency or audit id.
+    pub receipt_id: String,
+    /// Optional cross-surface correlation id.
+    pub correlation_id: Option<String>,
+    /// Requested action.
+    pub action: ResourcePressureAction,
+    /// Domain the action is meant to relieve.
+    pub target_domain: ResourcePressureDomain,
+    /// Request timestamp in milliseconds since the caller's chosen epoch.
+    pub requested_at_ms: u64,
+    /// Completion timestamp when known.
+    pub completed_at_ms: Option<u64>,
+    /// Caller-observed status.
+    pub status: ResourcePressureReceiptStatus,
+    /// Whether the caller intentionally avoided side effects.
+    pub dry_run: bool,
+    /// Policy gate decision.
+    pub policy_decision: ResourcePressurePolicyDecision,
+    /// Evidence freshness for the receipt.
+    pub evidence_state: ResourcePressureEvidenceState,
+    /// Known attribution.
+    pub attribution: ResourcePressureAttribution,
+    /// Caller-supplied reason codes.
+    pub reason_codes: Vec<String>,
+    /// Proof, audit, or replay artifacts.
+    pub artifact_paths: Vec<String>,
+}
+
+/// Normalized compact resource-pressure action receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureActionReceipt {
+    /// Receipt schema version.
+    pub schema_version: u32,
+    /// Stable idempotency or audit id.
+    pub receipt_id: String,
+    /// Optional cross-surface correlation id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Requested action.
+    pub action: ResourcePressureAction,
+    /// Domain the action is meant to relieve.
+    pub target_domain: ResourcePressureDomain,
+    /// Request timestamp in milliseconds.
+    pub requested_at_ms: u64,
+    /// Completion timestamp when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    /// Normalized status.
+    pub status: ResourcePressureReceiptStatus,
+    /// Whether side effects were intentionally avoided.
+    pub dry_run: bool,
+    /// Policy decision after fail-closed normalization.
+    pub policy_decision: ResourcePressurePolicyDecision,
+    /// Evidence freshness for the receipt.
+    pub evidence_state: ResourcePressureEvidenceState,
+    /// Known subject attribution.
+    pub attribution: ResourcePressureAttribution,
+    /// Stable reason codes.
+    pub reason_codes: Vec<String>,
+    /// Proof, audit, or replay artifacts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_paths: Vec<String>,
+}
+
+/// Per-domain receipt rollup for cockpit summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureDomainReceiptSummary {
+    /// Domain represented by this row.
+    pub target_domain: ResourcePressureDomain,
+    /// Total receipts in the domain.
+    pub total: u64,
+    /// Applied or succeeded receipts.
+    pub applied: u64,
+    /// Dry-run receipts.
+    pub dry_run: u64,
+    /// Blocked receipts.
+    pub blocked: u64,
+    /// Failed, compensation-failed, or rollback-required receipts.
+    pub failed: u64,
+    /// Receipts with unavailable evidence.
+    pub unavailable: u64,
+    /// Receipts with stale evidence.
+    pub stale: u64,
+    /// Stable reason codes observed in this domain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+}
+
+impl ResourcePressureDomainReceiptSummary {
+    const fn empty(target_domain: ResourcePressureDomain) -> Self {
+        Self {
+            target_domain,
+            total: 0,
+            applied: 0,
+            dry_run: 0,
+            blocked: 0,
+            failed: 0,
+            unavailable: 0,
+            stale: 0,
+            reason_codes: Vec::new(),
+        }
+    }
+}
+
+/// Complete receipt report for Robot/MCP/operator cockpit consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePressureActionReceiptReport {
+    /// Receipt schema version.
+    pub schema_version: u32,
+    /// Normalized receipts.
+    pub receipts: Vec<ResourcePressureActionReceipt>,
+    /// Per-domain rollups.
+    pub domain_summaries: Vec<ResourcePressureDomainReceiptSummary>,
+    /// Count of blocked receipts.
+    pub blocked_receipts: u64,
+    /// Count of failed receipts.
+    pub failed_receipts: u64,
+    /// Count of receipts with unavailable evidence.
+    pub unavailable_receipts: u64,
+    /// Count of receipts with stale evidence.
+    pub stale_receipts: u64,
+    /// Report-level reason codes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+}
+
+/// Normalize resource-pressure action receipts without performing side effects.
+///
+/// Missing telemetry is fail-closed for non-dry-run actions that would otherwise
+/// report progress. The receipt is rewritten to `blocked`, policy is escalated
+/// to `require_approval`, and the reason codes preserve the original cause.
+#[must_use]
+pub fn evaluate_resource_pressure_action_receipts(
+    inputs: &[ResourcePressureActionReceiptInput],
+) -> ResourcePressureActionReceiptReport {
+    let receipts = inputs
+        .iter()
+        .map(normalize_resource_pressure_action_receipt)
+        .collect::<Vec<_>>();
+    let domain_summaries = summarize_resource_pressure_receipt_domains(&receipts);
+
+    let blocked_receipts = receipts
+        .iter()
+        .filter(|receipt| receipt.status.is_blocked())
+        .count() as u64;
+    let failed_receipts = receipts
+        .iter()
+        .filter(|receipt| receipt.status.is_failed())
+        .count() as u64;
+    let unavailable_receipts = receipts
+        .iter()
+        .filter(|receipt| receipt.evidence_state == ResourcePressureEvidenceState::Unavailable)
+        .count() as u64;
+    let stale_receipts = receipts
+        .iter()
+        .filter(|receipt| receipt.evidence_state == ResourcePressureEvidenceState::Stale)
+        .count() as u64;
+
+    let mut reason_codes = Vec::new();
+    for receipt in &receipts {
+        for reason_code in &receipt.reason_codes {
+            push_reason_code(&mut reason_codes, reason_code);
+        }
+    }
+
+    ResourcePressureActionReceiptReport {
+        schema_version: RESOURCE_PRESSURE_ACTION_RECEIPT_SCHEMA_VERSION,
+        receipts,
+        domain_summaries,
+        blocked_receipts,
+        failed_receipts,
+        unavailable_receipts,
+        stale_receipts,
+        reason_codes,
+    }
+}
+
+fn normalize_resource_pressure_action_receipt(
+    input: &ResourcePressureActionReceiptInput,
+) -> ResourcePressureActionReceipt {
+    let mut status = if input.dry_run {
+        ResourcePressureReceiptStatus::DryRun
+    } else {
+        input.status
+    };
+    let mut policy_decision = input.policy_decision;
+    let mut reason_codes = input.reason_codes.clone();
+
+    match input.evidence_state {
+        ResourcePressureEvidenceState::Measured => {}
+        ResourcePressureEvidenceState::Simulated => {
+            push_reason_code(&mut reason_codes, "resource.telemetry.simulated");
+        }
+        ResourcePressureEvidenceState::Unavailable => {
+            push_reason_code(&mut reason_codes, "resource.telemetry.unavailable");
+            if !input.dry_run
+                && matches!(
+                    status,
+                    ResourcePressureReceiptStatus::Planned
+                        | ResourcePressureReceiptStatus::Applied
+                        | ResourcePressureReceiptStatus::Succeeded
+                )
+            {
+                status = ResourcePressureReceiptStatus::Blocked;
+                push_reason_code(&mut reason_codes, "admission.fail_closed.missing_telemetry");
+                policy_decision = ResourcePressurePolicyDecision::RequireApproval;
+            }
+        }
+        ResourcePressureEvidenceState::Stale => {
+            push_reason_code(&mut reason_codes, "resource.telemetry.stale");
+        }
+        ResourcePressureEvidenceState::Mixed => {
+            push_reason_code(&mut reason_codes, "resource.telemetry.mixed");
+        }
+    }
+
+    if input.attribution.is_unknown() {
+        push_reason_code(&mut reason_codes, "resource.attribution.unknown");
+    }
+    push_reason_code(&mut reason_codes, status.reason_code());
+
+    ResourcePressureActionReceipt {
+        schema_version: RESOURCE_PRESSURE_ACTION_RECEIPT_SCHEMA_VERSION,
+        receipt_id: input.receipt_id.clone(),
+        correlation_id: input.correlation_id.clone(),
+        action: input.action,
+        target_domain: input.target_domain,
+        requested_at_ms: input.requested_at_ms,
+        completed_at_ms: input.completed_at_ms,
+        status,
+        dry_run: input.dry_run,
+        policy_decision,
+        evidence_state: input.evidence_state,
+        attribution: input.attribution.clone(),
+        reason_codes,
+        artifact_paths: input.artifact_paths.clone(),
+    }
+}
+
+fn summarize_resource_pressure_receipt_domains(
+    receipts: &[ResourcePressureActionReceipt],
+) -> Vec<ResourcePressureDomainReceiptSummary> {
+    let mut summaries = ResourcePressureDomain::ALL
+        .iter()
+        .copied()
+        .map(ResourcePressureDomainReceiptSummary::empty)
+        .collect::<Vec<_>>();
+
+    for receipt in receipts {
+        let summary = &mut summaries[receipt.target_domain.index()];
+        summary.total = summary.total.saturating_add(1);
+        match receipt.status {
+            ResourcePressureReceiptStatus::Applied | ResourcePressureReceiptStatus::Succeeded => {
+                summary.applied = summary.applied.saturating_add(1);
+            }
+            ResourcePressureReceiptStatus::DryRun => {
+                summary.dry_run = summary.dry_run.saturating_add(1);
+            }
+            ResourcePressureReceiptStatus::Blocked => {
+                summary.blocked = summary.blocked.saturating_add(1);
+            }
+            ResourcePressureReceiptStatus::Failed
+            | ResourcePressureReceiptStatus::CompensationFailed
+            | ResourcePressureReceiptStatus::RollbackRequired => {
+                summary.failed = summary.failed.saturating_add(1);
+            }
+            ResourcePressureReceiptStatus::Planned | ResourcePressureReceiptStatus::Compensated => {
+            }
+        }
+        match receipt.evidence_state {
+            ResourcePressureEvidenceState::Unavailable => {
+                summary.unavailable = summary.unavailable.saturating_add(1);
+            }
+            ResourcePressureEvidenceState::Stale => {
+                summary.stale = summary.stale.saturating_add(1);
+            }
+            ResourcePressureEvidenceState::Measured
+            | ResourcePressureEvidenceState::Simulated
+            | ResourcePressureEvidenceState::Mixed => {}
+        }
+        for reason_code in &receipt.reason_codes {
+            push_reason_code(&mut summary.reason_codes, reason_code);
+        }
+    }
+
+    summaries
+        .into_iter()
+        .filter(|summary| summary.total > 0)
+        .collect()
+}
+
+// =============================================================================
 // Monitor
 // =============================================================================
 
@@ -1516,6 +2004,221 @@ Call graph:
                 .reason_codes
                 .iter()
                 .any(|code| code == "resource.memory.scrollback_stack_signal")
+        );
+    }
+
+    fn receipt_input(
+        receipt_id: &str,
+        action: ResourcePressureAction,
+        target_domain: ResourcePressureDomain,
+        status: ResourcePressureReceiptStatus,
+        evidence_state: ResourcePressureEvidenceState,
+    ) -> ResourcePressureActionReceiptInput {
+        ResourcePressureActionReceiptInput {
+            receipt_id: receipt_id.to_string(),
+            correlation_id: None,
+            action,
+            target_domain,
+            requested_at_ms: 1_000,
+            completed_at_ms: None,
+            status,
+            dry_run: false,
+            policy_decision: ResourcePressurePolicyDecision::Allow,
+            evidence_state,
+            attribution: ResourcePressureAttribution::default(),
+            reason_codes: Vec::new(),
+            artifact_paths: Vec::new(),
+        }
+    }
+
+    fn receipt_for<'a>(
+        report: &'a ResourcePressureActionReceiptReport,
+        receipt_id: &str,
+    ) -> &'a ResourcePressureActionReceipt {
+        report
+            .receipts
+            .iter()
+            .find(|receipt| receipt.receipt_id == receipt_id)
+            .expect("receipt should be present")
+    }
+
+    fn domain_summary_for(
+        report: &ResourcePressureActionReceiptReport,
+        target_domain: ResourcePressureDomain,
+    ) -> &ResourcePressureDomainReceiptSummary {
+        report
+            .domain_summaries
+            .iter()
+            .find(|summary| summary.target_domain == target_domain)
+            .expect("domain summary should be present")
+    }
+
+    #[test]
+    fn resource_pressure_receipts_fail_closed_on_missing_telemetry() {
+        let report = evaluate_resource_pressure_action_receipts(&[receipt_input(
+            "admission-missing-telemetry",
+            ResourcePressureAction::DelayAdmission,
+            ResourcePressureDomain::ResourceAdmission,
+            ResourcePressureReceiptStatus::Applied,
+            ResourcePressureEvidenceState::Unavailable,
+        )]);
+
+        let receipt = receipt_for(&report, "admission-missing-telemetry");
+        assert_eq!(receipt.status, ResourcePressureReceiptStatus::Blocked);
+        assert_eq!(
+            receipt.policy_decision,
+            ResourcePressurePolicyDecision::RequireApproval
+        );
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| { code == "admission.fail_closed.missing_telemetry" })
+        );
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| { code == "resource.telemetry.unavailable" })
+        );
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| { code == "action_receipt.blocked" })
+        );
+        assert_eq!(report.blocked_receipts, 1);
+        assert_eq!(report.unavailable_receipts, 1);
+        assert_eq!(
+            domain_summary_for(&report, ResourcePressureDomain::ResourceAdmission).blocked,
+            1
+        );
+    }
+
+    #[test]
+    fn resource_pressure_receipts_preserve_stale_attribution_and_correlation() {
+        let mut input = receipt_input(
+            "pane-degrade-stale",
+            ResourcePressureAction::DegradeCapture,
+            ResourcePressureDomain::PaneBudget,
+            ResourcePressureReceiptStatus::Planned,
+            ResourcePressureEvidenceState::Stale,
+        );
+        input.correlation_id = Some("pressure-run-42".to_string());
+        input.policy_decision = ResourcePressurePolicyDecision::RequireApproval;
+        input.attribution = ResourcePressureAttribution {
+            pane_id: Some(42),
+            agent_name: Some("TopazPuma".to_string()),
+            target_dir: Some("/tmp/ft-target".to_string()),
+            queue_name: None,
+            affected_bytes: Some(64 * 1024 * 1024),
+        };
+        input.artifact_paths = vec!["docs/resource-pressure/pane-42.json".to_string()];
+
+        let report = evaluate_resource_pressure_action_receipts(&[input]);
+        let receipt = receipt_for(&report, "pane-degrade-stale");
+
+        assert_eq!(receipt.status, ResourcePressureReceiptStatus::Planned);
+        assert_eq!(receipt.correlation_id.as_deref(), Some("pressure-run-42"));
+        assert_eq!(receipt.attribution.pane_id, Some(42));
+        assert_eq!(receipt.attribution.agent_name.as_deref(), Some("TopazPuma"));
+        assert_eq!(receipt.artifact_paths.len(), 1);
+        assert!(
+            receipt
+                .reason_codes
+                .iter()
+                .any(|code| { code == "resource.telemetry.stale" })
+        );
+        assert!(
+            !receipt
+                .reason_codes
+                .iter()
+                .any(|code| { code == "resource.attribution.unknown" })
+        );
+        assert_eq!(report.stale_receipts, 1);
+        assert_eq!(
+            domain_summary_for(&report, ResourcePressureDomain::PaneBudget).stale,
+            1
+        );
+    }
+
+    #[test]
+    fn resource_pressure_receipts_summarize_multiple_domains() {
+        let mut memory = receipt_input(
+            "memory-scrollback-applied",
+            ResourcePressureAction::EvictScrollback,
+            ResourcePressureDomain::Memory,
+            ResourcePressureReceiptStatus::Succeeded,
+            ResourcePressureEvidenceState::Measured,
+        );
+        memory.attribution = ResourcePressureAttribution {
+            pane_id: Some(7),
+            agent_name: None,
+            target_dir: None,
+            queue_name: None,
+            affected_bytes: Some(128 * 1024 * 1024),
+        };
+
+        let mut queue = receipt_input(
+            "queue-throttle-failed",
+            ResourcePressureAction::ThrottleQueue,
+            ResourcePressureDomain::QueueBackpressure,
+            ResourcePressureReceiptStatus::Failed,
+            ResourcePressureEvidenceState::Measured,
+        );
+        queue.attribution = ResourcePressureAttribution {
+            pane_id: None,
+            agent_name: None,
+            target_dir: None,
+            queue_name: Some("capture".to_string()),
+            affected_bytes: None,
+        };
+
+        let mut storage = receipt_input(
+            "storage-dry-run",
+            ResourcePressureAction::ShedOptionalWork,
+            ResourcePressureDomain::StorageIo,
+            ResourcePressureReceiptStatus::Planned,
+            ResourcePressureEvidenceState::Simulated,
+        );
+        storage.dry_run = true;
+        storage.policy_decision = ResourcePressurePolicyDecision::NotChecked;
+        storage.reason_codes = vec!["storage_io.defer.search_freshness_lag".to_string()];
+
+        let report = evaluate_resource_pressure_action_receipts(&[memory, queue, storage]);
+
+        assert_eq!(report.receipts.len(), 3);
+        assert_eq!(report.failed_receipts, 1);
+        assert_eq!(report.domain_summaries.len(), 3);
+        assert_eq!(
+            domain_summary_for(&report, ResourcePressureDomain::Memory).applied,
+            1
+        );
+        assert_eq!(
+            domain_summary_for(&report, ResourcePressureDomain::QueueBackpressure).failed,
+            1
+        );
+        assert_eq!(
+            domain_summary_for(&report, ResourcePressureDomain::StorageIo).dry_run,
+            1
+        );
+        assert!(
+            report
+                .reason_codes
+                .iter()
+                .any(|code| { code == "action_receipt.failed" })
+        );
+        assert!(
+            report
+                .reason_codes
+                .iter()
+                .any(|code| { code == "action_receipt.dry_run" })
+        );
+        assert!(
+            report
+                .reason_codes
+                .iter()
+                .any(|code| { code == "resource.telemetry.simulated" })
         );
     }
 

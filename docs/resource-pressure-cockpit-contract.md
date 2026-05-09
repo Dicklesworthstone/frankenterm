@@ -281,6 +281,26 @@ Each receipt must include:
 A recommendation without a receipt is only a recommendation. A mutation without
 a receipt is a defect in the later implementation.
 
+### Operator Interpretation
+
+Pressure actions are operational controls, not source-code failure verdicts.
+`delay_admission`, `degrade_capture`, `shed_optional_work`, `compress_scrollback`,
+and `evict_scrollback` mean the cockpit is preserving service under current
+resource evidence. Operators should first inspect `evidence_state`,
+`policy_decision`, and `reason_codes`:
+
+- `dry_run` or `planned` receipts prove intent only; they do not prove a side
+  effect happened.
+- `blocked` receipts with `admission.fail_closed.missing_telemetry` mean the
+  system refused to act because required telemetry was absent or stale enough to
+  make the action unsafe.
+- `applied` or `succeeded` receipts require a correlation id, affected resource
+  attribution when known, and artifact paths before they can be cited as proof.
+- `failed`, `compensation_failed`, or `rollback_required` receipts are
+  operational incidents for that action lane. They are not evidence that the
+  underlying pane, agent, or connector is defective without separate drilldown
+  evidence.
+
 ## Reason Codes
 
 Reason codes are low-cardinality, machine-readable strings. Use existing code
