@@ -128,6 +128,7 @@ bash scripts/validate_asupersync_rch_execution_policy.sh --self-test
 bash scripts/validate_asupersync_rch_execution_policy.sh --classify "cargo test --workspace"
 bash scripts/validate_asupersync_rch_execution_policy.sh --redact-text "API_KEY=... cargo test"
 bash scripts/validate_asupersync_rch_execution_policy.sh --validate-evidence <path-to-evidence.json>
+bash scripts/validate_asupersync_rch_execution_policy.sh --aggregate-ledger <path-to-ledger.jsonl>
 ```
 
 E2E policy validation:
@@ -152,11 +153,34 @@ Successful remote entries validate directly. Fail-open local fallback,
 timeouts, non-zero wrapper exits, missing metadata, or unredacted public fields
 produce entries that are intentionally not valid proof.
 
+Aggregate quality gate:
+
+- `--aggregate-ledger` scans a proof-ledger JSONL file, validates every run in
+  every retained evidence object, and emits an operator report.
+- Each row carries the bead ID, scenario ID, command, worker context, artifact
+  path(s), category, and stable reason code so Beads and release-readiness
+  comments can cite the exact proof shape.
+- Categories are:
+  - `proven_remote`: heavy Cargo proof ran through an RCH-recognized remote path.
+  - `light_local`: local non-heavy checks such as formatting.
+  - `approved_fallback`: heavy local fallback with explicit approval metadata.
+  - `rejected_local_heavy`: heavy local proof without required fallback approval.
+  - `malformed`: invalid JSON, stale schema, missing required fields, or malformed bead IDs.
+  - `missing_artifact`: an artifact path named by evidence is not retained.
+  - `residual_risk_only`: otherwise valid evidence with residual risk notes.
+- Blocking categories are `rejected_local_heavy`, `malformed`, and
+  `missing_artifact`. They make the aggregate command exit non-zero.
+- `approved_fallback` and `residual_risk_only` produce an `overall_verdict` of
+  `partial_risk`; this is acceptable evidence only when the operator-facing
+  closeout names the residual risk instead of claiming a clean pass.
+
 The self-test and E2E cover accepted remote proof, rejected local-heavy proof,
 accepted human-approved fallback, light local commands, stale schema versions,
 malformed bead IDs, missing artifacts, missing required booleans, unredacted
 provider tokens, SSH-style secret paths, wrapper-emitted ledger records, RCH
-setup chatter, and shell wrappers that mention RCH while running Cargo locally.
+setup chatter, shell wrappers that mention RCH while running Cargo locally, and
+aggregate quality-gate classification for mixed, missing, rejected, and
+malformed proof-ledger JSONL.
 
 ## User Impact
 

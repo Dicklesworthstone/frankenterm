@@ -13,6 +13,7 @@ Usage:
   validate_asupersync_rch_execution_policy.sh --classify "<command>"
   validate_asupersync_rch_execution_policy.sh --redact-text "<text>"
   validate_asupersync_rch_execution_policy.sh --validate-evidence <path>
+  validate_asupersync_rch_execution_policy.sh --aggregate-ledger <jsonl-path>
   validate_asupersync_rch_execution_policy.sh --self-test
 EOF
 }
@@ -228,7 +229,7 @@ require_public_text_fingerprint() {
 validate_evidence_file() {
   local evidence_file="$1"
 
-  if [[ ! -f "${evidence_file}" ]]; then
+  if [[ ! -f "${evidence_file}" && ! -r "${evidence_file}" ]]; then
     echo "evidence file not found: ${evidence_file}" >&2
     return 1
   fi
@@ -431,6 +432,235 @@ validate_evidence_file() {
   done
 
   echo "Evidence policy validation passed: ${evidence_file}"
+}
+
+aggregate_reason_for_validation_error() {
+  local error_text="$1"
+
+  if [[ "${error_text}" == *"artifact_paths["* && "${error_text}" == *"does not exist"* ]]; then
+    printf '%s\n' "aggregate.missing_artifact"
+  elif [[ "${error_text}" == *"heavy run requires fallback_reason_code"* ]]; then
+    printf '%s\n' "aggregate.rejected_local_heavy"
+  else
+    printf '%s\n' "aggregate.malformed"
+  fi
+}
+
+aggregate_category_for_reason() {
+  case "$1" in
+    aggregate.missing_artifact) printf '%s\n' "missing_artifact" ;;
+    aggregate.rejected_local_heavy) printf '%s\n' "rejected_local_heavy" ;;
+    *) printf '%s\n' "malformed" ;;
+  esac
+}
+
+aggregate_valid_run_category() {
+  local run="$1"
+  local execution_mode validation_status command_class used_rch residual_risk_notes
+
+  execution_mode="$(jq -r '.execution_mode // ""' <<<"${run}")"
+  validation_status="$(jq -r '.validation_status // ""' <<<"${run}")"
+  command_class="$(jq -r '.command_class // ""' <<<"${run}")"
+  used_rch="$(jq -r '.used_rch // false' <<<"${run}")"
+  residual_risk_notes="$(jq -r '.residual_risk_notes // ""' <<<"${run}")"
+
+  if [[ "${execution_mode}" == "approved_local_fallback" || "${validation_status}" == "approved_fallback" ]]; then
+    printf '%s\n' "approved_fallback"
+  elif [[ -n "${residual_risk_notes}" ]]; then
+    printf '%s\n' "residual_risk_only"
+  elif [[ "${command_class}" == "heavy" && "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" ]]; then
+    printf '%s\n' "proven_remote"
+  elif [[ "${command_class}" == "light" && "${execution_mode}" == "local_light" ]]; then
+    printf '%s\n' "light_local"
+  elif [[ "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" ]]; then
+    printf '%s\n' "proven_remote"
+  else
+    printf '%s\n' "residual_risk_only"
+  fi
+}
+
+aggregate_reason_for_valid_category() {
+  case "$1" in
+    proven_remote) printf '%s\n' "aggregate.proven_remote" ;;
+    light_local) printf '%s\n' "aggregate.light_local" ;;
+    approved_fallback) printf '%s\n' "aggregate.approved_fallback" ;;
+    residual_risk_only) printf '%s\n' "aggregate.residual_risk_only" ;;
+    *) printf '%s\n' "aggregate.residual_risk_only" ;;
+  esac
+}
+
+aggregate_run_entry_json() {
+  local line_no="$1"
+  local run_index="$2"
+  local evidence="$3"
+  local category="$4"
+  local reason_code="$5"
+  local reason_detail="${6:-}"
+  local validation_status="${7:-valid}"
+  local run bead_id scenario_id command worker_context artifact_paths artifact_path
+
+  run="$(jq -c ".runs[${run_index}]" <<<"${evidence}" 2>/dev/null || printf '{}')"
+  bead_id="$(jq -r '.bead_id // "unknown"' <<<"${evidence}" 2>/dev/null || printf 'unknown')"
+  scenario_id="$(jq -r '.scenario_id // "unknown"' <<<"${evidence}" 2>/dev/null || printf 'unknown')"
+  command="$(jq -r '.command // "unknown"' <<<"${run}" 2>/dev/null || printf 'unknown')"
+  worker_context="$(jq -r '.worker_context // "unknown"' <<<"${run}" 2>/dev/null || printf 'unknown')"
+  artifact_paths="$(jq -c 'if (.artifact_paths | type) == "array" then .artifact_paths else [] end' <<<"${run}" 2>/dev/null || printf '[]')"
+  artifact_path="$(jq -r 'if (.artifact_paths | type) == "array" and (.artifact_paths | length) > 0 then .artifact_paths[0] else "unknown" end' <<<"${run}" 2>/dev/null || printf 'unknown')"
+
+  jq -cn \
+    --argjson line_no "${line_no}" \
+    --argjson run_index "${run_index}" \
+    --arg bead_id "${bead_id}" \
+    --arg scenario_id "${scenario_id}" \
+    --arg command "${command}" \
+    --arg worker_context "${worker_context}" \
+    --arg artifact_path "${artifact_path}" \
+    --argjson artifact_paths "${artifact_paths}" \
+    --arg category "${category}" \
+    --arg reason_code "${reason_code}" \
+    --arg reason_detail "${reason_detail}" \
+    --arg validation_status "${validation_status}" \
+    '{
+      line_no: $line_no,
+      run_index: $run_index,
+      bead_id: $bead_id,
+      scenario_id: $scenario_id,
+      command: $command,
+      worker_context: $worker_context,
+      artifact_path: $artifact_path,
+      artifact_paths: $artifact_paths,
+      category: $category,
+      reason_code: $reason_code,
+      reason_detail: $reason_detail,
+      validation_status: $validation_status
+    }'
+}
+
+aggregate_malformed_line_json() {
+  local line_no="$1"
+  local reason_detail="$2"
+
+  jq -cn \
+    --argjson line_no "${line_no}" \
+    --arg reason_detail "${reason_detail}" \
+    '{
+      line_no: $line_no,
+      run_index: null,
+      bead_id: "unknown",
+      scenario_id: "unknown",
+      command: "unknown",
+      worker_context: "unknown",
+      artifact_path: "unknown",
+      artifact_paths: [],
+      category: "malformed",
+      reason_code: "aggregate.malformed",
+      reason_detail: $reason_detail,
+      validation_status: "invalid"
+    }'
+}
+
+aggregate_ledger_file() {
+  local ledger_file="$1"
+
+  if [[ ! -f "${ledger_file}" ]]; then
+    echo "ledger file not found: ${ledger_file}" >&2
+    return 1
+  fi
+
+  local rows="" line_no=0 line compact runs_count run_index single single_file validation_error
+  local category reason_code reason_detail validation_status
+  local validation_dir="${ledger_file}.aggregate-validation"
+
+  mkdir -p "${validation_dir}"
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line_no=$((line_no + 1))
+    [[ -n "${line}" ]] || continue
+
+    if ! compact="$(jq -c . <<<"${line}" 2>/dev/null)"; then
+      rows+=$(aggregate_malformed_line_json "${line_no}" "line is not valid JSON")
+      rows+=$'\n'
+      continue
+    fi
+
+    if ! runs_count="$(jq -r 'if (.runs | type) == "array" then (.runs | length) else -1 end' <<<"${compact}" 2>/dev/null)"; then
+      rows+=$(aggregate_malformed_line_json "${line_no}" "runs must be an array")
+      rows+=$'\n'
+      continue
+    fi
+    if [[ ! "${runs_count}" =~ ^[0-9]+$ || "${runs_count}" -le 0 ]]; then
+      rows+=$(aggregate_malformed_line_json "${line_no}" "runs must be a non-empty array")
+      rows+=$'\n'
+      continue
+    fi
+
+    for ((run_index = 0; run_index < runs_count; run_index++)); do
+      single="$(jq -c --argjson idx "${run_index}" '. as $root | $root + {runs: [$root.runs[$idx]]}' <<<"${compact}")"
+      single_file="${validation_dir}/entry_${line_no}_${run_index}.json"
+      printf '%s\n' "${single}" >"${single_file}"
+      validation_error=""
+      if validation_error="$(validate_evidence_file "${single_file}" 2>&1 >/dev/null)"; then
+        category="$(aggregate_valid_run_category "$(jq -c '.runs[0]' <<<"${single}")")"
+        reason_code="$(aggregate_reason_for_valid_category "${category}")"
+        reason_detail=""
+        validation_status="valid"
+      else
+        reason_code="$(aggregate_reason_for_validation_error "${validation_error}")"
+        category="$(aggregate_category_for_reason "${reason_code}")"
+        reason_detail="$(redact_proof_ledger_text "${validation_error}")"
+        validation_status="invalid"
+      fi
+
+      rows+=$(aggregate_run_entry_json \
+        "${line_no}" \
+        "${run_index}" \
+        "${single}" \
+        "${category}" \
+        "${reason_code}" \
+        "${reason_detail}" \
+        "${validation_status}")
+      rows+=$'\n'
+    done
+  done <"${ledger_file}"
+
+  if [[ -z "${rows}" ]]; then
+    rows="$(aggregate_malformed_line_json 0 "ledger file had no JSONL entries")"$'\n'
+  fi
+
+  printf '%s' "${rows}" | jq -s \
+    --arg schema_version "1" \
+    --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --arg ledger_path "${ledger_file}" \
+    --arg validation_dir "${validation_dir}" \
+    'def countcat($name): map(select(.category == $name)) | length;
+     . as $entries
+     | {
+        schema_version: ($schema_version | tonumber),
+        generated_at: $generated_at,
+        ledger_path: $ledger_path,
+        validation_dir: $validation_dir,
+        entries: $entries,
+        counts: {
+          proven_remote: countcat("proven_remote"),
+          light_local: countcat("light_local"),
+          approved_fallback: countcat("approved_fallback"),
+          rejected_local_heavy: countcat("rejected_local_heavy"),
+          malformed: countcat("malformed"),
+          missing_artifact: countcat("missing_artifact"),
+          residual_risk_only: countcat("residual_risk_only")
+        }
+      }
+      | .blocking_failure_count = (
+          .counts.rejected_local_heavy + .counts.malformed + .counts.missing_artifact
+        )
+      | .risk_count = (.counts.approved_fallback + .counts.residual_risk_only)
+      | .quality_gate_passed = (.blocking_failure_count == 0)
+      | .overall_verdict = (
+          if .blocking_failure_count > 0 then "failed"
+          elif .risk_count > 0 then "partial_risk"
+          else "passed"
+          end
+        )'
 }
 
 run_self_test() {
@@ -790,6 +1020,18 @@ case "$1" in
       exit 1
     fi
     validate_evidence_file "$1"
+    ;;
+  --aggregate-ledger)
+    shift
+    if [[ $# -ne 1 ]]; then
+      usage
+      exit 1
+    fi
+    aggregate_report="$(aggregate_ledger_file "$1")"
+    printf '%s\n' "${aggregate_report}"
+    if [[ "$(jq -r '.quality_gate_passed' <<<"${aggregate_report}")" != "true" ]]; then
+      exit 1
+    fi
     ;;
   --self-test)
     run_self_test

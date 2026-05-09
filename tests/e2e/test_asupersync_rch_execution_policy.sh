@@ -278,6 +278,16 @@ tmp_fallback_record="${tmp_dir}/fallback-required.json"
 tmp_timeout_record="${tmp_dir}/timeout.json"
 tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
+tmp_light_local="${tmp_dir}/light-local.json"
+tmp_residual_risk="${tmp_dir}/residual-risk.json"
+tmp_mixed_ledger="${tmp_dir}/mixed-ledger.jsonl"
+tmp_mixed_report="${tmp_dir}/mixed-ledger-report.json"
+tmp_rejected_ledger="${tmp_dir}/rejected-ledger.jsonl"
+tmp_rejected_report="${tmp_dir}/rejected-ledger-report.json"
+tmp_missing_artifact_ledger="${tmp_dir}/missing-artifact-ledger.jsonl"
+tmp_missing_artifact_report="${tmp_dir}/missing-artifact-ledger-report.json"
+tmp_malformed_ledger="${tmp_dir}/malformed-ledger.jsonl"
+tmp_malformed_report="${tmp_dir}/malformed-ledger-report.json"
 
 secret_fixture="API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz012345 cargo test -p frankenterm-core --header 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345' --path /Users/jemanuel/.ssh/id_ed25519 --safe crates/frankenterm"
 redaction_json="$("${VALIDATOR}" --redact-text "${secret_fixture}")"
@@ -633,6 +643,155 @@ expect_validation_failure \
   "failure_injection" \
   "stale_schema_version" \
   "stale schema versions must fail validation"
+
+emit_log \
+  "running" \
+  "aggregate_quality_gate" \
+  "mixed_ledger_partial_risk" \
+  "none" \
+  "none" \
+  "$(basename "${tmp_mixed_ledger}")" \
+  "aggregate gate should classify remote, light local, approved fallback, and residual-risk-only records"
+
+light_command="cargo fmt --check"
+light_worker="local"
+light_target="not_applicable"
+light_empty_risk=""
+jq --arg cmd "${light_command}" \
+  --arg cmd_fp "$(fingerprint_text "${light_command}")" \
+  --arg worker "${light_worker}" \
+  --arg worker_fp "$(fingerprint_text "${light_worker}")" \
+  --arg target "${light_target}" \
+  --arg target_fp "$(fingerprint_text "${light_target}")" \
+  --arg residual "${light_empty_risk}" \
+  --arg residual_fp "$(fingerprint_text "${light_empty_risk}")" \
+  '.runs[0].command = $cmd |
+    .runs[0].command_fingerprint = $cmd_fp |
+    .runs[0].command_class = "light" |
+    .runs[0].is_heavy = false |
+    .runs[0].used_rch = false |
+    .runs[0].worker_context = $worker |
+    .runs[0].worker_context_fingerprint = $worker_fp |
+    .runs[0].execution_mode = "local_light" |
+    .runs[0].target_dir = $target |
+    .runs[0].target_dir_fingerprint = $target_fp |
+    .runs[0].target_dir_lifecycle = "not_applicable" |
+    .runs[0].residual_risk_notes = $residual |
+    .runs[0].residual_risk_notes_fingerprint = $residual_fp |
+    .runs[0].validation_status = "valid"' \
+  "${tmp_valid}" > "${tmp_light_local}"
+
+residual_note="remote proof valid, but operator should cite the retained artifact bundle"
+jq --arg residual "${residual_note}" \
+  --arg residual_fp "$(fingerprint_text "${residual_note}")" \
+  '.runs[0].residual_risk_notes = $residual |
+    .runs[0].residual_risk_notes_fingerprint = $residual_fp' \
+  "${tmp_valid}" > "${tmp_residual_risk}"
+
+jq -c . "${tmp_valid}" "${tmp_light_local}" "${tmp_recovery}" "${tmp_residual_risk}" > "${tmp_mixed_ledger}"
+if ! "${VALIDATOR}" --aggregate-ledger "${tmp_mixed_ledger}" > "${tmp_mixed_report}"; then
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "mixed_ledger_partial_risk" \
+    "aggregate_unexpected_fail" \
+    "aggregate_report_failed" \
+    "$(basename "${tmp_mixed_report}")" \
+    "mixed valid ledger should not have blocking aggregate failures"
+  exit 1
+fi
+
+if [[ "$(jq -r '.overall_verdict' "${tmp_mixed_report}")" != "partial_risk" ]]; then
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "mixed_ledger_partial_risk" \
+    "wrong_verdict" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_mixed_report}")" \
+    "mixed ledger must produce a partial_risk verdict"
+  exit 1
+fi
+
+jq -e '
+  .quality_gate_passed == true and
+  .counts.proven_remote == 1 and
+  .counts.light_local == 1 and
+  .counts.approved_fallback == 1 and
+  .counts.residual_risk_only == 1 and
+  .blocking_failure_count == 0 and
+  ([.entries[] | select(.bead_id == "ft-kvs1e" and .scenario_id != "unknown" and .command != "unknown" and .worker_context != "unknown" and .artifact_path != "unknown" and .reason_code != "")] | length) == 4
+' "${tmp_mixed_report}" >/dev/null || {
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "mixed_ledger_partial_risk" \
+    "missing_operator_fields" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_mixed_report}")" \
+    "aggregate report must preserve bead, scenario, command, worker, artifact, and reason-code fields"
+  exit 1
+}
+
+jq -c . "${tmp_invalid}" > "${tmp_rejected_ledger}"
+set +e
+"${VALIDATOR}" --aggregate-ledger "${tmp_rejected_ledger}" > "${tmp_rejected_report}" 2>/dev/null
+aggregate_rejected_rc=$?
+set -e
+if [[ "${aggregate_rejected_rc}" -eq 0 ]] || [[ "$(jq -r '.counts.rejected_local_heavy' "${tmp_rejected_report}")" != "1" ]]; then
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "rejected_local_heavy" \
+    "negative_guardrail_not_enforced" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_rejected_report}")" \
+    "aggregate gate must reject local heavy Cargo without fallback approval"
+  exit 1
+fi
+
+jq -c . "${tmp_missing_artifact}" > "${tmp_missing_artifact_ledger}"
+set +e
+"${VALIDATOR}" --aggregate-ledger "${tmp_missing_artifact_ledger}" > "${tmp_missing_artifact_report}" 2>/dev/null
+aggregate_missing_rc=$?
+set -e
+if [[ "${aggregate_missing_rc}" -eq 0 ]] || [[ "$(jq -r '.counts.missing_artifact' "${tmp_missing_artifact_report}")" != "1" ]]; then
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "missing_artifact" \
+    "negative_guardrail_not_enforced" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_missing_artifact_report}")" \
+    "aggregate gate must reject missing proof artifact paths"
+  exit 1
+fi
+
+printf '%s\n' "not-json" > "${tmp_malformed_ledger}"
+set +e
+"${VALIDATOR}" --aggregate-ledger "${tmp_malformed_ledger}" > "${tmp_malformed_report}" 2>/dev/null
+aggregate_malformed_rc=$?
+set -e
+if [[ "${aggregate_malformed_rc}" -eq 0 ]] || [[ "$(jq -r '.counts.malformed' "${tmp_malformed_report}")" != "1" ]]; then
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "malformed_jsonl" \
+    "negative_guardrail_not_enforced" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_malformed_report}")" \
+    "aggregate gate must reject malformed JSONL rows"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "aggregate_quality_gate" \
+  "mixed_ledger_partial_risk->rejected_local_heavy->missing_artifact->malformed_jsonl" \
+  "aggregate_quality_gate_validated" \
+  "none" \
+  "$(basename "${tmp_mixed_report}")" \
+  "aggregate quality gate categories and partial-risk verdict validated"
 
 emit_log \
   "running" \

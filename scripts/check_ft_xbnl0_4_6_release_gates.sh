@@ -104,6 +104,10 @@ def evaluate_policy(root: Path, policy_path: Path, policy: dict[str, Any]) -> di
     leak_root = root / artifact_roots["leak_oracle_root"]
     soak_root = root / artifact_roots["soak_matrix_root"]
     guard_report_path = root / artifact_roots["guard_report"]
+    proof_ledger_report_config = artifact_roots.get("proof_ledger_aggregate_report")
+    proof_ledger_report_path = (
+        None if proof_ledger_report_config is None else root / proof_ledger_report_config
+    )
 
     checks: list[dict[str, Any]] = []
 
@@ -284,6 +288,47 @@ def evaluate_policy(root: Path, policy_path: Path, policy: dict[str, Any]) -> di
             },
         })
 
+    if proof_ledger_report_path is not None:
+        proof_detail = {
+            "aggregate_report": proof_ledger_report_path.as_posix(),
+            "action": "Run scripts/validate_asupersync_rch_execution_policy.sh --aggregate-ledger against retained proof-ledger JSONL and save the report before trusting release-readiness.",
+        }
+        if not proof_ledger_report_path.exists():
+            checks.append({
+                "gate_id": "REL-05-proof-ledger-quality",
+                "name": "Proof-ledger quality",
+                "status": "failed",
+                "reason_code": "proof_ledger_aggregate_missing",
+                "blocking": True,
+                "detail": proof_detail,
+            })
+        else:
+            proof_report = load_json(proof_ledger_report_path)
+            proof_gate_passed = proof_report.get("quality_gate_passed") is True
+            proof_verdict = proof_report.get("overall_verdict")
+            proof_reason = (
+                "proof_ledger_clean"
+                if proof_verdict == "passed"
+                else "proof_ledger_partial_risk"
+                if proof_gate_passed
+                else "proof_ledger_blocking_failures"
+            )
+            checks.append({
+                "gate_id": "REL-05-proof-ledger-quality",
+                "name": "Proof-ledger quality",
+                "status": "passed" if proof_gate_passed else "failed",
+                "reason_code": proof_reason,
+                "blocking": True,
+                "detail": proof_detail | {
+                    "overall_verdict": proof_verdict,
+                    "quality_gate_passed": proof_report.get("quality_gate_passed"),
+                    "blocking_failure_count": proof_report.get("blocking_failure_count"),
+                    "risk_count": proof_report.get("risk_count"),
+                    "counts": proof_report.get("counts", {}),
+                    "action": "Fix malformed, missing-artifact, or rejected-local-heavy proof entries before release-readiness; cite partial-risk entries explicitly when present.",
+                },
+            })
+
     overall_status = "passed"
     if any(check["blocking"] and check["status"] != "passed" for check in checks):
         overall_status = "failed"
@@ -299,6 +344,9 @@ def evaluate_policy(root: Path, policy_path: Path, policy: dict[str, Any]) -> di
             "latest_leak_summary": None if leak_summary_path is None else leak_summary_path.as_posix(),
             "latest_soak_wrapper_summary": None if soak_wrapper_path is None else soak_wrapper_path.as_posix(),
             "guard_report": guard_report_path.as_posix(),
+            "proof_ledger_aggregate_report": (
+                None if proof_ledger_report_path is None else proof_ledger_report_path.as_posix()
+            ),
         },
     }
 
@@ -312,6 +360,7 @@ def run_self_tests() -> None:
                 "leak_oracle_root": "leak",
                 "soak_matrix_root": "soak",
                 "guard_report": "guards.json",
+                "proof_ledger_aggregate_report": "proof-ledger-aggregate.json",
             },
             "thresholds": {
                 "required_pane_scales": [1, 50, 100, 200],
@@ -326,6 +375,24 @@ def run_self_tests() -> None:
         (root / "leak" / "run-1").mkdir(parents=True)
         (root / "soak" / "run-1").mkdir(parents=True)
         (root / "guards.json").write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+        (root / "proof-ledger-aggregate.json").write_text(
+            json.dumps({
+                "overall_verdict": "partial_risk",
+                "quality_gate_passed": True,
+                "blocking_failure_count": 0,
+                "risk_count": 1,
+                "counts": {
+                    "proven_remote": 1,
+                    "light_local": 1,
+                    "approved_fallback": 1,
+                    "rejected_local_heavy": 0,
+                    "malformed": 0,
+                    "missing_artifact": 0,
+                    "residual_risk_only": 0,
+                },
+            }),
+            encoding="utf-8",
+        )
         (root / "leak" / "run-1" / "summary.json").write_text(
             json.dumps({"status": "passed"}), encoding="utf-8"
         )

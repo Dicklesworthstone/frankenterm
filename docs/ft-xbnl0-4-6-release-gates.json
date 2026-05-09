@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "bead_id": "ft-xbnl0.4.6",
   "last_updated": "2026-04-19",
-  "description": "Blocking release-readiness policy for the ft-xbnl0 finish line. The evaluator in scripts/check_ft_xbnl0_4_6_release_gates.sh consumes this file to turn leak evidence, permanent guards, soak confidence, and runtime performance budgets into stable go/no-go checks.",
+  "description": "Blocking release-readiness policy for the ft-xbnl0 finish line. The evaluator in scripts/check_ft_xbnl0_4_6_release_gates.sh consumes this file to turn leak evidence, permanent guards, soak confidence, runtime performance budgets, and proof-ledger quality into stable go/no-go checks.",
   "artifact_roots": {
     "leak_oracle_root": "tests/e2e/artifacts/goal-line/ft-xbnl0.4.4/leak_oracle_regressions",
     "soak_matrix_root": "tests/e2e/artifacts/goal-line/ft-xbnl0.4.5/swarm_soak_matrix",
-    "guard_report": "docs/ft-xbnl0-5-2-finish-line-guards-validation.json"
+    "guard_report": "docs/ft-xbnl0-5-2-finish-line-guards-validation.json",
+    "proof_ledger_aggregate_report": "docs/asupersync-rch-proof-ledger-aggregate-validation.json"
   },
   "thresholds": {
     "required_pane_scales": [1, 50, 100, 200],
@@ -54,6 +55,15 @@
       "upstream_bead": "ft-xbnl0.4.5",
       "source": "nested smoke/release summaries referenced by the latest soak wrapper summary",
       "failure_action": "Reduce runtime cost or tune the workload until RSS, duration, and backpressure budgets hold."
+    },
+    {
+      "gate_id": "REL-05-proof-ledger-quality",
+      "name": "Proof-ledger quality",
+      "category": "proof ledger",
+      "blocking": true,
+      "upstream_bead": "ft-ns4by",
+      "source": "artifact_roots.proof_ledger_aggregate_report emitted by validate_asupersync_rch_execution_policy.sh --aggregate-ledger",
+      "failure_action": "Regenerate and fix the aggregate proof-ledger report until malformed, missing-artifact, and rejected-local-heavy counts are zero."
     }
   ]
 }
