@@ -118,6 +118,7 @@ fn manifest_is_well_formed_and_lists_expected_guards() {
         "no_runtime_regression",
         "asupersync_cutover_runtime_guards",
         "fake_sdk_capability_contract",
+        "supported_path_stub_markers",
         "finish_line_verification_contract_shape",
     ] {
         assert!(

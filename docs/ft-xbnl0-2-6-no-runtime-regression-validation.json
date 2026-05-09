@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-04-19T16:47:27Z",
+  "checked_at": "2026-05-09T17:53:39Z",
   "checks": [
     {
       "name": "contract_identity",
@@ -29,11 +29,11 @@
     },
     {
       "name": "source_quarantine_enforcement",
-      "quarantined_files": 54,
+      "quarantined_files": 55,
       "status": "passed"
     },
     {
-      "doc_hits": 17,
+      "doc_hits": 25,
       "name": "doc_narrative_enforcement",
       "status": "passed"
     },
@@ -46,7 +46,7 @@
   "repo_root": "/Users/jemanuel/projects/frankenterm",
   "status": "passed",
   "summary": {
-    "doc_files_with_tokens": 17,
+    "doc_files_with_tokens": 25,
     "manifest_dependency_hits": {
       "async-io": [
         "Cargo.toml",
@@ -67,11 +67,12 @@
     },
     "owner_inventory": [
       "ft-22x4r",
+      "ft-deexl",
       "ft-xbnl0.2.5",
       "ft-xbnl0.2.6",
       "wa-22x4r",
       "wa-2h1ha"
     ],
-    "source_files_quarantined": 54
+    "source_files_quarantined": 55
   }
 }

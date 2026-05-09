@@ -290,7 +290,7 @@ mod tests {
         probes.record(
             OnboardingCheck::ForbiddenSurfaces,
             CheckOutcome::Fail {
-                remediation: "remove direct tokio::test imports — see migration docs".to_string(),
+                remediation: "remove direct Tokio test attributes — see migration docs".to_string(),
                 issue_class: IssueClass::RepoCode,
             },
         );
@@ -329,7 +329,7 @@ mod tests {
         // Repo-code bucket has forbidden_surfaces failure.
         assert!(text.contains("repo_code:"));
         assert!(text.contains("forbidden_surfaces"));
-        assert!(text.contains("tokio::test"));
+        assert!(text.contains("Tokio test attributes"));
         // Skipped section present for MachineProfile.
         assert!(text.contains("skipped:"));
         assert!(text.contains("machine_profile"));

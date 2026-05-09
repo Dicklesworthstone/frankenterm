@@ -3727,7 +3727,6 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 
@@ -3810,7 +3809,6 @@ dependencies = [
  "tantivy 0.22.1",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 

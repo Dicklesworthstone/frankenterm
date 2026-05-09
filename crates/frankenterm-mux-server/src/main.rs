@@ -61,7 +61,7 @@ extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
 
 /// [ft-gqbpk] Install SIGTERM + SIGINT handlers using `libc::signal`.
 /// Kept minimal on purpose: no dependency on `signal-hook` or
-/// `tokio::signal`, and no `sigaction` plumbing, because the
+/// Tokio signal handling, and no `sigaction` plumbing, because the
 /// SimpleExecutor loop only needs a one-bit "someone asked us to
 /// stop" signal and the handler body is async-signal-safe.
 ///

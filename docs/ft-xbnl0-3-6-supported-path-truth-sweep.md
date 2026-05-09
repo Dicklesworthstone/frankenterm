@@ -74,6 +74,15 @@ map to:
 No supported-path `unimplemented!()` exists outside the inventory
 exclusions or the open finish-line owners. No anonymous fake remains.
 
+2026-05-09 guard update: `ft-akx00.6.3` is now closed. The readback
+paths that were open in the original inventory now expose explicit
+support discovery, real `ImageTexture` / `WebGpuTexture` readback where
+implemented, and an explicit unsupported error for `SrgbTexture2d`
+instead of `unimplemented!()`. The permanent CI guard
+`scripts/check_supported_path_stub_markers.sh` now re-runs the active
+marker scan and classifies only test-only fakes plus non-Rust SDK
+template markers as exclusions.
+
 The other renderer honesty gap that previously sat under
 `ft-xbnl0.3.5` was GUI image decode/bootstrap failure handling in
 `crates/frankenterm-gui/src/glyphcache.rs`. That path used to swap in
@@ -177,19 +186,19 @@ production null object. No widening required.
 ## Residual Risks
 
 1. The remaining `ft-xbnl0.3.5` rendering/backend gap is texture
-   readback only: the `Texture2d::read` sites in `bitmaps/mod.rs` and
-   `webgpu.rs` still belong to `ft-akx00.6.3`. Other previously tracked
-   rendering blockers (`ft-akx00.6.1`, `.6.2`, `.6.5`) are now closed,
-   and the GUI image decode/bootstrap path has been narrowed honestly to
-   an explicit failed-load state rather than a placeholder render.
+   readback only in the historical 2026-04-15 inventory. As of
+   2026-05-09, `ft-akx00.6.3` is closed and the active guard report in
+   `docs/ft-xbnl0-3-6-supported-path-stub-markers-validation.json`
+   finds no unexpected production stub marker.
 2. The non-Rust SDK templates remain template-only. If the supported
    matrix is ever widened to Python, TypeScript, or Go, the
    `is_fully_supported` gate must flip and the regression test must be
    updated alongside the wiring.
-3. CI does not yet enforce a workspace-wide grep for `unimplemented!()`
-   on supported-path crates. `ft-xbnl0.5.2` will pick that guardrail
-   up when it lands; this sweep records the contract in code and docs
-   so the guardrail has something to anchor against.
+3. CI now enforces the supported-path stub-marker inventory through the
+   `supported_path_stub_markers` entry in
+   `docs/ft-xbnl0-5-2-finish-line-guards.json`, which is run by
+   `.github/workflows/finish-line-guards.yml` on pull requests and
+   pushes to `main`.
 
 ## Verification Commands
 

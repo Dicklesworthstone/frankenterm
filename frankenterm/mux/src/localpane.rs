@@ -1763,9 +1763,7 @@ impl LocalPane {
                             foreground,
                             updated: Instant::now(),
                         });
-                        local
-                            .proc_list_warm_pending
-                            .store(false, Ordering::Release);
+                        local.proc_list_warm_pending.store(false, Ordering::Release);
                         return;
                     }
                 }
@@ -1775,9 +1773,7 @@ impl LocalPane {
             if let Some(mux) = Mux::try_get() {
                 if let Some(pane) = mux.get_pane(pane_id) {
                     if let Some(local) = pane.downcast_ref::<LocalPane>() {
-                        local
-                            .proc_list_warm_pending
-                            .store(false, Ordering::Release);
+                        local.proc_list_warm_pending.store(false, Ordering::Release);
                     }
                 }
             }

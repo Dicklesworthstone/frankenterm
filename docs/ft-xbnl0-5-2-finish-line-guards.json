@@ -44,6 +44,16 @@
       ]
     },
     {
+      "guard_id": "supported_path_stub_markers",
+      "invariant": "Supported-path Rust sources must not contain active production todo!(), unimplemented!(), or panic-based stub markers outside classified test-only fakes and non-Rust SDK template markers.",
+      "script": "scripts/check_supported_path_stub_markers.sh",
+      "output_artifact": "docs/ft-xbnl0-3-6-supported-path-stub-markers-validation.json",
+      "upstream_bead": "ft-g6lfc",
+      "failure_signatures": [
+        "unexpected_supported_path_stub_marker"
+      ]
+    },
+    {
       "guard_id": "finish_line_verification_contract_shape",
       "invariant": "Every finish-line E2E harness under tests/e2e/ that follows the artifact contract emits summary.json and structured.log into its per-run directory; deterministic scripts use the shared rch guard helper.",
       "script_check": "scripts/check_finish_line_guards.sh (internal verify_artifact_contract step)",

@@ -3,8 +3,8 @@ name: Finish-Line Guards
 # Permanent regression guards for the ft-xbnl0 finish-line program (bead
 # ft-xbnl0.5.2). Runs on every PR + push to main so the no-tokio/smol/
 # async-io invariant, the forbidden-token ceiling invariant, the fake-SDK
-# capability contract, and the artifact-contract shape never silently
-# regress.
+# capability contract, the supported-path stub-marker inventory, and the
+# artifact-contract shape never silently regress.
 #
 # Each guard is actionable: failure output names the exact guard,
 # reason_code, and log tail. Contributors can reproduce the full sweep
@@ -68,6 +68,7 @@ jobs:
           name: finish-line-guards-summary-shell
           path: |
             ${{ runner.temp }}/finish-line-guards.json
+            docs/ft-xbnl0-3-6-supported-path-stub-markers-validation.json
             docs/ft-xbnl0-2-6-no-runtime-regression-validation.json
             docs/asupersync-cutover-runtime-guard-validation.json
           if-no-files-found: warn

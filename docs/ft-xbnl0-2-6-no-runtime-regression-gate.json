@@ -91,10 +91,22 @@
       "removal_bead": "ft-xbnl0.2.5",
       "allowed_tokens": ["tokio::", "smol::", "async_io::"]
     },
-    "crates/frankenterm-core/src/runtime_async_surface_guard.rs": {
-      "owner": "ft-xbnl0.2.5",
-      "reason": "Compile-time guard module that names tokio types so its own surface contract test stays meaningful. Removed with runtime_compat under ft-xbnl0.2.5.",
-      "removal_bead": "ft-xbnl0.2.5",
+    "crates/frankenterm-core/src/runtime_proof.rs": {
+      "owner": "ft-deexl",
+      "reason": "RuntimeProof's negative compile-fail doctest intentionally names tokio::sync::Mutex to prove foreign runtime primitives cannot satisfy the sealed RuntimeProof trait. This is a guard fixture, not runtime usage.",
+      "removal_bead": "ft-deexl",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/src/mcp_proxy.rs": {
+      "owner": "ft-deexl",
+      "reason": "Narrative comment records a future timeout strategy using tokio::time::timeout syntax as an audited anti-pattern; no direct runtime usage is present.",
+      "removal_bead": "ft-deexl",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/src/web/sse.rs": {
+      "owner": "ft-deexl",
+      "reason": "Test helper documentation names the forbidden #[tokio::test] attribute to describe the supported-path migration invariant; no direct runtime usage is present.",
+      "removal_bead": "ft-deexl",
       "allowed_tokens": ["tokio::"]
     },
     "crates/frankenterm-core/src/dependency_eradication.rs": {
@@ -207,6 +219,7 @@
     "allowed_tokens": ["tokio::"]
   },
   "doc_narrative_allowlist": [
+    "AGENTS.md",
     "docs/asupersync-architecture-doctrine.md",
     "docs/asupersync-cutover-runtime-guard-validation.json",
     "docs/asupersync-cutover-runtime-guardrails.json",
@@ -225,12 +238,24 @@
     "docs/ft-xbnl0-2-6-no-runtime-regression-validation.json",
     "docs/COMPREHENSIVE_ANALYSIS_OF_coding_agent_usage_tracker.md",
     "docs/adr/0008-query-facade-contract.md",
+    "docs/audit-checklist.md",
+    "docs/contributing/auto-stamped-counts.md",
     "docs/ftui-pty-fixture-strategy.md",
     "docs/ftui-subprocess-forwarding-contract.md",
+    "docs/reality-check-bridge-plan.md",
+    "docs/reports/reality-check-2026-05-02.md",
     "docs/replay-test-taxonomy.md",
+    "docs/review/deadlock-audit.md",
+    "docs/runtime/loom-conventions.md",
+    "docs/runtime/runtime-proof-trait.md",
     "docs/timing-determinism.md"
   ],
   "doc_narrative_rewrite_owner": {
+    "AGENTS.md": {
+      "owner": "ft-deexl",
+      "reason": "Repo operating instructions intentionally name forbidden Tokio tokens to define the policy agents must avoid; this is policy narrative, not an implementation dependency.",
+      "removal_bead": "ft-deexl"
+    },
     "docs/COMPREHENSIVE_ANALYSIS_OF_coding_agent_usage_tracker.md": {
       "owner": "ft-xbnl0.5.1",
       "reason": "Third-party tool architecture analysis; references the analyzed project's own tokio::main entry point.",
@@ -240,6 +265,16 @@
       "owner": "ft-xbnl0.5.1",
       "reason": "ADR captures migration-era query facade runtime contract; rewritten to native asupersync narrative under ft-xbnl0.5.1 doc sweep.",
       "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/audit-checklist.md": {
+      "owner": "ft-deexl",
+      "reason": "Audit checklist intentionally names the forbidden Tokio test attribute as a reviewer check.",
+      "removal_bead": "ft-deexl"
+    },
+    "docs/contributing/auto-stamped-counts.md": {
+      "owner": "ft-deexl",
+      "reason": "Contributor count-stamping docs mention the forbidden-token guard inputs as policy examples.",
+      "removal_bead": "ft-deexl"
     },
     "docs/ftui-pty-fixture-strategy.md": {
       "owner": "ft-xbnl0.5.1",
@@ -251,10 +286,35 @@
       "reason": "ftui subprocess contract still references tokio::sync::watch as the shutdown signal type; replaced under ft-xbnl0.5.1 doc sweep.",
       "removal_bead": "ft-xbnl0.5.1"
     },
+    "docs/reality-check-bridge-plan.md": {
+      "owner": "ft-deexl",
+      "reason": "Historical bridge-plan audit records the original forbidden Tokio-token remediation targets.",
+      "removal_bead": "ft-deexl"
+    },
+    "docs/reports/reality-check-2026-05-02.md": {
+      "owner": "ft-deexl",
+      "reason": "Historical reality-check report cites a closed forbidden-token finding.",
+      "removal_bead": "ft-deexl"
+    },
     "docs/replay-test-taxonomy.md": {
       "owner": "ft-xbnl0.5.1",
       "reason": "Replay-test taxonomy mentions #[tokio::test] as the legacy async test convention; replaced under ft-xbnl0.5.1 doc sweep.",
       "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/review/deadlock-audit.md": {
+      "owner": "ft-deexl",
+      "reason": "Review notes mention the Tokio test attribute as a concrete audited anti-pattern.",
+      "removal_bead": "ft-deexl"
+    },
+    "docs/runtime/loom-conventions.md": {
+      "owner": "ft-deexl",
+      "reason": "Runtime testing guidance references Tokio APIs only as migration contrast for Loom/asupersync conventions.",
+      "removal_bead": "ft-deexl"
+    },
+    "docs/runtime/runtime-proof-trait.md": {
+      "owner": "ft-deexl",
+      "reason": "RuntimeProof documentation intentionally names Tokio mutex types to describe the sealed-trait negative proof.",
+      "removal_bead": "ft-deexl"
     },
     "docs/timing-determinism.md": {
       "owner": "ft-xbnl0.5.1",

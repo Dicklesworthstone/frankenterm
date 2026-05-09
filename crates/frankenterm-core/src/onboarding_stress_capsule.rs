@@ -83,8 +83,8 @@ pub enum OnboardingCheck {
     /// Storage path is writable + has at least the documented
     /// minimum free space.
     StoragePathWritable,
-    /// No forbidden direct tokio/test surfaces in the workspace
-    /// (e.g., `#[tokio::test]` outside the asupersync wrapper).
+    /// No forbidden direct Tokio test surfaces in the workspace
+    /// (e.g., the Tokio test attribute outside the asupersync wrapper).
     ForbiddenSurfaces,
     /// Optional high-end machine profile check (CPU cores, RAM,
     /// core-aware tunables). Skipped on small machines without
@@ -332,7 +332,7 @@ mod tests {
         probes.record(
             OnboardingCheck::ForbiddenSurfaces,
             CheckOutcome::Fail {
-                remediation: "remove direct tokio::test in src/foo.rs".to_string(),
+                remediation: "remove direct Tokio test attribute in src/foo.rs".to_string(),
                 issue_class: IssueClass::RepoCode,
             },
         );

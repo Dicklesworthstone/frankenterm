@@ -83,7 +83,7 @@ fn fixture_mixed_failures() -> OnboardingProbeResults {
     r.record(
         OnboardingCheck::ForbiddenSurfaces,
         CheckOutcome::Fail {
-            remediation: "remove `#[tokio::test]` from crates/foo/tests/bar.rs and migrate to asupersync_test_macro".into(),
+            remediation: "remove the Tokio test attribute from crates/foo/tests/bar.rs and migrate to asupersync_test_macro".into(),
             issue_class: IssueClass::RepoCode,
         },
     );

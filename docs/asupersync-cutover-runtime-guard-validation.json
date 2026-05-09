@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-04-19T16:47:27Z",
+  "checked_at": "2026-05-09T17:53:40Z",
   "checks": [
     {
       "name": "contract_identity",
@@ -31,7 +31,7 @@
       "counts": {
         "async_io::": 6,
         "smol::": 35,
-        "tokio::": 181
+        "tokio::": 143
       },
       "files": {
         "async_io::": [
@@ -50,10 +50,11 @@
           "crates/frankenterm-core/src/dependency_eradication.rs",
           "crates/frankenterm-core/src/forbidden_dep_guards.rs",
           "crates/frankenterm-core/src/manifest_dep_eradication.rs",
+          "crates/frankenterm-core/src/mcp_proxy.rs",
           "crates/frankenterm-core/src/runtime_async.rs",
-          "crates/frankenterm-core/src/runtime_async_surface_guard.rs",
+          "crates/frankenterm-core/src/runtime_proof.rs",
           "crates/frankenterm-core/src/vendored_async_contracts.rs",
-          "crates/frankenterm-core/tests/approval_labruntime.rs",
+          "crates/frankenterm-core/src/web/sse.rs",
           "crates/frankenterm-core/tests/cleanup_labruntime.rs",
           "crates/frankenterm-core/tests/diagnostic_labruntime.rs",
           "crates/frankenterm-core/tests/distributed_labruntime.rs",
@@ -76,7 +77,7 @@
           "crates/frankenterm-core/tests/restore_process_labruntime.rs",
           "crates/frankenterm-core/tests/restore_scrollback_labruntime.rs",
           "crates/frankenterm-core/tests/retry_labruntime.rs",
-          "crates/frankenterm-core/tests/runtime_compat_surface_guard.rs",
+          "crates/frankenterm-core/tests/runtime_async_surface_guard.rs",
           "crates/frankenterm-core/tests/runtime_labruntime.rs",
           "crates/frankenterm-core/tests/secrets_labruntime.rs",
           "crates/frankenterm-core/tests/session_correlation_labruntime.rs",
@@ -132,7 +133,7 @@
     "forbidden_token_counts": {
       "async_io::": 6,
       "smol::": 35,
-      "tokio::": 181
+      "tokio::": 143
     }
   }
 }

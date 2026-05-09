@@ -46,7 +46,7 @@
 //! ## What is deferred to the integration bead (ft-mpc9b.6.3.cont)
 //!
 //! - The actual `runtime_async::spawn` of the input task (asupersync
-//!   carries it, not raw `tokio::spawn` per AGENTS.md).
+//!   carries it, not raw Tokio spawning per AGENTS.md).
 //! - The libc `pthread_setschedparam` / Mach
 //!   `dispatch_set_qos_class_self` / Win32 `SetThreadPriority` calls.
 //! - The 1000-keystrokes-per-second-for-60-seconds stress bench.

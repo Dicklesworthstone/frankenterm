@@ -3,7 +3,7 @@
 //! boilerplate.
 //!
 //! **Bead:** ft-i2eni.2 (BR-RC-DOCTRINE.G1.2). Ships the macro that
-//! makes the 60-site `#[tokio::test]` → LabRuntime port (already
+//! makes the 60-site Tokio-test-attribute → LabRuntime port (already
 //! completed under wa-22x4r) ergonomic going forward. Each existing
 //! `*_labruntime.rs` test still wraps its body in
 //! `RuntimeFixture::current_thread().block_on(async { … })`; this
@@ -74,7 +74,7 @@
 //! - `common::fixtures::RuntimeFixture` — the underlying async
 //!   fixture the macro delegates to.
 //! - `tests/wa_22x4r_no_tokio_test_in_supported_paths.rs` — the
-//!   regression guard that pins the "no `#[tokio::test]` in
+//!   regression guard that pins the "no Tokio test attribute in
 //!   supported paths" invariant.
 
 /// Declarative macro that wraps an async-bodied test in the
