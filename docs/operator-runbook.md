@@ -57,7 +57,34 @@ Before sending the first marching order, verify the environment.
   ```bash
   scripts/swarm-tick.sh --agent-mail-fallback frankenterm
   ```
-  The snapshot includes the red-mail marker, active assignees from in-progress Beads, freshness/staleness, ready work, and dirty-file conflict hints.
+  The snapshot includes the red-mail marker, active assignees from in-progress
+  Beads, freshness/staleness, ready work, and dirty-file conflict hints. Its
+  `.git` object is the coordination contract while mail is red:
+  - `dirty_count`, `tracked_dirty_count`, `untracked_dirty_count`, and
+    `high_risk_count` give the fast numeric triage.
+  - `risk_level` is `clean`, `low`, `medium`, or `high`; `high` means at
+    least one tracked file or shared coordination tracker is dirty.
+  - `risk_reason` is short human text suitable for Beads handoff comments.
+  - `dirty_domains[]` groups paths by `category`, `severity`, `count`, and
+    `paths[]` so an agent can avoid parsing prose.
+  - `dirty_paths[]` and `conflict_hints[]` preserve per-path `category` and
+    `severity`.
+
+  The stable categories are:
+  - `shared_tracker` / `high`: `.beads/*`, especially `.beads/issues.jsonl`.
+  - `tracked_overlap_risk` / `high`: any tracked file with local changes.
+  - `untracked_review_required` / `medium`: untracked paths outside known
+    janitor scratch space.
+  - `janitor_untracked` / `low`: untracked `.stash_janitor_workspace/*`
+    artifacts.
+
+  This is intentionally a script-local JSON contract, not a
+  `docs/json-schema/wa-*` robot schema. The fallback is an operator script used
+  when Agent Mail is unavailable; the golden fixture in
+  `tests/fixtures/swarm-tick/agent-mail-fallback/expected.json` and
+  `tests/swarm_tick_tests.bats` are the schema-like compatibility gate. If the
+  data later moves into `ft robot` or MCP, add a normal `docs/json-schema`
+  entry in that bead.
 
 ## 2. Proof-Doctor Gate For Proof Lanes
 

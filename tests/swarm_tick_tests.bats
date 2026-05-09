@@ -16,6 +16,9 @@
 #   - Output is compared to fixture's expected.json after scrubbing the
 #     dynamic `ts` field via `jq -S '.ts="<scrubbed>"'`. `jq -S` sorts keys
 #     so formatting differences are irrelevant.
+#   - The agent-mail-fallback fixture is the schema-like compatibility gate
+#     for red-mail Beads/git coordination. It intentionally pins dirty-path
+#     risk categories and counts without adding a docs/json-schema robot file.
 #
 # Run:
 #   bats tests/swarm_tick_tests.bats
