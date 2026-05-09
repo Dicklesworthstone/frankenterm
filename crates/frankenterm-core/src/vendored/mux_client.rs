@@ -16,13 +16,15 @@ use crate::runtime_async::task;
 use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
 use codec::{
-    CODEC_VERSION, CompressionMode, CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion,
-    GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
+    AdjustPaneSize, CODEC_VERSION, CompressionMode, CreateFloatingPane, CycleStack, DecodedPdu,
+    GetCodecVersion, GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
     GetPaneRenderChangesResponse, ListPanes, ListPanesResponse, MoveFloatingPane, Pdu,
-    RemoveFloatingPane, SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle,
-    SwapToLayout, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WriteToPane,
+    RemoveFloatingPane, Resize, SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ,
+    SetLayoutCycle, SwapToLayout, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints,
+    WriteToPane,
 };
 use config as wezterm_config;
+use frankenterm_term::TerminalSize;
 use mux::client::ClientId;
 use mux::tab::FloatingPaneRect;
 
@@ -546,6 +548,74 @@ impl DirectMuxClient {
                 got: other.pdu_name().to_string(),
             }),
         }
+    }
+
+    /// Resize a pane through the mux session using the same PDU as a GUI client.
+    pub async fn resize(
+        &mut self,
+        containing_tab_id: u64,
+        pane_id: u64,
+        size: TerminalSize,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::Resize(Resize {
+            containing_tab_id: containing_tab_id as usize,
+            pane_id: pane_id as usize,
+            size,
+        }))
+        .await
+    }
+
+    /// Resize a pane through the mux session using an explicit capability context.
+    pub async fn resize_with_cx(
+        &mut self,
+        cx: &Cx,
+        containing_tab_id: u64,
+        pane_id: u64,
+        size: TerminalSize,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::Resize(Resize {
+                containing_tab_id: containing_tab_id as usize,
+                pane_id: pane_id as usize,
+                size,
+            }),
+        )
+        .await
+    }
+
+    /// Adjust pane split geometry through the mux session.
+    pub async fn adjust_pane_size(
+        &mut self,
+        pane_id: u64,
+        direction: wezterm_config::keyassignment::PaneDirection,
+        amount: usize,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::AdjustPaneSize(AdjustPaneSize {
+            pane_id: pane_id as usize,
+            direction,
+            amount,
+        }))
+        .await
+    }
+
+    /// Adjust pane split geometry through the mux session using an explicit capability context.
+    pub async fn adjust_pane_size_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        direction: wezterm_config::keyassignment::PaneDirection,
+        amount: usize,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::AdjustPaneSize(AdjustPaneSize {
+                pane_id: pane_id as usize,
+                direction,
+                amount,
+            }),
+        )
+        .await
     }
 
     async fn expect_unit_response(&mut self, request: Pdu) -> Result<UnitResponse, DirectMuxError> {

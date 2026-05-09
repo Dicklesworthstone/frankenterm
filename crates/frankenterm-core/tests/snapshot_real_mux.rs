@@ -22,7 +22,13 @@ mod common;
 
 use common::fixtures::RuntimeFixture;
 use common::wezterm_subprocess::{WeztermSubprocessFixture, should_run};
+#[cfg(all(feature = "vendored", unix))]
+use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
 use frankenterm_core::wezterm::PaneInfo;
+#[cfg(all(feature = "vendored", unix))]
+use frankenterm_core::wezterm::SplitDirection;
+#[cfg(all(feature = "vendored", unix))]
+use frankenterm_term::TerminalSize;
 
 /// Emit a structured JSON-line trace (per the no-mocks skill's logging
 /// pattern) on test stderr so CI failures are debuggable.
@@ -38,6 +44,41 @@ fn log(test: &str, phase: &str, body: serde_json::Value) {
         "data": body,
     });
     eprintln!("{line}");
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn wait_until_text_contains(
+    runtime: &RuntimeFixture,
+    client: &frankenterm_core::wezterm::WeztermClient,
+    pane_id: u64,
+    needle: &str,
+    deadline: std::time::Duration,
+) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        let client_for_poll = client.clone();
+        let text = runtime
+            .block_on(Box::pin(client_for_poll.get_text(pane_id, false)))
+            .expect("get_text during loopback wait");
+        if text.contains(needle) {
+            log(
+                "loopback",
+                "read_observed",
+                serde_json::json!({
+                    "pane_id": pane_id,
+                    "needle": needle,
+                    "bytes": text.len(),
+                    "elapsed_ms": start.elapsed().as_millis(),
+                }),
+            );
+            return text;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "timed out waiting for pane {pane_id} text to contain {needle:?}; last text={text:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 // ── Test 1: one-pane snapshot + metadata ─────────────────────────────────────
@@ -378,4 +419,157 @@ fn wait_until_pane_count_observes_async_spawn() {
         .expect("spawn second pane");
     let observed = count_at_least(2, std::time::Duration::from_secs(2));
     assert!(observed.len() >= 2);
+}
+
+// ── Test 6: no-mock PTY/mux loopback smoke ──────────────────────────────────
+//
+// Uses a real mux subprocess, a real PTY-backed `/bin/cat`, the CLI-backed
+// WeztermClient for spawn/send/read, and the direct mux client for resize.
+
+#[cfg(all(feature = "vendored", unix))]
+#[test]
+fn no_mock_spawn_send_resize_read_loopback() {
+    if !should_run() {
+        eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");
+        return;
+    }
+    let fixture = WeztermSubprocessFixture::spawn_with_default_prog(&["/bin/cat"])
+        .expect("spawn mux subprocess");
+    let client = fixture.client();
+    let runtime = RuntimeFixture::current_thread();
+
+    let initial = runtime
+        .block_on({
+            let client = client.clone();
+            async move { client.list_panes().await }
+        })
+        .expect("initial list_panes");
+    assert_eq!(initial.len(), 1, "cat fixture should start with one pane");
+    let source = initial[0].clone();
+    log(
+        "loopback",
+        "initial",
+        serde_json::json!({
+            "pane_id": source.pane_id,
+            "tab_id": source.tab_id,
+            "window_id": source.window_id,
+            "rows": source.effective_rows(),
+            "cols": source.effective_cols(),
+        }),
+    );
+
+    let spawned_pane_id = runtime
+        .block_on({
+            let client = client.clone();
+            async move { client.spawn(None, Some("ft-test")).await }
+        })
+        .expect("spawn second cat pane");
+    let split_pane_id = runtime
+        .block_on({
+            let client = client.clone();
+            async move {
+                client
+                    .split_pane(source.pane_id, SplitDirection::Right, None, Some(40))
+                    .await
+            }
+        })
+        .expect("split source pane");
+    let after_spawn = runtime
+        .block_on({
+            let client = client.clone();
+            async move { client.list_panes().await }
+        })
+        .expect("post-spawn list_panes");
+    let ids: Vec<u64> = after_spawn.iter().map(|pane| pane.pane_id).collect();
+    log(
+        "loopback",
+        "spawn_and_split",
+        serde_json::json!({
+            "spawned_pane_id": spawned_pane_id,
+            "split_pane_id": split_pane_id,
+            "pane_count": after_spawn.len(),
+            "ids": ids,
+        }),
+    );
+    assert!(
+        after_spawn
+            .iter()
+            .any(|pane| pane.pane_id == spawned_pane_id),
+        "spawned pane should be listed"
+    );
+    assert!(
+        after_spawn.iter().any(|pane| pane.pane_id == split_pane_id),
+        "split pane should be listed"
+    );
+    assert!(
+        after_spawn.len() >= 3,
+        "fixture should contain source, spawned, and split panes"
+    );
+
+    let mut direct = runtime
+        .block_on(async {
+            DirectMuxClient::connect(
+                DirectMuxClientConfig::default().with_socket_path(fixture.socket_path()),
+            )
+            .await
+        })
+        .expect("connect direct mux client");
+    let resized = TerminalSize {
+        rows: 31,
+        cols: 96,
+        pixel_width: 960,
+        pixel_height: 620,
+        dpi: 96,
+    };
+    runtime
+        .block_on(Box::pin(direct.resize(
+            source.tab_id,
+            source.pane_id,
+            resized,
+        )))
+        .expect("direct mux resize");
+    let render = runtime
+        .block_on(async { direct.get_pane_render_changes(source.pane_id).await })
+        .expect("render changes after resize");
+    log(
+        "loopback",
+        "resized",
+        serde_json::json!({
+            "pane_id": source.pane_id,
+            "rows": render.dimensions.viewport_rows,
+            "cols": render.dimensions.cols,
+            "pixel_width": render.dimensions.pixel_width,
+            "pixel_height": render.dimensions.pixel_height,
+        }),
+    );
+    assert_eq!(render.dimensions.viewport_rows, resized.rows);
+    assert_eq!(render.dimensions.cols, resized.cols);
+
+    let token = format!(
+        "ft-hme39-loopback-{}-{}",
+        source.pane_id,
+        std::process::id()
+    );
+    runtime
+        .block_on({
+            let client = client.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .send_text_with_options(source.pane_id, &format!("{token}\n"), true, true)
+                    .await
+            }
+        })
+        .expect("send token to cat pane");
+    let text = wait_until_text_contains(
+        &runtime,
+        &client,
+        source.pane_id,
+        &token,
+        std::time::Duration::from_secs(5),
+    );
+    assert!(
+        text.contains(&token),
+        "loopback read should include sent token"
+    );
 }

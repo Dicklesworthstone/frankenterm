@@ -35,6 +35,7 @@
 
 #![allow(dead_code)]
 
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -56,8 +57,16 @@ pub fn should_run() -> bool {
 pub enum FixtureError {
     BinaryNotFound(String),
     SpawnFailed(std::io::Error),
-    SocketTimeout(PathBuf),
-    EarlyExit(std::process::ExitStatus),
+    SocketTimeout {
+        path: PathBuf,
+        stdout: String,
+        stderr: String,
+    },
+    EarlyExit {
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    },
     TempDir(std::io::Error),
 }
 
@@ -66,8 +75,27 @@ impl std::fmt::Display for FixtureError {
         match self {
             Self::BinaryNotFound(p) => write!(f, "wezterm-mux-server binary not found at {p}"),
             Self::SpawnFailed(e) => write!(f, "failed to spawn wezterm-mux-server: {e}"),
-            Self::SocketTimeout(p) => write!(f, "timed out waiting for socket at {}", p.display()),
-            Self::EarlyExit(s) => write!(f, "wezterm-mux-server exited early: {s:?}"),
+            Self::SocketTimeout {
+                path,
+                stdout,
+                stderr,
+            } => write!(
+                f,
+                "timed out waiting for socket at {}; stdout={}; stderr={}",
+                path.display(),
+                format_child_output(stdout),
+                format_child_output(stderr)
+            ),
+            Self::EarlyExit {
+                status,
+                stdout,
+                stderr,
+            } => write!(
+                f,
+                "wezterm-mux-server exited early: {status:?}; stdout={}; stderr={}",
+                format_child_output(stdout),
+                format_child_output(stderr)
+            ),
             Self::TempDir(e) => write!(f, "failed to create test tempdir: {e}"),
         }
     }
@@ -84,17 +112,28 @@ pub struct WeztermSubprocessFixture {
 
 impl WeztermSubprocessFixture {
     /// Spawn a new wezterm-mux-server with a hermetic HOME and socket. Blocks
-    /// until the socket file appears (≤ 5s) or returns an error.
+    /// until the socket file appears (≤ 30s) or returns an error.
     pub fn spawn() -> Result<Self, FixtureError> {
-        let bin = locate_mux_binary().ok_or_else(|| {
-            FixtureError::BinaryNotFound(
+        Self::spawn_with_default_prog(&["/bin/sh", "-c", "while :; do sleep 3600; done"])
+    }
+
+    /// Spawn a new wezterm-mux-server with a caller-provided default program.
+    /// This keeps no-mock tests on a real mux/PTY boundary while allowing
+    /// scenarios to choose an interactive echo program such as `/bin/cat`.
+    pub fn spawn_with_default_prog(default_prog: &[&str]) -> Result<Self, FixtureError> {
+        let bin = locate_mux_binary()
+            .or_else(build_mux_binary)
+            .ok_or_else(|| {
+                FixtureError::BinaryNotFound(
                 "wezterm-mux-server (FT_WEZTERM_MUX_SERVER, current target dir, PATH, or Homebrew)"
                     .into(),
             )
-        })?;
+            })?;
 
         let home = TempDir::new().map_err(FixtureError::TempDir)?;
         let socket_path = home.path().join("mux.sock");
+        let stdout_path = home.path().join("mux-server.stdout.log");
+        let stderr_path = home.path().join("mux-server.stderr.log");
         let socket_str = socket_path.display().to_string();
 
         // wezterm config snippets passed via --config. Keep them minimal:
@@ -106,7 +145,7 @@ impl WeztermSubprocessFixture {
         let domain_cfg = format!(
             "unix_domains={{{{name='ft-test',socket_path='{socket_str}',skip_permissions_check=true}}}}"
         );
-        let prog_cfg = "default_prog={'/bin/sh','-c','while :; do sleep 3600; done'}".to_string();
+        let prog_cfg = format!("default_prog={}", lua_string_array(default_prog));
         let domain_default_cfg = "default_domain='ft-test'".to_string();
 
         let mut cmd = Command::new(&bin);
@@ -123,12 +162,16 @@ impl WeztermSubprocessFixture {
             .arg(&prog_cfg)
             .arg("--config")
             .arg(&domain_default_cfg)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(
+                File::create(&stdout_path).map_err(FixtureError::SpawnFailed)?,
+            ))
+            .stderr(Stdio::from(
+                File::create(&stderr_path).map_err(FixtureError::SpawnFailed)?,
+            ));
 
         let mut child = cmd.spawn().map_err(FixtureError::SpawnFailed)?;
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if socket_path.exists() {
                 // mux-server creates the socket on bind, but we briefly wait
@@ -141,12 +184,22 @@ impl WeztermSubprocessFixture {
                 });
             }
             if let Ok(Some(status)) = child.try_wait() {
-                return Err(FixtureError::EarlyExit(status));
+                let (stdout, stderr) = read_child_output(&stdout_path, &stderr_path);
+                return Err(FixtureError::EarlyExit {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(FixtureError::SocketTimeout(socket_path));
+                let (stdout, stderr) = read_child_output(&stdout_path, &stderr_path);
+                return Err(FixtureError::SocketTimeout {
+                    path: socket_path,
+                    stdout,
+                    stderr,
+                });
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -206,6 +259,36 @@ impl Drop for WeztermSubprocessFixture {
     }
 }
 
+fn lua_string_array(values: &[&str]) -> String {
+    let mut out = String::from("{");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&serde_json::to_string(value).expect("serialize lua string literal"));
+    }
+    out.push('}');
+    out
+}
+
+fn read_child_output(stdout_path: &Path, stderr_path: &Path) -> (String, String) {
+    (read_log_file(stdout_path), read_log_file(stderr_path))
+}
+
+fn read_log_file(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|err| format!("<failed to read {}: {err}>", path.display()))
+}
+
+fn format_child_output(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        "<empty>".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn locate_mux_binary() -> Option<PathBuf> {
     for candidate in mux_binary_candidates() {
         if candidate.exists() {
@@ -235,6 +318,30 @@ fn locate_mux_binary() -> Option<PathBuf> {
         return Some(usr_local);
     }
     None
+}
+
+fn build_mux_binary() -> Option<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().and_then(Path::parent)?;
+    let cargo = std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cargo"));
+
+    let status = Command::new(cargo)
+        .current_dir(workspace_root)
+        .arg("build")
+        .arg("-p")
+        .arg("frankenterm-mux-server")
+        .status()
+        .ok()?;
+
+    if !status.success() {
+        return None;
+    }
+
+    mux_binary_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 fn mux_binary_candidates() -> Vec<PathBuf> {
