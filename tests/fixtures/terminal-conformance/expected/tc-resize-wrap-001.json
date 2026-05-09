@@ -1,0 +1,17 @@
+{
+  "scenario_id": "tc-resize-wrap-001",
+  "min_actions": 4,
+  "required_action_kinds": {
+    "CSI": 1,
+    "PrintString": 2,
+    "Control": 2
+  },
+  "required_display_utf8": [
+    "alpha beta gamma",
+    "wrap-continued"
+  ],
+  "required_display_hex": [
+    "1b5b383b343b313274",
+    "0d0a"
+  ]
+}

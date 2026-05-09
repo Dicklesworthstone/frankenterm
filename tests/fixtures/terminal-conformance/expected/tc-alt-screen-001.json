@@ -1,0 +1,20 @@
+{
+  "scenario_id": "tc-alt-screen-001",
+  "min_actions": 5,
+  "required_action_kinds": {
+    "CSI": 4,
+    "PrintString": 2
+  },
+  "required_debug_fragments": [
+    "ClearAndEnableAlternateScreen",
+    "ShowCursor"
+  ],
+  "required_display_utf8": [
+    "ALT-SCREEN",
+    "cursor-hidden"
+  ],
+  "required_display_hex": [
+    "1b5b3f3130343968",
+    "1b5b3f313034396c"
+  ]
+}

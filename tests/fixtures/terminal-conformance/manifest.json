@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "bead": "ft-hme39.3",
+  "contract": "docs/terminal-conformance-contract.md",
+  "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+  "scenarios": [
+    {
+      "scenario_id": "tc-resize-wrap-001",
+      "matrix_row": 4,
+      "family": "Resize plus wrapped text and reflow",
+      "source": "manual synthetic transcript, reviewed for parser-level escape/action coverage",
+      "input_artifact": "transcripts/tc-resize-wrap-001.hex",
+      "expected_artifact": "expected/tc-resize-wrap-001.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "no_mock_boundary": "Parser-only transcript fixture; no-mock PTY/mux reflow assertion is deferred to ft-hme39.2 and ft-hme39.5.",
+      "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
+      "follow_up_bead": "ft-hme39.2"
+    },
+    {
+      "scenario_id": "tc-bracketed-paste-focus-001",
+      "matrix_row": 5,
+      "family": "Bracketed paste and focus events",
+      "source": "manual synthetic transcript using DEC private modes and paste delimiters",
+      "input_artifact": "transcripts/tc-bracketed-paste-focus-001.hex",
+      "expected_artifact": "expected/tc-bracketed-paste-focus-001.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "no_mock_boundary": "Parser-only mode/action assertion; no-mock pane IO is deferred to ft-hme39.2.",
+      "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
+      "follow_up_bead": "ft-hme39.2"
+    },
+    {
+      "scenario_id": "tc-osc8-hyperlink-001",
+      "matrix_row": 6,
+      "family": "OSC 8 hyperlink",
+      "source": "manual synthetic transcript using xterm OSC 8 start/end hyperlink",
+      "input_artifact": "transcripts/tc-osc8-hyperlink-001.hex",
+      "expected_artifact": "expected/tc-osc8-hyperlink-001.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "no_mock_boundary": "Parser-only hyperlink action assertion; robot read-surface metadata proof is deferred to ft-hme39.2.",
+      "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
+      "follow_up_bead": "ft-hme39.2"
+    },
+    {
+      "scenario_id": "tc-alt-screen-001",
+      "matrix_row": 8,
+      "family": "Alternate screen enter/exit",
+      "source": "manual synthetic transcript using alternate screen and cursor visibility modes",
+      "input_artifact": "transcripts/tc-alt-screen-001.hex",
+      "expected_artifact": "expected/tc-alt-screen-001.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "no_mock_boundary": "Parser-only mode/action assertion; no-mock scrollback/screen state proof is deferred to ft-hme39.2.",
+      "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
+      "follow_up_bead": "ft-hme39.2"
+    },
+    {
+      "scenario_id": "tc-utf8-grapheme-001",
+      "matrix_row": 9,
+      "family": "UTF-8 and grapheme boundaries",
+      "source": "manual synthetic transcript with combining mark, emoji ZWJ sequence, and CJK text",
+      "input_artifact": "transcripts/tc-utf8-grapheme-001.hex",
+      "expected_artifact": "expected/tc-utf8-grapheme-001.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "no_mock_boundary": "Parser-only UTF-8 action assertion; cell-width/render proof is deferred to ft-hme39.2 and ft-hme39.5.",
+      "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
+      "follow_up_bead": "ft-hme39.2"
+    },
+    {
+      "scenario_id": "tc-cursor-mode-001",
+      "matrix_row": 7,
+      "family": "CSI cursor shape and terminal modes",
+      "source": "manual synthetic transcript using cursor shape, autowrap, and grapheme clustering modes",
+      "input_artifact": "transcripts/tc-cursor-mode-001.hex",
+      "expected_artifact": "expected/tc-cursor-mode-001.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "no_mock_boundary": "Parser-only mode/action assertion; visible cursor/render proof is deferred to ft-hme39.2.",
+      "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
+      "follow_up_bead": "ft-hme39.2"
+    },
+    {
+      "scenario_id": "tc-graphics-negative-001",
+      "matrix_row": 10,
+      "family": "Graphics negative fixture",
+      "source": "manual synthetic malformed Kitty APC plus malformed sixel DCS transcript",
+      "input_artifact": "transcripts/tc-graphics-negative-001.hex",
+      "expected_artifact": "expected/tc-graphics-negative-001.json",
+      "proof_command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-hme39.3-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+      "no_mock_boundary": "Parser-only safe-rejection assertion; image/render artifact proof is deferred to ft-hme39.2.",
+      "redaction_status": "No secrets, hostnames, user paths, tokens, or private data.",
+      "follow_up_bead": "ft-hme39.2"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "scenario_id": "tc-bracketed-paste-focus-001",
+  "min_actions": 8,
+  "required_action_kinds": {
+    "CSI": 6,
+    "PrintString": 2,
+    "Control": 2
+  },
+  "required_debug_fragments": [
+    "BracketedPaste",
+    "FocusTracking"
+  ],
+  "required_display_utf8": [
+    "pasted",
+    "payload"
+  ],
+  "required_display_hex": [
+    "1b5b3230307e",
+    "1b5b3230317e"
+  ]
+}

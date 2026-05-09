@@ -1,0 +1,16 @@
+{
+  "scenario_id": "tc-utf8-grapheme-001",
+  "min_actions": 1,
+  "required_action_kinds": {
+    "PrintString": 1
+  },
+  "required_display_utf8": [
+    "ASCII",
+    "cafe"
+  ],
+  "required_display_hex": [
+    "65cc81",
+    "f09f91a9e2808df09f92bb",
+    "e6bca2e5ad97"
+  ]
+}

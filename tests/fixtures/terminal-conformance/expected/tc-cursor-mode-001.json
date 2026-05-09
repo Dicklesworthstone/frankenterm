@@ -1,0 +1,20 @@
+{
+  "scenario_id": "tc-cursor-mode-001",
+  "min_actions": 5,
+  "required_action_kinds": {
+    "CSI": 4,
+    "PrintString": 1
+  },
+  "required_debug_fragments": [
+    "AutoWrap",
+    "GraphemeClustering"
+  ],
+  "required_display_utf8": [
+    "Z"
+  ],
+  "required_display_hex": [
+    "1b5b362071",
+    "1b5b3f3230323768",
+    "1b5b3f323032376c"
+  ]
+}

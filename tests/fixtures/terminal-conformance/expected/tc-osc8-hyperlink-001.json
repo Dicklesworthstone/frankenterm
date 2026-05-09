@@ -1,0 +1,20 @@
+{
+  "scenario_id": "tc-osc8-hyperlink-001",
+  "min_actions": 3,
+  "required_action_kinds": {
+    "OperatingSystemCommand": 2,
+    "PrintString": 1
+  },
+  "required_debug_fragments": [
+    "SetHyperlink",
+    "ft-link",
+    "https://example.com/ft"
+  ],
+  "required_display_utf8": [
+    "link text"
+  ],
+  "required_display_hex": [
+    "1b5d383b69643d66742d6c696e6b3b",
+    "1b5d383b3b07"
+  ]
+}

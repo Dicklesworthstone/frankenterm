@@ -1,0 +1,18 @@
+{
+  "scenario_id": "tc-graphics-negative-001",
+  "min_actions": 1,
+  "required_action_kinds": {
+    "PrintString": 1
+  },
+  "forbidden_action_kinds": [
+    "KittyImage",
+    "Sixel"
+  ],
+  "required_input_hex": [
+    "1b5f47743d662c533d393939",
+    "1b5071213132"
+  ],
+  "required_display_utf8": [
+    "after"
+  ]
+}
