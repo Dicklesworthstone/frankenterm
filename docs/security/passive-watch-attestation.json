@@ -1,0 +1,181 @@
+{
+  "category": "security/passive-watch",
+  "schema_version": "ft.security.passive_watch_attestation.v1",
+  "release_version": "ft-e87u6.11-recovery",
+  "generated_at": "2026-05-09T00:00:00Z",
+  "produced_by_bead": "ft-e87u6.11",
+  "source_bead": "ft-x0666.1",
+  "attestation_manifest_slot": {
+    "category": "security/passive-watch",
+    "media_type": "application/json",
+    "current_null_slot_produced_by_bead": "ft-x0666.1",
+    "recommended_path": "docs/security/passive-watch-attestation.json",
+    "manifest_wiring_owner": "ft-e87u6.2"
+  },
+  "headline_rule": {
+    "summary": "ft watch is read-only; mutating actions must pass the Policy Engine.",
+    "hard_invariants": [
+      "zero outbound mutating IPC per fuzz input",
+      "zero non-capture storage writes per fuzz input"
+    ],
+    "allowed_actions": [
+      "capture",
+      "pattern_detection",
+      "watch_metadata_write"
+    ],
+    "forbidden_actions": [
+      "outbound_send",
+      "outbound_spawn",
+      "outbound_close",
+      "non_capture_storage_write"
+    ],
+    "review_signal_actions": [
+      "other"
+    ]
+  },
+  "artifact_basis": {
+    "status": "foundation_slice_attested",
+    "contract_module": "crates/frankenterm-core/src/passive_watch_invariant.rs",
+    "fuzz_target": "fuzz/fuzz_targets/passive_watch_invariant.rs",
+    "seed_corpus_dir": "fuzz/corpus/passive_watch_invariant/",
+    "audit_doc": "docs/security/passive-watch-attestation.md",
+    "real_watch_driver_integration": "follow_on_not_in_this_foundation_artifact",
+    "release_fuzz_duration_seconds": 0,
+    "release_fuzz_status": "not_run_in_recovery_artifact"
+  },
+  "passive_watch_health_contract": {
+    "type": "PassiveWatchHealth",
+    "fields": [
+      "iterations_total",
+      "captures_total",
+      "detections_total",
+      "metadata_writes_total",
+      "mutating_violations_total",
+      "unclassified_other_total"
+    ],
+    "safe_condition": "iterations_total > 0 && mutating_violations_total == 0",
+    "cold_baseline_safe": false,
+    "detection_rate": "detections_total / iterations_total, or 0.0 when iterations_total is 0"
+  },
+  "representative_clean_health_snapshot": {
+    "source": "contract-level clean observation shape exercised by passive_watch_invariant module tests",
+    "iterations_total": 1,
+    "captures_total": 1,
+    "detections_total": 1,
+    "metadata_writes_total": 1,
+    "mutating_violations_total": 0,
+    "unclassified_other_total": 0,
+    "is_safe": true
+  },
+  "seed_corpus": {
+    "seed_count": 10,
+    "total_bytes": 14516,
+    "kinds": [
+      "mutated_real_output",
+      "csi_injection",
+      "osc_injection",
+      "dcs_injection",
+      "prompt_mimic"
+    ],
+    "seeds": [
+      {
+        "name": "shell_prompt_bitflip",
+        "kind": "mutated_real_output",
+        "bytes": 50
+      },
+      {
+        "name": "csi_overlong_params",
+        "kind": "csi_injection",
+        "bytes": 4100
+      },
+      {
+        "name": "csi_invalid_final",
+        "kind": "csi_injection",
+        "bytes": 8
+      },
+      {
+        "name": "osc_oversized_title",
+        "kind": "osc_injection",
+        "bytes": 8197
+      },
+      {
+        "name": "osc_unterminated",
+        "kind": "osc_injection",
+        "bytes": 20
+      },
+      {
+        "name": "dcs_nested",
+        "kind": "dcs_injection",
+        "bytes": 14
+      },
+      {
+        "name": "dcs_sixel_like",
+        "kind": "dcs_injection",
+        "bytes": 2053
+      },
+      {
+        "name": "fake_codex_usage_limit",
+        "kind": "prompt_mimic",
+        "bytes": 51
+      },
+      {
+        "name": "fake_compacting",
+        "kind": "prompt_mimic",
+        "bytes": 15
+      },
+      {
+        "name": "fake_interactive_prompt",
+        "kind": "prompt_mimic",
+        "bytes": 8
+      }
+    ]
+  },
+  "fuzz_target_contract": {
+    "target_name": "passive_watch_invariant",
+    "input_cap_bytes": 262144,
+    "parser_surface": "scan_pipeline::quick_scan",
+    "observation_shape": [
+      "one Capture action for the consumed bytes",
+      "one PatternDetection per non-zero TriggerCategory count",
+      "one WatchMetadataWrite::Telemetry for the counter dump"
+    ],
+    "assertions": [
+      "scan.input_bytes equals input length",
+      "check_invariants(&obs) returns empty",
+      "PassiveWatchHealth::is_safe() is true after folding the observation"
+    ]
+  },
+  "unit_test_contract": {
+    "test_count": 15,
+    "covered_shapes": [
+      "read-only actions classify as non-mutating",
+      "mutating actions classify as mutating",
+      "Other actions produce the review invariant",
+      "capture-only observation is clean",
+      "outbound send violates NoOutboundMutatingIpc",
+      "non-capture storage write violates NoNonCaptureStorageWrite",
+      "seed corpus covers every kind",
+      "seed names are unique",
+      "seeds are non-empty",
+      "fold_observation updates health",
+      "mutating observation increments violation counters",
+      "observation JSONL round-trips",
+      "cold baseline is unsafe until at least one clean iteration",
+      "corpus slugs match the documented values",
+      "is_mutating_action matches WatchAction::is_mutating"
+    ]
+  },
+  "targeted_validation": {
+    "command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-passive-watch-target cargo test -p frankenterm-core passive_watch_invariant::tests --lib -- --nocapture",
+    "status": "blocked",
+    "error_code": "RCH-E104",
+    "notes": "Remote execution on vmi1153651 timed out after 1800 seconds before Cargo emitted a test summary; no local fallback was used and no Cargo pass is claimed."
+  },
+  "source_documents": [
+    "docs/security/passive-watch-attestation.md",
+    "crates/frankenterm-core/src/passive_watch_invariant.rs",
+    "fuzz/fuzz_targets/passive_watch_invariant.rs",
+    "fuzz/Cargo.toml",
+    "docs/attestations/null-slot-reconciliation.md"
+  ]
+}
