@@ -144,6 +144,12 @@ assert_match() {
     assert_match
     [[ "$(jq -r '.agent_mail.marker' "${TMP_DIR}/actual.json")" == *"retry once, do not repair/restart service"* ]]
     [[ "$(jq -r '.mode' "${TMP_DIR}/actual.json")" == "agent_mail_unavailable_beads_only" ]]
+    [[ "$(jq -r '.git.risk_level' "${TMP_DIR}/actual.json")" == "high" ]]
+    [[ "$(jq -r '.git.tracked_dirty_count' "${TMP_DIR}/actual.json")" == "2" ]]
+    [[ "$(jq -r '.git.untracked_dirty_count' "${TMP_DIR}/actual.json")" == "2" ]]
+    [[ "$(jq -r '.git.high_risk_count' "${TMP_DIR}/actual.json")" == "2" ]]
+    [[ "$(jq -r '.git.conflict_hints[] | select(.path == ".beads/issues.jsonl") | .category' "${TMP_DIR}/actual.json")" == "shared_tracker" ]]
+    [[ "$(jq -r '.git.conflict_hints[] | select(.path == ".stash_janitor_workspace/handoff_report.md") | .severity' "${TMP_DIR}/actual.json")" == "low" ]]
 }
 
 # ─── Schema invariants (run on healthy fixture) ──────────────────────────────

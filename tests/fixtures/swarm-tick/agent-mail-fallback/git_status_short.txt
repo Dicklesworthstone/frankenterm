@@ -1,2 +1,4 @@
+ M .beads/issues.jsonl
  M crates/frankenterm-core/src/storage.rs
+?? .stash_janitor_workspace/handoff_report.md
 ?? docs/robot-contracts/policy-recommendations.md

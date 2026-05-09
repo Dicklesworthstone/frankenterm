@@ -196,6 +196,47 @@ emit_agent_mail_fallback_snapshot() {
           stale_over_2h: (if $updated_epoch == null then false else (($now_epoch - $updated_epoch) >= 7200) end)
         };
 
+    def dirty_category:
+      if (.path == ".beads/issues.jsonl" or (.path | startswith(".beads/"))) then
+        "shared_tracker"
+      elif (.path | startswith(".stash_janitor_workspace/")) then
+        "janitor_untracked"
+      elif .status == "??" then
+        "untracked_review_required"
+      else
+        "tracked_overlap_risk"
+      end;
+
+    def dirty_severity:
+      dirty_category as $category
+      | if $category == "shared_tracker" then
+          "high"
+        elif $category == "tracked_overlap_risk" then
+          "high"
+        elif $category == "untracked_review_required" then
+          "medium"
+        else
+          "low"
+        end;
+
+    def dirty_guidance:
+      dirty_category as $category
+      | if $category == "shared_tracker" then
+          "Shared Beads tracker is dirty; coordinate before staging .beads and avoid bundling unrelated issue updates."
+        elif $category == "tracked_overlap_risk" then
+          "Tracked file already has local changes; treat as another active pane work item until ownership is known."
+        elif $category == "janitor_untracked" then
+          "Untracked janitor artifact; leave untouched unless you own the cleanup lane."
+        else
+          "Untracked path needs ownership review before editing or staging."
+        end;
+
+    def enriched_dirty_path:
+      . + {
+        category: dirty_category,
+        severity: dirty_severity
+      };
+
     def active_agents:
       map(enriched_issue)
       | sort_by(.assignee, .id)
@@ -212,6 +253,30 @@ emit_agent_mail_fallback_snapshot() {
           })
         });
 
+    ($dirty | map(enriched_dirty_path)) as $dirty_enriched
+    | ($dirty_enriched | map(select(.severity == "high")) | length) as $high_risk_count
+    | ($dirty_enriched | map(select(.severity == "medium")) | length) as $medium_risk_count
+    | ($dirty_enriched | map(select(.status != "??")) | length) as $tracked_dirty_count
+    | ($dirty_enriched | map(select(.status == "??")) | length) as $untracked_dirty_count
+    | (if $high_risk_count > 0 then
+         "high"
+       elif $medium_risk_count > 0 then
+         "medium"
+       elif ($dirty_enriched | length) > 0 then
+         "low"
+       else
+         "clean"
+       end) as $risk_level
+    | (if $high_risk_count > 0 then
+         "tracked or shared coordination files are already dirty"
+       elif $medium_risk_count > 0 then
+         "only untracked review-required paths are dirty"
+       elif ($dirty_enriched | length) > 0 then
+         "only low-risk janitor artifacts are dirty"
+       else
+         "worktree is clean"
+       end) as $risk_reason
+    |
     {
       ts: $ts,
       session: $session,
@@ -242,12 +307,30 @@ emit_agent_mail_fallback_snapshot() {
         }))
       },
       git: {
-        dirty_count: ($dirty | length),
-        dirty_paths: $dirty,
-        conflict_hints: ($dirty | map({
+        dirty_count: ($dirty_enriched | length),
+        tracked_dirty_count: $tracked_dirty_count,
+        untracked_dirty_count: $untracked_dirty_count,
+        high_risk_count: $high_risk_count,
+        risk_level: $risk_level,
+        risk_reason: $risk_reason,
+        dirty_domains: (
+          $dirty_enriched
+          | sort_by(.category)
+          | group_by(.category)
+          | map({
+              category: .[0].category,
+              severity: .[0].severity,
+              count: length,
+              paths: map(.path)
+            })
+        ),
+        dirty_paths: $dirty_enriched,
+        conflict_hints: ($dirty_enriched | map({
           path,
           status,
-          guidance: "Treat as shared-worktree conflict until owner is known; do not edit or stage unrelated paths."
+          category,
+          severity,
+          guidance: dirty_guidance
         }))
       },
       next_actions: [

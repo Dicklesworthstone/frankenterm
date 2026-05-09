@@ -84,29 +84,104 @@
   "git": {
     "conflict_hints": [
       {
-        "guidance": "Treat as shared-worktree conflict until owner is known; do not edit or stage unrelated paths.",
-        "path": "crates/frankenterm-core/src/storage.rs",
+        "category": "shared_tracker",
+        "guidance": "Shared Beads tracker is dirty; coordinate before staging .beads and avoid bundling unrelated issue updates.",
+        "path": ".beads/issues.jsonl",
+        "severity": "high",
         "status": " M"
       },
       {
-        "guidance": "Treat as shared-worktree conflict until owner is known; do not edit or stage unrelated paths.",
+        "category": "tracked_overlap_risk",
+        "guidance": "Tracked file already has local changes; treat as another active pane work item until ownership is known.",
+        "path": "crates/frankenterm-core/src/storage.rs",
+        "severity": "high",
+        "status": " M"
+      },
+      {
+        "category": "janitor_untracked",
+        "guidance": "Untracked janitor artifact; leave untouched unless you own the cleanup lane.",
+        "path": ".stash_janitor_workspace/handoff_report.md",
+        "severity": "low",
+        "status": "??"
+      },
+      {
+        "category": "untracked_review_required",
+        "guidance": "Untracked path needs ownership review before editing or staging.",
         "path": "docs/robot-contracts/policy-recommendations.md",
+        "severity": "medium",
         "status": "??"
       }
     ],
-    "dirty_count": 2,
+    "dirty_count": 4,
+    "dirty_domains": [
+      {
+        "category": "janitor_untracked",
+        "count": 1,
+        "paths": [
+          ".stash_janitor_workspace/handoff_report.md"
+        ],
+        "severity": "low"
+      },
+      {
+        "category": "shared_tracker",
+        "count": 1,
+        "paths": [
+          ".beads/issues.jsonl"
+        ],
+        "severity": "high"
+      },
+      {
+        "category": "tracked_overlap_risk",
+        "count": 1,
+        "paths": [
+          "crates/frankenterm-core/src/storage.rs"
+        ],
+        "severity": "high"
+      },
+      {
+        "category": "untracked_review_required",
+        "count": 1,
+        "paths": [
+          "docs/robot-contracts/policy-recommendations.md"
+        ],
+        "severity": "medium"
+      }
+    ],
     "dirty_paths": [
       {
-        "path": "crates/frankenterm-core/src/storage.rs",
-        "raw": " M crates/frankenterm-core/src/storage.rs",
+        "category": "shared_tracker",
+        "path": ".beads/issues.jsonl",
+        "raw": " M .beads/issues.jsonl",
+        "severity": "high",
         "status": " M"
       },
       {
+        "category": "tracked_overlap_risk",
+        "path": "crates/frankenterm-core/src/storage.rs",
+        "raw": " M crates/frankenterm-core/src/storage.rs",
+        "severity": "high",
+        "status": " M"
+      },
+      {
+        "category": "janitor_untracked",
+        "path": ".stash_janitor_workspace/handoff_report.md",
+        "raw": "?? .stash_janitor_workspace/handoff_report.md",
+        "severity": "low",
+        "status": "??"
+      },
+      {
+        "category": "untracked_review_required",
         "path": "docs/robot-contracts/policy-recommendations.md",
         "raw": "?? docs/robot-contracts/policy-recommendations.md",
+        "severity": "medium",
         "status": "??"
       }
-    ]
+    ],
+    "high_risk_count": 2,
+    "risk_level": "high",
+    "risk_reason": "tracked or shared coordination files are already dirty",
+    "tracked_dirty_count": 2,
+    "untracked_dirty_count": 2
   },
   "mode": "agent_mail_unavailable_beads_only",
   "next_actions": [
