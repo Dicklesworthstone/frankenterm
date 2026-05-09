@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Represents an opened .ftx package with its parsed manifest and file listing.
 #[derive(Clone, Debug)]
@@ -40,10 +40,15 @@ impl FtxPackage {
         let mut archive =
             zip::ZipArchive::new(cursor).context("failed to open .ftx as ZIP archive")?;
 
-        // Collect entry names
-        let entries: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
-            .collect();
+        let mut entries = Vec::with_capacity(archive.len());
+        for i in 0..archive.len() {
+            let file = archive
+                .by_index(i)
+                .with_context(|| format!("failed to read archive entry {i}"))?;
+            let name = file.name().to_string();
+            validate_archive_entry_name(&name)?;
+            entries.push(name);
+        }
 
         // Read and parse extension.toml
         let manifest_str = {
@@ -137,10 +142,7 @@ impl FtxPackage {
 
             let name = file.name().to_string();
 
-            // Security: reject paths with directory traversal
-            if name.contains("..") {
-                bail!("rejecting path with directory traversal: {name}");
-            }
+            validate_archive_entry_name(&name)?;
 
             let out_path = ext_dir.join(&name);
 
@@ -262,6 +264,35 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().into()
+}
+
+fn validate_archive_entry_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("rejecting empty archive entry name");
+    }
+
+    if name.starts_with('/') || name.starts_with('\\') || name.contains('\\') {
+        bail!("rejecting unsafe archive entry path: {name}");
+    }
+
+    if name.len() >= 2 && name.as_bytes()[1] == b':' && name.as_bytes()[0].is_ascii_alphabetic() {
+        bail!("rejecting unsafe archive entry path: {name}");
+    }
+
+    let path = Path::new(name);
+    for component in path.components() {
+        match component {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                bail!("rejecting unsafe archive entry path: {name}");
+            }
+            Component::Normal(_) => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -460,6 +491,24 @@ themes = ["assets/theme.toml"]
 
         let result = FtxPackage::open(&ftx_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_rejects_unsafe_archive_entry_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let ftx_path = dir.path().join("traversal.ftx");
+
+        let bytes = FtxBuilder::new()
+            .add_manifest(MINIMAL_WASM_MANIFEST)
+            .add_file("main.wasm", WASM_MAGIC)
+            .add_file("../escape.txt", b"escape")
+            .build()
+            .unwrap();
+        std::fs::write(&ftx_path, &bytes).unwrap();
+
+        let result = FtxPackage::open(&ftx_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsafe archive"));
     }
 
     #[test]

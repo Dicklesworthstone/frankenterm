@@ -1,0 +1,11 @@
+[extension]
+name = 7
+authors = "not-an-array"
+
+[engine]
+type = ["wasm"]
+entry = false
+
+[permissions]
+filesystem = "read:/tmp"
+network = "yes"

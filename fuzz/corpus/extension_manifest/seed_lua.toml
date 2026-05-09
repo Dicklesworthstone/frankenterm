@@ -1,0 +1,13 @@
+[extension]
+name = "lua-extension"
+version = "0.1.0"
+
+[engine]
+type = "lua"
+entry = "main.lua"
+
+[permissions]
+filesystem = ["read:~/.config/frankenterm/", "write:~/.local/share/frankenterm/"]
+environment = ["TERM", "FRANKENTERM_*"]
+network = false
+pane_access = true

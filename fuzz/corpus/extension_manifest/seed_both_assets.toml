@@ -1,0 +1,16 @@
+[extension]
+name = "dual-extension"
+version = "2.0.0"
+description = "Both engine paths plus assets"
+authors = ["Fuzzer <fuzzer@example.invalid>"]
+
+[engine]
+type = "both"
+entry = "main.wasm"
+
+[hooks]
+on_config_reload = "handle_reload"
+on_pane_focus = "handle_focus"
+
+[assets]
+themes = ["assets/theme.toml", "assets/dark.toml"]

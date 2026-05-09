@@ -8,7 +8,12 @@ edition = "2024"
 cargo-fuzz = true
 
 [features]
-default = ["core-fuzz-targets", "mcp-fuzz-targets", "mux-server-fuzz-targets"]
+default = [
+    "core-fuzz-targets",
+    "mcp-fuzz-targets",
+    "mux-server-fuzz-targets",
+    "scripting-fuzz-targets",
+]
 core-fuzz-targets = ["dep:frankenterm-core", "frankenterm-core/fuzz"]
 mcp-fuzz-targets = ["core-fuzz-targets", "frankenterm-core/mcp"]
 codec-fuzz-targets = ["dep:codec"]
@@ -18,12 +23,14 @@ mux-server-fuzz-targets = [
     "dep:mux",
     "dep:promise",
 ]
+scripting-fuzz-targets = ["dep:frankenterm-scripting"]
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 leb128.workspace = true
 libfuzzer-sys = "0.4.10"
 frankenterm-core = { path = "../crates/frankenterm-core", optional = true }
+frankenterm-scripting = { workspace = true, optional = true }
 frankenterm-mux-server-impl = { path = "../crates/frankenterm-mux-server-impl", optional = true }
 frankenterm-term = { workspace = true }
 frankenterm-escape-parser = { workspace = true, features = ["std"] }
@@ -116,6 +123,21 @@ name = "config_toml_parser"
 path = "fuzz_targets/config_toml_parser.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
+
+# ft-851up: user-supplied extension.toml parsing and .ftx ZIP package
+# opening. Keeps scripting package fuzzing behind its own feature so
+# harnesses can compile without enabling Lua/WASM engines.
+[[bin]]
+name = "extension_manifest"
+path = "fuzz_targets/extension_manifest.rs"
+doc = false
+required-features = ["scripting-fuzz-targets"]
+
+[[bin]]
+name = "ftx_package"
+path = "fuzz_targets/ftx_package.rs"
+doc = false
+required-features = ["scripting-fuzz-targets"]
 
 [[bin]]
 name = "ntm_importer_json"

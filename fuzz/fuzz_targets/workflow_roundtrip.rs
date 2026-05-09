@@ -149,7 +149,7 @@ fn arbitrary_json_value(
         return arbitrary_json_primitive(u);
     }
     Ok(match u.int_in_range(0..=5u8)? {
-        0 | 1 | 2 => arbitrary_json_primitive(u)?,
+        0..=2 => arbitrary_json_primitive(u)?,
         3 => {
             let len = u.int_in_range(0..=MAX_JSON_WIDTH)?;
             let mut v = Vec::with_capacity(len);

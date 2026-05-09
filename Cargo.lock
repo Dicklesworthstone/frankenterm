@@ -3940,6 +3940,7 @@ dependencies = [
  "frankenterm-core",
  "frankenterm-escape-parser",
  "frankenterm-mux-server-impl",
+ "frankenterm-scripting",
  "frankenterm-term",
  "jsonschema",
  "leb128",
