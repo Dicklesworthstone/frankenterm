@@ -924,7 +924,7 @@ mod metadata_parse_drop_tests {
                 "{\"unknown\":42}".to_string(),
                 "{\"pid\":\"not a number\"}".to_string(),
                 "not json at all".to_string(),
-                "".to_string(),
+                String::new(),
                 "{".to_string(),
             ]),
         ) {

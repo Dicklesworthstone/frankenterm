@@ -272,7 +272,7 @@ mod tests {
         // round to bucket boundaries; ±10% is reasonable.
         let c = d.count();
         assert!(
-            c >= 90 && c <= 110,
+            (90..=110).contains(&c),
             "count={c} should be ≈ 100 after 100 distinct inserts"
         );
     }

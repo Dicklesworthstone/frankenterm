@@ -776,8 +776,8 @@ mod tests {
         // Substrate guarantee: callers don't have to depend on
         // asupersync directly to use LabConfig / Budget. If these
         // re-exports break, downstream tests will fail to compile.
-        let _config: LabConfig = LabConfig::new(0).with_auto_advance().worker_count(1);
-        let _budget: Budget = Budget::INFINITE;
+        let _: LabConfig = LabConfig::new(0).with_auto_advance().worker_count(1);
+        let _: Budget = Budget::INFINITE;
     }
 
     // ========================================================================

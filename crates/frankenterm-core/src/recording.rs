@@ -3516,6 +3516,7 @@ mod tests {
     ///      TimedOut+finalized.
     ///   2. After retry (or race-win), is_finalized=true and no
     ///      pending receiver remains.
+    ///
     /// This pins the retry contract uniformly across the load envelope
     /// rather than relying on a single representative case.
     #[test]

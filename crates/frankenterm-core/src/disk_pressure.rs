@@ -728,6 +728,13 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    fn assert_f64_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "expected {actual} to be within EPSILON of {expected}"
+        );
+    }
+
     #[test]
     fn tier_ordering_and_labels_are_stable() {
         assert!(DiskPressureTier::Green < DiskPressureTier::Yellow);
@@ -1112,10 +1119,10 @@ mod tests {
     #[test]
     fn ft_761tz_ewma_rejects_nan_sample_and_preserves_prior_value() {
         let mut ewma = EwmaEstimator::new(0.5);
-        assert_eq!(ewma.update(0.42), 0.42);
+        assert_f64_close(ewma.update(0.42), 0.42);
         let out = ewma.update(f64::NAN);
         assert!(out.is_finite(), "NaN sample must not taint ewma.value");
-        assert_eq!(out, 0.42);
+        assert_f64_close(out, 0.42);
         // Recovery: next clean sample continues from the prior value.
         let recovered = ewma.update(0.50);
         assert!(recovered.is_finite());
@@ -1127,10 +1134,10 @@ mod tests {
     fn ft_761tz_ewma_rejects_nan_first_sample() {
         let mut ewma = EwmaEstimator::new(0.5);
         let out = ewma.update(f64::NAN);
-        assert_eq!(out, 0.0, "uninitialised ewma returns the default 0.0");
+        assert_f64_close(out, 0.0);
         // The next clean sample should initialise (not blend against NaN).
         let first_clean = ewma.update(0.3);
-        assert_eq!(first_clean, 0.3);
+        assert_f64_close(first_clean, 0.3);
     }
 
     /// PidController::update must no-op on NaN so one bad sample cannot
@@ -1142,17 +1149,9 @@ mod tests {
         let integral_before = pid.integral();
         let deriv_before = pid.derivative();
         let out = pid.update(f64::NAN, 1.0);
-        assert_eq!(out, 0.0, "NaN input must produce a neutral control signal");
-        assert_eq!(
-            pid.integral(),
-            integral_before,
-            "NaN input must not update the integral"
-        );
-        assert_eq!(
-            pid.derivative(),
-            deriv_before,
-            "NaN input must not update the derivative"
-        );
+        assert_f64_close(out, 0.0);
+        assert_f64_close(pid.integral(), integral_before);
+        assert_f64_close(pid.derivative(), deriv_before);
     }
 
     /// PidController::update must also no-op on NaN dt (which otherwise
@@ -1162,7 +1161,7 @@ mod tests {
         let mut pid = PidController::new(0.5, 0.5, 0.5, -1.0, 1.0);
         let _ = pid.update(0.1, 1.0);
         let out = pid.update(0.2, f64::NAN);
-        assert_eq!(out, 0.0);
+        assert_f64_close(out, 0.0);
         assert!(pid.integral().is_finite());
         assert!(pid.derivative().is_finite());
     }
@@ -1189,8 +1188,8 @@ mod tests {
         };
         let mut monitor = DiskPressureMonitor::new(config);
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_millis(1000);
-        let t2 = t0 + Duration::from_millis(2000);
+        let t1 = t0 + Duration::from_secs(1);
+        let t2 = t0 + Duration::from_secs(2);
 
         // Healthy sample → Green.
         let healthy = DiskSample {

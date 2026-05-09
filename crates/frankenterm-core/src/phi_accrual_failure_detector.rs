@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn no_heartbeats_yields_zero_suspicion() {
         let detector = PhiAccrualFailureDetector::new();
-        assert_eq!(detector.suspicion_at(10_000_000), 0.0);
+        assert!(detector.suspicion_at(10_000_000).abs() <= f64::EPSILON);
         assert!(!detector.is_unreachable(10_000_000, DEFAULT_SUSPICION_THRESHOLD));
     }
 

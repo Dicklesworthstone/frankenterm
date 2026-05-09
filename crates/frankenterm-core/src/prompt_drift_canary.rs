@@ -681,8 +681,8 @@ mod tests {
     fn new_starts_clean() {
         let stat = DriftStatistic::new(params());
         let snap = stat.snapshot();
-        assert_eq!(snap.cusum_high, 0.0);
-        assert_eq!(snap.cusum_low, 0.0);
+        assert!(snap.cusum_high.abs() <= f64::EPSILON);
+        assert!(snap.cusum_low.abs() <= f64::EPSILON);
         assert_eq!(snap.observations_count, 0);
         assert_eq!(snap.alarms_count, 0);
         assert_eq!(snap.suppressed_alarms_count, 0);
@@ -722,7 +722,9 @@ mod tests {
                         alerted = true;
                         break;
                     }
-                    other => panic!("expected UpwardShift, got {other:?}"),
+                    other @ DriftAlert::DownwardShift { .. } => {
+                        panic!("expected UpwardShift, got {other:?}")
+                    }
                 }
             }
         }
@@ -730,8 +732,8 @@ mod tests {
         let snap = stat.snapshot();
         assert_eq!(snap.alarms_count, 1);
         // Post-alarm, cusum reset to 0.
-        assert_eq!(snap.cusum_high, 0.0);
-        assert_eq!(snap.cusum_low, 0.0);
+        assert!(snap.cusum_high.abs() <= f64::EPSILON);
+        assert!(snap.cusum_low.abs() <= f64::EPSILON);
     }
 
     /// A sustained downward shift fires the DownwardShift variant.
@@ -982,7 +984,7 @@ mod tests {
     #[test]
     fn transcript_analysis_tracks_rule_hits_entropy_and_motifs() {
         let observations = analyze_transcript_window(&drifted_window(), 3);
-        assert_eq!(observations.rule_hit_rate, 0.0);
+        assert!(observations.rule_hit_rate.abs() <= f64::EPSILON);
         assert!(observations.unmatched_entropy > 0.0);
         assert!(observations.motif_frequency > 0.0);
         assert_eq!(observations.top_motif.as_deref(), Some("provider_slowdown"));

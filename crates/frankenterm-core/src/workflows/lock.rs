@@ -1558,7 +1558,7 @@ mod tests {
                 assert_eq!(g.pane_id(), 31);
                 assert_eq!(g.execution_id(), "exec-1");
             }
-            _ => panic!("expected Acquired"),
+            OwnedLockAcquisitionResult::AlreadyLocked { .. } => panic!("expected Acquired"),
         }
     }
 
@@ -1571,7 +1571,9 @@ mod tests {
             .expect("limit not hit");
         let _g1 = match g1 {
             OwnedLockAcquisitionResult::Acquired(g) => g,
-            _ => panic!("first acquire should succeed"),
+            OwnedLockAcquisitionResult::AlreadyLocked { .. } => {
+                panic!("first acquire should succeed")
+            }
         };
 
         // Second acquire on same pane → AlreadyLocked with payload.
@@ -1588,7 +1590,9 @@ mod tests {
                 assert_eq!(held_by_execution, "exec-first");
                 assert!(locked_since_ms > 0, "locked_since_ms must be populated");
             }
-            _ => panic!("expected AlreadyLocked with payload"),
+            OwnedLockAcquisitionResult::Acquired(_) => {
+                panic!("expected AlreadyLocked with payload")
+            }
         }
     }
 

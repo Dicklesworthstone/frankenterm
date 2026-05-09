@@ -588,8 +588,8 @@ mod tests {
         // Two calls with the same kind must return the exact same
         // pointer — that is what makes the regex compile a one-time
         // cost.
-        let a = compiled_pattern(SelectionPatternKind::Url) as *const Regex;
-        let b = compiled_pattern(SelectionPatternKind::Url) as *const Regex;
+        let a = std::ptr::from_ref::<Regex>(compiled_pattern(SelectionPatternKind::Url));
+        let b = std::ptr::from_ref::<Regex>(compiled_pattern(SelectionPatternKind::Url));
         assert!(std::ptr::eq(a, b));
     }
 }

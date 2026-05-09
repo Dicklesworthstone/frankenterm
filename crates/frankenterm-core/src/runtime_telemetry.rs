@@ -13369,7 +13369,13 @@ mod tests {
         let mut state = SwarmCapacityAdmissionControllerState::default();
 
         for _ in 0..7 {
-            let plan = controller.plan(10_000, &certificate, &report, &[request.clone()], &state);
+            let plan = controller.plan(
+                10_000,
+                &certificate,
+                &report,
+                std::slice::from_ref(&request),
+                &state,
+            );
             state.record_expected_loss_outcome(&plan, &controller.config);
         }
         assert_eq!(
@@ -13378,7 +13384,13 @@ mod tests {
         );
 
         for _ in 0..7 {
-            let plan = controller.plan(10_000, &certificate, &report, &[request.clone()], &state);
+            let plan = controller.plan(
+                10_000,
+                &certificate,
+                &report,
+                std::slice::from_ref(&request),
+                &state,
+            );
             state.record_expected_loss_outcome(&plan, &controller.config);
         }
         assert_eq!(
@@ -13386,7 +13398,13 @@ mod tests {
             SwarmCapacityAdmissionControllerStage::Default
         );
 
-        let default_plan = controller.plan(10_000, &certificate, &report, &[request], &state);
+        let default_plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            std::slice::from_ref(&request),
+            &state,
+        );
         assert_eq!(
             default_plan.planned_controller_action,
             SwarmCapacityDecisionAction::Allow
@@ -13408,7 +13426,13 @@ mod tests {
         let mut state = SwarmCapacityAdmissionControllerState::default();
 
         for _ in 0..20 {
-            let plan = controller.plan(10_000, &certificate, &report, &[request.clone()], &state);
+            let plan = controller.plan(
+                10_000,
+                &certificate,
+                &report,
+                std::slice::from_ref(&request),
+                &state,
+            );
             state.record_expected_loss_outcome(&plan, &controller.config);
         }
 

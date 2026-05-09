@@ -440,8 +440,8 @@ mod tests {
         let mut w = TripleBufferWatchdog::new();
         w.record_acquire(now);
         let _ = w.poll(now + Duration::from_millis(1500));
-        let d2 = w.poll(now + Duration::from_millis(2000));
-        let d3 = w.poll(now + Duration::from_millis(3000));
+        let d2 = w.poll(now + Duration::from_secs(2));
+        let d3 = w.poll(now + Duration::from_secs(3));
         assert_eq!(d2, WatchdogDecision::NoOp);
         assert_eq!(d3, WatchdogDecision::NoOp);
         assert_eq!(w.stats().warnings_emitted, 1);

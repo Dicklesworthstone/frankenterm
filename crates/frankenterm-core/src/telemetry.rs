@@ -3645,7 +3645,7 @@ mod tests {
             h.record(((i as f64) * 0.01) % 10.0 + 1.0);
         }
         for i in 0..1000 {
-            h.record(100.0 + (i as f64) * 0.1);
+            h.record((i as f64).mul_add(0.1, 100.0));
         }
         assert_eq!(h.count(), 10_000);
 
@@ -3653,7 +3653,7 @@ mod tests {
         // 1% is exactly the 1000 large samples).
         let p99 = h.p99().expect("p99 with 10k samples");
         assert!(
-            p99 >= 90.0 && p99 <= 210.0,
+            (90.0..=210.0).contains(&p99),
             "p99={} should be in the tail spike region [90, 210]; \
              br-ft-z9byv bounded-error guarantee allows ~1% relative \
              error at compression=200",
@@ -3841,7 +3841,10 @@ mod tests {
             m.is_finite(),
             "mean must stay finite after NaN sample, got {m}"
         );
-        assert_eq!(m, 20.0, "mean = (10+20+30)/3, NaN dropped on input");
+        assert!(
+            (m - 20.0).abs() <= f64::EPSILON,
+            "mean = (10+20+30)/3, NaN dropped on input"
+        );
         assert_eq!(h.count(), 3, "NaN must not advance total_count");
         assert_eq!(h.retained(), 3, "NaN must not enter the sample window");
     }
@@ -3909,7 +3912,10 @@ mod tests {
             m.is_finite(),
             "mean must stay finite after Inf sample, got {m}"
         );
-        assert_eq!(m, 20.0, "mean = (10+20+30)/3, Inf dropped on input");
+        assert!(
+            (m - 20.0).abs() <= f64::EPSILON,
+            "mean = (10+20+30)/3, Inf dropped on input"
+        );
         assert_eq!(h.count(), 3, "Inf must not advance total_count");
         assert_eq!(h.retained(), 3, "Inf must not enter the sample window");
     }
@@ -3925,7 +3931,7 @@ mod tests {
 
         let m = h.mean().expect("mean");
         assert!(m.is_finite(), "mean must stay finite, got {m}");
-        assert_eq!(m, 20.0);
+        assert!((m - 20.0).abs() <= f64::EPSILON);
         assert_eq!(h.count(), 2);
     }
 
@@ -3959,9 +3965,9 @@ mod tests {
         let s = h.summary();
         let max = s.max.expect("max present");
         assert!(max.is_finite(), "summary.max must stay finite, got {max}");
-        assert_eq!(max, 15.0);
+        assert!((max - 15.0).abs() <= f64::EPSILON);
         let min = s.min.expect("min present");
         assert!(min.is_finite());
-        assert_eq!(min, 5.0);
+        assert!((min - 5.0).abs() <= f64::EPSILON);
     }
 }

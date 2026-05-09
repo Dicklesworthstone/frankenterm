@@ -816,7 +816,7 @@ mod tests {
         let h = VrrHealth::baseline(promotion());
         assert!(h.is_safe());
         assert!(!h.vrr_active);
-        assert_eq!(h.mismatch_rate(), 0.0);
+        assert!(h.mismatch_rate().abs() <= f64::EPSILON);
     }
 
     #[test]

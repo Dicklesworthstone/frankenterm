@@ -563,15 +563,15 @@ mod tests {
     #[test]
     fn axis_weight_range_matches_opentype() {
         let (min, max) = VariableAxis::Weight.valid_range();
-        assert_eq!(min, 1.0);
-        assert_eq!(max, 1000.0);
+        assert!((min - 1.0).abs() <= f32::EPSILON);
+        assert!((max - 1000.0).abs() <= f32::EPSILON);
     }
 
     #[test]
     fn axis_slant_range_matches_opentype() {
         let (min, max) = VariableAxis::Slant.valid_range();
-        assert_eq!(min, -90.0);
-        assert_eq!(max, 90.0);
+        assert!((min - -90.0).abs() <= f32::EPSILON);
+        assert!((max - 90.0).abs() <= f32::EPSILON);
     }
 
     #[test]

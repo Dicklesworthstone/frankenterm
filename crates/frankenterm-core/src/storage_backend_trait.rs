@@ -1870,7 +1870,7 @@ mod tests {
         let row = backend
             .query_row_strings("SELECT id, name FROM p WHERE id = 1", &[])
             .unwrap();
-        assert_eq!(row, Some(vec!["1".to_string(), "".to_string()]));
+        assert_eq!(row, Some(vec!["1".to_string(), String::new()]));
     }
 
     #[test]
@@ -2141,7 +2141,10 @@ mod tests {
             SqlCell::from_canonical_string("-9223372036854775808"),
             SqlCell::Integer(i64::MIN)
         );
-        assert_eq!(SqlCell::from_canonical_string("3.14"), SqlCell::Real(3.14));
+        assert_eq!(
+            SqlCell::from_canonical_string("3.125"),
+            SqlCell::Real(3.125)
+        );
         assert_eq!(
             SqlCell::from_canonical_string("hello"),
             SqlCell::Text("hello".into())
@@ -2308,7 +2311,7 @@ mod tests {
         // back through the canonical parser.
         let mock = MockBackend::new();
         mock.enqueue_row_response(Some(vec![
-            "".to_string(),
+            String::new(),
             "42".to_string(),
             "3.5".to_string(),
             "hello".to_string(),

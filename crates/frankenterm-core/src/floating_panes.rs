@@ -851,11 +851,11 @@ mod tests {
         };
         // Top pane at the point is 30; cycle next → 10 (back-to-front
         // of the overlap stack, top-down then wrap).
-        let next = s.cycle_among_overlapping(Some(30), 5, 5, &rects);
+        let next = s.cycle_among_overlapping(Some(30), 5, 5, rects);
         assert_eq!(next, Some(20));
-        let next = s.cycle_among_overlapping(Some(20), 5, 5, &rects);
+        let next = s.cycle_among_overlapping(Some(20), 5, 5, rects);
         assert_eq!(next, Some(10));
-        let next = s.cycle_among_overlapping(Some(10), 5, 5, &rects);
+        let next = s.cycle_among_overlapping(Some(10), 5, 5, rects);
         assert_eq!(next, Some(30));
     }
 
@@ -865,7 +865,7 @@ mod tests {
         s.insert_top(10);
         s.insert_top(20);
         let rects = |_id: PaneId| Some(r(0, 0, 10, 10));
-        let next = s.cycle_among_overlapping(None, 5, 5, &rects);
+        let next = s.cycle_among_overlapping(None, 5, 5, rects);
         // No focus → start at top (20), cycle to next → 10.
         assert_eq!(next, Some(10));
     }
@@ -876,7 +876,7 @@ mod tests {
         s.insert_top(10);
         let rects = |_id: PaneId| Some(r(0, 0, 5, 5));
         // (50, 50) is outside any pane.
-        assert_eq!(s.cycle_among_overlapping(Some(10), 50, 50, &rects), None);
+        assert_eq!(s.cycle_among_overlapping(Some(10), 50, 50, rects), None);
     }
 
     // ----------------------------------------------------------------
@@ -1124,7 +1124,7 @@ mod tests {
 
         // Cycle from top among overlapping panes at (12, 6) where all
         // three overlap.
-        let next = zs.cycle_among_overlapping(Some(2), 12, 6, &rects);
+        let next = zs.cycle_among_overlapping(Some(2), 12, 6, rects);
         assert_eq!(next, Some(3));
     }
 

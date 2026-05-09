@@ -500,10 +500,10 @@ mod tests {
 
     #[test]
     fn row_f64_parses_decimal_strings() {
-        let r = row(&["1.5", "0.0", "-3.14"]);
+        let r = row(&["1.5", "0.0", "-3.125"]);
         assert!((row_f64(&r, 0).unwrap() - 1.5).abs() < f64::EPSILON);
         assert!((row_f64(&r, 1).unwrap() - 0.0).abs() < f64::EPSILON);
-        assert!((row_f64(&r, 2).unwrap() - -3.14).abs() < f64::EPSILON);
+        assert!((row_f64(&r, 2).unwrap() - -3.125).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -641,7 +641,7 @@ mod tests {
     fn cell_typed_helpers_reject_type_mismatches() {
         let row = vec![
             SqlCell::Integer(42),
-            SqlCell::Real(3.14),
+            SqlCell::Real(3.125),
             SqlCell::Text("abc".to_string()),
             SqlCell::Null,
             SqlCell::Blob(vec![0xde, 0xad]),
@@ -651,7 +651,7 @@ mod tests {
         assert!(cell_i64(&row, 2).is_err()); // text is not int
         assert!(cell_i64(&row, 3).is_err()); // null is not int
 
-        assert!((cell_f64(&row, 1).unwrap() - 3.14).abs() < f64::EPSILON);
+        assert!((cell_f64(&row, 1).unwrap() - 3.125).abs() < f64::EPSILON);
         assert!((cell_f64(&row, 0).unwrap() - 42.0).abs() < f64::EPSILON); // int promotes
         assert!(cell_f64(&row, 3).is_err());
 

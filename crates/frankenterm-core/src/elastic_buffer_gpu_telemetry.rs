@@ -461,7 +461,7 @@ mod tests {
     fn baseline_health_is_safe() {
         let h = ElasticBufferGpuHealth::baseline();
         assert!(h.is_safe());
-        assert_eq!(h.utilization(), 1.0); // capacity=0 → vacuous
+        assert!((h.utilization() - 1.0).abs() <= f64::EPSILON); // capacity=0 → vacuous
     }
 
     #[test]
@@ -471,7 +471,7 @@ mod tests {
             used: 250,
             ..ElasticBufferGpuHealth::baseline()
         };
-        assert_eq!(h.utilization(), 0.25);
+        assert!((h.utilization() - 0.25).abs() <= f64::EPSILON);
     }
 
     // ------------------------------------------------------------------------

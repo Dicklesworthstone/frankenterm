@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn health_unsafe_when_pushes_rejected() {
         let mut s = KittyKbdStack::new();
-        for _ in 0..(MAX_STACK_DEPTH + 1) {
+        for _ in 0..=MAX_STACK_DEPTH {
             s.push(KittyKbdFlagSet::empty());
         }
         let h = KittyKbdHealth::from_stack(&s, &BTreeMap::new());

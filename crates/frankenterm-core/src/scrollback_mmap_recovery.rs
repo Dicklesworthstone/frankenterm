@@ -593,7 +593,7 @@ mod tests {
     }
 
     fn write_valid_scrollback(dir: &Path, uuid_byte: u8) -> PathBuf {
-        let stem: String = (0..32).map(|_| format!("{uuid_byte:02x}")).collect();
+        let stem = format!("{uuid_byte:02x}").repeat(32);
         let path = dir.join(format!("{stem}.bin"));
         let header = ScrollbackHeader {
             version: FormatVersion::V1,
@@ -613,7 +613,7 @@ mod tests {
     }
 
     fn write_corrupt_scrollback(dir: &Path, uuid_byte: u8) -> PathBuf {
-        let stem: String = (0..32).map(|_| format!("{uuid_byte:02x}")).collect();
+        let stem = format!("{uuid_byte:02x}").repeat(32);
         let path = dir.join(format!("{stem}.bin"));
         let mut bad = vec![0u8; HEADER_SIZE];
         bad[0..4].copy_from_slice(b"NOPE");
@@ -656,11 +656,11 @@ mod tests {
     fn scan_marks_corrupt_header_with_decode_error() {
         let dir = temp_dir("corrupt");
         // Write a 64-char hex stem with bad magic bytes.
-        let stem: String = (0..32).map(|_| "ee".to_string()).collect();
+        let stem = "ee".repeat(32);
         let path = dir.join(format!("{stem}.bin"));
         let mut bad = vec![0u8; HEADER_SIZE];
         bad[0..4].copy_from_slice(b"XXXX"); // bad magic
-        fs::write(&path, &bad).unwrap();
+        fs::write(&path, bad).unwrap();
 
         let out = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
         assert_eq!(out.len(), 1);
@@ -672,9 +672,9 @@ mod tests {
     #[test]
     fn scan_marks_truncated_file_as_corrupt() {
         let dir = temp_dir("trunc");
-        let stem: String = (0..32).map(|_| "11".to_string()).collect();
+        let stem = "11".repeat(32);
         let path = dir.join(format!("{stem}.bin"));
-        fs::write(&path, &[0u8; 50]).unwrap(); // shorter than HEADER_SIZE
+        fs::write(&path, [0u8; 50]).unwrap(); // shorter than HEADER_SIZE
 
         let out = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
         assert_eq!(out.len(), 1);
@@ -712,7 +712,7 @@ mod tests {
     fn scan_classifies_short_stem_as_wrong_shape() {
         let dir = temp_dir("short");
         // .bin extension but stem is only 8 chars, not 64.
-        fs::write(dir.join("abcd1234.bin"), &[0u8; HEADER_SIZE]).unwrap();
+        fs::write(dir.join("abcd1234.bin"), [0u8; HEADER_SIZE]).unwrap();
         let out = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].state, OrphanState::WrongShape);
@@ -722,8 +722,8 @@ mod tests {
     fn scan_classifies_non_hex_stem_as_wrong_shape() {
         let dir = temp_dir("nonhex");
         // 64 chars but contains non-hex.
-        let stem: String = std::iter::repeat('z').take(64).collect();
-        fs::write(dir.join(format!("{stem}.bin")), &[0u8; HEADER_SIZE]).unwrap();
+        let stem = "z".repeat(64);
+        fs::write(dir.join(format!("{stem}.bin")), [0u8; HEADER_SIZE]).unwrap();
         let out = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].state, OrphanState::WrongShape);
@@ -733,8 +733,8 @@ mod tests {
     fn scan_classifies_wrong_extension_as_wrong_shape() {
         let dir = temp_dir("wrongext");
         // 64-hex stem but `.dat` extension instead of `.bin`.
-        let stem: String = (0..32).map(|_| "00".to_string()).collect();
-        fs::write(dir.join(format!("{stem}.dat")), &[0u8; HEADER_SIZE]).unwrap();
+        let stem = "00".repeat(32);
+        fs::write(dir.join(format!("{stem}.dat")), [0u8; HEADER_SIZE]).unwrap();
         let out = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].state, OrphanState::WrongShape);

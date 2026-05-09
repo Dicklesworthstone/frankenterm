@@ -87,19 +87,19 @@ pub fn epoch_clock_anomaly_count() -> u64 {
 /// Test helper: reset the drop counter so regression tests can
 /// assert post-bump values without state leakage between tests.
 #[cfg(test)]
-pub(crate) fn reset_sse_events_dropped_count_for_test() {
+fn reset_sse_events_dropped_count_for_test() {
     SSE_EVENTS_DROPPED_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Test helper: reset the stream-termination counter.
 #[cfg(test)]
-pub(crate) fn reset_sse_streams_terminated_by_drop_cap_count_for_test() {
+fn reset_sse_streams_terminated_by_drop_cap_count_for_test() {
     SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// br-ft-bn6qi: test helper to reset the clock-anomaly counter.
 #[cfg(test)]
-pub(crate) fn reset_epoch_clock_anomaly_count_for_test() {
+fn reset_epoch_clock_anomaly_count_for_test() {
     EPOCH_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
 }
 
@@ -1205,13 +1205,20 @@ mod tests {
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn run_drop_counter_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let _guard = drop_counter_test_lock();
+        run_async_test_isolated(f);
+    }
+
     /// br-ft-95fd3: a successful send does NOT bump either drop
     /// counter. Vacuous-regression guard against the bumpers
     /// false-positiving on the happy path.
     #[test]
     fn send_rate_limited_sse_ok_path_does_not_bump_drop_counter_ft_95fd3() {
-        run_async_test_isolated(|| async {
-            let _guard = drop_counter_test_lock();
+        run_drop_counter_async_test_isolated(|| async {
             super::reset_sse_events_dropped_count_for_test();
             super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
 
@@ -1252,8 +1259,7 @@ mod tests {
     /// test pins that the global counter now reflects the drop.
     #[test]
     fn send_rate_limited_sse_full_path_bumps_event_drop_counter_ft_95fd3() {
-        run_async_test_isolated(|| async {
-            let _guard = drop_counter_test_lock();
+        run_drop_counter_async_test_isolated(|| async {
             super::reset_sse_events_dropped_count_for_test();
             super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
             let before_events = super::sse_events_dropped_count();
@@ -1309,8 +1315,7 @@ mod tests {
     /// the common burst case.
     #[test]
     fn send_rate_limited_sse_drop_cap_bumps_termination_counter_ft_95fd3() {
-        run_async_test_isolated(|| async {
-            let _guard = drop_counter_test_lock();
+        run_drop_counter_async_test_isolated(|| async {
             super::reset_sse_events_dropped_count_for_test();
             super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
 
@@ -1495,7 +1500,7 @@ mod tests {
             } else {
                 // Post-epoch with offset==0 is exactly UNIX_EPOCH → ms=0,
                 // but does NOT bump the counter (already pinned by `bumped`).
-                let expected_ms: i64 = (offset_secs as i64) * 1000;
+                let expected_ms: i64 = offset_secs * 1000;
                 proptest::prop_assert_eq!(
                     ms, expected_ms,
                     "br-ft-bn6qi: post-epoch ms must equal offset_secs*1000"

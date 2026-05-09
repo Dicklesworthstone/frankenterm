@@ -20958,7 +20958,7 @@ mod pool_telemetry_tests {
             // br-ft-ac4j0.
             pool_lock_poisoned: 0,
         };
-        assert_eq!(s.hit_rate(), 0.0);
+        assert!(s.hit_rate().abs() <= f64::EPSILON);
     }
 
     #[test]

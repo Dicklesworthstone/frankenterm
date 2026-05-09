@@ -1476,9 +1476,9 @@ mod tests {
         fn pending_approvals_excludes_unregistered_panes_ft_fmeic(
             ops in proptest::collection::vec(
                 proptest::prop_oneof![
-                    (1u64..=8).prop_map(|p| ConsoleOp::Register(p)),
+                    (1u64..=8).prop_map(ConsoleOp::Register),
                     (1u64..=8, ".{0,16}").prop_map(|(p, d)| ConsoleOp::Submit(p, d)),
-                    (1u64..=8).prop_map(|p| ConsoleOp::Unregister(p)),
+                    (1u64..=8).prop_map(ConsoleOp::Unregister),
                 ],
                 0..32,
             ),

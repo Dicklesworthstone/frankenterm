@@ -855,8 +855,8 @@ mod tests {
             output.metrics.ansi_byte_count, 0,
             "ft-5m5xc: enable_ansi_analysis=false must zero ansi_byte_count"
         );
-        assert_eq!(
-            output.metrics.ansi_density, 0.0,
+        assert!(
+            output.metrics.ansi_density.abs() <= f64::EPSILON,
             "ft-5m5xc: density derived from zeroed ansi_byte_count must also be zero"
         );
 
@@ -1292,7 +1292,7 @@ mod tests {
         let summary = pipeline
             .try_process_chunk(b"more", &mut state)
             .expect("post-flush try_process_chunk must succeed");
-        assert!(summary.newline_count == 0 || summary.newline_count > 0);
+        assert_eq!(summary.logical_lines, 1);
     }
 
     proptest::proptest! {

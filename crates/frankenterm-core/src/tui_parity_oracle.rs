@@ -1018,7 +1018,7 @@ mod tests {
         // stamp behavior.
         let h = OracleHealth::baseline();
         assert!(!h.is_safe(), "cold baseline must be unsafe");
-        assert_eq!(h.divergence_rate(), 0.0);
+        assert!(h.divergence_rate().abs() <= f64::EPSILON);
     }
 
     #[test]

@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn baseline_health_has_zero_draft_ratio() {
         let h = RenderQualityHealth::baseline();
-        assert_eq!(h.draft_ratio(), 0.0);
+        assert!(h.draft_ratio().abs() <= f64::EPSILON);
     }
 
     #[test]

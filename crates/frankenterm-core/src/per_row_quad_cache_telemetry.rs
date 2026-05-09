@@ -486,7 +486,7 @@ mod tests {
     fn fold_frame_boundary_with_no_references_keeps_hit_rate_at_one() {
         let mut h = PerRowQuadCacheHealth::baseline();
         fold_event(&mut h, RowCacheEvent::FrameBoundary { rows_referenced: 0 });
-        assert_eq!(h.last_frame_hit_rate, 1.0);
+        assert!((h.last_frame_hit_rate - 1.0).abs() <= f64::EPSILON);
     }
 
     // ------------------------------------------------------------------------

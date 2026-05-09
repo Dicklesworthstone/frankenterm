@@ -1537,7 +1537,9 @@ mod tests {
             CapsuleInspectError::Read { path: p, .. } => {
                 assert_eq!(p, path);
             }
-            other => panic!("expected Read error, got {other:?}"),
+            other @ CapsuleInspectError::Decode { .. } => {
+                panic!("expected Read error, got {other:?}")
+            }
         }
     }
 
@@ -1554,7 +1556,9 @@ mod tests {
             CapsuleInspectError::Decode { path: p, .. } => {
                 assert_eq!(p, tmp.path());
             }
-            other => panic!("expected Decode error, got {other:?}"),
+            other @ CapsuleInspectError::Read { .. } => {
+                panic!("expected Decode error, got {other:?}")
+            }
         }
     }
 

@@ -259,7 +259,9 @@ mod tests {
                 assert!(!rationale.is_empty());
                 let _ = proof_commands;
             }
-            _ => panic!("expected Recommendation variant"),
+            AdvisorReportRendering::DataNeeded { .. } => {
+                panic!("expected Recommendation variant")
+            }
         }
     }
 
@@ -271,7 +273,9 @@ mod tests {
             AdvisorReportRendering::DataNeeded { reasons } => {
                 assert!(!reasons.is_empty());
             }
-            _ => panic!("expected DataNeeded variant"),
+            AdvisorReportRendering::Recommendation { .. } => {
+                panic!("expected DataNeeded variant")
+            }
         }
     }
 

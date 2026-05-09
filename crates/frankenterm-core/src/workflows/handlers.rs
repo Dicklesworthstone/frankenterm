@@ -7247,7 +7247,7 @@ mod tests {
         for spec in specs {
             match spec.bucket {
                 ProcessTriageBucket::AutoSafe => {
-                    auto_safe_count = auto_safe_count.saturating_add(1)
+                    auto_safe_count = auto_safe_count.saturating_add(1);
                 }
                 ProcessTriageBucket::Protected => {
                     protected_count = protected_count.saturating_add(1);

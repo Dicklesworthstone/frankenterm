@@ -1864,6 +1864,7 @@ mod tests {
     ///   - in-range limit + in-range timeout → Ok
     ///   - out-of-range limit (low or high) → Err
     ///   - in-range limit + out-of-range timeout (low or high) → Err
+    ///
     /// Pins the cross-product invariant against drift in either
     /// constant.
     #[test]

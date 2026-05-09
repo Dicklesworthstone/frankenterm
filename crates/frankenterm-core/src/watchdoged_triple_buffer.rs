@@ -610,11 +610,11 @@ mod tests {
         assert!(!d.force_recycled);
 
         // Tick 3: 3s — still warned, no-op
-        let d = wtb.poll(start + Duration::from_millis(3000));
+        let d = wtb.poll(start + Duration::from_secs(3));
         assert!(d.is_no_op());
 
         // Tick 4: 5s — force-recycle fires + auto-invokes inner.force_recycle
-        let d = wtb.poll(start + Duration::from_millis(5000));
+        let d = wtb.poll(start + Duration::from_secs(5));
         assert!(matches!(d.watchdog, WatchdogDecision::ForceRecycle { .. }));
         assert!(d.force_recycled);
         let h = wtb.health();

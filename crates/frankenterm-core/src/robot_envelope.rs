@@ -177,7 +177,7 @@ mod tests {
         // silent mutation to Infinity.
         let metric = value.get("metric").and_then(Value::as_f64).unwrap();
         assert!(metric.is_finite(), "metric must stay finite: {metric}");
-        assert_eq!(metric, 1.5e305);
+        assert_eq!(metric.to_bits(), 1.5e305_f64.to_bits());
     }
 
     /// [ft-m9gob] Values that DO round cleanly still get canonicalized.
@@ -203,7 +203,7 @@ mod tests {
         let mut value = json!({"count": 1_000_000.0});
         canonicalize_json(&mut value, None);
         let count = value.get("count").and_then(Value::as_f64).unwrap();
-        assert_eq!(count, 1_000_000.0);
+        assert_eq!(count.to_bits(), 1_000_000.0_f64.to_bits());
     }
 
     /// [ft-m9gob] Negative huge float — same overflow shape on the
@@ -218,7 +218,7 @@ mod tests {
             metric.is_finite(),
             "negative huge must stay finite: {metric}"
         );
-        assert_eq!(metric, -1.5e305);
+        assert_eq!(metric.to_bits(), (-1.5e305_f64).to_bits());
     }
 
     #[test]

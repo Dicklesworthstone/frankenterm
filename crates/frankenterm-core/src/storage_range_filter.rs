@@ -219,7 +219,7 @@ mod tests {
         let filter = StorageRangeFilter::new("events");
 
         assert!(!filter.could_have_match(i64::MIN, i64::MAX));
-        assert_eq!(filter.false_positive_rate_bound(), 0.0);
+        assert!(filter.false_positive_rate_bound().abs() <= f64::EPSILON);
         assert!(filter.is_empty());
     }
 
@@ -285,7 +285,7 @@ mod tests {
 
         assert_eq!(snapshot.table, "action_history");
         assert_eq!(snapshot.suffix_bits, 6);
-        assert_eq!(snapshot.false_positive_rate_bound, 0.0);
+        assert!(snapshot.false_positive_rate_bound.abs() <= f64::EPSILON);
         assert_eq!(snapshot.ranges, vec![(1, 5), (10, 11)]);
     }
 }

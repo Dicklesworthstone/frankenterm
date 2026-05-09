@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(b.total_pulls(), 0);
         for i in 0..3 {
             assert_eq!(b.pull_count(i), 0);
-            assert_eq!(b.expected_reward(i), 0.0);
+            assert!(b.expected_reward(i).abs() <= f64::EPSILON);
         }
     }
 

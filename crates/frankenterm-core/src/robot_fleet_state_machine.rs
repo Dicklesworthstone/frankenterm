@@ -671,7 +671,7 @@ mod tests {
             }
         );
         // Fleet 2 should not exist.
-        assert!(w.fleets.get(&2).is_none());
+        assert!(!w.fleets.contains_key(&2));
         let v = check_invariants(&prior, &w, action, outcome);
         assert!(v.is_empty(), "{v:?}");
     }

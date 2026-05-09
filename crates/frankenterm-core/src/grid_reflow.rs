@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn skip_ratio_baseline_is_zero() {
         let h = ReflowHealth::baseline();
-        assert_eq!(h.skip_ratio(), 0.0);
+        assert!(h.skip_ratio().abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -584,8 +584,8 @@ mod tests {
         let rows = reflow_line(&cells, 30);
         // Every row's cells must carry the same style.
         for row in &rows {
-            for i in row.start..row.end {
-                assert_eq!(cells[i].style, 0xDEADBEEF);
+            for cell in &cells[row.start..row.end] {
+                assert_eq!(cell.style, 0xDEADBEEF);
             }
         }
     }

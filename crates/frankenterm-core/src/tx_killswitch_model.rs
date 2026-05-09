@@ -588,7 +588,7 @@ mod tests {
             },
             safety_violations: vec![],
         };
-        let rendered = render_trace_jsonl(&[row.clone()]);
+        let rendered = render_trace_jsonl(std::slice::from_ref(&row));
         let parsed = parse_trace_jsonl(&rendered).unwrap();
         assert_eq!(parsed[0], row);
     }

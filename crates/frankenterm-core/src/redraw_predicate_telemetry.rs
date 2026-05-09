@@ -510,8 +510,8 @@ mod tests {
     fn baseline_is_safe_and_vacuously_perfect() {
         let h = RedrawDecisionHealth::baseline();
         assert!(h.is_safe());
-        assert_eq!(h.skip_rate(), 1.0);
-        assert_eq!(h.skip_rate_pct(), 100.0);
+        assert!((h.skip_rate() - 1.0).abs() <= f64::EPSILON);
+        assert!((h.skip_rate_pct() - 100.0).abs() <= f64::EPSILON);
     }
 
     // ----------------------------------------------------------------

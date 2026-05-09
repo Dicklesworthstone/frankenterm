@@ -546,7 +546,9 @@ mod tests {
             DirectScanoutDecision::Active { format } => {
                 assert_eq!(format, BufferFormat::Bgra8);
             }
-            other => panic!("expected Active; got {other:?}"),
+            other @ DirectScanoutDecision::Fallback { .. } => {
+                panic!("expected Active; got {other:?}")
+            }
         }
     }
 
@@ -807,7 +809,9 @@ mod tests {
                 // ft prefers Bgra8 first.
                 assert_eq!(format, BufferFormat::Bgra8);
             }
-            other => panic!("expected Active scanout; got {other:?}"),
+            other @ DirectScanoutDecision::Fallback { .. } => {
+                panic!("expected Active scanout; got {other:?}")
+            }
         }
     }
 
@@ -834,9 +838,12 @@ mod tests {
         let mut inputs = fullscreen_inputs(WaylandCompositor::Mutter);
         inputs.support = ScanoutSupport::NotSupported;
         let d = evaluate_direct_scanout(&inputs);
-        if let DirectScanoutDecision::Fallback { cause } = d {
-            assert!(!cause.is_acceptable_per_bead()); // unrecoverable
-            assert_eq!(cause, ScanoutFallback::CompositorUnsupported);
+        match d {
+            DirectScanoutDecision::Fallback { cause } => {
+                assert!(!cause.is_acceptable_per_bead()); // unrecoverable
+                assert_eq!(cause, ScanoutFallback::CompositorUnsupported);
+            }
+            DirectScanoutDecision::Active { .. } => panic!("expected Fallback"),
         }
     }
 
@@ -862,7 +869,8 @@ mod tests {
     fn scenario_full_corpus_decision_path_coverage() {
         // Walk every fallback variant through the decision
         // tree, asserting each lands on its expected cause.
-        let cases: &[(fn(&mut ScanoutInputs), ScanoutFallback)] = &[
+        type ScanoutCase = (fn(&mut ScanoutInputs), ScanoutFallback);
+        let cases: &[ScanoutCase] = &[
             (|i| i.fullscreen = false, ScanoutFallback::NotFullscreen),
             (
                 |i| i.support = ScanoutSupport::NotSupported,
@@ -888,7 +896,9 @@ mod tests {
             let d = evaluate_direct_scanout(&inputs);
             match d {
                 DirectScanoutDecision::Fallback { cause } => assert_eq!(cause, *expected_cause),
-                other => panic!("expected Fallback; got {other:?}"),
+                other @ DirectScanoutDecision::Active { .. } => {
+                    panic!("expected Fallback; got {other:?}")
+                }
             }
         }
     }

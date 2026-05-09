@@ -5914,13 +5914,16 @@ mod tests {
         }];
         let report = score_candidates(&inputs, &ScorerConfig::default());
         let s = &report.scored[0];
-        assert_eq!(s.final_score, 0.0, "NaN feature must zero final_score");
+        assert!(
+            s.final_score.abs() <= f64::EPSILON,
+            "NaN feature must zero final_score"
+        );
         assert!(
             s.below_confidence_threshold,
             "NaN feature must flag below_confidence_threshold"
         );
-        assert_eq!(
-            s.feature_composite, 0.0,
+        assert!(
+            s.feature_composite.abs() <= f64::EPSILON,
             "NaN feature must zero feature_composite"
         );
     }
@@ -5936,7 +5939,7 @@ mod tests {
         }];
         let report = score_candidates(&inputs, &ScorerConfig::default());
         let s = &report.scored[0];
-        assert_eq!(s.final_score, 0.0);
+        assert!(s.final_score.abs() <= f64::EPSILON);
         assert!(s.below_confidence_threshold);
     }
 
@@ -5961,7 +5964,7 @@ mod tests {
         };
         let report = score_candidates(&inputs, &bad_config);
         let s = &report.scored[0];
-        assert_eq!(s.final_score, 0.0);
+        assert!(s.final_score.abs() <= f64::EPSILON);
         assert!(s.below_confidence_threshold);
     }
 

@@ -172,7 +172,7 @@ pub fn mcp_clock_anomaly_count() -> u64 {
 /// collapse path can assert post-increment values without state
 /// leakage between tests.
 #[cfg(test)]
-pub(crate) fn reset_mcp_clock_anomaly_count_for_test() {
+fn reset_mcp_clock_anomaly_count_for_test() {
     MCP_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
 }
 
@@ -232,7 +232,7 @@ pub fn mcp_workflow_plan_serde_drop_count() -> u64 {
 /// Test helper: reset the counter so regression tests can assert
 /// post-bump values without state leakage between tests.
 #[cfg(test)]
-pub(crate) fn reset_mcp_workflow_plan_serde_drop_count_for_test() {
+fn reset_mcp_workflow_plan_serde_drop_count_for_test() {
     MCP_WORKFLOW_PLAN_SERDE_DROP_COUNT.store(0, Ordering::Relaxed);
 }
 
@@ -8612,7 +8612,7 @@ exit 17",
         for &v in &[
             CASS_TIMEOUT_SECS_MIN,
             CASS_TIMEOUT_SECS_MIN + 1,
-            (CASS_TIMEOUT_SECS_MIN + CASS_TIMEOUT_SECS_MAX) / 2,
+            CASS_TIMEOUT_SECS_MIN.midpoint(CASS_TIMEOUT_SECS_MAX),
             CASS_TIMEOUT_SECS_MAX - 1,
             CASS_TIMEOUT_SECS_MAX,
         ] {

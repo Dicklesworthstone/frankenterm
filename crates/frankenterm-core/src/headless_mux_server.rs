@@ -1364,7 +1364,7 @@ mod tests {
         });
 
         for i in 0..3 {
-            let peer = ServerNodeId::new("host", 9876, &format!("peer-{i}"));
+            let peer = ServerNodeId::new("host", 9876, format!("peer-{i}"));
             match server.handle_request(RemoteRequest::JoinFederation { peer }) {
                 RemoteResponse::FederationJoined { .. } => {}
                 other => panic!("peer-{i} expected FederationJoined, got {other:?}"),

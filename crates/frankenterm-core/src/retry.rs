@@ -918,7 +918,7 @@ mod tests {
                 .as_millis() as f64;
             // attempt=2 + backoff=2 → base=4000ms; ±10% → [3600, 4400].
             assert!(
-                d >= 3600.0 && d <= 4400.0,
+                (3600.0..=4400.0).contains(&d),
                 "LegacyEqual delay {d} outside [3600, 4400]"
             );
         }
@@ -941,7 +941,7 @@ mod tests {
                 .delay_for_attempt_with_mode(2, JitterMode::Full)
                 .as_millis() as f64;
             assert!(
-                d >= 0.0 && d <= 4000.0,
+                (0.0..=4000.0).contains(&d),
                 "Full jitter delay {d} outside [0, 4000]"
             );
         }
@@ -1002,7 +1002,7 @@ mod tests {
                 )
                 .as_millis() as f64;
             assert!(
-                d >= 1000.0 && d <= 6000.0,
+                (1000.0..=6000.0).contains(&d),
                 "Decorrelated delay {d} outside [1000, 6000] for initial=1000, prev=2000"
             );
         }

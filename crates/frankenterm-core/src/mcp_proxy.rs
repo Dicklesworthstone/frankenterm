@@ -60,7 +60,7 @@ pub fn mcp_proxy_mount_failure_count() -> u64 {
 /// failures can assert post-increment values without state
 /// leakage between tests.
 #[cfg(test)]
-pub(crate) fn reset_mcp_proxy_mount_failure_count_for_test() {
+fn reset_mcp_proxy_mount_failure_count_for_test() {
     MCP_PROXY_MOUNT_FAILURES.store(0, Ordering::Relaxed);
 }
 
@@ -106,7 +106,7 @@ pub fn mcp_proxy_unaudited_degraded_skip_count() -> u64 {
 /// Test helper: reset the counter so tests can assert
 /// post-increment values without state leakage between tests.
 #[cfg(test)]
-pub(crate) fn reset_mcp_proxy_unaudited_degraded_skip_count_for_test() {
+fn reset_mcp_proxy_unaudited_degraded_skip_count_for_test() {
     MCP_PROXY_UNAUDITED_DEGRADED_SKIPS.store(0, Ordering::Relaxed);
 }
 
@@ -150,7 +150,7 @@ pub fn mcp_proxy_destructive_filtered_count() -> u64 {
 /// safety-filter path can assert post-increment values
 /// without state leakage between tests.
 #[cfg(test)]
-pub(crate) fn reset_mcp_proxy_destructive_filtered_count_for_test() {
+fn reset_mcp_proxy_destructive_filtered_count_for_test() {
     MCP_PROXY_DESTRUCTIVE_FILTERED.store(0, Ordering::Relaxed);
 }
 
@@ -204,7 +204,7 @@ pub fn mcp_proxy_call_dispatch_failure_count() -> u64 {
 /// per-call dispatch-failure paths can assert post-increment
 /// values without state leakage between tests.
 #[cfg(test)]
-pub(crate) fn reset_mcp_proxy_call_dispatch_failure_count_for_test() {
+fn reset_mcp_proxy_call_dispatch_failure_count_for_test() {
     MCP_PROXY_CALL_DISPATCH_FAILURES.store(0, Ordering::Relaxed);
 }
 

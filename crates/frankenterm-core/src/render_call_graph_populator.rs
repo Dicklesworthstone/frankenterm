@@ -569,7 +569,7 @@ fn paint_impl() {
             AuditOutcome::FailedWithViolations { violations } => {
                 assert_eq!(violations.len(), 1);
             }
-            other => panic!("expected FailedWithViolations, got {other:?}"),
+            other @ AuditOutcome::Pass => panic!("expected FailedWithViolations, got {other:?}"),
         }
     }
 
@@ -869,7 +869,7 @@ fn unrelated() {
     #[test]
     fn empty_source_yields_empty_output() {
         let out = populate_from_sources(
-            &[("empty.rs".to_string(), "".to_string())],
+            &[("empty.rs".to_string(), String::new())],
             &PopulatorConfig::default(),
         );
         assert!(out.entry_points.is_empty());

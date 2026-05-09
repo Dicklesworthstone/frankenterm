@@ -1032,9 +1032,8 @@ mod apply_receipt_tests {
 
     #[test]
     fn hash_is_stable_for_same_inputs() {
-        let env: HashMap<String, String> = [("FOO".to_string(), "bar".to_string())]
-            .into_iter()
-            .collect();
+        let env: HashMap<String, String> =
+            std::iter::once(("FOO".to_string(), "bar".to_string())).collect();
         let h1 = compute_apply_content_hash("dev", 1_700_000_000_000, 3, &env);
         let h2 = compute_apply_content_hash("dev", 1_700_000_000_000, 3, &env);
         assert_eq!(h1, h2);

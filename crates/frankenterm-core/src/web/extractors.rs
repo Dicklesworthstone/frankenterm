@@ -48,7 +48,7 @@ pub fn redact_depth_limit_hit_count() -> u64 {
 
 /// br-ft-10i8s: test helper to reset the depth-cap counter.
 #[cfg(test)]
-pub(crate) fn reset_redact_depth_limit_hit_count_for_test() {
+fn reset_redact_depth_limit_hit_count_for_test() {
     REDACT_DEPTH_LIMIT_HIT_COUNT.store(0, Ordering::Relaxed);
 }
 

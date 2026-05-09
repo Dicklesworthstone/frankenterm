@@ -1431,7 +1431,9 @@ mod tests {
             MetadataIndexError::InvalidRow(reason) => {
                 assert_eq!(reason, "byte_start > byte_end");
             }
-            other => panic!("expected InvalidRow, got {other:?}"),
+            other @ MetadataIndexError::Sqlite(_) => {
+                panic!("expected InvalidRow, got {other:?}")
+            }
         }
         // Confirm no row was inserted.
         let listed = list_chunks_by_pane(&conn, 42, 0).unwrap();
@@ -1450,7 +1452,9 @@ mod tests {
         let err = insert_metadata_index_row(&conn, &row).unwrap_err();
         match err {
             MetadataIndexError::Sqlite(_) => {}
-            other => panic!("expected Sqlite error, got {other:?}"),
+            other @ MetadataIndexError::InvalidRow(_) => {
+                panic!("expected Sqlite error, got {other:?}")
+            }
         }
     }
 

@@ -674,8 +674,8 @@ mod tests {
             } else {
                 c.close_esu();
             }
-            // Invariant:
-            assert!(c.depth() <= u32::MAX);
+            // Invariant: depth never exceeds the number of processed events.
+            assert!(c.depth() <= (i + 1) as u32);
         }
     }
 

@@ -879,7 +879,9 @@ mod tests {
                 assert!(!reasons.is_empty());
                 assert!(reasons.iter().any(|r| r.contains("MIN_SAMPLE_OPS")));
             }
-            other => panic!("expected DataNeeded, got {other:?}"),
+            other @ AdvisorReport::Recommendation(_) => {
+                panic!("expected DataNeeded, got {other:?}")
+            }
         }
     }
 
@@ -923,7 +925,9 @@ mod tests {
                 assert_eq!(rec.index, IndexChoice::Hybrid);
                 assert_eq!(rec.backend, BackendChoice::Rusqlite);
             }
-            other => panic!("expected Recommendation, got {other:?}"),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                panic!("expected Recommendation, got {other:?}")
+            }
         }
     }
 
@@ -939,7 +943,9 @@ mod tests {
         };
         match classify(&profile) {
             AdvisorReport::Recommendation(rec) => assert_eq!(rec.index, IndexChoice::Tantivy),
-            other => panic!("expected Recommendation, got {other:?}"),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                panic!("expected Recommendation, got {other:?}")
+            }
         }
     }
 
@@ -958,7 +964,9 @@ mod tests {
             AdvisorReport::Recommendation(rec) => {
                 assert_eq!(rec.migration_priority, MigrationPriority::High);
             }
-            other => panic!("expected Recommendation, got {other:?}"),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                panic!("expected Recommendation, got {other:?}")
+            }
         }
     }
 
@@ -977,7 +985,9 @@ mod tests {
             AdvisorReport::Recommendation(rec) => {
                 assert_eq!(rec.migration_priority, MigrationPriority::Medium);
             }
-            other => panic!("expected Recommendation, got {other:?}"),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                panic!("expected Recommendation, got {other:?}")
+            }
         }
     }
 
@@ -993,7 +1003,9 @@ mod tests {
         };
         match classify(&profile) {
             AdvisorReport::Recommendation(rec) => assert_eq!(rec.index, IndexChoice::NoChange),
-            other => panic!("expected Recommendation, got {other:?}"),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                panic!("expected Recommendation, got {other:?}")
+            }
         }
     }
 
@@ -1009,7 +1021,9 @@ mod tests {
         };
         match classify(&profile) {
             AdvisorReport::Recommendation(rec) => assert_eq!(rec.confidence, Confidence::High),
-            other => panic!("expected Recommendation, got {other:?}"),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                panic!("expected Recommendation, got {other:?}")
+            }
         }
     }
 
@@ -1125,7 +1139,9 @@ mod tests {
                 assert_eq!(rec.index, IndexChoice::Hybrid);
                 assert_eq!(rec.backend, BackendChoice::Rusqlite);
             }
-            other => panic!("expected Recommendation, got {other:?}"),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                panic!("expected Recommendation, got {other:?}")
+            }
         }
     }
 
@@ -1214,7 +1230,9 @@ mod tests {
                 // → Confidence::High per the documented gate.
                 assert_eq!(rec.confidence, Confidence::High);
             }
-            other => panic!("expected Recommendation, got {other:?}"),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                panic!("expected Recommendation, got {other:?}")
+            }
         }
     }
 
@@ -1254,7 +1272,9 @@ mod tests {
                 assert!(!reasons.is_empty());
                 assert!(reasons.iter().any(|r| r.contains("MIN_SAMPLE_OPS")));
             }
-            other => panic!("expected DataNeeded, got {other:?}"),
+            other @ AdvisorReport::Recommendation(_) => {
+                panic!("expected DataNeeded, got {other:?}")
+            }
         }
     }
 

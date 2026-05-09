@@ -1080,7 +1080,7 @@ mod tests {
             plan.metrics.estimated_tokens,
             input.budget.max_tokens_per_response
         );
-        assert_eq!(plan.metrics.pattern_recall, 1.0);
+        assert!((plan.metrics.pattern_recall - 1.0).abs() <= f64::EPSILON);
         assert!(
             plan.metrics.search_recall >= input.budget.min_search_recall,
             "search recall fell below floor: {:?}",
@@ -1110,7 +1110,7 @@ mod tests {
         assert!(reduced.text.contains("RATE_LIMIT: retry after 60s"));
         assert!(reduced.text.contains("final prompt >"));
         assert!(reduced.omitted_lines > 0);
-        assert_eq!(reduced.critical_recall(), 1.0);
+        assert!((reduced.critical_recall() - 1.0).abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -1139,7 +1139,7 @@ mod tests {
         assert!(report.cpu_savings_micros > 0, "report={report:?}");
         assert!(report.correctness_preserved, "report={report:?}");
         assert_eq!(report.selected.critical_detections, 10);
-        assert_eq!(report.selected.pattern_recall, 1.0);
+        assert!((report.selected.pattern_recall - 1.0).abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -1171,15 +1171,15 @@ mod tests {
         assert_eq!(reduced.text, text);
         assert_eq!(reduced.original_lines, 4);
         assert_eq!(reduced.omitted_lines, 0);
-        assert_eq!(reduced.critical_recall(), 1.0);
+        assert!((reduced.critical_recall() - 1.0).abs() <= f64::EPSILON);
     }
 
     #[test]
     fn line_observation_sanitizes_repeated_ratio() {
         let pane = PaneRateDistortionObservation::new(7, 12, 1, 0, 9.0);
-        assert_eq!(pane.repeated_line_ratio, 1.0);
+        assert!((pane.repeated_line_ratio - 1.0).abs() <= f64::EPSILON);
 
         let pane = PaneRateDistortionObservation::new(8, 12, 1, 0, -1.0);
-        assert_eq!(pane.repeated_line_ratio, 0.0);
+        assert!(pane.repeated_line_ratio.abs() <= f64::EPSILON);
     }
 }

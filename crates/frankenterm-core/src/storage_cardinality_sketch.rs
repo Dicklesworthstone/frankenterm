@@ -226,10 +226,10 @@ mod tests {
         s.record_session_id("session-A");
         // Sessions only got 1 insert; embedders got 0.
         let panes = s.estimated_distinct_panes();
-        assert!(panes >= 2 && panes <= 4, "panes ≈ 3 expected (got {panes})");
+        assert!((2..=4).contains(&panes), "panes ≈ 3 expected (got {panes})");
         let sessions = s.estimated_distinct_sessions();
         assert!(
-            sessions >= 1 && sessions <= 2,
+            (1..=2).contains(&sessions),
             "sessions ≈ 1 expected (got {sessions})"
         );
         assert_eq!(s.estimated_distinct_embedders(), 0);

@@ -1202,32 +1202,36 @@ mod tests {
     #[test]
     fn database_page_stats_free_ratio_clamps_and_handles_zero() {
         // Both zero → 0.0.
-        assert_eq!(
+        assert!(
             DatabasePageStats {
                 page_count: 0,
                 free_pages: 0
             }
-            .free_ratio(),
-            0.0,
+            .free_ratio()
+            .abs()
+                <= f64::EPSILON,
         );
         // Negative inputs (shouldn't happen in practice but
         // SQLite returns i64) → 0.0.
-        assert_eq!(
+        assert!(
             DatabasePageStats {
                 page_count: -1,
                 free_pages: 50
             }
-            .free_ratio(),
-            0.0,
+            .free_ratio()
+            .abs()
+                <= f64::EPSILON,
         );
         // free > total → bounded to total → 1.0.
-        assert_eq!(
-            DatabasePageStats {
+        assert!(
+            (DatabasePageStats {
                 page_count: 100,
                 free_pages: 200
             }
-            .free_ratio(),
-            1.0,
+            .free_ratio()
+                - 1.0)
+                .abs()
+                <= f64::EPSILON,
         );
         // Normal case → exact ratio.
         let r = DatabasePageStats {

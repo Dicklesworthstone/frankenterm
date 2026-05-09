@@ -1946,7 +1946,7 @@ mod tests {
 
     #[test]
     fn compute_restore_state_hash_differs_by_session_id() {
-        let map: HashMap<u64, u64> = [(1u64, 1u64)].into_iter().collect();
+        let map: HashMap<u64, u64> = std::iter::once((1u64, 1u64)).collect();
         let a = compute_restore_state_hash("sess-a", &map, 1_000);
         let b = compute_restore_state_hash("sess-b", &map, 1_000);
         assert_ne!(a, b, "hash must discriminate on session_id");
@@ -1954,8 +1954,8 @@ mod tests {
 
     #[test]
     fn compute_restore_state_hash_differs_by_pane_map() {
-        let m1: HashMap<u64, u64> = [(1u64, 1u64)].into_iter().collect();
-        let m2: HashMap<u64, u64> = [(1u64, 2u64)].into_iter().collect();
+        let m1: HashMap<u64, u64> = std::iter::once((1u64, 1u64)).collect();
+        let m2: HashMap<u64, u64> = std::iter::once((1u64, 2u64)).collect();
         let a = compute_restore_state_hash("sess", &m1, 1_000);
         let b = compute_restore_state_hash("sess", &m2, 1_000);
         assert_ne!(a, b, "hash must discriminate on new pane id mapping");
@@ -1963,7 +1963,7 @@ mod tests {
 
     #[test]
     fn compute_restore_state_hash_differs_by_timestamp() {
-        let map: HashMap<u64, u64> = [(1u64, 1u64)].into_iter().collect();
+        let map: HashMap<u64, u64> = std::iter::once((1u64, 1u64)).collect();
         let a = compute_restore_state_hash("sess", &map, 1_000);
         let b = compute_restore_state_hash("sess", &map, 2_000);
         assert_ne!(a, b, "hash must discriminate on checkpoint timestamp");
@@ -1998,7 +1998,7 @@ mod tests {
         // algorithm but NOT the same input schema. A same-length
         // 16-hex hash coming from one helper must not silently match
         // the other — domain separator prefix guarantees that.
-        let map: HashMap<u64, u64> = [(1u64, 1u64)].into_iter().collect();
+        let map: HashMap<u64, u64> = std::iter::once((1u64, 1u64)).collect();
         let restore_hash = compute_restore_state_hash("sess", &map, 0);
         // Hash of just "sess" with no prefix, no session, no map.
         let naive: String = {

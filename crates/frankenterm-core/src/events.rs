@@ -3489,7 +3489,7 @@ mod tests {
             DedupeVerdict::Duplicate { suppressed_count } => {
                 assert_eq!(suppressed_count, 1);
             }
-            other => panic!(
+            other @ DedupeVerdict::New => panic!(
                 "reset-then-check must return Duplicate after insertion_order \
                  refresh; got {other:?}"
             ),

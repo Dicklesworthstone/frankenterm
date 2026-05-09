@@ -201,16 +201,16 @@ mod tests {
 
     /// Generic API that consumes `impl RuntimeProof`. Used to anchor the
     /// adoption pattern referenced in `docs/runtime/runtime-proof-trait.md`.
-    fn _generic_api_pattern<P: RuntimeProof + ?Sized>(p: &P) {
+    fn generic_api_pattern<P: RuntimeProof + ?Sized>(p: &P) {
         assert_runtime_proof(p);
     }
 
     #[test]
     fn generic_api_accepts_sealed_types() {
         let m: Mutex<i32> = Mutex::new(0);
-        _generic_api_pattern(&m);
+        generic_api_pattern(&m);
         let cx = for_request();
-        _generic_api_pattern(&cx);
+        generic_api_pattern(&cx);
     }
 
     // The compile-fail doctest demonstrating that tokio::sync::Mutex is

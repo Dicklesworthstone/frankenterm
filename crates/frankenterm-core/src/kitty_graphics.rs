@@ -628,7 +628,7 @@ mod tests {
                 assert_eq!(cell_x, 5);
                 assert_eq!(cell_y, 7);
             }
-            other => panic!("unexpected: {other:?}"),
+            other @ PlacementMode::Classical { .. } => panic!("unexpected: {other:?}"),
         }
     }
 
@@ -643,7 +643,7 @@ mod tests {
                 assert_eq!(px_x, 100);
                 assert_eq!(px_y, 200);
             }
-            other => panic!("unexpected: {other:?}"),
+            other @ PlacementMode::Virtual { .. } => panic!("unexpected: {other:?}"),
         }
     }
 

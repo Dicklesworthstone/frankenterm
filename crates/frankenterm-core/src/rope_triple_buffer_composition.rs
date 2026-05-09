@@ -668,7 +668,7 @@ mod tests {
         let est = SharedBytesEstimator;
         assert_eq!(est.total_bytes(&chunks), 300);
         assert_eq!(est.shared_bytes(&chunks), 0);
-        assert_eq!(est.average_sharing_pct(&chunks), 0.0);
+        assert!(est.average_sharing_pct(&chunks).abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -688,7 +688,7 @@ mod tests {
         let est = SharedBytesEstimator;
         assert_eq!(est.total_bytes(&chunks), 300);
         assert_eq!(est.shared_bytes(&chunks), 300);
-        assert_eq!(est.average_sharing_pct(&chunks), 100.0);
+        assert!((est.average_sharing_pct(&chunks) - 100.0).abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -717,7 +717,7 @@ mod tests {
         let est = SharedBytesEstimator;
         assert_eq!(est.total_bytes(&[]), 0);
         assert_eq!(est.shared_bytes(&[]), 0);
-        assert_eq!(est.average_sharing_pct(&[]), 0.0);
+        assert!(est.average_sharing_pct(&[]).abs() <= f64::EPSILON);
     }
 
     // ------------------------------------------------------------------------

@@ -463,7 +463,7 @@ mod tests {
         // rubber-stamp behavior.
         let h = WireDedupHealth::baseline();
         assert!(!h.is_safe(), "cold baseline must be unsafe");
-        assert_eq!(h.duplicate_ratio(), 0.0);
+        assert!(h.duplicate_ratio().abs() <= f64::EPSILON);
 
         // Once schedules are explored without violation, safe.
         let h2 = WireDedupHealth {
@@ -495,7 +495,7 @@ mod tests {
             duplicates_total: 0,
             safety_violations_total: 0,
         };
-        assert_eq!(h.duplicate_ratio(), 0.0);
+        assert!(h.duplicate_ratio().abs() <= f64::EPSILON);
     }
 
     #[test]

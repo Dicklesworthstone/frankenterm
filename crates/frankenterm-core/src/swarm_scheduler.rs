@@ -2217,7 +2217,7 @@ mod tests {
             .expect("latency telemetry should produce a ratio");
 
         assert!(ratio.is_finite());
-        assert_eq!(ratio, controller.config().shed_stage_over_budget_ratio);
+        assert!((ratio - controller.config().shed_stage_over_budget_ratio).abs() <= f64::EPSILON);
         assert!(
             summary
                 .reason_codes

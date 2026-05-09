@@ -789,7 +789,7 @@ mod tests {
                 assert_eq!(r.min_hz, 60);
                 assert_eq!(r.max_hz, 120);
             }
-            other => panic!("expected Negotiated, got {other:?}"),
+            RefreshNegotiation::OutOfRange { .. } => panic!("expected Negotiated"),
         }
     }
 
@@ -802,7 +802,7 @@ mod tests {
                 assert_eq!(r.min_hz, 60);
                 assert_eq!(r.max_hz, 120);
             }
-            other => panic!("expected Negotiated, got {other:?}"),
+            RefreshNegotiation::OutOfRange { .. } => panic!("expected Negotiated"),
         }
     }
 
@@ -812,7 +812,7 @@ mod tests {
         let requested = RefreshRange::new(120, 240);
         match negotiate_refresh_range(display, requested) {
             RefreshNegotiation::OutOfRange { applied_max_hz, .. } => assert_eq!(applied_max_hz, 60),
-            other => panic!("expected OutOfRange, got {other:?}"),
+            RefreshNegotiation::Negotiated(_) => panic!("expected OutOfRange"),
         }
     }
 
@@ -822,9 +822,9 @@ mod tests {
         let requested = RefreshRange::new(30, 60);
         match negotiate_refresh_range(display, requested) {
             RefreshNegotiation::OutOfRange { applied_max_hz, .. } => {
-                assert_eq!(applied_max_hz, 240)
+                assert_eq!(applied_max_hz, 240);
             }
-            other => panic!("expected OutOfRange, got {other:?}"),
+            RefreshNegotiation::Negotiated(_) => panic!("expected OutOfRange"),
         }
     }
 

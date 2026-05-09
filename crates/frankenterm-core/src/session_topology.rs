@@ -3419,7 +3419,9 @@ mod tests {
             TopologySnapshot::from_json(&json).expect_err("ft-nrqf7: extreme depth must reject");
         match err {
             TopologySnapshotError::TooDeep { .. } | TopologySnapshotError::Json(_) => {}
-            other => panic!("ft-nrqf7: expected TooDeep or Json, got {other:?}"),
+            other @ TopologySnapshotError::TooLarge { .. } => {
+                panic!("ft-nrqf7: expected TooDeep or Json, got {other:?}")
+            }
         }
     }
 

@@ -1338,8 +1338,8 @@ mod tests {
     #[test]
     fn provider_counters_handle_zero_division() {
         let p = ProviderCounters::default();
-        assert_eq!(p.recall(), 1.0);
-        assert_eq!(p.precision(), 1.0);
+        assert!((p.recall() - 1.0).abs() <= f64::EPSILON);
+        assert!((p.precision() - 1.0).abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -1357,8 +1357,8 @@ mod tests {
         // Recall/precision stay at 1.0 in the absence of FN/FP
         // because the denominators are zero — this is intentional
         // for the rate accessors.
-        assert_eq!(h.overall_recall(), 1.0);
-        assert_eq!(h.overall_precision(), 1.0);
+        assert!((h.overall_recall() - 1.0).abs() <= f64::EPSILON);
+        assert!((h.overall_precision() - 1.0).abs() <= f64::EPSILON);
     }
 
     #[test]

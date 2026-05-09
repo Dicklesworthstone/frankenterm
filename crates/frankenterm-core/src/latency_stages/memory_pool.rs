@@ -464,7 +464,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(pool.config.high_water_mark, 0.0);
+        assert!(pool.config.high_water_mark.abs() <= f64::EPSILON);
         assert!(pool.under_pressure());
     }
 
@@ -480,7 +480,7 @@ mod tests {
             prop_assert!((0.0..=1.0).contains(&pool.config.high_water_mark));
 
             let expected = normalize_high_water_mark(high_water_mark);
-            prop_assert_eq!(pool.config.high_water_mark, expected);
+            prop_assert!((pool.config.high_water_mark - expected).abs() <= f64::EPSILON);
             prop_assert_eq!(pool.under_pressure(), pool.utilization() >= expected);
         }
     }

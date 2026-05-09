@@ -492,8 +492,7 @@ mod tests {
             ..GestureFuzzConfig::default()
         };
         let stream = GestureFuzzStream::new(1, cfg);
-        let events: Vec<_> = stream.collect();
-        assert_eq!(events.len(), 50);
+        assert_eq!(stream.count(), 50);
     }
 
     #[test]
@@ -582,7 +581,7 @@ mod tests {
             }],
         };
         let report: SnapBackDivergenceReport = result.into();
-        let rendered = render_reports_jsonl(&[report.clone()]);
+        let rendered = render_reports_jsonl(std::slice::from_ref(&report));
         let parsed = parse_reports_jsonl(&rendered).unwrap();
         assert_eq!(parsed[0], report);
     }

@@ -906,7 +906,9 @@ mod tests {
                                     "trial {trial}: append_chunk Denied mutated state"
                                 );
                             }
-                            _ => panic!("append_chunk returned {outcome:?}"),
+                            MultipartOutcome::Finalized { .. } => {
+                                panic!("append_chunk returned {outcome:?}")
+                            }
                         }
                     }
                     1 => {
@@ -930,7 +932,9 @@ mod tests {
                                     assert_eq!(acc.finalized, prior.finalized);
                                 }
                             }
-                            _ => panic!("finalize returned {outcome:?}"),
+                            MultipartOutcome::Accepted { .. } => {
+                                panic!("finalize returned {outcome:?}")
+                            }
                         }
                     }
                     _ => {

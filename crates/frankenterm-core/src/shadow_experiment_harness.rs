@@ -599,10 +599,9 @@ mod tests {
     #[test]
     fn no_side_effect_api_shape() {
         // Compile-time check: the closures below must type-check.
-        let _record: fn(&mut ShadowExperimentHarness, ShadowDecisionPair) -> bool =
+        let _: fn(&mut ShadowExperimentHarness, ShadowDecisionPair) -> bool =
             ShadowExperimentHarness::record_pair;
-        let _ledger: fn(&ShadowExperimentHarness) -> &ExperimentLedger =
-            ShadowExperimentHarness::ledger;
-        let _is_aborted: fn(&ShadowExperimentHarness) -> bool = ShadowExperimentHarness::is_aborted;
+        let _: fn(&ShadowExperimentHarness) -> &ExperimentLedger = ShadowExperimentHarness::ledger;
+        let _: fn(&ShadowExperimentHarness) -> bool = ShadowExperimentHarness::is_aborted;
     }
 }

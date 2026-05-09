@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(hit.pane_id, 4);
         assert_eq!(hit.snippet.as_deref(), Some("needle"));
         assert_eq!(hit.content_len, 18);
-        assert_eq!(hit.score, 0.42);
+        assert!((hit.score - 0.42).abs() <= f64::EPSILON);
     }
 
     #[test]

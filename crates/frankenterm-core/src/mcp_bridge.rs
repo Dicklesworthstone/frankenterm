@@ -137,7 +137,7 @@ pub fn mcp_bridge_tools_skipped_no_db_count() -> u64 {
 /// degraded-mode path can assert the post-increment value
 /// without state leakage from sibling tests.
 #[cfg(test)]
-pub(crate) fn reset_mcp_bridge_tools_skipped_no_db_count_for_test() {
+fn reset_mcp_bridge_tools_skipped_no_db_count_for_test() {
     MCP_BRIDGE_TOOLS_SKIPPED_NO_DB.store(0, Ordering::Relaxed);
 }
 
@@ -616,6 +616,7 @@ mod tests {
     ///   1. `build_server_degraded(&config)` for the stripped catalog
     ///   2. `build_server_with_db(&config, Some(tempdir_path))` for
     ///      the full audited surface.
+    ///
     /// This test exercises BOTH replacement surfaces successfully so
     /// a future API change that breaks one of them trips here. Pre-
     /// fix this contract was implicit and split across multiple
