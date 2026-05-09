@@ -12,6 +12,7 @@ LOG_FILE="${LOG_DIR}/proof_ledger_policy_${RUN_ID}.jsonl"
 
 VALIDATOR="${ROOT_DIR}/scripts/validate_asupersync_rch_execution_policy.sh"
 POLICY_DOC="${ROOT_DIR}/docs/asupersync-rch-execution-policy.md"
+VERIFICATION_DOC="${ROOT_DIR}/docs/ft-xbnl0-verification-contract.md"
 SCHEMA_DOC="${ROOT_DIR}/docs/asupersync-rch-evidence-schema.json"
 
 # shellcheck source=tests/e2e/lib_rch_guards.sh
@@ -140,7 +141,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-for artifact in "${VALIDATOR}" "${POLICY_DOC}" "${SCHEMA_DOC}"; do
+for artifact in "${VALIDATOR}" "${POLICY_DOC}" "${VERIFICATION_DOC}" "${SCHEMA_DOC}"; do
   if [[ ! -f "${artifact}" ]]; then
     emit_log \
       "failed" \
@@ -924,6 +925,21 @@ emit_log \
   "$(basename "${tmp_mixed_report}")" \
   "aggregate quality gate categories and partial-risk verdict validated"
 
+aggregate_closeout_summary="$(jq -c '{
+  overall_verdict,
+  quality_gate_passed,
+  blocking_failure_count,
+  counts
+}' "${tmp_mixed_report}")"
+emit_log \
+  "passed" \
+  "closeout_workflow_examples" \
+  "remote_rch_proof->invalid_local_heavy_claim->approved_local_fallback->missing_artifact->aggregate_verdict" \
+  "proof_ledger_closeout_summary_validated" \
+  "none" \
+  "$(basename "${tmp_mixed_report}")" \
+  "${aggregate_closeout_summary}"
+
 emit_log \
   "running" \
   "doc_wiring" \
@@ -956,6 +972,47 @@ rg -q "validate_asupersync_rch_execution_policy.sh" "${POLICY_DOC}" || {
     "policy doc missing validator reference"
   exit 1
 }
+
+for required_term in \
+  "remote RCH proof" \
+  "light local proof" \
+  "approved local fallback" \
+  "invalid local-heavy claim" \
+  "static-only check" \
+  "blocked verifier"; do
+  rg -Fq "${required_term}" "${POLICY_DOC}" || {
+    emit_log \
+      "failed" \
+      "doc_wiring" \
+      "policy_terminology_check" \
+      "missing_closeout_term" \
+      "doc_reference_missing" \
+      "$(basename "${POLICY_DOC}")" \
+      "policy doc missing proof-ledger closeout term: ${required_term}"
+    exit 1
+  }
+done
+
+for required_term in \
+  "remote RCH proof" \
+  "light local proof" \
+  "approved local fallback" \
+  "static-only check" \
+  "blocked verifier" \
+  "invalid local-heavy claim" \
+  "Proof-ledger closeout summary"; do
+  rg -Fq "${required_term}" "${VERIFICATION_DOC}" || {
+    emit_log \
+      "failed" \
+      "doc_wiring" \
+      "verification_terminology_check" \
+      "missing_closeout_term" \
+      "doc_reference_missing" \
+      "$(basename "${VERIFICATION_DOC}")" \
+      "finish-line verification contract missing proof-ledger closeout term: ${required_term}"
+    exit 1
+  }
+done
 
 if rg -q "sk-proj-|Bearer abcdef|/Users/jemanuel" "${LOG_FILE}"; then
   emit_log \

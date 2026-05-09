@@ -13,6 +13,7 @@ This contract builds on existing repo rules and lower-level specs instead of rep
 - `docs/test-logging-contract.md`
 - `docs/asupersync-migration-playbook.md`
 - `docs/asupersync-runtime-doctrine.md`
+- `docs/asupersync-rch-execution-policy.md`
 - `tests/e2e/lib_rch_guards.sh`
 
 If a lower-level spec conflicts with this document, follow the more specific rule unless it would weaken the finish-line evidence bar.
@@ -47,6 +48,13 @@ Required for every finish-line bead that runs Cargo verification.
 - Run the required Cargo commands via `rch exec -- ...` or a fail-closed harness.
 - Use explicit target dirs such as `target/rch-<bead>-<purpose>`.
 - Record the exact remote commands in the closing comment or artifact manifest.
+- Retain and cite proof-ledger JSONL plus the aggregate report when the lane
+  emits them.
+
+For proof-ledger closeout, this level maps to **remote RCH proof** in
+`docs/asupersync-rch-execution-policy.md`: the material heavy command must
+aggregate as `proven_remote`. RCH setup, sync, transfer, worker selection, queue
+placement, or smoke-preflight logs are not a substitute.
 
 ### Level C: Artifact Bundle Proof
 
@@ -87,6 +95,21 @@ rch exec -- cargo fmt --check
 If a lane needs a shell harness, it must fail closed on `rch` fallback and record the same commands inside its logs. Placeholder-remediation harnesses under `tests/e2e/` using `lib_rch_guards.sh` already satisfy this pattern and should be treated as the model.
 
 Local Cargo verification is not sufficient for finish-line closure unless the bead explicitly documents why no remote verification applies.
+
+When the proof-ledger validator is in scope, finish-line comments must use the
+same terms as the repository-wide policy:
+
+| Finish-line claim | Required proof-ledger category |
+|---|---|
+| Heavy source/test behavior passed | `proven_remote` |
+| Formatting, docs, schema, or shell syntax only | `light_local` or a static-only check artifact |
+| Human-approved degraded heavy run | `approved_fallback`, with residual risk named |
+| Verifier could not produce proof | blocked verifier reason such as `missing_artifact`, `malformed`, queue/worker blocker, or timeout |
+| Local heavy Cargo without approval | invalid local-heavy claim, rejected as `rejected_local_heavy` |
+
+`approved_fallback` and `residual_risk_only` may support a partial-risk
+closeout only when the bead text explicitly allows degraded evidence. Blocking
+categories cannot close an implementation or release-readiness claim.
 
 ## RCH Worker Parity Profile
 
@@ -366,8 +389,13 @@ Artifacts:
 - <absolute artifact dir>
 - <absolute artifact dir>/summary.json
 - <absolute artifact dir>/structured.log
+- <absolute proof-ledger JSONL path, if emitted>
+- <absolute aggregate proof-ledger report path, if emitted>
 Consumed upstream evidence:
 - <bead id> -> <absolute artifact path>
+Proof-ledger closeout summary:
+- remote RCH proof | light local proof | approved local fallback | static-only check | blocked verifier | invalid local-heavy claim
+- aggregate verdict: passed | partial_risk | failed
 Residual risks:
 - none | <explicit remaining risk>
 ```

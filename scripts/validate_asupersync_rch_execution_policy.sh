@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCHEMA_FILE="${ROOT_DIR}/docs/asupersync-rch-evidence-schema.json"
 SCHEMA_VERSION=3
-POLICY_VERSION="3.0.0"
+POLICY_VERSION="3.2.0"
 REDACTION_POLICY_VERSION="frankenterm.redactor.v1"
 
 usage() {

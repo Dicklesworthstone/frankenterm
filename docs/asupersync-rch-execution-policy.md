@@ -1,7 +1,7 @@
 # RCH Proof Ledger Execution Policy
 
 **Bead:** `ft-kvs1e`
-**Version:** `3.1.0`
+**Version:** `3.2.0`
 **Status:** Active proof-ledger foundation
 **Worker-targeted extension:** `ft-ilxky.1`
 
@@ -41,6 +41,25 @@ Classifier implementation is canonical in:
 
 The classifier is intentionally strict: setup or sync chatter that merely
 mentions `rch` is not proof that Cargo ran remotely.
+
+## Proof Vocabulary
+
+Use this vocabulary in proof-ledger artifacts, Beads comments, Agent Mail
+closeouts, and Robot/MCP summaries. The terms describe evidence quality, not
+agent effort.
+
+The canonical closeout phrases are: remote RCH proof, light local proof,
+approved local fallback, invalid local-heavy claim, static-only check, and
+blocked verifier.
+
+| Term | Ledger shape | Closeout meaning |
+|---|---|---|
+| Remote RCH proof | `command_class: "heavy"`, `used_rch: true`, `execution_mode: "remote_rch"`, `validation_status: "valid"`, retained artifacts, and non-local worker context. | The material heavy command ran through an RCH-recognized remote path and may prove source behavior when the command passed. |
+| Light local proof | `command_class: "light"`, `execution_mode: "local_light"`, `validation_status: "valid"`, and `target_dir: "not_applicable"`. | A local non-heavy check, such as `cargo fmt --check`, docs validation, JSON parsing, or shell syntax validation, proved only the static surface it exercised. |
+| Approved local fallback | Heavy command evidence with `execution_mode: "approved_local_fallback"`, `validation_status: "approved_fallback"`, `fallback_reason_code`, and `fallback_approved_by`. | Human-approved degraded evidence. It is partial-risk evidence and must not be described as clean remote proof. |
+| Invalid local-heavy claim | Heavy command evidence without remote RCH confirmation and without fallback approval metadata. | The validator and aggregate gate must reject this as `rejected_local_heavy`; keep the bead open or rerun remotely. |
+| Static-only check | A light proof or non-Cargo static guard that never compiles, tests, benches, soaks, or runs the product. | Useful for docs, schemas, shell syntax, JSON shape, and grep-style assertions. It cannot close a source-behavior claim by itself. |
+| Blocked verifier | The intended verifier could not produce valid evidence because workers were unavailable, the selected worker mirror was stale, artifacts were missing, the command timed out, or policy forbade fallback. | Report the blocker with reason code and retained logs. Do not convert the blocked verifier into a pass. |
 
 ## Mandatory Rule
 
@@ -220,6 +239,128 @@ print raw sensitive values.
 Machine-readable schema:
 
 - `docs/asupersync-rch-evidence-schema.json` (`schema_version: 3`)
+
+## Machine-Readable Examples
+
+These examples use schema-v3 field names and the same category language emitted
+by `--aggregate-ledger`. They are intentionally compact so a fresh agent can
+copy the shape into a Beads comment, Robot/MCP closeout summary, or retained
+artifact manifest without consulting chat history.
+
+Valid remote RCH proof:
+
+```json
+{
+  "schema_version": 3,
+  "bead_id": "ft-example.1",
+  "scenario_id": "aegis_diagnostics",
+  "policy_version": "3.2.0",
+  "runs": [
+    {
+      "timestamp": "2026-05-09T00:00:00Z",
+      "command": "run_rch_cargo_logged tests/e2e/logs/ft-example/rch.log env CARGO_TARGET_DIR=target/rch-ft-example cargo test -p frankenterm-core --lib aegis -- --nocapture",
+      "command_fingerprint": "sha256:95e9a352dd547b31424d2dd5da248d6bb8492d421f079edb23d9558e0a6d3432",
+      "command_class": "heavy",
+      "is_heavy": true,
+      "used_rch": true,
+      "worker_context": "worker=vmi1149989; queue=ready; head=dfde9e8ea; remote_cargo_reached=true",
+      "worker_context_fingerprint": "sha256:303e72f290a5c036e562ec5df47d9e0e13da629685a2829cd1bedf94b0eef3f4",
+      "execution_mode": "remote_rch",
+      "target_dir": "target/rch-ft-example",
+      "target_dir_fingerprint": "sha256:291cad282f1c5c51c5c200844c46b6e2a5447eb98bb8eb279c6f74f9cbeeb140",
+      "target_dir_lifecycle": "retained",
+      "artifact_paths": ["tests/e2e/test_asupersync_rch_execution_policy.sh"],
+      "artifact_paths_fingerprint": "sha256:3ad0cb87e568876768f423eb2b4384212e3b8628674d8b337cc8e848def77cd2",
+      "elapsed_seconds": 897.071,
+      "exit_status": 0,
+      "residual_risk_notes": "",
+      "residual_risk_notes_fingerprint": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_status": "valid"
+    }
+  ]
+}
+```
+
+Invalid local-heavy claim. This must be rejected as `rejected_local_heavy`
+because the material Cargo command is local and there is no fallback approval:
+
+```json
+{
+  "schema_version": 3,
+  "bead_id": "ft-example.1",
+  "scenario_id": "bad_local_claim",
+  "policy_version": "3.2.0",
+  "runs": [
+    {
+      "timestamp": "2026-05-09T00:01:00Z",
+      "command": "cargo test -p frankenterm-core --lib aegis -- --nocapture",
+      "command_fingerprint": "sha256:43920385b22f697db883fb74797d81cf4c3b923b3c07475cfb9080f0f7378ddc",
+      "command_class": "heavy",
+      "is_heavy": true,
+      "used_rch": false,
+      "worker_context": "local",
+      "worker_context_fingerprint": "sha256:25bf8e1a2393f1108d37029b3df5593236c755742ec93465bbafa9b290bddcf6",
+      "execution_mode": "remote_rch",
+      "target_dir": "target/local-ft-example",
+      "target_dir_fingerprint": "sha256:be8bfccac6decadf97a94abb3b6e5d54c78802421bdd3325649aa95e24b516bd",
+      "target_dir_lifecycle": "retained",
+      "artifact_paths": ["tests/e2e/test_asupersync_rch_execution_policy.sh"],
+      "artifact_paths_fingerprint": "sha256:3ad0cb87e568876768f423eb2b4384212e3b8628674d8b337cc8e848def77cd2",
+      "elapsed_seconds": 42.0,
+      "exit_status": 0,
+      "residual_risk_notes": "",
+      "residual_risk_notes_fingerprint": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "validation_status": "valid"
+    }
+  ]
+}
+```
+
+Approved local fallback changes only the evidence classification, not the fact
+that the command ran locally:
+
+```toon
+proof_closeout{
+  bead_id: ft-example.1
+  scenario_id: rch_unavailable_fallback
+  category: approved_fallback
+  execution_mode: approved_local_fallback
+  validation_status: approved_fallback
+  fallback_reason_code: RCH-NO-HEALTHY-WORKERS
+  fallback_approved_by: human-operator
+  residual_risk_notes: "Not comparable to remote RCH proof; rerun remotely before release-readiness."
+}
+```
+
+Blocked verifier summaries should name the blocker rather than pretending a
+proof exists:
+
+```toon
+proof_closeout{
+  bead_id: ft-example.2
+  category: missing_artifact
+  blocked_verifier: true
+  reason_code: aggregate.missing_artifact
+  action: "Keep the bead open and rerun the verifier after retaining the log bundle."
+}
+```
+
+## Closeout Migration Rule
+
+Older closeouts sometimes treated RCH setup, sync, transfer, worker selection,
+or smoke-preflight chatter as if it proved the source command. New closeouts
+must cite proof-ledger artifacts instead:
+
+1. Cite the proof-ledger JSONL path and aggregate report path.
+2. Name the category from the aggregate gate: `proven_remote`, `light_local`,
+   `approved_fallback`, `rejected_local_heavy`, `missing_artifact`,
+   `malformed`, or `residual_risk_only`.
+3. For a clean source/test claim, require `proven_remote` for the material
+   heavy command. `light_local` is acceptable only for static-only checks.
+4. For `approved_fallback` or `residual_risk_only`, state the residual risk in
+   the closeout. Do not claim a clean pass.
+5. For `rejected_local_heavy`, `missing_artifact`, or `malformed`, keep the
+   bead open or reopen it with the retained failure report.
 
 ## Validation Tooling
 

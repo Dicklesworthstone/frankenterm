@@ -236,7 +236,7 @@ rch_emit_proof_ledger_entry() {
     jq -cn \
         --argjson schema_version 3 \
         --arg bead_id "${RCH_PROOF_LEDGER_BEAD_ID}" \
-        --arg policy_version "3.0.0" \
+        --arg policy_version "3.2.0" \
         --arg scenario_id "${RCH_PROOF_LEDGER_SCENARIO_ID}" \
         --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
         --arg command "${redacted_command}" \
