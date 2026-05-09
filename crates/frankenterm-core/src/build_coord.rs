@@ -107,7 +107,7 @@ impl Default for BuildCoordConfig {
 pub struct BuildLockMetadata {
     /// PID of the process holding the lock.
     pub pid: u32,
-    /// Cargo subcommand being run (build, check, test, bench, clippy).
+    /// Cargo subcommand being run (build, check, test, bench, clippy, run, install).
     pub cargo_command: String,
     /// Project root path.
     pub project_root: String,
@@ -337,7 +337,9 @@ impl BuildEnv {
 
 // ── Build status checking ───────────────────────────────────────────────────
 
-const HEAVY_CARGO_SUBCOMMANDS: &[&str] = &["build", "check", "test", "bench", "clippy"];
+const HEAVY_CARGO_SUBCOMMANDS: &[&str] = &[
+    "build", "check", "test", "bench", "clippy", "run", "install",
+];
 
 /// Check if a build is currently running for a project.
 ///
@@ -445,7 +447,7 @@ pub enum RchProofCommandSafety {
     ValidRemoteCargo,
     /// Heavy Cargo work appears without an `rch exec --` wrapper.
     MissingRch,
-    /// `rch exec --` delegates to a shell that then runs heavy Cargo.
+    /// A shell wrapper encloses heavy Cargo, hiding the actual execution shape.
     ShellWrappedRemoteCargo,
 }
 
@@ -473,8 +475,8 @@ impl RchProofCommandSafety {
 /// This is stricter than [`command_uses_rch`]. A command such as
 /// `rch exec -- bash -lc 'cargo test ...'` contains an RCH prefix, but RCH
 /// treats the payload as a shell command rather than a first-class Cargo job.
-/// That shape is diagnostic-only for FrankenTerm proof closeout because it can
-/// fall out of the remote compilation path and start local Cargo.
+/// Shell-wrapped heavy Cargo is diagnostic-only for FrankenTerm proof closeout
+/// because the policy cannot verify the remote compilation path directly.
 #[must_use]
 pub fn classify_rch_proof_command_shape(command: &str) -> RchProofCommandSafety {
     let tokens = command_tokens(command);
@@ -532,7 +534,7 @@ fn classify_rch_proof_segment(
 
     if let Some(shell_command) = shell_command_payload(tokens, idx) {
         let nested = classify_rch_proof_command_shape(shell_command);
-        if uses_rch && nested_mentions_heavy_cargo(nested) {
+        if nested_mentions_heavy_cargo(nested) {
             return RchProofCommandSafety::ShellWrappedRemoteCargo;
         }
         return nested;
@@ -636,6 +638,11 @@ fn segment_command_start(
         idx += 3;
     }
 
+    if let Some(payload_idx) = rch_cargo_wrapper_payload_start(tokens, idx) {
+        uses_rch = true;
+        idx = payload_idx;
+    }
+
     (skip_command_prefixes(tokens, idx), uses_rch)
 }
 
@@ -682,9 +689,19 @@ fn normalize_cargo_subcommand(token: &str) -> Option<&'static str> {
         "bench" => Some("bench"),
         "clippy" => Some("clippy"),
         "run" | "r" => Some("run"),
+        "install" => Some("install"),
         "doc" | "d" => Some("doc"),
         _ => None,
     }
+}
+
+fn rch_cargo_wrapper_payload_start(tokens: &[String], idx: usize) -> Option<usize> {
+    match tokens.get(idx).map(String::as_str) {
+        Some("run_rch_cargo_logged") => Some(idx + 2),
+        Some("run_rch_cargo_logged_with_timeout") => Some(idx + 3),
+        _ => None,
+    }
+    .filter(|payload_idx| *payload_idx <= tokens.len())
 }
 
 fn is_cargo_toolchain_override(token: &str) -> bool {
@@ -1258,7 +1275,7 @@ mod tests {
 
     #[test]
     fn detect_cargo_command_unknown_subcommand() {
-        assert_eq!(detect_cargo_command("cargo install"), None);
+        assert_eq!(detect_cargo_command("cargo install"), Some("install"));
         assert_eq!(detect_cargo_command("cargo publish"), None);
         assert_eq!(detect_cargo_command("cargo add"), None);
     }
@@ -1368,6 +1385,12 @@ mod tests {
         assert!(command_uses_rch(
             "env TMPDIR=/tmp /Users/jemanuel/.local/bin/rch exec -- cargo clippy"
         ));
+        assert!(command_uses_rch(
+            "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace"
+        ));
+        assert!(command_uses_rch(
+            "run_rch_cargo_logged_with_timeout 120 target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo install --locked --path crates/frankenterm"
+        ));
         assert!(!command_uses_rch("cargo test --workspace"));
         assert!(!command_uses_rch("env CARGO_TARGET_DIR=target cargo test"));
         assert!(command_uses_rch(
@@ -1397,6 +1420,10 @@ mod tests {
         assert!(is_heavy_cargo_command("cargo build"));
         assert!(is_heavy_cargo_command("cargo check --workspace"));
         assert!(is_heavy_cargo_command("cargo nextest run"));
+        assert!(is_heavy_cargo_command("cargo run --bin frankenterm"));
+        assert!(is_heavy_cargo_command(
+            "cargo install --locked --path crates/frankenterm"
+        ));
         assert!(is_heavy_cargo_command(
             "TMPDIR=/tmp rch exec -- cargo clippy"
         ));
@@ -1426,10 +1453,20 @@ mod tests {
     fn requires_rch_offload_only_for_unwrapped_heavy_commands() {
         assert!(requires_rch_offload("cargo test -p frankenterm-core"));
         assert!(requires_rch_offload("cargo check --help"));
+        assert!(requires_rch_offload("cargo run --bin frankenterm"));
+        assert!(requires_rch_offload(
+            "cargo install --locked --path crates/frankenterm"
+        ));
         assert!(requires_rch_offload("cargo +nightly check --workspace"));
         assert!(!requires_rch_offload("cargo fmt --check"));
         assert!(!requires_rch_offload(
             "TMPDIR=/tmp rch exec -- cargo test --workspace"
+        ));
+        assert!(!requires_rch_offload(
+            "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace"
+        ));
+        assert!(!requires_rch_offload(
+            "run_rch_cargo_logged_with_timeout 120 target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo install --locked --path crates/frankenterm"
         ));
         assert!(!requires_rch_offload(
             "TMPDIR=/tmp rch exec -- cargo +nightly -Z unstable-options check --workspace"
@@ -1485,7 +1522,10 @@ mod tests {
             "rch exec -- cargo test --workspace",
             "TMPDIR=/tmp rch exec -- cargo check -p frankenterm-core",
             "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo clippy --all-targets",
-            "bash -lc 'TMPDIR=/tmp rch exec -- cargo test -p frankenterm-core'",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof cargo run --bin frankenterm -- --version",
+            "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace",
+            "run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo install --locked --path crates/frankenterm",
+            "run_rch_cargo_logged_with_timeout 120 target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace",
         ] {
             let safety = classify_rch_proof_command_shape(command);
             assert_eq!(safety, RchProofCommandSafety::ValidRemoteCargo, "{command}");
@@ -1503,6 +1543,9 @@ mod tests {
             "rch exec -- bash -lc 'cargo test -p frankenterm-core -- --nocapture'",
             "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-proof bash -lc 'cargo check --workspace'",
             "TMPDIR=/tmp rch exec -- sh -c 'cargo clippy --all-targets -- -D warnings'",
+            "bash -lc 'TMPDIR=/tmp rch exec -- cargo test -p frankenterm-core'",
+            "bash -lc 'run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace'",
+            "bash -lc 'cargo install --locked --path crates/frankenterm'",
         ] {
             let safety = classify_rch_proof_command_shape(command);
             assert_eq!(
@@ -1528,6 +1571,11 @@ mod tests {
             missing.reason_code(),
             "proof.local_invalid.missing_rch_exec"
         );
+
+        let missing_install = classify_rch_proof_command_shape(
+            "env CARGO_TARGET_DIR=/tmp/ft-proof cargo install --locked --path crates/frankenterm",
+        );
+        assert_eq!(missing_install, RchProofCommandSafety::MissingRch);
 
         let mixed = classify_rch_proof_command_shape(
             "rch exec -- cargo check --help && cargo test -p frankenterm-core",
