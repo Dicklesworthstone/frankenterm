@@ -2164,9 +2164,9 @@ fn ensure_segment_embeddings_schema(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum V0InitStep {
-    AfterRepair,
-    AfterSchemaSql,
-    AfterMigrations,
+    RepairComplete,
+    SchemaSqlApplied,
+    MigrationsApplied,
 }
 
 #[cfg(test)]
@@ -2176,9 +2176,9 @@ static V0_INIT_FAULT_AT: std::sync::atomic::AtomicI8 = std::sync::atomic::Atomic
 pub(crate) fn set_v0_init_fault_for_test(step: Option<V0InitStep>) {
     let value: i8 = match step {
         None => -1,
-        Some(V0InitStep::AfterRepair) => 0,
-        Some(V0InitStep::AfterSchemaSql) => 1,
-        Some(V0InitStep::AfterMigrations) => 2,
+        Some(V0InitStep::RepairComplete) => 0,
+        Some(V0InitStep::SchemaSqlApplied) => 1,
+        Some(V0InitStep::MigrationsApplied) => 2,
     };
     V0_INIT_FAULT_AT.store(value, std::sync::atomic::Ordering::SeqCst);
 }
@@ -2187,9 +2187,9 @@ pub(crate) fn set_v0_init_fault_for_test(step: Option<V0InitStep>) {
 fn check_v0_init_fault(step: V0InitStep) -> Result<()> {
     let active = V0_INIT_FAULT_AT.load(std::sync::atomic::Ordering::SeqCst);
     let target = match step {
-        V0InitStep::AfterRepair => 0,
-        V0InitStep::AfterSchemaSql => 1,
-        V0InitStep::AfterMigrations => 2,
+        V0InitStep::RepairComplete => 0,
+        V0InitStep::SchemaSqlApplied => 1,
+        V0InitStep::MigrationsApplied => 2,
     };
     if active == target {
         // Clear the fault so the test can re-enter the helper and verify
@@ -2253,16 +2253,16 @@ fn run_v0_init_in_transaction(conn: &Connection) -> Result<()> {
     let result: Result<()> = (|| {
         repair_existing_v0_tables_before_schema_sql(conn)?;
         #[cfg(test)]
-        check_v0_init_fault(V0InitStep::AfterRepair)?;
+        check_v0_init_fault(V0InitStep::RepairComplete)?;
 
         conn.execute_batch(&schema_body)
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
         #[cfg(test)]
-        check_v0_init_fault(V0InitStep::AfterSchemaSql)?;
+        check_v0_init_fault(V0InitStep::SchemaSqlApplied)?;
 
         run_migrations(conn, 0)?;
         #[cfg(test)]
-        check_v0_init_fault(V0InitStep::AfterMigrations)?;
+        check_v0_init_fault(V0InitStep::MigrationsApplied)?;
 
         ensure_ft_meta(conn, SCHEMA_VERSION)?;
         Ok(())

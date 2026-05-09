@@ -123,7 +123,7 @@ fn v0_init_fault_after_repair_rolls_back_atomically() {
     assert!(!needs_initialization(&conn).unwrap());
 
     // Inject a fault that fires immediately after the repair step.
-    set_v0_init_fault_for_test(Some(V0InitStep::AfterRepair));
+    set_v0_init_fault_for_test(Some(V0InitStep::RepairComplete));
 
     let err = initialize_schema(&conn).expect_err("fault must propagate");
     assert!(
@@ -3349,7 +3349,7 @@ fn pooled_read_conn_acquire_after_dirty_drop_yields_fresh_autocommit_conn() {
         pooled.with_borrowed_backend(|backend| {
             backend
                 .with_connection(|conn| conn.execute_batch("BEGIN").unwrap())
-                .expect("pooled backend begin")
+                .expect("pooled backend begin");
         });
         // Drop with open tx → guard discards.
     }
