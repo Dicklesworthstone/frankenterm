@@ -124,6 +124,7 @@ fn normalize_model_selector(model: Option<&str>) -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
 fn build_embedder(model: Option<&str>) -> Result<SharedEmbedder, String> {
     let selector = normalize_model_selector(model)?;
     build_embedder_from_normalized_selector(&selector)
