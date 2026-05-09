@@ -342,6 +342,25 @@ RCH logs are not proof by themselves. The retained artifact must show the comman
 reached Cargo/test/runtime as appropriate, and high-scale claims must show the
 target hardware predicate.
 
+### RCH Soak Harness
+
+The first `ft-p3457.4` proof lane is intentionally reduced and fail-closed:
+
+```bash
+RCH_STEP_TIMEOUT_SECS=1800 tests/e2e/test_ft_p3457_4_resource_pressure_soak.sh
+```
+
+The harness refuses local heavy Cargo by using the shared RCH guard library with
+`RCH_REQUIRE_REMOTE=1`. It retains `commands.txt`, `env.txt`, `structured.log`,
+`host_capability.json`, `proof-ledger.jsonl`, before/during/after cockpit
+snapshot artifacts, and the remote `cargo test -p frankenterm-core
+resource_pressure_ --lib -- --nocapture` output. The summary explicitly
+separates measured remote execution and host capability from simulated
+scaled-equivalent pressure snapshots. A 200-pane or high-scale cockpit claim
+remains `skipped_not_proven` unless the remote host predicate is measured at
+64+ logical CPUs and 256+ GiB memory and a later live soak captures the runtime
+cockpit artifacts.
+
 ## Minimal Example
 
 ```json

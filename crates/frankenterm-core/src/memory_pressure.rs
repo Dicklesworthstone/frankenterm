@@ -2053,6 +2053,66 @@ Call graph:
             .expect("domain summary should be present")
     }
 
+    fn proc_kib_field(contents: &str, field: &str) -> Option<u64> {
+        contents.lines().find_map(|line| {
+            line.strip_prefix(field)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+    }
+
+    fn proc_mem_total_kib() -> Option<u64> {
+        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+        proc_kib_field(&contents, "MemTotal:")
+    }
+
+    fn proc_self_rss_kib() -> Option<u64> {
+        let contents = std::fs::read_to_string("/proc/self/status").ok()?;
+        proc_kib_field(&contents, "VmRSS:")
+    }
+
+    fn json_escape_for_test(value: &str) -> String {
+        let mut escaped = String::new();
+        for ch in value.chars() {
+            match ch {
+                '"' => escaped.push_str("\\\""),
+                '\\' => escaped.push_str("\\\\"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                ch if ch.is_control() => {
+                    escaped.push_str(&format!("\\u{:04x}", ch as u32));
+                }
+                ch => escaped.push(ch),
+            }
+        }
+        escaped
+    }
+
+    #[test]
+    fn resource_pressure_soak_host_capability_probe() {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(0);
+        let (total_memory_bytes, _) = read_memory_info();
+        let memory_kib = proc_mem_total_kib().unwrap_or(total_memory_bytes / 1024);
+        let probe_rss_kib = proc_self_rss_kib().unwrap_or(0);
+        let uname = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+
+        println!(
+            "FT_P3457_HOST_CAPABILITY_JSON:{{\"logical_cpus\":{},\"memory_kib\":{},\"probe_rss_kib\":{},\"uname\":\"{}\"}}",
+            logical_cpus,
+            memory_kib,
+            probe_rss_kib,
+            json_escape_for_test(&uname)
+        );
+
+        assert!(logical_cpus > 0, "host capability probe must report CPUs");
+        assert!(memory_kib > 0, "host capability probe must report memory");
+    }
+
     #[test]
     fn resource_pressure_receipts_fail_closed_on_missing_telemetry() {
         let report = evaluate_resource_pressure_action_receipts(&[receipt_input(
