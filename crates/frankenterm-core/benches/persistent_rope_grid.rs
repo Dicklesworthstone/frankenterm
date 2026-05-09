@@ -57,7 +57,7 @@ fn bench_snapshot_1000_lines(c: &mut Criterion) {
         b.iter(|| {
             let snap = g.clone();
             black_box(snap);
-        })
+        });
     });
 
     group.bench_function("rope_clone", |b| {
@@ -65,7 +65,7 @@ fn bench_snapshot_1000_lines(c: &mut Criterion) {
         b.iter(|| {
             let snap = g.clone();
             black_box(snap);
-        })
+        });
     });
 
     group.finish();
@@ -80,7 +80,7 @@ fn bench_snapshot_10k_lines(c: &mut Criterion) {
         b.iter(|| {
             let snap = g.clone();
             black_box(snap);
-        })
+        });
     });
 
     group.bench_function("rope_clone", |b| {
@@ -88,7 +88,7 @@ fn bench_snapshot_10k_lines(c: &mut Criterion) {
         b.iter(|| {
             let snap = g.clone();
             black_box(snap);
-        })
+        });
     });
 
     group.finish();
@@ -112,7 +112,7 @@ fn bench_full_reflow_1000_lines(c: &mut Criterion) {
                 black_box(g.line_count());
             },
             criterion::BatchSize::SmallInput,
-        )
+        );
     });
 
     group.bench_function("rope_set_every_line", |b| {
@@ -125,7 +125,7 @@ fn bench_full_reflow_1000_lines(c: &mut Criterion) {
                 black_box(g.line_count());
             },
             criterion::BatchSize::SmallInput,
-        )
+        );
     });
 
     group.finish();
@@ -148,7 +148,7 @@ fn bench_mixed_1000_lines(c: &mut Criterion) {
             }
             let snap = g.clone();
             black_box(snap);
-        })
+        });
     });
 
     group.bench_function("rope_100_sets_then_snapshot", |b| {
@@ -160,7 +160,7 @@ fn bench_mixed_1000_lines(c: &mut Criterion) {
             }
             let snap = g.clone();
             black_box(snap);
-        })
+        });
     });
 
     group.finish();

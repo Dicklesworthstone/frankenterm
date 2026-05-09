@@ -99,7 +99,7 @@ struct Parser<'a> {
     pos: usize,
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_> {
     fn peek(&self) -> u8 {
         self.src[self.pos]
     }
@@ -149,7 +149,7 @@ impl<'a> Parser<'a> {
             entries.push((k, v));
             self.skip_ws();
             match self.bump() {
-                b',' => continue,
+                b',' => {}
                 b'}' => break,
                 other => panic!("expected `,` or `}}`, got `{}`", other as char),
             }
@@ -169,7 +169,7 @@ impl<'a> Parser<'a> {
             items.push(v);
             self.skip_ws();
             match self.bump() {
-                b',' => continue,
+                b',' => {}
                 b']' => break,
                 other => panic!("expected `,` or `]`, got `{}`", other as char),
             }

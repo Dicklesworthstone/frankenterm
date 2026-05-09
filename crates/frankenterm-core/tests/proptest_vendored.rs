@@ -33,7 +33,7 @@ fn arb_hex_string(min_len: usize, max_len: usize) -> impl Strategy<Value = Strin
 /// Generate a hex string with at least one a-f character (recognized as a commit).
 fn arb_commit_hash() -> impl Strategy<Value = String> {
     (arb_hex_string(7, 40), 0usize..6).prop_map(|(mut hash, letter_idx)| {
-        let hex_letters: [u8; 6] = [b'a', b'b', b'c', b'd', b'e', b'f'];
+        let hex_letters = *b"abcdef";
         let pos = letter_idx % hash.len();
         let letter = hex_letters[letter_idx % hex_letters.len()];
         let mut bytes = hash.into_bytes();

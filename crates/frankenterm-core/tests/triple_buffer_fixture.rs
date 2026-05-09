@@ -424,7 +424,6 @@ proptest! {
     ) {
         let tb: TripleBuffer<u32> = TripleBuffer::new(0);
         let mut events = Vec::new();
-        let mut generation = 0u64;
         for (i, op) in ops.iter().enumerate() {
             let kind = match op {
                 Op::Publish => {
@@ -434,12 +433,11 @@ proptest! {
                 Op::Acquire => { tb.acquire(); TripleBufferOp::Acquire }
                 Op::ForceRecycle => { tb.force_recycle(); TripleBufferOp::ForceRecycle }
             };
-            generation += 1;
             events.push(TripleBufferEvent {
                 ts_ms: i as u64,
                 kind,
                 state: tb.debug_state(),
-                generation,
+                generation: (i + 1) as u64,
             });
         }
         let rendered = render_events_jsonl(&events);

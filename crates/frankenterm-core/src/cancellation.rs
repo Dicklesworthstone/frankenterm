@@ -2905,6 +2905,10 @@ mod tests {
         let n_threads = 10;
         let barrier = Arc::new(Barrier::new(n_threads));
 
+        #[expect(
+            clippy::needless_collect,
+            reason = "the test must spawn every worker before joining to exercise concurrent child registration"
+        )]
         let handles: Vec<_> = (0..n_threads)
             .map(|i| {
                 let parent = parent.clone();
@@ -2957,6 +2961,10 @@ mod tests {
             let parent = CancellationToken::new(ScopeId(format!("parent-{round}")));
             let barrier = Arc::new(Barrier::new(n_creators + 1));
 
+            #[expect(
+                clippy::needless_collect,
+                reason = "the test must spawn every worker before the parent cancellation race"
+            )]
             let handles: Vec<_> = (0..n_creators)
                 .map(|i| {
                     let parent = parent.clone();

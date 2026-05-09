@@ -1283,7 +1283,11 @@ mod tests {
         let before = ep.e_value();
         let after = ep.update(f64::NAN, true, 4.0, 0.5, 1.0, 0.3, 2);
         assert!(after.is_finite(), "e_value must stay finite, got {after}");
-        assert_eq!(after, before, "NaN entropy must not mutate e_value");
+        assert_eq!(
+            after.to_bits(),
+            before.to_bits(),
+            "NaN entropy must not mutate e_value"
+        );
     }
 
     #[test]
@@ -1294,8 +1298,8 @@ mod tests {
         let after_neg = ep.update(f64::NEG_INFINITY, true, 4.0, 0.5, 1.0, 0.3, 2);
         assert!(after_pos.is_finite());
         assert!(after_neg.is_finite());
-        assert_eq!(after_pos, before);
-        assert_eq!(after_neg, before);
+        assert_eq!(after_pos.to_bits(), before.to_bits());
+        assert_eq!(after_neg.to_bits(), before.to_bits());
     }
 
     #[test]
@@ -1310,10 +1314,10 @@ mod tests {
         assert!(after2.is_finite());
         assert!(after3.is_finite());
         assert!(after4.is_finite());
-        assert_eq!(after1, before);
-        assert_eq!(after2, before);
-        assert_eq!(after3, before);
-        assert_eq!(after4, before);
+        assert_eq!(after1.to_bits(), before.to_bits());
+        assert_eq!(after2.to_bits(), before.to_bits());
+        assert_eq!(after3.to_bits(), before.to_bits());
+        assert_eq!(after4.to_bits(), before.to_bits());
     }
 
     /// Zero or negative std is mathematically undefined for a Gaussian
@@ -1326,9 +1330,9 @@ mod tests {
         let a = ep.update(0.5, true, 4.0, 0.0, 1.0, 0.3, 2);
         let b = ep.update(0.5, true, 4.0, 0.5, 1.0, 0.0, 2);
         let c = ep.update(0.5, true, 4.0, -0.1, 1.0, 0.3, 2);
-        assert_eq!(a, before);
-        assert_eq!(b, before);
-        assert_eq!(c, before);
+        assert_eq!(a.to_bits(), before.to_bits());
+        assert_eq!(b.to_bits(), before.to_bits());
+        assert_eq!(c.to_bits(), before.to_bits());
     }
 
     /// After a stream of bad inputs, a subsequent GOOD update must

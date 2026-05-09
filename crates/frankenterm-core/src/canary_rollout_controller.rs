@@ -1660,7 +1660,7 @@ mod tests {
     #[test]
     fn allowlist_empty_entry_rejected() {
         let config = CanaryRolloutConfig {
-            canary_agent_allowlist: vec!["a1".to_string(), "".to_string()],
+            canary_agent_allowlist: vec!["a1".to_string(), String::new()],
             ..Default::default()
         };
         let err = CanaryRolloutController::try_new(config).expect_err("empty entry must reject");

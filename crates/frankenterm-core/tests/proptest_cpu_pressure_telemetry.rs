@@ -223,9 +223,9 @@ proptest! {
 
         prop_assert_eq!(back.enabled, enabled);
         prop_assert_eq!(back.sample_interval_ms, sample_interval_ms);
-        prop_assert_eq!(back.yellow_threshold, yellow_threshold);
-        prop_assert_eq!(back.orange_threshold, orange_threshold);
-        prop_assert_eq!(back.red_threshold, red_threshold);
+        prop_assert_eq!(back.yellow_threshold.to_bits(), yellow_threshold.to_bits());
+        prop_assert_eq!(back.orange_threshold.to_bits(), orange_threshold.to_bits());
+        prop_assert_eq!(back.red_threshold.to_bits(), red_threshold.to_bits());
     }
 
     #[test]

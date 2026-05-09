@@ -201,7 +201,7 @@ fn replay_attempt_never_accepts() {
     assert_eq!(session.last_seq, 5);
 
     let history: Vec<(SenderId, Seq)> = std::iter::once((1, 5))
-        .chain(std::iter::repeat((1, 5)).take(10))
+        .chain(std::iter::repeat_n((1, 5), 10))
         .collect();
     assert!(check_invariants(&state, &history).is_empty());
 }
@@ -244,7 +244,7 @@ fn baseline_health_unsafe_until_explored() {
     // (no schedule explored). Previously asserted is_safe.
     let h = WireDedupHealth::baseline();
     assert!(!h.is_safe());
-    assert_eq!(h.duplicate_ratio(), 0.0);
+    assert!(h.duplicate_ratio().abs() <= f64::EPSILON);
     assert_eq!(h.schedules_explored, 0);
 }
 

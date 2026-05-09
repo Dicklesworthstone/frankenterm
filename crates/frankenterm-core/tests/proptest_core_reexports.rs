@@ -31,7 +31,7 @@ proptest! {
 
         prop_assert!(ewma.is_initialized());
         prop_assert_eq!(ewma.count(), values.len() as u64);
-        prop_assert_eq!(ewma.half_life_ms(), half_life_ms);
+        prop_assert_eq!(ewma.half_life_ms().to_bits(), half_life_ms.to_bits());
         prop_assert!(value.is_finite());
         prop_assert!(value >= min_seen.min(max_seen) - f64::EPSILON);
         prop_assert!(value <= max_seen.max(min_seen) + f64::EPSILON);
@@ -53,7 +53,7 @@ proptest! {
 
         prop_assert_eq!(rate.total_events(), intervals.len() as u64 + 1);
         if intervals.is_empty() {
-            prop_assert_eq!(rate.rate_per_sec(), 0.0);
+            prop_assert!(rate.rate_per_sec().abs() <= f64::EPSILON);
         } else {
             prop_assert!(rate.rate_per_sec().is_finite());
             prop_assert!(rate.rate_per_sec() > 0.0);
@@ -61,7 +61,7 @@ proptest! {
 
         rate.reset();
         prop_assert_eq!(rate.total_events(), 0);
-        prop_assert_eq!(rate.rate_per_sec(), 0.0);
+        prop_assert!(rate.rate_per_sec().abs() <= f64::EPSILON);
     }
 
     #[test]
@@ -136,8 +136,8 @@ proptest! {
             write_depth as f64 / write_capacity as f64
         };
 
-        prop_assert_eq!(depths.capture_ratio(), expected_capture);
-        prop_assert_eq!(depths.write_ratio(), expected_write);
+        prop_assert!((depths.capture_ratio() - expected_capture).abs() <= f64::EPSILON);
+        prop_assert!((depths.write_ratio() - expected_write).abs() <= f64::EPSILON);
         prop_assert!(depths.capture_ratio().is_finite());
         prop_assert!(depths.write_ratio().is_finite());
     }

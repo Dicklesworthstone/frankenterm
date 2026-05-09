@@ -446,7 +446,9 @@ mod tests {
                     CredentialClassBlastBand::None
                 );
             }
-            other => panic!("expected AutomationCapable, got {other:?}"),
+            other @ ImpactReport::ManualApprovalRequired { .. } => {
+                panic!("expected AutomationCapable, got {other:?}");
+            }
         }
     }
 
@@ -466,7 +468,9 @@ mod tests {
                 assert!(preview.rollback_plan.verified);
                 assert!(preview.confidence.contains("medium"));
             }
-            other => panic!("expected AutomationCapable, got {other:?}"),
+            other @ ImpactReport::ManualApprovalRequired { .. } => {
+                panic!("expected AutomationCapable, got {other:?}");
+            }
         }
     }
 
@@ -480,7 +484,9 @@ mod tests {
             ImpactReport::ManualApprovalRequired { reasons } => {
                 assert!(reasons.iter().any(|r| r.contains("pane 99")));
             }
-            other => panic!("expected ManualApprovalRequired, got {other:?}"),
+            other @ ImpactReport::AutomationCapable { .. } => {
+                panic!("expected ManualApprovalRequired, got {other:?}");
+            }
         }
     }
 
@@ -507,7 +513,9 @@ mod tests {
                 assert!(reasons.iter().any(|r| r.contains("rm -rf /")));
                 assert!(reasons.iter().any(|r| r.contains("**/*")));
             }
-            other => panic!("expected ManualApprovalRequired, got {other:?}"),
+            other @ ImpactReport::AutomationCapable { .. } => {
+                panic!("expected ManualApprovalRequired, got {other:?}");
+            }
         }
     }
 
@@ -521,7 +529,9 @@ mod tests {
             ImpactReport::ManualApprovalRequired { reasons } => {
                 assert!(reasons.iter().any(|r| r.contains("Secret")));
             }
-            other => panic!("expected ManualApprovalRequired, got {other:?}"),
+            other @ ImpactReport::AutomationCapable { .. } => {
+                panic!("expected ManualApprovalRequired, got {other:?}");
+            }
         }
     }
 
@@ -535,7 +545,9 @@ mod tests {
             ImpactReport::ManualApprovalRequired { reasons } => {
                 assert!(reasons.iter().any(|r| r.contains("rollback plan")));
             }
-            other => panic!("expected ManualApprovalRequired, got {other:?}"),
+            other @ ImpactReport::AutomationCapable { .. } => {
+                panic!("expected ManualApprovalRequired, got {other:?}");
+            }
         }
     }
 
@@ -568,7 +580,9 @@ mod tests {
             ImpactReport::AutomationCapable { preview } => {
                 assert!(preview.confidence.contains("high"));
             }
-            other => panic!("expected AutomationCapable, got {other:?}"),
+            other @ ImpactReport::ManualApprovalRequired { .. } => {
+                panic!("expected AutomationCapable, got {other:?}");
+            }
         }
     }
 
@@ -585,7 +599,9 @@ mod tests {
             ImpactReport::AutomationCapable { preview } => {
                 assert!(preview.confidence.contains("low"));
             }
-            other => panic!("expected AutomationCapable, got {other:?}"),
+            other @ ImpactReport::ManualApprovalRequired { .. } => {
+                panic!("expected AutomationCapable, got {other:?}");
+            }
         }
     }
 

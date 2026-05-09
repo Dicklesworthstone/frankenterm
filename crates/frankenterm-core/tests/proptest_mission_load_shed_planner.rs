@@ -212,11 +212,11 @@ proptest! {
         let mut planner = LoadShedPlanner::new(LoadShedConfig::conservative());
         let decisions = planner.plan(&candidates, &OverloadSignals::default());
         for (_, decision, evidence) in &decisions {
-            let is_admit_or_keepalive = match (evidence.mission_priority, decision) {
-                (MissionPriority::Critical, LoadShedDecision::KeepAlive) => true,
-                (_, LoadShedDecision::Admit) => true,
-                _ => false,
-            };
+            let is_admit_or_keepalive = matches!(
+                (evidence.mission_priority, decision),
+                (MissionPriority::Critical, LoadShedDecision::KeepAlive)
+                    | (_, LoadShedDecision::Admit)
+            );
             prop_assert!(
                 is_admit_or_keepalive,
                 "no-pressure tick produced unexpected decision: {decision:?}"

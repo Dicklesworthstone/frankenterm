@@ -792,7 +792,11 @@ mod tests {
 
     #[test]
     fn empirical_bernstein_tightens_with_samples() {
-        let mk = |n: usize| -> Vec<f64> { (0..n).map(|i| (i % 2) as f64 * 0.5 + 0.25).collect() };
+        let mk = |n: usize| -> Vec<f64> {
+            (0..n)
+                .map(|i| ((i % 2) as f64).mul_add(0.5, 0.25))
+                .collect()
+        };
         let small = empirical_bernstein_ci(&mk(50), 1.0, 0.05).unwrap();
         let large = empirical_bernstein_ci(&mk(5000), 1.0, 0.05).unwrap();
         // Larger sample → tighter bound.
@@ -1078,8 +1082,8 @@ mod tests {
         // confidence = 1.0.
         let samples = vec![42.0; 100];
         let band = conformal_band(&samples, 0.10).unwrap();
-        assert_eq!(band.lower, 42.0);
-        assert_eq!(band.upper, 42.0);
-        assert_eq!(band.realised_confidence, 1.0);
+        assert_eq!(band.lower.to_bits(), 42.0_f64.to_bits());
+        assert_eq!(band.upper.to_bits(), 42.0_f64.to_bits());
+        assert_eq!(band.realised_confidence.to_bits(), 1.0_f64.to_bits());
     }
 }

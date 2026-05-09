@@ -143,7 +143,7 @@ impl SoakHarness {
     /// hold the guard. Watchdog poll runs after.
     fn tick(&mut self, tick: u64) {
         let now = self.tick_to_instant(tick);
-        for pane in self.panes.iter_mut() {
+        for pane in &mut self.panes {
             // 1) Publish a fresh state (input thread side).
             pane.last_published_seqno += 1;
             let new_state = TestPaneState {

@@ -77,7 +77,7 @@ fn replay_config_toml_parser() {
         if data.len() > 32_768 {
             continue;
         }
-        let text = match std::str::from_utf8(&data) {
+        let text = match std::str::from_utf8(data) {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -100,7 +100,7 @@ fn replay_tuning_config_toml() {
         if data.len() > 16_384 {
             continue;
         }
-        let text = match std::str::from_utf8(&data) {
+        let text = match std::str::from_utf8(data) {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -122,7 +122,7 @@ fn replay_osc_marker_parser() {
         if data.len() > 64_000 {
             continue;
         }
-        let text = String::from_utf8_lossy(&data);
+        let text = String::from_utf8_lossy(data);
         let markers = parse_osc133_markers(&text);
         let mut state = Osc133State::new();
         for marker in markers {
@@ -147,7 +147,7 @@ fn replay_string_parsers() {
         if data.len() > 4_096 {
             continue;
         }
-        let text = match std::str::from_utf8(&data) {
+        let text = match std::str::from_utf8(data) {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -170,7 +170,7 @@ fn replay_recorder_event_json() {
         if data.len() > 16_384 {
             continue;
         }
-        let text = match std::str::from_utf8(&data) {
+        let text = match std::str::from_utf8(data) {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -194,7 +194,7 @@ fn replay_ntm_importer_json() {
         if data.len() > 65_536 {
             continue;
         }
-        let text = match std::str::from_utf8(&data) {
+        let text = match std::str::from_utf8(data) {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -226,7 +226,7 @@ fn replay_pattern_pack_parser() {
         if data.len() > 16_384 {
             continue;
         }
-        let text = match std::str::from_utf8(&data) {
+        let text = match std::str::from_utf8(data) {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -267,7 +267,7 @@ fn replay_fts_query() {
         if data.len() > 8_192 {
             continue;
         }
-        let query = match std::str::from_utf8(&data) {
+        let query = match std::str::from_utf8(data) {
             Ok(t) => t,
             Err(_) => continue,
         };

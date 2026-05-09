@@ -763,7 +763,7 @@ mod tests {
     fn measurement_jsonl_roundtrips() {
         let red = Color::opaque(255, 0, 0, ColorSpace::Srgb);
         let m = ColorMeasurement::new(0, "test", red, red);
-        let rendered = render_measurements_jsonl(&[m.clone()]);
+        let rendered = render_measurements_jsonl(std::slice::from_ref(&m));
         let parsed: ColorMeasurement = serde_json::from_str(rendered.trim()).unwrap();
         assert_eq!(parsed, m);
     }

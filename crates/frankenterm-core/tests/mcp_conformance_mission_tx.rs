@@ -157,7 +157,7 @@ fn canonicalize(value: &mut Value, workspace_root: &Path) {
                     "mission_file" => *child = Value::String("<mission_file>".to_string()),
                     "contract_file" => *child = Value::String("<contract_file>".to_string()),
                     "checkpoint_id" if !child.is_null() => {
-                        *child = Value::String("<checkpoint_id>".to_string())
+                        *child = Value::String("<checkpoint_id>".to_string());
                     }
                     _ if key.ends_with("_ms") => *child = Value::from(0_i64),
                     _ => canonicalize(child, workspace_root),
@@ -727,14 +727,14 @@ fn mcp_conformance_wa_tx_run_contract_matches_golden() {
 fn mcp_conformance_wa_tx_rollback_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.tx_rollback",
-        |harness| seed_committed_tx(harness),
+        seed_committed_tx,
         |harness| {
             json!({
                 "format": "json",
                 "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
             })
         },
-        |harness| seed_committed_tx(harness),
+        seed_committed_tx,
         |harness| {
             json!({
                 "format": "json",

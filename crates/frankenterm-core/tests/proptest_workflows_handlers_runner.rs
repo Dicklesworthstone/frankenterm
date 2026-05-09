@@ -728,8 +728,7 @@ proptest! {
                 "saturated rejected bursts must not persist queued workflow records"
             );
 
-            let mut expected_records = max_concurrent;
-            for cycle in 0..drain_cycles {
+            for (expected_records, cycle) in ((max_concurrent + 1)..).zip(0..drain_cycles) {
                 let (released_pane_id, released_execution_id) = started.remove(0);
                 let result = runner
                     .run_workflow(
@@ -763,7 +762,6 @@ proptest! {
                     unreachable!("prop_assert above returns")
                 };
                 started.push((replacement_pane_id, execution_id));
-                expected_records += 1;
                 prop_assert_eq!(
                     lock_manager.active_locks().len(),
                     max_concurrent,

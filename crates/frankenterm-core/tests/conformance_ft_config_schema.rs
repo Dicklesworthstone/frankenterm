@@ -152,7 +152,7 @@ const README_DOCUMENTED_SECTIONS: &[&str] = &[
 /// where the README↔code reconciliation is tracked.
 const README_DOCUMENTED_BUT_UNREACHABLE: &[(&str, &str)] = &[];
 
-/// 1) The README's canonical TOML block must parse through the
+/// Step 1: The README's canonical TOML block must parse through the
 /// production loader without erroring. If serde's deserializer
 /// hard-fails on a documented key, the README is lying about that
 /// key's name or shape.
@@ -167,7 +167,7 @@ fn readme_canonical_toml_parses_through_production_loader() {
     );
 }
 
-/// 2) Round-trip parse → re-serialize. The re-serialized form must
+/// Step 2: Round-trip parse → re-serialize. The re-serialized form must
 /// contain every README-documented top-level section.
 ///
 /// If a documented section is silently dropped (because it was
@@ -202,7 +202,7 @@ fn round_trip_preserves_every_readme_documented_section() {
     );
 }
 
-/// 3) Parity gate: the fixture file must match the README's
+/// Step 3: Parity gate: the fixture file must match the README's
 /// canonical TOML block byte-for-byte. Updating the README without
 /// updating the fixture (or vice versa) fails this test, forcing
 /// both edits into the same PR diff.

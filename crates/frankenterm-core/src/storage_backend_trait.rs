@@ -2040,16 +2040,16 @@ mod tests {
 
     #[test]
     fn tosql_value_from_impls_cover_native_types() {
-        let s: ToSqlValue = "hi".into();
-        assert_eq!(s, ToSqlValue::Text("hi"));
-        let i: ToSqlValue = 42_i64.into();
-        assert_eq!(i, ToSqlValue::Integer(42));
-        let u: ToSqlValue = 100_u32.into();
-        assert_eq!(u, ToSqlValue::Integer(100));
-        let f: ToSqlValue = 1.5_f64.into();
-        assert_eq!(f, ToSqlValue::Real(1.5));
-        let b: ToSqlValue = true.into();
-        assert_eq!(b, ToSqlValue::Integer(1));
+        let string_value: ToSqlValue = "hi".into();
+        assert_eq!(string_value, ToSqlValue::Text("hi"));
+        let integer_value: ToSqlValue = 42_i64.into();
+        assert_eq!(integer_value, ToSqlValue::Integer(42));
+        let unsigned_value: ToSqlValue = 100_u32.into();
+        assert_eq!(unsigned_value, ToSqlValue::Integer(100));
+        let float_value: ToSqlValue = 1.5_f64.into();
+        assert_eq!(float_value, ToSqlValue::Real(1.5));
+        let bool_value: ToSqlValue = true.into();
+        assert_eq!(bool_value, ToSqlValue::Integer(1));
         let raw: &[u8] = &[0, 1, 2];
         let blob: ToSqlValue = raw.into();
         assert_eq!(blob, ToSqlValue::Blob(&[0, 1, 2]));

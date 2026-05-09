@@ -11,12 +11,12 @@ fn source(path: &str, body: &str) -> (String, String) {
 
 #[test]
 fn render_audit_driver_reports_transitive_mutation_guard_as_ci_diagnostic() {
-    let paint = r#"
+    let paint = r"
 fn paint_impl() {
     draw_cells();
 }
-"#;
-    let helpers = r#"
+";
+    let helpers = r"
 fn draw_cells() {
     acquire_mutation_guard();
 }
@@ -24,7 +24,7 @@ fn draw_cells() {
 fn acquire_mutation_guard() {
     let _guard = triple_buffer.write();
 }
-"#;
+";
 
     let report = run_audit_on_sources(
         &[
@@ -64,11 +64,11 @@ fn acquire_mutation_guard() {
 
 #[test]
 fn render_audit_driver_warn_mode_keeps_findings_but_does_not_block_release() {
-    let source_text = r#"
+    let source_text = r"
 fn paint_impl() {
     let _guard = triple_buffer.write();
 }
-"#;
+";
     let audit_config = AuditConfig {
         error_as_warn: true,
         ..AuditConfig::default()

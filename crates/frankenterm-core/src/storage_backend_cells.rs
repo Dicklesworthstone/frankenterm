@@ -164,29 +164,29 @@ mod tests {
 
     #[test]
     fn cell_typed_accessors_only_match_their_variant() {
-        let i = SqlCell::Integer(42);
-        assert_eq!(i.as_i64(), Some(42));
-        assert_eq!(i.as_f64(), None);
-        assert_eq!(i.as_text(), None);
-        assert_eq!(i.as_blob(), None);
+        let integer_cell = SqlCell::Integer(42);
+        assert_eq!(integer_cell.as_i64(), Some(42));
+        assert_eq!(integer_cell.as_f64(), None);
+        assert_eq!(integer_cell.as_text(), None);
+        assert_eq!(integer_cell.as_blob(), None);
 
-        let f = SqlCell::Real(3.5);
-        assert_eq!(f.as_f64(), Some(3.5));
-        assert_eq!(f.as_i64(), None);
+        let real_cell = SqlCell::Real(3.5);
+        assert_eq!(real_cell.as_f64(), Some(3.5));
+        assert_eq!(real_cell.as_i64(), None);
 
-        let t = SqlCell::Text("hi".to_string());
-        assert_eq!(t.as_text(), Some("hi"));
-        assert_eq!(t.as_i64(), None);
+        let text_cell = SqlCell::Text("hi".to_string());
+        assert_eq!(text_cell.as_text(), Some("hi"));
+        assert_eq!(text_cell.as_i64(), None);
 
-        let b = SqlCell::Blob(vec![1, 2, 3]);
-        assert_eq!(b.as_blob(), Some(&[1, 2, 3][..]));
-        assert_eq!(b.as_text(), None);
+        let blob_cell = SqlCell::Blob(vec![1, 2, 3]);
+        assert_eq!(blob_cell.as_blob(), Some(&[1, 2, 3][..]));
+        assert_eq!(blob_cell.as_text(), None);
 
-        let n = SqlCell::Null;
-        assert_eq!(n.as_i64(), None);
-        assert_eq!(n.as_f64(), None);
-        assert_eq!(n.as_text(), None);
-        assert_eq!(n.as_blob(), None);
+        let null_cell = SqlCell::Null;
+        assert_eq!(null_cell.as_i64(), None);
+        assert_eq!(null_cell.as_f64(), None);
+        assert_eq!(null_cell.as_text(), None);
+        assert_eq!(null_cell.as_blob(), None);
     }
 
     #[test]

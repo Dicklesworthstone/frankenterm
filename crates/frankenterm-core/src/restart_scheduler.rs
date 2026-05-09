@@ -804,11 +804,11 @@ mod tests {
             would_trigger: true,
         };
 
-        let scheduled = scheduler
+        let scheduled_restart = scheduler
             .schedule_from_decision(&decision, i64::MAX - 100)
             .expect("recommendation should schedule");
 
-        assert_eq!(scheduled.scheduled_at_ms, i64::MAX);
+        assert_eq!(scheduled_restart.scheduled_at_ms, i64::MAX);
         let mut warning_scheduler = RestartScheduler::new(RestartSchedulerConfig {
             mode: RestartMode::Automatic { min_score: 0.1 },
             advance_warning_minutes: u32::MAX,

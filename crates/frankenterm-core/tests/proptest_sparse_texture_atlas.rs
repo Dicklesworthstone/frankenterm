@@ -150,7 +150,7 @@ proptest! {
             max_slices
         };
         let expected_slice_dim = if query_dim < slice_dim { query_dim } else { slice_dim };
-        let expected_axis = if tile_dim == 0 { 0 } else { slice_dim / tile_dim };
+        let expected_axis = slice_dim.checked_div(tile_dim).unwrap_or(0);
 
         prop_assert_eq!(clamped.max_slices, expected_max_slices);
         prop_assert_eq!(clamped.slice_dim, expected_slice_dim);

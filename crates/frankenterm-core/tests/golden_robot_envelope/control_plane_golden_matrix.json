@@ -347,7 +347,7 @@
         "version": "0.1.0",
         "now": 0
       },
-      "notes": "Pins a successful fleet scale dry-run receipt from the live mutation substrate."
+      "notes": "Pins a successful fleet scale dry-run receipt from the live mutation substrate; dry-run receipts are not durable crash-replay proof. Durable non-dry-run replay/conflict semantics are covered by the robot_fleet_durable receipt tests."
     },
     {
       "id": "robot-fleet-scale-json-inventory-unavailable",
@@ -579,7 +579,7 @@
         "version": "0.1.0",
         "now": 0
       },
-      "notes": "Pins decoded TOON parity for a successful fleet rebalance dry-run receipt."
+      "notes": "Pins decoded TOON parity for a successful fleet rebalance dry-run receipt; dry-run receipts are not durable crash-replay proof. Durable non-dry-run replay/conflict semantics are covered by the robot_fleet_durable receipt tests."
     },
     {
       "id": "robot-agents-json-feature-not-available",

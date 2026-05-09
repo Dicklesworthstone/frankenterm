@@ -111,7 +111,7 @@ fn seed_queue(
     frame_id: u64,
 ) {
     for i in 0..count {
-        let direction = if mixed && i.is_multiple_of(2) {
+        let direction = if mixed && i % 2 == 0 {
             StagingTransferDirection::Promote
         } else {
             StagingTransferDirection::Demote
@@ -157,7 +157,7 @@ fn drive_one_frame(
 
     // Step 3: partition by frame budget. Production API allocates
     // two Vecs per call — this is the cost the bench is auditing.
-    let (admitted, deferred) = deferrer.partition(&events, frame_budget_us);
+    let (admitted, delayed) = deferrer.partition(&events, frame_budget_us);
 
     // Step 4: build the AtlasBlitPlan from admitted events. Allocates
     // a Vec<AtlasBlitCommand> sized to admitted.len().
@@ -168,7 +168,7 @@ fn drive_one_frame(
     black_box(plan.total_bytes());
 
     // Step 5: carry deferred over to the next frame.
-    *carry_over = deferred;
+    *carry_over = delayed;
 
     // Step 6: reset for the next frame so the budget accumulator
     // starts clean.

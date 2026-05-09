@@ -1213,7 +1213,9 @@ mod tests {
     }
 
     fn promote_codel_to_due_drop(gov: &mut CapacityGovernor, category: WorkloadCategory) {
-        let first = std::time::Instant::now() - std::time::Duration::from_millis(250);
+        let first = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(250))
+            .expect("250ms subtraction from Instant::now should be in range");
         let second = first + std::time::Duration::from_millis(120);
         gov.record_workload_sojourn_at(category, std::time::Duration::from_millis(20), first);
         gov.record_workload_sojourn_at(category, std::time::Duration::from_millis(20), second);

@@ -195,13 +195,15 @@ fn fake_panes() -> Value {
 }
 
 fn fake_wezterm_script(state_dir: &Path) -> String {
+    let state_dir_literal =
+        serde_json::to_string(&state_dir.display().to_string()).expect("state dir path json");
     format!(
         r#"#!/usr/bin/env python3
 import json
 import sys
 from pathlib import Path
 
-state_dir = Path({state_dir:?})
+state_dir = Path({state_dir_literal})
 panes = json.loads((state_dir / "panes.json").read_text())
 texts = state_dir / "texts"
 
@@ -631,8 +633,8 @@ fn assert_json_number_field(data: &Map<String, Value>, field: &str, expected: f6
         .get(field)
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("{field} should be numeric: {data:?}"));
-    assert_eq!(
-        actual, expected,
+    assert!(
+        (actual - expected).abs() <= f64::EPSILON,
         "{field} should equal {expected} regardless of JSON integer/float encoding"
     );
 }
@@ -929,7 +931,7 @@ fn canonicalize(value: &mut Value) {
                     // presence, so canonicalize to 0 here.
                     "polls" => *child = Value::from(0_u64),
                     "score" | "semantic_score" if child.is_number() => {
-                        *child = Value::from(0.0_f64)
+                        *child = Value::from(0.0_f64);
                     }
                     // `lexical_weight` / `semantic_weight` come from
                     // effective_search_fusion_weights at crates/frankenterm-core/src/mcp.rs

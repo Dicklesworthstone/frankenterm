@@ -121,9 +121,9 @@ fn loom_oneshot_delivers_value_exactly_once() {
         let receiver = thread::spawn(move || chan_r.recv());
 
         sender.join().unwrap();
-        let received = receiver.join().unwrap();
+        let joined_value = receiver.join().unwrap();
 
-        assert_eq!(received, Some(42));
+        assert_eq!(joined_value, Some(42));
     });
 }
 
@@ -141,9 +141,9 @@ fn loom_oneshot_sender_drop_observed_as_none() {
         let receiver = thread::spawn(move || chan_r.recv());
 
         sender.join().unwrap();
-        let received = receiver.join().unwrap();
+        let joined_value = receiver.join().unwrap();
 
-        assert_eq!(received, None);
+        assert_eq!(joined_value, None);
     });
 }
 
@@ -179,9 +179,11 @@ fn loom_oneshot_send_after_receiver_drop_returns_err() {
 }
 
 /// ft-zzw3s: concurrent send + close-sender race. The receiver must
-/// observe exactly one of:
+/// observe exactly one terminal outcome:
+///
 ///   * `Some(v)` — send linearized first
 ///   * `None`    — close_sender linearized first
+///
 /// Never both (would imply double-delivery) and never neither (would
 /// imply the receiver woke spuriously without a state transition).
 #[test]
@@ -204,11 +206,11 @@ fn loom_oneshot_send_close_race_one_outcome() {
 
         sender.join().unwrap();
         closer.join().unwrap();
-        let received = receiver.join().unwrap();
+        let joined_value = receiver.join().unwrap();
 
         // Receiver MUST observe a terminal outcome; either delivery
         // succeeded (Some(99)) or the channel closed first (None).
-        match received {
+        match joined_value {
             Some(v) => assert_eq!(v, 99),
             None => {}
         }

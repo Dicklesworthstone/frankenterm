@@ -143,13 +143,9 @@ fn replay_baseline_stable_never_alarms() {
 fn replay_old_to_new_drift_up() {
     let mut trajectory: Vec<f64> = Vec::new();
     // Old-prompt baseline.
-    for _ in 0..50 {
-        trajectory.push(0.0);
-    }
+    trajectory.extend(std::iter::repeat_n(0.0, 50));
     // New-prompt regime (shift up).
-    for _ in 0..100 {
-        trajectory.push(1.0);
-    }
+    trajectory.extend(std::iter::repeat_n(1.0, 100));
     let (_stat, alerts) = replay("old_to_new_drift_up", &trajectory, 5);
     assert!(
         !alerts.is_empty(),
@@ -177,12 +173,8 @@ fn replay_old_to_new_drift_up() {
 #[test]
 fn replay_old_to_new_drift_down() {
     let mut trajectory: Vec<f64> = Vec::new();
-    for _ in 0..50 {
-        trajectory.push(0.0);
-    }
-    for _ in 0..100 {
-        trajectory.push(-1.0);
-    }
+    trajectory.extend(std::iter::repeat_n(0.0, 50));
+    trajectory.extend(std::iter::repeat_n(-1.0, 100));
     let (_stat, alerts) = replay("old_to_new_drift_down", &trajectory, 5);
     assert!(!alerts.is_empty());
     let (fire_step, alert) = &alerts[0];
@@ -202,9 +194,7 @@ fn replay_sudden_spike_alarms_quickly() {
     // single step → crosses h=5.0 immediately.
     trajectory.push(10.0);
     // Tail: back to baseline.
-    for _ in 0..20 {
-        trajectory.push(0.0);
-    }
+    trajectory.extend(std::iter::repeat_n(0.0, 20));
     let (_stat, alerts) = replay("sudden_spike", &trajectory, 5);
     assert_eq!(alerts.len(), 1, "single spike should produce one alarm");
     let (fire_step, alert) = &alerts[0];
@@ -246,15 +236,9 @@ fn replay_budget_exhausts_after_documented_count() {
 #[test]
 fn replay_stability_byte_identical() {
     let mut trajectory: Vec<f64> = Vec::new();
-    for _ in 0..30 {
-        trajectory.push(0.0);
-    }
-    for _ in 0..50 {
-        trajectory.push(1.0);
-    }
-    for _ in 0..20 {
-        trajectory.push(0.0);
-    }
+    trajectory.extend(std::iter::repeat_n(0.0, 30));
+    trajectory.extend(std::iter::repeat_n(1.0, 50));
+    trajectory.extend(std::iter::repeat_n(0.0, 20));
 
     let (stat1, alerts1) = replay("stability_first", &trajectory, 5);
     let (stat2, alerts2) = replay("stability_second", &trajectory, 5);
@@ -281,13 +265,9 @@ fn replay_stability_byte_identical() {
 fn replay_drift_then_recover_silences_canary() {
     let mut trajectory: Vec<f64> = Vec::new();
     // Sustained drift up.
-    for _ in 0..30 {
-        trajectory.push(1.0);
-    }
+    trajectory.extend(std::iter::repeat_n(1.0, 30));
     // Recovery to baseline.
-    for _ in 0..200 {
-        trajectory.push(0.0);
-    }
+    trajectory.extend(std::iter::repeat_n(0.0, 200));
     let (stat, alerts) = replay("drift_then_recover", &trajectory, 10);
     let snap = stat.snapshot();
     assert!(

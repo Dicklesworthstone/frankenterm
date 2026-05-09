@@ -52,14 +52,13 @@ use frankenterm_core::wayland_compositor_matrix::{
 fn every_tier1_compositor_appears_in_all_table() {
     // The compositor enum is closed; this test pins coverage
     // for the bead's "Tier-1 verification matrix" requirement.
-    let tier1: Vec<_> = CompositorIdentity::ALL
+    let tier1_count = CompositorIdentity::ALL
         .iter()
         .copied()
         .filter(|c| c.tier() == CompositorTier::Tier1)
-        .collect();
+        .count();
     assert_eq!(
-        tier1.len(),
-        3,
+        tier1_count, 3,
         "Tier-1 compositors are mutter / kwin / sway"
     );
 }

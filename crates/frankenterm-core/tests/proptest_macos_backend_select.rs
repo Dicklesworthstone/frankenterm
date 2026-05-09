@@ -168,11 +168,10 @@ proptest! {
             backend_switches: 0,
         };
         let total = presented + skipped;
-        let expected = if total == 0 {
-            0
-        } else {
-            ((presented * 100) / total).min(100) as u32
-        };
+        let expected = (presented * 100)
+            .checked_div(total)
+            .unwrap_or(0)
+            .min(100) as u32;
 
         prop_assert_eq!(stats.present_rate_pct(), expected);
         prop_assert!(stats.present_rate_pct() <= 100);

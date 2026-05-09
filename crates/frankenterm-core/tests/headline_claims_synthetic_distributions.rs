@@ -79,7 +79,7 @@ impl Lcg {
         let u1 = self.next_f64().max(1e-12);
         let u2 = self.next_f64();
         let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-        (mu + sigma * z).exp()
+        sigma.mul_add(z, mu).exp()
     }
 }
 
@@ -360,7 +360,7 @@ fn percentile_reading_carries_documented_subkeys() {
     let dist =
         Distribution::summarize(&samples, Distribution::DEFAULT_QUANTILES, 200, 0.95, 17).unwrap();
     for p in &dist.percentiles {
-        let _: PercentileReading = p.clone();
+        let _: PercentileReading = *p;
         let _ = p.q;
         let _ = p.value;
         let _ = p.ci_lower;

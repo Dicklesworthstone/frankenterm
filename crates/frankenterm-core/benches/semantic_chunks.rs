@@ -87,7 +87,7 @@ fn synth_event(index: usize) -> RecorderEvent {
     let session_id = Some(format!("sess-{}", index / 256));
 
     // Every 17th event is a control marker (forces hard boundary).
-    if index.is_multiple_of(17) {
+    if index % 17 == 0 {
         return RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             event_id,
@@ -117,7 +117,7 @@ fn synth_event(index: usize) -> RecorderEvent {
         .collect();
 
     // Half ingress, half egress — exercises direction-change boundaries.
-    if index.is_multiple_of(2) {
+    if index % 2 == 0 {
         RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             event_id,

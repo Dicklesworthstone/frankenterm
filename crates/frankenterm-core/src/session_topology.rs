@@ -3329,9 +3329,9 @@ mod tests {
         }
         json.push_str(r#"{"type":"Leaf","pane_id":1,"rows":24,"cols":80}"#);
         for _ in 0..depth {
-            json.push_str(r#"]]}"#);
+            json.push_str(r"]]}");
         }
-        json.push_str(r#"}]}]}"#);
+        json.push_str(r"}]}]}");
         json
     }
 

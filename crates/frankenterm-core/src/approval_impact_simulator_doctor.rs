@@ -380,7 +380,9 @@ mod tests {
                 assert_eq!(target_panes, vec![7, 8]);
                 assert_eq!(credentials, CredentialClassRendering::LocalReadWrite);
             }
-            _ => panic!("expected Automation variant"),
+            ImpactReportRendering::ManualApproval { .. } => {
+                panic!("expected Automation variant");
+            }
         }
     }
 
@@ -397,7 +399,9 @@ mod tests {
                 assert!(!reasons.is_empty());
                 assert!(reasons.iter().any(|r| r.contains("sensitive credentials")));
             }
-            _ => panic!("expected ManualApproval variant"),
+            ImpactReportRendering::Automation { .. } => {
+                panic!("expected ManualApproval variant");
+            }
         }
     }
 

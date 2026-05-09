@@ -41,7 +41,7 @@ asupersync_test! {
 }
 
 asupersync_test! {
-    #[ignore]
+    #[ignore = "macro attribute forwarding fixture"]
     fn macro_forwards_attributes_to_generated_test_fn() {
         // This body intentionally never runs (#[ignore]); the
         // assertion exists to confirm the macro does NOT silently

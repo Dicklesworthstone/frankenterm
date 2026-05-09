@@ -185,8 +185,10 @@ fn e2e_50_pane_overload_no_critical_starvation() {
                     // is allowed (fail-closed).
                     high_priority_hard_pause_count += 1;
                 }
-                (MissionPriority::Low, LoadShedDecision::Throttle { .. })
-                | (MissionPriority::Low, LoadShedDecision::Pause { .. }) => {
+                (
+                    MissionPriority::Low,
+                    LoadShedDecision::Throttle { .. } | LoadShedDecision::Pause { .. },
+                ) => {
                     low_priority_pressure_decisions += 1;
                 }
                 _ => {}

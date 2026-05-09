@@ -100,7 +100,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let mut u = Unstructured::new(data);
+    let u = Unstructured::new(data);
     let input: Input = match Input::arbitrary_take_rest(u) {
         Ok(i) => i,
         Err(_) => return,

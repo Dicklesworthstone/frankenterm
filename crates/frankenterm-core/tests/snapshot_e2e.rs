@@ -1566,20 +1566,20 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
 
         // Per-pane hash report (used by the roll-up assertion below).
         for pane in &panes {
-            let restored = checkpoint
+            let restored_pane = checkpoint
                 .pane_states
                 .iter()
                 .find(|s| s.pane_id == pane.pane_id)
                 .expect("each captured pane must reappear post-restart");
-            let content_match = normalize_cwd(pane.cwd.as_deref()) == restored.cwd
+            let content_match = normalize_cwd(pane.cwd.as_deref()) == restored_pane.cwd
                 && pane.effective_rows()
-                    == restored
+                    == restored_pane
                         .terminal_state
                         .as_ref()
                         .map(|t| u32::from(t.rows))
                         .unwrap_or_default()
                 && pane.effective_cols()
-                    == restored
+                    == restored_pane
                         .terminal_state
                         .as_ref()
                         .map(|t| u32::from(t.cols))
@@ -1587,7 +1587,7 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
             report.pane_reports.push(PaneTestReport {
                 pane_id: pane.pane_id,
                 original_content_hash: pane_info_hash(pane),
-                restored_content_hash: restored_state_hash(restored),
+                restored_content_hash: restored_state_hash(restored_pane),
                 content_match,
                 layout_match: pane_count_matches && pane_ids_match,
                 process_match: true,
@@ -1979,7 +1979,7 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
         let original_pane_ids: HashSet<u64> = panes.iter().map(|p| p.pane_id).collect();
         let pane_set_match = reparsed_pane_ids == original_pane_ids;
         let pane_count_match = reparsed_topology.pane_count() == panes.len();
-        let window_count_match = reparsed_topology.windows.len() >= 1;
+        let window_count_match = !reparsed_topology.windows.is_empty();
         let topology_self_roundtrip = TopologySnapshot::from_json(
             &reparsed_topology
                 .to_json()

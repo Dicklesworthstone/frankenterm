@@ -399,13 +399,13 @@ fn api_surface_coverage_matrix_has_no_remaining_ft_luisq_deferrals() {
 
 #[test]
 fn matrix_parser_rejects_omitted_surface() {
-    let markdown = r#"
+    let markdown = r"
 ## Matrix
 
 | Surface | Category | Robot CLI | MCP surface | Schema artifact | Docs artifact | Golden or matrix artifact | Proof lane | Status |
 |---|---|---|---|---|---|---|---|---|
 | `get-text` | `pane` | `ft robot get-text <pane_id>` | `wa.get_text` | `docs/json-schema/wa-robot-get-text.json` | `docs/cli-reference.md` | `crates/frankenterm-core/tests/golden_robot_envelope/wa_get_text.json` | `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-b7ysg-api-surface cargo test -p frankenterm-core --test conformance_robot_api_surface_coverage -- --nocapture` | COVERED |
-"#;
+";
     let rows = parse_rows(markdown).expect("fixture matrix should parse");
     let errors = validate_surface_set(&rows).expect_err("omitted surfaces must fail");
 

@@ -204,8 +204,8 @@ fn timeline_pane_focus_filter_drops_unrelated_panes_ft_1650n_16() {
         ..FocusOptions::default()
     };
     let text = render_timeline_text(&nodes, &edges, &opts);
-    let entry_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("[")).collect();
-    assert_eq!(entry_lines.len(), 5, "pane=1 focus should keep 5 nodes");
+    let entry_line_count = text.lines().filter(|l| l.starts_with("[")).count();
+    assert_eq!(entry_line_count, 5, "pane=1 focus should keep 5 nodes");
     // Pane 2 nodes (n6, n7) and pane 3 node (n8) absent.
     assert!(!text.contains("pane 2 lockup"));
     assert!(!text.contains("workflow:diag_dump"));
@@ -225,10 +225,9 @@ fn timeline_time_window_focus_filter_inclusive_ft_1650n_16() {
         ..FocusOptions::default()
     };
     let text = render_timeline_text(&nodes, &edges, &opts);
-    let entry_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("[")).collect();
+    let entry_line_count = text.lines().filter(|l| l.starts_with("[")).count();
     assert_eq!(
-        entry_lines.len(),
-        4,
+        entry_line_count, 4,
         "window [1050, 1200] should keep 4 nodes"
     );
 }

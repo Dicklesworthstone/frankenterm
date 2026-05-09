@@ -292,9 +292,8 @@ fn mcp_manifest_matches_golden_without_db() {
         "no-db resource templates must be a subset of the db-backed manifest"
     );
 
-    let absent_db_tools: Vec<_> = full_tools.difference(&no_db_tools).cloned().collect();
     assert!(
-        !absent_db_tools.is_empty(),
+        full_tools.difference(&no_db_tools).next().is_some(),
         "expected db-backed manifest to expose db-gated tools absent from no-db mode"
     );
     // Whitelist of tools that MUST be db-gated. Each entry is verified
@@ -321,12 +320,8 @@ fn mcp_manifest_matches_golden_without_db() {
         );
     }
 
-    let absent_db_resources: Vec<_> = full_resources
-        .difference(&no_db_resources)
-        .cloned()
-        .collect();
     assert!(
-        !absent_db_resources.is_empty(),
+        full_resources.difference(&no_db_resources).next().is_some(),
         "expected db-backed manifest to expose db-gated resources absent from no-db mode"
     );
     for expected_absent_resource in ["wa://accounts", "wa://events", "wa://reservations"] {

@@ -1321,9 +1321,9 @@ proptest! {
         }];
         let report = score_candidates(&inputs, &ScorerConfig::default());
         let s = &report.scored[0];
-        prop_assert_eq!(s.final_score, 0.0);
+        prop_assert!(s.final_score.abs() <= f64::EPSILON);
         prop_assert!(s.below_confidence_threshold);
-        prop_assert_eq!(s.feature_composite, 0.0);
+        prop_assert!(s.feature_composite.abs() <= f64::EPSILON);
     }
 
     /// br-ft-nj0mq: assignments + rejected must cover every input
@@ -1400,7 +1400,7 @@ proptest! {
             .map(|i| ScoredCandidate {
                 bead_id: format!("b{i}"),
                 // Decreasing scores so the head fits under the cap.
-                final_score: 1.0 - (i as f64) * 0.05,
+                final_score: (i as f64).mul_add(-0.05, 1.0),
                 feature_composite: 0.5,
                 effort_penalty: 0.0,
                 tag_multiplier: 1.0,

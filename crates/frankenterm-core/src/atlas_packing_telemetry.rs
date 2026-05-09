@@ -485,7 +485,7 @@ mod tests {
         struct ExplodingWriter;
         impl Write for ExplodingWriter {
             fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::Other, "fault"))
+                Err(io::Error::other("fault"))
             }
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())

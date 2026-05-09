@@ -171,7 +171,7 @@ fn high_volume_event_sweep_invariants_hold() {
     // High-volume sweep — 1024 trials × 96 events = ~98k
     // transitions. Exercises long traces against a tighter
     // bound than the lib's 16-deep sweep.
-    let mut rng: u64 = 0xc0ffee15_bad_cafeu64;
+    let mut rng: u64 = 0x0c0f_fee1_5bad_cafe_u64;
     let xorshift = |s: &mut u64| -> u64 {
         let mut x = *s;
         x ^= x << 13;

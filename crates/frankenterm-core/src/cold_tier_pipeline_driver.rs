@@ -799,9 +799,7 @@ mod tests {
                     panic!("scenario should succeed after one retry");
                 }
             }
-            if retries > 5 {
-                panic!("guard: too many retries");
-            }
+            assert!(retries <= 5, "guard: too many retries");
         }
 
         assert_eq!(retries, 1);
@@ -843,9 +841,7 @@ mod tests {
                 }
                 DriverTickAction::Done => panic!("expected Failed eventually"),
             }
-            if retries > 10 {
-                panic!("guard: retries unbounded");
-            }
+            assert!(retries <= 10, "guard: retries unbounded");
         }
 
         // After max_retries=3, the next failure leaves the

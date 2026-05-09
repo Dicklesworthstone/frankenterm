@@ -42,7 +42,7 @@ fn bench_plain_snapshot(c: &mut Criterion) {
         let text = generate_content(lines);
         group.throughput(Throughput::Bytes(text.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(lines), &text, |b, text| {
-            b.iter(|| parse_osc133_markers(text))
+            b.iter(|| parse_osc133_markers(text));
         });
     }
     group.finish();
@@ -54,7 +54,7 @@ fn bench_sparse_markers(c: &mut Criterion) {
         let text = with_sparse_markers(lines);
         group.throughput(Throughput::Bytes(text.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(lines), &text, |b, text| {
-            b.iter(|| parse_osc133_markers(text))
+            b.iter(|| parse_osc133_markers(text));
         });
     }
     group.finish();

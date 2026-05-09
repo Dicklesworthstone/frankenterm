@@ -518,12 +518,12 @@ mod tests {
 
     #[test]
     fn populates_render_entry_with_readonly_guard() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     let snap = triple_buffer.read();
     let _ = snap;
 }
-"#;
+";
         let cfg = PopulatorConfig::default();
         let mut next_id = 1u32;
         let mut out = PopulatorOutput::default();
@@ -546,12 +546,12 @@ fn paint_impl() {
 
     #[test]
     fn mutation_guard_at_render_entry_fails_audit() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     let snap = triple_buffer.write();
     let _ = snap;
 }
-"#;
+";
         let out = populate_from_sources(
             &[("paint.rs".to_string(), src.to_string())],
             &PopulatorConfig::default(),
@@ -579,7 +579,7 @@ fn paint_impl() {
 
     #[test]
     fn transitive_call_to_helper_with_mutation_guard_fails_audit() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     helper_that_writes();
 }
@@ -588,7 +588,7 @@ fn helper_that_writes() {
     let snap = triple_buffer.write();
     let _ = snap;
 }
-"#;
+";
         let out = populate_from_sources(
             &[("paint.rs".to_string(), src.to_string())],
             &PopulatorConfig::default(),
@@ -622,7 +622,7 @@ fn helper_that_writes() {
 
     #[test]
     fn transitive_readonly_guard_passes_audit() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     helper_that_reads();
 }
@@ -631,7 +631,7 @@ fn helper_that_reads() {
     let snap = triple_buffer.read();
     let _ = snap;
 }
-"#;
+";
         let out = populate_from_sources(
             &[("paint.rs".to_string(), src.to_string())],
             &PopulatorConfig::default(),
@@ -653,7 +653,7 @@ fn helper_that_reads() {
     fn mutation_guard_off_render_path_passes_audit() {
         // mutation_only_path has the mutation guard but is
         // never called from any render entry → audit passes.
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     helper_that_reads();
 }
@@ -667,7 +667,7 @@ fn mutation_only_path() {
     let snap = triple_buffer.write();
     let _ = snap;
 }
-"#;
+";
         let out = populate_from_sources(
             &[("paint.rs".to_string(), src.to_string())],
             &PopulatorConfig::default(),
@@ -693,13 +693,13 @@ fn mutation_only_path() {
 
     #[test]
     fn comment_with_guard_pattern_is_ignored() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     // triple_buffer.write() — used to be here, now removed
     let snap = triple_buffer.read();
     let _ = snap;
 }
-"#;
+";
         let out = populate_from_sources(
             &[("paint.rs".to_string(), src.to_string())],
             &PopulatorConfig::default(),
@@ -732,17 +732,17 @@ fn paint_impl() {
 
     #[test]
     fn cross_file_call_edge_resolves() {
-        let paint_src = r#"
+        let paint_src = r"
 fn paint_impl() {
     helper_in_other_file();
 }
-"#;
-        let helper_src = r#"
+";
+        let helper_src = r"
 fn helper_in_other_file() {
     let snap = triple_buffer.write();
     let _ = snap;
 }
-"#;
+";
         let out = populate_from_sources(
             &[
                 ("paint.rs".to_string(), paint_src.to_string()),
@@ -768,13 +768,13 @@ fn helper_in_other_file() {
 
     #[test]
     fn pub_async_unsafe_const_fns_recognized() {
-        let src = r#"
+        let src = r"
 pub fn alpha() { let _ = triple_buffer.read(); }
 async fn beta() { let _ = triple_buffer.read(); }
 unsafe fn gamma() { let _ = triple_buffer.read(); }
 const fn delta() -> u32 { 0 }
 pub(crate) fn epsilon() { let _ = triple_buffer.read(); }
-"#;
+";
         let out = populate_from_sources(
             &[("mod.rs".to_string(), src.to_string())],
             &PopulatorConfig::default(),
@@ -793,13 +793,13 @@ pub(crate) fn epsilon() { let _ = triple_buffer.read(); }
 
     #[test]
     fn custom_render_entry_names_match() {
-        let src = r#"
+        let src = r"
 fn alternate_paint_root() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let mut cfg = PopulatorConfig::default();
         cfg.render_entry_names = vec!["alternate_paint_root".to_string()];
         let out = populate_from_sources(&[("paint.rs".to_string(), src.to_string())], &cfg);
@@ -820,13 +820,13 @@ fn alternate_paint_root() {
 
     #[test]
     fn audit_passes_when_no_render_entries_present() {
-        let src = r#"
+        let src = r"
 fn unrelated() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let out = populate_from_sources(
             &[("mod.rs".to_string(), src.to_string())],
             &PopulatorConfig::default(),

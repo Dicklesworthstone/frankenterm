@@ -30,8 +30,7 @@ fn arb_cursor_flag() -> impl Strategy<Value = u8> {
 }
 
 fn arb_rgba() -> impl Strategy<Value = [f32; 4]> {
-    (-2.0f32..=2.0, -2.0f32..=2.0, -2.0f32..=2.0, -2.0f32..=2.0)
-        .prop_map(|(r, g, b, a)| [r, g, b, a])
+    (-2.0f32..=2.0, -2.0f32..=2.0, -2.0f32..=2.0, -2.0f32..=2.0).prop_map(<[f32; 4]>::from)
 }
 
 fn arb_instance_config() -> impl Strategy<Value = InstanceBufferConfig> {

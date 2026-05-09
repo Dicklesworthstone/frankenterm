@@ -693,9 +693,9 @@ mod tests {
         });
 
         let counter_b = Arc::new(AtomicU32::new(0));
-        let counter_b_clone = Arc::clone(&counter_b);
+        let second_counter_clone = Arc::clone(&counter_b);
         let report_b = lab_runtime_test_with_seed(42, move |_cx| {
-            let counter = counter_b_clone;
+            let counter = second_counter_clone;
             async move {
                 for _ in 0..10 {
                     counter.fetch_add(1, Ordering::SeqCst);
@@ -987,9 +987,9 @@ mod tests {
     #[test]
     fn lab_runtime_multi_task_runs_two_tasks_to_completion() {
         let task_a_done = Arc::new(AtomicBool::new(false));
-        let task_b_done = Arc::new(AtomicBool::new(false));
+        let second_task_done = Arc::new(AtomicBool::new(false));
         let a = Arc::clone(&task_a_done);
-        let b = Arc::clone(&task_b_done);
+        let b = Arc::clone(&second_task_done);
 
         let report = LabRuntimeMultiTask::new()
             .spawn(move |_cx| {
@@ -1007,7 +1007,10 @@ mod tests {
             .run();
 
         assert!(task_a_done.load(Ordering::SeqCst), "task A must complete");
-        assert!(task_b_done.load(Ordering::SeqCst), "task B must complete");
+        assert!(
+            second_task_done.load(Ordering::SeqCst),
+            "task B must complete"
+        );
         assert_ran_to_completion(&report);
     }
 

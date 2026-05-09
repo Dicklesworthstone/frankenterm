@@ -5081,14 +5081,14 @@ mod tests {
 
     #[test]
     fn agent_detection_toml_uses_documented_thresholds() {
-        let toml = r#"
+        let toml = r"
 [agent_detection]
 enabled = false
 active_output_threshold_ms = 111
 thinking_silence_ms = 222
 stuck_silence_ms = 333
 idle_silence_ms = 444
-"#;
+";
 
         let config = Config::from_toml(toml).expect("Failed to parse");
         assert!(!config.agent_detection.enabled);

@@ -381,11 +381,11 @@ proptest! {
 
         prop_assert_eq!(
             summary.avg_decode_ns(),
-            if admitted == 0 { 0 } else { decode_ns / admitted },
+            decode_ns.checked_div(admitted).unwrap_or(0),
         );
         prop_assert_eq!(
             summary.compression_ratio_bp(),
-            if bytes_in == 0 { 0 } else { (bytes_out * 10_000) / bytes_in },
+            (bytes_out * 10_000).checked_div(bytes_in).unwrap_or(0),
         );
     }
 }

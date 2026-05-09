@@ -730,22 +730,37 @@ mod tests {
         // f64::clamp propagates NaN — sanitize_probability must
         // strip it so probabilistic fault injection isn't silently
         // disabled by an NaN passed via division-by-zero or similar.
-        assert_eq!(FaultMode::sanitize_probability(f64::NAN), 0.0);
+        assert_eq!(
+            FaultMode::sanitize_probability(f64::NAN).to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
     fn sanitize_probability_clamps_negative_and_overflow() {
-        assert_eq!(FaultMode::sanitize_probability(-1.0), 0.0);
-        assert_eq!(FaultMode::sanitize_probability(2.5), 1.0);
-        assert_eq!(FaultMode::sanitize_probability(f64::INFINITY), 1.0);
-        assert_eq!(FaultMode::sanitize_probability(f64::NEG_INFINITY), 0.0);
+        assert_eq!(
+            FaultMode::sanitize_probability(-1.0).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            FaultMode::sanitize_probability(2.5).to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            FaultMode::sanitize_probability(f64::INFINITY).to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            FaultMode::sanitize_probability(f64::NEG_INFINITY).to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
     fn fail_with_probability_builder_strips_nan() {
         match FaultMode::fail_with_probability(f64::NAN, "x") {
             FaultMode::FailWithProbability { probability, .. } => {
-                assert_eq!(probability, 0.0);
+                assert_eq!(probability.to_bits(), 0.0_f64.to_bits());
             }
             other => panic!("expected FailWithProbability, got {other:?}"),
         }

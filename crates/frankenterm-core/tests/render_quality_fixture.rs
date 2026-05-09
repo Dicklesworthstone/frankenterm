@@ -473,5 +473,5 @@ fn baseline_health_is_zero_across_the_board() {
     assert_eq!(h.fancy_frames_total, 0);
     assert_eq!(h.snap_back_total, 0);
     assert_eq!(h.quality_transitions_total, 0);
-    assert_eq!(h.draft_ratio(), 0.0);
+    assert!(h.draft_ratio().abs() <= f64::EPSILON);
 }

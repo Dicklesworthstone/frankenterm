@@ -298,12 +298,12 @@ mod tests {
 
     #[test]
     fn driver_pass_when_no_render_path_touches_mutation() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     let snap = triple_buffer.read();
     let _ = snap;
 }
-"#;
+";
         let report = run_audit_on_sources(
             &[pair("paint.rs", src)],
             &PopulatorConfig::default(),
@@ -320,12 +320,12 @@ fn paint_impl() {
 
     #[test]
     fn driver_fails_when_render_entry_touches_mutation_guard() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     let snap = triple_buffer.write();
     let _ = snap;
 }
-"#;
+";
         let report = run_audit_on_sources(
             &[pair("paint.rs", src)],
             &PopulatorConfig::default(),
@@ -337,13 +337,13 @@ fn paint_impl() {
 
     #[test]
     fn driver_treats_violations_as_warnings_when_error_as_warn() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let cfg = AuditConfig {
             error_as_warn: true,
             ..AuditConfig::default()
@@ -357,16 +357,16 @@ fn paint_impl() {
 
     #[test]
     fn driver_finds_transitive_violation_across_files() {
-        let paint = r#"
+        let paint = r"
 fn paint_impl() { helper_in_other_file(); }
-"#;
-        let helper = r#"
+";
+        let helper = r"
 fn helper_in_other_file() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let report = run_audit_on_sources(
             &[pair("paint.rs", paint), pair("helper.rs", helper)],
             &PopulatorConfig::default(),
@@ -381,14 +381,14 @@ fn helper_in_other_file() {
 
     #[test]
     fn render_diagnostic_pass_includes_scan_counts() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     let _ = triple_buffer.read();
 }
 fn helper() {
     let _ = triple_buffer.read();
 }
-"#;
+";
         let report = run_audit_on_sources(
             &[pair("paint.rs", src)],
             &PopulatorConfig::default(),
@@ -407,14 +407,14 @@ fn helper() {
 
     #[test]
     fn render_diagnostic_fail_lists_each_violation_with_path() {
-        let src = r#"
+        let src = r"
 fn paint_impl() { helper_writes(); }
 fn helper_writes() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let report = run_audit_on_sources(
             &[pair("paint.rs", src)],
             &PopulatorConfig::default(),
@@ -432,13 +432,13 @@ fn helper_writes() {
 
     #[test]
     fn render_diagnostic_fail_warn_mode_omits_release_blocked_banner() {
-        let src = r#"
+        let src = r"
 fn paint_impl() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let cfg = AuditConfig {
             error_as_warn: true,
             ..AuditConfig::default()
@@ -470,14 +470,14 @@ fn paint_impl() {
 
     #[test]
     fn render_jsonl_fail_emits_one_row_per_violation() {
-        let src = r#"
+        let src = r"
 fn paint_impl() { helper(); }
 fn helper() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let report = run_audit_on_sources(
             &[pair("paint.rs", src)],
             &PopulatorConfig::default(),
@@ -496,7 +496,7 @@ fn helper() {
     #[test]
     fn render_jsonl_each_line_is_valid_json() {
         // 2 entries each reaching a mutation guard transitively.
-        let src = r#"
+        let src = r"
 fn paint_impl() { helper_a(); }
 fn render_pane() { helper_b(); }
 fn helper_a() {
@@ -509,7 +509,7 @@ fn helper_b() {
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let report = run_audit_on_sources(
             &[pair("paint.rs", src)],
             &PopulatorConfig::default(),
@@ -540,13 +540,13 @@ fn helper_b() {
 
     #[test]
     fn driver_passes_when_no_render_entries() {
-        let src = r#"
+        let src = r"
 fn unrelated() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
-"#;
+";
         let report = run_audit_on_sources(
             &[pair("unrelated.rs", src)],
             &PopulatorConfig::default(),
@@ -561,14 +561,14 @@ fn unrelated() {
 
     #[test]
     fn driver_respects_custom_render_entry_names() {
-        let src = r#"
+        let src = r"
 fn alt_paint_root() {
     // br-ft-x2oyy: intentional synthetic mutation fixture;
     // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
 fn paint_impl() { let _ = triple_buffer.read(); }
-"#;
+";
         let mut populator_cfg = PopulatorConfig::default();
         populator_cfg.render_entry_names = vec!["alt_paint_root".to_string()];
         let report = run_audit_on_sources(

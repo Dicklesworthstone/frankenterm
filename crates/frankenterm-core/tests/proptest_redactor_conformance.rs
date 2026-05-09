@@ -355,8 +355,8 @@ proptest! {
         let mut streaming = StreamingRedactor::new();
         let mut out = Vec::new();
 
-        out.extend(streaming.redact_chunk(text[..split].as_bytes()).bytes);
-        out.extend(streaming.redact_chunk(text[split..].as_bytes()).bytes);
+        out.extend(streaming.redact_chunk(&text.as_bytes()[..split]).bytes);
+        out.extend(streaming.redact_chunk(&text.as_bytes()[split..]).bytes);
         out.extend(streaming.finish().bytes);
 
         prop_assert_eq!(out, expected);

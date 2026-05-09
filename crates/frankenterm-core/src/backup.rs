@@ -3048,7 +3048,7 @@ mod manifest_parse_drop_tests {
                 "{\"unknown\":42}".to_string(),
                 "{\"wa_version\":\"x\"}".to_string(),
                 "not json at all".to_string(),
-                "".to_string(),
+                String::new(),
                 "{".to_string(),
             ]),
         ) {

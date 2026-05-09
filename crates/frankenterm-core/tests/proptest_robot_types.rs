@@ -3124,7 +3124,7 @@ proptest! {
                 prop_assert_eq!(text, &ok_text);
                 prop_assert!(!truncated);
             }
-            other => prop_assert!(
+            other @ PaneTextResult::Error { .. } => prop_assert!(
                 false,
                 "expected PaneTextResult::Ok for pane_ok, got {:?}",
                 other
@@ -3135,7 +3135,7 @@ proptest! {
                 prop_assert_eq!(code, &err_code);
                 prop_assert_eq!(message, &err_msg);
             }
-            other => prop_assert!(
+            other @ PaneTextResult::Ok { .. } => prop_assert!(
                 false,
                 "expected PaneTextResult::Error for pane_err, got {:?}",
                 other

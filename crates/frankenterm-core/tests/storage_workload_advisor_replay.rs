@@ -249,7 +249,9 @@ fn replay_write_heavy_trajectory() {
                 rec.rationale
             );
         }
-        other => panic!("write-heavy final step should recommend; got {other:?}"),
+        other @ AdvisorReport::DataNeeded { .. } => {
+            panic!("write-heavy final step should recommend; got {other:?}")
+        }
     }
 }
 
@@ -306,7 +308,9 @@ fn replay_search_heavy_trajectory_hybrid() {
                 rec.rationale
             );
         }
-        other => panic!("search-heavy/both should recommend Hybrid; got {other:?}"),
+        other @ AdvisorReport::DataNeeded { .. } => {
+            panic!("search-heavy/both should recommend Hybrid; got {other:?}")
+        }
     }
 }
 
@@ -330,7 +334,9 @@ fn replay_search_heavy_trajectory_tantivy_only() {
     let report = replay("search_heavy_tantivy_only_trajectory", &trajectory);
     match report {
         AdvisorReport::Recommendation(rec) => assert_eq!(rec.index, IndexChoice::Tantivy),
-        other => panic!("expected Tantivy recommendation; got {other:?}"),
+        other @ AdvisorReport::DataNeeded { .. } => {
+            panic!("expected Tantivy recommendation; got {other:?}")
+        }
     }
 }
 
@@ -376,7 +382,9 @@ fn replay_balanced_trajectory() {
                 rec.rationale
             );
         }
-        other => panic!("balanced trajectory should recommend; got {other:?}"),
+        other @ AdvisorReport::DataNeeded { .. } => {
+            panic!("balanced trajectory should recommend; got {other:?}")
+        }
     }
 }
 
@@ -463,7 +471,9 @@ fn replay_cliff_priority_trajectory() {
         AdvisorReport::Recommendation(rec) => {
             assert_eq!(rec.migration_priority, MigrationPriority::None);
         }
-        other => panic!("step 0 should recommend; got {other:?}"),
+        other @ AdvisorReport::DataNeeded { .. } => {
+            panic!("step 0 should recommend; got {other:?}")
+        }
     }
 
     // Final step crosses the 64 MiB cliff → High.
@@ -472,7 +482,9 @@ fn replay_cliff_priority_trajectory() {
         AdvisorReport::Recommendation(rec) => {
             assert_eq!(rec.migration_priority, MigrationPriority::High);
         }
-        other => panic!("cliff trajectory final should recommend; got {other:?}"),
+        other @ AdvisorReport::DataNeeded { .. } => {
+            panic!("cliff trajectory final should recommend; got {other:?}")
+        }
     }
 }
 
@@ -498,6 +510,8 @@ fn replay_no_search_backend_trajectory() {
         AdvisorReport::Recommendation(rec) => {
             assert_eq!(rec.index, IndexChoice::NoChange);
         }
-        other => panic!("no-search-backend should still recommend; got {other:?}"),
+        other @ AdvisorReport::DataNeeded { .. } => {
+            panic!("no-search-backend should still recommend; got {other:?}")
+        }
     }
 }

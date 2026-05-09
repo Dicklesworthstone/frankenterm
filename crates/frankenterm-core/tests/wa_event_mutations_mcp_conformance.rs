@@ -154,7 +154,7 @@ fn canonicalize(value: &mut Value) {
             for (key, child) in map.iter_mut() {
                 match key.as_str() {
                     "now" | "elapsed_ms" | "note_updated_at" | "triage_updated_at" => {
-                        *child = Value::from(0_i64)
+                        *child = Value::from(0_i64);
                     }
                     _ => canonicalize(child),
                 }

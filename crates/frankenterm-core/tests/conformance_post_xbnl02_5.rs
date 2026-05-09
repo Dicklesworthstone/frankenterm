@@ -33,45 +33,39 @@
 //!
 //! ## SPEC-xbnl-2-5 (Cargo.toml structure, commit `dab704d3`)
 //!
-//!   * MUST-1: `asupersync` is listed as a non-optional dependency of
-//!             `frankenterm-core` — the line must NOT contain
-//!             `optional = true`.
-//!   * MUST-2: `asupersync` is always compiled with `features = ["tls"]`.
-//!   * MUST-3: The `asupersync-runtime` feature is declared and has an
-//!             empty feature list (it is a no-op).
-//!   * MUST-4: `sync` feature has an empty feature list — no
-//!             `dep:asupersync`.
-//!   * MUST-5: `native-wezterm` feature has an empty feature list —
-//!             no `asupersync-runtime`.
-//!   * MUST-6: `web` feature declares exactly `["dep:fastapi"]` — no
-//!             `dep:asupersync`, no `asupersync-runtime`.
-//!   * MUST-7: `distributed` feature does NOT declare `dep:asupersync`.
+//! * MUST-1: `asupersync` is listed as a non-optional dependency of
+//!   `frankenterm-core` — the line must NOT contain `optional = true`.
+//! * MUST-2: `asupersync` is always compiled with `features = ["tls"]`.
+//! * MUST-3: The `asupersync-runtime` feature is declared and has an
+//!   empty feature list (it is a no-op).
+//! * MUST-4: `sync` feature has an empty feature list — no
+//!   `dep:asupersync`.
+//! * MUST-5: `native-wezterm` feature has an empty feature list — no
+//!   `asupersync-runtime`.
+//! * MUST-6: `web` feature declares exactly `["dep:fastapi"]` — no
+//!   `dep:asupersync`, no `asupersync-runtime`.
+//! * MUST-7: `distributed` feature does NOT declare `dep:asupersync`.
 //!
 //! ## SPEC-2h5wv (MuxPool cx-cancellation preservation, commit `2cc8d5a6`)
 //!
-//!   * MUST-8:  The classifier fn `mux_error_should_fallback_to_cli` is
-//!              declared on `WeztermClient` with `#[cfg(all(feature =
-//!              "vendored", unix))]`. Dropping it is a reversion.
-//!   * MUST-9:  The adapter fn `mux_cancelled_error` is declared on
-//!              `WeztermClient` with the same cfg gate.
-//!   * MUST-10: The four regression tests landed in `2cc8d5a6`
-//!              (`mux_pool_cancelled_does_not_fallback_to_cli`,
-//!              `mux_transport_cancellation_does_not_fallback_to_cli`,
-//!              `mux_acquire_timeout_still_falls_back_to_cli`,
-//!              `mux_cancelled_error_maps_to_cancelled_core_error`) are
-//!              present in `wezterm.rs`. Removing any of them drops the
-//!              classifier's regression net.
-//!   * MUST-11: Every pub mux-caller path that catches a
-//!              `MuxPoolError` cites the classifier before the CLI
-//!              fallback `tracing::debug!` line — no path may regress
-//!              to the pre-fix "silently drop cancellation and fall
-//!              through to CLI" shape. The caller set is:
-//!              {list_panes, list_panes_with_cx, get_text,
-//!              pane_tiered_scrollback_summary,
-//!              pane_tiered_scrollback_summary_with_cx, send_text,
-//!              send_text_with_cx} — at least 7 call sites of
-//!              `mux_error_should_fallback_to_cli` must exist in
-//!              `wezterm.rs`.
+//! * MUST-8: The classifier fn `mux_error_should_fallback_to_cli` is
+//!   declared on `WeztermClient` with `#[cfg(all(feature = "vendored",
+//!   unix))]`. Dropping it is a reversion.
+//! * MUST-9: The adapter fn `mux_cancelled_error` is declared on
+//!   `WeztermClient` with the same cfg gate.
+//! * MUST-10: The four regression tests landed in `2cc8d5a6`
+//!   (`mux_pool_cancelled_does_not_fallback_to_cli`,
+//!   `mux_transport_cancellation_does_not_fallback_to_cli`,
+//!   `mux_acquire_timeout_still_falls_back_to_cli`,
+//!   `mux_cancelled_error_maps_to_cancelled_core_error`) are present in
+//!   `wezterm.rs`. Removing any of them drops the classifier's regression net.
+//! * MUST-11: Every pub mux-caller path that catches a `MuxPoolError` cites the
+//!   classifier before the CLI fallback `tracing::debug!` line — no path may
+//!   regress to the pre-fix "silently drop cancellation and fall through to CLI"
+//!   shape. The caller set is: {list_panes, list_panes_with_cx, get_text,
+//!   pane_tiered_scrollback_summary, pane_tiered_scrollback_summary_with_cx,
+//!   send_text, send_text_with_cx} — at least 7 call sites of
+//!   `mux_error_should_fallback_to_cli` must exist in `wezterm.rs`.
 //!
 //! # Discrepancies
 //!

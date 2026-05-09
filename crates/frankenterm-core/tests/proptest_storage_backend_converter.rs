@@ -301,8 +301,8 @@ proptest! {
         }
         insert_single_column_rows(&source, "diverge_table", &prefix);
         insert_single_column_rows(&dest, "diverge_table", &prefix);
-        insert_single_column_rows(&source, "diverge_table", &[left.clone()]);
-        insert_single_column_rows(&dest, "diverge_table", &[right.clone()]);
+        insert_single_column_rows(&source, "diverge_table", std::slice::from_ref(&left));
+        insert_single_column_rows(&dest, "diverge_table", std::slice::from_ref(&right));
 
         let err = verify_equivalence(&source, &dest, &["diverge_table"])
             .expect_err("differing tail rows must fail equivalence");

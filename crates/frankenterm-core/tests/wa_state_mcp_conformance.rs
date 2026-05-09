@@ -122,13 +122,15 @@ fn fake_panes() -> Value {
 }
 
 fn fake_wezterm_script(state_dir: &Path) -> String {
+    let state_dir_literal =
+        serde_json::to_string(&state_dir.display().to_string()).expect("state dir path json");
     format!(
         r#"#!/usr/bin/env python3
 import json
 import sys
 from pathlib import Path
 
-state_dir = Path({state_dir:?})
+state_dir = Path({state_dir_literal})
 panes = json.loads((state_dir / "panes.json").read_text())
 
 args = sys.argv[1:]

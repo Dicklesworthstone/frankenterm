@@ -562,8 +562,8 @@ mod tests {
     fn baseline_health_has_perfect_rates() {
         let h = BidiCorrectnessHealth::baseline();
         // Empty observation: pass rate is vacuously 1.0.
-        assert_eq!(h.pass_rate(), 1.0);
-        assert_eq!(h.cursor_correctness_rate(), 1.0);
+        assert_eq!(h.pass_rate().to_bits(), 1.0_f64.to_bits());
+        assert_eq!(h.cursor_correctness_rate().to_bits(), 1.0_f64.to_bits());
         assert!(!h.has_skipped_bidi_pass());
     }
 

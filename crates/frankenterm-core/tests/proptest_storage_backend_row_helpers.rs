@@ -110,11 +110,7 @@ proptest! {
         let row = row(vec![encoded]);
         let parsed = row_f64(&row, 0).expect("finite generated f64 parses");
 
-        if value == 0.0 {
-            prop_assert_eq!(parsed, value);
-        } else {
-            prop_assert_eq!(parsed.to_bits(), value.to_bits());
-        }
+        prop_assert_eq!(parsed.to_bits(), value.to_bits());
     }
 
     #[test]

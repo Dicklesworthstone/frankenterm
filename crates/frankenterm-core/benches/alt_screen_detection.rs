@@ -42,7 +42,7 @@ fn bench_detect_no_escape(c: &mut Criterion) {
         let text = generate_content(lines);
         group.throughput(Throughput::Bytes(text.len() as u64));
         group.bench_with_input(BenchmarkId::new("lines", lines), &text, |b, text| {
-            b.iter(|| detect_alt_screen_changes(text))
+            b.iter(|| detect_alt_screen_changes(text));
         });
     }
     group.finish();
@@ -70,7 +70,7 @@ fn bench_has_change(c: &mut Criterion) {
     for (label, text) in [("no_escape", &no_escape), ("with_toggle", &with_toggle)] {
         group.throughput(Throughput::Bytes(text.len() as u64));
         group.bench_with_input(BenchmarkId::new("case", label), text, |b, text| {
-            b.iter(|| has_alt_screen_change(text))
+            b.iter(|| has_alt_screen_change(text));
         });
     }
     group.finish();

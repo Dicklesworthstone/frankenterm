@@ -490,7 +490,7 @@ proptest! {
         prop_assert_eq!(tracker.tracked_pane_count(), 0);
         prop_assert!(tracker.pane_summary(pane_id).is_none());
         prop_assert_eq!(tracker.grand_total_tokens(), 0);
-        prop_assert_eq!(tracker.grand_total_cost(), 0.0);
+        prop_assert!(tracker.grand_total_cost().abs() <= f64::EPSILON);
         prop_assert!(tracker.dashboard_snapshot().grand_total_cost_usd.is_finite());
     }
 

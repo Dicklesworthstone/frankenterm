@@ -115,7 +115,7 @@ fn extract_string(haystack: &str, key: &str) -> Option<String> {
     let colon = after_key.find(':')?;
     let after_colon = &after_key[colon + 1..];
     let mut chars = after_colon.char_indices();
-    while let Some((_, c)) = chars.next() {
+    for (_, c) in chars.by_ref() {
         if c == '"' {
             break;
         }

@@ -47,6 +47,9 @@ use frankenterm_core::storage_backend_trait::{OpenConfig, RusqliteBackend, Stora
 
 mod bench_common;
 
+type BackendFactory = Box<dyn Fn() -> Box<dyn StorageBackend>>;
+type BackendSpec = (&'static str, BackendFactory);
+
 /// Backend variants registered for comparison.
 ///
 /// Each entry is `(label, factory)`. The factory closure
@@ -54,7 +57,7 @@ mod bench_common;
 /// comparison isn't perturbed by leftover state.
 ///
 /// Wired-pass cont-bead pushes a frankensqlite row here.
-fn backends_under_test() -> Vec<(&'static str, Box<dyn Fn() -> Box<dyn StorageBackend>>)> {
+fn backends_under_test() -> Vec<BackendSpec> {
     vec![
         (
             "rusqlite_memory",
@@ -140,7 +143,6 @@ fn bench_concurrent_writer_throughput(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1000));
 
     for (label, factory) in backends_under_test() {
-        let factory = Arc::new(factory);
         group.bench_with_input(
             BenchmarkId::from_parameter(label),
             &factory,

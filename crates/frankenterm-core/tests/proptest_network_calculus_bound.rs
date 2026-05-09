@@ -13,6 +13,10 @@ fn finite_positive() -> impl Strategy<Value = f64> {
     0.000_001f64..=1_000_000.0
 }
 
+fn approx_eq(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 1e-6
+}
+
 fn arb_arrival() -> impl Strategy<Value = ArrivalCurve> {
     (finite_non_negative(), finite_non_negative())
         .prop_map(|(burst, rate)| ArrivalCurve::new(burst, rate))
@@ -53,16 +57,16 @@ proptest! {
         t in finite_non_negative(),
         negative_t in -1_000_000.0f64..0.0,
     ) {
-        prop_assert_eq!(arrival.evaluate(negative_t), 0.0);
-        prop_assert_eq!(service.evaluate(service.latency()), 0.0);
+        prop_assert!(approx_eq(arrival.evaluate(negative_t), 0.0));
+        prop_assert!(approx_eq(service.evaluate(service.latency()), 0.0));
 
         let arrival_value = arrival.evaluate(t);
         prop_assert!(arrival_value >= arrival.burst());
-        prop_assert!((arrival_value - (arrival.burst() + arrival.rate() * t)).abs() <= 1e-6);
+        prop_assert!(approx_eq(arrival_value, arrival.rate().mul_add(t, arrival.burst())));
 
         let after_latency = service.latency() + t;
         prop_assert!(
-            (service.evaluate(after_latency) - service.rate() * t).abs() <= 1e-6,
+            approx_eq(service.rate().mul_add(-t, service.evaluate(after_latency)), 0.0),
         );
     }
 
@@ -79,7 +83,10 @@ proptest! {
 
         prop_assert!(is_stable(arrival, service));
         prop_assert_eq!(delay_bound(arrival, service), Some(latency + burst / service_rate));
-        prop_assert_eq!(backlog_bound(arrival, service), burst + arrival_rate * latency);
+        prop_assert!(approx_eq(
+            backlog_bound(arrival, service),
+            arrival_rate.mul_add(latency, burst),
+        ));
     }
 
     #[test]
@@ -105,13 +112,16 @@ proptest! {
         c in arb_service(),
     ) {
         let composed_pair = compose_serial(a, b);
-        prop_assert_eq!(composed_pair.rate(), a.rate().min(b.rate()));
-        prop_assert_eq!(composed_pair.latency(), a.latency() + b.latency());
+        prop_assert!(approx_eq(composed_pair.rate(), a.rate().min(b.rate())));
+        prop_assert!(approx_eq(composed_pair.latency(), a.latency() + b.latency()));
 
         let services = [a, b, c];
         let composed = compose_pipeline(&services).expect("non-empty pipeline composes");
-        prop_assert_eq!(composed.rate(), a.rate().min(b.rate()).min(c.rate()));
-        prop_assert_eq!(composed.latency(), a.latency() + b.latency() + c.latency());
+        prop_assert!(approx_eq(composed.rate(), a.rate().min(b.rate()).min(c.rate())));
+        prop_assert!(approx_eq(
+            composed.latency(),
+            a.latency() + b.latency() + c.latency(),
+        ));
 
         let stages = vec![
             StageModel::new("capture", a),

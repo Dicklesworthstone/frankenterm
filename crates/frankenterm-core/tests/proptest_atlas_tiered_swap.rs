@@ -238,27 +238,26 @@ proptest! {
         let mut stats = TierSwapStats::default();
         stats.record_action(action, region_bytes);
 
-        prop_assert_eq!(stats.vram_swap_in_count, if matches!(
+        prop_assert_eq!(stats.vram_swap_in_count, u64::from(matches!(
             action,
             EvictionAction::Promote { to: AtlasTier::Vram, .. }
-        ) { 1 } else { 0 });
-        prop_assert_eq!(stats.host_ram_swap_in_count, if matches!(
+        )));
+        prop_assert_eq!(stats.host_ram_swap_in_count, u64::from(matches!(
             action,
             EvictionAction::Promote { to: AtlasTier::HostRam, .. }
-        ) { 1 } else { 0 });
-        prop_assert_eq!(stats.vram_swap_out_count, if matches!(
+        )));
+        prop_assert_eq!(stats.vram_swap_out_count, u64::from(matches!(
             action,
             EvictionAction::Demote { from: AtlasTier::Vram, .. }
-        ) { 1 } else { 0 });
-        prop_assert_eq!(stats.host_ram_swap_out_count, if matches!(
+        )));
+        prop_assert_eq!(stats.host_ram_swap_out_count, u64::from(matches!(
             action,
             EvictionAction::Demote { from: AtlasTier::HostRam, .. }
-        ) { 1 } else { 0 });
-        prop_assert_eq!(stats.disk_eviction_count, if matches!(action, EvictionAction::Evict { .. }) {
-            1
-        } else {
-            0
-        });
+        )));
+        prop_assert_eq!(
+            stats.disk_eviction_count,
+            u64::from(matches!(action, EvictionAction::Evict { .. }))
+        );
         prop_assert_eq!(stats.swap_total_bytes, if matches!(action, EvictionAction::Promote { .. } | EvictionAction::Demote { .. }) {
             region_bytes
         } else {

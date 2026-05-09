@@ -116,7 +116,7 @@ fn temp_dir(label: &str) -> PathBuf {
 
 /// 64-hex-char filename keyed by `byte` (matches `is_scrollback_filename`).
 fn scrollback_path(dir: &Path, byte: u8) -> PathBuf {
-    let stem: String = (0..32).map(|_| format!("{byte:02x}")).collect();
+    let stem = format!("{byte:02x}").repeat(32);
     dir.join(format!("{stem}.bin"))
 }
 

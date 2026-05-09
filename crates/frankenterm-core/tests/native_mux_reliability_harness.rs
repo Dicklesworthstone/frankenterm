@@ -984,11 +984,7 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
         checkpoint_id: cp_id,
         reason: "recover from mass disconnect".to_string(),
     }) {
-        RemoteResponse::RollbackComplete {
-            restored,
-            removed: _,
-            ..
-        } => {
+        RemoteResponse::RollbackComplete { restored, .. } => {
             assert!(restored >= 3, "3 orphaned panes should be restored");
         }
         other => panic!("expected RollbackComplete, got {other:?}"),

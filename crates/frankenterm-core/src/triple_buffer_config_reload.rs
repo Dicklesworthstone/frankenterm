@@ -235,11 +235,11 @@ mod tests {
 
     #[test]
     fn parse_returns_section_when_present() {
-        let toml_str = r#"
+        let toml_str = r"
 [render.triple_buffer]
 warn_after_ms = 2000
 force_recycle_after_ms = 8000
-"#;
+";
         let parsed = parse_render_triple_buffer_section(toml_str).unwrap();
         assert_eq!(
             parsed,
@@ -270,22 +270,22 @@ key = "value"
 
     #[test]
     fn parse_surfaces_validation_error() {
-        let toml_str = r#"
+        let toml_str = r"
 [render.triple_buffer]
 warn_after_ms = 0
 force_recycle_after_ms = 5000
-"#;
+";
         let err = parse_render_triple_buffer_section(toml_str).unwrap_err();
         assert_eq!(err, TripleBufferConfigError::WarnZero);
     }
 
     #[test]
     fn parse_surfaces_invariant_inversion() {
-        let toml_str = r#"
+        let toml_str = r"
 [render.triple_buffer]
 warn_after_ms = 5000
 force_recycle_after_ms = 1000
-"#;
+";
         let err = parse_render_triple_buffer_section(toml_str).unwrap_err();
         assert!(matches!(
             err,
@@ -302,10 +302,10 @@ force_recycle_after_ms = 1000
 
     #[test]
     fn parse_rejects_section_missing_force_field() {
-        let toml_str = r#"
+        let toml_str = r"
 [render.triple_buffer]
 warn_after_ms = 1000
-"#;
+";
         let err = parse_render_triple_buffer_section(toml_str).unwrap_err();
         assert!(matches!(err, TripleBufferConfigError::TomlParse(_)));
     }
@@ -362,11 +362,11 @@ warn_after_ms = 1000
 
     #[test]
     fn scenario_operator_reload_pipeline() {
-        let toml_str = r#"
+        let toml_str = r"
 [render.triple_buffer]
 warn_after_ms = 750
 force_recycle_after_ms = 3000
-"#;
+";
         let new_section = parse_render_triple_buffer_section(toml_str)
             .expect("parse ok")
             .expect("section present");

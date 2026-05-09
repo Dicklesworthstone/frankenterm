@@ -141,7 +141,7 @@ proptest! {
         } else {
             skips as f64 / (paints + skips) as f64
         };
-        prop_assert_eq!(health.skip_rate(), expected_skip_rate);
+        prop_assert!((health.skip_rate() - expected_skip_rate).abs() <= f64::EPSILON);
         prop_assert_eq!(health.meets_idle_skip_rq(), expected_skip_rate * 100.0 >= 99.0);
         prop_assert_eq!(health.meets_typing_cadence_rq(), expected_skip_rate * 100.0 >= 40.0);
 

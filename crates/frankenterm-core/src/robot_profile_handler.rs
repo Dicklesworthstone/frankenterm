@@ -1681,7 +1681,7 @@ mod bootstrap_serde_drop_tests {
         reset_robot_profile_bootstrap_serde_drop_count_for_test();
         let mut metadata = HashMap::new();
         // Vec<i32>, not Vec<String>
-        metadata.insert("bootstrap_commands".to_string(), r#"[1, 2, 3]"#.to_string());
+        metadata.insert("bootstrap_commands".to_string(), r"[1, 2, 3]".to_string());
         let result = parse_bootstrap_commands(&metadata);
         assert!(result.is_empty());
         assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);

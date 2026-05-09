@@ -784,14 +784,17 @@ mod tests {
 
             prop_assert_eq!(report.connector_stress.connector_count, 0);
             prop_assert_eq!(report.connector_stress.total_operations, 0);
-            prop_assert_eq!(report.connector_stress.success_rate, 0.0);
+            prop_assert_eq!(
+                report.connector_stress.success_rate.to_bits(),
+                0.0_f64.to_bits()
+            );
 
             let circuit_slo = report
                 .slo_results
                 .iter()
                 .find(|slo| slo.metric == SloMetric::CircuitBreakerTripRate)
                 .expect("default SLOs include circuit-breaker trip rate");
-            prop_assert_eq!(circuit_slo.actual, 1.0);
+            prop_assert_eq!(circuit_slo.actual.to_bits(), 1.0_f64.to_bits());
             prop_assert!(!circuit_slo.passed);
             prop_assert!(!report.overall_pass);
         }
@@ -929,7 +932,7 @@ mod tests {
         let result = &report.slo_results[0];
 
         assert_eq!(result.metric, SloMetric::RecoveryTimeMs);
-        assert_eq!(result.actual, 0.0);
+        assert_eq!(result.actual.to_bits(), 0.0_f64.to_bits());
         assert!(!result.measured);
         assert!(!result.passed);
         assert!(!report.overall_pass);
@@ -953,7 +956,7 @@ mod tests {
             let report = harness.run();
             prop_assert_eq!(report.slo_results.len(), 1);
             prop_assert_eq!(report.slo_results[0].metric, SloMetric::RecoveryTimeMs);
-            prop_assert_eq!(report.slo_results[0].actual, 0.0);
+            prop_assert_eq!(report.slo_results[0].actual.to_bits(), 0.0_f64.to_bits());
             prop_assert!(!report.slo_results[0].measured);
             prop_assert!(!report.slo_results[0].passed);
             prop_assert!(!report.overall_pass);
@@ -1030,8 +1033,14 @@ mod tests {
             let report = harness.run();
 
             prop_assert_eq!(report.governor_probe.evaluations, 0);
-            prop_assert_eq!(report.governor_probe.allow_rate, 0.0);
-            prop_assert_eq!(report.governor_probe.block_rate, 1.0);
+            prop_assert_eq!(
+                report.governor_probe.allow_rate.to_bits(),
+                0.0_f64.to_bits()
+            );
+            prop_assert_eq!(
+                report.governor_probe.block_rate.to_bits(),
+                1.0_f64.to_bits()
+            );
             prop_assert!(!report.overall_pass);
             prop_assert!(report
                 .slo_results

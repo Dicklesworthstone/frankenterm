@@ -282,7 +282,7 @@ fn bench_append_batch(c: &mut Criterion) {
                         .expect("append");
                 }
                 storage.shutdown().await.expect("shutdown");
-            })
+            });
         });
     });
 
@@ -306,7 +306,7 @@ fn bench_append_batch(c: &mut Criterion) {
                         .await
                         .expect("append");
                 }
-            })
+            });
         });
 
         rt.block_on(storage.shutdown()).expect("shutdown");
@@ -545,7 +545,7 @@ fn bench_recorder_append_log_profile(c: &mut Criterion) {
                             response.accepted_count,
                             health,
                         ));
-                    })
+                    });
                 });
             },
         );
@@ -665,7 +665,7 @@ fn bench_recorder_swarm_load_profile(c: &mut Criterion) {
                         lexical_hits.len(),
                         hybrid_bundle.results.len(),
                     ));
-                })
+                });
                 });
             },
         );
@@ -821,7 +821,7 @@ fn bench_aggregator_persist_latency(c: &mut Criterion) {
                 }
 
                 black_box(started.elapsed());
-            })
+            });
         });
     });
 
@@ -902,7 +902,7 @@ fn bench_aggregator_query_under_load(c: &mut Criterion) {
                     .expect("search");
                 black_box(query_started.elapsed());
                 black_box(hits.len());
-            })
+            });
         });
     });
 

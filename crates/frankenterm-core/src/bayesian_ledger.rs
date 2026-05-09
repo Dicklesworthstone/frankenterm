@@ -1619,7 +1619,7 @@ mod tests {
         led.update(1, Evidence::Entropy(f64::NEG_INFINITY));
         led.update(1, Evidence::Entropy(3.5));
         let result = led.classify(1).expect("pane 1 must be classified");
-        for (_state, &prob) in &result.posterior {
+        for &prob in result.posterior.values() {
             assert!(prob.is_finite());
             assert!((0.0..=1.0).contains(&prob));
         }

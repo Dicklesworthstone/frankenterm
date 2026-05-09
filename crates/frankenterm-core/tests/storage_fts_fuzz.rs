@@ -164,7 +164,7 @@ fn arb_malformed() -> impl Strategy<Value = String> {
         Just("AND word".to_string()), // leading operator
         Just("(((".to_string()),      // unbalanced parens
         Just("word OR OR word".to_string()),
-        Just("".to_string()),               // empty query
+        Just(String::new()),                // empty query
         Just(" ".to_string()),              // whitespace only
         Just("*".to_string()),              // prefix with nothing
         Just("word\x00middle".to_string()), // NUL byte smuggled in

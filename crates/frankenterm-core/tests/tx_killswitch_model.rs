@@ -297,7 +297,7 @@ proptest! {
             let action = actions
                 .iter()
                 .find(|a| !matches!(a, KillSwitchAction::FlipKillSwitch { .. }))
-                .or(actions.first())
+                .or_else(|| actions.first())
                 .copied();
             let Some(action) = action else { break };
             state = apply(&state, action);

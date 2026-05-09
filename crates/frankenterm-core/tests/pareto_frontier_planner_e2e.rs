@@ -202,7 +202,7 @@ fn e2e_concurrency_sweep_all_pareto_optimal() {
             assert_eq!(frontier[2].config.capture_concurrency, 4);
             assert_eq!(frontier[3].config.capture_concurrency, 8);
         }
-        other => panic!("expected Frontier, got {other:?}"),
+        other @ PlannerReport::DataNeeded { .. } => panic!("expected Frontier, got {other:?}"),
     }
 }
 
@@ -276,7 +276,7 @@ fn e2e_compression_sweep_all_pareto_optimal() {
                 assert_eq!(p.config.output_compression_level as usize, idx);
             }
         }
-        other => panic!("expected Frontier, got {other:?}"),
+        other @ PlannerReport::DataNeeded { .. } => panic!("expected Frontier, got {other:?}"),
     }
 }
 
@@ -367,7 +367,7 @@ fn e2e_backpressure_sweep_with_dominated_config() {
             assert!(dims.iter().any(|d| d == "p99_us"));
             assert!(dims.iter().any(|d| d == "memory_bytes"));
         }
-        other => panic!("expected Frontier, got {other:?}"),
+        other @ PlannerReport::DataNeeded { .. } => panic!("expected Frontier, got {other:?}"),
     }
 }
 
@@ -452,6 +452,8 @@ fn e2e_sparse_evidence_requests_more_data() {
                         || r.contains("3"))
             );
         }
-        other => panic!("expected DataNeeded, got {other:?}"),
+        other @ PlannerReport::Frontier { .. } => {
+            panic!("expected DataNeeded, got {other:?}")
+        }
     }
 }

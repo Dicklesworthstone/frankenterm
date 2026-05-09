@@ -103,8 +103,8 @@ proptest! {
         if let Ok(row) = result {
             let stage_model = row.to_stage_model();
             prop_assert_eq!(stage_model.name.as_str(), expected_stage_name(stage));
-            prop_assert_eq!(stage_model.service.rate(), service_rate);
-            prop_assert_eq!(stage_model.service.latency(), p99_latency);
+            prop_assert_eq!(stage_model.service.rate().to_bits(), service_rate.to_bits());
+            prop_assert_eq!(stage_model.service.latency().to_bits(), p99_latency.to_bits());
         }
     }
 
@@ -120,13 +120,19 @@ proptest! {
             .to_network_calculus_inputs()
             .expect("validated model converts");
 
-        prop_assert_eq!(arrival.burst(), burst);
-        prop_assert_eq!(arrival.rate(), arrival_rate);
+        prop_assert_eq!(arrival.burst().to_bits(), burst.to_bits());
+        prop_assert_eq!(arrival.rate().to_bits(), arrival_rate.to_bits());
         prop_assert_eq!(stage_models.len(), stages.len());
         for (actual, expected) in stage_models.iter().zip(stages.iter()) {
             prop_assert_eq!(actual.name.as_str(), expected_stage_name(expected.stage));
-            prop_assert_eq!(actual.service.rate(), expected.service_rate_events_per_sec);
-            prop_assert_eq!(actual.service.latency(), expected.p99_latency_ms);
+            prop_assert_eq!(
+                actual.service.rate().to_bits(),
+                expected.service_rate_events_per_sec.to_bits()
+            );
+            prop_assert_eq!(
+                actual.service.latency().to_bits(),
+                expected.p99_latency_ms.to_bits()
+            );
         }
     }
 
@@ -234,6 +240,6 @@ proptest! {
             .fold(f64::INFINITY, f64::min);
         let total_latency: f64 = stage_models.iter().map(|stage| stage.service.latency()).sum();
 
-        prop_assert_eq!(bound, total_latency + burst / bottleneck);
+        prop_assert!((bound - (total_latency + burst / bottleneck)).abs() <= 1e-6);
     }
 }

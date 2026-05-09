@@ -100,9 +100,7 @@ fn wrong_shape_candidate(label: impl AsRef<str>) -> OrphanCandidate {
 }
 
 fn expected_uuid_short(uuid_byte: u8) -> String {
-    (0..8)
-        .map(|_| format!("{uuid_byte:02x}"))
-        .collect::<String>()
+    format!("{uuid_byte:02x}").repeat(8)
 }
 
 proptest! {

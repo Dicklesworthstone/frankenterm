@@ -53,21 +53,21 @@ fn staging_swap_deferrer_requires_frame_boundary_reset_for_deferred_work() {
     let mut deferrer = FrameBudgetSwapDeferrer::with_throughput(1000);
     let pending = [staging_event(1, 2000, 10), staging_event(2, 2000, 10)];
 
-    let (admitted, deferred) = deferrer.partition(&pending, 3);
+    let (admitted, delayed) = deferrer.partition(&pending, 3);
 
     assert_eq!(admitted, vec![pending[0]]);
-    assert_eq!(deferred, vec![pending[1]]);
+    assert_eq!(delayed, vec![pending[1]]);
     assert_eq!(deferrer.admitted_bytes(), 2000);
 
-    let (still_admitted, still_deferred) = deferrer.partition(&deferred, 3);
+    let (still_admitted, still_deferred) = deferrer.partition(&delayed, 3);
 
     assert!(still_admitted.is_empty());
-    assert_eq!(still_deferred, deferred);
+    assert_eq!(still_deferred, delayed);
 
     deferrer.reset_for_new_frame();
-    let (next_frame_admitted, next_frame_deferred) = deferrer.partition(&deferred, 3);
+    let (next_frame_admitted, next_frame_deferred) = deferrer.partition(&delayed, 3);
 
-    assert_eq!(next_frame_admitted, deferred);
+    assert_eq!(next_frame_admitted, delayed);
     assert!(next_frame_deferred.is_empty());
     assert_eq!(deferrer.admitted_bytes(), 2000);
 }
@@ -103,10 +103,10 @@ fn staging_swap_deferrer_charges_fractional_carry_once_per_running_total() {
         .map(|region_id| staging_event(region_id, 1500, 10))
         .collect();
 
-    let (admitted, deferred) = deferrer.partition(&pending, 2);
+    let (admitted, delayed) = deferrer.partition(&pending, 2);
 
     assert_eq!(admitted.as_slice(), &pending[..4]);
-    assert_eq!(deferred.as_slice(), &pending[4..]);
+    assert_eq!(delayed.as_slice(), &pending[4..]);
     assert_eq!(deferrer.admitted_bytes(), 6000);
 }
 

@@ -4086,7 +4086,7 @@ mod tests {
         assert_eq!(candidate.direction, CandidateDirection::Increase);
         assert!(!candidate.would_apply);
         assert!(!candidate.live_mutation_allowed);
-        assert_eq!(candidate.candidate_value, 75.0);
+        assert_eq!(candidate.candidate_value.to_bits(), 75.0_f64.to_bits());
         assert_eq!(
             candidate.reason_code,
             "auto_tune.candidate.runtime.output_coalesce_window_ms"

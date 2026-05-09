@@ -327,7 +327,7 @@ mod tests {
         assert!(
             matches
                 .iter()
-                .any(|m| &text[m.span_start..m.span_end] == r#"$'tab\there'"#)
+                .any(|m| &text[m.span_start..m.span_end] == r"$'tab\there'")
         );
     }
 

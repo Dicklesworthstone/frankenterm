@@ -65,11 +65,12 @@ proptest! {
 
         prop_assert!((0.0..=1.0).contains(&ratio));
         if page_count <= 0 || free_pages <= 0 {
-            prop_assert_eq!(ratio, 0.0);
+            prop_assert!(ratio.abs() <= f64::EPSILON);
         } else if free_pages >= page_count {
-            prop_assert_eq!(ratio, 1.0);
+            prop_assert!((ratio - 1.0).abs() <= f64::EPSILON);
         } else {
-            prop_assert_eq!(ratio, free_pages as f64 / page_count as f64);
+            let expected = free_pages as f64 / page_count as f64;
+            prop_assert!((ratio - expected).abs() <= f64::EPSILON);
         }
     }
 

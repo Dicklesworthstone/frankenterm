@@ -16,6 +16,7 @@
 //!   * `pane_id`/`tab_id`/`window_id` → `"[counter]"`
 //!   * `pane_uuid` → `"[uuid]"`
 //!   * `cwd` → `"[cwd]"`
+//!
 //! leaving the structural shape and the deterministic fields visible.
 
 use frankenterm_core::robot_types::{PaneStateData, PaneTextResult, StateWithTextData};

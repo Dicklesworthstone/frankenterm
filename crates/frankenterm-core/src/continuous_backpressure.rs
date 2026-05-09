@@ -811,10 +811,10 @@ mod tests {
     #[test]
     fn ft_yskcu_smoother_rejects_nan_sample_and_preserves_prior_value() {
         let mut smoother = EmaSmoother::new(4);
-        assert_eq!(smoother.update(0.42), 0.42);
+        assert_eq!(smoother.update(0.42).to_bits(), 0.42_f64.to_bits());
         let out = smoother.update(f64::NAN);
         assert!(out.is_finite(), "NaN sample must not taint smoother.value");
-        assert_eq!(out, 0.42);
+        assert_eq!(out.to_bits(), 0.42_f64.to_bits());
         // Recovery: next clean sample blends from the preserved prior.
         let recovered = smoother.update(0.50);
         assert!(recovered.is_finite());
@@ -826,14 +826,18 @@ mod tests {
     fn ft_yskcu_smoother_rejects_nan_first_sample() {
         let mut smoother = EmaSmoother::new(4);
         let out = smoother.update(f64::NAN);
-        assert_eq!(out, 0.0, "uninitialised smoother returns the default 0.0");
+        assert_eq!(
+            out.to_bits(),
+            0.0_f64.to_bits(),
+            "uninitialised smoother returns the default 0.0"
+        );
         assert!(
             !smoother.is_initialized(),
             "NaN must not flip initialized to true"
         );
         // The next clean sample initialises (not blend against NaN).
         let first_clean = smoother.update(0.3);
-        assert_eq!(first_clean, 0.3);
+        assert_eq!(first_clean.to_bits(), 0.3_f64.to_bits());
         assert!(smoother.is_initialized());
     }
 
@@ -843,7 +847,11 @@ mod tests {
     #[test]
     fn ft_yskcu_sigmoid_collapses_nan_to_midpoint() {
         let s = sigmoid(f64::NAN);
-        assert_eq!(s, 0.5, "NaN sigmoid input must collapse to neutral 0.5");
+        assert_eq!(
+            s.to_bits(),
+            0.5_f64.to_bits(),
+            "NaN sigmoid input must collapse to neutral 0.5"
+        );
     }
 
     /// ContinuousBackpressure::update must skip the entire update when
@@ -875,8 +883,8 @@ mod tests {
             count_before,
             "NaN tick must not advance update_count (snapshot integrity)"
         );
-        assert_eq!(bp.queue_ratio(), q_before);
-        assert_eq!(bp.severity(), s_before);
+        assert_eq!(bp.queue_ratio().to_bits(), q_before.to_bits());
+        assert_eq!(bp.severity().to_bits(), s_before.to_bits());
 
         // Clean tick after the NaN → continues from the prior smoothed
         // state (no NaN poison, no false reset).

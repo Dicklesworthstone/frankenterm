@@ -22,34 +22,34 @@ use frankenterm_core::atlas_bin_packing::{
     AllocationOutcome, Atlas2DSize, BinPacker, GlyphSize, PackerKind, PackingStats, make_packer,
 };
 
-pub(crate) const ATLAS_SIZE: u32 = 2048;
-pub(crate) const SCHEMA_VERSION: &str = "1.0.0";
+pub const ATLAS_SIZE: u32 = 2048;
+pub const SCHEMA_VERSION: &str = "1.0.0";
 
-pub(crate) fn corpus_latin() -> Vec<GlyphSize> {
+pub fn corpus_latin() -> Vec<GlyphSize> {
     (0x20u32..=0x7eu32)
         .map(|cp| GlyphSize::new(8 + (cp % 4), 16))
         .collect()
 }
 
-pub(crate) fn corpus_cjk() -> Vec<GlyphSize> {
+pub fn corpus_cjk() -> Vec<GlyphSize> {
     (0..1500u32)
         .map(|i| GlyphSize::new(16 + (i % 3), 16 + (i % 3)))
         .collect()
 }
 
-pub(crate) fn corpus_nerd_font() -> Vec<GlyphSize> {
+pub fn corpus_nerd_font() -> Vec<GlyphSize> {
     let mut glyphs = corpus_latin();
     glyphs.extend((0..500u32).map(|i| GlyphSize::new(12 + (i % 13), 12 + (i % 13))));
     glyphs
 }
 
-pub(crate) fn corpus_emoji() -> Vec<GlyphSize> {
+pub fn corpus_emoji() -> Vec<GlyphSize> {
     (0..750u32)
         .map(|i| GlyphSize::new(16 + (i % 5), 16 + (i % 5)))
         .collect()
 }
 
-pub(crate) fn corpora() -> Vec<(&'static str, Vec<GlyphSize>)> {
+pub fn corpora() -> Vec<(&'static str, Vec<GlyphSize>)> {
     vec![
         ("latin", corpus_latin()),
         ("cjk", corpus_cjk()),
@@ -58,7 +58,7 @@ pub(crate) fn corpora() -> Vec<(&'static str, Vec<GlyphSize>)> {
     ]
 }
 
-pub(crate) fn pack_into(kind: PackerKind, glyphs: &[GlyphSize]) -> (PackingStats, u64, u64) {
+pub fn pack_into(kind: PackerKind, glyphs: &[GlyphSize]) -> (PackingStats, u64, u64) {
     let size = Atlas2DSize::try_new(ATLAS_SIZE, ATLAS_SIZE).expect("atlas size > 0");
     let mut packer: Box<dyn BinPacker> = make_packer(kind, size);
     let mut stats = PackingStats::default();
@@ -80,7 +80,7 @@ pub(crate) fn pack_into(kind: PackerKind, glyphs: &[GlyphSize]) -> (PackingStats
     (stats, placed_total, rejected_total)
 }
 
-pub(crate) fn packer_label(kind: PackerKind) -> &'static str {
+pub fn packer_label(kind: PackerKind) -> &'static str {
     match kind {
         PackerKind::Shelf => "shelf",
         PackerKind::Skyline => "skyline",

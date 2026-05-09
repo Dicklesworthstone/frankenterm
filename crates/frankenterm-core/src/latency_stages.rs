@@ -378,16 +378,16 @@ pub use policy_controller::*;
 
 // ── Runtime Enforcement ─────────────────────────────────────────────
 
-/// AARSP Bead: ft-2p9cb.1.3 — Runtime Budget Enforcement
-///
-/// This section implements the enforcement guards that sit on the critical path,
-/// applying deterministic mitigation when budgets are exceeded.
-/// Mitigation policy, recovery protocol, and per-stage enforcement state are
-/// extracted to `latency_stages/runtime_policy.rs` under br-ft-l8s7v slice 36.
-/// Re-exported above via `pub use`.
-/// Runtime enforcer decision/config/snapshot types are extracted to
-/// `latency_stages/runtime_enforcer.rs` under br-ft-l8s7v slice 37.
-/// Re-exported above via `pub use`.
+// AARSP Bead: ft-2p9cb.1.3 — Runtime Budget Enforcement
+//
+// This section implements the enforcement guards that sit on the critical path,
+// applying deterministic mitigation when budgets are exceeded.
+// Mitigation policy, recovery protocol, and per-stage enforcement state are
+// extracted to `latency_stages/runtime_policy.rs` under br-ft-l8s7v slice 36.
+// Re-exported above via `pub use`.
+// Runtime enforcer decision/config/snapshot types are extracted to
+// `latency_stages/runtime_enforcer.rs` under br-ft-l8s7v slice 37.
+// Re-exported above via `pub use`.
 
 // ── A4: Adaptive Budget Allocator ─────────────────────────────────
 // Extracted to `latency_stages/adaptive_allocator.rs` under br-ft-l8s7v slice 21.

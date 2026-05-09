@@ -280,7 +280,7 @@ fn every_top_level_error_variant_has_a_golden() {
         // Skip *.actual.json (drift artifacts; gitignored)
         if p.file_name()
             .and_then(|s| s.to_str())
-            .map_or(false, |n| n.ends_with(".actual.json"))
+            .is_some_and(|n| n.ends_with(".actual.json"))
         {
             continue;
         }

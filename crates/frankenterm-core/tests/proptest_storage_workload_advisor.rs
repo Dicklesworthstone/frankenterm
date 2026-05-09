@@ -191,7 +191,9 @@ proptest! {
             AdvisorReport::Recommendation(rec) => {
                 prop_assert_eq!(rec.index, IndexChoice::NoChange);
             }
-            other => prop_assert!(false, "expected Recommendation, got {:?}", other),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                prop_assert!(false, "expected Recommendation, got {:?}", other);
+            }
         }
     }
 
@@ -215,7 +217,9 @@ proptest! {
             AdvisorReport::Recommendation(rec) => {
                 prop_assert_eq!(rec.index, IndexChoice::Hybrid);
             }
-            other => prop_assert!(false, "expected Recommendation, got {:?}", other),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                prop_assert!(false, "expected Recommendation, got {:?}", other);
+            }
         }
     }
 
@@ -253,7 +257,9 @@ proptest! {
             AdvisorReport::Recommendation(rec) => {
                 prop_assert_eq!(rec.migration_priority, MigrationPriority::High);
             }
-            other => prop_assert!(false, "expected Recommendation, got {:?}", other),
+            other @ AdvisorReport::DataNeeded { .. } => {
+                prop_assert!(false, "expected Recommendation, got {:?}", other);
+            }
         }
     }
 

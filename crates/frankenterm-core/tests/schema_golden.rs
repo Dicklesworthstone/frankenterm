@@ -214,7 +214,11 @@ fn schema_provenance_covers_all_disk_schemas() {
         let Some((name, _)) = rest.split_once("` |") else {
             continue;
         };
-        if name.ends_with(".json") {
+        if std::path::Path::new(name)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
             documented.insert(name.to_string());
         }
     }

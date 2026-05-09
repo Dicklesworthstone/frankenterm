@@ -126,7 +126,7 @@ fn bench_per_corpus(c: &mut Criterion) {
                 b.iter(|| {
                     let (_stats, placed) = pack_into(kind, &glyphs);
                     black_box(placed);
-                })
+                });
             });
         }
     }
@@ -161,7 +161,7 @@ fn bench_efficiency_ordering_invariant(c: &mut Criterion) {
     // Symbolic bench so criterion records the invariant ran. The
     // assertions above are the actual gate.
     c.bench_function("atlas_packing/efficiency_ordering_invariant", |b| {
-        b.iter(|| black_box(()))
+        b.iter(|| black_box(()));
     });
 }
 

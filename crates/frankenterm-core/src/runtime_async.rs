@@ -6649,19 +6649,13 @@ mod tests {
 
     // ── Signal module tests ──────────────────────────────────────────────
 
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
-    #[cfg(unix)]
     // -------------------------------------------------------------------------
     // LabRuntime deterministic tests for the Cx-first Mutex/RwLock primitives
     // (ft-xbnl0.2.x slice). Pin that lock_with_cx / read_with_cx /
     // write_with_cx actually honor the passed-in Cx under virtual time,
     // rather than falling back to cx::for_request() via the legacy path.
     // -------------------------------------------------------------------------
-
+    #[cfg(unix)]
     mod labruntime_sync_primitives_cx {
         use super::*;
 
