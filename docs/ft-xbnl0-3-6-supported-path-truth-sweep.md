@@ -127,39 +127,37 @@ matches:
 
 | File / line | Classification | Owner |
 |-------------|----------------|-------|
-| `crates/frankenterm-core/src/robot_sdk_contracts.rs:917` (Python template) | template-only — non-Rust SDK | inventory exclusion |
-| `crates/frankenterm-core/src/robot_sdk_contracts.rs:943` (TypeScript template) | template-only — non-Rust SDK | inventory exclusion |
-| `crates/frankenterm-core/src/robot_sdk_contracts.rs:998` (Go template) | template-only — non-Rust SDK | inventory exclusion |
-| `crates/frankenterm-core/src/robot_sdk_contracts.rs:2298+` | assertion guard for the Rust SDK | n/a |
+| `crates/frankenterm-core/src/robot_sdk_contracts.rs` (Go template) | template-only — unsupported Go SDK | inventory exclusion |
+| `crates/frankenterm-core/src/robot_sdk_contracts.rs` (test assertions) | assertion guard for supported SDKs and the remaining Go template | n/a |
 | `.beads/issues.jsonl` | bead history | n/a |
 
-The inventory excludes non-Rust SDK templates from the finish-line
-supported matrix. The sweep tightens this exclusion in code by:
+The inventory excludes template SDKs from the finish-line supported matrix. The
+current sweep tightens this exclusion in code by:
 
 - adding a fully-supported gating method on `SdkLanguage`:
 
   ```rust
-  impl SdkLanguage {
-      pub fn is_fully_supported(&self) -> bool {
-          matches!(self, Self::Rust)
-      }
-  }
-  ```
+	  impl SdkLanguage {
+	      pub fn is_fully_supported(&self) -> bool {
+	          matches!(self, Self::Python | Self::TypeScript | Self::Rust)
+	      }
+	  }
+	  ```
 
-- promoting the doc comments on `Python`, `TypeScript`, and `Go` to call
-  out the `transport not wired` stub explicitly so any future SDK
-  consumer sees the narrowed support contract on first read;
+- promoting the doc comments on `Python`, `TypeScript`, and `Rust` to call
+  out their real transports and on `Go` to call out the remaining
+  `transport not wired` stub explicitly;
 
 - adding a regression test
-  `ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported` that
-  asserts (a) only `SdkLanguage::Rust` reports `is_fully_supported() ==
-  true` and (b) each non-Rust template still emits its `transport not
-  wired` marker so a future quiet wiring change cannot silently widen
-  the supported matrix without flipping `is_fully_supported`.
+  `ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported`
+  that asserts (a) Python, TypeScript, and Rust report
+  `is_fully_supported() == true` and emit no transport stub and (b) Go
+  remains unsupported while its template still emits its `transport not wired`
+  marker.
 
-Operator-visible docs already match: the only `docs/extensions/sdk/`
-quickstart is `rust-quickstart.md`. No doc advertises Python, TypeScript,
-or Go SDKs as supported finish-line targets.
+Operator-visible docs already match: `docs/robot-contracts/sdk-transports.md`
+lists Rust, Python, and TypeScript as supported and keeps Go in the
+template-only bucket.
 
 ### Unsupported-platform shims
 
@@ -190,10 +188,9 @@ production null object. No widening required.
    2026-05-09, `ft-akx00.6.3` is closed and the active guard report in
    `docs/ft-xbnl0-3-6-supported-path-stub-markers-validation.json`
    finds no unexpected production stub marker.
-2. The non-Rust SDK templates remain template-only. If the supported
-   matrix is ever widened to Python, TypeScript, or Go, the
-   `is_fully_supported` gate must flip and the regression test must be
-   updated alongside the wiring.
+2. The Go SDK template remains template-only. If the supported matrix is ever
+   widened to Go, the `is_fully_supported` gate must flip and the regression
+   test must be updated alongside the wiring.
 3. CI now enforces the supported-path stub-marker inventory through the
    `supported_path_stub_markers` entry in
    `docs/ft-xbnl0-5-2-finish-line-guards.json`, which is run by
@@ -205,7 +202,8 @@ production null object. No widening required.
 The sweep is anchored by two new artifacts in this commit:
 
 - the regression test
-  `ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported` in
+  `ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported`
+  in
   `crates/frankenterm-core/src/robot_sdk_contracts.rs`;
 - the deterministic E2E harness
   `tests/e2e/test_ft_xbnl0_3_6_supported_path_truth_sweep.sh` which
@@ -219,7 +217,7 @@ Recommended remote-verification commands (per the
 ```bash
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-3-6-test \
   cargo test -p frankenterm-core --lib \
-  ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported -- --nocapture
+  ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported -- --nocapture
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-3-6-check \
   cargo check -p frankenterm-core --lib --tests
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-3-6-clippy \

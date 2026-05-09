@@ -241,19 +241,19 @@ pub struct ErrorCodeSpec {
 
 /// Language target for SDK generation.
 ///
-/// [`SdkLanguage::Python`] and [`SdkLanguage::Rust`] are fully-supported
-/// finish-line SDK targets: Python wires Robot Mode through a bounded default
-/// process transport, and Rust wires through [`RustSdkTransport`] end-to-end.
-/// The `TypeScript` and `Go` variants still render *template skeletons*
-/// whose transport methods throw/panic with `transport not wired` and must be
-/// implemented by the consumer before use. Use
-/// [`SdkLanguage::is_fully_supported`] to gate any code path that requires a
-/// real, wired transport.
+/// [`SdkLanguage::Python`], [`SdkLanguage::TypeScript`], and
+/// [`SdkLanguage::Rust`] are fully-supported finish-line SDK targets: Python
+/// and TypeScript wire Robot Mode through bounded default process transports,
+/// and Rust wires through [`RustSdkTransport`] end-to-end. The `Go` variant
+/// still renders a *template skeleton* whose transport method panics with
+/// `transport not wired` and must be implemented by the consumer before use.
+/// Use [`SdkLanguage::is_fully_supported`] to gate any code path that requires
+/// a real, wired transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SdkLanguage {
     /// Python SDK with a default `ft robot --format json` process transport.
     Python,
-    /// TypeScript/JavaScript SDK template. Transport stub: consumer must implement `call`.
+    /// TypeScript/JavaScript SDK with a Node-only default process transport.
     TypeScript,
     /// Rust SDK (client crate). Fully-supported finish-line target.
     Rust,
@@ -285,14 +285,10 @@ impl SdkLanguage {
     }
 
     /// Returns `true` only for SDK targets whose generated client has a
-    /// fully-wired transport. TypeScript and Go currently emit template
-    /// skeletons with `transport not wired` placeholders and must not be
-    /// advertised as finish-line supported capabilities. Tracked for the
-    /// `ft-xbnl0` finish-line program in the `ft-xbnl0.1.2` capability
-    /// inventory.
+    /// fully-wired transport.
     #[must_use]
     pub fn is_fully_supported(&self) -> bool {
-        matches!(self, Self::Python | Self::Rust)
+        matches!(self, Self::Python | Self::TypeScript | Self::Rust)
     }
 }
 
@@ -1334,14 +1330,169 @@ def _format_args(args: Sequence[str]) -> str:
 }
 
 fn render_typescript_client(surface: &SdkSurface) -> String {
-    let mut out = String::from("export type JsonPayload = Record<string, unknown>;\n\n");
+    let mut out = String::from(
+        r"declare const require: (id: string) => any;
+declare const process: { env: Record<string, string | undefined> };
+
+export type JsonPayload = Record<string, unknown>;
+export type FrankentermProcessResult = {
+  returnCode: number;
+  stdout: string;
+  stderr: string;
+};
+export type ProcessRunner = (
+  args: readonly string[],
+  env: Record<string, string> | undefined,
+  timeoutMs: number | undefined,
+) => Promise<FrankentermProcessResult>;
+export type FrankentermClientOptions = {
+  ftBinary?: string;
+  timeoutMs?: number;
+  env?: Record<string, string>;
+  runner?: ProcessRunner;
+};
+
+",
+    );
 
     for return_type in unique_return_types(surface) {
         out.push_str(&format!("export type {return_type} = unknown;\n"));
     }
 
     out.push_str(
-        "\nexport class FrankentermClient {\n  protected async call(command: string, payload: JsonPayload): Promise<unknown> {\n    throw new Error(`transport not wired for ${command}`);\n  }\n",
+        r#"
+const SUPPORTED_COMMANDS = ["get-text", "send-text", "state", "search"] as const;
+const SUPPORTED_COMMAND_SET = new Set<string>(SUPPORTED_COMMANDS);
+const STDERR_LIMIT = 4096;
+
+type ChildProcessLike = {
+  stdout?: StreamLike;
+  stderr?: StreamLike;
+  on(event: "error", handler: (error: unknown) => void): void;
+  on(event: "close", handler: (code: unknown) => void): void;
+  kill(signal?: string): void;
+};
+
+type StreamLike = {
+  on(event: "data", handler: (chunk: unknown) => void): void;
+};
+
+export class FrankentermTransportError extends Error {
+  readonly cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "FrankentermTransportError";
+    this.cause = cause;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export class FrankentermUnsupportedCommandError extends FrankentermTransportError {
+  readonly command: string;
+
+  constructor(command: string) {
+    super(
+      `unsupported robot SDK command ${JSON.stringify(command)} (supported: ${SUPPORTED_COMMANDS.join(", ")})`,
+    );
+    this.name = "FrankentermUnsupportedCommandError";
+    this.command = command;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export class FrankentermRobotError extends Error {
+  readonly code?: string;
+  readonly hint?: string;
+  readonly details?: unknown;
+  readonly elapsedMs?: number;
+  readonly envelope: JsonPayload;
+
+  constructor(
+    message: string,
+    options: {
+      code?: string;
+      hint?: string;
+      details?: unknown;
+      elapsedMs?: number;
+      envelope: JsonPayload;
+    },
+  ) {
+    super(message);
+    this.name = "FrankentermRobotError";
+    this.code = options.code;
+    this.hint = options.hint;
+    this.details = options.details;
+    this.elapsedMs = options.elapsedMs;
+    this.envelope = options.envelope;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export class FrankentermClient {
+  private readonly ftBinary: string;
+  private readonly timeoutMs: number | undefined;
+  private readonly env: Record<string, string> | undefined;
+  private readonly runner: ProcessRunner;
+
+  constructor(options: FrankentermClientOptions = {}) {
+    if (options.timeoutMs !== undefined && options.timeoutMs <= 0) {
+      throw new Error("timeoutMs must be positive or undefined");
+    }
+    this.ftBinary = options.ftBinary ?? process.env.FRANKENTERM_FT_BINARY ?? "ft";
+    this.timeoutMs = options.timeoutMs ?? 30_000;
+    this.env = options.env;
+    this.runner = options.runner ?? runProcess;
+  }
+
+  static supportedCommands(): readonly string[] {
+    return SUPPORTED_COMMANDS;
+  }
+
+  static supportsCommand(command: string): boolean {
+    return SUPPORTED_COMMAND_SET.has(command);
+  }
+
+  protected async call(command: string, payload: JsonPayload): Promise<unknown> {
+    if (!SUPPORTED_COMMAND_SET.has(command)) {
+      throw new FrankentermUnsupportedCommandError(command);
+    }
+
+    const cleanPayload = withoutUndefined(payload);
+    const args = [
+      this.ftBinary,
+      "robot",
+      "--format",
+      "json",
+      ...commandArgs(command, cleanPayload),
+    ];
+    const result = await this.runner(args, this.env, this.timeoutMs);
+
+    if (result.returnCode !== 0) {
+      throw new FrankentermTransportError(
+        `robot command exited ${result.returnCode}: ${stderrTail(result.stderr)}`,
+      );
+    }
+
+    const envelope = decodeEnvelope(result.stdout, command);
+    const ok = envelope["ok"];
+    if (ok === true) {
+      if (!Object.prototype.hasOwnProperty.call(envelope, "data")) {
+        throw new FrankentermTransportError(
+          `robot command ${JSON.stringify(command)} returned ok=true without data`,
+        );
+      }
+      return envelope["data"];
+    }
+    if (ok === false) {
+      throw robotError(envelope);
+    }
+
+    throw new FrankentermTransportError(
+      `robot command ${JSON.stringify(command)} returned malformed envelope: missing boolean ok`,
+    );
+  }
+"#,
     );
 
     for method in &surface.methods {
@@ -1357,6 +1508,364 @@ fn render_typescript_client(surface: &SdkSurface) -> String {
     }
 
     out.push_str("}\n");
+    out.push_str(
+        r#"
+
+async function runProcess(
+  args: readonly string[],
+  env: Record<string, string> | undefined,
+  timeoutMs: number | undefined,
+): Promise<FrankentermProcessResult> {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const childProcess = require("node:child_process") as {
+      spawn: (
+        command: string,
+        args: readonly string[],
+        options: {
+          env?: Record<string, string | undefined>;
+          stdio: readonly ["ignore", "pipe", "pipe"];
+        },
+      ) => ChildProcessLike;
+    };
+
+    const finish = (fn: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      fn();
+    };
+
+    let child: ChildProcessLike;
+    try {
+      child = childProcess.spawn(args[0], args.slice(1), {
+        env: mergedEnv(env),
+        stdio: ["ignore", "pipe", "pipe"] as const,
+      });
+    } catch (error: unknown) {
+      throw new FrankentermTransportError(
+        `failed to start robot command ${formatArgs(args)}: ${errorMessage(error)}`,
+        error,
+      );
+    }
+
+    child.stdout?.on("data", (chunk: unknown) => {
+      stdout += chunkToString(chunk);
+    });
+    child.stderr?.on("data", (chunk: unknown) => {
+      stderr += chunkToString(chunk);
+    });
+    child.on("error", (error: unknown) => {
+      finish(() => {
+        const code = errorCode(error);
+        const message =
+          code === "ENOENT"
+            ? `ft binary not found: ${args[0]}`
+            : `failed to start robot command ${formatArgs(args)}: ${errorMessage(error)}`;
+        reject(new FrankentermTransportError(message, error));
+      });
+    });
+    child.on("close", (code: unknown) => {
+      finish(() => {
+        resolve({
+          returnCode: typeof code === "number" ? code : -1,
+          stdout,
+          stderr,
+        });
+      });
+    });
+
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        finish(() => {
+          child.kill();
+          reject(
+            new FrankentermTransportError(
+              `robot command timed out after ${timeoutMs} ms: ${formatArgs(args)}`,
+            ),
+          );
+        });
+      }, timeoutMs);
+    }
+  });
+}
+
+function commandArgs(command: string, payload: JsonPayload): string[] {
+  if (command === "get-text") {
+    const args = ["get-text", String(requiredNonnegativeInteger(payload, command, "pane_id"))];
+    const tailLines = optionalNonnegativeInteger(payload, command, "tail_lines");
+    if (tailLines !== undefined) {
+      args.push("--tail", String(tailLines));
+    }
+    if (optionalBoolean(payload, command, "escapes") === true) {
+      args.push("--escapes");
+    }
+    return args;
+  }
+
+  if (command === "send-text") {
+    const args = [
+      "send",
+      String(requiredNonnegativeInteger(payload, command, "pane_id")),
+      requiredString(payload, command, "text"),
+    ];
+    if (optionalBoolean(payload, command, "dry_run") === true) {
+      args.push("--dry-run");
+    }
+    const approvalCode = optionalString(payload, command, "approval_code");
+    if (approvalCode !== undefined) {
+      args.push("--approval-code", approvalCode);
+    }
+
+    const waitFor = optionalString(payload, command, "wait_for");
+    const waitForRegex = optionalBoolean(payload, command, "wait_for_regex") === true;
+    const timeoutSecs = optionalNonnegativeInteger(payload, command, "timeout_secs");
+    if (waitFor === undefined && waitForRegex) {
+      throw new FrankentermTransportError("wait_for_regex requires wait_for");
+    }
+    if (waitFor === undefined && timeoutSecs !== undefined) {
+      throw new FrankentermTransportError("timeout_secs requires wait_for");
+    }
+    if (waitFor !== undefined) {
+      args.push("--wait-for", waitFor);
+      if (timeoutSecs !== undefined) {
+        args.push("--timeout-secs", String(timeoutSecs));
+      }
+      if (waitForRegex) {
+        args.push("--wait-for-regex");
+      }
+    }
+    return args;
+  }
+
+  if (command === "state") {
+    const args = ["state"];
+    const includeText = optionalBoolean(payload, command, "include_text") === true;
+    const tail = optionalNonnegativeInteger(payload, command, "tail");
+    const escapes = optionalBoolean(payload, command, "escapes") === true;
+    if (includeText || tail !== undefined || escapes) {
+      args.push("--include-text");
+      if (tail !== undefined) {
+        args.push("--tail", String(tail));
+      }
+      if (escapes) {
+        args.push("--escapes");
+      }
+    }
+    return args;
+  }
+
+  if (command === "search") {
+    const args = ["search", requiredString(payload, command, "query")];
+    const limit = optionalNonnegativeInteger(payload, command, "limit");
+    if (limit !== undefined) {
+      args.push("--limit", String(limit));
+    }
+    const pane = optionalNonnegativeInteger(payload, command, "pane");
+    if (pane !== undefined) {
+      args.push("--pane", String(pane));
+    }
+    const since = optionalInteger(payload, command, "since");
+    if (since !== undefined) {
+      args.push("--since", String(since));
+    }
+    const until = optionalInteger(payload, command, "until");
+    if (until !== undefined) {
+      args.push("--until", String(until));
+    }
+    const snippets = optionalBoolean(payload, command, "snippets");
+    if (snippets !== undefined) {
+      args.push(snippets ? "--snippets" : "--snippets=false");
+    }
+    const mode = optionalString(payload, command, "mode");
+    if (mode !== undefined) {
+      if (!["lexical", "semantic", "hybrid"].includes(mode)) {
+        throw new FrankentermTransportError("mode must be one of: lexical, semantic, hybrid");
+      }
+      args.push("--mode", mode);
+    }
+    return args;
+  }
+
+  throw new FrankentermUnsupportedCommandError(command);
+}
+
+function requiredString(payload: JsonPayload, command: string, field: string): string {
+  const value = requiredValue(payload, command, field);
+  if (typeof value !== "string") {
+    throw invalidPayload(command, field, "expected string");
+  }
+  return value;
+}
+
+function optionalString(payload: JsonPayload, command: string, field: string): string | undefined {
+  const value = payload[field];
+  if (value == null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw invalidPayload(command, field, "expected string");
+  }
+  return value;
+}
+
+function optionalBoolean(payload: JsonPayload, command: string, field: string): boolean | undefined {
+  const value = payload[field];
+  if (value == null) {
+    return undefined;
+  }
+  if (typeof value !== "boolean") {
+    throw invalidPayload(command, field, "expected boolean");
+  }
+  return value;
+}
+
+function optionalInteger(payload: JsonPayload, command: string, field: string): number | undefined {
+  const value = payload[field];
+  if (value == null) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw invalidPayload(command, field, "expected integer");
+  }
+  return value;
+}
+
+function requiredNonnegativeInteger(payload: JsonPayload, command: string, field: string): number {
+  const value = optionalNonnegativeInteger(payload, command, field);
+  if (value === undefined) {
+    throw invalidPayload(command, field, "missing required integer");
+  }
+  return value;
+}
+
+function optionalNonnegativeInteger(
+  payload: JsonPayload,
+  command: string,
+  field: string,
+): number | undefined {
+  const value = optionalInteger(payload, command, field);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value < 0) {
+    throw invalidPayload(command, field, "expected non-negative integer");
+  }
+  return value;
+}
+
+function requiredValue(payload: JsonPayload, command: string, field: string): unknown {
+  const value = payload[field];
+  if (value == null) {
+    throw invalidPayload(command, field, "missing required value");
+  }
+  return value;
+}
+
+function invalidPayload(command: string, field: string, message: string): FrankentermTransportError {
+  return new FrankentermTransportError(
+    `invalid payload for ${JSON.stringify(command)} field ${JSON.stringify(field)}: ${message}`,
+  );
+}
+
+function decodeEnvelope(stdout: string, command: string): JsonPayload {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(stdout);
+  } catch (error: unknown) {
+    throw new FrankentermTransportError(
+      `robot command ${JSON.stringify(command)} returned invalid JSON`,
+      error,
+    );
+  }
+  if (!isRecord(decoded)) {
+    throw new FrankentermTransportError(
+      `robot command ${JSON.stringify(command)} returned non-object JSON envelope`,
+    );
+  }
+  return decoded;
+}
+
+function robotError(envelope: JsonPayload): FrankentermRobotError {
+  const rawMessage = envelope["error"] ?? envelope["message"];
+  const message = typeof rawMessage === "string" && rawMessage !== "" ? rawMessage : "unknown robot error";
+  const code = typeof envelope["error_code"] === "string" ? envelope["error_code"] : undefined;
+  const hint = typeof envelope["hint"] === "string" ? envelope["hint"] : undefined;
+  const elapsedMs = typeof envelope["elapsed_ms"] === "number" ? envelope["elapsed_ms"] : undefined;
+  return new FrankentermRobotError(message, {
+    code,
+    hint,
+    details: envelope["details"],
+    elapsedMs,
+    envelope,
+  });
+}
+
+function stderrTail(stderr: string): string {
+  const trimmed = stderr.trim();
+  if (trimmed === "") {
+    return "stderr was empty";
+  }
+  return trimmed.slice(-STDERR_LIMIT);
+}
+
+function mergedEnv(env: Record<string, string> | undefined): Record<string, string | undefined> | undefined {
+  if (env === undefined) {
+    return undefined;
+  }
+  return { ...process.env, ...env };
+}
+
+function withoutUndefined(payload: JsonPayload): JsonPayload {
+  const clean: JsonPayload = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (value !== undefined) {
+      clean[key] = value;
+    }
+  }
+  return clean;
+}
+
+function isRecord(value: unknown): value is JsonPayload {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function chunkToString(chunk: unknown): string {
+  if (typeof chunk === "string") {
+    return chunk;
+  }
+  if (chunk && typeof (chunk as { toString?: (encoding?: string) => string }).toString === "function") {
+    return (chunk as { toString: (encoding?: string) => string }).toString("utf8");
+  }
+  return String(chunk);
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (isRecord(error) && typeof error["code"] === "string") {
+    return error["code"];
+  }
+  return undefined;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function formatArgs(args: readonly string[]): string {
+  return args.join(" ");
+}
+"#,
+    );
     out
 }
 
@@ -2616,7 +3125,7 @@ mod tests {
     #[test]
     fn contract_artifact_bundle_renders_deterministic_exports() {
         let bundle = standard_contract_artifacts().unwrap();
-        assert_eq!(bundle.sdk_count(), 2);
+        assert_eq!(bundle.sdk_count(), 3);
         assert!(
             bundle
                 .endpoint_specs_json
@@ -2636,7 +3145,11 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["frankenterm_client_python.py", "frankenterm_client_rust.rs"]
+            vec![
+                "frankenterm_client_python.py",
+                "frankenterm_client_rust.rs",
+                "frankenterm_client_typescript.ts"
+            ]
         );
         assert!(
             bundle
@@ -2674,6 +3187,25 @@ mod tests {
         assert!(python.contains("wait_for_regex requires wait_for"));
         assert!(!python.contains("transport not wired"));
         assert!(!python.contains("NotImplementedError"));
+    }
+
+    #[test]
+    fn contract_artifact_bundle_typescript_sdk_source_includes_process_transport() {
+        let bundle = standard_contract_artifacts().unwrap();
+        let typescript = bundle
+            .sdk_sources
+            .get("frankenterm_client_typescript.ts")
+            .unwrap();
+
+        assert!(typescript.contains("node:child_process"));
+        assert!(typescript.contains("FRANKENTERM_FT_BINARY"));
+        assert!(typescript.contains("FrankentermRobotError"));
+        assert!(typescript.contains("FrankentermTransportError"));
+        assert!(typescript.contains("FrankentermUnsupportedCommandError"));
+        assert!(typescript.contains("SUPPORTED_COMMANDS"));
+        assert!(typescript.contains("wait_for_regex requires wait_for"));
+        assert!(typescript.contains("mode must be one of: lexical, semantic, hybrid"));
+        assert!(!typescript.contains("transport not wired"));
     }
 
     #[test]
@@ -2795,6 +3327,23 @@ mod tests {
         assert!(source.contains("mode must be one of: lexical, semantic, hybrid"));
         assert!(!source.contains("transport not wired"));
         assert!(!source.contains("NotImplementedError"));
+    }
+
+    #[test]
+    fn typescript_sdk_render_uses_real_transport_backend() {
+        let mut sdk = SdkSurface::new(SdkLanguage::TypeScript, "frankenterm");
+        sdk.generate_from_specs(&core_endpoint_specs());
+        let source = sdk.render_client_source();
+
+        assert!(source.contains("node:child_process"));
+        assert!(source.contains("ProcessRunner"));
+        assert!(source.contains("FrankentermClientOptions"));
+        assert!(source.contains("FrankentermUnsupportedCommandError"));
+        assert!(source.contains("FrankentermRobotError"));
+        assert!(source.contains("\"send\","));
+        assert!(source.contains("--snippets=false"));
+        assert!(source.contains("mode must be one of: lexical, semantic, hybrid"));
+        assert!(!source.contains("transport not wired"));
     }
 
     #[cfg(unix)]
@@ -2970,16 +3519,264 @@ asyncio.run(main())
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn ft_xbnl0_3_6_python_and_rust_sdk_targets_are_finish_line_supported() {
-        // Truth-sweep guard for ft-xbnl0.3.6: Python and Rust now ship real
-        // generated transports, while TypeScript and Go remain excluded from
-        // the finish-line supported matrix until their template transports are
-        // replaced.
-        assert!(SdkLanguage::Python.is_fully_supported());
-        assert!(SdkLanguage::Rust.is_fully_supported());
+    fn typescript_sdk_generated_transport_fixture_behaviors() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
 
-        for lang in [SdkLanguage::Python, SdkLanguage::Rust] {
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node missing; skipping generated TypeScript SDK behavior fixture");
+            return;
+        }
+        if Command::new("tsc").arg("--version").output().is_err() {
+            eprintln!("tsc missing; skipping generated TypeScript SDK behavior fixture");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create TypeScript SDK fixture tempdir");
+        let sleep_binary = dir.path().join("ft-sleep");
+        let missing_binary = dir.path().join("missing-ft");
+        let source_path = dir.path().join("frankenterm_client_typescript.ts");
+        let out_dir = dir.path().join("js");
+        assert!(!missing_binary.exists());
+        std::fs::create_dir(&out_dir).expect("create TypeScript SDK fixture out dir");
+        std::fs::write(&sleep_binary, "#!/bin/sh\nsleep 1\n")
+            .expect("write timeout fixture binary");
+        let mut permissions = std::fs::metadata(&sleep_binary)
+            .expect("stat timeout fixture binary")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&sleep_binary, permissions).expect("chmod timeout fixture binary");
+
+        let mut sdk = SdkSurface::new(SdkLanguage::TypeScript, "frankenterm");
+        sdk.generate_from_specs(&core_endpoint_specs());
+        let mut script = sdk.render_client_source();
+        script.push_str(
+            r#"
+
+type CallRecord = {
+  args: readonly string[];
+  env: Record<string, string> | undefined;
+  timeoutMs: number | undefined;
+};
+
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) {
+    throw new Error(message);
+  }
+}
+
+function assertDeepEqual(actual: unknown, expected: unknown, message: string): void {
+  const actualJson = JSON.stringify(actual);
+  const expectedJson = JSON.stringify(expected);
+  if (actualJson !== expectedJson) {
+    throw new Error(`${message}: expected ${expectedJson}, got ${actualJson}`);
+  }
+}
+
+async function expectError(
+  label: string,
+  action: () => Promise<unknown>,
+  expectedCtor: new (...args: any[]) => Error,
+  expectedText: string,
+): Promise<Error> {
+  try {
+    await action();
+  } catch (error: unknown) {
+    assert(error instanceof expectedCtor, `${label}: wrong error class ${String(error)}`);
+    assert(error.message.includes(expectedText), `${label}: wrong message ${error.message}`);
+    return error;
+  }
+  throw new Error(`${label}: expected error`);
+}
+
+class ExposedClient extends FrankentermClient {
+  callForTest(command: string, payload: JsonPayload): Promise<unknown> {
+    return this.call(command, payload);
+  }
+}
+
+async function main(): Promise<void> {
+  const successCalls: CallRecord[] = [];
+  const successRunner: ProcessRunner = async (args, env, timeoutMs) => {
+    successCalls.push({ args: [...args], env, timeoutMs });
+    return {
+      returnCode: 0,
+      stdout: JSON.stringify({
+        ok: true,
+        data: { pane_id: 7, text: "hello", tail_lines: 12 },
+        elapsed_ms: 1,
+        version: "test",
+        now: 1,
+        schema_version: 1,
+      }),
+      stderr: "warning: ignored on success",
+    };
+  };
+  const client = new FrankentermClient({
+    ftBinary: "/bin/ft-test",
+    timeoutMs: 12000,
+    env: { FT_TEST: "1" },
+    runner: successRunner,
+  });
+  const data = (await client.getText(7, 12, true)) as { text: string };
+  assert(data.text === "hello", "success envelope should return decoded data");
+  assertDeepEqual(
+    successCalls[0],
+    {
+      args: [
+        "/bin/ft-test",
+        "robot",
+        "--format",
+        "json",
+        "get-text",
+        "7",
+        "--tail",
+        "12",
+        "--escapes",
+      ],
+      env: { FT_TEST: "1" },
+      timeoutMs: 12000,
+    },
+    "getText should map to robot get-text args",
+  );
+
+  const robotErrorRunner: ProcessRunner = async () => ({
+    returnCode: 0,
+    stdout: JSON.stringify({
+      ok: false,
+      error: "blocked by policy",
+      error_code: "robot.policy_denied",
+      hint: "request approval",
+      details: { rule: "fixture" },
+      elapsed_ms: 2,
+    }),
+    stderr: "",
+  });
+  const robotError = await expectError(
+    "robot error",
+    () => new FrankentermClient({ runner: robotErrorRunner }).search("panic"),
+    FrankentermRobotError,
+    "blocked by policy",
+  ) as FrankentermRobotError;
+  assert(robotError.code === "robot.policy_denied", "robot error code should be preserved");
+  assert(robotError.hint === "request approval", "robot error hint should be preserved");
+  assert(robotError.elapsedMs === 2, "robot error elapsed_ms should be preserved");
+
+  await expectError(
+    "invalid payload",
+    () => (client as any).getText("not-an-int"),
+    FrankentermTransportError,
+    "pane_id",
+  );
+  assert(successCalls.length === 1, "invalid payload should not invoke process runner");
+
+  let unsupportedCalls = 0;
+  const unsupportedRunner: ProcessRunner = async () => {
+    unsupportedCalls += 1;
+    return { returnCode: 0, stdout: "{}", stderr: "" };
+  };
+  const unsupported = await expectError(
+    "unsupported command",
+    () => new ExposedClient({ runner: unsupportedRunner }).callForTest("events", {}),
+    FrankentermUnsupportedCommandError,
+    "unsupported robot SDK command",
+  ) as FrankentermUnsupportedCommandError;
+  assert(unsupported.command === "events", "unsupported command should be preserved");
+  assert(unsupportedCalls === 0, "unsupported command should not invoke process runner");
+
+  await expectError(
+    "invalid JSON",
+    () => new FrankentermClient({
+      runner: async () => ({ returnCode: 0, stdout: "not-json", stderr: "" }),
+    }).state(),
+    FrankentermTransportError,
+    "invalid JSON",
+  );
+
+  await expectError(
+    "nonzero exit",
+    () => new FrankentermClient({
+      runner: async () => ({ returnCode: 2, stdout: "", stderr: "boom" }),
+    }).state(),
+    FrankentermTransportError,
+    "exited 2: boom",
+  );
+
+  const missingBinary = process.env.FT_MISSING_BINARY;
+  assert(typeof missingBinary === "string", "FT_MISSING_BINARY must be set");
+  await expectError(
+    "missing binary",
+    () => new FrankentermClient({ ftBinary: missingBinary, timeoutMs: 100 }).state(),
+    FrankentermTransportError,
+    "ft binary not found",
+  );
+
+  const sleepBinary = process.env.FT_SLEEP_BINARY;
+  assert(typeof sleepBinary === "string", "FT_SLEEP_BINARY must be set");
+  await expectError(
+    "timeout",
+    () => new FrankentermClient({ ftBinary: sleepBinary, timeoutMs: 10 }).state(),
+    FrankentermTransportError,
+    "timed out",
+  );
+}
+
+main();
+"#,
+        );
+        std::fs::write(&source_path, script).expect("write generated TypeScript SDK fixture");
+
+        let tsc_output = Command::new("tsc")
+            .arg("--target")
+            .arg("ES2020")
+            .arg("--module")
+            .arg("commonjs")
+            .arg("--strict")
+            .arg("--skipLibCheck")
+            .arg("--outDir")
+            .arg(&out_dir)
+            .arg(&source_path)
+            .output()
+            .expect("spawn tsc for generated TypeScript SDK fixture");
+        assert!(
+            tsc_output.status.success(),
+            "generated TypeScript SDK fixture failed to compile\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&tsc_output.stdout),
+            String::from_utf8_lossy(&tsc_output.stderr)
+        );
+
+        let js_path = out_dir.join("frankenterm_client_typescript.js");
+        let output = Command::new("node")
+            .arg(&js_path)
+            .env("FT_MISSING_BINARY", &missing_binary)
+            .env("FT_SLEEP_BINARY", &sleep_binary)
+            .output()
+            .expect("spawn generated TypeScript SDK fixture");
+        assert!(
+            output.status.success(),
+            "generated TypeScript SDK fixture failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported() {
+        // Truth-sweep guard for ft-xbnl0.3.6 plus ft-gzgfc.3: Python,
+        // TypeScript, and Rust now ship real generated transports. Go stays
+        // template-only until its dedicated promotion bead wires and tests it.
+        assert!(SdkLanguage::Python.is_fully_supported());
+        assert!(SdkLanguage::TypeScript.is_fully_supported());
+        assert!(SdkLanguage::Rust.is_fully_supported());
+        assert!(!SdkLanguage::Go.is_fully_supported());
+
+        for lang in [
+            SdkLanguage::Python,
+            SdkLanguage::TypeScript,
+            SdkLanguage::Rust,
+        ] {
             let mut sdk = SdkSurface::new(lang, "frankenterm");
             sdk.generate_from_specs(&core_endpoint_specs());
             let source = sdk.render_client_source();
@@ -2990,24 +3787,13 @@ asyncio.run(main())
             );
         }
 
-        for lang in [SdkLanguage::TypeScript, SdkLanguage::Go] {
-            assert!(
-                !lang.is_fully_supported(),
-                "{} SDK template still emits a `transport not wired` stub; \
-                 narrow it explicitly before claiming finish-line support",
-                lang.label()
-            );
-            let mut sdk = SdkSurface::new(lang, "frankenterm");
-            sdk.generate_from_specs(&core_endpoint_specs());
-            let source = sdk.render_client_source();
-            assert!(
-                source.contains("transport not wired"),
-                "{} template lost its `transport not wired` marker; \
-                 either wire the transport (and update is_fully_supported) \
-                 or restore the marker so the supported-path sweep stays honest",
-                lang.label()
-            );
-        }
+        let mut go_sdk = SdkSurface::new(SdkLanguage::Go, "frankenterm");
+        go_sdk.generate_from_specs(&core_endpoint_specs());
+        let go_source = go_sdk.render_client_source();
+        assert!(
+            go_source.contains("transport not wired"),
+            "Go SDK template must keep an explicit unsupported transport marker until promoted"
+        );
     }
 
     // ---- E2E ----

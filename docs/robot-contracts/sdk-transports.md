@@ -3,12 +3,14 @@
 **Bead:** `ft-gzgfc.1`
 **Audience:** Agents implementing generated Robot Mode SDK clients.
 
-The generated Rust SDK is the only finish-line supported SDK target today.
-Python, TypeScript, and Go currently render template clients whose transport
-methods fail with `transport not wired`. That is intentional honesty, not a
-supported user workflow. A language may move from template-only to supported
-only after it satisfies this contract and its generated artifact no longer
-contains a placeholder transport.
+The generated Rust, Python, and TypeScript SDKs are finish-line supported SDK
+targets today. Rust uses the in-process `RustSdkTransport`; Python and
+TypeScript use tested default process transports that run
+`ft robot --format json` without shell interpolation. Go still renders a
+template client whose transport panics with `transport not wired`. That is
+intentional honesty, not a supported user workflow. A language may move from
+template-only to supported only after it satisfies this contract and its
+generated artifact no longer contains a placeholder transport.
 
 This document defines the shared transport behavior that non-Rust SDK targets
 must implement before changing `SdkLanguage::is_fully_supported`.
@@ -113,23 +115,24 @@ text and artifact bundle with RCH-backed Rust tests.
 
 ### Python
 
-The Python client should expose an async-friendly API, but the default
-transport may be sync internally if it runs in a bounded subprocess call. It
-must provide an injectable callable for tests. Robot errors should be distinct
-from transport errors.
+The Python client exposes an async-friendly API backed by
+`asyncio.create_subprocess_exec`. It provides an injectable callable for tests,
+validates known command payloads before spawning `ft`, and reports robot errors
+separately from transport errors.
 
-Promotion removes the generated `_call` method that raises
+The generated source must not contain
 `NotImplementedError("transport not wired")`.
 
 ### TypeScript
 
-The TypeScript client must state whether the default process transport is
-Node-only. Browser support requires a separate daemon or fetch transport and
-must not be implied by a child-process implementation. The generated client
-should expose an interface that tests can satisfy without spawning a process.
+The TypeScript client ships a Node-only default process transport using
+`node:child_process`. Browser support requires a separate daemon or fetch
+transport and must not be implied by the child-process implementation. The
+generated client exposes a `ProcessRunner` interface that tests and advanced
+callers can satisfy without spawning a process.
 
-Promotion removes the generated `throw new Error("transport not wired...")`
-default.
+The generated source must not contain
+`throw new Error("transport not wired...")`.
 
 ### Go
 
@@ -152,7 +155,8 @@ When a language is promoted, tests must assert all of the following:
 - the contract artifact bundle includes the promoted source;
 - the promoted source includes a real default transport or a real default
   transport factory;
-- README or SDK docs list the language as supported with proof links.
+- SDK docs list the language as supported and identify any runtime constraint,
+  such as TypeScript's Node-only process transport.
 
 The artifact bundle must never mix a `supported_*` language state with a
 placeholder transport marker.

@@ -2,7 +2,7 @@ name: Finish-Line Guards
 
 # Permanent regression guards for the ft-xbnl0 finish-line program (bead
 # ft-xbnl0.5.2). Runs on every PR + push to main so the no-tokio/smol/
-# async-io invariant, the forbidden-token ceiling invariant, the fake-SDK
+# async-io invariant, the forbidden-token ceiling invariant, the SDK
 # capability contract, the supported-path stub-marker inventory, and the
 # artifact-contract shape never silently regress.
 #
@@ -47,7 +47,7 @@ jobs:
       - name: Run ft-xbnl0.5.2 composition (skip cargo test guard)
         env:
           # cargo test runs in the cargo-guards job below, not here,
-          # so the composition's fake-SDK guard is explicitly skipped
+          # so the composition's SDK-capability guard is explicitly skipped
           # to keep this job fast and cargo-free.
           FT_XBNL0_5_2_SKIP_CARGO_TEST: "1"
         run: bash scripts/check_finish_line_guards.sh --output "$RUNNER_TEMP/finish-line-guards.json"
@@ -85,10 +85,10 @@ jobs:
         with:
           key: finish-line-guards-cargo
 
-      - name: Run ft-xbnl0.3.6 fake-SDK capability contract test
+      - name: Run ft-xbnl0.3.6 SDK capability contract test
         run: |
           cargo test -p frankenterm-core --lib \
-            robot_sdk_contracts::tests::ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported \
+            robot_sdk_contracts::tests::ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported \
             -- --exact --nocapture
 
       - name: Run ft-xbnl0.2.6 no-runtime regression gate (Rust wrapper)

@@ -2,87 +2,73 @@
   "allowed_markers": [
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 248,
+      "line": 249,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "/// whose transport methods throw/panic with `transport not wired` and must be"
+      "source": "/// `transport not wired` and must be implemented by the consumer before use."
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 289,
-      "marker": "transport_not_wired_marker",
-      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "/// skeletons with `transport not wired` placeholders and must not be"
-    },
-    {
-      "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 1344,
-      "marker": "transport_not_wired_marker",
-      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "\"\\nexport class FrankentermClient {\\n  protected async call(command: string, payload: JsonPayload): Promise<unknown> {\\n    throw new Error(`transport not wired for ${command}`);\\n  }\\n\","
-    },
-    {
-      "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 1399,
+      "line": 1908,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "\"\\ntype FrankentermClient struct{}\\n\\nfunc (c *FrankentermClient) call(command string, payload map[string]interface{}) (map[string]interface{}, error) {\\n\\tpanic(\\\"transport not wired\\\")\\n}\\n\","
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 2645,
+      "line": 3158,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": ".all(|source| !source.contains(\"transport not wired\")),"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 2675,
+      "line": 3188,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "assert!(!python.contains(\"transport not wired\"));"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 2777,
+      "line": 3208,
+      "marker": "transport_not_wired_marker",
+      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
+      "source": "assert!(!typescript.contains(\"transport not wired\"));"
+    },
+    {
+      "classification": "non_rust_sdk_template_or_assertion_guard",
+      "line": 3309,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "assert!(!source.contains(\"transport not wired\"));"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 2796,
+      "line": 3328,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "assert!(!source.contains(\"transport not wired\"));"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 2987,
+      "line": 3346,
+      "marker": "transport_not_wired_marker",
+      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
+      "source": "assert!(!source.contains(\"transport not wired\"));"
+    },
+    {
+      "classification": "non_rust_sdk_template_or_assertion_guard",
+      "line": 3784,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
       "source": "!source.contains(\"transport not wired\"),"
     },
     {
       "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 2996,
+      "line": 3794,
       "marker": "transport_not_wired_marker",
       "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "\"{} SDK template still emits a `transport not wired` stub; \\"
-    },
-    {
-      "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3004,
-      "marker": "transport_not_wired_marker",
-      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "source.contains(\"transport not wired\"),"
-    },
-    {
-      "classification": "non_rust_sdk_template_or_assertion_guard",
-      "line": 3005,
-      "marker": "transport_not_wired_marker",
-      "path": "crates/frankenterm-core/src/robot_sdk_contracts.rs",
-      "source": "\"{} template lost its `transport not wired` marker; \\"
+      "source": "go_source.contains(\"transport not wired\"),"
     },
     {
       "classification": "test_only_cfg_scope",
@@ -289,7 +275,7 @@
     }
   ],
   "bead_id": "ft-g6lfc",
-  "checked_at": "2026-05-09T19:01:00Z",
+  "checked_at": "2026-05-09T21:31:50Z",
   "contract_id": "ft.xbnl0.3.6.supported_path_stub_markers.v1",
   "scan_roots": [
     "crates",
@@ -297,7 +283,7 @@
   ],
   "status": "passed",
   "totals": {
-    "allowed_markers": 41,
+    "allowed_markers": 39,
     "rust_files_scanned": 1186,
     "unexpected_markers": 0
   },

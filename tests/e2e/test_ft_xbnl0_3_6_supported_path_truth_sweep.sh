@@ -24,8 +24,9 @@ SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
 
 exec > >(tee -a "${STDOUT_FILE}") 2> >(tee -a "${STDERR_FILE}" >&2)
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-RCH_STEP_TIMEOUT_SECS=2400
+export RCH_STEP_TIMEOUT_SECS=2400
 rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "ft_xbnl0_3_6_supported_path_truth_sweep"
 export RCH_SKIP_SMOKE_PREFLIGHT=1
 ensure_rch_ready
@@ -188,7 +189,7 @@ echo "Artifacts: ${ARTIFACT_DIR}"
 # Level A: cargo regression test that pins the SDK support contract.
 run_cargo_step "sdk_support_contract_test" \
   test -p frankenterm-core --lib \
-  ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported -- --nocapture
+  ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported -- --nocapture
 run_cargo_step "rust_sdk_render_test" \
   test -p frankenterm-core --lib rust_sdk_render_uses_real_transport_backend -- --nocapture
 run_cargo_step "core_check" check -p frankenterm-core --lib --tests

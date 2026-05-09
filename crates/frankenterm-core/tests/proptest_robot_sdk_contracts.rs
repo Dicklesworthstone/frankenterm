@@ -623,7 +623,7 @@ fn standard_contract_artifacts_render_successfully() {
     let bundle = standard_contract_artifacts().unwrap();
     assert_eq!(
         bundle.sdk_count(),
-        2,
+        3,
         "production bundle should include every fully-supported SDK language"
     );
     assert!(!bundle.endpoint_specs_json.is_empty());
@@ -638,6 +638,11 @@ fn standard_contract_artifacts_render_successfully() {
         bundle
             .sdk_sources
             .contains_key("frankenterm_client_rust.rs")
+    );
+    assert!(
+        bundle
+            .sdk_sources
+            .contains_key("frankenterm_client_typescript.ts")
     );
 
     for (filename, source) in &bundle.sdk_sources {

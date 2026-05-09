@@ -109,7 +109,7 @@ Guard surfaces:
 - Guard outcomes currently passed:
   - `scripts/check_no_runtime_regression.sh`
   - `scripts/validate_asupersync_cutover_runtime_guards.sh`
-  - `ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported`
+  - `ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported`
 
 Tuning and large-fleet evidence:
 

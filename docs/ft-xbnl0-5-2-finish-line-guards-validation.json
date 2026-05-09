@@ -1,9 +1,10 @@
 {
   "contract_id": "ft.xbnl0.5.2.finish_line_guards.v1",
   "bead_id": "ft-xbnl0.5.2",
-  "checked_at": "2026-04-19T16:47:27Z",
+  "checked_at": "2026-05-09T21:14:24Z",
   "status": "passed",
   "manifest_path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards.json",
+  "artifact_dir": "/Users/jemanuel/projects/frankenterm/docs/finish-line-guard-artifacts/20260509T211424Z-21438",
   "guards": [
     {
       "guard_id": "no_runtime_regression",
@@ -14,6 +15,7 @@
         "exit_code": 0,
         "report_status": "passed",
         "error_code": "",
+        "log_file": "/Users/jemanuel/projects/frankenterm/docs/finish-line-guard-artifacts/20260509T211424Z-21438/no_runtime_regression.shell.log",
         "log_tail": ""
       }
     },
@@ -26,20 +28,30 @@
         "exit_code": 0,
         "report_status": "passed",
         "error_code": "",
+        "log_file": "/Users/jemanuel/projects/frankenterm/docs/finish-line-guard-artifacts/20260509T211424Z-21438/asupersync_cutover_runtime_guards.shell.log",
         "log_tail": ""
       }
     },
     {
       "guard_id": "fake_sdk_capability_contract",
-      "outcome": "passed",
-      "reason_code": "cargo_test_passed",
+      "outcome": "skipped",
+      "reason_code": "skip_via_FT_XBNL0_5_2_SKIP_CARGO_TEST",
       "detail": {
-        "test_name": "ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported",
-        "test_target": "-p frankenterm-core --lib",
+        "test_name": "ft_xbnl0_3_6_python_rust_and_typescript_sdk_targets_are_finish_line_supported",
+        "skip_reason": "FT_XBNL0_5_2_SKIP_CARGO_TEST=1 set; contributor must run the Cargo test through RCH before relying on this guard."
+      }
+    },
+    {
+      "guard_id": "supported_path_stub_markers",
+      "outcome": "passed",
+      "reason_code": "guard_script_passed",
+      "detail": {
+        "script": "scripts/check_supported_path_stub_markers.sh",
         "exit_code": 0,
-        "cargo_target_dir": "/tmp/ft-jemanuel-target",
-        "openssl_no_vendor": "1",
-        "log_tail": "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:\npackage:   /Users/jemanuel/projects/frankenterm/fuzz/Cargo.toml\nworkspace: /Users/jemanuel/projects/frankenterm/Cargo.toml\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s\n     Running unittests src/lib.rs (/tmp/ft-jemanuel-target/debug/deps/frankenterm_core-c5a1ee8c6df755a6)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 25655 filtered out; finished in 0.00s"
+        "report_status": "passed",
+        "error_code": "",
+        "log_file": "/Users/jemanuel/projects/frankenterm/docs/finish-line-guard-artifacts/20260509T211424Z-21438/supported_path_stub_markers.shell.log",
+        "log_tail": "supported-path stub marker guard passed: 1186 Rust files scanned, 37 classified marker(s), 0 unexpected"
       }
     },
     {
@@ -47,7 +59,7 @@
       "outcome": "passed",
       "reason_code": "artifact_contract_satisfied",
       "detail": {
-        "inspected": 2,
+        "inspected": 0,
         "missing": [],
         "policy": "latest-run-per-scenario",
         "required_structured_log_fields": [

@@ -207,20 +207,29 @@ run_cargo_test_guard() {
     cat "${log_file}" >&2
   fi
 
+  local matched_test_binary=0
+  if grep -Eq '^running [1-9][0-9]* tests?$' "${log_file}"; then
+    matched_test_binary=1
+  fi
+
   local detail
   detail="$(jq -n \
     --arg test "${test_name}" \
     --arg target "${test_target}" \
     --arg rc "${rc}" \
+    --arg matched_test_binary "${matched_test_binary}" \
     --arg cargo_target_dir "${CARGO_TARGET_DIR}" \
     --arg openssl_no_vendor "${OPENSSL_NO_VENDOR:-}" \
     --arg log_file "${log_file}" \
     --arg log_tail "$(tail -20 "${log_file}" | head -c 4000)" \
-    '{test_name: $test, test_target: $target, exit_code: ($rc | tonumber), cargo_target_dir: $cargo_target_dir, openssl_no_vendor: (if $openssl_no_vendor == "" then null else $openssl_no_vendor end), log_file: $log_file, log_tail: $log_tail}')"
+    '{test_name: $test, test_target: $target, exit_code: ($rc | tonumber), matched_test_binary: ($matched_test_binary | tonumber), cargo_target_dir: $cargo_target_dir, openssl_no_vendor: (if $openssl_no_vendor == "" then null else $openssl_no_vendor end), log_file: $log_file, log_tail: $log_tail}')"
 
-  if [[ ${rc} -eq 0 ]]; then
+  if [[ ${rc} -eq 0 && ${matched_test_binary} -eq 1 ]]; then
     append_result "${guard_id}" "passed" "cargo_test_passed" "${detail}"
     return 0
+  elif [[ ${rc} -eq 0 ]]; then
+    append_result "${guard_id}" "failed" "cargo_test_not_found" "${detail}"
+    return 1
   else
     append_result "${guard_id}" "failed" "cargo_test_failed" "${detail}"
     return 1
