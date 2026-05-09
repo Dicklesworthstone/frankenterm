@@ -8362,6 +8362,672 @@ fn robot_fleet_agent_counts(
     (active, idle, stalled)
 }
 
+const ROBOT_FLEET_SCALE_MAX_TARGET: usize = 256;
+
+fn robot_fleet_agent_id(
+    pane_id: u64,
+    entry: &frankenterm_core::agent_correlator::RunningAgentInventoryEntry,
+) -> String {
+    format!("{}:{pane_id}", entry.slug)
+}
+
+fn robot_fleet_scale_delta(target_count: usize, current_count: usize) -> i64 {
+    let target = i64::try_from(target_count).unwrap_or(i64::MAX);
+    let current = i64::try_from(current_count).unwrap_or(i64::MAX);
+    target.saturating_sub(current)
+}
+
+fn robot_fleet_claimed_work_counts(
+    db_path: &str,
+    running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+) -> (BTreeMap<u64, usize>, Option<String>) {
+    let conn = match robot_work_open_conn(db_path) {
+        Ok(conn) => conn,
+        Err(err) => return (BTreeMap::new(), Some(err.to_string())),
+    };
+
+    let mut counts = BTreeMap::new();
+    for (pane_id, entry) in running_agents {
+        let agent_id = robot_fleet_agent_id(*pane_id, entry);
+        let count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_claims WHERE state = 'claimed' AND owner = ?1",
+                [agent_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(robot_work_count)
+            .unwrap_or(0);
+        counts.insert(*pane_id, count);
+    }
+
+    (counts, None)
+}
+
+fn robot_fleet_normalized_program_slug(program: &str) -> String {
+    frankenterm_core::agent_provider::AgentProvider::from_slug(program.trim())
+        .canonical_slug()
+        .to_ascii_lowercase()
+}
+
+fn robot_fleet_scale_step_policy(
+    target_count: usize,
+) -> frankenterm_core::fleet_mutation::FleetMutationPolicyDecision {
+    if target_count > ROBOT_FLEET_SCALE_MAX_TARGET {
+        frankenterm_core::fleet_mutation::FleetMutationPolicyDecision::Deny {
+            reason_code: "scale_target_exceeds_policy_limit".to_string(),
+            message: format!(
+                "requested target_count {target_count} exceeds the fleet scale safety limit of {ROBOT_FLEET_SCALE_MAX_TARGET}"
+            ),
+        }
+    } else {
+        frankenterm_core::fleet_mutation::FleetMutationPolicyDecision::Allow
+    }
+}
+
+fn robot_fleet_scale_spawn_action(
+    program_slug: &str,
+) -> frankenterm_core::fleet_mutation::FleetMutationAction {
+    frankenterm_core::fleet_mutation::FleetMutationAction::SpawnAgent {
+        profile_name: program_slug.to_string(),
+        program: program_slug.to_string(),
+        cwd: None,
+        domain: None,
+        env: BTreeMap::new(),
+    }
+}
+
+fn robot_fleet_scale_base_data(
+    program: &str,
+    program_slug: &str,
+    target_count: usize,
+    dry_run: bool,
+    current_count: usize,
+    running_count: usize,
+    running_error: Option<String>,
+    work_queue_error: Option<String>,
+) -> serde_json::Value {
+    let delta = robot_fleet_scale_delta(target_count, current_count);
+    serde_json::json!({
+        "family": "fleet",
+        "action": "scale",
+        "backend": "native_agent_inventory",
+        "mutation_backend": "fleet_mutation_substrate",
+        "live_cli_contract": "status_scale_rebalance_agents",
+        "requested": {
+            "program": program,
+            "program_slug": program_slug,
+            "target_count": target_count,
+            "dry_run": dry_run,
+        },
+        "current_count": current_count,
+        "target_count": target_count,
+        "delta": delta,
+        "effective_delta": 0i64,
+        "remaining_delta": delta,
+        "selected_targets": [],
+        "skipped_agents": [],
+        "running_inventory": {
+            "ok": running_error.is_none(),
+            "error": running_error,
+            "count": running_count,
+        },
+        "work_queue": {
+            "ok": work_queue_error.is_none(),
+            "error": work_queue_error,
+            "owner_convention": "<program_slug>:<pane_id>",
+        },
+        "policy": {
+            "max_target_count": ROBOT_FLEET_SCALE_MAX_TARGET,
+        },
+        "plan": null,
+        "receipt": null,
+    })
+}
+
+fn robot_fleet_scale_plan(
+    program: &str,
+    target_count: u32,
+    dry_run: bool,
+    running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    running_error: Option<String>,
+    claimed_work_by_pane: &BTreeMap<u64, usize>,
+    work_queue_error: Option<String>,
+) -> (
+    serde_json::Value,
+    Option<frankenterm_core::fleet_mutation::FleetMutationPlan>,
+) {
+    use frankenterm_core::fleet_mutation::{
+        FleetMutationAction, FleetMutationPlan, FleetMutationPolicyDecision, FleetMutationStep,
+    };
+
+    let target_count = usize::try_from(target_count).unwrap_or(usize::MAX);
+    let program_slug = robot_fleet_normalized_program_slug(program);
+    let matching_agents = running_agents
+        .iter()
+        .filter(|(_, entry)| robot_fleet_program_matches_filter(entry, Some(&program_slug)))
+        .collect::<Vec<_>>();
+    let current_count = matching_agents.len();
+    let mut data = robot_fleet_scale_base_data(
+        program,
+        &program_slug,
+        target_count,
+        dry_run,
+        current_count,
+        running_agents.len(),
+        running_error.clone(),
+        work_queue_error.clone(),
+    );
+
+    if running_error.is_some() {
+        data["status"] = serde_json::json!("running_inventory_unavailable");
+        data["reason_code"] = serde_json::json!("running_inventory_unavailable");
+        return (data, None);
+    }
+
+    let delta = robot_fleet_scale_delta(target_count, current_count);
+    let plan_id = format!("fleet-scale:{program_slug}:{current_count}->{target_count}");
+    let policy = robot_fleet_scale_step_policy(target_count);
+    if !policy.is_allow() {
+        data["status"] = serde_json::json!("policy_denied");
+        data["reason_code"] = serde_json::json!("scale_target_exceeds_policy_limit");
+        data["skipped_agents"] = serde_json::json!([{
+            "reason_code": "scale_target_exceeds_policy_limit",
+            "message": format!(
+                "requested target_count {target_count} exceeds the fleet scale safety limit of {ROBOT_FLEET_SCALE_MAX_TARGET}"
+            ),
+        }]);
+        let step = FleetMutationStep {
+            step_id: "policy-target-count".to_string(),
+            action: robot_fleet_scale_spawn_action(&program_slug),
+            policy,
+            compensation: None,
+        };
+        let plan = FleetMutationPlan::new(plan_id, dry_run, vec![step]);
+        data["plan"] = serde_json::to_value(&plan).unwrap_or_else(|err| {
+            serde_json::json!({
+                "serialization_error": err.to_string(),
+            })
+        });
+        return (data, Some(plan));
+    }
+
+    if delta == 0 {
+        data["status"] = serde_json::json!("already_at_target");
+        data["reason_code"] = serde_json::json!("already_at_target");
+        return (data, None);
+    }
+
+    let mut steps = Vec::new();
+    let mut selected_targets = Vec::new();
+    let mut skipped_agents = Vec::new();
+
+    if delta > 0 {
+        let missing = usize::try_from(delta).unwrap_or(usize::MAX);
+        for index in 0..missing {
+            let requested_slot = current_count.saturating_add(index).saturating_add(1);
+            let step_id = format!("spawn-{program_slug}-{requested_slot}");
+            steps.push(FleetMutationStep {
+                step_id: step_id.clone(),
+                action: robot_fleet_scale_spawn_action(&program_slug),
+                policy: FleetMutationPolicyDecision::Allow,
+                compensation: None,
+            });
+            selected_targets.push(serde_json::json!({
+                "operation": "spawn_agent",
+                "step_id": step_id,
+                "program": program_slug,
+                "requested_slot": requested_slot,
+            }));
+        }
+        data["status"] = serde_json::json!("scale_up_plan_created");
+    } else {
+        let excess = usize::try_from(delta.saturating_abs()).unwrap_or(usize::MAX);
+        if work_queue_error.is_some() {
+            for (pane_id, entry) in matching_agents {
+                skipped_agents.push(serde_json::json!({
+                    "pane_id": pane_id,
+                    "agent_id": robot_fleet_agent_id(*pane_id, entry),
+                    "program": entry.slug.clone(),
+                    "state": entry.state.clone(),
+                    "state_bucket": robot_fleet_state_bucket(&entry.state),
+                    "reason_code": "work_queue_unavailable",
+                    "message": "work queue state could not be checked, so scale-down stop is blocked",
+                }));
+            }
+        } else {
+            for (pane_id, entry) in matching_agents {
+                let bucket = robot_fleet_state_bucket(&entry.state);
+                let claimed_work_count = claimed_work_by_pane.get(pane_id).copied().unwrap_or(0);
+                if bucket == "idle" && claimed_work_count == 0 && steps.len() < excess {
+                    let step_id = format!("stop-{program_slug}-pane-{pane_id}");
+                    steps.push(FleetMutationStep {
+                        step_id: step_id.clone(),
+                        action: FleetMutationAction::StopAgent {
+                            pane_id: *pane_id,
+                            reason: format!(
+                                "fleet scale requested target_count {target_count} for {program_slug}"
+                            ),
+                        },
+                        policy: FleetMutationPolicyDecision::Allow,
+                        compensation: Some(robot_fleet_scale_spawn_action(&program_slug)),
+                    });
+                    selected_targets.push(serde_json::json!({
+                        "operation": "stop_agent",
+                        "step_id": step_id,
+                        "pane_id": pane_id,
+                        "agent_id": robot_fleet_agent_id(*pane_id, entry),
+                        "program": entry.slug.clone(),
+                        "state": entry.state.clone(),
+                        "state_bucket": bucket,
+                        "claimed_work_count": claimed_work_count,
+                    }));
+                } else if bucket != "idle" {
+                    skipped_agents.push(serde_json::json!({
+                        "pane_id": pane_id,
+                        "agent_id": robot_fleet_agent_id(*pane_id, entry),
+                        "program": entry.slug.clone(),
+                        "state": entry.state.clone(),
+                        "state_bucket": bucket,
+                        "reason_code": format!("{bucket}_agent_not_eligible"),
+                        "message": "scale-down only stops idle agents",
+                    }));
+                } else if claimed_work_count > 0 {
+                    skipped_agents.push(serde_json::json!({
+                        "pane_id": pane_id,
+                        "agent_id": robot_fleet_agent_id(*pane_id, entry),
+                        "program": entry.slug.clone(),
+                        "state": entry.state.clone(),
+                        "state_bucket": bucket,
+                        "claimed_work_count": claimed_work_count,
+                        "reason_code": "claimed_work_present",
+                        "message": "idle pane still owns claimed work",
+                    }));
+                }
+            }
+        }
+        data["status"] = if steps.is_empty() {
+            serde_json::json!("no_eligible_scale_down_targets")
+        } else if steps.len() < excess {
+            serde_json::json!("scale_down_partial_plan_created")
+        } else {
+            serde_json::json!("scale_down_plan_created")
+        };
+    }
+
+    let effective_delta = if delta > 0 {
+        i64::try_from(steps.len()).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(steps.len()).unwrap_or(i64::MAX)
+    };
+    data["effective_delta"] = serde_json::json!(effective_delta);
+    data["remaining_delta"] = serde_json::json!(delta.saturating_sub(effective_delta));
+    data["selected_targets"] = serde_json::json!(selected_targets);
+    data["skipped_agents"] = serde_json::json!(skipped_agents);
+
+    if steps.is_empty() {
+        return (data, None);
+    }
+
+    let plan = FleetMutationPlan::new(plan_id, dry_run, steps);
+    data["plan"] = serde_json::to_value(&plan).unwrap_or_else(|err| {
+        serde_json::json!({
+            "serialization_error": err.to_string(),
+        })
+    });
+    (data, Some(plan))
+}
+
+fn robot_fleet_scale_data_with_executor<
+    E: frankenterm_core::fleet_mutation::FleetMutationExecutor,
+>(
+    program: &str,
+    target_count: u32,
+    dry_run: bool,
+    running_agents: BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+    running_error: Option<String>,
+    claimed_work_by_pane: BTreeMap<u64, usize>,
+    work_queue_error: Option<String>,
+    ledger: &mut frankenterm_core::fleet_mutation::FleetMutationLedger,
+    executor: &mut E,
+) -> Result<serde_json::Value, frankenterm_core::fleet_mutation::FleetMutationPlanError> {
+    let (mut data, plan) = robot_fleet_scale_plan(
+        program,
+        target_count,
+        dry_run,
+        &running_agents,
+        running_error,
+        &claimed_work_by_pane,
+        work_queue_error,
+    );
+
+    if let Some(plan) = plan {
+        let receipt = ledger.execute_plan(&plan, executor)?;
+        data["receipt"] = serde_json::to_value(&receipt).unwrap_or_else(|err| {
+            serde_json::json!({
+                "serialization_error": err.to_string(),
+            })
+        });
+    }
+
+    Ok(data)
+}
+
+fn robot_fleet_scale_failure(
+    data: &serde_json::Value,
+    dry_run: bool,
+) -> Option<(&'static str, String, Option<String>)> {
+    let status = data
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if status == "running_inventory_unavailable" {
+        return Some((
+            "robot.fleet.inventory_unavailable",
+            "ft robot fleet scale cannot compute a safe delta because running agent inventory is unavailable".to_string(),
+            Some("Retry after the terminal inventory backend is reachable; no fleet mutation was attempted.".to_string()),
+        ));
+    }
+
+    if dry_run {
+        return None;
+    }
+
+    let receipt_status = data
+        .get("receipt")
+        .and_then(|receipt| receipt.get("status"))
+        .and_then(serde_json::Value::as_str);
+    match receipt_status {
+        Some("denied") => {
+            return Some((
+                "robot.fleet.policy_denied",
+                "ft robot fleet scale was denied by policy before any side effect".to_string(),
+                Some("Inspect data.receipt.steps[].policy for the denial reason.".to_string()),
+            ));
+        }
+        Some("approval_required") => {
+            return Some((
+                "robot.fleet.approval_required",
+                "ft robot fleet scale requires approval before any side effect".to_string(),
+                Some("Inspect data.receipt.steps[].policy for the approval request.".to_string()),
+            ));
+        }
+        Some("failed") | Some("compensated") | Some("compensation_failed") => {
+            let code = data
+                .get("receipt")
+                .and_then(|receipt| receipt.get("steps"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|steps| steps.iter().find_map(|step| step.get("error")))
+                .and_then(|error| error.get("error_code"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("robot.fleet.mutation_failed");
+            return Some((
+                if code == "robot.fleet.daemon_unavailable" {
+                    "robot.fleet.daemon_unavailable"
+                } else {
+                    "robot.fleet.mutation_failed"
+                },
+                "ft robot fleet scale mutation did not complete successfully".to_string(),
+                Some(
+                    "Inspect data.receipt for completed, failed, and compensated steps."
+                        .to_string(),
+                ),
+            ));
+        }
+        _ => {}
+    }
+
+    let remaining_delta = data
+        .get("remaining_delta")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    if remaining_delta != 0 {
+        let code = if status == "no_eligible_scale_down_targets" {
+            "robot.fleet.no_eligible_targets"
+        } else {
+            "robot.fleet.target_not_reached"
+        };
+        return Some((
+            code,
+            "ft robot fleet scale could not reach the requested target without unsafe stops"
+                .to_string(),
+            Some("Inspect data.skipped_agents for reason codes; active or claimed-work agents are never stopped silently.".to_string()),
+        ));
+    }
+
+    None
+}
+
+struct RobotFleetMuxExecutor {
+    mux: frankenterm_core::wezterm::MuxHandle,
+}
+
+impl RobotFleetMuxExecutor {
+    fn new(mux: frankenterm_core::wezterm::MuxHandle) -> Self {
+        Self { mux }
+    }
+
+    fn runtime() -> Result<
+        frankenterm_core::runtime_async::Runtime,
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+    > {
+        frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|err| {
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.daemon_unavailable",
+                    format!("failed to build fleet mutation runtime: {err}"),
+                )
+            })
+    }
+
+    fn spawn_agent(
+        &self,
+        profile_name: &str,
+        program: &str,
+        cwd: Option<&str>,
+        domain: Option<&str>,
+        env: &BTreeMap<String, String>,
+    ) -> Result<
+        frankenterm_core::fleet_mutation::FleetMutationStepOutput,
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+    > {
+        use frankenterm_core::runtime_async::CompatRuntime;
+
+        let launch = robot_fleet_launch_script(program, env)?;
+        let runtime = Self::runtime()?;
+        let pane_id = runtime
+            .block_on(self.mux.spawn(cwd, domain))
+            .map_err(|err| {
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.spawn_failed",
+                    format!("failed to spawn fleet agent profile `{profile_name}`: {err}"),
+                )
+            })?;
+
+        if let Err(err) = runtime.block_on(self.mux.send_text(pane_id, &launch)) {
+            let _ = runtime.block_on(self.mux.kill_pane(pane_id));
+            return Err(
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.launch_failed",
+                    format!(
+                        "spawned pane {pane_id} for profile `{profile_name}` but failed to send launch command: {err}"
+                    ),
+                ),
+            );
+        }
+
+        let mut output = frankenterm_core::fleet_mutation::FleetMutationStepOutput {
+            pane_id: Some(pane_id),
+            ..frankenterm_core::fleet_mutation::FleetMutationStepOutput::default()
+        };
+        output
+            .details
+            .insert("profile_name".to_string(), profile_name.to_string());
+        output
+            .details
+            .insert("program".to_string(), program.to_string());
+        if let Some(cwd) = cwd {
+            output.details.insert("cwd".to_string(), cwd.to_string());
+        }
+        if let Some(domain) = domain {
+            output
+                .details
+                .insert("domain".to_string(), domain.to_string());
+        }
+        Ok(output)
+    }
+
+    fn stop_agent(
+        &self,
+        pane_id: u64,
+        reason: &str,
+    ) -> Result<
+        frankenterm_core::fleet_mutation::FleetMutationStepOutput,
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+    > {
+        use frankenterm_core::runtime_async::CompatRuntime;
+
+        let runtime = Self::runtime()?;
+        runtime
+            .block_on(self.mux.kill_pane(pane_id))
+            .map_err(|err| {
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.stop_failed",
+                    format!("failed to stop pane {pane_id} ({reason}): {err}"),
+                )
+            })?;
+
+        let mut output = frankenterm_core::fleet_mutation::FleetMutationStepOutput {
+            pane_id: Some(pane_id),
+            ..frankenterm_core::fleet_mutation::FleetMutationStepOutput::default()
+        };
+        output
+            .details
+            .insert("reason".to_string(), reason.to_string());
+        Ok(output)
+    }
+}
+
+impl frankenterm_core::fleet_mutation::FleetMutationExecutor for RobotFleetMuxExecutor {
+    fn execute_step(
+        &mut self,
+        step: &frankenterm_core::fleet_mutation::FleetMutationStep,
+    ) -> Result<
+        frankenterm_core::fleet_mutation::FleetMutationStepOutput,
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+    > {
+        match &step.action {
+            frankenterm_core::fleet_mutation::FleetMutationAction::SpawnAgent {
+                profile_name,
+                program,
+                cwd,
+                domain,
+                env,
+            } => self.spawn_agent(
+                profile_name,
+                program,
+                cwd.as_deref(),
+                domain.as_deref(),
+                env,
+            ),
+            frankenterm_core::fleet_mutation::FleetMutationAction::StopAgent {
+                pane_id,
+                reason,
+            } => self.stop_agent(*pane_id, reason),
+            frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork { .. } => Err(
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.unsupported_action",
+                    format!(
+                        "ft robot fleet scale cannot execute {} actions",
+                        step.action.family()
+                    ),
+                ),
+            ),
+        }
+    }
+
+    fn compensate_step(
+        &mut self,
+        original: &frankenterm_core::fleet_mutation::FleetMutationStep,
+        compensation: &frankenterm_core::fleet_mutation::FleetMutationAction,
+    ) -> Result<
+        frankenterm_core::fleet_mutation::FleetMutationStepOutput,
+        frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+    > {
+        match compensation {
+            frankenterm_core::fleet_mutation::FleetMutationAction::SpawnAgent {
+                profile_name,
+                program,
+                cwd,
+                domain,
+                env,
+            } => self.spawn_agent(
+                profile_name,
+                program,
+                cwd.as_deref(),
+                domain.as_deref(),
+                env,
+            ),
+            frankenterm_core::fleet_mutation::FleetMutationAction::StopAgent {
+                pane_id,
+                reason,
+            } => self.stop_agent(*pane_id, reason),
+            frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork { .. } => Err(
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.unsupported_compensation",
+                    format!(
+                        "ft robot fleet scale cannot compensate {} on {} with {}",
+                        original.action.family(),
+                        original.action.target_id(),
+                        compensation.family()
+                    ),
+                ),
+            ),
+        }
+    }
+}
+
+fn robot_fleet_launch_script(
+    program: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<String, frankenterm_core::fleet_mutation::FleetMutationExecutionError> {
+    let mut lines = Vec::new();
+    let mut exports = Vec::new();
+    for (key, value) in env {
+        if !robot_fleet_env_key_is_shell_identifier(key) {
+            return Err(
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.validation_failed",
+                    format!("environment key `{key}` is not a shell identifier"),
+                ),
+            );
+        }
+        exports.push(format!("{key}={}", robot_fleet_shell_single_quote(value)));
+    }
+    if !exports.is_empty() {
+        lines.push(format!("export {}", exports.join(" ")));
+    }
+    lines.push(format!("exec {}", robot_fleet_shell_single_quote(program)));
+    Ok(format!("{}\n", lines.join("\n")))
+}
+
+fn robot_fleet_env_key_is_shell_identifier(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn robot_fleet_shell_single_quote(value: &str) -> String {
+    if value.is_empty() {
+        "''".to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn robot_fleet_work_queue_summary(db_path: &str) -> serde_json::Value {
     let conn = match robot_work_open_conn(db_path) {
         Ok(conn) => conn,
@@ -8454,9 +9120,10 @@ fn robot_fleet_status_data(
         "by_program": robot_fleet_program_summaries(&running_agents),
         "work_queue": robot_fleet_work_queue_summary(db_path),
         "mutating_capabilities": {
-            "scale": "capability_unavailable",
+            "scale": "fleet_mutation_substrate",
             "rebalance": "capability_unavailable",
-            "reason": "daemon-side fleet mutation is not wired to native Robot Mode yet",
+            "scale_reason": "ft robot fleet scale computes native plans and executes commit receipts through the mux-backed fleet mutation substrate",
+            "rebalance_reason": "daemon-side fleet rebalance mutation is not wired to native Robot Mode yet",
         },
     });
 
@@ -8598,15 +9265,51 @@ async fn robot_fleet_command_response(
             program,
             target_count,
             dry_run,
-        } => robot_fleet_capability_unavailable(
-            "scale",
-            serde_json::json!({
-                "program": program,
-                "target_count": target_count,
-                "dry_run": dry_run,
-            }),
-            elapsed_ms,
-        ),
+        } => {
+            let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
+            let (claimed_work_by_pane, work_queue_error) =
+                robot_fleet_claimed_work_counts(db_path, &running_agents);
+            let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+            let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+            let mut executor = RobotFleetMuxExecutor::new(mux);
+            match robot_fleet_scale_data_with_executor(
+                program,
+                *target_count,
+                *dry_run,
+                running_agents,
+                running_error,
+                claimed_work_by_pane,
+                work_queue_error,
+                &mut ledger,
+                &mut executor,
+            ) {
+                Ok(data) => {
+                    if let Some((code, message, hint)) = robot_fleet_scale_failure(&data, *dry_run)
+                    {
+                        robot_fleet_error_with_data(code, message, hint, data, elapsed_ms)
+                    } else {
+                        RobotResponse::success(data, elapsed_ms)
+                    }
+                }
+                Err(err) => robot_fleet_error_with_data(
+                    "robot.fleet.plan_error",
+                    format!("ft robot fleet scale could not construct a valid mutation plan: {err}"),
+                    Some("Inspect the request and retry with a fresh idempotency key if this was a replay collision.".to_string()),
+                    serde_json::json!({
+                        "family": "fleet",
+                        "action": "scale",
+                        "backend": "native_agent_inventory",
+                        "requested": {
+                            "program": program,
+                            "target_count": target_count,
+                            "dry_run": dry_run,
+                        },
+                        "error": err,
+                    }),
+                    elapsed_ms,
+                ),
+            }
+        }
         RobotFleetCommands::Rebalance { strategy, dry_run } => robot_fleet_capability_unavailable(
             "rebalance",
             serde_json::json!({
@@ -61583,6 +62286,328 @@ log_level = "debug"
         ));
     }
 
+    fn robot_fleet_test_running_agents(
+        entries: &[(u64, &str, &str)],
+    ) -> BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry> {
+        use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
+
+        entries
+            .iter()
+            .map(|(pane_id, slug, state)| {
+                (
+                    *pane_id,
+                    RunningAgentInventoryEntry {
+                        slug: (*slug).to_string(),
+                        state: (*state).to_string(),
+                        session_id: None,
+                        source: DetectionSource::PaneTitle,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct RobotFleetTestExecutor {
+        executed_steps: Vec<String>,
+        compensated_steps: Vec<String>,
+        fail_on_step: Option<String>,
+        fail_compensation: bool,
+        next_pane_id: u64,
+    }
+
+    impl frankenterm_core::fleet_mutation::FleetMutationExecutor for RobotFleetTestExecutor {
+        fn execute_step(
+            &mut self,
+            step: &frankenterm_core::fleet_mutation::FleetMutationStep,
+        ) -> Result<
+            frankenterm_core::fleet_mutation::FleetMutationStepOutput,
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+        > {
+            if self.fail_on_step.as_deref() == Some(step.step_id.as_str()) {
+                return Err(
+                    frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                        "robot.fleet.test_failure",
+                        format!("forced failure at {}", step.step_id),
+                    ),
+                );
+            }
+
+            self.executed_steps.push(step.step_id.clone());
+            let mut output = frankenterm_core::fleet_mutation::FleetMutationStepOutput::default();
+            if matches!(
+                step.action,
+                frankenterm_core::fleet_mutation::FleetMutationAction::SpawnAgent { .. }
+            ) {
+                let pane_id = if self.next_pane_id == 0 {
+                    900
+                } else {
+                    self.next_pane_id
+                };
+                output.pane_id = Some(pane_id);
+                self.next_pane_id = pane_id.saturating_add(1);
+            }
+            Ok(output)
+        }
+
+        fn compensate_step(
+            &mut self,
+            original: &frankenterm_core::fleet_mutation::FleetMutationStep,
+            _compensation: &frankenterm_core::fleet_mutation::FleetMutationAction,
+        ) -> Result<
+            frankenterm_core::fleet_mutation::FleetMutationStepOutput,
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError,
+        > {
+            if self.fail_compensation {
+                return Err(
+                    frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                        "robot.fleet.test_compensation_failure",
+                        format!("forced compensation failure at {}", original.step_id),
+                    ),
+                );
+            }
+
+            self.compensated_steps.push(original.step_id.clone());
+            Ok(frankenterm_core::fleet_mutation::FleetMutationStepOutput::default())
+        }
+    }
+
+    fn robot_fleet_test_scale_data(
+        program: &str,
+        target_count: u32,
+        dry_run: bool,
+        running_agents: BTreeMap<
+            u64,
+            frankenterm_core::agent_correlator::RunningAgentInventoryEntry,
+        >,
+        claimed_work_by_pane: BTreeMap<u64, usize>,
+        ledger: &mut frankenterm_core::fleet_mutation::FleetMutationLedger,
+        executor: &mut RobotFleetTestExecutor,
+    ) -> serde_json::Value {
+        robot_fleet_scale_data_with_executor(
+            program,
+            target_count,
+            dry_run,
+            running_agents,
+            None,
+            claimed_work_by_pane,
+            None,
+            ledger,
+            executor,
+        )
+        .expect("scale data")
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_up_dry_run_plans_spawn_receipts() {
+        let running_agents = robot_fleet_test_running_agents(&[(1, "codex", "active")]);
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let data = robot_fleet_test_scale_data(
+            "codex-cli",
+            3,
+            true,
+            running_agents,
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "scale_up_plan_created");
+        assert_eq!(data["current_count"].as_u64(), Some(1));
+        assert_eq!(data["target_count"].as_u64(), Some(3));
+        assert_eq!(data["delta"].as_i64(), Some(2));
+        assert_eq!(data["effective_delta"].as_i64(), Some(2));
+        assert_eq!(data["remaining_delta"].as_i64(), Some(0));
+        assert_eq!(data["selected_targets"].as_array().unwrap().len(), 2);
+        assert_eq!(data["receipt"]["status"], "dry_run");
+        assert_eq!(data["receipt"]["steps"].as_array().unwrap().len(), 2);
+        assert!(executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_down_idle_agents_uses_stop_receipts() {
+        let running_agents = robot_fleet_test_running_agents(&[
+            (1, "codex", "idle"),
+            (2, "codex", "idle"),
+            (3, "codex", "working"),
+        ]);
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let data = robot_fleet_test_scale_data(
+            "codex",
+            1,
+            false,
+            running_agents,
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "scale_down_plan_created");
+        assert_eq!(data["effective_delta"].as_i64(), Some(-2));
+        assert_eq!(data["remaining_delta"].as_i64(), Some(0));
+        assert_eq!(data["selected_targets"].as_array().unwrap().len(), 2);
+        assert_eq!(data["skipped_agents"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            data["skipped_agents"][0]["reason_code"],
+            "active_agent_not_eligible"
+        );
+        assert_eq!(data["receipt"]["status"], "succeeded");
+        assert_eq!(data["receipt"]["completed_count"].as_u64(), Some(2));
+        assert!(robot_fleet_scale_failure(&data, false).is_none());
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_down_active_agents_are_skipped() {
+        let running_agents = robot_fleet_test_running_agents(&[(7, "codex", "working")]);
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let data = robot_fleet_test_scale_data(
+            "codex",
+            0,
+            false,
+            running_agents,
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "no_eligible_scale_down_targets");
+        assert_eq!(data["selected_targets"].as_array().unwrap().len(), 0);
+        assert_eq!(data["skipped_agents"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            data["skipped_agents"][0]["reason_code"],
+            "active_agent_not_eligible"
+        );
+        assert_eq!(data["receipt"], serde_json::Value::Null);
+        let (code, _, _) = robot_fleet_scale_failure(&data, false).expect("scale failure");
+        assert_eq!(code, "robot.fleet.no_eligible_targets");
+        assert!(executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_policy_denial_uses_receipt() {
+        let running_agents = robot_fleet_test_running_agents(&[]);
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+        let target_count =
+            u32::try_from(ROBOT_FLEET_SCALE_MAX_TARGET.saturating_add(1)).unwrap_or(u32::MAX);
+
+        let data = robot_fleet_test_scale_data(
+            "codex",
+            target_count,
+            false,
+            running_agents,
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "policy_denied");
+        assert_eq!(data["receipt"]["status"], "denied");
+        assert_eq!(
+            data["receipt"]["steps"][0]["policy"]["reason_code"],
+            "scale_target_exceeds_policy_limit"
+        );
+        let (code, _, _) = robot_fleet_scale_failure(&data, false).expect("scale failure");
+        assert_eq!(code, "robot.fleet.policy_denied");
+        assert!(executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_idempotent_retry_replays_receipt() {
+        let running_agents = robot_fleet_test_running_agents(&[]);
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let first = robot_fleet_test_scale_data(
+            "codex",
+            1,
+            false,
+            running_agents.clone(),
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+        let second = robot_fleet_test_scale_data(
+            "codex",
+            1,
+            false,
+            running_agents,
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(first["receipt"]["status"], "succeeded");
+        assert_eq!(second["receipt"]["status"], "succeeded");
+        assert_eq!(second["receipt"]["idempotent_replay"].as_bool(), Some(true));
+        assert_eq!(executor.executed_steps, vec!["spawn-codex-1".to_string()]);
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_partial_failure_compensates_prior_stops() {
+        let running_agents = robot_fleet_test_running_agents(&[
+            (1, "codex", "idle"),
+            (2, "codex", "idle"),
+            (3, "codex", "idle"),
+        ]);
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor {
+            fail_on_step: Some("stop-codex-pane-2".to_string()),
+            ..RobotFleetTestExecutor::default()
+        };
+
+        let data = robot_fleet_test_scale_data(
+            "codex",
+            0,
+            false,
+            running_agents,
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "scale_down_plan_created");
+        assert_eq!(data["receipt"]["status"], "compensated");
+        assert_eq!(data["receipt"]["steps"][0]["status"], "compensated");
+        assert_eq!(
+            data["receipt"]["steps"][0]["compensation"]["status"],
+            "succeeded"
+        );
+        assert_eq!(data["receipt"]["steps"][1]["status"], "failed");
+        assert_eq!(
+            executor.compensated_steps,
+            vec!["stop-codex-pane-1".to_string()]
+        );
+        let (code, _, _) = robot_fleet_scale_failure(&data, false).expect("scale failure");
+        assert_eq!(code, "robot.fleet.mutation_failed");
+    }
+
+    #[test]
+    fn test_robot_fleet_launch_script_quotes_program_and_env() {
+        let mut env = BTreeMap::new();
+        env.insert("FT_LABEL".to_string(), "fleet's edge".to_string());
+
+        let script = robot_fleet_launch_script("codex; echo no", &env).expect("launch script");
+
+        assert_eq!(
+            script,
+            "export FT_LABEL='fleet'\\''s edge'\nexec 'codex; echo no'\n"
+        );
+        assert!(
+            robot_fleet_launch_script(
+                "codex",
+                &BTreeMap::from([("not-a-key".to_string(), "value".to_string())])
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn test_robot_fleet_status_and_error_toon_roundtrip() {
         use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
@@ -61626,10 +62651,9 @@ log_level = "debug"
         );
 
         let unavailable_resp = robot_fleet_capability_unavailable(
-            "scale",
+            "rebalance",
             serde_json::json!({
-                "program": "codex",
-                "target_count": 2,
+                "strategy": "load_based",
                 "dry_run": true,
             }),
             12,
@@ -61650,7 +62674,7 @@ log_level = "debug"
             "robot.fleet.capability_unavailable"
         );
         assert_eq!(unavailable_roundtrip["data"]["family"], "fleet");
-        assert_eq!(unavailable_roundtrip["data"]["action"], "scale");
+        assert_eq!(unavailable_roundtrip["data"]["action"], "rebalance");
         assert_eq!(
             unavailable_roundtrip["data"]["capability_available"].as_bool(),
             Some(false)
