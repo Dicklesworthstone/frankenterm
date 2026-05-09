@@ -6,13 +6,16 @@ LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
-SCENARIO_ID="ft_54ut8_proof_ledger_redaction_policy"
-CORRELATION_ID="ft-54ut8-${RUN_ID}"
+SCENARIO_ID="ft_kvs1e_proof_ledger_wrapper_policy"
+CORRELATION_ID="ft-kvs1e-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/proof_ledger_policy_${RUN_ID}.jsonl"
 
 VALIDATOR="${ROOT_DIR}/scripts/validate_asupersync_rch_execution_policy.sh"
 POLICY_DOC="${ROOT_DIR}/docs/asupersync-rch-execution-policy.md"
 SCHEMA_DOC="${ROOT_DIR}/docs/asupersync-rch-evidence-schema.json"
+
+# shellcheck source=tests/e2e/lib_rch_guards.sh
+source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
 
 emit_log() {
   local outcome="$1"
@@ -123,7 +126,7 @@ emit_log \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "ft-54ut8 repository proof-ledger redaction policy validation"
+  "ft-kvs1e wrapper-emitted proof-ledger policy validation"
 
 if ! command -v jq >/dev/null 2>&1; then
   emit_log \
@@ -261,9 +264,6 @@ emit_log \
 
 tmp_dir="${LOG_DIR}/asupersync_rch_policy_${RUN_ID}_evidence"
 mkdir -p "${tmp_dir}"
-mock_artifact="${tmp_dir}/mock_rch_policy.jsonl"
-mock_artifact_rel="${mock_artifact#"${ROOT_DIR}"/}"
-printf '{"mock":true}\n' > "${mock_artifact}"
 
 tmp_valid="${tmp_dir}/valid.json"
 tmp_invalid="${tmp_dir}/invalid.json"
@@ -274,6 +274,8 @@ tmp_missing_artifact="${tmp_dir}/missing-artifact.json"
 tmp_missing_is_heavy="${tmp_dir}/missing-is-heavy.json"
 tmp_secret_command="${tmp_dir}/secret-command.json"
 tmp_secret_path="${tmp_dir}/secret-path.json"
+tmp_fallback_record="${tmp_dir}/fallback-required.json"
+tmp_timeout_record="${tmp_dir}/timeout.json"
 tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
 
@@ -323,89 +325,124 @@ emit_log \
   "$(basename "${VALIDATOR}")" \
   "${redacted_summary}"
 
-remote_cmd="rch exec -- cargo check --workspace --all-targets"
-remote_worker="worker=contabo-2"
-remote_target="/tmp/ft-54ut8-rch-target"
-wrapped_cmd="run_rch_cargo_logged target/proof.log env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace"
-wrapped_target="target/rch-proof"
-light_cmd_value="cargo fmt --check"
-light_worker="local"
-light_target="not_applicable"
-artifact_paths_fp="$(artifact_paths_fingerprint "${mock_artifact_rel}")"
-empty_fp="$(fingerprint_text "")"
+_RCH_REPO_ROOT="${ROOT_DIR}"
+wrapper_ledger="${tmp_dir}/wrapper-ledger.jsonl"
+mock_rch_log="${tmp_dir}/wrapper-rch.log"
+cat >"${mock_rch_log}" <<'LOG'
+Selected worker: contabo-2 at 10.0.0.12
+Sync complete: workspace in 42ms
+Remote command finished: exit=0 in 11100ms
+LOG
+rch_write_meta_json "${mock_rch_log}" "0"
+RCH_PROOF_LEDGER_FILE="${wrapper_ledger}" \
+RCH_PROOF_LEDGER_BEAD_ID="ft-kvs1e" \
+RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
+  rch_emit_proof_ledger_entry \
+    "run_rch_cargo_logged ${mock_rch_log} env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace" \
+    "${mock_rch_log}" \
+    "0" \
+    "target/rch-proof" \
+    "retained" \
+    ""
+sed -n '1p' "${wrapper_ledger}" >"${tmp_valid}"
 
-cat > "${tmp_valid}" <<JSON
-{
-  "schema_version": 3,
-  "bead_id": "ft-54ut8",
-  "policy_version": "3.0.0",
-  "runs": [
-    {
-      "timestamp": "2026-02-25T00:00:00Z",
-      "command": "${remote_cmd}",
-      "command_fingerprint": "$(fingerprint_text "${remote_cmd}")",
-      "command_class": "heavy",
-      "is_heavy": true,
-      "used_rch": true,
-      "worker_context": "${remote_worker}",
-      "worker_context_fingerprint": "$(fingerprint_text "${remote_worker}")",
-      "execution_mode": "remote_rch",
-      "target_dir": "${remote_target}",
-      "target_dir_fingerprint": "$(fingerprint_text "${remote_target}")",
-      "target_dir_lifecycle": "retained",
-      "artifact_paths": ["${mock_artifact_rel}"],
-      "artifact_paths_fingerprint": "${artifact_paths_fp}",
-      "elapsed_seconds": 31.4,
-      "exit_status": 0,
-      "residual_risk_notes": "",
-      "residual_risk_notes_fingerprint": "${empty_fp}",
-      "validation_status": "valid"
-    },
-    {
-      "timestamp": "2026-02-25T00:01:00Z",
-      "command": "${wrapped_cmd}",
-      "command_fingerprint": "$(fingerprint_text "${wrapped_cmd}")",
-      "command_class": "heavy",
-      "is_heavy": true,
-      "used_rch": true,
-      "worker_context": "${remote_worker}",
-      "worker_context_fingerprint": "$(fingerprint_text "${remote_worker}")",
-      "execution_mode": "remote_rch",
-      "target_dir": "${wrapped_target}",
-      "target_dir_fingerprint": "$(fingerprint_text "${wrapped_target}")",
-      "target_dir_lifecycle": "retained",
-      "artifact_paths": ["${mock_artifact_rel}"],
-      "artifact_paths_fingerprint": "${artifact_paths_fp}",
-      "elapsed_seconds": 11.1,
-      "exit_status": 0,
-      "residual_risk_notes": "",
-      "residual_risk_notes_fingerprint": "${empty_fp}",
-      "validation_status": "valid"
-    },
-    {
-      "timestamp": "2026-02-25T00:02:00Z",
-      "command": "${light_cmd_value}",
-      "command_fingerprint": "$(fingerprint_text "${light_cmd_value}")",
-      "command_class": "light",
-      "is_heavy": false,
-      "used_rch": false,
-      "worker_context": "${light_worker}",
-      "worker_context_fingerprint": "$(fingerprint_text "${light_worker}")",
-      "execution_mode": "local_light",
-      "target_dir": "${light_target}",
-      "target_dir_fingerprint": "$(fingerprint_text "${light_target}")",
-      "target_dir_lifecycle": "not_applicable",
-      "artifact_paths": ["${mock_artifact_rel}"],
-      "artifact_paths_fingerprint": "${artifact_paths_fp}",
-      "elapsed_seconds": 0.6,
-      "exit_status": 0,
-      "residual_risk_notes": "",
-      "residual_risk_notes_fingerprint": "${empty_fp}",
-      "validation_status": "valid"
-    }
-  ]
-}
-JSON
+while IFS= read -r artifact_path; do
+  if [[ ! -e "${ROOT_DIR}/${artifact_path}" && ! -e "${artifact_path}" ]]; then
+    emit_log \
+      "failed" \
+      "wrapper_ledger" \
+      "artifact_retention" \
+      "missing_artifact" \
+      "artifact_not_retained" \
+      "${artifact_path}" \
+      "wrapper-emitted artifact path must exist"
+    exit 1
+  fi
+done < <(jq -r '.runs[0].artifact_paths[]' "${tmp_valid}")
+
+fallback_log="${tmp_dir}/fallback.log"
+printf '%s\n' "[RCH] local fallback running locally" >"${fallback_log}"
+rch_write_meta_json "${fallback_log}" "0"
+RCH_PROOF_LEDGER_FILE="${wrapper_ledger}" \
+RCH_PROOF_LEDGER_BEAD_ID="ft-kvs1e" \
+RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
+  rch_emit_proof_ledger_entry \
+    "run_rch_cargo_logged ${fallback_log} env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace" \
+    "${fallback_log}" \
+    "0" \
+    "target/rch-proof" \
+    "retained" \
+    "local fallback marker detected"
+tail -n 1 "${wrapper_ledger}" >"${tmp_fallback_record}"
+if [[ "$(jq -r '.runs[0].validation_status' "${tmp_fallback_record}")" != "fallback_required" ]]; then
+  emit_log \
+    "failed" \
+    "wrapper_ledger" \
+    "local_fallback_detection" \
+    "fallback_not_marked" \
+    "unexpected_validation_status" \
+    "$(basename "${tmp_fallback_record}")" \
+    "local fallback record must be marked fallback_required"
+  exit 1
+fi
+expect_validation_failure \
+  "${tmp_fallback_record}" \
+  "wrapper_ledger" \
+  "local_fallback_detection" \
+  "wrapper-emitted local fallback record must not validate as passing proof"
+
+timeout_log="${tmp_dir}/timeout.log"
+printf '%s\n' "Remote command still running" >"${timeout_log}"
+rch_write_meta_json "${timeout_log}" "124"
+RCH_PROOF_LEDGER_FILE="${wrapper_ledger}" \
+RCH_PROOF_LEDGER_BEAD_ID="ft-kvs1e" \
+RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
+  rch_emit_proof_ledger_entry \
+    "run_rch_cargo_logged_with_timeout 1 ${timeout_log} env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace" \
+    "${timeout_log}" \
+    "124" \
+    "target/rch-proof" \
+    "retained" \
+    "timeout fixture"
+tail -n 1 "${wrapper_ledger}" >"${tmp_timeout_record}"
+if [[ "$(jq -r '.runs[0].validation_status' "${tmp_timeout_record}")" != "timeout" ]]; then
+  emit_log \
+    "failed" \
+    "wrapper_ledger" \
+    "timeout_classification" \
+    "timeout_not_marked" \
+    "unexpected_validation_status" \
+    "$(basename "${tmp_timeout_record}")" \
+    "timeout record must be marked timeout"
+  exit 1
+fi
+expect_validation_failure \
+  "${tmp_timeout_record}" \
+  "wrapper_ledger" \
+  "timeout_classification" \
+  "wrapper-emitted timeout record must not validate as passing proof"
+
+if (
+  RCH_PROOF_LEDGER_FILE="${tmp_dir}/missing-metadata.jsonl" \
+  RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
+    rch_emit_proof_ledger_entry \
+      "run_rch_cargo_logged ${mock_rch_log} env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace" \
+      "${mock_rch_log}" \
+      "0" \
+      "target/rch-proof" \
+      "retained" \
+      ""
+) >/dev/null 2>&1; then
+  emit_log \
+    "failed" \
+    "wrapper_ledger" \
+    "missing_bead_metadata" \
+    "missing_metadata_allowed" \
+    "guardrail_not_enforced" \
+    "missing-metadata.jsonl" \
+    "proof-ledger emission without bead metadata must fail"
+  exit 1
+fi
 
 emit_log \
   "running" \
@@ -518,7 +555,8 @@ expect_validation_failure \
   "shell_wrapper_false_proof" \
   "shell wrapper that only mentions RCH must not validate as RCH proof"
 
-missing_artifact_rel="${mock_artifact_rel%/*}/missing.jsonl"
+missing_artifact_rel="${mock_rch_log#"${ROOT_DIR}"/}"
+missing_artifact_rel="${missing_artifact_rel%/*}/missing.jsonl"
 jq --arg missing "${missing_artifact_rel}" \
   --arg artifact_fp "$(artifact_paths_fingerprint "${missing_artifact_rel}")" \
   '.runs[0].artifact_paths = [$missing] |
@@ -657,6 +695,6 @@ emit_log \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "ft-54ut8 proof-ledger policy validation passed"
+  "ft-kvs1e proof-ledger wrapper policy validation passed"
 
-echo "ft-54ut8 proof-ledger policy e2e validation passed. Log: ${LOG_FILE}"
+echo "ft-kvs1e proof-ledger wrapper policy e2e validation passed. Log: ${LOG_FILE}"

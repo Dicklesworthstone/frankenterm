@@ -15,6 +15,7 @@
 #   ensure_rch_ready()         - Preflight: probe workers + smoke cargo check
 #   run_rch_cargo_logged()     - Timeout-wrapped rch cargo with stall/fallback detection
 #   rch_write_meta_json()      - Persist worker/exit/timing metadata for an rch log
+#   rch_emit_proof_ledger_entry() - Optional proof-ledger JSONL emission
 #   check_rch_fallback()       - Fatal if rch entered a fail-open/off-policy path
 #   run_rch()                  - TMPDIR-safe rch wrapper
 #   resolve_timeout_bin()      - Find timeout or gtimeout
@@ -68,6 +69,221 @@ rch_smoke_log_path() {
 
 rch_log_meta_path() {
     printf '%s.rch_meta.json\n' "$1"
+}
+
+rch_proof_ledger_enabled() {
+    [[ -n "${RCH_PROOF_LEDGER_FILE:-}" ]]
+}
+
+rch_proof_ledger_validator() {
+    printf '%s\n' "${RCH_PROOF_LEDGER_VALIDATOR:-${_RCH_REPO_ROOT}/scripts/validate_asupersync_rch_execution_policy.sh}"
+}
+
+rch_proof_ledger_require_config() {
+    local validator
+    validator="$(rch_proof_ledger_validator)"
+
+    [[ -n "${RCH_PROOF_LEDGER_BEAD_ID:-}" ]] || rch_fatal "RCH_PROOF_LEDGER_FILE is set but RCH_PROOF_LEDGER_BEAD_ID is missing."
+    [[ -n "${RCH_PROOF_LEDGER_SCENARIO_ID:-}" ]] || rch_fatal "RCH_PROOF_LEDGER_FILE is set but RCH_PROOF_LEDGER_SCENARIO_ID is missing."
+    [[ -x "${validator}" ]] || rch_fatal "proof-ledger validator is not executable: ${validator}"
+    command -v jq >/dev/null 2>&1 || rch_fatal "jq is required for proof-ledger emission."
+}
+
+rch_repo_relative_path() {
+    local path="$1"
+    if [[ -n "${_RCH_REPO_ROOT}" && "${path}" == "${_RCH_REPO_ROOT}/"* ]]; then
+        printf '%s\n' "${path#"${_RCH_REPO_ROOT}"/}"
+    else
+        printf '%s\n' "${path}"
+    fi
+}
+
+rch_proof_redacted_text() {
+    local text="$1"
+    "$(rch_proof_ledger_validator)" --redact-text "${text}" | jq -r '.redacted'
+}
+
+rch_proof_fingerprint_text() {
+    local text="$1"
+    "$(rch_proof_ledger_validator)" --redact-text "${text}" | jq -r '.fingerprint'
+}
+
+rch_proof_artifact_paths_fingerprint() {
+    local artifact_paths_json="$1"
+    local digest
+
+    if command -v shasum >/dev/null 2>&1; then
+        digest="$(printf '%s' "${artifact_paths_json}" | shasum -a 256 | awk '{print $1}')"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        digest="$(printf '%s' "${artifact_paths_json}" | sha256sum | awk '{print $1}')"
+    else
+        rch_fatal "shasum or sha256sum is required for proof-ledger artifact fingerprints."
+    fi
+
+    printf 'sha256:%s\n' "${digest}"
+}
+
+rch_extract_cargo_target_dir_from_args() {
+    local arg next_is_target_dir="false"
+    for arg in "$@"; do
+        if [[ "${next_is_target_dir}" == "true" ]]; then
+            printf '%s\n' "${arg}"
+            return 0
+        fi
+        case "${arg}" in
+            CARGO_TARGET_DIR=*)
+                printf '%s\n' "${arg#CARGO_TARGET_DIR=}"
+                return 0
+                ;;
+            CARGO_TARGET_DIR)
+                next_is_target_dir="true"
+                ;;
+        esac
+    done
+    printf '%s\n' "not_applicable"
+}
+
+rch_meta_json_field() {
+    local meta_file="$1"
+    local jq_expr="$2"
+    if [[ -f "${meta_file}" ]]; then
+        jq -r "${jq_expr} // \"\"" "${meta_file}" 2>/dev/null || true
+    fi
+}
+
+rch_emit_proof_ledger_entry() {
+    local command_text="$1"
+    local log_file="$2"
+    local wrapper_exit_code="${3:-0}"
+    local target_dir="${4:-not_applicable}"
+    local target_dir_lifecycle="${5:-retained}"
+    local residual_risk_notes="${6:-}"
+
+    rch_proof_ledger_enabled || return 0
+    rch_proof_ledger_require_config
+
+    local validator meta_file log_artifact meta_artifact artifact_paths_json artifact_paths_fingerprint
+    local redacted_command command_fingerprint classified command_class is_heavy used_rch
+    local selected_worker worker_context redacted_worker worker_context_fingerprint
+    local redacted_target target_dir_fingerprint redacted_residual residual_risk_notes_fingerprint
+    local fail_open timed_out remote_duration_ms elapsed_seconds execution_mode validation_status
+    local failure_reason_code failure_reason_detail remote_exit_status
+
+    validator="$(rch_proof_ledger_validator)"
+    meta_file="$(rch_log_meta_path "${log_file}")"
+    log_artifact="$(rch_repo_relative_path "${log_file}")"
+    meta_artifact="$(rch_repo_relative_path "${meta_file}")"
+    artifact_paths_json="$(jq -cn --arg log "${log_artifact}" --arg meta "${meta_artifact}" '[$log, $meta]')"
+    artifact_paths_fingerprint="$(rch_proof_artifact_paths_fingerprint "${artifact_paths_json}")"
+
+    redacted_command="$(rch_proof_redacted_text "${command_text}")"
+    command_fingerprint="$(rch_proof_fingerprint_text "${command_text}")"
+    classified="$("${validator}" --classify "${redacted_command}")"
+    command_class="$(jq -r '.command_class' <<<"${classified}")"
+    is_heavy="$(jq -r '.is_heavy' <<<"${classified}")"
+    used_rch="$(jq -r '.used_rch' <<<"${classified}")"
+
+    selected_worker="$(rch_meta_json_field "${meta_file}" '.selected_worker')"
+    fail_open="$(rch_meta_json_field "${meta_file}" '.fail_open_detected')"
+    timed_out="$(rch_meta_json_field "${meta_file}" '.timed_out')"
+    remote_duration_ms="$(rch_meta_json_field "${meta_file}" '.remote_duration_ms')"
+    failure_reason_code="$(rch_meta_json_field "${meta_file}" '.failure_reason_code')"
+    failure_reason_detail="$(rch_meta_json_field "${meta_file}" '.failure_reason_detail')"
+    remote_exit_status="$(rch_meta_json_field "${meta_file}" '.remote_exit_code')"
+
+    if [[ "${fail_open}" == "true" ]]; then
+        worker_context="local_fallback"
+    elif [[ -n "${selected_worker}" ]]; then
+        worker_context="worker=${selected_worker}"
+    else
+        worker_context="worker=unknown"
+    fi
+    redacted_worker="$(rch_proof_redacted_text "${worker_context}")"
+    worker_context_fingerprint="$(rch_proof_fingerprint_text "${worker_context}")"
+
+    redacted_target="$(rch_proof_redacted_text "${target_dir}")"
+    target_dir_fingerprint="$(rch_proof_fingerprint_text "${target_dir}")"
+    redacted_residual="$(rch_proof_redacted_text "${residual_risk_notes:-${failure_reason_detail}}")"
+    residual_risk_notes_fingerprint="$(rch_proof_fingerprint_text "${residual_risk_notes:-${failure_reason_detail}}")"
+
+    if [[ -n "${remote_duration_ms}" && "${remote_duration_ms}" =~ ^[0-9]+$ ]]; then
+        elapsed_seconds="$(jq -n --arg ms "${remote_duration_ms}" '$ms | tonumber / 1000')"
+    else
+        elapsed_seconds="0"
+    fi
+
+    execution_mode="remote_rch"
+    validation_status="valid"
+    if [[ "${is_heavy}" == "false" && "${used_rch}" == "false" ]]; then
+        execution_mode="local_light"
+    elif [[ "${fail_open}" == "true" ]]; then
+        execution_mode="approved_local_fallback"
+        validation_status="fallback_required"
+        failure_reason_code="${failure_reason_code:-RCH-LOCAL-FALLBACK}"
+    elif [[ "${timed_out}" == "true" ]]; then
+        validation_status="timeout"
+        failure_reason_code="${failure_reason_code:-RCH-REMOTE-STALL}"
+    elif [[ "${wrapper_exit_code}" != "0" ]]; then
+        validation_status="invalid"
+    fi
+
+    if [[ "${remote_exit_status}" =~ ^-?[0-9]+$ ]]; then
+        wrapper_exit_code="${remote_exit_status}"
+    fi
+
+    mkdir -p "$(dirname "${RCH_PROOF_LEDGER_FILE}")"
+    jq -cn \
+        --argjson schema_version 3 \
+        --arg bead_id "${RCH_PROOF_LEDGER_BEAD_ID}" \
+        --arg policy_version "3.0.0" \
+        --arg scenario_id "${RCH_PROOF_LEDGER_SCENARIO_ID}" \
+        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg command "${redacted_command}" \
+        --arg command_fingerprint "${command_fingerprint}" \
+        --arg command_class "${command_class}" \
+        --arg worker_context "${redacted_worker}" \
+        --arg worker_context_fingerprint "${worker_context_fingerprint}" \
+        --arg execution_mode "${execution_mode}" \
+        --arg target_dir "${redacted_target}" \
+        --arg target_dir_fingerprint "${target_dir_fingerprint}" \
+        --arg target_dir_lifecycle "${target_dir_lifecycle}" \
+        --argjson artifact_paths "${artifact_paths_json}" \
+        --arg artifact_paths_fingerprint "${artifact_paths_fingerprint}" \
+        --argjson elapsed_seconds "${elapsed_seconds}" \
+        --argjson exit_status "${wrapper_exit_code}" \
+        --arg residual_risk_notes "${redacted_residual}" \
+        --arg residual_risk_notes_fingerprint "${residual_risk_notes_fingerprint}" \
+        --arg validation_status "${validation_status}" \
+        --arg fallback_reason_code "${failure_reason_code}" \
+        --argjson is_heavy "${is_heavy}" \
+        --argjson used_rch "${used_rch}" \
+        '{
+          schema_version: $schema_version,
+          bead_id: $bead_id,
+          policy_version: $policy_version,
+          scenario_id: $scenario_id,
+          runs: [{
+            timestamp: $timestamp,
+            command: $command,
+            command_fingerprint: $command_fingerprint,
+            command_class: $command_class,
+            is_heavy: $is_heavy,
+            used_rch: $used_rch,
+            worker_context: $worker_context,
+            worker_context_fingerprint: $worker_context_fingerprint,
+            execution_mode: $execution_mode,
+            target_dir: $target_dir,
+            target_dir_fingerprint: $target_dir_fingerprint,
+            target_dir_lifecycle: $target_dir_lifecycle,
+            artifact_paths: $artifact_paths,
+            artifact_paths_fingerprint: $artifact_paths_fingerprint,
+            elapsed_seconds: $elapsed_seconds,
+            exit_status: $exit_status,
+            residual_risk_notes: $residual_risk_notes,
+            residual_risk_notes_fingerprint: $residual_risk_notes_fingerprint,
+            validation_status: $validation_status
+          } + (if $fallback_reason_code == "" then {} else {fallback_reason_code: $fallback_reason_code} end)]
+        }' >>"${RCH_PROOF_LEDGER_FILE}"
 }
 
 rch_write_meta_json() {
@@ -378,6 +594,21 @@ run_rch_cargo_logged_with_timeout() {
     set -e
     stop_rch_fallback_monitor "${monitor_pid}"
     rch_write_meta_json "${output_file}" "${rc}"
+    local target_dir target_dir_lifecycle command_text residual_risk_notes
+    target_dir="$(rch_extract_cargo_target_dir_from_args "$@")"
+    target_dir_lifecycle="retained"
+    if [[ "${target_dir}" == "not_applicable" ]]; then
+        target_dir_lifecycle="not_applicable"
+    fi
+    command_text="run_rch_cargo_logged_with_timeout ${timeout_secs} ${output_file} $*"
+    residual_risk_notes="$(rch_extract_failure_reason_detail "${output_file}")"
+    rch_emit_proof_ledger_entry \
+        "${command_text}" \
+        "${output_file}" \
+        "${rc}" \
+        "${target_dir}" \
+        "${target_dir_lifecycle}" \
+        "${residual_risk_notes}"
 
     check_rch_fallback "${output_file}"
     if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
@@ -429,6 +660,13 @@ ensure_rch_ready() {
     local probe_rc=$?
     set -e
     rch_write_meta_json "${_RCH_PROBE_LOG}" "${probe_rc}"
+    rch_emit_proof_ledger_entry \
+        "rch --json workers probe --all" \
+        "${_RCH_PROBE_LOG}" \
+        "${probe_rc}" \
+        "not_applicable" \
+        "not_applicable" \
+        ""
     if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${_RCH_PROBE_LOG}"; then
         rch_fatal "rch workers are unavailable; refusing local cargo execution. See ${_RCH_PROBE_LOG}"
     fi
@@ -436,6 +674,13 @@ ensure_rch_ready() {
     if [[ "${RCH_SKIP_SMOKE_PREFLIGHT}" == "1" ]]; then
         printf '%s\n' "Smoke preflight skipped because RCH_SKIP_SMOKE_PREFLIGHT=1" >"${_RCH_SMOKE_LOG}"
         rch_write_meta_json "${_RCH_SMOKE_LOG}" "0"
+        rch_emit_proof_ledger_entry \
+            "RCH_SKIP_SMOKE_PREFLIGHT=1 ensure_rch_ready" \
+            "${_RCH_SMOKE_LOG}" \
+            "0" \
+            "not_applicable" \
+            "not_applicable" \
+            "smoke preflight skipped because first material verifier uses run_rch_cargo_logged"
         return 0
     fi
 

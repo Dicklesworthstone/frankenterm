@@ -209,6 +209,22 @@ require_fingerprint() {
   }
 }
 
+require_public_text_fingerprint() {
+  local label="$1"
+  local actual="$2"
+  local public_text="$3"
+
+  fingerprint_is_valid "${actual}" || {
+    echo "${label} must be sha256:<64 lowercase hex chars>" >&2
+    return 1
+  }
+
+  if [[ "${public_text}" != *"[REDACTED"* && "${actual}" != "$(fingerprint_text "${public_text}")" ]]; then
+    echo "${label} mismatch for non-redacted public text" >&2
+    return 1
+  fi
+}
+
 validate_evidence_file() {
   local evidence_file="$1"
 
@@ -282,10 +298,10 @@ validate_evidence_file() {
     require_no_sensitive_text "run[$i] worker_context" "${worker_context}" || return 1
     require_no_sensitive_text "run[$i] target_dir" "${target_dir}" || return 1
     require_no_sensitive_text "run[$i] residual_risk_notes" "${residual_risk_notes}" || return 1
-    require_fingerprint "run[$i] command_fingerprint" "${command_fingerprint}" "$(fingerprint_text "${cmd}")" || return 1
-    require_fingerprint "run[$i] worker_context_fingerprint" "${worker_context_fingerprint}" "$(fingerprint_text "${worker_context}")" || return 1
-    require_fingerprint "run[$i] target_dir_fingerprint" "${target_dir_fingerprint}" "$(fingerprint_text "${target_dir}")" || return 1
-    require_fingerprint "run[$i] residual_risk_notes_fingerprint" "${residual_risk_notes_fingerprint}" "$(fingerprint_text "${residual_risk_notes}")" || return 1
+    require_public_text_fingerprint "run[$i] command_fingerprint" "${command_fingerprint}" "${cmd}" || return 1
+    require_public_text_fingerprint "run[$i] worker_context_fingerprint" "${worker_context_fingerprint}" "${worker_context}" || return 1
+    require_public_text_fingerprint "run[$i] target_dir_fingerprint" "${target_dir_fingerprint}" "${target_dir}" || return 1
+    require_public_text_fingerprint "run[$i] residual_risk_notes_fingerprint" "${residual_risk_notes_fingerprint}" "${residual_risk_notes}" || return 1
     [[ "${declared_command_class}" =~ ^(heavy|light)$ ]] || {
       echo "run[$i] command_class must be heavy or light" >&2
       return 1
@@ -522,7 +538,7 @@ run_self_test() {
   local artifact_paths_fp empty_fp
   remote_cmd="rch exec -- cargo test --workspace"
   remote_worker="worker=mock-1"
-  remote_target="/tmp/ft-54ut8-rch-target"
+  remote_target="/tmp/ft-kvs1e-rch-target"
   light_cmd_value="cargo fmt --check"
   light_worker="local"
   light_target="not_applicable"
@@ -538,7 +554,7 @@ run_self_test() {
   cat > "${tmp_evidence}" <<JSON
 {
   "schema_version": ${SCHEMA_VERSION},
-  "bead_id": "ft-54ut8",
+  "bead_id": "ft-kvs1e",
   "policy_version": "${POLICY_VERSION}",
   "runs": [
     {

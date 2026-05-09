@@ -1,6 +1,6 @@
 # RCH Proof Ledger Execution Policy
 
-**Bead:** `ft-54ut8`
+**Bead:** `ft-kvs1e`
 **Version:** `3.0.0`
 **Status:** Active proof-ledger foundation
 
@@ -136,11 +136,27 @@ E2E policy validation:
 bash tests/e2e/test_asupersync_rch_execution_policy.sh
 ```
 
+Shared RCH wrapper emission is opt-in. Harnesses that source
+`tests/e2e/lib_rch_guards.sh` can set:
+
+```bash
+RCH_PROOF_LEDGER_FILE=tests/e2e/logs/<run>/proof-ledger.jsonl
+RCH_PROOF_LEDGER_BEAD_ID=ft-...
+RCH_PROOF_LEDGER_SCENARIO_ID=<scenario>
+```
+
+When those variables are present, `ensure_rch_ready`,
+`run_rch_cargo_logged`, and `run_rch_cargo_logged_with_timeout` append
+schema-v3 proof-ledger JSONL entries for probe/smoke and remote Cargo logs.
+Successful remote entries validate directly. Fail-open local fallback,
+timeouts, non-zero wrapper exits, missing metadata, or unredacted public fields
+produce entries that are intentionally not valid proof.
+
 The self-test and E2E cover accepted remote proof, rejected local-heavy proof,
 accepted human-approved fallback, light local commands, stale schema versions,
 malformed bead IDs, missing artifacts, missing required booleans, unredacted
-provider tokens, SSH-style secret paths, RCH setup chatter, and shell wrappers
-that mention RCH while running Cargo locally.
+provider tokens, SSH-style secret paths, wrapper-emitted ledger records, RCH
+setup chatter, and shell wrappers that mention RCH while running Cargo locally.
 
 ## User Impact
 
