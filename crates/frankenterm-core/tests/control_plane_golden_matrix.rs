@@ -292,7 +292,7 @@ fn matrix_covers_required_control_plane_surfaces_and_scenarios() {
         "degraded",
         "blocked",
         "policy_required",
-        "capability_unavailable",
+        "backend_unavailable",
         "unsupported",
     ] {
         assert!(
@@ -351,13 +351,57 @@ fn matrix_covers_representative_contract_cases() {
         "matrix must pin require-approval separately from hard denial"
     );
     assert!(
+        matrix.entries.iter().any(|entry| entry.family == "fleet"
+            && entry.action == "scale"
+            && entry.transport == "robot"
+            && entry.format == "json"
+            && entry.status == "ok"
+            && entry
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.pointer("/data/mutation_backend"))
+                .and_then(Value::as_str)
+                == Some("fleet_mutation_substrate")
+            && entry
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.pointer("/data/receipt/status"))
+                .and_then(Value::as_str)
+                == Some("dry_run")),
+        "matrix must pin fleet scale JSON receipts from the live mutation substrate"
+    );
+    assert!(
+        matrix.entries.iter().any(|entry| entry.family == "fleet"
+            && entry.action == "rebalance"
+            && entry.transport == "robot"
+            && entry.format == "toon"
+            && entry.status == "ok"
+            && entry
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.pointer("/data/receipt/status"))
+                .and_then(Value::as_str)
+                == Some("dry_run")),
+        "matrix must pin fleet rebalance TOON parity for live mutation receipts"
+    );
+    assert!(
         matrix
             .entries
             .iter()
-            .any(|entry| entry.scenario == "capability_unavailable"
-                && entry.format == "toon"
-                && entry.expected_code.as_deref() == Some("robot.fleet.capability_unavailable")),
-        "matrix must pin capability-unavailable TOON parity"
+            .any(|entry| entry.scenario == "backend_unavailable"
+                && entry.expected_code.as_deref() == Some("robot.fleet.inventory_unavailable")),
+        "matrix must pin unavailable fleet inventory as a typed backend error"
+    );
+    assert!(
+        matrix.entries.iter().all(|entry| {
+            entry.expected_code.as_deref() != Some("robot.fleet.capability_unavailable")
+                && entry.envelope.as_ref().is_none_or(|envelope| {
+                    !envelope
+                        .to_string()
+                        .contains("robot.fleet.capability_unavailable")
+                })
+        }),
+        "matrix must not keep the retired fleet capability-unavailable stub"
     );
 }
 

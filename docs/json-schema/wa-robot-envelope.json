@@ -19,7 +19,7 @@
     },
     "error_code": {
       "type": "string",
-      "description": "Machine-readable error code for programmatic handling. Present when ok=false. Format: 'robot.<code>' or 'robot.<family>.<code>' (e.g., 'robot.require_approval', 'robot.wezterm_not_running', 'robot.fleet.capability_unavailable').",
+      "description": "Machine-readable error code for programmatic handling. Present when ok=false. Format: 'robot.<code>' or 'robot.<family>.<code>' (e.g., 'robot.require_approval', 'robot.wezterm_not_running', 'robot.fleet.inventory_unavailable').",
       "pattern": "^robot\\.[a-z0-9_]+(?:\\.[a-z0-9_]+)*$"
     },
     "hint": {
@@ -109,7 +109,34 @@
         "robot.profile.not_found",
         "robot.profile.storage",
         "robot.profile.spawn_failed",
-        "robot.fleet.capability_unavailable"
+        "robot.profile.validation_failed",
+        "robot.profile.policy_denied",
+        "robot.profile.require_approval",
+        "robot.profile.daemon_unavailable",
+        "robot.profile.bootstrap_failed",
+        "robot.profile.compensation_failed",
+        "robot.profile.apply_log",
+        "robot.profile.mutation_plan",
+        "robot.fleet.inventory_unavailable",
+        "robot.fleet.work_queue_unavailable",
+        "robot.fleet.policy_denied",
+        "robot.fleet.approval_required",
+        "robot.fleet.daemon_unavailable",
+        "robot.fleet.mutation_failed",
+        "robot.fleet.no_eligible_targets",
+        "robot.fleet.target_not_reached",
+        "robot.fleet.validation_failed",
+        "robot.fleet.work_item_not_found",
+        "robot.fleet.work_item_completed",
+        "robot.fleet.work_item_blocked",
+        "robot.fleet.work_item_approval_blocked",
+        "robot.fleet.work_item_reserved",
+        "robot.fleet.reassign_conflict",
+        "robot.fleet.reassign_failed",
+        "robot.fleet.spawn_failed",
+        "robot.fleet.launch_failed",
+        "robot.fleet.stop_failed",
+        "robot.fleet.plan_error"
       ]
     }
   }

@@ -257,16 +257,20 @@ fn synthetic_namespaced_robot_error_code_validates() {
 
     let envelope = serde_json::json!({
         "ok": false,
-        "error": "fleet mutation is unavailable",
-        "error_code": "robot.fleet.capability_unavailable",
-        "hint": "Use read-only fleet commands until daemon-side mutation is wired.",
+        "error": "fleet inventory is unavailable",
+        "error_code": "robot.fleet.inventory_unavailable",
+        "hint": "Retry after the terminal inventory backend is reachable; no fleet mutation was attempted.",
         "elapsed_ms": 5,
         "version": "0.1.0",
         "now": 1_700_000_000_000_u64,
         "data": {
             "family": "fleet",
             "action": "scale",
-            "capability_available": false
+            "running_inventory": {
+                "ok": false,
+                "error": "inventory backend unreachable",
+                "count": 0
+            }
         }
     });
 

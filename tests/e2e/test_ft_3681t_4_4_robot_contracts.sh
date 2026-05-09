@@ -57,6 +57,24 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
+assert_absent() {
+  local pattern="$1"
+  local reason_code="$2"
+  shift 2
+  local matches
+  if matches=$(grep -n -- "${pattern}" "$@" 2>/dev/null); then
+    emit_log \
+      "failed" \
+      "contract_drift_guard" \
+      "${reason_code}" \
+      "stale_contract_text" \
+      "$(basename "${STDOUT_FILE}")" \
+      "Pattern '${pattern}' still appears in contract docs"
+    printf '%s\n' "${matches}" >&2
+    exit 1
+  fi
+}
+
 run_rch_test() {
   local decision_path="$1"
   local reason_code="$2"
@@ -125,6 +143,27 @@ emit_log \
 
 : > "${STDOUT_FILE}"
 
+assert_absent \
+  "robot.fleet.capability_unavailable" \
+  "fleet_mutation_stub_retired" \
+  "${ROOT_DIR}/README.md" \
+  "${ROOT_DIR}/docs/robot-contracts/fleet.md" \
+  "${ROOT_DIR}/docs/robot-contracts/current-ntm-gap-dispatch.md" \
+  "${ROOT_DIR}/crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json"
+
+assert_absent \
+  "until daemon-side mutation is wired" \
+  "fleet_mutation_stub_phrase_retired" \
+  "${ROOT_DIR}/README.md" \
+  "${ROOT_DIR}/docs/robot-contracts/fleet.md" \
+  "${ROOT_DIR}/docs/robot-contracts/current-ntm-gap-dispatch.md"
+
+assert_absent \
+  "robot.profile.spawn_failed" \
+  "profile_live_apply_spawn_stub_retired" \
+  "${ROOT_DIR}/docs/robot-contracts/current-ntm-gap-dispatch.md" \
+  "${ROOT_DIR}/docs/robot/profile-apply-daemon-handler-integration.md"
+
 run_rch_test \
   "sdk_artifact_exports" \
   "sdk_bundle_validation" \
@@ -140,6 +179,11 @@ run_rch_test \
   "contract_lifecycle_validation" \
   test -p frankenterm-core --lib e2e_ -- --nocapture
 
+run_rch_test \
+  "fleet_mutation_receipts" \
+  "fleet_mutation_contract_validation" \
+  test -p frankenterm --bin ft robot_fleet -- --nocapture
+
 required_markers=(
   "contract_artifact_bundle_renders_deterministic_exports ... ok"
   "contract_artifact_bundle_sdk_sources_include_wire_keys ... ok"
@@ -149,6 +193,14 @@ required_markers=(
   "e2e_replay_contract_suite ... ok"
   "e2e_full_contract_validation ... ok"
   "e2e_contract_with_failures_and_diffs ... ok"
+  "test_robot_fleet_scale_up_dry_run_plans_spawn_receipts ... ok"
+  "test_robot_fleet_scale_down_idle_agents_uses_stop_receipts ... ok"
+  "test_robot_fleet_scale_policy_denial_uses_receipt ... ok"
+  "test_robot_fleet_scale_idempotent_retry_replays_receipt ... ok"
+  "test_robot_fleet_scale_partial_failure_compensates_prior_stops ... ok"
+  "test_robot_fleet_rebalance_load_based_dry_run_moves_overloaded_owner ... ok"
+  "test_robot_fleet_rebalance_idempotent_retry_replays_receipt ... ok"
+  "test_robot_fleet_rebalance_partial_failure_compensates_prior_moves ... ok"
 )
 
 for marker in "${required_markers[@]}"; do
@@ -166,8 +218,8 @@ done
 
 emit_log \
   "passed" \
-  "sdk_exports->contract_exports->replay_validation" \
+  "sdk_exports->contract_exports->replay_validation->fleet_mutation_receipts" \
   "robot_contracts_validated" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "Robot contract artifact rendering, compatibility bundle export, and replay lifecycle validation completed"
+  "Robot contract artifact rendering, compatibility bundle export, replay lifecycle validation, and fleet mutation receipt validation completed"

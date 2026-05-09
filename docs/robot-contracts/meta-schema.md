@@ -8,9 +8,9 @@ apply; `checkpoint` now routes through the native snapshot/session adapter
 with mutating rollback approval-blocked outside `--dry-run`; `context` now
 routes through the native SQLite `pane_contexts` / `context_rotations`
 registry; `work` now routes through the native SQLite `work_claims` queue.
-`fleet` now routes through native read paths and typed fleet capability errors
-for unavailable mutating controls. The current generic NTM-gap fallback set is
-empty.
+`fleet` now routes through native read paths plus live scale/rebalance
+plan-and-receipt paths backed by the fleet mutation substrate. The current
+generic NTM-gap fallback set is empty.
 
 This document is the **single source of truth** for what a "complete"
 robot-family contract looks like. Each family is described by a

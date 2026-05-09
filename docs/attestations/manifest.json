@@ -90,8 +90,8 @@
       "category": "proofs/robot-contracts",
       "path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
       "media_type": "application/json",
-      "produced_by_bead": "ft-q5njp",
-      "description": "Robot/MCP/CLI control-plane golden matrix for schema-backed envelope, policy, and capability contract coverage (G2)."
+      "produced_by_bead": "ft-0elb9",
+      "description": "Robot/MCP/CLI control-plane golden matrix for schema-backed envelopes, live profile/fleet mutation receipts, and backend-unavailable/policy/approval failure contracts (G2; originally introduced under ft-q5njp)."
     },
     {
       "category": "doctrine/agents-md-counts",

@@ -44,6 +44,10 @@ catch common omissions.
    `scripts/attestation-verify.sh` + the smoke test.
    Block tagging if the bundle is partial or any verification
    step fails (ft-187kv).
+   For robot-contract updates, confirm `proofs/robot-contracts`
+   covers the checked-in live profile/fleet mutation receipt matrix
+   and failure envelopes as repository evidence, not as a production
+   deployment claim.
 8. **Run the high-scale release evidence gate.** Ensure
    `cargo test -p frankenterm-core --test large_swarm_replay_corpus release_evidence --no-default-features`
    passes before publishing any 64-core / 256 GiB swarm-performance

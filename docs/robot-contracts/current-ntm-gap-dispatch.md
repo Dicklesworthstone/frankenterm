@@ -11,9 +11,10 @@ native semantics and state-machine proofs.
 
 ## Current Status
 
-`profile` is not part of this gap: list/show/validate and dry-run apply
-dispatch through `robot_profile_handler`; non-dry-run apply returns a typed
-profile spawn error until daemon-side pane spawning lands.
+`profile` is not part of this gap: list/show/validate, dry-run apply, and
+mux-backed non-dry-run apply dispatch through `robot_profile_handler`. Live
+apply failures return typed profile mutation errors for daemon reachability,
+policy, approval, validation, spawn/bootstrap, and compensation failures.
 
 The checkpoint, context, work, and live fleet CLI shapes have graduated from
 the NTM-gap fallback:
@@ -23,7 +24,7 @@ the NTM-gap fallback:
 | `checkpoint` | `save`, `list`, `show`, `delete`, `rollback` | native snapshot/session adapter; rollback mutating execution is approval-blocked unless `--dry-run` is used |
 | `context` | `status`, `rotate`, `history` | native SQLite `pane_contexts` / `context_rotations` registry; rotation receipts are durable, support optional idempotency-key replay, and store metadata without raw conversation content |
 | `work` | `claim`, `release`, `complete`, `list`, `ready`, `assign` | native SQLite `work_claims` queue; claims/assignments are serialized per item and completion is durable |
-| `fleet` | `status`, `scale`, `rebalance`, `agents` | native agent-inventory/work-queue read paths for `status` and `agents`; mutating `scale`/`rebalance` parse natively and return typed `robot.fleet.capability_unavailable` until daemon-side mutation is wired |
+| `fleet` | `status`, `scale`, `rebalance`, `agents` | native agent-inventory/work-queue read paths for `status` and `agents`; mutating `scale`/`rebalance` compute native plans and return dry-run or commit receipts through the fleet mutation substrate |
 
 ## Harness Contract
 
@@ -33,15 +34,16 @@ native-dispatch manifest. It asserts that each listed action parses, emits a
 JSON robot envelope, and does not return the retired
 `robot.not_implemented` fallback. The native assertion intentionally does not
 require success, because a real backend can still return typed errors for
-missing state, unavailable daemons, or denied policy.
+missing state, unavailable inventory/work queues, approval-required mutations,
+unreachable daemons, or denied policy.
 
 The cross-surface Robot/MCP golden matrix lives at
 `crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json`.
 `crates/frankenterm-core/tests/control_plane_golden_matrix.rs` validates that
 matrix for required families, scenarios, checked-in fixture/schema/doc
 references, and proof commands. Use it when updating README or robot-contract
-examples so healthy, degraded, blocked, policy-required, unsupported, and
-capability-unavailable envelopes stay tied to executable proof lanes.
+examples so healthy, degraded, blocked, policy-required, backend-unavailable,
+and unsupported envelopes stay tied to executable proof lanes.
 
 Re-run the live dispatch proof through RCH:
 

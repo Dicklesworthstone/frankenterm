@@ -217,82 +217,369 @@
       "notes": "Pins require-approval as distinct from a hard policy denial."
     },
     {
-      "id": "robot-fleet-scale-json-capability-unavailable",
+      "id": "robot-fleet-scale-json-dry-run-receipt",
       "surface": "robot fleet scale",
       "family": "fleet",
       "action": "scale",
       "transport": "robot",
       "format": "json",
-      "scenario": "capability_unavailable",
-      "status": "error",
-      "expected_code": "robot.fleet.capability_unavailable",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin frankenterm robot_fleet_toon_roundtrip",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_scale_up_dry_run_plans_spawn_receipts -- --nocapture",
       "envelope": {
-        "ok": false,
-        "error": "ft robot fleet scale is parsed natively but daemon-side fleet mutation is not available yet.",
-        "error_code": "robot.fleet.capability_unavailable",
-        "hint": "Use read-only ft robot fleet status or ft robot fleet agents until daemon-side mutation is wired.",
+        "ok": true,
         "data": {
           "family": "fleet",
           "action": "scale",
           "backend": "native_agent_inventory",
-          "capability_available": false,
-          "capability": "daemon_side_fleet_mutation",
+          "mutation_backend": "fleet_mutation_substrate",
+          "live_cli_contract": "status_scale_rebalance_agents",
           "requested": {
             "program": "codex",
+            "program_slug": "codex",
             "target_count": 2,
             "dry_run": true
           },
-          "audit": {
-            "event": "fleet.scale.denied",
-            "reason": "capability_unavailable"
+          "status": "scale_up_plan_created",
+          "current_count": 1,
+          "target_count": 2,
+          "delta": 1,
+          "effective_delta": 1,
+          "remaining_delta": 0,
+          "selected_targets": [
+            {
+              "operation": "spawn_agent",
+              "step_id": "spawn-codex-2",
+              "program": "codex",
+              "requested_slot": 2
+            }
+          ],
+          "skipped_agents": [],
+          "running_inventory": {
+            "ok": true,
+            "error": null,
+            "count": 1
+          },
+          "work_queue": {
+            "ok": true,
+            "error": null,
+            "owner_convention": "<program_slug>:<pane_id>"
+          },
+          "policy": {
+            "max_target_count": 256
+          },
+          "plan": {
+            "plan_id": "fleet-scale:codex:1->2",
+            "idempotency_key": {
+              "key": "rk:0000000000000001",
+              "action": "fleet_mutation_plan"
+            },
+            "payload_fingerprint": {
+              "key": "rk:0000000000000002",
+              "action": "fleet_mutation_plan_payload"
+            },
+            "dry_run": true,
+            "steps": [
+              {
+                "step_id": "spawn-codex-2",
+                "action": {
+                  "kind": "spawn_agent",
+                  "profile_name": "codex",
+                  "program": "codex",
+                  "cwd": null,
+                  "domain": null,
+                  "env": {}
+                },
+                "policy": {
+                  "decision": "allow"
+                },
+                "compensation": null
+              }
+            ]
+          },
+          "receipt": {
+            "plan_id": "fleet-scale:codex:1->2",
+            "idempotency_key": {
+              "key": "rk:0000000000000001",
+              "action": "fleet_mutation_plan"
+            },
+            "payload_fingerprint": {
+              "key": "rk:0000000000000002",
+              "action": "fleet_mutation_plan_payload"
+            },
+            "dry_run": true,
+            "status": "dry_run",
+            "idempotent_replay": false,
+            "completed_count": 0,
+            "failed_count": 0,
+            "compensated_count": 0,
+            "skipped_count": 0,
+            "steps": [
+              {
+                "step_id": "spawn-codex-2",
+                "action": {
+                  "kind": "spawn_agent",
+                  "profile_name": "codex",
+                  "program": "codex",
+                  "cwd": null,
+                  "domain": null,
+                  "env": {}
+                },
+                "target_id": "profile:codex:program:codex",
+                "status": "planned",
+                "policy": {
+                  "decision": "allow"
+                },
+                "idempotency_key": {
+                  "key": "rk:0000000000000003",
+                  "action": "fleet_mutation_step"
+                },
+                "output": null,
+                "error": null,
+                "compensation": null
+              }
+            ]
           }
         },
         "elapsed_ms": 0,
         "version": "0.1.0",
         "now": 0
       },
-      "notes": "Pins the namespaced capability-unavailable code emitted by native fleet mutation stubs."
+      "notes": "Pins a successful fleet scale dry-run receipt from the live mutation substrate."
     },
     {
-      "id": "robot-fleet-scale-toon-capability-unavailable",
+      "id": "robot-fleet-scale-json-inventory-unavailable",
       "surface": "robot fleet scale",
       "family": "fleet",
       "action": "scale",
       "transport": "robot",
-      "format": "toon",
-      "scenario": "capability_unavailable",
+      "format": "json",
+      "scenario": "backend_unavailable",
       "status": "error",
-      "expected_code": "robot.fleet.capability_unavailable",
+      "expected_code": "robot.fleet.inventory_unavailable",
       "fixture": null,
-      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin frankenterm robot_fleet_toon_roundtrip",
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_scale_up_dry_run_plans_spawn_receipts -- --nocapture",
       "envelope": {
         "ok": false,
-        "error": "ft robot fleet scale is parsed natively but daemon-side fleet mutation is not available yet.",
-        "error_code": "robot.fleet.capability_unavailable",
-        "hint": "Use read-only ft robot fleet status or ft robot fleet agents until daemon-side mutation is wired.",
+        "error": "ft robot fleet scale cannot compute a safe delta because running agent inventory is unavailable",
+        "error_code": "robot.fleet.inventory_unavailable",
+        "hint": "Retry after the terminal inventory backend is reachable; no fleet mutation was attempted.",
         "data": {
           "family": "fleet",
           "action": "scale",
           "backend": "native_agent_inventory",
-          "capability_available": false,
-          "capability": "daemon_side_fleet_mutation",
+          "mutation_backend": "fleet_mutation_substrate",
+          "live_cli_contract": "status_scale_rebalance_agents",
           "requested": {
             "program": "codex",
+            "program_slug": "codex",
             "target_count": 2,
             "dry_run": true
           },
-          "audit": {
-            "event": "fleet.scale.denied",
-            "reason": "capability_unavailable"
+          "status": "running_inventory_unavailable",
+          "reason_code": "running_inventory_unavailable",
+          "current_count": 0,
+          "target_count": 2,
+          "delta": 2,
+          "effective_delta": 0,
+          "remaining_delta": 2,
+          "selected_targets": [],
+          "skipped_agents": [],
+          "running_inventory": {
+            "ok": false,
+            "error": "inventory backend unreachable",
+            "count": 0
+          },
+          "work_queue": {
+            "ok": true,
+            "error": null,
+            "owner_convention": "<program_slug>:<pane_id>"
+          },
+          "policy": {
+            "max_target_count": 256
+          },
+          "plan": null,
+          "receipt": null
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins unavailable inventory as a typed backend error without reverting to the retired mutation stub."
+    },
+    {
+      "id": "robot-fleet-rebalance-toon-dry-run-receipt",
+      "surface": "robot fleet rebalance",
+      "family": "fleet",
+      "action": "rebalance",
+      "transport": "robot",
+      "format": "toon",
+      "scenario": "healthy",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm --bin ft test_robot_fleet_status_and_error_toon_roundtrip -- --nocapture",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "family": "fleet",
+          "action": "rebalance",
+          "backend": "native_agent_inventory",
+          "mutation_backend": "fleet_mutation_substrate",
+          "live_cli_contract": "status_scale_rebalance_agents",
+          "requested": {
+            "strategy": "load_based",
+            "strategy_normalized": "load_based",
+            "dry_run": true
+          },
+          "status": "rebalance_plan_created",
+          "strategy": "load_based",
+          "dry_run": true,
+          "items_reassigned": 1,
+          "reassignments": [
+            {
+              "operation": "reassign_work",
+              "step_id": "reassign-load_based-1",
+              "item_id": "ft-a",
+              "from_agent": "codex:1",
+              "to_agent": "codex:2",
+              "reason": "load_based: codex:1 load 2 -> codex:2 load 0",
+              "policy_decision": "allow"
+            }
+          ],
+          "skipped_work_items": [],
+          "agent_loads_before": [
+            {
+              "pane_id": 1,
+              "agent_id": "codex:1",
+              "program": "codex",
+              "state": "active",
+              "state_bucket": "active",
+              "claimed_work_count": 2
+            },
+            {
+              "pane_id": 2,
+              "agent_id": "codex:2",
+              "program": "codex",
+              "state": "idle",
+              "state_bucket": "idle",
+              "claimed_work_count": 0
+            }
+          ],
+          "agent_loads_after": [
+            {
+              "pane_id": 1,
+              "agent_id": "codex:1",
+              "program": "codex",
+              "state": "active",
+              "state_bucket": "active",
+              "claimed_work_count": 1
+            },
+            {
+              "pane_id": 2,
+              "agent_id": "codex:2",
+              "program": "codex",
+              "state": "idle",
+              "state_bucket": "idle",
+              "claimed_work_count": 1
+            }
+          ],
+          "running_inventory": {
+            "ok": true,
+            "error": null,
+            "count": 2
+          },
+          "work_queue": {
+            "ok": true,
+            "error": null,
+            "storage_table": "work_claims",
+            "owner_convention": "<program_slug>:<pane_id>",
+            "rows_scanned": 2
+          },
+          "plan": {
+            "plan_id": "fleet-rebalance:load_based:2-items",
+            "idempotency_key": {
+              "key": "rk:0000000000000011",
+              "action": "fleet_mutation_plan"
+            },
+            "payload_fingerprint": {
+              "key": "rk:0000000000000012",
+              "action": "fleet_mutation_plan_payload"
+            },
+            "dry_run": true,
+            "steps": [
+              {
+                "step_id": "reassign-load_based-1",
+                "action": {
+                  "kind": "reassign_work",
+                  "work_item_id": "ft-a",
+                  "from_agent": "codex:1",
+                  "to_agent": "codex:2",
+                  "reason": "load_based: codex:1 load 2 -> codex:2 load 0"
+                },
+                "policy": {
+                  "decision": "allow"
+                },
+                "compensation": {
+                  "kind": "reassign_work",
+                  "work_item_id": "ft-a",
+                  "from_agent": "codex:2",
+                  "to_agent": "codex:1",
+                  "reason": "rollback load_based: codex:1 load 2 -> codex:2 load 0"
+                }
+              }
+            ]
+          },
+          "receipt": {
+            "plan_id": "fleet-rebalance:load_based:2-items",
+            "idempotency_key": {
+              "key": "rk:0000000000000011",
+              "action": "fleet_mutation_plan"
+            },
+            "payload_fingerprint": {
+              "key": "rk:0000000000000012",
+              "action": "fleet_mutation_plan_payload"
+            },
+            "dry_run": true,
+            "status": "dry_run",
+            "idempotent_replay": false,
+            "completed_count": 0,
+            "failed_count": 0,
+            "compensated_count": 0,
+            "skipped_count": 0,
+            "steps": [
+              {
+                "step_id": "reassign-load_based-1",
+                "action": {
+                  "kind": "reassign_work",
+                  "work_item_id": "ft-a",
+                  "from_agent": "codex:1",
+                  "to_agent": "codex:2",
+                  "reason": "load_based: codex:1 load 2 -> codex:2 load 0"
+                },
+                "target_id": "work:ft-a",
+                "status": "planned",
+                "policy": {
+                  "decision": "allow"
+                },
+                "idempotency_key": {
+                  "key": "rk:0000000000000013",
+                  "action": "fleet_mutation_step"
+                },
+                "output": null,
+                "error": null,
+                "compensation": null
+              }
+            ]
           }
         },
         "elapsed_ms": 0,
         "version": "0.1.0",
         "now": 0
       },
-      "notes": "Pins the decoded TOON envelope for the same capability-unavailable fleet mutation contract."
+      "notes": "Pins decoded TOON parity for a successful fleet rebalance dry-run receipt."
     },
     {
       "id": "robot-agents-json-feature-not-available",

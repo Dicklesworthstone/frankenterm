@@ -32,9 +32,17 @@ The producing-bead column is the source of truth for which work item gates the a
 | `security/distributed-threat-model` | `ft-x0666.3` | G11 |
 | `proofs/loom-runtime-async` | `ft-syqcz.6` | G8 |
 | `proofs/runtime-proof-trait` | `ft-i2eni.1` | G1 |
-| `proofs/robot-contracts` | `ft-q5njp` | G2 |
+| `proofs/robot-contracts` | `ft-0elb9` | G2 |
 | `doctrine/agents-md-counts` | `ft-i2eni.5` | G6 |
 | `doctrine/vendored-provenance` | `ft-i2eni.6` | G15 |
+
+`proofs/robot-contracts` was introduced under `ft-q5njp` and refreshed under
+`ft-0elb9`. It is repository evidence: it attests checked-in schema, golden
+matrix, and test contracts for live profile apply, fleet scale, and fleet
+rebalance receipt shapes plus unavailable, denied, and approval-required
+envelopes. It does not claim those paths have been exercised in a production
+deployment; release-specific production evidence belongs in the signed release
+bundle.
 
 ## Building a bundle
 

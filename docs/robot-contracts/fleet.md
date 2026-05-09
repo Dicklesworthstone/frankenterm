@@ -3,10 +3,11 @@
 **Bead:** [BR-RC-ROBOT-CONTRACT.5] / `ft-hac7w.6`
 **Status:** Native read adapter shipped under `ft-bs9uh.5`. Live
 `RobotCommands::Fleet` dispatches to `robot_fleet_command_response`: `status`
-and `agents` use native agent-inventory/work-queue read paths, while `scale`
-and `rebalance` parse natively and return typed
-`robot.fleet.capability_unavailable` until daemon-side fleet mutation lands.
-The TX-engine-integrated state-space proof remains the mutation substrate.
+and `agents` use native agent-inventory/work-queue read paths, `scale`
+computes spawn/stop plans and executes commit receipts through the mux-backed
+fleet mutation substrate, and `rebalance` computes work-assignment plans and
+executes commit receipts through the `work_claims` mutation substrate. Dry-run
+uses the same plan path and returns a `dry_run` receipt without side effects.
 **Cross-link to `ft-x0666.4`
 (`tx_killswitch_model`):** the kill-switch invariant
 `stop_completes_under_kill_switch_hardstop` reuses that proof's
@@ -19,8 +20,8 @@ pattern.
 |---|---|---|---|
 | `status` | Idempotent | MustNotPartiallyMutate | (read-only) |
 | `agents` | Idempotent | MustNotPartiallyMutate | (read-only) |
-| `scale` | Sequential (daemon mutation unavailable) | Typed `robot.fleet.capability_unavailable`; MustNotPartiallyMutate | (none until daemon mutation is wired) |
-| `rebalance` | Sequential (daemon mutation unavailable) | Typed `robot.fleet.capability_unavailable`; MustNotPartiallyMutate | (none until daemon mutation is wired) |
+| `scale` | Sequential | Typed inventory / policy / approval / plan / mutation errors; failed commits carry receipts and compensate prior side effects | Spawn or stop panes through the mux-backed fleet mutation executor; dry-run is read-only |
+| `rebalance` | Sequential | Typed inventory / work-queue / policy / approval / plan / mutation errors; failed commits carry receipts and compensate prior side effects | Reassign claimed work in `work_claims`; dry-run is read-only |
 
 Concurrency: **PerPaneSerial** — serializable per `fleet_id`,
 parallel across distinct fleets.
@@ -157,8 +158,13 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-ntm-gap \
   robot_checkpoint_context_work_fleet_dispatch_matches_manifest -- --nocapture
 
 # Focused native fleet response tests:
-rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-fleet-backend \
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-0elb9-fleet-backend \
   cargo test -p frankenterm --bin ft robot_fleet -- --nocapture
+
+# Cross-surface Robot/MCP golden matrix:
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-0elb9-golden-matrix \
+  cargo test -p frankenterm-core --test control_plane_golden_matrix \
+  --features vc-export -- --nocapture
 
 # State-machine model:
 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-fleet-core \
@@ -179,8 +185,8 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-fleet-conformance \
 |---|---|
 | Contract at docs/robot-contracts/fleet.md | ✓ |
 | Status/agents wired to native reads | ✓ `status` and `agents` use native inventory/work-queue summaries |
-| Scale/rebalance parse natively | ✓ return typed `robot.fleet.capability_unavailable` until daemon-side mutation is wired |
-| Launch/stop wired through TX engine | ⏳ deferred daemon mutation path; state-machine model is ready and tx_execution.rs is the substrate |
+| Scale/rebalance parse natively | ✓ live plan/receipt paths for dry-run and commit |
+| Launch/stop wired through mutation substrate | ✓ scale uses mux-backed spawn/stop receipts; rebalance uses durable `work_claims` reassignment receipts |
 | Conformance harness with TX kill-switch interleavings | ✓ (cross-links to ft-x0666.4 via stop_completes_under_kill_switch_hardstop invariant + harness test) |
 | E2E example | ✓ README implementation-status examples include status/agents/scale dry-run |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |

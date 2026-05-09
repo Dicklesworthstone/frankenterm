@@ -131,18 +131,17 @@ the same `handle_apply_non_dry_run` function above.
 ## Error variant migration (scope item 4)
 
 The deprecated `ProfileHandlerError::SpawnNotWired` variant was
-removed in favour of typed `SpawnFailed { reason }` handling. The CLI
-translator at `main.rs:23270` maps:
+removed in favour of typed live apply failures. The live CLI apply path
+uses the mux-backed executor and maps daemon, policy, approval,
+validation, bootstrap, and compensation failures into namespaced
+`robot.profile.*` envelopes:
 
 ```rust
 match err {
-    ProfileHandlerError::SpawnFailed { reason } => {
-        // The standalone handler reports robot.profile.spawn_failed.
-        // Future daemon-side typed failures can split this into
-        // storage / timeout / daemon-unreachable codes when those
-        // reason kinds exist.
-        eprintln!("{reason}");
-    }
+    ProfileHandlerError::ApplyFailed { error_code, .. }
+        if error_code == "robot.profile.daemon_unavailable" => { /* daemon hint */ }
+    ProfileHandlerError::ApplyFailed { error_code, .. }
+        if error_code == "robot.profile.bootstrap_failed" => { /* bootstrap hint */ }
     // existing variants unchanged
 }
 ```
