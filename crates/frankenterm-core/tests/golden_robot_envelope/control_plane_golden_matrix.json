@@ -605,6 +605,597 @@
       "notes": "Documents feature-gated robot families that are unavailable in trimmed builds."
     },
     {
+      "id": "robot-batch-get-text-json-focused",
+      "surface": "robot batch-get-text",
+      "family": "get_text",
+      "action": "batch_get_text",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "pane_ids": [1, 2],
+          "tail_lines": 20,
+          "escapes_included": false,
+          "results": {
+            "1": {
+              "status": "ok",
+              "text": "ready",
+              "truncated": false,
+              "truncation_info": null
+            },
+            "2": {
+              "status": "error",
+              "code": "robot.pane_not_found",
+              "message": "pane 2 was not found",
+              "hint": "Run ft robot state to refresh pane ids."
+            }
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the batched get-text data shape separately from the single-pane wa.get_text fixture."
+    },
+    {
+      "id": "robot-search-explain-json-focused",
+      "surface": "robot search-explain",
+      "family": "search",
+      "action": "explain",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "query": "panic",
+          "parser": "fts5",
+          "terms": ["panic"],
+          "plan": {
+            "strategy": "lexical",
+            "uses_semantic": false
+          },
+          "warnings": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins a focused search-explain success envelope for the ApiSurface matrix."
+    },
+    {
+      "id": "robot-search-pipeline-status-json-focused",
+      "surface": "robot search-pipeline-status",
+      "family": "search",
+      "action": "pipeline_status",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "indexed_documents": 12,
+          "pending_documents": 0,
+          "last_commit_epoch_ms": 0,
+          "pipeline_health": "healthy",
+          "backend": "tantivy"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Binds the ApiSurface search-pipeline-status row to the search-index stats response shape."
+    },
+    {
+      "id": "robot-workflow-run-json-focused",
+      "surface": "robot workflow run",
+      "family": "workflow",
+      "action": "run",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "execution_id": "wf-0001",
+          "workflow": "triage",
+          "pane_id": 1,
+          "status": "queued"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the workflow-run success receipt shape."
+    },
+    {
+      "id": "robot-workflow-list-json-focused",
+      "surface": "robot workflow list",
+      "family": "workflow",
+      "action": "list",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "workflows": [
+            {
+              "name": "triage",
+              "enabled": true
+            }
+          ],
+          "count": 1
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the workflow-list success response shape."
+    },
+    {
+      "id": "robot-workflow-status-json-focused",
+      "surface": "robot workflow status",
+      "family": "workflow",
+      "action": "status",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "execution_id": "wf-0001",
+          "workflow": "triage",
+          "status": "running",
+          "current_step": "inspect"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the workflow-status success response shape."
+    },
+    {
+      "id": "robot-workflow-abort-json-focused",
+      "surface": "robot workflow abort",
+      "family": "workflow",
+      "action": "abort",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "execution_id": "wf-0001",
+          "aborted": true,
+          "status": "aborted"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the workflow-abort acknowledgement envelope."
+    },
+    {
+      "id": "robot-rules-lint-json-focused",
+      "surface": "robot rules lint",
+      "family": "rules",
+      "action": "lint",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "valid": true,
+          "warnings": [],
+          "errors": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the rules-lint success envelope."
+    },
+    {
+      "id": "robot-agent-inventory-json-focused",
+      "surface": "robot agents list",
+      "family": "agents",
+      "action": "list",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "inventory": [
+            {
+              "agent_id": "codex:1",
+              "status": "running",
+              "pane_id": 1
+            }
+          ],
+          "count": 1
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins an agent inventory success envelope in addition to the feature-gated error fixture."
+    },
+    {
+      "id": "robot-agent-configure-json-focused",
+      "surface": "robot agents configure",
+      "family": "agents",
+      "action": "configure",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "agent_id": "codex:1",
+          "dry_run": true,
+          "changed": false,
+          "applied": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the dry-run agent configure acknowledgement shape."
+    },
+    {
+      "id": "robot-accounts-list-json-focused",
+      "surface": "robot accounts list",
+      "family": "accounts",
+      "action": "list",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "accounts": [
+            {
+              "account_id": "local",
+              "status": "available"
+            }
+          ],
+          "count": 1
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the accounts-list success envelope."
+    },
+    {
+      "id": "robot-accounts-refresh-json-focused",
+      "surface": "robot accounts refresh",
+      "family": "accounts",
+      "action": "refresh",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "refreshed": true,
+          "account_count": 1,
+          "warnings": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the accounts-refresh success envelope."
+    },
+    {
+      "id": "robot-reserve-json-focused",
+      "surface": "robot reservations reserve",
+      "family": "reservations",
+      "action": "reserve",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "reservation_id": "res-0001",
+          "resource": "pane:1",
+          "status": "reserved",
+          "expires_at_ms": 0
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the reservation-create success envelope."
+    },
+    {
+      "id": "robot-release-json-focused",
+      "surface": "robot reservations release",
+      "family": "reservations",
+      "action": "release",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "reservation_id": "res-0001",
+          "released": true,
+          "status": "released"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the reservation-release success envelope."
+    },
+    {
+      "id": "robot-replay-inspect-json-focused",
+      "surface": "robot replay inspect",
+      "family": "replay",
+      "action": "inspect",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "artifact": "fixtures/replay/minimal.json",
+          "format_version": 1,
+          "event_count": 3,
+          "duration_ms": 0,
+          "metadata": {
+            "source": "golden"
+          }
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the stable replay-inspect data subset."
+    },
+    {
+      "id": "robot-replay-regression-json-focused",
+      "surface": "robot replay regression",
+      "family": "replay",
+      "action": "regression",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "suite": "minimal",
+          "verdict": "pass",
+          "case_count": 1,
+          "failed_count": 0,
+          "cases": [
+            {
+              "name": "startup",
+              "verdict": "pass"
+            }
+          ]
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the replay-regression summary envelope."
+    },
+    {
+      "id": "robot-health-json-focused",
+      "surface": "robot health",
+      "family": "diagnostics",
+      "action": "health",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "health_level": "green",
+          "summary": "healthy",
+          "snapshot_at": 0,
+          "observed_panes": 1,
+          "capture_queue_depth": 0,
+          "write_queue_depth": 0,
+          "ingest_lag_avg_ms": 0,
+          "ingest_lag_max_ms": 0,
+          "db_writable": true,
+          "restart_count": 0,
+          "consecutive_crashes": 0,
+          "in_crash_loop": false,
+          "current_backoff_ms": 0,
+          "leak_risk": {
+            "level": "low"
+          },
+          "warnings": [],
+          "guidance": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the diagnostics health success envelope and data subset."
+    },
+    {
+      "id": "robot-coordination-risk-json-focused",
+      "surface": "robot coordination-risk",
+      "family": "diagnostics",
+      "action": "coordination_risk",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "risk_level": "low",
+          "conflicts": [],
+          "recommended_actions": []
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins a coordination-risk success envelope alongside the dedicated schema artifact."
+    },
+    {
+      "id": "robot-quickstart-json-focused",
+      "surface": "robot quickstart",
+      "family": "meta",
+      "action": "quickstart",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "commands": [
+            "ft robot state",
+            "ft robot get-text 1"
+          ],
+          "default_format": "json"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the quickstart metadata envelope."
+    },
+    {
+      "id": "robot-why-json-focused",
+      "surface": "robot why",
+      "family": "meta",
+      "action": "why",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "code": "robot.policy_denied",
+          "meaning": "The requested operation was denied by policy.",
+          "remediation": "Review policy and request approval if appropriate."
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the why metadata explanation envelope."
+    },
+    {
+      "id": "robot-approve-json-focused",
+      "surface": "robot approve",
+      "family": "meta",
+      "action": "approve",
+      "transport": "robot",
+      "format": "json",
+      "scenario": "focused_backfill",
+      "status": "ok",
+      "expected_code": null,
+      "fixture": null,
+      "proof_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bsfb9-5 cargo test -p frankenterm-core --test control_plane_golden_matrix",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "approval_id": "appr-0001",
+          "approved": true,
+          "status": "approved"
+        },
+        "elapsed_ms": 0,
+        "version": "0.1.0",
+        "now": 0
+      },
+      "notes": "Pins the approval acknowledgement envelope."
+    },
+    {
       "id": "contract-profile-list",
       "surface": "ft.profile.list",
       "family": "profile",

@@ -235,6 +235,18 @@ impl SchemaRegistry {
                     since: "0.1.0".into(),
                 },
                 EndpointMeta {
+                    id: "api_surface_data_schemas".into(),
+                    title: "Robot ApiSurface Supplemental Data Schemas".into(),
+                    description:
+                        "Schema bundle for ApiSurface data payloads tracked by the coverage matrix"
+                            .into(),
+                    robot_command: None,
+                    mcp_tool: None,
+                    schema_file: "wa-robot-api-surface-data-schemas.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
                     id: "state".into(),
                     title: "Pane State".into(),
                     description: "Get all observed panes as structured data".into(),

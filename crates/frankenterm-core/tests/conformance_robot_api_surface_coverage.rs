@@ -376,6 +376,28 @@ fn api_surface_coverage_artifacts_exist_or_name_deferred_bead() {
 }
 
 #[test]
+fn api_surface_coverage_matrix_has_no_remaining_ft_luisq_deferrals() {
+    let matrix = load_matrix();
+    let rows = parse_rows(&matrix)
+        .unwrap_or_else(|errors| panic!("failed to parse coverage matrix:\n{}", errors.join("\n")));
+
+    let deferred_rows: Vec<String> = rows
+        .iter()
+        .filter(|row| {
+            row.schema_artifact.contains(FOLLOW_UP_BEAD)
+                || row.golden_artifact.contains(FOLLOW_UP_BEAD)
+                || row.status.contains(FOLLOW_UP_BEAD)
+        })
+        .map(|row| row.surface.clone())
+        .collect();
+
+    assert!(
+        deferred_rows.is_empty(),
+        "{FOLLOW_UP_BEAD} is complete; remove deferred artifact markers from rows: {deferred_rows:?}"
+    );
+}
+
+#[test]
 fn matrix_parser_rejects_omitted_surface() {
     let markdown = r#"
 ## Matrix

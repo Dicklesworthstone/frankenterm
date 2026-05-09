@@ -1,0 +1,370 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-api-surface-data-schemas.json",
+  "title": "WA Robot ApiSurface Supplemental Data Schemas",
+  "description": "Supplemental data-schema bundle for Robot ApiSurface rows whose stable payloads are tracked through shared contract matrices rather than one schema file per command.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/batch_get_text" },
+    { "$ref": "#/$defs/mission_state" },
+    { "$ref": "#/$defs/mission_decisions" },
+    { "$ref": "#/$defs/tx_plan" },
+    { "$ref": "#/$defs/tx_run" },
+    { "$ref": "#/$defs/tx_rollback" },
+    { "$ref": "#/$defs/tx_show" },
+    { "$ref": "#/$defs/replay_inspect" },
+    { "$ref": "#/$defs/replay_diff" },
+    { "$ref": "#/$defs/replay_regression" },
+    { "$ref": "#/$defs/health" }
+  ],
+  "$defs": {
+    "pane_text_result": {
+      "description": "Per-pane result in a batch pane-text read.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "text"],
+          "properties": {
+            "status": { "const": "ok" },
+            "text": { "type": "string" },
+            "truncated": { "type": "boolean" },
+            "truncation_info": {
+              "type": ["object", "null"],
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["status", "code", "message"],
+          "properties": {
+            "status": { "const": "error" },
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "hint": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "batch_get_text": {
+      "type": "object",
+      "required": ["pane_ids", "tail_lines", "escapes_included", "results"],
+      "properties": {
+        "pane_ids": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "tail_lines": { "type": "integer", "minimum": 0 },
+        "escapes_included": { "type": "boolean" },
+        "results": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/pane_text_result" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "mission_state": {
+      "type": "object",
+      "required": [
+        "mission_file",
+        "mission_id",
+        "title",
+        "mission_hash",
+        "lifecycle_state",
+        "mission_matches_filter",
+        "candidate_count",
+        "assignment_count",
+        "matched_assignment_count",
+        "returned_assignment_count",
+        "filters",
+        "assignment_counters",
+        "available_transitions",
+        "assignments"
+      ],
+      "properties": {
+        "mission_file": { "type": "string" },
+        "mission_id": { "type": "string" },
+        "title": { "type": "string" },
+        "mission_hash": { "type": "string" },
+        "lifecycle_state": { "type": "string" },
+        "mission_matches_filter": { "type": "boolean" },
+        "candidate_count": { "type": "integer", "minimum": 0 },
+        "assignment_count": { "type": "integer", "minimum": 0 },
+        "matched_assignment_count": { "type": "integer", "minimum": 0 },
+        "returned_assignment_count": { "type": "integer", "minimum": 0 },
+        "filters": { "type": "object", "additionalProperties": true },
+        "assignment_counters": { "type": "object", "additionalProperties": true },
+        "available_transitions": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "assignments": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "additionalProperties": false
+    },
+    "mission_decisions": {
+      "type": "object",
+      "required": [
+        "mission_file",
+        "mission_id",
+        "title",
+        "mission_hash",
+        "lifecycle_state",
+        "mission_matches_filter",
+        "candidate_count",
+        "assignment_count",
+        "matched_assignment_count",
+        "returned_assignment_count",
+        "filters",
+        "available_transitions",
+        "failure_catalog",
+        "decisions"
+      ],
+      "properties": {
+        "mission_file": { "type": "string" },
+        "mission_id": { "type": "string" },
+        "title": { "type": "string" },
+        "mission_hash": { "type": "string" },
+        "lifecycle_state": { "type": "string" },
+        "mission_matches_filter": { "type": "boolean" },
+        "candidate_count": { "type": "integer", "minimum": 0 },
+        "assignment_count": { "type": "integer", "minimum": 0 },
+        "matched_assignment_count": { "type": "integer", "minimum": 0 },
+        "returned_assignment_count": { "type": "integer", "minimum": 0 },
+        "filters": { "type": "object", "additionalProperties": true },
+        "available_transitions": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "failure_catalog": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "decisions": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "additionalProperties": false
+    },
+    "tx_plan": {
+      "type": "object",
+      "required": [
+        "plan_id",
+        "plan_hash",
+        "steps",
+        "execution_order",
+        "parallel_levels",
+        "risk_summary",
+        "rejected_edges"
+      ],
+      "properties": {
+        "plan_id": { "type": "string" },
+        "plan_hash": { "type": "integer", "minimum": 0 },
+        "steps": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "execution_order": { "type": "array", "items": { "type": "string" } },
+        "parallel_levels": {
+          "type": "array",
+          "items": { "type": "array", "items": { "type": "string" } }
+        },
+        "risk_summary": { "type": "object", "additionalProperties": true },
+        "rejected_edges": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "additionalProperties": false
+    },
+    "tx_run": {
+      "type": "object",
+      "required": [
+        "execution_id",
+        "plan_id",
+        "plan_hash",
+        "phase",
+        "step_count",
+        "completed_count",
+        "failed_count",
+        "skipped_count",
+        "records",
+        "chain_verification"
+      ],
+      "properties": {
+        "execution_id": { "type": "string" },
+        "plan_id": { "type": "string" },
+        "plan_hash": { "type": "integer", "minimum": 0 },
+        "phase": { "type": "string" },
+        "step_count": { "type": "integer", "minimum": 0 },
+        "completed_count": { "type": "integer", "minimum": 0 },
+        "failed_count": { "type": "integer", "minimum": 0 },
+        "skipped_count": { "type": "integer", "minimum": 0 },
+        "records": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "chain_verification": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": false
+    },
+    "tx_rollback": {
+      "type": "object",
+      "required": [
+        "execution_id",
+        "plan_id",
+        "phase",
+        "compensated_steps",
+        "failed_compensations",
+        "total_compensated",
+        "total_failed",
+        "chain_verification"
+      ],
+      "properties": {
+        "execution_id": { "type": "string" },
+        "plan_id": { "type": "string" },
+        "phase": { "type": "string" },
+        "compensated_steps": { "type": "array", "items": { "type": "string" } },
+        "failed_compensations": { "type": "array", "items": { "type": "string" } },
+        "total_compensated": { "type": "integer", "minimum": 0 },
+        "total_failed": { "type": "integer", "minimum": 0 },
+        "chain_verification": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": false
+    },
+    "tx_show": {
+      "type": "object",
+      "required": [
+        "execution_id",
+        "plan_id",
+        "plan_hash",
+        "phase",
+        "classification",
+        "step_count",
+        "record_count",
+        "high_risk_count",
+        "critical_risk_count",
+        "overall_risk",
+        "chain_intact",
+        "timeline",
+        "records",
+        "redacted_field_count"
+      ],
+      "properties": {
+        "execution_id": { "type": "string" },
+        "plan_id": { "type": "string" },
+        "plan_hash": { "type": "integer", "minimum": 0 },
+        "phase": { "type": "string" },
+        "classification": { "type": "string" },
+        "step_count": { "type": "integer", "minimum": 0 },
+        "record_count": { "type": "integer", "minimum": 0 },
+        "high_risk_count": { "type": "integer", "minimum": 0 },
+        "critical_risk_count": { "type": "integer", "minimum": 0 },
+        "overall_risk": { "type": "string" },
+        "chain_intact": { "type": "boolean" },
+        "timeline": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "resume": { "type": ["object", "null"], "additionalProperties": true },
+        "records": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "redacted_field_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "replay_inspect": {
+      "type": "object",
+      "required": ["artifact", "format_version", "event_count", "duration_ms"],
+      "properties": {
+        "artifact": { "type": "string" },
+        "format_version": { "type": "integer", "minimum": 0 },
+        "event_count": { "type": "integer", "minimum": 0 },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "metadata": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": false
+    },
+    "replay_diff": {
+      "type": "object",
+      "required": ["baseline", "candidate", "verdict", "diff_count"],
+      "properties": {
+        "baseline": { "type": "string" },
+        "candidate": { "type": "string" },
+        "verdict": { "type": "string" },
+        "diff_count": { "type": "integer", "minimum": 0 },
+        "diffs": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "additionalProperties": false
+    },
+    "replay_regression": {
+      "type": "object",
+      "required": ["suite", "verdict", "case_count", "failed_count"],
+      "properties": {
+        "suite": { "type": "string" },
+        "verdict": { "type": "string" },
+        "case_count": { "type": "integer", "minimum": 0 },
+        "failed_count": { "type": "integer", "minimum": 0 },
+        "cases": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "additionalProperties": false
+    },
+    "health": {
+      "type": "object",
+      "required": [
+        "health_level",
+        "summary",
+        "snapshot_at",
+        "observed_panes",
+        "capture_queue_depth",
+        "write_queue_depth",
+        "ingest_lag_avg_ms",
+        "ingest_lag_max_ms",
+        "db_writable",
+        "restart_count",
+        "consecutive_crashes",
+        "in_crash_loop",
+        "current_backoff_ms",
+        "leak_risk"
+      ],
+      "properties": {
+        "health_level": { "type": "string" },
+        "summary": { "type": "string" },
+        "snapshot_at": { "type": "integer", "minimum": 0 },
+        "observed_panes": { "type": "integer", "minimum": 0 },
+        "capture_queue_depth": { "type": "integer", "minimum": 0 },
+        "write_queue_depth": { "type": "integer", "minimum": 0 },
+        "ingest_lag_avg_ms": { "type": "number", "minimum": 0 },
+        "ingest_lag_max_ms": { "type": "integer", "minimum": 0 },
+        "db_writable": { "type": "boolean" },
+        "backpressure_tier": { "type": "string" },
+        "fleet_pressure_tier": { "type": "string" },
+        "restart_count": { "type": "integer", "minimum": 0 },
+        "consecutive_crashes": { "type": "integer", "minimum": 0 },
+        "in_crash_loop": { "type": "boolean" },
+        "current_backoff_ms": { "type": "integer", "minimum": 0 },
+        "leak_risk": { "type": "object", "additionalProperties": true },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "guidance": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
