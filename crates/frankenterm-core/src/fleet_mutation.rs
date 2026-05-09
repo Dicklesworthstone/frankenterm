@@ -284,9 +284,33 @@ pub struct FleetMutationReceipt {
 }
 
 impl FleetMutationReceipt {
-    fn replay(mut self) -> Self {
+    #[must_use]
+    pub fn replay(mut self) -> Self {
         self.idempotent_replay = true;
         self
+    }
+
+    fn refresh_counts(&mut self) {
+        self.completed_count = self
+            .steps
+            .iter()
+            .filter(|step| matches!(step.status, FleetMutationStepStatus::Succeeded))
+            .count();
+        self.failed_count = self
+            .steps
+            .iter()
+            .filter(|step| matches!(step.status, FleetMutationStepStatus::Failed))
+            .count();
+        self.compensated_count = self
+            .steps
+            .iter()
+            .filter(|step| matches!(step.status, FleetMutationStepStatus::Compensated))
+            .count();
+        self.skipped_count = self
+            .steps
+            .iter()
+            .filter(|step| matches!(step.status, FleetMutationStepStatus::Skipped))
+            .count();
     }
 }
 
@@ -617,6 +641,62 @@ fn receipt_with_counts(
 
 fn compensation_failed(compensation: Option<&FleetMutationCompensationReceipt>) -> bool {
     compensation.is_some_and(|receipt| receipt.status == FleetMutationCompensationStatus::Failed)
+}
+
+/// Compensate successful side effects from an already-built receipt.
+///
+/// Durable receipt writers call this after a plan executed but the receipt
+/// could not be persisted. The receipt remains the forensic payload returned to
+/// Robot/MCP callers, with any successful rollback attempts attached to the
+/// original step receipts.
+#[must_use]
+pub fn compensate_committed_receipt<E: FleetMutationExecutor>(
+    plan: &FleetMutationPlan,
+    mut receipt: FleetMutationReceipt,
+    executor: &mut E,
+) -> FleetMutationReceipt {
+    if receipt.dry_run
+        || matches!(
+            receipt.status,
+            FleetMutationReceiptStatus::DryRun
+                | FleetMutationReceiptStatus::Denied
+                | FleetMutationReceiptStatus::ApprovalRequired
+                | FleetMutationReceiptStatus::Compensated
+                | FleetMutationReceiptStatus::CompensationFailed
+        )
+    {
+        return receipt;
+    }
+
+    let succeeded_indexes = receipt
+        .steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            (step.status == FleetMutationStepStatus::Succeeded).then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    if succeeded_indexes.is_empty() {
+        receipt.status = FleetMutationReceiptStatus::Failed;
+        receipt.refresh_counts();
+        return receipt;
+    }
+
+    compensate_successes(plan, executor, &mut receipt.steps, &succeeded_indexes);
+    receipt.status = if receipt
+        .steps
+        .iter()
+        .any(|step| compensation_failed(step.compensation.as_ref()))
+    {
+        FleetMutationReceiptStatus::CompensationFailed
+    } else if receipt.steps.iter().any(|step| step.compensation.is_some()) {
+        FleetMutationReceiptStatus::Compensated
+    } else {
+        FleetMutationReceiptStatus::Failed
+    };
+    receipt.refresh_counts();
+    receipt
 }
 
 fn stable_json<T: Serialize>(value: &T) -> String {

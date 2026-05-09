@@ -1499,6 +1499,35 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
              DROP TABLE IF EXISTS profiles_applied_log;",
         ),
     },
+    // ft-27rlg: durable fleet mutation receipts for non-dry-run
+    // `ft robot fleet scale` and `ft robot fleet rebalance`. The
+    // in-memory FleetMutationLedger still executes and builds typed
+    // receipts; this table records the completed receipt keyed by the
+    // plan idempotency key so a fresh CLI/daemon process can replay
+    // identical requests and reject same-key/different-payload retries
+    // before side effects.
+    Migration {
+        version: 27,
+        description: "Add fleet_mutation_receipts table for durable fleet scale/rebalance \
+                      idempotency (ft-27rlg)",
+        up_sql: r"
+        CREATE TABLE IF NOT EXISTS fleet_mutation_receipts (
+            idempotency_key     TEXT PRIMARY KEY NOT NULL,
+            payload_fingerprint TEXT NOT NULL,
+            action              TEXT NOT NULL,
+            plan_id             TEXT NOT NULL,
+            dry_run             INTEGER NOT NULL DEFAULT 0,
+            receipt_json        TEXT NOT NULL,
+            recorded_at_ms      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS fleet_mutation_receipts_action_time_idx
+            ON fleet_mutation_receipts(action, recorded_at_ms DESC);
+        ",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS fleet_mutation_receipts_action_time_idx;
+             DROP TABLE IF EXISTS fleet_mutation_receipts;",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -2925,6 +2954,32 @@ mod tests {
         let down = m25.down_sql.expect("down_sql must be supported");
         assert!(down.contains("DROP INDEX IF EXISTS agent_profiles_role_idx"));
         assert!(down.contains("DROP TABLE IF EXISTS agent_profiles"));
+    }
+
+    #[test]
+    fn fleet_mutation_receipts_migration_entry_present_at_version_27() {
+        let m27 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 27)
+            .expect("version 27 migration must be registered");
+        assert!(
+            m27.description.contains("fleet_mutation_receipts"),
+            "description must reference fleet_mutation_receipts, got: {:?}",
+            m27.description,
+        );
+        assert!(
+            m27.up_sql
+                .contains("CREATE TABLE IF NOT EXISTS fleet_mutation_receipts"),
+            "up_sql must include the fleet_mutation_receipts CREATE TABLE",
+        );
+        assert!(
+            m27.up_sql
+                .contains("fleet_mutation_receipts_action_time_idx"),
+            "up_sql must include the action/time index",
+        );
+        let down = m27.down_sql.expect("down_sql must be supported");
+        assert!(down.contains("DROP INDEX IF EXISTS fleet_mutation_receipts_action_time_idx"));
+        assert!(down.contains("DROP TABLE IF EXISTS fleet_mutation_receipts"));
     }
 
     /// br-ft-4yr9i: applying the version-25 migration to a fresh

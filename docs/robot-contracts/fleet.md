@@ -6,8 +6,12 @@
 and `agents` use native agent-inventory/work-queue read paths, `scale`
 computes spawn/stop plans and executes commit receipts through the mux-backed
 fleet mutation substrate, and `rebalance` computes work-assignment plans and
-executes commit receipts through the `work_claims` mutation substrate. Dry-run
-uses the same plan path and returns a `dry_run` receipt without side effects.
+executes commit receipts through the `work_claims` mutation substrate.
+Non-dry-run `scale` / `rebalance` write durable `fleet_mutation_receipts`
+rows before reporting success; retries with the same idempotency key replay the
+stored receipt across a fresh CLI/daemon boundary, while same-key/different-plan
+payloads return an explicit conflict before side effects. Dry-run uses the same
+plan path and returns a `dry_run` receipt without side effects or durable writes.
 **Cross-link to `ft-x0666.4`
 (`tx_killswitch_model`):** the kill-switch invariant
 `stop_completes_under_kill_switch_hardstop` reuses that proof's
@@ -20,8 +24,8 @@ pattern.
 |---|---|---|---|
 | `status` | Idempotent | MustNotPartiallyMutate | (read-only) |
 | `agents` | Idempotent | MustNotPartiallyMutate | (read-only) |
-| `scale` | Sequential | Typed inventory / policy / approval / plan / mutation errors; failed commits carry receipts and compensate prior side effects | Spawn or stop panes through the mux-backed fleet mutation executor; dry-run is read-only |
-| `rebalance` | Sequential | Typed inventory / work-queue / policy / approval / plan / mutation errors; failed commits carry receipts and compensate prior side effects | Reassign claimed work in `work_claims`; dry-run is read-only |
+| `scale` | Idempotent with receipt key; sequential for new commits | Typed inventory / policy / approval / plan / durable-receipt / mutation errors; failed commits carry receipts and compensate prior side effects | Spawn or stop panes through the mux-backed fleet mutation executor; non-dry-run receipts persist in `fleet_mutation_receipts`; dry-run is read-only |
+| `rebalance` | Idempotent with receipt key; sequential for new commits | Typed inventory / work-queue / policy / approval / plan / durable-receipt / mutation errors; failed commits carry receipts and compensate prior side effects | Reassign claimed work in `work_claims`; non-dry-run receipts persist in `fleet_mutation_receipts`; dry-run is read-only |
 
 Concurrency: **PerPaneSerial** — serializable per `fleet_id`,
 parallel across distinct fleets.
@@ -187,6 +191,7 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-fleet-conformance \
 | Status/agents wired to native reads | ✓ `status` and `agents` use native inventory/work-queue summaries |
 | Scale/rebalance parse natively | ✓ live plan/receipt paths for dry-run and commit |
 | Launch/stop wired through mutation substrate | ✓ scale uses mux-backed spawn/stop receipts; rebalance uses durable `work_claims` reassignment receipts |
+| Durable fleet receipt replay | ✓ non-dry-run scale/rebalance persist `fleet_mutation_receipts`; matching idempotency-key retries replay stored receipts, conflicts stop before side effects |
 | Conformance harness with TX kill-switch interleavings | ✓ (cross-links to ft-x0666.4 via stop_completes_under_kill_switch_hardstop invariant + harness test) |
 | E2E example | ✓ README implementation-status examples include status/agents/scale dry-run |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |

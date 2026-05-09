@@ -3725,6 +3725,10 @@ enum RobotFleetCommands {
         /// Preview only
         #[arg(long)]
         dry_run: bool,
+
+        /// Caller-supplied idempotency key for durable non-dry-run replay
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Rebalance work across agents
     Rebalance {
@@ -3735,6 +3739,10 @@ enum RobotFleetCommands {
         /// Preview only
         #[arg(long)]
         dry_run: bool,
+
+        /// Caller-supplied idempotency key for durable non-dry-run replay
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// List agent slots and their assignments
     Agents {
@@ -8516,6 +8524,21 @@ fn robot_fleet_scale_spawn_action(
     }
 }
 
+fn robot_fleet_plan_with_optional_key(
+    plan_id: impl Into<String>,
+    dry_run: bool,
+    steps: Vec<frankenterm_core::fleet_mutation::FleetMutationStep>,
+    idempotency_key: Option<&str>,
+) -> frankenterm_core::fleet_mutation::FleetMutationPlan {
+    if let Some(key) = idempotency_key {
+        frankenterm_core::fleet_mutation::FleetMutationPlan::with_client_key(
+            plan_id, dry_run, steps, key,
+        )
+    } else {
+        frankenterm_core::fleet_mutation::FleetMutationPlan::new(plan_id, dry_run, steps)
+    }
+}
+
 fn robot_fleet_scale_base_data(
     program: &str,
     program_slug: &str,
@@ -8538,6 +8561,7 @@ fn robot_fleet_scale_base_data(
             "program_slug": program_slug,
             "target_count": target_count,
             "dry_run": dry_run,
+            "idempotency_key_present": false,
         },
         "current_count": current_count,
         "target_count": target_count,
@@ -8568,6 +8592,7 @@ fn robot_fleet_scale_plan(
     program: &str,
     target_count: u32,
     dry_run: bool,
+    idempotency_key: Option<&str>,
     running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
     running_error: Option<String>,
     claimed_work_by_pane: &BTreeMap<u64, usize>,
@@ -8577,7 +8602,7 @@ fn robot_fleet_scale_plan(
     Option<frankenterm_core::fleet_mutation::FleetMutationPlan>,
 ) {
     use frankenterm_core::fleet_mutation::{
-        FleetMutationAction, FleetMutationPlan, FleetMutationPolicyDecision, FleetMutationStep,
+        FleetMutationAction, FleetMutationPolicyDecision, FleetMutationStep,
     };
 
     let target_count = usize::try_from(target_count).unwrap_or(usize::MAX);
@@ -8597,6 +8622,7 @@ fn robot_fleet_scale_plan(
         running_error.clone(),
         work_queue_error.clone(),
     );
+    data["requested"]["idempotency_key_present"] = serde_json::json!(idempotency_key.is_some());
 
     if running_error.is_some() {
         data["status"] = serde_json::json!("running_inventory_unavailable");
@@ -8622,7 +8648,8 @@ fn robot_fleet_scale_plan(
             policy,
             compensation: None,
         };
-        let plan = FleetMutationPlan::new(plan_id, dry_run, vec![step]);
+        let plan =
+            robot_fleet_plan_with_optional_key(plan_id, dry_run, vec![step], idempotency_key);
         data["plan"] = serde_json::to_value(&plan).unwrap_or_else(|err| {
             serde_json::json!({
                 "serialization_error": err.to_string(),
@@ -8650,7 +8677,12 @@ fn robot_fleet_scale_plan(
                 step_id: step_id.clone(),
                 action: robot_fleet_scale_spawn_action(&program_slug),
                 policy: FleetMutationPolicyDecision::Allow,
-                compensation: None,
+                compensation: Some(FleetMutationAction::StopAgent {
+                    pane_id: 0,
+                    reason: format!(
+                        "rollback fleet scale spawn for {program_slug} slot {requested_slot}"
+                    ),
+                }),
             });
             selected_targets.push(serde_json::json!({
                 "operation": "spawn_agent",
@@ -8748,7 +8780,7 @@ fn robot_fleet_scale_plan(
         return (data, None);
     }
 
-    let plan = FleetMutationPlan::new(plan_id, dry_run, steps);
+    let plan = robot_fleet_plan_with_optional_key(plan_id, dry_run, steps, idempotency_key);
     data["plan"] = serde_json::to_value(&plan).unwrap_or_else(|err| {
         serde_json::json!({
             "serialization_error": err.to_string(),
@@ -8757,12 +8789,14 @@ fn robot_fleet_scale_plan(
     (data, Some(plan))
 }
 
+#[cfg(test)]
 fn robot_fleet_scale_data_with_executor<
     E: frankenterm_core::fleet_mutation::FleetMutationExecutor,
 >(
     program: &str,
     target_count: u32,
     dry_run: bool,
+    idempotency_key: Option<&str>,
     running_agents: BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
     running_error: Option<String>,
     claimed_work_by_pane: BTreeMap<u64, usize>,
@@ -8774,6 +8808,7 @@ fn robot_fleet_scale_data_with_executor<
         program,
         target_count,
         dry_run,
+        idempotency_key,
         &running_agents,
         running_error,
         &claimed_work_by_pane,
@@ -8831,7 +8866,7 @@ fn robot_fleet_scale_failure(
                 Some("Inspect data.receipt.steps[].policy for the approval request.".to_string()),
             ));
         }
-        Some("failed") | Some("compensated") | Some("compensation_failed") => {
+        Some("failed" | "compensated" | "compensation_failed") => {
             let code = data
                 .get("receipt")
                 .and_then(|receipt| receipt.get("steps"))
@@ -9211,6 +9246,7 @@ fn robot_fleet_rebalance_step(
 fn robot_fleet_rebalance_plan(
     strategy: &str,
     dry_run: bool,
+    idempotency_key: Option<&str>,
     running_agents: &BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
     running_error: Option<String>,
     work_rows: &[RobotWorkRow],
@@ -9219,8 +9255,6 @@ fn robot_fleet_rebalance_plan(
     serde_json::Value,
     Option<frankenterm_core::fleet_mutation::FleetMutationPlan>,
 ) {
-    use frankenterm_core::fleet_mutation::FleetMutationPlan;
-
     let (strategy_name, strategy_error) = match robot_fleet_rebalance_strategy_name(strategy) {
         Ok(strategy_name) => (strategy_name, None),
         Err(err) => ("invalid", Some(err)),
@@ -9235,6 +9269,7 @@ fn robot_fleet_rebalance_plan(
             "strategy": strategy,
             "strategy_normalized": strategy_name,
             "dry_run": dry_run,
+            "idempotency_key_present": idempotency_key.is_some(),
         },
         "status": "not_started",
         "strategy": strategy_name,
@@ -9389,7 +9424,7 @@ fn robot_fleet_rebalance_plan(
 
     data["status"] = serde_json::json!("rebalance_plan_created");
     let plan_id = format!("fleet-rebalance:{strategy_name}:{}-items", work_rows.len());
-    let plan = FleetMutationPlan::new(plan_id, dry_run, steps);
+    let plan = robot_fleet_plan_with_optional_key(plan_id, dry_run, steps, idempotency_key);
     data["plan"] = serde_json::to_value(&plan).unwrap_or_else(|err| {
         serde_json::json!({
             "serialization_error": err.to_string(),
@@ -9398,11 +9433,13 @@ fn robot_fleet_rebalance_plan(
     (data, Some(plan))
 }
 
+#[cfg(test)]
 fn robot_fleet_rebalance_data_with_executor<
     E: frankenterm_core::fleet_mutation::FleetMutationExecutor,
 >(
     strategy: &str,
     dry_run: bool,
+    idempotency_key: Option<&str>,
     running_agents: BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
     running_error: Option<String>,
     work_rows: Vec<RobotWorkRow>,
@@ -9413,6 +9450,7 @@ fn robot_fleet_rebalance_data_with_executor<
     let (mut data, plan) = robot_fleet_rebalance_plan(
         strategy,
         dry_run,
+        idempotency_key,
         &running_agents,
         running_error,
         &work_rows,
@@ -9486,13 +9524,295 @@ fn robot_fleet_rebalance_failure(
             "ft robot fleet rebalance requires approval before any side effect".to_string(),
             Some("Inspect data.receipt.steps[].policy for the approval request.".to_string()),
         )),
-        Some("failed") | Some("compensated") | Some("compensation_failed") => Some((
+        Some("failed" | "compensated" | "compensation_failed") => Some((
             "robot.fleet.mutation_failed",
             "ft robot fleet rebalance mutation did not complete successfully".to_string(),
             Some("Inspect data.receipt for completed, failed, and compensated steps.".to_string()),
         )),
         _ => None,
     }
+}
+
+#[derive(Debug)]
+enum RobotFleetReceiptExecutionError {
+    Plan(frankenterm_core::fleet_mutation::FleetMutationPlanError),
+    Storage {
+        error_code: &'static str,
+        message: String,
+        hint: Option<String>,
+        receipt: Option<Box<frankenterm_core::fleet_mutation::FleetMutationReceipt>>,
+    },
+}
+
+impl From<frankenterm_core::fleet_mutation::FleetMutationPlanError>
+    for RobotFleetReceiptExecutionError
+{
+    fn from(err: frankenterm_core::fleet_mutation::FleetMutationPlanError) -> Self {
+        Self::Plan(err)
+    }
+}
+
+fn robot_fleet_receipt_storage_error(
+    message: impl Into<String>,
+    receipt: Option<frankenterm_core::fleet_mutation::FleetMutationReceipt>,
+) -> RobotFleetReceiptExecutionError {
+    RobotFleetReceiptExecutionError::Storage {
+        error_code: "robot.fleet.receipt_persist_failed",
+        message: message.into(),
+        hint: Some(
+            "The mutation result could not be durably recorded; inspect data.receipt for compensation evidence."
+                .to_string(),
+        ),
+        receipt: receipt.map(Box::new),
+    }
+}
+
+fn robot_fleet_replay_or_conflict(
+    plan: &frankenterm_core::fleet_mutation::FleetMutationPlan,
+    record: frankenterm_core::storage::fleet_mutation_receipts_sql::FleetMutationReceiptRecord,
+) -> Result<frankenterm_core::fleet_mutation::FleetMutationReceipt, RobotFleetReceiptExecutionError>
+{
+    if record.payload_fingerprint != plan.payload_fingerprint.as_str() {
+        return Err(
+            frankenterm_core::fleet_mutation::FleetMutationPlanError::IdempotencyKeyConflict {
+                idempotency_key: plan.idempotency_key.as_str().to_string(),
+                existing_payload_fingerprint: record.payload_fingerprint,
+                incoming_payload_fingerprint: plan.payload_fingerprint.as_str().to_string(),
+            }
+            .into(),
+        );
+    }
+    Ok(record.receipt.replay())
+}
+
+fn robot_fleet_execute_plan_with_receipt_backend<
+    E: frankenterm_core::fleet_mutation::FleetMutationExecutor,
+>(
+    backend: &dyn frankenterm_core::storage_backend_trait::StorageBackend,
+    action: &str,
+    plan: &frankenterm_core::fleet_mutation::FleetMutationPlan,
+    executor: &mut E,
+    recorded_at_ms: i64,
+) -> Result<frankenterm_core::fleet_mutation::FleetMutationReceipt, RobotFleetReceiptExecutionError>
+{
+    use frankenterm_core::storage::fleet_mutation_receipts_sql::{
+        FleetMutationReceiptRecord, ensure_fleet_mutation_receipts_schema,
+        get_fleet_mutation_receipt, insert_fleet_mutation_receipt,
+    };
+
+    let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+    if plan.dry_run {
+        return ledger.execute_plan(plan, executor).map_err(Into::into);
+    }
+
+    ensure_fleet_mutation_receipts_schema(backend)
+        .map_err(|err| robot_fleet_receipt_storage_error(err.to_string(), None))?;
+    if let Some(existing) = get_fleet_mutation_receipt(backend, plan.idempotency_key.as_str())
+        .map_err(|err| robot_fleet_receipt_storage_error(err.to_string(), None))?
+    {
+        return robot_fleet_replay_or_conflict(plan, existing);
+    }
+
+    let receipt = ledger.execute_plan(plan, executor)?;
+    let record = FleetMutationReceiptRecord::from_receipt(
+        action.to_string(),
+        receipt.clone(),
+        recorded_at_ms,
+    );
+    match insert_fleet_mutation_receipt(backend, &record) {
+        Ok(()) => Ok(receipt),
+        Err(insert_err) => {
+            if let Ok(Some(existing)) =
+                get_fleet_mutation_receipt(backend, plan.idempotency_key.as_str())
+            {
+                if existing.payload_fingerprint == plan.payload_fingerprint.as_str() {
+                    let compensated =
+                        frankenterm_core::fleet_mutation::compensate_committed_receipt(
+                            plan, receipt, executor,
+                        );
+                    if compensated.status
+                        != frankenterm_core::fleet_mutation::FleetMutationReceiptStatus::CompensationFailed
+                    {
+                        return Ok(existing.receipt.replay());
+                    }
+                    return Err(robot_fleet_receipt_storage_error(
+                        format!(
+                            "fleet mutation receipt insert raced with an existing receipt, \
+                             but duplicate side-effect compensation failed: {insert_err}"
+                        ),
+                        Some(compensated),
+                    ));
+                }
+            }
+
+            let compensated = frankenterm_core::fleet_mutation::compensate_committed_receipt(
+                plan, receipt, executor,
+            );
+            Err(robot_fleet_receipt_storage_error(
+                format!("failed to persist fleet mutation receipt: {insert_err}"),
+                Some(compensated),
+            ))
+        }
+    }
+}
+
+fn robot_fleet_execute_plan_with_durable_receipt<
+    E: frankenterm_core::fleet_mutation::FleetMutationExecutor,
+>(
+    db_path: &str,
+    action: &str,
+    plan: &frankenterm_core::fleet_mutation::FleetMutationPlan,
+    executor: &mut E,
+) -> Result<frankenterm_core::fleet_mutation::FleetMutationReceipt, RobotFleetReceiptExecutionError>
+{
+    if plan.dry_run {
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        return ledger.execute_plan(plan, executor).map_err(Into::into);
+    }
+
+    let backend = frankenterm_core::storage_backend_trait::RusqliteBackend::open(
+        db_path,
+        &frankenterm_core::storage_backend_trait::OpenConfig::default(),
+    )
+    .map_err(|err| robot_fleet_receipt_storage_error(err.to_string(), None))?;
+    frankenterm_core::storage_backend_trait::StorageBackend::set_busy_timeout(
+        &backend,
+        Duration::from_secs(2),
+    )
+    .map_err(|err| robot_fleet_receipt_storage_error(err.to_string(), None))?;
+    robot_fleet_execute_plan_with_receipt_backend(&backend, action, plan, executor, now_ms_i64())
+}
+
+fn robot_fleet_replay_receipt_with_backend(
+    backend: &dyn frankenterm_core::storage_backend_trait::StorageBackend,
+    idempotency_key: &str,
+) -> Result<
+    Option<frankenterm_core::fleet_mutation::FleetMutationReceipt>,
+    RobotFleetReceiptExecutionError,
+> {
+    use frankenterm_core::storage::fleet_mutation_receipts_sql::{
+        ensure_fleet_mutation_receipts_schema, get_fleet_mutation_receipt,
+    };
+
+    ensure_fleet_mutation_receipts_schema(backend)
+        .map_err(|err| robot_fleet_receipt_storage_error(err.to_string(), None))?;
+    Ok(get_fleet_mutation_receipt(backend, idempotency_key)
+        .map_err(|err| robot_fleet_receipt_storage_error(err.to_string(), None))?
+        .map(|record| record.receipt.replay()))
+}
+
+fn robot_fleet_replay_receipt_with_durable_backend(
+    db_path: &str,
+    idempotency_key: &str,
+) -> Result<
+    Option<frankenterm_core::fleet_mutation::FleetMutationReceipt>,
+    RobotFleetReceiptExecutionError,
+> {
+    let backend = frankenterm_core::storage_backend_trait::RusqliteBackend::open(
+        db_path,
+        &frankenterm_core::storage_backend_trait::OpenConfig::default(),
+    )
+    .map_err(|err| robot_fleet_receipt_storage_error(err.to_string(), None))?;
+    frankenterm_core::storage_backend_trait::StorageBackend::set_busy_timeout(
+        &backend,
+        Duration::from_secs(2),
+    )
+    .map_err(|err| robot_fleet_receipt_storage_error(err.to_string(), None))?;
+    robot_fleet_replay_receipt_with_backend(&backend, idempotency_key)
+}
+
+fn robot_fleet_attach_receipt(
+    data: &mut serde_json::Value,
+    receipt: &frankenterm_core::fleet_mutation::FleetMutationReceipt,
+) {
+    data["receipt"] = serde_json::to_value(receipt).unwrap_or_else(|err| {
+        serde_json::json!({
+            "serialization_error": err.to_string(),
+        })
+    });
+}
+
+fn robot_fleet_attach_durable_replay_receipt(
+    data: &mut serde_json::Value,
+    receipt: &frankenterm_core::fleet_mutation::FleetMutationReceipt,
+) {
+    robot_fleet_attach_receipt(data, receipt);
+    data["status"] = serde_json::json!("durable_receipt_replayed");
+    data["reason_code"] = serde_json::json!("durable_receipt_replayed");
+    data["durable_receipt_replay"] = serde_json::json!(true);
+    if data.get("remaining_delta").is_some() {
+        data["remaining_delta"] = serde_json::json!(0);
+    }
+}
+
+fn robot_fleet_receipt_execution_error_response(
+    action: &str,
+    requested: serde_json::Value,
+    mut data: serde_json::Value,
+    err: RobotFleetReceiptExecutionError,
+    elapsed_ms: u64,
+) -> RobotResponse<serde_json::Value> {
+    match err {
+        RobotFleetReceiptExecutionError::Plan(err) => robot_fleet_error_with_data(
+            "robot.fleet.plan_error",
+            format!("ft robot fleet {action} could not construct a valid mutation plan: {err}"),
+            Some(
+                "Inspect the request and retry with a fresh idempotency key if this was a replay collision."
+                    .to_string(),
+            ),
+            serde_json::json!({
+                "family": "fleet",
+                "action": action,
+                "backend": "native_agent_inventory",
+                "requested": requested,
+                "error": err,
+            }),
+            elapsed_ms,
+        ),
+        RobotFleetReceiptExecutionError::Storage {
+            error_code,
+            message,
+            hint,
+            receipt,
+        } => {
+            data["status"] = serde_json::json!("receipt_persist_failed");
+            data["reason_code"] = serde_json::json!("receipt_persist_failed");
+            if let Some(receipt) = receipt {
+                robot_fleet_attach_receipt(&mut data, receipt.as_ref());
+            }
+            robot_fleet_error_with_data(error_code, message, hint, data, elapsed_ms)
+        }
+    }
+}
+
+fn robot_fleet_validate_idempotency_key(
+    idempotency_key: Option<&str>,
+    elapsed_ms: u64,
+) -> RobotJsonResult<()> {
+    let Some(key) = idempotency_key else {
+        return Ok(());
+    };
+    if key.trim().is_empty() {
+        return Err(Box::new(
+            RobotResponse::<serde_json::Value>::error_with_code(
+                ROBOT_ERR_INVALID_ARGS,
+                "fleet idempotency_key must not be empty when supplied",
+                None,
+                elapsed_ms,
+            ),
+        ));
+    }
+    if key.len() > 256 {
+        return Err(Box::new(
+            RobotResponse::<serde_json::Value>::error_with_code(
+                ROBOT_ERR_INVALID_ARGS,
+                "fleet idempotency_key is too long; maximum is 256 bytes",
+                None,
+                elapsed_ms,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn robot_fleet_reassign_work(
@@ -9646,6 +9966,7 @@ fn robot_fleet_reassign_work(
 struct RobotFleetMuxExecutor {
     mux: frankenterm_core::wezterm::MuxHandle,
     db_path: String,
+    spawned_by_step: BTreeMap<String, u64>,
 }
 
 impl RobotFleetMuxExecutor {
@@ -9653,6 +9974,7 @@ impl RobotFleetMuxExecutor {
         Self {
             mux,
             db_path: db_path.into(),
+            spawned_by_step: BTreeMap::new(),
         }
     }
 
@@ -9786,13 +10108,19 @@ impl frankenterm_core::fleet_mutation::FleetMutationExecutor for RobotFleetMuxEx
                 cwd,
                 domain,
                 env,
-            } => self.spawn_agent(
-                profile_name,
-                program,
-                cwd.as_deref(),
-                domain.as_deref(),
-                env,
-            ),
+            } => {
+                let output = self.spawn_agent(
+                    profile_name,
+                    program,
+                    cwd.as_deref(),
+                    domain.as_deref(),
+                    env,
+                )?;
+                if let Some(pane_id) = output.pane_id {
+                    self.spawned_by_step.insert(step.step_id.clone(), pane_id);
+                }
+                Ok(output)
+            }
             frankenterm_core::fleet_mutation::FleetMutationAction::StopAgent {
                 pane_id,
                 reason,
@@ -9808,7 +10136,7 @@ impl frankenterm_core::fleet_mutation::FleetMutationExecutor for RobotFleetMuxEx
 
     fn compensate_step(
         &mut self,
-        _original: &frankenterm_core::fleet_mutation::FleetMutationStep,
+        original: &frankenterm_core::fleet_mutation::FleetMutationStep,
         compensation: &frankenterm_core::fleet_mutation::FleetMutationAction,
     ) -> Result<
         frankenterm_core::fleet_mutation::FleetMutationStepOutput,
@@ -9831,7 +10159,27 @@ impl frankenterm_core::fleet_mutation::FleetMutationExecutor for RobotFleetMuxEx
             frankenterm_core::fleet_mutation::FleetMutationAction::StopAgent {
                 pane_id,
                 reason,
-            } => self.stop_agent(*pane_id, reason),
+            } => {
+                let resolved_pane_id = if *pane_id == 0 {
+                    self.spawned_by_step
+                        .get(&original.step_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                                "robot.fleet.compensation_missing_pane",
+                                format!(
+                                    "no spawned pane recorded for scale compensation step {}",
+                                    original.step_id
+                                ),
+                            )
+                        })?
+                } else {
+                    *pane_id
+                };
+                let output = self.stop_agent(resolved_pane_id, reason)?;
+                self.spawned_by_step.remove(&original.step_id);
+                Ok(output)
+            }
             frankenterm_core::fleet_mutation::FleetMutationAction::ReassignWork {
                 work_item_id,
                 from_agent,
@@ -10092,97 +10440,149 @@ async fn robot_fleet_command_response(
             program,
             target_count,
             dry_run,
+            idempotency_key,
         } => {
+            if let Err(response) =
+                robot_fleet_validate_idempotency_key(idempotency_key.as_deref(), elapsed_ms)
+            {
+                return *response;
+            }
             let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
             let (claimed_work_by_pane, work_queue_error) =
                 robot_fleet_claimed_work_counts(db_path, &running_agents);
-            let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
             let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
             let mut executor = RobotFleetMuxExecutor::new(mux, db_path);
-            match robot_fleet_scale_data_with_executor(
+            let (mut data, plan) = robot_fleet_scale_plan(
                 program,
                 *target_count,
                 *dry_run,
-                running_agents,
+                idempotency_key.as_deref(),
+                &running_agents,
                 running_error,
-                claimed_work_by_pane,
+                &claimed_work_by_pane,
                 work_queue_error,
-                &mut ledger,
-                &mut executor,
-            ) {
-                Ok(data) => {
-                    if let Some((code, message, hint)) = robot_fleet_scale_failure(&data, *dry_run)
-                    {
-                        robot_fleet_error_with_data(code, message, hint, data, elapsed_ms)
-                    } else {
-                        RobotResponse::success(data, elapsed_ms)
+            );
+            if let Some(plan) = plan {
+                match robot_fleet_execute_plan_with_durable_receipt(
+                    db_path,
+                    "scale",
+                    &plan,
+                    &mut executor,
+                ) {
+                    Ok(receipt) => robot_fleet_attach_receipt(&mut data, &receipt),
+                    Err(err) => {
+                        return robot_fleet_receipt_execution_error_response(
+                            "scale",
+                            serde_json::json!({
+                                "program": program,
+                                "target_count": target_count,
+                                "dry_run": dry_run,
+                                "idempotency_key_present": idempotency_key.is_some(),
+                            }),
+                            data,
+                            err,
+                            elapsed_ms,
+                        );
                     }
                 }
-                Err(err) => robot_fleet_error_with_data(
-                    "robot.fleet.plan_error",
-                    format!("ft robot fleet scale could not construct a valid mutation plan: {err}"),
-                    Some("Inspect the request and retry with a fresh idempotency key if this was a replay collision.".to_string()),
-                    serde_json::json!({
-                        "family": "fleet",
-                        "action": "scale",
-                        "backend": "native_agent_inventory",
-                        "requested": {
-                            "program": program,
-                            "target_count": target_count,
-                            "dry_run": dry_run,
-                        },
-                        "error": err,
-                    }),
-                    elapsed_ms,
-                ),
+            } else if let Some(key) = idempotency_key.as_deref() {
+                match robot_fleet_replay_receipt_with_durable_backend(db_path, key) {
+                    Ok(Some(receipt)) => {
+                        robot_fleet_attach_durable_replay_receipt(&mut data, &receipt);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        return robot_fleet_receipt_execution_error_response(
+                            "scale",
+                            serde_json::json!({
+                                "program": program,
+                                "target_count": target_count,
+                                "dry_run": dry_run,
+                                "idempotency_key_present": true,
+                            }),
+                            data,
+                            err,
+                            elapsed_ms,
+                        );
+                    }
+                }
+            }
+            if let Some((code, message, hint)) = robot_fleet_scale_failure(&data, *dry_run) {
+                robot_fleet_error_with_data(code, message, hint, data, elapsed_ms)
+            } else {
+                RobotResponse::success(data, elapsed_ms)
             }
         }
-        RobotFleetCommands::Rebalance { strategy, dry_run } => {
+        RobotFleetCommands::Rebalance {
+            strategy,
+            dry_run,
+            idempotency_key,
+        } => {
+            if let Err(response) =
+                robot_fleet_validate_idempotency_key(idempotency_key.as_deref(), elapsed_ms)
+            {
+                return *response;
+            }
             let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
             let (work_rows, work_queue_error) = robot_fleet_rebalance_work_rows(db_path);
-            let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
             let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
             let mut executor = RobotFleetMuxExecutor::new(mux, db_path);
-            match robot_fleet_rebalance_data_with_executor(
+            let (mut data, plan) = robot_fleet_rebalance_plan(
                 strategy,
                 *dry_run,
-                running_agents,
+                idempotency_key.as_deref(),
+                &running_agents,
                 running_error,
-                work_rows,
+                &work_rows,
                 work_queue_error,
-                &mut ledger,
-                &mut executor,
-            ) {
-                Ok(data) => {
-                    if let Some((code, message, hint)) =
-                        robot_fleet_rebalance_failure(&data, *dry_run)
-                    {
-                        robot_fleet_error_with_data(code, message, hint, data, elapsed_ms)
-                    } else {
-                        RobotResponse::success(data, elapsed_ms)
+            );
+            if let Some(plan) = plan {
+                match robot_fleet_execute_plan_with_durable_receipt(
+                    db_path,
+                    "rebalance",
+                    &plan,
+                    &mut executor,
+                ) {
+                    Ok(receipt) => robot_fleet_attach_receipt(&mut data, &receipt),
+                    Err(err) => {
+                        return robot_fleet_receipt_execution_error_response(
+                            "rebalance",
+                            serde_json::json!({
+                                "strategy": strategy,
+                                "dry_run": dry_run,
+                                "idempotency_key_present": idempotency_key.is_some(),
+                            }),
+                            data,
+                            err,
+                            elapsed_ms,
+                        );
                     }
                 }
-                Err(err) => robot_fleet_error_with_data(
-                    "robot.fleet.plan_error",
-                    format!(
-                        "ft robot fleet rebalance could not construct a valid mutation plan: {err}"
-                    ),
-                    Some(
-                        "Inspect the request and retry with a fresh idempotency key if this was a replay collision."
-                            .to_string(),
-                    ),
-                    serde_json::json!({
-                        "family": "fleet",
-                        "action": "rebalance",
-                        "backend": "native_agent_inventory",
-                        "requested": {
-                            "strategy": strategy,
-                            "dry_run": dry_run,
-                        },
-                        "error": err,
-                    }),
-                    elapsed_ms,
-                ),
+            } else if let Some(key) = idempotency_key.as_deref() {
+                match robot_fleet_replay_receipt_with_durable_backend(db_path, key) {
+                    Ok(Some(receipt)) => {
+                        robot_fleet_attach_durable_replay_receipt(&mut data, &receipt);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        return robot_fleet_receipt_execution_error_response(
+                            "rebalance",
+                            serde_json::json!({
+                                "strategy": strategy,
+                                "dry_run": dry_run,
+                                "idempotency_key_present": true,
+                            }),
+                            data,
+                            err,
+                            elapsed_ms,
+                        );
+                    }
+                }
+            }
+            if let Some((code, message, hint)) = robot_fleet_rebalance_failure(&data, *dry_run) {
+                robot_fleet_error_with_data(code, message, hint, data, elapsed_ms)
+            } else {
+                RobotResponse::success(data, elapsed_ms)
             }
         }
     }
@@ -63405,6 +63805,7 @@ log_level = "debug"
             program,
             target_count,
             dry_run,
+            None,
             running_agents,
             None,
             claimed_work_by_pane,
@@ -63456,6 +63857,7 @@ log_level = "debug"
         robot_fleet_rebalance_data_with_executor(
             strategy,
             dry_run,
+            None,
             running_agents,
             None,
             work_rows,
@@ -63464,6 +63866,99 @@ log_level = "debug"
             executor,
         )
         .expect("rebalance data")
+    }
+
+    fn robot_fleet_test_receipt_backend() -> frankenterm_core::storage_backend_trait::RusqliteBackend
+    {
+        let backend = frankenterm_core::storage_backend_trait::RusqliteBackend::open(
+            ":memory:",
+            &frankenterm_core::storage_backend_trait::OpenConfig {
+                wal_mode: false,
+                ..frankenterm_core::storage_backend_trait::OpenConfig::default()
+            },
+        )
+        .expect("receipt backend");
+        frankenterm_core::storage::fleet_mutation_receipts_sql::ensure_fleet_mutation_receipts_schema(
+            &backend,
+        )
+        .expect("receipt schema");
+        backend
+    }
+
+    fn robot_fleet_test_scale_data_durable(
+        backend: &dyn frankenterm_core::storage_backend_trait::StorageBackend,
+        program: &str,
+        target_count: u32,
+        idempotency_key: &str,
+        running_agents: BTreeMap<
+            u64,
+            frankenterm_core::agent_correlator::RunningAgentInventoryEntry,
+        >,
+        claimed_work_by_pane: BTreeMap<u64, usize>,
+        executor: &mut RobotFleetTestExecutor,
+    ) -> Result<serde_json::Value, RobotFleetReceiptExecutionError> {
+        let (mut data, plan) = robot_fleet_scale_plan(
+            program,
+            target_count,
+            false,
+            Some(idempotency_key),
+            &running_agents,
+            None,
+            &claimed_work_by_pane,
+            None,
+        );
+        if let Some(plan) = plan {
+            let receipt = robot_fleet_execute_plan_with_receipt_backend(
+                backend,
+                "scale",
+                &plan,
+                executor,
+                1_800_000_000_000,
+            )?;
+            robot_fleet_attach_receipt(&mut data, &receipt);
+        } else if let Some(receipt) =
+            robot_fleet_replay_receipt_with_backend(backend, idempotency_key)?
+        {
+            robot_fleet_attach_durable_replay_receipt(&mut data, &receipt);
+        }
+        Ok(data)
+    }
+
+    fn robot_fleet_test_rebalance_data_durable(
+        backend: &dyn frankenterm_core::storage_backend_trait::StorageBackend,
+        strategy: &str,
+        idempotency_key: &str,
+        running_agents: BTreeMap<
+            u64,
+            frankenterm_core::agent_correlator::RunningAgentInventoryEntry,
+        >,
+        work_rows: Vec<RobotWorkRow>,
+        executor: &mut RobotFleetTestExecutor,
+    ) -> Result<serde_json::Value, RobotFleetReceiptExecutionError> {
+        let (mut data, plan) = robot_fleet_rebalance_plan(
+            strategy,
+            false,
+            Some(idempotency_key),
+            &running_agents,
+            None,
+            &work_rows,
+            None,
+        );
+        if let Some(plan) = plan {
+            let receipt = robot_fleet_execute_plan_with_receipt_backend(
+                backend,
+                "rebalance",
+                &plan,
+                executor,
+                1_800_000_000_000,
+            )?;
+            robot_fleet_attach_receipt(&mut data, &receipt);
+        } else if let Some(receipt) =
+            robot_fleet_replay_receipt_with_backend(backend, idempotency_key)?
+        {
+            robot_fleet_attach_durable_replay_receipt(&mut data, &receipt);
+        }
+        Ok(data)
     }
 
     #[test]
@@ -63618,6 +64113,240 @@ log_level = "debug"
     }
 
     #[test]
+    fn test_robot_fleet_scale_up_durable_receipt_replays_without_reexecution() {
+        let backend = robot_fleet_test_receipt_backend();
+        let running_agents = robot_fleet_test_running_agents(&[]);
+        let mut first_executor = RobotFleetTestExecutor::default();
+
+        let first = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            1,
+            "scale-up-key",
+            running_agents.clone(),
+            BTreeMap::new(),
+            &mut first_executor,
+        )
+        .expect("first durable scale");
+        assert_eq!(first["receipt"]["status"], "succeeded");
+        assert_eq!(
+            first_executor.executed_steps,
+            vec!["spawn-codex-1".to_string()]
+        );
+
+        let mut replay_executor = RobotFleetTestExecutor::default();
+        let replay = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            1,
+            "scale-up-key",
+            running_agents,
+            BTreeMap::new(),
+            &mut replay_executor,
+        )
+        .expect("replay durable scale");
+
+        assert_eq!(replay["receipt"]["status"], "succeeded");
+        assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
+        assert!(replay_executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_durable_receipt_replays_when_state_already_reached_target() {
+        let backend = robot_fleet_test_receipt_backend();
+        let mut first_executor = RobotFleetTestExecutor::default();
+        robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            1,
+            "scale-retry-key",
+            robot_fleet_test_running_agents(&[]),
+            BTreeMap::new(),
+            &mut first_executor,
+        )
+        .expect("first durable scale");
+
+        let mut replay_executor = RobotFleetTestExecutor::default();
+        let replay = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            1,
+            "scale-retry-key",
+            robot_fleet_test_running_agents(&[(900, "codex", "active")]),
+            BTreeMap::new(),
+            &mut replay_executor,
+        )
+        .expect("already-at-target durable replay");
+
+        assert_eq!(replay["status"], "durable_receipt_replayed");
+        assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
+        assert!(replay_executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_down_durable_receipt_replays_without_reexecution() {
+        let backend = robot_fleet_test_receipt_backend();
+        let running_agents = robot_fleet_test_running_agents(&[(7, "codex", "idle")]);
+        let mut first_executor = RobotFleetTestExecutor::default();
+
+        let first = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            0,
+            "scale-down-key",
+            running_agents.clone(),
+            BTreeMap::new(),
+            &mut first_executor,
+        )
+        .expect("first durable scale down");
+        assert_eq!(first["receipt"]["status"], "succeeded");
+        assert_eq!(
+            first_executor.executed_steps,
+            vec!["stop-codex-pane-7".to_string()]
+        );
+
+        let mut replay_executor = RobotFleetTestExecutor::default();
+        let replay = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            0,
+            "scale-down-key",
+            running_agents,
+            BTreeMap::new(),
+            &mut replay_executor,
+        )
+        .expect("replay durable scale down");
+
+        assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
+        assert!(replay_executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_durable_receipt_conflict_rejects_before_side_effects() {
+        let backend = robot_fleet_test_receipt_backend();
+        let running_agents = robot_fleet_test_running_agents(&[]);
+        let mut first_executor = RobotFleetTestExecutor::default();
+        robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            1,
+            "same-client-key",
+            running_agents.clone(),
+            BTreeMap::new(),
+            &mut first_executor,
+        )
+        .expect("first durable scale");
+
+        let mut conflicting_executor = RobotFleetTestExecutor::default();
+        let err = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            2,
+            "same-client-key",
+            running_agents,
+            BTreeMap::new(),
+            &mut conflicting_executor,
+        )
+        .expect_err("same client key with different scale payload must conflict");
+
+        assert!(matches!(
+            err,
+            RobotFleetReceiptExecutionError::Plan(
+                frankenterm_core::fleet_mutation::FleetMutationPlanError::IdempotencyKeyConflict { .. }
+            )
+        ));
+        assert!(conflicting_executor.executed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_robot_fleet_durable_receipt_persist_failure_compensates_successes() {
+        let backend = robot_fleet_test_receipt_backend();
+        frankenterm_core::storage_backend_trait::StorageBackend::execute_batch(
+            &backend,
+            "CREATE TRIGGER fail_fleet_receipt_insert
+             BEFORE INSERT ON fleet_mutation_receipts
+             BEGIN
+                 SELECT RAISE(FAIL, 'injected fleet receipt persist failure');
+             END;",
+        )
+        .expect("install failure trigger");
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let err = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            1,
+            "persist-failure-key",
+            robot_fleet_test_running_agents(&[]),
+            BTreeMap::new(),
+            &mut executor,
+        )
+        .expect_err("receipt persist failure must surface");
+
+        match err {
+            RobotFleetReceiptExecutionError::Storage {
+                error_code,
+                receipt: Some(receipt),
+                ..
+            } => {
+                assert_eq!(error_code, "robot.fleet.receipt_persist_failed");
+                assert_eq!(
+                    receipt.status,
+                    frankenterm_core::fleet_mutation::FleetMutationReceiptStatus::Compensated
+                );
+                assert_eq!(receipt.compensated_count, 1);
+            }
+            other => panic!("expected storage error with compensated receipt, got {other:?}"),
+        }
+        assert_eq!(executor.executed_steps, vec!["spawn-codex-1".to_string()]);
+        assert_eq!(
+            executor.compensated_steps,
+            vec!["spawn-codex-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_robot_fleet_durable_mid_commit_failure_replays_compensated_receipt() {
+        let backend = robot_fleet_test_receipt_backend();
+        let running_agents = robot_fleet_test_running_agents(&[]);
+        let mut first_executor = RobotFleetTestExecutor {
+            fail_on_step: Some("spawn-codex-2".to_string()),
+            ..RobotFleetTestExecutor::default()
+        };
+        let first = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            2,
+            "mid-commit-key",
+            running_agents.clone(),
+            BTreeMap::new(),
+            &mut first_executor,
+        )
+        .expect("first durable partial failure receipt");
+        assert_eq!(first["receipt"]["status"], "compensated");
+        assert_eq!(
+            first_executor.compensated_steps,
+            vec!["spawn-codex-1".to_string()]
+        );
+
+        let mut replay_executor = RobotFleetTestExecutor::default();
+        let replay = robot_fleet_test_scale_data_durable(
+            &backend,
+            "codex",
+            2,
+            "mid-commit-key",
+            running_agents,
+            BTreeMap::new(),
+            &mut replay_executor,
+        )
+        .expect("replay compensated durable receipt");
+
+        assert_eq!(replay["receipt"]["status"], "compensated");
+        assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
+        assert!(replay_executor.executed_steps.is_empty());
+    }
+
+    #[test]
     fn test_robot_fleet_scale_partial_failure_compensates_prior_stops() {
         let running_agents = robot_fleet_test_running_agents(&[
             (1, "codex", "idle"),
@@ -63651,6 +64380,45 @@ log_level = "debug"
         assert_eq!(
             executor.compensated_steps,
             vec!["stop-codex-pane-1".to_string()]
+        );
+        let (code, _, _) = robot_fleet_scale_failure(&data, false).expect("scale failure");
+        assert_eq!(code, "robot.fleet.mutation_failed");
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_up_partial_failure_compensates_prior_spawns() {
+        let running_agents = robot_fleet_test_running_agents(&[]);
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor {
+            fail_on_step: Some("spawn-codex-2".to_string()),
+            ..RobotFleetTestExecutor::default()
+        };
+
+        let data = robot_fleet_test_scale_data(
+            "codex",
+            3,
+            false,
+            running_agents,
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+
+        assert_eq!(data["status"], "scale_up_plan_created");
+        assert_eq!(data["receipt"]["status"], "compensated");
+        assert_eq!(data["receipt"]["steps"][0]["status"], "compensated");
+        assert_eq!(
+            data["receipt"]["steps"][0]["compensation"]["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            data["receipt"]["steps"][0]["compensation"]["action"]["kind"],
+            "stop_agent"
+        );
+        assert_eq!(data["receipt"]["steps"][1]["status"], "failed");
+        assert_eq!(
+            executor.compensated_steps,
+            vec!["spawn-codex-1".to_string()]
         );
         let (code, _, _) = robot_fleet_scale_failure(&data, false).expect("scale failure");
         assert_eq!(code, "robot.fleet.mutation_failed");
@@ -63853,6 +64621,47 @@ log_level = "debug"
             executor.executed_steps,
             vec!["reassign-capability_based-1".to_string()]
         );
+    }
+
+    #[test]
+    fn test_robot_fleet_rebalance_durable_receipt_replays_without_reexecution() {
+        let backend = robot_fleet_test_receipt_backend();
+        let running_agents =
+            robot_fleet_test_running_agents(&[(1, "codex", "active"), (2, "codex", "idle")]);
+        let work_rows = vec![
+            robot_fleet_test_work_row("ft-a", "claimed", Some("codex:1"), 1, &[], 0, None),
+            robot_fleet_test_work_row("ft-b", "claimed", Some("codex:1"), 2, &[], 0, None),
+        ];
+        let mut first_executor = RobotFleetTestExecutor::default();
+        let first = robot_fleet_test_rebalance_data_durable(
+            &backend,
+            "capability_based",
+            "rebalance-key",
+            running_agents.clone(),
+            work_rows.clone(),
+            &mut first_executor,
+        )
+        .expect("first durable rebalance");
+        assert_eq!(first["receipt"]["status"], "succeeded");
+        assert_eq!(
+            first_executor.executed_steps,
+            vec!["reassign-capability_based-1".to_string()]
+        );
+
+        let mut replay_executor = RobotFleetTestExecutor::default();
+        let replay = robot_fleet_test_rebalance_data_durable(
+            &backend,
+            "capability_based",
+            "rebalance-key",
+            running_agents,
+            work_rows,
+            &mut replay_executor,
+        )
+        .expect("replay durable rebalance");
+
+        assert_eq!(replay["receipt"]["status"], "succeeded");
+        assert_eq!(replay["receipt"]["idempotent_replay"].as_bool(), Some(true));
+        assert!(replay_executor.executed_steps.is_empty());
     }
 
     #[test]

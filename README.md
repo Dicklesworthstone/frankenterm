@@ -689,7 +689,7 @@ limits instead of the generic `robot.not_implemented` fallback.
 | `ft robot checkpoint`    | save / list / show / delete / rollback    | ✅ native snapshot/session adapter; rollback execution requires `--dry-run` until robot policy approval lands |
 | `ft robot context`       | status / rotate / history                 | ✅ native SQLite context registry; rotation receipts are durable and raw context content is not stored |
 | `ft robot work`          | claim / release / complete / list / ready / assign | ✅ native SQLite `work_claims` queue |
-| `ft robot fleet`         | status / scale / rebalance / agents       | ✅ native read paths plus live scale/rebalance plans, dry-run receipts, and typed mutation/error receipts |
+| `ft robot fleet`         | status / scale / rebalance / agents       | ✅ native read paths plus live scale/rebalance plans, dry-run receipts, durable non-dry-run receipt replay, and typed mutation/error receipts |
 | `ft robot profile`       | list / show / validate / apply            | ✅ shipped for read paths, dry-run apply, and mux-backed non-dry-run apply with durable receipts |
 
 Examples for the graduated NTM-gap families:
@@ -710,7 +710,7 @@ ft robot --format json work claim ft-smoke --agent-id agent-a
 ft robot --format json work list --status claimed --limit 5
 ft robot --format json work complete ft-smoke --summary done --evidence commit:abc123
 
-# Fleet controls are native; mutating controls return receipts and typed errors.
+# Fleet controls are native; mutating controls return durable receipts and typed errors.
 ft robot --format json fleet status --detailed
 ft robot --format json fleet agents --program codex --state idle
 ft robot --format json fleet scale codex 1 --dry-run

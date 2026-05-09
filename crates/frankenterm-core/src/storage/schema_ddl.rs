@@ -37,7 +37,11 @@
 /// storage/migrations.rs; the receipt schema mirrors the
 /// `ApplyReceipt` substrate type at
 /// crates/frankenterm-core/src/robot_profile_handler.rs.
-pub const SCHEMA_VERSION: i32 = 26;
+///
+/// Per ft-27rlg: bumped 26 → 27 to gate the
+/// `fleet_mutation_receipts` table used by non-dry-run
+/// `ft robot fleet scale` / `rebalance` durable receipt replay.
+pub const SCHEMA_VERSION: i32 = 27;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with

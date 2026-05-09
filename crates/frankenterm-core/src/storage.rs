@@ -150,6 +150,9 @@ pub mod agent_profiles_sql;
 // callable from the storage writer thread or from tests.
 // Schema lives at MIGRATIONS[25] (v26).
 pub mod profiles_applied_log_sql;
+// ft-27rlg: synchronous SQL primitives for durable fleet scale/rebalance
+// mutation receipts. Schema lives at MIGRATIONS[26] (v27).
+pub mod fleet_mutation_receipts_sql;
 #[cfg(test)]
 pub(crate) use migrations::{
     FtVersion, MIGRATIONS, V0InitStep, apply_migration_plan, apply_migration_step,
