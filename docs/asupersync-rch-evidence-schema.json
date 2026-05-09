@@ -82,6 +82,97 @@
             "type": "string",
             "pattern": "^sha256:[a-f0-9]{64}$"
           },
+          "worker_evidence_confidence": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "target_worker_remote_proof",
+              "target_worker_mirror_attestation",
+              "scheduler_selected_remote_proof",
+              "worker_self_test_only",
+              "sync_or_transfer_only",
+              "inconclusive_worker_evidence",
+              "legacy_unknown_worker_evidence",
+              null
+            ]
+          },
+          "intended_worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selected_worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worker_queue_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "ready",
+              "busy_wait",
+              "unhealthy",
+              "unsupported_worker_selection",
+              "queue_timeout",
+              "unknown",
+              "not_applicable",
+              null
+            ]
+          },
+          "repo_snapshot_head": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^([a-f0-9]{40}|unknown|not_applicable)$"
+          },
+          "source_mirror_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "present",
+              "missing",
+              "stale",
+              "unreachable",
+              "not_checked",
+              "unknown",
+              "not_applicable",
+              null
+            ]
+          },
+          "source_mirror_reason_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remote_cargo_reached": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "remote_rustc_reached": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "test_binary_reached": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "execution_mode": {
             "type": "string",
             "enum": [

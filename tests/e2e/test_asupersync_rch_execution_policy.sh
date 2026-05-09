@@ -279,6 +279,12 @@ tmp_fallback_record="${tmp_dir}/fallback-required.json"
 tmp_timeout_record="${tmp_dir}/timeout.json"
 tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
+tmp_missing_worker_id="${tmp_dir}/missing-worker-id.json"
+tmp_missing_repo_snapshot="${tmp_dir}/missing-repo-snapshot.json"
+tmp_bad_target_mirror_status="${tmp_dir}/bad-target-mirror-status.json"
+tmp_mirror_failed_attestation="${tmp_dir}/mirror-failed-attestation.json"
+tmp_mirror_failed_ledger="${tmp_dir}/mirror-failed-ledger.jsonl"
+tmp_mirror_failed_report="${tmp_dir}/mirror-failed-ledger-report.json"
 tmp_light_local="${tmp_dir}/light-local.json"
 tmp_residual_risk="${tmp_dir}/residual-risk.json"
 tmp_mixed_ledger_a="${tmp_dir}/mixed-ledger-a.jsonl"
@@ -357,6 +363,21 @@ RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
     "retained" \
     ""
 sed -n '1p' "${wrapper_ledger}" >"${tmp_valid}"
+
+if [[ "$(jq -r '.runs[0].worker_evidence_confidence' "${tmp_valid}")" != "scheduler_selected_remote_proof" ]] \
+  || [[ "$(jq -r '.runs[0].selected_worker_id' "${tmp_valid}")" != "contabo-2" ]] \
+  || [[ "$(jq -r '.runs[0].source_mirror_status' "${tmp_valid}")" != "present" ]] \
+  || [[ "$(jq -r '.runs[0].remote_cargo_reached' "${tmp_valid}")" != "true" ]]; then
+  emit_log \
+    "failed" \
+    "wrapper_ledger" \
+    "worker_evidence_fields" \
+    "worker_evidence_missing" \
+    "unexpected_worker_evidence" \
+    "$(basename "${tmp_valid}")" \
+    "wrapper-emitted remote proof must carry scheduler-selected worker and source-mirror fields"
+  exit 1
+fi
 
 while IFS= read -r artifact_path; do
   if [[ ! -e "${ROOT_DIR}/${artifact_path}" && ! -e "${artifact_path}" ]]; then
@@ -636,7 +657,14 @@ jq '.runs[0].fallback_reason_code = "RCH-E100" |
     .runs[0].fallback_approved_by = "human-operator" |
     .runs[0].execution_mode = "approved_local_fallback" |
     .runs[0].target_dir_lifecycle = "inventory_only" |
-    .runs[0].validation_status = "approved_fallback"' \
+    .runs[0].validation_status = "approved_fallback" |
+    .runs[0].worker_evidence_confidence = "inconclusive_worker_evidence" |
+    .runs[0].selected_worker_id = null |
+    .runs[0].worker_queue_state = "unsupported_worker_selection" |
+    .runs[0].source_mirror_status = "not_checked" |
+    .runs[0].remote_cargo_reached = false |
+    .runs[0].remote_rustc_reached = false |
+    .runs[0].test_binary_reached = false' \
   "${tmp_invalid}" > "${tmp_recovery}"
 
 emit_log \
@@ -774,6 +802,118 @@ expect_validation_failure \
   "stale_schema_version" \
   "stale schema versions must fail validation"
 
+jq '.runs[0].worker_evidence_confidence = "target_worker_remote_proof" |
+    .runs[0].intended_worker_id = "contabo-2" |
+    .runs[0].selected_worker_id = null' \
+  "${tmp_valid}" > "${tmp_missing_worker_id}"
+expect_validation_failure \
+  "${tmp_missing_worker_id}" \
+  "failure_injection" \
+  "target_worker_missing_selected_worker" \
+  "target-worker proof without selected worker id must fail validation"
+
+jq '.runs[0].worker_evidence_confidence = "scheduler_selected_remote_proof" |
+    .runs[0].repo_snapshot_head = null' \
+  "${tmp_valid}" > "${tmp_missing_repo_snapshot}"
+expect_validation_failure \
+  "${tmp_missing_repo_snapshot}" \
+  "failure_injection" \
+  "scheduler_selected_missing_repo_snapshot" \
+  "scheduler-selected proof without source snapshot must fail validation"
+
+jq '.runs[0].worker_evidence_confidence = "target_worker_remote_proof" |
+    .runs[0].intended_worker_id = "contabo-2" |
+    .runs[0].selected_worker_id = "contabo-2" |
+    .runs[0].source_mirror_status = "missing" |
+    .runs[0].source_mirror_reason_code = "rch_mirror.missing_tracked_file"' \
+  "${tmp_valid}" > "${tmp_bad_target_mirror_status}"
+expect_validation_failure \
+  "${tmp_bad_target_mirror_status}" \
+  "failure_injection" \
+  "target_worker_missing_source_mirror" \
+  "target-worker remote proof with missing source mirror must fail validation"
+
+mock_rch_log_rel="${mock_rch_log#"${ROOT_DIR}"/}"
+mirror_cmd="bash scripts/attest_rch_worker_mirror.sh --worker contabo-2 --path Cargo.toml --output ${mock_rch_log_rel}"
+mirror_worker="worker=contabo-2"
+mirror_residual="mirror attestation showed the named worker is missing a tracked file; no material Cargo proof ran"
+jq --arg cmd "${mirror_cmd}" \
+  --arg cmd_fp "$(fingerprint_text "${mirror_cmd}")" \
+  --arg worker "${mirror_worker}" \
+  --arg worker_fp "$(fingerprint_text "${mirror_worker}")" \
+  --arg target "not_applicable" \
+  --arg target_fp "$(fingerprint_text "not_applicable")" \
+  --arg residual "${mirror_residual}" \
+  --arg residual_fp "$(fingerprint_text "${mirror_residual}")" \
+  '.runs[0].command = $cmd |
+    .runs[0].command_fingerprint = $cmd_fp |
+    .runs[0].command_class = "light" |
+    .runs[0].is_heavy = false |
+    .runs[0].used_rch = false |
+    .runs[0].worker_context = $worker |
+    .runs[0].worker_context_fingerprint = $worker_fp |
+    .runs[0].execution_mode = "local_light" |
+    .runs[0].target_dir = $target |
+    .runs[0].target_dir_fingerprint = $target_fp |
+    .runs[0].target_dir_lifecycle = "not_applicable" |
+    .runs[0].residual_risk_notes = $residual |
+    .runs[0].residual_risk_notes_fingerprint = $residual_fp |
+    .runs[0].worker_evidence_confidence = "target_worker_mirror_attestation" |
+    .runs[0].intended_worker_id = "contabo-2" |
+    .runs[0].selected_worker_id = "contabo-2" |
+    .runs[0].worker_queue_state = "not_applicable" |
+    .runs[0].repo_snapshot_head = "unknown" |
+    .runs[0].source_mirror_status = "missing" |
+    .runs[0].source_mirror_reason_code = "rch_mirror.missing_tracked_file" |
+    .runs[0].remote_cargo_reached = false |
+    .runs[0].remote_rustc_reached = false |
+    .runs[0].test_binary_reached = false' \
+  "${tmp_valid}" > "${tmp_mirror_failed_attestation}"
+
+if ! "${VALIDATOR}" --validate-evidence "${tmp_mirror_failed_attestation}" >/dev/null; then
+  emit_log \
+    "failed" \
+    "worker_evidence" \
+    "mirror_failed_attestation" \
+    "unexpected_mirror_attestation_reject" \
+    "validator_rejected_mirror_failed_attestation" \
+    "$(basename "${tmp_mirror_failed_attestation}")" \
+    "mirror-failed static attestation should validate as diagnostic evidence"
+  exit 1
+fi
+
+jq -c . "${tmp_mirror_failed_attestation}" > "${tmp_mirror_failed_ledger}"
+if ! "${VALIDATOR}" --aggregate-ledger "${tmp_mirror_failed_ledger}" > "${tmp_mirror_failed_report}"; then
+  emit_log \
+    "failed" \
+    "worker_evidence" \
+    "mirror_failed_aggregate" \
+    "aggregate_unexpected_fail" \
+    "aggregate_report_failed" \
+    "$(basename "${tmp_mirror_failed_report}")" \
+    "mirror-failed static attestation aggregate should pass with partial risk"
+  exit 1
+fi
+
+jq -e '
+  .overall_verdict == "partial_risk" and
+  .quality_gate_passed == true and
+  .counts.residual_risk_only == 1 and
+  .worker_evidence_counts.mirror_failed == 1 and
+  .entries[0].worker_evidence_confidence == "target_worker_mirror_attestation" and
+  .entries[0].source_mirror_status == "missing"
+' "${tmp_mirror_failed_report}" >/dev/null || {
+  emit_log \
+    "failed" \
+    "worker_evidence" \
+    "mirror_failed_aggregate" \
+    "missing_worker_fields" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_mirror_failed_report}")" \
+    "mirror-failed aggregate must expose worker-evidence confidence and mirror status"
+  exit 1
+}
+
 emit_log \
   "running" \
   "aggregate_quality_gate" \
@@ -808,6 +948,16 @@ jq --arg cmd "${light_command}" \
     .runs[0].target_dir_lifecycle = "not_applicable" |
     .runs[0].residual_risk_notes = $residual |
     .runs[0].residual_risk_notes_fingerprint = $residual_fp |
+    .runs[0].worker_evidence_confidence = "legacy_unknown_worker_evidence" |
+    .runs[0].intended_worker_id = null |
+    .runs[0].selected_worker_id = null |
+    .runs[0].worker_queue_state = "not_applicable" |
+    .runs[0].repo_snapshot_head = "not_applicable" |
+    .runs[0].source_mirror_status = "not_applicable" |
+    .runs[0].source_mirror_reason_code = null |
+    .runs[0].remote_cargo_reached = false |
+    .runs[0].remote_rustc_reached = false |
+    .runs[0].test_binary_reached = false |
     .runs[0].validation_status = "valid"' \
   "${tmp_valid}" > "${tmp_light_local}"
 
@@ -850,9 +1000,12 @@ jq -e '
   .counts.light_local == 1 and
   .counts.approved_fallback == 1 and
   .counts.residual_risk_only == 1 and
+  .worker_evidence_counts.scheduler_selected_remote == 2 and
+  .worker_evidence_counts.inconclusive_worker_evidence == 1 and
+  .worker_evidence_counts.legacy_unknown_worker_evidence == 1 and
   (.ledger_paths | length) == 2 and
   .blocking_failure_count == 0 and
-  ([.entries[] | select(.bead_id == "ft-kvs1e" and .scenario_id != "unknown" and .command != "unknown" and .worker_context != "unknown" and .artifact_path != "unknown" and .reason_code != "")] | length) == 4
+  ([.entries[] | select(.bead_id == "ft-kvs1e" and .scenario_id != "unknown" and .command != "unknown" and .worker_context != "unknown" and .artifact_path != "unknown" and .reason_code != "" and .worker_evidence_confidence != "" and .worker_evidence_category != "")] | length) == 4
 ' "${tmp_mixed_report}" >/dev/null || {
   emit_log \
     "failed" \
@@ -929,7 +1082,8 @@ aggregate_closeout_summary="$(jq -c '{
   overall_verdict,
   quality_gate_passed,
   blocking_failure_count,
-  counts
+  counts,
+  worker_evidence_counts
 }' "${tmp_mixed_report}")"
 emit_log \
   "passed" \
@@ -978,6 +1132,10 @@ for required_term in \
   "light local proof" \
   "approved local fallback" \
   "invalid local-heavy claim" \
+  "worker_evidence_confidence" \
+  "target_worker_remote_proof" \
+  "scheduler_selected_remote_proof" \
+  "source_mirror_status" \
   "static-only check" \
   "blocked verifier"; do
   rg -Fq "${required_term}" "${POLICY_DOC}" || {
@@ -997,6 +1155,9 @@ for required_term in \
   "remote RCH proof" \
   "light local proof" \
   "approved local fallback" \
+  "worker_evidence_confidence" \
+  "target_worker_remote_proof" \
+  "source_mirror_status" \
   "static-only check" \
   "blocked verifier" \
   "invalid local-heavy claim" \

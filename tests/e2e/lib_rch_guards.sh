@@ -152,6 +152,32 @@ rch_meta_json_field() {
     fi
 }
 
+rch_current_repo_snapshot_head() {
+    if [[ -n "${_RCH_REPO_ROOT}" ]] && git -C "${_RCH_REPO_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        git -C "${_RCH_REPO_ROOT}" rev-parse HEAD 2>/dev/null || printf '%s\n' "unknown"
+    else
+        printf '%s\n' "unknown"
+    fi
+}
+
+rch_log_remote_cargo_reached() {
+    local output_file="$1"
+    rch_log_has_remote_execution_marker "${output_file}" || return 1
+    grep -Eq "Remote command finished:|Compiling |Checking |Finished |error\\[E[0-9]+\\]|error:" "${output_file}" 2>/dev/null
+}
+
+rch_log_remote_rustc_reached() {
+    local output_file="$1"
+    rch_log_has_remote_execution_marker "${output_file}" || return 1
+    grep -Eq "Compiling |Checking |Finished |error\\[E[0-9]+\\]" "${output_file}" 2>/dev/null
+}
+
+rch_log_test_binary_reached() {
+    local output_file="$1"
+    rch_log_has_remote_execution_marker "${output_file}" || return 1
+    grep -Eq "running [0-9]+ tests?|test result:" "${output_file}" 2>/dev/null
+}
+
 rch_emit_proof_ledger_entry() {
     local command_text="$1"
     local log_file="$2"
@@ -169,6 +195,9 @@ rch_emit_proof_ledger_entry() {
     local redacted_target target_dir_fingerprint redacted_residual residual_risk_notes_fingerprint
     local fail_open timed_out remote_duration_ms elapsed_seconds execution_mode validation_status
     local failure_reason_code failure_reason_detail remote_exit_status
+    local intended_worker repo_snapshot_head source_mirror_status source_mirror_reason_code
+    local worker_queue_state worker_evidence_confidence
+    local remote_cargo_reached remote_rustc_reached test_binary_reached
 
     validator="$(rch_proof_ledger_validator)"
     meta_file="$(rch_log_meta_path "${log_file}")"
@@ -191,6 +220,8 @@ rch_emit_proof_ledger_entry() {
     failure_reason_code="$(rch_meta_json_field "${meta_file}" '.failure_reason_code')"
     failure_reason_detail="$(rch_meta_json_field "${meta_file}" '.failure_reason_detail')"
     remote_exit_status="$(rch_meta_json_field "${meta_file}" '.remote_exit_code')"
+    intended_worker="${RCH_PROOF_LEDGER_INTENDED_WORKER_ID:-}"
+    repo_snapshot_head="$(rch_current_repo_snapshot_head)"
 
     if [[ "${fail_open}" == "true" ]]; then
         worker_context="local_fallback"
@@ -232,6 +263,54 @@ rch_emit_proof_ledger_entry() {
         wrapper_exit_code="${remote_exit_status}"
     fi
 
+    worker_queue_state="unknown"
+    if [[ "${timed_out}" == "true" ]]; then
+        worker_queue_state="queue_timeout"
+    elif [[ "${fail_open}" == "true" ]]; then
+        worker_queue_state="unsupported_worker_selection"
+    elif [[ -n "${selected_worker}" ]]; then
+        worker_queue_state="ready"
+    fi
+
+    source_mirror_status="not_checked"
+    source_mirror_reason_code=""
+    if [[ "${failure_reason_code}" == "RCH-REMOTE-MIRROR-MISSING-FILE" ]]; then
+        source_mirror_status="missing"
+        source_mirror_reason_code="${failure_reason_code}"
+    elif [[ -n "${selected_worker}" && "${repo_snapshot_head}" =~ ^[a-f0-9]{40}$ ]]; then
+        source_mirror_status="present"
+    elif [[ -n "${selected_worker}" ]]; then
+        source_mirror_status="unknown"
+    fi
+
+    remote_cargo_reached="false"
+    remote_rustc_reached="false"
+    test_binary_reached="false"
+    if [[ "${fail_open}" != "true" && "${timed_out}" != "true" && "${is_heavy}" == "true" && -f "${log_file}" ]]; then
+        if rch_log_remote_cargo_reached "${log_file}"; then
+            remote_cargo_reached="true"
+        fi
+        if rch_log_remote_rustc_reached "${log_file}"; then
+            remote_rustc_reached="true"
+        fi
+        if rch_log_test_binary_reached "${log_file}"; then
+            test_binary_reached="true"
+        fi
+    fi
+
+    worker_evidence_confidence="legacy_unknown_worker_evidence"
+    if [[ "${fail_open}" == "true" || "${timed_out}" == "true" || "${wrapper_exit_code}" != "0" ]]; then
+        worker_evidence_confidence="inconclusive_worker_evidence"
+    elif [[ "${is_heavy}" == "true" && "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" && -n "${selected_worker}" ]]; then
+        if [[ -n "${intended_worker}" && "${intended_worker}" == "${selected_worker}" ]]; then
+            worker_evidence_confidence="target_worker_remote_proof"
+        else
+            worker_evidence_confidence="scheduler_selected_remote_proof"
+        fi
+    elif [[ "${is_heavy}" == "false" && "${used_rch}" == "true" ]]; then
+        worker_evidence_confidence="worker_self_test_only"
+    fi
+
     mkdir -p "$(dirname "${RCH_PROOF_LEDGER_FILE}")"
     jq -cn \
         --argjson schema_version 3 \
@@ -244,6 +323,16 @@ rch_emit_proof_ledger_entry() {
         --arg command_class "${command_class}" \
         --arg worker_context "${redacted_worker}" \
         --arg worker_context_fingerprint "${worker_context_fingerprint}" \
+        --arg worker_evidence_confidence "${worker_evidence_confidence}" \
+        --arg intended_worker_id "${intended_worker}" \
+        --arg selected_worker_id "${selected_worker}" \
+        --arg worker_queue_state "${worker_queue_state}" \
+        --arg repo_snapshot_head "${repo_snapshot_head}" \
+        --arg source_mirror_status "${source_mirror_status}" \
+        --arg source_mirror_reason_code "${source_mirror_reason_code}" \
+        --argjson remote_cargo_reached "${remote_cargo_reached}" \
+        --argjson remote_rustc_reached "${remote_rustc_reached}" \
+        --argjson test_binary_reached "${test_binary_reached}" \
         --arg execution_mode "${execution_mode}" \
         --arg target_dir "${redacted_target}" \
         --arg target_dir_fingerprint "${target_dir_fingerprint}" \
@@ -272,6 +361,16 @@ rch_emit_proof_ledger_entry() {
             used_rch: $used_rch,
             worker_context: $worker_context,
             worker_context_fingerprint: $worker_context_fingerprint,
+            worker_evidence_confidence: $worker_evidence_confidence,
+            intended_worker_id: (if $intended_worker_id == "" then null else $intended_worker_id end),
+            selected_worker_id: (if $selected_worker_id == "" then null else $selected_worker_id end),
+            worker_queue_state: $worker_queue_state,
+            repo_snapshot_head: (if $repo_snapshot_head == "" then "unknown" else $repo_snapshot_head end),
+            source_mirror_status: $source_mirror_status,
+            source_mirror_reason_code: (if $source_mirror_reason_code == "" then null else $source_mirror_reason_code end),
+            remote_cargo_reached: $remote_cargo_reached,
+            remote_rustc_reached: $remote_rustc_reached,
+            test_binary_reached: $test_binary_reached,
             execution_mode: $execution_mode,
             target_dir: $target_dir,
             target_dir_fingerprint: $target_dir_fingerprint,

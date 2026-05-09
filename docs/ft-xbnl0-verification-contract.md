@@ -119,6 +119,14 @@ mirror, also follow the worker-targeted proof contract in
 `docs/asupersync-rch-execution-policy.md`. Generic worker parity is not enough
 to close a worker-specific blocker.
 
+Worker-specific closeout comments must cite the proof-ledger
+`worker_evidence_confidence` and `source_mirror_status` fields. A clean
+worker-specific closeout needs `target_worker_remote_proof`; a generic remote
+test lane may use `scheduler_selected_remote_proof` with the selected worker
+named. Mirror-only evidence, including a `source_mirror_status` of `missing`,
+`stale`, or `unreachable`, is diagnostic or blocking evidence rather than a
+material Cargo/test pass.
+
 The minimum remote-verification profile is:
 
 1. Capacity proof:

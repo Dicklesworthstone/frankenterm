@@ -96,6 +96,24 @@ bead_id_is_valid() {
   [[ "${bead_id}" =~ ^ft-[[:alnum:]][[:alnum:]-]*(\.[[:alnum:]][[:alnum:]-]*)*$ ]]
 }
 
+optional_worker_text_is_safe() {
+  local label="$1"
+  local text="$2"
+
+  [[ -z "${text}" || "${text}" == "null" ]] && return 0
+  require_no_sensitive_text "${label}" "${text}" || return 1
+}
+
+missing_worker_value() {
+  local value="$1"
+  [[ -z "${value}" || "${value}" == "null" || "${value}" == "unknown" || "${value}" == "not_applicable" ]]
+}
+
+repo_snapshot_head_is_valid() {
+  local value="$1"
+  [[ "${value}" =~ ^[a-f0-9]{40}$ ]]
+}
+
 artifact_path_exists() {
   local path="$1"
   if [[ "${path}" = /* ]]; then
@@ -224,6 +242,155 @@ require_public_text_fingerprint() {
     echo "${label} mismatch for non-redacted public text" >&2
     return 1
   fi
+}
+
+validate_worker_evidence_fields() {
+  local run_index="$1"
+  local run="$2"
+  local command_class="$3"
+  local used_rch="$4"
+  local execution_mode="$5"
+  local validation_status="$6"
+
+  local confidence intended_worker selected_worker worker_queue_state repo_snapshot_head
+  local source_mirror_status source_mirror_reason_code remote_cargo_reached
+  local remote_rustc_reached test_binary_reached
+
+  jq -e '
+    (if has("worker_evidence_confidence") then (.worker_evidence_confidence == null or (.worker_evidence_confidence | type == "string")) else true end) and
+    (if has("intended_worker_id") then (.intended_worker_id == null or (.intended_worker_id | type == "string")) else true end) and
+    (if has("selected_worker_id") then (.selected_worker_id == null or (.selected_worker_id | type == "string")) else true end) and
+    (if has("worker_queue_state") then (.worker_queue_state == null or (.worker_queue_state | type == "string")) else true end) and
+    (if has("repo_snapshot_head") then (.repo_snapshot_head == null or (.repo_snapshot_head | type == "string")) else true end) and
+    (if has("source_mirror_status") then (.source_mirror_status == null or (.source_mirror_status | type == "string")) else true end) and
+    (if has("source_mirror_reason_code") then (.source_mirror_reason_code == null or (.source_mirror_reason_code | type == "string")) else true end) and
+    (if has("remote_cargo_reached") then (.remote_cargo_reached == null or (.remote_cargo_reached | type == "boolean")) else true end) and
+    (if has("remote_rustc_reached") then (.remote_rustc_reached == null or (.remote_rustc_reached | type == "boolean")) else true end) and
+    (if has("test_binary_reached") then (.test_binary_reached == null or (.test_binary_reached | type == "boolean")) else true end)
+  ' <<<"${run}" >/dev/null || {
+    echo "run[$run_index] worker evidence fields must use strings, booleans, or nulls with their documented types" >&2
+    return 1
+  }
+
+  confidence="$(jq -r '.worker_evidence_confidence // ""' <<<"${run}")"
+  intended_worker="$(jq -r '.intended_worker_id // ""' <<<"${run}")"
+  selected_worker="$(jq -r '.selected_worker_id // ""' <<<"${run}")"
+  worker_queue_state="$(jq -r '.worker_queue_state // ""' <<<"${run}")"
+  repo_snapshot_head="$(jq -r '.repo_snapshot_head // ""' <<<"${run}")"
+  source_mirror_status="$(jq -r '.source_mirror_status // ""' <<<"${run}")"
+  source_mirror_reason_code="$(jq -r '.source_mirror_reason_code // ""' <<<"${run}")"
+  remote_cargo_reached="$(jq -r 'if has("remote_cargo_reached") then (.remote_cargo_reached | tostring) else "" end' <<<"${run}")"
+  remote_rustc_reached="$(jq -r 'if has("remote_rustc_reached") then (.remote_rustc_reached | tostring) else "" end' <<<"${run}")"
+  test_binary_reached="$(jq -r 'if has("test_binary_reached") then (.test_binary_reached | tostring) else "" end' <<<"${run}")"
+
+  optional_worker_text_is_safe "run[$run_index] worker_evidence_confidence" "${confidence}" || return 1
+  optional_worker_text_is_safe "run[$run_index] intended_worker_id" "${intended_worker}" || return 1
+  optional_worker_text_is_safe "run[$run_index] selected_worker_id" "${selected_worker}" || return 1
+  optional_worker_text_is_safe "run[$run_index] worker_queue_state" "${worker_queue_state}" || return 1
+  optional_worker_text_is_safe "run[$run_index] repo_snapshot_head" "${repo_snapshot_head}" || return 1
+  optional_worker_text_is_safe "run[$run_index] source_mirror_status" "${source_mirror_status}" || return 1
+  optional_worker_text_is_safe "run[$run_index] source_mirror_reason_code" "${source_mirror_reason_code}" || return 1
+
+  [[ -z "${confidence}" || "${confidence}" =~ ^(target_worker_remote_proof|target_worker_mirror_attestation|scheduler_selected_remote_proof|worker_self_test_only|sync_or_transfer_only|inconclusive_worker_evidence|legacy_unknown_worker_evidence)$ ]] || {
+    echo "run[$run_index] worker_evidence_confidence has unsupported value: ${confidence}" >&2
+    return 1
+  }
+  [[ -z "${worker_queue_state}" || "${worker_queue_state}" =~ ^(ready|busy_wait|unhealthy|unsupported_worker_selection|queue_timeout|unknown|not_applicable)$ ]] || {
+    echo "run[$run_index] worker_queue_state must be ready, busy_wait, unhealthy, unsupported_worker_selection, queue_timeout, unknown, or not_applicable" >&2
+    return 1
+  }
+  [[ -z "${repo_snapshot_head}" || "${repo_snapshot_head}" == "unknown" || "${repo_snapshot_head}" == "not_applicable" || "${repo_snapshot_head}" =~ ^[a-f0-9]{40}$ ]] || {
+    echo "run[$run_index] repo_snapshot_head must be a 40-character lowercase git SHA, unknown, or not_applicable" >&2
+    return 1
+  }
+  [[ -z "${source_mirror_status}" || "${source_mirror_status}" =~ ^(present|missing|stale|unreachable|not_checked|unknown|not_applicable)$ ]] || {
+    echo "run[$run_index] source_mirror_status must be present, missing, stale, unreachable, not_checked, unknown, or not_applicable" >&2
+    return 1
+  }
+
+  case "${confidence}" in
+    target_worker_remote_proof)
+      missing_worker_value "${intended_worker}" && {
+        echo "run[$run_index] target_worker_remote_proof requires intended_worker_id" >&2
+        return 1
+      }
+      missing_worker_value "${selected_worker}" && {
+        echo "run[$run_index] target_worker_remote_proof requires selected_worker_id" >&2
+        return 1
+      }
+      [[ "${intended_worker}" == "${selected_worker}" ]] || {
+        echo "run[$run_index] target_worker_remote_proof requires intended_worker_id to match selected_worker_id" >&2
+        return 1
+      }
+      [[ "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" && "${validation_status}" == "valid" ]] || {
+        echo "run[$run_index] target_worker_remote_proof requires valid remote_rch execution" >&2
+        return 1
+      }
+      repo_snapshot_head_is_valid "${repo_snapshot_head}" || {
+        echo "run[$run_index] target_worker_remote_proof requires repo_snapshot_head" >&2
+        return 1
+      }
+      [[ "${source_mirror_status}" == "present" ]] || {
+        echo "run[$run_index] target_worker_remote_proof requires source_mirror_status=present" >&2
+        return 1
+      }
+      if [[ "${command_class}" == "heavy" && "${remote_cargo_reached}" != "true" ]]; then
+        echo "run[$run_index] target_worker_remote_proof for heavy commands requires remote_cargo_reached=true" >&2
+        return 1
+      fi
+      ;;
+    scheduler_selected_remote_proof)
+      missing_worker_value "${selected_worker}" && {
+        echo "run[$run_index] scheduler_selected_remote_proof requires selected_worker_id" >&2
+        return 1
+      }
+      [[ "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" && "${validation_status}" == "valid" ]] || {
+        echo "run[$run_index] scheduler_selected_remote_proof requires valid remote_rch execution" >&2
+        return 1
+      }
+      repo_snapshot_head_is_valid "${repo_snapshot_head}" || {
+        echo "run[$run_index] scheduler_selected_remote_proof requires repo_snapshot_head" >&2
+        return 1
+      }
+      [[ "${source_mirror_status}" == "present" ]] || {
+        echo "run[$run_index] scheduler_selected_remote_proof requires source_mirror_status=present" >&2
+        return 1
+      }
+      if [[ "${command_class}" == "heavy" && "${remote_cargo_reached}" != "true" ]]; then
+        echo "run[$run_index] scheduler_selected_remote_proof for heavy commands requires remote_cargo_reached=true" >&2
+        return 1
+      fi
+      ;;
+    target_worker_mirror_attestation)
+      if missing_worker_value "${intended_worker}" && missing_worker_value "${selected_worker}"; then
+        echo "run[$run_index] target_worker_mirror_attestation requires intended_worker_id or selected_worker_id" >&2
+        return 1
+      fi
+      [[ "${source_mirror_status}" =~ ^(present|missing|stale|unreachable)$ ]] || {
+        echo "run[$run_index] target_worker_mirror_attestation requires source_mirror_status present, missing, stale, or unreachable" >&2
+        return 1
+      }
+      if [[ "${source_mirror_status}" == "present" ]]; then
+        repo_snapshot_head_is_valid "${repo_snapshot_head}" || {
+          echo "run[$run_index] target_worker_mirror_attestation with present source mirror requires repo_snapshot_head" >&2
+          return 1
+        }
+      elif [[ -z "${source_mirror_reason_code}" || "${source_mirror_reason_code}" == "null" ]]; then
+        echo "run[$run_index] target_worker_mirror_attestation with failed mirror requires source_mirror_reason_code" >&2
+        return 1
+      fi
+      [[ "${remote_cargo_reached}" != "true" && "${remote_rustc_reached}" != "true" && "${test_binary_reached}" != "true" ]] || {
+        echo "run[$run_index] target_worker_mirror_attestation must not claim remote Cargo, rustc, or test execution" >&2
+        return 1
+      }
+      ;;
+    worker_self_test_only|sync_or_transfer_only)
+      [[ "${remote_cargo_reached}" != "true" && "${remote_rustc_reached}" != "true" && "${test_binary_reached}" != "true" ]] || {
+        echo "run[$run_index] ${confidence} must not claim remote Cargo, rustc, or test execution" >&2
+        return 1
+      }
+      ;;
+  esac
 }
 
 validate_evidence_file() {
@@ -429,6 +596,13 @@ validate_evidence_file() {
       echo "run[$i] validation_status mismatch: declared=${validation_status}, expected=${expected_validation_status}" >&2
       return 1
     fi
+    validate_worker_evidence_fields \
+      "${i}" \
+      "${run}" \
+      "${declared_command_class}" \
+      "${declared_used_rch}" \
+      "${execution_mode}" \
+      "${validation_status}" || return 1
   done
 
   echo "Evidence policy validation passed: ${evidence_file}"
@@ -457,26 +631,52 @@ aggregate_category_for_reason() {
 aggregate_valid_run_category() {
   local run="$1"
   local execution_mode validation_status command_class used_rch residual_risk_notes
+  local worker_evidence_confidence
 
   execution_mode="$(jq -r '.execution_mode // ""' <<<"${run}")"
   validation_status="$(jq -r '.validation_status // ""' <<<"${run}")"
   command_class="$(jq -r '.command_class // ""' <<<"${run}")"
   used_rch="$(jq -r '.used_rch // false' <<<"${run}")"
   residual_risk_notes="$(jq -r '.residual_risk_notes // ""' <<<"${run}")"
+  worker_evidence_confidence="$(jq -r '.worker_evidence_confidence // ""' <<<"${run}")"
 
   if [[ "${execution_mode}" == "approved_local_fallback" || "${validation_status}" == "approved_fallback" ]]; then
     printf '%s\n' "approved_fallback"
   elif [[ -n "${residual_risk_notes}" ]]; then
     printf '%s\n' "residual_risk_only"
-  elif [[ "${command_class}" == "heavy" && "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" ]]; then
+  elif [[ "${command_class}" == "heavy" && "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" && "${worker_evidence_confidence}" =~ ^(target_worker_remote_proof|scheduler_selected_remote_proof)$ ]]; then
     printf '%s\n' "proven_remote"
   elif [[ "${command_class}" == "light" && "${execution_mode}" == "local_light" ]]; then
     printf '%s\n' "light_local"
-  elif [[ "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" ]]; then
+  elif [[ "${used_rch}" == "true" && "${execution_mode}" == "remote_rch" && "${worker_evidence_confidence}" =~ ^(target_worker_remote_proof|scheduler_selected_remote_proof)$ ]]; then
     printf '%s\n' "proven_remote"
   else
     printf '%s\n' "residual_risk_only"
   fi
+}
+
+aggregate_worker_evidence_category() {
+  local run="$1"
+  local confidence source_mirror_status
+
+  confidence="$(jq -r '.worker_evidence_confidence // "legacy_unknown_worker_evidence"' <<<"${run}" 2>/dev/null || printf 'legacy_unknown_worker_evidence')"
+  source_mirror_status="$(jq -r '.source_mirror_status // ""' <<<"${run}" 2>/dev/null || printf '')"
+
+  case "${confidence}" in
+    target_worker_remote_proof) printf '%s\n' "target_worker_remote" ;;
+    scheduler_selected_remote_proof) printf '%s\n' "scheduler_selected_remote" ;;
+    target_worker_mirror_attestation)
+      if [[ "${source_mirror_status}" == "present" ]]; then
+        printf '%s\n' "mirror_attested"
+      else
+        printf '%s\n' "mirror_failed"
+      fi
+      ;;
+    worker_self_test_only) printf '%s\n' "worker_self_test_only" ;;
+    sync_or_transfer_only) printf '%s\n' "sync_or_transfer_only" ;;
+    inconclusive_worker_evidence) printf '%s\n' "inconclusive_worker_evidence" ;;
+    *) printf '%s\n' "legacy_unknown_worker_evidence" ;;
+  esac
 }
 
 aggregate_reason_for_valid_category() {
@@ -499,6 +699,9 @@ aggregate_run_entry_json() {
   local reason_detail="${7:-}"
   local validation_status="${8:-valid}"
   local run bead_id scenario_id command worker_context artifact_paths artifact_path
+  local worker_evidence_confidence worker_evidence_category intended_worker_id selected_worker_id
+  local worker_queue_state repo_snapshot_head source_mirror_status source_mirror_reason_code
+  local remote_cargo_reached remote_rustc_reached test_binary_reached
 
   run="$(jq -c ".runs[${run_index}]" <<<"${evidence}" 2>/dev/null || printf '{}')"
   bead_id="$(jq -r '.bead_id // "unknown"' <<<"${evidence}" 2>/dev/null || printf 'unknown')"
@@ -507,6 +710,17 @@ aggregate_run_entry_json() {
   worker_context="$(jq -r '.worker_context // "unknown"' <<<"${run}" 2>/dev/null || printf 'unknown')"
   artifact_paths="$(jq -c 'if (.artifact_paths | type) == "array" then .artifact_paths else [] end' <<<"${run}" 2>/dev/null || printf '[]')"
   artifact_path="$(jq -r 'if (.artifact_paths | type) == "array" and (.artifact_paths | length) > 0 then .artifact_paths[0] else "unknown" end' <<<"${run}" 2>/dev/null || printf 'unknown')"
+  worker_evidence_confidence="$(jq -r '.worker_evidence_confidence // "legacy_unknown_worker_evidence"' <<<"${run}" 2>/dev/null || printf 'legacy_unknown_worker_evidence')"
+  worker_evidence_category="$(aggregate_worker_evidence_category "${run}")"
+  intended_worker_id="$(jq -r '.intended_worker_id // ""' <<<"${run}" 2>/dev/null || printf '')"
+  selected_worker_id="$(jq -r '.selected_worker_id // ""' <<<"${run}" 2>/dev/null || printf '')"
+  worker_queue_state="$(jq -r '.worker_queue_state // ""' <<<"${run}" 2>/dev/null || printf '')"
+  repo_snapshot_head="$(jq -r '.repo_snapshot_head // ""' <<<"${run}" 2>/dev/null || printf '')"
+  source_mirror_status="$(jq -r '.source_mirror_status // ""' <<<"${run}" 2>/dev/null || printf '')"
+  source_mirror_reason_code="$(jq -r '.source_mirror_reason_code // ""' <<<"${run}" 2>/dev/null || printf '')"
+  remote_cargo_reached="$(jq -r 'if has("remote_cargo_reached") then .remote_cargo_reached else null end' <<<"${run}" 2>/dev/null || printf 'null')"
+  remote_rustc_reached="$(jq -r 'if has("remote_rustc_reached") then .remote_rustc_reached else null end' <<<"${run}" 2>/dev/null || printf 'null')"
+  test_binary_reached="$(jq -r 'if has("test_binary_reached") then .test_binary_reached else null end' <<<"${run}" 2>/dev/null || printf 'null')"
 
   jq -cn \
     --arg ledger_path "${ledger_file}" \
@@ -522,6 +736,17 @@ aggregate_run_entry_json() {
     --arg reason_code "${reason_code}" \
     --arg reason_detail "${reason_detail}" \
     --arg validation_status "${validation_status}" \
+    --arg worker_evidence_confidence "${worker_evidence_confidence}" \
+    --arg worker_evidence_category "${worker_evidence_category}" \
+    --arg intended_worker_id "${intended_worker_id}" \
+    --arg selected_worker_id "${selected_worker_id}" \
+    --arg worker_queue_state "${worker_queue_state}" \
+    --arg repo_snapshot_head "${repo_snapshot_head}" \
+    --arg source_mirror_status "${source_mirror_status}" \
+    --arg source_mirror_reason_code "${source_mirror_reason_code}" \
+    --argjson remote_cargo_reached "${remote_cargo_reached}" \
+    --argjson remote_rustc_reached "${remote_rustc_reached}" \
+    --argjson test_binary_reached "${test_binary_reached}" \
     '{
       ledger_path: $ledger_path,
       line_no: $line_no,
@@ -535,7 +760,18 @@ aggregate_run_entry_json() {
       category: $category,
       reason_code: $reason_code,
       reason_detail: $reason_detail,
-      validation_status: $validation_status
+      validation_status: $validation_status,
+      worker_evidence_confidence: $worker_evidence_confidence,
+      worker_evidence_category: $worker_evidence_category,
+      intended_worker_id: (if $intended_worker_id == "" then null else $intended_worker_id end),
+      selected_worker_id: (if $selected_worker_id == "" then null else $selected_worker_id end),
+      worker_queue_state: (if $worker_queue_state == "" then null else $worker_queue_state end),
+      repo_snapshot_head: (if $repo_snapshot_head == "" then null else $repo_snapshot_head end),
+      source_mirror_status: (if $source_mirror_status == "" then null else $source_mirror_status end),
+      source_mirror_reason_code: (if $source_mirror_reason_code == "" then null else $source_mirror_reason_code end),
+      remote_cargo_reached: $remote_cargo_reached,
+      remote_rustc_reached: $remote_rustc_reached,
+      test_binary_reached: $test_binary_reached
     }'
 }
 
@@ -641,6 +877,7 @@ aggregate_ledger_file() {
     --arg ledger_path "${ledger_file}" \
     --arg validation_dir "${validation_dir}" \
     'def countcat($name): map(select(.category == $name)) | length;
+     def countworker($name): map(select(.worker_evidence_category == $name)) | length;
      . as $entries
      | {
         schema_version: ($schema_version | tonumber),
@@ -658,6 +895,16 @@ aggregate_ledger_file() {
           malformed: countcat("malformed"),
           missing_artifact: countcat("missing_artifact"),
           residual_risk_only: countcat("residual_risk_only")
+        },
+        worker_evidence_counts: {
+          target_worker_remote: countworker("target_worker_remote"),
+          scheduler_selected_remote: countworker("scheduler_selected_remote"),
+          mirror_attested: countworker("mirror_attested"),
+          mirror_failed: countworker("mirror_failed"),
+          worker_self_test_only: countworker("worker_self_test_only"),
+          sync_or_transfer_only: countworker("sync_or_transfer_only"),
+          inconclusive_worker_evidence: countworker("inconclusive_worker_evidence"),
+          legacy_unknown_worker_evidence: countworker("legacy_unknown_worker_evidence")
         }
       }
       | .blocking_failure_count = (
@@ -706,6 +953,7 @@ aggregate_ledger_files() {
     --argjson ledger_paths "${ledger_paths_json}" \
     --argjson validation_dirs "${validation_dirs_json}" \
     'def countcat($name): map(select(.category == $name)) | length;
+     def countworker($name): map(select(.worker_evidence_category == $name)) | length;
      . as $entries
      | {
         schema_version: ($schema_version | tonumber),
@@ -723,6 +971,16 @@ aggregate_ledger_files() {
           malformed: countcat("malformed"),
           missing_artifact: countcat("missing_artifact"),
           residual_risk_only: countcat("residual_risk_only")
+        },
+        worker_evidence_counts: {
+          target_worker_remote: countworker("target_worker_remote"),
+          scheduler_selected_remote: countworker("scheduler_selected_remote"),
+          mirror_attested: countworker("mirror_attested"),
+          mirror_failed: countworker("mirror_failed"),
+          worker_self_test_only: countworker("worker_self_test_only"),
+          sync_or_transfer_only: countworker("sync_or_transfer_only"),
+          inconclusive_worker_evidence: countworker("inconclusive_worker_evidence"),
+          legacy_unknown_worker_evidence: countworker("legacy_unknown_worker_evidence")
         }
       }
       | .blocking_failure_count = (
@@ -840,13 +1098,14 @@ run_self_test() {
   tmp_evidence="${tmp_dir}/valid-evidence.json"
   local remote_cmd remote_worker remote_target light_cmd_value light_worker light_target
   local remote_cmd_fp remote_worker_fp remote_target_fp light_cmd_fp light_worker_fp light_target_fp
-  local artifact_paths_fp empty_fp
+  local artifact_paths_fp empty_fp remote_repo_snapshot
   remote_cmd="rch exec -- cargo test --workspace"
   remote_worker="worker=mock-1"
   remote_target="/tmp/ft-kvs1e-rch-target"
   light_cmd_value="cargo fmt --check"
   light_worker="local"
   light_target="not_applicable"
+  remote_repo_snapshot="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   remote_cmd_fp="$(fingerprint_text "${remote_cmd}")"
   remote_worker_fp="$(fingerprint_text "${remote_worker}")"
   remote_target_fp="$(fingerprint_text "${remote_target}")"
@@ -871,6 +1130,16 @@ run_self_test() {
       "used_rch": true,
       "worker_context": "${remote_worker}",
       "worker_context_fingerprint": "${remote_worker_fp}",
+      "worker_evidence_confidence": "scheduler_selected_remote_proof",
+      "intended_worker_id": null,
+      "selected_worker_id": "mock-1",
+      "worker_queue_state": "ready",
+      "repo_snapshot_head": "${remote_repo_snapshot}",
+      "source_mirror_status": "present",
+      "source_mirror_reason_code": null,
+      "remote_cargo_reached": true,
+      "remote_rustc_reached": null,
+      "test_binary_reached": null,
       "execution_mode": "remote_rch",
       "target_dir": "${remote_target}",
       "target_dir_fingerprint": "${remote_target_fp}",
@@ -892,6 +1161,16 @@ run_self_test() {
       "used_rch": false,
       "worker_context": "${light_worker}",
       "worker_context_fingerprint": "${light_worker_fp}",
+      "worker_evidence_confidence": "legacy_unknown_worker_evidence",
+      "intended_worker_id": null,
+      "selected_worker_id": null,
+      "worker_queue_state": "not_applicable",
+      "repo_snapshot_head": "not_applicable",
+      "source_mirror_status": "not_applicable",
+      "source_mirror_reason_code": null,
+      "remote_cargo_reached": false,
+      "remote_rustc_reached": false,
+      "test_binary_reached": false,
       "execution_mode": "local_light",
       "target_dir": "${light_target}",
       "target_dir_fingerprint": "${light_target_fp}",
@@ -938,7 +1217,8 @@ JSON
 
   local tmp_fail_open tmp_fail_open_recovered tmp_sync_chatter tmp_shell_wrapper
   local tmp_missing_artifact tmp_missing_is_heavy tmp_secret_command tmp_secret_path
-  local tmp_malformed_bead tmp_stale_schema
+  local tmp_malformed_bead tmp_stale_schema tmp_missing_worker_id tmp_missing_repo_snapshot
+  local tmp_bad_target_mirror_status tmp_mirror_failed_attestation
   tmp_fail_open="${tmp_dir}/fail-open.json"
   tmp_fail_open_recovered="${tmp_dir}/fail-open-recovered.json"
   tmp_sync_chatter="${tmp_dir}/sync-chatter.json"
@@ -949,6 +1229,10 @@ JSON
   tmp_secret_path="${tmp_dir}/secret-path.json"
   tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
   tmp_stale_schema="${tmp_dir}/stale-schema.json"
+  tmp_missing_worker_id="${tmp_dir}/missing-worker-id.json"
+  tmp_missing_repo_snapshot="${tmp_dir}/missing-repo-snapshot.json"
+  tmp_bad_target_mirror_status="${tmp_dir}/bad-target-mirror-status.json"
+  tmp_mirror_failed_attestation="${tmp_dir}/mirror-failed-attestation.json"
 
   local local_fallback_worker local_fallback_worker_fp
   local_fallback_worker="local_fallback"
@@ -968,7 +1252,14 @@ JSON
   jq '.runs[0].fallback_reason_code = "RCH-LOCAL-FALLBACK" |
       .runs[0].fallback_approved_by = "human-operator" |
       .runs[0].execution_mode = "approved_local_fallback" |
-      .runs[0].validation_status = "approved_fallback"' \
+      .runs[0].validation_status = "approved_fallback" |
+      .runs[0].worker_evidence_confidence = "inconclusive_worker_evidence" |
+      .runs[0].selected_worker_id = null |
+      .runs[0].worker_queue_state = "unsupported_worker_selection" |
+      .runs[0].source_mirror_status = "not_checked" |
+      .runs[0].remote_cargo_reached = false |
+      .runs[0].remote_rustc_reached = false |
+      .runs[0].test_binary_reached = false' \
     "${tmp_fail_open}" > "${tmp_fail_open_recovered}"
   validate_evidence_file "${tmp_fail_open_recovered}" >/dev/null
 
@@ -1062,6 +1353,75 @@ JSON
     echo "self-test failed: stale schema_version must be rejected" >&2
     return 1
   fi
+
+  jq '.runs[0].worker_evidence_confidence = "target_worker_remote_proof" |
+      .runs[0].intended_worker_id = "mock-1" |
+      .runs[0].selected_worker_id = null' \
+    "${tmp_evidence}" > "${tmp_missing_worker_id}"
+  if validate_evidence_file "${tmp_missing_worker_id}" >/dev/null 2>&1; then
+    echo "self-test failed: target-worker proof without selected worker id must be rejected" >&2
+    return 1
+  fi
+
+  jq '.runs[0].worker_evidence_confidence = "scheduler_selected_remote_proof" |
+      .runs[0].repo_snapshot_head = null' \
+    "${tmp_evidence}" > "${tmp_missing_repo_snapshot}"
+  if validate_evidence_file "${tmp_missing_repo_snapshot}" >/dev/null 2>&1; then
+    echo "self-test failed: scheduler-selected proof without repo snapshot must be rejected" >&2
+    return 1
+  fi
+
+  jq '.runs[0].worker_evidence_confidence = "target_worker_remote_proof" |
+      .runs[0].intended_worker_id = "mock-1" |
+      .runs[0].selected_worker_id = "mock-1" |
+      .runs[0].source_mirror_status = "missing" |
+      .runs[0].source_mirror_reason_code = "rch_mirror.missing_tracked_file"' \
+    "${tmp_evidence}" > "${tmp_bad_target_mirror_status}"
+  if validate_evidence_file "${tmp_bad_target_mirror_status}" >/dev/null 2>&1; then
+    echo "self-test failed: target-worker remote proof with missing source mirror must be rejected" >&2
+    return 1
+  fi
+
+  local mirror_cmd mirror_cmd_fp mirror_worker mirror_worker_fp mirror_residual mirror_residual_fp
+  mirror_cmd="bash scripts/attest_rch_worker_mirror.sh --worker mock-1 --path Cargo.toml --output ${tmp_artifact_rel}"
+  mirror_cmd_fp="$(fingerprint_text "${mirror_cmd}")"
+  mirror_worker="worker=mock-1"
+  mirror_worker_fp="$(fingerprint_text "${mirror_worker}")"
+  mirror_residual="mirror attestation showed the named worker is missing a tracked file; no material Cargo proof ran"
+  mirror_residual_fp="$(fingerprint_text "${mirror_residual}")"
+  jq --arg cmd "${mirror_cmd}" \
+    --arg cmd_fp "${mirror_cmd_fp}" \
+    --arg worker "${mirror_worker}" \
+    --arg worker_fp "${mirror_worker_fp}" \
+    --arg target "${light_target}" \
+    --arg target_fp "${light_target_fp}" \
+    --arg residual "${mirror_residual}" \
+    --arg residual_fp "${mirror_residual_fp}" \
+    '.runs[0].command = $cmd |
+      .runs[0].command_fingerprint = $cmd_fp |
+      .runs[0].command_class = "light" |
+      .runs[0].is_heavy = false |
+      .runs[0].used_rch = false |
+      .runs[0].worker_context = $worker |
+      .runs[0].worker_context_fingerprint = $worker_fp |
+      .runs[0].execution_mode = "local_light" |
+      .runs[0].target_dir = $target |
+      .runs[0].target_dir_fingerprint = $target_fp |
+      .runs[0].target_dir_lifecycle = "not_applicable" |
+      .runs[0].residual_risk_notes = $residual |
+      .runs[0].residual_risk_notes_fingerprint = $residual_fp |
+      .runs[0].worker_evidence_confidence = "target_worker_mirror_attestation" |
+      .runs[0].intended_worker_id = "mock-1" |
+      .runs[0].selected_worker_id = "mock-1" |
+      .runs[0].worker_queue_state = "not_applicable" |
+      .runs[0].repo_snapshot_head = "unknown" |
+      .runs[0].source_mirror_status = "missing" |
+      .runs[0].source_mirror_reason_code = "rch_mirror.missing_tracked_file" |
+      .runs[0].remote_cargo_reached = false |
+      .runs[0].remote_rustc_reached = false |
+      .runs[0].test_binary_reached = false' \
+    "${tmp_evidence}" > "${tmp_mirror_failed_attestation}"
+  validate_evidence_file "${tmp_mirror_failed_attestation}" >/dev/null
 
   echo "Self-test passed"
 }

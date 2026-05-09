@@ -130,10 +130,13 @@ explicitly classify the result as `inconclusive_worker_evidence`:
 9. Residual risk notes when proof was scheduler-selected rather than
    target-worker-enforced.
 
-Until the proof-ledger schema grows first-class worker-targeted fields, record
-the extra worker evidence in `worker_context`, `artifact_paths`, and
-`residual_risk_notes` with stable fingerprints. Do not silently promote those
-records to target-worker proof.
+The schema-v3 proof-ledger fields for this contract are
+`worker_evidence_confidence`, `intended_worker_id`, `selected_worker_id`,
+`worker_queue_state`, `repo_snapshot_head`, `source_mirror_status`,
+`source_mirror_reason_code`, `remote_cargo_reached`,
+`remote_rustc_reached`, and `test_binary_reached`. Older records without
+these fields are legacy/unknown worker evidence; do not silently promote them
+to target-worker proof.
 
 ### Allowed And Forbidden Incident Actions
 
@@ -214,18 +217,36 @@ Every proof-ledger run must be logged with fields:
 6. `used_rch`
 7. `worker_context`
 8. `worker_context_fingerprint`
-9. `execution_mode` (`remote_rch`, `local_light`, or `approved_local_fallback`)
-10. `target_dir`
-11. `target_dir_fingerprint`
-12. `target_dir_lifecycle` (`not_applicable`, `retained`, `inventory_only`, or `cleanup_approved`)
-13. `artifact_paths` (each path must exist when evidence is validated)
-14. `artifact_paths_fingerprint`
-15. `elapsed_seconds`
-16. `exit_status`
-17. `residual_risk_notes`
-18. `residual_risk_notes_fingerprint`
-19. `validation_status` (`valid` or `approved_fallback`)
-20. Optional fallback fields when a heavy run is not confirmed as remote RCH:
+9. Optional `worker_evidence_confidence`
+   (`target_worker_remote_proof`, `target_worker_mirror_attestation`,
+   `scheduler_selected_remote_proof`, `worker_self_test_only`,
+   `sync_or_transfer_only`, `inconclusive_worker_evidence`, or
+   `legacy_unknown_worker_evidence`)
+10. Optional `intended_worker_id`
+11. Optional `selected_worker_id`
+12. Optional `worker_queue_state` (`ready`, `busy_wait`, `unhealthy`,
+   `unsupported_worker_selection`, `queue_timeout`, `unknown`, or
+   `not_applicable`)
+13. Optional `repo_snapshot_head` (40-character git SHA, `unknown`, or
+   `not_applicable`)
+14. Optional `source_mirror_status` (`present`, `missing`, `stale`,
+   `unreachable`, `not_checked`, `unknown`, or `not_applicable`)
+15. Optional `source_mirror_reason_code`
+16. Optional `remote_cargo_reached`
+17. Optional `remote_rustc_reached`
+18. Optional `test_binary_reached`
+19. `execution_mode` (`remote_rch`, `local_light`, or `approved_local_fallback`)
+20. `target_dir`
+21. `target_dir_fingerprint`
+22. `target_dir_lifecycle` (`not_applicable`, `retained`, `inventory_only`, or `cleanup_approved`)
+23. `artifact_paths` (each path must exist when evidence is validated)
+24. `artifact_paths_fingerprint`
+25. `elapsed_seconds`
+26. `exit_status`
+27. `residual_risk_notes`
+28. `residual_risk_notes_fingerprint`
+29. `validation_status` (`valid` or `approved_fallback`)
+30. Optional fallback fields when a heavy run is not confirmed as remote RCH:
    - `fallback_reason_code`
    - `fallback_approved_by`
 
@@ -405,7 +426,8 @@ Aggregate quality gate:
 - `--aggregate-ledger` scans one or more proof-ledger JSONL files, validates
   every run in every retained evidence object, and emits an operator report.
 - Each row carries the bead ID, scenario ID, command, worker context, artifact
-  path(s), category, and stable reason code so Beads and release-readiness
+  path(s), category, worker-evidence confidence, worker-evidence category,
+  source mirror status, and stable reason code so Beads and release-readiness
   comments can cite the exact proof shape.
 - Categories are:
   - `proven_remote`: heavy Cargo proof ran through an RCH-recognized remote path.
@@ -420,14 +442,20 @@ Aggregate quality gate:
 - `approved_fallback` and `residual_risk_only` produce an `overall_verdict` of
   `partial_risk`; this is acceptable evidence only when the operator-facing
   closeout names the residual risk instead of claiming a clean pass.
+- `worker_evidence_counts` separately tracks `target_worker_remote`,
+  `scheduler_selected_remote`, `mirror_attested`, `mirror_failed`,
+  `worker_self_test_only`, `sync_or_transfer_only`,
+  `inconclusive_worker_evidence`, and `legacy_unknown_worker_evidence` so
+  direct worker proof, indirect scheduler proof, and mirror-failed diagnostics
+  are not conflated.
 
 The self-test and E2E cover accepted remote proof, rejected local-heavy proof,
 accepted human-approved fallback, light local commands, stale schema versions,
 malformed bead IDs, missing artifacts, missing required booleans, unredacted
 provider tokens, SSH-style secret paths, wrapper-emitted ledger records, RCH
 setup chatter, shell wrappers that mention RCH while running Cargo locally, and
-aggregate quality-gate classification for mixed, missing, rejected, and
-malformed proof-ledger JSONL.
+aggregate quality-gate classification for mixed, missing, rejected, malformed,
+target-worker, scheduler-selected, and mirror-failed proof-ledger JSONL.
 
 ## User Impact
 
