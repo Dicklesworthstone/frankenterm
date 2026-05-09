@@ -1,8 +1,13 @@
 //! PolicyEngine health diagnostics.
 //!
-//! Provides structured health checks for all PolicyEngine subsystems,
+//! Provides structured health checks for the operator-visible PolicyEngine
+//! diagnostics surface,
 //! integrating with the [`HealthCheckRegistry`](crate::runtime_health::HealthCheckRegistry)
 //! to surface policy-layer health alongside runtime health in `ft doctor` output.
+//!
+//! The historical twenty-one policy/control surfaces are reconciled in
+//! `docs/adrs/policy-subsystem-count-audit.md`; only the fourteen checks below
+//! produce independent policy diagnostics verdicts.
 //!
 //! # Checks
 //!
@@ -26,6 +31,9 @@
 use crate::policy::PolicyEngine;
 use crate::runtime_health::{RemediationEffort, RemediationHint, RuntimeHealthCheck};
 
+/// Number of operator-visible PolicyEngine diagnostics checks.
+pub const POLICY_SUBSYSTEM_COUNT: usize = 14;
+
 /// Run all PolicyEngine health checks and return individual results.
 ///
 /// Each check inspects a specific subsystem and produces a
@@ -38,7 +46,7 @@ pub fn check_policy_engine_health(
     engine: &mut PolicyEngine,
     now_ms: u64,
 ) -> Vec<RuntimeHealthCheck> {
-    vec![
+    let checks = vec![
         check_decision_log(engine),
         check_quarantine(engine, now_ms),
         check_audit_chain(engine, now_ms),
@@ -53,7 +61,13 @@ pub fn check_policy_engine_health(
         check_connector_mesh(engine),
         check_bundles(engine, now_ms),
         check_ingestion(engine, now_ms),
-    ]
+    ];
+    debug_assert_eq!(
+        checks.len(),
+        POLICY_SUBSYSTEM_COUNT,
+        "policy diagnostics enumeration must match POLICY_SUBSYSTEM_COUNT",
+    );
+    checks
 }
 
 // =============================================================================

@@ -83,7 +83,7 @@ Current implementation reality:
 | **Event-Driven Automation** | Workflows trigger on patterns, not sleep loops or polling heuristics |
 | **Robot Mode API** | JSON/TOON interface optimized for AI agents to control other AI agents |
 | **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output |
-| **Policy Engine** | 21-subsystem policy framework with capability gates, rate limiting, audit trails, and approval tokens |
+| **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
 | **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; memory-envelope claims should be treated as benchmark-dependent until linked artifacts are published |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing; the shipped recorder backend is currently `append_log`, while `frankensqlite` remains rollout/test-only until live bootstrap support lands |
@@ -335,7 +335,7 @@ Operator guidance:
 | Event-driven automation | Built-in workflows + policy gate | Not native | Not native | Not native |
 | Machine API for agents | Robot Mode + MCP + TOON | No equivalent | No equivalent | No equivalent |
 | Cross-session state + recovery | Built-in snapshots/sessions | Partial/manual | Session-centric, not swarm-centric | Minimal |
-| Agent-safe control plane | 21-subsystem policy engine | Not native | Not native | Not native |
+| Agent-safe control plane | 14-subsystem policy diagnostics surface | Not native | Not native | Not native |
 | Transactional multi-pane ops | Prepare/commit/compensate | No equivalent | No equivalent | No equivalent |
 | Full-text search over output | FTS5 + semantic/hybrid modes | No equivalent | No equivalent | No equivalent |
 | Memory management at scale | Three-tier scrollback + fleet controller | Single tier | Single tier | Single tier |
@@ -1046,7 +1046,7 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
                     └──────────────┼──────────────┘
                                    ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│                   Policy Engine (21 subsystems)                       │
+│                   Policy Engine (14 health checks)                    │
 │ Capability Gates │ Rate Limiting │ Audit Trail │ Approval Tokens      │
 │ Secret Redaction │ Backpressure Tiers │ Circuit Breakers              │
 └───────────────────────────────────────────────────────────────────────┘

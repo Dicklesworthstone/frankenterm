@@ -239,7 +239,7 @@ pub enum SubsystemLayer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "subsystem", rename_all = "snake_case")]
 pub enum SubsystemPayload {
-    /// Aggregated policy engine snapshot (all 21 subsystems).
+    /// Aggregated policy engine snapshot; operator-visible diagnostics enumerate 14 checks.
     Policy(Box<PolicyPayload>),
     /// Swarm scheduler snapshot.
     SwarmScheduler(SwarmSchedulerPayload),
