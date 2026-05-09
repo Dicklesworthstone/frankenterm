@@ -21,6 +21,8 @@
 #     risk categories and counts without adding a docs/json-schema robot file.
 #   - expected_handoff.md pins the read-only red-mail Beads handoff comment
 #     formatter; the script prints it but never posts it.
+#   - expected_handoff_missing_bead.stderr pins validation output for missing
+#     required review metadata so argument failures stay deterministic.
 #
 # Run:
 #   bats tests/swarm_tick_tests.bats
@@ -133,6 +135,28 @@ run_agent_mail_handoff_fixture() {
     log_event "compare" "actual=${TMP_DIR}/actual_handoff.md expected=${TMP_DIR}/expected_handoff.md"
 }
 
+run_agent_mail_handoff_missing_bead_fixture() {
+    local fixture="${FIXTURES_ROOT}/agent-mail-fallback"
+    [[ -d "$fixture" ]] || { echo "missing fixture: $fixture" >&2; return 2; }
+
+    log_event "setup" "fixture=agent-mail-fallback-handoff-missing-bead"
+
+    local stdout_file="${TMP_DIR}/actual_missing_bead.stdout"
+    local stderr_file="${TMP_DIR}/actual_missing_bead.stderr"
+    set +e
+    PATH="${STUBS_DIR}:$PATH" \
+        FIXTURE_DIR="$fixture" \
+        REPO_ROOT="$REPO_ROOT" \
+        FT_OPERATOR_NOW_ISO="2026-05-06T17:00:00Z" \
+        FT_OPERATOR_NOW_EPOCH="1778086800" \
+        bash "$SCRIPT" --agent-mail-handoff frankenterm >"$stdout_file" 2>"$stderr_file"
+    HANDOFF_MISSING_BEAD_STATUS="$?"
+    set -e
+
+    cp "${fixture}/expected_handoff_missing_bead.stderr" "${TMP_DIR}/expected_missing_bead.stderr"
+    log_event "compare" "actual=${stderr_file} expected=${TMP_DIR}/expected_missing_bead.stderr status=${HANDOFF_MISSING_BEAD_STATUS}"
+}
+
 # Assert that the running fixture's actual matches expected.
 assert_match() {
     if ! diff -u "${TMP_DIR}/expected.json" "${TMP_DIR}/actual.json" > "${TMP_DIR}/diff.txt"; then
@@ -154,6 +178,19 @@ assert_handoff_match() {
         cat "${TMP_DIR}/expected_handoff.md" >&2
         echo "--- actual" >&2
         cat "${TMP_DIR}/actual_handoff.md" >&2
+        echo "--- diff" >&2
+        cat "${TMP_DIR}/diff.txt" >&2
+        return 1
+    fi
+}
+
+assert_handoff_missing_bead_match() {
+    if ! diff -u "${TMP_DIR}/expected_missing_bead.stderr" "${TMP_DIR}/actual_missing_bead.stderr" > "${TMP_DIR}/diff.txt"; then
+        log_event "diff" "$(cat "${TMP_DIR}/diff.txt")"
+        echo "--- expected" >&2
+        cat "${TMP_DIR}/expected_missing_bead.stderr" >&2
+        echo "--- actual" >&2
+        cat "${TMP_DIR}/actual_missing_bead.stderr" >&2
         echo "--- diff" >&2
         cat "${TMP_DIR}/diff.txt" >&2
         return 1
@@ -208,6 +245,13 @@ assert_handoff_match() {
     [[ "$(grep -c '^Avoided paths:' "${TMP_DIR}/actual_handoff.md")" == "1" ]]
     [[ "$(grep -c '^Proof commands actually run:' "${TMP_DIR}/actual_handoff.md")" == "1" ]]
     grep -F "Sync chatter, transfer logs, and code presence alone are not proof." "${TMP_DIR}/actual_handoff.md" >/dev/null
+}
+
+@test "agent-mail handoff fixture: missing bead id → exact validation error" {
+    run_agent_mail_handoff_missing_bead_fixture
+    [[ "$HANDOFF_MISSING_BEAD_STATUS" == "64" ]]
+    [[ ! -s "${TMP_DIR}/actual_missing_bead.stdout" ]]
+    assert_handoff_missing_bead_match
 }
 
 # ─── Schema invariants (run on healthy fixture) ──────────────────────────────
