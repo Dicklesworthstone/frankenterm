@@ -168,7 +168,7 @@ emit_inventory() {
     echo "inventory target_glob=$target_glob threshold_hours=$hours threshold_min=$threshold_min"
   fi
 
-  for d in "${candidates[@]}"; do
+  for d in "${candidates[@]+"${candidates[@]}"}"; do
     [ -d "$d" ] || continue
 
     local mtime
@@ -322,6 +322,7 @@ trap 'release_operator_lock "$operator_lock_dir"; exit 143' TERM
 # Expand glob in current shell. If nothing matches under nullglob, the array
 # stays empty so the for-loop does nothing.
 shopt -s nullglob
+declare -a candidates=()
 # shellcheck disable=SC2206
 candidates=( $target_glob )
 shopt -u nullglob
@@ -346,7 +347,7 @@ if [ "$dry_run" = "1" ]; then
 fi
 
 now=$(date +%s)
-for d in "${candidates[@]}"; do
+for d in "${candidates[@]+"${candidates[@]}"}"; do
   [ -d "$d" ] || continue
   mtime=$(read_mtime_seconds "$d")
   age_min=$(( (now - mtime) / 60 ))
