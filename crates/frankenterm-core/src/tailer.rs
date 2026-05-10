@@ -666,7 +666,10 @@ impl CaptureScheduler {
 
         // Debit global capture budget for the count we'll schedule.
         if self.budget.max_captures_per_sec > 0 {
-            let debit = selected.len() as u32;
+            let debit = match u32::try_from(selected.len()) {
+                Ok(debit) => debit,
+                Err(_) => self.global_captures_remaining,
+            };
             self.global_captures_remaining = self.global_captures_remaining.saturating_sub(debit);
         }
 
