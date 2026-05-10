@@ -1,6 +1,6 @@
 {
   "$schema": "./schema.json#/$defs/manifestPlaceholder",
-  "_comment": "Declarative input list for scripts/attestation-build.sh. Per-category slots map to the artifact path the producing bead must emit. The build script (a) errors if a slot has no path declared, and (b) hashes the file at that path and assembles a bundle. Until a producing bead has shipped, leave 'path' as null and the build fails with a clear pointer to the responsible bead — that's the gating behaviour described in ft-syqcz.1's acceptance criteria.",
+  "_comment": "Declarative input list for scripts/attestation-build.sh. Per-category slots map to the artifact path the producing bead must emit. The build script hashes each populated path and assembles a bundle. A null path is allowed only when deferred_to_bead and deferred_reason identify the bead that must publish the missing artifact; release builds can still fail deferred slots with --strict-deferred.",
   "required_categories": [
     "perf/headline-claims",
     "perf/competitor-matrix",
@@ -18,17 +18,17 @@
   "slots": [
     {
       "category": "perf/headline-claims",
-      "path": null,
+      "path": "docs/perf/headline-claims.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-syqcz.3",
       "description": "Headline-claim manifest + 5 must-prove benches (G3)."
     },
     {
       "category": "perf/competitor-matrix",
-      "path": null,
+      "path": "docs/perf/competitor-matrix.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-syqcz.4",
-      "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3)."
+      "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3). Recovery artifact published by ft-e87u6.9 (closed) backfilling the original ft-syqcz.4 producer slot."
     },
     {
       "category": "perf/lindley-bounds",
@@ -39,10 +39,10 @@
     },
     {
       "category": "tui/render-parity",
-      "path": null,
+      "path": "docs/attestations/tui/render-parity.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-35yac.2",
-      "description": "ratatui<->ftui differential render parity report (G5)."
+      "description": "ratatui<->ftui differential render parity report (G5). Recovery artifact published by ft-e87u6.10 (closed) backfilling the original ft-35yac.2 producer slot. The GPU adjunct stays in the sibling slot for ft-35yac.1.2."
     },
     {
       "category": "tui/render-parity",
@@ -53,38 +53,38 @@
     },
     {
       "category": "security/passive-watch",
-      "path": null,
+      "path": "docs/security/passive-watch-attestation.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-x0666.1",
-      "description": "Passive-watch read-only fuzz proof (G9)."
+      "description": "Passive-watch read-only fuzz proof (G9). Recovery artifact published by ft-e87u6.11 (closed) backfilling the original ft-x0666.1 producer slot."
     },
     {
       "category": "security/redactor-coverage",
-      "path": null,
+      "path": "docs/security/redactor-coverage.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-x0666.2",
       "description": "Redactor recall/precision matrix vs gitleaks/trufflehog corpora (G10)."
     },
     {
       "category": "security/distributed-threat-model",
-      "path": null,
+      "path": "docs/security/distributed-threat-model.md",
       "media_type": "text/markdown",
       "produced_by_bead": "ft-x0666.3",
       "description": "Distributed wire-protocol threat model + diff fuzz (G11)."
     },
     {
       "category": "proofs/loom-runtime-async",
-      "path": null,
+      "path": "docs/attestations/proofs/loom-runtime-async.json",
       "media_type": "application/json",
-      "produced_by_bead": "ft-syqcz.6",
+      "produced_by_bead": "ft-e87u6.12",
       "description": "Loom proof for runtime_async primitives (G8)."
     },
     {
       "category": "proofs/runtime-proof-trait",
-      "path": null,
+      "path": "docs/attestations/proofs/runtime-proof-trait.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-i2eni.1",
-      "description": "RuntimeProof sealed trait + tokio type-level seal (G1)."
+      "description": "RuntimeProof sealed trait + tokio type-level seal (G1). Recovery artifact published by ft-e87u6.13 (closed) backfilling the original ft-i2eni.1 producer slot."
     },
     {
       "category": "proofs/robot-contracts",
@@ -95,9 +95,9 @@
     },
     {
       "category": "doctrine/agents-md-counts",
-      "path": null,
+      "path": "docs/attestations/doctrine/agents-md-counts.json",
       "media_type": "application/json",
-      "produced_by_bead": "ft-i2eni.5",
+      "produced_by_bead": "ft-e87u6.14",
       "description": "Auto-stamped README/AGENTS module/crate/test counts (G6)."
     },
     {
