@@ -66363,6 +66363,36 @@ log_level = "debug"
         }
     }
 
+    fn proof_doctor_test_payload(
+        bead_id: &str,
+        agent_name: &str,
+        command: Vec<String>,
+        scope: ProofDoctorScopeArg,
+        required_backend: ProofDoctorBackendArg,
+    ) -> serde_json::Value {
+        let input = ProofDoctorPreflightInput {
+            bead_id: Some(bead_id.to_string()),
+            parent_bead_id: None,
+            agent_name: agent_name.to_string(),
+            repo_path: "/tmp/frankenterm".to_string(),
+            git_head: "abc123".to_string(),
+            branch: "main".to_string(),
+            generated_at_utc: "2026-05-10T05:36:00Z".to_string(),
+            intended_target_dir: extract_proof_doctor_target_dir(&command),
+            intended_scope: proof_doctor_scope(scope),
+            required_backend: proof_doctor_backend(required_backend),
+            phase: ProofDoctorPhase::Preflight,
+            proof_path_prefixes: Vec::new(),
+            evidence: ProofDoctorEvidence {
+                local_cargo_detected: proof_doctor_is_local_cargo_command(&command),
+                ..ProofDoctorEvidence::default()
+            },
+            intended_command: command,
+        };
+
+        build_proof_doctor_payload_from_input(input)
+    }
+
     #[test]
     fn proof_doctor_payload_accepts_direct_rch_cargo_shape() {
         let command = vec![
@@ -66377,14 +66407,12 @@ log_level = "debug"
             "frankenterm-core-audit-types".to_string(),
         ];
 
-        let payload = build_proof_doctor_payload(
-            Some("ft-wik9p.2"),
-            Some("MistyBay"),
+        let payload = proof_doctor_test_payload(
+            "ft-wik9p.2",
+            "MistyBay",
+            command,
             ProofDoctorScopeArg::CargoTest,
             ProofDoctorBackendArg::Rch,
-            None,
-            &command,
-            Path::new("."),
         );
 
         assert_eq!(payload["schema_version"].as_i64(), Some(1));
@@ -66421,14 +66449,12 @@ log_level = "debug"
             "frankenterm".to_string(),
         ];
 
-        let payload = build_proof_doctor_payload(
-            Some("ft-wik9p.2"),
-            Some("MistyBay"),
+        let payload = proof_doctor_test_payload(
+            "ft-wik9p.2",
+            "MistyBay",
+            command,
             ProofDoctorScopeArg::CargoTest,
             ProofDoctorBackendArg::Rch,
-            None,
-            &command,
-            Path::new("."),
         );
 
         assert_eq!(payload["verdict"]["status"].as_str(), Some("invalid"));
