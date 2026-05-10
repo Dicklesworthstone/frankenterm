@@ -41,6 +41,8 @@ RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
 # Populated by rch_init().
 _RCH_PROBE_LOG=""
 _RCH_QUEUE_LOG=""
+_RCH_CAPABILITIES_LOG=""
+_RCH_CAPABILITIES_REFRESH_LOG=""
 _RCH_SMOKE_LOG=""
 _RCH_REMOTE_PREFLIGHT_LOG=""
 _RCH_MIRROR_PREFLIGHT_LOG=""
@@ -78,6 +80,14 @@ rch_smoke_log_path() {
 
 rch_queue_log_path() {
     printf '%s\n' "${_RCH_QUEUE_LOG}"
+}
+
+rch_capabilities_log_path() {
+    printf '%s\n' "${_RCH_CAPABILITIES_LOG}"
+}
+
+rch_capabilities_refresh_log_path() {
+    printf '%s\n' "${_RCH_CAPABILITIES_REFRESH_LOG}"
 }
 
 rch_remote_preflight_log_path() {
@@ -575,7 +585,10 @@ rch_write_meta_json() {
 
 rch_extract_selected_worker() {
     local output_file="$1"
-    sed -nE 's/.*Selected worker: ([^ ]+) at .*/\1/p' "${output_file}" 2>/dev/null | tail -n 1
+    {
+        sed -nE 's/.*Selected worker: ([^ ]+) at .*/\1/p' "${output_file}" 2>/dev/null
+        sed -nE 's/.*\[RCH\][[:space:]]+remote[[:space:]]+(vmi[[:alnum:]_.-]+)([[:space:]:].*)?$/\1/p' "${output_file}" 2>/dev/null
+    } | tail -n 1
 }
 
 rch_extract_probe_worker_ids() {
@@ -611,7 +624,7 @@ rch_extract_remote_exit_code() {
 
 rch_log_has_remote_execution_marker() {
     local output_file="$1"
-    grep -Eq "Selected worker:|Sync complete:|Remote command finished:" "${output_file}" 2>/dev/null
+    grep -Eq "Selected worker:|Sync complete:|Remote command finished:|\[RCH\][[:space:]]+remote[[:space:]]+vmi[[:alnum:]_.-]+([[:space:]:]|$)" "${output_file}" 2>/dev/null
 }
 
 rch_log_has_remote_mirror_missing_file() {
@@ -878,6 +891,59 @@ ensure_rch_remote_only_preflight() {
     fi
 }
 
+ensure_rch_runtime_capabilities() {
+    set +e
+    run_rch --json workers capabilities >"${_RCH_CAPABILITIES_LOG}" 2>&1
+    local capabilities_rc=$?
+    set -e
+    rch_write_meta_json "${_RCH_CAPABILITIES_LOG}" "${capabilities_rc}"
+    rch_emit_proof_ledger_entry \
+        "rch --json workers capabilities" \
+        "${_RCH_CAPABILITIES_LOG}" \
+        "${capabilities_rc}" \
+        "not_applicable" \
+        "not_applicable" \
+        "read cached daemon-side runtime capabilities before remote-only cargo proof"
+
+    local rust_worker_count=0
+    if [[ "${capabilities_rc}" -eq 0 ]] && jq -e . "${_RCH_CAPABILITIES_LOG}" >/dev/null 2>&1; then
+        rust_worker_count="$(jq -r '
+            (.data.workers // .workers // [])
+            | map(select(.capabilities.rustc_version? != null))
+            | length
+        ' "${_RCH_CAPABILITIES_LOG}" 2>/dev/null || printf '0')"
+        if rch_is_unsigned_int "${rust_worker_count}" && [[ "${rust_worker_count}" -gt 0 ]]; then
+            return 0
+        fi
+    fi
+
+    set +e
+    run_rch --json workers capabilities --refresh >"${_RCH_CAPABILITIES_REFRESH_LOG}" 2>&1
+    local refresh_rc=$?
+    set -e
+    rch_write_meta_json "${_RCH_CAPABILITIES_REFRESH_LOG}" "${refresh_rc}"
+    rch_emit_proof_ledger_entry \
+        "rch --json workers capabilities --refresh" \
+        "${_RCH_CAPABILITIES_REFRESH_LOG}" \
+        "${refresh_rc}" \
+        "not_applicable" \
+        "not_applicable" \
+        "refresh daemon-side runtime capabilities after cached capabilities had no Rust workers"
+
+    if [[ "${refresh_rc}" -ne 0 ]] || ! jq -e . "${_RCH_CAPABILITIES_REFRESH_LOG}" >/dev/null 2>&1; then
+        rch_fatal "rch worker capability refresh failed after cached capabilities had no Rust-capable workers. See ${_RCH_CAPABILITIES_REFRESH_LOG}; cached capabilities: ${_RCH_CAPABILITIES_LOG}"
+    fi
+
+    rust_worker_count="$(jq -r '
+        (.data.workers // .workers // [])
+        | map(select(.capabilities.rustc_version? != null))
+        | length
+    ' "${_RCH_CAPABILITIES_REFRESH_LOG}" 2>/dev/null || printf '0')"
+    if ! rch_is_unsigned_int "${rust_worker_count}" || [[ "${rust_worker_count}" -eq 0 ]]; then
+        rch_fatal "rch worker capability refresh found no Rust-capable workers. See ${_RCH_CAPABILITIES_REFRESH_LOG}; cached capabilities: ${_RCH_CAPABILITIES_LOG}"
+    fi
+}
+
 rch_mirror_required_paths() {
     [[ -n "${RCH_MIRROR_REQUIRED_PATHS}" ]] || return 0
     printf '%s\n' "${RCH_MIRROR_REQUIRED_PATHS}" \
@@ -995,6 +1061,9 @@ check_rch_fallback() {
     local output_file="$1"
     if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
         rch_fatal "rch entered a fail-open or off-policy execution path; refusing offload policy violation. See ${output_file}"
+    fi
+    if rch_remote_only_required && ! rch_log_has_remote_execution_marker "${output_file}"; then
+        rch_fatal "rch did not record remote execution; refusing local/non-compilation path. See ${output_file}"
     fi
 }
 
@@ -1172,6 +1241,8 @@ rch_init() {
 
     _RCH_PROBE_LOG="${log_dir}/${harness_name}_${run_id}.rch_probe.log"
     _RCH_QUEUE_LOG="${log_dir}/${harness_name}_${run_id}.rch_queue.log"
+    _RCH_CAPABILITIES_LOG="${log_dir}/${harness_name}_${run_id}.rch_capabilities.log"
+    _RCH_CAPABILITIES_REFRESH_LOG="${log_dir}/${harness_name}_${run_id}.rch_capabilities_refresh.log"
     _RCH_SMOKE_LOG="${log_dir}/${harness_name}_${run_id}.rch_smoke.log"
     _RCH_REMOTE_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_preflight.json"
     _RCH_MIRROR_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_mirror_preflight.json"
@@ -1208,6 +1279,7 @@ ensure_rch_ready() {
     fi
 
     ensure_rch_remote_only_preflight
+    ensure_rch_runtime_capabilities
     ensure_rch_mirror_preflight
 
     if [[ "${RCH_SKIP_SMOKE_PREFLIGHT}" == "1" ]]; then

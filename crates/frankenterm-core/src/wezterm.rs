@@ -938,7 +938,8 @@ pub struct WeztermClient {
     #[cfg(all(feature = "vendored", unix))]
     mux_circuit_breaker: Arc<Mutex<CircuitBreaker>>,
     /// Optional mux connection pool for direct socket communication.
-    /// When present, operations try the pool first and fall back to CLI.
+    /// When present, operations try the pool first; implicit-socket clients may
+    /// fall back to CLI, but explicit-socket clients keep failures hermetic.
     #[cfg(all(feature = "vendored", unix))]
     mux_pool: Option<Arc<crate::vendored::MuxPool>>,
     /// Time-windowed cache for CLI `list_panes` results.
@@ -1056,7 +1057,8 @@ impl WeztermClient {
     /// Attach a mux connection pool for direct socket communication.
     ///
     /// When a pool is attached, operations like `list_panes()` and `send_text()`
-    /// try the pool first and fall back to CLI subprocess spawning on failure.
+    /// try the pool first. Implicit-socket clients may fall back to CLI
+    /// subprocess spawning on failure; explicit-socket clients do not.
     #[cfg(all(feature = "vendored", unix))]
     #[must_use]
     pub fn with_mux_pool(mut self, pool: Arc<crate::vendored::MuxPool>) -> Self {
@@ -1182,7 +1184,7 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
-                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("list_panes", e));
                         }
                         tracing::debug!(
@@ -1260,7 +1262,7 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
-                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("list_panes_with_cx", e));
                         }
                         tracing::debug!(
@@ -1339,7 +1341,7 @@ impl WeztermClient {
                         Ok(changes) => changes,
                         Err(e) => {
                             self.mux_circuit_record_failure(&e);
-                            if !Self::mux_error_should_fallback_to_cli(&e) {
+                            if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                                 return Err(Self::mux_cancelled_error("get_text", e));
                             }
                             tracing::debug!(
@@ -1412,7 +1414,7 @@ impl WeztermClient {
                             }
                             Err(e) => {
                                 self.mux_circuit_record_failure(&e);
-                                if !Self::mux_error_should_fallback_to_cli(&e) {
+                                if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                                     return Err(Self::mux_cancelled_error("get_text", e));
                                 }
                                 tracing::debug!(
@@ -1609,7 +1611,7 @@ impl WeztermClient {
                     }
                     Err(err) => {
                         self.mux_circuit_record_failure(&err);
-                        if !Self::mux_error_should_fallback_to_cli(&err) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&err) {
                             return Err(Self::mux_cancelled_error(
                                 "pane_tiered_scrollback_summary",
                                 err,
@@ -1664,7 +1666,7 @@ impl WeztermClient {
                     }
                     Err(err) => {
                         self.mux_circuit_record_failure(&err);
-                        if !Self::mux_error_should_fallback_to_cli(&err) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&err) {
                             return Err(Self::mux_cancelled_error(
                                 "pane_tiered_scrollback_summary_with_cx",
                                 err,
@@ -1877,7 +1879,7 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
-                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("spawn_targeted", e));
                         }
                         tracing::debug!(
@@ -1942,7 +1944,7 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
-                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("spawn_targeted_with_cx", e));
                         }
                         tracing::debug!(
@@ -2009,7 +2011,7 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
-                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("split_pane", e));
                         }
                         tracing::debug!(
@@ -2078,7 +2080,7 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
-                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("split_pane_with_cx", e));
                         }
                         tracing::debug!(
@@ -2285,7 +2287,7 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
-                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("send_text", e));
                         }
                         tracing::debug!(error = %e, "mux pool send failed, falling back to CLI");
@@ -2345,7 +2347,7 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
-                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
                             return Err(Self::mux_cancelled_error("send_text_with_cx", e));
                         }
                         tracing::debug!(
@@ -2589,13 +2591,38 @@ impl WeztermClient {
         match err {
             crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled) => false,
             crate::vendored::MuxPoolError::Pool(_) => true,
-            crate::vendored::MuxPoolError::Mux(mux) => !mux.is_cancelled(),
+            crate::vendored::MuxPoolError::Mux(mux) => {
+                !matches!(mux, crate::vendored::DirectMuxError::RemoteError(_))
+                    && !mux.is_cancelled()
+            }
         }
     }
 
     #[cfg(all(feature = "vendored", unix))]
+    fn mux_error_should_fallback_to_cli_for_client(
+        &self,
+        err: &crate::vendored::MuxPoolError,
+    ) -> bool {
+        if self.socket_path.is_some() {
+            return false;
+        }
+        Self::mux_error_should_fallback_to_cli(err)
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
     fn mux_cancelled_error(op: &str, err: crate::vendored::MuxPoolError) -> crate::Error {
-        crate::Error::Cancelled(format!("wezterm mux {op} cancelled: {err}"))
+        match &err {
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled) => {
+                crate::Error::Cancelled(format!("wezterm mux {op} cancelled: {err}"))
+            }
+            crate::vendored::MuxPoolError::Mux(mux) if mux.is_cancelled() => {
+                crate::Error::Cancelled(format!("wezterm mux {op} cancelled: {err}"))
+            }
+            _ => WeztermError::CommandFailed(format!(
+                "wezterm mux {op} failed without CLI fallback: {err}"
+            ))
+            .into(),
+        }
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -2606,6 +2633,13 @@ impl WeztermClient {
         };
 
         if guard.allow() {
+            true
+        } else if self.socket_path.is_some() {
+            let status = guard.status();
+            tracing::debug!(
+                retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0),
+                "mux connection circuit breaker open; explicit socket has no CLI fallback"
+            );
             true
         } else {
             let status = guard.status();
@@ -5405,6 +5439,15 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
+    fn mux_remote_error_does_not_trigger_circuit_breaker() {
+        let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
+            "invalid spawn domain".to_string(),
+        ));
+        assert!(!WeztermClient::mux_error_is_circuit_breaker_trigger(&err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
     fn mux_pool_cancelled_does_not_fallback_to_cli() {
         let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled);
         assert!(!WeztermClient::mux_error_should_fallback_to_cli(&err));
@@ -5424,9 +5467,58 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
+    fn mux_remote_error_does_not_fallback_to_cli() {
+        let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
+            "invalid spawn domain".to_string(),
+        ));
+        assert!(!WeztermClient::mux_error_should_fallback_to_cli(&err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
     fn mux_acquire_timeout_still_falls_back_to_cli() {
         let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::AcquireTimeout);
         assert!(WeztermClient::mux_error_should_fallback_to_cli(&err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn explicit_socket_mux_error_does_not_fallback_to_cli() {
+        let client = WeztermClient::with_socket("/tmp/ft-explicit-mux.sock");
+        let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::AcquireTimeout);
+        assert!(!client.mux_error_should_fallback_to_cli_for_client(&err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn explicit_socket_mux_circuit_open_still_allows_direct_attempt() {
+        let mut explicit = WeztermClient::with_socket("/tmp/ft-explicit-mux.sock");
+        explicit.mux_circuit_breaker = Arc::new(Mutex::new(CircuitBreaker::with_name(
+            "mux_connection_explicit_socket_open_test",
+            CircuitBreakerConfig::new(1, 1, std::time::Duration::from_secs(60)),
+        )));
+        {
+            let mut guard = explicit
+                .mux_circuit_breaker
+                .lock()
+                .expect("mux circuit lock");
+            guard.record_failure();
+        }
+        assert!(explicit.mux_circuit_guard());
+
+        let mut implicit = WeztermClient::new();
+        implicit.mux_circuit_breaker = Arc::new(Mutex::new(CircuitBreaker::with_name(
+            "mux_connection_implicit_socket_open_test",
+            CircuitBreakerConfig::new(1, 1, std::time::Duration::from_secs(60)),
+        )));
+        {
+            let mut guard = implicit
+                .mux_circuit_breaker
+                .lock()
+                .expect("mux circuit lock");
+            guard.record_failure();
+        }
+        assert!(!implicit.mux_circuit_guard());
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -5436,6 +5528,18 @@ mod tests {
         let mapped = WeztermClient::mux_cancelled_error("list_panes", err);
         assert!(
             matches!(mapped, crate::Error::Cancelled(message) if message.contains("list_panes"))
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_remote_error_maps_to_command_failed() {
+        let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
+            "invalid spawn domain".to_string(),
+        ));
+        let mapped = WeztermClient::mux_cancelled_error("spawn_targeted", err);
+        assert!(
+            matches!(mapped, crate::Error::Wezterm(WeztermError::CommandFailed(message)) if message.contains("spawn_targeted"))
         );
     }
 

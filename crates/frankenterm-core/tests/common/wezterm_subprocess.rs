@@ -10,8 +10,9 @@
 //! - A persistent `default_prog` loop so the default pane and spawned
 //!   default-program panes stay alive across follow-up `list_panes` calls.
 //! - A mux-server binary selected from the current ft build when available
-//!   (`FT_WEZTERM_MUX_SERVER`, Cargo's bin env, or the workspace target dir)
-//!   before falling back to a system `wezterm-mux-server`.
+//!   (`FT_WEZTERM_MUX_SERVER`, Cargo's bin env, or the workspace target dir),
+//!   or built from this workspace before falling back to a system
+//!   `wezterm-mux-server`.
 //!
 //! Returns a real `WeztermClient` configured `with_socket(...)` against the
 //! hermetic socket. When the vendored mux backend is available, the client is
@@ -62,11 +63,13 @@ pub enum FixtureError {
     ConfigSerialize(toml::ser::Error),
     SpawnFailed(std::io::Error),
     SocketTimeout {
+        binary: PathBuf,
         path: PathBuf,
         stdout: String,
         stderr: String,
     },
     EarlyExit {
+        binary: PathBuf,
         status: std::process::ExitStatus,
         stdout: String,
         stderr: String,
@@ -81,23 +84,27 @@ impl std::fmt::Display for FixtureError {
             Self::ConfigSerialize(e) => write!(f, "failed to serialize mux-server config: {e}"),
             Self::SpawnFailed(e) => write!(f, "failed to spawn wezterm-mux-server: {e}"),
             Self::SocketTimeout {
+                binary,
                 path,
                 stdout,
                 stderr,
             } => write!(
                 f,
-                "timed out waiting for socket at {}; stdout={}; stderr={}",
+                "timed out waiting for socket at {} from {}; stdout={}; stderr={}",
                 path.display(),
+                binary.display(),
                 format_child_output(stdout),
                 format_child_output(stderr)
             ),
             Self::EarlyExit {
+                binary,
                 status,
                 stdout,
                 stderr,
             } => write!(
                 f,
-                "wezterm-mux-server exited early: {status:?}; stdout={}; stderr={}",
+                "wezterm-mux-server {} exited early: {status:?}; stdout={}; stderr={}",
+                binary.display(),
                 format_child_output(stdout),
                 format_child_output(stderr)
             ),
@@ -126,8 +133,9 @@ impl WeztermSubprocessFixture {
     /// This keeps no-mock tests on a real mux/PTY boundary while allowing
     /// scenarios to choose an interactive echo program such as `/bin/cat`.
     pub fn spawn_with_default_prog(default_prog: &[&str]) -> Result<Self, FixtureError> {
-        let bin = locate_mux_binary()
+        let bin = locate_current_mux_binary()
             .or_else(build_mux_binary)
+            .or_else(locate_system_mux_binary)
             .ok_or_else(|| {
                 FixtureError::BinaryNotFound(
                 "wezterm-mux-server (FT_WEZTERM_MUX_SERVER, current target dir, PATH, or Homebrew)"
@@ -176,6 +184,7 @@ impl WeztermSubprocessFixture {
             if let Ok(Some(status)) = child.try_wait() {
                 let (stdout, stderr) = read_child_output(&stdout_path, &stderr_path);
                 return Err(FixtureError::EarlyExit {
+                    binary: bin.clone(),
                     status,
                     stdout,
                     stderr,
@@ -186,6 +195,7 @@ impl WeztermSubprocessFixture {
                 let _ = child.wait();
                 let (stdout, stderr) = read_child_output(&stdout_path, &stderr_path);
                 return Err(FixtureError::SocketTimeout {
+                    binary: bin.clone(),
                     path: socket_path,
                     stdout,
                     stderr,
@@ -211,9 +221,12 @@ impl WeztermSubprocessFixture {
         let client = WeztermClient::with_socket(self.socket_path.display().to_string());
         #[cfg(all(feature = "vendored", unix))]
         {
+            let mut mux = frankenterm_core::vendored::DirectMuxClientConfig::default()
+                .with_socket_path(self.socket_path.clone());
+            mux.read_timeout = Duration::from_secs(30);
+            mux.write_timeout = Duration::from_secs(30);
             let pool = frankenterm_core::vendored::MuxPoolConfig {
-                mux: frankenterm_core::vendored::DirectMuxClientConfig::default()
-                    .with_socket_path(self.socket_path.clone()),
+                mux,
                 ..frankenterm_core::vendored::MuxPoolConfig::default()
             };
             client.with_mux_pool(std::sync::Arc::new(
@@ -308,13 +321,17 @@ fn format_child_output(output: &str) -> String {
     }
 }
 
-fn locate_mux_binary() -> Option<PathBuf> {
+fn locate_current_mux_binary() -> Option<PathBuf> {
     for candidate in mux_binary_candidates() {
         if candidate.exists() {
             return Some(candidate);
         }
     }
 
+    None
+}
+
+fn locate_system_mux_binary() -> Option<PathBuf> {
     // Try $PATH via `which`-style probe after ft-built candidates. A system
     // wezterm-mux-server may speak a different binary codec than this checkout.
     if let Ok(output) = Command::new("/usr/bin/which")
@@ -346,6 +363,7 @@ fn build_mux_binary() -> Option<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cargo"));
 
+    eprintln!("building frankenterm-mux-server for real mux fixture");
     let status = Command::new(cargo)
         .current_dir(workspace_root)
         .arg("build")
