@@ -253,7 +253,11 @@ must emit a structured warning and continue with the remaining sources.
 ### Extension Layout
 
 The extension may be a standalone bundle or a subdirectory inside a current
-incident bundle. The required layout is:
+incident bundle. The current `collect_incident_bundle` implementation preserves
+the existing `wa_incident_{kind}_{timestamp}` bundle shape and embeds this
+contract under `incident_manifest.json` as the `swarm` object. Standalone future
+collectors may promote the same fields to the manifest top level. The required
+layout is:
 
 ```text
 swarm_incident_{kind}_{YYYYMMDDTHHMMSSZ}/
@@ -280,7 +284,9 @@ must have a matching manifest entry with an explicit source status.
 
 ### Manifest Fields
 
-The extension manifest must include these fields:
+The extension manifest must include these fields. In the current in-tree
+collector, read these under `incident_manifest.json` → `swarm` unless the field
+already exists on the legacy top-level incident manifest.
 
 | Field | Meaning |
 | --- | --- |
@@ -292,8 +298,9 @@ The extension manifest must include these fields:
 | `generator` | ft version, git commit if known, hostname class, OS, and command/API surface. |
 | `privacy_budget` | Applied tier and hard limits. Must match the table above unless `tier=custom`. |
 | `collection_policy` | Read-only guarantees, allowed optional samplers, timeout limits, and whether live pane text was permitted. |
+| `environment` | Secret-safe runtime summary such as OS/architecture and whether cwd lookup succeeded; never raw environment variables or local cwd paths. |
 | `sources` | Array of per-source entries described below. |
-| `warnings` | Array of warning ids also written to `warnings.jsonl`. |
+| `warnings` | Array of structured warning records also written to `warnings.jsonl`; source entries refer to these by `warning_ids`. |
 | `redaction_summary` | Counts only; no raw secret values. |
 | `total_size_bytes` | Total bytes written after truncation/redaction. |
 

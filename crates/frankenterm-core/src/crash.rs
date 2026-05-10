@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -787,6 +787,257 @@ pub struct IncidentBundleResult {
     pub wa_version: String,
     /// Timestamp of export
     pub exported_at: String,
+    /// Optional swarm-triage extension manifest for read-only source provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm: Option<SwarmIncidentBundleManifest>,
+}
+
+/// Read-only swarm-triage extension metadata for incident bundles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmIncidentBundleManifest {
+    /// Stable extension contract id.
+    pub contract_id: String,
+    /// Extension schema version retained for machine consumers.
+    pub schema_version: u32,
+    /// Human-readable extension format version.
+    pub format_version: String,
+    /// Unique bundle identifier derived from the bundle directory name.
+    pub bundle_id: String,
+    /// Incident kind represented by this bundle.
+    pub kind: IncidentKind,
+    /// UTC timestamp for bundle creation.
+    pub created_at: String,
+    /// Generator metadata for the collector that produced the bundle.
+    pub generator: IncidentBundleGenerator,
+    /// Privacy budget applied by the collector.
+    pub privacy_budget: IncidentPrivacyBudget,
+    /// Read-only collection policy that governed this bundle.
+    pub collection_policy: IncidentCollectionPolicy,
+    /// Host/runtime summary that does not contain secrets.
+    pub environment: IncidentEnvironmentSummary,
+    /// Per-source collection status and provenance.
+    pub sources: Vec<IncidentSourceEntry>,
+    /// Structured warnings emitted during partial collection.
+    pub warnings: Vec<IncidentBundleWarning>,
+    /// Redaction counts for the bundle.
+    pub redaction_summary: IncidentRedactionSummary,
+    /// Total bytes written for files tracked by the manifest.
+    pub total_size_bytes: u64,
+}
+
+/// Metadata about the collector that produced a swarm incident bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentBundleGenerator {
+    /// `ft` version embedded in the binary.
+    pub ft_version: String,
+    /// Git commit if it was embedded at build time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
+    /// Coarse host class that avoids leaking hostnames.
+    pub hostname_class: String,
+    /// Operating system family reported by Rust.
+    pub os: String,
+    /// CPU architecture reported by Rust.
+    pub arch: String,
+    /// API surface used to build the bundle.
+    pub source_surface: String,
+}
+
+impl IncidentBundleGenerator {
+    fn current() -> Self {
+        Self {
+            ft_version: crate::VERSION.to_string(),
+            git_commit: option_env!("VERGEN_GIT_SHA")
+                .or(option_env!("GIT_COMMIT"))
+                .map(str::to_string),
+            hostname_class: "local".to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            source_surface: "frankenterm_core::crash::collect_incident_bundle".to_string(),
+        }
+    }
+}
+
+/// Privacy limits applied during bundle collection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentPrivacyBudget {
+    /// Sharing tier applied to the default collector.
+    pub tier: String,
+    /// Maximum bytes read from a config source before truncation.
+    pub config_summary_max_bytes: u64,
+    /// Maximum recent event summaries requested.
+    pub max_events: usize,
+    /// Whether pane text collection was permitted.
+    pub pane_text_allowed: bool,
+    /// Whether process sampling was permitted.
+    pub process_sample_allowed: bool,
+}
+
+impl IncidentPrivacyBudget {
+    fn default_for(max_events: usize) -> Self {
+        Self {
+            tier: "default".to_string(),
+            config_summary_max_bytes: 64 * 1024,
+            max_events,
+            pane_text_allowed: false,
+            process_sample_allowed: false,
+        }
+    }
+}
+
+/// Counts describing redaction work performed for the bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentRedactionSummary {
+    /// Total number of redactions across all files.
+    pub total_redactions: usize,
+    /// Number of files that had at least one redaction.
+    pub redacted_files: usize,
+}
+
+/// Non-mutating policy applied by the read-only incident collector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentCollectionPolicy {
+    /// Whether the collector is allowed to mutate external state.
+    pub mutating_actions_allowed: bool,
+    /// Pane text collection mode.
+    pub pane_text_allowed: String,
+    /// Process sampler mode.
+    pub process_sampler: String,
+    /// Whether Agent Mail repair/restart actions are allowed.
+    pub agent_mail_repair_allowed: bool,
+    /// Maximum time any future external source should spend collecting.
+    pub source_timeout_ms: u64,
+}
+
+impl Default for IncidentCollectionPolicy {
+    fn default() -> Self {
+        Self {
+            mutating_actions_allowed: false,
+            pane_text_allowed: "disabled".to_string(),
+            process_sampler: "disabled".to_string(),
+            agent_mail_repair_allowed: false,
+            source_timeout_ms: 5_000,
+        }
+    }
+}
+
+/// Secret-safe host/runtime summary for a bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentEnvironmentSummary {
+    /// Operating system family reported by Rust.
+    pub os: String,
+    /// CPU architecture reported by Rust.
+    pub arch: String,
+    /// Whether the collector could observe a current directory without recording it.
+    pub current_dir_available: bool,
+}
+
+impl IncidentEnvironmentSummary {
+    fn current() -> Self {
+        Self {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            current_dir_available: std::env::current_dir().is_ok(),
+        }
+    }
+}
+
+/// Status of one source in the read-only incident collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentSourceStatus {
+    /// Source payload was collected and written.
+    Collected,
+    /// Source was intentionally skipped by policy or options.
+    Skipped,
+    /// Source was not available in the current environment.
+    Unavailable,
+    /// Source collection was attempted and failed.
+    Failed,
+    /// Source was available but outside the freshness budget.
+    Stale,
+}
+
+/// Evidence quality for one incident-bundle source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentEvidenceState {
+    /// Evidence came from a measured live or persisted source.
+    Measured,
+    /// Evidence is synthetic or simulated.
+    Simulated,
+    /// No evidence was available.
+    Unavailable,
+    /// Evidence existed but was too old for the freshness budget.
+    Stale,
+    /// Evidence combines measured and unavailable fields.
+    Mixed,
+}
+
+/// Redaction state for a source payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentRedactionState {
+    /// No redaction was required.
+    None,
+    /// Some content was redacted.
+    Partial,
+    /// The whole source was withheld or fully redacted.
+    Full,
+    /// Redaction does not apply because no payload was written.
+    NotApplicable,
+}
+
+/// Per-source provenance and degradation state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentSourceEntry {
+    /// Stable source identifier.
+    pub name: String,
+    /// Bundle-relative payload path when a payload was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Collection result for this source.
+    pub status: IncidentSourceStatus,
+    /// Evidence quality for this source.
+    pub evidence_state: IncidentEvidenceState,
+    /// Command or API surface used for collection.
+    pub source_surface: String,
+    /// Whether collection mutated external state.
+    pub mutates_state: bool,
+    /// Source generation timestamp when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
+    /// Age of the source in milliseconds when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_ms: Option<u64>,
+    /// Freshness budget in milliseconds when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_age_ms: Option<u64>,
+    /// Redaction state for the source payload.
+    pub redaction: IncidentRedactionState,
+    /// Privacy tier applied to this source.
+    pub privacy_tier: String,
+    /// Bytes written for the source payload.
+    pub size_bytes: u64,
+    /// Collection elapsed time in milliseconds.
+    pub elapsed_ms: u64,
+    /// Warning ids that explain partial or degraded collection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warning_ids: Vec<String>,
+}
+
+/// Structured warning emitted when a source degrades instead of aborting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentBundleWarning {
+    /// Stable warning identifier.
+    pub id: String,
+    /// Warning severity.
+    pub severity: String,
+    /// Source that emitted this warning, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Human-readable warning message.
+    pub message: String,
 }
 
 /// Export an incident bundle to `out_dir`.
@@ -872,6 +1123,7 @@ pub fn export_incident_bundle(
         total_size_bytes: total_size,
         wa_version: crate::VERSION.to_string(),
         exported_at: format_iso8601(ts),
+        swarm: None,
     };
 
     let manifest_json = serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?;
@@ -936,6 +1188,144 @@ pub struct IncidentBundleOptions<'a> {
     pub max_events: usize,
 }
 
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn bundle_file_size(bundle_dir: &Path, name: &str) -> u64 {
+    fs::metadata(bundle_dir.join(name)).map_or(0, |metadata| metadata.len())
+}
+
+fn redaction_state_for_file(
+    redaction_entries: &[FileRedactionEntry],
+    name: &str,
+) -> IncidentRedactionState {
+    if redaction_entries.iter().any(|entry| entry.file == name) {
+        IncidentRedactionState::Partial
+    } else {
+        IncidentRedactionState::None
+    }
+}
+
+fn incident_warning(id: &str, source: &str, message: String) -> IncidentBundleWarning {
+    IncidentBundleWarning {
+        id: id.to_string(),
+        severity: "warning".to_string(),
+        source: Some(source.to_string()),
+        message,
+    }
+}
+
+fn skipped_source(
+    name: &str,
+    source_surface: impl Into<String>,
+    max_age_ms: Option<u64>,
+    elapsed_ms: u64,
+    warning_id: &str,
+    message: String,
+    warnings: &mut Vec<IncidentBundleWarning>,
+) -> IncidentSourceEntry {
+    warnings.push(incident_warning(warning_id, name, message));
+    IncidentSourceEntry {
+        name: name.to_string(),
+        file: None,
+        status: IncidentSourceStatus::Skipped,
+        evidence_state: IncidentEvidenceState::Unavailable,
+        source_surface: source_surface.into(),
+        mutates_state: false,
+        generated_at: None,
+        freshness_ms: None,
+        max_age_ms,
+        redaction: IncidentRedactionState::NotApplicable,
+        privacy_tier: "default".to_string(),
+        size_bytes: 0,
+        elapsed_ms,
+        warning_ids: vec![warning_id.to_string()],
+    }
+}
+
+fn skipped_contract_source(
+    name: &str,
+    source_surface: &str,
+    warnings: &mut Vec<IncidentBundleWarning>,
+) -> IncidentSourceEntry {
+    let warning_id = format!("{name}.not_wired");
+    skipped_source(
+        name,
+        source_surface.to_string(),
+        Some(30_000),
+        0,
+        &warning_id,
+        "source is part of the swarm incident contract but is not wired into the core collector yet"
+            .to_string(),
+        warnings,
+    )
+}
+
+fn add_unwired_swarm_sources(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+) {
+    for (name, surface) in [
+        ("robot_state", "not wired into core collector yet"),
+        ("pane_text_summaries", "not wired into core collector yet"),
+        ("tailer_capture_health", "not wired into core collector yet"),
+        (
+            "resource_pressure_cockpit",
+            "not wired into core collector yet",
+        ),
+        ("proof_rch_evidence", "not wired into core collector yet"),
+        (
+            "beads_coordination_snapshot",
+            "not wired into core collector yet",
+        ),
+        ("git_dirty_tree", "not wired into core collector yet"),
+        ("agent_mail", "not wired into core collector yet"),
+    ] {
+        sources.push(skipped_contract_source(name, surface, warnings));
+    }
+}
+
+fn warnings_jsonl(warnings: &[IncidentBundleWarning]) -> std::io::Result<String> {
+    let mut out = String::new();
+    for warning in warnings {
+        let line = serde_json::to_string(warning).map_err(std::io::Error::other)?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn generate_incident_bundle_readme(
+    kind: IncidentKind,
+    exported_at: &str,
+    files: &[String],
+    source_count: usize,
+    warning_count: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str("# ft Incident Bundle\n\n");
+    out.push_str(&format!("Kind: {kind}\n"));
+    out.push_str(&format!("Exported: {exported_at}\n"));
+    out.push_str("Collector: read-only enhanced incident bundle\n\n");
+    out.push_str("## Files\n\n");
+    for file in files {
+        out.push_str("- `");
+        out.push_str(file);
+        out.push_str("`\n");
+    }
+    out.push_str("\n## Swarm Source Provenance\n\n");
+    out.push_str(&format!(
+        "The manifest records {source_count} source entry/entries and {warning_count} warning(s).\n"
+    ));
+    out.push_str(
+        "Collection is non-mutating: it must not send pane input, claim Beads, repair Agent Mail, mutate git state, or run new proof commands.\n\n",
+    );
+    out.push_str("## Validation\n\n");
+    out.push_str("Run `ft reproduce replay <bundle-dir> --mode policy` before sharing.\n");
+    out
+}
+
 /// Collect a comprehensive incident bundle with DB metadata, recent events,
 /// and a redaction report.
 ///
@@ -955,10 +1345,17 @@ pub fn collect_incident_bundle(
     let mut files = Vec::new();
     let mut total_size: u64 = 0;
     let mut redaction_entries: Vec<FileRedactionEntry> = Vec::new();
+    let exported_at = format_iso8601(ts);
+    let mut sources: Vec<IncidentSourceEntry> = Vec::new();
+    let mut warnings: Vec<IncidentBundleWarning> = Vec::new();
+    add_unwired_swarm_sources(&mut sources, &mut warnings);
 
     // 1. Include latest crash bundle contents (if crash kind)
+    let source_started = Instant::now();
     if opts.kind == IncidentKind::Crash {
         if let Some(crash) = latest_crash_bundle(opts.crash_dir) {
+            let redaction_start = redaction_entries.len();
+            let mut crash_primary_file: Option<String> = None;
             if let Some(ref report) = crash.report {
                 let json = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
                 write_redacted_file(
@@ -970,6 +1367,7 @@ pub fn collect_incident_bundle(
                     &mut total_size,
                     &mut redaction_entries,
                 )?;
+                crash_primary_file.get_or_insert_with(|| "crash_report.json".to_string());
             }
 
             if let Some(ref manifest) = crash.manifest {
@@ -983,6 +1381,7 @@ pub fn collect_incident_bundle(
                     &mut total_size,
                     &mut redaction_entries,
                 )?;
+                crash_primary_file.get_or_insert_with(|| "crash_manifest.json".to_string());
             }
 
             let health_path = crash.path.join("health_snapshot.json");
@@ -997,31 +1396,194 @@ pub fn collect_incident_bundle(
                         &mut total_size,
                         &mut redaction_entries,
                     )?;
+                    crash_primary_file.get_or_insert_with(|| "health_snapshot.json".to_string());
                 }
             }
+            if let Some(primary_file) = crash_primary_file {
+                sources.push(IncidentSourceEntry {
+                    name: "crash_bundle".to_string(),
+                    file: Some(primary_file.clone()),
+                    status: IncidentSourceStatus::Collected,
+                    evidence_state: IncidentEvidenceState::Measured,
+                    source_surface: "latest_crash_bundle".to_string(),
+                    mutates_state: false,
+                    generated_at: Some(exported_at.clone()),
+                    freshness_ms: Some(0),
+                    max_age_ms: Some(300_000),
+                    redaction: if redaction_entries.len() > redaction_start {
+                        IncidentRedactionState::Partial
+                    } else {
+                        IncidentRedactionState::None
+                    },
+                    privacy_tier: "default".to_string(),
+                    size_bytes: bundle_file_size(&bundle_dir, &primary_file),
+                    elapsed_ms: elapsed_ms(source_started),
+                    warning_ids: Vec::new(),
+                });
+            } else {
+                let warning_id = "crash_bundle.empty";
+                warnings.push(incident_warning(
+                    warning_id,
+                    "crash_bundle",
+                    "latest crash bundle existed, but no readable payload files were available"
+                        .to_string(),
+                ));
+                sources.push(IncidentSourceEntry {
+                    name: "crash_bundle".to_string(),
+                    file: None,
+                    status: IncidentSourceStatus::Unavailable,
+                    evidence_state: IncidentEvidenceState::Unavailable,
+                    source_surface: "latest_crash_bundle".to_string(),
+                    mutates_state: false,
+                    generated_at: None,
+                    freshness_ms: None,
+                    max_age_ms: Some(300_000),
+                    redaction: IncidentRedactionState::NotApplicable,
+                    privacy_tier: "default".to_string(),
+                    size_bytes: 0,
+                    elapsed_ms: elapsed_ms(source_started),
+                    warning_ids: vec![warning_id.to_string()],
+                });
+            }
+        } else {
+            let warning_id = "crash_bundle.unavailable";
+            warnings.push(incident_warning(
+                warning_id,
+                "crash_bundle",
+                "crash incident requested, but no crash bundle was available".to_string(),
+            ));
+            sources.push(IncidentSourceEntry {
+                name: "crash_bundle".to_string(),
+                file: None,
+                status: IncidentSourceStatus::Unavailable,
+                evidence_state: IncidentEvidenceState::Unavailable,
+                source_surface: "latest_crash_bundle".to_string(),
+                mutates_state: false,
+                generated_at: None,
+                freshness_ms: None,
+                max_age_ms: Some(300_000),
+                redaction: IncidentRedactionState::NotApplicable,
+                privacy_tier: "default".to_string(),
+                size_bytes: 0,
+                elapsed_ms: elapsed_ms(source_started),
+                warning_ids: vec![warning_id.to_string()],
+            });
         }
+    } else {
+        sources.push(skipped_source(
+            "crash_bundle",
+            "latest_crash_bundle".to_string(),
+            Some(300_000),
+            elapsed_ms(source_started),
+            "crash_bundle.skipped",
+            "bundle kind did not request crash payload collection".to_string(),
+            &mut warnings,
+        ));
     }
 
     // 2. Include config summary (redacted, max 64 KiB)
+    let source_started = Instant::now();
     if let Some(cfg_path) = opts.config_path {
         if cfg_path.exists() {
-            if let Ok(contents) = fs::read_to_string(cfg_path) {
-                let truncated =
-                    truncate_utf8_with_marker(&contents, 64 * 1024, "\n... [truncated at 64 KiB]");
-                write_redacted_file(
-                    "config_summary.toml",
-                    &truncated,
-                    &bundle_dir,
-                    &redactor,
-                    &mut files,
-                    &mut total_size,
-                    &mut redaction_entries,
-                )?;
+            match fs::read_to_string(cfg_path) {
+                Ok(contents) => {
+                    let truncated = truncate_utf8_with_marker(
+                        &contents,
+                        64 * 1024,
+                        "\n... [truncated at 64 KiB]",
+                    );
+                    write_redacted_file(
+                        "config_summary.toml",
+                        &truncated,
+                        &bundle_dir,
+                        &redactor,
+                        &mut files,
+                        &mut total_size,
+                        &mut redaction_entries,
+                    )?;
+                    sources.push(IncidentSourceEntry {
+                        name: "config_summary".to_string(),
+                        file: Some("config_summary.toml".to_string()),
+                        status: IncidentSourceStatus::Collected,
+                        evidence_state: IncidentEvidenceState::Measured,
+                        source_surface: format!("read redacted config {}", cfg_path.display()),
+                        mutates_state: false,
+                        generated_at: Some(exported_at.clone()),
+                        freshness_ms: Some(0),
+                        max_age_ms: Some(300_000),
+                        redaction: redaction_state_for_file(
+                            &redaction_entries,
+                            "config_summary.toml",
+                        ),
+                        privacy_tier: "default".to_string(),
+                        size_bytes: bundle_file_size(&bundle_dir, "config_summary.toml"),
+                        elapsed_ms: elapsed_ms(source_started),
+                        warning_ids: Vec::new(),
+                    });
+                }
+                Err(error) => {
+                    let warning_id = "config_summary.read_failed";
+                    warnings.push(incident_warning(
+                        warning_id,
+                        "config_summary",
+                        format!("failed to read config summary source: {error}"),
+                    ));
+                    sources.push(IncidentSourceEntry {
+                        name: "config_summary".to_string(),
+                        file: None,
+                        status: IncidentSourceStatus::Failed,
+                        evidence_state: IncidentEvidenceState::Unavailable,
+                        source_surface: format!("read redacted config {}", cfg_path.display()),
+                        mutates_state: false,
+                        generated_at: None,
+                        freshness_ms: None,
+                        max_age_ms: Some(300_000),
+                        redaction: IncidentRedactionState::NotApplicable,
+                        privacy_tier: "default".to_string(),
+                        size_bytes: 0,
+                        elapsed_ms: elapsed_ms(source_started),
+                        warning_ids: vec![warning_id.to_string()],
+                    });
+                }
             }
+        } else {
+            let warning_id = "config_summary.unavailable";
+            warnings.push(incident_warning(
+                warning_id,
+                "config_summary",
+                format!("config path does not exist: {}", cfg_path.display()),
+            ));
+            sources.push(IncidentSourceEntry {
+                name: "config_summary".to_string(),
+                file: None,
+                status: IncidentSourceStatus::Unavailable,
+                evidence_state: IncidentEvidenceState::Unavailable,
+                source_surface: format!("read redacted config {}", cfg_path.display()),
+                mutates_state: false,
+                generated_at: None,
+                freshness_ms: None,
+                max_age_ms: Some(300_000),
+                redaction: IncidentRedactionState::NotApplicable,
+                privacy_tier: "default".to_string(),
+                size_bytes: 0,
+                elapsed_ms: elapsed_ms(source_started),
+                warning_ids: vec![warning_id.to_string()],
+            });
         }
+    } else {
+        sources.push(skipped_source(
+            "config_summary",
+            "optional config path not provided".to_string(),
+            Some(300_000),
+            elapsed_ms(source_started),
+            "config_summary.skipped",
+            "optional config path was not provided".to_string(),
+            &mut warnings,
+        ));
     }
 
     // 3. Gather DB metadata + recent events
+    let db_source_started = Instant::now();
     if let Some(db_path) = opts.db_path {
         if db_path.exists() {
             let db_meta = collect_db_metadata(db_path);
@@ -1036,8 +1598,29 @@ pub fn collect_incident_bundle(
                 &mut total_size,
                 &mut redaction_entries,
             )?;
+            sources.push(IncidentSourceEntry {
+                name: "db_metadata".to_string(),
+                file: Some("db_metadata.json".to_string()),
+                status: IncidentSourceStatus::Collected,
+                evidence_state: if db_meta.schema_version.is_some() {
+                    IncidentEvidenceState::Measured
+                } else {
+                    IncidentEvidenceState::Mixed
+                },
+                source_surface: format!("rusqlite read-only {}", db_path.display()),
+                mutates_state: false,
+                generated_at: Some(exported_at.clone()),
+                freshness_ms: Some(0),
+                max_age_ms: Some(300_000),
+                redaction: redaction_state_for_file(&redaction_entries, "db_metadata.json"),
+                privacy_tier: "default".to_string(),
+                size_bytes: bundle_file_size(&bundle_dir, "db_metadata.json"),
+                elapsed_ms: elapsed_ms(db_source_started),
+                warning_ids: Vec::new(),
+            });
 
             // Recent events (sanitized summaries)
+            let events_source_started = Instant::now();
             if opts.max_events > 0 {
                 if let Some(events_json) = collect_recent_events_summary(db_path, opts.max_events) {
                     write_redacted_file(
@@ -1049,13 +1632,143 @@ pub fn collect_incident_bundle(
                         &mut total_size,
                         &mut redaction_entries,
                     )?;
+                    sources.push(IncidentSourceEntry {
+                        name: "recent_events".to_string(),
+                        file: Some("recent_events.json".to_string()),
+                        status: IncidentSourceStatus::Collected,
+                        evidence_state: IncidentEvidenceState::Measured,
+                        source_surface: format!(
+                            "rusqlite read-only recent events {}",
+                            db_path.display()
+                        ),
+                        mutates_state: false,
+                        generated_at: Some(exported_at.clone()),
+                        freshness_ms: Some(0),
+                        max_age_ms: Some(300_000),
+                        redaction: redaction_state_for_file(
+                            &redaction_entries,
+                            "recent_events.json",
+                        ),
+                        privacy_tier: "default".to_string(),
+                        size_bytes: bundle_file_size(&bundle_dir, "recent_events.json"),
+                        elapsed_ms: elapsed_ms(events_source_started),
+                        warning_ids: Vec::new(),
+                    });
+                } else {
+                    let warning_id = "recent_events.query_failed";
+                    warnings.push(incident_warning(
+                        warning_id,
+                        "recent_events",
+                        "failed to query recent events from the read-only database".to_string(),
+                    ));
+                    sources.push(IncidentSourceEntry {
+                        name: "recent_events".to_string(),
+                        file: None,
+                        status: IncidentSourceStatus::Failed,
+                        evidence_state: IncidentEvidenceState::Unavailable,
+                        source_surface: format!(
+                            "rusqlite read-only recent events {}",
+                            db_path.display()
+                        ),
+                        mutates_state: false,
+                        generated_at: None,
+                        freshness_ms: None,
+                        max_age_ms: Some(300_000),
+                        redaction: IncidentRedactionState::NotApplicable,
+                        privacy_tier: "default".to_string(),
+                        size_bytes: 0,
+                        elapsed_ms: elapsed_ms(events_source_started),
+                        warning_ids: vec![warning_id.to_string()],
+                    });
                 }
+            } else {
+                sources.push(skipped_source(
+                    "recent_events",
+                    "max_events=0".to_string(),
+                    Some(300_000),
+                    elapsed_ms(events_source_started),
+                    "recent_events.max_events_zero",
+                    "max_events=0 disabled recent event collection".to_string(),
+                    &mut warnings,
+                ));
+            }
+        } else {
+            let warning_id = "db_metadata.unavailable";
+            warnings.push(incident_warning(
+                warning_id,
+                "db_metadata",
+                format!("database path does not exist: {}", db_path.display()),
+            ));
+            sources.push(IncidentSourceEntry {
+                name: "db_metadata".to_string(),
+                file: None,
+                status: IncidentSourceStatus::Unavailable,
+                evidence_state: IncidentEvidenceState::Unavailable,
+                source_surface: format!("rusqlite read-only {}", db_path.display()),
+                mutates_state: false,
+                generated_at: None,
+                freshness_ms: None,
+                max_age_ms: Some(300_000),
+                redaction: IncidentRedactionState::NotApplicable,
+                privacy_tier: "default".to_string(),
+                size_bytes: 0,
+                elapsed_ms: elapsed_ms(db_source_started),
+                warning_ids: vec![warning_id.to_string()],
+            });
+            if opts.max_events > 0 {
+                let events_warning_id = "recent_events.unavailable";
+                warnings.push(incident_warning(
+                    events_warning_id,
+                    "recent_events",
+                    "recent events were requested, but the database path was unavailable"
+                        .to_string(),
+                ));
+                sources.push(IncidentSourceEntry {
+                    name: "recent_events".to_string(),
+                    file: None,
+                    status: IncidentSourceStatus::Unavailable,
+                    evidence_state: IncidentEvidenceState::Unavailable,
+                    source_surface: format!(
+                        "rusqlite read-only recent events {}",
+                        db_path.display()
+                    ),
+                    mutates_state: false,
+                    generated_at: None,
+                    freshness_ms: None,
+                    max_age_ms: Some(300_000),
+                    redaction: IncidentRedactionState::NotApplicable,
+                    privacy_tier: "default".to_string(),
+                    size_bytes: 0,
+                    elapsed_ms: elapsed_ms(db_source_started),
+                    warning_ids: vec![events_warning_id.to_string()],
+                });
             }
         }
+    } else {
+        let elapsed = elapsed_ms(db_source_started);
+        sources.push(skipped_source(
+            "db_metadata",
+            "optional database path not provided".to_string(),
+            Some(300_000),
+            elapsed,
+            "db_metadata.skipped",
+            "optional database path was not provided".to_string(),
+            &mut warnings,
+        ));
+        sources.push(skipped_source(
+            "recent_events",
+            "optional database path not provided".to_string(),
+            Some(300_000),
+            elapsed,
+            "recent_events.db_not_configured",
+            "recent event collection was skipped because no database path was provided".to_string(),
+            &mut warnings,
+        ));
     }
 
     // 4. Write redaction report
     let total_redactions: usize = redaction_entries.iter().map(|e| e.count).sum();
+    let redacted_files = redaction_entries.len();
     let redaction_report = RedactionReport {
         total_redactions,
         per_file: redaction_entries,
@@ -1067,14 +1780,53 @@ pub fn collect_incident_bundle(
     write_file_sync(&bundle_dir.join("redaction_report.json"), report_bytes)?;
     files.push("redaction_report.json".to_string());
 
-    // 5. Write incident manifest
+    // 5. Write source warnings and README before the manifest so the manifest
+    // file list is complete.
+    let warnings_body = warnings_jsonl(&warnings)?;
+    let warning_bytes = warnings_body.as_bytes();
+    total_size += warning_bytes.len() as u64;
+    write_file_sync(&bundle_dir.join("warnings.jsonl"), warning_bytes)?;
+    files.push("warnings.jsonl".to_string());
+
+    let readme = generate_incident_bundle_readme(
+        opts.kind,
+        &exported_at,
+        &files,
+        sources.len(),
+        warnings.len(),
+    );
+    let readme_bytes = readme.as_bytes();
+    total_size += readme_bytes.len() as u64;
+    write_file_sync(&bundle_dir.join("README.md"), readme_bytes)?;
+    files.push("README.md".to_string());
+
+    // 6. Write incident manifest
     let result = IncidentBundleResult {
         path: bundle_dir.clone(),
         kind: opts.kind,
         files: files.clone(),
         total_size_bytes: total_size,
         wa_version: crate::VERSION.to_string(),
-        exported_at: format_iso8601(ts),
+        exported_at: exported_at.clone(),
+        swarm: Some(SwarmIncidentBundleManifest {
+            contract_id: "ft.swarm_incident_bundle.v1".to_string(),
+            schema_version: 1,
+            format_version: "1.0".to_string(),
+            bundle_id: bundle_name,
+            kind: opts.kind,
+            created_at: exported_at.clone(),
+            generator: IncidentBundleGenerator::current(),
+            privacy_budget: IncidentPrivacyBudget::default_for(opts.max_events),
+            collection_policy: IncidentCollectionPolicy::default(),
+            environment: IncidentEnvironmentSummary::current(),
+            sources,
+            warnings,
+            redaction_summary: IncidentRedactionSummary {
+                total_redactions,
+                redacted_files,
+            },
+            total_size_bytes: total_size,
+        }),
     };
 
     let manifest_json = serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?;
@@ -2363,11 +3115,9 @@ mod tests {
 
         assert!(manifest.files.contains(&"crash_report.json".to_string()));
         assert!(!manifest.files.contains(&"health_snapshot.json".to_string()));
-        assert!(
-            manifest
-                .files
-                .contains(&"resize_forensics.json".to_string())
-        );
+        assert!(manifest
+            .files
+            .contains(&"resize_forensics.json".to_string()));
         assert!(!manifest.has_health_snapshot);
         assert!(manifest.has_resize_forensics);
 
@@ -2642,15 +3392,13 @@ mod tests {
             export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Manual).unwrap();
 
         assert_eq!(result.kind, IncidentKind::Manual);
-        assert!(
-            result
-                .path
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("wa_incident_manual_")
-        );
+        assert!(result
+            .path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("wa_incident_manual_"));
     }
 
     #[test]
@@ -3521,6 +4269,7 @@ mod tests {
             total_size_bytes: 1024,
             wa_version: "0.1.0".to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: IncidentBundleResult = serde_json::from_str(&json).unwrap();
@@ -3688,12 +4437,10 @@ mod tests {
         // Empty directory — no manifest.json or incident_manifest.json
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         assert_eq!(result.status, "fail");
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "manifest_valid" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "manifest_valid" && !c.passed));
     }
 
     #[test]
@@ -3703,12 +4450,10 @@ mod tests {
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         assert_eq!(result.status, "fail");
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "manifest_valid" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "manifest_valid" && !c.passed));
     }
 
     #[test]
@@ -3721,32 +4466,27 @@ mod tests {
             total_size_bytes: 0,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         fs::write(tmp.path().join("incident_manifest.json"), &json).unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         // Manifest is valid
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "manifest_valid" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "manifest_valid" && c.passed));
         // No redaction report → warning
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("redaction_report"))
-        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("redaction_report")));
         // No secrets found → passes
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "no_secrets_leaked" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "no_secrets_leaked" && c.passed));
     }
 
     #[test]
@@ -3759,6 +4499,7 @@ mod tests {
             total_size_bytes: 100,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -3779,12 +4520,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "redaction_report_valid" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "redaction_report_valid" && c.passed));
     }
 
     #[test]
@@ -3797,6 +4536,7 @@ mod tests {
             total_size_bytes: 100,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -3806,12 +4546,10 @@ mod tests {
         fs::write(tmp.path().join("redaction_report.json"), "{ bad json }").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "redaction_report_valid" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "redaction_report_valid" && !c.passed));
     }
 
     #[test]
@@ -3824,6 +4562,7 @@ mod tests {
             total_size_bytes: 200,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -3838,12 +4577,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "crash_report_valid" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "crash_report_valid" && c.passed));
     }
 
     #[test]
@@ -3856,6 +4593,7 @@ mod tests {
             total_size_bytes: 200,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -3865,12 +4603,10 @@ mod tests {
         fs::write(tmp.path().join("crash_report.json"), "not valid crash json").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "crash_report_valid" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "crash_report_valid" && !c.passed));
     }
 
     #[test]
@@ -3883,6 +4619,7 @@ mod tests {
             total_size_bytes: 0,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -3903,12 +4640,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "db_metadata_valid" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "db_metadata_valid" && c.passed));
     }
 
     #[test]
@@ -3921,6 +4656,7 @@ mod tests {
             total_size_bytes: 100,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -3948,18 +4684,14 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "events_structure_valid" && c.passed)
-        );
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "events_text_bounded" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_structure_valid" && c.passed));
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && c.passed));
     }
 
     #[test]
@@ -3972,6 +4704,7 @@ mod tests {
             total_size_bytes: 0,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -3993,6 +4726,7 @@ mod tests {
             total_size_bytes: 100,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -4014,12 +4748,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "events_text_bounded" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && !c.passed));
     }
 
     #[test]
@@ -4032,6 +4764,7 @@ mod tests {
             total_size_bytes: 100,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -4054,12 +4787,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "events_text_bounded" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && c.passed));
     }
 
     #[test]
@@ -4075,6 +4806,7 @@ mod tests {
             total_size_bytes: 100,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -4090,12 +4822,10 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "files_complete" && !c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "files_complete" && !c.passed));
     }
 
     #[test]
@@ -4108,6 +4838,7 @@ mod tests {
             total_size_bytes: 50,
             wa_version: crate::VERSION.to_string(),
             exported_at: "2023-11-14T22:13:20Z".to_string(),
+            swarm: None,
         };
         fs::write(
             tmp.path().join("incident_manifest.json"),
@@ -4117,12 +4848,10 @@ mod tests {
         fs::write(tmp.path().join("data.json"), "{}").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(
-            result
-                .checks
-                .iter()
-                .any(|c| c.name == "files_complete" && c.passed)
-        );
+        assert!(result
+            .checks
+            .iter()
+            .any(|c| c.name == "files_complete" && c.passed));
     }
 
     // -- write_redacted_file tests --
@@ -4182,6 +4911,54 @@ mod tests {
     }
 
     #[test]
+    fn collect_incident_bundle_manual_records_skipped_source_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+
+        let opts = IncidentBundleOptions {
+            crash_dir: &crash_dir,
+            config_path: None,
+            out_dir: &out_dir,
+            kind: IncidentKind::Manual,
+            db_path: None,
+            max_events: 0,
+        };
+
+        let result = collect_incident_bundle(&opts).unwrap();
+        let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
+        let warning_ids: std::collections::HashSet<&str> = swarm
+            .warnings
+            .iter()
+            .map(|warning| warning.id.as_str())
+            .collect();
+
+        for source in &swarm.sources {
+            if source.status != IncidentSourceStatus::Collected {
+                assert!(
+                    !source.warning_ids.is_empty(),
+                    "degraded source {} should carry a typed warning id",
+                    source.name
+                );
+                for warning_id in &source.warning_ids {
+                    assert!(
+                        warning_ids.contains(warning_id.as_str()),
+                        "source {} references missing warning id {}",
+                        source.name,
+                        warning_id
+                    );
+                }
+            }
+        }
+
+        assert!(warning_ids.contains("robot_state.not_wired"));
+        assert!(warning_ids.contains("crash_bundle.skipped"));
+        assert!(warning_ids.contains("config_summary.skipped"));
+        assert!(warning_ids.contains("db_metadata.skipped"));
+        assert!(warning_ids.contains("recent_events.db_not_configured"));
+    }
+
+    #[test]
     fn collect_incident_bundle_crash_with_existing_bundle() {
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
@@ -4226,6 +5003,46 @@ mod tests {
 
         let result = collect_incident_bundle(&opts).unwrap();
         assert!(result.files.contains(&"config_summary.toml".to_string()));
+    }
+
+    #[test]
+    fn collect_incident_bundle_invalid_db_records_failed_recent_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+        let db_path = tmp.path().join("invalid.db");
+        fs::write(&db_path, "this is not sqlite").unwrap();
+
+        let opts = IncidentBundleOptions {
+            crash_dir: &crash_dir,
+            config_path: None,
+            out_dir: &out_dir,
+            kind: IncidentKind::Manual,
+            db_path: Some(&db_path),
+            max_events: 10,
+        };
+
+        let result = collect_incident_bundle(&opts).unwrap();
+        assert!(result.path.join("db_metadata.json").exists());
+        assert!(!result.path.join("recent_events.json").exists());
+
+        let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
+        assert!(swarm
+            .sources
+            .iter()
+            .any(|source| source.name == "recent_events"
+                && source.status == IncidentSourceStatus::Failed
+                && source
+                    .warning_ids
+                    .iter()
+                    .any(|id| id == "recent_events.query_failed")));
+        assert!(swarm
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "recent_events.query_failed"));
+
+        let replay = replay_incident_bundle(&result.path, ReplayMode::Policy).unwrap();
+        assert_eq!(replay.status, "pass");
     }
 
     #[test]

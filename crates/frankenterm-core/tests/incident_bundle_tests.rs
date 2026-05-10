@@ -8,10 +8,10 @@ use std::fs;
 use std::path::Path;
 
 use frankenterm_core::crash::{
-    CrashManifest, CrashReport, HealthSnapshot, IncidentBundleOptions, IncidentBundleResult,
-    IncidentKind, PanePriorityOverrideSnapshot, ReplayMode, collect_incident_bundle,
-    export_incident_bundle, latest_crash_bundle, list_crash_bundles, replay_incident_bundle,
-    write_crash_bundle,
+    collect_incident_bundle, export_incident_bundle, latest_crash_bundle, list_crash_bundles,
+    replay_incident_bundle, write_crash_bundle, CrashManifest, CrashReport, HealthSnapshot,
+    IncidentBundleOptions, IncidentBundleResult, IncidentKind, IncidentSourceStatus,
+    PanePriorityOverrideSnapshot, ReplayMode,
 };
 use frankenterm_core::policy::Redactor;
 
@@ -710,9 +710,66 @@ fn collect_incident_bundle_manual_kind_produces_manifest() {
     let manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
     assert_eq!(manifest["kind"], "manual");
+    assert_eq!(
+        manifest["swarm"]["contract_id"],
+        "ft.swarm_incident_bundle.v1"
+    );
+    assert_eq!(manifest["swarm"]["format_version"], "1.0");
+    assert_eq!(manifest["swarm"]["kind"], "manual");
+    assert!(manifest["swarm"]["bundle_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("wa_incident_manual_"));
+    assert_eq!(
+        manifest["swarm"]["generator"]["source_surface"],
+        "frankenterm_core::crash::collect_incident_bundle"
+    );
+    assert_eq!(
+        manifest["swarm"]["privacy_budget"]["pane_text_allowed"],
+        false
+    );
+    assert_eq!(
+        manifest["swarm"]["redaction_summary"]["total_redactions"],
+        0
+    );
 
     let redaction_path = result.path.join("redaction_report.json");
     assert!(redaction_path.exists());
+    assert!(result.path.join("warnings.jsonl").exists());
+    assert!(result.path.join("README.md").exists());
+
+    let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
+    assert!(!swarm.collection_policy.mutating_actions_allowed);
+    let warning_ids: HashSet<&str> = swarm
+        .warnings
+        .iter()
+        .map(|warning| warning.id.as_str())
+        .collect();
+    for source in &swarm.sources {
+        if source.status != IncidentSourceStatus::Collected {
+            assert!(
+                !source.warning_ids.is_empty(),
+                "degraded source {} should carry a typed warning id",
+                source.name
+            );
+            for warning_id in &source.warning_ids {
+                assert!(
+                    warning_ids.contains(warning_id.as_str()),
+                    "source {} references missing warning id {}",
+                    source.name,
+                    warning_id
+                );
+            }
+        }
+    }
+    assert!(swarm
+        .sources
+        .iter()
+        .any(|source| source.name == "crash_bundle"
+            && source.status == IncidentSourceStatus::Skipped));
+    assert!(swarm.sources.iter().any(
+        |source| source.name == "robot_state" && source.status == IncidentSourceStatus::Skipped
+    ));
 }
 
 #[test]
@@ -999,6 +1056,84 @@ fn collect_incident_bundle_nonexistent_db_skips_db_files() {
     // DB files should not be created for nonexistent DB
     assert!(!result.path.join("db_metadata.json").exists());
     assert!(!result.path.join("recent_events.json").exists());
+    assert!(result.path.join("incident_manifest.json").exists());
+    assert!(result.path.join("redaction_report.json").exists());
+    assert!(result.path.join("warnings.jsonl").exists());
+
+    let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
+    assert!(swarm
+        .sources
+        .iter()
+        .any(|source| source.name == "db_metadata"
+            && source.status == IncidentSourceStatus::Unavailable));
+    assert!(swarm
+        .sources
+        .iter()
+        .any(|source| source.name == "recent_events"
+            && source.status == IncidentSourceStatus::Unavailable));
+    assert!(swarm
+        .warnings
+        .iter()
+        .any(|warning| warning.id == "db_metadata.unavailable"));
+    assert!(swarm
+        .warnings
+        .iter()
+        .any(|warning| warning.id == "recent_events.unavailable"));
+
+    let manifest: IncidentBundleResult = serde_json::from_str(
+        &fs::read_to_string(result.path.join("incident_manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest.swarm.is_some());
+
+    let replay = replay_incident_bundle(&result.path, ReplayMode::Policy).unwrap();
+    assert_eq!(replay.status, "pass");
+}
+
+#[test]
+fn collect_incident_bundle_invalid_db_records_failure_but_replays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crash_dir = tmp.path().join("crashes");
+    let out_dir = tmp.path().join("output");
+    fs::create_dir_all(&crash_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let bad_db = tmp.path().join("invalid.db");
+    fs::write(&bad_db, "this is not sqlite").unwrap();
+
+    let opts = IncidentBundleOptions {
+        crash_dir: &crash_dir,
+        config_path: None,
+        out_dir: &out_dir,
+        kind: IncidentKind::Manual,
+        db_path: Some(&bad_db),
+        max_events: 10,
+    };
+
+    let result = collect_incident_bundle(&opts).unwrap();
+    assert!(result.path.join("db_metadata.json").exists());
+    assert!(!result.path.join("recent_events.json").exists());
+
+    let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
+    assert!(swarm
+        .sources
+        .iter()
+        .any(|source| source.name == "recent_events"
+            && source.status == IncidentSourceStatus::Failed
+            && source
+                .warning_ids
+                .iter()
+                .any(|id| id == "recent_events.query_failed")));
+    assert!(swarm
+        .warnings
+        .iter()
+        .any(|warning| warning.id == "recent_events.query_failed"));
+
+    let warnings_jsonl = fs::read_to_string(result.path.join("warnings.jsonl")).unwrap();
+    assert!(warnings_jsonl.contains("recent_events.query_failed"));
+
+    let replay = replay_incident_bundle(&result.path, ReplayMode::Policy).unwrap();
+    assert_eq!(replay.status, "pass");
 }
 
 #[test]
@@ -1070,24 +1205,18 @@ fn replay_clean_bundle_policy_mode_passes() {
     let result = replay_incident_bundle(&bundle.path, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "pass");
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name == "manifest_valid" && c.passed)
-    );
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name == "no_secrets_leaked" && c.passed)
-    );
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name == "files_complete" && c.passed)
-    );
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name == "manifest_valid" && c.passed));
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name == "no_secrets_leaked" && c.passed));
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name == "files_complete" && c.passed));
 }
 
 #[test]
@@ -1114,12 +1243,10 @@ fn replay_bundle_with_db_metadata_policy_mode() {
     let result = replay_incident_bundle(&bundle.path, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "pass");
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name == "db_metadata_valid" && c.passed)
-    );
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name == "db_metadata_valid" && c.passed));
 }
 
 #[test]
@@ -1146,18 +1273,14 @@ fn replay_bundle_rules_mode_validates_events() {
     let result = replay_incident_bundle(&bundle.path, ReplayMode::Rules).unwrap();
 
     assert_eq!(result.status, "pass");
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_structure_valid" && c.passed)
-    );
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_text_bounded" && c.passed)
-    );
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name == "events_structure_valid" && c.passed));
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name == "events_text_bounded" && c.passed));
 }
 
 #[test]
@@ -1174,6 +1297,7 @@ fn replay_detects_secret_leak_in_bundle() {
         total_size_bytes: 100,
         wa_version: "0.1.0".to_string(),
         exported_at: "2026-01-01T00:00:00Z".to_string(),
+        swarm: None,
     };
     fs::write(
         bundle_dir.join("incident_manifest.json"),
@@ -1192,12 +1316,10 @@ fn replay_detects_secret_leak_in_bundle() {
     let result = replay_incident_bundle(&bundle_dir, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "fail");
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name.starts_with("no_secrets_") && !c.passed)
-    );
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name.starts_with("no_secrets_") && !c.passed));
 }
 
 #[test]
@@ -1209,12 +1331,10 @@ fn replay_empty_bundle_dir_fails_manifest() {
     let result = replay_incident_bundle(&bundle_dir, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "fail");
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name == "manifest_valid" && !c.passed)
-    );
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name == "manifest_valid" && !c.passed));
 }
 
 #[test]
@@ -1269,10 +1389,8 @@ fn replay_crash_kind_bundle_validates_crash_report() {
     let result = replay_incident_bundle(&bundle.path, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "pass");
-    assert!(
-        result
-            .checks
-            .iter()
-            .any(|c| c.name == "crash_report_valid" && c.passed)
-    );
+    assert!(result
+        .checks
+        .iter()
+        .any(|c| c.name == "crash_report_valid" && c.passed));
 }
