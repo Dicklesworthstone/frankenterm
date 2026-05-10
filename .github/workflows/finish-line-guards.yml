@@ -145,6 +145,23 @@ jobs:
           FT_XBNL0_5_2_SKIP_CARGO_TEST: "1"
         run: bash tests/e2e/test_ft_xbnl0_5_2_finish_line_guards.sh
 
+      - name: Run ft-5eqd4.4 policy count doc-pin E2E
+        run: bash tests/e2e/test_ft_5eqd4_4_policy_count_doc_pin.sh
+
+      - name: Assert ft-5eqd4.4 policy count E2E emitted no failed rows
+        if: always()
+        run: |
+          shopt -s nullglob
+          logs=(tests/e2e/artifacts/goal-line/ft-5eqd4/policy_count_doc_pin/*/structured.log)
+          if [[ ${#logs[@]} -eq 0 ]]; then
+            echo "No ft-5eqd4.4 structured.log files found" >&2
+            exit 1
+          fi
+          if jq -e 'select(.outcome == "failed")' "${logs[@]}" >/dev/null; then
+            echo "ft-5eqd4.4 policy count harness emitted failed rows" >&2
+            exit 1
+          fi
+
       - name: Upload E2E artifact bundle
         if: always()
         uses: actions/upload-artifact@v4
@@ -152,4 +169,13 @@ jobs:
           name: finish-line-guards-e2e-bundle
           path: tests/e2e/logs/ft_xbnl0_5_2_finish_line_guards_*/
           if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload ft-5eqd4.4 policy count artifact bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ft-5eqd4-4-policy-count-doc-pin
+          path: tests/e2e/artifacts/goal-line/ft-5eqd4/policy_count_doc_pin/
+          if-no-files-found: error
           retention-days: 30
