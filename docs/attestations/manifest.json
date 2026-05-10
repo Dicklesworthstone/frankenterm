@@ -27,8 +27,8 @@
       "category": "perf/competitor-matrix",
       "path": "docs/perf/competitor-matrix.json",
       "media_type": "application/json",
-      "produced_by_bead": "ft-syqcz.4",
-      "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3). Recovery artifact published by ft-e87u6.9 (closed) backfilling the original ft-syqcz.4 producer slot."
+      "produced_by_bead": "ft-e87u6.9",
+      "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3). Recovery artifact published by ft-e87u6.9 (closed); substrate provenance traces to the ft-t101b deterministic competitor-bench fixture under ft-syqcz.5. Producer attribution corrected from the original null-slot misattribution to ft-syqcz.4 per the artifact's recommended_produced_by_bead field."
     },
     {
       "category": "perf/lindley-bounds",
