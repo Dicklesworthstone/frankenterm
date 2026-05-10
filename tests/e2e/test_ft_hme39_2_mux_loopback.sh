@@ -102,6 +102,10 @@ failure_reason_for_log() {
     printf '%s\n' "rch_infrastructure_cargo_dep_info_missing"
     return
   fi
+  if grep -Fq '[RCH] local (no workers with Rust installed)' "${log_file}" 2>/dev/null; then
+    printf '%s\n' "rch_infrastructure_no_rust_worker_available"
+    return
+  fi
   meta_file="$(rch_log_meta_path "${log_file}")"
   if [[ ! -f "${meta_file}" ]]; then
     printf '%s\n' "source_or_test_failure"
@@ -131,7 +135,9 @@ run_rch_step() {
 
   emit_event "${decision_path}" "running" "remote_rch_started" "none" "${log_file}" "${command_summary}"
   set +e
-  run_rch_cargo_logged "${log_file}" "$@"
+  (
+    run_rch_cargo_logged "${log_file}" "$@"
+  )
   local rc=$?
   set -e
 
