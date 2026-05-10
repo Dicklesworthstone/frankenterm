@@ -18,9 +18,11 @@ use std::backtrace::Backtrace;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -874,13 +876,13 @@ pub struct IncidentPrivacyBudget {
 }
 
 impl IncidentPrivacyBudget {
-    fn default_for(max_events: usize) -> Self {
+    fn default_for_process_sampling(max_events: usize, process_sample_allowed: bool) -> Self {
         Self {
             tier: "default".to_string(),
             config_summary_max_bytes: 64 * 1024,
             max_events,
             pane_text_allowed: false,
-            process_sample_allowed: false,
+            process_sample_allowed,
         }
     }
 }
@@ -911,10 +913,16 @@ pub struct IncidentCollectionPolicy {
 
 impl Default for IncidentCollectionPolicy {
     fn default() -> Self {
+        Self::with_process_sampler("disabled")
+    }
+}
+
+impl IncidentCollectionPolicy {
+    fn with_process_sampler(process_sampler: &str) -> Self {
         Self {
             mutating_actions_allowed: false,
             pane_text_allowed: "disabled".to_string(),
-            process_sampler: "disabled".to_string(),
+            process_sampler: process_sampler.to_string(),
             agent_mail_repair_allowed: false,
             source_timeout_ms: 5_000,
         }
@@ -1038,6 +1046,117 @@ pub struct IncidentBundleWarning {
     pub source: Option<String>,
     /// Human-readable warning message.
     pub message: String,
+}
+
+/// Bounded process-sampler command used by opt-in incident bundles.
+#[derive(Debug, Clone)]
+pub struct IncidentProcessSamplerConfig {
+    /// Maximum wall-clock time spent waiting for the sampler command.
+    pub timeout_ms: u64,
+    /// Privacy tier recorded on the process-sample source.
+    pub privacy_tier: String,
+    program: IncidentProcessSamplerProgram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncidentProcessSamplerProgram {
+    Ps,
+    MissingToolForTest,
+}
+
+impl IncidentProcessSamplerConfig {
+    /// Build the default read-only `ps` snapshot sampler.
+    #[must_use]
+    pub fn ps_snapshot(timeout_ms: u64) -> Self {
+        Self {
+            timeout_ms,
+            privacy_tier: "default".to_string(),
+            program: IncidentProcessSamplerProgram::Ps,
+        }
+    }
+
+    /// Build a deterministic missing-tool sampler for tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn missing_tool_for_test(timeout_ms: u64) -> Self {
+        Self {
+            timeout_ms,
+            privacy_tier: "default".to_string(),
+            program: IncidentProcessSamplerProgram::MissingToolForTest,
+        }
+    }
+
+    fn source_surface(&self) -> String {
+        format!("bounded process sampler command {}", self.program.label())
+    }
+
+    fn command_args(&self) -> &'static [&'static str] {
+        self.program.args()
+    }
+}
+
+impl IncidentProcessSamplerProgram {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ps => "ps",
+            Self::MissingToolForTest => "__ft_missing_process_sampler__",
+        }
+    }
+
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Ps => &["-axo", "pid=,ppid=,rss=,vsz=,comm="],
+            Self::MissingToolForTest => &[],
+        }
+    }
+}
+
+/// Captured process-sampler payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentProcessSample {
+    /// Operating-system family reported by Rust.
+    pub platform: String,
+    /// CPU architecture reported by Rust.
+    pub arch: String,
+    /// ISO-8601 UTC timestamp for this sample.
+    pub sampled_at: String,
+    /// Sampler timeout budget.
+    pub timeout_ms: u64,
+    /// Command label used to collect the sample.
+    pub collector: String,
+    /// Parsed process rows from the snapshot.
+    pub processes: Vec<IncidentProcessRow>,
+    /// Memory categories distinguished by this platform/sample.
+    pub memory_categories: Vec<IncidentProcessMemoryCategory>,
+}
+
+/// One row in a process sample.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentProcessRow {
+    /// Process id.
+    pub pid: u32,
+    /// Parent process id, when reported.
+    pub parent_pid: Option<u32>,
+    /// Resident memory in bytes, when reported.
+    pub resident_bytes: Option<u64>,
+    /// Virtual memory in bytes, when reported.
+    pub virtual_bytes: Option<u64>,
+    /// Sanitized executable label.
+    pub command: String,
+}
+
+/// Memory category summary for process-sampler output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentProcessMemoryCategory {
+    /// Stable category id.
+    pub category: String,
+    /// Byte total for measured categories.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Collection status for this category.
+    pub status: IncidentSourceStatus,
+    /// Evidence state for this category.
+    pub evidence_state: IncidentEvidenceState,
 }
 
 /// Export an incident bundle to `out_dir`.
@@ -1333,6 +1452,21 @@ fn generate_incident_bundle_readme(
 /// gathers storage metadata and recent event summaries.
 pub fn collect_incident_bundle(
     opts: &IncidentBundleOptions<'_>,
+) -> std::io::Result<IncidentBundleResult> {
+    collect_incident_bundle_inner(opts, None)
+}
+
+/// Collect a comprehensive incident bundle with an opt-in bounded process sampler.
+pub fn collect_incident_bundle_with_process_sampler(
+    opts: &IncidentBundleOptions<'_>,
+    process_sampler: &IncidentProcessSamplerConfig,
+) -> std::io::Result<IncidentBundleResult> {
+    collect_incident_bundle_inner(opts, Some(process_sampler))
+}
+
+fn collect_incident_bundle_inner(
+    opts: &IncidentBundleOptions<'_>,
+    process_sampler: Option<&IncidentProcessSamplerConfig>,
 ) -> std::io::Result<IncidentBundleResult> {
     let ts = epoch_secs();
     let ts_str = format_timestamp(ts);
@@ -1766,7 +1900,87 @@ pub fn collect_incident_bundle(
         ));
     }
 
-    // 4. Write redaction report
+    // 4. Optionally collect a bounded process sample.
+    let process_source_started = Instant::now();
+    if let Some(config) = process_sampler {
+        match run_process_sampler(config, &exported_at) {
+            Ok(sample) => {
+                let sample_json =
+                    serde_json::to_string_pretty(&sample).map_err(std::io::Error::other)?;
+                write_redacted_file(
+                    "process_sample.json",
+                    &sample_json,
+                    &bundle_dir,
+                    &redactor,
+                    &mut files,
+                    &mut total_size,
+                    &mut redaction_entries,
+                )?;
+                sources.push(IncidentSourceEntry {
+                    name: "process_sample".to_string(),
+                    file: Some("process_sample.json".to_string()),
+                    status: IncidentSourceStatus::Collected,
+                    evidence_state: IncidentEvidenceState::Mixed,
+                    source_surface: config.source_surface(),
+                    mutates_state: false,
+                    generated_at: Some(exported_at.clone()),
+                    freshness_ms: Some(0),
+                    max_age_ms: Some(config.timeout_ms),
+                    redaction: redaction_state_for_file(&redaction_entries, "process_sample.json"),
+                    privacy_tier: config.privacy_tier.to_string(),
+                    size_bytes: bundle_file_size(&bundle_dir, "process_sample.json"),
+                    elapsed_ms: elapsed_ms(process_source_started),
+                    warning_ids: Vec::new(),
+                });
+            }
+            Err(ProcessSamplerError::Unavailable(message)) => {
+                let warning_id = "process_sample.unavailable";
+                warnings.push(incident_warning(warning_id, "process_sample", message));
+                sources.push(process_sample_degraded_source(
+                    config,
+                    IncidentSourceStatus::Unavailable,
+                    elapsed_ms(process_source_started),
+                    warning_id,
+                ));
+            }
+            Err(ProcessSamplerError::Timeout { timeout_ms }) => {
+                let warning_id = "process_sample.timeout";
+                warnings.push(incident_warning(
+                    warning_id,
+                    "process_sample",
+                    format!("process sampler exceeded its {timeout_ms} ms timeout"),
+                ));
+                sources.push(process_sample_degraded_source(
+                    config,
+                    IncidentSourceStatus::Failed,
+                    elapsed_ms(process_source_started),
+                    warning_id,
+                ));
+            }
+            Err(ProcessSamplerError::Failed(message)) => {
+                let warning_id = "process_sample.failed";
+                warnings.push(incident_warning(warning_id, "process_sample", message));
+                sources.push(process_sample_degraded_source(
+                    config,
+                    IncidentSourceStatus::Failed,
+                    elapsed_ms(process_source_started),
+                    warning_id,
+                ));
+            }
+        }
+    } else {
+        sources.push(skipped_source(
+            "process_sample",
+            "process sampler disabled by incident-bundle privacy policy".to_string(),
+            Some(5_000),
+            elapsed_ms(process_source_started),
+            "process_sample.skipped",
+            "process sampling is opt-in and was not enabled for this bundle".to_string(),
+            &mut warnings,
+        ));
+    }
+
+    // 5. Write redaction report
     let total_redactions: usize = redaction_entries.iter().map(|e| e.count).sum();
     let redacted_files = redaction_entries.len();
     let redaction_report = RedactionReport {
@@ -1780,7 +1994,7 @@ pub fn collect_incident_bundle(
     write_file_sync(&bundle_dir.join("redaction_report.json"), report_bytes)?;
     files.push("redaction_report.json".to_string());
 
-    // 5. Write source warnings and README before the manifest so the manifest
+    // 6. Write source warnings and README before the manifest so the manifest
     // file list is complete.
     let warnings_body = warnings_jsonl(&warnings)?;
     let warning_bytes = warnings_body.as_bytes();
@@ -1800,7 +2014,8 @@ pub fn collect_incident_bundle(
     write_file_sync(&bundle_dir.join("README.md"), readme_bytes)?;
     files.push("README.md".to_string());
 
-    // 6. Write incident manifest
+    // 7. Write incident manifest
+    let process_sample_allowed = process_sampler.is_some();
     let result = IncidentBundleResult {
         path: bundle_dir.clone(),
         kind: opts.kind,
@@ -1816,8 +2031,18 @@ pub fn collect_incident_bundle(
             kind: opts.kind,
             created_at: exported_at.clone(),
             generator: IncidentBundleGenerator::current(),
-            privacy_budget: IncidentPrivacyBudget::default_for(opts.max_events),
-            collection_policy: IncidentCollectionPolicy::default(),
+            privacy_budget: if process_sample_allowed {
+                IncidentPrivacyBudget::default_for_process_sampling(opts.max_events, true)
+            } else {
+                IncidentPrivacyBudget::default_for_process_sampling(opts.max_events, false)
+            },
+            collection_policy: IncidentCollectionPolicy::with_process_sampler(
+                if process_sample_allowed {
+                    "bounded_snapshot"
+                } else {
+                    "disabled"
+                },
+            ),
             environment: IncidentEnvironmentSummary::current(),
             sources,
             warnings,
@@ -1939,6 +2164,238 @@ fn collect_recent_events_summary(db_path: &Path, max_events: usize) -> Option<St
     serde_json::to_string_pretty(&events)
         .inspect_err(|e| tracing::warn!(error = %e, "crash dump events serialization failed"))
         .ok()
+}
+
+#[derive(Debug)]
+enum ProcessSamplerError {
+    Unavailable(String),
+    Timeout { timeout_ms: u64 },
+    Failed(String),
+}
+
+fn process_sample_degraded_source(
+    config: &IncidentProcessSamplerConfig,
+    status: IncidentSourceStatus,
+    elapsed_ms: u64,
+    warning_id: &str,
+) -> IncidentSourceEntry {
+    IncidentSourceEntry {
+        name: "process_sample".to_string(),
+        file: None,
+        status,
+        evidence_state: IncidentEvidenceState::Unavailable,
+        source_surface: config.source_surface(),
+        mutates_state: false,
+        generated_at: None,
+        freshness_ms: None,
+        max_age_ms: Some(config.timeout_ms),
+        redaction: IncidentRedactionState::NotApplicable,
+        privacy_tier: config.privacy_tier.clone(),
+        size_bytes: 0,
+        elapsed_ms,
+        warning_ids: vec![warning_id.to_string()],
+    }
+}
+
+fn run_process_sampler(
+    config: &IncidentProcessSamplerConfig,
+    sampled_at: &str,
+) -> Result<IncidentProcessSample, ProcessSamplerError> {
+    if config.timeout_ms == 0 {
+        return Err(ProcessSamplerError::Timeout { timeout_ms: 0 });
+    }
+
+    let mut command = match config.program {
+        IncidentProcessSamplerProgram::Ps => Command::new("ps"),
+        IncidentProcessSamplerProgram::MissingToolForTest => {
+            Command::new("__ft_missing_process_sampler__")
+        }
+    };
+    command
+        .args(config.command_args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ProcessSamplerError::Unavailable(format!(
+                "process sampler command was unavailable: {}",
+                config.program.label()
+            ))
+        } else {
+            ProcessSamplerError::Failed(format!(
+                "failed to start process sampler command {}: {error}",
+                config.program.label()
+            ))
+        }
+    })?;
+
+    let deadline = Instant::now() + Duration::from_millis(config.timeout_ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let output = child.wait_with_output().map_err(|error| {
+                    ProcessSamplerError::Failed(format!(
+                        "failed to collect process sampler output: {error}"
+                    ))
+                })?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(ProcessSamplerError::Failed(format!(
+                        "process sampler exited with status {}: {}",
+                        output.status,
+                        stderr.trim()
+                    )));
+                }
+                let stdout = String::from_utf8(output.stdout).map_err(|error| {
+                    ProcessSamplerError::Failed(format!(
+                        "process sampler output was not valid UTF-8: {error}"
+                    ))
+                })?;
+                return Ok(build_process_sample(config, sampled_at, &stdout));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ProcessSamplerError::Timeout {
+                        timeout_ms: config.timeout_ms,
+                    });
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProcessSamplerError::Failed(format!(
+                    "failed while waiting for process sampler command: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn build_process_sample(
+    config: &IncidentProcessSamplerConfig,
+    sampled_at: &str,
+    stdout: &str,
+) -> IncidentProcessSample {
+    let processes = parse_process_rows(stdout);
+    let resident_bytes = sum_optional_bytes(processes.iter().map(|row| row.resident_bytes));
+    let virtual_bytes = sum_optional_bytes(processes.iter().map(|row| row.virtual_bytes));
+    let memory_categories = vec![
+        memory_category(
+            "resident_memory",
+            resident_bytes,
+            IncidentSourceStatus::Collected,
+            IncidentEvidenceState::Measured,
+        ),
+        memory_category(
+            "virtual_memory",
+            virtual_bytes,
+            IncidentSourceStatus::Collected,
+            IncidentEvidenceState::Measured,
+        ),
+        memory_category(
+            "heap_memory",
+            None,
+            IncidentSourceStatus::Unavailable,
+            IncidentEvidenceState::Unavailable,
+        ),
+        memory_category(
+            "graphics_media_memory",
+            None,
+            IncidentSourceStatus::Unavailable,
+            IncidentEvidenceState::Unavailable,
+        ),
+    ];
+
+    IncidentProcessSample {
+        platform: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        sampled_at: sampled_at.to_string(),
+        timeout_ms: config.timeout_ms,
+        collector: config.program.label().to_string(),
+        processes,
+        memory_categories,
+    }
+}
+
+fn parse_process_rows(stdout: &str) -> Vec<IncidentProcessRow> {
+    stdout
+        .lines()
+        .filter_map(parse_process_row)
+        .take(512)
+        .collect()
+}
+
+fn parse_process_row(line: &str) -> Option<IncidentProcessRow> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let parent_pid = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let resident_bytes = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(kib_to_bytes);
+    let virtual_bytes = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(kib_to_bytes);
+    let command = sanitize_process_command(&parts.collect::<Vec<_>>().join(" "));
+    Some(IncidentProcessRow {
+        pid,
+        parent_pid,
+        resident_bytes,
+        virtual_bytes,
+        command,
+    })
+}
+
+fn sum_optional_bytes(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    let mut saw_value = false;
+    let mut total = 0_u64;
+    for value in values.flatten() {
+        saw_value = true;
+        total = total.saturating_add(value);
+    }
+    saw_value.then_some(total)
+}
+
+fn memory_category(
+    category: &str,
+    bytes: Option<u64>,
+    status: IncidentSourceStatus,
+    evidence_state: IncidentEvidenceState,
+) -> IncidentProcessMemoryCategory {
+    IncidentProcessMemoryCategory {
+        category: category.to_string(),
+        bytes,
+        status,
+        evidence_state,
+    }
+}
+
+fn kib_to_bytes(kib: u64) -> u64 {
+    kib.saturating_mul(1024)
+}
+
+fn sanitize_process_command(command: &str) -> String {
+    let label = Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .chars()
+        .take(200)
+        .collect::<String>();
+    if label.is_empty() {
+        "unknown".to_string()
+    } else {
+        label
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3115,9 +3572,11 @@ mod tests {
 
         assert!(manifest.files.contains(&"crash_report.json".to_string()));
         assert!(!manifest.files.contains(&"health_snapshot.json".to_string()));
-        assert!(manifest
-            .files
-            .contains(&"resize_forensics.json".to_string()));
+        assert!(
+            manifest
+                .files
+                .contains(&"resize_forensics.json".to_string())
+        );
         assert!(!manifest.has_health_snapshot);
         assert!(manifest.has_resize_forensics);
 
@@ -3392,13 +3851,15 @@ mod tests {
             export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Manual).unwrap();
 
         assert_eq!(result.kind, IncidentKind::Manual);
-        assert!(result
-            .path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("wa_incident_manual_"));
+        assert!(
+            result
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("wa_incident_manual_")
+        );
     }
 
     #[test]
@@ -4437,10 +4898,12 @@ mod tests {
         // Empty directory — no manifest.json or incident_manifest.json
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         assert_eq!(result.status, "fail");
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "manifest_valid" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "manifest_valid" && !c.passed)
+        );
     }
 
     #[test]
@@ -4450,10 +4913,12 @@ mod tests {
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         assert_eq!(result.status, "fail");
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "manifest_valid" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "manifest_valid" && !c.passed)
+        );
     }
 
     #[test]
@@ -4473,20 +4938,26 @@ mod tests {
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
         // Manifest is valid
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "manifest_valid" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "manifest_valid" && c.passed)
+        );
         // No redaction report → warning
-        assert!(result
-            .warnings
-            .iter()
-            .any(|w| w.contains("redaction_report")));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("redaction_report"))
+        );
         // No secrets found → passes
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "no_secrets_leaked" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "no_secrets_leaked" && c.passed)
+        );
     }
 
     #[test]
@@ -4520,10 +4991,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "redaction_report_valid" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "redaction_report_valid" && c.passed)
+        );
     }
 
     #[test]
@@ -4546,10 +5019,12 @@ mod tests {
         fs::write(tmp.path().join("redaction_report.json"), "{ bad json }").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "redaction_report_valid" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "redaction_report_valid" && !c.passed)
+        );
     }
 
     #[test]
@@ -4577,10 +5052,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "crash_report_valid" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "crash_report_valid" && c.passed)
+        );
     }
 
     #[test]
@@ -4603,10 +5080,12 @@ mod tests {
         fs::write(tmp.path().join("crash_report.json"), "not valid crash json").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "crash_report_valid" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "crash_report_valid" && !c.passed)
+        );
     }
 
     #[test]
@@ -4640,10 +5119,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "db_metadata_valid" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "db_metadata_valid" && c.passed)
+        );
     }
 
     #[test]
@@ -4684,14 +5165,18 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_structure_valid" && c.passed));
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_text_bounded" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "events_structure_valid" && c.passed)
+        );
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "events_text_bounded" && c.passed)
+        );
     }
 
     #[test]
@@ -4748,10 +5233,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_text_bounded" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "events_text_bounded" && !c.passed)
+        );
     }
 
     #[test]
@@ -4787,10 +5274,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Rules).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "events_text_bounded" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "events_text_bounded" && c.passed)
+        );
     }
 
     #[test]
@@ -4822,10 +5311,12 @@ mod tests {
         .unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "files_complete" && !c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "files_complete" && !c.passed)
+        );
     }
 
     #[test]
@@ -4848,10 +5339,12 @@ mod tests {
         fs::write(tmp.path().join("data.json"), "{}").unwrap();
 
         let result = replay_incident_bundle(tmp.path(), ReplayMode::Policy).unwrap();
-        assert!(result
-            .checks
-            .iter()
-            .any(|c| c.name == "files_complete" && c.passed));
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "files_complete" && c.passed)
+        );
     }
 
     // -- write_redacted_file tests --
@@ -5027,19 +5520,20 @@ mod tests {
         assert!(!result.path.join("recent_events.json").exists());
 
         let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
-        assert!(swarm
-            .sources
-            .iter()
-            .any(|source| source.name == "recent_events"
+        assert!(swarm.sources.iter().any(|source| {
+            source.name == "recent_events"
                 && source.status == IncidentSourceStatus::Failed
                 && source
                     .warning_ids
                     .iter()
-                    .any(|id| id == "recent_events.query_failed")));
-        assert!(swarm
-            .warnings
-            .iter()
-            .any(|warning| warning.id == "recent_events.query_failed"));
+                    .any(|id| id == "recent_events.query_failed")
+        }));
+        assert!(
+            swarm
+                .warnings
+                .iter()
+                .any(|warning| warning.id == "recent_events.query_failed")
+        );
 
         let replay = replay_incident_bundle(&result.path, ReplayMode::Policy).unwrap();
         assert_eq!(replay.status, "pass");

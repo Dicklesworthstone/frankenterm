@@ -8,10 +8,11 @@ use std::fs;
 use std::path::Path;
 
 use frankenterm_core::crash::{
-    collect_incident_bundle, export_incident_bundle, latest_crash_bundle, list_crash_bundles,
-    replay_incident_bundle, write_crash_bundle, CrashManifest, CrashReport, HealthSnapshot,
-    IncidentBundleOptions, IncidentBundleResult, IncidentKind, IncidentSourceStatus,
-    PanePriorityOverrideSnapshot, ReplayMode,
+    CrashManifest, CrashReport, HealthSnapshot, IncidentBundleOptions, IncidentBundleResult,
+    IncidentKind, IncidentProcessSamplerConfig, IncidentSourceStatus, PanePriorityOverrideSnapshot,
+    ReplayMode, collect_incident_bundle, collect_incident_bundle_with_process_sampler,
+    export_incident_bundle, latest_crash_bundle, list_crash_bundles, replay_incident_bundle,
+    write_crash_bundle,
 };
 use frankenterm_core::policy::Redactor;
 
@@ -716,10 +717,12 @@ fn collect_incident_bundle_manual_kind_produces_manifest() {
     );
     assert_eq!(manifest["swarm"]["format_version"], "1.0");
     assert_eq!(manifest["swarm"]["kind"], "manual");
-    assert!(manifest["swarm"]["bundle_id"]
-        .as_str()
-        .unwrap()
-        .starts_with("wa_incident_manual_"));
+    assert!(
+        manifest["swarm"]["bundle_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("wa_incident_manual_")
+    );
     assert_eq!(
         manifest["swarm"]["generator"]["source_surface"],
         "frankenterm_core::crash::collect_incident_bundle"
@@ -762,14 +765,23 @@ fn collect_incident_bundle_manual_kind_produces_manifest() {
             }
         }
     }
-    assert!(swarm
-        .sources
-        .iter()
-        .any(|source| source.name == "crash_bundle"
-            && source.status == IncidentSourceStatus::Skipped));
+    assert!(
+        swarm
+            .sources
+            .iter()
+            .any(|source| source.name == "crash_bundle"
+                && source.status == IncidentSourceStatus::Skipped)
+    );
     assert!(swarm.sources.iter().any(
         |source| source.name == "robot_state" && source.status == IncidentSourceStatus::Skipped
     ));
+    assert!(
+        swarm
+            .sources
+            .iter()
+            .any(|source| source.name == "process_sample"
+                && source.status == IncidentSourceStatus::Skipped)
+    );
 }
 
 #[test]
@@ -1061,24 +1073,32 @@ fn collect_incident_bundle_nonexistent_db_skips_db_files() {
     assert!(result.path.join("warnings.jsonl").exists());
 
     let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
-    assert!(swarm
-        .sources
-        .iter()
-        .any(|source| source.name == "db_metadata"
-            && source.status == IncidentSourceStatus::Unavailable));
-    assert!(swarm
-        .sources
-        .iter()
-        .any(|source| source.name == "recent_events"
-            && source.status == IncidentSourceStatus::Unavailable));
-    assert!(swarm
-        .warnings
-        .iter()
-        .any(|warning| warning.id == "db_metadata.unavailable"));
-    assert!(swarm
-        .warnings
-        .iter()
-        .any(|warning| warning.id == "recent_events.unavailable"));
+    assert!(
+        swarm
+            .sources
+            .iter()
+            .any(|source| source.name == "db_metadata"
+                && source.status == IncidentSourceStatus::Unavailable)
+    );
+    assert!(
+        swarm
+            .sources
+            .iter()
+            .any(|source| source.name == "recent_events"
+                && source.status == IncidentSourceStatus::Unavailable)
+    );
+    assert!(
+        swarm
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "db_metadata.unavailable")
+    );
+    assert!(
+        swarm
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "recent_events.unavailable")
+    );
 
     let manifest: IncidentBundleResult = serde_json::from_str(
         &fs::read_to_string(result.path.join("incident_manifest.json")).unwrap(),
@@ -1115,19 +1135,20 @@ fn collect_incident_bundle_invalid_db_records_failure_but_replays() {
     assert!(!result.path.join("recent_events.json").exists());
 
     let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
-    assert!(swarm
-        .sources
-        .iter()
-        .any(|source| source.name == "recent_events"
+    assert!(swarm.sources.iter().any(|source| {
+        source.name == "recent_events"
             && source.status == IncidentSourceStatus::Failed
             && source
                 .warning_ids
                 .iter()
-                .any(|id| id == "recent_events.query_failed")));
-    assert!(swarm
-        .warnings
-        .iter()
-        .any(|warning| warning.id == "recent_events.query_failed"));
+                .any(|id| id == "recent_events.query_failed")
+    }));
+    assert!(
+        swarm
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "recent_events.query_failed")
+    );
 
     let warnings_jsonl = fs::read_to_string(result.path.join("warnings.jsonl")).unwrap();
     assert!(warnings_jsonl.contains("recent_events.query_failed"));
@@ -1173,6 +1194,147 @@ fn collect_incident_bundle_files_list_matches_disk() {
     assert!(result.path.join("incident_manifest.json").exists());
 }
 
+#[test]
+fn collect_incident_bundle_process_sampler_writes_bounded_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crash_dir = tmp.path().join("crashes");
+    let out_dir = tmp.path().join("output");
+    fs::create_dir_all(&crash_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let opts = IncidentBundleOptions {
+        crash_dir: &crash_dir,
+        config_path: None,
+        out_dir: &out_dir,
+        kind: IncidentKind::Manual,
+        db_path: None,
+        max_events: 0,
+    };
+    let sampler = IncidentProcessSamplerConfig::ps_snapshot(1_000);
+
+    let result = collect_incident_bundle_with_process_sampler(&opts, &sampler).unwrap();
+    let sample_path = result.path.join("process_sample.json");
+    assert!(sample_path.exists());
+    assert!(result.files.contains(&"process_sample.json".to_string()));
+
+    let sample: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sample_path).unwrap()).unwrap();
+    assert_eq!(sample["collector"], "ps");
+    let processes = sample["processes"].as_array().unwrap();
+    assert!(!processes.is_empty());
+    assert!(
+        processes
+            .iter()
+            .all(|process| process["pid"].as_u64().is_some())
+    );
+
+    let categories = sample["memory_categories"].as_array().unwrap();
+    assert!(categories.iter().any(|category| {
+        category["category"] == "resident_memory"
+            && category["status"] == "collected"
+            && category["evidence_state"] == "measured"
+    }));
+    assert!(categories.iter().any(|category| {
+        category["category"] == "heap_memory"
+            && category["status"] == "unavailable"
+            && category["evidence_state"] == "unavailable"
+    }));
+    assert!(categories.iter().any(|category| {
+        category["category"] == "graphics_media_memory"
+            && category["status"] == "unavailable"
+            && category["evidence_state"] == "unavailable"
+    }));
+
+    let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
+    assert!(swarm.privacy_budget.process_sample_allowed);
+    assert_eq!(swarm.collection_policy.process_sampler, "bounded_snapshot");
+    assert!(
+        swarm
+            .sources
+            .iter()
+            .any(|source| source.name == "process_sample"
+                && source.status == IncidentSourceStatus::Collected
+                && !source.mutates_state)
+    );
+}
+
+#[test]
+fn collect_incident_bundle_process_sampler_tool_absence_is_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crash_dir = tmp.path().join("crashes");
+    let out_dir = tmp.path().join("output");
+    fs::create_dir_all(&crash_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let opts = IncidentBundleOptions {
+        crash_dir: &crash_dir,
+        config_path: None,
+        out_dir: &out_dir,
+        kind: IncidentKind::Manual,
+        db_path: None,
+        max_events: 0,
+    };
+    let sampler = IncidentProcessSamplerConfig::missing_tool_for_test(100);
+
+    let result = collect_incident_bundle_with_process_sampler(&opts, &sampler).unwrap();
+    assert!(!result.path.join("process_sample.json").exists());
+
+    let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
+    assert!(swarm.privacy_budget.process_sample_allowed);
+    assert!(swarm.sources.iter().any(|source| {
+        source.name == "process_sample"
+            && source.status == IncidentSourceStatus::Unavailable
+            && source
+                .warning_ids
+                .iter()
+                .any(|id| id == "process_sample.unavailable")
+    }));
+    assert!(
+        swarm
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "process_sample.unavailable")
+    );
+}
+
+#[test]
+fn collect_incident_bundle_process_sampler_timeout_is_typed_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crash_dir = tmp.path().join("crashes");
+    let out_dir = tmp.path().join("output");
+    fs::create_dir_all(&crash_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let opts = IncidentBundleOptions {
+        crash_dir: &crash_dir,
+        config_path: None,
+        out_dir: &out_dir,
+        kind: IncidentKind::Manual,
+        db_path: None,
+        max_events: 0,
+    };
+    let sampler = IncidentProcessSamplerConfig::ps_snapshot(0);
+
+    let result = collect_incident_bundle_with_process_sampler(&opts, &sampler).unwrap();
+    assert!(!result.path.join("process_sample.json").exists());
+
+    let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
+    assert!(swarm.sources.iter().any(|source| {
+        source.name == "process_sample"
+            && source.status == IncidentSourceStatus::Failed
+            && source
+                .warning_ids
+                .iter()
+                .any(|id| id == "process_sample.timeout")
+    }));
+    assert!(
+        swarm
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "process_sample.timeout")
+    );
+}
+
 // ── Replay tests ──────────────────────────────────────────────────────
 
 #[test]
@@ -1205,18 +1367,24 @@ fn replay_clean_bundle_policy_mode_passes() {
     let result = replay_incident_bundle(&bundle.path, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "pass");
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name == "manifest_valid" && c.passed));
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name == "no_secrets_leaked" && c.passed));
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name == "files_complete" && c.passed));
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "manifest_valid" && c.passed)
+    );
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "no_secrets_leaked" && c.passed)
+    );
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "files_complete" && c.passed)
+    );
 }
 
 #[test]
@@ -1243,10 +1411,12 @@ fn replay_bundle_with_db_metadata_policy_mode() {
     let result = replay_incident_bundle(&bundle.path, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "pass");
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name == "db_metadata_valid" && c.passed));
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "db_metadata_valid" && c.passed)
+    );
 }
 
 #[test]
@@ -1273,14 +1443,18 @@ fn replay_bundle_rules_mode_validates_events() {
     let result = replay_incident_bundle(&bundle.path, ReplayMode::Rules).unwrap();
 
     assert_eq!(result.status, "pass");
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name == "events_structure_valid" && c.passed));
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name == "events_text_bounded" && c.passed));
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_structure_valid" && c.passed)
+    );
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "events_text_bounded" && c.passed)
+    );
 }
 
 #[test]
@@ -1316,10 +1490,12 @@ fn replay_detects_secret_leak_in_bundle() {
     let result = replay_incident_bundle(&bundle_dir, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "fail");
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name.starts_with("no_secrets_") && !c.passed));
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name.starts_with("no_secrets_") && !c.passed)
+    );
 }
 
 #[test]
@@ -1331,10 +1507,12 @@ fn replay_empty_bundle_dir_fails_manifest() {
     let result = replay_incident_bundle(&bundle_dir, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "fail");
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name == "manifest_valid" && !c.passed));
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "manifest_valid" && !c.passed)
+    );
 }
 
 #[test]
@@ -1389,8 +1567,10 @@ fn replay_crash_kind_bundle_validates_crash_report() {
     let result = replay_incident_bundle(&bundle.path, ReplayMode::Policy).unwrap();
 
     assert_eq!(result.status, "pass");
-    assert!(result
-        .checks
-        .iter()
-        .any(|c| c.name == "crash_report_valid" && c.passed));
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|c| c.name == "crash_report_valid" && c.passed)
+    );
 }
