@@ -1981,6 +1981,7 @@ impl StreamingHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2905,6 +2906,64 @@ mod tests {
             .collect()
     }
 
+    fn increment_count(map: &mut BTreeMap<String, u64>, key: impl Into<String>) {
+        let entry = map.entry(key.into()).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn percentile_u64(values: &[u64], percentile: u64) -> u64 {
+        assert!(!values.is_empty(), "percentile input must not be empty");
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        let index = ((sorted.len() - 1) as u64 * percentile).div_ceil(100) as usize;
+        sorted[index.min(sorted.len() - 1)]
+    }
+
+    fn service_gap_bucket(gap: u64) -> &'static str {
+        match gap {
+            0 => "0",
+            1 => "1",
+            2..=5 => "2_to_5",
+            6..=10 => "6_to_10",
+            11..=20 => "11_to_20",
+            _ => "gt_20",
+        }
+    }
+
+    fn poll_outcome_name(outcome: &PollOutcome) -> &'static str {
+        match outcome {
+            PollOutcome::Changed { .. } => "changed",
+            PollOutcome::NoChange => "no_change",
+            PollOutcome::Backpressure => "send_backpressure",
+            PollOutcome::ChannelClosed => "channel_closed",
+            PollOutcome::CaptureTimeout => "capture_timeout",
+            PollOutcome::CircuitOpen { .. } => "capture_circuit_open",
+            PollOutcome::Error(_) => "capture_error",
+            PollOutcome::NoCursor => "no_cursor",
+            PollOutcome::OverflowGapEmitted => "overflow_gap_emitted",
+        }
+    }
+
+    fn priority_label(priority: u32) -> &'static str {
+        match priority {
+            0..=50 => "priority_010_high",
+            51..=150 => "priority_100_low",
+            _ => "priority_200_lower_low",
+        }
+    }
+
+    fn write_capture_fairness_artifact(summary: &serde_json::Value) {
+        let Some(artifact_dir) = std::env::var_os("FT_N447Z5_ARTIFACT_DIR") else {
+            return;
+        };
+        let artifact_dir = std::path::PathBuf::from(artifact_dir);
+        std::fs::create_dir_all(&artifact_dir).expect("create ft-n447z.5 artifact dir");
+        let summary_path = artifact_dir.join("capture_fairness_200_pane_summary.json");
+        let summary_text =
+            serde_json::to_string_pretty(summary).expect("serialize ft-n447z.5 summary");
+        std::fs::write(&summary_path, summary_text).expect("write ft-n447z.5 summary artifact");
+    }
+
     #[test]
     fn scheduler_unlimited_budget_allows_all() {
         let budget = CaptureBudgetConfig {
@@ -3365,6 +3424,274 @@ mod tests {
             vec![1],
             "{scenario_id}: tailer scheduler must honor the reverted effective priority map after TTL purge upstream"
         );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_200_pane_reduced_fairness_proof_artifact() {
+        run_async_test(async {
+            let scenario_id = "capture.service_lag_200_panes/reduced_rch_proof";
+            let total_panes = 200_u64;
+            let high_panes = 160_u64;
+            let low_panes = 32_u64;
+            let lower_low_panes = 8_u64;
+            let max_concurrent = 20_usize;
+            let rounds = 40_usize;
+
+            let config = TailerConfig {
+                min_interval: Duration::ZERO,
+                max_interval: Duration::ZERO,
+                backoff_multiplier: 1.0,
+                max_concurrent,
+                send_timeout: Duration::from_millis(100),
+                capture_timeout: Duration::from_millis(500),
+                ..Default::default()
+            };
+            let (tx, rx) = mpsc::channel(4096);
+            let _keep_rx_alive = rx;
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(FixedSource);
+
+            let mut panes = HashMap::new();
+            let mut priorities = HashMap::new();
+            {
+                let mut cursor_guard = cursors.write().await;
+                for pane_id in 1..=total_panes {
+                    cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+                    panes.insert(pane_id, make_pane(pane_id));
+                    let priority = if pane_id <= high_panes {
+                        10
+                    } else if pane_id <= high_panes + low_panes {
+                        100
+                    } else {
+                        200
+                    };
+                    priorities.insert(pane_id, priority);
+                }
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            supervisor.sync_tailers(&panes);
+            supervisor.update_pane_priorities(priorities.clone());
+
+            let mut selected_counts = HashMap::<u64, u64>::new();
+            let mut first_service_round = HashMap::<u64, usize>::new();
+            let mut last_service_round = HashMap::<u64, usize>::new();
+            let mut service_gaps = Vec::<u64>::new();
+            let mut service_gap_histogram = BTreeMap::<String, u64>::new();
+            let mut selected_by_priority = BTreeMap::<String, u64>::new();
+            let mut outcome_counts = BTreeMap::<String, u64>::new();
+            let mut skip_reason_counts = BTreeMap::<String, u64>::new();
+            let mut round_selection_counts = Vec::<usize>::new();
+            let mut representative_snapshots = Vec::<serde_json::Value>::new();
+            let mut timeout_events = 0_u64;
+            let mut backpressure_events = 0_u64;
+
+            for round in 0..rounds {
+                let mut poll_tasks = TailerPollTaskSet::new();
+                supervisor.spawn_ready(&mut poll_tasks);
+
+                let mut selected = Vec::<u64>::new();
+                while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                    if matches!(outcome, PollOutcome::CaptureTimeout) {
+                        timeout_events = timeout_events.saturating_add(1);
+                    }
+                    if matches!(outcome, PollOutcome::Backpressure) {
+                        backpressure_events = backpressure_events.saturating_add(1);
+                    }
+                    increment_count(&mut outcome_counts, poll_outcome_name(&outcome));
+                    selected.push(pane_id);
+                    supervisor.handle_poll_result(pane_id, outcome);
+                }
+
+                selected.sort_unstable();
+                assert_eq!(
+                    selected.len(),
+                    max_concurrent,
+                    "{scenario_id} round {round}: should admit exactly the concurrency limit"
+                );
+
+                let selected_high = selected
+                    .iter()
+                    .filter(|pane_id| **pane_id <= high_panes)
+                    .count();
+                let selected_low = selected
+                    .iter()
+                    .filter(|pane_id| {
+                        (**pane_id > high_panes) && (**pane_id <= high_panes + low_panes)
+                    })
+                    .count();
+                let selected_lower_low = selected
+                    .iter()
+                    .filter(|pane_id| **pane_id > high_panes + low_panes)
+                    .count();
+                if round == 0 {
+                    assert_eq!(
+                        selected_high, 16,
+                        "{scenario_id}: first round should preserve high-tier precedence"
+                    );
+                    assert_eq!(
+                        selected_low, 4,
+                        "{scenario_id}: first round should reserve the low-tier floor"
+                    );
+                    assert_eq!(
+                        selected_lower_low, 0,
+                        "{scenario_id}: lower low-priority panes should not jump first-round order"
+                    );
+                }
+
+                for pane_id in &selected {
+                    let priority = priorities
+                        .get(pane_id)
+                        .copied()
+                        .expect("selected pane priority exists");
+                    increment_count(&mut selected_by_priority, priority_label(priority));
+                    *selected_counts.entry(*pane_id).or_insert(0) += 1;
+                    first_service_round.entry(*pane_id).or_insert(round);
+                    let gap = if let Some(last_round) = last_service_round.insert(*pane_id, round) {
+                        round.saturating_sub(last_round) as u64
+                    } else {
+                        round as u64
+                    };
+                    service_gaps.push(gap);
+                    increment_count(&mut service_gap_histogram, service_gap_bucket(gap));
+                }
+
+                let snapshot = supervisor.scheduler_snapshot();
+                assert_eq!(
+                    snapshot.pane_rows_total, total_panes as usize,
+                    "{scenario_id}: snapshot should account for all synthetic panes"
+                );
+                assert!(
+                    !snapshot.pane_rows_truncated,
+                    "{scenario_id}: 200-pane proof must not truncate scheduler rows"
+                );
+                for row in &snapshot.panes {
+                    increment_count(&mut skip_reason_counts, row.last_reason_code.as_str());
+                }
+
+                if matches!(round, 0 | 19 | 39) {
+                    representative_snapshots.push(serde_json::json!({
+                        "round": round,
+                        "selected_total": selected.len(),
+                        "selected_high": selected_high,
+                        "selected_low": selected_low,
+                        "selected_lower_low": selected_lower_low,
+                        "selected_panes": selected,
+                        "captures_remaining": snapshot.captures_remaining,
+                        "bytes_remaining": snapshot.bytes_remaining,
+                        "tracked_panes": snapshot.tracked_panes,
+                        "pane_rows_total": snapshot.pane_rows_total,
+                        "pane_rows_truncated": snapshot.pane_rows_truncated,
+                        "tiers": snapshot.tiers,
+                    }));
+                }
+                round_selection_counts.push(selected.len());
+            }
+
+            let high_seen = (1..=high_panes)
+                .filter(|pane_id| selected_counts.contains_key(pane_id))
+                .count();
+            let low_seen = ((high_panes + 1)..=(high_panes + low_panes))
+                .filter(|pane_id| selected_counts.contains_key(pane_id))
+                .count();
+            let lower_low_seen = ((high_panes + low_panes + 1)..=total_panes)
+                .filter(|pane_id| selected_counts.contains_key(pane_id))
+                .count();
+            assert_eq!(
+                high_seen, high_panes as usize,
+                "{scenario_id}: high pane coverage"
+            );
+            assert_eq!(
+                low_seen, low_panes as usize,
+                "{scenario_id}: low pane coverage"
+            );
+            assert_eq!(
+                lower_low_seen, lower_low_panes as usize,
+                "{scenario_id}: lower low-priority pane coverage"
+            );
+            assert_eq!(
+                selected_counts.len(),
+                total_panes as usize,
+                "{scenario_id}: every synthetic pane must receive service"
+            );
+            assert_eq!(
+                timeout_events, 0,
+                "{scenario_id}: synthetic source should not time out"
+            );
+            assert_eq!(
+                backpressure_events, 0,
+                "{scenario_id}: artifact channel should not backpressure"
+            );
+
+            let max_first_service_round = first_service_round
+                .values()
+                .copied()
+                .max()
+                .expect("at least one service round");
+            let max_service_gap = service_gaps
+                .iter()
+                .copied()
+                .max()
+                .expect("service gaps collected");
+            let selected_total = selected_counts.values().copied().sum::<u64>();
+            let opportunity_total = total_panes * rounds as u64;
+            let skipped_total = opportunity_total.saturating_sub(selected_total);
+
+            let summary = serde_json::json!({
+                "schema_version": 1,
+                "bead_id": "ft-n447z.5",
+                "scenario_id": scenario_id,
+                "proof_interpretation": {
+                    "evidence_level": "remote_reduced_when_run_through_rch",
+                    "target_class_hardware": "skipped_not_proven",
+                    "target_class_requirement": {
+                        "logical_cpus": 64,
+                        "memory_gib": 256
+                    },
+                    "live_gui_dependency": false,
+                    "source_kind": "synthetic_pane_source"
+                },
+                "inputs": {
+                    "total_panes": total_panes,
+                    "high_priority_panes": high_panes,
+                    "low_priority_panes": low_panes,
+                    "lower_low_priority_panes": lower_low_panes,
+                    "rounds": rounds,
+                    "available_permits": max_concurrent
+                },
+                "pass_fail": {
+                    "status": "passed",
+                    "failure_classification": "none",
+                    "every_pane_serviced": selected_counts.len() == total_panes as usize,
+                    "snapshot_rows_untruncated": true,
+                    "timeout_events": timeout_events,
+                    "backpressure_events": backpressure_events
+                },
+                "throughput_counters": {
+                    "selection_opportunities": opportunity_total,
+                    "selected_total": selected_total,
+                    "skipped_total": skipped_total,
+                    "round_selection_counts": round_selection_counts,
+                    "selected_by_priority": selected_by_priority
+                },
+                "capture_lag_histograms": {
+                    "unit": "scheduler_rounds_between_service",
+                    "max_first_service_round": max_first_service_round,
+                    "max_service_gap": max_service_gap,
+                    "p50_service_gap": percentile_u64(&service_gaps, 50),
+                    "p99_service_gap": percentile_u64(&service_gaps, 99),
+                    "buckets": service_gap_histogram
+                },
+                "skipped_poll_reasons": skip_reason_counts,
+                "poll_outcomes": outcome_counts,
+                "representative_scheduler_snapshots": representative_snapshots
+            });
+
+            write_capture_fairness_artifact(&summary);
+        });
     }
 
     #[test]

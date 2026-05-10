@@ -301,6 +301,32 @@ For downstream implementation/proof beads:
 - Target-class claims require retained hardware predicate artifacts from the
   high-core runbook.
 
+### `ft-n447z.5` Retained 200-Pane Proof Lane
+
+The repeatable reduced-scale proof command is:
+
+```bash
+bash tests/e2e/test_ft_n447z_5_capture_fairness_200.sh
+```
+
+It runs the focused Rust proof through `run_rch_cargo_logged` with
+`RCH_REQUIRE_REMOTE=1` and writes retained artifacts under:
+
+```text
+tests/e2e/artifacts/goal-line/ft-n447z.5/capture_fairness_200_pane_reduced/<run-id>/
+```
+
+The lane must emit `summary.json`, `proof-ledger.jsonl`, the raw RCH log and
+metadata, and
+`rust/capture_fairness_200_pane_summary.json`. The Rust summary is the source
+artifact for pass/fail, lag histograms, skipped-poll reasons, poll outcomes,
+and representative scheduler snapshots. The wrapper summary classifies any
+failure as `source_or_test`, `environment`, or `rch_substrate`.
+
+This lane is `remote_reduced` evidence only. It explicitly records
+`target_class_hardware: "skipped_not_proven"` unless a separate high-core
+hardware predicate artifact proves the 64+ CPU / 256 GiB target class.
+
 ## Non-Goals
 
 - No scheduler policy change in this bead.
