@@ -431,6 +431,176 @@ fn resource_pressure_cockpit_docs_truth_gate() {
 }
 
 #[test]
+fn context_horizon_contract_docs_truth_gate() {
+    let contract = read_repo_doc("docs/context-horizon-contract.md");
+    let provenance = read_repo_doc("docs/json-schema/PROVENANCE.md");
+    let schema = read_repo_doc("docs/json-schema/ft-context-horizon.json");
+
+    assert_contains_all(
+        "context horizon contract",
+        &contract,
+        &[
+            "`ft robot context status`",
+            "`ft robot context rotate`",
+            "`ft robot context history`",
+            "`ft.context_horizon.v1`",
+            "`schema_version`",
+            "`contract_id`",
+            "`evidence_state`",
+            "`horizon_window_ms`",
+            "`fleet_summary`",
+            "`pane_risks`",
+            "`recommendations`",
+            "`citations`",
+            "`unavailable_domains`",
+            "`redaction_policy`",
+            "`artifact_paths`",
+            "`raw_context_content_stored` must be `false`",
+            "`measured`",
+            "`inferred`",
+            "`simulated`",
+            "`stale`",
+            "`unavailable`",
+            "`mixed`",
+            "`rotate_context`",
+            "`prepare_handoff`",
+            "`reduce_fanout`",
+            "`pause_assignment`",
+            "`inspect_prompt`",
+            "`collect_incident_bundle`",
+            "`none`",
+            "`mutation_allowed`",
+            "`policy_state`",
+            "`source_regression`",
+            "`privacy_violation`",
+            "`environment_blocked`",
+            "`unavailable_evidence`",
+            "`target_hardware_skipped`",
+        ],
+    );
+    assert_contains_all(
+        "context horizon privacy invariants",
+        &contract,
+        &[
+            "no raw pane transcript",
+            "no prompt body",
+            "no session cookies, API keys, or bearer tokens",
+            "no unbounded text excerpts",
+            "no hidden mutation through a recommended command",
+        ],
+    );
+    assert_excludes_all(
+        "context horizon contract",
+        &contract,
+        &["raw transcript is allowed", "raw prompt is allowed"],
+    );
+
+    assert_contains_all(
+        "schema provenance",
+        &provenance,
+        &[
+            "`ft-context-horizon.json`",
+            "`docs/context-horizon-contract.md`",
+            "context_horizon_contract_docs_truth_gate",
+        ],
+    );
+
+    let parsed_schema: serde_json::Value =
+        serde_json::from_str(&schema).expect("context horizon schema should parse as JSON");
+    assert_eq!(
+        parsed_schema
+            .pointer("/properties/contract_id/const")
+            .and_then(serde_json::Value::as_str),
+        Some("ft.context_horizon.v1")
+    );
+    assert_eq!(
+        parsed_schema
+            .pointer("/properties/raw_context_content_stored/const")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+
+    let required = parsed_schema
+        .pointer("/required")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema should expose root required fields");
+    for field in [
+        "schema_version",
+        "contract_id",
+        "generated_at_ms",
+        "source",
+        "evidence_state",
+        "horizon_window_ms",
+        "fleet_summary",
+        "pane_risks",
+        "recommendations",
+        "citations",
+        "unavailable_domains",
+        "redaction_policy",
+        "raw_context_content_stored",
+        "artifact_paths",
+    ] {
+        assert!(
+            required.iter().any(|value| value.as_str() == Some(field)),
+            "context horizon schema should require {field}"
+        );
+    }
+
+    let evidence_states = parsed_schema
+        .pointer("/$defs/evidence_state/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema should expose evidence state enum");
+    for state in [
+        "measured",
+        "inferred",
+        "simulated",
+        "stale",
+        "unavailable",
+        "mixed",
+    ] {
+        assert!(
+            evidence_states
+                .iter()
+                .any(|value| value.as_str() == Some(state)),
+            "context horizon schema should include evidence state {state}"
+        );
+    }
+
+    let actions = parsed_schema
+        .pointer("/$defs/action_kind/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema should expose action kind enum");
+    for action in [
+        "rotate_context",
+        "prepare_handoff",
+        "reduce_fanout",
+        "pause_assignment",
+        "inspect_prompt",
+        "collect_incident_bundle",
+        "none",
+    ] {
+        assert!(
+            actions.iter().any(|value| value.as_str() == Some(action)),
+            "context horizon schema should include action {action}"
+        );
+    }
+
+    for forbidden_pointer in [
+        "/$defs/redaction_policy/properties/raw_transcript_allowed/const",
+        "/$defs/redaction_policy/properties/raw_prompt_allowed/const",
+        "/$defs/recommendation/properties/mutation_allowed/const",
+    ] {
+        assert_eq!(
+            parsed_schema
+                .pointer(forbidden_pointer)
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "{forbidden_pointer} should be fail-closed false"
+        );
+    }
+}
+
+#[test]
 fn smoke_ft_robot_default() {
     // `ft robot` with no subcommand defaults to quick-start
     let output = wa_cmd()
