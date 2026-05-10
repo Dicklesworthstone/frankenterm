@@ -7373,7 +7373,7 @@ fn swarm_resource_cockpit_run_identity(
             logical_cpus: None,
             memory_gib: None,
             target_class: false,
-            proof_status: "unavailable".to_string(),
+            proof_status: "skipped_not_proven".to_string(),
         },
     }
 }
@@ -15851,7 +15851,7 @@ mod tests {
         assert_eq!(json["run_identity"]["evidence_level"], "skipped_not_proven");
         assert_eq!(
             json["run_identity"]["hardware_predicate"]["proof_status"],
-            "unavailable"
+            "skipped_not_proven"
         );
         for key in [
             "memory",
@@ -15893,6 +15893,28 @@ mod tests {
         assert_eq!(
             json["action_receipts"][0]["receipt_id"],
             "action_receipts.unavailable"
+        );
+    }
+
+    #[test]
+    fn swarm_resource_cockpit_skipped_high_scale_predicate_is_explicit_ft_rz0eb_4() {
+        let summary =
+            SwarmCapacityOperatorSummary::unavailable(1_700_000_050_001, 2, "test.missing");
+        let cockpit = summary
+            .resource_cockpit
+            .as_ref()
+            .expect("level 2 includes cockpit");
+        let json = serde_json::to_value(cockpit).expect("cockpit serializes");
+
+        assert_eq!(cockpit.run_identity.evidence_level, "skipped_not_proven");
+        assert!(!cockpit.run_identity.hardware_predicate.target_class);
+        assert_eq!(
+            cockpit.run_identity.hardware_predicate.proof_status,
+            "skipped_not_proven"
+        );
+        assert_eq!(
+            json["run_identity"]["hardware_predicate"]["proof_status"],
+            "skipped_not_proven"
         );
     }
 

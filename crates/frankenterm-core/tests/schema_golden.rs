@@ -14,16 +14,46 @@
 //! - wa-upg.10.1: Schema-driven API strategy
 //! - wa-upg.10.2: Schema-driven docs generator
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
 use frankenterm_core::api_schema::SchemaRegistry;
+use frankenterm_core::auto_tune::{
+    AUTO_TUNE_DECISION_RECORD_SCHEMA_VERSION, KnobGate, TunableKnobId, TuningConfidenceState,
+    TuningDecisionKind, TuningDecisionRecord, TuningMetricWindowSummary, TuningMode,
+};
 use frankenterm_core::docs_gen::{
     DocGenConfig, EndpointCategory, categorize_endpoint, generate_endpoint_summary,
     generate_reference, parse_schema,
 };
-use serde_json::Value;
+use frankenterm_core::fleet_memory_controller::{
+    FleetMemoryTier, FleetMemoryTierReclamationAction, FleetPressureTier,
+};
+use frankenterm_core::memory_pressure::MacosResidencyBucket;
+use frankenterm_core::runtime_telemetry::{
+    SWARM_RESOURCE_COCKPIT_CONTRACT_ID, SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION,
+    SwarmCapacityAdmissionAction, SwarmCapacityCertificateStatus,
+    SwarmCapacityOperatorDecisionSummary, SwarmCapacityOperatorStatus,
+    SwarmCapacityOperatorSummary, SwarmCapacityStage, SwarmCapacityWorkClass,
+    SwarmResourceCockpitActionReceipt, SwarmResourceCockpitAdmissionCounters,
+    SwarmResourceCockpitAdmissionDecision, SwarmResourceCockpitDomainSummary,
+    SwarmResourceCockpitDomains, SwarmResourceCockpitDrilldown,
+    SwarmResourceCockpitEvidenceFreshness, SwarmResourceCockpitEvidenceState,
+    SwarmResourceCockpitHardwarePredicate, SwarmResourceCockpitLatencyCohort,
+    SwarmResourceCockpitMemoryTierSummary, SwarmResourceCockpitProofGate,
+    SwarmResourceCockpitQueueBackpressureSummary, SwarmResourceCockpitResidencyBucket,
+    SwarmResourceCockpitRunIdentity, SwarmResourceCockpitSnapshot, SwarmTailRiskStatus,
+};
+use frankenterm_core::storage::io_scheduler::{
+    StorageIoClass, StorageIoDominantClassSummary, StorageIoOperatorSummary, StorageIoPressureTier,
+};
+use frankenterm_core::swarm_scheduler::{
+    AdmissionAction, AdmissionDecisionCounters, AdmissionReasonCode,
+    ResourceAdmissionDecisionSummary,
+};
+use jsonschema::Validator;
+use serde_json::{Value, json};
 
 /// Workspace root: two levels up from crate manifest dir.
 fn workspace_root() -> PathBuf {
@@ -70,6 +100,30 @@ fn load_all_schemas() -> Vec<(String, Value)> {
 
     schemas.sort_by(|a, b| a.0.cmp(&b.0));
     schemas
+}
+
+fn load_schema(name: &str) -> Value {
+    let path = schema_dir().join(name);
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read schema {}: {err}", path.display()));
+    serde_json::from_str(&content)
+        .unwrap_or_else(|err| panic!("failed to parse schema {}: {err}", path.display()))
+}
+
+fn compile_draft_2020_schema(schema: &Value) -> Validator {
+    jsonschema::draft202012::options()
+        .build(schema)
+        .expect("resource cockpit schema compiles as Draft 2020-12")
+}
+
+fn assert_schema_accepts(label: &str, validator: &Validator, value: &Value) {
+    if let Err(errors) = validator.validate(value) {
+        let messages = errors
+            .map(|error| format!("{}: {}", error.instance_path, error))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!("{label} did not match resource cockpit schema:\n{messages}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -179,7 +233,10 @@ fn schema_files_have_id() {
         let id = schema.get("$id").and_then(Value::as_str);
         assert!(id.is_some(), "{name} missing '$id'");
         let id = id.unwrap();
-        let expected_domain = if name == "ft-config.json" || name == "ft-pattern-pack.json" {
+        let expected_domain = if name == "ft-config.json"
+            || name == "ft-pattern-pack.json"
+            || name == "ft-resource-pressure-cockpit.json"
+        {
             "frankenterm.dev"
         } else {
             "wezterm-automata.dev"
@@ -279,6 +336,617 @@ fn schema_files_no_additional_properties_leak() {
     }
 }
 
+fn resource_cockpit_domain(
+    name: &str,
+    evidence_state: SwarmResourceCockpitEvidenceState,
+    pressure_tier: &str,
+    reason_code: &str,
+) -> SwarmResourceCockpitDomainSummary {
+    let freshness = (evidence_state != SwarmResourceCockpitEvidenceState::Measured).then(|| {
+        SwarmResourceCockpitEvidenceFreshness {
+            state: evidence_state,
+            source: "schema_golden.resource_cockpit_fixture".to_string(),
+            generated_at_ms: Some(1_700_000_050_000),
+            freshness_ms: Some(0),
+            max_age_ms: Some(60_000),
+            reason_codes: vec![reason_code.to_string()],
+        }
+    });
+
+    SwarmResourceCockpitDomainSummary {
+        name: name.to_string(),
+        evidence_state,
+        pressure_tier: pressure_tier.to_string(),
+        summary: format!("{name} fixture summary"),
+        operator_action: if pressure_tier == "normal" || pressure_tier == "green" {
+            "none".to_string()
+        } else {
+            format!("inspect_{name}")
+        },
+        reason_codes: vec![reason_code.to_string()],
+        freshness,
+        metrics: BTreeMap::from([("fixture".to_string(), json!(true))]),
+    }
+}
+
+fn resource_cockpit_domains(
+    evidence_state: SwarmResourceCockpitEvidenceState,
+    pressure_tier: &str,
+) -> SwarmResourceCockpitDomains {
+    let reason_code = if evidence_state == SwarmResourceCockpitEvidenceState::Measured {
+        "resource.proof.healthy"
+    } else {
+        "resource.telemetry.simulated"
+    };
+    SwarmResourceCockpitDomains {
+        memory: resource_cockpit_domain("memory", evidence_state, pressure_tier, reason_code),
+        rss_residency: resource_cockpit_domain(
+            "rss_residency",
+            evidence_state,
+            pressure_tier,
+            reason_code,
+        ),
+        pane_budget: resource_cockpit_domain(
+            "pane_budget",
+            evidence_state,
+            pressure_tier,
+            reason_code,
+        ),
+        queue_backpressure: resource_cockpit_domain(
+            "queue_backpressure",
+            evidence_state,
+            pressure_tier,
+            reason_code,
+        ),
+        storage_io: resource_cockpit_domain(
+            "storage_io",
+            evidence_state,
+            pressure_tier,
+            reason_code,
+        ),
+        worker_pool: resource_cockpit_domain(
+            "worker_pool",
+            evidence_state,
+            pressure_tier,
+            reason_code,
+        ),
+        capacity_admission: resource_cockpit_domain(
+            "capacity_admission",
+            evidence_state,
+            pressure_tier,
+            reason_code,
+        ),
+        resource_admission: resource_cockpit_domain(
+            "resource_admission",
+            evidence_state,
+            pressure_tier,
+            reason_code,
+        ),
+        action_receipts: resource_cockpit_domain(
+            "action_receipts",
+            evidence_state,
+            pressure_tier,
+            reason_code,
+        ),
+    }
+}
+
+fn resource_cockpit_mixed_domains() -> SwarmResourceCockpitDomains {
+    SwarmResourceCockpitDomains {
+        memory: resource_cockpit_domain(
+            "memory",
+            SwarmResourceCockpitEvidenceState::Measured,
+            "elevated",
+            "resource.memory.tier_pressure",
+        ),
+        rss_residency: resource_cockpit_domain(
+            "rss_residency",
+            SwarmResourceCockpitEvidenceState::Stale,
+            "yellow",
+            "resource.telemetry.stale",
+        ),
+        pane_budget: resource_cockpit_domain(
+            "pane_budget",
+            SwarmResourceCockpitEvidenceState::Unavailable,
+            "unknown",
+            "resource.telemetry.unavailable",
+        ),
+        queue_backpressure: resource_cockpit_domain(
+            "queue_backpressure",
+            SwarmResourceCockpitEvidenceState::Measured,
+            "red",
+            "queue_saturated",
+        ),
+        storage_io: resource_cockpit_domain(
+            "storage_io",
+            SwarmResourceCockpitEvidenceState::Measured,
+            "red",
+            "storage_io.write_error.io_error",
+        ),
+        worker_pool: resource_cockpit_domain(
+            "worker_pool",
+            SwarmResourceCockpitEvidenceState::Unavailable,
+            "unknown",
+            "worker_pool.stale_inventory",
+        ),
+        capacity_admission: resource_cockpit_domain(
+            "capacity_admission",
+            SwarmResourceCockpitEvidenceState::Measured,
+            "elevated",
+            "capacity.operator.watch",
+        ),
+        resource_admission: resource_cockpit_domain(
+            "resource_admission",
+            SwarmResourceCockpitEvidenceState::Measured,
+            "critical",
+            "memory_tier_pressure",
+        ),
+        action_receipts: resource_cockpit_domain(
+            "action_receipts",
+            SwarmResourceCockpitEvidenceState::Mixed,
+            "yellow",
+            "action_receipt.dry_run",
+        ),
+    }
+}
+
+fn resource_cockpit_capacity_decision(pressured: bool) -> SwarmCapacityOperatorDecisionSummary {
+    SwarmCapacityOperatorDecisionSummary {
+        stable_id_hash: "sha256:capacity-fixture".to_string(),
+        work_class: SwarmCapacityWorkClass::Maintenance,
+        action: if pressured {
+            SwarmCapacityAdmissionAction::Defer
+        } else {
+            SwarmCapacityAdmissionAction::Admit
+        },
+        reason_code: if pressured {
+            "capacity.operator.watch"
+        } else {
+            "resource.proof.healthy"
+        }
+        .to_string(),
+        retry_after_secs: pressured.then_some(30),
+        would_apply: false,
+        audit_record_id: "audit-capacity-fixture".to_string(),
+    }
+}
+
+fn resource_cockpit_resource_decision(pressured: bool) -> ResourceAdmissionDecisionSummary {
+    ResourceAdmissionDecisionSummary {
+        action: if pressured {
+            AdmissionAction::Degrade
+        } else {
+            AdmissionAction::Admit
+        },
+        reason_codes: if pressured {
+            vec![
+                AdmissionReasonCode::MemoryTierPressure,
+                AdmissionReasonCode::QueueSaturated,
+            ]
+        } else {
+            vec![AdmissionReasonCode::Healthy]
+        },
+        counters: if pressured {
+            AdmissionDecisionCounters {
+                admitted: 0,
+                deferred: 0,
+                degraded: 1,
+                shed: 0,
+            }
+        } else {
+            AdmissionDecisionCounters {
+                admitted: 1,
+                deferred: 0,
+                degraded: 0,
+                shed: 0,
+            }
+        },
+        raw_pressure_severity: if pressured { 3 } else { 0 },
+        effective_pressure_severity: if pressured { 2 } else { 0 },
+        priority_protection_units: u8::from(pressured),
+        queue_utilization: Some(if pressured { 0.91 } else { 0.25 }),
+        pending_items: Some(if pressured { 512 } else { 0 }),
+        fleet_pressure: Some(if pressured {
+            FleetPressureTier::Critical
+        } else {
+            FleetPressureTier::Normal
+        }),
+        memory_tier_pressure: Some(if pressured {
+            FleetPressureTier::Emergency
+        } else {
+            FleetPressureTier::Normal
+        }),
+        max_latency_over_budget_ratio: Some(if pressured { 1.75 } else { 0.5 }),
+        herd_wave_pressure: pressured.then_some(FleetPressureTier::Elevated),
+        herd_wave_recommended_stagger_ms: pressured.then_some(250),
+        herd_wave_cohort_max_stagger_ms: pressured.then_some(2_000),
+    }
+}
+
+fn resource_cockpit_admission_counters(pressured: bool) -> SwarmResourceCockpitAdmissionCounters {
+    if pressured {
+        SwarmResourceCockpitAdmissionCounters {
+            admitted: 0,
+            deferred: 0,
+            degraded: 1,
+            shed: 0,
+        }
+    } else {
+        SwarmResourceCockpitAdmissionCounters {
+            admitted: 1,
+            deferred: 0,
+            degraded: 0,
+            shed: 0,
+        }
+    }
+}
+
+fn resource_cockpit_full_fixture(
+    label: &str,
+    status: SwarmCapacityOperatorStatus,
+    proof_gate: SwarmResourceCockpitProofGate,
+    evidence_state: SwarmResourceCockpitEvidenceState,
+    pressure_tier: &str,
+) -> SwarmResourceCockpitSnapshot {
+    let pressured = !matches!(pressure_tier, "normal" | "green");
+    let capacity_decision = resource_cockpit_capacity_decision(pressured);
+    let resource_decision = resource_cockpit_resource_decision(pressured);
+    let domains = if evidence_state == SwarmResourceCockpitEvidenceState::Mixed {
+        resource_cockpit_mixed_domains()
+    } else {
+        resource_cockpit_domains(evidence_state, pressure_tier)
+    };
+    let memory_reason_code = if pressured {
+        "resource.memory.tier_pressure"
+    } else {
+        "resource.proof.healthy"
+    };
+    let queue_tier = if pressured { "red" } else { "green" };
+    let admission_action = if pressured { "degrade" } else { "admit" };
+    let storage_tier = if pressured {
+        StorageIoPressureTier::Red
+    } else {
+        StorageIoPressureTier::Green
+    };
+
+    SwarmResourceCockpitSnapshot {
+        schema_version: SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION,
+        contract_id: SWARM_RESOURCE_COCKPIT_CONTRACT_ID.to_string(),
+        generated_at_ms: 1_700_000_050_000,
+        source: format!("schema_golden.{label}"),
+        status,
+        proof_gate,
+        evidence_state,
+        summary: format!("{label} resource cockpit fixture"),
+        next_operator_move: "retain schema, golden, and e2e proof artifacts".to_string(),
+        run_identity: SwarmResourceCockpitRunIdentity {
+            run_id: format!("ft-rz0eb-4-{label}"),
+            evidence_level: "remote_reduced".to_string(),
+            git_head: Some("test-head".to_string()),
+            repo_snapshot_head: None,
+            artifact_paths: vec![format!("tests/e2e/artifacts/{label}/summary.json")],
+            hardware_predicate: SwarmResourceCockpitHardwarePredicate {
+                logical_cpus: Some(16),
+                memory_gib: Some(64),
+                target_class: false,
+                proof_status: "skipped_not_proven".to_string(),
+            },
+        },
+        domains,
+        memory_pressure: match pressure_tier {
+            "normal" | "green" => Some(FleetPressureTier::Normal),
+            "elevated" | "yellow" => Some(FleetPressureTier::Elevated),
+            "critical" | "red" => Some(FleetPressureTier::Critical),
+            "emergency" | "black" => Some(FleetPressureTier::Emergency),
+            _ => None,
+        },
+        memory_tiers: vec![SwarmResourceCockpitMemoryTierSummary {
+            tier: FleetMemoryTier::HotResident,
+            tier_name: "hot_resident".to_string(),
+            evidence_state: SwarmResourceCockpitEvidenceState::Measured,
+            resident: true,
+            budget_bytes: 2_048,
+            actual_bytes: if pressured { 3_072 } else { 1_024 },
+            over_budget_bytes: if pressured { 1_024 } else { 0 },
+            remaining_budget_bytes: if pressured { 0 } else { 1_024 },
+            reclaimable_bytes: if pressured { 512 } else { 0 },
+            reclaimed_bytes: if pressured { 128 } else { 0 },
+            evicted_bytes: if pressured { 64 } else { 0 },
+            refused_bytes: if pressured { 32 } else { 0 },
+            has_pressure: pressured,
+            reclamation_action: Some(FleetMemoryTierReclamationAction::DemoteHotToWarm),
+            reason_codes: vec![memory_reason_code.to_string()],
+        }],
+        residency_buckets: vec![SwarmResourceCockpitResidencyBucket {
+            bucket: MacosResidencyBucket::RustHeap,
+            bucket_name: "rust_heap".to_string(),
+            evidence_state: SwarmResourceCockpitEvidenceState::Measured,
+            bytes: Some(if pressured { 2_097_152 } else { 1_048_576 }),
+            confidence: 92,
+            dominant: true,
+            reason_codes: vec![memory_reason_code.to_string()],
+        }],
+        slowest_latency_cohorts: vec![SwarmResourceCockpitLatencyCohort {
+            stage: SwarmCapacityStage::StorageWrite,
+            stage_name: "storage_write".to_string(),
+            certificate_status: if pressured {
+                SwarmCapacityCertificateStatus::Unsafe
+            } else {
+                SwarmCapacityCertificateStatus::Safe
+            },
+            tail_risk_status: Some(if pressured {
+                SwarmTailRiskStatus::Watch
+            } else {
+                SwarmTailRiskStatus::Green
+            }),
+            reason_code: if pressured {
+                "capacity.stage.storage_write_over_budget"
+            } else {
+                "resource.proof.healthy"
+            }
+            .to_string(),
+            utilization: Some(if pressured { 0.88 } else { 0.25 }),
+            observed_p99_ms: Some(if pressured { 18.0 } else { 5.0 }),
+            modeled_p99_ms: Some(10.0),
+            p99_over_model_ratio: Some(if pressured { 1.8 } else { 0.5 }),
+        }],
+        capacity_admission_decisions: vec![capacity_decision],
+        resource_admission_decisions: vec![resource_decision],
+        storage_io: Some(StorageIoOperatorSummary {
+            schema_version: 1,
+            pressure_domain: "storage_io".to_string(),
+            io_pressure_tier: storage_tier,
+            io_pressure_reason: if pressured {
+                "storage_io.defer.search_freshness_lag"
+            } else {
+                "storage_io.within_budget"
+            }
+            .to_string(),
+            operator_action: if pressured {
+                "throttle_or_defer_io"
+            } else {
+                "none"
+            }
+            .to_string(),
+            aggregate_queue_depth: if pressured { 8 } else { 0 },
+            aggregate_bytes_pending: if pressured { 4_096 } else { 0 },
+            oldest_queued_age_ms: pressured.then_some(250),
+            durability_pending_total: if pressured { 2 } else { 0 },
+            search_lag_segments: if pressured { 7 } else { 0 },
+            hydration_lag_pages: u64::from(pressured),
+            audit_fail_closed_total: 0,
+            write_error_total: u64::from(pressured),
+            dominant_class: Some(StorageIoDominantClassSummary {
+                class: StorageIoClass::FtsIncremental,
+                class_name: "fts_incremental".to_string(),
+                queue_depth: if pressured { 8 } else { 0 },
+                bytes_pending: if pressured { 4_096 } else { 0 },
+                oldest_queued_age_ms: pressured.then_some(250),
+                fail_closed_total: 0,
+                write_error_total: u64::from(pressured),
+                reason_code: pressured.then(|| "storage_io.write_error.io_error".to_string()),
+            }),
+        }),
+        queue_backpressure: vec![SwarmResourceCockpitQueueBackpressureSummary {
+            queue: "resource_admission".to_string(),
+            evidence_state: SwarmResourceCockpitEvidenceState::Measured,
+            tier: queue_tier.to_string(),
+            depth: Some(if pressured { 512 } else { 0 }),
+            capacity: Some(1_024),
+            utilization: Some(if pressured { 0.91 } else { 0.25 }),
+            oldest_queued_age_ms: pressured.then_some(750),
+            operator_action: if pressured {
+                "degrade_noncritical_work"
+            } else {
+                "none"
+            }
+            .to_string(),
+            reason_codes: vec![if pressured {
+                "queue_saturated".to_string()
+            } else {
+                "resource.proof.healthy".to_string()
+            }],
+        }],
+        admission_decisions: vec![SwarmResourceCockpitAdmissionDecision {
+            source: "resource_admission".to_string(),
+            action: admission_action.to_string(),
+            reason_codes: vec![if pressured {
+                "memory_tier_pressure".to_string()
+            } else {
+                "resource.proof.healthy".to_string()
+            }],
+            counters: resource_cockpit_admission_counters(pressured),
+            raw_pressure_severity: Some(if pressured { 3 } else { 0 }),
+            effective_pressure_severity: Some(if pressured { 2 } else { 0 }),
+            priority_protection_units: Some(u64::from(pressured)),
+            queue_utilization: Some(if pressured { 0.91 } else { 0.25 }),
+            pending_items: Some(if pressured { 512 } else { 0 }),
+            fleet_pressure: Some(if pressured { "critical" } else { "normal" }.to_string()),
+            memory_tier_pressure: Some(if pressured { "emergency" } else { "normal" }.to_string()),
+            max_latency_over_budget_ratio: Some(if pressured { 1.75 } else { 0.5 }),
+        }],
+        action_receipts: vec![SwarmResourceCockpitActionReceipt {
+            receipt_id: format!("{label}-receipt"),
+            correlation_id: Some(format!("{label}-correlation")),
+            action: "observe".to_string(),
+            target_domain: "action_receipts".to_string(),
+            requested_at_ms: 1_700_000_050_001,
+            completed_at_ms: Some(1_700_000_050_002),
+            status: "dry_run".to_string(),
+            dry_run: true,
+            policy_decision: "allow".to_string(),
+            evidence_state: SwarmResourceCockpitEvidenceState::Measured,
+            freshness: None,
+            pane_id: Some(42),
+            agent_name: Some("BluePike".to_string()),
+            target_dir: Some("/tmp/ft-rz0eb-4".to_string()),
+            queue_name: Some("resource_admission".to_string()),
+            affected_bytes: Some(2_097_152),
+            reason_codes: vec!["action_receipt.dry_run".to_string()],
+            artifact_paths: vec![format!("artifacts/{label}/receipt.json")],
+        }],
+        auto_tune_decisions: vec![TuningDecisionRecord {
+            schema_version: AUTO_TUNE_DECISION_RECORD_SCHEMA_VERSION,
+            timestamp_ms: 1_700_000_050_003,
+            profile: "high-core-canary".to_string(),
+            correlation_id: format!("{label}-auto-tune"),
+            kind: TuningDecisionKind::CandidateStarted,
+            mode: TuningMode::Exploration,
+            knob_id: Some(TunableKnobId::RuntimeOutputCoalesceWindowMs),
+            knob_name: Some("runtime.output_coalesce_window_ms".to_string()),
+            old_value: Some(50.0),
+            new_value: Some(75.0),
+            rollback_value: None,
+            gate: Some(KnobGate::ObserveFirst),
+            would_apply: true,
+            live_mutation_allowed: false,
+            reason_codes: vec!["auto_tune.candidate.runtime.output_coalesce_window_ms".to_string()],
+            metric_window: Some(TuningMetricWindowSummary {
+                warmup_complete: true,
+                measurement_count: Some(30),
+                minimum_measurements: Some(10),
+                confidence: Some(0.95),
+                minimum_confidence: Some(0.80),
+                confidence_state: TuningConfidenceState::Acceptable,
+            }),
+            safety_checks: Vec::new(),
+            active_explorations: Some(1),
+            max_concurrent_explorations: Some(1),
+        }],
+        mitigation_history: vec![SwarmResourceCockpitDrilldown {
+            subject: "memory".to_string(),
+            reason_code: "resource.memory.tier_pressure".to_string(),
+            detail: "hot resident tier exceeded fixture budget".to_string(),
+        }],
+        drilldowns: vec![SwarmResourceCockpitDrilldown {
+            subject: "resource_admission".to_string(),
+            reason_code: "memory_tier_pressure".to_string(),
+            detail: "resource admission degraded noncritical work".to_string(),
+        }],
+        artifact_paths: vec![format!("tests/e2e/artifacts/{label}/summary.json")],
+    }
+}
+
+#[test]
+fn resource_pressure_cockpit_schema_accepts_generated_and_fixture_states_ft_rz0eb_4() {
+    let schema = load_schema("ft-resource-pressure-cockpit.json");
+    let validator = compile_draft_2020_schema(&schema);
+    let unavailable = SwarmCapacityOperatorSummary::unavailable(
+        1_700_000_050_000,
+        2,
+        "schema_golden.unavailable",
+    );
+    let unavailable_json = serde_json::to_value(
+        unavailable
+            .resource_cockpit
+            .as_ref()
+            .expect("unavailable level 2 summary includes cockpit"),
+    )
+    .expect("serialize generated unavailable cockpit");
+
+    assert_schema_accepts(
+        "generated unavailable/skipped cockpit",
+        &validator,
+        &unavailable_json,
+    );
+    assert_eq!(
+        unavailable_json["run_identity"]["hardware_predicate"]["proof_status"],
+        "skipped_not_proven"
+    );
+    for domain in [
+        "memory",
+        "rss_residency",
+        "pane_budget",
+        "queue_backpressure",
+        "storage_io",
+        "worker_pool",
+        "capacity_admission",
+        "resource_admission",
+        "action_receipts",
+    ] {
+        assert_eq!(
+            unavailable_json["domains"][domain]["evidence_state"], "unavailable",
+            "missing telemetry must produce unavailable domain {domain}"
+        );
+    }
+    assert!(
+        unavailable_json.get("memory_tiers").is_none(),
+        "empty optional memory tiers may be omitted"
+    );
+
+    let fixtures = [
+        resource_cockpit_full_fixture(
+            "healthy",
+            SwarmCapacityOperatorStatus::Ready,
+            SwarmResourceCockpitProofGate::Healthy,
+            SwarmResourceCockpitEvidenceState::Measured,
+            "normal",
+        ),
+        resource_cockpit_full_fixture(
+            "pressured",
+            SwarmCapacityOperatorStatus::Watch,
+            SwarmResourceCockpitProofGate::Pressured,
+            SwarmResourceCockpitEvidenceState::Measured,
+            "elevated",
+        ),
+        resource_cockpit_full_fixture(
+            "degraded",
+            SwarmCapacityOperatorStatus::Violated,
+            SwarmResourceCockpitProofGate::Degraded,
+            SwarmResourceCockpitEvidenceState::Measured,
+            "critical",
+        ),
+        resource_cockpit_full_fixture(
+            "mixed",
+            SwarmCapacityOperatorStatus::Watch,
+            SwarmResourceCockpitProofGate::Pressured,
+            SwarmResourceCockpitEvidenceState::Mixed,
+            "elevated",
+        ),
+    ];
+
+    for fixture in fixtures {
+        let value = serde_json::to_value(&fixture).expect("serialize cockpit fixture");
+        assert_schema_accepts(&fixture.source, &validator, &value);
+        assert!(
+            !value["run_identity"]["hardware_predicate"]["target_class"]
+                .as_bool()
+                .expect("target_class is boolean"),
+            "{} fixture must not claim target hardware",
+            fixture.source
+        );
+        assert_eq!(
+            value["run_identity"]["hardware_predicate"]["proof_status"], "skipped_not_proven",
+            "{} fixture must keep high-scale proof skipped",
+            fixture.source
+        );
+    }
+}
+
+#[test]
+fn resource_pressure_cockpit_schema_rejects_missing_required_domain_ft_rz0eb_4() {
+    let schema = load_schema("ft-resource-pressure-cockpit.json");
+    let validator = compile_draft_2020_schema(&schema);
+    let mut value = serde_json::to_value(resource_cockpit_full_fixture(
+        "missing-domain",
+        SwarmCapacityOperatorStatus::Watch,
+        SwarmResourceCockpitProofGate::Pressured,
+        SwarmResourceCockpitEvidenceState::Mixed,
+        "elevated",
+    ))
+    .expect("serialize cockpit fixture");
+
+    value["domains"]
+        .as_object_mut()
+        .expect("domains object")
+        .remove("action_receipts");
+
+    assert!(
+        !validator.is_valid(&value),
+        "schema must reject omitted required cockpit domains"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Registry ↔ disk coverage
 // ─────────────────────────────────────────────────────────────────────
@@ -292,8 +960,8 @@ fn registry_covers_all_disk_schemas() {
 
     let registry = SchemaRegistry::canonical();
     // Exclude non-endpoint schemas: the envelopes are response wrappers,
-    // ft-config documents ft.toml, and ft-pattern-pack documents extension
-    // files rather than robot endpoints.
+    // ft-config documents ft.toml, ft-pattern-pack documents extension files,
+    // and the resource cockpit is nested under doctor/robot capacity output.
     let disk_names: Vec<String> = schemas
         .iter()
         .map(|(name, _)| name.clone())
@@ -302,6 +970,7 @@ fn registry_covers_all_disk_schemas() {
                 && name != "wa-mcp-envelope.json"
                 && name != "ft-config.json"
                 && name != "ft-pattern-pack.json"
+                && name != "ft-resource-pressure-cockpit.json"
         })
         .collect();
 

@@ -223,7 +223,7 @@ extract_host_capability() {
         && ((memory_kib >= 268435456))
     then
         TARGET_HARDWARE_MET="true"
-        HIGH_SCALE_PROOF_STATUS="target_hardware_measured"
+        HIGH_SCALE_PROOF_STATUS="proven_predicate_met"
     else
         TARGET_HARDWARE_MET="false"
         HIGH_SCALE_PROOF_STATUS="skipped_not_proven"
@@ -299,32 +299,26 @@ write_cockpit_snapshot() {
           contract_id: "ft.resource_pressure_cockpit.v1",
           generated_at_ms: (now * 1000 | floor),
           source: "tests/e2e/test_ft_p3457_4_resource_pressure_soak.sh",
-          phase: $phase,
           status: "watch",
           proof_gate: $proof_gate,
           evidence_state: $evidence_state,
           summary: "RCH resource-pressure soak lane retained artifacts without claiming live 200-pane proof",
           next_operator_move: "Inspect summary.json and proof-ledger.jsonl before citing any high-scale result",
           run_identity: {
-            bead_id: $bead_id,
-            scenario_id: $scenario_id,
             run_id: $run_id,
-            correlation_id: $correlation_id,
             evidence_level: "remote_reduced",
-            artifact_dir: $artifact_dir,
-            remote_cargo_target_dir: $remote_target_dir,
+            artifact_paths: [
+              "commands.txt",
+              "structured.log",
+              "summary.json",
+              "proof-ledger.jsonl",
+              "host_capability.json"
+            ],
             hardware_predicate: {
-              required_logical_cpus: 64,
-              required_memory_gib: 256,
-              observed_logical_cpus: ($host_capability.logical_cpus // 0),
-              observed_memory_gib: ($host_capability.memory_gib // 0),
+              logical_cpus: ($host_capability.logical_cpus // null),
+              memory_gib: ($host_capability.memory_gib // null),
               target_class: $target_hardware_met,
               proof_status: $high_scale_proof_status
-            },
-            live_soak: {
-              target_panes: $target_panes,
-              proof_status: $live_soak_status,
-              reason_codes: ["resource.proof.skipped", "resource.telemetry.simulated"]
             }
           },
           domains: {
@@ -343,6 +337,14 @@ write_cockpit_snapshot() {
               summary: "no live FrankenTerm process RSS peak was captured by this first proof lane",
               operator_action: "capture ft doctor and macOS residency bundle during a live soak",
               reason_codes: ["resource.telemetry.unavailable"]
+            },
+            pane_budget: {
+              name: "pane_budget",
+              evidence_state: "simulated",
+              pressure_tier: "unknown",
+              summary: "200-pane budget target is retained as a reduced proof predicate, not a live pane count",
+              operator_action: "run the live swarm exercise before promotion",
+              reason_codes: ["resource.telemetry.simulated", "resource.proof.skipped"]
             },
             queue_backpressure: {
               name: "queue_backpressure",
@@ -367,14 +369,40 @@ write_cockpit_snapshot() {
               summary: "RCH worker host capability is measured separately from fleet worker-pool saturation",
               operator_action: "inspect RCH preflight and proof-ledger artifacts",
               reason_codes: [($host_capability.reason_code // "resource.telemetry.unavailable")]
+            },
+            capacity_admission: {
+              name: "capacity_admission",
+              evidence_state: "simulated",
+              pressure_tier: "unknown",
+              summary: "capacity admission is covered by reduced Cargo tests, not a live high-scale admission run",
+              operator_action: "retain capacity artifacts from the live exercise before promotion",
+              reason_codes: ["resource.telemetry.simulated", "resource.proof.skipped"]
+            },
+            resource_admission: {
+              name: "resource_admission",
+              evidence_state: "simulated",
+              pressure_tier: "unknown",
+              summary: "resource admission is covered by reduced Cargo tests, not a live high-scale admission run",
+              operator_action: "retain resource admission artifacts from the live exercise before promotion",
+              reason_codes: ["resource.telemetry.simulated", "resource.proof.skipped"]
+            },
+            action_receipts: {
+              name: "action_receipts",
+              evidence_state: "measured",
+              pressure_tier: "green",
+              summary: "receipt normalization is covered by the RCH cargo test proof",
+              operator_action: "inspect proof-ledger and receipt test artifacts",
+              reason_codes: ["action_receipt.dry_run"]
             }
           },
           residency_buckets: [
             {
               bucket: "unknown",
+              bucket_name: "unknown",
               evidence_state: "unavailable",
-              peak_rss_bytes: null,
-              probe_rss_kib: ($host_capability.probe_rss_kib // 0),
+              bytes: null,
+              confidence: 0,
+              dominant: true,
               reason_codes: ["resource.telemetry.unavailable"]
             }
           ],
@@ -382,15 +410,21 @@ write_cockpit_snapshot() {
             {
               queue: "resource_admission",
               evidence_state: "simulated",
-              target_panes: $target_panes,
+              tier: "unknown",
+              depth: null,
+              capacity: $target_panes,
+              utilization: null,
+              operator_action: "run_live_swarm_exercise",
               reason_codes: ["resource.telemetry.simulated"]
             }
           ],
+          admission_decisions: [],
           action_receipts: [
             {
               receipt_id: ($bead_id + ":" + $run_id + ":receipts-test"),
               action: "dry_run",
               target_domain: "action_receipts",
+              requested_at_ms: (now * 1000 | floor),
               status: "dry_run",
               dry_run: true,
               policy_decision: "not_checked",
