@@ -30,6 +30,7 @@ use frankenterm_core::proof_doctor::{
     PROOF_DOCTOR_SCHEMA_VERSION, ProofDoctorBeadRef, ProofDoctorDirtyPath, ProofDoctorEvidence,
     ProofDoctorPhase, ProofDoctorPreflightInput, classify_proof_doctor,
 };
+use frankenterm_core::proof_handoff::build_proof_handoff;
 use frankenterm_core::proof_lane::{ProofBackend, ProofScope};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 
@@ -6000,11 +6001,17 @@ fn build_proof_doctor_payload(
         proof_path_prefixes,
         evidence,
     };
+    build_proof_doctor_payload_from_input(input)
+}
+
+fn build_proof_doctor_payload_from_input(input: ProofDoctorPreflightInput) -> serde_json::Value {
     let verdict = classify_proof_doctor(&input);
+    let handoff = build_proof_handoff(&verdict);
 
     serde_json::json!({
         "schema_version": PROOF_DOCTOR_SCHEMA_VERSION,
         "verdict": verdict,
+        "handoff": handoff,
     })
 }
 
@@ -66394,6 +66401,15 @@ log_level = "debug"
             payload["verdict"]["evidence"]["local_cargo_detected"].as_bool(),
             Some(false)
         );
+        assert_eq!(payload["handoff"]["bead_id"].as_str(), Some("ft-wik9p.2"));
+        assert_eq!(payload["handoff"]["status"].as_str(), Some("runnable"));
+        assert_eq!(payload["handoff"]["safe_to_close"].as_bool(), Some(false));
+        assert_eq!(payload["handoff"]["agent_mail"], serde_json::Value::Null);
+        assert!(
+            payload["handoff"]["beads_comment"]
+                .as_str()
+                .is_some_and(|comment| comment.contains("Proof-doctor handoff for ft-wik9p.2"))
+        );
     }
 
     #[test]
@@ -66423,6 +66439,83 @@ log_level = "debug"
         assert_eq!(
             payload["verdict"]["evidence"]["local_cargo_detected"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            payload["handoff"]["reason_code"].as_str(),
+            Some("proof.command.local_cargo_invalid")
+        );
+        assert!(
+            payload["handoff"]["beads_comment"]
+                .as_str()
+                .is_some_and(|comment| comment.contains("local_cargo_invalid"))
+        );
+    }
+
+    #[test]
+    fn proof_doctor_payload_includes_agent_mail_handoff_for_other_owner() {
+        let input = ProofDoctorPreflightInput {
+            bead_id: Some("ft-782hw.1".to_string()),
+            parent_bead_id: Some("ft-782hw".to_string()),
+            agent_name: "Codex".to_string(),
+            repo_path: "/tmp/frankenterm".to_string(),
+            git_head: "abc123".to_string(),
+            branch: "main".to_string(),
+            generated_at_utc: "2026-05-10T04:44:00Z".to_string(),
+            intended_command: vec![
+                "rch".to_string(),
+                "exec".to_string(),
+                "--".to_string(),
+                "env".to_string(),
+                "CARGO_TARGET_DIR=/tmp/ft-782hw-1-proof".to_string(),
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "frankenterm".to_string(),
+            ],
+            intended_target_dir: Some("/tmp/ft-782hw-1-proof".to_string()),
+            intended_scope: ProofScope::CargoTest,
+            required_backend: ProofBackend::Rch,
+            phase: ProofDoctorPhase::Preflight,
+            proof_path_prefixes: vec!["crates/frankenterm".to_string()],
+            evidence: ProofDoctorEvidence {
+                dirty_paths: vec![ProofDoctorDirtyPath {
+                    path: "crates/frankenterm/src/main.rs".to_string(),
+                    status: "M".to_string(),
+                    affects_proof: true,
+                    owner: Some(
+                        frankenterm_core::proof_doctor::ProofDoctorOwner::OtherAgent {
+                            agent_name: "BluePike".to_string(),
+                            bead_id: Some("ft-other".to_string()),
+                        },
+                    ),
+                }],
+                ..ProofDoctorEvidence::default()
+            },
+        };
+
+        let payload = build_proof_doctor_payload_from_input(input);
+
+        assert_eq!(
+            payload["verdict"]["status"].as_str(),
+            Some("dirty_tree_blocked")
+        );
+        assert_eq!(
+            payload["handoff"]["reason_code"].as_str(),
+            Some("proof.dirty.active_owned_path_overlap")
+        );
+        assert_eq!(
+            payload["handoff"]["agent_mail"]["to"][0].as_str(),
+            Some("BluePike")
+        );
+        assert!(
+            payload["handoff"]["agent_mail"]["body_md"]
+                .as_str()
+                .is_some_and(|body| body.contains("ft-782hw.1"))
+        );
+        assert!(
+            payload["handoff"]["beads_comment"]
+                .as_str()
+                .is_some_and(|comment| comment.contains("agent BluePike"))
         );
     }
 
