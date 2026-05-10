@@ -133,6 +133,7 @@ github_actions_local_cargo_enabled() {
 
 run_github_actions_cargo_logged() {
   : >"$LOG_FILE"
+  set +u
   (
     cd "$PROJECT_ROOT"
     env \
@@ -146,6 +147,9 @@ run_github_actions_cargo_logged() {
         -- \
         "${HARNESS_ARGS[@]}"
   ) >"$LOG_FILE" 2>&1
+  local rc=$?
+  set -u
+  return "$rc"
 }
 
 extract_json_lines() {
@@ -438,9 +442,11 @@ emit_setup
 set +e
 if github_actions_local_cargo_enabled; then
   run_github_actions_cargo_logged
+  run_exit_code=$?
 else
   rch_init "$RUN_DIR" "$RUN_ID" "gpu_harness" "$PROJECT_ROOT"
   ensure_rch_ready
+  set +u
   # shellcheck disable=SC2016
   run_rch_cargo_logged "$LOG_FILE" \
     env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
@@ -508,8 +514,9 @@ PY
       printf "%s\n" "$end"
       exit "$rc"
     ' bash "${EXTRA_CARGO_ARGS[@]}" -- "${HARNESS_ARGS[@]}"
+  run_exit_code=$?
+  set -u
 fi
-run_exit_code=$?
 set -e
 
 end_ms="$(now_ms)"
