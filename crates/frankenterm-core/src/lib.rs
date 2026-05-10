@@ -189,6 +189,7 @@ pub mod connector_testbed;
 pub mod consistent_hash;
 pub mod content_dedup;
 pub mod context_budget;
+pub mod context_horizon;
 // `context_snapshot` extracted to `frankenterm-core-telemetry-types` (ft-yf2am / ft-y0loj.3.2).
 pub mod continuous_backpressure;
 pub mod cooldown_tracker;
