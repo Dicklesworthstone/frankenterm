@@ -168,6 +168,21 @@ ubs*.txt
 # Ephemeral regex/test scratch directories (agent experiments)
 tmp_re_test/
 
+# git-stash-janitor skill scratch workspace (inventories, triage tsvs,
+# handoff reports). Always ephemeral; recreated each run.
+/.stash_janitor_workspace/
+
+# Timestamped RCH probe/smoke/queue log dumps written next to docs/
+# during remote-compilation rollouts. The schema and policy docs at
+# docs/asupersync-rch-* ARE committed; only the timestamped run dirs
+# (rch-YYYYMMDDTHHMMSSZ-NNNNN) are ignored.
+/docs/rch-*/
+
+# Finish-line-guard run artifacts (per-run guard-results-*.json,
+# shell.log dumps, artifact-contract.json). The guard contract itself
+# lives elsewhere under docs/; only the timestamped run dirs are ephemeral.
+/docs/finish-line-guard-artifacts/
+
 # Agent tool MCP config backups (timestamped .bak files)
 .claude/*.bak
 .cline.mcp.json.*
