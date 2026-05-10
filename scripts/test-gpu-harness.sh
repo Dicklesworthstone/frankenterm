@@ -19,6 +19,11 @@ set -euo pipefail
 #   GPU_HARNESS_RUN_DIR    run artifact directory override
 #   GPU_HARNESS_CARGO_ARGS extra cargo args before "--" (space-separated)
 #   GPU_HARNESS_RCH_TARGET_DIR repo-relative remote CARGO_TARGET_DIR override
+#   GPU_HARNESS_GITHUB_ACTIONS_LOCAL_CARGO
+#                           set to 1 only in GitHub Actions GPU jobs, where the
+#                           GitHub-hosted runner is the CI execution target and
+#                           the local agent/operator RCH offload policy is not
+#                           available.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -115,6 +120,36 @@ now_ms() {
 import time
 print(int(time.time() * 1000))
 PY
+}
+
+github_actions_local_cargo_enabled() {
+  case "${GPU_HARNESS_GITHUB_ACTIONS_LOCAL_CARGO:-}" in
+    1|true|TRUE|yes|YES) ;;
+    *) return 1 ;;
+  esac
+
+  [[ "${GITHUB_ACTIONS:-}" == "true" ]]
+}
+
+run_github_actions_cargo_logged() {
+  : >"$LOG_FILE"
+  set +u
+  (
+    cd "$PROJECT_ROOT"
+    env \
+      GPU_HARNESS_ARTIFACT_DIR="$ARTIFACT_DIR" \
+      GPU_HARNESS_PERF_REPORT="$PERF_REPORT" \
+      cargo test \
+        -p frankenterm-gui \
+        --features headless-render \
+        --test gpu_regression \
+        "${EXTRA_CARGO_ARGS[@]}" \
+        -- \
+        "${HARNESS_ARGS[@]}"
+  ) >"$LOG_FILE" 2>&1
+  local rc=$?
+  set -u
+  return "$rc"
 }
 
 extract_json_lines() {
@@ -403,16 +438,21 @@ PY
 mkdir -p "$RUN_DIR" "$ARTIFACT_DIR"
 start_ms="$(now_ms)"
 emit_setup
-rch_init "$RUN_DIR" "$RUN_ID" "gpu_harness" "$PROJECT_ROOT"
-ensure_rch_ready
 
 set +e
-# shellcheck disable=SC2016
-run_rch_cargo_logged "$LOG_FILE" \
-  env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
-    FT_GPU_HARNESS_ARTIFACTS_BEGIN="$REMOTE_ARTIFACTS_BEGIN" \
-    FT_GPU_HARNESS_ARTIFACTS_END="$REMOTE_ARTIFACTS_END" \
-    bash -lc '
+if github_actions_local_cargo_enabled; then
+  run_github_actions_cargo_logged
+  run_exit_code=$?
+else
+  rch_init "$RUN_DIR" "$RUN_ID" "gpu_harness" "$PROJECT_ROOT"
+  ensure_rch_ready
+  set +u
+  # shellcheck disable=SC2016
+  run_rch_cargo_logged "$LOG_FILE" \
+    env CARGO_TARGET_DIR="$RCH_TARGET_DIR" \
+      FT_GPU_HARNESS_ARTIFACTS_BEGIN="$REMOTE_ARTIFACTS_BEGIN" \
+      FT_GPU_HARNESS_ARTIFACTS_END="$REMOTE_ARTIFACTS_END" \
+      bash -lc '
       set -euo pipefail
       begin="${FT_GPU_HARNESS_ARTIFACTS_BEGIN:?}"
       end="${FT_GPU_HARNESS_ARTIFACTS_END:?}"
@@ -474,7 +514,9 @@ PY
       printf "%s\n" "$end"
       exit "$rc"
     ' bash "${EXTRA_CARGO_ARGS[@]}" -- "${HARNESS_ARGS[@]}"
-run_exit_code=$?
+  run_exit_code=$?
+  set -u
+fi
 set -e
 
 end_ms="$(now_ms)"
