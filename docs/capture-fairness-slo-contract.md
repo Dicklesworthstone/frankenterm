@@ -188,7 +188,7 @@ proof artifacts.
 | `capture.active_resets_to_min_interval` | strict invariant | A changed capture or emitted overflow GAP resets the pane interval to `min_interval`. |
 | `capture.idle_backs_off_to_max_interval` | strict invariant | No-change and fail-closed poll outcomes back off by `backoff_multiplier` and never exceed `max_interval`. |
 | `capture.equal_priority_rotation` | strict invariant | Under completed tasks, available permits, and non-exhausted budgets, equal-priority panes rotate so stable pane id order does not permanently starve higher pane ids. |
-| `capture.low_tier_floor` | strict invariant | When high and low panes are ready and `effective_limit >= 2`, the low tier receives `min(low_ready_count, max(1, effective_limit / 5))` slots before high-tier spillover. |
+| `capture.low_tier_floor` | strict invariant | When high and low panes are ready and `effective_limit >= 2`, the low tier receives `min(low_ready_count, max(1, effective_limit / 5))` reserved slots before high-tier spillover; when multiple low-priority values are ready, the reserved floor rotates across the low tier so lower low-priority subtiers eventually receive service under sustained high-priority pressure. |
 | `capture.single_slot_priority` | strict invariant | When `effective_limit == 1`, no low-tier floor is available; numeric priority order decides the single slot. |
 | `capture.capture_budget_window` | strict invariant | `max_captures_per_sec > 0` limits scheduled captures inside the current one-second scheduler window. |
 | `capture.byte_budget_stop` | strict invariant | Once global bytes remaining is zero, `spawn_ready` does not schedule new polling work until the byte window refills. |
@@ -243,7 +243,7 @@ The deterministic model/test bead should cover at least:
 | `scheduler_mixed_high_low_floor` | Mixed high/low panes with `effective_limit >= 2`; low-tier floor is asserted exactly. |
 | `scheduler_single_slot_no_floor` | Mixed tiers with `effective_limit == 1`; no low-tier floor is asserted. |
 | `scheduler_equal_priority_rotation` | Equal-priority groups rotate across repeated completed rounds. |
-| `scheduler_low_subtier_starvation_probe` | Distinct low priorities show the current limitation: low tier is protected, but lower-priority subtiers may still wait behind higher low-priority values. |
+| `scheduler_low_subtier_starvation_probe` | Distinct low priorities prove the reserved low-tier floor rotates across lower low-priority subtiers while preserving high-tier precedence and single-slot priority semantics. |
 | `scheduler_capture_budget_exhaustion` | Capture budget depletes across calls and refills only after the one-second window. |
 | `scheduler_byte_budget_exhaustion` | Byte budget saturates to zero after capture and blocks new admission until refill. |
 | `scheduler_backpressure_overflow_gap` | Five consecutive `send_backpressure` outcomes lead to `backpressure_overflow` on the next successful path. |

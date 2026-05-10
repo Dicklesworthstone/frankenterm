@@ -516,6 +516,10 @@ pub struct CaptureScheduler {
     global_window_start: Instant,
     /// Per-pane budget tracking.
     pane_trackers: HashMap<u64, PaneBudgetTracker>,
+    /// Rotates the reserved low-tier floor when multiple low-priority subtier
+    /// values are ready, so lower subtiers cannot wait forever behind priority
+    /// 100 panes. Equal-priority rotation remains owned by `TailerSupervisor`.
+    low_tier_floor_offset: usize,
     /// Scheduler metrics.
     metrics: SchedulerMetrics,
 }
@@ -529,6 +533,7 @@ impl CaptureScheduler {
             global_window_start: Instant::now(),
             budget,
             pane_trackers: HashMap::new(),
+            low_tier_floor_offset: 0,
             metrics: SchedulerMetrics::default(),
         }
     }
@@ -604,8 +609,10 @@ impl CaptureScheduler {
     /// Uses a tiered anti-starvation algorithm:
     /// 1. Panes split into High (<= 50) and Low (> 50) priority.
     /// 2. Low priority gets a reserved 20% floor of available slots.
+    ///    The reserved floor rotates across the whole low tier only when
+    ///    multiple low-priority values are ready.
     /// 3. High priority gets the remaining 80% (plus any unused Low slots).
-    /// 4. Excess High slots spill back to Low.
+    /// 4. Excess High slots spill back to Low in priority order.
     ///
     /// This ensures low-priority panes (e.g. SSH) get at least *some* service
     /// even when high-priority panes (e.g. Codex) are saturating the budget.
@@ -644,7 +651,7 @@ impl CaptureScheduler {
             0
         };
 
-        // Calculate allocations allowing spillover
+        // Calculate allocations allowing spillover.
         let guaranteed_low = low_prio.len().min(target_low_count);
         let mut slots_remaining = effective_limit - guaranteed_low;
 
@@ -652,17 +659,57 @@ impl CaptureScheduler {
         let taken_high = high_prio.len().min(slots_remaining);
         slots_remaining -= taken_high;
 
-        // Low priority gets the reserved slots + any spillover from high
-        let taken_low = guaranteed_low
-            + low_prio
-                .len()
-                .saturating_sub(guaranteed_low)
-                .min(slots_remaining);
+        let low_tier_contention = !high_prio.is_empty()
+            && guaranteed_low > 0
+            && guaranteed_low + slots_remaining < low_prio.len();
+
+        let mut low_floor = Vec::with_capacity(guaranteed_low);
+        if guaranteed_low > 0 {
+            let should_rotate_low_floor =
+                low_tier_contention && low_prio.windows(2).any(|window| window[0].1 != window[1].1);
+            if should_rotate_low_floor {
+                // Use stable pane order for the subtier cursor. The caller may
+                // have already rotated equal-priority groups, and combining the
+                // two rotations can phase-lock on the same lower-subtier panes.
+                let mut floor_order = low_prio.to_vec();
+                floor_order.sort_by_key(|(id, priority)| (*priority, *id));
+
+                let low_len = floor_order.len();
+                let start = self.low_tier_floor_offset % low_len;
+                low_floor.extend(
+                    (0..guaranteed_low).map(|offset| floor_order[(start + offset) % low_len].0),
+                );
+                self.low_tier_floor_offset = (start + guaranteed_low) % low_len;
+            } else {
+                low_floor.extend(low_prio.iter().take(guaranteed_low).map(|(id, _)| *id));
+            }
+        }
+
+        // Low priority gets the reserved floor plus any spillover from high.
+        // Spillover keeps priority order; the adaptive cursor applies only to
+        // the anti-starvation floor.
+        let low_spillover = low_prio
+            .len()
+            .saturating_sub(low_floor.len())
+            .min(slots_remaining);
 
         // Collect results (stable order preserved from input sort)
-        let mut selected = Vec::with_capacity(taken_high + taken_low);
+        let mut selected = Vec::with_capacity(taken_high + low_floor.len() + low_spillover);
         selected.extend(high_prio.iter().take(taken_high).map(|(id, _)| *id));
-        selected.extend(low_prio.iter().take(taken_low).map(|(id, _)| *id));
+        selected.extend(low_floor.iter().copied());
+        if low_spillover > 0 {
+            let mut spillover_taken = 0usize;
+            for (id, _) in low_prio {
+                if low_floor.contains(id) {
+                    continue;
+                }
+                selected.push(*id);
+                spillover_taken += 1;
+                if spillover_taken == low_spillover {
+                    break;
+                }
+            }
+        }
 
         // Debit global capture budget for the count we'll schedule.
         if self.budget.max_captures_per_sec > 0 {
@@ -3128,6 +3175,79 @@ mod tests {
                 expected_low,
                 "{}: low-tier floor did not service every low-priority pane",
                 case.scenario_id
+            );
+        }
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_low_subtier_floor_rotates_under_pressure() {
+        let scenario_id = "scheduler_low_subtier_starvation_probe";
+        let mut panes = (1_u64..=8).map(|pane_id| (pane_id, 10)).collect::<Vec<_>>();
+        panes.extend((100_u64..120).map(|pane_id| (pane_id, 100)));
+        panes.extend((200_u64..204).map(|pane_id| (pane_id, 200)));
+
+        let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        });
+
+        let first_round = model.tick(&panes, 10);
+        assert_eq!(
+            first_round.iter().filter(|pane_id| **pane_id <= 8).count(),
+            8,
+            "{scenario_id}: high-priority panes should keep the non-reserved slots"
+        );
+        assert_eq!(
+            first_round
+                .iter()
+                .filter(|pane_id| (100_u64..120).contains(*pane_id))
+                .count(),
+            2,
+            "{scenario_id}: first low-tier floor still honors low-priority order"
+        );
+        assert!(
+            first_round
+                .iter()
+                .all(|pane_id| !(200_u64..204).contains(pane_id)),
+            "{scenario_id}: lower low-priority subtiers should not jump the initial floor"
+        );
+
+        let mut lowest_low_seen = HashSet::<u64>::new();
+        for pane_id in first_round {
+            if (200_u64..204).contains(&pane_id) {
+                lowest_low_seen.insert(pane_id);
+            }
+        }
+
+        for _round in 1..12 {
+            for pane_id in model.tick(&panes, 10) {
+                if (200_u64..204).contains(&pane_id) {
+                    lowest_low_seen.insert(pane_id);
+                }
+            }
+        }
+
+        assert!(
+            (200_u64..204).all(|pane_id| lowest_low_seen.contains(&pane_id)),
+            "{scenario_id}: reserved low-tier floor must eventually reach lower low-priority subtiers"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_low_subtier_floor_preserves_order_without_pressure() {
+        let scenario_id = "scheduler_low_subtier_no_pressure_order";
+        let mut scheduler = CaptureScheduler::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        });
+        let panes = vec![(100, 100), (101, 100), (200, 200), (201, 200)];
+
+        for round in 0..4 {
+            let selected = scheduler.select_panes(&panes, 10);
+            assert_eq!(
+                selected,
+                vec![100, 101, 200, 201],
+                "{scenario_id} round {round}: low-priority order should stay stable when all low panes fit"
             );
         }
     }
