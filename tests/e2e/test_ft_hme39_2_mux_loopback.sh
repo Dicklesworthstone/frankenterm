@@ -96,6 +96,11 @@ worker_for_log() {
 failure_reason_for_log() {
   local log_file="$1"
   local meta_file code
+  if sed -n 's/^error: could not parse\/generate dep info at: //p' "${log_file}" | grep -q . \
+    && grep -Fq 'No such file or directory (os error 2)' "${log_file}"; then
+    printf '%s\n' "rch_infrastructure_cargo_dep_info_missing"
+    return
+  fi
   meta_file="$(rch_log_meta_path "${log_file}")"
   if [[ ! -f "${meta_file}" ]]; then
     printf '%s\n' "source_or_test_failure"
