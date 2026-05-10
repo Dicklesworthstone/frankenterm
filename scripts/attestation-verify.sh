@@ -21,19 +21,23 @@ JSON_OUTPUT=0
 
 usage() {
   cat <<EOF
-Usage: $0 <bundle.json> [--json] [--strict-required]
+Usage: $0 <bundle.json> [--json] [--strict-required] [--strict-deferred]
 
   --json             Emit machine-readable JSON.
   --strict-required  Fail if the bundle's required_categories list does not match
-                     the canonical list in docs/attestations/manifest.json.
+                     the canonical list in docs/attestations/manifest.json, allowing
+                     deferred_slots to satisfy categories in non-release checks.
+  --strict-deferred  Fail if the bundle declares any deferred_slots.
 EOF
 }
 
 STRICT_REQUIRED=0
+STRICT_DEFERRED=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json)             JSON_OUTPUT=1; shift ;;
     --strict-required)  STRICT_REQUIRED=1; shift ;;
+    --strict-deferred)  STRICT_DEFERRED=1; shift ;;
     -h|--help)          usage; exit 0 ;;
     -*) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
     *) [[ -z "$BUNDLE" ]] || { echo "extra arg: $1" >&2; exit 2; }; BUNDLE="$1"; shift ;;
@@ -99,10 +103,10 @@ done
 if [[ $STRICT_REQUIRED -eq 1 ]]; then
   manifest_path="$REPO_ROOT/docs/attestations/manifest.json"
   if [[ -f "$manifest_path" ]]; then
-    manifest_required="$(jq -c -S '.required_categories' "$manifest_path")"
-    bundle_required="$(jq -c -S '.required_categories' <<<"$bundle_json")"
+    manifest_required="$(jq -c -S '.required_categories | unique' "$manifest_path")"
+    bundle_required="$(jq -c -S '((.required_categories // []) + ((.deferred_slots // []) | map(.category))) | unique' <<<"$bundle_json")"
     if [[ "$manifest_required" == "$bundle_required" ]]; then
-      record_check "required_categories_match_manifest" true "matches docs/attestations/manifest.json"
+      record_check "required_categories_match_manifest" true "matches docs/attestations/manifest.json via artifacts + deferred_slots"
     else
       record_check "required_categories_match_manifest" false "diverges from docs/attestations/manifest.json"
     fi
@@ -121,6 +125,33 @@ for cat in "${required_cats[@]}"; do
     record_check "category:$cat" false "no artifact found for required category"
   fi
 done
+
+# Deferred-slot audit: dev bundles may expose intentionally missing
+# manifest slots. They are not artifact categories, but they must be
+# visible and release gates can reject them with --strict-deferred.
+deferred_count="$(jq '(.deferred_slots // []) | length' <<<"$bundle_json")"
+for ((i=0; i<deferred_count; i++)); do
+  def="$(jq -c "(.deferred_slots // [])[$i]" <<<"$bundle_json")"
+  category="$(jq -r '.category // ""' <<<"$def")"
+  deferred_to_bead="$(jq -r '.deferred_to_bead // ""' <<<"$def")"
+  reason="$(jq -r '.deferred_reason // ""' <<<"$def")"
+  if [[ -z "$category" || -z "$deferred_to_bead" || -z "$reason" ]]; then
+    record_check "deferred_slot:$i" false "missing category/deferred_to_bead/deferred_reason"
+    continue
+  fi
+  if [[ ! "$deferred_to_bead" =~ ^ft-[a-z0-9.]+$ ]]; then
+    record_check "deferred_slot:$category" false "invalid deferred_to_bead: $deferred_to_bead"
+    continue
+  fi
+  record_check "deferred_slot:$category" true "deferred to $deferred_to_bead"
+done
+if [[ "$deferred_count" -gt 0 && "$STRICT_DEFERRED" -eq 1 ]]; then
+  record_check "deferred_slots_strict" false "--strict-deferred rejects $deferred_count deferred slot(s)"
+elif [[ "$deferred_count" -gt 0 ]]; then
+  record_check "deferred_slots" true "$deferred_count deferred slot(s) declared"
+else
+  record_check "deferred_slots" true "none"
+fi
 
 # Per-artifact hash recomputation.
 artifact_count="$(jq '.artifacts | length' <<<"$bundle_json")"
