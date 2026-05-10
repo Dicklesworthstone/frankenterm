@@ -23,6 +23,7 @@
 #     bash scripts/stamp-readme-counts.sh                  # rewrite
 #     bash scripts/stamp-readme-counts.sh --check          # advisory
 #     bash scripts/stamp-readme-counts.sh --check --strict # exact match
+#     bash scripts/stamp-readme-counts.sh --json           # machine-readable snapshot
 #
 # Cross-references:
 #   ft-d3awp / ft-hdvvo — drift incidents that motivated this work
@@ -41,6 +42,7 @@ STRICT=0
 for arg in "$@"; do
     case "$arg" in
         --check)   MODE="check" ;;
+        --json)    MODE="json" ;;
         --strict)  STRICT=1 ;;
         --threshold=*) THRESHOLD_PCT="${arg#--threshold=}" ;;
         --help|-h)
@@ -125,33 +127,96 @@ PYEOF
 
 declare -a violations=()
 declare -a updates=()
+declare -a count_reports=()
 total_count=0
 present_count=0
+missing_placeholder_count=0
+matching_count=0
+within_threshold_count=0
 
 for entry in "${MANIFEST[@]}"; do
     name="${entry%%|*}"
     cmd="${entry#*|}"
     live="$(compute_count "${cmd}")"
     total_count=$((total_count + 1))
+    live_status="ok"
     if [[ -z "${live}" ]] || ! [[ "${live}" =~ ^[0-9]+$ ]]; then
         violations+=("${name}: command failed to produce an integer (got '${live}')")
+        live_status="invalid"
+        if [[ "${MODE}" == "json" ]]; then
+            declare -a invalid_doc_reports=()
+            for doc in "${DOCS[@]}"; do
+                documented="$(read_documented_value "${doc}" "${name}")"
+                if [[ -z "${documented}" ]]; then
+                    missing_placeholder_count=$((missing_placeholder_count + 1))
+                    invalid_doc_reports+=("$(jq -cn \
+                        --arg path "${doc}" \
+                        '{path:$path, placeholder_present:false, documented_value:null, drift_pct:null, status:"missing_placeholder"}')")
+                else
+                    present_count=$((present_count + 1))
+                    invalid_doc_reports+=("$(jq -cn \
+                        --arg path "${doc}" \
+                        --arg documented "${documented}" \
+                        '{path:$path, placeholder_present:true, documented_value:($documented|tonumber), live_value:null, drift_pct:null, status:"command_invalid"}')")
+                fi
+            done
+            docs_json="$(printf '%s\n' "${invalid_doc_reports[@]}" | jq -c -s '.')"
+            count_reports+=("$(jq -cn \
+                --arg name "${name}" \
+                --arg command "${cmd}" \
+                --arg live_status "${live_status}" \
+                --argjson documents "${docs_json}" \
+                '{name:$name, command:$command, live_value:null, live_status:$live_status, documents:$documents}')")
+        fi
         continue
     fi
+    declare -a doc_reports=()
     for doc in "${DOCS[@]}"; do
         documented="$(read_documented_value "${doc}" "${name}")"
         if [[ -z "${documented}" ]]; then
-            continue  # placeholder not present in this file
+            missing_placeholder_count=$((missing_placeholder_count + 1))
+            if [[ "${MODE}" == "json" ]]; then
+                doc_reports+=("$(jq -cn \
+                    --arg path "${doc}" \
+                    '{path:$path, placeholder_present:false, documented_value:null, drift_pct:null, status:"missing_placeholder"}')")
+            fi
+            continue
         fi
         present_count=$((present_count + 1))
         drift_pct="$(percent_drift "${documented}" "${live}")"
+        doc_status="matches"
+        if [[ "${documented}" == "${live}" ]]; then
+            matching_count=$((matching_count + 1))
+        elif [[ "${STRICT}" -eq 1 ]]; then
+            doc_status="strict_mismatch"
+        elif [[ "${drift_pct}" -le "${THRESHOLD_PCT}" ]]; then
+            within_threshold_count=$((within_threshold_count + 1))
+            doc_status="drift_within_threshold"
+        else
+            doc_status="drift_exceeded"
+        fi
         if [[ "${MODE}" == "check" ]]; then
             if [[ "${STRICT}" -eq 1 ]]; then
                 if [[ "${documented}" != "${live}" ]]; then
                     violations+=("${doc}::${name}: documented=${documented} live=${live} (strict)")
+                    doc_status="strict_mismatch"
                 fi
             elif [[ "${drift_pct}" -gt "${THRESHOLD_PCT}" ]]; then
                 violations+=("${doc}::${name}: documented=${documented} live=${live} drift=${drift_pct}% > ${THRESHOLD_PCT}%")
             fi
+        elif [[ "${MODE}" == "json" ]]; then
+            if [[ "${doc_status}" == "drift_exceeded" ]]; then
+                violations+=("${doc}::${name}: documented=${documented} live=${live} drift=${drift_pct}% > ${THRESHOLD_PCT}%")
+            elif [[ "${doc_status}" == "strict_mismatch" ]]; then
+                violations+=("${doc}::${name}: documented=${documented} live=${live} (strict)")
+            fi
+            doc_reports+=("$(jq -cn \
+                --arg path "${doc}" \
+                --arg documented "${documented}" \
+                --argjson live "${live}" \
+                --argjson drift_pct "${drift_pct}" \
+                --arg status "${doc_status}" \
+                '{path:$path, placeholder_present:true, documented_value:($documented|tonumber), live_value:$live, drift_pct:$drift_pct, status:$status}')")
         else
             if [[ "${documented}" != "${live}" ]]; then
                 rewrite_placeholders_in_file "${doc}" "${name}" "${live}"
@@ -159,13 +224,83 @@ for entry in "${MANIFEST[@]}"; do
             fi
         fi
     done
+    if [[ "${MODE}" == "json" ]]; then
+        if [[ ${#doc_reports[@]} -eq 0 ]]; then
+            docs_json="[]"
+        else
+            docs_json="$(printf '%s\n' "${doc_reports[@]}" | jq -c -s '.')"
+        fi
+        count_reports+=("$(jq -cn \
+            --arg name "${name}" \
+            --arg command "${cmd}" \
+            --arg live_status "${live_status}" \
+            --argjson live_value "${live:-0}" \
+            --argjson documents "${docs_json}" \
+            '{name:$name, command:$command, live_value:$live_value, live_status:$live_status, documents:$documents}')")
+    fi
 done
 
 # ---- report ----------------------------------------------------------
 
+if [[ "${MODE}" == "json" ]]; then
+    if [[ ${#count_reports[@]} -eq 0 ]]; then
+        counts_json="[]"
+    else
+        counts_json="$(printf '%s\n' "${count_reports[@]}" | jq -c -s '.')"
+    fi
+    overall_status="passed"
+    if [[ ${#violations[@]} -gt 0 ]]; then
+        overall_status="failed"
+    fi
+    jq -n \
+        --arg schema_version "1.0.0" \
+        --arg bead_id "ft-e87u6.14" \
+        --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg generator "scripts/stamp-readme-counts.sh --json" \
+        --arg check_status "${overall_status}" \
+        --argjson threshold_pct "${THRESHOLD_PCT}" \
+        --argjson strict "${STRICT}" \
+        --argjson tracked_counts "${total_count}" \
+        --argjson placeholder_occurrences "${present_count}" \
+        --argjson missing_placeholders "${missing_placeholder_count}" \
+        --argjson matching_placeholders "${matching_count}" \
+        --argjson within_threshold_placeholders "${within_threshold_count}" \
+        --argjson violation_count "${#violations[@]}" \
+        --argjson counts "${counts_json}" \
+        '{
+          schema_version: $schema_version,
+          bead_id: $bead_id,
+          generated_at: $generated_at,
+          generator: $generator,
+          source: {
+            script: "scripts/stamp-readme-counts.sh",
+            docs: ["README.md", "AGENTS.md"]
+          },
+          check: {
+            status: $check_status,
+            strict: ($strict == 1),
+            threshold_pct: $threshold_pct
+          },
+          summary: {
+            tracked_counts: $tracked_counts,
+            placeholder_occurrences: $placeholder_occurrences,
+            missing_placeholders: $missing_placeholders,
+            matching_placeholders: $matching_placeholders,
+            within_threshold_placeholders: $within_threshold_placeholders,
+            violation_count: $violation_count
+          },
+          counts: $counts
+        }'
+    exit 0
+fi
+
 if [[ "${MODE}" == "check" ]]; then
     if [[ ${#violations[@]} -eq 0 ]]; then
-        echo "ft-i2eni.5: ${present_count} placeholder(s) within ${THRESHOLD_PCT}% drift threshold (${total_count} tracked counts)."
+        if [[ "${STRICT}" -eq 1 ]]; then
+            echo "ft-i2eni.5: ${present_count} placeholder(s) exactly match live values (${total_count} tracked counts)."
+        else
+            echo "ft-i2eni.5: ${present_count} placeholder(s) within ${THRESHOLD_PCT}% drift threshold (${total_count} tracked counts)."
+        fi
         exit 0
     fi
     echo "ft-i2eni.5: drift threshold exceeded for ${#violations[@]} placeholder(s):" >&2
