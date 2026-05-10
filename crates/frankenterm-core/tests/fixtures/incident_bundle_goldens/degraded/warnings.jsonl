@@ -1,0 +1,3 @@
+{"id":"agent_mail.unavailable","message":"Agent Mail database was unavailable; no repair or restart action was attempted.","severity":"warning","source":"agent_mail_snapshot"}
+{"id":"process_sample.unavailable","message":"Platform sampler was unavailable in this fixture environment.","severity":"warning","source":"process_sample"}
+{"id":"rch.timeout","message":"RCH proof command exceeded the fixture timeout budget.","severity":"warning","source":"rch_timeout_evidence"}

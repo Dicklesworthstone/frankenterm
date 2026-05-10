@@ -1,0 +1,17 @@
+{
+  "blocked": [
+    {
+      "blocked_by": [
+        "ft-krsq0.4"
+      ],
+      "id": "ft-krsq0.5",
+      "title": "Build incident bundle verifier and summary view"
+    }
+  ],
+  "generated_at": "2026-05-10T11:12:40Z",
+  "provenance": {
+    "mutates_state": false,
+    "source_surface": "fixture::beads_blocker_snapshot"
+  },
+  "ready_count": 0
+}

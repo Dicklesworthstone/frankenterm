@@ -1,0 +1,15 @@
+{
+  "generated_at": "2026-05-10T11:12:40Z",
+  "panes": [
+    {
+      "pane_id": 41,
+      "redactions": 2,
+      "summary": "build log contained [REDACTED] and was clipped at [PANE_TEXT_TRUNCATED]",
+      "tail_lines": 20
+    }
+  ],
+  "provenance": {
+    "mutates_state": false,
+    "source_surface": "fixture::pane_text_summaries"
+  }
+}
