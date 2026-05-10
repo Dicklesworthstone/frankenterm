@@ -9,6 +9,7 @@ ARTIFACT_DIR="${ROOT_DIR}/tests/e2e/logs/terminal-conformance/${BEAD_ID}/${RUN_I
 EVENT_LOG="${ARTIFACT_DIR}/events.jsonl"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
 REMOTE_TARGET_DIR="${RCH_REMOTE_TARGET_DIR:-target/rch-e2e-ft-hme39-2-${RUN_ID}}"
+SUMMARY_REMOTE_TARGET_DIR="${REMOTE_TARGET_DIR}"
 MUX_BIN="\${CARGO_TARGET_DIR}/debug/frankenterm-mux-server"
 
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-1800}"
@@ -164,7 +165,7 @@ write_summary() {
     --arg build_meta "$(rch_log_meta_path "${build_log}" | sed "s#^${ROOT_DIR}/##")" \
     --arg test_log "${test_log#"${ROOT_DIR}"/}" \
     --arg test_meta "$(rch_log_meta_path "${test_log}" | sed "s#^${ROOT_DIR}/##")" \
-    --arg remote_target_dir "${REMOTE_TARGET_DIR}" \
+    --arg remote_target_dir "${SUMMARY_REMOTE_TARGET_DIR}" \
     --arg mux_bin "${MUX_BIN}" \
     '{
       bead_id: $bead_id,
@@ -185,6 +186,19 @@ write_summary() {
     }' >"${SUMMARY_FILE}"
 }
 
+run_loopback_test() {
+  local decision_path="$1"
+  local log_file="$2"
+  local target_dir="$3"
+
+  run_rch_step "${decision_path}" "${log_file}" \
+    "cargo test -p frankenterm-core --no-default-features --features vendored,asupersync-runtime --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback target_dir=${target_dir}" \
+    env FT_REAL_WEZTERM_TESTS=1 \
+    CARGO_TARGET_DIR="${target_dir}" \
+    cargo test -p frankenterm-core --no-default-features --features vendored,asupersync-runtime \
+      --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback -- --nocapture
+}
+
 require_cmd jq
 require_cmd rch
 
@@ -198,13 +212,18 @@ BUILD_LOG="${ARTIFACT_DIR}/loopback_test.log"
 TEST_LOG="${BUILD_LOG}"
 status=0
 
-if ! run_rch_step "loopback.spawn_send_resize_read" "${TEST_LOG}" \
-  "cargo test -p frankenterm-core --no-default-features --features vendored,asupersync-runtime --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback" \
-  env FT_REAL_WEZTERM_TESTS=1 \
-  CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-  cargo test -p frankenterm-core --no-default-features --features vendored,asupersync-runtime \
-    --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback -- --nocapture; then
+if ! run_loopback_test "loopback.spawn_send_resize_read" "${TEST_LOG}" "${REMOTE_TARGET_DIR}"; then
   status=1
+  if [[ "$(failure_reason_for_log "${TEST_LOG}")" == "rch_infrastructure_cargo_dep_info_missing" ]]; then
+    RETRY_TEST_LOG="${ARTIFACT_DIR}/loopback_test.retry.log"
+    RETRY_TARGET_DIR="${REMOTE_TARGET_DIR}-retry"
+    TEST_LOG="${RETRY_TEST_LOG}"
+    SUMMARY_REMOTE_TARGET_DIR="${RETRY_TARGET_DIR}"
+    if run_loopback_test "loopback.spawn_send_resize_read.retry_after_dep_info_loss" \
+      "${RETRY_TEST_LOG}" "${RETRY_TARGET_DIR}"; then
+      status=0
+    fi
+  fi
 fi
 
 if [[ "${status}" -eq 0 ]]; then
