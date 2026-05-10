@@ -50689,6 +50689,75 @@ mod tests {
         }
     }
 
+    fn test_health_snapshot_with_swarm_capacity(
+        summary: frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary,
+    ) -> frankenterm_core::crash::HealthSnapshot {
+        frankenterm_core::crash::HealthSnapshot {
+            timestamp: 1_700_000_050_000,
+            observed_panes: 0,
+            capture_queue_depth: 0,
+            write_queue_depth: 0,
+            last_seq_by_pane: Vec::new(),
+            warnings: Vec::new(),
+            ingest_lag_avg_ms: 0.0,
+            ingest_lag_max_ms: 0,
+            db_writable: true,
+            db_last_write_at: Some(1_700_000_049_999),
+            pane_priority_overrides: Vec::new(),
+            scheduler: None,
+            backpressure_tier: None,
+            last_activity_by_pane: Vec::new(),
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
+            fleet_pressure_tier: None,
+            swarm_capacity: Some(summary),
+            leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
+        }
+    }
+
+    fn normalize_integral_toon_numbers(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    normalize_integral_toon_numbers(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (_, nested) in map.iter_mut() {
+                    normalize_integral_toon_numbers(nested);
+                }
+            }
+            serde_json::Value::Number(number) => {
+                // toon_rust currently decodes numbers as floats; normalize integral floats back
+                // to integers so comparisons against serde_json::to_value(...) are stable.
+                if let Some(float) = number.as_f64() {
+                    #[allow(clippy::cast_precision_loss)]
+                    let max_u64 = u64::MAX as f64;
+                    if float.fract() == 0.0 && float >= 0.0 && float <= max_u64 {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let as_u64 = float as u64;
+                        *value = serde_json::Value::Number(serde_json::Number::from(as_u64));
+                    }
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+            }
+        }
+    }
+
+    fn toon_roundtrip_json(value: &serde_json::Value) -> serde_json::Value {
+        let toon = toon_rust::encode(value.clone(), None);
+        let decoded = toon_rust::try_decode(&toon, None).expect("TOON decodes");
+        let json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+        let mut decoded_value: serde_json::Value =
+            serde_json::from_str(&json).expect("decoded TOON JSON parses");
+        normalize_integral_toon_numbers(&mut decoded_value);
+        decoded_value
+    }
+
     fn setup_session_show_test_db() -> (String, rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("create session show tempdir");
         let db_path = dir.path().join("session-show.db");
@@ -68783,6 +68852,111 @@ A  docs/new-proof.md\n";
 
         assert_eq!(overall, "ok");
         assert!(!has_errors);
+    }
+
+    #[test]
+    fn doctor_swarm_capacity_json_exposes_v1_cockpit_after_level_upgrade_ft_rz0eb_3() {
+        let stored_level_one =
+            frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable(
+                1_700_000_050_001,
+                1,
+                "test.health_snapshot.level_one",
+            );
+        assert!(stored_level_one.resource_cockpit.is_none());
+        let snapshot = test_health_snapshot_with_swarm_capacity(stored_level_one);
+        let summary = swarm_capacity_summary_from_health_snapshot(&snapshot, 2);
+        let mut result = serde_json::json!({
+            "ok": true,
+            "status": "ok",
+            "version": "0.1.0",
+            "checks": [],
+        });
+        result["swarm_capacity"] =
+            serde_json::to_value(&summary).expect("swarm capacity serializes");
+
+        let cockpit = &result["swarm_capacity"]["resource_cockpit"];
+        assert_eq!(result["swarm_capacity"]["transparency_level"], 2);
+        assert_eq!(
+            cockpit["contract_id"],
+            frankenterm_core::runtime_telemetry::SWARM_RESOURCE_COCKPIT_CONTRACT_ID
+        );
+        assert_eq!(cockpit["evidence_state"], "unavailable");
+        for key in [
+            "domains",
+            "run_identity",
+            "residency_buckets",
+            "queue_backpressure",
+            "admission_decisions",
+            "action_receipts",
+            "artifact_paths",
+        ] {
+            assert!(
+                cockpit.get(key).is_some(),
+                "doctor JSON cockpit missing {key}"
+            );
+        }
+        assert_eq!(
+            cockpit["domains"]["rss_residency"]["evidence_state"],
+            "unavailable"
+        );
+        assert!(cockpit["residency_buckets"].is_array());
+        assert!(cockpit["action_receipts"].is_array());
+
+        let rows = summary
+            .resource_cockpit
+            .as_ref()
+            .expect("cockpit attached")
+            .compact_table_rows();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("proof_gate=skipped_proof")),
+            "doctor plain compact rows should preserve cockpit status: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn robot_capacity_level_two_json_and_toon_preserve_v1_cockpit_ft_rz0eb_3() {
+        let stored_level_one =
+            frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable(
+                1_700_000_050_101,
+                1,
+                "test.robot_snapshot.level_one",
+            );
+        let snapshot = test_health_snapshot_with_swarm_capacity(stored_level_one);
+        let summary = swarm_capacity_summary_from_health_snapshot(&snapshot, 2);
+        let response = RobotResponse::success(summary, 17);
+        let json_value = serde_json::to_value(&response).expect("robot response serializes");
+
+        assert_eq!(json_value["ok"], true);
+        assert_eq!(json_value["data"]["transparency_level"], 2);
+        assert_eq!(
+            json_value["data"]["resource_cockpit"]["contract_id"],
+            frankenterm_core::runtime_telemetry::SWARM_RESOURCE_COCKPIT_CONTRACT_ID
+        );
+        assert!(json_value["data"]["resource_cockpit"]["domains"].is_object());
+        assert!(json_value["data"]["resource_cockpit"]["action_receipts"].is_array());
+        assert!(json_value["data"]["resource_cockpit"]["residency_buckets"].is_array());
+
+        let toon = toon_rust::encode(json_value.clone(), None);
+        for needle in [
+            "resource_cockpit",
+            "contract_id",
+            "residency_buckets",
+            "action_receipts",
+            "rss_residency",
+        ] {
+            assert!(toon.contains(needle), "TOON missing {needle}\n{toon}");
+        }
+
+        let roundtripped = toon_roundtrip_json(&json_value);
+        assert_eq!(
+            roundtripped["data"]["resource_cockpit"]["contract_id"],
+            json_value["data"]["resource_cockpit"]["contract_id"]
+        );
+        assert_eq!(
+            roundtripped["data"]["resource_cockpit"]["domains"]["rss_residency"]["evidence_state"],
+            "unavailable"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

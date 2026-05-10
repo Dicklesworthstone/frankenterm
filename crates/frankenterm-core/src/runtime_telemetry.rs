@@ -7348,6 +7348,12 @@ impl SwarmCapacityOperatorSummary {
         }
         if level < 2 {
             summary.resource_cockpit = None;
+        } else if summary.resource_cockpit.is_none() {
+            summary.resource_cockpit = Some(SwarmResourceCockpitSnapshot::from_capacity_summary(
+                &summary,
+                None,
+                &[],
+            ));
         }
         summary
     }
@@ -15760,6 +15766,33 @@ mod tests {
                 .proof_gate,
             SwarmResourceCockpitProofGate::SkippedProof
         );
+    }
+
+    #[test]
+    fn swarm_capacity_transparency_upgrade_attaches_v1_cockpit_ft_rz0eb_3() {
+        let level_one =
+            SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 1, "test.missing");
+        assert!(level_one.resource_cockpit.is_none());
+
+        let upgraded = level_one.with_transparency_level(2);
+        let cockpit = upgraded
+            .resource_cockpit
+            .as_ref()
+            .expect("level 2 surface must expose resource cockpit");
+        let json = serde_json::to_value(&upgraded).expect("summary serializes");
+
+        assert_eq!(upgraded.transparency_level, 2);
+        assert_eq!(cockpit.contract_id, SWARM_RESOURCE_COCKPIT_CONTRACT_ID);
+        assert_eq!(
+            json["resource_cockpit"]["contract_id"],
+            SWARM_RESOURCE_COCKPIT_CONTRACT_ID
+        );
+        assert_eq!(
+            json["resource_cockpit"]["domains"]["rss_residency"]["evidence_state"],
+            "unavailable"
+        );
+        assert!(json["resource_cockpit"]["residency_buckets"].is_array());
+        assert!(json["resource_cockpit"]["action_receipts"].is_array());
     }
 
     fn cockpit_domain_for_test(
