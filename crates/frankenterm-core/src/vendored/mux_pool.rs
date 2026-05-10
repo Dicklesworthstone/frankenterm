@@ -38,7 +38,10 @@ use crate::runtime_async::sleep;
 use super::mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind,
 };
-use codec::{GetLinesResponse, GetPaneRenderChangesResponse, ListPanesResponse, UnitResponse};
+use codec::{
+    GetLinesResponse, GetPaneRenderChangesResponse, ListPanesResponse, SpawnResponse, SpawnV2,
+    SplitPane, UnitResponse,
+};
 
 /// Error type for mux pool operations.
 #[derive(Debug, thiserror::Error)]
@@ -390,6 +393,54 @@ impl MuxPool {
         self.execute_with_recovery_with_cx(cx, "list_panes", move |client| {
             let op_cx = op_cx.clone();
             Box::pin(async move { client.list_panes_with_cx(&op_cx).await })
+        })
+        .await
+    }
+
+    /// Spawn a new mux pane/tab through a pooled connection.
+    pub async fn spawn_v2(&self, spawn: SpawnV2) -> Result<SpawnResponse, MuxPoolError> {
+        self.execute_with_recovery("spawn_v2", move |client| {
+            let spawn = spawn.clone();
+            Box::pin(client.spawn_v2(spawn))
+        })
+        .await
+    }
+
+    /// Spawn a new mux pane/tab through a pooled connection using explicit `Cx`.
+    pub async fn spawn_v2_with_cx(
+        &self,
+        cx: &Cx,
+        spawn: SpawnV2,
+    ) -> Result<SpawnResponse, MuxPoolError> {
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(cx, "spawn_v2", move |client| {
+            let spawn = spawn.clone();
+            let op_cx = op_cx.clone();
+            Box::pin(async move { client.spawn_v2_with_cx(&op_cx, spawn).await })
+        })
+        .await
+    }
+
+    /// Split an existing pane through a pooled connection.
+    pub async fn split_pane(&self, split: SplitPane) -> Result<SpawnResponse, MuxPoolError> {
+        self.execute_with_recovery("split_pane", move |client| {
+            let split = split.clone();
+            Box::pin(client.split_pane(split))
+        })
+        .await
+    }
+
+    /// Split an existing pane through a pooled connection using explicit `Cx`.
+    pub async fn split_pane_with_cx(
+        &self,
+        cx: &Cx,
+        split: SplitPane,
+    ) -> Result<SpawnResponse, MuxPoolError> {
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(cx, "split_pane", move |client| {
+            let split = split.clone();
+            let op_cx = op_cx.clone();
+            Box::pin(async move { client.split_pane_with_cx(&op_cx, split).await })
         })
         .await
     }

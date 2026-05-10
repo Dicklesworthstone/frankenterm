@@ -1064,6 +1064,88 @@ impl WeztermClient {
         self
     }
 
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_pane_id(pane_id: u64, operation: &str) -> Result<usize> {
+        pane_id.try_into().map_err(|_| {
+            WeztermError::CommandFailed(format!(
+                "{operation}: pane id {pane_id} does not fit mux protocol"
+            ))
+            .into()
+        })
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_window_id(target: SpawnTarget) -> Result<Option<usize>> {
+        if target.new_window {
+            return Ok(None);
+        }
+        target
+            .window_id
+            .map(|window_id| {
+                window_id.try_into().map_err(|_| {
+                    WeztermError::CommandFailed(format!(
+                        "spawn: window id {window_id} does not fit mux protocol"
+                    ))
+                    .into()
+                })
+            })
+            .transpose()
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_domain(domain_name: Option<&str>) -> config::keyassignment::SpawnTabDomain {
+        match domain_name {
+            Some(domain) => config::keyassignment::SpawnTabDomain::DomainName(domain.to_string()),
+            None => config::keyassignment::SpawnTabDomain::DefaultDomain,
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_spawn_request(
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> Result<codec::SpawnV2> {
+        Ok(codec::SpawnV2 {
+            domain: Self::mux_domain(domain_name),
+            window_id: Self::mux_window_id(target)?,
+            command: None,
+            command_dir: cwd.map(str::to_string),
+            size: frankenterm_term::TerminalSize::default(),
+            workspace: mux::DEFAULT_WORKSPACE.to_string(),
+        })
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_split_request(
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        percent: Option<u8>,
+    ) -> Result<codec::SplitPane> {
+        let (direction, target_is_second) = match direction {
+            SplitDirection::Left => (mux::tab::SplitDirection::Horizontal, false),
+            SplitDirection::Right => (mux::tab::SplitDirection::Horizontal, true),
+            SplitDirection::Top => (mux::tab::SplitDirection::Vertical, false),
+            SplitDirection::Bottom => (mux::tab::SplitDirection::Vertical, true),
+        };
+        Ok(codec::SplitPane {
+            pane_id: Self::mux_pane_id(pane_id, "split_pane")?,
+            split_request: mux::tab::SplitRequest {
+                direction,
+                target_is_second,
+                top_level: false,
+                size: percent
+                    .map(|pct| mux::tab::SplitSize::Percent(pct.clamp(10, 90)))
+                    .unwrap_or_default(),
+            },
+            command: None,
+            command_dir: cwd.map(str::to_string),
+            domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+            move_pane_id: None,
+        })
+    }
+
     /// Configure circuit breaker settings.
     #[must_use]
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
@@ -1784,6 +1866,29 @@ impl WeztermClient {
         domain_name: Option<&str>,
         target: SpawnTarget,
     ) -> Result<u64> {
+        #[cfg(all(feature = "vendored", unix))]
+        if let Some(ref pool) = self.mux_pool {
+            if self.mux_circuit_guard() {
+                let spawn = Self::mux_spawn_request(cwd, domain_name, target)?;
+                match pool.spawn_v2(spawn).await {
+                    Ok(response) => {
+                        self.mux_circuit_record_success();
+                        return Ok(response.pane_id as u64);
+                    }
+                    Err(e) => {
+                        self.mux_circuit_record_failure(&e);
+                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                            return Err(Self::mux_cancelled_error("spawn_targeted", e));
+                        }
+                        tracing::debug!(
+                            error = %e,
+                            "mux pool spawn_targeted failed, falling back to CLI"
+                        );
+                    }
+                }
+            }
+        }
+
         let mut args = vec!["cli", "spawn"];
 
         let window_id_arg;
@@ -1826,6 +1931,29 @@ impl WeztermClient {
         domain_name: Option<&str>,
         target: SpawnTarget,
     ) -> Result<u64> {
+        #[cfg(all(feature = "vendored", unix))]
+        if let Some(ref pool) = self.mux_pool {
+            if self.mux_circuit_guard() {
+                let spawn = Self::mux_spawn_request(cwd, domain_name, target)?;
+                match pool.spawn_v2_with_cx(cx, spawn).await {
+                    Ok(response) => {
+                        self.mux_circuit_record_success();
+                        return Ok(response.pane_id as u64);
+                    }
+                    Err(e) => {
+                        self.mux_circuit_record_failure(&e);
+                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                            return Err(Self::mux_cancelled_error("spawn_targeted_with_cx", e));
+                        }
+                        tracing::debug!(
+                            error = %e,
+                            "mux pool spawn_targeted_with_cx failed, falling back to CLI"
+                        );
+                    }
+                }
+            }
+        }
+
         let mut args = vec!["cli", "spawn"];
 
         let window_id_arg;
@@ -1870,6 +1998,29 @@ impl WeztermClient {
         cwd: Option<&str>,
         percent: Option<u8>,
     ) -> Result<u64> {
+        #[cfg(all(feature = "vendored", unix))]
+        if let Some(ref pool) = self.mux_pool {
+            if self.mux_circuit_guard() {
+                let split = Self::mux_split_request(pane_id, direction, cwd, percent)?;
+                match pool.split_pane(split).await {
+                    Ok(response) => {
+                        self.mux_circuit_record_success();
+                        return Ok(response.pane_id as u64);
+                    }
+                    Err(e) => {
+                        self.mux_circuit_record_failure(&e);
+                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                            return Err(Self::mux_cancelled_error("split_pane", e));
+                        }
+                        tracing::debug!(
+                            error = %e,
+                            "mux pool split_pane failed, falling back to CLI"
+                        );
+                    }
+                }
+            }
+        }
+
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "split-pane", "--pane-id", &pane_id_str];
 
@@ -1916,6 +2067,29 @@ impl WeztermClient {
         cwd: Option<&str>,
         percent: Option<u8>,
     ) -> Result<u64> {
+        #[cfg(all(feature = "vendored", unix))]
+        if let Some(ref pool) = self.mux_pool {
+            if self.mux_circuit_guard() {
+                let split = Self::mux_split_request(pane_id, direction, cwd, percent)?;
+                match pool.split_pane_with_cx(cx, split).await {
+                    Ok(response) => {
+                        self.mux_circuit_record_success();
+                        return Ok(response.pane_id as u64);
+                    }
+                    Err(e) => {
+                        self.mux_circuit_record_failure(&e);
+                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                            return Err(Self::mux_cancelled_error("split_pane_with_cx", e));
+                        }
+                        tracing::debug!(
+                            error = %e,
+                            "mux pool split_pane_with_cx failed, falling back to CLI"
+                        );
+                    }
+                }
+            }
+        }
+
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "split-pane", "--pane-id", &pane_id_str];
 

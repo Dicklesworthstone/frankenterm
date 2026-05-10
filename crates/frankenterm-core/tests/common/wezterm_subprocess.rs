@@ -14,8 +14,9 @@
 //!   before falling back to a system `wezterm-mux-server`.
 //!
 //! Returns a real `WeztermClient` configured `with_socket(...)` against the
-//! hermetic socket. CLI subprocesses spawned by the client inherit the
-//! `WEZTERM_UNIX_SOCKET` env var (see wezterm.rs:2148).
+//! hermetic socket. When the vendored mux backend is available, the client is
+//! also given a direct mux pool so tests do not depend on a system `wezterm`
+//! CLI binary.
 //!
 //! ## Usage
 //! ```ignore
@@ -205,11 +206,24 @@ impl WeztermSubprocessFixture {
         self.home_dir.path()
     }
 
-    /// Construct a real `WeztermClient` pointed at the hermetic socket. The
-    /// client passes `WEZTERM_UNIX_SOCKET` to every spawned wezterm CLI
-    /// subprocess (see frankenterm_core::wezterm::WeztermClient::with_socket).
+    /// Construct a real `WeztermClient` pointed at the hermetic socket.
     pub fn client(&self) -> WeztermClient {
-        WeztermClient::with_socket(self.socket_path.display().to_string())
+        let client = WeztermClient::with_socket(self.socket_path.display().to_string());
+        #[cfg(all(feature = "vendored", unix))]
+        {
+            let pool = frankenterm_core::vendored::MuxPoolConfig {
+                mux: frankenterm_core::vendored::DirectMuxClientConfig::default()
+                    .with_socket_path(self.socket_path.clone()),
+                ..frankenterm_core::vendored::MuxPoolConfig::default()
+            };
+            client.with_mux_pool(std::sync::Arc::new(
+                frankenterm_core::vendored::MuxPool::new(pool),
+            ))
+        }
+        #[cfg(not(all(feature = "vendored", unix)))]
+        {
+            client
+        }
     }
 
     /// Construct a `WeztermHandle` (`Arc<dyn MuxInterface>`) for tests that
