@@ -1,0 +1,188 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "ft-e87u6.14",
+  "generated_at": "2026-05-09T22:24:57Z",
+  "generator": "scripts/stamp-readme-counts.sh --json",
+  "source": {
+    "script": "scripts/stamp-readme-counts.sh",
+    "docs": [
+      "README.md",
+      "AGENTS.md"
+    ]
+  },
+  "check": {
+    "status": "passed",
+    "strict": false,
+    "threshold_pct": 5
+  },
+  "summary": {
+    "tracked_counts": 7,
+    "placeholder_occurrences": 6,
+    "missing_placeholders": 8,
+    "matching_placeholders": 6,
+    "within_threshold_placeholders": 0,
+    "violation_count": 0
+  },
+  "counts": [
+    {
+      "name": "workspace_members",
+      "command": "awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"'",
+      "live_value": 74,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "placeholder_present": true,
+          "documented_value": 74,
+          "live_value": 74,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "vendored_members",
+      "command": "awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"frankenterm/'",
+      "live_value": 47,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        },
+        {
+          "path": "AGENTS.md",
+          "placeholder_present": true,
+          "documented_value": 47,
+          "live_value": 47,
+          "drift_pct": 0,
+          "status": "matches"
+        }
+      ]
+    },
+    {
+      "name": "vendored_top_level",
+      "command": "find frankenterm -maxdepth 2 -name Cargo.toml | wc -l",
+      "live_value": 42,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        },
+        {
+          "path": "AGENTS.md",
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "core_subcrates",
+      "command": "ls -d crates/frankenterm-core-* | wc -l",
+      "live_value": 19,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "placeholder_present": true,
+          "documented_value": 19,
+          "live_value": 19,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "core_top_level_modules",
+      "command": "find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l",
+      "live_value": 504,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "placeholder_present": true,
+          "documented_value": 504,
+          "live_value": 504,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "core_loc",
+      "command": "find crates/frankenterm-core/src -name '*.rs' -exec cat {} + | wc -l",
+      "live_value": 983357,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "placeholder_present": true,
+          "documented_value": 983357,
+          "live_value": 983357,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "test_count",
+      "command": "grep -rE '^[[:space:]]*#\\[(test|tokio::test|asupersync_test::test)' crates/ | wc -l",
+      "live_value": 55188,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "placeholder_present": true,
+          "documented_value": 55188,
+          "live_value": 55188,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    }
+  ]
+}
