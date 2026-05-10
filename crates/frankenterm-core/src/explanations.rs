@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn suggestions_are_actionable() {
-        for (_id, template) in EXPLANATION_TEMPLATES.iter() {
+        for template in EXPLANATION_TEMPLATES.values() {
             for suggestion in template.suggestions {
                 // Suggestions should start with a verb or "Use"
                 let first_word = suggestion.split_whitespace().next().unwrap_or("");
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn see_also_references_valid_commands() {
-        for (_id, template) in EXPLANATION_TEMPLATES.iter() {
+        for template in EXPLANATION_TEMPLATES.values() {
             for reference in template.see_also {
                 // Should be a wa command or external tool
                 assert!(
@@ -1082,7 +1082,7 @@ mod tests {
 
     #[test]
     fn all_templates_serialize_roundtrip_to_json() {
-        for (_id, template) in EXPLANATION_TEMPLATES.iter() {
+        for template in EXPLANATION_TEMPLATES.values() {
             let json = serde_json::to_string(template);
             assert!(
                 json.is_ok(),
@@ -1256,7 +1256,7 @@ mod tests {
 
     #[test]
     fn detailed_text_has_reasonable_length() {
-        for (_id, template) in EXPLANATION_TEMPLATES.iter() {
+        for template in EXPLANATION_TEMPLATES.values() {
             assert!(
                 template.detailed.len() >= 50,
                 "Template '{}' detailed text too short ({} chars)",

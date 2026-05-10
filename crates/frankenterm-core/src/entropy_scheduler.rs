@@ -510,7 +510,7 @@ mod tests {
         sched.register_pane(1);
         assert_eq!(sched.pane_count(), 1);
         // Data should still be there
-        assert!(sched.in_warmup(1) == Some(false)); // 1000 > 256
+        assert_eq!(sched.in_warmup(1), Some(false)); // 1000 > 256
     }
 
     #[test]

@@ -1003,7 +1003,7 @@ mod tests {
         let s = tracker.advance(&id, "audit", StepOutcome::Ok, "recorded");
         assert_eq!(s, Some(CompletionState::Completed));
 
-        assert!(tracker.state(&id) == Some(CompletionState::Completed));
+        assert_eq!(tracker.state(&id), Some(CompletionState::Completed));
         // Active count drops to 0 since the token is terminal.
         assert_eq!(tracker.active_count(), 0);
     }

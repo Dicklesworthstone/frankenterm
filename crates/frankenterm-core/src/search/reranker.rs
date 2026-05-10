@@ -1330,13 +1330,22 @@ mod tests {
 
     #[test]
     fn sanitize_nan_to_neg_infinity() {
-        assert!(sanitize_score(f32::NAN) == f32::NEG_INFINITY);
+        assert_eq!(
+            sanitize_score(f32::NAN).to_bits(),
+            f32::NEG_INFINITY.to_bits()
+        );
     }
 
     #[test]
     fn sanitize_infinity_to_neg_infinity() {
-        assert!(sanitize_score(f32::INFINITY) == f32::NEG_INFINITY);
-        assert!(sanitize_score(f32::NEG_INFINITY) == f32::NEG_INFINITY);
+        assert_eq!(
+            sanitize_score(f32::INFINITY).to_bits(),
+            f32::NEG_INFINITY.to_bits()
+        );
+        assert_eq!(
+            sanitize_score(f32::NEG_INFINITY).to_bits(),
+            f32::NEG_INFINITY.to_bits()
+        );
     }
 
     // =====================================================================

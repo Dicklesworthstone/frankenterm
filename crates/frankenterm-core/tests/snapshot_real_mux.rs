@@ -51,16 +51,15 @@ fn spawn_in_window(runtime: &RuntimeFixture, client: &WeztermClient, window_id: 
         .block_on({
             let client = client.clone();
             async move {
-                client
-                    .spawn_targeted(
-                        None,
-                        None,
-                        SpawnTarget {
-                            window_id: Some(window_id),
-                            new_window: false,
-                        },
-                    )
-                    .await
+                Box::pin(client.spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: Some(window_id),
+                        new_window: false,
+                    },
+                ))
+                .await
             }
         })
         .expect("spawn pane in fixture window")

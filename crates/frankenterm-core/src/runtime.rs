@@ -7794,7 +7794,7 @@ mod tests {
         let event = detection_to_stored_event(1, Some("uuid-abc"), &detection, Some(42));
         assert_eq!(event.severity, "critical");
         assert_eq!(event.segment_id, Some(42));
-        assert!(event.matched_text.as_deref() == Some("out of memory"));
+        assert_eq!(event.matched_text.as_deref(), Some("out of memory"));
         assert!(event.extracted.is_some());
     }
 

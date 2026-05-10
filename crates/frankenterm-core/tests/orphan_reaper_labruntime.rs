@@ -32,7 +32,7 @@ fn reap_orphans_async_returns_report() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let report: ReapReport = reap_orphans(999_999).await;
-        assert!(report.killed_pids.len() == report.killed);
+        assert_eq!(report.killed_pids.len(), report.killed);
     });
 }
 
@@ -41,7 +41,7 @@ fn reap_orphans_async_zero_max_age() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let report: ReapReport = reap_orphans(0).await;
-        assert!(report.killed_pids.len() == report.killed);
+        assert_eq!(report.killed_pids.len(), report.killed);
     });
 }
 

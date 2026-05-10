@@ -322,13 +322,9 @@ fn format_child_output(output: &str) -> String {
 }
 
 fn locate_current_mux_binary() -> Option<PathBuf> {
-    for candidate in mux_binary_candidates() {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    None
+    mux_binary_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 fn locate_system_mux_binary() -> Option<PathBuf> {

@@ -537,7 +537,7 @@ mod tests {
     fn rank_monotonically_increasing() {
         let data = b"abracadabra";
         let wt = WaveletTree::new(data);
-        for symbol in [b'a', b'b', b'c', b'd', b'r'] {
+        for symbol in *b"abcdr" {
             let mut prev = 0;
             for pos in 0..=data.len() {
                 let r = wt.rank(symbol, pos);

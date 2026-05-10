@@ -181,7 +181,7 @@ proptest! {
         positions.dedup();
 
         for &pos in &positions {
-            parts[pos] = format!("{} {} rest\n", &parts[pos].trim_end(), needle);
+            parts[pos] = format!("{} {} rest\n", parts[pos].trim_end(), needle);
         }
 
         let input: String = parts.join("");

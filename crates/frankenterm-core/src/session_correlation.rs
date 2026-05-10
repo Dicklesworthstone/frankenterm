@@ -916,7 +916,7 @@ mod tests {
 
         assert_eq!(result.status, CorrelationStatus::Unlinked);
         assert!(result.external_id.is_none());
-        assert!(result.confidence == 0.0);
+        assert_eq!(result.confidence.to_bits(), 0.0f64.to_bits());
     }
 
     #[test]

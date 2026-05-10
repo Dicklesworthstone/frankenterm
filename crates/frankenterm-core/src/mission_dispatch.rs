@@ -535,8 +535,8 @@ mod tests {
         assert_eq!(detection.event_type, "mission_dispatch");
         assert!((detection.confidence - 1.0).abs() < f64::EPSILON);
         assert_eq!(detection.severity, Severity::Info);
-        assert!(detection.extracted["assignment_id"] == "assign-42");
-        assert!(detection.extracted["target_agent"] == "agent-alpha");
+        assert_eq!(detection.extracted["assignment_id"], "assign-42");
+        assert_eq!(detection.extracted["target_agent"], "agent-alpha");
     }
 
     #[test]

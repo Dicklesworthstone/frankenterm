@@ -616,7 +616,7 @@ fn test_ci_gate_script_executable() {
         .join("ci_frankensqlite_gates.sh");
     let metadata = std::fs::metadata(&script).unwrap();
     let mode = metadata.permissions().mode();
-    assert!(mode & 0o111 != 0, "CI gate script should be executable");
+    assert_ne!(mode & 0o111, 0, "CI gate script should be executable");
 }
 
 #[test]

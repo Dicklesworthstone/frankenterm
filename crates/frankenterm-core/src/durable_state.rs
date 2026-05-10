@@ -1187,7 +1187,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(mgr.checkpoint_count(), 3);
-        assert!(mgr.rollback_history().len() == 1);
+        assert_eq!(mgr.rollback_history().len(), 1);
     }
 
     #[test]

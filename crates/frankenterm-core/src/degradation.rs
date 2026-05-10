@@ -1256,7 +1256,7 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].subsystem, Subsystem::DbWrite);
         assert_eq!(snapshots[0].level, "degraded");
-        assert!(snapshots[0].reason.as_deref() == Some("disk full"));
+        assert_eq!(snapshots[0].reason.as_deref(), Some("disk full"));
         assert!(snapshots[0].since_epoch_ms.is_some());
         assert!(snapshots[0].duration_ms.is_some());
     }

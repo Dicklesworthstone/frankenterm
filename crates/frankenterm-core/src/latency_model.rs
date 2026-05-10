@@ -1664,7 +1664,7 @@ mod tests {
         let analysis = analyze_frankenterm_pipeline(&profiles, &config);
         assert!(analysis.is_stable);
         assert!(analysis.max_delay_ms < 100.0); // < 100ms end-to-end
-        assert!(analysis.stages.len() == 3);
+        assert_eq!(analysis.stages.len(), 3);
     }
 
     #[test]

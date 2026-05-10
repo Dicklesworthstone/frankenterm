@@ -2693,7 +2693,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(request.summary, "Custom approval summary");
-            assert!(request.allow_once_code.len() == DEFAULT_CODE_LEN);
+            assert_eq!(request.allow_once_code.len(), DEFAULT_CODE_LEN);
 
             cleanup_storage(storage, &db_path).await;
         });

@@ -1601,7 +1601,7 @@ mod tests {
             det.observe(&v);
         }
         // With a tiny window, the detector should still function.
-        assert!(det.total_observations() == 10);
+        assert_eq!(det.total_observations(), 10);
     }
 
     #[test]
