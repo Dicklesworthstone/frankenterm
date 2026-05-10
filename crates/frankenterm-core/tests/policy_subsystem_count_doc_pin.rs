@@ -14,6 +14,48 @@ use frankenterm_core::runtime_health::{CheckStatus, RuntimeHealthCheck};
 
 const NOW_MS: u64 = 1_700_000_000_000;
 
+mod policy_subsystem_count {
+    use std::path::Path;
+
+    pub const README_POLICY_FRAMEWORK_PATTERN: &str = r"(\d+)-subsystem policy framework";
+
+    pub fn readme_extract(
+        readme_path: &Path,
+        readme: &str,
+        expected_count: usize,
+    ) -> Result<usize, String> {
+        let needle = format!("{expected_count}-subsystem policy framework");
+        if !readme.contains(&needle) {
+            return Err(format!(
+                "{} does not advertise '{needle}'; POLICY_SUBSYSTEM_COUNT = {expected_count}. Fix the README claim or update the diagnostics enumeration.",
+                readme_path.display(),
+            ));
+        }
+
+        let regex = regex::Regex::new(README_POLICY_FRAMEWORK_PATTERN).unwrap();
+        let mut matches = 0_usize;
+        for cap in regex.captures_iter(readme) {
+            matches += 1;
+            let n = cap[1].parse::<usize>().unwrap();
+            if n != expected_count {
+                return Err(format!(
+                    "{} cites {n} policy subsystems but runtime count is {expected_count}",
+                    readme_path.display(),
+                ));
+            }
+        }
+
+        if matches == 0 {
+            return Err(format!(
+                "{} must contain the policy framework subsystem headline",
+                readme_path.display(),
+            ));
+        }
+
+        Ok(matches)
+    }
+}
+
 fn readme_path() -> PathBuf {
     env::var_os("FT_5EQD4_README_PATH").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
@@ -60,35 +102,7 @@ fn validate_policy_subsystem_count(
     readme: &str,
     expected_count: usize,
 ) -> Result<usize, String> {
-    let needle = format!("{expected_count}-subsystem policy framework");
-    if !readme.contains(&needle) {
-        return Err(format!(
-            "{} does not advertise '{needle}'; POLICY_SUBSYSTEM_COUNT = {expected_count}. Fix the README claim or update the diagnostics enumeration.",
-            readme_path.display(),
-        ));
-    }
-
-    let regex = regex::Regex::new(r"(\d+)-subsystem policy framework").unwrap();
-    let mut matches = 0_usize;
-    for cap in regex.captures_iter(readme) {
-        matches += 1;
-        let n = cap[1].parse::<usize>().unwrap();
-        if n != expected_count {
-            return Err(format!(
-                "{} cites {n} policy subsystems but runtime count is {expected_count}",
-                readme_path.display(),
-            ));
-        }
-    }
-
-    if matches == 0 {
-        return Err(format!(
-            "{} must contain the policy framework subsystem headline",
-            readme_path.display(),
-        ));
-    }
-
-    Ok(matches)
+    policy_subsystem_count::readme_extract(readme_path, readme, expected_count)
 }
 
 fn assert_pinned_count_and_order(checks: &[RuntimeHealthCheck]) {
@@ -150,6 +164,22 @@ fn readme_policy_subsystem_count_matches_runtime() {
 }
 
 #[test]
+fn epic_convergence_reuses_readme_extract_helper() {
+    let (readme_path, readme) = read_readme();
+    let expected_count = expected_policy_subsystem_count();
+    let readme_matches =
+        policy_subsystem_count::readme_extract(&readme_path, &readme, expected_count)
+            .unwrap_or_else(|error| panic!("{error}"));
+    let mut engine = PolicyEngine::new(10, 100, true);
+    let checks = check_policy_engine_health(&mut engine, NOW_MS);
+    assert_pinned_count_and_order(&checks);
+    println!(
+        "epic_convergence policy_subsystem_count={expected_count} readme_matches={readme_matches} diagnostics_count={} helper=policy_subsystem_count::readme_extract",
+        checks.len(),
+    );
+}
+
+#[test]
 fn mutation_readme_wrong_number_is_rejected() {
     let expected_count = POLICY_SUBSYSTEM_COUNT;
     let wrong_count = expected_count + 1;
@@ -187,7 +217,9 @@ fn enumerate_returns_pinned_count() {
 
 #[test]
 fn policy_subsystem_count_under_fault_injection() {
+    let mut cases = 0_usize;
     for faulty_check_id in POLICY_DIAGNOSTIC_CHECK_IDS {
+        cases += 1;
         let mut engine = PolicyEngine::new(10, 100, true);
         let checks =
             check_policy_engine_health_with_injected_fault(&mut engine, NOW_MS, faulty_check_id);
@@ -226,4 +258,7 @@ fn policy_subsystem_count_under_fault_injection() {
             "fault injection target {faulty_check_id} was not present in diagnostics output",
         );
     }
+    println!(
+        "fault_injection_count_invariance=passed cases={cases} policy_subsystem_count={POLICY_SUBSYSTEM_COUNT}",
+    );
 }

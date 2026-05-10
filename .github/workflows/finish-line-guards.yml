@@ -162,6 +162,23 @@ jobs:
             exit 1
           fi
 
+      - name: Run ft-5eqd4.5 policy count epic convergence E2E
+        run: bash tests/e2e/test_ft_5eqd4_5_epic_convergence.sh
+
+      - name: Assert ft-5eqd4.5 policy convergence emitted no failed rows
+        if: always()
+        run: |
+          shopt -s nullglob
+          logs=(tests/e2e/artifacts/goal-line/ft-5eqd4/convergence/*/structured.log)
+          if [[ ${#logs[@]} -eq 0 ]]; then
+            echo "No ft-5eqd4.5 structured.log files found" >&2
+            exit 1
+          fi
+          if jq -e 'select(.outcome == "failed")' "${logs[@]}" >/dev/null; then
+            echo "ft-5eqd4.5 policy convergence harness emitted failed rows" >&2
+            exit 1
+          fi
+
       - name: Upload E2E artifact bundle
         if: always()
         uses: actions/upload-artifact@v4
@@ -177,5 +194,14 @@ jobs:
         with:
           name: ft-5eqd4-4-policy-count-doc-pin
           path: tests/e2e/artifacts/goal-line/ft-5eqd4/policy_count_doc_pin/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload ft-5eqd4.5 policy convergence artifact bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ft-5eqd4-5-policy-convergence
+          path: tests/e2e/artifacts/goal-line/ft-5eqd4/convergence/
           if-no-files-found: error
           retention-days: 30
