@@ -158,6 +158,14 @@ fn kind_counts(actions: &[Action]) -> BTreeMap<&'static str, usize> {
     counts
 }
 
+fn coalesce_print_actions(actions: Vec<Action>) -> Vec<Action> {
+    let mut coalesced = Vec::with_capacity(actions.len());
+    for action in actions {
+        action.append_to(&mut coalesced);
+    }
+    coalesced
+}
+
 fn assert_expected_actions(scenario_id: &str, actions: &[Action], expected: &Value) -> TestResult {
     let min_actions = expected
         .get("min_actions")
@@ -351,7 +359,7 @@ fn terminal_conformance_transcripts_match_expected_actions() -> TestResult {
         let input = decode_hex(scenario_id, &input_path)?;
         assert_expected_input(scenario_id, &input, &expected)?;
         let mut parser = Parser::new();
-        let actions = parser.parse_as_vec(&input);
+        let actions = coalesce_print_actions(parser.parse_as_vec(&input));
         assert_expected_actions(scenario_id, &actions, &expected)?;
     }
     Ok(())
