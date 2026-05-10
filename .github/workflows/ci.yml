@@ -359,6 +359,7 @@ jobs:
     timeout-minutes: 25
     env:
       GPU_HARNESS_RUN_DIR: target/gpu-regression/macos-15
+      GPU_HARNESS_GITHUB_ACTIONS_LOCAL_CARGO: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -400,6 +401,7 @@ jobs:
       GPU_PILOT_FIXTURES: text-basic-paragraph,text-box-drawing,cursor-block-steady,selection-word,overlay-visual-mode
       GPU_LINUX_GOLDEN_ROOT: target/gpu-regression/linux-llvmpipe-goldens
       GPU_LINUX_VS_MACOS_ARTIFACT_DIR: target/gpu-regression/linux-vs-macos
+      GPU_HARNESS_GITHUB_ACTIONS_LOCAL_CARGO: "1"
       FT_GPU_HARNESS_FORCE_SOFTWARE: "1"
       FT_GPU_HARNESS_EXPECT_SOFTWARE: "1"
       FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING: llvmpipe
