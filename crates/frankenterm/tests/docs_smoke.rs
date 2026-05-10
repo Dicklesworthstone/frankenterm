@@ -55,6 +55,25 @@ fn repo_file(relative: &str) -> PathBuf {
         .join(relative)
 }
 
+fn read_repo_doc(relative: &str) -> String {
+    fs::read_to_string(repo_file(relative)).unwrap_or_else(|err| panic!("read {relative}: {err}"))
+}
+
+fn assert_contains_all(label: &str, text: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(text.contains(needle), "{label} should contain `{needle}`");
+    }
+}
+
+fn assert_excludes_all(label: &str, text: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            !text.contains(needle),
+            "{label} should not contain stale or forbidden text `{needle}`"
+        );
+    }
+}
+
 fn save_artifact(name: &str, content: &str) {
     let dir = artifact_dir();
     let path = dir.join(name);
@@ -228,9 +247,8 @@ fn smoke_ft_robot_quick_start() {
 
 #[test]
 fn install_docs_use_package_name_and_bin() {
-    let readme = fs::read_to_string(repo_file("README.md")).expect("read README");
-    let remote_setup =
-        fs::read_to_string(repo_file("docs/remote-setup-spec.md")).expect("read remote setup spec");
+    let readme = read_repo_doc("README.md");
+    let remote_setup = read_repo_doc("docs/remote-setup-spec.md");
 
     let wrong = "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft";
     let correct = "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm";
@@ -247,6 +265,169 @@ fn install_docs_use_package_name_and_bin() {
         remote_setup.contains(correct),
         "remote setup spec should use the explicit package+bin cargo install command"
     );
+}
+
+#[test]
+fn resource_pressure_cockpit_docs_truth_gate() {
+    const CONFORMANCE_SUMMARY: &str = "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json";
+
+    let readme = read_repo_doc("README.md");
+    let contract = read_repo_doc("docs/resource-pressure-cockpit-contract.md");
+    let high_core = read_repo_doc("docs/high-core-swarm-runbook.md");
+    let operator_playbook = read_repo_doc("docs/operator-playbook.md");
+    let operator_runbook = read_repo_doc("docs/operator-runbook.md");
+    let release_checklist = read_repo_doc("docs/release/checklist.md");
+    let provenance = read_repo_doc("docs/json-schema/PROVENANCE.md");
+    let schema = read_repo_doc("docs/json-schema/ft-resource-pressure-cockpit.json");
+
+    assert_contains_all(
+        "resource cockpit contract",
+        &contract,
+        &[
+            CONFORMANCE_SUMMARY,
+            "`run_identity`",
+            "`domains`",
+            "`residency_buckets`",
+            "`queue_backpressure`",
+            "`admission_decisions`",
+            "`action_receipts`",
+            "`artifact_paths`",
+            "`remote_reduced = \"passed\"`",
+            "`target_hardware = \"skipped_not_proven\"`",
+            "`sqlite_page_cache`",
+            "`scrollback_cache`",
+        ],
+    );
+    assert_excludes_all(
+        "resource cockpit contract",
+        &contract,
+        &[
+            "`sqlite_cache`",
+            "`scrollback_tiers`",
+            "| `allocator_pools` |",
+        ],
+    );
+
+    assert_contains_all(
+        "high-core runbook cockpit section",
+        &high_core,
+        &[
+            CONFORMANCE_SUMMARY,
+            "`run_identity`",
+            "`domains`",
+            "`residency_buckets`",
+            "`queue_backpressure`",
+            "`admission_decisions`",
+            "`action_receipts`",
+            "`artifact_paths`",
+            "resource_pressure_cockpit_docs_truth_gate",
+        ],
+    );
+    assert_excludes_all(
+        "high-core runbook cockpit section",
+        &high_core,
+        &[
+            "slowest_latency_cohorts",
+            "resource_admission_decisions",
+            ".resource_cockpit.memory_pressure",
+            ".resource_cockpit.memory_tiers",
+        ],
+    );
+
+    assert_contains_all(
+        "operator memory guidance",
+        &operator_playbook,
+        &[
+            CONFORMANCE_SUMMARY,
+            "`rust_heap`",
+            "`mmap_file_backed`",
+            "`sqlite_page_cache`",
+            "`graphics_media`",
+            "`scrollback_cache`",
+            "`child_processes`",
+            "`unknown`",
+            "`domains.rss_residency`",
+            "`domains.storage_io`",
+            "`domains.action_receipts`",
+            "`action_receipts`",
+            "`artifact_paths`",
+        ],
+    );
+
+    assert_contains_all(
+        "README cockpit truth",
+        &readme,
+        &[
+            "retained remote-reduced conformance artifact",
+            "`rust_heap`",
+            "`sqlite_page_cache`",
+            "`scrollback_cache`",
+            "`action_receipts`",
+            "`skipped_not_proven`",
+        ],
+    );
+
+    assert_contains_all(
+        "release and provenance docs",
+        &(release_checklist.clone() + "\n" + &provenance),
+        &[CONFORMANCE_SUMMARY, "target hardware", "RCH"],
+    );
+
+    let parsed_schema: serde_json::Value =
+        serde_json::from_str(&schema).expect("resource cockpit schema should parse as JSON");
+    let bucket_enum = parsed_schema
+        .pointer("/$defs/residency_bucket/properties/bucket/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema should expose residency bucket enum");
+    for bucket in [
+        "rust_heap",
+        "mmap_file_backed",
+        "sqlite_page_cache",
+        "graphics_media",
+        "scrollback_cache",
+        "child_processes",
+        "unknown",
+    ] {
+        assert!(
+            bucket_enum
+                .iter()
+                .any(|value| value.as_str() == Some(bucket)),
+            "schema residency bucket enum should include {bucket}"
+        );
+    }
+
+    let live_docs = [
+        ("README.md", readme.as_str()),
+        (
+            "docs/resource-pressure-cockpit-contract.md",
+            contract.as_str(),
+        ),
+        ("docs/high-core-swarm-runbook.md", high_core.as_str()),
+        ("docs/operator-playbook.md", operator_playbook.as_str()),
+        ("docs/operator-runbook.md", operator_runbook.as_str()),
+        ("docs/release/checklist.md", release_checklist.as_str()),
+        ("docs/json-schema/PROVENANCE.md", provenance.as_str()),
+    ];
+    let legacy_branch = ["mas", "ter"].concat();
+    let legacy_branch_patterns = [
+        format!("origin/{legacy_branch}"),
+        format!("main:{legacy_branch}"),
+        format!("`{legacy_branch}` branch"),
+        format!("branch `{legacy_branch}`"),
+        format!("branch is `{legacy_branch}`"),
+        format!("on {legacy_branch}"),
+        format!("to {legacy_branch}"),
+        format!("from {legacy_branch}"),
+        format!("{legacy_branch} branch"),
+    ];
+    for (path, doc) in live_docs {
+        for pattern in &legacy_branch_patterns {
+            assert!(
+                !doc.contains(pattern),
+                "{path} should not contain legacy branch text `{pattern}`"
+            );
+        }
+    }
 }
 
 #[test]

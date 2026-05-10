@@ -202,12 +202,13 @@ heap <pid> > /tmp/frankenterm-<pid>.heap.txt
 
 | Bucket | Evidence to look for | Next move |
 | --- | --- | --- |
-| Rust heap | `heap` growth, allocator buckets, long-lived Rust structures | File a heap-retention issue with sample + heap output. |
-| mmap/file-backed residency | `vmmap` file mappings, SQLite/Tantivy/cold-tier mappings | Check cache pressure and whether RSS is reclaimable file-backed memory. |
-| Graphics/media residency | GPU, image, font, or render/media segments | Use GUI/render runbooks before changing scrollback or heap code. |
-| Scrollback/cache growth | cockpit memory tiers, gap bursts, warm/cold tier pressure | Tune retention, capture cadence, or tier budgets with proof artifacts. |
-| Child processes | child RSS in `ps` tree | Attribute to the child before changing ft memory policy. |
-| Unknown | non-zero unknown cockpit row or unclassified `vmmap` regions | Add drilldown evidence; do not hide it under a generic leak label. |
+| `rust_heap` | `heap` growth, allocator buckets, long-lived Rust structures | File a heap-retention issue with sample + heap output. |
+| `mmap_file_backed` | `vmmap` file mappings, Tantivy/cold-tier mappings | Check cache pressure and whether RSS is reclaimable file-backed memory. |
+| `sqlite_page_cache` | SQLite mappings, page-cache residency, WAL/page-cache evidence | Check storage pressure before blaming heap or scrollback retention. |
+| `graphics_media` | GPU, image, font, or render/media segments | Use GUI/render runbooks before changing scrollback or heap code. |
+| `scrollback_cache` | cockpit memory tiers, gap bursts, warm/cold tier pressure | Tune retention, capture cadence, or tier budgets with proof artifacts. |
+| `child_processes` | child RSS in `ps` tree | Attribute to the child before changing ft memory policy. |
+| `unknown` | non-zero unknown cockpit row or unclassified `vmmap` regions | Add drilldown evidence; do not hide it under a generic leak label. |
 
 The resource-pressure cockpit contract is
 `docs/resource-pressure-cockpit-contract.md`. The first reduced RCH proof lane is
@@ -215,6 +216,12 @@ The resource-pressure cockpit contract is
 it proves remote execution and artifact shape, but it deliberately leaves
 200-pane/high-scale claims as `skipped_not_proven` unless the host has at least
 64 logical CPUs and 256 GiB memory and a live cockpit artifact is retained.
+The retained v1 conformance summary at
+`tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`
+proves the schema/runtime lane at `remote_reduced` only. During memory
+incidents, also preserve `domains.rss_residency`, `domains.storage_io`,
+`domains.action_receipts`, `residency_buckets`, `action_receipts`, and
+`artifact_paths` from the live cockpit output.
 
 ---
 

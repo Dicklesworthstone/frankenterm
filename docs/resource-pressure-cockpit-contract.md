@@ -1,6 +1,7 @@
 # Resource Pressure Cockpit Contract
 
-Status: contract for `ft-p3457.1`; implementation follow-up required
+Status: v1 contract with retained remote-reduced conformance proof; target-hardware
+proof still required for high-scale claims
 
 This document defines the versioned operator-facing contract for the resource
 pressure cockpit. The cockpit is the single shape that future `ft doctor`,
@@ -13,6 +14,14 @@ pressure cockpit. The cockpit is the single shape that future `ft doctor`,
 
 The JSON schema sketch lives at
 `docs/json-schema/ft-resource-pressure-cockpit.json`.
+
+Current retained v1 conformance evidence lives at
+`tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`.
+That run passed local static checks and the remote-reduced schema/runtime lane,
+with remote Cargo, rustc, and test-binary execution observed on an RCH worker. It
+is the reference artifact for this contract's schema and runtime conformance
+wording. It is not target-hardware proof: the same summary records
+`target_hardware = "skipped_not_proven"`.
 
 ## Existing Anchors
 
@@ -151,7 +160,6 @@ but does not directly reclaim RSS.
 | `graphics_media` | GPU, image, font, and render/media residency. |
 | `scrollback_cache` | Hot and warm scrollback buffers not already accounted elsewhere. |
 | `child_processes` | Child process RSS attributable to the same fleet run. |
-| `allocator_pools` | Reusable arenas and pools that may be trimmable. |
 | `unknown` | Unattributed resident bytes. Non-zero unknown pressure must create a drilldown. |
 
 The cockpit must not collapse heap growth and file-backed residency into a
@@ -342,6 +350,19 @@ RCH logs are not proof by themselves. The retained artifact must show the comman
 reached Cargo/test/runtime as appropriate, and high-scale claims must show the
 target hardware predicate.
 
+The current v1 retained conformance artifact is:
+
+```text
+tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json
+```
+
+Its status is `passed`, with `local_static = "passed"`,
+`remote_reduced = "passed"`, `target_hardware = "skipped_not_proven"`,
+`remote_cargo_reached = true`, `remote_rustc_reached = true`, and
+`test_binary_reached = true`. Cite it only for schema/runtime conformance and
+remote-reduced proof. A 64-core / 256 GiB or 200+ pane resource claim still
+requires a separate target-class hardware artifact.
+
 ### RCH Soak Harness
 
 The first `ft-p3457.4` proof lane is intentionally reduced and fail-closed:
@@ -385,10 +406,13 @@ vmmap <pid> -summary > /tmp/frankenterm-<pid>.vmmap.txt
 heap <pid> > /tmp/frankenterm-<pid>.heap.txt
 ```
 
-The closing diagnosis must classify resident bytes as `rust_heap`,
-`mmap_file_backed`, `sqlite_cache`, `graphics_media`, `scrollback_tiers`,
-`child_processes`, or `unknown`. Non-zero `unknown` is an investigation result,
-not a bucket to hide in a leak summary.
+The closing diagnosis must classify resident bytes through the v1
+`residency_buckets` rows as `rust_heap`, `mmap_file_backed`,
+`sqlite_page_cache`, `graphics_media`, `scrollback_cache`, `child_processes`, or
+`unknown`. Cross-check `domains.rss_residency`, `domains.storage_io`,
+`domains.action_receipts`, `action_receipts`, and `artifact_paths` before naming
+an incident root cause. Non-zero `unknown` is an investigation result, not a
+bucket to hide in a leak summary.
 
 ## Minimal Example
 
@@ -407,7 +431,9 @@ not a bucket to hide in a leak summary.
     "run_id": "capacity-20260509T180000Z",
     "evidence_level": "remote_reduced",
     "git_head": "unknown",
-    "artifact_paths": ["docs/rch-20260509T180000Z/doctor.json"],
+    "artifact_paths": [
+      "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json"
+    ],
     "hardware_predicate": {
       "logical_cpus": 16,
       "memory_gib": 64,
@@ -490,10 +516,36 @@ not a bucket to hide in a leak summary.
     }
   },
   "memory_tiers": [],
-  "residency_buckets": [],
+  "residency_buckets": [
+    {
+      "bucket": "sqlite_page_cache",
+      "bucket_name": "SQLite page cache",
+      "evidence_state": "unavailable",
+      "bytes": null,
+      "confidence": 0,
+      "dominant": false,
+      "reason_codes": ["resource.telemetry.unavailable"]
+    }
+  ],
   "queue_backpressure": [],
   "admission_decisions": [],
-  "action_receipts": [],
+  "action_receipts": [
+    {
+      "receipt_id": "receipt-20260509T180000Z-001",
+      "action": "hold_fanout",
+      "target_domain": "capacity_admission",
+      "requested_at_ms": 1778359200000,
+      "completed_at_ms": 1778359201000,
+      "status": "succeeded",
+      "dry_run": false,
+      "policy_decision": "allow",
+      "evidence_state": "measured",
+      "reason_codes": ["action_receipt.applied"],
+      "artifact_paths": [
+        "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json"
+      ]
+    }
+  ],
   "mitigation_history": [],
   "drilldowns": [
     {
@@ -502,6 +554,8 @@ not a bucket to hide in a leak summary.
       "detail": "classifier is not implemented yet"
     }
   ],
-  "artifact_paths": ["docs/rch-20260509T180000Z/doctor.json"]
+  "artifact_paths": [
+    "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json"
+  ]
 }
 ```

@@ -48,12 +48,16 @@ catch common omissions.
    covers the checked-in live profile/fleet mutation receipt matrix
    and failure envelopes as repository evidence, not as a production
    deployment claim.
-8. **Run the high-scale release evidence gate.** Ensure
-   `cargo test -p frankenterm-core --test large_swarm_replay_corpus release_evidence --no-default-features`
+8. **Run the high-scale release evidence gate through RCH.** Ensure
+   `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-evidence cargo test -p frankenterm-core --test large_swarm_replay_corpus release_evidence --no-default-features`
    passes before publishing any 64-core / 256 GiB swarm-performance
    claim. Synthetic/local smoke manifests must render
    `SKIPPED_NOT_PROVEN`; only a real-hardware proof-gauntlet manifest
-   with linked replay artifacts may render as proven.
+   with linked replay artifacts may render as proven. For resource-cockpit
+   claims, the retained
+   `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`
+   artifact is remote-reduced schema/runtime evidence only; target hardware
+   remains `skipped_not_proven` until a target-class live artifact is retained.
 9. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
    The release workflow at `.github/workflows/release.yml`
    handles the rest (binaries, checksums, GitHub release notes,
