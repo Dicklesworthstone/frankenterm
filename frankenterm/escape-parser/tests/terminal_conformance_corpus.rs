@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 const MIN_SCENARIOS: usize = 6;
+const MIN_MINIMIZED_CASES: usize = 1;
 
 type TestResult<T = ()> = Result<T, String>;
 
@@ -53,16 +54,21 @@ fn optional_string_array<'a>(
 }
 
 fn relative_artifact_path(scenario_id: &str, root: &Path, rel: &str) -> TestResult<PathBuf> {
+    validate_relative_path_text(scenario_id, rel, "artifact path")?;
+    Ok(root.join(Path::new(rel)))
+}
+
+fn validate_relative_path_text(scenario_id: &str, rel: &str, key: &str) -> TestResult {
     let rel_path = Path::new(rel);
     let escapes_root = rel_path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir));
     if !rel_path.is_relative() || escapes_root {
         return Err(format!(
-            "{scenario_id}: artifact path must stay fixture-root relative: {rel}"
+            "{scenario_id}: {key} must stay relative and must not escape its root: {rel}"
         ));
     }
-    Ok(root.join(rel_path))
+    Ok(())
 }
 
 fn decode_hex(scenario_id: &str, path: &Path) -> TestResult<Vec<u8>> {
@@ -250,6 +256,155 @@ fn assert_expected_input(scenario_id: &str, input: &[u8], expected: &Value) -> T
     Ok(())
 }
 
+fn bool_field(scenario_id: &str, value: &Value, key: &str) -> TestResult<bool> {
+    value
+        .get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("{scenario_id}: missing bool field {key}"))
+}
+
+fn object_field<'a>(scenario_id: &str, value: &'a Value, key: &str) -> TestResult<&'a Value> {
+    let item = value
+        .get(key)
+        .ok_or_else(|| format!("{scenario_id}: missing object field {key}"))?;
+    if !item.is_object() {
+        return Err(format!("{scenario_id}: {key} must be an object"));
+    }
+    Ok(item)
+}
+
+fn array_field<'a>(scenario_id: &str, value: &'a Value, key: &str) -> TestResult<&'a Vec<Value>> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{scenario_id}: missing array field {key}"))
+}
+
+fn assert_minimized_case_metadata(
+    root: &Path,
+    metadata: &Value,
+    main_scenario_ids: &BTreeSet<String>,
+    seen_minimized_ids: &mut BTreeSet<String>,
+) -> TestResult {
+    let scenario_id = string_field("minimized case", metadata, "scenario_id")?;
+    if !seen_minimized_ids.insert(scenario_id.to_owned()) {
+        return Err(format!("{scenario_id}: duplicate minimized scenario_id"));
+    }
+    if main_scenario_ids.contains(scenario_id) {
+        return Err(format!(
+            "{scenario_id}: minimized case must not duplicate a main corpus scenario"
+        ));
+    }
+    if !scenario_id.starts_with("tc-") {
+        return Err(format!("{scenario_id}: scenario_id must use tc- prefix"));
+    }
+
+    for key in [
+        "source",
+        "original_artifact_path",
+        "minimized_input_artifact",
+        "residual_risk",
+        "redaction_status",
+    ] {
+        let value = string_field(scenario_id, metadata, key)?;
+        if value.trim().is_empty() {
+            return Err(format!("{scenario_id}: {key} is empty"));
+        }
+    }
+    if !string_field(scenario_id, metadata, "redaction_status")?.contains("No secrets") {
+        return Err(format!(
+            "{scenario_id}: redaction status must explicitly rule out secrets"
+        ));
+    }
+
+    validate_relative_path_text(
+        scenario_id,
+        string_field(scenario_id, metadata, "original_artifact_path")?,
+        "original_artifact_path",
+    )?;
+    let minimized_input = relative_artifact_path(
+        scenario_id,
+        root,
+        string_field(scenario_id, metadata, "minimized_input_artifact")?,
+    )?;
+    if !minimized_input.is_file() {
+        return Err(format!(
+            "{scenario_id}: missing minimized input {}",
+            minimized_input.display()
+        ));
+    }
+    decode_hex(scenario_id, &minimized_input)?;
+
+    let expected_failure = object_field(scenario_id, metadata, "expected_failure")?;
+    for key in ["assertion", "failure_signature"] {
+        let value = string_field(scenario_id, expected_failure, key)?;
+        if value.trim().is_empty() {
+            return Err(format!("{scenario_id}: expected_failure.{key} is empty"));
+        }
+    }
+    if !bool_field(
+        scenario_id,
+        expected_failure,
+        "preserved_by_minimized_input",
+    )? {
+        return Err(format!(
+            "{scenario_id}: expected_failure.preserved_by_minimized_input must be true"
+        ));
+    }
+
+    let steps = array_field(scenario_id, metadata, "minimization_steps")?;
+    if steps.is_empty() {
+        return Err(format!(
+            "{scenario_id}: minimization_steps must record at least one reduction step"
+        ));
+    }
+    for step in steps {
+        let step_number = step
+            .get("step")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("{scenario_id}: minimization step missing numeric step"))?;
+        if step_number == 0 {
+            return Err(format!(
+                "{scenario_id}: minimization step numbers start at 1"
+            ));
+        }
+        for key in ["action", "evidence"] {
+            let value = string_field(scenario_id, step, key)?;
+            if value.trim().is_empty() {
+                return Err(format!(
+                    "{scenario_id}: minimization step {step_number} {key} is empty"
+                ));
+            }
+        }
+    }
+
+    let quarantine = object_field(scenario_id, metadata, "quarantine")?;
+    if !bool_field(scenario_id, quarantine, "allowed")? {
+        return Err(format!("{scenario_id}: quarantine.allowed must be true"));
+    }
+    for key in ["reason", "follow_up_bead", "promotion_condition"] {
+        let value = string_field(scenario_id, quarantine, key)?;
+        if value.trim().is_empty() {
+            return Err(format!("{scenario_id}: quarantine.{key} is empty"));
+        }
+    }
+    let follow_up = string_field(scenario_id, quarantine, "follow_up_bead")?;
+    if !follow_up.starts_with("ft-") {
+        return Err(format!(
+            "{scenario_id}: quarantine.follow_up_bead must name a FrankenTerm bead"
+        ));
+    }
+
+    let promotion = object_field(scenario_id, metadata, "promotion")?;
+    for key in ["target_manifest", "required_proof", "criteria"] {
+        let value = string_field(scenario_id, promotion, key)?;
+        if value.trim().is_empty() {
+            return Err(format!("{scenario_id}: promotion.{key} is empty"));
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn terminal_conformance_manifest_is_well_formed() -> TestResult {
     let root = fixture_root();
@@ -323,6 +478,60 @@ fn terminal_conformance_manifest_is_well_formed() -> TestResult {
         if !expected.is_file() {
             return Err(format!("{scenario_id}: missing {}", expected.display()));
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn terminal_conformance_minimized_cases_are_well_formed() -> TestResult {
+    let root = fixture_root();
+    let manifest = load_json(&root.join("manifest.json"))?;
+    let scenarios = manifest
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "manifest scenarios must be an array".to_string())?;
+    let main_scenario_ids = scenarios
+        .iter()
+        .map(|scenario| {
+            string_field("manifest scenario", scenario, "scenario_id").map(ToOwned::to_owned)
+        })
+        .collect::<TestResult<BTreeSet<_>>>()?;
+
+    let minimized_cases = manifest
+        .get("minimized_cases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "manifest minimized_cases must be an array".to_string())?;
+    if minimized_cases.len() < MIN_MINIMIZED_CASES {
+        return Err(format!(
+            "manifest must contain at least {MIN_MINIMIZED_CASES} minimized case"
+        ));
+    }
+
+    let mut seen_metadata_paths = BTreeSet::new();
+    let mut seen_minimized_ids = BTreeSet::new();
+    for entry in minimized_cases {
+        let metadata_rel = entry
+            .as_str()
+            .ok_or_else(|| "manifest minimized_cases entries must be strings".to_string())?;
+        if !seen_metadata_paths.insert(metadata_rel.to_owned()) {
+            return Err(format!(
+                "manifest minimized_cases contains duplicate entry {metadata_rel}"
+            ));
+        }
+        let metadata_path = relative_artifact_path("manifest minimized case", &root, metadata_rel)?;
+        if !metadata_path.is_file() {
+            return Err(format!(
+                "manifest minimized case missing {}",
+                metadata_path.display()
+            ));
+        }
+        let metadata = load_json(&metadata_path)?;
+        assert_minimized_case_metadata(
+            &root,
+            &metadata,
+            &main_scenario_ids,
+            &mut seen_minimized_ids,
+        )?;
     }
     Ok(())
 }
