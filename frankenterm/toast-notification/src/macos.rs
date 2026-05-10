@@ -1,5 +1,5 @@
 #![cfg(target_os = "macos")]
-use crate::ToastNotification;
+use crate::{ToastNotification, ToastNotificationAction};
 use block2::{Block, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
@@ -11,10 +11,35 @@ use objc2_user_notifications::{
     UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
     UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
-use std::sync::{LazyLock, Once};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, Once};
 
 const NEEDS_SIGN: &str = "Note that the application must be code-signed \
                           for UNUserNotificationCenter to work";
+
+static ACTION_HANDLERS: LazyLock<Mutex<HashMap<String, ToastNotificationAction>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn register_action_handler(identifier: &str, action: &ToastNotificationAction) {
+    match ACTION_HANDLERS.lock() {
+        Ok(mut handlers) => {
+            handlers.insert(identifier.to_string(), action.clone());
+        }
+        Err(err) => {
+            log::error!("cannot register toast action handler: {err:#}");
+        }
+    }
+}
+
+fn take_action_handler(identifier: &str) -> Option<ToastNotificationAction> {
+    match ACTION_HANDLERS.lock() {
+        Ok(mut handlers) => handlers.remove(identifier),
+        Err(err) => {
+            log::error!("cannot resolve toast action handler: {err:#}");
+            None
+        }
+    }
+}
 
 fn ns_error_to_string(err: *mut NSError) -> String {
     if err.is_null() {
@@ -62,12 +87,26 @@ define_class!(
             completion_handler: &Block<dyn Fn()>,
         ) {
             let action = response.actionIdentifier();
-            let user_info = response.notification().request().content().userInfo();
+            let request = response.notification().request();
+            let identifier = request.identifier().to_string();
+            let user_info = request.content().userInfo();
             let url = user_info.valueForKey(ns_string!("url"));
 
-            log::debug!("did_receive_notification -> action={action:?} url={url:?}");
+            log::debug!(
+                "did_receive_notification -> action={action:?} identifier={identifier} url={url:?}"
+            );
 
-            if let Some(url) = url {
+            let is_activation = action.isEqualToString(ns_string!("SHOW_URL"))
+                || action.to_string() == "com.apple.UNNotificationDefaultActionIdentifier";
+
+            if !is_activation {
+                log::debug!(
+                    "ignoring non-activation notification response action={action:?} identifier={identifier}"
+                );
+                take_action_handler(&identifier);
+            } else if let Some(action) = take_action_handler(&identifier) {
+                action.invoke();
+            } else if let Some(url) = url {
                 if let Ok(url_str) = url.downcast::<NSString>() {
                     frankenterm_open_url::open_url(&url_str.to_string());
                 }
@@ -187,6 +226,8 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
         notif.setTitle(&NSString::from_str(&toast.title));
         notif.setBody(&NSString::from_str(&toast.message));
 
+        let identifier = uuid::Uuid::new_v4().to_string();
+
         if let Some(url) = &toast.url {
             let info =
                 NSDictionary::from_slices(&[ns_string!("url")], &[&*NSString::from_str(url)]);
@@ -194,10 +235,14 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
                 info.downcast_ref::<NSDictionary>()
                     .expect("is NSDictionary"),
             );
+        }
+        if toast.has_activation_action() {
             notif.setCategoryIdentifier(ns_string!("SHOW_URL_ACTION"));
         }
 
-        let identifier = uuid::Uuid::new_v4().to_string();
+        if let Some(action) = toast.action.as_ref() {
+            register_action_handler(&identifier, action);
+        }
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &NSString::from_str(&identifier),
             &notif,
@@ -214,6 +259,7 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
                             .name("macos-toast-timeout".to_string())
                             .spawn(move || {
                                 std::thread::sleep(timeout);
+                                take_action_handler(&identifier);
                                 // Remove this notification
                                 let ident_array =
                                     NSArray::from_retained_slice(&[NSString::from_str(
@@ -227,6 +273,7 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
                         }
                     }
                 } else {
+                    take_action_handler(&identifier);
                     log::error!("notif failed {}. {NEEDS_SIGN}", ns_error_to_string(err));
                 }
             })),

@@ -118,7 +118,7 @@ impl GuiFrontEnd {
                         Alert::ToastNotification {
                             title,
                             body,
-                            focus: _,
+                            focus,
                         },
                 } => {
                     let Some(mux) = Mux::try_get() else {
@@ -144,10 +144,13 @@ impl GuiFrontEnd {
                             if show {
                                 let message = if title.is_none() { "" } else { &body };
                                 let title = title.as_ref().unwrap_or(&body);
-                                // FIXME: if notification.focus is true, we should do
-                                // something here to arrange to focus pane_id when the
-                                // notification is clicked
-                                persistent_toast_notification(title, message);
+                                if let Some(action) = terminal_toast_action(focus, pane_id) {
+                                    persistent_toast_notification_with_action(
+                                        title, message, action,
+                                    );
+                                } else {
+                                    persistent_toast_notification(title, message);
+                                }
                             }
                         }
                     }
@@ -613,11 +616,53 @@ fn osc22_accessibility_announcement(shape: CursorShapeSlug) -> String {
     format!("Cursor shape {}", shape.slug().replace('_', " "))
 }
 
+fn terminal_toast_action(
+    focus: bool,
+    pane_id: mux::pane::PaneId,
+) -> Option<ToastNotificationAction> {
+    focus.then(|| {
+        ToastNotificationAction::new("Focus", move || {
+            promise::spawn::spawn_into_main_thread(async move {
+                focus_terminal_toast_source(pane_id);
+            })
+            .detach();
+        })
+    })
+}
+
+fn focus_terminal_toast_source(pane_id: mux::pane::PaneId) {
+    let Some(mux) = Mux::try_get() else {
+        log::warn!("cannot focus toast source pane {pane_id}: mux singleton is not available");
+        return;
+    };
+    let Some((_domain, window_id, _tab_id)) = mux.resolve_pane_id(pane_id) else {
+        log::warn!("cannot focus toast source pane {pane_id}: pane is no longer in the mux");
+        return;
+    };
+
+    if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
+        log::error!("cannot focus toast source pane {pane_id}: {err:#}");
+        return;
+    }
+
+    let Some(front_end) = crate::frontend::try_front_end() else {
+        log::warn!("cannot raise toast source window for pane {pane_id}: frontend is unavailable");
+        return;
+    };
+    let Some(gui_window) = front_end.gui_window_for_mux_window(window_id) else {
+        log::warn!("cannot raise toast source window for pane {pane_id}: GUI window not found");
+        return;
+    };
+
+    gui_window.window.focus();
+    front_end.apply_osc22_cursor_shape_for_pane(pane_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
-        mouse_cursor_for_osc22_shape, osc22_accessibility_announcement,
+        mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
 
     #[test]
@@ -680,6 +725,14 @@ mod tests {
             osc22_accessibility_announcement(CursorShapeSlug::UnderlineSteady),
             "Cursor shape underline steady"
         );
+    }
+
+    #[test]
+    fn terminal_toast_focus_flag_controls_activation_payload() {
+        assert!(terminal_toast_action(false, 42).is_none());
+
+        let action = terminal_toast_action(true, 42).expect("focus=true should attach action");
+        assert_eq!(action.label(), "Focus");
     }
 }
 
