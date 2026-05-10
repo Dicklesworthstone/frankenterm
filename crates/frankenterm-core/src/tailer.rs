@@ -2289,6 +2289,120 @@ mod tests {
 
     // ─── CaptureScheduler tests ─────────────────────────────────────
 
+    struct SchedulerSelectionModel {
+        scheduler: CaptureScheduler,
+        priority_round_robin_offsets: HashMap<u32, usize>,
+    }
+
+    impl SchedulerSelectionModel {
+        fn new(budget: CaptureBudgetConfig) -> Self {
+            Self {
+                scheduler: CaptureScheduler::new(budget),
+                priority_round_robin_offsets: HashMap::new(),
+            }
+        }
+
+        fn tick(&mut self, panes: &[(u64, u32)], available_permits: usize) -> Vec<u64> {
+            if self.scheduler.is_byte_budget_exhausted() {
+                return Vec::new();
+            }
+
+            let mut ready_panes = panes.to_vec();
+            ready_panes.sort_by_key(|&(pane_id, priority)| (priority, pane_id));
+            let group_lengths = self.rotate_equal_priority_ready_panes(&mut ready_panes);
+            let selected = self.scheduler.select_panes(&ready_panes, available_permits);
+            self.advance_offsets(&ready_panes, &selected, &group_lengths);
+            selected
+        }
+
+        fn record_capture(&mut self, pane_id: u64, bytes: u64) {
+            self.scheduler.record_capture(pane_id, bytes);
+        }
+
+        fn rotate_equal_priority_ready_panes(
+            &self,
+            ready_panes: &mut [(u64, u32)],
+        ) -> Vec<(u32, usize)> {
+            let mut group_lengths = Vec::new();
+            let mut start = 0usize;
+            while start < ready_panes.len() {
+                let priority = ready_panes[start].1;
+                let mut end = start + 1;
+                while end < ready_panes.len() && ready_panes[end].1 == priority {
+                    end += 1;
+                }
+
+                let group_len = end - start;
+                group_lengths.push((priority, group_len));
+                if group_len > 1 {
+                    let rotate_by = self
+                        .priority_round_robin_offsets
+                        .get(&priority)
+                        .copied()
+                        .unwrap_or(0)
+                        % group_len;
+                    ready_panes[start..end].rotate_left(rotate_by);
+                }
+
+                start = end;
+            }
+
+            group_lengths
+        }
+
+        fn advance_offsets(
+            &mut self,
+            ready_panes: &[(u64, u32)],
+            selected: &[u64],
+            group_lengths: &[(u32, usize)],
+        ) {
+            let mut started_per_priority = Vec::<(u32, usize)>::new();
+            for pane_id in selected {
+                let priority = ready_panes
+                    .iter()
+                    .find_map(|(candidate, priority)| (*candidate == *pane_id).then_some(*priority))
+                    .expect("selected pane must come from ready set");
+                TailerSupervisor::<StaticSource>::increment_started_priority(
+                    &mut started_per_priority,
+                    priority,
+                );
+            }
+
+            for (priority, started) in started_per_priority {
+                let group_len = group_lengths
+                    .iter()
+                    .find_map(|(candidate, len)| (*candidate == priority).then_some(*len))
+                    .unwrap_or(1);
+                let offset = self
+                    .priority_round_robin_offsets
+                    .entry(priority)
+                    .or_insert(0);
+                *offset = (*offset + started) % group_len;
+            }
+        }
+    }
+
+    struct SchedulerFairnessCase {
+        scenario_id: &'static str,
+        total_panes: u64,
+        high_priority_panes: u64,
+        available_permits: usize,
+        rounds: usize,
+        expected_low_first_round: usize,
+    }
+
+    fn scheduler_fairness_panes(case: &SchedulerFairnessCase) -> Vec<(u64, u32)> {
+        (1..=case.total_panes)
+            .map(|pane_id| {
+                if pane_id <= case.high_priority_panes {
+                    (pane_id, 10)
+                } else {
+                    (pane_id, 100)
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn scheduler_unlimited_budget_allows_all() {
         let budget = CaptureBudgetConfig {
@@ -2469,6 +2583,213 @@ mod tests {
         let panes = vec![(1, 10), (2, 50), (3, 100), (4, 200)];
         let selected = sched.select_panes(&panes, 10);
         assert_eq!(selected, vec![1, 3]);
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_table_driven_load_fixtures_cover_starvation_cases() {
+        let cases = [
+            SchedulerFairnessCase {
+                scenario_id: "capture.service_lag_10_panes/all_high",
+                total_panes: 10,
+                high_priority_panes: 10,
+                available_permits: 4,
+                rounds: 3,
+                expected_low_first_round: 0,
+            },
+            SchedulerFairnessCase {
+                scenario_id: "capture.service_lag_50_panes/mixed_high_low",
+                total_panes: 50,
+                high_priority_panes: 40,
+                available_permits: 10,
+                rounds: 5,
+                expected_low_first_round: 2,
+            },
+            SchedulerFairnessCase {
+                scenario_id: "capture.service_lag_200_panes/mixed_high_low",
+                total_panes: 200,
+                high_priority_panes: 160,
+                available_permits: 10,
+                rounds: 20,
+                expected_low_first_round: 2,
+            },
+            SchedulerFairnessCase {
+                scenario_id: "capture.service_lag_1000_panes_synthetic/equal_priority",
+                total_panes: 1_000,
+                high_priority_panes: 0,
+                available_permits: 10,
+                rounds: 100,
+                expected_low_first_round: 10,
+            },
+        ];
+
+        for case in cases {
+            let panes = scheduler_fairness_panes(&case);
+            let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+                max_captures_per_sec: 0,
+                max_bytes_per_sec: 0,
+            });
+            let mut seen = HashSet::<u64>::new();
+            let mut low_seen = HashSet::<u64>::new();
+
+            for round in 0..case.rounds {
+                let selected = model.tick(&panes, case.available_permits);
+                assert!(
+                    selected.len() <= case.available_permits,
+                    "{} round {round}: selected {} panes with only {} permits",
+                    case.scenario_id,
+                    selected.len(),
+                    case.available_permits
+                );
+                if round == 0 {
+                    let low_selected = selected
+                        .iter()
+                        .filter(|pane_id| **pane_id > case.high_priority_panes)
+                        .count();
+                    assert_eq!(
+                        low_selected, case.expected_low_first_round,
+                        "{} first round low-priority service count drifted",
+                        case.scenario_id
+                    );
+                }
+
+                for pane_id in selected {
+                    seen.insert(pane_id);
+                    if pane_id > case.high_priority_panes {
+                        low_seen.insert(pane_id);
+                    }
+                }
+            }
+
+            assert_eq!(
+                seen.len() as u64,
+                case.total_panes,
+                "{}: round-robin model did not service every pane",
+                case.scenario_id
+            );
+
+            let expected_low = case.total_panes - case.high_priority_panes;
+            assert_eq!(
+                low_seen.len() as u64,
+                expected_low,
+                "{}: low-tier floor did not service every low-priority pane",
+                case.scenario_id
+            );
+        }
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_capture_budget_window_exhaustion_is_explicit() {
+        let scenario_id = "capture.capture_budget_window";
+        let panes = vec![(1, 10), (2, 10), (3, 100), (4, 100)];
+        let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+            max_captures_per_sec: 3,
+            max_bytes_per_sec: 0,
+        });
+
+        let selected = model.tick(&panes, 10);
+        assert_eq!(
+            selected,
+            vec![1, 2, 3],
+            "{scenario_id}: expected two high-priority panes plus the low-tier floor"
+        );
+
+        let blocked = model.tick(&panes, 10);
+        assert!(
+            blocked.is_empty(),
+            "{scenario_id}: exhausted capture window must not schedule more panes"
+        );
+        assert_eq!(
+            model.scheduler.metrics().global_rate_limited,
+            1,
+            "{scenario_id}: exhausted capture window must be counted"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_byte_budget_stop_prevents_selection() {
+        let scenario_id = "capture.byte_budget_stop";
+        let panes = vec![(1, 10), (2, 10), (3, 100), (4, 100)];
+        let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 100,
+        });
+
+        let selected = model.tick(&panes, 10);
+        assert_eq!(
+            selected.len(),
+            panes.len(),
+            "{scenario_id}: byte budget is checked before capture bytes are known"
+        );
+
+        let first_selected = selected
+            .first()
+            .copied()
+            .expect("initial byte-budget selection should not be empty");
+        model.record_capture(first_selected, 100);
+        let blocked = model.tick(&panes, 10);
+        assert!(
+            blocked.is_empty(),
+            "{scenario_id}: exhausted byte budget must stop scheduling"
+        );
+        assert_eq!(
+            model.scheduler.metrics().pane_byte_budget_exceeded,
+            1,
+            "{scenario_id}: byte-budget stop must be counted"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_overflow_gap_pending_after_backpressure_threshold() {
+        let scenario_id = "capture.overflow_gap_after_backpressure_threshold";
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        for _ in 0..OVERFLOW_BACKPRESSURE_THRESHOLD {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+        }
+
+        let tailer = supervisor.tailers.get(&1).expect("tailer exists");
+        assert!(
+            tailer.overflow_gap_pending,
+            "{scenario_id}: sustained backpressure must mark an overflow gap pending"
+        );
+        assert_eq!(
+            tailer.consecutive_backpressure, OVERFLOW_BACKPRESSURE_THRESHOLD,
+            "{scenario_id}: backpressure counter should preserve threshold evidence"
+        );
+    }
+
+    #[test]
+    fn tailer_scheduler_slo_priority_override_effective_updates_are_reversible() {
+        let scenario_id = "capture.priority_override_effective_map";
+        let mut model = SchedulerSelectionModel::new(CaptureBudgetConfig {
+            max_captures_per_sec: 0,
+            max_bytes_per_sec: 0,
+        });
+
+        let override_active = vec![(1, 100), (2, 10)];
+        assert_eq!(
+            model.tick(&override_active, 1),
+            vec![2],
+            "{scenario_id}: runtime effective priority override should win while active"
+        );
+
+        let override_expired = vec![(1, 10), (2, 100)];
+        assert_eq!(
+            model.tick(&override_expired, 1),
+            vec![1],
+            "{scenario_id}: tailer scheduler must honor the reverted effective priority map after TTL purge upstream"
+        );
     }
 
     #[test]
