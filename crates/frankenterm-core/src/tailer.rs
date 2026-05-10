@@ -28,6 +28,13 @@ use crate::wezterm::{PaneInfo, PaneTextSource};
 /// to signal that capture data was likely lost during the congestion period.
 pub const OVERFLOW_BACKPRESSURE_THRESHOLD: u64 = 5;
 
+/// Maximum per-pane scheduler rows included in the compact health snapshot.
+pub const MAX_SCHEDULER_SNAPSHOT_PANES: usize = 200;
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 /// Configuration for the tailer supervisor.
 #[derive(Debug, Clone)]
 pub struct TailerConfig {
@@ -87,6 +94,163 @@ pub struct SupervisorMetrics {
     pub sync_count: u64,
 }
 
+/// Stable reason code for the latest polling outcome, skip, or scheduler deferral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSkipReason {
+    /// Pane has not reached a capture scheduler decision yet.
+    NotObserved,
+    /// Pane is handled by streaming capture instead of polling.
+    StreamingMode,
+    /// Pane fell back from streaming capture to polling.
+    StreamingFallback,
+    /// Pane was checked before its current adaptive poll interval elapsed.
+    NotDue,
+    /// Pane already has an in-flight capture task.
+    AlreadyCapturing,
+    /// Global capture-per-second budget prevented this ready pane from polling.
+    GlobalCaptureBudgetExhausted,
+    /// Global byte-per-second budget prevented this ready pane from polling.
+    GlobalByteBudgetExhausted,
+    /// No concurrency permit was available for this ready pane.
+    NoPermit,
+    /// Capture result could not be sent because downstream was backpressured.
+    SendBackpressure,
+    /// Backpressure threshold was reached and an overflow gap is pending.
+    OverflowGapPending,
+    /// Overflow gap event was emitted after earlier capture backpressure.
+    OverflowGapEmitted,
+    /// Pane had no cursor available for incremental capture.
+    NoCursor,
+    /// Capture task channel closed before a normal result was delivered.
+    ChannelClosed,
+    /// Capture operation exceeded its timeout.
+    CaptureTimeout,
+    /// Capture circuit breaker was open for this pane.
+    CaptureCircuitOpen,
+    /// Capture operation returned an error.
+    CaptureError,
+    /// Poll completed successfully and found no changed text.
+    NoChange,
+    /// Poll completed successfully and produced a changed capture segment.
+    Changed,
+    /// Supervisor shutdown prevented polling.
+    Shutdown,
+}
+
+impl CaptureSkipReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::StreamingMode => "streaming_mode",
+            Self::StreamingFallback => "streaming_fallback",
+            Self::NotDue => "not_due",
+            Self::AlreadyCapturing => "already_capturing",
+            Self::GlobalCaptureBudgetExhausted => "global_capture_budget_exhausted",
+            Self::GlobalByteBudgetExhausted => "global_byte_budget_exhausted",
+            Self::NoPermit => "no_permit",
+            Self::SendBackpressure => "send_backpressure",
+            Self::OverflowGapPending => "overflow_gap_pending",
+            Self::OverflowGapEmitted => "overflow_gap_emitted",
+            Self::NoCursor => "no_cursor",
+            Self::ChannelClosed => "channel_closed",
+            Self::CaptureTimeout => "capture_timeout",
+            Self::CaptureCircuitOpen => "capture_circuit_open",
+            Self::CaptureError => "capture_error",
+            Self::NoChange => "no_change",
+            Self::Changed => "changed",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Priority tier used by the weighted capture scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePriorityTier {
+    /// High-priority pane tier (`priority <= 50`).
+    High,
+    /// Lower-priority pane tier (`priority > 50`).
+    Low,
+}
+
+impl CapturePriorityTier {
+    #[must_use]
+    pub const fn from_priority(priority: u32) -> Self {
+        if priority <= 50 {
+            Self::High
+        } else {
+            Self::Low
+        }
+    }
+}
+
+/// Starvation warning class for compact operator telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStarvationWarning {
+    /// No starvation warning is active for this pane.
+    None,
+    /// Strict capture invariant is violated, usually because overflow is pending.
+    StrictInvariantFailed,
+    /// Pane is stale for a scheduler or capture-backpressure reason.
+    BenchmarkTargetMissed,
+    /// Pane is stale but this snapshot cannot attribute it to scheduler starvation.
+    NotProven,
+}
+
+impl CaptureStarvationWarning {
+    const fn severity_rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::NotProven => 1,
+            Self::BenchmarkTargetMissed => 2,
+            Self::StrictInvariantFailed => 3,
+        }
+    }
+}
+
+/// Per-pane scheduler row included in the compact scheduler snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaneSchedulerSnapshot {
+    pub pane_id: u64,
+    pub priority: u32,
+    pub tier: CapturePriorityTier,
+    pub mode: TailerMode,
+    pub stale: bool,
+    pub last_successful_capture_age_ms: Option<u64>,
+    pub last_poll_age_ms: u64,
+    pub current_interval_ms: u64,
+    pub last_reason_code: CaptureSkipReason,
+    pub selection_opportunities: u64,
+    pub selected_count: u64,
+    pub skipped_count: u64,
+    pub consecutive_backpressure: u64,
+    pub overflow_gap_pending: bool,
+    pub starvation_warning: CaptureStarvationWarning,
+}
+
+/// Aggregate scheduler service counters per priority tier.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerTierSnapshot {
+    pub tier: CapturePriorityTier,
+    pub selection_opportunities: u64,
+    pub selected_count: u64,
+    pub skipped_count: u64,
+}
+
+impl SchedulerTierSnapshot {
+    fn new(tier: CapturePriorityTier) -> Self {
+        Self {
+            tier,
+            selection_opportunities: 0,
+            selected_count: 0,
+            skipped_count: 0,
+        }
+    }
+}
+
 /// A captured segment event for persistence.
 #[derive(Debug, Clone)]
 pub struct CaptureEvent {
@@ -103,8 +267,18 @@ struct PaneTailer {
     current_interval: Duration,
     /// Last poll time
     last_poll: Instant,
+    /// Last poll that completed successfully, including no-change captures.
+    last_successful_capture: Option<Instant>,
     /// Whether changes were detected in last poll
     had_changes: bool,
+    /// Latest stable reason code for operator telemetry
+    last_reason_code: CaptureSkipReason,
+    /// Number of times this pane reached scheduler selection.
+    selection_opportunities: u64,
+    /// Number of times this pane was admitted for polling.
+    selected_count: u64,
+    /// Number of times this pane was skipped or deferred.
+    skipped_count: u64,
     /// Consecutive backpressure events without a successful capture
     consecutive_backpressure: u64,
     /// Whether an overflow GAP needs to be emitted on the next successful poll
@@ -117,7 +291,12 @@ impl PaneTailer {
             pane_id,
             current_interval: initial_interval,
             last_poll: Instant::now(),
+            last_successful_capture: None,
             had_changes: false,
+            last_reason_code: CaptureSkipReason::NotObserved,
+            selection_opportunities: 0,
+            selected_count: 0,
+            skipped_count: 0,
             consecutive_backpressure: 0,
             overflow_gap_pending: false,
         }
@@ -127,9 +306,30 @@ impl PaneTailer {
         self.last_poll.elapsed() >= self.current_interval
     }
 
+    #[cfg(test)]
     fn record_poll(&mut self, had_changes: bool, config: &TailerConfig) {
-        self.last_poll = Instant::now();
+        let reason = if had_changes {
+            CaptureSkipReason::Changed
+        } else {
+            CaptureSkipReason::NoChange
+        };
+        self.record_poll_outcome(had_changes, true, reason, config);
+    }
+
+    fn record_poll_outcome(
+        &mut self,
+        had_changes: bool,
+        successful_capture: bool,
+        reason: CaptureSkipReason,
+        config: &TailerConfig,
+    ) {
+        let now = Instant::now();
+        self.last_poll = now;
+        if successful_capture {
+            self.last_successful_capture = Some(now);
+        }
         self.had_changes = had_changes;
+        self.last_reason_code = reason;
 
         // Adaptive interval: speed up if changes, slow down if idle
         if had_changes {
@@ -140,6 +340,79 @@ impl PaneTailer {
             );
             self.current_interval = new_interval.min(config.max_interval);
         }
+    }
+
+    fn record_selection_opportunity(&mut self) {
+        self.selection_opportunities = self.selection_opportunities.saturating_add(1);
+    }
+
+    fn record_selected(&mut self) {
+        self.selected_count = self.selected_count.saturating_add(1);
+        if self.overflow_gap_pending {
+            self.last_reason_code = CaptureSkipReason::OverflowGapPending;
+        }
+    }
+
+    fn record_skip(&mut self, reason: CaptureSkipReason) {
+        self.skipped_count = self.skipped_count.saturating_add(1);
+        self.last_reason_code = reason;
+    }
+
+    fn snapshot(&self, pane_id: u64, priority: u32, now: Instant) -> PaneSchedulerSnapshot {
+        let last_poll_age_ms =
+            duration_millis_saturating(now.saturating_duration_since(self.last_poll));
+        let last_successful_capture_age_ms = self
+            .last_successful_capture
+            .map(|last| duration_millis_saturating(now.saturating_duration_since(last)));
+        let current_interval_ms = duration_millis_saturating(self.current_interval);
+        let stale_threshold_ms = current_interval_ms.saturating_mul(2);
+        let stale = last_successful_capture_age_ms
+            .map_or(last_poll_age_ms > stale_threshold_ms, |age| {
+                age > stale_threshold_ms
+            });
+        let starvation_warning = self.starvation_warning(stale);
+
+        PaneSchedulerSnapshot {
+            pane_id,
+            priority,
+            tier: CapturePriorityTier::from_priority(priority),
+            mode: TailerMode::Polling,
+            stale,
+            last_successful_capture_age_ms,
+            last_poll_age_ms,
+            current_interval_ms,
+            last_reason_code: self.last_reason_code,
+            selection_opportunities: self.selection_opportunities,
+            selected_count: self.selected_count,
+            skipped_count: self.skipped_count,
+            consecutive_backpressure: self.consecutive_backpressure,
+            overflow_gap_pending: self.overflow_gap_pending,
+            starvation_warning,
+        }
+    }
+
+    fn starvation_warning(&self, stale: bool) -> CaptureStarvationWarning {
+        if self.overflow_gap_pending
+            || self.consecutive_backpressure >= OVERFLOW_BACKPRESSURE_THRESHOLD
+        {
+            return CaptureStarvationWarning::StrictInvariantFailed;
+        }
+
+        if stale {
+            return match self.last_reason_code {
+                CaptureSkipReason::GlobalCaptureBudgetExhausted
+                | CaptureSkipReason::GlobalByteBudgetExhausted
+                | CaptureSkipReason::NoPermit
+                | CaptureSkipReason::SendBackpressure
+                | CaptureSkipReason::CaptureTimeout
+                | CaptureSkipReason::CaptureCircuitOpen => {
+                    CaptureStarvationWarning::BenchmarkTargetMissed
+                }
+                _ => CaptureStarvationWarning::NotProven,
+            };
+        }
+
+        CaptureStarvationWarning::None
     }
 }
 
@@ -177,6 +450,18 @@ pub struct SchedulerSnapshot {
     pub total_throttle_events: u64,
     /// Number of panes being tracked.
     pub tracked_panes: usize,
+    /// Total per-pane rows represented by the supervisor snapshot.
+    #[serde(default)]
+    pub pane_rows_total: usize,
+    /// Whether `panes` was truncated to the compact snapshot cap.
+    #[serde(default)]
+    pub pane_rows_truncated: bool,
+    /// Per-pane scheduler rows, capped for compact health reporting.
+    #[serde(default)]
+    pub panes: Vec<PaneSchedulerSnapshot>,
+    /// Aggregate scheduler service counters per priority tier.
+    #[serde(default)]
+    pub tiers: Vec<SchedulerTierSnapshot>,
 }
 
 /// Per-pane budget tracking within a sliding window.
@@ -408,6 +693,10 @@ impl CaptureScheduler {
             total_byte_budget_exceeded: self.metrics.pane_byte_budget_exceeded,
             total_throttle_events: self.metrics.throttle_events,
             tracked_panes: self.pane_trackers.len(),
+            pane_rows_total: 0,
+            pane_rows_truncated: false,
+            panes: Vec::new(),
+            tiers: Vec::new(),
         }
     }
 
@@ -718,7 +1007,75 @@ where
     /// Export a serializable snapshot of the scheduler state.
     #[must_use]
     pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
-        self.scheduler.snapshot()
+        let mut snapshot = self.scheduler.snapshot();
+        let mut pane_rows = self.scheduler_pane_rows();
+        snapshot.pane_rows_total = pane_rows.len();
+        snapshot.tiers = Self::tier_snapshots(&pane_rows);
+        snapshot.pane_rows_truncated = pane_rows.len() > MAX_SCHEDULER_SNAPSHOT_PANES;
+        if snapshot.pane_rows_truncated {
+            pane_rows.truncate(MAX_SCHEDULER_SNAPSHOT_PANES);
+        }
+        snapshot.panes = pane_rows;
+        snapshot
+    }
+
+    fn scheduler_pane_rows(&self) -> Vec<PaneSchedulerSnapshot> {
+        let now = Instant::now();
+        let mut rows: Vec<PaneSchedulerSnapshot> = self
+            .tailers
+            .iter()
+            .map(|(pane_id, tailer)| {
+                let priority = self
+                    .pane_priorities
+                    .get(pane_id)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                tailer.snapshot(*pane_id, priority, now)
+            })
+            .collect();
+
+        rows.sort_by(|left, right| {
+            right
+                .stale
+                .cmp(&left.stale)
+                .then_with(|| {
+                    right
+                        .starvation_warning
+                        .severity_rank()
+                        .cmp(&left.starvation_warning.severity_rank())
+                })
+                .then_with(|| {
+                    let right_lag = right
+                        .last_successful_capture_age_ms
+                        .unwrap_or(right.last_poll_age_ms);
+                    let left_lag = left
+                        .last_successful_capture_age_ms
+                        .unwrap_or(left.last_poll_age_ms);
+                    right_lag.cmp(&left_lag)
+                })
+                .then_with(|| left.pane_id.cmp(&right.pane_id))
+        });
+
+        rows
+    }
+
+    fn tier_snapshots(rows: &[PaneSchedulerSnapshot]) -> Vec<SchedulerTierSnapshot> {
+        let mut high = SchedulerTierSnapshot::new(CapturePriorityTier::High);
+        let mut low = SchedulerTierSnapshot::new(CapturePriorityTier::Low);
+
+        for row in rows {
+            let target = match row.tier {
+                CapturePriorityTier::High => &mut high,
+                CapturePriorityTier::Low => &mut low,
+            };
+            target.selection_opportunities = target
+                .selection_opportunities
+                .saturating_add(row.selection_opportunities);
+            target.selected_count = target.selected_count.saturating_add(row.selected_count);
+            target.skipped_count = target.skipped_count.saturating_add(row.skipped_count);
+        }
+
+        vec![high, low]
     }
 
     fn rotate_equal_priority_ready_panes(
@@ -773,32 +1130,78 @@ where
         T: PollTaskSet,
     {
         if self.shutdown_flag.load(Ordering::SeqCst) {
+            for tailer in self.tailers.values_mut() {
+                tailer.record_skip(CaptureSkipReason::Shutdown);
+            }
             return;
         }
 
         // Check if byte budget is exhausted before doing any work.
         if self.scheduler.is_byte_budget_exhausted() {
+            let capturing_panes = &self.capturing_panes;
+            for (pane_id, tailer) in &mut self.tailers {
+                if capturing_panes.contains(pane_id) {
+                    tailer.record_skip(CaptureSkipReason::AlreadyCapturing);
+                } else if tailer.should_poll() {
+                    tailer.record_selection_opportunity();
+                    tailer.record_skip(CaptureSkipReason::GlobalByteBudgetExhausted);
+                } else {
+                    tailer.record_skip(CaptureSkipReason::NotDue);
+                }
+            }
             return;
         }
 
         // Find panes ready for polling AND not currently capturing.
-        let mut ready_panes: Vec<(u64, u32)> = self
-            .tailers
-            .iter()
-            .filter(|(id, t)| t.should_poll() && !self.capturing_panes.contains(id))
-            .map(|(id, _)| {
-                let prio = self.pane_priorities.get(id).copied().unwrap_or(u32::MAX);
-                (*id, prio)
-            })
-            .collect();
+        let mut ready_panes = Vec::<(u64, u32)>::new();
+        let capturing_panes = &self.capturing_panes;
+        let pane_priorities = &self.pane_priorities;
+        for (pane_id, tailer) in &mut self.tailers {
+            if capturing_panes.contains(pane_id) {
+                tailer.record_skip(CaptureSkipReason::AlreadyCapturing);
+                continue;
+            }
+
+            if !tailer.should_poll() {
+                tailer.record_skip(CaptureSkipReason::NotDue);
+                continue;
+            }
+
+            tailer.record_selection_opportunity();
+            let prio = pane_priorities.get(pane_id).copied().unwrap_or(u32::MAX);
+            ready_panes.push((*pane_id, prio));
+        }
 
         // Order by priority (lower = higher), tie-breaker pane_id for determinism.
         ready_panes.sort_by_key(|&(pane_id, prio)| (prio, pane_id));
         let ready_group_lengths = self.rotate_equal_priority_ready_panes(&mut ready_panes);
 
         // Apply weighted scheduling with budget enforcement.
+        self.scheduler.maybe_refill_global();
         let available = self.semaphore.available_permits();
+        let capture_limit_before = if self.scheduler.budget.max_captures_per_sec > 0 {
+            self.scheduler.global_captures_remaining as usize
+        } else {
+            usize::MAX
+        };
         let selected = self.scheduler.select_panes(&ready_panes, available);
+        let selected_set: HashSet<u64> = selected.iter().copied().collect();
+        let defer_reason = if available == 0 {
+            CaptureSkipReason::NoPermit
+        } else if self.scheduler.budget.max_captures_per_sec > 0
+            && capture_limit_before <= available
+        {
+            CaptureSkipReason::GlobalCaptureBudgetExhausted
+        } else {
+            CaptureSkipReason::NoPermit
+        };
+        for (pane_id, _) in &ready_panes {
+            if !selected_set.contains(pane_id)
+                && let Some(tailer) = self.tailers.get_mut(pane_id)
+            {
+                tailer.record_skip(defer_reason);
+            }
+        }
         let mut started_per_priority = Vec::<(u32, usize)>::new();
 
         macro_rules! reserve_capture_event_permit {
@@ -838,13 +1241,17 @@ where
                     // This is unexpected since we bound `selected` by `available`, but if it happens,
                     // just record backpressure.
                     if let Some(tailer) = self.tailers.get_mut(&pane_id) {
-                        tailer.record_poll(false, &self.config);
+                        tailer.record_skip(CaptureSkipReason::NoPermit);
                         tailer.consecutive_backpressure += 1;
                         self.metrics.send_timeouts += 1;
                     }
                     continue;
                 }
             };
+
+            if let Some(tailer) = self.tailers.get_mut(&pane_id) {
+                tailer.record_selected();
+            }
 
             // Mark as capturing to prevent duplicate spawns
             self.capturing_panes.insert(pane_id);
@@ -1064,19 +1471,34 @@ where
         if let Some(tailer) = self.tailers.get_mut(&pane_id) {
             match outcome {
                 PollOutcome::Changed { bytes } => {
-                    tailer.record_poll(true, &self.config);
+                    tailer.record_poll_outcome(
+                        true,
+                        true,
+                        CaptureSkipReason::Changed,
+                        &self.config,
+                    );
                     tailer.consecutive_backpressure = 0;
                     self.metrics.events_sent += 1;
                     self.scheduler.record_capture(pane_id, bytes);
                 }
                 PollOutcome::NoChange => {
-                    tailer.record_poll(false, &self.config);
+                    tailer.record_poll_outcome(
+                        false,
+                        true,
+                        CaptureSkipReason::NoChange,
+                        &self.config,
+                    );
                     tailer.consecutive_backpressure = 0;
                     self.metrics.no_change_captures += 1;
                     trace!(pane_id, "Tailer poll no change");
                 }
                 PollOutcome::Backpressure => {
-                    tailer.record_poll(false, &self.config);
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::SendBackpressure,
+                        &self.config,
+                    );
                     self.metrics.send_timeouts += 1;
                     tailer.consecutive_backpressure += 1;
                     if tailer.consecutive_backpressure >= OVERFLOW_BACKPRESSURE_THRESHOLD {
@@ -1091,7 +1513,12 @@ where
                     }
                 }
                 PollOutcome::OverflowGapEmitted => {
-                    tailer.record_poll(true, &self.config);
+                    tailer.record_poll_outcome(
+                        true,
+                        true,
+                        CaptureSkipReason::OverflowGapEmitted,
+                        &self.config,
+                    );
                     tailer.overflow_gap_pending = false;
                     tailer.consecutive_backpressure = 0;
                     self.metrics.events_sent += 1;
@@ -1099,27 +1526,52 @@ where
                     debug!(pane_id, "Overflow GAP emitted");
                 }
                 PollOutcome::NoCursor => {
-                    tailer.record_poll(false, &self.config);
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::NoCursor,
+                        &self.config,
+                    );
                     trace!(pane_id, "Tailer poll skipped (no cursor)");
                 }
                 PollOutcome::ChannelClosed => {
-                    tailer.record_poll(false, &self.config);
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::ChannelClosed,
+                        &self.config,
+                    );
                     warn!(pane_id, "Tailer channel closed");
                 }
                 PollOutcome::CaptureTimeout => {
-                    tailer.record_poll(false, &self.config);
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::CaptureTimeout,
+                        &self.config,
+                    );
                     self.metrics.capture_timeouts += 1;
                     warn!(pane_id, "Tailer capture timed out");
                 }
                 PollOutcome::CircuitOpen { retry_after_ms } => {
-                    tailer.record_poll(false, &self.config);
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::CaptureCircuitOpen,
+                        &self.config,
+                    );
                     trace!(
                         pane_id,
                         retry_after_ms, "Tailer poll skipped (capture circuit breaker open)"
                     );
                 }
                 PollOutcome::Error(error) => {
-                    tailer.record_poll(false, &self.config);
+                    tailer.record_poll_outcome(
+                        false,
+                        false,
+                        CaptureSkipReason::CaptureError,
+                        &self.config,
+                    );
                     warn!(pane_id, error = %error, "Tailer poll failed");
                 }
             }
@@ -2793,6 +3245,237 @@ mod tests {
     }
 
     #[test]
+    fn tailer_scheduler_reason_codes_are_stable() {
+        let cases = [
+            (CaptureSkipReason::NotObserved, "not_observed"),
+            (CaptureSkipReason::StreamingMode, "streaming_mode"),
+            (CaptureSkipReason::StreamingFallback, "streaming_fallback"),
+            (CaptureSkipReason::NotDue, "not_due"),
+            (CaptureSkipReason::AlreadyCapturing, "already_capturing"),
+            (
+                CaptureSkipReason::GlobalCaptureBudgetExhausted,
+                "global_capture_budget_exhausted",
+            ),
+            (
+                CaptureSkipReason::GlobalByteBudgetExhausted,
+                "global_byte_budget_exhausted",
+            ),
+            (CaptureSkipReason::NoPermit, "no_permit"),
+            (CaptureSkipReason::SendBackpressure, "send_backpressure"),
+            (
+                CaptureSkipReason::OverflowGapPending,
+                "overflow_gap_pending",
+            ),
+            (
+                CaptureSkipReason::OverflowGapEmitted,
+                "overflow_gap_emitted",
+            ),
+            (CaptureSkipReason::NoCursor, "no_cursor"),
+            (CaptureSkipReason::ChannelClosed, "channel_closed"),
+            (CaptureSkipReason::CaptureTimeout, "capture_timeout"),
+            (
+                CaptureSkipReason::CaptureCircuitOpen,
+                "capture_circuit_open",
+            ),
+            (CaptureSkipReason::CaptureError, "capture_error"),
+            (CaptureSkipReason::NoChange, "no_change"),
+            (CaptureSkipReason::Changed, "changed"),
+            (CaptureSkipReason::Shutdown, "shutdown"),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected);
+            let encoded = serde_json::to_string(&reason).expect("serialize reason");
+            assert_eq!(encoded, format!("\"{expected}\""));
+            let decoded: CaptureSkipReason =
+                serde_json::from_str(&encoded).expect("deserialize reason");
+            assert_eq!(decoded, reason);
+        }
+    }
+
+    #[test]
+    fn tailer_scheduler_snapshot_marks_new_panes_not_observed() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(7, make_pane(7));
+        supervisor.sync_tailers(&panes);
+
+        let snap = supervisor.scheduler_snapshot();
+        assert_eq!(snap.pane_rows_total, 1);
+        let row = snap.panes.first().expect("new pane row");
+        assert_eq!(row.pane_id, 7);
+        assert_eq!(row.last_reason_code, CaptureSkipReason::NotObserved);
+        assert_eq!(row.selection_opportunities, 0);
+        assert_eq!(row.selected_count, 0);
+        assert_eq!(row.skipped_count, 0);
+    }
+
+    #[test]
+    fn tailer_scheduler_snapshot_tracks_pane_reasons_and_tiers() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 10,
+                ..Default::default()
+            };
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+            supervisor.sync_tailers(&panes);
+            supervisor.update_pane_priorities(HashMap::from([(1, 10), (2, 100)]));
+
+            supervisor
+                .tailers
+                .get_mut(&1)
+                .expect("pane 1 tailer")
+                .record_selected();
+            supervisor.handle_poll_result(1, PollOutcome::Changed { bytes: 128 });
+            supervisor.handle_poll_result(2, PollOutcome::Backpressure);
+
+            let snap = supervisor.scheduler_snapshot();
+            assert_eq!(snap.pane_rows_total, 2);
+            assert!(!snap.pane_rows_truncated);
+            assert_eq!(snap.panes.len(), 2);
+
+            let pane_1 = snap
+                .panes
+                .iter()
+                .find(|row| row.pane_id == 1)
+                .expect("pane 1 row");
+            assert_eq!(pane_1.priority, 10);
+            assert_eq!(pane_1.tier, CapturePriorityTier::High);
+            assert_eq!(pane_1.mode, TailerMode::Polling);
+            assert_eq!(pane_1.last_reason_code, CaptureSkipReason::Changed);
+            assert!(
+                pane_1.last_successful_capture_age_ms.unwrap_or(u64::MAX) < 100,
+                "successful capture age should be fresh"
+            );
+            assert_eq!(pane_1.selected_count, 1);
+            assert_eq!(pane_1.starvation_warning, CaptureStarvationWarning::None);
+
+            let pane_2 = snap
+                .panes
+                .iter()
+                .find(|row| row.pane_id == 2)
+                .expect("pane 2 row");
+            assert_eq!(pane_2.priority, 100);
+            assert_eq!(pane_2.tier, CapturePriorityTier::Low);
+            assert_eq!(pane_2.last_reason_code, CaptureSkipReason::SendBackpressure);
+            assert_eq!(pane_2.last_successful_capture_age_ms, None);
+            assert_eq!(pane_2.consecutive_backpressure, 1);
+
+            let high = snap
+                .tiers
+                .iter()
+                .find(|tier| tier.tier == CapturePriorityTier::High)
+                .expect("high tier");
+            assert_eq!(high.selected_count, 1);
+            let low = snap
+                .tiers
+                .iter()
+                .find(|tier| tier.tier == CapturePriorityTier::Low)
+                .expect("low tier");
+            assert_eq!(low.selected_count, 0);
+        });
+    }
+
+    #[test]
+    fn tailer_scheduler_snapshot_records_capture_budget_deferrals() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 10,
+                ..Default::default()
+            };
+            let budget = CaptureBudgetConfig {
+                max_captures_per_sec: 1,
+                max_bytes_per_sec: 0,
+            };
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+            let mut supervisor = TailerSupervisor::with_budget(
+                config, tx, cursors, registry, shutdown, source, budget,
+            );
+
+            let mut panes = HashMap::new();
+            for pane_id in 1..=3 {
+                panes.insert(pane_id, make_pane(pane_id));
+            }
+            supervisor.sync_tailers(&panes);
+            supervisor.update_pane_priorities(HashMap::from([(1, 10), (2, 10), (3, 10)]));
+            crate::runtime_async::sleep(Duration::from_millis(2)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+            assert_eq!(poll_tasks.len(), 1);
+
+            let snap = supervisor.scheduler_snapshot();
+            let admitted = snap
+                .panes
+                .iter()
+                .filter(|row| row.selected_count == 1)
+                .count();
+            assert_eq!(admitted, 1);
+            let deferred = snap
+                .panes
+                .iter()
+                .filter(|row| {
+                    row.last_reason_code == CaptureSkipReason::GlobalCaptureBudgetExhausted
+                })
+                .count();
+            assert_eq!(deferred, 2);
+            assert!(
+                snap.panes
+                    .iter()
+                    .all(|row| row.selection_opportunities == 1)
+            );
+        });
+    }
+
+    #[test]
+    fn tailer_scheduler_snapshot_pane_rows_are_bounded_under_250_panes() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        for pane_id in 1..=250 {
+            panes.insert(pane_id, make_pane(pane_id));
+        }
+        supervisor.sync_tailers(&panes);
+
+        let snap = supervisor.scheduler_snapshot();
+        assert_eq!(snap.pane_rows_total, 250);
+        assert!(snap.pane_rows_truncated);
+        assert_eq!(snap.panes.len(), MAX_SCHEDULER_SNAPSHOT_PANES);
+        assert_eq!(snap.tiers.len(), 2);
+    }
+
+    #[test]
     fn supervisor_with_budget_limits_captures() {
         run_async_test(async {
             let config = TailerConfig {
@@ -3593,6 +4276,7 @@ mod tests {
             total_byte_budget_exceeded: 1,
             total_throttle_events: 4,
             tracked_panes: 7,
+            ..SchedulerSnapshot::default()
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let deser: SchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -4109,6 +4793,7 @@ mod tests {
                     total_byte_budget_exceeded: 0,
                     total_throttle_events: 3,
                     tracked_panes: 4,
+                    ..SchedulerSnapshot::default()
                 };
                 let json = serde_json::to_string(&snap).expect("serialize");
                 let restored: SchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");

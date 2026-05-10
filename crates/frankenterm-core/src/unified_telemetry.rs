@@ -712,6 +712,7 @@ mod tests {
                 total_byte_budget_exceeded: 0,
                 total_throttle_events: 0,
                 tracked_panes: 5,
+                ..crate::tailer::SchedulerSnapshot::default()
             },
         });
 
@@ -769,6 +770,7 @@ mod tests {
                     total_byte_budget_exceeded: 0,
                     total_throttle_events: 0,
                     tracked_panes: 0,
+                    ..crate::tailer::SchedulerSnapshot::default()
                 },
             }));
 
@@ -789,6 +791,7 @@ mod tests {
                     total_byte_budget_exceeded: 0,
                     total_throttle_events: 0,
                     tracked_panes: 0,
+                    ..crate::tailer::SchedulerSnapshot::default()
                 },
             }));
 
@@ -822,6 +825,7 @@ mod tests {
                     total_byte_budget_exceeded: 0,
                     total_throttle_events: 0,
                     tracked_panes: 0,
+                    ..crate::tailer::SchedulerSnapshot::default()
                 },
             }),
         );
@@ -837,6 +841,7 @@ mod tests {
                     total_byte_budget_exceeded: 0,
                     total_throttle_events: 0,
                     tracked_panes: 0,
+                    ..crate::tailer::SchedulerSnapshot::default()
                 },
             }),
         );
@@ -852,6 +857,7 @@ mod tests {
                     total_byte_budget_exceeded: 0,
                     total_throttle_events: 0,
                     tracked_panes: 0,
+                    ..crate::tailer::SchedulerSnapshot::default()
                 },
             }),
         );
@@ -906,6 +912,7 @@ mod tests {
                     total_byte_budget_exceeded: 1,
                     total_throttle_events: 4,
                     tracked_panes: 10,
+                    ..crate::tailer::SchedulerSnapshot::default()
                 },
             }));
 
@@ -936,6 +943,7 @@ mod tests {
                     total_byte_budget_exceeded: 0,
                     total_throttle_events: 0,
                     tracked_panes: 0,
+                    ..crate::tailer::SchedulerSnapshot::default()
                 },
             }));
 

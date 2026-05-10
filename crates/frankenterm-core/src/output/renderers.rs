@@ -4805,6 +4805,7 @@ mod tests {
             total_byte_budget_exceeded: 2,
             total_throttle_events: 9,
             tracked_panes: 3,
+            ..SchedulerSnapshot::default()
         });
         snapshot.backpressure_tier = Some("Yellow".to_string());
 
@@ -4856,6 +4857,7 @@ mod tests {
             total_byte_budget_exceeded: 0,
             total_throttle_events: 0,
             tracked_panes: 1,
+            ..SchedulerSnapshot::default()
         });
 
         let ctx = RenderContext::new(OutputFormat::Json);
@@ -4958,6 +4960,7 @@ mod tests {
             total_byte_budget_exceeded: 0,
             total_throttle_events: 0,
             tracked_panes: 1,
+            ..crate::tailer::SchedulerSnapshot::default()
         });
         snapshot.backpressure_tier = Some("Green".to_string());
 

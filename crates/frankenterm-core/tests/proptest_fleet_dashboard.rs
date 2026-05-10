@@ -33,6 +33,7 @@ fn make_ingest_payload() -> SubsystemPayload {
             total_byte_budget_exceeded: 0,
             total_throttle_events: 0,
             tracked_panes: 0,
+            ..frankenterm_core::tailer::SchedulerSnapshot::default()
         },
     })
 }

@@ -6919,6 +6919,7 @@ mod tests {
             total_byte_budget_exceeded: 1,
             total_throttle_events: 4,
             tracked_panes: 5,
+            ..SchedulerSnapshot::default()
         };
 
         let snapshot = HealthSnapshot {
@@ -6981,6 +6982,7 @@ mod tests {
                 total_byte_budget_exceeded: 0,
                 total_throttle_events: 0,
                 tracked_panes: 2,
+                ..SchedulerSnapshot::default()
             }),
             backpressure_tier: None,
             last_activity_by_pane: vec![],
