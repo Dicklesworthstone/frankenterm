@@ -15,6 +15,7 @@
 //! ```
 
 use std::backtrace::Backtrace;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1442,6 +1443,23 @@ fn generate_incident_bundle_readme(
     );
     out.push_str("## Validation\n\n");
     out.push_str("Run `ft reproduce replay <bundle-dir> --mode policy` before sharing.\n");
+    out.push_str(
+        "Use `ft reproduce replay <bundle-dir> --mode policy --format json` when another agent needs the structured replay and verifier result.\n\n",
+    );
+    out.push_str("## Operator Handoff\n\n");
+    out.push_str("- Capture before cleanup, restarts, Beads reassignment, or pane interaction.\n");
+    out.push_str(
+        "- Treat missing Agent Mail, RCH, Beads, git, robot, or process data as a degraded source with a warning; do not repair or restart shared services during bundle capture.\n",
+    );
+    out.push_str(
+        "- Keep `incident_manifest.json`, `warnings.jsonl`, `redaction_report.json`, and this `README.md` with any `sources/` payloads.\n",
+    );
+    out.push_str(
+        "- Classify RCH setup, sync, worker, package, and transport failures separately from verifier or source-test failures.\n",
+    );
+    out.push_str(
+        "- Run heavy Cargo validation through remote-required RCH and retain the exact command plus log or artifact path; local Cargo is not proof for the handoff lane.\n",
+    );
     out
 }
 
@@ -2002,24 +2020,28 @@ fn collect_incident_bundle_inner(
     write_file_sync(&bundle_dir.join("warnings.jsonl"), warning_bytes)?;
     files.push("warnings.jsonl".to_string());
 
+    let mut manifest_files = files.clone();
+    manifest_files.push("README.md".to_string());
+    manifest_files.push("incident_manifest.json".to_string());
+
     let readme = generate_incident_bundle_readme(
         opts.kind,
         &exported_at,
-        &files,
+        &manifest_files,
         sources.len(),
         warnings.len(),
     );
     let readme_bytes = readme.as_bytes();
     total_size += readme_bytes.len() as u64;
     write_file_sync(&bundle_dir.join("README.md"), readme_bytes)?;
-    files.push("README.md".to_string());
 
-    // 7. Write incident manifest
+    // 7. Write incident manifest. The manifest lists itself, so compute
+    // total_size_bytes to a fixed point before writing it.
     let process_sample_allowed = process_sampler.is_some();
-    let result = IncidentBundleResult {
+    let mut result = IncidentBundleResult {
         path: bundle_dir.clone(),
         kind: opts.kind,
-        files: files.clone(),
+        files: manifest_files,
         total_size_bytes: total_size,
         wa_version: crate::VERSION.to_string(),
         exported_at: exported_at.clone(),
@@ -2054,7 +2076,17 @@ fn collect_incident_bundle_inner(
         }),
     };
 
-    let manifest_json = serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?;
+    let manifest_json = loop {
+        let manifest_json = serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?;
+        let next_total = total_size.saturating_add(manifest_json.len() as u64);
+        if next_total == result.total_size_bytes {
+            break manifest_json;
+        }
+        result.total_size_bytes = next_total;
+        if let Some(swarm) = &mut result.swarm {
+            swarm.total_size_bytes = next_total;
+        }
+    };
     write_file_sync(
         &bundle_dir.join("incident_manifest.json"),
         manifest_json.as_bytes(),
@@ -2443,6 +2475,810 @@ pub struct ReplayResult {
     pub checks: Vec<ReplayCheck>,
     /// Warnings (non-fatal issues).
     pub warnings: Vec<String>,
+}
+
+const SWARM_INCIDENT_BUNDLE_CONTRACT_ID: &str = "ft.swarm_incident_bundle.v1";
+
+/// Per-status count for a verified incident bundle's source inventory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IncidentSourceStatusCounts {
+    /// Sources that wrote a payload.
+    pub collected: usize,
+    /// Sources intentionally skipped by policy/options.
+    pub skipped: usize,
+    /// Sources unavailable in the captured environment.
+    pub unavailable: usize,
+    /// Sources that were attempted and failed.
+    pub failed: usize,
+    /// Sources outside their freshness budget.
+    pub stale: usize,
+}
+
+impl IncidentSourceStatusCounts {
+    fn record(&mut self, status: IncidentSourceStatus) {
+        match status {
+            IncidentSourceStatus::Collected => self.collected += 1,
+            IncidentSourceStatus::Skipped => self.skipped += 1,
+            IncidentSourceStatus::Unavailable => self.unavailable += 1,
+            IncidentSourceStatus::Failed => self.failed += 1,
+            IncidentSourceStatus::Stale => self.stale += 1,
+        }
+    }
+}
+
+/// Operator-facing summary extracted from a verified incident bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentBundleVerificationSummary {
+    /// Bundle directory that was verified.
+    pub bundle_path: String,
+    /// Incident kind parsed from the manifest, when available.
+    pub kind: Option<IncidentKind>,
+    /// Swarm extension contract id.
+    pub contract_id: Option<String>,
+    /// Swarm extension schema version.
+    pub schema_version: Option<u32>,
+    /// Swarm extension format version.
+    pub format_version: Option<String>,
+    /// Privacy tier recorded by the collector.
+    pub privacy_tier: Option<String>,
+    /// Counts by source collection status.
+    pub source_counts: IncidentSourceStatusCounts,
+    /// Sources with skipped, unavailable, failed, or stale status.
+    pub degraded_sources: Vec<String>,
+    /// Highest-signal source problems for the operator to inspect first.
+    pub suspect_sources: Vec<String>,
+    /// Active Beads blockers discovered in bundle payloads.
+    pub active_blockers: Vec<String>,
+    /// RCH/proof evidence summary discovered in bundle payloads.
+    pub proof_rch_status: Option<String>,
+    /// Resource pressure summary discovered in bundle payloads.
+    pub resource_pressure: Option<String>,
+    /// Process sampler summary or degraded state.
+    pub process_sample: Option<String>,
+    /// Concrete next commands a second agent can run from the bundle summary.
+    pub next_commands: Vec<String>,
+}
+
+impl IncidentBundleVerificationSummary {
+    fn new(bundle_path: &Path) -> Self {
+        Self {
+            bundle_path: bundle_path.display().to_string(),
+            kind: None,
+            contract_id: None,
+            schema_version: None,
+            format_version: None,
+            privacy_tier: None,
+            source_counts: IncidentSourceStatusCounts::default(),
+            degraded_sources: Vec::new(),
+            suspect_sources: Vec::new(),
+            active_blockers: Vec::new(),
+            proof_rch_status: None,
+            resource_pressure: None,
+            process_sample: None,
+            next_commands: Vec::new(),
+        }
+    }
+}
+
+/// Strict verifier result for an incident bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentBundleVerificationResult {
+    /// Overall verifier status: "pass" or "fail".
+    pub status: String,
+    /// Concise operator summary derived from the manifest and payloads.
+    pub summary: IncidentBundleVerificationSummary,
+    /// Individual structural, privacy, and consistency checks.
+    pub checks: Vec<ReplayCheck>,
+    /// Non-fatal warnings, including readable newer-minor format versions.
+    pub warnings: Vec<String>,
+}
+
+/// Verify an incident bundle as a portable handoff artifact.
+///
+/// Unlike replay mode, this checks the complete bundle contract: required
+/// files, swarm schema version, warnings/source consistency, recursive
+/// redaction, and source-payload provenance.
+pub fn verify_incident_bundle(
+    bundle_path: &Path,
+) -> std::io::Result<IncidentBundleVerificationResult> {
+    if !bundle_path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Bundle directory not found: {}", bundle_path.display()),
+        ));
+    }
+
+    let mut checks = Vec::new();
+    let mut warnings = Vec::new();
+    let mut summary = IncidentBundleVerificationSummary::new(bundle_path);
+    let manifest_path = bundle_path.join("incident_manifest.json");
+
+    let manifest = match fs::read_to_string(&manifest_path) {
+        Ok(content) => match serde_json::from_str::<IncidentBundleResult>(&content) {
+            Ok(manifest) => {
+                push_replay_check(
+                    &mut checks,
+                    "manifest_valid",
+                    true,
+                    "incident_manifest.json is valid",
+                );
+                manifest
+            }
+            Err(error) => {
+                push_replay_check(
+                    &mut checks,
+                    "manifest_valid",
+                    false,
+                    format!("Invalid manifest JSON: {error}"),
+                );
+                return Ok(finalize_incident_bundle_verification(
+                    bundle_path,
+                    summary,
+                    checks,
+                    warnings,
+                ));
+            }
+        },
+        Err(error) => {
+            push_replay_check(
+                &mut checks,
+                "manifest_valid",
+                false,
+                format!("Cannot read manifest: {error}"),
+            );
+            return Ok(finalize_incident_bundle_verification(
+                bundle_path,
+                summary,
+                checks,
+                warnings,
+            ));
+        }
+    };
+
+    summary.kind = Some(manifest.kind);
+    let mut manifest_files = HashSet::new();
+    let mut manifest_file_paths_valid = true;
+    let mut manifest_listed_files_present = true;
+    for file in &manifest.files {
+        if let Err(error) = validate_bundle_relative_path(file) {
+            manifest_file_paths_valid = false;
+            warnings.push(format!("manifest file path {file} is invalid: {error}"));
+            continue;
+        }
+        manifest_files.insert(file.clone());
+        if !bundle_path.join(file).is_file() {
+            manifest_listed_files_present = false;
+        }
+    }
+    push_replay_check(
+        &mut checks,
+        "manifest_file_paths_safe",
+        manifest_file_paths_valid,
+        if manifest_file_paths_valid {
+            "All manifest file paths are bundle-relative".to_string()
+        } else {
+            "One or more manifest file paths are unsafe".to_string()
+        },
+    );
+    push_replay_check(
+        &mut checks,
+        "files_complete",
+        manifest_listed_files_present,
+        if manifest_listed_files_present {
+            format!(
+                "All {} manifest-listed files are present",
+                manifest.files.len()
+            )
+        } else {
+            "One or more manifest-listed files are missing".to_string()
+        },
+    );
+
+    let required_files_present = [
+        "incident_manifest.json",
+        "README.md",
+        "redaction_report.json",
+        "warnings.jsonl",
+    ]
+    .into_iter()
+    .all(|file| manifest_files.contains(file) && bundle_path.join(file).is_file());
+    push_replay_check(
+        &mut checks,
+        "required_files_present",
+        required_files_present,
+        if required_files_present {
+            "Required bundle files are listed and present".to_string()
+        } else {
+            "Required bundle files must be listed in the manifest and present on disk".to_string()
+        },
+    );
+
+    let Some(swarm) = manifest.swarm.as_ref() else {
+        push_replay_check(
+            &mut checks,
+            "swarm_extension_present",
+            false,
+            "manifest missing swarm incident-bundle extension",
+        );
+        return Ok(finalize_incident_bundle_verification(
+            bundle_path,
+            summary,
+            checks,
+            warnings,
+        ));
+    };
+
+    summary.contract_id = Some(swarm.contract_id.clone());
+    summary.schema_version = Some(swarm.schema_version);
+    summary.format_version = Some(swarm.format_version.clone());
+    summary.privacy_tier = Some(swarm.privacy_budget.tier.clone());
+
+    push_replay_check(
+        &mut checks,
+        "swarm_contract_id",
+        swarm.contract_id == SWARM_INCIDENT_BUNDLE_CONTRACT_ID,
+        format!("contract_id={}", swarm.contract_id),
+    );
+    push_replay_check(
+        &mut checks,
+        "schema_version_supported",
+        swarm.schema_version == 1,
+        format!("schema_version={}", swarm.schema_version),
+    );
+    push_replay_check(
+        &mut checks,
+        "version_compatible",
+        incident_format_version_compatible(&swarm.format_version, &mut warnings),
+        format!("format_version={}", swarm.format_version),
+    );
+
+    let manifest_warning_ids = swarm
+        .warnings
+        .iter()
+        .map(|warning| warning.id.clone())
+        .collect::<HashSet<_>>();
+    match warning_jsonl_ids(bundle_path) {
+        Ok(jsonl_warning_ids) => {
+            push_replay_check(
+                &mut checks,
+                "warnings_jsonl_consistent",
+                jsonl_warning_ids == manifest_warning_ids,
+                if jsonl_warning_ids == manifest_warning_ids {
+                    format!("{} warning id(s) match manifest", jsonl_warning_ids.len())
+                } else {
+                    format!(
+                        "warnings.jsonl ids {jsonl_warning_ids:?} do not match manifest ids {manifest_warning_ids:?}"
+                    )
+                },
+            );
+        }
+        Err(error) => {
+            push_replay_check(&mut checks, "warnings_jsonl_consistent", false, error);
+        }
+    }
+
+    let mut source_files = HashMap::new();
+    let mut source_warning_refs_valid = true;
+    let mut degraded_sources_explained = true;
+    let mut source_payload_refs_valid = true;
+    for source in &swarm.sources {
+        summary.source_counts.record(source.status);
+        if source.status != IncidentSourceStatus::Collected {
+            let degraded = format!(
+                "{}:{}",
+                source.name,
+                incident_source_status_label(source.status)
+            );
+            summary.degraded_sources.push(degraded.clone());
+            if matches!(
+                source.status,
+                IncidentSourceStatus::Unavailable
+                    | IncidentSourceStatus::Failed
+                    | IncidentSourceStatus::Stale
+            ) {
+                summary.suspect_sources.push(degraded);
+            }
+            if source.warning_ids.is_empty() {
+                degraded_sources_explained = false;
+            }
+        }
+        for warning_id in &source.warning_ids {
+            if !manifest_warning_ids.contains(warning_id) {
+                source_warning_refs_valid = false;
+            }
+        }
+        if source.status == IncidentSourceStatus::Collected && source.file.is_none() {
+            source_payload_refs_valid = false;
+        }
+        if source.status == IncidentSourceStatus::Unavailable && source.file.is_some() {
+            source_payload_refs_valid = false;
+        }
+        if let Some(file) = &source.file {
+            if validate_bundle_relative_path(file).is_err()
+                || !manifest_files.contains(file)
+                || !bundle_path.join(file).is_file()
+            {
+                source_payload_refs_valid = false;
+            } else {
+                source_files.insert(file.clone(), source.name.clone());
+                enrich_incident_verification_summary(bundle_path, source, &mut summary);
+            }
+        } else if source.name == "process_sample"
+            && source.status != IncidentSourceStatus::Collected
+        {
+            summary.process_sample = Some(incident_source_status_label(source.status).to_string());
+        }
+    }
+    push_replay_check(
+        &mut checks,
+        "degraded_sources_explained",
+        degraded_sources_explained,
+        if degraded_sources_explained {
+            "All degraded sources carry warning ids".to_string()
+        } else {
+            "One or more degraded sources lack warning ids".to_string()
+        },
+    );
+    push_replay_check(
+        &mut checks,
+        "source_warning_refs_valid",
+        source_warning_refs_valid,
+        if source_warning_refs_valid {
+            "All source warning ids resolve to manifest warnings".to_string()
+        } else {
+            "One or more source warning ids are missing from manifest warnings".to_string()
+        },
+    );
+    push_replay_check(
+        &mut checks,
+        "source_payload_refs_valid",
+        source_payload_refs_valid,
+        if source_payload_refs_valid {
+            "All collected source payloads are listed and present".to_string()
+        } else {
+            "One or more source payload references are missing or unsafe".to_string()
+        },
+    );
+
+    let source_payloads_have_provenance = match source_payload_files(bundle_path) {
+        Ok(payloads) => payloads.into_iter().all(|path| {
+            bundle_relative_display(bundle_path, &path)
+                .ok()
+                .is_some_and(|relative| source_files.contains_key(&relative))
+        }),
+        Err(error) => {
+            warnings.push(error);
+            false
+        }
+    };
+    push_replay_check(
+        &mut checks,
+        "source_payloads_have_provenance",
+        source_payloads_have_provenance,
+        if source_payloads_have_provenance {
+            "All files under sources/ are referenced by manifest source entries".to_string()
+        } else {
+            "One or more files under sources/ lack manifest source provenance".to_string()
+        },
+    );
+
+    match read_redaction_report(bundle_path) {
+        Ok(report) => {
+            push_replay_check(
+                &mut checks,
+                "redaction_report_valid",
+                true,
+                format!(
+                    "{} total redactions across {} files",
+                    report.total_redactions,
+                    report.per_file.len()
+                ),
+            );
+            push_replay_check(
+                &mut checks,
+                "redaction_summary_consistent",
+                report.total_redactions == swarm.redaction_summary.total_redactions,
+                if report.total_redactions == swarm.redaction_summary.total_redactions {
+                    "redaction_report total matches manifest swarm summary".to_string()
+                } else {
+                    format!(
+                        "redaction_report total {} does not match manifest total {}",
+                        report.total_redactions, swarm.redaction_summary.total_redactions
+                    )
+                },
+            );
+        }
+        Err(error) => {
+            push_replay_check(&mut checks, "redaction_report_valid", false, error);
+        }
+    }
+
+    match scan_bundle_for_raw_secrets(bundle_path) {
+        Ok(leaks) => {
+            push_replay_check(
+                &mut checks,
+                "no_raw_secrets_recursive",
+                leaks.is_empty(),
+                if leaks.is_empty() {
+                    "No raw secrets detected in bundle text files".to_string()
+                } else {
+                    format!("raw secret candidates detected in {}", leaks.join(", "))
+                },
+            );
+        }
+        Err(error) => {
+            push_replay_check(
+                &mut checks,
+                "no_raw_secrets_recursive",
+                false,
+                error.to_string(),
+            );
+        }
+    }
+
+    Ok(finalize_incident_bundle_verification(
+        bundle_path,
+        summary,
+        checks,
+        warnings,
+    ))
+}
+
+/// Render the strict verifier result into a concise human-readable summary.
+#[must_use]
+pub fn render_incident_bundle_verification_summary(
+    result: &IncidentBundleVerificationResult,
+) -> String {
+    let summary = &result.summary;
+    let mut out = String::new();
+    out.push_str("Verifier summary\n");
+    out.push_str(&format!("  Status:  {}\n", result.status));
+    if let Some(kind) = summary.kind {
+        out.push_str(&format!("  Kind:    {kind}\n"));
+    }
+    if let Some(tier) = &summary.privacy_tier {
+        out.push_str(&format!("  Privacy: {tier}\n"));
+    }
+    out.push_str(&format!(
+        "  Sources: collected={}, skipped={}, unavailable={}, failed={}, stale={}\n",
+        summary.source_counts.collected,
+        summary.source_counts.skipped,
+        summary.source_counts.unavailable,
+        summary.source_counts.failed,
+        summary.source_counts.stale,
+    ));
+    if !summary.suspect_sources.is_empty() {
+        out.push_str("  Suspect sources:\n");
+        for source in &summary.suspect_sources {
+            out.push_str(&format!("    - {source}\n"));
+        }
+    }
+    if !summary.active_blockers.is_empty() {
+        out.push_str("  Active blockers:\n");
+        for blocker in &summary.active_blockers {
+            out.push_str(&format!("    - {blocker}\n"));
+        }
+    }
+    if let Some(rch_status) = &summary.proof_rch_status {
+        out.push_str(&format!("  RCH/proof: {rch_status}\n"));
+    }
+    if let Some(resource_pressure) = &summary.resource_pressure {
+        out.push_str(&format!("  Resource pressure: {resource_pressure}\n"));
+    }
+    if let Some(process_sample) = &summary.process_sample {
+        out.push_str(&format!("  Process sample: {process_sample}\n"));
+    }
+    if !summary.next_commands.is_empty() {
+        out.push_str("  Next commands:\n");
+        for command in &summary.next_commands {
+            out.push_str(&format!("    - {command}\n"));
+        }
+    }
+    out
+}
+
+fn finalize_incident_bundle_verification(
+    bundle_path: &Path,
+    mut summary: IncidentBundleVerificationSummary,
+    checks: Vec<ReplayCheck>,
+    warnings: Vec<String>,
+) -> IncidentBundleVerificationResult {
+    let status = if checks.iter().all(|check| check.passed) {
+        "pass"
+    } else {
+        "fail"
+    }
+    .to_string();
+    summary.next_commands = incident_verification_next_commands(bundle_path, &summary, &checks);
+    IncidentBundleVerificationResult {
+        status,
+        summary,
+        checks,
+        warnings,
+    }
+}
+
+fn push_replay_check(
+    checks: &mut Vec<ReplayCheck>,
+    name: impl Into<String>,
+    passed: bool,
+    detail: impl Into<String>,
+) {
+    checks.push(ReplayCheck {
+        name: name.into(),
+        passed,
+        detail: Some(detail.into()),
+    });
+}
+
+fn incident_format_version_compatible(format_version: &str, warnings: &mut Vec<String>) -> bool {
+    let Some((major, minor)) = parse_incident_format_version(format_version) else {
+        return false;
+    };
+    let reader = crate::incident_bundle::CURRENT_FORMAT_VERSION;
+    if major != reader.major {
+        return false;
+    }
+    if minor > reader.minor {
+        warnings.push(format!(
+            "bundle minor format {minor} is newer than reader minor {}",
+            reader.minor
+        ));
+    }
+    true
+}
+
+fn parse_incident_format_version(format_version: &str) -> Option<(u16, u16)> {
+    let (major, minor) = format_version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+fn validate_bundle_relative_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("path is empty".to_string());
+    }
+    if path.contains('\\') {
+        return Err("path contains a backslash separator".to_string());
+    }
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Err("path is absolute".to_string());
+    }
+    for component in path.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err("path contains a non-normal component".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn warning_jsonl_ids(bundle_path: &Path) -> Result<HashSet<String>, String> {
+    let warnings_path = bundle_path.join("warnings.jsonl");
+    let warnings = fs::read_to_string(&warnings_path)
+        .map_err(|error| format!("cannot read {}: {error}", warnings_path.display()))?;
+    let mut ids = HashSet::new();
+    for (index, line) in warnings.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let warning: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|error| format!("warnings.jsonl line {} invalid: {error}", index + 1))?;
+        let id = warning
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("warnings.jsonl line {} missing id", index + 1))?;
+        ids.insert(id.to_string());
+    }
+    Ok(ids)
+}
+
+fn read_redaction_report(bundle_path: &Path) -> Result<RedactionReport, String> {
+    let path = bundle_path.join("redaction_report.json");
+    serde_json::from_str(
+        &fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("invalid redaction_report.json: {error}"))
+}
+
+fn source_payload_files(bundle_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let sources = bundle_path.join("sources");
+    if !sources.exists() {
+        return Ok(Vec::new());
+    }
+    collect_bundle_files(&sources)
+}
+
+fn collect_bundle_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    collect_bundle_files_inner(root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_bundle_files_inner(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in
+        fs::read_dir(root).map_err(|error| format!("cannot read {}: {error}", root.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read directory entry: {error}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot read file type for {}: {error}", path.display()))?;
+        if file_type.is_dir() {
+            collect_bundle_files_inner(&path, files)?;
+        } else if file_type.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn scan_bundle_for_raw_secrets(bundle_path: &Path) -> std::io::Result<Vec<String>> {
+    let redactor = Redactor::new();
+    let mut leaks = Vec::new();
+    for path in collect_bundle_files(bundle_path).map_err(std::io::Error::other)? {
+        if !should_scan_bundle_text_file(&path) {
+            continue;
+        }
+        let content = fs::read_to_string(&path)?;
+        if !redactor.detect(&content).is_empty() {
+            leaks.push(
+                bundle_relative_display(bundle_path, &path)
+                    .unwrap_or_else(|_| path.display().to_string()),
+            );
+        }
+    }
+    Ok(leaks)
+}
+
+fn should_scan_bundle_text_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("json" | "jsonl" | "toml" | "md" | "txt")
+    )
+}
+
+fn bundle_relative_display(bundle_path: &Path, path: &Path) -> Result<String, String> {
+    let relative = path.strip_prefix(bundle_path).map_err(|error| {
+        format!(
+            "{} is outside {}: {error}",
+            path.display(),
+            bundle_path.display()
+        )
+    })?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn incident_source_status_label(status: IncidentSourceStatus) -> &'static str {
+    match status {
+        IncidentSourceStatus::Collected => "collected",
+        IncidentSourceStatus::Skipped => "skipped",
+        IncidentSourceStatus::Unavailable => "unavailable",
+        IncidentSourceStatus::Failed => "failed",
+        IncidentSourceStatus::Stale => "stale",
+    }
+}
+
+fn enrich_incident_verification_summary(
+    bundle_path: &Path,
+    source: &IncidentSourceEntry,
+    summary: &mut IncidentBundleVerificationSummary,
+) {
+    let Some(file) = &source.file else {
+        return;
+    };
+    let path = bundle_path.join(file);
+    let Ok(content) = fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+
+    match source.name.as_str() {
+        "beads_blocker_snapshot" => {
+            if let Some(blocked) = value.get("blocked").and_then(serde_json::Value::as_array) {
+                for item in blocked {
+                    let id = item
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let blockers = item
+                        .get("blocked_by")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+                    if blockers.is_empty() {
+                        summary.active_blockers.push(id.to_string());
+                    } else {
+                        summary
+                            .active_blockers
+                            .push(format!("{id} blocked by {blockers}"));
+                    }
+                }
+            }
+        }
+        "resource_pressure_snapshot" => {
+            if let Some(pressure) = value.get("pressure").and_then(serde_json::Value::as_object) {
+                let mut parts = pressure
+                    .iter()
+                    .map(|(key, value)| {
+                        format!(
+                            "{key}={}",
+                            value
+                                .as_str()
+                                .map_or_else(|| value.to_string(), str::to_string)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                parts.sort();
+                summary.resource_pressure = Some(parts.join(", "));
+            }
+        }
+        "rch_timeout_evidence" | "proof_rch_evidence" => {
+            let verdict = value
+                .get("verdict")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let timeout = value
+                .get("timeout_ms")
+                .and_then(serde_json::Value::as_u64)
+                .map(|timeout| format!(" after {timeout}ms"))
+                .unwrap_or_default();
+            summary.proof_rch_status = Some(format!("{verdict}{timeout}"));
+        }
+        "process_sample" => {
+            let process_count = value
+                .get("processes")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            summary.process_sample = Some(format!("{process_count} process row(s)"));
+        }
+        _ => {}
+    }
+}
+
+fn incident_verification_next_commands(
+    bundle_path: &Path,
+    summary: &IncidentBundleVerificationSummary,
+    checks: &[ReplayCheck],
+) -> Vec<String> {
+    let mut commands = vec![format!(
+        "ft reproduce replay {} --mode policy --format json",
+        bundle_path.display()
+    )];
+    if checks
+        .iter()
+        .any(|check| !check.passed && matches!(check.name.as_str(), "no_raw_secrets_recursive"))
+    {
+        commands.push("ft reproduce export --kind manual --format json".to_string());
+    }
+    for blocker in &summary.active_blockers {
+        if let Some(id) = blocker.split_whitespace().next() {
+            commands.push(format!("br show {id} --json"));
+        }
+    }
+    if summary
+        .proof_rch_status
+        .as_deref()
+        .is_some_and(|status| status.contains("timeout"))
+    {
+        commands.push("rch --json status --workers".to_string());
+    }
+    if summary.resource_pressure.is_some() {
+        commands.push("ft doctor --format json".to_string());
+    }
+    commands.sort();
+    commands.dedup();
+    commands
 }
 
 /// Replay an incident bundle for deterministic analysis.

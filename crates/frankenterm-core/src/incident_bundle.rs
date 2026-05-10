@@ -723,9 +723,10 @@ pub fn generate_bundle_readme(manifest: &IncidentManifest) -> String {
     out.push_str("## Replay\n\n");
     out.push_str("Validate this bundle using:\n\n");
     out.push_str("```bash\n");
-    out.push_str("ft reproduce --mode policy  <bundle-dir>  # check consistency + redaction\n");
-    out.push_str("ft reproduce --mode rules   <bundle-dir>  # check event structure\n");
-    out.push_str("ft reproduce --mode workflow <bundle-dir>  # check workflow traces\n");
+    out.push_str(
+        "ft reproduce replay <bundle-dir> --mode policy  # check consistency + redaction\n",
+    );
+    out.push_str("ft reproduce replay <bundle-dir> --mode rules   # check event structure\n");
     out.push_str("```\n\n");
 
     out.push_str("## Safety\n\n");

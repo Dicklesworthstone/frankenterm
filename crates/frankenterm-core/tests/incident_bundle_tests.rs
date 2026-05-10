@@ -5,13 +5,14 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use frankenterm_core::crash::{
     CrashManifest, CrashReport, HealthSnapshot, IncidentBundleOptions, IncidentBundleResult,
     IncidentKind, IncidentProcessSamplerConfig, IncidentSourceStatus, PanePriorityOverrideSnapshot,
     ReplayMode, collect_incident_bundle, collect_incident_bundle_with_process_sampler,
-    export_incident_bundle, latest_crash_bundle, list_crash_bundles, replay_incident_bundle,
+    export_incident_bundle, latest_crash_bundle, list_crash_bundles,
+    render_incident_bundle_verification_summary, replay_incident_bundle, verify_incident_bundle,
     write_crash_bundle,
 };
 use frankenterm_core::policy::Redactor;
@@ -77,6 +78,62 @@ fn read_all_bundle_text(dir: &Path) -> String {
         }
     }
     combined
+}
+
+fn incident_bundle_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("incident_bundle_goldens")
+        .join(name)
+}
+
+fn repo_doc(path: &str) -> String {
+    fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(path),
+    )
+    .unwrap_or_else(|error| panic!("failed to read repo doc {path}: {error}"))
+}
+
+fn assert_contains_all(label: &str, text: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(text.contains(needle), "{label} should contain `{needle}`");
+    }
+}
+
+fn copy_fixture_to_temp(name: &str) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    copy_dir_recursive(&incident_bundle_fixture(name), temp.path()).unwrap();
+    temp
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|error| format!("cannot create {}: {error}", dst.display()))?;
+    for entry in
+        fs::read_dir(src).map_err(|error| format!("cannot read {}: {error}", src.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read directory entry: {error}"))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|error| {
+            format!("cannot read file type for {}: {error}", src_path.display())
+        })?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path).map_err(|error| {
+                format!(
+                    "cannot copy {} to {}: {error}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 // ── Multi-pattern redaction in crash bundles ──────────────────────────
@@ -740,6 +797,19 @@ fn collect_incident_bundle_manual_kind_produces_manifest() {
     assert!(redaction_path.exists());
     assert!(result.path.join("warnings.jsonl").exists());
     assert!(result.path.join("README.md").exists());
+    let readme = fs::read_to_string(result.path.join("README.md")).unwrap();
+    assert_contains_all(
+        "generated incident bundle README",
+        &readme,
+        &[
+            "Operator Handoff",
+            "ft reproduce replay <bundle-dir> --mode policy",
+            "ft reproduce replay <bundle-dir> --mode policy --format json",
+            "do not repair or restart shared services",
+            "Classify RCH setup, sync, worker, package, and transport failures separately",
+            "local Cargo is not proof for the handoff lane",
+        ],
+    );
 
     let swarm = result.swarm.as_ref().expect("swarm provenance manifest");
     assert!(!swarm.collection_policy.mutating_actions_allowed);
@@ -1573,4 +1643,267 @@ fn replay_crash_kind_bundle_validates_crash_report() {
             .iter()
             .any(|c| c.name == "crash_report_valid" && c.passed)
     );
+}
+
+#[test]
+fn verify_degraded_fixture_emits_operator_summary() {
+    let bundle = incident_bundle_fixture("degraded");
+    let result = verify_incident_bundle(&bundle).unwrap();
+
+    assert_eq!(result.status, "pass");
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|check| check.name == "required_files_present" && check.passed)
+    );
+    assert!(
+        result
+            .summary
+            .active_blockers
+            .iter()
+            .any(|blocker| blocker.contains("ft-krsq0.5"))
+    );
+    assert_eq!(
+        result.summary.proof_rch_status.as_deref(),
+        Some("timeout after 300000ms")
+    );
+    assert_eq!(
+        result.summary.process_sample.as_deref(),
+        Some("unavailable")
+    );
+    assert!(
+        result
+            .summary
+            .next_commands
+            .iter()
+            .any(|command| command == "br show ft-krsq0.5 --json")
+    );
+
+    let rendered = render_incident_bundle_verification_summary(&result);
+    assert!(rendered.contains("Verifier summary"));
+    assert!(rendered.contains("Active blockers"));
+}
+
+#[test]
+fn verify_incident_bundle_docs_define_rch_safe_handoff_lane() {
+    let docs = repo_doc("docs/incident-bundles.md");
+    assert_contains_all(
+        "incident bundle handoff docs",
+        &docs,
+        &[
+            "RCH-Safe Handoff Proof Lane",
+            "Capture first, then verify the captured bundle",
+            "privacy tiers",
+            "Expected handoff artifacts",
+            "ft reproduce replay /path/to/wa_incident_manual_20260510_111240 --mode policy",
+            "ft reproduce replay /path/to/wa_incident_manual_20260510_111240 --mode policy --format json",
+            "RCH_REQUIRE_REMOTE=1",
+            "CARGO_TARGET_DIR=/tmp/ft-krsq0-6-incident-bundle",
+            "cargo test -p frankenterm-core --test incident_bundle_tests verify_ -- --nocapture",
+            "RCH fails before remote Cargo starts",
+            "RCH reaches Cargo but times out",
+            "Local Cargo is used for the heavy lane without explicit fallback approval",
+            "`am doctor repair`",
+            "`am service restart`",
+            "pane writes",
+            "`git reset --hard`",
+            "`git clean -fd`",
+        ],
+    );
+}
+
+#[test]
+fn verify_generated_bundle_readme_includes_rch_safe_handoff_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crash_dir = tmp.path().join("crashes");
+    let out_dir = tmp.path().join("output");
+    fs::create_dir_all(&crash_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let opts = IncidentBundleOptions {
+        crash_dir: &crash_dir,
+        config_path: None,
+        out_dir: &out_dir,
+        kind: IncidentKind::Manual,
+        db_path: None,
+        max_events: 0,
+    };
+
+    let bundle = collect_incident_bundle(&opts).unwrap();
+    let readme = fs::read_to_string(bundle.path.join("README.md")).unwrap();
+
+    assert_contains_all(
+        "generated incident bundle README",
+        &readme,
+        &[
+            "Operator Handoff",
+            "ft reproduce replay <bundle-dir> --mode policy",
+            "ft reproduce replay <bundle-dir> --mode policy --format json",
+            "do not repair or restart shared services",
+            "Classify RCH setup, sync, worker, package, and transport failures separately",
+            "local Cargo is not proof for the handoff lane",
+        ],
+    );
+}
+
+#[test]
+fn verify_collected_bundle_lists_required_files_and_passes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crash_dir = tmp.path().join("crashes");
+    let out_dir = tmp.path().join("output");
+    fs::create_dir_all(&crash_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let opts = IncidentBundleOptions {
+        crash_dir: &crash_dir,
+        config_path: None,
+        out_dir: &out_dir,
+        kind: IncidentKind::Manual,
+        db_path: None,
+        max_events: 0,
+    };
+
+    let bundle = collect_incident_bundle(&opts).unwrap();
+    let manifest: IncidentBundleResult = serde_json::from_str(
+        &fs::read_to_string(bundle.path.join("incident_manifest.json")).unwrap(),
+    )
+    .unwrap();
+    for required in [
+        "incident_manifest.json",
+        "README.md",
+        "redaction_report.json",
+        "warnings.jsonl",
+    ] {
+        assert!(
+            manifest.files.iter().any(|file| file == required),
+            "generated manifest should list required file {required}"
+        );
+    }
+
+    let result = verify_incident_bundle(&bundle.path).unwrap();
+    assert_eq!(result.status, "pass");
+}
+
+#[test]
+fn verify_corrupt_bundle_manifest_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("incident_manifest.json"), "not json").unwrap();
+
+    let result = verify_incident_bundle(temp.path()).unwrap();
+
+    assert_eq!(result.status, "fail");
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|check| check.name == "manifest_valid" && !check.passed)
+    );
+}
+
+#[test]
+fn verify_incomplete_bundle_fails_required_file_checks() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("incident_manifest.json"),
+        fs::read_to_string(incident_bundle_fixture("normal").join("incident_manifest.json"))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let result = verify_incident_bundle(temp.path()).unwrap();
+
+    assert_eq!(result.status, "fail");
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|check| check.name == "required_files_present" && !check.passed)
+    );
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|check| check.name == "files_complete" && !check.passed)
+    );
+}
+
+#[test]
+fn verify_unsafe_manifest_paths_fail() {
+    let temp = copy_fixture_to_temp("normal");
+    let manifest_path = temp.path().join("incident_manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::Value::String("sources\\leak.json".to_string()));
+    fs::write(
+        &manifest_path,
+        format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()),
+    )
+    .unwrap();
+
+    let result = verify_incident_bundle(temp.path()).unwrap();
+
+    assert_eq!(result.status, "fail");
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|check| check.name == "manifest_file_paths_safe" && !check.passed)
+    );
+}
+
+#[test]
+fn verify_incompatible_bundle_format_fails() {
+    let temp = copy_fixture_to_temp("normal");
+    let manifest_path = temp.path().join("incident_manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["swarm"]["format_version"] = serde_json::Value::String("2.0".to_string());
+    fs::write(
+        &manifest_path,
+        format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()),
+    )
+    .unwrap();
+
+    let result = verify_incident_bundle(temp.path()).unwrap();
+
+    assert_eq!(result.status, "fail");
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|check| check.name == "version_compatible" && !check.passed)
+    );
+}
+
+#[test]
+fn verify_privacy_violating_bundle_fails_recursive_secret_scan() {
+    let temp = copy_fixture_to_temp("sensitive_transcript");
+    let leaked = format!(
+        "{{\"pane_id\":41,\"tail\":\"{}\"}}\n",
+        synthetic_aws_access_key()
+    );
+    fs::write(
+        temp.path().join("sources").join("pane_text_summaries.json"),
+        leaked,
+    )
+    .unwrap();
+
+    let result = verify_incident_bundle(temp.path()).unwrap();
+
+    assert_eq!(result.status, "fail");
+    assert!(
+        result
+            .checks
+            .iter()
+            .any(|check| check.name == "no_raw_secrets_recursive" && !check.passed)
+    );
+}
+
+fn synthetic_aws_access_key() -> String {
+    let prefix = ["AK", "IA"].concat();
+    format!("{prefix}ABCDEFGHIJKLMNOP")
 }

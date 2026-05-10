@@ -36795,7 +36795,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 mode,
                 format,
             } => {
-                use frankenterm_core::crash::replay_incident_bundle;
+                use frankenterm_core::crash::{
+                    render_incident_bundle_verification_summary, replay_incident_bundle,
+                    verify_incident_bundle,
+                };
 
                 let replay_mode = match mode.to_lowercase().as_str() {
                     "policy" => frankenterm_core::crash::ReplayMode::Policy,
@@ -36808,8 +36811,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 match replay_incident_bundle(&bundle, replay_mode) {
                     Ok(result) => {
+                        let verification = verify_incident_bundle(&bundle);
                         if format.to_lowercase() == "json" {
-                            let json = serde_json::to_string_pretty(&result)
+                            let payload = match verification {
+                                Ok(verification) => serde_json::json!({
+                                    "replay": result,
+                                    "verification": verification,
+                                }),
+                                Err(error) => serde_json::json!({
+                                    "replay": result,
+                                    "verification_error": error.to_string(),
+                                }),
+                            };
+                            let json = serde_json::to_string_pretty(&payload)
                                 .unwrap_or_else(|_| "{}".to_string());
                             println!("{json}");
                         } else {
@@ -36836,6 +36850,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 println!("\nWarnings:");
                                 for w in &result.warnings {
                                     println!("  - {w}");
+                                }
+                            }
+                            match verification {
+                                Ok(verification) => {
+                                    println!();
+                                    print!(
+                                        "{}",
+                                        render_incident_bundle_verification_summary(&verification)
+                                    );
+                                }
+                                Err(error) => {
+                                    println!("\nVerifier summary unavailable: {error}");
                                 }
                             }
                         }

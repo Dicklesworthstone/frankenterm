@@ -480,6 +480,74 @@ If validation invokes Cargo, clippy, benchmarks, or E2E harnesses, the proof
 must run through RCH and preserve the exact command plus artifact path in the
 closing evidence.
 
+### RCH-Safe Handoff Proof Lane
+
+Use this lane when an incident bundle becomes the handoff artifact between
+agents. Capture first, then verify the captured bundle; do not collect new live
+state while proving the handoff.
+
+Capture timing and privacy tiers:
+
+- Capture after the operator has identified an incident and before any cleanup,
+  restart, Beads reassignment, or pane interaction.
+- Prefer `strict` for external handoff, `default` for normal internal triage,
+  and `verbose` only when the recipient is authorized for larger internal
+  diagnostics.
+- If Agent Mail, RCH, Beads, git, robot, or process data is unavailable, record
+  a degraded source and warning instead of repairing or restarting anything.
+
+Expected handoff artifacts:
+
+- bundle directory path, exactly as emitted by `ft reproduce export`
+- `incident_manifest.json`, `README.md`, `redaction_report.json`, and
+  `warnings.jsonl`
+- optional `sources/*` payloads, each backed by a manifest source entry
+- verifier output from `ft reproduce replay <bundle-dir> --mode policy`
+- exact RCH command and retained log or artifact path for any heavy proof
+
+Verifier use:
+
+```bash
+ft reproduce replay /path/to/wa_incident_manual_20260510_111240 --mode policy
+ft reproduce replay /path/to/wa_incident_manual_20260510_111240 --mode policy --format json
+```
+
+The human summary names degraded sources, active Beads blockers, RCH/proof
+status, process-sampler state, and follow-up commands for the receiving agent.
+The JSON output includes the replay result plus the strict verifier result.
+
+Remote-required source proof must use RCH. This focused lane exercises the
+fixture verifier and generated-bundle verifier without falling back to local
+Cargo:
+
+```bash
+RCH_REQUIRE_REMOTE=1 \
+RCH_NO_UPDATE_CHECK=1 \
+RCH_EXTERNAL_TIMEOUT_ENABLED=false \
+rch exec -- env \
+  CARGO_TARGET_DIR=/tmp/ft-krsq0-6-incident-bundle \
+  CARGO_INCREMENTAL=0 \
+  CARGO_BUILD_JOBS=1 \
+  RUST_TEST_THREADS=1 \
+  cargo test -p frankenterm-core --test incident_bundle_tests verify_ -- --nocapture
+```
+
+Failure classification:
+
+| Failure | Classification | Closeout behavior |
+| --- | --- | --- |
+| `ft reproduce replay` reports failed verifier checks | Product/source regression or privacy defect. Fix the bundle producer, verifier, or fixture before sharing. |
+| RCH fails before remote Cargo starts | Environmental substrate failure. Record worker, reason code, command, and artifact path; do not claim source proof. |
+| RCH reaches Cargo but times out, loses files, or fails package materialization before tests run | RCH substrate/materialization failure. Keep it separate from source regressions and rerun after the substrate is healthy. |
+| Remote Cargo runs the verifier tests and tests fail | Source/test failure. Fix the failing code or fixture. |
+| Local Cargo is used for the heavy lane without explicit fallback approval | Invalid proof. Rerun through RCH before closing the handoff bead. |
+
+During capture and handoff, do not run `am doctor repair`, `am doctor fix`,
+`am service restart`, RCH daemon restarts, pane writes, Beads reopen/claim
+actions, `git reset --hard`, `git clean -fd`, or destructive cleanup. If one of
+those actions appears necessary, file or update a separate blocker bead with the
+diagnosis instead of mutating the incident environment.
+
 ## Redaction
 
 All bundle files pass through the secret redactor before being written.
