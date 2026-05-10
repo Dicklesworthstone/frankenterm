@@ -145,6 +145,11 @@ jobs:
           FT_XBNL0_5_2_SKIP_CARGO_TEST: "1"
         run: bash tests/e2e/test_ft_xbnl0_5_2_finish_line_guards.sh
 
+      - name: Run ft-e87u6.2 attestation build matrix
+        env:
+          FT_E87U6_2_ARTIFACT_DIR: ${{ runner.temp }}/ft-e87u6-2-attestation-build-matrix
+        run: bash tests/scripts/test_attestation_build_matrix.sh
+
       - name: Upload E2E artifact bundle
         if: always()
         uses: actions/upload-artifact@v4
@@ -152,4 +157,13 @@ jobs:
           name: finish-line-guards-e2e-bundle
           path: tests/e2e/logs/ft_xbnl0_5_2_finish_line_guards_*/
           if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload ft-e87u6.2 attestation build matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ft-e87u6-2-attestation-build-matrix
+          path: ${{ runner.temp }}/ft-e87u6-2-attestation-build-matrix/
+          if-no-files-found: error
           retention-days: 30

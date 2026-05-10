@@ -17,23 +17,27 @@
 
 set -euo pipefail
 
-GENERATOR_VERSION="1.0.0"
+GENERATOR_VERSION="1.1.0"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-MANIFEST="$REPO_ROOT/docs/attestations/manifest.json"
-OUT_DIR="$REPO_ROOT/docs/attestations"
-SCHEMA_PATH="$REPO_ROOT/docs/attestations/schema.json"
+MANIFEST="${FT_ATTESTATION_MANIFEST:-$REPO_ROOT/docs/attestations/manifest.json}"
+OUT_DIR="${FT_ATTESTATION_OUT_DIR:-$REPO_ROOT/docs/attestations}"
+SCHEMA_PATH="${FT_ATTESTATION_SCHEMA:-$REPO_ROOT/docs/attestations/schema.json}"
 
 VERSION=""
 CHANNEL="dev"
 SIGN_METHOD="unsigned"
 ALLOW_PARTIAL=0
+STRICT_DEFERRED=0
 COSIGN_IDENTITY="${COSIGN_IDENTITY:-}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 ED25519_PRIVATE_KEY_PATH="${ED25519_PRIVATE_KEY_PATH:-}"
+FT_BEAD_ID="${FT_BEAD_ID:-ft-e87u6.2}"
+FT_SCENARIO_ID="${FT_SCENARIO_ID:-attestation_build}"
+FT_CORRELATION_ID="${FT_CORRELATION_ID:-}"
 
 usage() {
   cat <<EOF
-Usage: $0 --version <semver> [--channel stable|beta|nightly|dev] [--sign cosign|ed25519|unsigned] [--allow-partial]
+Usage: $0 --version <semver> [--channel stable|beta|nightly|dev] [--sign cosign|ed25519|unsigned] [--allow-partial] [--strict-deferred]
 
   --version       Required. Semver, no leading 'v'.
   --channel       Release channel. Default: dev.
@@ -41,12 +45,18 @@ Usage: $0 --version <semver> [--channel stable|beta|nightly|dev] [--sign cosign|
                   (e.g. the GHA workflow ref); ed25519 requires \$ED25519_PRIVATE_KEY_PATH.
   --allow-partial Permit missing artifact paths in the manifest. Without this the build fails on any null path,
                   which is the desired CI behavior (bridge plan: "CI fails any release that omits a required artifact").
+  --strict-deferred
+                  Treat any deferred slot as an error. Use for release gates that must not ship a deferred set.
   -h, --help      Show this message.
 
 Environment:
   COSIGN_IDENTITY        Expected SAN/identity for cosign keyless. Required when --sign cosign.
   COSIGN_OIDC_ISSUER     Override OIDC issuer. Default: https://token.actions.githubusercontent.com
   ED25519_PRIVATE_KEY_PATH  PEM-encoded Ed25519 private key for --sign ed25519.
+  FT_ATTESTATION_MANIFEST   Override manifest path for tests.
+  FT_ATTESTATION_OUT_DIR    Override output directory for tests.
+  FT_BEAD_ID / FT_SCENARIO_ID / FT_CORRELATION_ID
+                           Structured-log identity fields.
 EOF
 }
 
@@ -56,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --channel)        CHANNEL="${2:?--channel requires a value}"; shift 2 ;;
     --sign)           SIGN_METHOD="${2:?--sign requires a value}"; shift 2 ;;
     --allow-partial)  ALLOW_PARTIAL=1; shift ;;
+    --strict-deferred) STRICT_DEFERRED=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -101,12 +112,63 @@ GIT_TREE="$(git -C "$REPO_ROOT" rev-parse "HEAD^{tree}")"
 GIT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 TAG="v${VERSION}"
+if [[ "$FT_SCENARIO_ID" == "attestation_build" ]]; then
+  FT_SCENARIO_ID="attestation_build_${VERSION}"
+fi
+if [[ -z "$FT_CORRELATION_ID" ]]; then
+  FT_CORRELATION_ID="${FT_BEAD_ID}-${FT_SCENARIO_ID}-${GENERATED_AT}"
+fi
+
+build_log() {
+  echo "[build] $*" >&2
+}
+
+emit_build_json() {
+  local step="$1"
+  local outcome="$2"
+  local reason_code="$3"
+  local error_code="$4"
+  local slot_category="${5:-}"
+  local deferred_to_bead="${6:-}"
+  local message="${7:-}"
+  local event
+  event="$(jq -cn \
+    --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg bead_id "$FT_BEAD_ID" \
+    --arg scenario_id "$FT_SCENARIO_ID" \
+    --arg surface "scripts/attestation-build.sh" \
+    --arg step "$step" \
+    --arg outcome "$outcome" \
+    --arg reason_code "$reason_code" \
+    --arg error_code "$error_code" \
+    --arg slot_category "$slot_category" \
+    --arg deferred_to_bead "$deferred_to_bead" \
+    --arg correlation_id "$FT_CORRELATION_ID" \
+    --arg message "$message" \
+    '{
+      timestamp: $timestamp,
+      bead_id: $bead_id,
+      scenario_id: $scenario_id,
+      surface: $surface,
+      step: $step,
+      outcome: $outcome,
+      reason_code: $reason_code,
+      error_code: $error_code,
+      slot_category: (if $slot_category == "" then null else $slot_category end),
+      deferred_to_bead: (if $deferred_to_bead == "" then null else $deferred_to_bead end),
+      correlation_id: $correlation_id,
+      message: $message
+    }')"
+  echo "[build:json] ${event}" >&2
+}
 
 CANONICAL_REQUIRED_JSON="$(jq -c '.required_categories' "$MANIFEST")"
 SLOTS_JSON="$(jq -c '.slots' "$MANIFEST")"
 
 # Enumerate slots, hash each non-null artifact path. Track unfilled categories.
 declare -a artifact_objs=()
+declare -a deferred_objs=()
+declare -a deferred_categories=()
 unfilled=()
 slot_count="$(jq 'length' <<<"$SLOTS_JSON")"
 
@@ -116,17 +178,41 @@ for ((i=0; i<slot_count; i++)); do
   path="$(jq -r '.path // ""' <<<"$slot")"
   media_type="$(jq -r '.media_type' <<<"$slot")"
   produced_by_bead="$(jq -r '.produced_by_bead // ""' <<<"$slot")"
+  deferred_to_bead="$(jq -r '.deferred_to_bead // ""' <<<"$slot")"
+  deferred_reason="$(jq -r '.deferred_reason // ""' <<<"$slot")"
   description="$(jq -r '.description // ""' <<<"$slot")"
 
   if [[ -z "$path" ]]; then
+    if [[ -n "$deferred_to_bead" ]]; then
+      deferred_obj="$(jq -n \
+        --arg category "$category" \
+        --arg media_type "$media_type" \
+        --arg produced_by_bead "$produced_by_bead" \
+        --arg deferred_to_bead "$deferred_to_bead" \
+        --arg deferred_reason "$deferred_reason" \
+        --arg description "$description" \
+        '{category:$category, media_type:$media_type, produced_by_bead:$produced_by_bead,
+          deferred_to_bead:$deferred_to_bead, deferred_reason:$deferred_reason}
+         + (if $description != "" then {description:$description} else {} end)')"
+      deferred_objs+=("$deferred_obj")
+      deferred_categories+=("$category")
+      emit_build_json "warn.deferred" "warned" "slot_deferred" "none" "$category" "$deferred_to_bead" "$deferred_reason"
+      continue
+    fi
     unfilled+=("$category (produced by ${produced_by_bead:-?})")
+    emit_build_json "error.unfilled" "failed" "slot_unfilled" "ATTESTATION-SLOT-UNFILLED" "$category" "" "slot has path=null with no deferred_to_bead"
     continue
   fi
 
   abs_path="$REPO_ROOT/$path"
   if [[ ! -f "$abs_path" ]]; then
-    echo "error: artifact missing on disk: $path (declared for category $category, bead $produced_by_bead)" >&2
-    exit 1
+    unfilled+=("$category (missing path $path, produced by ${produced_by_bead:-?})")
+    emit_build_json "error.missing_artifact" "failed" "artifact_missing" "ATTESTATION-ARTIFACT-MISSING" "$category" "" "$path"
+    if [[ $ALLOW_PARTIAL -eq 0 ]]; then
+      build_log "error: artifact missing on disk: $path (declared for category $category, bead $produced_by_bead)"
+      exit 1
+    fi
+    continue
   fi
 
   hash="$(sha256_file "$abs_path")"
@@ -144,6 +230,7 @@ for ((i=0; i<slot_count; i++)); do
      + (if $produced_by_bead != "" then {produced_by_bead:$produced_by_bead} else {} end)
      + (if $description       != "" then {description:$description}             else {} end)')"
   artifact_objs+=("$obj")
+  emit_build_json "validate.${category}" "passed" "artifact_hashed" "none" "$category" "" "$path"
 done
 
 # Required-category gate. Production releases must satisfy every canonical category.
@@ -160,23 +247,48 @@ for ((i=0; i<canonical_count; i++)); do
   if [[ $found -eq 1 ]]; then
     delivered_categories+=("$cat")
   else
+    deferred=0
+    for deferred_cat in "${deferred_categories[@]}"; do
+      if [[ "$deferred_cat" == "$cat" ]]; then deferred=1; break; fi
+    done
+    if [[ $deferred -eq 1 ]]; then
+      continue
+    fi
     missing_required+=("$cat")
   fi
 done
 
-if [[ ${#missing_required[@]} -gt 0 ]]; then
-  echo "error: canonical required categories missing from bundle:" >&2
-  for c in "${missing_required[@]}"; do echo "  - $c" >&2; done
-  if [[ $ALLOW_PARTIAL -eq 0 ]]; then
-    echo "  hint: producing beads have not yet shipped — see docs/reality-check-bridge-plan.md" >&2
-    echo "  to build a partial bundle anyway (dev channel only) pass --allow-partial" >&2
+if [[ ${#deferred_categories[@]} -gt 0 ]]; then
+  build_log "warning: deferred attestation slots present:"
+  for obj in "${deferred_objs[@]}"; do
+    category="$(jq -r '.category' <<<"$obj")"
+    bead="$(jq -r '.deferred_to_bead' <<<"$obj")"
+    reason="$(jq -r '.deferred_reason' <<<"$obj")"
+    build_log "  - $category deferred to $bead: $reason"
+  done
+  if [[ $STRICT_DEFERRED -eq 1 ]]; then
+    emit_build_json "summary" "failed" "strict_deferred" "ATTESTATION-DEFERRED-SLOT" "" "" "strict deferred mode rejected ${#deferred_categories[@]} deferred slot(s)"
+    build_log "error: --strict-deferred rejects ${#deferred_categories[@]} deferred slot(s)"
     exit 1
+  fi
+fi
+
+if [[ ${#missing_required[@]} -gt 0 ]]; then
+  build_log "error: canonical required categories missing from bundle:"
+  for c in "${missing_required[@]}"; do build_log "  - $c"; done
+  if [[ $ALLOW_PARTIAL -eq 0 ]]; then
+    build_log "  hint: producing beads have not yet shipped — see docs/reality-check-bridge-plan.md"
+    build_log "  to build a partial bundle anyway (dev channel only) pass --allow-partial"
+    emit_build_json "summary" "failed" "missing_required" "ATTESTATION-REQUIRED-MISSING" "" "" "${#missing_required[@]} required category/categories missing"
+    exit 1
+  else
+    emit_build_json "summary" "warned" "allow_partial_missing_required" "none" "" "" "${#missing_required[@]} required category/categories omitted by --allow-partial"
   fi
   if [[ "$CHANNEL" != "dev" ]]; then
-    echo "error: --allow-partial only permitted on --channel dev (got: $CHANNEL)" >&2
+    build_log "error: --allow-partial only permitted on --channel dev (got: $CHANNEL)"
     exit 1
   fi
-  echo "warning: building partial bundle on channel=dev. Bundle's required_categories will list only delivered categories." >&2
+  build_log "warning: building partial bundle on channel=dev. Bundle's required_categories will list only delivered categories."
 fi
 
 # The bundle commits to delivering only what it actually includes. verify --strict-required
@@ -188,7 +300,16 @@ else
 fi
 
 # Assemble bundle (without signature, then add signature placeholder).
-artifacts_json="$(printf '%s\n' "${artifact_objs[@]}" | jq -c -s '.')"
+if [[ ${#artifact_objs[@]} -eq 0 ]]; then
+  artifacts_json="[]"
+else
+  artifacts_json="$(printf '%s\n' "${artifact_objs[@]}" | jq -c -s '.')"
+fi
+if [[ ${#deferred_objs[@]} -eq 0 ]]; then
+  deferred_slots_json="[]"
+else
+  deferred_slots_json="$(printf '%s\n' "${deferred_objs[@]}" | jq -c -s '.')"
+fi
 
 bundle_no_sig="$(jq -n \
   --arg schema_version "1.0.0" \
@@ -202,6 +323,7 @@ bundle_no_sig="$(jq -n \
   --arg branch "$GIT_BRANCH" \
   --argjson artifacts "$artifacts_json" \
   --argjson required_categories "$REQUIRED_CATEGORIES_JSON" \
+  --argjson deferred_slots "$deferred_slots_json" \
   '{
     schema_version: $schema_version,
     release: {
@@ -216,7 +338,8 @@ bundle_no_sig="$(jq -n \
     },
     git: ({commit: $commit, tree: $tree} + (if $branch != "" then {branch: $branch} else {} end)),
     artifacts: $artifacts,
-    required_categories: $required_categories
+    required_categories: $required_categories,
+    deferred_slots: $deferred_slots
   }')"
 
 # Canonical signing payload: bundle (without .signature) sorted-keys + compact.
@@ -303,9 +426,13 @@ echo "  schema_version : 1.0.0"
 echo "  release        : v${VERSION} (${CHANNEL})"
 echo "  git            : ${GIT_COMMIT}"
 echo "  artifacts      : ${#artifact_objs[@]}"
+if [[ ${#deferred_objs[@]} -gt 0 ]]; then
+  echo "  deferred slots : ${#deferred_objs[@]}"
+fi
 if [[ ${#unfilled[@]} -gt 0 ]]; then
   echo "  unfilled slots : ${#unfilled[@]}"
   for u in "${unfilled[@]}"; do echo "    - $u"; done
 fi
 echo "  signature      : $SIGN_METHOD"
+emit_build_json "summary" "passed" "bundle_written" "none" "" "" "$out_path"
 echo "  canonical_sha  : $canonical_sha"

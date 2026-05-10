@@ -75,6 +75,12 @@
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/category" }
     },
+    "deferred_slots": {
+      "description": "Required manifest slots intentionally deferred to a live recovery or producer bead. Release gates can reject these with --strict-deferred, but dev bundles expose them so third-party verifiers can audit the gap.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/deferredSlot" },
+      "default": []
+    },
     "signature": { "$ref": "#/$defs/signature" }
   },
   "$defs": {
@@ -93,7 +99,8 @@
         "proofs/robot-contracts",
         "doctrine/agents-md-counts",
         "doctrine/vendored-provenance",
-        "doctrine/cx-propagation"
+        "doctrine/cx-propagation",
+        "perf/atlas-packing"
       ]
     },
     "artifact": {
@@ -131,6 +138,109 @@
           "pattern": "^(ft|wa|br)-[a-z0-9.]+$"
         },
         "description": { "type": "string" }
+      }
+    },
+    "deferredSlot": {
+      "type": "object",
+      "required": ["category", "media_type", "produced_by_bead", "deferred_to_bead", "deferred_reason"],
+      "additionalProperties": false,
+      "properties": {
+        "category": { "$ref": "#/$defs/category" },
+        "media_type": {
+          "enum": [
+            "application/json",
+            "text/markdown",
+            "application/x-tla+text",
+            "application/x-tar",
+            "text/plain"
+          ]
+        },
+        "produced_by_bead": {
+          "type": "string",
+          "pattern": "^(ft|wa|br)-[a-z0-9.]+$"
+        },
+        "deferred_to_bead": {
+          "type": "string",
+          "pattern": "^ft-[a-z0-9.]+$"
+        },
+        "deferred_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "description": { "type": "string" }
+      }
+    },
+    "manifestSlot": {
+      "type": "object",
+      "required": ["category", "path", "media_type", "produced_by_bead", "description"],
+      "additionalProperties": false,
+      "properties": {
+        "category": { "$ref": "#/$defs/category" },
+        "path": {
+          "description": "Repo-relative POSIX path to the artifact, or null only when deferred_to_bead and deferred_reason explain the live follow-up.",
+          "oneOf": [
+            { "type": "string", "pattern": "^[^/].*$" },
+            { "type": "null" }
+          ]
+        },
+        "media_type": {
+          "enum": [
+            "application/json",
+            "text/markdown",
+            "application/x-tla+text",
+            "application/x-tar",
+            "text/plain"
+          ]
+        },
+        "produced_by_bead": {
+          "type": "string",
+          "pattern": "^(ft|wa|br)-[a-z0-9.]+$"
+        },
+        "deferred_to_bead": {
+          "type": "string",
+          "pattern": "^ft-[a-z0-9.]+$",
+          "description": "When path is null, names the bead whose closure will populate this slot."
+        },
+        "deferred_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "Short human-readable explanation of why the slot is deferred. Required when deferred_to_bead is set."
+        },
+        "description": { "type": "string" }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "path": { "type": "string", "pattern": "^[^/].*$" }
+          },
+          "not": { "required": ["deferred_to_bead"] }
+        },
+        {
+          "required": ["deferred_to_bead", "deferred_reason"],
+          "properties": {
+            "path": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "manifestPlaceholder": {
+      "type": "object",
+      "required": ["required_categories", "slots"],
+      "additionalProperties": false,
+      "properties": {
+        "$schema": { "type": "string" },
+        "_comment": { "type": "string" },
+        "required_categories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/category" }
+        },
+        "slots": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/manifestSlot" }
+        }
       }
     },
     "signature": {
