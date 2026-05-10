@@ -284,6 +284,49 @@ for a compact health surface, the compact snapshot should include top-N stale
 panes plus aggregate counts, and the full artifact should be retained in the RCH
 proof lane.
 
+## Operator Interpretation And Claim Wording
+
+Use this section when reading live telemetry or retained proof artifacts. When a
+field is present only in a retained proof artifact today, do not describe it as a
+live Robot Mode or `ft doctor` surface until the implementing bead closes.
+
+| Signal | Meaning | Operator action |
+| --- | --- | --- |
+| `max_first_service_round`, `max_service_gap`, p99 lag rows | Service-opportunity lag for panes inside the measured model or proof window. | If lag exceeds the named benchmark target, keep the result at `benchmark_target_missed`, reduce fanout or capture concurrency, and retain the artifact before changing scheduler policy. |
+| `selected_total` and `selected_by_priority` | How many scheduler slots each priority cohort received. | Verify high-priority work receives precedence and low-tier work still receives its floor. If a tier is absent from the workload, do not claim cross-tier fairness from that run. |
+| `skipped_poll_reasons.not_due` | The adaptive interval intentionally deferred the pane. | Treat as healthy backoff unless stale-pane age grows past the benchmark target. |
+| `skipped_poll_reasons.already_capturing` | A poll was already in flight for the pane. | Healthy in small bursts. Sustained growth means capture tasks are taking too long or permits are too low. |
+| `skipped_poll_reasons.no_permit` | Scheduler selection outpaced available capture permits. | Treat as concurrency saturation; lower fanout, increase `ingest.max_concurrent_captures` only with proof, or inspect worker-pool pressure first. |
+| `global_capture_budget_exhausted` or `global_byte_budget_exhausted` | The configured global budget blocked admission. | This is policy backpressure, not source failure. Tune budgets only after confirming downstream storage and event queues are healthy. |
+| `send_backpressure`, `overflow_gap_pending`, `overflow_gap_emitted` | The capture-event channel could not accept work fast enough, and the system is preserving an explicit GAP. | Triage downstream queue pressure before increasing polling. A generated overflow GAP is evidence of slow-and-signal behavior, not lossless capture. |
+| `capture_timeout`, `capture_circuit_open`, `capture_error`, `no_cursor`, `channel_closed` | The source path or capture circuit failed closed. | Separate source regressions from substrate failures with the raw RCH log, Rust test output, and wrapper summary classification. |
+| `poll_outcomes.changed` and `poll_outcomes.no_change` | Completed polls that either produced a segment or confirmed no delta. | `no_change` is not a failure. It should correlate with interval backoff and lower capture pressure. |
+| `starvation_warning` | Compact verdict for fairness health. | `none` is green for that artifact. `strict_invariant_failed` is a source/test red result. `benchmark_target_missed` is a performance miss. `not_proven` means the run did not cover the claim. |
+| `proof_interpretation.target_class_hardware` | Whether the run proves the 64+ CPU / 256 GiB target predicate. | `skipped_not_proven` forbids target-class support claims even when the reduced proof passed. |
+
+Proof strength must be labeled with one of these levels:
+
+| Level | Required evidence | Allowed wording | Forbidden wording |
+| --- | --- | --- | --- |
+| `model_only` | Deterministic scheduler model or unit proof with retained scenario rows. | "The scheduler model covers these fairness invariants." | "RCH proved 200-pane behavior" or "target-class proven." |
+| `remote_reduced` | RCH wrapper summary, proof ledger, raw RCH log, and Rust summary from a reduced run such as `ft-n447z.5`. | "The retained 200-pane reduced RCH lane passed for this commit/run." | "64-core / 256 GiB proven" or "production 200+ pane latency guaranteed." |
+| `target_class` | `ft doctor --json` hardware predicate showing at least 64 logical CPUs and 256 GiB memory, plus the matching proof run and retained artifacts. | "Target-class proof passed for this retained run." | Any claim that omits the hardware predicate artifact. |
+| `docs_static` | Markdown, shell syntax, or wording checks only. | "Docs/static proof only; no runtime behavior claimed." | Any runtime performance or support claim. |
+
+README and support text should say that sub-50ms capture lag is a benchmark
+target unless the statement names the artifact that proves the measured run. A
+passing `ft-n447z.5` artifact can back a 200-pane reduced RCH claim, but it
+cannot back a target-class high-core production claim.
+
+Failure classification should stay precise:
+
+| Classification | Use when | Closeout wording |
+| --- | --- | --- |
+| `source_or_test` | Cargo, rustc, or the named Rust test binary reached execution and an assertion or required artifact failed. | Treat as a source/test defect and fix before closing. |
+| `environment` | Local tooling, shell syntax, artifact parsing, or test-binary reachability blocked the wrapper without proving source failure. | Report the missing tool or harness condition separately from code health. |
+| `rch_substrate` | RCH preflight, sync, worker selection, timeout, fail-open detection, or remote Cargo reachability failed before the proof lane ran. | Do not convert RCH chatter into proof; record the substrate blocker and rerun when healthy. |
+| `dirty_tree_blocked` | Unrelated tracked changes prevent a trustworthy docs or proof closeout. | Name the dirty paths, avoid staging them, and keep the bead open or close only with an explicit docs-static proof. |
+
 ## Proof And Closeout Rules
 
 For this contract bead:

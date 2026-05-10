@@ -58,6 +58,9 @@ catch common omissions.
    `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`
    artifact is remote-reduced schema/runtime evidence only; target hardware
    remains `skipped_not_proven` until a target-class live artifact is retained.
+   For capture-lag or capture-fairness claims, cite the retained `ft-n447z.5`
+   200-pane reduced RCH artifact and keep target-class wording blocked unless
+   the same run also retains a passing high-core hardware predicate.
 9. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
    The release workflow at `.github/workflows/release.yml`
    handles the rest (binaries, checksums, GitHub release notes,

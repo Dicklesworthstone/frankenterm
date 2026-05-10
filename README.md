@@ -1304,7 +1304,7 @@ When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
 
 | Operation | Target | Notes |
 |-----------|--------|-------|
-| Delta capture latency | <50ms | 4KB overlap matching |
+| Delta capture latency | <50ms benchmark target | 4KB overlap matching; 200-pane or target-class claims must cite the capture fairness proof artifact and runbook |
 | Pattern detection | <1ms per rule pack | Bloom filter pre-rejection |
 | FTS5 query | <10ms | SQLite full-text search |
 | Robot Mode response | <5ms | JSON envelope generation |
@@ -1507,7 +1507,8 @@ ft rules test "FATAL ERROR: database connection lost"
 - **CPU**: <1% during idle; brief spikes during pattern detection
 - **Memory**: ~50MB for watcher with 100 panes (with tiered scrollback); ~200MB for 200 panes
 - **Disk**: ~10MB/day for typical multi-agent usage (compressed deltas)
-- **Latency**: <50ms average capture lag
+- **Latency**: <50ms capture-lag benchmark target; 200-pane or target-class
+  claims must cite the retained capture fairness proof artifact
 
 ### How does the transaction system work?
 
