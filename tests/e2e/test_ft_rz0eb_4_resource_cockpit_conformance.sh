@@ -296,7 +296,7 @@ echo "=== ${BEAD_ID} resource cockpit conformance ==="
 : >"${PROOF_LEDGER_FILE}"
 : >"${COMMANDS_FILE}"
 : >"${STRUCTURED_LOG}"
-printf 'Combined schema_golden + runtime resource_cockpit proof is captured in schema-golden-rch.log.\n' >"${RUNTIME_TEST_LOG}"
+printf 'Combined schema_golden + runtime cockpit proof is captured in schema-golden-rch.log.\n' >"${RUNTIME_TEST_LOG}"
 
 run_static_step "schema-json-valid" "${SCHEMA_STATIC_LOG}" jq empty "${ROOT_DIR}/docs/json-schema/ft-resource-pressure-cockpit.json"
 run_static_step "e2e-shell-valid" "${SHELL_STATIC_LOG}" bash -n "${BASH_SOURCE[0]}"
@@ -308,7 +308,7 @@ if run_rch_step \
     "schema-golden-and-runtime-resource-cockpit" \
     "${SCHEMA_TEST_LOG}" \
     env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" RUST_TEST_THREADS=1 \
-    cargo test -p frankenterm-core --lib --test schema_golden resource_cockpit -- --nocapture
+    cargo test -p frankenterm-core --lib --test schema_golden cockpit -- --nocapture
 then
     :
 fi
