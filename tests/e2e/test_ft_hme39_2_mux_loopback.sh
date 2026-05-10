@@ -14,7 +14,7 @@ MUX_BIN="\${CARGO_TARGET_DIR}/debug/frankenterm-mux-server"
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-1800}"
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
-RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS:-Cargo.toml,crates/frankenterm-core-replay/src/lib.rs,crates/frankenterm-core/src/lib.rs,crates/frankenterm-core/tests/snapshot_real_mux.rs}"
+RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS:-Cargo.toml,crates/frankenterm-core-replay/src/lib.rs,crates/frankenterm-core/src/lib.rs,crates/frankenterm-core/tests/snapshot_real_mux.rs,crates/frankenterm-core/tests/common/wezterm_subprocess.rs}"
 
 mkdir -p "${ARTIFACT_DIR}"
 

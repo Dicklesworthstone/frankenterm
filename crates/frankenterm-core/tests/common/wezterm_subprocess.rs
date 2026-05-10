@@ -5,7 +5,7 @@
 //!   `~/.local/share/wezterm/pid` from the user's interactive session
 //!   does NOT block test invocations.
 //! - A unix domain socket inside that TempDir.
-//! - A generated `wezterm.lua` inside that TempDir so the subprocess has
+//! - A generated `frankenterm.toml` inside that TempDir so the subprocess has
 //!   a single, explicit config source.
 //! - A persistent `default_prog` loop so the default pane and spawned
 //!   default-program panes stay alive across follow-up `list_panes` calls.
@@ -58,6 +58,7 @@ pub fn should_run() -> bool {
 #[derive(Debug)]
 pub enum FixtureError {
     BinaryNotFound(String),
+    ConfigSerialize(toml::ser::Error),
     SpawnFailed(std::io::Error),
     SocketTimeout {
         path: PathBuf,
@@ -76,6 +77,7 @@ impl std::fmt::Display for FixtureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BinaryNotFound(p) => write!(f, "wezterm-mux-server binary not found at {p}"),
+            Self::ConfigSerialize(e) => write!(f, "failed to serialize mux-server config: {e}"),
             Self::SpawnFailed(e) => write!(f, "failed to spawn wezterm-mux-server: {e}"),
             Self::SocketTimeout {
                 path,
@@ -136,13 +138,9 @@ impl WeztermSubprocessFixture {
         let socket_path = home.path().join("mux.sock");
         let stdout_path = home.path().join("mux-server.stdout.log");
         let stderr_path = home.path().join("mux-server.stderr.log");
-        let config_path = home.path().join("wezterm.lua");
-        let config_lua = format!(
-            "return {{\n  unix_domains = {{\n    {{ name = \"ft-test\", socket_path = {}, skip_permissions_check = true }},\n  }},\n  default_domain = \"ft-test\",\n  default_prog = {},\n}}\n",
-            lua_string_literal(&socket_path.display().to_string()),
-            lua_string_array(default_prog),
-        );
-        fs::write(&config_path, config_lua).map_err(FixtureError::SpawnFailed)?;
+        let config_path = home.path().join("frankenterm.toml");
+        let config_toml = mux_server_config_toml(&socket_path, default_prog)?;
+        fs::write(&config_path, config_toml).map_err(FixtureError::SpawnFailed)?;
 
         let mut cmd = Command::new(&bin);
         cmd.env("HOME", home.path())
@@ -250,20 +248,32 @@ impl Drop for WeztermSubprocessFixture {
     }
 }
 
-fn lua_string_array(values: &[&str]) -> String {
-    let mut out = String::from("{");
-    for (idx, value) in values.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&serde_json::to_string(value).expect("serialize lua string literal"));
-    }
-    out.push('}');
-    out
+#[derive(serde::Serialize)]
+struct FixtureMuxServerConfig<'a> {
+    default_prog: Vec<&'a str>,
+    unix_domains: Vec<FixtureUnixDomain>,
 }
 
-fn lua_string_literal(value: &str) -> String {
-    serde_json::to_string(value).expect("serialize lua string literal")
+#[derive(serde::Serialize)]
+struct FixtureUnixDomain {
+    name: &'static str,
+    socket_path: String,
+    skip_permissions_check: bool,
+}
+
+fn mux_server_config_toml(
+    socket_path: &Path,
+    default_prog: &[&str],
+) -> Result<String, FixtureError> {
+    toml::to_string(&FixtureMuxServerConfig {
+        default_prog: default_prog.to_vec(),
+        unix_domains: vec![FixtureUnixDomain {
+            name: "ft-test",
+            socket_path: socket_path.display().to_string(),
+            skip_permissions_check: true,
+        }],
+    })
+    .map_err(FixtureError::ConfigSerialize)
 }
 
 fn read_child_output(stdout_path: &Path, stderr_path: &Path) -> (String, String) {
