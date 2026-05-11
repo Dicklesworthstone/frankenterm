@@ -530,7 +530,7 @@ jobs:
     needs:
       - gpu-regression-macos
       - gpu-linux-llvmpipe-pilot
-    if: always()
+    if: ${{ always() && !cancelled() }}
     timeout-minutes: 5
     steps:
       - name: Check required GPU lanes
