@@ -189,7 +189,7 @@ pub struct SearchPrefetchEntryDiagnostics {
 }
 
 /// Aggregate operator diagnostics for search prefetch behavior.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchPrefetchTelemetry {
     /// Candidates considered by the advisor.
     pub considered_candidates: u64,
@@ -225,30 +225,6 @@ pub struct SearchPrefetchTelemetry {
     pub last_decision: Option<SearchPrefetchDecision>,
     /// Currently admitted entries, sorted by fingerprint.
     pub entries: Vec<SearchPrefetchEntryDiagnostics>,
-}
-
-impl Default for SearchPrefetchTelemetry {
-    fn default() -> Self {
-        Self {
-            considered_candidates: 0,
-            admitted_prefetches: 0,
-            skipped_low_signal: 0,
-            yielded_pressure: 0,
-            yielded_semantic_backoff: 0,
-            refused_budget: 0,
-            refused_candidate_too_large: 0,
-            skipped_zero_bytes: 0,
-            prefetch_hits: 0,
-            prefetch_misses: 0,
-            prefetch_evictions: 0,
-            active_prefetch_bytes: 0,
-            admitted_prefetch_bytes: 0,
-            refused_prefetch_bytes: 0,
-            evicted_prefetch_bytes: 0,
-            last_decision: None,
-            entries: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

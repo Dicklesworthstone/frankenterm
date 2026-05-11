@@ -598,10 +598,11 @@ pub struct UnifiedTelemetryRecord {
 /// br-ft-7cqhu: redaction policy applied to top-level identity
 /// fields (`scope_id`, `correlation_id`, embedded record_id
 /// segments) when normalizing into a [`UnifiedTelemetryRecord`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdRedactionPolicy {
     /// Copy raw values from the source event. Legacy default.
+    #[default]
     Passthrough,
     /// Replace each identity field with a deterministic FNV-1a
     /// hash of its original value (formatted as `"hash:<u64-hex>"`).
@@ -609,12 +610,6 @@ pub enum IdRedactionPolicy {
     /// hash); raw user-controlled identifiers do not appear in the
     /// serialized record.
     Hash,
-}
-
-impl Default for IdRedactionPolicy {
-    fn default() -> Self {
-        Self::Passthrough
-    }
 }
 
 /// br-ft-7cqhu: deterministic hash of an identity field. Uses the
@@ -3384,10 +3379,11 @@ pub struct SwarmCapacityStageSnapshot {
 }
 
 /// Workload class attached to a swarm capacity certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SwarmCapacityWorkloadClass {
     /// Idle observation loop with little operator traffic.
+    #[default]
     IdleObservation,
     /// Heavy pane capture and delta extraction.
     HeavyCapture,
@@ -3407,12 +3403,6 @@ pub enum SwarmCapacityWorkloadClass {
     BackpressureEscalation,
     /// Capacity-governor decision scenario.
     CapacityGovernor,
-}
-
-impl Default for SwarmCapacityWorkloadClass {
-    fn default() -> Self {
-        Self::IdleObservation
-    }
 }
 
 impl SwarmCapacityWorkloadClass {

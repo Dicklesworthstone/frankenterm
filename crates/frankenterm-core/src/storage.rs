@@ -9975,7 +9975,7 @@ fn record_policy_denial_audit_backend(
     record: &PolicyDeniedAuditRecord,
 ) -> Result<i64> {
     let ts_ms = if record.ts_ms == 0 {
-        i64::try_from(now_ms()).unwrap_or(0)
+        now_ms()
     } else {
         record.ts_ms
     };

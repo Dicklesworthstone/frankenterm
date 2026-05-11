@@ -806,19 +806,19 @@ impl CanaryRolloutController {
 
     fn decide_action(&self, health_check: &CanaryHealthCheck) -> CanaryAction {
         if health_check.healthy {
-            // Check if we should advance
-            if self.config.auto_advance && self.phase.next().is_some() {
-                if self.metrics.consecutive_healthy >= self.config.min_healthy_before_advance {
-                    return CanaryAction::Advance;
-                }
+            if self.config.auto_advance
+                && self.phase.next().is_some()
+                && self.metrics.consecutive_healthy >= self.config.min_healthy_before_advance
+            {
+                return CanaryAction::Advance;
             }
             CanaryAction::Hold
         } else {
-            // Check if we should rollback
-            if self.config.auto_rollback && self.phase != CanaryPhase::Shadow {
-                if self.metrics.consecutive_unhealthy >= self.config.max_consecutive_unhealthy {
-                    return CanaryAction::Rollback;
-                }
+            if self.config.auto_rollback
+                && self.phase != CanaryPhase::Shadow
+                && self.metrics.consecutive_unhealthy >= self.config.max_consecutive_unhealthy
+            {
+                return CanaryAction::Rollback;
             }
             CanaryAction::Hold
         }

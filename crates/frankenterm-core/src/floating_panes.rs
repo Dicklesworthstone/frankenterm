@@ -351,9 +351,10 @@ pub enum ResizeHandle {
 /// State of an in-flight drag or resize operation. The integration
 /// layer routes mouse events / keyboard commands through `begin` /
 /// `update` / `commit` / `cancel`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DragResizeState {
     /// No operation in progress.
+    #[default]
     Idle,
     /// Drag (move) in progress. `original` is the pre-drag rect for
     /// cancel; `current` is the live preview.
@@ -369,12 +370,6 @@ pub enum DragResizeState {
         original: FloatingRect,
         current: FloatingRect,
     },
-}
-
-impl Default for DragResizeState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl DragResizeState {

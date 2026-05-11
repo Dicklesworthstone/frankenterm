@@ -73,7 +73,7 @@ pub type Seq = u8;
 /// `crate::wire_protocol::AgentSession` minus the `last_seen_ms`
 /// timestamp (which is a liveness-only field, not a safety
 /// concern for the dedup proof).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DedupSession {
     /// Highest seq accepted from this sender.
     pub last_seq: Seq,
@@ -86,17 +86,6 @@ pub struct DedupSession {
     /// distinguish "first message at seq 0" from "duplicate at
     /// seq 0").
     pub initialized: bool,
-}
-
-impl Default for DedupSession {
-    fn default() -> Self {
-        Self {
-            last_seq: 0,
-            messages_received: 0,
-            duplicates_skipped: 0,
-            initialized: false,
-        }
-    }
 }
 
 /// Outcome of an ingest attempt against a session.

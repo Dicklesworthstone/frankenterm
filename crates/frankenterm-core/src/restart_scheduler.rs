@@ -16,21 +16,16 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Restart scheduling mode.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartMode {
     /// Fully automatic — restart when score exceeds threshold.
     Automatic { min_score: f64 },
     /// Suggest only — alert user with recommended window.
+    #[default]
     Advisory,
     /// Disabled — manual restarts only.
     Manual,
-}
-
-impl Default for RestartMode {
-    fn default() -> Self {
-        Self::Advisory
-    }
 }
 
 /// Configuration for the restart scheduler.

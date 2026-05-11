@@ -362,22 +362,21 @@ pub fn check_invariants(
 
     // NoDoubleSpawnOnDuplicateApply: a duplicate apply must not
     // grow `panes`.
-    if matches!(outcome, Outcome::AppliedDuplicate) {
-        if pre_state.panes != post_state.panes || pre_state.next_pane_id != post_state.next_pane_id
-        {
-            return Some(Invariant::NoDoubleSpawnOnDuplicateApply);
-        }
+    if matches!(outcome, Outcome::AppliedDuplicate)
+        && (pre_state.panes != post_state.panes
+            || pre_state.next_pane_id != post_state.next_pane_id)
+    {
+        return Some(Invariant::NoDoubleSpawnOnDuplicateApply);
     }
 
     // ApplyAtomic: ApplyFail leaves agent_profiles + panes +
     // next_pane_id unchanged.
-    if matches!(action, Action::ApplyFail { .. }) {
-        if pre_state.agent_profiles != post_state.agent_profiles
+    if matches!(action, Action::ApplyFail { .. })
+        && (pre_state.agent_profiles != post_state.agent_profiles
             || pre_state.panes != post_state.panes
-            || pre_state.next_pane_id != post_state.next_pane_id
-        {
-            return Some(Invariant::ApplyAtomic);
-        }
+            || pre_state.next_pane_id != post_state.next_pane_id)
+    {
+        return Some(Invariant::ApplyAtomic);
     }
 
     // DryRunPure.

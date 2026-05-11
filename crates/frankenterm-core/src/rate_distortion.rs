@@ -273,7 +273,7 @@ impl RateDistortionPressure {
 }
 
 /// Controller input for one profile selection.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RateDistortionInput {
     /// Candidate pane observations.
@@ -284,17 +284,6 @@ pub struct RateDistortionInput {
     pub pressure: RateDistortionPressure,
     /// If true, use full fidelity regardless of budget scoring.
     pub operator_requested_full_fidelity: bool,
-}
-
-impl Default for RateDistortionInput {
-    fn default() -> Self {
-        Self {
-            panes: Vec::new(),
-            budget: RateDistortionBudget::default(),
-            pressure: RateDistortionPressure::default(),
-            operator_requested_full_fidelity: false,
-        }
-    }
 }
 
 /// Estimated correctness and resource metrics for a profile.
