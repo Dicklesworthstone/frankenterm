@@ -75,8 +75,8 @@ Run 2 bug-bash sessions during the stabilization window:
 
 | Issue Category | Primary Owner | Backup |
 |---------------|--------------|--------|
-| Rendering / layout | ftui_stub.rs owner | view_adapters.rs owner |
-| Key routing / input | keymap.rs owner | ftui_stub.rs owner |
+| Rendering / layout | ftui_backend.rs owner | view_adapters.rs owner |
+| Key routing / input | keymap.rs owner | ftui_backend.rs owner |
 | Terminal lifecycle | terminal_session.rs owner | crash.rs owner |
 | Performance | Perf reviewer | Migration Lead |
 | Compatibility | Compat reviewer | Migration Lead |

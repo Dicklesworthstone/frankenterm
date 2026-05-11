@@ -7,7 +7,7 @@
 
 ## 1  Problem Statement
 
-The existing FTUI-07.3 E2E tests (in `ftui_stub.rs`) run headless: they feed
+The existing FTUI-07.3 E2E tests (in `ftui_backend.rs`) run headless: they feed
 key events into the `WaModel` and snapshot the in-memory `Frame` buffer. This
 validates rendering logic but misses:
 
@@ -364,8 +364,8 @@ PTY tests run slower and cover the terminal integration boundary.
 
 ## References
 
-- `crates/frankenterm-core/src/tui/ftui_stub.rs:6432-7045` — existing headless E2E tests
-- `crates/frankenterm-core/src/tui/ftui_stub.rs:6441-6539` — E2eSession helper
+- `crates/frankenterm-core/src/tui/ftui_backend.rs:7210-7798` — existing headless E2E tests
+- `crates/frankenterm-core/src/tui/ftui_backend.rs:7210-7309` — E2eSession helper
 - `docs/ftui-command-handoff-traces.md` — handoff state machine (wa-bjvg)
 - `docs/ftui-teardown-harness.md` — teardown invariants (wa-3fed)
 - `docs/ftui-subprocess-forwarding-contract.md` — PTY capture contract (wa-3gsu)

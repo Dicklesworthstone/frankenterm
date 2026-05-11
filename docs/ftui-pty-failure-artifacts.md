@@ -308,4 +308,4 @@ If it passes locally → **flake** (S4). Check:
 - `docs/ftui-teardown-harness.md` — restoration invariants (wa-3fed)
 - `docs/ftui-command-handoff-traces.md` — handoff state machine (wa-bjvg)
 - `crates/frankenterm-core/src/crash.rs` — crash bundle format (existing)
-- `crates/frankenterm-core/src/tui/ftui_stub.rs:6432-7045` — headless E2E tests
+- `crates/frankenterm-core/src/tui/ftui_backend.rs:7210-7798` — headless E2E tests

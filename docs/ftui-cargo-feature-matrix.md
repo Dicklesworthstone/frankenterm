@@ -119,7 +119,7 @@ Each check logs:
 
 | Module | Purpose |
 |--------|---------|
-| `tui::ftui_stub` | ftui Model implementation + all views |
+| `tui::ftui_backend` | ftui Model implementation + all views |
 | `tui::ftui_compat` conversions | `StyleSpec → ftui::CellStyle`, `Key → ftui::Key` |
 
 ### `cfg(any(feature = "tui", feature = "ftui"))` code

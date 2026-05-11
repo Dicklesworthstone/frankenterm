@@ -97,7 +97,7 @@ for another agent or developer to reproduce the observation:
 
 ### Unit Test Evidence
 
-Unit tests in `ftui_stub.rs` and adapter modules validate reducer logic,
+Unit tests in `ftui_backend.rs` and adapter modules validate reducer logic,
 state transitions, and view model correctness.
 
 | Evidence Type | When Required | What to Capture |
@@ -217,4 +217,4 @@ This template operationalizes the high-level parity contract in ADR-0006:
 - ADR-0006: Parity Contract (source of truth for what must match)
 - ADR-0010: One-Writer Rule Adaptation (terminal ownership evidence)
 - `docs/test-logging-contract.md` (log level and artifact conventions)
-- `crates/frankenterm-core/src/tui/ftui_stub.rs` (primary test location)
+- `crates/frankenterm-core/src/tui/ftui_backend.rs` (primary test location)
