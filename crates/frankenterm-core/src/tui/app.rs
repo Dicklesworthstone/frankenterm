@@ -52,6 +52,12 @@ impl Default for AppConfig {
 /// Result type for TUI operations
 pub type TuiResult<T> = std::result::Result<T, TuiError>;
 
+fn has_command_modifier(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT))
+}
+
 /// Errors that can occur in the TUI
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
@@ -171,17 +177,25 @@ impl<Q: QueryClient> App<Q> {
 
     /// Handle keyboard input
     fn handle_key_event(&mut self, key: KeyEvent) {
-        // Global keybindings (work in any view)
+        let plain_char = !has_command_modifier(&key);
+        let in_search = self.current_view == View::Search;
+        let in_events = self.current_view == View::Events;
+        let in_triage = self.current_view == View::Triage;
+        let in_history = self.current_view == View::History;
+        let has_text_input = in_search || in_history;
+
+        // Global keybindings. Character globals are contextual so text/filter
+        // views can own the character input they display.
         match key.code {
-            KeyCode::Char('q') => {
+            KeyCode::Char('q') if plain_char && !has_text_input => {
                 self.should_quit = true;
                 return;
             }
-            KeyCode::Char('?') => {
+            KeyCode::Char('?') if plain_char && !has_text_input => {
                 self.current_view = View::Help;
                 return;
             }
-            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('r') if plain_char && !has_text_input => {
                 self.refresh_data();
                 return;
             }
@@ -198,35 +212,35 @@ impl<Q: QueryClient> App<Q> {
                 return;
             }
             // Number keys for direct view access
-            KeyCode::Char('1') => {
+            KeyCode::Char('1') if plain_char && !has_text_input && !in_events && !in_triage => {
                 self.current_view = View::Home;
                 return;
             }
-            KeyCode::Char('2') => {
+            KeyCode::Char('2') if plain_char && !has_text_input && !in_events && !in_triage => {
                 self.current_view = View::Panes;
                 return;
             }
-            KeyCode::Char('3') => {
+            KeyCode::Char('3') if plain_char && !has_text_input && !in_events && !in_triage => {
                 self.current_view = View::Events;
                 return;
             }
-            KeyCode::Char('4') => {
+            KeyCode::Char('4') if plain_char && !has_text_input && !in_events && !in_triage => {
                 self.current_view = View::Triage;
                 return;
             }
-            KeyCode::Char('5') => {
+            KeyCode::Char('5') if plain_char && !has_text_input && !in_events && !in_triage => {
                 self.current_view = View::History;
                 return;
             }
-            KeyCode::Char('6') => {
+            KeyCode::Char('6') if plain_char && !has_text_input && !in_events && !in_triage => {
                 self.current_view = View::Search;
                 return;
             }
-            KeyCode::Char('7') => {
+            KeyCode::Char('7') if plain_char && !has_text_input && !in_events && !in_triage => {
                 self.current_view = View::Help;
                 return;
             }
-            KeyCode::Char('8') => {
+            KeyCode::Char('8') if plain_char && !has_text_input && !in_events && !in_triage => {
                 self.current_view = View::Timeline;
                 return;
             }
@@ -248,32 +262,33 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the panes view
     fn handle_panes_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_pane_indices(&self.view_state).len();
+        let plain_char = !has_command_modifier(&key);
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
+            KeyCode::Down | KeyCode::Char('j') if plain_char && filtered_len > 0 => {
                 self.view_state.selected_index =
                     (self.view_state.selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
+            KeyCode::Up | KeyCode::Char('k') if plain_char && filtered_len > 0 => {
                 self.view_state.selected_index = self
                     .view_state
                     .selected_index
                     .checked_sub(1)
                     .unwrap_or(filtered_len - 1);
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') if plain_char => {
                 self.view_state.panes_unhandled_only = !self.view_state.panes_unhandled_only;
                 self.view_state.selected_index = 0;
             }
-            KeyCode::Char('b') => {
+            KeyCode::Char('b') if plain_char => {
                 self.view_state.panes_bookmarked_only = !self.view_state.panes_bookmarked_only;
                 self.view_state.selected_index = 0;
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if plain_char => {
                 self.view_state.panes_agent_filter =
                     Self::next_agent_filter(self.view_state.panes_agent_filter.as_deref());
                 self.view_state.selected_index = 0;
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if plain_char => {
                 self.view_state.panes_domain_filter =
                     Self::next_domain_filter(self.view_state.panes_domain_filter.as_deref());
                 self.view_state.selected_index = 0;
@@ -286,7 +301,7 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.panes_filter_query.clear();
                 self.view_state.selected_index = 0;
             }
-            KeyCode::Char('p') => {
+            KeyCode::Char('p') if plain_char => {
                 if let Some(profile_state) = &self.view_state.ruleset_profile_state
                     && !profile_state.profiles.is_empty()
                 {
@@ -308,7 +323,7 @@ impl<Q: QueryClient> App<Q> {
                         Some(format!("ft rules profile apply {}", selected.name));
                 }
             }
-            KeyCode::Char(c) if !c.is_control() => {
+            KeyCode::Char(c) if plain_char && !c.is_control() => {
                 self.view_state.panes_filter_query.push(c);
                 self.view_state.selected_index = 0;
             }
@@ -337,19 +352,20 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the events view
     fn handle_events_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_event_indices(&self.view_state).len();
+        let plain_char = !has_command_modifier(&key);
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
+            KeyCode::Down | KeyCode::Char('j') if plain_char && filtered_len > 0 => {
                 self.view_state.events_selected_index =
                     (self.view_state.events_selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
+            KeyCode::Up | KeyCode::Char('k') if plain_char && filtered_len > 0 => {
                 self.view_state.events_selected_index = self
                     .view_state
                     .events_selected_index
                     .checked_sub(1)
                     .unwrap_or(filtered_len - 1);
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') if plain_char => {
                 self.view_state.events_unhandled_only = !self.view_state.events_unhandled_only;
                 self.view_state.events_selected_index = 0;
             }
@@ -361,7 +377,7 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.events_pane_filter.clear();
                 self.view_state.events_selected_index = 0;
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
+            KeyCode::Char(c) if plain_char && c.is_ascii_digit() => {
                 self.view_state.events_pane_filter.push(c);
                 self.view_state.events_selected_index = 0;
             }
@@ -371,25 +387,30 @@ impl<Q: QueryClient> App<Q> {
 
     /// Handle key events in the triage view
     fn handle_triage_key(&mut self, key: KeyEvent) {
+        let plain_char = !has_command_modifier(&key);
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') if !self.view_state.triage_items.is_empty() => {
+            KeyCode::Down | KeyCode::Char('j')
+                if plain_char && !self.view_state.triage_items.is_empty() =>
+            {
                 self.view_state.triage_selected_index = (self.view_state.triage_selected_index + 1)
                     % self.view_state.triage_items.len();
             }
-            KeyCode::Up | KeyCode::Char('k') if !self.view_state.triage_items.is_empty() => {
+            KeyCode::Up | KeyCode::Char('k')
+                if plain_char && !self.view_state.triage_items.is_empty() =>
+            {
                 self.view_state.triage_selected_index = self
                     .view_state
                     .triage_selected_index
                     .checked_sub(1)
                     .unwrap_or(self.view_state.triage_items.len() - 1);
             }
-            KeyCode::Enter | KeyCode::Char('a') => {
+            KeyCode::Enter | KeyCode::Char('a') if plain_char => {
                 self.queue_triage_action(0);
             }
-            KeyCode::Char('m') => {
+            KeyCode::Char('m') if plain_char => {
                 self.mute_selected_event();
             }
-            KeyCode::Char('e') if !self.view_state.workflows.is_empty() => {
+            KeyCode::Char('e') if plain_char && !self.view_state.workflows.is_empty() => {
                 // Toggle expand/collapse for workflow progress
                 if self.view_state.triage_expanded.is_some() {
                     self.view_state.triage_expanded = None;
@@ -397,7 +418,7 @@ impl<Q: QueryClient> App<Q> {
                     self.view_state.triage_expanded = Some(0);
                 }
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
+            KeyCode::Char(c) if plain_char && c.is_ascii_digit() => {
                 let idx = c.to_digit(10).unwrap_or(0);
                 if idx > 0 {
                     self.queue_triage_action(idx as usize - 1);
@@ -409,6 +430,7 @@ impl<Q: QueryClient> App<Q> {
 
     /// Handle key events in the search view
     fn handle_search_key(&mut self, key: KeyEvent) {
+        let plain_char = !has_command_modifier(&key);
         match key.code {
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.view_state.search_fast_only = !self.view_state.search_fast_only;
@@ -470,18 +492,18 @@ impl<Q: QueryClient> App<Q> {
                     self.view_state.set_error("No saved search selected");
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') if !self.view_state.search_results.is_empty() => {
+            KeyCode::Down if !self.view_state.search_results.is_empty() => {
                 self.view_state.search_selected_index = (self.view_state.search_selected_index + 1)
                     % self.view_state.search_results.len();
             }
-            KeyCode::Up | KeyCode::Char('k') if !self.view_state.search_results.is_empty() => {
+            KeyCode::Up if !self.view_state.search_results.is_empty() => {
                 self.view_state.search_selected_index = self
                     .view_state
                     .search_selected_index
                     .checked_sub(1)
                     .unwrap_or(self.view_state.search_results.len() - 1);
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if plain_char => {
                 self.view_state.search_query.push(c);
                 self.refresh_search_suggestions();
             }
@@ -511,19 +533,20 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the history view
     fn handle_history_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_history_indices(&self.view_state).len();
+        let plain_char = !has_command_modifier(&key);
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
+            KeyCode::Down | KeyCode::Char('j') if plain_char && filtered_len > 0 => {
                 self.view_state.history_selected_index =
                     (self.view_state.history_selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
+            KeyCode::Up | KeyCode::Char('k') if plain_char && filtered_len > 0 => {
                 self.view_state.history_selected_index = self
                     .view_state
                     .history_selected_index
                     .checked_sub(1)
                     .unwrap_or(filtered_len - 1);
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') if plain_char => {
                 self.view_state.history_undoable_only = !self.view_state.history_undoable_only;
                 self.view_state.history_selected_index = 0;
             }
@@ -536,7 +559,7 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.history_undoable_only = false;
                 self.view_state.history_selected_index = 0;
             }
-            KeyCode::Char(c) if !c.is_control() => {
+            KeyCode::Char(c) if plain_char && !c.is_control() => {
                 self.view_state.history_filter_query.push(c);
                 self.view_state.history_selected_index = 0;
             }
@@ -570,6 +593,15 @@ impl<Q: QueryClient> App<Q> {
                     self.refresh_timeline_data();
                 }
             }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.view_state.timeline_scroll = self.view_state.timeline_scroll.saturating_sub(1);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if timeline_len > 0 {
+                    self.view_state.timeline_scroll =
+                        (self.view_state.timeline_scroll + 1).min(timeline_len.saturating_sub(1));
+                }
+            }
             _ => {}
         }
     }
@@ -598,16 +630,27 @@ impl<Q: QueryClient> App<Q> {
                     .collect::<Vec<_>>();
                 if self.view_state.timeline_rows.is_empty() {
                     self.view_state.timeline_selected_index = 0;
+                    self.view_state.timeline_scroll = 0;
                 } else if self.view_state.timeline_selected_index
                     >= self.view_state.timeline_rows.len()
                 {
                     self.view_state.timeline_selected_index =
                         self.view_state.timeline_rows.len() - 1;
+                    self.view_state.timeline_scroll = self
+                        .view_state
+                        .timeline_scroll
+                        .min(self.view_state.timeline_rows.len() - 1);
+                } else {
+                    self.view_state.timeline_scroll = self
+                        .view_state
+                        .timeline_scroll
+                        .min(self.view_state.timeline_rows.len() - 1);
                 }
             }
             Err(QueryError::DatabaseNotInitialized(_)) => {
                 self.view_state.timeline_rows.clear();
                 self.view_state.timeline_selected_index = 0;
+                self.view_state.timeline_scroll = 0;
             }
             Err(e) => {
                 self.view_state
@@ -1732,6 +1775,61 @@ mod tests {
     }
 
     #[test]
+    fn contextual_globals_are_text_in_search() {
+        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        app.current_view = View::Search;
+
+        for ch in ['q', '?', 'r', '5'] {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        assert!(!app.should_quit);
+        assert_eq!(app.current_view, View::Search);
+        assert_eq!(app.view_state.search_query, "q?r5");
+    }
+
+    #[test]
+    fn contextual_digit_globals_are_filters_and_actions() {
+        let mut events = App::new(EventQueryClient, AppConfig::default());
+        events.refresh_data();
+        events.current_view = View::Events;
+        events.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(events.current_view, View::Events);
+        assert_eq!(events.view_state.events_pane_filter, "3");
+
+        let mut history = App::new(FixtureQueryClient, AppConfig::default());
+        history.current_view = View::History;
+        history.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        assert_eq!(history.current_view, View::History);
+        assert_eq!(history.view_state.history_filter_query, "5");
+
+        let mut triage = App::new(TestQueryClient, AppConfig::default());
+        triage.current_view = View::Triage;
+        triage.view_state.triage_items = vec![crate::tui::query::TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test".to_string(),
+            detail: String::new(),
+            actions: vec![
+                crate::tui::query::TriageAction {
+                    label: "First".to_string(),
+                    command: "ft first".to_string(),
+                },
+                crate::tui::query::TriageAction {
+                    label: "Second".to_string(),
+                    command: "ft second".to_string(),
+                },
+            ],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }];
+        triage.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(triage.current_view, View::Triage);
+        assert_eq!(triage.pending_command.as_deref(), Some("ft second"));
+    }
+
+    #[test]
     fn panes_navigation_down_up_wraps() {
         let mut app = App::new(MultiPaneQueryClient, AppConfig::default());
         app.refresh_data();
@@ -1879,15 +1977,16 @@ mod tests {
     }
 
     #[test]
-    fn search_j_k_noop_without_results() {
+    fn search_j_k_append_to_query_text() {
         let mut app = App::new(SearchQueryClient, AppConfig::default());
         app.refresh_data();
         assert!(app.view_state.search_results.is_empty());
 
-        // j/k should not panic with empty results
         app.handle_search_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_query, "j");
         assert_eq!(app.view_state.search_selected_index, 0);
         app.handle_search_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.search_query, "jk");
         assert_eq!(app.view_state.search_selected_index, 0);
     }
 
@@ -2055,6 +2154,12 @@ mod tests {
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         assert_eq!(app.view_state.timeline_selected_index, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.timeline_scroll, 1);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.view_state.timeline_scroll, 0);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
         assert_eq!(app.view_state.timeline_zoom, 0);

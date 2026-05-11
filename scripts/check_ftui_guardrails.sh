@@ -129,7 +129,7 @@ echo "--- Check 3: Import isolation ---"
 
 FTUI_AGNOSTIC_FILES=(
     "crates/frankenterm-core/src/tui/query.rs"
-    "crates/frankenterm-core/src/tui/ftui_stub.rs"
+    "crates/frankenterm-core/src/tui/ftui_backend.rs"
     "crates/frankenterm-core/src/tui/view_adapters.rs"
     "crates/frankenterm-core/src/tui/keymap.rs"
     "crates/frankenterm-core/src/tui/state.rs"
@@ -186,15 +186,15 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5. Test presence: snapshot and E2E tests must exist in ftui_stub.rs
+# 5. Test presence: snapshot and E2E tests must exist in ftui_backend.rs
 # Implements: wa-36xw (FTUI-07.4)
 # ---------------------------------------------------------------------------
 echo "--- Check 5: FTUI test presence ---"
 
-FTUI_STUB="crates/frankenterm-core/src/tui/ftui_stub.rs"
-if [ -f "$FTUI_STUB" ]; then
-    SNAPSHOT_FNS=$(grep -c 'fn snapshot_' "$FTUI_STUB" || true)
-    E2E_FNS=$(grep -c 'fn e2e_' "$FTUI_STUB" || true)
+FTUI_BACKEND="crates/frankenterm-core/src/tui/ftui_backend.rs"
+if [ -f "$FTUI_BACKEND" ]; then
+    SNAPSHOT_FNS=$(grep -c 'fn snapshot_' "$FTUI_BACKEND" || true)
+    E2E_FNS=$(grep -c 'fn e2e_' "$FTUI_BACKEND" || true)
 
     if [ "$SNAPSHOT_FNS" -ge 20 ]; then
         pass "Snapshot tests present ($SNAPSHOT_FNS functions)"
@@ -208,7 +208,7 @@ if [ -f "$FTUI_STUB" ]; then
         fail "E2E tests missing or below 10 (found $E2E_FNS)"
     fi
 else
-    fail "ftui_stub.rs not found"
+    fail "ftui_backend.rs not found"
 fi
 
 echo ""

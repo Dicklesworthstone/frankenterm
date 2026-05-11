@@ -53,7 +53,7 @@ crates/frankenterm-core/src/tui/
 ├── keymap.rs           # ftui: key binding configuration
 ├── state.rs            # ftui: ViewState, FocusRegion, per-view state
 ├── view_adapters.rs    # ftui: domain→view-model adapters
-└── ftui_stub.rs        # ftui: WaModel, views, rendering, tests
+└── ftui_backend.rs     # ftui: WaModel, views, rendering, tests
 ```
 
 ### Shared vs Backend-Specific Code
@@ -64,7 +64,7 @@ crates/frankenterm-core/src/tui/
 | `command_handoff.rs` | Shared | CommandHandoff state machine |
 | `output_gate.rs` | Shared | GatePhase atomic, TuiAwareWriter |
 | `crash.rs` | Shared | Panic hook with terminal restoration |
-| `ftui_stub.rs` | ftui only | Model, views, message routing |
+| `ftui_backend.rs` | ftui only | Model, views, message routing |
 | `view_adapters.rs` | ftui only | Adapter functions for each view |
 | `state.rs` | ftui only | Per-view state structs |
 | `keymap.rs` | ftui only | Key binding registry |
@@ -82,7 +82,7 @@ Event → update(WaMsg) → Cmd<WaMsg> → view(Frame)
 Key types:
 - `WaMsg` — message enum: `TermEvent(Event)`, `SwitchView(View)`, `NextTab`, `PrevTab`, `Tick`, `Quit`
 - `WaModel` — application state + `ftui::Model` implementation
-- `View` — enum of 7 views: Home, Panes, Events, Triage, History, Search, Help
+- `View` — enum of 8 views: Home, Panes, Events, Triage, History, Search, Help, Timeline
 
 ### Key Routing
 
@@ -91,10 +91,10 @@ TermEvent(Key) → handle_modal_key() → handle_global_key() → handle_view_ke
 ```
 
 1. Modal intercept (confirmation dialogs absorb all keys)
-2. Global: Tab/BackTab navigation, 'q' quit, 'r' refresh, digit view shortcuts
+2. Global: Tab/BackTab navigation always; plain `q`/`?`/`r` and digit view shortcuts only when the active view does not own that character input
 3. View-specific: per-view navigation, filter input, selection
 
-Digit keys 1-7 switch views globally **except** on Events/Triage/History views where they're routed to view-specific handlers (filter input).
+Digit keys 1-8 switch views globally **except** on Events/Triage/History/Search views where they're routed to view-specific handlers or text input. Search/History also keep printable `q`, `?`, and `r` as text input rather than quitting, opening help, or refreshing.
 
 ### Data Flow
 
@@ -106,7 +106,7 @@ Data is pulled on `Tick` and `'r'` keypress. Views read directly from model fiel
 
 ## 5  Adding a New View
 
-1. Add variant to `View` enum in `ftui_stub.rs`
+1. Add variant to `View` enum in `ftui_backend.rs`
 2. Update `View::all()`, `View::next()`, `View::prev()`, `View::from_shortcut()`
 3. Add view state struct to `state.rs` and field to `ViewState`
 4. Add `handle_<view>_key()` method on `WaModel`
@@ -120,12 +120,12 @@ Data is pulled on `Tick` and `'r'` keypress. Views read directly from model fiel
 
 | Helper | Location | Purpose |
 |--------|----------|---------|
-| `make_model(query)` | ftui_stub.rs tests | Create WaModel with MockQuery |
-| `press_key(model, code)` | ftui_stub.rs tests | Direct key press (no update pipeline) |
-| `E2eSession` | ftui_stub.rs tests | Full pipeline: press/char/capture/assert_view |
-| `MockQuery` | ftui_stub.rs tests | Fixtures: healthy/degraded/with_events/with_history/with_triage |
-| `frame_to_text(frame)` | ftui_stub.rs tests | Render frame to string for assertions |
-| `assert_ti(ti, text, cursor)` | ftui_stub.rs tests | TextInput state assertion |
+| `make_model(query)` | ftui_backend.rs tests | Create WaModel with MockQuery |
+| `press_key(model, code)` | ftui_backend.rs tests | Direct key press (no update pipeline) |
+| `E2eSession` | ftui_backend.rs tests | Full pipeline: press/char/capture/assert_view |
+| `MockQuery` | ftui_backend.rs tests | Fixtures: healthy/degraded/with_events/with_history/with_triage |
+| `frame_to_text(frame)` | ftui_backend.rs tests | Render frame to string for assertions |
+| `assert_ti(ti, text, cursor)` | ftui_backend.rs tests | TextInput state assertion |
 
 ### Test Categories
 
@@ -178,7 +178,7 @@ model.update(WaMsg::TermEvent(ftui::Event::Key(key)));
 
 ### What Stays the Same
 
-- All 7 views: Home, Panes, Events, Triage, History, Search, Help
+- All 8 views: Home, Panes, Events, Triage, History, Search, Help, Timeline
 - 'q' to quit, '?' for help, 'r' to refresh
 - j/k and arrow key navigation
 - Robot Mode API (unaffected — headless)

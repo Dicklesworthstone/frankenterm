@@ -14,7 +14,7 @@ ftui migration to prevent scope creep and enable parallel execution.
 ### In scope
 
 1. **Rendering layer replacement.** Replace ratatui widget rendering with ftui
-   equivalents in all 7 views (Home, Panes, Events, Triage, History, Search, Help).
+   equivalents in all 7 legacy parity views (Home, Panes, Events, Triage, History, Search, Help).
 
 2. **Terminal management migration.** Replace crossterm terminal setup/teardown
    (`enable_raw_mode`, `EnterAlternateScreen`, etc.) with ftui's terminal
@@ -30,7 +30,7 @@ ftui migration to prevent scope creep and enable parallel execution.
 5. **Test migration.** Replace any ratatui-specific test assertions with ftui
    snapshot tests and PTY E2E scenarios.
 
-6. **Input/keybinding parity.** All current keybindings (global: q/?/r/Tab/1-7,
+6. **Input/keybinding parity.** All current keybindings (global: q/?/r/Tab/1-8,
    per-view: j/k/arrows/Enter/Esc/f/b) must work identically after migration.
 
 ### Out of scope
@@ -140,7 +140,8 @@ means. Intentional deltas are logged in the parity ledger with rationale.
 ## Non-goals (explicit)
 
 - Rewrite the TUI from scratch. This is a migration, not a redesign.
-- Change the view set. The same 7 views exist post-migration.
+- Change the legacy parity view set. Timeline is a later ftui-only addition and
+  is tracked separately from the original ratatui parity scope.
 - Alter data flow. QueryClient -> ViewState -> Render remains the pattern.
 - Optimize rendering performance. Performance is tracked (FTUI-08) but is
   not a migration blocker unless it regresses catastrophically.

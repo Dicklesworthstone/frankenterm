@@ -15,7 +15,7 @@ This document defines the evidence-based criteria for deciding whether the ratat
 
 | # | Criterion | Evidence Artifact | Status |
 |---|-----------|------------------|--------|
-| F1 | All 7 views render correctly (Home, Panes, Events, Triage, History, Search, Help) | `evidence/ftui-05.*/matrix.md` | Verified |
+| F1 | All 8 views render correctly (Home, Panes, Events, Triage, History, Search, Help, Timeline) | `evidence/ftui-05.*/matrix.md` | Verified |
 | F2 | View adapter unit tests pass (76+) | `cargo test --features ftui --lib -- view_adapters` | Verified |
 | F3 | Snapshot/golden tests pass across terminal sizes (75+) | `cargo test --features ftui --lib -- snapshot_` | Verified |
 | F4 | E2E headless scenarios pass (38+) | `cargo test --features ftui --lib -- e2e_` | Verified |

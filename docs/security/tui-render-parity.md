@@ -130,7 +130,7 @@ scripts** at multiple frame dimensions:
 |---|---|---|
 | `smoke_quit_from_home` | 80×24 | minimal — quit from default view |
 | `tab_cycle_all_views` | 80×24 | NextTab through every view |
-| `goto_view_jumps` | 80×24 | direct jump to all 7 views |
+| `goto_view_jumps` | 80×24 | direct jump to all 8 views |
 | `panes_filter_toggle` | 100×30 | filter toggles + cycles in Panes view |
 | `search_filter_text_entry` | 80×24 | FilterAppend/Delete/Clear sequence |
 | `events_digit_filter` | 80×24 | EventsFilterDigit cycle |

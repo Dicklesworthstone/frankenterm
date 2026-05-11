@@ -120,18 +120,17 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "--- Check 3: View contract consistency ---"
 
-FTUI_STUB="crates/frankenterm-core/src/tui/ftui_stub.rs"
+FTUI_BACKEND="crates/frankenterm-core/src/tui/ftui_backend.rs"
 PARITY_ADR="docs/adr/0006-parity-contract.md"
 
 # Extract View variants from code
-if [ -f "$FTUI_STUB" ]; then
-    CODE_VIEWS=$(grep -A 10 'pub enum View' "$FTUI_STUB" \
-        | grep -oP '^\s+(\w+),' \
-        | sed 's/[, ]//g' \
+if [ -f "$FTUI_BACKEND" ]; then
+    CODE_VIEWS=$(grep -A 12 'pub enum View' "$FTUI_BACKEND" \
+        | sed -nE 's/^[[:space:]]+([[:alnum:]_]+),.*/\1/p' \
         | sort)
 else
     CODE_VIEWS=""
-    fail "ftui_stub.rs not found"
+    fail "ftui_backend.rs not found"
 fi
 
 # Expected views from ADR-0006
@@ -141,25 +140,26 @@ History
 Home
 Panes
 Search
+Timeline
 Triage"
 
 if [ "$CODE_VIEWS" = "$EXPECTED_VIEWS" ]; then
-    pass "View enum matches ADR-0006 parity contract (7 views)"
+    pass "View enum matches ADR-0006 parity contract (8 views)"
 else
     fail "View enum drift — code has: $(echo "$CODE_VIEWS" | tr '\n' ',') vs expected: $(echo "$EXPECTED_VIEWS" | tr '\n' ',')"
 fi
 
-# Verify ADR-0006 mentions all 7 views
+# Verify ADR-0006 mentions all 8 views
 if [ -f "$PARITY_ADR" ]; then
     MISSING_IN_ADR=0
-    for view in Home Panes Events Triage History Search Help; do
+    for view in Home Panes Events Triage History Search Help Timeline; do
         if ! grep -q "| $view " "$PARITY_ADR"; then
             fail "ADR-0006 missing view: $view"
             MISSING_IN_ADR=1
         fi
     done
     if [ "$MISSING_IN_ADR" -eq 0 ]; then
-        pass "ADR-0006 documents all 7 views"
+        pass "ADR-0006 documents all 8 views"
     fi
 else
     skip "ADR-0006 not found"
@@ -182,6 +182,7 @@ if [ -f "$VIEW_ADAPTERS" ]; then
         "adapt_history"
         "adapt_search"
         "adapt_workflow"
+        "adapt_timeline_event"
         "adapt_health"
     )
 
@@ -194,7 +195,7 @@ if [ -f "$VIEW_ADAPTERS" ]; then
     done
 
     # Verify Row types exist
-    for row_type in PaneRow EventRow TriageRow HistoryRow SearchRow WorkflowRow HealthModel; do
+    for row_type in PaneRow EventRow TriageRow HistoryRow SearchRow WorkflowRow TimelineRow HealthModel; do
         if grep -q "pub struct $row_type" "$VIEW_ADAPTERS"; then
             pass "$row_type struct present"
         else
@@ -312,8 +313,8 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "|-------|--------|"
         echo "| ADR presence | $( (( FAIL == 0 )) && echo 'pass' || echo 'see details' ) |"
         echo "| Feature matrix smoke | compiled |"
-        echo "| View contract | 7 views |"
-        echo "| Adapter coverage | 7 adapters + 7 types |"
+        echo "| View contract | 8 views |"
+        echo "| Adapter coverage | 8 adapters + 8 types |"
         echo "| Parity template | fields + verdicts |"
         echo "| JSON schemas | present |"
         echo ""

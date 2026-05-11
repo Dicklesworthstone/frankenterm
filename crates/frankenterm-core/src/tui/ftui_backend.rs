@@ -5,7 +5,8 @@
 //!
 //! - View routing (Home, Panes, Events, Triage, History, Search, Help)
 //! - Tab bar rendering with highlighted active view
-//! - Global keybindings (Tab, 1-7, q, ?, r)
+//! - Global keybindings (Tab always; character shortcuts when the active view
+//!   does not own that character input)
 //! - Status footer with view name and refresh indicator
 //! - Periodic data refresh via background tasks
 //!
@@ -141,6 +142,12 @@ impl View {
             _ => None,
         }
     }
+}
+
+fn has_command_modifier(key: &ftui::KeyEvent) -> bool {
+    matches!(key.code, ftui::KeyCode::Char(_))
+        && (key.modifiers.contains(ftui::Modifiers::CTRL)
+            || key.modifiers.contains(ftui::Modifiers::ALT))
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +551,7 @@ pub struct WaModel {
     timeline_rows: Vec<TimelineRow>,
     timeline_selected: usize,
     timeline_zoom: u8,
+    timeline_scroll: usize,
 }
 
 impl WaModel {
@@ -575,6 +583,7 @@ impl WaModel {
             timeline_rows: Vec::new(),
             timeline_selected: 0,
             timeline_zoom: 0,
+            timeline_scroll: 0,
         }
     }
 
@@ -601,21 +610,22 @@ impl WaModel {
 
         let filtered = self.filtered_pane_indices();
         let count = filtered.len();
+        let plain_char = !has_command_modifier(key);
 
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') if plain_char => {
                 if count > 0 {
                     self.panes_selected = (self.panes_selected + 1) % count;
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') if plain_char => {
                 if count > 0 {
                     self.panes_selected = self.panes_selected.checked_sub(1).unwrap_or(count - 1);
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if plain_char => {
                 // Cycle domain filter
                 let domains = self.unique_domains();
                 self.panes_domain_filter = match &self.panes_domain_filter {
@@ -650,31 +660,32 @@ impl WaModel {
         use ftui::KeyCode;
 
         let count = self.triage_items.len();
+        let plain_char = !has_command_modifier(key);
 
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') if plain_char => {
                 if count > 0 {
                     self.triage_selected = (self.triage_selected + 1) % count;
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') if plain_char => {
                 if count > 0 {
                     self.triage_selected = self.triage_selected.checked_sub(1).unwrap_or(count - 1);
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Enter | KeyCode::Char('a') => {
+            KeyCode::Enter | KeyCode::Char('a') if plain_char => {
                 // Queue primary action (index 0) for the selected triage item.
                 self.queue_triage_action(0);
                 ftui::Cmd::None
             }
-            KeyCode::Char('m') => {
+            KeyCode::Char('m') if plain_char => {
                 // Mute the selected triage item's event (if it has an event_id).
                 self.mute_selected_triage_event();
                 ftui::Cmd::None
             }
-            KeyCode::Char('e') => {
+            KeyCode::Char('e') if plain_char => {
                 // Toggle workflow progress expand/collapse.
                 if !self.workflows.is_empty() {
                     if self.triage_expanded.is_some() {
@@ -685,7 +696,7 @@ impl WaModel {
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
+            KeyCode::Char(c) if plain_char && c.is_ascii_digit() => {
                 let idx = c.to_digit(10).unwrap_or(0);
                 if idx > 0 {
                     self.queue_triage_action(idx as usize - 1);
@@ -818,9 +829,10 @@ impl WaModel {
 
         let filtered = self.view_state.history.filtered_indices();
         let count = filtered.len();
+        let plain_char = !has_command_modifier(key);
 
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') if plain_char => {
                 self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.view_state.history.selected_index =
@@ -828,7 +840,7 @@ impl WaModel {
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') if plain_char => {
                 self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.view_state.history.selected_index = self
@@ -840,7 +852,7 @@ impl WaModel {
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') if plain_char => {
                 self.view_state.focus = FocusRegion::PrimaryList;
                 self.view_state.history.undoable_only = !self.view_state.history.undoable_only;
                 self.view_state.history.selected_index = 0;
@@ -885,7 +897,7 @@ impl WaModel {
                 self.view_state.history.filter_input.move_end();
                 ftui::Cmd::None
             }
-            KeyCode::Char(c) if !c.is_control() => {
+            KeyCode::Char(c) if plain_char && !c.is_control() => {
                 self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.history.filter_input.insert_char(c);
                 self.view_state.history.selected_index = 0;
@@ -898,12 +910,21 @@ impl WaModel {
     /// Handle keys specific to the Search view.
     ///
     /// Text input: chars append to query, Backspace removes, Enter executes,
-    /// Escape clears.  j/k/Down/Up navigate results.
+    /// Escape clears.  Down/Up navigate results.  Ctrl saved-search shortcuts
+    /// are reserved here so they do not corrupt the query text while the FTUI
+    /// saved-search panel is still being wired.
     fn handle_search_key(&mut self, key: &ftui::KeyEvent) -> ftui::Cmd<WaMsg> {
         use ftui::KeyCode;
 
+        let plain_char = !has_command_modifier(key);
+
         match key.code {
-            KeyCode::Char(c) => {
+            KeyCode::Char('n' | 'p' | 'r' | 'e')
+                if key.modifiers.contains(ftui::Modifiers::CTRL) =>
+            {
+                ftui::Cmd::None
+            }
+            KeyCode::Char(c) if plain_char => {
                 self.view_state.focus = FocusRegion::FilterBar;
                 self.search_input.insert_char(c);
                 ftui::Cmd::None
@@ -990,28 +1011,39 @@ impl WaModel {
         use ftui::KeyCode;
 
         let count = self.timeline_rows.len();
+        let plain_char = !has_command_modifier(key);
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') if plain_char => {
                 if count > 0 {
                     self.timeline_selected = (self.timeline_selected + 1) % count;
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') if plain_char => {
                 if count > 0 {
                     self.timeline_selected =
                         self.timeline_selected.checked_sub(1).unwrap_or(count - 1);
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Char('+') => {
+            KeyCode::Char('+') if plain_char => {
                 if self.timeline_zoom < 5 {
                     self.timeline_zoom += 1;
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Char('-') => {
+            KeyCode::Char('-') if plain_char => {
                 self.timeline_zoom = self.timeline_zoom.saturating_sub(1);
+                ftui::Cmd::None
+            }
+            KeyCode::Left | KeyCode::Char('h') if plain_char => {
+                self.timeline_scroll = self.timeline_scroll.saturating_sub(1);
+                ftui::Cmd::None
+            }
+            KeyCode::Right | KeyCode::Char('l') if plain_char => {
+                if count > 0 {
+                    self.timeline_scroll = (self.timeline_scroll + 1).min(count.saturating_sub(1));
+                }
                 ftui::Cmd::None
             }
             _ => ftui::Cmd::None,
@@ -1027,9 +1059,10 @@ impl WaModel {
 
         let filtered = self.view_state.events.filtered_indices();
         let count = filtered.len();
+        let plain_char = !has_command_modifier(key);
 
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') if plain_char => {
                 self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.view_state.events.selected_index =
@@ -1037,7 +1070,7 @@ impl WaModel {
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') if plain_char => {
                 self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.view_state.events.selected_index = self
@@ -1049,7 +1082,7 @@ impl WaModel {
                 }
                 ftui::Cmd::None
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') if plain_char => {
                 self.view_state.focus = FocusRegion::PrimaryList;
                 self.view_state.events.unhandled_only = !self.view_state.events.unhandled_only;
                 self.view_state.events.selected_index = 0;
@@ -1093,7 +1126,7 @@ impl WaModel {
                 self.view_state.events.pane_filter.move_end();
                 ftui::Cmd::None
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
+            KeyCode::Char(c) if plain_char && c.is_ascii_digit() => {
                 self.view_state.focus = FocusRegion::FilterBar;
                 self.view_state.events.pane_filter.insert_char(c);
                 self.view_state.events.selected_index = 0;
@@ -1234,9 +1267,11 @@ impl WaModel {
                 self.timeline_rows = timeline.events.iter().map(adapt_timeline_event).collect();
                 if self.timeline_rows.is_empty() {
                     self.timeline_selected = 0;
+                    self.timeline_scroll = 0;
                 } else {
                     self.timeline_selected =
                         self.timeline_selected.min(self.timeline_rows.len() - 1);
+                    self.timeline_scroll = self.timeline_scroll.min(self.timeline_rows.len() - 1);
                 }
             }
             Err(_) => { /* non-fatal */ }
@@ -1253,6 +1288,7 @@ impl WaModel {
             return Some(ftui::Cmd::None);
         }
 
+        let plain_char = !has_command_modifier(key);
         let in_search = self.view_state.current_view == View::Search;
         let in_events = self.view_state.current_view == View::Events;
         let in_triage = self.view_state.current_view == View::Triage;
@@ -1274,18 +1310,20 @@ impl WaModel {
             }
             // Character-based shortcuts are suppressed in views with text input
             // so that keystrokes flow to the query/filter input instead.
-            KeyCode::Char('q') if !has_text_input => Some(ftui::Cmd::Quit),
-            KeyCode::Char('?') if !has_text_input => {
+            KeyCode::Char('q') if plain_char && !has_text_input => Some(ftui::Cmd::Quit),
+            KeyCode::Char('?') if plain_char && !has_text_input => {
                 self.view_state.current_view = View::Help;
                 Some(ftui::Cmd::None)
             }
-            KeyCode::Char('r') if !has_text_input => {
+            KeyCode::Char('r') if plain_char && !has_text_input => {
                 self.view_state.error_message = None;
                 self.refresh_data();
                 Some(ftui::Cmd::None)
             }
             // In Events/Triage/History views, digits go to view-specific handlers.
-            KeyCode::Char(ch @ '1'..='7') if !has_text_input && !in_events && !in_triage => {
+            KeyCode::Char(ch @ '1'..='8')
+                if plain_char && !has_text_input && !in_events && !in_triage =>
+            {
                 if let Some(view) = View::from_shortcut(ch) {
                     self.view_state.current_view = view;
                 }
@@ -1447,6 +1485,7 @@ impl ftui::Model for WaModel {
                 &self.timeline_rows,
                 self.timeline_selected,
                 self.timeline_zoom,
+                self.timeline_scroll,
             ),
         }
 
@@ -3020,6 +3059,7 @@ fn render_timeline_view(
     rows: &[TimelineRow],
     selected: usize,
     zoom: u8,
+    scroll: usize,
 ) {
     if height == 0 {
         return;
@@ -3037,15 +3077,16 @@ fn render_timeline_view(
         2 => "2h",
         _ => "6h+",
     };
+    let scroll = scroll.min(rows.len().saturating_sub(1));
     let header = if layout.stacked {
         format!(
-            "  Timeline {}  zoom={}  +/- j/k  [compact]",
+            "  Timeline {}  zoom={}  +/- j/k h/l  [compact]",
             rows.len(),
             zoom_label,
         )
     } else {
         format!(
-            "  Timeline ({} events)  zoom={}  +/-=zoom j/k=nav",
+            "  Timeline ({} events)  zoom={}  +/-=zoom j/k=nav h/l=scroll",
             rows.len(),
             zoom_label,
         )
@@ -3084,7 +3125,7 @@ fn render_timeline_view(
         }
         row += 1;
     } else {
-        for (pos, trow) in rows.iter().enumerate() {
+        for (pos, trow) in rows.iter().enumerate().skip(scroll) {
             if row >= list_end {
                 break;
             }
@@ -4402,6 +4443,25 @@ mod tests {
     }
 
     #[test]
+    fn search_ctrl_saved_shortcuts_do_not_edit_query_text() {
+        let mut model = make_model(MockQuery::healthy());
+        model.view_state.current_view = View::Search;
+        model.search_input.set_text("error".into());
+
+        for ch in ['n', 'p', 'r', 'e'] {
+            let key = ftui::KeyEvent {
+                code: ftui::KeyCode::Char(ch),
+                kind: ftui::KeyEventKind::Press,
+                modifiers: ftui::Modifiers::CTRL,
+            };
+            let result = model.handle_global_key(&key);
+            assert!(result.is_none());
+            model.handle_view_key(&key);
+            assert_eq!(model.search_input.text(), "error");
+        }
+    }
+
+    #[test]
     fn search_tab_still_navigates_views() {
         let mut model = make_model(MockQuery::healthy());
         model.view_state.current_view = View::Search;
@@ -4752,6 +4812,29 @@ mod tests {
             result.is_none(),
             "digit should not be consumed globally in Events view"
         );
+    }
+
+    #[test]
+    fn events_plain_digits_filter_but_ctrl_digits_do_not() {
+        let mut model = make_model(MockQuery::with_events());
+        model.view_state.current_view = View::Events;
+        model.refresh_data();
+
+        let plain = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('4'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_view_key(&plain);
+        assert_eq!(model.view_state.events.pane_filter.text(), "4");
+
+        let ctrl = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('5'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::CTRL,
+        };
+        model.handle_view_key(&ctrl);
+        assert_eq!(model.view_state.events.pane_filter.text(), "4");
     }
 
     #[test]
@@ -5157,6 +5240,30 @@ mod tests {
             "Digit should not be consumed globally in Triage view"
         );
         assert_eq!(model.view_state.current_view, View::Triage);
+    }
+
+    #[test]
+    fn triage_plain_digits_queue_actions_but_ctrl_digits_do_not() {
+        let mut model = make_model(MockQuery::with_triage());
+        model.refresh_data();
+        model.view_state.current_view = View::Triage;
+
+        let ctrl = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('2'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::CTRL,
+        };
+        model.handle_triage_key(&ctrl);
+        assert!(model.active_modal.is_none());
+        assert!(model.triage_queued_action.is_none());
+
+        let plain = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('2'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_triage_key(&plain);
+        assert!(model.active_modal.is_some());
     }
 
     #[test]
@@ -7335,7 +7442,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_direct_navigation_1_through_7() {
+    fn e2e_direct_navigation_1_through_8() {
         // Scenario: User jumps to each view via number keys from Home
         // Note: digit keys are consumed by filters in Events/Triage/History/Search,
         // so we return to Home between each navigation.
@@ -7348,6 +7455,7 @@ mod tests {
             ('5', View::History),
             ('6', View::Search),
             ('7', View::Help),
+            ('8', View::Timeline),
         ];
         for (key, view) in views {
             // Return to Home first (where digits always navigate)
@@ -8048,14 +8156,14 @@ mod tests {
     fn render_timeline_empty_no_panic() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_timeline_view(&mut frame, 2, 80, 20, &[], 0, 0);
+        render_timeline_view(&mut frame, 2, 80, 20, &[], 0, 0, 0);
     }
 
     #[test]
     fn render_timeline_zero_height_no_panic() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_timeline_view(&mut frame, 2, 80, 0, &[], 0, 0);
+        render_timeline_view(&mut frame, 2, 80, 0, &[], 0, 0, 0);
     }
 
     #[test]
@@ -8094,7 +8202,7 @@ mod tests {
         ];
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_timeline_view(&mut frame, 2, 80, 20, &rows, 0, 0);
+        render_timeline_view(&mut frame, 2, 80, 20, &rows, 0, 0, 0);
     }
 
     #[test]
@@ -8134,7 +8242,7 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(100, 24, &mut pool);
         // selected=1 should render detail panel for second event
-        render_timeline_view(&mut frame, 1, 100, 22, &rows, 1, 2);
+        render_timeline_view(&mut frame, 1, 100, 22, &rows, 1, 2, 0);
     }
 
     #[test]
@@ -8173,7 +8281,7 @@ mod tests {
         ];
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
-        render_timeline_view(&mut frame, 2, 80, 20, &rows, 0, 0);
+        render_timeline_view(&mut frame, 2, 80, 20, &rows, 0, 0, 0);
 
         let detail_row = first_row_containing(&frame, 24, "Event Details")
             .expect("compact timeline layout should still show detail header");
@@ -8268,6 +8376,63 @@ mod tests {
         // Doesn't go below 0
         model.handle_timeline_key(&minus);
         assert_eq!(model.timeline_zoom, 0);
+    }
+
+    #[test]
+    fn timeline_key_scroll_left_right() {
+        let mut model = make_model(MockQuery::healthy());
+        model.timeline_rows = vec![
+            TimelineRow {
+                id: "1".to_string(),
+                timestamp: "t".to_string(),
+                pane_label: "P0".to_string(),
+                agent_label: "a".to_string(),
+                event_type: "e".to_string(),
+                severity_label: "info".to_string(),
+                handled_label: "h".to_string(),
+                correlation_label: String::new(),
+                summary: String::new(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+            TimelineRow {
+                id: "2".to_string(),
+                timestamp: "t".to_string(),
+                pane_label: "P1".to_string(),
+                agent_label: "b".to_string(),
+                event_type: "e".to_string(),
+                severity_label: "error".to_string(),
+                handled_label: "u".to_string(),
+                correlation_label: String::new(),
+                summary: String::new(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+        ];
+
+        let right = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('l'),
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_timeline_key(&right);
+        assert_eq!(model.timeline_scroll, 1);
+        model.handle_timeline_key(&right);
+        assert_eq!(model.timeline_scroll, 1);
+
+        let left = ftui::KeyEvent {
+            code: ftui::KeyCode::Left,
+            kind: ftui::KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        };
+        model.handle_timeline_key(&left);
+        assert_eq!(model.timeline_scroll, 0);
+        model.handle_timeline_key(&left);
+        assert_eq!(model.timeline_scroll, 0);
     }
 
     #[test]

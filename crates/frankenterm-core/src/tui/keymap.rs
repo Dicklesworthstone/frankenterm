@@ -3,8 +3,10 @@
 //! All keybindings are defined declaratively in [`KEYMAP`] as
 //! `(KeyPattern, Scope, Action)` tuples.  The [`resolve`] function matches
 //! an incoming [`KeyInput`](super::ftui_compat::KeyInput) against the table
-//! for a given view, with global bindings checked first (deterministic
-//! conflict policy: **global wins over view-specific**).
+//! for a given view. Non-character globals (`Tab` / `BackTab`) are always
+//! global. Plain character globals are context-aware: text-entry views keep
+//! printable characters, and digit-driven views keep digit input for
+//! view-specific filters/actions.
 //!
 //! # Parity guarantee
 //!
@@ -53,7 +55,7 @@ pub enum Action {
     Refresh,
     NextTab,
     PrevTab,
-    GoToView(u8), // 1-7
+    GoToView(u8), // 1-8
 
     // -- list navigation (shared pattern across Panes/Events/Triage/History/Search) --
     ListNext,
@@ -445,17 +447,7 @@ static KEYMAP: &[Binding] = &[
         action: Action::ListNext,
     },
     Binding {
-        pattern: key(Key::Char('j')),
-        scope: Scope::Search,
-        action: Action::ListNext,
-    },
-    Binding {
         pattern: key(Key::Up),
-        scope: Scope::Search,
-        action: Action::ListPrev,
-    },
-    Binding {
-        pattern: key(Key::Char('k')),
         scope: Scope::Search,
         action: Action::ListPrev,
     },
@@ -549,7 +541,8 @@ fn view_scope(view_name: &str) -> Option<Scope> {
 /// Resolve a key input to an action.
 ///
 /// Resolution order:
-/// 1. Global bindings (always checked first).
+/// 1. Global bindings, except plain-character globals suppressed by the active
+///    input context.
 /// 2. View-specific bindings for the active view.
 /// 3. Fallback heuristics for unbound printable characters:
 ///    - Panes/History: `FilterAppendChar` for non-control chars
@@ -559,24 +552,17 @@ fn view_scope(view_name: &str) -> Option<Scope> {
 ///
 /// Returns `None` if the key is not bound in the current context.
 pub fn resolve(input: &KeyInput, view_name: &str) -> Option<Action> {
-    // 1. Global bindings
-    //
-    // Special case: `r` without Ctrl is Refresh globally, but `Ctrl+R` in
-    // Search is SearchRunSaved.  The legacy code checks `!CONTROL` for `r`.
-    // Since global is checked first, we need to skip global `r` when Ctrl is
-    // pressed.
+    let scope = view_scope(view_name);
+
+    // 1. Global bindings that are not suppressed by the active input context.
     for b in KEYMAP.iter().filter(|b| b.scope == Scope::Global) {
-        if b.pattern.matches(input) {
-            // Skip global `r` when Ctrl is held (let view-specific handle it)
-            if matches!(b.action, Action::Refresh) && input.ctrl {
-                continue;
-            }
+        if b.pattern.matches(input) && !suppresses_global_action(scope, b.action) {
             return Some(b.action);
         }
     }
 
     // 2. View-specific bindings
-    if let Some(scope) = view_scope(view_name) {
+    if let Some(scope) = scope {
         for b in KEYMAP.iter().filter(|b| b.scope == scope) {
             if b.pattern.matches(input) {
                 return Some(b.action);
@@ -615,6 +601,17 @@ pub fn resolve(input: &KeyInput, view_name: &str) -> Option<Action> {
     }
 
     None
+}
+
+fn suppresses_global_action(scope: Option<Scope>, action: Action) -> bool {
+    match (scope, action) {
+        (
+            Some(Scope::Search | Scope::History),
+            Action::Quit | Action::ShowHelp | Action::Refresh | Action::GoToView(_),
+        ) => true,
+        (Some(Scope::Events | Scope::Triage), Action::GoToView(_)) => true,
+        _ => false,
+    }
 }
 
 /// Return a human-readable description of the action (for help text).
@@ -691,7 +688,16 @@ mod tests {
     fn parity_global_quit() {
         assert_eq!(resolve(&ki(Key::Char('q')), "Home"), Some(Action::Quit));
         assert_eq!(resolve(&ki(Key::Char('q')), "Panes"), Some(Action::Quit));
-        assert_eq!(resolve(&ki(Key::Char('q')), "Search"), Some(Action::Quit));
+        assert_eq!(resolve(&ki(Key::Char('q')), "Events"), Some(Action::Quit));
+        assert_eq!(resolve(&ki(Key::Char('q')), "Triage"), Some(Action::Quit));
+        assert_eq!(
+            resolve(&ki(Key::Char('q')), "History"),
+            Some(Action::FilterAppendChar('q'))
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('q')), "Search"),
+            Some(Action::FilterAppendChar('q'))
+        );
     }
 
     #[test]
@@ -725,10 +731,18 @@ mod tests {
 
     #[test]
     fn parity_global_number_keys() {
-        for n in 1..=7 {
+        for n in 1..=8 {
             let ch = char::from_digit(n, 10).unwrap();
             assert_eq!(
                 resolve(&ki(Key::Char(ch)), "Home"),
+                Some(Action::GoToView(n as u8))
+            );
+            assert_eq!(
+                resolve(&ki(Key::Char(ch)), "Panes"),
+                Some(Action::GoToView(n as u8))
+            );
+            assert_eq!(
+                resolve(&ki(Key::Char(ch)), "Timeline"),
                 Some(Action::GoToView(n as u8))
             );
         }
@@ -801,17 +815,15 @@ mod tests {
     fn parity_events_filter_digit() {
         assert_eq!(
             resolve(&ki(Key::Char('5')), "Events"),
-            // Global GoToView(5) wins over events digit filter
-            Some(Action::GoToView(5))
+            Some(Action::EventsFilterDigit('5'))
         );
-        // But 0, 9 are not global (8 is now GoToView(8))
         assert_eq!(
             resolve(&ki(Key::Char('0')), "Events"),
             Some(Action::EventsFilterDigit('0'))
         );
         assert_eq!(
             resolve(&ki(Key::Char('8')), "Events"),
-            Some(Action::GoToView(8))
+            Some(Action::EventsFilterDigit('8'))
         );
     }
 
@@ -845,10 +857,13 @@ mod tests {
 
     #[test]
     fn parity_triage_numbered_actions() {
-        // 1-8 are global (GoToView), 9 is triage-specific
+        assert_eq!(
+            resolve(&ki(Key::Char('1')), "Triage"),
+            Some(Action::TriageNumberedAction(1))
+        );
         assert_eq!(
             resolve(&ki(Key::Char('8')), "Triage"),
-            Some(Action::GoToView(8))
+            Some(Action::TriageNumberedAction(8))
         );
         assert_eq!(
             resolve(&ki(Key::Char('9')), "Triage"),
@@ -878,6 +893,10 @@ mod tests {
         assert_eq!(
             resolve(&ki(Key::Char('z')), "History"),
             Some(Action::FilterAppendChar('z'))
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('5')), "History"),
+            Some(Action::FilterAppendChar('5'))
         );
     }
 
@@ -913,15 +932,37 @@ mod tests {
             resolve(&ki(Key::Char('z')), "Search"),
             Some(Action::FilterAppendChar('z'))
         );
+        assert_eq!(
+            resolve(&ki(Key::Char('j')), "Search"),
+            Some(Action::FilterAppendChar('j'))
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('k')), "Search"),
+            Some(Action::FilterAppendChar('k'))
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('5')), "Search"),
+            Some(Action::FilterAppendChar('5'))
+        );
     }
 
     // -- conflict policy --
 
     #[test]
-    fn global_wins_over_view_specific() {
-        // 'q' is global quit — even in views with text input
+    fn character_global_policy_is_contextual() {
         assert_eq!(resolve(&ki(Key::Char('q')), "Panes"), Some(Action::Quit));
-        assert_eq!(resolve(&ki(Key::Char('q')), "Search"), Some(Action::Quit));
+        assert_eq!(
+            resolve(&ki(Key::Char('q')), "Search"),
+            Some(Action::FilterAppendChar('q'))
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('4')), "Events"),
+            Some(Action::EventsFilterDigit('4'))
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('4')), "Triage"),
+            Some(Action::TriageNumberedAction(4))
+        );
     }
 
     #[test]

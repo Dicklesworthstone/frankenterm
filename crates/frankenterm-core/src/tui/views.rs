@@ -218,6 +218,8 @@ pub struct ViewState {
     pub timeline_selected_index: usize,
     /// Timeline zoom/window level.
     pub timeline_zoom: u8,
+    /// Timeline viewport offset.
+    pub timeline_scroll: usize,
     /// Expanded workflow index in triage view (None = collapsed)
     pub triage_expanded: Option<usize>,
     /// Bookmark records for panes.
@@ -2584,6 +2586,9 @@ pub fn render_timeline_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .timeline_selected_index
         .min(state.timeline_rows.len().saturating_sub(1));
     let selected_row = state.timeline_rows.get(selected_index);
+    let timeline_scroll = state
+        .timeline_scroll
+        .min(state.timeline_rows.len().saturating_sub(1));
 
     let list_block = Block::default()
         .title(format!(
@@ -2615,12 +2620,12 @@ pub fn render_timeline_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     };
     let summary = if stacked_mode {
         format!(
-            "window={}  j/k nav  +/- zoom  corr=*",
+            "window={}  j/k nav  h/l scroll  +/- zoom  corr=*",
             timeline_zoom_label(state.timeline_zoom),
         )
     } else {
         format!(
-            "window={}  j/k select  +/- widen/narrow  corr=*",
+            "window={}  j/k select  h/l scroll  +/- widen/narrow  corr=*",
             timeline_zoom_label(state.timeline_zoom),
         )
     };
@@ -2641,8 +2646,15 @@ pub fn render_timeline_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .render(list_chunks[1], buf);
     } else {
         let row_width = usize::from(list_chunks[1].width.saturating_sub(1)).max(1);
-        let mut lines: Vec<Line> = Vec::with_capacity(state.timeline_rows.len());
-        for (pos, row) in state.timeline_rows.iter().enumerate() {
+        let visible_count = usize::from(list_chunks[1].height).max(1);
+        let mut lines: Vec<Line> = Vec::with_capacity(visible_count);
+        for (pos, row) in state
+            .timeline_rows
+            .iter()
+            .enumerate()
+            .skip(timeline_scroll)
+            .take(visible_count)
+        {
             let corr_marker = if row.correlation_label.is_empty() {
                 "-"
             } else {
@@ -3859,6 +3871,24 @@ mod tests {
         assert!(text.contains("Timeline (1)"));
         assert!(text.contains("Event Details"));
         assert!(text.contains("Correlations: failover"));
+    }
+
+    #[test]
+    fn render_timeline_view_respects_scroll_offset() {
+        let mut state = ViewState::default();
+        state.timeline_rows = vec![
+            timeline_row("evt-1", "error", "failover"),
+            timeline_row("evt-2", "warning", ""),
+        ];
+        state.timeline_scroll = 1;
+        state.timeline_selected_index = 1;
+        let area = Rect::new(0, 0, 120, 24);
+        let mut buf = Buffer::empty(area);
+        render_timeline_view(&state, area, &mut buf);
+
+        let text = buffer_text(area, &buf);
+        assert!(text.contains("warning"));
+        assert!(!text.contains("error"));
     }
 
     // --- Triage edge cases ---

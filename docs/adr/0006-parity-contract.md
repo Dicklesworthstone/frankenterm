@@ -20,8 +20,9 @@ Each row defines a view and what parity means for it.
 | Events | Filtered list with selection highlight | EventView (id, rule_id, pane_id, severity, handled, ts) | j/k, u (unhandled filter), 0-9/Backspace/Esc (pane filter) | None |
 | Triage | Ranked list with expand/collapse | TriageItemView (ranked issues + workflow progress) | j/k, Enter/a (action), m (mute), e (expand) | None |
 | History | Filtered list with undo indicator | HistoryEntryView (audit id, action, result, undo status) | j/k, u (undoable filter), Backspace/Esc (filter clear), 0-9/alpha (filter input), z (undo action) | None |
-| Search | Input field + results list + saved searches | SearchResultView + SavedSearchView + suggestions | Char input, Enter (execute), Backspace (edit), Esc (clear), Ctrl+n/p (saved search nav), Ctrl+r (run saved), Ctrl+e (edit saved), j/k or Down/Up (results nav) | None |
+| Search | Input field + results list + saved searches | SearchResultView + SavedSearchView + suggestions | Char input, Enter (execute), Backspace (edit), Esc (clear), Ctrl+n/p (saved search nav), Ctrl+r (run saved), Ctrl+e (edit saved), Down/Up (results nav) | None |
 | Help | Static text | Keybinding reference | (none, display only) | None |
+| Timeline | Cross-pane correlated event timeline with detail panel | TimelineRow (event id, pane, severity, event type, timestamp, correlation, summary) | j/k, +/-, h/l or Left/Right | New ftui-only view; no legacy ratatui parity target |
 
 ## Parity Matrix: Global Keybindings
 
@@ -32,7 +33,9 @@ Each row defines a view and what parity means for it.
 | `r` | Refresh data (non-Ctrl) | Yes |
 | `Tab` | Next view | Yes |
 | `Shift+Tab` / `BackTab` | Previous view | Yes |
-| `1`-`7` | Direct view access (Home..Help) | Yes |
+| `1`-`8` | Direct view access (Home..Timeline) | Yes |
+
+Plain-character globals are contextual: Search/History keep printable characters as text input, and Events/Triage keep digits for pane filters or numbered actions. `Tab` and `BackTab` remain global in every view.
 
 ## Parity Matrix: Per-View Keybindings
 
@@ -96,8 +99,19 @@ Each row defines a view and what parity means for it.
 | `Ctrl+p` | Previous saved search | Yes |
 | `Ctrl+r` | Run selected saved search | Yes |
 | `Ctrl+e` | Edit selected saved search | Yes |
-| `j` / `Down` | Next result (when results present) | Yes |
-| `k` / `Up` | Previous result (when results present) | Yes |
+| `Down` | Next result (when results present) | Yes |
+| `Up` | Previous result (when results present) | Yes |
+
+### Timeline View
+
+| Key | Action | Parity Required |
+|-----|--------|----------------|
+| `j` / `Down` | Move selection down | No (ftui-only view) |
+| `k` / `Up` | Move selection up | No (ftui-only view) |
+| `+` | Zoom timeline in | No (ftui-only view) |
+| `-` | Zoom timeline out | No (ftui-only view) |
+| `h` / `Left` | Scroll timeline left | No (ftui-only view) |
+| `l` / `Right` | Scroll timeline right | No (ftui-only view) |
 
 ## Parity Matrix: Terminal Behavior
 
@@ -138,7 +152,7 @@ For each migrated view (FTUI-05.*), verify:
 
 For input migration (FTUI-06.*), verify:
 
-- [ ] All global keybindings (q, ?, r, Tab, Shift+Tab, 1-7) work
+- [ ] All global keybindings (q, ?, r, Tab, Shift+Tab, 1-8) work in views that do not own that character input; Tab/Shift+Tab work everywhere
 - [ ] Text input fields (search, filters) handle all printable ASCII
 - [ ] Backspace and Esc behave correctly in all contexts
 - [ ] Ctrl+key combinations work (search saved search navigation)
@@ -162,6 +176,7 @@ QueryClient.list_history()  -> ViewState.history   -> render_history_view()
 QueryClient.list_triage()   -> ViewState.triage    -> render_triage_view()
 QueryClient.search()        -> ViewState.results   -> render_search_view()
 QueryClient.health()        -> ViewState.health    -> render_home_view()
+QueryClient.get_timeline()  -> WaModel.timeline    -> render_timeline_view()
 ```
 
 The QueryClient trait, ViewState struct, and all data types in `ui_query.rs`
