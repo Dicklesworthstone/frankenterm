@@ -225,6 +225,75 @@ incidents, also preserve `domains.rss_residency`, `domains.storage_io`,
 
 ---
 
+## Flow 3c: context horizon forecast
+
+Use this before assigning more work to a pane that may be near context pressure,
+after compaction/rate-limit detections, before large fanout changes, or when a
+handoff decision needs evidence. The horizon is read-only forecast evidence; it
+does not compact, hand off, pause, or mutate anything by itself.
+
+1) Capture the machine contract:
+
+```bash
+ft robot --format json context horizon --horizon-window-ms 900000 \
+  > /tmp/ft-context-horizon.json
+ft robot --format toon context horizon --horizon-window-ms 900000 \
+  > /tmp/ft-context-horizon.toon
+ft doctor --json > /tmp/ft-doctor-context-horizon.json
+```
+
+2) Read the root state first:
+
+| Field | Operator check |
+| --- | --- |
+| `generated_at_ms` | Forecast time; stale saved JSON is not live dispatch evidence. |
+| `horizon_window_ms` | Lookahead window used by risk scoring. |
+| `evidence_state` | `measured`/`inferred` may guide decisions; `stale`, `unavailable`, and `mixed` require domain review. |
+| `unavailable_domains` | Missing or stale evidence that must be named before acting. |
+| `artifact_paths` | Retained fixtures or proof artifacts used to audit the claim. |
+| `raw_context_content_stored` | Must be `false`; any true value is a source regression. |
+
+3) Interpret pane tiers conservatively:
+
+| Tier | Normal next move |
+| --- | --- |
+| `green` | No context-specific action; keep observing. |
+| `yellow` | Reduce fanout or prepare handoff material if citations support it. |
+| `red` | Prefer handoff preparation, dry-run rotation planning, or assignment pause. |
+| `black` | Stop assigning new work to that pane and collect an incident bundle if the cause is unclear. |
+| `unknown` | Treat as missing evidence, not as healthy. |
+
+4) Treat recommendations as dry-run advice. In v1 every recommendation must
+have `mutation_allowed=false`. A `suggested_command` can be copied into a later
+approval-gated workflow only after the operator separately checks policy,
+ownership, and current pane state. Do not run Agent Mail repair/restart, RCH
+service changes, destructive git/filesystem operations, or pane mutations just
+because a context-horizon row exists.
+
+5) Classify failures before filing or closing work:
+
+| Class | Meaning |
+| --- | --- |
+| `source_regression` | Schema, fields, serialization, or recommendation semantics are wrong. |
+| `privacy_violation` | Raw prompt, transcript, secret-like text, or unsafe artifact paths escaped. |
+| `environment_blocked` | Storage, RCH, worker, or platform dependency prevented proof. |
+| `unavailable_evidence` | The horizon ran but required evidence was missing. |
+| `target_hardware_skipped` | High-scale hardware claims were not proven. |
+
+6) Preserve proof accurately. For docs/schema changes, the focused truth gate is:
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-r920m-6-docs-smoke \
+  cargo test -p frankenterm --test docs_smoke \
+  context_horizon_contract_docs_truth_gate -- --nocapture
+```
+
+For implementation changes, keep the core and robot lanes separate and record
+the exact RCH command, selected worker, remote Cargo/test reachability, target
+directory, artifacts, and failure class. RCH sync chatter alone is not proof.
+
+---
+
 ## Flow 4: triage → mute / noise control
 
 If an event is noisy but safe, reduce noise without losing observability.

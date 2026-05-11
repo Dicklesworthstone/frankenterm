@@ -1,9 +1,9 @@
 # Context Horizon Contract
 
 Status: v1 contract. The native predictor and read-only robot, doctor, and MCP
-surfaces are wired under `ft-r920m.3` / `ft-r920m.4`; deterministic fixtures,
-privacy-golden checks, and final RCH proof artifacts remain tracked by later
-`ft-r920m` beads.
+surfaces are wired under `ft-r920m.3` / `ft-r920m.4`; deterministic fixtures and
+privacy-golden checks landed under `ft-r920m.5`; operator closeout and release
+truth gates are tracked by `ft-r920m.6`.
 
 This document defines the first operator-facing contract for a context horizon:
 a privacy-bounded forecast of which panes are likely to hit context pressure,
@@ -40,6 +40,54 @@ Required implementation surfaces:
 | `ft doctor --json` | May embed a context-horizon summary when context telemetry is available. |
 | Doctor/plain output | Shows compact operator rows without implying that dry-run recommendations have executed. |
 | `wa://context/horizon` MCP resource | Returns the same contract through a read-only, storage-backed MCP resource. |
+
+## Operator Workflow
+
+Inspect the context horizon when an operator is about to assign more work to an
+already-long-running pane, after compaction or rate-limit detections, before a
+large fanout/rebalance decision, and during handoff planning. The horizon is a
+forecast, not proof that an intervention ran.
+
+Recommended read sequence:
+
+```bash
+ft robot --format json context horizon --horizon-window-ms 900000
+ft robot --format toon context horizon --horizon-window-ms 900000
+ft doctor --json
+```
+
+Use the JSON form for retained artifacts and the TOON form for AI-to-AI triage.
+`ft doctor --json` embeds the same read-only posture for first-run and incident
+diagnostics. Plain doctor output is an operator summary only; it must not be the
+only retained artifact for a release claim.
+
+Freshness is part of the decision:
+
+- `generated_at_ms` is the forecast time; compare it to the incident or dispatch
+  decision time before acting.
+- `horizon_window_ms` is the lookahead window, not a telemetry freshness budget.
+- `measured` and `inferred` rows may guide operator decisions when citations are
+  fresh and bounded.
+- `stale`, `unavailable`, and `mixed` rows fail closed: inspect
+  `unavailable_domains`, classify the failure, and do not convert an advisor row
+  into a mutating action.
+- `simulated` rows are for fixture and replay proof only.
+
+Pressure tiers are interpreted conservatively:
+
+| Tier | Operator posture |
+| --- | --- |
+| `green` | No context-horizon action is needed; keep observing. |
+| `yellow` | Reduce fanout or prepare handoff material if other risk signals agree. |
+| `red` | Prefer handoff preparation, dry-run rotation planning, or assignment pause before the pane crosses the horizon. |
+| `black` | Treat the pane as unsafe for new work; preserve evidence and collect an incident bundle if the cause is unclear. |
+| `unknown` | Evidence is missing or unusable; do not claim healthy context posture. |
+
+Recommendations are dry-run by contract. Every v1 recommendation must keep
+`mutation_allowed` false. Suggested commands may point operators at read-only
+inspection, handoff preparation, proof artifacts, or incident-bundle collection,
+but they must not restart Agent Mail, repair shared services, mutate panes, or
+hide a required approval.
 
 ## Versioned Envelope
 
@@ -139,6 +187,12 @@ bounded identifiers, counters, event ids, hashes, and redacted labels. If a
 future implementation needs content-derived evidence, it must emit a redaction
 reason and bounded citation rather than the content itself.
 
+Artifacts follow the same privacy model. Safe repo-relative artifact paths may
+be retained; absolute paths, parent-directory traversal, raw prompt/transcript
+terms, and secret-like strings must be redacted before the report is emitted.
+The deterministic privacy fixture intentionally includes secret-like input so
+the test can prove that the output redacts it.
+
 ## Failure Classification
 
 Contract and proof artifacts should classify failures as:
@@ -153,14 +207,25 @@ Contract and proof artifacts should classify failures as:
 
 ## Proof Expectations
 
-The implementation is not complete until later beads add:
+A context-horizon closeout is not valid unless the proof states exactly what was
+proved and what was not. Required evidence:
 
-- deterministic schema/golden fixtures,
+- deterministic schema/golden fixtures, including normal, degraded, stale,
+  unavailable, high-risk, malformed-counter, and privacy-violation cases,
 - docs-smoke checks that keep docs and schema names aligned,
 - Robot JSON and TOON contract tests,
-- privacy fixtures that fail on raw prompt or secret leakage,
+- doctor JSON/plain output tests,
+- privacy fixtures that fail on raw prompt, transcript, secret, or unsafe
+  artifact-path leakage,
 - RCH-backed proof artifacts with exact commands and isolated target dirs.
 
-Until those land, this document and the shipped read surfaces define the v1
-operator contract, but the deterministic fixture and proof corpus is not yet
-complete.
+The retained fixture matrix is
+`crates/frankenterm-core/tests/fixtures/context_horizon_golden_matrix.json`.
+The schema is `docs/json-schema/ft-context-horizon.json`. The docs truth gate is
+`crates/frankenterm/tests/docs_smoke.rs::context_horizon_contract_docs_truth_gate`.
+
+Context-horizon tests prove the v1 contract, privacy posture, read-only
+recommendation behavior, and release-documentation consistency. They do not
+prove 64 CPU / 256 GiB swarm behavior, provider-token availability, live pane
+mutation safety, or high-scale throughput. Any high-scale claim must cite a
+separate target-hardware artifact and otherwise remain `target_hardware_skipped`.

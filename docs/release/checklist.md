@@ -48,7 +48,28 @@ catch common omissions.
    covers the checked-in live profile/fleet mutation receipt matrix
    and failure envelopes as repository evidence, not as a production
    deployment claim.
-8. **Run the high-scale release evidence gate through RCH.** Ensure
+8. **Run the context-horizon truth gate when release claims mention it.**
+   If README, release notes, attestation text, or operator docs claim
+   context-horizon behavior, verify the contract, schema, fixture, and
+   read surfaces as repository evidence before tagging. At minimum run:
+   ```bash
+   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-docs \
+     cargo test -p frankenterm --test docs_smoke \
+     context_horizon_contract_docs_truth_gate -- --nocapture
+   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-core \
+     cargo test -p frankenterm-core --lib context_horizon -- --nocapture
+   rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-context-horizon-ft \
+     cargo test -p frankenterm --bin ft context_horizon -- --nocapture
+   ```
+   Retain the exact commands, selected worker/runtime reachability,
+   target dirs, artifact paths, and failure classification. These checks
+   prove the v1 contract, privacy posture, deterministic fixtures, robot
+   JSON/TOON behavior, and doctor embedding; they do not prove provider
+   token availability, live pane mutation safety, or 64 CPU / 256 GiB
+   high-scale behavior. Any high-scale context-horizon wording must stay
+   caveated or `target_hardware_skipped` unless the high-scale evidence
+   gate below also retains a target-class artifact.
+9. **Run the high-scale release evidence gate through RCH.** Ensure
    `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-release-evidence cargo test -p frankenterm-core --test large_swarm_replay_corpus release_evidence --no-default-features`
    passes before publishing any 64-core / 256 GiB swarm-performance
    claim. Synthetic/local smoke manifests must render
@@ -61,7 +82,7 @@ catch common omissions.
    For capture-lag or capture-fairness claims, cite the retained `ft-n447z.5`
    200-pane reduced RCH artifact and keep target-class wording blocked unless
    the same run also retains a passing high-core hardware predicate.
-9. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
+10. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
    The release workflow at `.github/workflows/release.yml`
    handles the rest (binaries, checksums, GitHub release notes,
    sigstore-signed attestation bundle).
