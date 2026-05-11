@@ -876,17 +876,23 @@ fn default_true() -> bool {
     true
 }
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn resolve_workspace_relative(path: PathBuf) -> PathBuf {
+    if path.is_relative() {
+        workspace_root().join(path)
+    } else {
+        path
+    }
+}
+
 fn fixtures_root() -> PathBuf {
     env::var_os("GPU_HARNESS_FIXTURE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("tests")
-                .join("golden")
-                .join("gpu")
-        })
+        .map(resolve_workspace_relative)
+        .unwrap_or_else(|| workspace_root().join("tests").join("golden").join("gpu"))
 }
 
 fn fixture_filter(arg_filters: &[String]) -> Option<Vec<String>> {
@@ -929,18 +935,14 @@ fn env_fixture_filter_present() -> bool {
 }
 
 fn default_perf_report_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
+    workspace_root()
         .join("target")
         .join("gpu-regression")
         .join("perf-report.json")
 }
 
 fn default_perf_baseline_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
+    workspace_root()
         .join("tests")
         .join("golden")
         .join("gpu")
@@ -951,6 +953,7 @@ fn perf_report_path(override_path: Option<&Path>) -> PathBuf {
     override_path
         .map(PathBuf::from)
         .or_else(|| env::var_os("GPU_HARNESS_PERF_REPORT").map(PathBuf::from))
+        .map(resolve_workspace_relative)
         .unwrap_or_else(default_perf_report_path)
 }
 
@@ -1352,13 +1355,8 @@ fn run_perf_self_test() -> Result<(), Box<dyn std::error::Error>> {
 fn artifact_root() -> PathBuf {
     env::var_os("GPU_HARNESS_ARTIFACT_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("target")
-                .join("gpu-regression")
-        })
+        .map(resolve_workspace_relative)
+        .unwrap_or_else(|| workspace_root().join("target").join("gpu-regression"))
 }
 
 fn emit_json(value: serde_json::Value) {

@@ -166,8 +166,10 @@ while current nightly rejects rustix 0.37's auto-detected internal
 
 It writes Linux captures and `generated_at_runner=ubuntu-24.04-llvmpipe`
 metadata to `target/gpu-regression/linux-llvmpipe-goldens/` instead of
-mutating the checked-in macOS reference fixtures. The job then validates that
-namespace against itself as the determinism gate. A final
+mutating the checked-in macOS reference fixtures. The harness resolves that
+relative fixture-root override against the workspace root, not the package test
+process directory. The job then validates that namespace against itself as the
+determinism gate. A final
 macOS-vs-Linux comparison runs against `tests/golden/gpu`; exit code `1` is
 converted to a GitHub warning and uploaded as
 `target/gpu-regression/linux-vs-macos/` artifacts so platform divergence is
