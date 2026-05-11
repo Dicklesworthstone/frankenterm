@@ -154,8 +154,9 @@ Linux CI cost bounded:
 - `overlay-visual-mode`
 
 The job installs Mesa's Vulkan software stack plus the X11/X11-XCB, XCB-util,
-and Cairo pkg-config development stubs needed by the GUI dependency graph on
-`ubuntu-24.04`, forces the headless renderer through `WGPU_BACKEND=vulkan`,
+XCB-image, xkbcommon, xkbcommon-X11, and Cairo pkg-config/link development
+stubs needed by the GUI dependency graph on `ubuntu-24.04`, forces the
+headless renderer through `WGPU_BACKEND=vulkan`,
 `LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`, and
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`, and forces rustix's
 stable libc backend for the transitive `k9`/`terminal_size` dev-dependency path
