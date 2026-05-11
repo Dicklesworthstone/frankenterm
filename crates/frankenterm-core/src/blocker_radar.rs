@@ -52,6 +52,7 @@ impl BlockerRadarEvidenceState {
 #[serde(rename_all = "snake_case")]
 pub enum BlockerRadarSourceKind {
     Rch,
+    #[serde(rename = "github_actions")]
     GitHubActions,
     AgentMail,
     Beads,
@@ -73,6 +74,7 @@ pub enum BlockerRadarSeverity {
 #[serde(rename_all = "snake_case")]
 pub enum BlockerRadarSubstrate {
     Rch,
+    #[serde(rename = "github_actions")]
     GitHubActions,
     AgentMail,
     Beads,
@@ -112,6 +114,7 @@ pub enum BlockerRadarFailureClass {
 #[serde(rename_all = "snake_case")]
 pub enum BlockerRadarObservationStatus {
     PassActionable,
+    WaitingExternal,
     RchSubstrateBlocked,
     RchLocalFallbackRefused,
     CiQueued,
@@ -129,6 +132,7 @@ impl BlockerRadarObservationStatus {
     fn evidence_state(self) -> BlockerRadarEvidenceState {
         match self {
             Self::PassActionable => BlockerRadarEvidenceState::Actionable,
+            Self::WaitingExternal => BlockerRadarEvidenceState::WaitingExternal,
             Self::RchSubstrateBlocked | Self::RchLocalFallbackRefused => {
                 BlockerRadarEvidenceState::RchSubstrateBlocked
             }
@@ -147,6 +151,7 @@ impl BlockerRadarObservationStatus {
     fn default_reason_code(self) -> &'static str {
         match self {
             Self::PassActionable => "evidence.actionable",
+            Self::WaitingExternal => "external.waiting",
             Self::RchSubstrateBlocked => "rch.substrate_blocked",
             Self::RchLocalFallbackRefused => "rch.local_fallback_refused",
             Self::CiQueued => "ci.queued",
@@ -167,7 +172,8 @@ impl BlockerRadarObservationStatus {
             Self::CiQueued | Self::StalePossible | Self::DegradedUnavailable | Self::Unknown => {
                 BlockerRadarSeverity::Warning
             }
-            Self::RchSubstrateBlocked
+            Self::WaitingExternal
+            | Self::RchSubstrateBlocked
             | Self::RchLocalFallbackRefused
             | Self::CiZeroJobs
             | Self::ArtifactMissing
@@ -180,6 +186,7 @@ impl BlockerRadarObservationStatus {
     fn action_kind(self) -> BlockerRadarActionKind {
         match self {
             Self::PassActionable => BlockerRadarActionKind::ChooseReadyBead,
+            Self::WaitingExternal => BlockerRadarActionKind::RecheckStatus,
             Self::RchSubstrateBlocked | Self::RchLocalFallbackRefused => {
                 BlockerRadarActionKind::FileFollowupBead
             }
@@ -195,6 +202,7 @@ impl BlockerRadarObservationStatus {
     fn failure_class(self) -> BlockerRadarFailureClass {
         match self {
             Self::PassActionable => BlockerRadarFailureClass::UnavailableEvidence,
+            Self::WaitingExternal => BlockerRadarFailureClass::ExternalQueueBlocked,
             Self::RchSubstrateBlocked | Self::RchLocalFallbackRefused => {
                 BlockerRadarFailureClass::EnvironmentBlocked
             }
@@ -219,6 +227,7 @@ impl BlockerRadarObservationStatus {
         matches!(
             self,
             Self::RchSubstrateBlocked
+                | Self::WaitingExternal
                 | Self::RchLocalFallbackRefused
                 | Self::CiQueued
                 | Self::CiZeroJobs
@@ -1007,6 +1016,10 @@ fn operator_summary_for_action(observation: &BlockerRadarCollectorObservation) -
     match observation.status {
         BlockerRadarObservationStatus::PassActionable => {
             "choose the next ready bead after confirming ownership and dirty paths".to_string()
+        }
+        BlockerRadarObservationStatus::WaitingExternal => {
+            "recheck the external substrate without repairing, restarting, or rerunning it"
+                .to_string()
         }
         BlockerRadarObservationStatus::RchSubstrateBlocked
         | BlockerRadarObservationStatus::RchLocalFallbackRefused => {

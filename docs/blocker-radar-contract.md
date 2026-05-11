@@ -195,9 +195,45 @@ Contract and proof artifacts should classify failures as:
 | `owner_handoff_required` | Another active owner controls the lane. |
 | `target_hardware_skipped` | High-scale 64 CPU / 256 GiB claims were not proven. |
 
+## Conformance Matrix
+
+`ft-9ntud.4` pins deterministic semantic goldens in
+`crates/frankenterm-core/tests/fixtures/blocker_radar/conformance_cases.json`
+and validates them with
+`crates/frankenterm-core/tests/blocker_radar_conformance.rs`. The fixture matrix
+must stay small, scrubbed, and reviewable; expected outputs are the required
+state vectors, action kinds, citations, failure classes, dirty paths, and
+artifact paths for each scenario.
+
+MUST-level state coverage:
+
+| Evidence state | Fixture case(s) |
+| --- | --- |
+| `actionable` | `normal-actionable` |
+| `waiting_external` | `waiting-external-generic` |
+| `waiting_owner` | `active-owner` |
+| `stale_possible` | `stale-possible` |
+| `dirty_overlap` | `dirty-overlap` |
+| `rch_substrate_blocked` | `rch-substrate-blocked`, `rch-local-fallback-refused`, `all-external-blocked` |
+| `ci_queued` | `ci-queued`, `all-external-blocked` |
+| `ci_zero_jobs` | `ci-zero-jobs` |
+| `artifact_missing` | `artifact-missing`, `all-external-blocked` |
+| `mail_unavailable` | `mail-unavailable` |
+| `degraded` | `mixed-degraded` |
+| `unknown` | `mixed-degraded` |
+
+The fixture test validates every generated report against
+`docs/json-schema/ft-blocker-radar.json` and fails on missing citations,
+state collapse, nondeterministic timestamps, raw secret-like fixture content,
+or mutating recommendations. The mock-free wrapper
+`tests/e2e/test_ft_9ntud_4_blocker_radar_conformance.sh` runs the same Rust
+conformance lane through RCH and writes structured JSONL plus a summary artifact
+instead of treating local Cargo as proof.
+
 ## Proof Expectations
 
-The contract is not complete until later beads add:
+The v1 proof stack is complete only when every layer below is present and its
+current artifact is cited in the closing bead:
 
 - deterministic schema/golden fixtures,
 - docs-smoke checks that keep docs and schema names aligned,
@@ -206,6 +242,6 @@ The contract is not complete until later beads add:
 - mock-free e2e wrapper logs with exact source classifications,
 - RCH-backed proof artifacts with exact commands and isolated target dirs.
 
-Until those later proof beads land, this document is a v1 contract and live
-surface description, not proof that every substrate collector has full
-end-to-end coverage.
+This document is the v1 contract and live surface description. It is not, by
+itself, proof that every live substrate collector has end-to-end coverage; use
+the fixture/e2e artifacts and RCH logs for that claim.

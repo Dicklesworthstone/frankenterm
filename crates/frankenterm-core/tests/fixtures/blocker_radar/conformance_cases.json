@@ -1,0 +1,588 @@
+{
+  "schema_version": 1,
+  "generated_by": "ft-9ntud.4-blocker-radar-conformance",
+  "fixed_generated_at_ms": 1770000000001,
+  "proof_target": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-9ntud-4-blocker-radar-conformance cargo test -p frankenterm-core --test blocker_radar_conformance -- --nocapture",
+  "nondeterministic_fields": [],
+  "requirements": [
+    {
+      "id": "BR-MUST-actionable",
+      "level": "MUST",
+      "evidence_state": "actionable",
+      "covered_by": ["normal-actionable"]
+    },
+    {
+      "id": "BR-MUST-waiting-external",
+      "level": "MUST",
+      "evidence_state": "waiting_external",
+      "covered_by": ["waiting-external-generic"]
+    },
+    {
+      "id": "BR-MUST-waiting-owner",
+      "level": "MUST",
+      "evidence_state": "waiting_owner",
+      "covered_by": ["active-owner"]
+    },
+    {
+      "id": "BR-MUST-stale-possible",
+      "level": "MUST",
+      "evidence_state": "stale_possible",
+      "covered_by": ["stale-possible"]
+    },
+    {
+      "id": "BR-MUST-dirty-overlap",
+      "level": "MUST",
+      "evidence_state": "dirty_overlap",
+      "covered_by": ["dirty-overlap"]
+    },
+    {
+      "id": "BR-MUST-rch-substrate-blocked",
+      "level": "MUST",
+      "evidence_state": "rch_substrate_blocked",
+      "covered_by": ["rch-substrate-blocked", "rch-local-fallback-refused", "all-external-blocked"]
+    },
+    {
+      "id": "BR-MUST-ci-queued",
+      "level": "MUST",
+      "evidence_state": "ci_queued",
+      "covered_by": ["ci-queued", "all-external-blocked"]
+    },
+    {
+      "id": "BR-MUST-ci-zero-jobs",
+      "level": "MUST",
+      "evidence_state": "ci_zero_jobs",
+      "covered_by": ["ci-zero-jobs"]
+    },
+    {
+      "id": "BR-MUST-artifact-missing",
+      "level": "MUST",
+      "evidence_state": "artifact_missing",
+      "covered_by": ["artifact-missing", "all-external-blocked"]
+    },
+    {
+      "id": "BR-MUST-mail-unavailable",
+      "level": "MUST",
+      "evidence_state": "mail_unavailable",
+      "covered_by": ["mail-unavailable"]
+    },
+    {
+      "id": "BR-MUST-degraded",
+      "level": "MUST",
+      "evidence_state": "degraded",
+      "covered_by": ["mixed-degraded"]
+    },
+    {
+      "id": "BR-MUST-unknown",
+      "level": "MUST",
+      "evidence_state": "unknown",
+      "covered_by": ["mixed-degraded"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "normal-actionable",
+      "description": "Ready Beads evidence is actionable and carries no blocker rows.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.normal_actionable",
+        "observations": [
+          {
+            "source_id": "beads.ready",
+            "source_kind": "beads",
+            "status": "pass_actionable",
+            "command_or_api": "br ready --json",
+            "summary": "ready bead ft-ready.1 is available after owner and dirty-tree checks",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 0,
+            "reason_codes": ["beads.ready_available"],
+            "dependency_ids": ["ft-ready.1"]
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "actionable",
+        "source_states": ["actionable"],
+        "blocker_states": [],
+        "external_queue_states": [],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["choose_ready_bead"],
+        "required_reason_codes": ["evidence.actionable", "beads.ready_available"],
+        "required_citation_ids": ["citation.beads.ready"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "waiting-external-generic",
+      "description": "A read-only external queue that is neither CI nor RCH stays distinct from unknown.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.waiting_external",
+        "observations": [
+          {
+            "source_id": "external.queue.wait",
+            "source_kind": "fixture",
+            "status": "waiting_external",
+            "command_or_api": "read-only external status API",
+            "summary": "external proof substrate accepted the request but has not assigned work yet",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 5000,
+            "reason_codes": ["external.queue_wait"],
+            "run_id": "external-run-42",
+            "url": "https://ci.example.invalid/runs/external-run-42"
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "waiting_external",
+        "source_states": ["waiting_external"],
+        "blocker_states": ["waiting_external"],
+        "external_queue_states": ["waiting_external"],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["recheck_status"],
+        "required_reason_codes": ["external.waiting", "external.queue_wait"],
+        "required_citation_ids": ["citation.external.queue.wait"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "ci-queued",
+      "description": "GitHub Actions queued work is a queued CI state, not a generic degraded source.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.ci_queued",
+        "observations": [
+          {
+            "source_id": "github.run.1001",
+            "source_kind": "github_actions",
+            "status": "ci_queued",
+            "command_or_api": "gh run view 1001 --json status,conclusion,jobs",
+            "summary": "GitHub Actions run 1001 is queued and has not started jobs",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 10000,
+            "reason_codes": ["github.actions.run_queued"],
+            "run_id": "1001",
+            "url": "https://github.example.invalid/actions/runs/1001"
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "ci_queued",
+        "source_states": ["ci_queued"],
+        "blocker_states": ["ci_queued"],
+        "external_queue_states": ["ci_queued"],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["recheck_status"],
+        "required_reason_codes": ["ci.queued", "github.actions.run_queued"],
+        "required_citation_ids": ["citation.github.run.1001"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "ci-zero-jobs",
+      "description": "A materialized check suite with zero jobs is separate from an ordinary queued run.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.ci_zero_jobs",
+        "observations": [
+          {
+            "source_id": "github.suite.zero_jobs",
+            "source_kind": "github_actions",
+            "status": "ci_zero_jobs",
+            "command_or_api": "gh api repos/org/frankenterm/commits/head/check-suites",
+            "summary": "check suite exists but materialized zero jobs",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 12000,
+            "reason_codes": ["github.actions.zero_jobs"],
+            "run_id": "suite-zero-jobs",
+            "url": "https://github.example.invalid/check-suites/suite-zero-jobs"
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "ci_zero_jobs",
+        "source_states": ["ci_zero_jobs"],
+        "blocker_states": ["ci_zero_jobs"],
+        "external_queue_states": ["ci_zero_jobs"],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["recheck_status"],
+        "required_reason_codes": ["ci.zero_jobs", "github.actions.zero_jobs"],
+        "required_citation_ids": ["citation.github.suite.zero_jobs"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "artifact-missing",
+      "description": "A missing package/proof artifact blocks artifact inspection without rerunning CI.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.artifact_missing",
+        "artifact_paths": ["tests/e2e/artifacts/packages/frankenterm-macos.dmg"],
+        "observations": [
+          {
+            "source_id": "artifact.package.macos",
+            "source_kind": "github_actions",
+            "status": "artifact_missing",
+            "command_or_api": "gh run download 1002 --name frankenterm-macos",
+            "summary": "expected macOS package artifact frankenterm-macos.dmg was not retained",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 15000,
+            "reason_codes": ["github.actions.artifact_missing"],
+            "artifact_paths": ["tests/e2e/artifacts/packages/frankenterm-macos.dmg"],
+            "artifact_name": "frankenterm-macos"
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "artifact_missing",
+        "source_states": ["artifact_missing"],
+        "blocker_states": ["artifact_missing"],
+        "external_queue_states": ["artifact_missing"],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["inspect_artifact"],
+        "required_reason_codes": ["artifact.missing", "github.actions.artifact_missing"],
+        "required_citation_ids": ["citation.artifact.package.macos"],
+        "artifact_paths": ["tests/e2e/artifacts/packages/frankenterm-macos.dmg"]
+      }
+    },
+    {
+      "id": "rch-substrate-blocked",
+      "description": "RCH reached a remote worker but failed before useful proof materialized.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.rch_substrate_blocked",
+        "observations": [
+          {
+            "source_id": "rch.worker.vmi1153651",
+            "source_kind": "rch",
+            "status": "rch_substrate_blocked",
+            "command_or_api": "rch exec -- cargo test -p frankenterm-core --test blocker_radar_conformance",
+            "summary": "RCH selected vmi1153651 but the command failed before the test binary ran",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 3000,
+            "reason_codes": ["rch.remote_command_failed_before_test_binary"],
+            "run_id": "rch-run-1003",
+            "worker_id": "vmi1153651"
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "rch_substrate_blocked",
+        "source_states": ["rch_substrate_blocked"],
+        "blocker_states": ["rch_substrate_blocked"],
+        "external_queue_states": ["rch_substrate_blocked"],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["file_followup_bead"],
+        "required_reason_codes": ["rch.substrate_blocked", "rch.remote_command_failed_before_test_binary"],
+        "required_citation_ids": ["citation.rch.worker.vmi1153651"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "rch-local-fallback-refused",
+      "description": "RCH local fallback refusal is a substrate blocker with a distinct reason code.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.rch_local_fallback_refused",
+        "observations": [
+          {
+            "source_id": "rch.local_fallback.refused",
+            "source_kind": "rch",
+            "status": "rch_local_fallback_refused",
+            "command_or_api": "RCH_REQUIRE_REMOTE=1 rch exec -- cargo test ...",
+            "summary": "RCH refused local fallback under remote-only proof policy",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 0,
+            "reason_codes": ["rch.require_remote_refused_local"]
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "rch_substrate_blocked",
+        "source_states": ["rch_substrate_blocked"],
+        "blocker_states": ["rch_substrate_blocked"],
+        "external_queue_states": ["rch_substrate_blocked"],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["file_followup_bead"],
+        "required_reason_codes": ["rch.local_fallback_refused", "rch.require_remote_refused_local"],
+        "required_citation_ids": ["citation.rch.local_fallback.refused"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "mail-unavailable",
+      "description": "Agent Mail unavailable state uses swarm-tick fallback and does not suggest repair.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.mail_unavailable",
+        "observations": [
+          {
+            "source_id": "agent_mail.fallback",
+            "source_kind": "agent_mail",
+            "status": "mail_unavailable",
+            "command_or_api": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+            "summary": "Agent Mail health check failed, coordination must use Beads/git fallback",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 0,
+            "reason_codes": ["agent_mail.fallback_mode"]
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "mail_unavailable",
+        "source_states": ["mail_unavailable"],
+        "blocker_states": ["mail_unavailable"],
+        "external_queue_states": [],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": ["mail_unavailable"],
+        "unavailable_failure_classes": ["unavailable_evidence"],
+        "action_kinds": ["run_swarm_tick"],
+        "required_reason_codes": ["agent_mail.unavailable", "agent_mail.fallback_mode"],
+        "required_citation_ids": ["citation.agent_mail.fallback"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "active-owner",
+      "description": "A fresh active owner requires waiting or handoff, not takeover.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.active_owner",
+        "observations": [
+          {
+            "source_id": "beads.owner.BlueLake",
+            "source_kind": "beads",
+            "status": "active_owner_fresh",
+            "command_or_api": "br show ft-active.1 --json",
+            "summary": "BlueLake owns ft-active.1 and updated it recently",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 2500,
+            "reason_codes": ["beads.owner_active"],
+            "dependency_ids": ["ft-active.1"],
+            "owner": "BlueLake",
+            "updated_at_ms": 1769999999000
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "waiting_owner",
+        "source_states": ["waiting_owner"],
+        "blocker_states": ["waiting_owner"],
+        "external_queue_states": [],
+        "active_agent_states": ["waiting_owner"],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["wait_for_owner"],
+        "required_reason_codes": ["beads.active_owner_fresh", "beads.owner_active"],
+        "required_citation_ids": ["citation.beads.owner.BlueLake"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "stale-possible",
+      "description": "A stale-looking bead requires evidence and a comment before reopening.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.stale_possible",
+        "observations": [
+          {
+            "source_id": "beads.stale.ft-stale.1",
+            "source_kind": "beads",
+            "status": "stale_possible",
+            "command_or_api": "br show ft-stale.1 --json",
+            "summary": "ft-stale.1 has not been updated for the stale threshold",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 3000,
+            "reason_codes": ["beads.status_check_before_reopen"],
+            "dependency_ids": ["ft-stale.1"],
+            "owner": "SilverMaple",
+            "updated_at_ms": 1769990000000
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "stale_possible",
+        "source_states": ["stale_possible"],
+        "blocker_states": ["stale_possible"],
+        "external_queue_states": [],
+        "active_agent_states": ["stale_possible"],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["add_beads_comment"],
+        "required_reason_codes": ["beads.owner_stale_possible", "beads.status_check_before_reopen"],
+        "required_citation_ids": ["citation.beads.stale.ft-stale.1"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "dirty-overlap",
+      "description": "A dirty path blocks edits and staging for that surface.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.dirty_overlap",
+        "observations": [
+          {
+            "source_id": "git.dirty.crash_rs",
+            "source_kind": "git",
+            "status": "dirty_overlap",
+            "command_or_api": "git status --short --branch",
+            "summary": "M crates/frankenterm-core/src/crash.rs (active incident lane)",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 0,
+            "reason_codes": ["git.tracked_dirty_overlap"],
+            "affected_paths": ["crates/frankenterm-core/src/crash.rs"],
+            "dependency_ids": ["ft-incident.1"],
+            "owner": "OtherAgent"
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "dirty_overlap",
+        "source_states": ["dirty_overlap"],
+        "blocker_states": ["dirty_overlap"],
+        "external_queue_states": [],
+        "active_agent_states": [],
+        "dirty_paths": ["crates/frankenterm-core/src/crash.rs"],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["wait_for_owner"],
+        "required_reason_codes": ["git.dirty_overlap", "git.tracked_dirty_overlap"],
+        "required_citation_ids": ["citation.git.dirty.crash_rs"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "mixed-degraded",
+      "description": "Degraded unavailable collectors fail closed while keeping unknown separate.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.mixed_degraded",
+        "observations": [
+          {
+            "source_id": "rch.uncollected",
+            "source_kind": "rch",
+            "status": "degraded_unavailable",
+            "command_or_api": "not_collected_by_fixture",
+            "summary": "RCH evidence was unavailable in this fixture",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 0,
+            "reason_codes": ["rch.evidence_not_collected"]
+          },
+          {
+            "source_id": "github_actions.uncollected",
+            "source_kind": "github_actions",
+            "status": "degraded_unavailable",
+            "command_or_api": "not_collected_by_fixture",
+            "summary": "GitHub Actions evidence was unavailable in this fixture",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 0,
+            "reason_codes": ["ci.evidence_not_collected"]
+          },
+          {
+            "source_id": "manual.unknown",
+            "source_kind": "manual",
+            "status": "unknown",
+            "command_or_api": "manual",
+            "summary": "manual operator evidence was not supplied",
+            "reason_codes": ["manual.evidence_missing"]
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "degraded",
+        "source_states": ["degraded", "degraded", "unknown"],
+        "blocker_states": ["degraded", "degraded", "unknown"],
+        "external_queue_states": [],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": ["degraded", "degraded", "unknown"],
+        "unavailable_failure_classes": ["unavailable_evidence", "unavailable_evidence", "unavailable_evidence"],
+        "action_kinds": ["run_bv_robot_triage", "run_bv_robot_triage", "run_bv_robot_triage"],
+        "required_reason_codes": ["source.degraded", "rch.evidence_not_collected", "ci.evidence_not_collected", "evidence.unknown", "manual.evidence_missing"],
+        "required_citation_ids": ["citation.rch.uncollected", "citation.github_actions.uncollected", "citation.manual.unknown"],
+        "artifact_paths": []
+      }
+    },
+    {
+      "id": "all-external-blocked",
+      "description": "Multiple external blockers preserve their separate source states and action kinds.",
+      "input": {
+        "generated_at_ms": 1770000000001,
+        "source": "fixture.blocker_radar.all_external_blocked",
+        "artifact_paths": ["tests/e2e/artifacts/packages/frankenterm-macos.dmg"],
+        "observations": [
+          {
+            "source_id": "rch.local_fallback.refused",
+            "source_kind": "rch",
+            "status": "rch_local_fallback_refused",
+            "command_or_api": "RCH_REQUIRE_REMOTE=1 rch exec -- cargo test ...",
+            "summary": "RCH refused local fallback under remote-only proof policy",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 0,
+            "reason_codes": ["rch.require_remote_refused_local"]
+          },
+          {
+            "source_id": "github.run.1001",
+            "source_kind": "github_actions",
+            "status": "ci_queued",
+            "command_or_api": "gh run view 1001 --json status,conclusion,jobs",
+            "summary": "GitHub Actions run 1001 is queued and has not started jobs",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 10000,
+            "reason_codes": ["github.actions.run_queued"],
+            "run_id": "1001"
+          },
+          {
+            "source_id": "artifact.package.macos",
+            "source_kind": "github_actions",
+            "status": "artifact_missing",
+            "command_or_api": "gh run download 1002 --name frankenterm-macos",
+            "summary": "expected macOS package artifact frankenterm-macos.dmg was not retained",
+            "collected_at_ms": 1770000000001,
+            "freshness_ms": 15000,
+            "reason_codes": ["github.actions.artifact_missing"],
+            "artifact_paths": ["tests/e2e/artifacts/packages/frankenterm-macos.dmg"],
+            "artifact_name": "frankenterm-macos"
+          }
+        ]
+      },
+      "expected": {
+        "overall_state": "rch_substrate_blocked",
+        "source_states": ["rch_substrate_blocked", "ci_queued", "artifact_missing"],
+        "blocker_states": ["rch_substrate_blocked", "ci_queued", "artifact_missing"],
+        "external_queue_states": ["rch_substrate_blocked", "ci_queued", "artifact_missing"],
+        "active_agent_states": [],
+        "dirty_paths": [],
+        "unavailable_source_states": [],
+        "unavailable_failure_classes": [],
+        "action_kinds": ["file_followup_bead", "recheck_status", "inspect_artifact"],
+        "required_reason_codes": ["rch.local_fallback_refused", "rch.require_remote_refused_local", "ci.queued", "github.actions.run_queued", "artifact.missing", "github.actions.artifact_missing"],
+        "required_citation_ids": ["citation.rch.local_fallback.refused", "citation.github.run.1001", "citation.artifact.package.macos"],
+        "artifact_paths": ["tests/e2e/artifacts/packages/frankenterm-macos.dmg"]
+      }
+    }
+  ]
+}
