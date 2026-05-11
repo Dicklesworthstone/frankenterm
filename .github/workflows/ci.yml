@@ -313,7 +313,9 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # macOS regularly spends most of a cold run compiling/linking the workspace
+    # before tests start, so the full workspace gate needs more than 30 minutes.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
