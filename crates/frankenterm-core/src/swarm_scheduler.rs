@@ -241,6 +241,86 @@ pub struct HerdWaveStaggerPlan {
     pub actions: Vec<HerdWaveStaggeredAction>,
 }
 
+/// Stable dry-run recommendation for one herd-wave cohort entry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdWaveDryRunRecommendation {
+    /// No herd-wave action is needed.
+    Noop,
+    /// Admit after the computed stagger window.
+    AdmitAfterStagger,
+    /// Defer until pressure drops or a later retry window opens.
+    DeferUntilPressureDrops,
+    /// Admit only in a reduced-quality mode after the stagger window.
+    DegradeAfterStagger,
+    /// Do not shed without explicit operator review.
+    RequireOperatorReviewBeforeShed,
+}
+
+/// One dry-run calendar row for a pane in the active herd-wave cohort.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveDryRunCalendarEntry {
+    /// Pane whose follow-up is represented.
+    pub pane_id: u64,
+    /// Signal family that put this pane in the cohort.
+    pub kind: HerdWaveEventKind,
+    /// Original signal timestamp in epoch milliseconds.
+    pub observed_at_ms: u64,
+    /// Deterministic cohort order used for delay computation.
+    pub cohort_rank: u32,
+    /// Delay before this recommendation should be considered.
+    pub delay_ms: u64,
+    /// Absolute dry-run scheduled timestamp.
+    pub scheduled_at_ms: u64,
+    /// Admission verdict applied to this recommendation.
+    pub admission_action: AdmissionAction,
+    /// Operator-safe dry-run recommendation.
+    pub recommendation: HerdWaveDryRunRecommendation,
+    /// Whether priority protection affected the admission verdict.
+    pub priority_protected: bool,
+    /// Stable reason codes for machine surfaces.
+    pub reason_codes: Vec<String>,
+    /// This row never mutates live panes, queues, Agent Mail, or RCH.
+    pub dry_run_only: bool,
+}
+
+/// Non-mutating herd-wave admission calendar for robot/doctor/MCP surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveDryRunPlan {
+    /// Schema version shared with the v1 herd-wave contract.
+    pub schema_version: u16,
+    /// Contract id shared with the v1 herd-wave contract.
+    pub contract_id: &'static str,
+    /// Planner generation time in epoch milliseconds.
+    pub generated_at_ms: u64,
+    /// The planner is recommendation-only.
+    pub dry_run_only: bool,
+    /// A hard false sentinel for future execution surfaces.
+    pub live_mutation_allowed: bool,
+    /// Detection summary that produced this calendar.
+    pub summary: HerdWavePressureSummary,
+    /// Final admission action, when an admission decision was supplied.
+    pub admission_action: Option<AdmissionAction>,
+    /// Final pressure severity after protection and fail-closed gates.
+    pub effective_pressure_severity: Option<u8>,
+    /// Priority-protection projection for this dry-run plan.
+    pub priority_protection: HerdWavePriorityProtectionSnapshot,
+    /// Optional capacity-controller state mirrored from runtime telemetry.
+    pub capacity_controller: Option<HerdWaveCapacityControllerSnapshot>,
+    /// Stable plan-level reason codes.
+    pub reason_codes: Vec<String>,
+    /// Operator-safe next-action codes.
+    pub operator_next_actions: Vec<String>,
+    /// AGENTS-derived actions that this dry-run planner must not perform.
+    pub forbidden_actions: Vec<String>,
+    /// Cooldown notes derived from optional controller state.
+    pub cooldown_notes: Vec<String>,
+    /// Circuit-breaker notes for downstream operator surfaces.
+    pub circuit_breaker_notes: Vec<String>,
+    /// Deterministic per-pane dry-run calendar.
+    pub calendar: Vec<HerdWaveDryRunCalendarEntry>,
+}
+
 /// Contract id for the v1 herd-wave operator snapshot.
 pub const HERD_WAVE_CONTRACT_ID: &str = "ft.herd_wave.v1";
 
@@ -2182,6 +2262,106 @@ pub fn plan_herd_wave_staggered_actions(
     HerdWaveStaggerPlan { summary, actions }
 }
 
+/// Build a non-mutating dry-run admission calendar for a herd-wave cohort.
+///
+/// This planner is intentionally side-effect-free. It only consumes already
+/// computed signals/admission summaries and returns stable DTOs for later
+/// robot, doctor, TOON, or MCP read surfaces.
+#[must_use]
+pub fn plan_herd_wave_dry_run_actions(
+    generated_at_ms: u64,
+    signals: &[HerdWaveSignal],
+    config: &HerdWaveDetectionConfig,
+    admission_decision: Option<&ResourceAdmissionDecisionSummary>,
+    capacity_controller: Option<&HerdWaveCapacityControllerSnapshot>,
+) -> HerdWaveDryRunPlan {
+    let stagger_plan = plan_herd_wave_staggered_actions(signals, config);
+    let priority_protection = HerdWavePriorityProtectionSnapshot::from_decision(admission_decision);
+    let admission_action = admission_decision.map(|decision| decision.action);
+    let effective_pressure_severity =
+        admission_decision.map(|decision| decision.effective_pressure_severity);
+    let calendar_action = admission_action.unwrap_or({
+        if stagger_plan.summary.detected {
+            AdmissionAction::Defer
+        } else {
+            AdmissionAction::Admit
+        }
+    });
+    let recommendation = dry_run_recommendation(stagger_plan.summary.detected, calendar_action);
+    let mut reason_codes = dry_run_plan_reason_codes(
+        &stagger_plan.summary,
+        admission_decision,
+        capacity_controller,
+    );
+    let forbidden_actions = herd_wave_dry_run_forbidden_actions();
+    let cooldown_notes = herd_wave_dry_run_cooldown_notes(capacity_controller);
+    let circuit_breaker_notes =
+        herd_wave_dry_run_circuit_breaker_notes(&stagger_plan.summary, admission_action);
+    let operator_next_actions = herd_wave_operator_next_actions(
+        stagger_plan.summary.detected,
+        recommendation,
+        admission_action,
+        &priority_protection,
+    );
+
+    let calendar = stagger_plan
+        .actions
+        .iter()
+        .map(|action| {
+            let mut entry_reasons = Vec::new();
+            push_string_reason(&mut entry_reasons, herd_wave_event_reason_code(action.kind));
+            push_string_reason(
+                &mut entry_reasons,
+                dry_run_admission_action_reason_code(calendar_action),
+            );
+            if priority_protection.protected {
+                push_string_reason(&mut entry_reasons, "herd_wave.priority.protected");
+            }
+            if action.delay_ms > 0 {
+                push_string_reason(&mut entry_reasons, "herd_wave.dry_run.staggered");
+            } else {
+                push_string_reason(&mut entry_reasons, "herd_wave.dry_run.first_in_cohort");
+            }
+            for reason in &entry_reasons {
+                push_string_reason(&mut reason_codes, reason);
+            }
+
+            HerdWaveDryRunCalendarEntry {
+                pane_id: action.pane_id,
+                kind: action.kind,
+                observed_at_ms: action.observed_at_ms,
+                cohort_rank: action.cohort_rank,
+                delay_ms: action.delay_ms,
+                scheduled_at_ms: action.scheduled_at_ms,
+                admission_action: calendar_action,
+                recommendation,
+                priority_protected: priority_protection.protected,
+                reason_codes: entry_reasons,
+                dry_run_only: true,
+            }
+        })
+        .collect();
+
+    HerdWaveDryRunPlan {
+        schema_version: HERD_WAVE_SCHEMA_VERSION,
+        contract_id: HERD_WAVE_CONTRACT_ID,
+        generated_at_ms,
+        dry_run_only: true,
+        live_mutation_allowed: false,
+        summary: stagger_plan.summary,
+        admission_action,
+        effective_pressure_severity,
+        priority_protection,
+        capacity_controller: capacity_controller.cloned(),
+        reason_codes,
+        operator_next_actions,
+        forbidden_actions,
+        cooldown_notes,
+        circuit_breaker_notes,
+        calendar,
+    }
+}
+
 fn herd_wave_pressure_tier(
     distinct_panes: u32,
     config: &HerdWaveDetectionConfig,
@@ -2416,6 +2596,155 @@ fn admission_reason_code(reason: AdmissionReasonCode) -> &'static str {
             "herd_wave.admission.fail_closed_missing_telemetry"
         }
     }
+}
+
+fn dry_run_recommendation(detected: bool, action: AdmissionAction) -> HerdWaveDryRunRecommendation {
+    if !detected {
+        return HerdWaveDryRunRecommendation::Noop;
+    }
+    match action {
+        AdmissionAction::Admit => HerdWaveDryRunRecommendation::AdmitAfterStagger,
+        AdmissionAction::Defer => HerdWaveDryRunRecommendation::DeferUntilPressureDrops,
+        AdmissionAction::Degrade => HerdWaveDryRunRecommendation::DegradeAfterStagger,
+        AdmissionAction::Shed => HerdWaveDryRunRecommendation::RequireOperatorReviewBeforeShed,
+    }
+}
+
+fn dry_run_plan_reason_codes(
+    summary: &HerdWavePressureSummary,
+    admission_decision: Option<&ResourceAdmissionDecisionSummary>,
+    capacity_controller: Option<&HerdWaveCapacityControllerSnapshot>,
+) -> Vec<String> {
+    let mut reasons = root_reason_codes(summary, &[]);
+    push_string_reason(&mut reasons, "herd_wave.dry_run.plan");
+    push_string_reason(&mut reasons, "herd_wave.dry_run.no_live_mutation");
+    if let Some(decision) = admission_decision {
+        push_string_reason(
+            &mut reasons,
+            dry_run_admission_action_reason_code(decision.action),
+        );
+        for reason in &decision.reason_codes {
+            push_string_reason(&mut reasons, admission_reason_code(*reason));
+        }
+    } else {
+        push_string_reason(&mut reasons, "herd_wave.admission.decision_unavailable");
+    }
+    if let Some(controller) = capacity_controller {
+        for reason in &controller.reason_codes {
+            push_string_reason(&mut reasons, reason);
+        }
+    } else {
+        push_string_reason(&mut reasons, "herd_wave.admission_controller.unavailable");
+    }
+    reasons
+}
+
+fn dry_run_admission_action_reason_code(action: AdmissionAction) -> &'static str {
+    match action {
+        AdmissionAction::Admit => "herd_wave.dry_run.admit",
+        AdmissionAction::Defer => "herd_wave.dry_run.defer",
+        AdmissionAction::Degrade => "herd_wave.dry_run.degrade",
+        AdmissionAction::Shed => "herd_wave.dry_run.shed",
+    }
+}
+
+fn herd_wave_dry_run_forbidden_actions() -> Vec<String> {
+    [
+        "forbidden.agent_mail.repair_or_restart",
+        "forbidden.rch.live_restart_update_or_drain_without_operator_approval",
+        "forbidden.git_or_filesystem.destructive_operation",
+        "forbidden.pane.live_mutation",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn herd_wave_dry_run_cooldown_notes(
+    capacity_controller: Option<&HerdWaveCapacityControllerSnapshot>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    match capacity_controller {
+        Some(controller) if controller.cooldown_or_pressure_active => {
+            push_string_reason(&mut notes, "herd_wave.cooldown.pressure_action_active");
+            if let Some(action) = controller.last_pressure_action.as_deref() {
+                push_string_reason(
+                    &mut notes,
+                    format!("herd_wave.cooldown.last_action.{action}"),
+                );
+            }
+        }
+        Some(_) => {
+            push_string_reason(&mut notes, "herd_wave.cooldown.no_pressure_action_active");
+        }
+        None => {
+            push_string_reason(&mut notes, "herd_wave.cooldown.controller_unavailable");
+        }
+    }
+    notes
+}
+
+fn herd_wave_dry_run_circuit_breaker_notes(
+    summary: &HerdWavePressureSummary,
+    admission_action: Option<AdmissionAction>,
+) -> Vec<String> {
+    let mut notes = vec!["herd_wave.circuit_breaker.not_mutated_by_dry_run".to_string()];
+    if summary.pressure_tier >= FleetPressureTier::Critical {
+        push_string_reason(
+            &mut notes,
+            "herd_wave.circuit_breaker.review_under_high_pressure",
+        );
+    }
+    if admission_action == Some(AdmissionAction::Shed) {
+        push_string_reason(
+            &mut notes,
+            "herd_wave.circuit_breaker.operator_review_required_before_live_shed",
+        );
+    }
+    notes
+}
+
+fn herd_wave_operator_next_actions(
+    detected: bool,
+    recommendation: HerdWaveDryRunRecommendation,
+    admission_action: Option<AdmissionAction>,
+    priority_protection: &HerdWavePriorityProtectionSnapshot,
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    if !detected {
+        push_string_reason(&mut actions, "herd_wave.next.noop");
+        return actions;
+    }
+    match recommendation {
+        HerdWaveDryRunRecommendation::Noop => {
+            push_string_reason(&mut actions, "herd_wave.next.noop");
+        }
+        HerdWaveDryRunRecommendation::AdmitAfterStagger => {
+            push_string_reason(&mut actions, "herd_wave.next.admit_after_stagger");
+        }
+        HerdWaveDryRunRecommendation::DeferUntilPressureDrops => {
+            push_string_reason(&mut actions, "herd_wave.next.defer_until_pressure_drops");
+        }
+        HerdWaveDryRunRecommendation::DegradeAfterStagger => {
+            push_string_reason(&mut actions, "herd_wave.next.degrade_after_stagger");
+        }
+        HerdWaveDryRunRecommendation::RequireOperatorReviewBeforeShed => {
+            push_string_reason(&mut actions, "herd_wave.next.operator_review_before_shed");
+        }
+    }
+    if priority_protection.protected {
+        push_string_reason(
+            &mut actions,
+            "herd_wave.next.preserve_priority_protected_work",
+        );
+    }
+    if admission_action == Some(AdmissionAction::Shed) {
+        push_string_reason(
+            &mut actions,
+            "herd_wave.next.confirm_noncritical_before_shed",
+        );
+    }
+    actions
 }
 
 // =============================================================================
@@ -3090,6 +3419,201 @@ mod tests {
                 .reason_codes
                 .contains(&"herd_wave.admission_controller.pressure_active".to_string())
         );
+    }
+
+    fn capacity_action_for_admission(
+        action: AdmissionAction,
+    ) -> crate::runtime_telemetry::SwarmCapacityAdmissionAction {
+        match action {
+            AdmissionAction::Admit => crate::runtime_telemetry::SwarmCapacityAdmissionAction::Admit,
+            AdmissionAction::Defer => crate::runtime_telemetry::SwarmCapacityAdmissionAction::Defer,
+            AdmissionAction::Degrade => {
+                crate::runtime_telemetry::SwarmCapacityAdmissionAction::ThrottleCapturePolling
+            }
+            AdmissionAction::Shed => crate::runtime_telemetry::SwarmCapacityAdmissionAction::Shed,
+        }
+    }
+
+    fn herd_wave_dry_run_fixture(
+        signals: &[HerdWaveSignal],
+        request: &AdmissionRequest,
+    ) -> HerdWaveDryRunPlan {
+        let config = HerdWaveDetectionConfig::default();
+        let controller = SwarmAdmissionController::default();
+        let wave = detect_herd_wave_pressure(signals, &config);
+        let telemetry =
+            admission_telemetry(0.10, FleetPressureTier::Normal).with_herd_wave_pressure(wave);
+        let decision = controller.evaluate(request, &telemetry);
+        let mut controller_state =
+            crate::runtime_telemetry::SwarmCapacityAdmissionControllerState::default();
+        controller_state.record_decision(capacity_action_for_admission(decision.action), 20_000);
+        let controller_snapshot = HerdWaveCapacityControllerSnapshot::from(&controller_state);
+        plan_herd_wave_dry_run_actions(
+            20_000,
+            signals,
+            &config,
+            Some(&decision),
+            Some(&controller_snapshot),
+        )
+    }
+
+    #[test]
+    fn herd_wave_dry_run_plans_synchronized_compaction_without_mutation_ft_5bwjf_3() {
+        let signals = vec![
+            HerdWaveSignal::pane(1, HerdWaveEventKind::Compaction, 10_000),
+            HerdWaveSignal::pane(2, HerdWaveEventKind::Compaction, 10_010),
+            HerdWaveSignal::pane(3, HerdWaveEventKind::Compaction, 10_020),
+        ];
+
+        let plan = herd_wave_dry_run_fixture(&signals, &background_admission_request());
+
+        assert!(plan.summary.detected);
+        assert!(plan.dry_run_only);
+        assert!(!plan.live_mutation_allowed);
+        assert_eq!(plan.admission_action, Some(AdmissionAction::Defer));
+        assert_eq!(plan.calendar.len(), 3);
+        assert_eq!(plan.calendar[0].delay_ms, 0);
+        assert_eq!(
+            plan.calendar[1].delay_ms,
+            HerdWaveDetectionConfig::default().base_stagger_ms
+        );
+        assert_eq!(
+            plan.calendar[2].delay_ms,
+            HerdWaveDetectionConfig::default().base_stagger_ms * 2
+        );
+        assert!(
+            plan.operator_next_actions
+                .contains(&"herd_wave.next.defer_until_pressure_drops".to_string())
+        );
+        assert!(
+            plan.forbidden_actions
+                .contains(&"forbidden.agent_mail.repair_or_restart".to_string())
+        );
+        assert!(plan.calendar.iter().all(|entry| entry.dry_run_only));
+    }
+
+    #[test]
+    fn herd_wave_dry_run_retry_storm_requires_operator_review_before_shed_ft_5bwjf_3() {
+        let signals: Vec<_> = (0..16)
+            .map(|pane| HerdWaveSignal::pane(pane, HerdWaveEventKind::Retry, 30_000 + pane))
+            .collect();
+
+        let plan = herd_wave_dry_run_fixture(&signals, &background_admission_request());
+
+        assert_eq!(plan.summary.pressure_tier, FleetPressureTier::Emergency);
+        assert_eq!(plan.admission_action, Some(AdmissionAction::Shed));
+        assert_eq!(plan.calendar.len(), 16);
+        assert!(plan.calendar.iter().all(|entry| {
+            entry.recommendation == HerdWaveDryRunRecommendation::RequireOperatorReviewBeforeShed
+                && entry.delay_ms <= HerdWaveDetectionConfig::default().max_stagger_ms
+        }));
+        assert!(
+            plan.operator_next_actions
+                .contains(&"herd_wave.next.operator_review_before_shed".to_string())
+        );
+        assert!(
+            plan.operator_next_actions
+                .contains(&"herd_wave.next.confirm_noncritical_before_shed".to_string())
+        );
+        assert!(plan.circuit_breaker_notes.contains(
+            &"herd_wave.circuit_breaker.operator_review_required_before_live_shed".to_string()
+        ));
+    }
+
+    #[test]
+    fn herd_wave_dry_run_rate_limit_recovery_preserves_priority_work_ft_5bwjf_3() {
+        let signals: Vec<_> = (0..16)
+            .map(|pane| {
+                HerdWaveSignal::pane(pane, HerdWaveEventKind::RateLimitRecovery, 40_000 + pane)
+            })
+            .collect();
+
+        let plan = herd_wave_dry_run_fixture(&signals, &mission_critical_admission_request());
+
+        assert_eq!(plan.summary.pressure_tier, FleetPressureTier::Emergency);
+        assert_eq!(plan.admission_action, Some(AdmissionAction::Defer));
+        assert!(plan.priority_protection.protected);
+        assert!(
+            plan.operator_next_actions
+                .contains(&"herd_wave.next.preserve_priority_protected_work".to_string())
+        );
+        assert!(plan.calendar.iter().all(
+            |entry| entry.admission_action != AdmissionAction::Shed && entry.priority_protected
+        ));
+    }
+
+    #[test]
+    fn herd_wave_dry_run_search_burst_degrades_after_stagger_ft_5bwjf_3() {
+        let signals: Vec<_> = (0..8)
+            .map(|pane| HerdWaveSignal::pane(pane, HerdWaveEventKind::SearchBurst, 50_000 + pane))
+            .collect();
+
+        let plan = herd_wave_dry_run_fixture(&signals, &background_admission_request());
+
+        assert_eq!(plan.summary.pressure_tier, FleetPressureTier::Critical);
+        assert_eq!(plan.admission_action, Some(AdmissionAction::Degrade));
+        assert!(
+            plan.operator_next_actions
+                .contains(&"herd_wave.next.degrade_after_stagger".to_string())
+        );
+        assert!(
+            plan.reason_codes
+                .contains(&"herd_wave.kind.search_burst".to_string())
+        );
+        assert!(plan.calendar.iter().all(|entry| {
+            entry.recommendation == HerdWaveDryRunRecommendation::DegradeAfterStagger
+        }));
+    }
+
+    #[test]
+    fn herd_wave_dry_run_mixed_wave_keeps_per_kind_reason_codes_ft_5bwjf_3() {
+        let signals = vec![
+            HerdWaveSignal::pane(1, HerdWaveEventKind::Compaction, 60_000),
+            HerdWaveSignal::pane(2, HerdWaveEventKind::Retry, 60_005),
+            HerdWaveSignal::pane(3, HerdWaveEventKind::SearchBurst, 60_010),
+            HerdWaveSignal::pane(4, HerdWaveEventKind::Compaction, 60_015),
+        ];
+
+        let plan = herd_wave_dry_run_fixture(&signals, &background_admission_request());
+
+        assert!(plan.summary.detected);
+        assert_eq!(plan.calendar.len(), 4);
+        assert!(
+            plan.reason_codes
+                .contains(&"herd_wave.kind.compaction".to_string())
+        );
+        assert!(
+            plan.reason_codes
+                .contains(&"herd_wave.kind.retry".to_string())
+        );
+        assert!(
+            plan.reason_codes
+                .contains(&"herd_wave.kind.search_burst".to_string())
+        );
+        assert!(
+            plan.reason_codes
+                .contains(&"herd_wave.dry_run.no_live_mutation".to_string())
+        );
+    }
+
+    #[test]
+    fn herd_wave_dry_run_no_wave_returns_empty_calendar_ft_5bwjf_3() {
+        let signals = vec![
+            HerdWaveSignal::pane(1, HerdWaveEventKind::Wake, 70_000),
+            HerdWaveSignal::pane(2, HerdWaveEventKind::Wake, 70_010),
+        ];
+
+        let plan = herd_wave_dry_run_fixture(&signals, &background_admission_request());
+
+        assert!(!plan.summary.detected);
+        assert!(plan.calendar.is_empty());
+        assert_eq!(plan.admission_action, Some(AdmissionAction::Admit));
+        assert!(
+            plan.operator_next_actions
+                .contains(&"herd_wave.next.noop".to_string())
+        );
+        assert!(plan.dry_run_only);
+        assert!(!plan.live_mutation_allowed);
     }
 
     proptest! {
