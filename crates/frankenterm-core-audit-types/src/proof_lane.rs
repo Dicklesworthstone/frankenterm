@@ -608,10 +608,10 @@ pub fn validate_proof_record(record: &ProofAttemptRecord) -> Vec<ProofLedgerFind
     }
 
     if record.state.is_terminal()
-        && !record
+        && record
             .finished_at_utc
             .as_deref()
-            .is_some_and(|timestamp| !timestamp.trim().is_empty())
+            .is_none_or(|timestamp| timestamp.trim().is_empty())
     {
         findings.push(ProofLedgerFinding::error(
             record,
@@ -723,7 +723,7 @@ pub fn validate_proof_record(record: &ProofAttemptRecord) -> Vec<ProofLedgerFind
         && record
             .claims_allowed
             .iter()
-            .any(|claim| is_proven_claim(claim.as_str()))
+            .any(|claim| is_proven_claim(claim))
     {
         findings.push(ProofLedgerFinding::error(
             record,
@@ -736,7 +736,7 @@ pub fn validate_proof_record(record: &ProofAttemptRecord) -> Vec<ProofLedgerFind
         && record
             .claims_allowed
             .iter()
-            .any(|claim| is_proven_claim(claim.as_str()))
+            .any(|claim| is_proven_claim(claim))
     {
         findings.push(ProofLedgerFinding::error(
             record,

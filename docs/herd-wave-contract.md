@@ -152,6 +152,71 @@ bounded identifiers, counters, event ids, hashes, artifact paths, and redacted
 labels. If a future implementation needs content-derived evidence, it must emit
 a redaction reason and bounded citation rather than the content itself.
 
+## Golden Fixture and Conformance Policy
+
+Every deterministic herd-wave fixture row must carry enough metadata for a
+reviewer to understand what is stable, what is intentionally volatile, and what
+proof claim the fixture is allowed to support.
+
+Required golden confidence matrix fields:
+
+| Field | Meaning |
+| --- | --- |
+| `scenario_id` | Stable fixture scenario id, shared by JSON, TOON, e2e, and proof logs. |
+| `surface` | Contract surface under test, for example robot JSON, robot TOON, doctor JSON, doctor text, or MCP resource. |
+| `determinism` | `deterministic`, `platform_dependent`, or `volatile`. |
+| `comparison_strategy` | `exact`, `canonical_json`, `canonical_toon`, `contains_rows`, `schema_only`, or `privacy_negative`. |
+| `canonicalizer` | Named scrub/canonicalization rule set used before comparison. |
+| `contract_requirements` | Requirement ids or field names covered by this fixture row. |
+| `update_command` | Exact intentional-update command or `none`. |
+| `review_required` | Must be `true` for any fixture that can change committed goldens. |
+
+Golden canonicalizers may scrub volatile transport and runtime details only:
+`generated_at_ms`, `run_id`, `correlation_id`, selected worker ids, absolute
+paths, artifact roots, queue timestamps, wall-clock durations, and environment
+labels that vary across RCH workers. Canonicalizers must not scrub contract
+truth. In particular, `reason_codes`, `admission_action`, `pressure_tier`,
+`event_count`, `distinct_panes`, `unavailable_sources`, `forbidden_actions`,
+`raw_pane_content_stored`, and `target_class_hardware_proof` must remain
+asserted values.
+
+JSON and TOON goldens must come from the same canonical snapshot. A JSON pass
+and a TOON pass over independently generated snapshots are not parity proof.
+The parity check must compare decoded canonical values after format-specific
+serialization differences have been normalized.
+
+Committed goldens are immutable by default. Intentional updates must require an
+explicit environment gate, currently documented as
+`UPDATE_HERD_WAVE_GOLDENS=1`, and must emit a structured update event with
+`scenario_id`, `old_sha256`, `new_sha256`, `changed_fixture_count`,
+`update_command`, and `review_required=true`. CI must fail when generated
+goldens differ from the committed files and the update gate is absent.
+
+Conformance accounting must be explicit. The conformance matrix should map each
+contract requirement to fixture coverage with:
+
+| Field | Meaning |
+| --- | --- |
+| `requirement_id` | Stable id for the contract field, state, invariant, or proof rule. |
+| `level` | `MUST`, `SHOULD`, or `MAY`. |
+| `fixture_ids` | Fixture rows that exercise the requirement. |
+| `surfaces` | Surfaces covered by those fixtures. |
+| `status` | `covered`, `partial`, `planned`, `blocked`, or `not_applicable`. |
+| `divergence` | Required explanation for partial, blocked, or intentional surface differences. |
+
+Privacy negative fixtures are required. At minimum they must prove that prompt
+text, bearer-token-like strings, cookies, and raw pane excerpts cannot appear in
+robot, doctor, MCP, artifact, JSONL e2e, or committed golden output. These
+fixtures should fail closed as `privacy_violation` if redaction or bounded
+citation behavior regresses.
+
+Synthetic scale fixtures are not target-class hardware proof. A deterministic
+200-pane synthetic replay can prove schema behavior, scheduling math, and
+privacy invariants, but it must not set or imply a 64+ CPU / 256+ GiB
+target-class claim. Target-class proof requires retained RCH artifacts that
+record the worker predicate, exact commands, isolated target directory, and
+artifact hashes.
+
 ## Failure Classification
 
 Contract and proof artifacts should classify failures as:

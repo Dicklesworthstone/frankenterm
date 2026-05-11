@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// All fields use `#[serde(default)]` so missing keys produce the original
 /// hard-coded values. This struct is immutable after loading — hot-reload is
 /// a future enhancement.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TuningConfig {
     /// Runtime observation loop parameters.

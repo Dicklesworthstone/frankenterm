@@ -484,7 +484,7 @@ impl QuarantineRegistry {
     // ---- Quarantine operations ----
 
     /// Quarantine a component.
-    /// The explicit fields make audit/event provenance visible at each callsite.
+    // The explicit fields match the audit record emitted by this operation.
     #[allow(clippy::too_many_arguments)]
     pub fn quarantine(
         &mut self,
