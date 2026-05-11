@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// All fields use `#[serde(default)]` so missing keys produce the original
 /// hard-coded values. This struct is immutable after loading — hot-reload is
 /// a future enhancement.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct TuningConfig {
     /// Runtime observation loop parameters.
@@ -61,26 +61,6 @@ pub struct TuningConfig {
     pub ipc: IpcTuning,
     /// WezTerm backend adapter timeouts.
     pub wezterm: WeztermTuning,
-}
-
-impl Default for TuningConfig {
-    fn default() -> Self {
-        Self {
-            runtime: RuntimeTuning::default(),
-            backpressure: BackpressureTuning::default(),
-            snapshot: SnapshotTuning::default(),
-            ingest: IngestTuning::default(),
-            patterns: PatternsTuning::default(),
-            policy: PolicyTuning::default(),
-            audit: AuditTuning::default(),
-            web: WebTuning::default(),
-            workflows: WorkflowsTuning::default(),
-            search: SearchTuning::default(),
-            wire_protocol: WireProtocolTuning::default(),
-            ipc: IpcTuning::default(),
-            wezterm: WeztermTuning::default(),
-        }
-    }
 }
 
 // =============================================================================
