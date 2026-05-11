@@ -223,13 +223,13 @@ fn main() -> ExitCode {
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     if args.self_test {
-        return run_self_test().map_err(Into::into);
+        return run_self_test();
     }
     if args.headless_render_self_test {
-        return run_headless_render_self_test().map_err(Into::into);
+        return run_headless_render_self_test();
     }
     if args.perf_self_test {
-        return run_perf_self_test().map_err(Into::into);
+        return run_perf_self_test();
     }
 
     if args.update_goldens {

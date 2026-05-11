@@ -71,7 +71,7 @@ impl<'a> Arbitrary<'a> for RegexChoice {
     fn arbitrary(u: &mut Unstructured<'a>) -> libfuzzer_sys::arbitrary::Result<Self> {
         Ok(match u.int_in_range(0..=4u8)? {
             0 => Self::None,
-            1 | 2 | 3 => Self::Pool(u.arbitrary::<u8>()?),
+            1..=3 => Self::Pool(u.arbitrary::<u8>()?),
             _ => Self::User(bounded_ascii(u, MAX_REGEX_LEN)?),
         })
     }

@@ -498,7 +498,7 @@ mod tests {
 
     fn sorted_render_layer_specs(specs: &[RenderLayerSpec]) -> Vec<RenderLayerSpec> {
         let mut sorted = specs.to_vec();
-        sorted.sort_by(|a, b| a.z_order.cmp(&b.z_order));
+        sorted.sort_by_key(|spec| spec.z_order);
         sorted
     }
 

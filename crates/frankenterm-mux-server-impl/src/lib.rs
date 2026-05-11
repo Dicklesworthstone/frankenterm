@@ -144,10 +144,9 @@ fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
     let (compressed, encoded) =
         if let Some(encoded) = record.strip_prefix(LIVE_SCROLLBACK_LINE_RECORD_V1_UNCOMPRESSED) {
             (false, encoded)
-        } else if let Some(encoded) = record.strip_prefix(LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD) {
-            (true, encoded)
         } else {
-            return None;
+            let encoded = record.strip_prefix(LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD)?;
+            (true, encoded)
         };
 
     let payload = base64::engine::general_purpose::STANDARD_NO_PAD

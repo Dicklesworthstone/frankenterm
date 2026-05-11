@@ -85,17 +85,17 @@ fn icon_path() -> Vec<PathBuf> {
     fn tilde_expand(p: PathBuf) -> PathBuf {
         match p.to_str() {
             Some(s) => {
-                if s.starts_with("~/") {
+                if let Some(stripped) = s.strip_prefix("~/") {
                     if let Some(home) = dirs_next::home_dir() {
-                        home.join(&s[2..])
+                        home.join(stripped)
                     } else {
-                        p.into()
+                        p
                     }
                 } else {
-                    p.into()
+                    p
                 }
             }
-            None => p.into(),
+            None => p,
         }
     }
 
@@ -146,7 +146,7 @@ impl CursorInfo {
             }) {
                 // 0.5 and later have the required support
                 if (vers.major_version(), vers.minor_version()) >= (0, 5) {
-                    size.replace(cursor_size(&config.xcursor_size, &*conn.xrm.borrow()));
+                    size.replace(cursor_size(&config.xcursor_size, &conn.xrm.borrow()));
                     theme = config
                         .xcursor_theme
                         .as_ref()
@@ -296,7 +296,7 @@ impl CursorInfo {
                         cursor,
                         XcbCursor {
                             id: cursor_id,
-                            conn: Rc::downgrade(&conn),
+                            conn: Rc::downgrade(conn),
                         },
                     );
                     return Some(cursor_id);
@@ -345,7 +345,7 @@ impl CursorInfo {
                                     cursor,
                                     XcbCursor {
                                         id: cursor_id,
-                                        conn: Rc::downgrade(&conn),
+                                        conn: Rc::downgrade(conn),
                                     },
                                 );
 
@@ -398,7 +398,7 @@ impl CursorInfo {
             cursor,
             XcbCursor {
                 id: cursor_id,
-                conn: Rc::downgrade(&conn),
+                conn: Rc::downgrade(conn),
             },
         );
 
@@ -545,7 +545,7 @@ impl CursorInfo {
 
         let num_pixels = (width as usize) * (height as usize);
         ensure!(
-            num_pixels < u32::max_value() as usize,
+            num_pixels < u32::MAX as usize,
             "cursor image is larger than fits in u32"
         );
 

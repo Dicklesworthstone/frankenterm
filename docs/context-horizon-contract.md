@@ -1,7 +1,9 @@
 # Context Horizon Contract
 
-Status: v1 planning contract; implementation and RCH proof pending under
-`ft-r920m`
+Status: v1 contract. The native predictor and read-only robot, doctor, and MCP
+surfaces are wired under `ft-r920m.3` / `ft-r920m.4`; deterministic fixtures,
+privacy-golden checks, and final RCH proof artifacts remain tracked by later
+`ft-r920m` beads.
 
 This document defines the first operator-facing contract for a context horizon:
 a privacy-bounded forecast of which panes are likely to hit context pressure,
@@ -37,7 +39,7 @@ Required implementation surfaces:
 | `ft robot --format toon context horizon` | Preserves all pane risk rows, reason codes, unavailable domains, and recommendation ids. |
 | `ft doctor --json` | May embed a context-horizon summary when context telemetry is available. |
 | Doctor/plain output | Shows compact operator rows without implying that dry-run recommendations have executed. |
-| MCP/Robot read resource | Optional for v1; if implemented, it must return the same contract and remain read-only. |
+| `wa://context/horizon` MCP resource | Returns the same contract through a read-only, storage-backed MCP resource. |
 
 ## Versioned Envelope
 
@@ -151,7 +153,7 @@ Contract and proof artifacts should classify failures as:
 
 ## Proof Expectations
 
-The contract is not complete until later beads add:
+The implementation is not complete until later beads add:
 
 - deterministic schema/golden fixtures,
 - docs-smoke checks that keep docs and schema names aligned,
@@ -159,5 +161,6 @@ The contract is not complete until later beads add:
 - privacy fixtures that fail on raw prompt or secret leakage,
 - RCH-backed proof artifacts with exact commands and isolated target dirs.
 
-Until then, this document is a v1 contract and planning surface, not proof that
-the context horizon is implemented.
+Until those land, this document and the shipped read surfaces define the v1
+operator contract, but the deterministic fixture and proof corpus is not yet
+complete.

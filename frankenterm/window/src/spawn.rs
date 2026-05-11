@@ -191,7 +191,7 @@ impl SpawnQueue {
         // iteration.
         let mut byte = [0u8; 64];
         use std::io::Read;
-        lock_or_recover(&self.read).read(&mut byte).ok();
+        let _drained_bytes = lock_or_recover(&self.read).read(&mut byte).unwrap_or(0);
 
         self.has_any_queued()
     }

@@ -112,8 +112,8 @@ pub use mcp_proxy::{
     mcp_proxy_mount_failure_count, mcp_proxy_unaudited_degraded_skip_count,
 };
 use mcp_resources::{
-    WaAccountsByServiceTemplateResource, WaAccountsResource, WaEventsResource,
-    WaEventsTemplateResource, WaEventsUnhandledTemplateResource, WaPanesResource,
+    WaAccountsByServiceTemplateResource, WaAccountsResource, WaContextHorizonResource,
+    WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource, WaPanesResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
     WaRulesResource, WaWorkflowsResource,
 };
@@ -1470,6 +1470,7 @@ mod tests {
                 "wa://accounts".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://context/horizon".to_string(),
                 "wa://reservations".to_string(),
             ])
         );

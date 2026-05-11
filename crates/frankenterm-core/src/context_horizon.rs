@@ -5,12 +5,32 @@
 //! reading pane text or storing prompt/transcript content.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 pub const CONTEXT_HORIZON_CONTRACT_ID: &str = "ft.context_horizon.v1";
 pub const CONTEXT_HORIZON_SCHEMA_VERSION: u16 = 1;
 const DEFAULT_HORIZON_WINDOW_MS: u64 = 15 * 60 * 1000;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ContextHorizonSqliteError {
+    #[error("pane_id {0} exceeds SQLite INTEGER range")]
+    PaneIdOutOfRange(u64),
+    #[error("failed to open context database {path}: {source}")]
+    Open {
+        path: String,
+        source: rusqlite::Error,
+    },
+    #[error("failed to query context horizon {operation}: {source}")]
+    Query {
+        operation: &'static str,
+        source: rusqlite::Error,
+    },
+}
+
+type SqliteResult<T> = std::result::Result<T, ContextHorizonSqliteError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -207,6 +227,349 @@ impl ContextHorizonInput {
             artifact_paths: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct SqliteContextRow {
+    depth: i64,
+    token_budget: i64,
+    tokens_consumed: i64,
+    pressure_tier: String,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SqliteEventEvidence {
+    recent_rate_limit_events: u32,
+    last_activity_at_ms: Option<i64>,
+    events_available: bool,
+}
+
+#[must_use]
+pub fn context_horizon_unavailable_report(
+    generated_at_ms: u64,
+    horizon_window_ms: u64,
+    source: &str,
+    domain: impl Into<String>,
+    reason_code: impl Into<String>,
+    failure_class: ContextHorizonFailureClass,
+) -> ContextHorizonReport {
+    let mut input = ContextHorizonInput::new(generated_at_ms);
+    input.horizon_window_ms = horizon_window_ms.max(1);
+    input
+        .unavailable_domains
+        .push(ContextHorizonUnavailableDomain {
+            domain: domain.into(),
+            evidence_state: ContextHorizonEvidenceState::Unavailable,
+            reason_codes: vec![reason_code.into()],
+            failure_class,
+        });
+    let mut report = predict_context_horizon(&input);
+    report.source = source.to_string();
+    report
+}
+
+pub fn predict_context_horizon_from_sqlite(
+    db_path: &Path,
+    pane_id: Option<u64>,
+    generated_at_ms: u64,
+    horizon_window_ms: u64,
+    source: &str,
+) -> SqliteResult<ContextHorizonReport> {
+    let horizon_window_ms = horizon_window_ms.max(1);
+    if !db_path.exists() {
+        return Ok(context_horizon_unavailable_report(
+            generated_at_ms,
+            horizon_window_ms,
+            source,
+            "native_context_registry",
+            "evidence.context_database_missing",
+            ContextHorizonFailureClass::EnvironmentBlocked,
+        ));
+    }
+
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|source| ContextHorizonSqliteError::Open {
+                path: db_path.display().to_string(),
+                source,
+            })?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|source| ContextHorizonSqliteError::Query {
+            operation: "busy_timeout",
+            source,
+        })?;
+
+    let mut input = ContextHorizonInput::new(generated_at_ms);
+    input.horizon_window_ms = horizon_window_ms;
+
+    if !sqlite_table_exists(&conn, "pane_contexts")?
+        || !sqlite_table_exists(&conn, "context_rotations")?
+    {
+        input
+            .unavailable_domains
+            .push(ContextHorizonUnavailableDomain {
+                domain: "native_context_registry".to_string(),
+                evidence_state: ContextHorizonEvidenceState::Unavailable,
+                reason_codes: vec!["evidence.context_registry_tables_missing".to_string()],
+                failure_class: ContextHorizonFailureClass::UnavailableEvidence,
+            });
+        let mut report = predict_context_horizon(&input);
+        report.source = source.to_string();
+        return Ok(report);
+    }
+
+    let events_available = sqlite_table_exists(&conn, "events")?;
+    if !events_available {
+        input
+            .unavailable_domains
+            .push(ContextHorizonUnavailableDomain {
+                domain: "runtime_events".to_string(),
+                evidence_state: ContextHorizonEvidenceState::Unavailable,
+                reason_codes: vec!["evidence.runtime_events_table_missing".to_string()],
+                failure_class: ContextHorizonFailureClass::UnavailableEvidence,
+            });
+    }
+
+    let pane_ids = if let Some(pane_id) = pane_id {
+        vec![sqlite_pane_id(pane_id)?]
+    } else {
+        sqlite_context_pane_ids(&conn)?
+    };
+
+    for pane_id in pane_ids {
+        input.panes.push(sqlite_pane_evidence(
+            &conn,
+            pane_id,
+            generated_at_ms,
+            horizon_window_ms,
+            events_available,
+        )?);
+    }
+
+    let mut report = predict_context_horizon(&input);
+    report.source = source.to_string();
+    Ok(report)
+}
+
+fn sqlite_query_error(
+    operation: &'static str,
+) -> impl FnOnce(rusqlite::Error) -> ContextHorizonSqliteError {
+    move |source| ContextHorizonSqliteError::Query { operation, source }
+}
+
+fn sqlite_pane_id(pane_id: u64) -> SqliteResult<i64> {
+    i64::try_from(pane_id).map_err(|_| ContextHorizonSqliteError::PaneIdOutOfRange(pane_id))
+}
+
+fn sqlite_table_exists(conn: &rusqlite::Connection, table_name: &str) -> SqliteResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table_name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(sqlite_query_error("table existence"))
+}
+
+fn sqlite_active_context_row(
+    conn: &rusqlite::Connection,
+    pane_id: i64,
+) -> SqliteResult<Option<SqliteContextRow>> {
+    conn.query_row(
+        r"
+        SELECT depth, token_budget, tokens_consumed, pressure_tier, created_at_ms
+        FROM pane_contexts
+        WHERE pane_id = ?1 AND state = 'active'
+        ",
+        [pane_id],
+        |row| {
+            Ok(SqliteContextRow {
+                depth: row.get(0)?,
+                token_budget: row.get(1)?,
+                tokens_consumed: row.get(2)?,
+                pressure_tier: row.get(3)?,
+                created_at_ms: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sqlite_query_error("active pane context"))
+}
+
+fn sqlite_context_pane_ids(conn: &rusqlite::Connection) -> SqliteResult<Vec<i64>> {
+    let mut stmt = conn
+        .prepare(
+            r"
+            SELECT pane_id FROM (
+                SELECT pane_id FROM pane_contexts
+                UNION
+                SELECT pane_id FROM context_rotations
+            )
+            ORDER BY pane_id
+            ",
+        )
+        .map_err(sqlite_query_error("context pane id prepare"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(sqlite_query_error("context pane id query"))?;
+    let mut pane_ids = Vec::new();
+    for row in rows {
+        pane_ids.push(row.map_err(sqlite_query_error("context pane id row"))?);
+    }
+    Ok(pane_ids)
+}
+
+fn sqlite_rotation_count(conn: &rusqlite::Connection, pane_id: i64) -> SqliteResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM context_rotations WHERE pane_id = ?1",
+        [pane_id],
+        |row| row.get(0),
+    )
+    .map_err(sqlite_query_error("context rotation count"))
+}
+
+fn sqlite_recent_compaction_count(
+    conn: &rusqlite::Connection,
+    pane_id: i64,
+    cutoff_ms: i64,
+) -> SqliteResult<u32> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM context_rotations WHERE pane_id = ?1 AND rotated_at_ms >= ?2",
+            rusqlite::params![pane_id, cutoff_ms],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_query_error("recent context rotations"))?;
+    Ok(count.max(0).min(i64::from(u32::MAX)) as u32)
+}
+
+fn sqlite_last_rotation_at(conn: &rusqlite::Connection, pane_id: i64) -> SqliteResult<Option<i64>> {
+    conn.query_row(
+        r"
+        SELECT rotated_at_ms FROM context_rotations
+        WHERE pane_id = ?1
+        ORDER BY rotated_at_ms DESC
+        LIMIT 1
+        ",
+        [pane_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sqlite_query_error("last context rotation"))
+}
+
+fn sqlite_event_evidence(
+    conn: &rusqlite::Connection,
+    pane_id: i64,
+    cutoff_ms: i64,
+    events_available: bool,
+) -> SqliteResult<SqliteEventEvidence> {
+    if !events_available {
+        return Ok(SqliteEventEvidence {
+            recent_rate_limit_events: 0,
+            last_activity_at_ms: None,
+            events_available,
+        });
+    }
+
+    let recent_rate_limit_events: i64 = conn
+        .query_row(
+            r"
+            SELECT COUNT(*) FROM events
+            WHERE pane_id = ?1
+              AND detected_at >= ?2
+              AND (
+                lower(rule_id) LIKE '%rate%limit%'
+                OR lower(rule_id) LIKE '%usage%limit%'
+                OR lower(event_type) LIKE '%rate%limit%'
+                OR lower(event_type) LIKE '%usage%limit%'
+              )
+            ",
+            rusqlite::params![pane_id, cutoff_ms],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_query_error("recent rate-limit events"))?;
+    let last_activity_at_ms = conn
+        .query_row(
+            "SELECT MAX(detected_at) FROM events WHERE pane_id = ?1",
+            [pane_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_query_error("last event activity"))?
+        .flatten();
+
+    Ok(SqliteEventEvidence {
+        recent_rate_limit_events: recent_rate_limit_events.max(0).min(i64::from(u32::MAX)) as u32,
+        last_activity_at_ms,
+        events_available,
+    })
+}
+
+fn sqlite_pane_evidence(
+    conn: &rusqlite::Connection,
+    pane_id: i64,
+    generated_at_ms: u64,
+    horizon_window_ms: u64,
+    events_available: bool,
+) -> SqliteResult<ContextHorizonPaneEvidence> {
+    let cutoff_ms =
+        i64::try_from(generated_at_ms.saturating_sub(horizon_window_ms)).unwrap_or(i64::MAX);
+    let active = sqlite_active_context_row(conn, pane_id)?;
+    let rotation_count = sqlite_rotation_count(conn, pane_id)?;
+    let recent_compaction_events = sqlite_recent_compaction_count(conn, pane_id, cutoff_ms)?;
+    let last_rotated_at_ms = sqlite_last_rotation_at(conn, pane_id)?;
+    let event_evidence = sqlite_event_evidence(conn, pane_id, cutoff_ms, events_available)?;
+
+    let (
+        active_context_present,
+        token_budget,
+        tokens_consumed,
+        pressure_tier,
+        active_depth,
+        created_at_ms,
+    ) = active.map_or_else(
+        || (false, None, None, Some("unknown".to_string()), 0, None),
+        |row| {
+            (
+                true,
+                Some(row.token_budget),
+                Some(row.tokens_consumed),
+                Some(row.pressure_tier),
+                row.depth,
+                Some(row.created_at_ms),
+            )
+        },
+    );
+    let last_activity_at_ms = event_evidence
+        .last_activity_at_ms
+        .or(created_at_ms)
+        .or(last_rotated_at_ms);
+    let evidence_state = if active_context_present {
+        if event_evidence.events_available {
+            ContextHorizonEvidenceState::Measured
+        } else {
+            ContextHorizonEvidenceState::Inferred
+        }
+    } else {
+        ContextHorizonEvidenceState::Unavailable
+    };
+
+    Ok(ContextHorizonPaneEvidence {
+        pane_id: u64::try_from(pane_id.max(0)).unwrap_or(0),
+        active_context_present,
+        token_budget,
+        tokens_consumed,
+        pressure_tier,
+        compaction_count: Some(rotation_count.max(active_depth)),
+        last_rotated_at_ms,
+        last_activity_at_ms,
+        previous_utilization: None,
+        recent_rate_limit_events: event_evidence.recent_rate_limit_events,
+        recent_compaction_events,
+        evidence_state,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1315,6 +1678,128 @@ mod tests {
         assert_eq!(
             value["redaction_policy"]["raw_transcript_allowed"],
             serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn context_horizon_sqlite_missing_db_returns_contract_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing.sqlite3");
+
+        let report = predict_context_horizon_from_sqlite(
+            &db_path,
+            None,
+            1_700_000_000_000,
+            60_000,
+            "test.context_horizon",
+        )
+        .expect("missing db should produce unavailable report");
+
+        assert_eq!(report.contract_id, CONTEXT_HORIZON_CONTRACT_ID);
+        assert_eq!(report.source, "test.context_horizon");
+        assert_eq!(
+            report.evidence_state,
+            ContextHorizonEvidenceState::Unavailable
+        );
+        assert_eq!(report.raw_context_content_stored, false);
+        assert_eq!(report.unavailable_domains.len(), 1);
+        assert_eq!(
+            report.unavailable_domains[0].reason_codes,
+            vec!["evidence.context_database_missing"]
+        );
+    }
+
+    #[test]
+    fn context_horizon_sqlite_reads_context_registry_and_rate_limit_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("context.sqlite3");
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        conn.execute_batch(
+            r"
+            CREATE TABLE pane_contexts (
+                context_id TEXT PRIMARY KEY NOT NULL,
+                pane_id INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                depth INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                archived_at_ms INTEGER,
+                token_budget INTEGER NOT NULL,
+                tokens_consumed INTEGER NOT NULL,
+                pressure_tier TEXT NOT NULL,
+                source TEXT NOT NULL
+            );
+            CREATE TABLE context_rotations (
+                rotation_id TEXT PRIMARY KEY NOT NULL,
+                pane_id INTEGER NOT NULL,
+                previous_context_id TEXT,
+                new_context_id TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                reason TEXT,
+                caller_idempotency_key TEXT,
+                rotated_at_ms INTEGER NOT NULL,
+                tokens_before INTEGER NOT NULL,
+                tokens_after INTEGER NOT NULL,
+                tokens_freed INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detected_at INTEGER NOT NULL
+            );
+            INSERT INTO pane_contexts
+                (context_id, pane_id, state, depth, created_at_ms, token_budget,
+                 tokens_consumed, pressure_tier, source)
+            VALUES
+                ('ctx-1', 7, 'active', 2, 1699999990000, 1000, 910, 'yellow',
+                 'test');
+            INSERT INTO context_rotations
+                (rotation_id, pane_id, previous_context_id, new_context_id, strategy,
+                 rotated_at_ms, tokens_before, tokens_after, tokens_freed, created_at_ms)
+            VALUES
+                ('rot-1', 7, NULL, 'ctx-1', 'agent_default', 1699999995000, 900,
+                 100, 800, 1699999995000);
+            INSERT INTO events
+                (pane_id, rule_id, event_type, detected_at)
+            VALUES
+                (7, 'codex.usage.limit', 'rate_limit', 1699999999000);
+            ",
+        )
+        .expect("seed context horizon sqlite");
+        drop(conn);
+
+        let report = predict_context_horizon_from_sqlite(
+            &db_path,
+            Some(7),
+            1_700_000_000_000,
+            60_000,
+            "robot.context.horizon",
+        )
+        .expect("sqlite horizon report");
+
+        assert_eq!(report.source, "robot.context.horizon");
+        assert_eq!(report.pane_risks.len(), 1);
+        let risk = &report.pane_risks[0];
+        assert_eq!(risk.pane_id, 7);
+        assert!(risk.risk_tier >= ContextHorizonRiskTier::Red);
+        assert_eq!(risk.rate_limit_risk, ContextHorizonRiskTier::Yellow);
+        assert_eq!(
+            risk.handoff_readiness,
+            ContextHorizonHandoffReadiness::Prepare
+        );
+        assert!(
+            risk.reason_codes
+                .iter()
+                .any(|reason| reason == "provider.rate_limit_recent")
+        );
+        assert_eq!(report.raw_context_content_stored, false);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .all(|recommendation| !recommendation.mutation_allowed)
         );
     }
 

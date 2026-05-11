@@ -6,15 +6,15 @@
 use super::{
     AuditedToolHandler, Config, FormatAwareToolHandler, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
-    WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool,
-    WaEventsResource, WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool,
-    WaEventsUnhandledTemplateResource, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
-    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaPanesResource, WaReleaseTool,
-    WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
-    WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
-    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
-    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
-    WaWorkflowsResource, build_mcp_shared_rate_limiter,
+    WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaContextHorizonResource,
+    WaEventsAnnotateTool, WaEventsLabelTool, WaEventsResource, WaEventsTemplateResource,
+    WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource, WaGetTextTool,
+    WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool,
+    WaMissionStateTool, WaPanesResource, WaReleaseTool, WaReservationsByPaneTemplateResource,
+    WaReservationsResource, WaReservationsTool, WaReserveTool, WaRulesByAgentTemplateResource,
+    WaRulesListTool, WaRulesResource, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
+    WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+    WaWorkflowStatusTool, WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
 use crate::mcp_framework::{
     FrameworkServer as Server, framework_server_builder, run_framework_stdio_server,
@@ -98,6 +98,7 @@ pub const DB_GATED_RESOURCE_URIS: &[&str] = &[
     "wa://events/unhandled/{limit}",
     "wa://accounts",
     "wa://accounts/{service}",
+    "wa://context/horizon",
     "wa://reservations",
     "wa://reservations/{pane_id}",
 ];
@@ -437,6 +438,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             .resource(WaAccountsByServiceTemplateResource::new(Arc::clone(
                 db_path,
             )))
+            .resource(WaContextHorizonResource::new(Arc::clone(db_path)))
             .resource(WaReservationsResource::new(Arc::clone(db_path)))
             .resource(WaReservationsByPaneTemplateResource::new(Arc::clone(
                 db_path,

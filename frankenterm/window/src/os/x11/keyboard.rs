@@ -506,7 +506,7 @@ impl KeyboardWithFallback {
         connection: &xcb::Connection,
         event: &xcb::Event,
     ) -> anyhow::Result<Option<(Modifiers, KeyboardLedStatus)>> {
-        let before = self.selected.mods_leds.borrow().clone();
+        let before = *self.selected.mods_leds.borrow();
 
         match event {
             xcb::Event::Xkb(xcb::xkb::Event::StateNotify(e)) => {
@@ -522,7 +522,7 @@ impl KeyboardWithFallback {
 
         let after = (self.get_key_modifiers(), self.get_led_status());
         if after != before {
-            *self.selected.mods_leds.borrow_mut() = after.clone();
+            *self.selected.mods_leds.borrow_mut() = after;
             Ok(Some(after))
         } else {
             Ok(None)
@@ -640,12 +640,12 @@ impl Keyboard {
             .first_event;
 
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let device_id = xkb::x11::get_core_keyboard_device_id(&connection);
+        let device_id = xkb::x11::get_core_keyboard_device_id(connection);
         ensure!(device_id != -1, "Couldn't find core keyboard device");
 
         let keymap = xkb::x11::keymap_new_from_device(
             &context,
-            &connection,
+            connection,
             device_id,
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         );
@@ -768,7 +768,7 @@ impl Keyboard {
     }
 
     pub fn merge_current_xcb_modifiers(&self, mods: ModMask) {
-        let state = self.last_xcb_state.borrow().clone();
+        let state = *self.last_xcb_state.borrow();
         log::trace!(
             "merge_current_xcb_modifiers({}); state before={state:?}, mods={mods:?}",
             self.label
@@ -784,7 +784,7 @@ impl Keyboard {
     }
 
     pub fn reapply_last_xcb_state(&self) {
-        let state = self.last_xcb_state.borrow().clone();
+        let state = *self.last_xcb_state.borrow();
         self.state.borrow_mut().update_mask(
             state.depressed_mods,
             state.latched_mods,
@@ -800,7 +800,7 @@ impl Keyboard {
 
         let new_keymap = xkb::x11::keymap_new_from_device(
             &self.context,
-            &connection,
+            connection,
             self.get_device_id(),
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         );

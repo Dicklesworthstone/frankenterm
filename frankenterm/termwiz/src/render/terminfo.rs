@@ -1070,7 +1070,7 @@ mod test {
 
     impl RealPtyTerm {
         fn new_with_size(caps: Capabilities, width: usize, height: usize) -> Self {
-            let mut size = winsize {
+            let size = winsize {
                 ws_col: cast(width).unwrap(),
                 ws_row: cast(height).unwrap(),
                 ws_xpixel: 0,
@@ -1079,13 +1079,27 @@ mod test {
             let mut master_fd = -1;
             let mut slave_fd = -1;
             let opened = unsafe {
-                libc::openpty(
-                    &mut master_fd,
-                    &mut slave_fd,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut size,
-                )
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                {
+                    let mut size = size;
+                    libc::openpty(
+                        &mut master_fd,
+                        &mut slave_fd,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut size,
+                    )
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                {
+                    libc::openpty(
+                        &mut master_fd,
+                        &mut slave_fd,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &size,
+                    )
+                }
             };
             assert_eq!(opened, 0, "openpty failed: {}", IoError::last_os_error());
 

@@ -1002,6 +1002,10 @@ mod tests {
         cells
     }
 
+    fn grid_index(row: usize, col: usize, cols: usize) -> usize {
+        row * cols + col
+    }
+
     #[test]
     fn differential_cell_stream_starts_with_full_rewrite() {
         let current = grid(3, 4);
@@ -1022,7 +1026,8 @@ mod tests {
     fn differential_cell_stream_uploads_only_changed_cells_in_dirty_rows() {
         let initial = grid(4, 5);
         let mut current = initial.clone();
-        current[1 * 5 + 3] = gpu_cell(1, 3, 9_001);
+        let changed_index = grid_index(1, 3, 5);
+        current[changed_index] = gpu_cell(1, 3, 9_001);
         current[2 * 5 + 4] = gpu_cell(2, 4, 9_002);
         let mut stream = DifferentialCellStream::new(4, 5, 20, 8);
         stream.push_frame(&initial, []).unwrap();
@@ -1037,7 +1042,10 @@ mod tests {
             frame.uploaded_bytes < current.len() * INSTANCE_BYTES_PER_CELL,
             "sparse upload should be smaller than a full rewrite",
         );
-        assert_eq!(stream.previous_grid()[1 * 5 + 3], current[1 * 5 + 3]);
+        assert_eq!(
+            stream.previous_grid()[changed_index],
+            current[changed_index]
+        );
         assert_eq!(stream.previous_grid()[2 * 5 + 4], initial[2 * 5 + 4]);
     }
 
@@ -1135,7 +1143,7 @@ mod tests {
         assert_eq!(replayed, initial);
 
         let mut current = initial.clone();
-        current[0 * 4 + 1] = gpu_cell(0, 1, 501);
+        current[grid_index(0, 1, 4)] = gpu_cell(0, 1, 501);
         current[2 * 4 + 3] = gpu_cell(2, 3, 503);
         let delta = stream.push_frame(&current, [0, 2]).unwrap();
         apply_cell_delta_records(&mut replayed, 4, &delta.records);

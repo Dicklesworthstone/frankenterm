@@ -16,6 +16,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use frankenterm_alloc as _;
 use frankenterm_core::cass::CassErrorRemediationExt;
 use frankenterm_core::caut::CautErrorRemediationExt;
+use frankenterm_core::context_horizon::{
+    ContextHorizonFailureClass, ContextHorizonReport, context_horizon_unavailable_report,
+    predict_context_horizon_from_sqlite,
+};
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
 use frankenterm_core::plan::mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report;
 #[cfg(test)]
@@ -3653,6 +3657,16 @@ enum RobotContextCommands {
         /// Specific pane ID (omit for fleet-wide summary)
         #[arg(long)]
         pane_id: Option<u64>,
+    },
+    /// Forecast context pressure, compaction, rate-limit, and handoff risk
+    Horizon {
+        /// Specific pane ID (omit for fleet-wide horizon)
+        #[arg(long)]
+        pane_id: Option<u64>,
+
+        /// Forecast window in milliseconds
+        #[arg(long)]
+        horizon_window_ms: Option<u64>,
     },
     /// Trigger context rotation for a pane
     Rotate {
@@ -13182,6 +13196,51 @@ fn robot_context_status_data(
     }))
 }
 
+fn robot_context_horizon_data(
+    db_path: &str,
+    pane_id: Option<u64>,
+    horizon_window_ms: Option<u64>,
+    elapsed_ms: u64,
+) -> RobotJsonResult<serde_json::Value> {
+    let horizon_window_ms = horizon_window_ms.unwrap_or(15 * 60 * 1000);
+    if horizon_window_ms == 0 {
+        return Err(Box::new(robot_context_error_response(
+            ROBOT_ERR_INVALID_ARGS,
+            "horizon_window_ms must be greater than zero.",
+            Some("Omit --horizon-window-ms to use the default 15 minute forecast.".to_string()),
+            elapsed_ms,
+        )));
+    }
+
+    let report = predict_context_horizon_from_sqlite(
+        Path::new(db_path),
+        pane_id,
+        now_ms(),
+        horizon_window_ms,
+        "robot.context.horizon",
+    )
+    .map_err(|err| {
+        robot_context_error_response(
+            ROBOT_ERR_STORAGE,
+            format!("Failed to build context horizon: {err}"),
+            Some(
+                "Check the workspace database path; the context horizon read path is non-mutating."
+                    .to_string(),
+            ),
+            elapsed_ms,
+        )
+    })?;
+
+    serde_json::to_value(report).map_err(|err| {
+        Box::new(robot_context_error_response(
+            "robot.serialization_error",
+            format!("Failed to serialize context horizon: {err}"),
+            None,
+            elapsed_ms,
+        ))
+    })
+}
+
 fn robot_context_rotation_response(
     row: &RobotContextRotationRow,
     is_replay: bool,
@@ -13421,6 +13480,10 @@ fn robot_context_command_response(
         RobotContextCommands::Status { pane_id } => {
             robot_context_status_data(db_path, *pane_id, elapsed_ms)
         }
+        RobotContextCommands::Horizon {
+            pane_id,
+            horizon_window_ms,
+        } => robot_context_horizon_data(db_path, *pane_id, *horizon_window_ms, elapsed_ms),
         RobotContextCommands::Rotate {
             pane_id,
             strategy,
@@ -13583,6 +13646,94 @@ mod robot_context_backend_tests {
         assert_ne!(first["rotation_id"], third["rotation_id"]);
         assert_eq!(third["is_replay"].as_bool(), Some(false));
         assert_eq!(context_rotation_count(&db_path, 42), 2);
+    }
+
+    #[test]
+    fn robot_context_horizon_emits_v1_contract_without_mutation() {
+        let (_dir, db_path) = setup_robot_context_test_db();
+        let conn = robot_context_open_conn(&db_path).expect("open context db");
+        conn.execute(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detected_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .expect("create events table");
+        conn.execute(
+            "INSERT INTO pane_contexts
+             (context_id, pane_id, state, depth, created_at_ms, token_budget,
+              tokens_consumed, pressure_tier, source)
+             VALUES ('ctx-horizon', 9, 'active', 1, ?1, 1000, 910, 'yellow',
+                     'test')",
+            [now_ms_i64().saturating_sub(1_000)],
+        )
+        .expect("insert active context");
+        conn.execute(
+            "INSERT INTO events (pane_id, rule_id, event_type, detected_at)
+             VALUES (9, 'codex.usage.limit', 'rate_limit', ?1)",
+            [now_ms_i64().saturating_sub(500)],
+        )
+        .expect("insert event");
+        drop(conn);
+
+        let horizon = expect_context_ok(robot_context_horizon_data(
+            &db_path,
+            Some(9),
+            Some(60_000),
+            13,
+        ));
+        assert_eq!(
+            horizon["contract_id"].as_str(),
+            Some("ft.context_horizon.v1")
+        );
+        assert_eq!(horizon["source"].as_str(), Some("robot.context.horizon"));
+        assert_eq!(horizon["raw_context_content_stored"].as_bool(), Some(false));
+        assert_eq!(horizon["pane_risks"][0]["pane_id"].as_u64(), Some(9));
+        assert_eq!(
+            horizon["pane_risks"][0]["reason_codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str() == Some("provider.rate_limit_recent")),
+            true
+        );
+        assert!(
+            horizon["recommendations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["mutation_allowed"].as_bool() == Some(false))
+        );
+
+        let response = RobotResponse::success(horizon, 13);
+        let encoded = toon_rust::encode(serde_json::to_value(&response).unwrap(), None);
+        assert!(encoded.contains("pane_risks"));
+        assert!(encoded.contains("reason_codes"));
+        assert!(encoded.contains("raw_context_content_stored"));
+        let decoded_toon = toon_rust::try_decode(&encoded, None).expect("decode horizon toon");
+        let decoded_json =
+            toon_rust::cli::json_stringify::json_stringify_lines(&decoded_toon, 0).join("\n");
+        let decoded: serde_json::Value =
+            serde_json::from_str(&decoded_json).expect("horizon toon roundtrip json");
+        assert_eq!(
+            decoded["data"]["contract_id"].as_str(),
+            Some("ft.context_horizon.v1")
+        );
+        assert_eq!(
+            decoded["data"]["pane_risks"][0]["reason_codes"][0].is_string(),
+            true
+        );
+    }
+
+    #[test]
+    fn robot_context_horizon_rejects_zero_window() {
+        let (_dir, db_path) = setup_robot_context_test_db();
+        let error = expect_context_error(robot_context_horizon_data(&db_path, None, Some(0), 13));
+        assert_eq!(error.error_code.as_deref(), Some(ROBOT_ERR_INVALID_ARGS));
     }
 
     #[test]
@@ -36579,6 +36730,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| {
                     frankenterm_core::hardware_profile::collect_hardware_profile(&layout.root)
                 });
+            let context_horizon_report = build_context_horizon_doctor_report(&layout.db_path);
             let herd_wave_report = build_herd_wave_surface_report(
                 "doctor.herd_wave",
                 now_ms(),
@@ -36664,6 +36816,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
                 result["swarm_capacity"] = serde_json::to_value(&swarm_capacity_summary)
                     .unwrap_or(serde_json::Value::Null);
+                result["context_horizon"] = serde_json::to_value(&context_horizon_report)
+                    .unwrap_or(serde_json::Value::Null);
                 result["herd_wave"] = herd_wave_report.clone();
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
@@ -36719,6 +36873,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
 
                 print_swarm_capacity_doctor_section(&swarm_capacity_summary);
+                print_context_horizon_doctor_section(&context_horizon_report);
                 print_herd_wave_doctor_section(&herd_wave_report);
 
                 println!();
@@ -49673,6 +49828,92 @@ fn print_operator_guidance(guidance: &OperatorGuidance) {
         for step in &guidance.next_steps {
             println!("    - {}: {}", step.label, step.command);
         }
+    }
+}
+
+fn context_horizon_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn build_context_horizon_doctor_report(db_path: &Path) -> ContextHorizonReport {
+    let generated_at_ms = now_ms();
+    let horizon_window_ms = 15 * 60 * 1000;
+    predict_context_horizon_from_sqlite(
+        db_path,
+        None,
+        generated_at_ms,
+        horizon_window_ms,
+        "doctor.context_horizon",
+    )
+    .unwrap_or_else(|_| {
+        context_horizon_unavailable_report(
+            generated_at_ms,
+            horizon_window_ms,
+            "doctor.context_horizon",
+            "native_context_registry",
+            "evidence.context_horizon_read_error",
+            ContextHorizonFailureClass::EnvironmentBlocked,
+        )
+    })
+}
+
+fn print_context_horizon_doctor_section(report: &ContextHorizonReport) {
+    println!();
+    println!("Context Horizon:");
+    println!(
+        "  forecast: evidence={} panes={} red_or_black={} top_move={} raw_context_content_stored={}",
+        context_horizon_label(&report.evidence_state),
+        report.fleet_summary.total_panes,
+        report.fleet_summary.panes_at_red_or_black,
+        report.fleet_summary.top_operator_move,
+        report.raw_context_content_stored,
+    );
+
+    for risk in report.pane_risks.iter().take(8) {
+        println!(
+            "  pane {}: risk={} evidence={} handoff={} reasons={}",
+            risk.pane_id,
+            context_horizon_label(&risk.risk_tier),
+            context_horizon_label(&risk.evidence_state),
+            context_horizon_label(&risk.handoff_readiness),
+            risk.reason_codes.join(","),
+        );
+    }
+    if report.pane_risks.len() > 8 {
+        println!(
+            "  ... {} more pane risk rows",
+            report.pane_risks.len().saturating_sub(8)
+        );
+    }
+
+    for domain in &report.unavailable_domains {
+        println!(
+            "  unavailable {}: evidence={} class={} reasons={}",
+            domain.domain,
+            context_horizon_label(&domain.evidence_state),
+            context_horizon_label(&domain.failure_class),
+            domain.reason_codes.join(","),
+        );
+    }
+
+    for recommendation in report.recommendations.iter().take(5) {
+        println!(
+            "  advice {}: action={} policy={} mutation_allowed={} reasons={}",
+            recommendation.recommendation_id,
+            context_horizon_label(&recommendation.action_kind),
+            context_horizon_label(&recommendation.policy_state),
+            recommendation.mutation_allowed,
+            recommendation.reason_codes.join(","),
+        );
+    }
+    if report.recommendations.len() > 5 {
+        println!(
+            "  ... {} more dry-run advice rows",
+            report.recommendations.len().saturating_sub(5)
+        );
     }
 }
 
@@ -66530,6 +66771,38 @@ log_level = "debug"
                     assert!(!escapes);
                 }
                 _ => panic!("expected RobotCommands::State"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_context_horizon_parses() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "context",
+            "horizon",
+            "--pane-id",
+            "9",
+            "--horizon-window-ms",
+            "60000",
+        ])
+        .expect("robot context horizon should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Context {
+                    command:
+                        RobotContextCommands::Horizon {
+                            pane_id,
+                            horizon_window_ms,
+                        },
+                }) => {
+                    assert_eq!(pane_id, Some(9));
+                    assert_eq!(horizon_window_ms, Some(60_000));
+                }
+                _ => panic!("expected RobotCommands::Context::Horizon"),
             },
             _ => panic!("expected Robot command"),
         }

@@ -487,9 +487,11 @@ mod tests {
 
     #[test]
     fn standard_theme_class_preserves_configured_palette() {
-        let mut base = config::Palette::default();
-        base.foreground = Some(config::RgbaColor::try_from("#123456".to_string()).unwrap());
-        base.background = Some(config::RgbaColor::try_from("#abcdef".to_string()).unwrap());
+        let base = config::Palette {
+            foreground: Some(config::RgbaColor::try_from("#123456".to_string()).unwrap()),
+            background: Some(config::RgbaColor::try_from("#abcdef".to_string()).unwrap()),
+            ..Default::default()
+        };
 
         let result = palette_with_accessibility_preferences(
             &base,
@@ -505,9 +507,11 @@ mod tests {
 
     #[test]
     fn non_standard_theme_class_overlays_live_config_palette() {
-        let mut base = config::Palette::default();
-        base.foreground = Some(config::RgbaColor::try_from("#123456".to_string()).unwrap());
-        base.background = Some(config::RgbaColor::try_from("#abcdef".to_string()).unwrap());
+        let base = config::Palette {
+            foreground: Some(config::RgbaColor::try_from("#123456".to_string()).unwrap()),
+            background: Some(config::RgbaColor::try_from("#abcdef".to_string()).unwrap()),
+            ..Default::default()
+        };
 
         let result = palette_with_accessibility_preferences(
             &base,

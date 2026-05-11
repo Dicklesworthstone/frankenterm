@@ -1045,7 +1045,10 @@ mod tests {
             "NaN must not advance total_observations"
         );
         assert!(!monitor.calibrated, "NaN must not trigger calibration");
-        assert_eq!(monitor.null_rate, 0.0, "NaN must not touch null_rate");
+        assert!(
+            monitor.null_rate.abs() <= f64::EPSILON,
+            "NaN must not touch null_rate"
+        );
     }
 
     /// After calibration, a NaN observation must leave e_value, null_rate,
@@ -1070,8 +1073,8 @@ mod tests {
         assert!(matches!(verdict, DriftVerdict::NoDrift { .. }));
 
         // No counters bumped, no numeric state touched.
-        assert_eq!(monitor.e_value(), pre_e);
-        assert_eq!(monitor.null_rate, pre_null);
+        assert!((monitor.e_value() - pre_e).abs() <= f64::EPSILON);
+        assert!((monitor.null_rate - pre_null).abs() <= f64::EPSILON);
         assert_eq!(monitor.total_observations, pre_total);
         assert_eq!(monitor.post_cal_observations, pre_post_cal);
     }

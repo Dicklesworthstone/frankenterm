@@ -194,7 +194,7 @@ fn get_wm_name(
         }))
         .context("GetProperty _NET_SUPPORTING_WM_CHECK")?;
 
-    let wm_window = match reply.value::<xcb::x::Window>().get(0) {
+    let wm_window = match reply.value::<xcb::x::Window>().first() {
         Some(w) => *w,
         None => anyhow::bail!("empty list of windows"),
     };
@@ -286,7 +286,7 @@ impl ConnectionOps for XConnection {
             .send_and_wait_request(&xcb::randr::GetScreenResourcesCurrent { window: self.root })
             .context("get_screen_resources_current")
         {
-            Ok(cur) if cur.outputs().len() > 0 => ScreenResources::Current(cur),
+            Ok(cur) if !cur.outputs().is_empty() => ScreenResources::Current(cur),
             _ => ScreenResources::All(
                 self.send_and_wait_request(&xcb::randr::GetScreenResources { window: self.root })
                     .context("get_screen_resources")?,
@@ -478,8 +478,8 @@ impl XConnection {
             }
         }
 
-        let xrm = crate::x11::xrm::parse_root_resource_manager(&self.conn, self.root)
-            .unwrap_or(HashMap::new());
+        let xrm =
+            crate::x11::xrm::parse_root_resource_manager(&self.conn, self.root).unwrap_or_default();
         *self.xrm.borrow_mut() = xrm;
 
         let dpi = compute_default_dpi(&self.xrm.borrow(), &self.xsettings.borrow());
@@ -541,9 +541,7 @@ impl XConnection {
             .poll_for_event()
             .context("X11 connection is broken")?
         {
-            if let Err(err) = self.process_xcb_event_ime(&event) {
-                return Err(err);
-            }
+            self.process_xcb_event_ime(&event)?;
         }
         self.conn.flush().context("flushing pending requests")?;
 
@@ -778,7 +776,7 @@ impl XConnection {
         if visuals.is_empty() {
             bail!("no suitable visuals of depth 24 or 32 are available");
         }
-        visuals.sort_by(|(a_depth, _), (b_depth, _)| b_depth.cmp(&a_depth));
+        visuals.sort_by(|(a_depth, _), (b_depth, _)| b_depth.cmp(a_depth));
         let (depth, visual) = visuals[0];
         let visual = *visual;
 
@@ -817,8 +815,7 @@ impl XConnection {
             .context("XRANDR::SelectInput")?;
         }
 
-        let xrm =
-            crate::x11::xrm::parse_root_resource_manager(&conn, root).unwrap_or(HashMap::new());
+        let xrm = crate::x11::xrm::parse_root_resource_manager(&conn, root).unwrap_or_default();
 
         let xsettings = read_xsettings(&conn, atom_xsettings_selection, atom_xsettings_settings)
             .unwrap_or_else(|err| {

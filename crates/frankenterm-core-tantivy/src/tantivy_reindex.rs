@@ -4381,7 +4381,7 @@ mod tests {
             };
 
             let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
-            let mut observer = NullObserver;
+            let observer = NullObserver;
             let (progress, _stats) = pipeline
                 .reindex_range_observed(
                     &storage,
@@ -4392,7 +4392,7 @@ mod tests {
                     20,
                     false,
                     RECORDER_EVENT_SCHEMA_VERSION_V1,
-                    &mut observer,
+                    &observer,
                 )
                 .await
                 .unwrap();

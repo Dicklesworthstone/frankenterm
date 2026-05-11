@@ -325,7 +325,7 @@ impl GuiFrontEnd {
 
                 fn spawn_command(spawn: &SpawnCommand, spawn_where: SpawnWhere) {
                     let config = config::configuration();
-                    let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
+                    let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
                     let size =
                         config.initial_size(dpi as u32, crate::cell_pixel_dims(&config, dpi).ok());
                     let term_config = Arc::new(config::TermConfig::with_config(config));

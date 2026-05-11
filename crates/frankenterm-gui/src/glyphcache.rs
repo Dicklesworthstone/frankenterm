@@ -1107,7 +1107,7 @@ impl GlyphCache {
             glyph_pos: info.glyph_pos,
             font_feature_atlas_key: monochrome_glyph_feature_atlas_key(font.id(), info.glyph_pos),
             subpixel_bin,
-            num_cells: num_cells,
+            num_cells,
             style,
             followed_by_space,
             metric: metrics.into(),
@@ -1903,7 +1903,7 @@ mod tests {
 
         let dpi = config::configuration()
             .dpi
-            .unwrap_or_else(|| ::window::default_dpi()) as usize;
+            .unwrap_or_else(::window::default_dpi) as usize;
         let fonts = Rc::new(FontConfiguration::new(None, dpi).unwrap());
         let metrics = RenderMetrics::new(&fonts).unwrap();
         let cache = GlyphCache::new_in_memory(&fonts, size).unwrap();

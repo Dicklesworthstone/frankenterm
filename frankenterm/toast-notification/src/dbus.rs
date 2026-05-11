@@ -134,12 +134,10 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
         async {
             while let Some(signal) = invoked_stream.next().await {
                 let args = signal.args()?;
-                if args.nid == notification {
-                    if notif.has_activation_action() {
-                        notif.activate();
-                        abort_closed.abort();
-                        break;
-                    }
+                if args.nid == notification && notif.has_activation_action() {
+                    notif.activate();
+                    abort_closed.abort();
+                    break;
                 }
             }
             Ok::<(), zbus::Error>(())
