@@ -241,6 +241,353 @@ pub struct HerdWaveStaggerPlan {
     pub actions: Vec<HerdWaveStaggeredAction>,
 }
 
+/// Contract id for the v1 herd-wave operator snapshot.
+pub const HERD_WAVE_CONTRACT_ID: &str = "ft.herd_wave.v1";
+
+/// Schema version for the v1 herd-wave operator snapshot.
+pub const HERD_WAVE_SCHEMA_VERSION: u16 = 1;
+
+/// Evidence posture for a herd-wave source row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdWaveEvidenceState {
+    /// Fresh evidence collected from the represented workspace/run.
+    Measured,
+    /// Derived from measured counters or event history.
+    Inferred,
+    /// Fixture, replay, synthetic, or model-only evidence.
+    Simulated,
+    /// Evidence exists but exceeded its freshness budget.
+    Stale,
+    /// Required evidence was absent or unwired.
+    Unavailable,
+    /// Root object combines domains with different states.
+    Mixed,
+}
+
+/// Source class for a telemetry row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdWaveTelemetrySourceKind {
+    /// Live runtime source.
+    Live,
+    /// Deterministic fixture or replay source.
+    Fixture,
+    /// Source was present but degraded.
+    Degraded,
+    /// Source was not available.
+    Unavailable,
+}
+
+/// Root operator state for the herd-wave contract.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdWaveOverallState {
+    Normal,
+    Elevated,
+    Critical,
+    Emergency,
+    MissingTelemetry,
+    StaleEvidence,
+    PriorityProtected,
+    OperatorOverride,
+    CooldownActive,
+    CircuitBreakerActive,
+    Unknown,
+}
+
+/// Freshness and provenance for one telemetry input domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveSourceFreshness {
+    /// Stable source name.
+    pub source: String,
+    /// Source class.
+    pub source_kind: HerdWaveTelemetrySourceKind,
+    /// Source evidence posture.
+    pub evidence_state: HerdWaveEvidenceState,
+    /// When the source sample was generated.
+    pub generated_at_ms: Option<u64>,
+    /// Source age at root generation time.
+    pub freshness_ms: Option<u64>,
+    /// Maximum accepted source age.
+    pub max_age_ms: u64,
+    /// Stable reasons for unavailable/stale/degraded rows.
+    pub reason_codes: Vec<String>,
+}
+
+impl HerdWaveSourceFreshness {
+    /// Build a live source row and mark it stale when it exceeds `max_age_ms`.
+    #[must_use]
+    pub fn live(
+        source: impl Into<String>,
+        root_generated_at_ms: u64,
+        source_generated_at_ms: u64,
+        max_age_ms: u64,
+    ) -> Self {
+        let freshness_ms = root_generated_at_ms.saturating_sub(source_generated_at_ms);
+        let evidence_state = if freshness_ms > max_age_ms {
+            HerdWaveEvidenceState::Stale
+        } else {
+            HerdWaveEvidenceState::Measured
+        };
+        let mut reason_codes = Vec::new();
+        if evidence_state == HerdWaveEvidenceState::Stale {
+            reason_codes.push("herd_wave.telemetry.stale".to_string());
+        }
+        Self {
+            source: source.into(),
+            source_kind: HerdWaveTelemetrySourceKind::Live,
+            evidence_state,
+            generated_at_ms: Some(source_generated_at_ms),
+            freshness_ms: Some(freshness_ms),
+            max_age_ms,
+            reason_codes,
+        }
+    }
+
+    /// Build a fixture/source row for deterministic tests and replay.
+    #[must_use]
+    pub fn fixture(source: impl Into<String>, generated_at_ms: u64) -> Self {
+        Self {
+            source: source.into(),
+            source_kind: HerdWaveTelemetrySourceKind::Fixture,
+            evidence_state: HerdWaveEvidenceState::Simulated,
+            generated_at_ms: Some(generated_at_ms),
+            freshness_ms: Some(0),
+            max_age_ms: 0,
+            reason_codes: vec!["herd_wave.telemetry.fixture".to_string()],
+        }
+    }
+
+    /// Build a degraded source row.
+    #[must_use]
+    pub fn degraded(
+        source: impl Into<String>,
+        generated_at_ms: Option<u64>,
+        max_age_ms: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            source_kind: HerdWaveTelemetrySourceKind::Degraded,
+            evidence_state: HerdWaveEvidenceState::Inferred,
+            generated_at_ms,
+            freshness_ms: None,
+            max_age_ms,
+            reason_codes: vec![reason.into()],
+        }
+    }
+
+    /// Build an unavailable source row.
+    #[must_use]
+    pub fn unavailable(source: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            source_kind: HerdWaveTelemetrySourceKind::Unavailable,
+            evidence_state: HerdWaveEvidenceState::Unavailable,
+            generated_at_ms: None,
+            freshness_ms: None,
+            max_age_ms: 0,
+            reason_codes: vec![reason.into()],
+        }
+    }
+
+    const fn is_unavailable(&self) -> bool {
+        matches!(self.evidence_state, HerdWaveEvidenceState::Unavailable)
+    }
+
+    const fn is_stale(&self) -> bool {
+        matches!(self.evidence_state, HerdWaveEvidenceState::Stale)
+    }
+}
+
+/// One unavailable source projected into the v1 contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveUnavailableSource {
+    pub source: String,
+    pub evidence_state: HerdWaveEvidenceState,
+    pub freshness_ms: Option<u64>,
+    pub max_age_ms: u64,
+    pub reason_codes: Vec<String>,
+}
+
+impl From<&HerdWaveSourceFreshness> for HerdWaveUnavailableSource {
+    fn from(source: &HerdWaveSourceFreshness) -> Self {
+        Self {
+            source: source.source.clone(),
+            evidence_state: source.evidence_state,
+            freshness_ms: source.freshness_ms,
+            max_age_ms: source.max_age_ms,
+            reason_codes: source.reason_codes.clone(),
+        }
+    }
+}
+
+/// Admission controller state mirrored for herd-wave evidence without depending
+/// on pane text or mutation surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveCapacityControllerSnapshot {
+    pub admission_stage: String,
+    pub last_pressure_action: Option<String>,
+    pub last_pressure_action_at_ms: Option<u64>,
+    pub cooldown_or_pressure_active: bool,
+    pub reason_codes: Vec<String>,
+}
+
+/// Priority-protection projection for the v1 contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWavePriorityProtectionSnapshot {
+    pub protected: bool,
+    pub protection_units: u8,
+    pub operator_override_active: bool,
+    pub reason_codes: Vec<String>,
+}
+
+impl HerdWavePriorityProtectionSnapshot {
+    fn from_decision(decision: Option<&ResourceAdmissionDecisionSummary>) -> Self {
+        let Some(decision) = decision else {
+            return Self {
+                protected: false,
+                protection_units: 0,
+                operator_override_active: false,
+                reason_codes: Vec::new(),
+            };
+        };
+        let protected = decision.priority_protection_units > 0
+            || decision
+                .reason_codes
+                .contains(&AdmissionReasonCode::PriorityProtected);
+        let operator_override_active = decision
+            .reason_codes
+            .contains(&AdmissionReasonCode::OperatorOverride);
+        let mut reason_codes = Vec::new();
+        if protected {
+            reason_codes.push("herd_wave.priority.protected".to_string());
+        }
+        if operator_override_active {
+            reason_codes.push("herd_wave.priority.operator_override".to_string());
+        }
+        Self {
+            protected,
+            protection_units: decision.priority_protection_units,
+            operator_override_active,
+            reason_codes,
+        }
+    }
+}
+
+/// Contract-shaped read-only snapshot used by later robot/doctor/MCP surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveContractSnapshot {
+    pub schema_version: u16,
+    pub contract_id: &'static str,
+    pub generated_at_ms: u64,
+    pub source: String,
+    pub source_freshness: Vec<HerdWaveSourceFreshness>,
+    pub evidence_state: HerdWaveEvidenceState,
+    pub overall_state: HerdWaveOverallState,
+    pub dominant_kind: Option<HerdWaveEventKind>,
+    pub event_count: u32,
+    pub distinct_panes: u32,
+    pub window_ms: u64,
+    pub pressure_tier: FleetPressureTier,
+    pub admission_action: Option<AdmissionAction>,
+    pub reason_codes: Vec<String>,
+    pub recommended_stagger_ms: u64,
+    pub cohort_max_stagger_ms: u64,
+    pub wave_summary: HerdWavePressureSummary,
+    pub priority_protection: HerdWavePriorityProtectionSnapshot,
+    pub unavailable_sources: Vec<HerdWaveUnavailableSource>,
+    pub raw_pane_content_stored: bool,
+    pub artifact_paths: Vec<String>,
+}
+
+impl HerdWaveContractSnapshot {
+    /// Build a v1 snapshot from admission telemetry and an optional admission decision.
+    #[must_use]
+    pub fn from_telemetry(
+        generated_at_ms: u64,
+        source: impl Into<String>,
+        telemetry: &SwarmAdmissionTelemetry,
+        admission_decision: Option<&ResourceAdmissionDecisionSummary>,
+        telemetry_generated_at_ms: Option<u64>,
+        max_age_ms: u64,
+    ) -> Self {
+        let source_freshness = herd_wave_source_freshness_from_telemetry(
+            generated_at_ms,
+            telemetry,
+            telemetry_generated_at_ms,
+            max_age_ms,
+        );
+        let wave_summary = telemetry
+            .herd_wave_pressure
+            .clone()
+            .unwrap_or_else(missing_herd_wave_summary);
+        Self::from_parts(
+            generated_at_ms,
+            source,
+            wave_summary,
+            admission_decision,
+            source_freshness,
+        )
+    }
+
+    /// Build a v1 snapshot from already-computed pieces.
+    #[must_use]
+    pub fn from_parts(
+        generated_at_ms: u64,
+        source: impl Into<String>,
+        wave_summary: HerdWavePressureSummary,
+        admission_decision: Option<&ResourceAdmissionDecisionSummary>,
+        source_freshness: Vec<HerdWaveSourceFreshness>,
+    ) -> Self {
+        let priority_protection =
+            HerdWavePriorityProtectionSnapshot::from_decision(admission_decision);
+        let unavailable_sources: Vec<_> = source_freshness
+            .iter()
+            .filter(|source| source.is_unavailable() || source.is_stale())
+            .map(HerdWaveUnavailableSource::from)
+            .collect();
+        let evidence_state = root_evidence_state(&source_freshness);
+        let overall_state =
+            root_overall_state(&wave_summary, &priority_protection, &source_freshness);
+        let admission_action = admission_decision.map(|decision| decision.action);
+        let mut reason_codes = root_reason_codes(&wave_summary, &source_freshness);
+        if let Some(decision) = admission_decision {
+            for reason in &decision.reason_codes {
+                push_string_reason(&mut reason_codes, admission_reason_code(*reason));
+            }
+        }
+        for reason in &priority_protection.reason_codes {
+            push_string_reason(&mut reason_codes, reason);
+        }
+
+        Self {
+            schema_version: HERD_WAVE_SCHEMA_VERSION,
+            contract_id: HERD_WAVE_CONTRACT_ID,
+            generated_at_ms,
+            source: source.into(),
+            source_freshness,
+            evidence_state,
+            overall_state,
+            dominant_kind: wave_summary.dominant_kind,
+            event_count: wave_summary.event_count,
+            distinct_panes: wave_summary.distinct_panes,
+            window_ms: wave_summary.window_ms,
+            pressure_tier: wave_summary.pressure_tier,
+            admission_action,
+            reason_codes,
+            recommended_stagger_ms: wave_summary.recommended_stagger_ms,
+            cohort_max_stagger_ms: wave_summary.cohort_max_stagger_ms,
+            wave_summary,
+            priority_protection,
+            unavailable_sources,
+            raw_pane_content_stored: false,
+            artifact_paths: Vec::new(),
+        }
+    }
+}
+
 /// Compute a bounded per-rank stagger delay for a herd-wave cohort.
 #[must_use]
 pub fn herd_wave_stagger_delay_ms(cohort_rank: u32, config: &HerdWaveDetectionConfig) -> u64 {
@@ -1879,6 +2226,198 @@ fn saturating_usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+fn herd_wave_source_freshness_from_telemetry(
+    generated_at_ms: u64,
+    telemetry: &SwarmAdmissionTelemetry,
+    telemetry_generated_at_ms: Option<u64>,
+    max_age_ms: u64,
+) -> Vec<HerdWaveSourceFreshness> {
+    let observed_at_ms = telemetry_generated_at_ms.unwrap_or(generated_at_ms);
+    let live = |source: &'static str| {
+        HerdWaveSourceFreshness::live(source, generated_at_ms, observed_at_ms, max_age_ms)
+    };
+
+    let mut sources = Vec::with_capacity(5);
+    sources.push(if telemetry.queue_pressure.is_some() {
+        live("swarm.queue_pressure")
+    } else {
+        HerdWaveSourceFreshness::unavailable(
+            "swarm.queue_pressure",
+            "herd_wave.telemetry.missing_queue",
+        )
+    });
+    sources.push(if telemetry.fleet_pressure.is_some() {
+        live("swarm.fleet_pressure")
+    } else {
+        HerdWaveSourceFreshness::unavailable(
+            "swarm.fleet_pressure",
+            "herd_wave.telemetry.missing_fleet",
+        )
+    });
+    sources.push(if telemetry.memory_tier_budget.is_some() {
+        live("swarm.memory_tier_budget")
+    } else {
+        HerdWaveSourceFreshness::unavailable(
+            "swarm.memory_tier_budget",
+            "herd_wave.telemetry.missing_memory_tier",
+        )
+    });
+    sources.push(
+        if telemetry
+            .latency_stage_pressures
+            .as_ref()
+            .is_some_and(|pressures| !pressures.is_empty())
+        {
+            live("swarm.latency_stages")
+        } else {
+            HerdWaveSourceFreshness::unavailable(
+                "swarm.latency_stages",
+                "herd_wave.telemetry.missing_latency",
+            )
+        },
+    );
+    sources.push(if telemetry.herd_wave_pressure.is_some() {
+        live("swarm.herd_wave_pressure")
+    } else {
+        HerdWaveSourceFreshness::unavailable(
+            "swarm.herd_wave_pressure",
+            "herd_wave.telemetry.missing_herd_wave",
+        )
+    });
+    sources
+}
+
+fn missing_herd_wave_summary() -> HerdWavePressureSummary {
+    HerdWavePressureSummary {
+        pressure_tier: FleetPressureTier::Normal,
+        detected: false,
+        event_count: 0,
+        distinct_panes: 0,
+        window_ms: 0,
+        first_seen_ms: None,
+        last_seen_ms: None,
+        dominant_kind: None,
+        dominant_kind_count: 0,
+        recommended_stagger_ms: 0,
+        cohort_max_stagger_ms: 0,
+    }
+}
+
+fn root_evidence_state(sources: &[HerdWaveSourceFreshness]) -> HerdWaveEvidenceState {
+    if sources.is_empty() {
+        return HerdWaveEvidenceState::Unavailable;
+    }
+    if sources.iter().any(HerdWaveSourceFreshness::is_unavailable) {
+        return HerdWaveEvidenceState::Unavailable;
+    }
+    if sources.iter().any(HerdWaveSourceFreshness::is_stale) {
+        return HerdWaveEvidenceState::Stale;
+    }
+
+    let Some(first) = sources.first().map(|source| source.evidence_state) else {
+        return HerdWaveEvidenceState::Unavailable;
+    };
+    if sources.iter().all(|source| source.evidence_state == first) {
+        first
+    } else {
+        HerdWaveEvidenceState::Mixed
+    }
+}
+
+fn root_overall_state(
+    wave_summary: &HerdWavePressureSummary,
+    priority_protection: &HerdWavePriorityProtectionSnapshot,
+    sources: &[HerdWaveSourceFreshness],
+) -> HerdWaveOverallState {
+    if sources.iter().any(HerdWaveSourceFreshness::is_unavailable) {
+        return HerdWaveOverallState::MissingTelemetry;
+    }
+    if sources.iter().any(HerdWaveSourceFreshness::is_stale) {
+        return HerdWaveOverallState::StaleEvidence;
+    }
+    if priority_protection.operator_override_active {
+        return HerdWaveOverallState::OperatorOverride;
+    }
+    if priority_protection.protected {
+        return HerdWaveOverallState::PriorityProtected;
+    }
+    match wave_summary.pressure_tier {
+        FleetPressureTier::Normal => HerdWaveOverallState::Normal,
+        FleetPressureTier::Elevated => HerdWaveOverallState::Elevated,
+        FleetPressureTier::Critical => HerdWaveOverallState::Critical,
+        FleetPressureTier::Emergency => HerdWaveOverallState::Emergency,
+    }
+}
+
+fn root_reason_codes(
+    wave_summary: &HerdWavePressureSummary,
+    sources: &[HerdWaveSourceFreshness],
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for source in sources {
+        for reason in &source.reason_codes {
+            push_string_reason(&mut reasons, reason);
+        }
+    }
+    if let Some(kind) = wave_summary.dominant_kind {
+        push_string_reason(&mut reasons, herd_wave_event_reason_code(kind));
+    }
+    if wave_summary.detected {
+        push_string_reason(&mut reasons, "herd_wave.threshold.distinct_panes");
+    } else if reasons.is_empty() {
+        push_string_reason(&mut reasons, "herd_wave.admission.healthy");
+    }
+    reasons
+}
+
+fn push_string_reason(reasons: &mut Vec<String>, reason: impl AsRef<str>) {
+    let reason = reason.as_ref();
+    if !reasons.iter().any(|existing| existing == reason) {
+        reasons.push(reason.to_string());
+    }
+}
+
+fn herd_wave_event_reason_code(kind: HerdWaveEventKind) -> &'static str {
+    match kind {
+        HerdWaveEventKind::Compaction => "herd_wave.kind.compaction",
+        HerdWaveEventKind::Retry => "herd_wave.kind.retry",
+        HerdWaveEventKind::RateLimitRecovery => "herd_wave.kind.rate_limit_recovery",
+        HerdWaveEventKind::SearchBurst => "herd_wave.kind.search_burst",
+        HerdWaveEventKind::WorkflowFanout => "herd_wave.kind.workflow_fanout",
+        HerdWaveEventKind::Wake => "herd_wave.kind.wake",
+        HerdWaveEventKind::Other => "herd_wave.kind.other",
+    }
+}
+
+fn admission_reason_code(reason: AdmissionReasonCode) -> &'static str {
+    match reason {
+        AdmissionReasonCode::Healthy => "herd_wave.admission.healthy",
+        AdmissionReasonCode::QueueElevated => "herd_wave.admission.queue_elevated",
+        AdmissionReasonCode::QueueSaturated => "herd_wave.admission.queue_saturated",
+        AdmissionReasonCode::QueueOverCapacity => "herd_wave.admission.queue_over_capacity",
+        AdmissionReasonCode::FailureRateHigh => "herd_wave.admission.failure_rate_high",
+        AdmissionReasonCode::FleetPressure => "herd_wave.admission.fleet_pressure",
+        AdmissionReasonCode::MemoryTierPressure => "herd_wave.admission.memory_tier_pressure",
+        AdmissionReasonCode::LatencyStageOverBudget => {
+            "herd_wave.admission.latency_stage_over_budget"
+        }
+        AdmissionReasonCode::HerdWavePressure => "herd_wave.admission.herd_wave_pressure",
+        AdmissionReasonCode::MissingQueueTelemetry => "herd_wave.telemetry.missing_queue",
+        AdmissionReasonCode::MissingFleetTelemetry => "herd_wave.telemetry.missing_fleet",
+        AdmissionReasonCode::MissingMemoryTierTelemetry => {
+            "herd_wave.telemetry.missing_memory_tier"
+        }
+        AdmissionReasonCode::MissingLatencyTelemetry => "herd_wave.telemetry.missing_latency",
+        AdmissionReasonCode::NonFiniteTelemetry => "herd_wave.telemetry.non_finite",
+        AdmissionReasonCode::InvalidLatencyTelemetry => "herd_wave.telemetry.invalid_latency",
+        AdmissionReasonCode::PriorityProtected => "herd_wave.priority.protected",
+        AdmissionReasonCode::OperatorOverride => "herd_wave.priority.operator_override",
+        AdmissionReasonCode::FailClosedMissingTelemetry => {
+            "herd_wave.admission.fail_closed_missing_telemetry"
+        }
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -2335,6 +2874,222 @@ mod tests {
         let json = serde_json::to_string(&summary).expect("serialize summary");
         assert!(json.contains("herd_wave_pressure"));
         assert!(json.contains("herd_wave_recommended_stagger_ms"));
+    }
+
+    #[test]
+    fn herd_wave_contract_snapshot_maps_normal_live_telemetry_ft_5bwjf_2() {
+        let controller = SwarmAdmissionController::default();
+        let wave = detect_herd_wave_pressure(&[], &HerdWaveDetectionConfig::default());
+        let telemetry =
+            admission_telemetry(0.10, FleetPressureTier::Normal).with_herd_wave_pressure(wave);
+        let decision = controller.evaluate(&background_admission_request(), &telemetry);
+
+        let snapshot = HerdWaveContractSnapshot::from_telemetry(
+            20_000,
+            "unit.herd_wave",
+            &telemetry,
+            Some(&decision),
+            Some(19_900),
+            1_000,
+        );
+
+        assert_eq!(snapshot.contract_id, HERD_WAVE_CONTRACT_ID);
+        assert_eq!(snapshot.schema_version, HERD_WAVE_SCHEMA_VERSION);
+        assert_eq!(snapshot.evidence_state, HerdWaveEvidenceState::Measured);
+        assert_eq!(snapshot.overall_state, HerdWaveOverallState::Normal);
+        assert_eq!(snapshot.admission_action, Some(AdmissionAction::Admit));
+        assert!(!snapshot.raw_pane_content_stored);
+        assert!(snapshot.unavailable_sources.is_empty());
+
+        let json = serde_json::to_value(&snapshot).expect("serialize herd-wave snapshot");
+        assert_eq!(json["contract_id"], HERD_WAVE_CONTRACT_ID);
+        assert_eq!(json["raw_pane_content_stored"], false);
+    }
+
+    #[test]
+    fn herd_wave_contract_snapshot_distinguishes_elevated_and_critical_ft_5bwjf_2() {
+        let controller = SwarmAdmissionController::default();
+        let elevated_wave = detect_herd_wave_pressure(
+            &[
+                HerdWaveSignal::pane(1, HerdWaveEventKind::Retry, 1_000),
+                HerdWaveSignal::pane(2, HerdWaveEventKind::Retry, 1_010),
+                HerdWaveSignal::pane(3, HerdWaveEventKind::Retry, 1_020),
+            ],
+            &HerdWaveDetectionConfig::default(),
+        );
+        let elevated_telemetry = admission_telemetry(0.10, FleetPressureTier::Normal)
+            .with_herd_wave_pressure(elevated_wave);
+        let elevated_decision =
+            controller.evaluate(&background_admission_request(), &elevated_telemetry);
+        let elevated = HerdWaveContractSnapshot::from_telemetry(
+            2_000,
+            "unit.herd_wave",
+            &elevated_telemetry,
+            Some(&elevated_decision),
+            Some(1_990),
+            1_000,
+        );
+
+        assert_eq!(elevated.overall_state, HerdWaveOverallState::Elevated);
+        assert_eq!(elevated.pressure_tier, FleetPressureTier::Elevated);
+        assert_eq!(elevated.dominant_kind, Some(HerdWaveEventKind::Retry));
+        assert!(
+            elevated
+                .reason_codes
+                .contains(&"herd_wave.kind.retry".to_string())
+        );
+
+        let critical_signals: Vec<_> = (0..8)
+            .map(|pane| HerdWaveSignal::pane(pane, HerdWaveEventKind::SearchBurst, 3_000 + pane))
+            .collect();
+        let critical_wave =
+            detect_herd_wave_pressure(&critical_signals, &HerdWaveDetectionConfig::default());
+        let critical_telemetry = admission_telemetry(0.10, FleetPressureTier::Normal)
+            .with_herd_wave_pressure(critical_wave);
+        let critical_decision =
+            controller.evaluate(&background_admission_request(), &critical_telemetry);
+        let critical = HerdWaveContractSnapshot::from_telemetry(
+            4_000,
+            "unit.herd_wave",
+            &critical_telemetry,
+            Some(&critical_decision),
+            Some(3_990),
+            1_000,
+        );
+
+        assert_eq!(critical.overall_state, HerdWaveOverallState::Critical);
+        assert_eq!(critical.pressure_tier, FleetPressureTier::Critical);
+        assert_eq!(critical.admission_action, Some(AdmissionAction::Degrade));
+        assert!(
+            critical
+                .reason_codes
+                .contains(&"herd_wave.kind.search_burst".to_string())
+        );
+    }
+
+    #[test]
+    fn herd_wave_contract_snapshot_fails_closed_for_missing_telemetry_ft_5bwjf_2() {
+        let controller = SwarmAdmissionController::default();
+        let telemetry = SwarmAdmissionTelemetry {
+            queue_pressure: None,
+            fleet_pressure: None,
+            memory_tier_budget: None,
+            latency_stage_pressures: None,
+            herd_wave_pressure: None,
+        };
+        let decision = controller.evaluate(&mission_critical_admission_request(), &telemetry);
+
+        let snapshot = HerdWaveContractSnapshot::from_telemetry(
+            10_000,
+            "unit.herd_wave",
+            &telemetry,
+            Some(&decision),
+            None,
+            1_000,
+        );
+
+        assert_eq!(snapshot.evidence_state, HerdWaveEvidenceState::Unavailable);
+        assert_eq!(
+            snapshot.overall_state,
+            HerdWaveOverallState::MissingTelemetry
+        );
+        assert_eq!(snapshot.admission_action, Some(AdmissionAction::Defer));
+        assert_eq!(snapshot.unavailable_sources.len(), 5);
+        assert!(
+            snapshot
+                .reason_codes
+                .contains(&"herd_wave.telemetry.missing_queue".to_string())
+        );
+        assert!(
+            snapshot
+                .reason_codes
+                .contains(&"herd_wave.admission.fail_closed_missing_telemetry".to_string())
+        );
+    }
+
+    #[test]
+    fn herd_wave_contract_snapshot_marks_stale_freshness_ft_5bwjf_2() {
+        let controller = SwarmAdmissionController::default();
+        let wave = detect_herd_wave_pressure(
+            &[
+                HerdWaveSignal::pane(1, HerdWaveEventKind::Compaction, 1_000),
+                HerdWaveSignal::pane(2, HerdWaveEventKind::Compaction, 1_010),
+                HerdWaveSignal::pane(3, HerdWaveEventKind::Compaction, 1_020),
+            ],
+            &HerdWaveDetectionConfig::default(),
+        );
+        let telemetry =
+            admission_telemetry(0.10, FleetPressureTier::Normal).with_herd_wave_pressure(wave);
+        let decision = controller.evaluate(&background_admission_request(), &telemetry);
+
+        let snapshot = HerdWaveContractSnapshot::from_telemetry(
+            20_000,
+            "unit.herd_wave",
+            &telemetry,
+            Some(&decision),
+            Some(10_000),
+            500,
+        );
+
+        assert_eq!(snapshot.evidence_state, HerdWaveEvidenceState::Stale);
+        assert_eq!(snapshot.overall_state, HerdWaveOverallState::StaleEvidence);
+        assert_eq!(snapshot.unavailable_sources.len(), 5);
+        assert!(
+            snapshot
+                .source_freshness
+                .iter()
+                .all(|source| source.evidence_state == HerdWaveEvidenceState::Stale)
+        );
+    }
+
+    #[test]
+    fn herd_wave_contract_snapshot_surfaces_priority_and_controller_state_ft_5bwjf_2() {
+        let controller = SwarmAdmissionController::default();
+        let wave_signals: Vec<_> = (0..16)
+            .map(|pane| HerdWaveSignal::pane(pane, HerdWaveEventKind::Wake, 5_000 + pane))
+            .collect();
+        let wave = detect_herd_wave_pressure(&wave_signals, &HerdWaveDetectionConfig::default());
+        let telemetry =
+            admission_telemetry(0.10, FleetPressureTier::Normal).with_herd_wave_pressure(wave);
+        let decision = controller.evaluate(&mission_critical_admission_request(), &telemetry);
+
+        let snapshot = HerdWaveContractSnapshot::from_telemetry(
+            6_000,
+            "unit.herd_wave",
+            &telemetry,
+            Some(&decision),
+            Some(5_990),
+            1_000,
+        );
+
+        assert_eq!(
+            snapshot.overall_state,
+            HerdWaveOverallState::PriorityProtected
+        );
+        assert!(snapshot.priority_protection.protected);
+        assert!(snapshot.priority_protection.protection_units > 0);
+        assert!(
+            snapshot
+                .reason_codes
+                .contains(&"herd_wave.priority.protected".to_string())
+        );
+
+        let mut controller_state =
+            crate::runtime_telemetry::SwarmCapacityAdmissionControllerState::default();
+        controller_state.record_decision(
+            crate::runtime_telemetry::SwarmCapacityAdmissionAction::Defer,
+            6_000,
+        );
+        let mirrored = HerdWaveCapacityControllerSnapshot::from(&controller_state);
+
+        assert_eq!(mirrored.admission_stage, "shadow");
+        assert_eq!(mirrored.last_pressure_action.as_deref(), Some("defer"));
+        assert!(mirrored.cooldown_or_pressure_active);
+        assert!(
+            mirrored
+                .reason_codes
+                .contains(&"herd_wave.admission_controller.pressure_active".to_string())
+        );
     }
 
     proptest! {

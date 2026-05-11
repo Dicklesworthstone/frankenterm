@@ -6053,6 +6053,30 @@ impl SwarmCapacityAdmissionControllerState {
     }
 }
 
+impl From<&SwarmCapacityAdmissionControllerState>
+    for crate::swarm_scheduler::HerdWaveCapacityControllerSnapshot
+{
+    fn from(state: &SwarmCapacityAdmissionControllerState) -> Self {
+        let cooldown_or_pressure_active = state.last_pressure_action.is_some();
+        let mut reason_codes = vec![format!(
+            "herd_wave.admission_controller.stage.{}",
+            state.admission_stage.as_str()
+        )];
+        if cooldown_or_pressure_active {
+            reason_codes.push("herd_wave.admission_controller.pressure_active".to_string());
+        }
+        Self {
+            admission_stage: state.admission_stage.as_str().to_string(),
+            last_pressure_action: state
+                .last_pressure_action
+                .map(|action| action.as_str().to_string()),
+            last_pressure_action_at_ms: state.last_pressure_action_at_ms,
+            cooldown_or_pressure_active,
+            reason_codes,
+        }
+    }
+}
+
 /// Side-effect-free input request for the admission/backpressure controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmCapacityAdmissionRequest {
