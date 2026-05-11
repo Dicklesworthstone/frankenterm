@@ -6523,6 +6523,8 @@ mod tests {
 mod e2e_crash_recovery {
     use super::*;
 
+    static CRASH_BUNDLE_PARSE_DROP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Simulate a full watcher lifecycle: start, run for N "ticks", crash.
     /// Returns the pane states at the time of crash (for checkpointing).
     fn simulate_watcher_run(
@@ -6898,6 +6900,9 @@ mod e2e_crash_recovery {
     fn read_optional_json_bundle_file_returns_none_when_absent_ft_94cdu() {
         // File-not-found is NOT a drop — it's legitimate absence.
         // The counter must NOT bump.
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
         super::reset_crash_bundle_parse_drop_count_for_test();
         let dir = tempfile::tempdir().expect("tempdir");
         let bundle_path = dir.path().to_path_buf();
@@ -6920,6 +6925,9 @@ mod e2e_crash_recovery {
     fn read_optional_json_bundle_file_bumps_on_parse_fail_ft_94cdu() {
         // br-ft-94cdu: file present but malformed JSON triggers
         // the parse_fail phase. Counter bumps once.
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
         super::reset_crash_bundle_parse_drop_count_for_test();
         let dir = tempfile::tempdir().expect("tempdir");
         let bundle_path = dir.path().to_path_buf();
@@ -6943,6 +6951,9 @@ mod e2e_crash_recovery {
     fn read_optional_json_bundle_file_no_bump_on_well_formed_ft_94cdu() {
         // Sanity: a well-formed JSON file parses cleanly and does
         // NOT bump the counter.
+        let _guard = CRASH_BUNDLE_PARSE_DROP_TEST_LOCK
+            .lock()
+            .expect("crash bundle parse-drop test lock");
         super::reset_crash_bundle_parse_drop_count_for_test();
         let dir = tempfile::tempdir().expect("tempdir");
         let bundle_path = dir.path().to_path_buf();
