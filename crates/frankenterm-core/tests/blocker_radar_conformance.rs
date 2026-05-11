@@ -20,7 +20,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const MATRIX_JSON: &str = include_str!("fixtures/blocker_radar/conformance_cases.json");
+const CLAIMABILITY_JSON: &str = include_str!("fixtures/blocker_radar/claimability_cases.json");
 const TARGET_DIR: &str = "CARGO_TARGET_DIR=/tmp/ft-9ntud-4-blocker-radar-conformance";
+const CLAIMABILITY_TARGET_DIR: &str = "CARGO_TARGET_DIR=/tmp/ft-htcwc-2-claimability-fixtures";
 
 #[derive(Debug, Deserialize)]
 struct ConformanceMatrix {
@@ -107,8 +109,72 @@ struct ExpectedReport {
     artifact_paths: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClaimabilityMatrix {
+    schema_version: u16,
+    generated_by: String,
+    fixed_generated_at_ms: u64,
+    proof_target: String,
+    verdicts: Vec<ClaimabilityVerdictCoverage>,
+    cases: Vec<ClaimabilityCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimabilityVerdictCoverage {
+    verdict: String,
+    covered_by: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimabilityCase {
+    id: String,
+    description: String,
+    source_commands: Vec<String>,
+    input: ClaimabilityInput,
+    expected: ExpectedClaimabilityVerdict,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimabilityInput {
+    candidate_id: String,
+    br_ready_ids: Vec<String>,
+    br_show: ClaimabilityBrShow,
+    bv_recommendation: ClaimabilityBvRecommendation,
+    mail_state: String,
+    dirty_paths: Vec<String>,
+    external_state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimabilityBrShow {
+    status: String,
+    assignee: Option<String>,
+    dependencies: Vec<String>,
+    fresh_comments: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimabilityBvRecommendation {
+    status: String,
+    reasons: Vec<String>,
+    blocked_by: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedClaimabilityVerdict {
+    final_verdict: String,
+    supporting_verdicts: Vec<String>,
+    reason_codes: Vec<String>,
+    next_action: String,
+    forbidden_actions: Vec<String>,
+}
+
 fn load_matrix() -> ConformanceMatrix {
     serde_json::from_str(MATRIX_JSON).expect("blocker-radar conformance matrix must be valid JSON")
+}
+
+fn load_claimability_matrix() -> ClaimabilityMatrix {
+    serde_json::from_str(CLAIMABILITY_JSON).expect("claimability fixture matrix must be valid JSON")
 }
 
 fn workspace_root() -> PathBuf {
@@ -313,6 +379,14 @@ fn case_by_id<'a>(matrix: &'a ConformanceMatrix, id: &str) -> &'a FixtureCase {
         .unwrap_or_else(|| panic!("fixture case {id} exists"))
 }
 
+fn claimability_case_by_id<'a>(matrix: &'a ClaimabilityMatrix, id: &str) -> &'a ClaimabilityCase {
+    matrix
+        .cases
+        .iter()
+        .find(|case| case.id == id)
+        .unwrap_or_else(|| panic!("claimability fixture case {id} exists"))
+}
+
 fn report_signature(report: &BlockerRadarReport) -> String {
     serde_json::json!({
         "overall_state": report.overall_state,
@@ -344,6 +418,32 @@ fn assert_no_sensitive_text(label: &str, value: &Value) {
         assert!(
             !haystack.contains(forbidden),
             "{label} contains forbidden sensitive marker {forbidden}"
+        );
+    }
+}
+
+fn assert_read_only_source_command(case_id: &str, command: &str) {
+    let normalized = command.to_ascii_lowercase();
+    for forbidden in [
+        "am service restart",
+        "am service stop",
+        "am doctor fix",
+        "am doctor repair",
+        "rch daemon restart",
+        "git reset --hard",
+        "git clean -fd",
+        "rm -rf",
+        "kill ",
+    ] {
+        assert!(
+            !normalized.contains(forbidden),
+            "{case_id} source command must not contain forbidden action {forbidden}: {command}"
+        );
+    }
+    if normalized.contains("br update") {
+        assert!(
+            normalized.contains("--dry-run"),
+            "{case_id} may only include br update as a dry-run source command: {command}"
         );
     }
 }
@@ -556,6 +656,250 @@ fn blocker_radar_conformance_matrix_metadata_is_remote_and_deterministic() {
 
     let fixture_value: Value = serde_json::from_str(MATRIX_JSON).expect("matrix parses as JSON");
     assert_no_sensitive_text("blocker-radar fixture matrix", &fixture_value);
+}
+
+#[test]
+fn claimability_fixture_matrix_metadata_is_remote_and_deterministic() {
+    let matrix = load_claimability_matrix();
+    assert_eq!(matrix.schema_version, 1);
+    assert_eq!(matrix.generated_by, "ft-htcwc.2-claimability-fixtures");
+    assert!(
+        matrix.proof_target.starts_with("rch exec -- env "),
+        "claimability proof target must use rch: {}",
+        matrix.proof_target
+    );
+    assert!(
+        matrix.proof_target.contains(CLAIMABILITY_TARGET_DIR),
+        "claimability proof target must preserve isolated target dir: {}",
+        matrix.proof_target
+    );
+    assert_eq!(
+        matrix.fixed_generated_at_ms, 1_770_000_000_001,
+        "claimability fixtures should use the blocker-radar fixed timestamp"
+    );
+    assert!(
+        !matrix.verdicts.is_empty(),
+        "claimability matrix must define verdict coverage"
+    );
+    assert!(
+        !matrix.cases.is_empty(),
+        "claimability matrix must contain fixture cases"
+    );
+
+    let mut ids = BTreeSet::new();
+    for case in &matrix.cases {
+        assert!(
+            ids.insert(case.id.as_str()),
+            "duplicate claimability case id {}",
+            case.id
+        );
+        assert!(
+            !case.description.trim().is_empty(),
+            "{} needs a reviewer-facing description",
+            case.id
+        );
+        assert!(
+            !case.input.candidate_id.trim().is_empty(),
+            "{} must name the candidate or coordination snapshot",
+            case.id
+        );
+        assert!(
+            !case.source_commands.is_empty(),
+            "{} must cite source commands",
+            case.id
+        );
+        for command in &case.source_commands {
+            assert_read_only_source_command(&case.id, command);
+        }
+        assert!(
+            !case.input.br_show.status.trim().is_empty(),
+            "{} must carry br_show status",
+            case.id
+        );
+        assert!(
+            !case.input.bv_recommendation.status.trim().is_empty(),
+            "{} must carry bv recommendation status",
+            case.id
+        );
+        assert!(
+            !case.input.mail_state.trim().is_empty(),
+            "{} must carry Agent Mail state",
+            case.id
+        );
+        assert!(
+            !case.input.external_state.trim().is_empty(),
+            "{} must carry external substrate state",
+            case.id
+        );
+        assert!(
+            case.input
+                .br_show
+                .fresh_comments
+                .iter()
+                .all(|comment| !comment.trim().is_empty()),
+            "{} fresh comments must not contain blank entries",
+            case.id
+        );
+        assert!(
+            case.input
+                .bv_recommendation
+                .reasons
+                .iter()
+                .all(|reason| !reason.trim().is_empty()),
+            "{} BV reasons must not contain blank entries",
+            case.id
+        );
+        assert!(
+            case.input
+                .bv_recommendation
+                .blocked_by
+                .iter()
+                .all(|blocked_by| !blocked_by.trim().is_empty()),
+            "{} blocked_by entries must not be blank",
+            case.id
+        );
+        assert!(
+            case.input
+                .dirty_paths
+                .iter()
+                .all(|path| !path.trim().is_empty()),
+            "{} dirty path entries must not be blank",
+            case.id
+        );
+        assert!(
+            !case.expected.reason_codes.is_empty(),
+            "{} must carry reason codes",
+            case.id
+        );
+        assert!(
+            !case.expected.next_action.trim().is_empty(),
+            "{} must name a next action",
+            case.id
+        );
+        assert!(
+            !case.expected.forbidden_actions.is_empty(),
+            "{} must name forbidden actions",
+            case.id
+        );
+    }
+
+    let fixture_value: Value =
+        serde_json::from_str(CLAIMABILITY_JSON).expect("claimability matrix parses as JSON");
+    assert_no_sensitive_text("claimability fixture matrix", &fixture_value);
+}
+
+#[test]
+fn claimability_fixture_matrix_covers_contract_verdicts_and_observed_mismatch() {
+    let matrix = load_claimability_matrix();
+    let case_ids = matrix
+        .cases
+        .iter()
+        .map(|case| case.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let contract_verdicts = BTreeSet::from([
+        "claimable",
+        "no_ready",
+        "dependency_blocked",
+        "owner_blocked",
+        "external_wait",
+        "dirty_overlap",
+        "mail_degraded",
+        "tracker_inconsistent",
+    ]);
+    let coverage_verdicts = matrix
+        .verdicts
+        .iter()
+        .map(|coverage| coverage.verdict.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        coverage_verdicts, contract_verdicts,
+        "claimability fixture matrix must cover every ft-htcwc.1 verdict"
+    );
+
+    for coverage in &matrix.verdicts {
+        assert!(
+            !coverage.covered_by.is_empty(),
+            "{} must name fixture coverage",
+            coverage.verdict
+        );
+        for covered_by in &coverage.covered_by {
+            assert!(
+                case_ids.contains(covered_by.as_str()),
+                "{} references missing claimability case {}",
+                coverage.verdict,
+                covered_by
+            );
+            let case = claimability_case_by_id(&matrix, covered_by);
+            let mut verdicts = BTreeSet::from([case.expected.final_verdict.as_str()]);
+            verdicts.extend(case.expected.supporting_verdicts.iter().map(String::as_str));
+            assert!(
+                verdicts.contains(coverage.verdict.as_str()),
+                "{} says {} covers {}, but case verdicts were {:?}",
+                coverage.verdict,
+                covered_by,
+                coverage.verdict,
+                verdicts
+            );
+        }
+    }
+
+    let mismatch = claimability_case_by_id(&matrix, "bv_blocked_available_mismatch");
+    assert_eq!(mismatch.input.candidate_id, "ft-e87u6.2");
+    assert_eq!(mismatch.input.br_show.status, "blocked");
+    assert_eq!(mismatch.input.br_show.assignee.as_deref(), Some("BluePike"));
+    assert_eq!(mismatch.input.bv_recommendation.status, "blocked");
+    assert!(
+        mismatch
+            .input
+            .bv_recommendation
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("available for work")),
+        "observed mismatch must preserve the misleading BV availability reason"
+    );
+    assert_eq!(mismatch.expected.final_verdict, "tracker_inconsistent");
+    for verdict in ["owner_blocked", "external_wait", "mail_degraded"] {
+        assert!(
+            mismatch
+                .expected
+                .supporting_verdicts
+                .iter()
+                .any(|actual| actual == verdict),
+            "mismatch case should retain supporting verdict {verdict}"
+        );
+    }
+    for reason in [
+        "bv.br_status_mismatch",
+        "br.assignee_active",
+        "github.current_head_queued",
+        "agent_mail.degraded",
+    ] {
+        assert!(
+            mismatch
+                .expected
+                .reason_codes
+                .iter()
+                .any(|actual| actual == reason),
+            "mismatch case should retain reason code {reason}"
+        );
+    }
+
+    let claimable = claimability_case_by_id(&matrix, "true_claimable");
+    assert_eq!(claimable.expected.final_verdict, "claimable");
+    assert!(
+        claimable
+            .input
+            .br_ready_ids
+            .iter()
+            .any(|id| id == &claimable.input.candidate_id),
+        "true claimable case must be present in br ready output"
+    );
+    assert_eq!(claimable.input.br_show.status, "open");
+    assert!(claimable.input.br_show.assignee.is_none());
+    assert!(claimable.input.br_show.dependencies.is_empty());
+    assert!(claimable.input.dirty_paths.is_empty());
+    assert_eq!(claimable.input.mail_state, "ok");
+    assert_eq!(claimable.input.external_state, "none");
 }
 
 #[test]

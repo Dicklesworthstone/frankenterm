@@ -1,0 +1,302 @@
+{
+  "schema_version": 1,
+  "generated_by": "ft-htcwc.2-claimability-fixtures",
+  "fixed_generated_at_ms": 1770000000001,
+  "proof_target": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-htcwc-2-claimability-fixtures cargo test -p frankenterm-core --test blocker_radar_conformance claimability -- --nocapture",
+  "verdicts": [
+    {
+      "verdict": "claimable",
+      "covered_by": ["true_claimable"]
+    },
+    {
+      "verdict": "no_ready",
+      "covered_by": ["empty_ready_clean_queue"]
+    },
+    {
+      "verdict": "dependency_blocked",
+      "covered_by": ["blocked_child_claim_denied"]
+    },
+    {
+      "verdict": "owner_blocked",
+      "covered_by": ["bv_blocked_available_mismatch", "owner_active_fresh_comment"]
+    },
+    {
+      "verdict": "external_wait",
+      "covered_by": ["bv_blocked_available_mismatch", "external_ci_wait"]
+    },
+    {
+      "verdict": "dirty_overlap",
+      "covered_by": ["dirty_path_overlap"]
+    },
+    {
+      "verdict": "mail_degraded",
+      "covered_by": ["mail_degraded_fallback", "bv_blocked_available_mismatch"]
+    },
+    {
+      "verdict": "tracker_inconsistent",
+      "covered_by": ["bv_blocked_available_mismatch"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "bv_blocked_available_mismatch",
+      "description": "BV recommends ft-e87u6.2 as available/actionable while BR says blocked, assigned, and waiting on PR 59 checks.",
+      "source_commands": [
+        "br ready --json",
+        "bv --robot-triage",
+        "br show ft-e87u6.2 --json",
+        "gh pr view 59 --json number,state,headRefOid,statusCheckRollup"
+      ],
+      "input": {
+        "candidate_id": "ft-e87u6.2",
+        "br_ready_ids": [],
+        "br_show": {
+          "status": "blocked",
+          "assignee": "BluePike",
+          "dependencies": ["ft-e87u6"],
+          "fresh_comments": ["2026-05-11T14:55:21Z PR 59 current-head runs dispatched and queued"]
+        },
+        "bv_recommendation": {
+          "status": "blocked",
+          "reasons": [
+            "Unblocks 2 item(s): ft-e87u6.3, ft-e87u6.5",
+            "Currently unclaimed - available for work"
+          ],
+          "blocked_by": []
+        },
+        "mail_state": "mail_degraded",
+        "dirty_paths": [
+          "crates/frankenterm-core/src/crash.rs",
+          "crates/frankenterm-core/src/secrets.rs",
+          "tests/e2e/test_ft_3681t_4_4_robot_contracts.sh"
+        ],
+        "external_state": "github_actions_queued"
+      },
+      "expected": {
+        "final_verdict": "tracker_inconsistent",
+        "supporting_verdicts": ["owner_blocked", "external_wait", "mail_degraded"],
+        "reason_codes": [
+          "bv.br_status_mismatch",
+          "br.assignee_active",
+          "github.current_head_queued",
+          "agent_mail.degraded"
+        ],
+        "next_action": "wait_or_coordinate_existing_owner",
+        "forbidden_actions": ["auto_claim", "reopen_without_handoff", "rerun_ci", "repair_agent_mail"]
+      }
+    },
+    {
+      "id": "empty_ready_clean_queue",
+      "description": "The ready queue is empty and no BV recommendation becomes safe after authoritative BR checks.",
+      "source_commands": ["br ready --json", "bv --robot-triage"],
+      "input": {
+        "candidate_id": "none",
+        "br_ready_ids": [],
+        "br_show": {
+          "status": "none",
+          "assignee": null,
+          "dependencies": [],
+          "fresh_comments": []
+        },
+        "bv_recommendation": {
+          "status": "blocked",
+          "reasons": ["top picks are blocked or externally waiting"],
+          "blocked_by": ["external_wait"]
+        },
+        "mail_state": "mail_degraded",
+        "dirty_paths": [],
+        "external_state": "none"
+      },
+      "expected": {
+        "final_verdict": "no_ready",
+        "supporting_verdicts": ["mail_degraded"],
+        "reason_codes": ["br.ready_empty", "bv.no_safe_candidate", "agent_mail.degraded"],
+        "next_action": "create_or_refine_planning_bead",
+        "forbidden_actions": ["force_claim_blocked", "invent_ready_work"]
+      }
+    },
+    {
+      "id": "blocked_child_claim_denied",
+      "description": "A child bead looks useful but BR rejects claim because a dependency remains blocked.",
+      "source_commands": ["br show ft-e87u6.5 --json", "br update ft-e87u6.5 --claim --dry-run"],
+      "input": {
+        "candidate_id": "ft-e87u6.5",
+        "br_ready_ids": [],
+        "br_show": {
+          "status": "open",
+          "assignee": null,
+          "dependencies": ["ft-e87u6.2"],
+          "fresh_comments": []
+        },
+        "bv_recommendation": {
+          "status": "open",
+          "reasons": ["would unblock release-build regression work"],
+          "blocked_by": ["ft-e87u6.2"]
+        },
+        "mail_state": "mail_degraded",
+        "dirty_paths": [],
+        "external_state": "none"
+      },
+      "expected": {
+        "final_verdict": "dependency_blocked",
+        "supporting_verdicts": ["mail_degraded"],
+        "reason_codes": ["br.dependency_blocked", "br.claim_denied", "agent_mail.degraded"],
+        "next_action": "work_or_wait_on_dependency",
+        "forbidden_actions": ["force_claim_blocked", "edit_child_before_dependency"]
+      }
+    },
+    {
+      "id": "owner_active_fresh_comment",
+      "description": "A fresh assignee/comment means the lane remains owned even if it is high impact.",
+      "source_commands": ["br show ft-owner.1 --json", "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"],
+      "input": {
+        "candidate_id": "ft-owner.1",
+        "br_ready_ids": [],
+        "br_show": {
+          "status": "in_progress",
+          "assignee": "OtherAgent",
+          "dependencies": [],
+          "fresh_comments": ["2026-05-11T15:00:00Z proof run still active"]
+        },
+        "bv_recommendation": {
+          "status": "open",
+          "reasons": ["high PageRank"],
+          "blocked_by": []
+        },
+        "mail_state": "mail_degraded",
+        "dirty_paths": [],
+        "external_state": "none"
+      },
+      "expected": {
+        "final_verdict": "owner_blocked",
+        "supporting_verdicts": ["mail_degraded"],
+        "reason_codes": ["br.assignee_active", "br.fresh_comment", "agent_mail.degraded"],
+        "next_action": "request_handoff_or_choose_another_bead",
+        "forbidden_actions": ["reopen_without_handoff", "stage_owner_paths"]
+      }
+    },
+    {
+      "id": "external_ci_wait",
+      "description": "A current-head CI or finish-line run is queued with no failure logs, so the correct action is wait/recheck.",
+      "source_commands": [
+        "gh run view 25677841551 --json status,conclusion,jobs",
+        "gh run view 25677841635 --json status,conclusion,jobs"
+      ],
+      "input": {
+        "candidate_id": "ft-pr-wait.1",
+        "br_ready_ids": [],
+        "br_show": {
+          "status": "blocked",
+          "assignee": "BluePike",
+          "dependencies": [],
+          "fresh_comments": ["fresh current-head CI dispatch comment"]
+        },
+        "bv_recommendation": {
+          "status": "blocked",
+          "reasons": ["blocked by current-head CI evidence"],
+          "blocked_by": []
+        },
+        "mail_state": "ok",
+        "dirty_paths": [],
+        "external_state": "github_actions_queued"
+      },
+      "expected": {
+        "final_verdict": "external_wait",
+        "supporting_verdicts": ["owner_blocked"],
+        "reason_codes": ["github.current_head_queued", "github.no_failure_log", "br.assignee_active"],
+        "next_action": "read_only_recheck_later",
+        "forbidden_actions": ["rerun_ci", "call_ci_passed", "call_ci_failed"]
+      }
+    },
+    {
+      "id": "dirty_path_overlap",
+      "description": "The candidate's edit surface overlaps local dirty tracked paths, so claiming would risk mixing ownership.",
+      "source_commands": ["git status --short --branch", "br show ft-dirty.1 --json"],
+      "input": {
+        "candidate_id": "ft-dirty.1",
+        "br_ready_ids": ["ft-dirty.1"],
+        "br_show": {
+          "status": "open",
+          "assignee": null,
+          "dependencies": [],
+          "fresh_comments": []
+        },
+        "bv_recommendation": {
+          "status": "open",
+          "reasons": ["currently unclaimed"],
+          "blocked_by": []
+        },
+        "mail_state": "ok",
+        "dirty_paths": ["docs/blocker-radar-contract.md"],
+        "external_state": "none"
+      },
+      "expected": {
+        "final_verdict": "dirty_overlap",
+        "supporting_verdicts": [],
+        "reason_codes": ["git.dirty_overlap", "ownership.unclear"],
+        "next_action": "stop_and_request_handoff_or_split",
+        "forbidden_actions": ["stage_dirty_overlap", "format_broad_package"]
+      }
+    },
+    {
+      "id": "mail_degraded_fallback",
+      "description": "Agent Mail list/inbox are degraded, so Beads/git fallback is usable but must be cited before any claim.",
+      "source_commands": ["scripts/swarm-tick.sh --agent-mail-fallback frankenterm", "br ready --json"],
+      "input": {
+        "candidate_id": "coordination-snapshot",
+        "br_ready_ids": [],
+        "br_show": {
+          "status": "none",
+          "assignee": null,
+          "dependencies": [],
+          "fresh_comments": []
+        },
+        "bv_recommendation": {
+          "status": "none",
+          "reasons": [],
+          "blocked_by": []
+        },
+        "mail_state": "mail_degraded",
+        "dirty_paths": [],
+        "external_state": "none"
+      },
+      "expected": {
+        "final_verdict": "mail_degraded",
+        "supporting_verdicts": [],
+        "reason_codes": ["agent_mail.degraded", "fallback.beads_git_only"],
+        "next_action": "use_beads_git_fallback",
+        "forbidden_actions": ["repair_agent_mail", "restart_agent_mail"]
+      }
+    },
+    {
+      "id": "true_claimable",
+      "description": "The happy path remains claimable only when BR ready, BR show, BV, dirty paths, ownership, and external evidence all agree.",
+      "source_commands": ["br ready --json", "br show ft-ready.1 --json", "git status --short --branch"],
+      "input": {
+        "candidate_id": "ft-ready.1",
+        "br_ready_ids": ["ft-ready.1"],
+        "br_show": {
+          "status": "open",
+          "assignee": null,
+          "dependencies": [],
+          "fresh_comments": []
+        },
+        "bv_recommendation": {
+          "status": "open",
+          "reasons": ["currently unclaimed"],
+          "blocked_by": []
+        },
+        "mail_state": "ok",
+        "dirty_paths": [],
+        "external_state": "none"
+      },
+      "expected": {
+        "final_verdict": "claimable",
+        "supporting_verdicts": [],
+        "reason_codes": ["br.ready_contains_candidate", "br.unassigned", "git.no_dirty_overlap"],
+        "next_action": "reserve_then_claim",
+        "forbidden_actions": ["auto_claim_without_reservation"]
+      }
+    }
+  ]
+}
