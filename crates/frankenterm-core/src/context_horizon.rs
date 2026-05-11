@@ -666,7 +666,8 @@ pub struct ContextHorizonReport {
 
 #[must_use]
 pub fn predict_context_horizon(input: &ContextHorizonInput) -> ContextHorizonReport {
-    let mut unavailable_domains = input.unavailable_domains.clone();
+    let mut unavailable_domains = sanitize_unavailable_domains(&input.unavailable_domains);
+    let artifact_paths = sanitize_context_horizon_artifact_paths(&input.artifact_paths);
     if input.panes.is_empty() && unavailable_domains.is_empty() {
         unavailable_domains.push(ContextHorizonUnavailableDomain::unavailable(
             "pane_contexts",
@@ -728,7 +729,7 @@ pub fn predict_context_horizon(input: &ContextHorizonInput) -> ContextHorizonRep
         citations,
         unavailable_domains,
         redaction_policy: ContextHorizonRedactionPolicy::default(),
-        artifact_paths: input.artifact_paths.clone(),
+        artifact_paths,
         raw_context_content_stored: false,
     }
 }
@@ -1284,9 +1285,169 @@ fn nonempty_reason_codes(values: &[String], fallback: &str) -> Vec<String> {
     }
 }
 
+fn sanitize_unavailable_domains(
+    domains: &[ContextHorizonUnavailableDomain],
+) -> Vec<ContextHorizonUnavailableDomain> {
+    let redactor = crate::redactor::Redactor::new();
+    domains
+        .iter()
+        .map(|domain| ContextHorizonUnavailableDomain {
+            domain: sanitize_context_horizon_domain(&redactor, &domain.domain),
+            evidence_state: domain.evidence_state,
+            reason_codes: sanitize_context_horizon_reason_codes(&redactor, &domain.reason_codes),
+            failure_class: domain.failure_class,
+        })
+        .collect()
+}
+
+fn sanitize_context_horizon_domain(redactor: &crate::redactor::Redactor, value: &str) -> String {
+    let trimmed = value.trim();
+    if !is_context_horizon_identifier(trimmed)
+        || contains_context_horizon_private_term(trimmed)
+        || redactor.redact(trimmed) != trimmed
+    {
+        return "redacted_domain".to_string();
+    }
+    bounded_context_horizon_identifier(trimmed)
+}
+
+fn sanitize_context_horizon_reason_codes(
+    redactor: &crate::redactor::Redactor,
+    values: &[String],
+) -> Vec<String> {
+    let codes = values
+        .iter()
+        .filter_map(|value| sanitize_context_horizon_reason_code(redactor, value))
+        .collect::<BTreeSet<_>>();
+    if codes.is_empty() {
+        vec!["evidence.unavailable".to_string()]
+    } else {
+        codes.into_iter().collect()
+    }
+}
+
+fn sanitize_context_horizon_reason_code(
+    redactor: &crate::redactor::Redactor,
+    value: &str,
+) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !is_context_horizon_identifier(trimmed)
+        || contains_context_horizon_private_term(trimmed)
+        || redactor.redact(trimmed) != trimmed
+    {
+        return Some("privacy.redacted_reason_code".to_string());
+    }
+    Some(bounded_context_horizon_identifier(trimmed))
+}
+
+fn sanitize_context_horizon_artifact_paths(paths: &[String]) -> Vec<String> {
+    let redactor = crate::redactor::Redactor::new();
+    paths
+        .iter()
+        .filter_map(|path| sanitize_context_horizon_artifact_path(&redactor, path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn sanitize_context_horizon_artifact_path(
+    redactor: &crate::redactor::Redactor,
+    value: &str,
+) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !is_context_horizon_artifact_path(trimmed)
+        || contains_context_horizon_private_term(trimmed)
+        || redactor.redact(trimmed) != trimmed
+    {
+        return Some("redacted_artifact_path".to_string());
+    }
+    Some(trimmed.chars().take(160).collect())
+}
+
+fn is_context_horizon_artifact_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
+}
+
+fn is_context_horizon_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+}
+
+fn contains_context_horizon_private_term(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "raw_prompt",
+        "raw_transcript",
+        "prompt_body",
+        "pane_text",
+        "raw_text",
+        "transcript",
+        "authorization",
+        "bearer",
+        "password",
+        "secret",
+        "api_key",
+        "apikey",
+        "cookie",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn bounded_context_horizon_identifier(value: &str) -> String {
+    value.chars().take(96).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct ContextHorizonGoldenMatrix {
+        contract_id: String,
+        schema_version: u16,
+        cases: Vec<ContextHorizonGoldenCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ContextHorizonGoldenCase {
+        name: String,
+        input: ContextHorizonInput,
+        expect: ContextHorizonGoldenExpect,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ContextHorizonGoldenExpect {
+        total_panes: usize,
+        evidence_state: ContextHorizonEvidenceState,
+        highest_risk_tier: ContextHorizonRiskTier,
+        top_operator_move: String,
+        unavailable_domain_count: usize,
+        pane_risk_tiers: Vec<ContextHorizonRiskTier>,
+        required_reason_codes: Vec<String>,
+        required_action_kinds: Vec<ContextHorizonActionKind>,
+        #[serde(default)]
+        required_unavailable_domains: Vec<String>,
+        #[serde(default)]
+        required_artifact_paths: Vec<String>,
+        #[serde(default)]
+        expected_handoff_readiness: Vec<ContextHorizonHandoffReadiness>,
+        forbidden_substrings: Vec<String>,
+    }
 
     fn pane(pane_id: u64, consumed: i64, budget: i64) -> ContextHorizonPaneEvidence {
         ContextHorizonPaneEvidence {
@@ -1650,6 +1811,251 @@ mod tests {
             if let Some(command) = &record.suggested_command {
                 assert!(is_safe_suggested_command(command), "{command}");
             }
+        }
+    }
+
+    #[test]
+    fn context_horizon_sanitizes_unavailable_domain_private_text_before_output() {
+        let private_domain =
+            "raw_prompt transcript password=hunter2 sk-proj-abcdefghijklmnopqrstuvwxyz";
+        let safe_artifact_path = "docs/context-horizon/golden.json";
+        let input = ContextHorizonInput {
+            generated_at_ms: 10_000,
+            horizon_window_ms: 10_000,
+            panes: Vec::new(),
+            unavailable_domains: vec![ContextHorizonUnavailableDomain {
+                domain: private_domain.to_string(),
+                evidence_state: ContextHorizonEvidenceState::Unavailable,
+                reason_codes: vec![
+                    "evidence.runtime_events_table_missing".to_string(),
+                    private_domain.to_string(),
+                ],
+                failure_class: ContextHorizonFailureClass::PrivacyViolation,
+            }],
+            artifact_paths: vec![
+                safe_artifact_path.to_string(),
+                format!("docs/raw_prompt/{private_domain}.json"),
+            ],
+        };
+
+        let report = predict_context_horizon(&input);
+        let json = serde_json::to_string(&report).expect("serialize context horizon report");
+
+        assert_eq!(report.unavailable_domains[0].domain, "redacted_domain");
+        assert!(
+            report.unavailable_domains[0]
+                .reason_codes
+                .contains(&"privacy.redacted_reason_code".to_string())
+        );
+        assert!(
+            report.unavailable_domains[0]
+                .reason_codes
+                .contains(&"evidence.runtime_events_table_missing".to_string())
+        );
+        assert!(
+            report
+                .artifact_paths
+                .contains(&safe_artifact_path.to_string())
+        );
+        assert!(
+            report
+                .artifact_paths
+                .contains(&"redacted_artifact_path".to_string())
+        );
+        let leaked_artifact = format!("docs/raw_prompt/{private_domain}.json");
+        for leaked in [
+            "hunter2",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "raw_prompt transcript",
+            leaked_artifact.as_str(),
+        ] {
+            assert!(!json.contains(leaked), "{leaked}");
+        }
+        assert!(report.citations.iter().all(|citation| citation.redacted));
+        assert!(
+            report
+                .citations
+                .iter()
+                .any(|citation| citation.citation_id == "domain:redacted_domain:availability")
+        );
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .all(|recommendation| !recommendation.mutation_allowed)
+        );
+    }
+
+    #[test]
+    fn context_horizon_fixture_matrix_is_deterministic_and_cited() {
+        let matrix: ContextHorizonGoldenMatrix = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/context_horizon_golden_matrix.json"
+        )))
+        .expect("context horizon golden matrix fixture must parse");
+        assert_eq!(matrix.contract_id, CONTEXT_HORIZON_CONTRACT_ID);
+        assert_eq!(matrix.schema_version, CONTEXT_HORIZON_SCHEMA_VERSION);
+
+        let case_names = matrix
+            .cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for required_case in [
+            "empty_fleet",
+            "healthy_fleet",
+            "rising_context_pressure",
+            "stale_evidence",
+            "rate_limit_risk",
+            "handoff_ready_pane",
+            "missing_storage",
+            "malformed_counters",
+            "privacy_violation",
+        ] {
+            assert!(
+                case_names.contains(required_case),
+                "missing golden fixture case {required_case}"
+            );
+        }
+
+        for case in matrix.cases {
+            let name = case.name.as_str();
+            let first = predict_context_horizon(&case.input);
+            let second = predict_context_horizon(&case.input);
+            let first_value = serde_json::to_value(&first).expect("serialize first report");
+            let second_value = serde_json::to_value(&second).expect("serialize second report");
+            assert_eq!(first_value, second_value, "{name}");
+            let first_json = serde_json::to_string(&first).expect("serialize report json");
+
+            assert_eq!(
+                first.schema_version, CONTEXT_HORIZON_SCHEMA_VERSION,
+                "{name}"
+            );
+            assert_eq!(first.contract_id, CONTEXT_HORIZON_CONTRACT_ID, "{name}");
+            assert_eq!(
+                first.fleet_summary.total_panes, case.expect.total_panes,
+                "{name}"
+            );
+            assert_eq!(first.evidence_state, case.expect.evidence_state, "{name}");
+            assert_eq!(
+                first.fleet_summary.highest_risk_tier, case.expect.highest_risk_tier,
+                "{name}"
+            );
+            assert_eq!(
+                first.fleet_summary.top_operator_move, case.expect.top_operator_move,
+                "{name}"
+            );
+            assert_eq!(
+                first.unavailable_domains.len(),
+                case.expect.unavailable_domain_count,
+                "{name}"
+            );
+            assert_eq!(
+                first
+                    .pane_risks
+                    .iter()
+                    .map(|risk| risk.risk_tier)
+                    .collect::<Vec<_>>(),
+                case.expect.pane_risk_tiers,
+                "{name}"
+            );
+            if !case.expect.expected_handoff_readiness.is_empty() {
+                assert_eq!(
+                    first
+                        .pane_risks
+                        .iter()
+                        .map(|risk| risk.handoff_readiness)
+                        .collect::<Vec<_>>(),
+                    case.expect.expected_handoff_readiness,
+                    "{name}"
+                );
+            }
+
+            let citation_ids = first
+                .citations
+                .iter()
+                .map(|citation| citation.citation_id.as_str())
+                .collect::<BTreeSet<_>>();
+            for risk in &first.pane_risks {
+                assert!(!risk.citation_ids.is_empty(), "{name}");
+                assert!(
+                    risk.citation_ids
+                        .iter()
+                        .all(|citation_id| citation_ids.contains(citation_id.as_str())),
+                    "{name}: {:?}",
+                    risk.citation_ids
+                );
+            }
+            for recommendation in &first.recommendations {
+                assert!(!recommendation.citation_ids.is_empty(), "{name}");
+                assert!(
+                    recommendation
+                        .citation_ids
+                        .iter()
+                        .all(|citation_id| citation_ids.contains(citation_id.as_str())),
+                    "{name}: {:?}",
+                    recommendation.citation_ids
+                );
+            }
+
+            let mut reason_codes = BTreeSet::new();
+            for risk in &first.pane_risks {
+                reason_codes.extend(risk.reason_codes.iter().map(String::as_str));
+            }
+            for domain in &first.unavailable_domains {
+                reason_codes.extend(domain.reason_codes.iter().map(String::as_str));
+            }
+            for recommendation in &first.recommendations {
+                reason_codes.extend(recommendation.reason_codes.iter().map(String::as_str));
+            }
+            for required_reason in &case.expect.required_reason_codes {
+                assert!(
+                    reason_codes.contains(required_reason.as_str()),
+                    "{name}: missing reason code {required_reason}; had {reason_codes:?}"
+                );
+            }
+
+            let action_kinds = first
+                .recommendations
+                .iter()
+                .map(|recommendation| recommendation.action_kind)
+                .collect::<Vec<_>>();
+            for required_action in &case.expect.required_action_kinds {
+                assert!(
+                    action_kinds.contains(required_action),
+                    "{name}: missing action kind {required_action:?}; had {action_kinds:?}"
+                );
+            }
+            for required_domain in &case.expect.required_unavailable_domains {
+                assert!(
+                    first
+                        .unavailable_domains
+                        .iter()
+                        .any(|domain| domain.domain == *required_domain),
+                    "{name}: missing unavailable domain {required_domain}"
+                );
+            }
+            for required_artifact in &case.expect.required_artifact_paths {
+                assert!(
+                    first.artifact_paths.contains(required_artifact),
+                    "{name}: missing artifact path {required_artifact}"
+                );
+            }
+            for forbidden in &case.expect.forbidden_substrings {
+                assert!(
+                    !first_json.contains(forbidden),
+                    "{name}: leaked forbidden substring {forbidden}"
+                );
+            }
+            assert!(!first.raw_context_content_stored, "{name}");
+            assert!(first.citations.iter().all(|citation| citation.redacted));
+            assert!(
+                first
+                    .recommendations
+                    .iter()
+                    .all(|recommendation| !recommendation.mutation_allowed),
+                "{name}"
+            );
         }
     }
 

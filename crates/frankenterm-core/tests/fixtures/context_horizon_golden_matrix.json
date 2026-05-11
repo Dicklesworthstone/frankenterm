@@ -1,0 +1,348 @@
+{
+  "contract_id": "ft.context_horizon.v1",
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "empty_fleet",
+      "input": {
+        "generated_at_ms": 20000,
+        "horizon_window_ms": 10000,
+        "panes": [],
+        "unavailable_domains": [],
+        "artifact_paths": []
+      },
+      "expect": {
+        "total_panes": 0,
+        "evidence_state": "unavailable",
+        "highest_risk_tier": "unknown",
+        "top_operator_move": "none",
+        "unavailable_domain_count": 1,
+        "pane_risk_tiers": [],
+        "required_reason_codes": ["evidence.pane_contexts_unavailable"],
+        "required_action_kinds": ["none"],
+        "required_unavailable_domains": ["pane_contexts"],
+        "forbidden_substrings": []
+      }
+    },
+    {
+      "name": "healthy_fleet",
+      "input": {
+        "generated_at_ms": 20000,
+        "horizon_window_ms": 10000,
+        "panes": [
+          {
+            "pane_id": 1,
+            "active_context_present": true,
+            "token_budget": 1000,
+            "tokens_consumed": 100,
+            "pressure_tier": "green",
+            "compaction_count": 0,
+            "last_rotated_at_ms": 1000,
+            "last_activity_at_ms": 19000,
+            "previous_utilization": null,
+            "recent_rate_limit_events": 0,
+            "recent_compaction_events": 0,
+            "evidence_state": "measured"
+          }
+        ],
+        "unavailable_domains": [],
+        "artifact_paths": []
+      },
+      "expect": {
+        "total_panes": 1,
+        "evidence_state": "measured",
+        "highest_risk_tier": "green",
+        "top_operator_move": "none",
+        "unavailable_domain_count": 0,
+        "pane_risk_tiers": ["green"],
+        "required_reason_codes": ["risk.normal"],
+        "required_action_kinds": [],
+        "expected_handoff_readiness": ["not_needed"],
+        "forbidden_substrings": []
+      }
+    },
+    {
+      "name": "rising_context_pressure",
+      "input": {
+        "generated_at_ms": 20000,
+        "horizon_window_ms": 10000,
+        "panes": [
+          {
+            "pane_id": 2,
+            "active_context_present": true,
+            "token_budget": 1000,
+            "tokens_consumed": 760,
+            "pressure_tier": "green",
+            "compaction_count": 0,
+            "last_rotated_at_ms": 19000,
+            "last_activity_at_ms": 19000,
+            "previous_utilization": 0.2,
+            "recent_rate_limit_events": 0,
+            "recent_compaction_events": 0,
+            "evidence_state": "measured"
+          }
+        ],
+        "unavailable_domains": [],
+        "artifact_paths": []
+      },
+      "expect": {
+        "total_panes": 1,
+        "evidence_state": "measured",
+        "highest_risk_tier": "yellow",
+        "top_operator_move": "rotate_context",
+        "unavailable_domain_count": 0,
+        "pane_risk_tiers": ["yellow"],
+        "required_reason_codes": [
+          "advisor.rotate_context",
+          "context.utilization_rising"
+        ],
+        "required_action_kinds": ["rotate_context"],
+        "expected_handoff_readiness": ["not_needed"],
+        "forbidden_substrings": []
+      }
+    },
+    {
+      "name": "stale_evidence",
+      "input": {
+        "generated_at_ms": 60000,
+        "horizon_window_ms": 10000,
+        "panes": [
+          {
+            "pane_id": 3,
+            "active_context_present": true,
+            "token_budget": 1000,
+            "tokens_consumed": 300,
+            "pressure_tier": "green",
+            "compaction_count": 0,
+            "last_rotated_at_ms": 1000,
+            "last_activity_at_ms": 1000,
+            "previous_utilization": null,
+            "recent_rate_limit_events": 0,
+            "recent_compaction_events": 0,
+            "evidence_state": "measured"
+          }
+        ],
+        "unavailable_domains": [],
+        "artifact_paths": []
+      },
+      "expect": {
+        "total_panes": 1,
+        "evidence_state": "mixed",
+        "highest_risk_tier": "yellow",
+        "top_operator_move": "inspect_prompt",
+        "unavailable_domain_count": 0,
+        "pane_risk_tiers": ["yellow"],
+        "required_reason_codes": [
+          "advisor.inspect_prompt",
+          "evidence.last_activity_stale",
+          "evidence.last_rotation_stale"
+        ],
+        "required_action_kinds": ["inspect_prompt"],
+        "expected_handoff_readiness": ["blocked"],
+        "forbidden_substrings": []
+      }
+    },
+    {
+      "name": "rate_limit_risk",
+      "input": {
+        "generated_at_ms": 20000,
+        "horizon_window_ms": 10000,
+        "panes": [
+          {
+            "pane_id": 4,
+            "active_context_present": true,
+            "token_budget": 1000,
+            "tokens_consumed": 300,
+            "pressure_tier": "green",
+            "compaction_count": 0,
+            "last_rotated_at_ms": 19000,
+            "last_activity_at_ms": 19000,
+            "previous_utilization": null,
+            "recent_rate_limit_events": 2,
+            "recent_compaction_events": 0,
+            "evidence_state": "measured"
+          }
+        ],
+        "unavailable_domains": [],
+        "artifact_paths": []
+      },
+      "expect": {
+        "total_panes": 1,
+        "evidence_state": "measured",
+        "highest_risk_tier": "red",
+        "top_operator_move": "reduce_fanout",
+        "unavailable_domain_count": 0,
+        "pane_risk_tiers": ["red"],
+        "required_reason_codes": [
+          "advisor.reduce_fanout",
+          "provider.rate_limit_recent"
+        ],
+        "required_action_kinds": ["reduce_fanout"],
+        "expected_handoff_readiness": ["prepare"],
+        "forbidden_substrings": []
+      }
+    },
+    {
+      "name": "handoff_ready_pane",
+      "input": {
+        "generated_at_ms": 20000,
+        "horizon_window_ms": 10000,
+        "panes": [
+          {
+            "pane_id": 5,
+            "active_context_present": true,
+            "token_budget": 1000,
+            "tokens_consumed": 990,
+            "pressure_tier": "green",
+            "compaction_count": 1,
+            "last_rotated_at_ms": 19000,
+            "last_activity_at_ms": 19000,
+            "previous_utilization": null,
+            "recent_rate_limit_events": 0,
+            "recent_compaction_events": 0,
+            "evidence_state": "measured"
+          }
+        ],
+        "unavailable_domains": [],
+        "artifact_paths": []
+      },
+      "expect": {
+        "total_panes": 1,
+        "evidence_state": "measured",
+        "highest_risk_tier": "black",
+        "top_operator_move": "pause_assignment",
+        "unavailable_domain_count": 0,
+        "pane_risk_tiers": ["black"],
+        "required_reason_codes": [
+          "advisor.collect_incident_bundle",
+          "advisor.pause_assignment",
+          "risk.black_pane_present"
+        ],
+        "required_action_kinds": ["pause_assignment", "collect_incident_bundle"],
+        "expected_handoff_readiness": ["ready"],
+        "forbidden_substrings": []
+      }
+    },
+    {
+      "name": "missing_storage",
+      "input": {
+        "generated_at_ms": 20000,
+        "horizon_window_ms": 10000,
+        "panes": [],
+        "unavailable_domains": [
+          {
+            "domain": "native_context_registry",
+            "evidence_state": "unavailable",
+            "reason_codes": ["evidence.context_registry_tables_missing"],
+            "failure_class": "unavailable_evidence"
+          }
+        ],
+        "artifact_paths": []
+      },
+      "expect": {
+        "total_panes": 0,
+        "evidence_state": "unavailable",
+        "highest_risk_tier": "unknown",
+        "top_operator_move": "none",
+        "unavailable_domain_count": 1,
+        "pane_risk_tiers": [],
+        "required_reason_codes": ["evidence.context_registry_tables_missing"],
+        "required_action_kinds": ["none"],
+        "required_unavailable_domains": ["native_context_registry"],
+        "forbidden_substrings": []
+      }
+    },
+    {
+      "name": "malformed_counters",
+      "input": {
+        "generated_at_ms": 20000,
+        "horizon_window_ms": 10000,
+        "panes": [
+          {
+            "pane_id": 6,
+            "active_context_present": false,
+            "token_budget": -1,
+            "tokens_consumed": -5,
+            "pressure_tier": "not-a-tier",
+            "compaction_count": -2,
+            "last_rotated_at_ms": -1,
+            "last_activity_at_ms": null,
+            "previous_utilization": 2.0,
+            "recent_rate_limit_events": 1,
+            "recent_compaction_events": 0,
+            "evidence_state": "measured"
+          }
+        ],
+        "unavailable_domains": [],
+        "artifact_paths": []
+      },
+      "expect": {
+        "total_panes": 1,
+        "evidence_state": "mixed",
+        "highest_risk_tier": "yellow",
+        "top_operator_move": "reduce_fanout",
+        "unavailable_domain_count": 0,
+        "pane_risk_tiers": ["yellow"],
+        "required_reason_codes": [
+          "advisor.reduce_fanout",
+          "context.active_context_missing",
+          "evidence.compaction_count_invalid",
+          "evidence.last_rotated_at_ms_invalid",
+          "evidence.pressure_tier_unrecognized",
+          "evidence.token_budget_invalid",
+          "evidence.tokens_consumed_invalid",
+          "provider.rate_limit_recent"
+        ],
+        "required_action_kinds": ["reduce_fanout"],
+        "expected_handoff_readiness": ["blocked"],
+        "forbidden_substrings": []
+      }
+    },
+    {
+      "name": "privacy_violation",
+      "input": {
+        "generated_at_ms": 20000,
+        "horizon_window_ms": 10000,
+        "panes": [],
+        "unavailable_domains": [
+          {
+            "domain": "raw_prompt transcript password=hunter2 sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "evidence_state": "unavailable",
+            "reason_codes": [
+              "evidence.runtime_events_table_missing",
+              "raw_prompt transcript password=hunter2 sk-proj-abcdefghijklmnopqrstuvwxyz"
+            ],
+            "failure_class": "privacy_violation"
+          }
+        ],
+        "artifact_paths": [
+          "docs/context-horizon/golden-matrix.json",
+          "docs/raw_prompt/raw_prompt transcript password=hunter2 sk-proj-abcdefghijklmnopqrstuvwxyz.json"
+        ]
+      },
+      "expect": {
+        "total_panes": 0,
+        "evidence_state": "unavailable",
+        "highest_risk_tier": "unknown",
+        "top_operator_move": "none",
+        "unavailable_domain_count": 1,
+        "pane_risk_tiers": [],
+        "required_reason_codes": [
+          "evidence.runtime_events_table_missing",
+          "privacy.redacted_reason_code"
+        ],
+        "required_action_kinds": ["none"],
+        "required_unavailable_domains": ["redacted_domain"],
+        "required_artifact_paths": [
+          "docs/context-horizon/golden-matrix.json",
+          "redacted_artifact_path"
+        ],
+        "forbidden_substrings": [
+          "hunter2",
+          "sk-proj-abcdefghijklmnopqrstuvwxyz",
+          "raw_prompt transcript"
+        ]
+      }
+    }
+  ]
+}
