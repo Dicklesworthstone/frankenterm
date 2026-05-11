@@ -79,7 +79,7 @@ jobs:
           - '0xBADC0DE'
           - '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
