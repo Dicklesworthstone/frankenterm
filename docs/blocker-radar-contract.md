@@ -88,6 +88,64 @@ The blocker radar must not collapse all blockers into a single vague state.
 Rows may combine states through multiple blockers, but each blocker row must
 retain its source-specific state and reason codes.
 
+## Claimability Reconciliation
+
+`ft-htcwc.1` extends the blocker-radar contract with a pre-claim
+claimability reconciliation vocabulary. This is stricter than the root
+`actionable` state: a high graph score or unblock count is never enough to
+claim a bead. The claimability check compares the ready queue, the individual
+Beads record, BV's ranked recommendation, degraded-mail fallback state,
+dirty-tree risk, and optional GitHub/RCH evidence before it returns a final
+answer.
+
+The claimability check must treat `bv --robot-triage` and `bv --robot-next` as
+advisory prioritization only. `br ready --json` and `br show <id> --json` are
+authoritative for Beads status, dependencies, and assignee state. If BV says a
+blocked or assigned bead is "available for work" while BR says the bead is not
+ready, the final verdict is `tracker_inconsistent` and non-claimable.
+
+The observed regression fixture for this contract is `ft-e87u6.2`: BV reported
+the bead as status `blocked` while also giving the reason "Currently
+unclaimed - available for work"; BR showed status `blocked`, assignee
+`BluePike`, and fresh PR 59 CI-wait comments. That state must resolve to
+`tracker_inconsistent` plus `owner_blocked` or `external_wait`, never
+`claimable`.
+
+Required claimability verdicts:
+
+| Verdict | Meaning | Safe next action |
+| --- | --- | --- |
+| `claimable` | The bead is in `br ready --json`, dependencies are satisfied, ownership is clear, dirty paths do not overlap, and no fresh external wait blocks the lane. | Reserve the owned paths, then claim with `br update <id> --claim --actor <agent> --json`. |
+| `no_ready` | The ready queue is empty and no candidate can be made safe from the advisory BV list. | Use idea-wizard or create/refine planning beads; do not force-claim blocked work. |
+| `dependency_blocked` | A Beads dependency or parent blocker prevents the candidate from being ready. | Work the dependency if it is claimable, otherwise wait or create a precise blocker. |
+| `owner_blocked` | Another assignee, fresh activity, reservation, or handoff evidence controls the lane. | Wait, ask for handoff, or choose another bead. |
+| `external_wait` | CI, RCH, package, Agent Mail, or another substrate is queued, pending, or missing evidence without a source failure to fix. | Recheck read-only status later or comment with exact external evidence. |
+| `dirty_overlap` | Local dirty tracked paths overlap the candidate's likely edit surface. | Stop before editing or staging and request handoff/split. |
+| `mail_degraded` | Agent Mail list/inbox is unavailable, so Beads/git fallback is the handoff surface. | Continue with Beads/git evidence only; do not repair or restart Agent Mail. |
+| `tracker_inconsistent` | BV, BR, fallback state, or live substrate evidence disagree in a way that could mislead an agent into an unsafe claim. | Fail closed, cite the conflicting sources, and do not claim until the authoritative source changes. |
+
+Required claimability output fields are `candidate_id`, `generated_at`,
+`sources`, `ready_queue_verdict`, `dependency_verdict`, `owner_verdict`,
+`dirty_path_verdict`, `external_wait_verdict`, `mail_verdict`,
+`tracker_consistency_verdict`, `final_verdict`, `reason_codes`,
+`next_action`, and `forbidden_actions`.
+
+Precedence is fail-closed:
+
+1. `tracker_inconsistent`, `owner_blocked`, `dependency_blocked`,
+   `dirty_overlap`, and `external_wait` override BV score, priority, PageRank,
+   and unblock count.
+2. `mail_degraded` requires Beads/git fallback citations before any claim, and
+   it can only support `claimable` when BR, ownership, dirty paths, and
+   dependencies all agree.
+3. `claimable` is only valid when every safety predicate passes. Missing source
+   data produces `unknown`, `degraded`, or `tracker_inconsistent`, not a claim.
+
+Forbidden actions for claimability reconciliation include claiming or assigning
+a bead automatically, posting comments automatically, restarting/repairing
+Agent Mail or RCH, cancelling/rerunning CI, mutating panes, staging dirty
+overlap, or treating sync chatter as proof.
+
 ## Source Snapshots
 
 Each `sources` row describes one read-only observation:
