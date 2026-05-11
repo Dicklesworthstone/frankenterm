@@ -188,7 +188,7 @@ jobs:
   summary:
     name: 24h fuzz summary
     needs: fuzz
-    if: always()
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

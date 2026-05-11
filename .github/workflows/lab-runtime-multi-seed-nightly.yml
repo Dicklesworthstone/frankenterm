@@ -145,7 +145,7 @@ jobs:
     name: Multi-seed summary
     runs-on: ubuntu-latest
     needs: sweep
-    if: always()
+    if: ${{ always() && !cancelled() }}
     timeout-minutes: 5
     steps:
       - uses: actions/download-artifact@v4
