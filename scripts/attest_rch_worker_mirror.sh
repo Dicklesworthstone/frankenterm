@@ -262,7 +262,6 @@ populate_candidate_roots() {
         add_candidate_root "${remote_base%/}/${repo_name}"
         add_candidate_root "${remote_base%/}/projects/${repo_name}/*"
         add_candidate_root "${remote_base%/}/projects/${repo_name}"
-        add_candidate_root "${remote_base%/}"
     fi
     add_candidate_root "/data/projects/${repo_name}"
     add_candidate_root "/dp/${repo_name}"
@@ -557,6 +556,7 @@ first_existing_root=""
 first_all_present_root=""
 best_present_root=""
 best_present_count=-1
+best_manifest_present=0
 shopt -s nullglob
 for root in "${roots[@]}"; do
     expanded_roots=()
@@ -579,6 +579,10 @@ for root in "${roots[@]}"; do
 
         all_present="true"
         present_count=0
+        manifest_present=0
+        if [[ -f "${expanded_root}/Cargo.toml" ]]; then
+            manifest_present=1
+        fi
         for path in "${paths[@]}"; do
             if [[ -f "${expanded_root}/${path}" ]]; then
                 present_count=$((present_count + 1))
@@ -587,8 +591,10 @@ for root in "${roots[@]}"; do
             fi
         done
 
-        if [[ "${present_count}" -gt "${best_present_count}" ]]; then
+        if [[ "${present_count}" -gt "${best_present_count}" ]] \
+            || [[ "${present_count}" -eq "${best_present_count}" && "${manifest_present}" -gt "${best_manifest_present}" ]]; then
             best_present_count="${present_count}"
+            best_manifest_present="${manifest_present}"
             best_present_root="${expanded_root}"
         fi
 
