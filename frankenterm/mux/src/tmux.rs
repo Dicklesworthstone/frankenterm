@@ -275,7 +275,7 @@ impl TmuxDomainState {
 
                     {
                         let mut pane_map = self.remote_panes.lock();
-                        for (_, v) in pane_map.iter_mut() {
+                        for v in pane_map.values_mut() {
                             let remote_pane = v.lock();
                             remote_pane
                                 .child_state

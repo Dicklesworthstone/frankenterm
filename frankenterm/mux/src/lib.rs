@@ -1465,7 +1465,7 @@ impl Mux {
 
         {
             let mut windows = self.windows.write();
-            for (_, win) in windows.iter_mut() {
+            for win in windows.values_mut() {
                 for tab in win.iter() {
                     tab.kill_panes_in_domain(domain);
                 }

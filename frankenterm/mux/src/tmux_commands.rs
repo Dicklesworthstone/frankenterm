@@ -455,7 +455,7 @@ impl TmuxDomainState {
             };
 
             let tab = Arc::new(Tab::new(&size));
-            tab.set_title(&format!("{}", &window.window_name));
+            tab.set_title(&window.window_name);
             mux.add_tab_no_panes(&tab);
 
             let _ = self.add_attached_window(window, &tab.tab_id())?;

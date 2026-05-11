@@ -1196,7 +1196,7 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                 if let Some(tmux) = self.tmux_domain.as_ref() {
                     tmux.advance(events);
                 } else {
-                    log::warn!("unhandled DeviceControlMode::TmuxEvents {:?}", &events);
+                    log::warn!("unhandled DeviceControlMode::TmuxEvents {:?}", events);
                 }
             }
             _ => {
