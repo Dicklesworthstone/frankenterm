@@ -421,7 +421,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-tools libgl1-mesa-dri libx11-dev libx11-xcb-dev libcairo2-dev pkg-config jq
+          sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-tools libgl1-mesa-dri libx11-dev libx11-xcb-dev libxcb-util-dev libcairo2-dev pkg-config jq
           mkdir -p target/ci-logs "$GPU_LINUX_GOLDEN_ROOT" "$GPU_LINUX_VS_MACOS_ARTIFACT_DIR"
           ls -l /usr/share/vulkan/icd.d | tee target/ci-logs/gpu-linux-icd-files.log
           vulkaninfo --summary 2>&1 | tee target/ci-logs/gpu-linux-vulkaninfo.log || true
