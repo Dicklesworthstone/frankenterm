@@ -709,10 +709,7 @@ mod tests {
 
         // At capacity, adding one more should evict the remediated one
         engine.record_violation(make_violation("v4", 4000, ViolationSeverity::Low, "policy"));
-        assert_eq!(
-            engine.violations.iter().any(|v| v.violation_id == "v1"),
-            false
-        );
+        assert!(!engine.violations.iter().any(|v| v.violation_id == "v1"));
         assert_eq!(engine.violations.len(), 3);
     }
 
