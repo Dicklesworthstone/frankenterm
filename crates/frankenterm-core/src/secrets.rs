@@ -475,6 +475,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::storage::PaneRecord;
+    use std::path::Path;
 
     fn make_segment(id: i64, pane_id: u64, content: &str) -> Segment {
         Segment {
@@ -527,6 +528,25 @@ mod tests {
             .await
             .expect("register pane");
         (storage, db_path)
+    }
+
+    fn insert_raw_secret_scan_fixture(db_path: &Path, pane_id: u64, content: &str) {
+        let conn = rusqlite::Connection::open(db_path).expect("open raw fixture db");
+        let pane_id_i64 = i64::try_from(pane_id).expect("pane id fits in i64");
+        let next_seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM output_segments WHERE pane_id = ?1",
+                [pane_id_i64],
+                |row| row.get(0),
+            )
+            .expect("query next raw fixture seq");
+        let content_len = i64::try_from(content.len()).expect("content length fits in i64");
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            rusqlite::params![pane_id_i64, next_seq, content, content_len, crate::accounts::now_ms()],
+        )
+        .expect("insert raw secret scan fixture");
     }
 
     async fn teardown(storage: StorageHandle, db_path: &std::path::Path) {
@@ -1152,23 +1172,23 @@ mod tests {
         run_async_test(async {
             let (storage, db_path) = setup_storage("cx_matches").await;
 
-            // Insert identical segments: some with secrets, some without.
-            storage
-                .append_segment(
-                    1,
-                    "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
-                    None,
-                )
-                .await
-                .expect("seg1");
+            // Seed historical/raw rows directly. The production append path
+            // redacts before persistence, so using it here would test storage
+            // redaction instead of the secret scanner.
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
+            );
             storage
                 .append_segment(1, "Hello, no secrets here.", None)
                 .await
                 .expect("seg2");
-            storage
-                .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-                .await
-                .expect("seg3");
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            );
 
             let engine = SecretScanEngine::new();
             let cx = crate::cx::for_request();
@@ -1220,23 +1240,22 @@ mod tests {
         run_async_test(async {
             let (storage, db_path) = setup_storage("matches").await;
 
-            // Insert segments with secrets
-            storage
-                .append_segment(
-                    1,
-                    "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
-                    None,
-                )
-                .await
-                .expect("insert segment");
+            // Seed historical/raw rows directly. The production append path
+            // redacts before persistence.
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
+            );
             storage
                 .append_segment(1, "Hello, no secrets here.", None)
                 .await
                 .expect("insert segment");
-            storage
-                .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-                .await
-                .expect("insert segment");
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            );
 
             let engine = SecretScanEngine::new();
             let report = engine
@@ -1318,16 +1337,13 @@ mod tests {
         run_async_test(async {
             let (storage, db_path) = setup_storage("incr").await;
 
-            // Insert initial segments
+            // Insert initial historical/raw segments.
             for i in 0..3u64 {
-                storage
-                    .append_segment(
-                        1,
-                        &format!("line {i}: sk-abc{i}234567890abcdef1234567890abcdef12345678"),
-                        None,
-                    )
-                    .await
-                    .expect("insert");
+                insert_raw_secret_scan_fixture(
+                    &db_path,
+                    1,
+                    &format!("line {i}: sk-abc{i}234567890abcdef1234567890abcdef12345678"),
+                );
             }
 
             let engine = SecretScanEngine::new();
@@ -1343,16 +1359,13 @@ mod tests {
             let first_matches = report1.matches_total;
             assert!(first_matches > 0);
 
-            // Insert 2 more segments
+            // Insert 2 more historical/raw segments.
             for i in 3..5u64 {
-                storage
-                    .append_segment(
-                        1,
-                        &format!("line {i}: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678{i}"),
-                        None,
-                    )
-                    .await
-                    .expect("insert");
+                insert_raw_secret_scan_fixture(
+                    &db_path,
+                    1,
+                    &format!("line {i}: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678{i}"),
+                );
             }
 
             // Second incremental scan - should only scan new segments
@@ -1462,17 +1475,15 @@ mod tests {
                 .await
                 .expect("register pane 2");
 
-            // Pane 1: has secret
-            storage
-                .append_segment(1, "sk-abc1234567890abcdef1234567890abcdef12345678", None)
-                .await
-                .expect("insert");
+            // Pane 1: has historical/raw secret
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "sk-abc1234567890abcdef1234567890abcdef12345678",
+            );
 
-            // Pane 2: has secret
-            storage
-                .append_segment(2, "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-                .await
-                .expect("insert");
+            // Pane 2: has historical/raw secret
+            insert_raw_secret_scan_fixture(&db_path, 2, "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
 
             let engine = SecretScanEngine::new();
 
@@ -1484,6 +1495,7 @@ mod tests {
             let report = engine.scan_storage(&storage, options).await.expect("scan");
 
             // Should only find secrets from pane 1
+            assert!(report.matches_total > 0, "pane 1 scan should find matches");
             for sample in &report.samples {
                 assert_eq!(sample.pane_id, 1);
             }
@@ -1517,12 +1529,9 @@ mod tests {
         run_async_test(async {
             let (storage, db_path) = setup_storage("e2e_fixtures").await;
 
-            // Insert each secret as a distinct segment
+            // Insert each secret as a distinct historical/raw segment.
             for (label, secret) in E2E_SECRETS {
-                storage
-                    .append_segment(1, &format!("{label}_key={secret}"), None)
-                    .await
-                    .expect("insert fixture");
+                insert_raw_secret_scan_fixture(&db_path, 1, &format!("{label}_key={secret}"));
             }
 
             let engine = SecretScanEngine::new();
@@ -1575,14 +1584,11 @@ mod tests {
 
             // Phase 1: insert 3 segments with secrets
             for i in 0..3u64 {
-                storage
-                    .append_segment(
-                        1,
-                        &format!("phase1-{i}: sk-key{i}234567890abcdef1234567890abcdef12345678"),
-                        None,
-                    )
-                    .await
-                    .expect("insert phase1");
+                insert_raw_secret_scan_fixture(
+                    &db_path,
+                    1,
+                    &format!("phase1-{i}: sk-key{i}234567890abcdef1234567890abcdef12345678"),
+                );
             }
 
             let engine = SecretScanEngine::new();
@@ -1600,14 +1606,11 @@ mod tests {
                 .append_segment(1, "phase2: clean output", None)
                 .await
                 .expect("insert phase2 clean");
-            storage
-                .append_segment(
-                    1,
-                    "phase2: ghp_NEWTOKEN123456789012345678901234567890",
-                    None,
-                )
-                .await
-                .expect("insert phase2 secret");
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "phase2: ghp_NEWTOKEN123456789012345678901234567890",
+            );
 
             let r2 = engine
                 .scan_storage_incremental(&storage, opts.clone())
@@ -1645,19 +1648,17 @@ mod tests {
         run_async_test(async {
             let (storage, db_path) = setup_storage("e2e_json").await;
 
-            // Insert fixtures
-            storage
-                .append_segment(
-                    1,
-                    "export KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
-                    None,
-                )
-                .await
-                .expect("insert");
-            storage
-                .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-                .await
-                .expect("insert");
+            // Insert historical/raw fixtures.
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "export KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
+            );
+            insert_raw_secret_scan_fixture(
+                &db_path,
+                1,
+                "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            );
 
             let engine = SecretScanEngine::new();
 
@@ -1706,10 +1707,7 @@ mod tests {
                 "STRIPE=sk_live_abcdefghijklmnopqrstuvwxyz0123 ",
                 "DB=postgres://root:hunter2@db:5432/prod",
             );
-            storage
-                .append_segment(1, content, None)
-                .await
-                .expect("insert");
+            insert_raw_secret_scan_fixture(&db_path, 1, content);
 
             let engine = SecretScanEngine::new();
             let report = engine
@@ -1751,10 +1749,11 @@ mod tests {
 
             // Insert many segments, each with a secret
             for i in 0..20u64 {
-                storage
-                    .append_segment(1, &format!("password=super_secret_pass_{i:03}xx"), None)
-                    .await
-                    .expect("insert");
+                insert_raw_secret_scan_fixture(
+                    &db_path,
+                    1,
+                    &format!("password=super_secret_pass_{i:03}xx"),
+                );
             }
 
             let engine = SecretScanEngine::new();
