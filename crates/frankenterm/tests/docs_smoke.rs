@@ -601,6 +601,243 @@ fn context_horizon_contract_docs_truth_gate() {
 }
 
 #[test]
+fn blocker_radar_contract_docs_truth_gate() {
+    let contract = read_repo_doc("docs/blocker-radar-contract.md");
+    let provenance = read_repo_doc("docs/json-schema/PROVENANCE.md");
+    let schema = read_repo_doc("docs/json-schema/ft-blocker-radar.json");
+
+    assert_contains_all(
+        "blocker radar contract",
+        &contract,
+        &[
+            "`scripts/swarm-tick.sh --agent-mail-fallback frankenterm`",
+            "`br ready`",
+            "`br show`",
+            "`br dep cycles --json`",
+            "`bv --robot-triage`",
+            "`git status --short --branch`",
+            "`rch status`",
+            "`rch diagnose`",
+            "`gh run view`",
+            "`ft.blocker_radar.v1`",
+            "`schema_version`",
+            "`contract_id`",
+            "`overall_state`",
+            "`sources`",
+            "`blockers`",
+            "`active_agents`",
+            "`dirty_overlap`",
+            "`external_queues`",
+            "`next_actions`",
+            "`forbidden_actions`",
+            "`citations`",
+            "`unavailable_sources`",
+            "`redaction_policy`",
+            "`artifact_paths`",
+            "`raw_pane_content_stored` must be `false`",
+            "`actionable`",
+            "`waiting_external`",
+            "`waiting_owner`",
+            "`stale_possible`",
+            "`dirty_overlap`",
+            "`rch_substrate_blocked`",
+            "`ci_queued`",
+            "`ci_zero_jobs`",
+            "`artifact_missing`",
+            "`mail_unavailable`",
+            "`degraded`",
+            "`unknown`",
+            "`recheck_status`",
+            "`inspect_artifact`",
+            "`add_beads_comment`",
+            "`wait_for_owner`",
+            "`choose_ready_bead`",
+            "`run_bv_robot_triage`",
+            "`run_swarm_tick`",
+            "`file_followup_bead`",
+            "`none`",
+            "`mutation_allowed`",
+            "`source_regression`",
+            "`privacy_violation`",
+            "`environment_blocked`",
+            "`unavailable_evidence`",
+            "`external_queue_blocked`",
+            "`dirty_tree_blocked`",
+            "`owner_handoff_required`",
+            "`target_hardware_skipped`",
+        ],
+    );
+    assert_contains_all(
+        "blocker radar privacy and safety invariants",
+        &contract,
+        &[
+            "no raw pane transcript",
+            "no prompt body",
+            "no session cookies, API keys, or bearer tokens",
+            "no unbounded command output",
+            "no hidden mutation through a recommended command",
+            "`am service restart`",
+            "`am doctor fix`",
+            "`kill am`",
+            "`rch daemon restart`",
+            "`git reset --hard`",
+            "`git clean -fd`",
+        ],
+    );
+    assert_excludes_all(
+        "blocker radar contract",
+        &contract,
+        &[
+            "raw pane transcript is allowed",
+            "raw prompt is allowed",
+            "recommended restart",
+        ],
+    );
+
+    assert_contains_all(
+        "schema provenance",
+        &provenance,
+        &[
+            "`ft-blocker-radar.json`",
+            "`docs/blocker-radar-contract.md`",
+            "blocker_radar_contract_docs_truth_gate",
+        ],
+    );
+
+    let parsed_schema: serde_json::Value =
+        serde_json::from_str(&schema).expect("blocker radar schema should parse as JSON");
+    assert_eq!(
+        parsed_schema
+            .pointer("/properties/contract_id/const")
+            .and_then(serde_json::Value::as_str),
+        Some("ft.blocker_radar.v1")
+    );
+    assert_eq!(
+        parsed_schema
+            .pointer("/properties/raw_pane_content_stored/const")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+
+    let required = parsed_schema
+        .pointer("/required")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema should expose root required fields");
+    for field in [
+        "schema_version",
+        "contract_id",
+        "generated_at_ms",
+        "source",
+        "overall_state",
+        "sources",
+        "blockers",
+        "active_agents",
+        "dirty_overlap",
+        "external_queues",
+        "next_actions",
+        "forbidden_actions",
+        "citations",
+        "unavailable_sources",
+        "redaction_policy",
+        "raw_pane_content_stored",
+        "artifact_paths",
+    ] {
+        assert!(
+            required.iter().any(|value| value.as_str() == Some(field)),
+            "blocker radar schema should require {field}"
+        );
+    }
+
+    let evidence_states = parsed_schema
+        .pointer("/$defs/evidence_state/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema should expose evidence state enum");
+    for state in [
+        "actionable",
+        "waiting_external",
+        "waiting_owner",
+        "stale_possible",
+        "dirty_overlap",
+        "rch_substrate_blocked",
+        "ci_queued",
+        "ci_zero_jobs",
+        "artifact_missing",
+        "mail_unavailable",
+        "degraded",
+        "unknown",
+    ] {
+        assert!(
+            evidence_states
+                .iter()
+                .any(|value| value.as_str() == Some(state)),
+            "blocker radar schema should include evidence state {state}"
+        );
+    }
+
+    let source_kinds = parsed_schema
+        .pointer("/$defs/source_kind/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema should expose source kind enum");
+    for source_kind in [
+        "rch",
+        "github_actions",
+        "agent_mail",
+        "beads",
+        "git",
+        "manual",
+        "fixture",
+    ] {
+        assert!(
+            source_kinds
+                .iter()
+                .any(|value| value.as_str() == Some(source_kind)),
+            "blocker radar schema should include source kind {source_kind}"
+        );
+    }
+
+    let actions = parsed_schema
+        .pointer("/$defs/action_kind/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema should expose action kind enum");
+    for action in [
+        "recheck_status",
+        "inspect_artifact",
+        "add_beads_comment",
+        "wait_for_owner",
+        "choose_ready_bead",
+        "run_bv_robot_triage",
+        "run_swarm_tick",
+        "file_followup_bead",
+        "none",
+    ] {
+        assert!(
+            actions.iter().any(|value| value.as_str() == Some(action)),
+            "blocker radar schema should include action {action}"
+        );
+    }
+
+    for forbidden_pointer in [
+        "/properties/raw_pane_content_stored/const",
+        "/$defs/redaction_policy/properties/raw_pane_content_allowed/const",
+        "/$defs/redaction_policy/properties/raw_prompt_allowed/const",
+        "/$defs/next_action/properties/mutation_allowed/const",
+    ] {
+        assert_eq!(
+            parsed_schema
+                .pointer(forbidden_pointer)
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "{forbidden_pointer} should be fail-closed false"
+        );
+    }
+
+    let bounded_citations = parsed_schema
+        .pointer("/$defs/redaction_policy/properties/bounded_citations_only/const")
+        .and_then(serde_json::Value::as_bool);
+    assert_eq!(bounded_citations, Some(true));
+}
+
+#[test]
 fn smoke_ft_robot_default() {
     // `ft robot` with no subcommand defaults to quick-start
     let output = wa_cmd()

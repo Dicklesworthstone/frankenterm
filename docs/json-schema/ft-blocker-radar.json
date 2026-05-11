@@ -1,0 +1,576 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-blocker-radar.json",
+  "title": "FrankenTerm Blocker Radar",
+  "description": "Versioned operator-facing contract for read-only substrate blocker classification across RCH, CI, Agent Mail, Beads, and dirty-tree state.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source",
+    "overall_state",
+    "sources",
+    "blockers",
+    "active_agents",
+    "dirty_overlap",
+    "external_queues",
+    "next_actions",
+    "forbidden_actions",
+    "citations",
+    "unavailable_sources",
+    "redaction_policy",
+    "raw_pane_content_stored",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.blocker_radar.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "overall_state": {
+      "$ref": "#/$defs/evidence_state"
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source_snapshot"
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/blocker"
+      }
+    },
+    "active_agents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/active_agent"
+      }
+    },
+    "dirty_overlap": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/dirty_overlap"
+      }
+    },
+    "external_queues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/external_queue"
+      }
+    },
+    "next_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/next_action"
+      }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "citations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/citation"
+      }
+    },
+    "unavailable_sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/unavailable_source"
+      }
+    },
+    "redaction_policy": {
+      "$ref": "#/$defs/redaction_policy"
+    },
+    "raw_pane_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "artifact_paths": {
+      "$ref": "#/$defs/string_array"
+    }
+  },
+  "$defs": {
+    "evidence_state": {
+      "type": "string",
+      "enum": [
+        "actionable",
+        "waiting_external",
+        "waiting_owner",
+        "stale_possible",
+        "dirty_overlap",
+        "rch_substrate_blocked",
+        "ci_queued",
+        "ci_zero_jobs",
+        "artifact_missing",
+        "mail_unavailable",
+        "degraded",
+        "unknown"
+      ]
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "rch",
+        "github_actions",
+        "agent_mail",
+        "beads",
+        "git",
+        "manual",
+        "fixture"
+      ]
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "blocked",
+        "critical"
+      ]
+    },
+    "substrate": {
+      "type": "string",
+      "enum": [
+        "rch",
+        "github_actions",
+        "agent_mail",
+        "beads",
+        "git",
+        "package_artifact",
+        "unknown"
+      ]
+    },
+    "action_kind": {
+      "type": "string",
+      "enum": [
+        "recheck_status",
+        "inspect_artifact",
+        "add_beads_comment",
+        "wait_for_owner",
+        "choose_ready_bead",
+        "run_bv_robot_triage",
+        "run_swarm_tick",
+        "file_followup_bead",
+        "none"
+      ]
+    },
+    "failure_class": {
+      "type": "string",
+      "enum": [
+        "source_regression",
+        "privacy_violation",
+        "environment_blocked",
+        "unavailable_evidence",
+        "external_queue_blocked",
+        "dirty_tree_blocked",
+        "owner_handoff_required",
+        "target_hardware_skipped"
+      ]
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "source_kind",
+        "evidence_state",
+        "collected_at_ms",
+        "freshness_ms",
+        "command_or_api",
+        "live",
+        "redacted",
+        "reason_codes",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_kind": {
+          "$ref": "#/$defs/source_kind"
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "collected_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "freshness_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "command_or_api": {
+          "type": "string",
+          "minLength": 1
+        },
+        "live": {
+          "type": "boolean"
+        },
+        "redacted": {
+          "type": "boolean",
+          "const": true
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "required": [
+        "blocker_id",
+        "evidence_state",
+        "severity",
+        "summary",
+        "source_ids",
+        "citation_ids",
+        "dependency_ids",
+        "next_action_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "blocker_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "severity": {
+          "$ref": "#/$defs/severity"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_ids": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "citation_ids": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "dependency_ids": {
+          "$ref": "#/$defs/string_array"
+        },
+        "next_action_ids": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "active_agent": {
+      "type": "object",
+      "required": [
+        "agent_name",
+        "active_beads",
+        "evidence_state",
+        "updated_at_ms",
+        "stale_over_threshold"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "agent_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "active_beads": {
+          "$ref": "#/$defs/string_array"
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "updated_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stale_over_threshold": {
+          "type": "boolean"
+        }
+      }
+    },
+    "dirty_overlap": {
+      "type": "object",
+      "required": [
+        "path",
+        "status",
+        "risk_level",
+        "expected_owner",
+        "related_bead_ids",
+        "recommendation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "risk_level": {
+          "$ref": "#/$defs/severity"
+        },
+        "expected_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "related_bead_ids": {
+          "$ref": "#/$defs/string_array"
+        },
+        "recommendation": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "external_queue": {
+      "type": "object",
+      "required": [
+        "queue_id",
+        "substrate",
+        "evidence_state",
+        "run_id",
+        "url",
+        "worker_id",
+        "artifact_name",
+        "source_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "queue_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "substrate": {
+          "$ref": "#/$defs/substrate"
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worker_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "artifact_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_ids": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "next_action": {
+      "type": "object",
+      "required": [
+        "action_id",
+        "action_kind",
+        "mutation_allowed",
+        "operator_summary",
+        "suggested_command",
+        "reason_codes",
+        "citation_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "action_kind": {
+          "$ref": "#/$defs/action_kind"
+        },
+        "mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "operator_summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "suggested_command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "citation_ids": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "forbidden_action": {
+      "type": "object",
+      "required": [
+        "command_pattern",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "command_pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "citation": {
+      "type": "object",
+      "required": [
+        "citation_id",
+        "source_id",
+        "summary",
+        "redacted"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "redacted": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "unavailable_source": {
+      "type": "object",
+      "required": [
+        "source_kind",
+        "evidence_state",
+        "reason_codes",
+        "failure_class"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_kind": {
+          "$ref": "#/$defs/source_kind"
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "failure_class": {
+          "$ref": "#/$defs/failure_class"
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "required": [
+        "raw_pane_content_allowed",
+        "raw_prompt_allowed",
+        "bounded_citations_only",
+        "secret_redaction_required",
+        "command_output_max_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "raw_prompt_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "bounded_citations_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "secret_redaction_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "command_output_max_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "string_array": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "non_empty_string_array": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
