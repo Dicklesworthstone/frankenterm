@@ -87,7 +87,7 @@ impl TryFrom<String> for RgbaColor {
     fn try_from(s: String) -> anyhow::Result<RgbaColor> {
         Ok(RgbaColor {
             color: SrgbaTuple::from_str(&s)
-                .map_err(|_| anyhow::anyhow!("failed to parse {} as RgbaColor", &s))?,
+                .map_err(|_| anyhow::anyhow!("failed to parse {} as RgbaColor", s))?,
         })
     }
 }

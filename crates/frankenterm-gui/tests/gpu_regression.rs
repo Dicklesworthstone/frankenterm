@@ -656,6 +656,7 @@ fn render_headless_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn s
     };
     let mut input = HeadlessFixtureInput {
         viewport: viewport_from_meta(&fixture.meta.viewport),
+        monitors: Vec::new(),
         lines,
         cursor,
         selection: fixture

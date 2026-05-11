@@ -153,9 +153,9 @@ Linux CI cost bounded:
 - `selection-word`
 - `overlay-visual-mode`
 
-The job installs Mesa's Vulkan software stack plus the X11/X11-XCB pkg-config
-development stubs needed by the GUI dependency graph on `ubuntu-24.04`, forces
-the headless renderer through `WGPU_BACKEND=vulkan`,
+The job installs Mesa's Vulkan software stack plus the X11/X11-XCB and Cairo
+pkg-config development stubs needed by the GUI dependency graph on
+`ubuntu-24.04`, forces the headless renderer through `WGPU_BACKEND=vulkan`,
 `LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`, and
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`, then asserts adapter
 metadata contains `llvmpipe`.

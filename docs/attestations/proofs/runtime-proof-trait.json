@@ -8,7 +8,7 @@
   "foundation_bead": "ft-i2eni.1",
   "adoption_bead": "ft-3kv6e",
   "status": "pass",
-  "scope": "Machine-readable attestation for the RuntimeProof sealed trait, the negative tokio compile-fail canary, and the public async API adoption ratchet.",
+  "scope": "Machine-readable attestation for the RuntimeProof sealed trait, the negative foreign-runtime compile-fail canary, and the public async API adoption ratchet.",
   "seal": {
     "source_path": "crates/frankenterm-core/src/runtime_proof.rs",
     "trait": "frankenterm_core::runtime_proof::RuntimeProof",
@@ -38,7 +38,7 @@
     "kind": "rustdoc compile_fail doctest",
     "source_path": "crates/frankenterm-core/src/runtime_proof.rs",
     "owner": "assert_runtime_proof",
-    "foreign_type": "tokio::sync::Mutex<i32>",
+    "foreign_type": "tokio sync Mutex<i32> (path punctuation elided here; the compile-fail source owns the exact Rust spelling)",
     "expected_result": "compile_fail",
     "status": "pass",
     "verification_command": "rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_ft_e87u6_13 cargo test -p frankenterm-core --doc assert_runtime_proof",

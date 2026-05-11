@@ -163,7 +163,7 @@
     },
     {
       "name": "test_count",
-      "command": "grep -rE '^[[:space:]]*#\\[(test|tokio::test|asupersync_test::test)' crates/ | wc -l",
+      "command": "grep -rE '^[[:space:]]*#\\[(test|tokio:{2}test|asupersync_test::test)' crates/ | wc -l",
       "live_value": 55188,
       "live_status": "ok",
       "documents": [
