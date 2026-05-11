@@ -157,8 +157,11 @@ The job installs Mesa's Vulkan software stack plus the X11/X11-XCB, XCB-util,
 and Cairo pkg-config development stubs needed by the GUI dependency graph on
 `ubuntu-24.04`, forces the headless renderer through `WGPU_BACKEND=vulkan`,
 `LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`, and
-`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`, then asserts adapter
-metadata contains `llvmpipe`.
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`, and forces rustix's
+stable libc backend for the transitive `k9`/`terminal_size` dev-dependency path
+while current nightly rejects rustix 0.37's auto-detected internal
+`rustc_attrs` linux_raw path. It then asserts adapter metadata contains
+`llvmpipe`.
 
 It writes Linux captures and `generated_at_runner=ubuntu-24.04-llvmpipe`
 metadata to `target/gpu-regression/linux-llvmpipe-goldens/` instead of

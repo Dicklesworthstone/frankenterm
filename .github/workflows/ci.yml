@@ -410,6 +410,11 @@ jobs:
       GALLIUM_DRIVER: llvmpipe
       VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
       MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE: "1"
+      # k9 0.12.0 -> terminal_size 0.2.6 -> rustix 0.37.28 still auto-detects
+      # internal rustc_attrs on nightly for the linux_raw backend. Current
+      # nightly rejects those compiler-reserved attributes, so keep this
+      # Linux-only GPU pilot on rustix's stable libc backend.
+      RUSTFLAGS: --cfg=rustix_use_libc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
