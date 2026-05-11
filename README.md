@@ -42,7 +42,7 @@
 
 **A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** Tens of workspace crates, hundreds of core-library modules, 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
 
-_Hand-edited workspace counts drift fast (ft-d3awp / ft-hdvvo / ft-1b0rn); the canonical figures are whatever these commands return at HEAD: `ls -d crates/frankenterm-core-* | wc -l` for sub-crate count (currently 17 ft-y0loj.\* extractions), `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` for vendored Cargo workspace member count (currently 47), `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l` for top-level vendored crate directory count (currently 42), and `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l` for core top-level module count (currently 496). The new sub-crates are listed in the Workspace tree below._
+_Hand-edited workspace counts drift fast (ft-d3awp / ft-hdvvo / ft-1b0rn); the canonical figures are whatever these commands return at HEAD: `ls -d crates/frankenterm-core-* | wc -l` for sub-crate count (currently 19 ft-y0loj.\* extractions), `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` for vendored Cargo workspace member count (currently 47), `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l` for top-level vendored crate directory count (currently 42), and `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l` for core top-level module count (currently 506). The new sub-crates are listed in the Workspace tree below._
 
 <div align="center">
 <h3>Quick Install</h3>
