@@ -67,7 +67,8 @@ main() {
     echo ""
 
     # Use a temp directory for testing
-    export E2E_ARTIFACTS_BASE="$(mktemp -d /tmp/e2e-artifacts-test-XXXXXX)"
+    E2E_ARTIFACTS_BASE="$(mktemp -d /tmp/e2e-artifacts-test-XXXXXX)"
+    export E2E_ARTIFACTS_BASE
     export E2E_MAX_FILE_SIZE=5000  # 5KB for testing truncation
 
     info "Using artifacts base: $E2E_ARTIFACTS_BASE"
@@ -233,6 +234,12 @@ main() {
     else
         fail "Summary not created"
     fi
+
+    if "$PROJECT_ROOT/scripts/validate_artifacts.sh" "$run_dir"; then
+        pass "validate_artifacts.sh accepts generated bundle"
+    else
+        fail "validate_artifacts.sh rejected generated bundle"
+    fi
     echo ""
 
     # Final summary
@@ -250,8 +257,12 @@ main() {
     echo ""
 
     # Cleanup
-    info "Cleaning up test artifacts..."
-    rm -rf "$E2E_ARTIFACTS_BASE"
+    if [[ "${E2E_ARTIFACTS_CLEANUP:-1}" == "1" ]]; then
+        info "Cleaning up test artifacts..."
+        rm -rf "$E2E_ARTIFACTS_BASE"
+    else
+        info "Preserving test artifacts: $E2E_ARTIFACTS_BASE"
+    fi
 
     echo ""
     echo -e "${GREEN}All tests passed!${NC}"
