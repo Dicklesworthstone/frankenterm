@@ -33,6 +33,10 @@ use frankenterm_core::proof_doctor::{
 use frankenterm_core::proof_handoff::build_proof_handoff;
 use frankenterm_core::proof_lane::{ProofBackend, ProofScope};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
+use frankenterm_core::swarm_scheduler::{
+    AdmissionRequest, HerdWaveDetectionConfig, HerdWaveEventKind, HerdWaveSignal,
+    SwarmAdmissionController, SwarmAdmissionTelemetry,
+};
 
 /// Build metadata captured at compile time.
 mod build_meta {
@@ -2883,6 +2887,30 @@ enum RobotCommands {
         level: u8,
     },
 
+    /// Emit read-only herd-wave contract and dry-run planner output
+    #[command(visible_alias = "herd_wave")]
+    HerdWave {
+        /// Pane IDs to model as the current synchronized cohort
+        #[arg(long = "signal-pane", value_delimiter = ',')]
+        signal_panes: Vec<u64>,
+
+        /// Event kind to apply to supplied signal panes
+        #[arg(long, value_enum, default_value_t = RobotHerdWaveEventKind::Wake)]
+        kind: RobotHerdWaveEventKind,
+
+        /// Stable generation timestamp for deterministic replay
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
+
+        /// Milliseconds between modeled pane signals
+        #[arg(long, default_value_t = 10)]
+        signal_spacing_ms: u64,
+
+        /// Freshness window for evidence rows
+        #[arg(long, default_value_t = 60_000)]
+        max_age_ms: u64,
+    },
+
     /// Emit Agent Mail fallback Beads/git coordination-risk snapshot
     #[command(visible_aliases = ["agent-mail-fallback", "red-mail"])]
     CoordinationRisk {
@@ -2974,6 +3002,31 @@ enum RobotCommands {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RobotHerdWaveEventKind {
+    Compaction,
+    Retry,
+    RateLimitRecovery,
+    SearchBurst,
+    WorkflowFanout,
+    Wake,
+    Other,
+}
+
+impl From<RobotHerdWaveEventKind> for HerdWaveEventKind {
+    fn from(kind: RobotHerdWaveEventKind) -> Self {
+        match kind {
+            RobotHerdWaveEventKind::Compaction => Self::Compaction,
+            RobotHerdWaveEventKind::Retry => Self::Retry,
+            RobotHerdWaveEventKind::RateLimitRecovery => Self::RateLimitRecovery,
+            RobotHerdWaveEventKind::SearchBurst => Self::SearchBurst,
+            RobotHerdWaveEventKind::WorkflowFanout => Self::WorkflowFanout,
+            RobotHerdWaveEventKind::Wake => Self::Wake,
+            RobotHerdWaveEventKind::Other => Self::Other,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -16983,6 +17036,158 @@ fn unavailable_swarm_capacity_summary(
     )
 }
 
+fn build_herd_wave_surface_report(
+    source: &str,
+    generated_at_ms: u64,
+    signal_panes: &[u64],
+    kind: HerdWaveEventKind,
+    signal_spacing_ms: u64,
+    max_age_ms: u64,
+) -> serde_json::Value {
+    let config = HerdWaveDetectionConfig::default();
+    let signal_tail_len = u64::try_from(signal_panes.len().saturating_sub(1)).unwrap_or(u64::MAX);
+    let first_signal_ms =
+        generated_at_ms.saturating_sub(signal_spacing_ms.saturating_mul(signal_tail_len));
+    let signals = signal_panes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, pane_id)| {
+            let index = u64::try_from(index).unwrap_or(u64::MAX);
+            HerdWaveSignal::pane(
+                pane_id,
+                kind,
+                first_signal_ms.saturating_add(signal_spacing_ms.saturating_mul(index)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let wave_summary = if signals.is_empty() {
+        None
+    } else {
+        Some(frankenterm_core::swarm_scheduler::detect_herd_wave_pressure(&signals, &config))
+    };
+    let telemetry = SwarmAdmissionTelemetry {
+        queue_pressure: None,
+        fleet_pressure: None,
+        memory_tier_budget: None,
+        latency_stage_pressures: None,
+        herd_wave_pressure: wave_summary.clone(),
+    };
+    let estimated_effort = u32::try_from(signal_panes.len().max(1)).unwrap_or(u32::MAX);
+    let admission_request = AdmissionRequest::standard(5, estimated_effort);
+    let admission_decision =
+        SwarmAdmissionController::default().evaluate(&admission_request, &telemetry);
+    let snapshot = frankenterm_core::swarm_scheduler::HerdWaveContractSnapshot::from_telemetry(
+        generated_at_ms,
+        source,
+        &telemetry,
+        Some(&admission_decision),
+        (!signals.is_empty()).then_some(generated_at_ms),
+        max_age_ms,
+    );
+    let dry_run_plan = frankenterm_core::swarm_scheduler::plan_herd_wave_dry_run_actions(
+        generated_at_ms,
+        &signals,
+        &config,
+        Some(&admission_decision),
+        None,
+    );
+
+    let mut report = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut report {
+        map.insert(
+            "dry_run_plan".to_string(),
+            serde_json::to_value(dry_run_plan).unwrap_or(serde_json::Value::Null),
+        );
+        map.insert(
+            "signal_input".to_string(),
+            serde_json::json!({
+                "signal_count": signals.len(),
+                "signal_panes": signal_panes,
+                "kind": kind,
+                "signal_spacing_ms": signal_spacing_ms,
+                "manual_signals_only": true,
+            }),
+        );
+        map.insert(
+            "mcp_resource".to_string(),
+            serde_json::json!({
+                "implemented": false,
+                "deferred_follow_up": "ft-5bwjf.8",
+                "reason": "mcp_resources.rs has active context-horizon edits; herd-wave MCP parity is isolated to a follow-up bead.",
+                "read_only_required": true,
+            }),
+        );
+    }
+    report
+}
+
+fn herd_wave_report_text<'a>(report: &'a serde_json::Value, key: &str) -> &'a str {
+    report
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn print_herd_wave_doctor_section(report: &serde_json::Value) {
+    println!();
+    println!("Herd Wave:");
+    println!(
+        "  State: {}",
+        herd_wave_report_text(report, "overall_state")
+    );
+    println!(
+        "  Pressure: {} (distinct_panes={}, events={})",
+        herd_wave_report_text(report, "pressure_tier"),
+        report
+            .get("distinct_panes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        report
+            .get("event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    );
+    println!(
+        "  Dominant kind: {}",
+        herd_wave_report_text(report, "dominant_kind")
+    );
+    println!(
+        "  Stagger: recommended={}ms max={}ms",
+        report
+            .get("recommended_stagger_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        report
+            .get("cohort_max_stagger_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    );
+    println!(
+        "  Admission: {}",
+        herd_wave_report_text(report, "admission_action")
+    );
+    if let Some(next_actions) = report
+        .pointer("/dry_run_plan/operator_next_actions")
+        .and_then(serde_json::Value::as_array)
+    {
+        let actions = next_actions
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        if !actions.is_empty() {
+            println!("  Next: {}", actions.join(", "));
+        }
+    }
+    let unavailable_count = report
+        .get("unavailable_sources")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    println!("  Unavailable sources: {unavailable_count}");
+    println!("  Raw pane content stored: false");
+    println!("  MCP: deferred to ft-5bwjf.8");
+}
+
 fn print_swarm_capacity_doctor_section(
     summary: &frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary,
 ) {
@@ -29483,6 +29688,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let response = RobotResponse::success(summary, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
+                        RobotCommands::HerdWave {
+                            signal_panes,
+                            kind,
+                            generated_at_ms,
+                            signal_spacing_ms,
+                            max_age_ms,
+                        } => {
+                            let report = build_herd_wave_surface_report(
+                                "robot.herd_wave",
+                                generated_at_ms.unwrap_or_else(now_ms),
+                                &signal_panes,
+                                kind.into(),
+                                signal_spacing_ms,
+                                max_age_ms,
+                            );
+                            let response = RobotResponse::success(report, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
                         RobotCommands::Resource { command } => match command {
                             RobotResourceCommands::WhatIf {
                                 trace,
@@ -36356,6 +36579,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| {
                     frankenterm_core::hardware_profile::collect_hardware_profile(&layout.root)
                 });
+            let herd_wave_report = build_herd_wave_surface_report(
+                "doctor.herd_wave",
+                now_ms(),
+                &[],
+                HerdWaveEventKind::Wake,
+                10,
+                60_000,
+            );
 
             // Determine overall status
             let has_errors = all_checks
@@ -36433,6 +36664,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
                 result["swarm_capacity"] = serde_json::to_value(&swarm_capacity_summary)
                     .unwrap_or(serde_json::Value::Null);
+                result["herd_wave"] = herd_wave_report.clone();
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
                         serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
@@ -36487,6 +36719,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
 
                 print_swarm_capacity_doctor_section(&swarm_capacity_summary);
+                print_herd_wave_doctor_section(&herd_wave_report);
 
                 println!();
                 println!("Hardware Profile:");
@@ -66330,6 +66563,88 @@ log_level = "debug"
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn cli_robot_herd_wave_parses_alias_and_signal_panes() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "herd_wave",
+            "--signal-pane",
+            "7,8,9",
+            "--kind",
+            "rate-limit-recovery",
+            "--generated-at-ms",
+            "1770000000000",
+        ])
+        .expect("robot herd-wave alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::HerdWave {
+                    signal_panes,
+                    kind,
+                    generated_at_ms,
+                    ..
+                }) => {
+                    assert_eq!(signal_panes, vec![7, 8, 9]);
+                    assert!(matches!(kind, RobotHerdWaveEventKind::RateLimitRecovery));
+                    assert_eq!(generated_at_ms, Some(1_770_000_000_000));
+                }
+                _ => panic!("expected RobotCommands::HerdWave"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn robot_herd_wave_json_and_toon_preserve_contract_and_dry_run_plan() {
+        let report = build_herd_wave_surface_report(
+            "robot.herd_wave",
+            1_770_000_000_000,
+            &[1, 2, 3],
+            HerdWaveEventKind::Retry,
+            10,
+            60_000,
+        );
+
+        assert_eq!(report["contract_id"].as_str(), Some("ft.herd_wave.v1"));
+        assert_eq!(report["source"].as_str(), Some("robot.herd_wave"));
+        assert_eq!(report["raw_pane_content_stored"].as_bool(), Some(false));
+        assert_eq!(report["distinct_panes"].as_u64(), Some(3));
+        assert_eq!(report["dominant_kind"].as_str(), Some("retry"));
+        assert_eq!(
+            report["dry_run_plan"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            report["dry_run_plan"]["reason_codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str() == Some("herd_wave.dry_run.no_live_mutation"))
+        );
+        assert_eq!(report["mcp_resource"]["implemented"].as_bool(), Some(false));
+
+        let response = RobotResponse::success(report, 17);
+        let json_value = serde_json::to_value(&response).expect("robot response serializes");
+        let roundtripped = toon_roundtrip_json(&json_value);
+        assert_eq!(
+            roundtripped["data"]["contract_id"].as_str(),
+            Some("ft.herd_wave.v1")
+        );
+        assert_eq!(
+            roundtripped["data"]["dry_run_plan"]["calendar"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            roundtripped["data"]["dry_run_plan"]["calendar"][0]["reason_codes"][0].is_string(),
+            true
+        );
     }
 
     #[test]
