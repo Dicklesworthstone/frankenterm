@@ -7,8 +7,8 @@
 use frankenterm_gui::gpu_regression::{CompareResult, Thresholds, compare_images};
 #[cfg(feature = "headless-render")]
 use frankenterm_gui::headless_render::{
-    HeadlessCursor, HeadlessFixtureInput, HeadlessRenderError, HeadlessSelection, HeadlessViewport,
-    render_headless, smoketest_input,
+    HeadlessCursor, HeadlessFixtureInput, HeadlessMonitor, HeadlessRenderError, HeadlessSelection,
+    HeadlessViewport, render_headless, smoketest_input,
 };
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder, ImageReader, Rgba, RgbaImage};
@@ -61,6 +61,8 @@ struct InputSpec {
     #[serde(default)]
     resize_sequence: Vec<ResizeFrameSpec>,
     #[serde(default)]
+    monitors: Vec<HeadlessMonitorSpec>,
+    #[serde(default)]
     cursor: Option<HeadlessCursorSpec>,
     #[serde(default)]
     selection: Option<HeadlessSelectionSpec>,
@@ -109,6 +111,16 @@ struct HeadlessSelectionSpec {
     start_col: u32,
     end_row: u32,
     end_col: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "headless-render"), allow(dead_code))]
+struct HeadlessMonitorSpec {
+    id: String,
+    x: u32,
+    width: u32,
+    dpi: f64,
+    color_profile: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -656,6 +668,18 @@ fn render_headless_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn s
     };
     let mut input = HeadlessFixtureInput {
         viewport: viewport_from_meta(&fixture.meta.viewport),
+        monitors: fixture
+            .input
+            .monitors
+            .iter()
+            .map(|monitor| HeadlessMonitor {
+                id: monitor.id.clone(),
+                x: monitor.x,
+                width: monitor.width,
+                dpi: monitor.dpi,
+                color_profile: monitor.color_profile.clone(),
+            })
+            .collect(),
         lines,
         cursor,
         selection: fixture
