@@ -1,14 +1,15 @@
 # Blocker Radar Contract
 
-Status: v1 planning contract; implementation and RCH proof pending under
-`ft-9ntud`.
+Status: v1 contract. The DTO normalization and first read-only robot/doctor
+surfaces are implemented under `ft-9ntud.2` / `ft-9ntud.3`; deterministic
+golden/e2e proof remains tracked by later `ft-9ntud` beads.
 
 This document defines the first operator-facing contract for a read-only
 blocker radar: a deterministic summary of whether a FrankenTerm swarm lane is
 actionable, waiting on another owner, or blocked by an external substrate such
 as RCH, GitHub Actions, Agent Mail, Beads state, or dirty-tree overlap.
 
-The JSON schema sketch lives at `docs/json-schema/ft-blocker-radar.json`.
+The JSON schema lives at `docs/json-schema/ft-blocker-radar.json`.
 
 ## Existing Anchors
 
@@ -34,11 +35,11 @@ Required implementation surfaces:
 
 | Command or API | Required posture |
 | --- | --- |
-| `ft robot blocker-radar` | Emits the full v1 JSON envelope. |
+| `ft robot blocker-radar` | Emits the full v1 JSON envelope from read-only coordination fallback evidence. |
 | `ft robot --format toon blocker-radar` | Preserves blocker rows, source states, citations, and next-action ids. |
-| `ft doctor --json` | May embed a blocker-radar summary when substrate evidence is available. |
+| `ft doctor --json` | Embeds the blocker-radar summary under `blocker_radar` when diagnostics run. |
 | Doctor/plain output | Shows compact operator rows without implying that any repair or proof command executed. |
-| MCP/Robot read resource | Optional for v1; if implemented, it must return the same contract and remain read-only. |
+| MCP read resource | Deferred for v1 until the robot/doctor surface has golden and e2e proof; any future MCP resource must return the same contract and remain read-only. |
 
 ## Versioned Envelope
 
@@ -205,5 +206,6 @@ The contract is not complete until later beads add:
 - mock-free e2e wrapper logs with exact source classifications,
 - RCH-backed proof artifacts with exact commands and isolated target dirs.
 
-Until then, this document is a v1 contract and planning surface, not proof that
-the blocker radar is implemented.
+Until those later proof beads land, this document is a v1 contract and live
+surface description, not proof that every substrate collector has full
+end-to-end coverage.

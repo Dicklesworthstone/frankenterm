@@ -266,6 +266,265 @@ impl BlockerRadarInput {
     }
 }
 
+#[must_use]
+pub fn blocker_radar_input_from_coordination_snapshot(
+    snapshot: &serde_json::Value,
+    generated_at_ms: u64,
+    source: impl Into<String>,
+) -> BlockerRadarInput {
+    let mut input = BlockerRadarInput::new(generated_at_ms, source);
+
+    input = input.with_observation(
+        BlockerRadarCollectorObservation::new(
+            "rch.uncollected",
+            BlockerRadarSourceKind::Rch,
+            BlockerRadarObservationStatus::DegradedUnavailable,
+            "not_collected_by_swarm_tick_fallback",
+            "RCH evidence was not collected by the Agent Mail fallback snapshot",
+        )
+        .live(generated_at_ms, 0)
+        .with_reason_code("rch.evidence_not_collected"),
+    );
+    input = input.with_observation(
+        BlockerRadarCollectorObservation::new(
+            "github_actions.uncollected",
+            BlockerRadarSourceKind::GitHubActions,
+            BlockerRadarObservationStatus::DegradedUnavailable,
+            "not_collected_by_swarm_tick_fallback",
+            "GitHub Actions evidence was not collected by the Agent Mail fallback snapshot",
+        )
+        .live(generated_at_ms, 0)
+        .with_reason_code("ci.evidence_not_collected"),
+    );
+
+    if snapshot
+        .get("agent_mail")
+        .and_then(|agent_mail| agent_mail.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("unavailable")
+    {
+        let marker = snapshot
+            .get("agent_mail")
+            .and_then(|agent_mail| agent_mail.get("marker"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Agent Mail unavailable; using Beads/git fallback");
+        input = input.with_observation(
+            BlockerRadarCollectorObservation::new(
+                "agent_mail.fallback",
+                BlockerRadarSourceKind::AgentMail,
+                BlockerRadarObservationStatus::MailUnavailable,
+                "scripts/swarm-tick.sh --agent-mail-fallback",
+                marker,
+            )
+            .live(generated_at_ms, 0)
+            .with_reason_code("agent_mail.fallback_mode"),
+        );
+    }
+
+    let ready = snapshot
+        .get("beads")
+        .and_then(|beads| beads.get("ready"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if !ready.is_empty() {
+        let mut observation = BlockerRadarCollectorObservation::new(
+            "beads.ready",
+            BlockerRadarSourceKind::Beads,
+            BlockerRadarObservationStatus::PassActionable,
+            "br ready --json",
+            format!("{} ready bead(s) are available", ready.len()),
+        )
+        .live(generated_at_ms, 0)
+        .with_reason_code("beads.ready_available");
+        for bead in ready {
+            if let Some(id) = bead.get("id").and_then(serde_json::Value::as_str) {
+                observation = observation.with_dependency_id(id);
+            }
+        }
+        input = input.with_observation(observation);
+    }
+
+    let stale_candidate_ids = snapshot
+        .get("beads")
+        .and_then(|beads| beads.get("stale_reopen"))
+        .and_then(|stale| stale.get("candidates"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| candidate.get("id").and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    for agent in snapshot
+        .get("beads")
+        .and_then(|beads| beads.get("active_agents"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let owner = agent
+            .get("assignee")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let mut fresh_bead_ids = Vec::new();
+        let mut stale_without_candidate_ids = Vec::new();
+        let bead_rows = agent.get("beads").and_then(serde_json::Value::as_array);
+
+        if let Some(beads) = bead_rows {
+            for bead in beads {
+                if let Some(id) = bead.get("id").and_then(serde_json::Value::as_str) {
+                    let stale_over_threshold = bead
+                        .get("stale_over_2h")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if stale_over_threshold || stale_candidate_ids.contains(id) {
+                        if !stale_candidate_ids.contains(id) {
+                            push_nonempty_unique(&mut stale_without_candidate_ids, id);
+                        }
+                    } else {
+                        push_nonempty_unique(&mut fresh_bead_ids, id);
+                    }
+                }
+            }
+        }
+
+        if !fresh_bead_ids.is_empty() || bead_rows.is_none() {
+            let mut observation = BlockerRadarCollectorObservation::new(
+                format!("beads.owner.{owner}"),
+                BlockerRadarSourceKind::Beads,
+                BlockerRadarObservationStatus::ActiveOwnerFresh,
+                "scripts/swarm-tick.sh --agent-mail-fallback",
+                format!("active owner {owner} has recent in-progress work"),
+            )
+            .live(generated_at_ms, 0)
+            .with_owner(owner, None)
+            .with_reason_code("beads.owner_active");
+
+            for id in fresh_bead_ids {
+                observation = observation.with_dependency_id(id);
+            }
+            input = input.with_observation(observation);
+        }
+
+        if !stale_without_candidate_ids.is_empty() {
+            let mut observation = BlockerRadarCollectorObservation::new(
+                format!("beads.stale_owner.{}", stable_id_fragment(owner)),
+                BlockerRadarSourceKind::Beads,
+                BlockerRadarObservationStatus::StalePossible,
+                "scripts/swarm-tick.sh --agent-mail-fallback",
+                format!(
+                    "owner {owner} has stale in-progress work that requires status check before takeover"
+                ),
+            )
+            .live(generated_at_ms, 0)
+            .with_owner(owner, None)
+            .with_reason_code("beads.status_check_before_reopen");
+
+            for id in stale_without_candidate_ids {
+                observation = observation.with_dependency_id(id);
+            }
+            input = input.with_observation(observation);
+        }
+    }
+
+    for candidate in snapshot
+        .get("beads")
+        .and_then(|beads| beads.get("stale_reopen"))
+        .and_then(|stale| stale.get("candidates"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = candidate
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let owner = candidate
+            .get("assignee")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let age_seconds = candidate
+            .get("age_seconds")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let mut observation = BlockerRadarCollectorObservation::new(
+            format!("beads.stale.{id}"),
+            BlockerRadarSourceKind::Beads,
+            BlockerRadarObservationStatus::StalePossible,
+            "scripts/swarm-tick.sh --agent-mail-fallback",
+            format!(
+                "bead {id} may be stale after {age_seconds}s but requires evidence before takeover"
+            ),
+        )
+        .live(generated_at_ms, 0)
+        .with_owner(owner, None)
+        .with_dependency_id(id)
+        .with_reason_code("beads.status_check_before_reopen");
+
+        if let Some(reason) = candidate
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            observation = observation.with_reason_code(reason_code_fragment(reason));
+        }
+        input = input.with_observation(observation);
+    }
+
+    for dirty_path in snapshot
+        .get("git")
+        .and_then(|git| git.get("dirty_paths"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let path = dirty_path
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let status = dirty_path
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("dirty");
+        let category = dirty_path
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("dirty_tree");
+        let mut observation = BlockerRadarCollectorObservation::new(
+            format!("git.dirty.{}", stable_id_fragment(path)),
+            BlockerRadarSourceKind::Git,
+            BlockerRadarObservationStatus::DirtyOverlap,
+            "git status --short --branch",
+            format!("{status} {path} ({category})"),
+        )
+        .live(generated_at_ms, 0)
+        .with_affected_path(path)
+        .with_reason_code("git.tracked_dirty_overlap");
+        if let Some(raw) = dirty_path.get("raw").and_then(serde_json::Value::as_str) {
+            observation = observation.with_reason_code(reason_code_fragment(raw));
+        }
+        input = input.with_observation(observation);
+    }
+
+    if input.observations.len() == 2 {
+        input = input.with_observation(
+            BlockerRadarCollectorObservation::new(
+                "coordination_fallback.empty",
+                BlockerRadarSourceKind::Manual,
+                BlockerRadarObservationStatus::Unknown,
+                "scripts/swarm-tick.sh --agent-mail-fallback",
+                "coordination fallback snapshot contained no Beads, Mail, or Git evidence",
+            )
+            .live(generated_at_ms, 0)
+            .with_reason_code("coordination_fallback.empty"),
+        );
+    }
+
+    input
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockerRadarCollectorObservation {
     pub source_id: String,
@@ -852,6 +1111,27 @@ fn citation_id(source_id: &str) -> String {
     format!("citation.{source_id}")
 }
 
+fn stable_id_fragment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn reason_code_fragment(value: &str) -> String {
+    format!("evidence.{}", stable_id_fragment(value))
+}
+
 fn forbidden_actions() -> Vec<BlockerRadarForbiddenAction> {
     [
         (
@@ -1206,5 +1486,118 @@ mod tests {
         assert_eq!(json["redaction_policy"]["raw_prompt_allowed"], false);
         assert_eq!(json["citations"][0]["redacted"], true);
         assert_eq!(json["sources"][0]["redacted"], true);
+    }
+
+    #[test]
+    fn blocker_radar_coordination_snapshot_maps_mail_beads_and_dirty_tree() {
+        let snapshot = serde_json::json!({
+            "agent_mail": {
+                "status": "unavailable",
+                "marker": "Agent Mail unavailable: retry once, do not repair/restart service"
+            },
+            "beads": {
+                "ready": [
+                    {"id": "ft-9ntud.3", "title": "wire blocker radar"}
+                ],
+                "active_agents": [
+                    {
+                        "assignee": "BlueLake",
+                        "beads": [
+                            {
+                                "id": "ft-active",
+                                "updated_at": "2026-05-11T00:00:00Z",
+                                "stale_over_2h": false
+                            }
+                        ]
+                    },
+                    {
+                        "assignee": "AmberLake",
+                        "beads": [
+                            {
+                                "id": "ft-stale",
+                                "updated_at": "2026-05-10T21:00:00Z",
+                                "stale_over_2h": true
+                            }
+                        ]
+                    }
+                ],
+                "stale_reopen": {
+                    "candidates": [
+                        {
+                            "id": "ft-stale",
+                            "assignee": "AmberLake",
+                            "age_seconds": 8000,
+                            "reason": "status_check_before_reopen"
+                        }
+                    ]
+                }
+            },
+            "git": {
+                "dirty_paths": [
+                    {
+                        "status": " M",
+                        "path": "crates/frankenterm-core/src/context_horizon.rs",
+                        "category": "tracked_overlap_risk",
+                        "raw": " M crates/frankenterm-core/src/context_horizon.rs"
+                    }
+                ]
+            }
+        });
+
+        let input =
+            blocker_radar_input_from_coordination_snapshot(&snapshot, 1_770_000_000_001, "robot");
+        let report = build_blocker_radar_report(&input);
+
+        assert_eq!(
+            report.overall_state,
+            BlockerRadarEvidenceState::DirtyOverlap
+        );
+        assert!(report.sources.iter().any(|source| {
+            source.source_kind == BlockerRadarSourceKind::AgentMail
+                && source.evidence_state == BlockerRadarEvidenceState::MailUnavailable
+        }));
+        assert!(report.sources.iter().any(|source| {
+            source.source_kind == BlockerRadarSourceKind::Rch
+                && source
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "rch.evidence_not_collected")
+        }));
+        assert!(
+            report
+                .next_actions
+                .iter()
+                .any(|action| action.action_kind == BlockerRadarActionKind::ChooseReadyBead)
+        );
+        assert_eq!(report.active_agents.len(), 2);
+        assert!(
+            report
+                .active_agents
+                .iter()
+                .any(|agent| agent.agent_name == "BlueLake" && !agent.stale_over_threshold)
+        );
+        assert!(
+            report
+                .active_agents
+                .iter()
+                .any(|agent| agent.agent_name == "AmberLake" && agent.stale_over_threshold)
+        );
+        assert!(
+            !report
+                .active_agents
+                .iter()
+                .any(|agent| agent.agent_name == "AmberLake" && !agent.stale_over_threshold)
+        );
+        assert_eq!(
+            report.dirty_overlap[0].path,
+            "crates/frankenterm-core/src/context_horizon.rs"
+        );
+        assert!(
+            report
+                .forbidden_actions
+                .iter()
+                .any(|action| action.command_pattern == "am service restart")
+        );
+        assert!(!report.raw_pane_content_stored);
     }
 }

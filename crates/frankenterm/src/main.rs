@@ -14,6 +14,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
+use frankenterm_core::blocker_radar::{
+    BlockerRadarCollectorObservation, BlockerRadarInput, BlockerRadarObservationStatus,
+    BlockerRadarReport, BlockerRadarSourceKind, blocker_radar_input_from_coordination_snapshot,
+    build_blocker_radar_report,
+};
 use frankenterm_core::cass::CassErrorRemediationExt;
 use frankenterm_core::caut::CautErrorRemediationExt;
 use frankenterm_core::context_horizon::{
@@ -2919,6 +2924,14 @@ enum RobotCommands {
     #[command(visible_aliases = ["agent-mail-fallback", "red-mail"])]
     CoordinationRisk {
         /// Swarm session name passed to the fallback producer
+        #[arg(default_value = "frankenterm")]
+        session: String,
+    },
+
+    /// Emit read-only blocker radar across mail, Beads, git, RCH, and CI evidence
+    #[command(visible_alias = "blocker_radar")]
+    BlockerRadar {
+        /// Swarm session name passed to the Agent Mail fallback producer
         #[arg(default_value = "frankenterm")]
         session: String,
     },
@@ -6158,6 +6171,34 @@ fn load_coordination_risk_snapshot(
     }
 
     parse_coordination_risk_snapshot(&output.stdout)
+}
+
+fn build_blocker_radar_report_from_fallback(
+    workspace_root: &Path,
+    session: &str,
+    generated_at_ms: u64,
+    source: &str,
+) -> BlockerRadarReport {
+    match load_coordination_risk_snapshot(workspace_root, session) {
+        Ok(snapshot) => {
+            let input =
+                blocker_radar_input_from_coordination_snapshot(&snapshot, generated_at_ms, source);
+            build_blocker_radar_report(&input)
+        }
+        Err(err) => build_blocker_radar_report(
+            &BlockerRadarInput::new(generated_at_ms, source).with_observation(
+                BlockerRadarCollectorObservation::new(
+                    "coordination_fallback.unavailable",
+                    BlockerRadarSourceKind::Manual,
+                    BlockerRadarObservationStatus::DegradedUnavailable,
+                    "scripts/swarm-tick.sh --agent-mail-fallback",
+                    format!("Failed to build coordination fallback snapshot: {err}"),
+                )
+                .live(generated_at_ms, 0)
+                .with_reason_code("coordination_fallback.unavailable"),
+            ),
+        ),
+    }
 }
 
 fn estimate_tokens(s: &str) -> usize {
@@ -16658,6 +16699,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Emit Agent Mail fallback Beads/git coordination-risk snapshot",
             },
             RobotCommandInfo {
+                name: "blocker-radar",
+                description: "Emit read-only blocker radar across Mail, Beads, git, RCH, and CI evidence",
+            },
+            RobotCommandInfo {
                 name: "resource what-if",
                 description: "Run a read-only resource-control digital-twin simulation",
             },
@@ -17039,6 +17084,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot coordination-risk",
                     "ft robot --format toon coordination-risk frankenterm",
+                ],
+            },
+            QuickStartCommand {
+                name: "blocker-radar",
+                args: "[session]",
+                summary: "Read the v1 blocker-radar contract from read-only coordination evidence",
+                examples: vec![
+                    "ft robot blocker-radar",
+                    "ft robot --format toon blocker-radar frankenterm",
                 ],
             },
             QuickStartCommand {
@@ -23790,6 +23844,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::BlockerRadar { session } => {
+                    let report = build_blocker_radar_report_from_fallback(
+                        &workspace_root,
+                        &session,
+                        now_ms(),
+                        "robot.blocker_radar",
+                    );
+                    let response = RobotResponse::success(report, elapsed_ms(start));
+                    print_robot_response(&response, format, stats)?;
+                }
                 other => {
                     let ctx = match build_robot_context(&config, &workspace_root) {
                         Ok(ctx) => ctx,
@@ -30108,6 +30172,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             unreachable!("handled above")
                         }
                         RobotCommands::CoordinationRisk { .. } => unreachable!("handled above"),
+                        RobotCommands::BlockerRadar { .. } => unreachable!("handled above"),
                         RobotCommands::ProofDoctor { .. } => unreachable!("handled above"),
                     }
                 }
@@ -36731,6 +36796,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     frankenterm_core::hardware_profile::collect_hardware_profile(&layout.root)
                 });
             let context_horizon_report = build_context_horizon_doctor_report(&layout.db_path);
+            let blocker_radar_report = build_blocker_radar_report_from_fallback(
+                &workspace_root,
+                "frankenterm",
+                now_ms(),
+                "doctor.blocker_radar",
+            );
             let herd_wave_report = build_herd_wave_surface_report(
                 "doctor.herd_wave",
                 now_ms(),
@@ -36818,6 +36889,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .unwrap_or(serde_json::Value::Null);
                 result["context_horizon"] = serde_json::to_value(&context_horizon_report)
                     .unwrap_or(serde_json::Value::Null);
+                result["blocker_radar"] =
+                    serde_json::to_value(&blocker_radar_report).unwrap_or(serde_json::Value::Null);
                 result["herd_wave"] = herd_wave_report.clone();
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
@@ -36874,6 +36947,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 print_swarm_capacity_doctor_section(&swarm_capacity_summary);
                 print_context_horizon_doctor_section(&context_horizon_report);
+                print_blocker_radar_doctor_section(&blocker_radar_report);
                 print_herd_wave_doctor_section(&herd_wave_report);
 
                 println!();
@@ -49913,6 +49987,163 @@ fn print_context_horizon_doctor_section(report: &ContextHorizonReport) {
         println!(
             "  ... {} more dry-run advice rows",
             report.recommendations.len().saturating_sub(5)
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_horizon_doctor_tests {
+    use super::*;
+
+    fn seed_context_horizon_doctor_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("create doctor context tempdir");
+        let db_path = dir.path().join("doctor-context-horizon.db");
+        let db_path_string = db_path.to_string_lossy().to_string();
+        let conn = robot_context_open_conn(&db_path_string).expect("open doctor context db");
+        conn.execute(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detected_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .expect("create events table");
+        conn.execute(
+            "INSERT INTO pane_contexts
+             (context_id, pane_id, state, depth, created_at_ms, token_budget,
+              tokens_consumed, pressure_tier, source)
+             VALUES ('ctx-doctor-horizon', 19, 'active', 2, ?1, 1000, 930,
+                     'red', 'test')",
+            [now_ms_i64().saturating_sub(1_000)],
+        )
+        .expect("insert active context");
+        conn.execute(
+            "INSERT INTO events (pane_id, rule_id, event_type, detected_at)
+             VALUES (19, 'codex.usage.limit', 'rate_limit', ?1)",
+            [now_ms_i64().saturating_sub(500)],
+        )
+        .expect("insert rate-limit event");
+        drop(conn);
+        (dir, db_path)
+    }
+
+    #[test]
+    fn doctor_context_horizon_embeds_v1_contract_as_json() {
+        let (_dir, db_path) = seed_context_horizon_doctor_db();
+
+        let report = build_context_horizon_doctor_report(&db_path);
+        assert_eq!(report.contract_id, "ft.context_horizon.v1");
+        assert_eq!(report.source, "doctor.context_horizon");
+        assert!(!report.raw_context_content_stored);
+        assert_eq!(report.pane_risks[0].pane_id, 19);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .all(|recommendation| !recommendation.mutation_allowed)
+        );
+
+        let payload = serde_json::json!({
+            "context_horizon": serde_json::to_value(&report)
+                .expect("serialize doctor context horizon")
+        });
+        assert_eq!(
+            payload["context_horizon"]["contract_id"].as_str(),
+            Some("ft.context_horizon.v1")
+        );
+        assert_eq!(
+            payload["context_horizon"]["source"].as_str(),
+            Some("doctor.context_horizon")
+        );
+        assert_eq!(
+            payload["context_horizon"]["raw_context_content_stored"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn doctor_context_horizon_missing_storage_fails_closed_without_raw_content() {
+        let dir = tempfile::tempdir().expect("create doctor missing-db tempdir");
+        let db_path = dir.path().join("missing").join("context.db");
+
+        let report = build_context_horizon_doctor_report(&db_path);
+        let json = serde_json::to_string(&report).expect("serialize doctor horizon fallback");
+
+        assert_eq!(report.source, "doctor.context_horizon");
+        assert!(!report.raw_context_content_stored);
+        assert!(
+            report
+                .unavailable_domains
+                .iter()
+                .any(|domain| domain.domain == "native_context_registry")
+        );
+        assert!(json.contains("evidence.context_database_missing"));
+        assert!(!report.redaction_policy.raw_prompt_allowed);
+        assert!(!report.redaction_policy.raw_transcript_allowed);
+        assert!(report.redaction_policy.bounded_citations_only);
+        assert!(report.redaction_policy.secret_redaction_required);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .all(|recommendation| !recommendation.mutation_allowed)
+        );
+    }
+}
+
+fn blocker_radar_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn print_blocker_radar_doctor_section(report: &BlockerRadarReport) {
+    println!();
+    println!("Blocker Radar:");
+    println!(
+        "  state={} blockers={} active_agents={} dirty_overlap={} unavailable_sources={} raw_pane_content_stored={}",
+        blocker_radar_label(&report.overall_state),
+        report.blockers.len(),
+        report.active_agents.len(),
+        report.dirty_overlap.len(),
+        report.unavailable_sources.len(),
+        report.raw_pane_content_stored,
+    );
+
+    for blocker in report.blockers.iter().take(6) {
+        println!(
+            "  blocker {}: state={} severity={} next={} summary={}",
+            blocker.blocker_id,
+            blocker_radar_label(&blocker.evidence_state),
+            blocker_radar_label(&blocker.severity),
+            blocker.next_action_ids.join(","),
+            blocker.summary,
+        );
+    }
+    if report.blockers.len() > 6 {
+        println!(
+            "  ... {} more blocker rows",
+            report.blockers.len().saturating_sub(6)
+        );
+    }
+
+    for action in report.next_actions.iter().take(5) {
+        println!(
+            "  next {}: kind={} mutation_allowed={} command={}",
+            action.action_id,
+            blocker_radar_label(&action.action_kind),
+            action.mutation_allowed,
+            action.suggested_command.as_deref().unwrap_or("n/a"),
+        );
+    }
+    if report.next_actions.len() > 5 {
+        println!(
+            "  ... {} more next-action rows",
+            report.next_actions.len().saturating_sub(5)
         );
     }
 }
@@ -66872,6 +67103,88 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_coordination_risk_parses_default_session() {
+        let cli = Cli::try_parse_from(["ft", "robot", "coordination-risk"])
+            .expect("robot coordination-risk should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::CoordinationRisk { session }) => {
+                    assert_eq!(session, "frankenterm");
+                }
+                _ => panic!("expected RobotCommands::CoordinationRisk"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_coordination_risk_parses_alias_and_session() {
+        let cli = Cli::try_parse_from(["ft", "robot", "agent-mail-fallback", "staging"])
+            .expect("robot coordination-risk alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::CoordinationRisk { session }) => {
+                    assert_eq!(session, "staging");
+                }
+                _ => panic!("expected RobotCommands::CoordinationRisk"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_blocker_radar_parses_default_and_alias_session() {
+        let cli = Cli::try_parse_from(["ft", "robot", "blocker-radar"])
+            .expect("robot blocker-radar should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::BlockerRadar { session }) => {
+                    assert_eq!(session, "frankenterm");
+                }
+                _ => panic!("expected RobotCommands::BlockerRadar"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+
+        let cli = Cli::try_parse_from(["ft", "robot", "blocker_radar", "staging"])
+            .expect("robot blocker_radar alias should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::BlockerRadar { session }) => {
+                    assert_eq!(session, "staging");
+                }
+                _ => panic!("expected RobotCommands::BlockerRadar"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn robot_help_and_quick_start_list_blocker_radar_surface() {
+        let help = build_robot_help();
+        assert!(help.commands.iter().any(|command| {
+            command.name == "blocker-radar"
+                && command.description.contains("read-only blocker radar")
+        }));
+
+        let quick_start = build_robot_quick_start();
+        let blocker_radar = quick_start
+            .commands
+            .iter()
+            .find(|command| command.name == "blocker-radar")
+            .expect("quick start should list blocker-radar");
+        assert_eq!(blocker_radar.args, "[session]");
+        assert!(
+            blocker_radar
+                .examples
+                .iter()
+                .any(|example| example == &"ft robot --format toon blocker-radar frankenterm")
+        );
+    }
+
+    #[test]
     fn robot_herd_wave_json_and_toon_preserve_contract_and_dry_run_plan() {
         let report = build_herd_wave_surface_report(
             "robot.herd_wave",
@@ -66921,35 +67234,122 @@ log_level = "debug"
     }
 
     #[test]
-    fn cli_robot_coordination_risk_parses_default_session() {
-        let cli = Cli::try_parse_from(["ft", "robot", "coordination-risk"])
-            .expect("robot coordination-risk should parse");
+    fn robot_blocker_radar_unavailable_fallback_still_emits_contract() {
+        let report = build_blocker_radar_report_from_fallback(
+            Path::new("/nonexistent/frankenterm-blocker-radar-test"),
+            "frankenterm",
+            1_770_000_000_001,
+            "robot.blocker_radar",
+        );
 
-        match cli.command.map(|b| *b) {
-            Some(Commands::Robot { command, .. }) => match command {
-                Some(RobotCommands::CoordinationRisk { session }) => {
-                    assert_eq!(session, "frankenterm");
-                }
-                _ => panic!("expected RobotCommands::CoordinationRisk"),
-            },
-            _ => panic!("expected Robot command"),
-        }
+        assert_eq!(report.contract_id, "ft.blocker_radar.v1");
+        assert_eq!(report.source, "robot.blocker_radar");
+        assert_eq!(report.raw_pane_content_stored, false);
+        assert!(report.unavailable_sources.iter().any(|source| {
+            source
+                .reason_codes
+                .contains(&"coordination_fallback.unavailable".to_string())
+        }));
+        assert!(
+            report
+                .next_actions
+                .iter()
+                .all(|action| !action.mutation_allowed)
+        );
+
+        let response = RobotResponse::success(report, 17);
+        let json_value = serde_json::to_value(&response).expect("serialize response");
+        let roundtripped = toon_roundtrip_json(&json_value);
+        assert_eq!(
+            roundtripped["data"]["contract_id"].as_str(),
+            Some("ft.blocker_radar.v1")
+        );
+        assert_eq!(
+            roundtripped["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert!(roundtripped["data"]["next_actions"].is_array());
     }
 
     #[test]
-    fn cli_robot_coordination_risk_parses_alias_and_session() {
-        let cli = Cli::try_parse_from(["ft", "robot", "agent-mail-fallback", "staging"])
-            .expect("robot coordination-risk alias should parse");
+    fn robot_blocker_radar_json_and_toon_preserve_contract_rows() {
+        let report = build_blocker_radar_report(
+            &BlockerRadarInput::new(1_770_000_000_001, "robot.blocker_radar")
+                .with_observation(
+                    BlockerRadarCollectorObservation::new(
+                        "beads.ready",
+                        BlockerRadarSourceKind::Beads,
+                        BlockerRadarObservationStatus::PassActionable,
+                        "br ready --json",
+                        "ready bead exists",
+                    )
+                    .with_dependency_id("ft-ready")
+                    .with_reason_code("beads.ready_available"),
+                )
+                .with_observation(
+                    BlockerRadarCollectorObservation::new(
+                        "agent_mail.fallback",
+                        BlockerRadarSourceKind::AgentMail,
+                        BlockerRadarObservationStatus::MailUnavailable,
+                        "scripts/swarm-tick.sh --agent-mail-fallback",
+                        "Agent Mail unavailable; using fallback",
+                    )
+                    .with_reason_code("agent_mail.fallback_mode"),
+                )
+                .with_observation(
+                    BlockerRadarCollectorObservation::new(
+                        "git.dirty.blocker_radar",
+                        BlockerRadarSourceKind::Git,
+                        BlockerRadarObservationStatus::DirtyOverlap,
+                        "git status --short --branch",
+                        "tracked blocker-radar file is dirty",
+                    )
+                    .with_affected_path("crates/frankenterm-core/src/blocker_radar.rs")
+                    .with_dependency_id("ft-9ntud.3")
+                    .with_reason_code("git.tracked_dirty_overlap"),
+                ),
+        );
+        let json_value = serde_json::to_value(RobotResponse::success(report, 17))
+            .expect("serialize blocker-radar response");
+        let roundtripped = toon_roundtrip_json(&json_value);
+        let data = &roundtripped["data"];
 
-        match cli.command.map(|b| *b) {
-            Some(Commands::Robot { command, .. }) => match command {
-                Some(RobotCommands::CoordinationRisk { session }) => {
-                    assert_eq!(session, "staging");
-                }
-                _ => panic!("expected RobotCommands::CoordinationRisk"),
-            },
-            _ => panic!("expected Robot command"),
-        }
+        assert_eq!(data["contract_id"].as_str(), Some("ft.blocker_radar.v1"));
+        assert_eq!(data["source"].as_str(), Some("robot.blocker_radar"));
+        assert_eq!(data["raw_pane_content_stored"].as_bool(), Some(false));
+        assert_eq!(data["sources"].as_array().map(Vec::len), Some(3));
+        assert_eq!(data["blockers"].as_array().map(Vec::len), Some(2));
+        assert_eq!(data["citations"].as_array().map(Vec::len), Some(3));
+        assert!(data["sources"].as_array().unwrap().iter().any(|source| {
+            source["source_id"].as_str() == Some("agent_mail.fallback")
+                && source["evidence_state"].as_str() == Some("mail_unavailable")
+                && source["reason_codes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason.as_str() == Some("agent_mail.fallback_mode"))
+        }));
+        assert!(
+            data["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["mutation_allowed"].as_bool() == Some(false))
+        );
+        assert_eq!(
+            data["dirty_overlap"][0]["path"].as_str(),
+            Some("crates/frankenterm-core/src/blocker_radar.rs")
+        );
+        assert!(
+            data["citations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|citation| {
+                    citation["citation_id"].as_str() == Some("citation.git.dirty.blocker_radar")
+                        && citation["redacted"].as_bool() == Some(true)
+                })
+        );
     }
 
     #[test]
