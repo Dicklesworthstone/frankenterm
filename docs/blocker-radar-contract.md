@@ -2,7 +2,7 @@
 
 Status: v1 contract. The DTO normalization and first read-only robot/doctor
 surfaces are implemented under `ft-9ntud.2` / `ft-9ntud.3`; deterministic
-golden/e2e proof remains tracked by later `ft-9ntud` beads.
+golden/e2e proof is pinned by `ft-9ntud.4`.
 
 This document defines the first operator-facing contract for a read-only
 blocker radar: a deterministic summary of whether a FrankenTerm swarm lane is
@@ -10,6 +10,8 @@ actionable, waiting on another owner, or blocked by an external substrate such
 as RCH, GitHub Actions, Agent Mail, Beads state, or dirty-tree overlap.
 
 The JSON schema lives at `docs/json-schema/ft-blocker-radar.json`.
+Operator interpretation and Beads handoff examples live in
+`docs/blocker-radar-runbook.md`.
 
 ## Existing Anchors
 
