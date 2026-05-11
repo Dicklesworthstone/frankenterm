@@ -186,7 +186,7 @@ run_rch_test \
 
 required_markers=(
   "contract_artifact_bundle_renders_deterministic_exports ... ok"
-  "contract_artifact_bundle_sdk_sources_include_wire_keys ... ok"
+  "contract_artifact_bundle_rust_sdk_source_includes_wire_keys ... ok"
   "contract_export_artifacts_render_json_snapshots ... ok"
   "contract_export_artifacts_preserve_failure_metadata ... ok"
   "e2e_sdk_generation_and_compat_validation ... ok"
