@@ -717,7 +717,7 @@ impl WorkflowRunner {
         // A workflow with N steps should never need more than N*10 jumps.
         let max_total_jumps = step_count.saturating_mul(10).max(100);
         let start_action_id = if start_step == 0 {
-            let rec = if let Some(cx) = cx {
+            if let Some(cx) = cx {
                 record_workflow_start_action_with_cx(
                     cx,
                     &self.storage,
@@ -738,15 +738,13 @@ impl WorkflowRunner {
                     start_step,
                 )
                 .await
-            };
-            rec
+            }
         } else {
-            let fetched = if let Some(cx) = cx {
+            if let Some(cx) = cx {
                 fetch_workflow_start_action_id_with_cx(cx, &self.storage, execution_id).await
             } else {
                 fetch_workflow_start_action_id(&self.storage, execution_id).await
-            };
-            fetched
+            }
         };
 
         // Create workflow context with injector for policy-gated actions.
@@ -1061,12 +1059,11 @@ impl WorkflowRunner {
                 // caller cancellation mid-step. Implementors that use
                 // the default trait impl still receive ambient semantics
                 // — the default delegates to execute_step unchanged.
-                let step_outcome = if let Some(cx) = cx {
+                if let Some(cx) = cx {
                     workflow.execute_step_cx(cx, &mut ctx, current_step).await
                 } else {
                     workflow.execute_step(&mut ctx, current_step).await
-                };
-                step_outcome
+                }
             };
 
             // Log step result

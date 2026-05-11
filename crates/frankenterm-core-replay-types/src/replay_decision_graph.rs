@@ -164,6 +164,9 @@ pub struct DecisionEvent {
 impl DecisionEvent {
     /// Convenience constructor that hashes the definition, input, and output texts.
     #[must_use]
+    // The constructor mirrors the persisted event schema; callers pass the
+    // schema fields explicitly so replay fixtures stay easy to audit.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         decision_type: DecisionType,
         pane_id: u64,

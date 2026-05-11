@@ -608,10 +608,10 @@ pub fn validate_proof_record(record: &ProofAttemptRecord) -> Vec<ProofLedgerFind
     }
 
     if record.state.is_terminal()
-        && !record
+        && record
             .finished_at_utc
             .as_deref()
-            .is_some_and(|timestamp| !timestamp.trim().is_empty())
+            .is_none_or(|timestamp| timestamp.trim().is_empty())
     {
         findings.push(ProofLedgerFinding::error(
             record,
@@ -719,7 +719,11 @@ pub fn validate_proof_record(record: &ProofAttemptRecord) -> Vec<ProofLedgerFind
         ));
     }
 
-    if record.state == ProofState::LocalInvalid && record.claims_allowed.iter().any(is_proven_claim)
+    if record.state == ProofState::LocalInvalid
+        && record
+            .claims_allowed
+            .iter()
+            .any(|claim| is_proven_claim(claim))
     {
         findings.push(ProofLedgerFinding::error(
             record,
@@ -729,7 +733,10 @@ pub fn validate_proof_record(record: &ProofAttemptRecord) -> Vec<ProofLedgerFind
     }
 
     if record.state == ProofState::SkippedNotProven
-        && record.claims_allowed.iter().any(is_proven_claim)
+        && record
+            .claims_allowed
+            .iter()
+            .any(|claim| is_proven_claim(claim))
     {
         findings.push(ProofLedgerFinding::error(
             record,
@@ -806,7 +813,7 @@ fn proof_doctor_status_matches_state(status: ProofDoctorStatus, state: ProofStat
     }
 }
 
-fn is_proven_claim(claim: &String) -> bool {
+fn is_proven_claim(claim: &str) -> bool {
     let normalized = claim.to_ascii_lowercase();
     normalized.contains("proven") || normalized.contains("passed") || normalized.contains("green")
 }
