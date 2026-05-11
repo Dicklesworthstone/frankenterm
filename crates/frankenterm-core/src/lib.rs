@@ -124,6 +124,7 @@ pub mod bidi_correctness;
 pub mod bimap;
 pub mod binomial_heap;
 pub mod block_mode_terminal;
+pub mod blocker_radar;
 pub mod bloom_filter;
 pub mod bocpd;
 pub mod bounded_edit_distance;
