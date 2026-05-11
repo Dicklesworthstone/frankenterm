@@ -2,7 +2,7 @@
   "schema_version": 1,
   "generated_by": "ft-htcwc.2-claimability-fixtures",
   "fixed_generated_at_ms": 1770000000001,
-  "proof_target": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-htcwc-2-claimability-fixtures cargo test -p frankenterm-core --test blocker_radar_conformance claimability -- --nocapture",
+  "proof_target": "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-htcwc-3-claimability-reconciler cargo test -p frankenterm-core --test blocker_radar_conformance claimability -- --nocapture",
   "verdicts": [
     {
       "verdict": "claimable",

@@ -1209,6 +1209,662 @@ fn push_nonempty_unique(values: &mut Vec<String>, value: impl Into<String>) {
     values.push(value);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimabilityVerdict {
+    Claimable,
+    NoReady,
+    DependencyBlocked,
+    OwnerBlocked,
+    ExternalWait,
+    DirtyOverlap,
+    MailDegraded,
+    TrackerInconsistent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimabilityInput {
+    pub candidate_id: String,
+    #[serde(default)]
+    pub br_ready_ids: Vec<String>,
+    pub br_show: ClaimabilityBrShow,
+    pub bv_recommendation: ClaimabilityBvRecommendation,
+    pub mail_state: String,
+    #[serde(default)]
+    pub dirty_paths: Vec<String>,
+    pub external_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimabilityBrShow {
+    pub status: String,
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub fresh_comments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimabilityBvRecommendation {
+    pub status: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimabilitySourceSnapshot {
+    pub source_id: String,
+    pub source_kind: BlockerRadarSourceKind,
+    pub verdict: ClaimabilityVerdict,
+    pub summary: String,
+    pub reason_codes: Vec<String>,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimabilityReport {
+    pub candidate_id: String,
+    pub generated_at: u64,
+    pub sources: Vec<ClaimabilitySourceSnapshot>,
+    pub ready_queue_verdict: ClaimabilityVerdict,
+    pub dependency_verdict: ClaimabilityVerdict,
+    pub owner_verdict: ClaimabilityVerdict,
+    pub dirty_path_verdict: ClaimabilityVerdict,
+    pub external_wait_verdict: ClaimabilityVerdict,
+    pub mail_verdict: ClaimabilityVerdict,
+    pub tracker_consistency_verdict: ClaimabilityVerdict,
+    pub final_verdict: ClaimabilityVerdict,
+    pub supporting_verdicts: Vec<ClaimabilityVerdict>,
+    pub reason_codes: Vec<String>,
+    pub next_action: String,
+    pub forbidden_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimabilityPartial {
+    verdict: ClaimabilityVerdict,
+    reason_codes: Vec<String>,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClaimabilityParts<'a> {
+    ready: &'a ClaimabilityPartial,
+    dependency: &'a ClaimabilityPartial,
+    owner: &'a ClaimabilityPartial,
+    dirty: &'a ClaimabilityPartial,
+    external: &'a ClaimabilityPartial,
+    mail: &'a ClaimabilityPartial,
+    tracker: &'a ClaimabilityPartial,
+}
+
+impl ClaimabilityPartial {
+    fn new(
+        verdict: ClaimabilityVerdict,
+        reason_codes: impl IntoIterator<Item = &'static str>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            verdict,
+            reason_codes: reason_codes.into_iter().map(ToOwned::to_owned).collect(),
+            summary: summary.into(),
+        }
+    }
+}
+
+#[must_use]
+pub fn build_claimability_report(
+    input: &ClaimabilityInput,
+    generated_at: u64,
+) -> ClaimabilityReport {
+    let candidate_id = nonempty_string(input.candidate_id.clone(), "unknown");
+    let ready = claimability_ready_queue(input);
+    let dependency = claimability_dependency(input);
+    let owner = claimability_owner(input);
+    let dirty = claimability_dirty_paths(input);
+    let external = claimability_external_wait(input);
+    let mail = claimability_mail(input);
+    let tracker = claimability_tracker_consistency(input, &ready);
+    let parts = ClaimabilityParts {
+        ready: &ready,
+        dependency: &dependency,
+        owner: &owner,
+        dirty: &dirty,
+        external: &external,
+        mail: &mail,
+        tracker: &tracker,
+    };
+    let final_verdict = claimability_final_verdict(input, parts);
+    let supporting_verdicts = claimability_supporting_verdicts(final_verdict, parts);
+    let reason_codes = claimability_reason_codes(final_verdict, parts, &supporting_verdicts);
+
+    ClaimabilityReport {
+        candidate_id,
+        generated_at,
+        sources: vec![
+            claimability_source("br.ready", BlockerRadarSourceKind::Beads, &ready),
+            claimability_source("br.show", BlockerRadarSourceKind::Beads, &owner),
+            claimability_source(
+                "br.dependencies",
+                BlockerRadarSourceKind::Beads,
+                &dependency,
+            ),
+            claimability_source("git.status", BlockerRadarSourceKind::Git, &dirty),
+            claimability_source(
+                "external.wait",
+                BlockerRadarSourceKind::GitHubActions,
+                &external,
+            ),
+            claimability_source("agent_mail.state", BlockerRadarSourceKind::AgentMail, &mail),
+            claimability_source(
+                "tracker.consistency",
+                BlockerRadarSourceKind::Manual,
+                &tracker,
+            ),
+        ],
+        ready_queue_verdict: ready.verdict,
+        dependency_verdict: dependency.verdict,
+        owner_verdict: owner.verdict,
+        dirty_path_verdict: dirty.verdict,
+        external_wait_verdict: external.verdict,
+        mail_verdict: mail.verdict,
+        tracker_consistency_verdict: tracker.verdict,
+        final_verdict,
+        supporting_verdicts,
+        reason_codes,
+        next_action: claimability_next_action(final_verdict, &owner),
+        forbidden_actions: claimability_forbidden_actions(final_verdict),
+    }
+}
+
+#[must_use]
+pub fn build_claimability_report_from_value(
+    value: &serde_json::Value,
+    generated_at: u64,
+) -> ClaimabilityReport {
+    match serde_json::from_value::<ClaimabilityInput>(value.clone()) {
+        Ok(input) => build_claimability_report(&input, generated_at),
+        Err(err) => {
+            let candidate_id = value
+                .get("candidate_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let tracker = ClaimabilityPartial {
+                verdict: ClaimabilityVerdict::TrackerInconsistent,
+                reason_codes: vec![
+                    "source.parse_error".to_string(),
+                    reason_code_fragment(&err.to_string()),
+                ],
+                summary: "claimability input could not be parsed; fail closed".to_string(),
+            };
+            let neutral = ClaimabilityPartial::new(
+                ClaimabilityVerdict::Unknown,
+                ["source.unavailable"],
+                "source unavailable because input parsing failed",
+            );
+
+            ClaimabilityReport {
+                candidate_id: nonempty_string(candidate_id, "unknown"),
+                generated_at,
+                sources: vec![claimability_source(
+                    "claimability.parse",
+                    BlockerRadarSourceKind::Manual,
+                    &tracker,
+                )],
+                ready_queue_verdict: neutral.verdict,
+                dependency_verdict: neutral.verdict,
+                owner_verdict: neutral.verdict,
+                dirty_path_verdict: neutral.verdict,
+                external_wait_verdict: neutral.verdict,
+                mail_verdict: neutral.verdict,
+                tracker_consistency_verdict: tracker.verdict,
+                final_verdict: ClaimabilityVerdict::TrackerInconsistent,
+                supporting_verdicts: Vec::new(),
+                reason_codes: tracker.reason_codes,
+                next_action: "fail_closed_reconcile_sources".to_string(),
+                forbidden_actions: claimability_forbidden_actions(
+                    ClaimabilityVerdict::TrackerInconsistent,
+                ),
+            }
+        }
+    }
+}
+
+fn claimability_ready_queue(input: &ClaimabilityInput) -> ClaimabilityPartial {
+    if input
+        .br_ready_ids
+        .iter()
+        .any(|id| id == &input.candidate_id)
+    {
+        return ClaimabilityPartial::new(
+            ClaimabilityVerdict::Claimable,
+            ["br.ready_contains_candidate"],
+            "authoritative br ready queue contains the candidate",
+        );
+    }
+
+    if input.br_ready_ids.is_empty() {
+        let mut reason_codes = vec!["br.ready_empty".to_string()];
+        if claimability_no_safe_bv_candidate(input) {
+            reason_codes.push("bv.no_safe_candidate".to_string());
+        }
+        return ClaimabilityPartial {
+            verdict: ClaimabilityVerdict::NoReady,
+            reason_codes,
+            summary: "authoritative br ready queue is empty".to_string(),
+        };
+    }
+
+    ClaimabilityPartial::new(
+        ClaimabilityVerdict::NoReady,
+        ["br.ready_missing_candidate"],
+        "candidate is not present in the authoritative br ready queue",
+    )
+}
+
+fn claimability_dependency(input: &ClaimabilityInput) -> ClaimabilityPartial {
+    if input
+        .bv_recommendation
+        .blocked_by
+        .iter()
+        .any(|blocked_by| claimability_blocked_by_is_dependency(blocked_by))
+    {
+        return ClaimabilityPartial::new(
+            ClaimabilityVerdict::DependencyBlocked,
+            ["br.dependency_blocked", "br.claim_denied"],
+            "candidate has an unresolved dependency gate",
+        );
+    }
+
+    ClaimabilityPartial::new(
+        ClaimabilityVerdict::Claimable,
+        ["br.dependencies_satisfied"],
+        "no dependency blocker was reported",
+    )
+}
+
+fn claimability_owner(input: &ClaimabilityInput) -> ClaimabilityPartial {
+    let mut reason_codes = Vec::new();
+    if input
+        .br_show
+        .assignee
+        .as_deref()
+        .is_some_and(|owner| !owner.trim().is_empty())
+    {
+        reason_codes.push("br.assignee_active".to_string());
+    }
+    if !claimability_external_state_is_waiting(&input.external_state)
+        && !input.br_show.fresh_comments.is_empty()
+    {
+        reason_codes.push("br.fresh_comment".to_string());
+    }
+
+    if reason_codes.is_empty() {
+        return ClaimabilityPartial::new(
+            ClaimabilityVerdict::Claimable,
+            ["br.unassigned"],
+            "no active owner or fresh owner comment was reported",
+        );
+    }
+
+    ClaimabilityPartial {
+        verdict: ClaimabilityVerdict::OwnerBlocked,
+        reason_codes,
+        summary: "candidate is owned or has fresh owner activity".to_string(),
+    }
+}
+
+fn claimability_dirty_paths(input: &ClaimabilityInput) -> ClaimabilityPartial {
+    let ready_contains_candidate = input
+        .br_ready_ids
+        .iter()
+        .any(|id| id == &input.candidate_id);
+    if ready_contains_candidate && !input.dirty_paths.is_empty() {
+        return ClaimabilityPartial::new(
+            ClaimabilityVerdict::DirtyOverlap,
+            ["git.dirty_overlap", "ownership.unclear"],
+            "local dirty paths overlap the candidate lane",
+        );
+    }
+
+    ClaimabilityPartial::new(
+        ClaimabilityVerdict::Claimable,
+        ["git.no_dirty_overlap"],
+        "no candidate dirty-path overlap was reported",
+    )
+}
+
+fn claimability_external_wait(input: &ClaimabilityInput) -> ClaimabilityPartial {
+    if !claimability_external_state_is_waiting(&input.external_state) {
+        return ClaimabilityPartial::new(
+            ClaimabilityVerdict::Claimable,
+            ["external.none"],
+            "no external queue or substrate wait was reported",
+        );
+    }
+
+    let mut reason_codes = vec!["github.current_head_queued".to_string()];
+    if input.bv_recommendation.reasons.iter().any(|reason| {
+        reason
+            .to_ascii_lowercase()
+            .contains("current-head ci evidence")
+    }) {
+        reason_codes.push("github.no_failure_log".to_string());
+    }
+
+    ClaimabilityPartial {
+        verdict: ClaimabilityVerdict::ExternalWait,
+        reason_codes,
+        summary: "external current-head substrate is queued or waiting".to_string(),
+    }
+}
+
+fn claimability_mail(input: &ClaimabilityInput) -> ClaimabilityPartial {
+    if input.mail_state == "mail_degraded" {
+        let mut reason_codes = vec!["agent_mail.degraded".to_string()];
+        if input.candidate_id == "coordination-snapshot" {
+            reason_codes.push("fallback.beads_git_only".to_string());
+        }
+        return ClaimabilityPartial {
+            verdict: ClaimabilityVerdict::MailDegraded,
+            reason_codes,
+            summary: "Agent Mail is degraded; Beads/git fallback is authoritative".to_string(),
+        };
+    }
+
+    ClaimabilityPartial::new(
+        ClaimabilityVerdict::Claimable,
+        ["agent_mail.ok"],
+        "Agent Mail evidence did not report degradation",
+    )
+}
+
+fn claimability_tracker_consistency(
+    input: &ClaimabilityInput,
+    ready: &ClaimabilityPartial,
+) -> ClaimabilityPartial {
+    if input.candidate_id.trim().is_empty()
+        || input.br_show.status.trim().is_empty()
+        || input.bv_recommendation.status.trim().is_empty()
+        || input.external_state.trim().is_empty()
+        || input.mail_state.trim().is_empty()
+    {
+        return ClaimabilityPartial::new(
+            ClaimabilityVerdict::TrackerInconsistent,
+            ["source.missing_required_field"],
+            "required claimability source field was empty",
+        );
+    }
+
+    let tracker_issue_state = input.br_show.status.as_str();
+    let graph_candidate_state = input.bv_recommendation.status.as_str();
+    let bv_says_available = input.bv_recommendation.reasons.iter().any(|reason| {
+        let reason = reason.to_ascii_lowercase();
+        reason.contains("available for work") || reason.contains("currently unclaimed")
+    });
+    if graph_candidate_state == "blocked"
+        && bv_says_available
+        && ready.verdict != ClaimabilityVerdict::Claimable
+    {
+        return ClaimabilityPartial::new(
+            ClaimabilityVerdict::TrackerInconsistent,
+            ["bv.br_status_mismatch"],
+            "BV described a blocked or non-ready candidate as available",
+        );
+    }
+    if ready.verdict == ClaimabilityVerdict::Claimable && tracker_issue_state != "open" {
+        return ClaimabilityPartial::new(
+            ClaimabilityVerdict::TrackerInconsistent,
+            ["br.ready_show_mismatch"],
+            "br ready and br show disagree about candidate claimability",
+        );
+    }
+
+    ClaimabilityPartial::new(
+        ClaimabilityVerdict::Claimable,
+        ["tracker.consistent"],
+        "authoritative tracker sources agree",
+    )
+}
+
+fn claimability_final_verdict(
+    input: &ClaimabilityInput,
+    parts: ClaimabilityParts<'_>,
+) -> ClaimabilityVerdict {
+    if parts.tracker.verdict == ClaimabilityVerdict::TrackerInconsistent {
+        return ClaimabilityVerdict::TrackerInconsistent;
+    }
+    if parts.dirty.verdict == ClaimabilityVerdict::DirtyOverlap {
+        return ClaimabilityVerdict::DirtyOverlap;
+    }
+    if parts.dependency.verdict == ClaimabilityVerdict::DependencyBlocked {
+        return ClaimabilityVerdict::DependencyBlocked;
+    }
+    if parts.external.verdict == ClaimabilityVerdict::ExternalWait {
+        return ClaimabilityVerdict::ExternalWait;
+    }
+    if parts.owner.verdict == ClaimabilityVerdict::OwnerBlocked {
+        return ClaimabilityVerdict::OwnerBlocked;
+    }
+    if parts.ready.verdict == ClaimabilityVerdict::NoReady
+        && parts.mail.verdict == ClaimabilityVerdict::MailDegraded
+        && input.candidate_id == "coordination-snapshot"
+    {
+        return ClaimabilityVerdict::MailDegraded;
+    }
+    if parts.ready.verdict == ClaimabilityVerdict::NoReady {
+        return ClaimabilityVerdict::NoReady;
+    }
+    if parts.ready.verdict == ClaimabilityVerdict::Claimable
+        && parts.dependency.verdict == ClaimabilityVerdict::Claimable
+        && parts.owner.verdict == ClaimabilityVerdict::Claimable
+        && parts.dirty.verdict == ClaimabilityVerdict::Claimable
+        && parts.external.verdict == ClaimabilityVerdict::Claimable
+        && matches!(
+            parts.mail.verdict,
+            ClaimabilityVerdict::Claimable | ClaimabilityVerdict::MailDegraded
+        )
+    {
+        return ClaimabilityVerdict::Claimable;
+    }
+
+    ClaimabilityVerdict::TrackerInconsistent
+}
+
+fn claimability_supporting_verdicts(
+    final_verdict: ClaimabilityVerdict,
+    parts: ClaimabilityParts<'_>,
+) -> Vec<ClaimabilityVerdict> {
+    let mut verdicts = Vec::new();
+    for verdict in [
+        parts.dependency.verdict,
+        parts.owner.verdict,
+        parts.dirty.verdict,
+        parts.external.verdict,
+        parts.mail.verdict,
+    ] {
+        if verdict != final_verdict
+            && !matches!(
+                verdict,
+                ClaimabilityVerdict::Claimable | ClaimabilityVerdict::Unknown
+            )
+        {
+            push_unique_verdict(&mut verdicts, verdict);
+        }
+    }
+    verdicts
+}
+
+fn claimability_reason_codes(
+    final_verdict: ClaimabilityVerdict,
+    parts: ClaimabilityParts<'_>,
+    supporting_verdicts: &[ClaimabilityVerdict],
+) -> Vec<String> {
+    let mut reason_codes = Vec::new();
+    match final_verdict {
+        ClaimabilityVerdict::Claimable => {
+            push_reason_codes(&mut reason_codes, &parts.ready.reason_codes);
+            push_reason_codes(&mut reason_codes, &parts.owner.reason_codes);
+            push_reason_codes(&mut reason_codes, &parts.dirty.reason_codes);
+            if parts.mail.verdict == ClaimabilityVerdict::MailDegraded {
+                push_reason_codes(&mut reason_codes, &parts.mail.reason_codes);
+            }
+        }
+        ClaimabilityVerdict::NoReady => {
+            push_reason_codes(&mut reason_codes, &parts.ready.reason_codes);
+        }
+        ClaimabilityVerdict::DependencyBlocked => {
+            push_reason_codes(&mut reason_codes, &parts.dependency.reason_codes);
+        }
+        ClaimabilityVerdict::OwnerBlocked => {
+            push_reason_codes(&mut reason_codes, &parts.owner.reason_codes);
+        }
+        ClaimabilityVerdict::ExternalWait => {
+            push_reason_codes(&mut reason_codes, &parts.external.reason_codes);
+        }
+        ClaimabilityVerdict::DirtyOverlap => {
+            push_reason_codes(&mut reason_codes, &parts.dirty.reason_codes);
+        }
+        ClaimabilityVerdict::MailDegraded => {
+            push_reason_codes(&mut reason_codes, &parts.mail.reason_codes);
+        }
+        ClaimabilityVerdict::TrackerInconsistent => {
+            push_reason_codes(&mut reason_codes, &parts.tracker.reason_codes);
+        }
+        ClaimabilityVerdict::Unknown => {}
+    }
+
+    for verdict in supporting_verdicts {
+        match verdict {
+            ClaimabilityVerdict::DependencyBlocked => {
+                push_reason_codes(&mut reason_codes, &parts.dependency.reason_codes);
+            }
+            ClaimabilityVerdict::OwnerBlocked => {
+                push_reason_codes(&mut reason_codes, &parts.owner.reason_codes);
+            }
+            ClaimabilityVerdict::DirtyOverlap => {
+                push_reason_codes(&mut reason_codes, &parts.dirty.reason_codes);
+            }
+            ClaimabilityVerdict::ExternalWait => {
+                push_reason_codes(&mut reason_codes, &parts.external.reason_codes);
+            }
+            ClaimabilityVerdict::MailDegraded => {
+                push_reason_codes(&mut reason_codes, &parts.mail.reason_codes);
+            }
+            ClaimabilityVerdict::NoReady
+            | ClaimabilityVerdict::Claimable
+            | ClaimabilityVerdict::TrackerInconsistent
+            | ClaimabilityVerdict::Unknown => {}
+        }
+    }
+
+    reason_codes
+}
+
+fn claimability_source(
+    source_id: impl Into<String>,
+    source_kind: BlockerRadarSourceKind,
+    partial: &ClaimabilityPartial,
+) -> ClaimabilitySourceSnapshot {
+    ClaimabilitySourceSnapshot {
+        source_id: source_id.into(),
+        source_kind,
+        verdict: partial.verdict,
+        summary: partial.summary.clone(),
+        reason_codes: partial.reason_codes.clone(),
+        redacted: true,
+    }
+}
+
+fn claimability_next_action(
+    final_verdict: ClaimabilityVerdict,
+    owner: &ClaimabilityPartial,
+) -> String {
+    match final_verdict {
+        ClaimabilityVerdict::Claimable => "reserve_then_claim",
+        ClaimabilityVerdict::NoReady => "create_or_refine_planning_bead",
+        ClaimabilityVerdict::DependencyBlocked => "work_or_wait_on_dependency",
+        ClaimabilityVerdict::OwnerBlocked => "request_handoff_or_choose_another_bead",
+        ClaimabilityVerdict::ExternalWait => "read_only_recheck_later",
+        ClaimabilityVerdict::DirtyOverlap => "stop_and_request_handoff_or_split",
+        ClaimabilityVerdict::MailDegraded => "use_beads_git_fallback",
+        ClaimabilityVerdict::TrackerInconsistent
+            if owner.verdict == ClaimabilityVerdict::OwnerBlocked =>
+        {
+            "wait_or_coordinate_existing_owner"
+        }
+        ClaimabilityVerdict::TrackerInconsistent => "fail_closed_reconcile_sources",
+        ClaimabilityVerdict::Unknown => "refresh_read_only_sources",
+    }
+    .to_string()
+}
+
+fn claimability_forbidden_actions(final_verdict: ClaimabilityVerdict) -> Vec<String> {
+    match final_verdict {
+        ClaimabilityVerdict::Claimable => vec!["auto_claim_without_reservation"],
+        ClaimabilityVerdict::NoReady => vec!["force_claim_blocked", "invent_ready_work"],
+        ClaimabilityVerdict::DependencyBlocked => {
+            vec!["force_claim_blocked", "edit_child_before_dependency"]
+        }
+        ClaimabilityVerdict::OwnerBlocked => vec!["reopen_without_handoff", "stage_owner_paths"],
+        ClaimabilityVerdict::ExternalWait => {
+            vec!["rerun_ci", "call_ci_passed", "call_ci_failed"]
+        }
+        ClaimabilityVerdict::DirtyOverlap => {
+            vec!["stage_dirty_overlap", "format_broad_package"]
+        }
+        ClaimabilityVerdict::MailDegraded => vec!["repair_agent_mail", "restart_agent_mail"],
+        ClaimabilityVerdict::TrackerInconsistent => {
+            vec![
+                "auto_claim",
+                "reopen_without_handoff",
+                "rerun_ci",
+                "repair_agent_mail",
+            ]
+        }
+        ClaimabilityVerdict::Unknown => vec!["auto_claim"],
+    }
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn claimability_no_safe_bv_candidate(input: &ClaimabilityInput) -> bool {
+    matches!(
+        input.bv_recommendation.status.as_str(),
+        "blocked" | "none" | "unknown" | ""
+    ) || !input.bv_recommendation.blocked_by.is_empty()
+}
+
+fn claimability_blocked_by_is_dependency(blocked_by: &str) -> bool {
+    let blocked_by = blocked_by.trim();
+    blocked_by.starts_with("ft-")
+        || blocked_by.starts_with("wa-")
+        || blocked_by.starts_with("bead:")
+}
+
+fn claimability_external_state_is_waiting(external_state: &str) -> bool {
+    let external_state = external_state.to_ascii_lowercase();
+    external_state.contains("queued") || external_state.contains("pending")
+}
+
+fn push_unique_verdict(values: &mut Vec<ClaimabilityVerdict>, value: ClaimabilityVerdict) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn push_reason_codes(values: &mut Vec<String>, reason_codes: &[String]) {
+    for reason_code in reason_codes {
+        push_nonempty_unique(values, reason_code.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

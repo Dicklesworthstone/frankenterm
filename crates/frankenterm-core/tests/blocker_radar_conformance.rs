@@ -13,7 +13,8 @@ use frankenterm_core::blocker_radar::{
     BLOCKER_RADAR_CONTRACT_ID, BLOCKER_RADAR_SCHEMA_VERSION, BlockerRadarActionKind,
     BlockerRadarCollectorObservation, BlockerRadarEvidenceState, BlockerRadarFailureClass,
     BlockerRadarInput, BlockerRadarObservationStatus, BlockerRadarReport, BlockerRadarSourceKind,
-    build_blocker_radar_report,
+    ClaimabilityInput, ClaimabilityReport, ClaimabilityVerdict, build_blocker_radar_report,
+    build_claimability_report, build_claimability_report_from_value,
 };
 use jsonschema::{Draft, Validator};
 use serde::Deserialize;
@@ -22,7 +23,7 @@ use serde_json::Value;
 const MATRIX_JSON: &str = include_str!("fixtures/blocker_radar/conformance_cases.json");
 const CLAIMABILITY_JSON: &str = include_str!("fixtures/blocker_radar/claimability_cases.json");
 const TARGET_DIR: &str = "CARGO_TARGET_DIR=/tmp/ft-9ntud-4-blocker-radar-conformance";
-const CLAIMABILITY_TARGET_DIR: &str = "CARGO_TARGET_DIR=/tmp/ft-htcwc-2-claimability-fixtures";
+const CLAIMABILITY_TARGET_DIR: &str = "CARGO_TARGET_DIR=/tmp/ft-htcwc-3-claimability-reconciler";
 
 #[derive(Debug, Deserialize)]
 struct ConformanceMatrix {
@@ -121,7 +122,7 @@ struct ClaimabilityMatrix {
 
 #[derive(Debug, Deserialize)]
 struct ClaimabilityVerdictCoverage {
-    verdict: String,
+    verdict: ClaimabilityVerdict,
     covered_by: Vec<String>,
 }
 
@@ -135,35 +136,9 @@ struct ClaimabilityCase {
 }
 
 #[derive(Debug, Deserialize)]
-struct ClaimabilityInput {
-    candidate_id: String,
-    br_ready_ids: Vec<String>,
-    br_show: ClaimabilityBrShow,
-    bv_recommendation: ClaimabilityBvRecommendation,
-    mail_state: String,
-    dirty_paths: Vec<String>,
-    external_state: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaimabilityBrShow {
-    status: String,
-    assignee: Option<String>,
-    dependencies: Vec<String>,
-    fresh_comments: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaimabilityBvRecommendation {
-    status: String,
-    reasons: Vec<String>,
-    blocked_by: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ExpectedClaimabilityVerdict {
-    final_verdict: String,
-    supporting_verdicts: Vec<String>,
+    final_verdict: ClaimabilityVerdict,
+    supporting_verdicts: Vec<ClaimabilityVerdict>,
     reason_codes: Vec<String>,
     next_action: String,
     forbidden_actions: Vec<String>,
@@ -589,6 +564,68 @@ fn assert_expected_report(case: &FixtureCase, report: &BlockerRadarReport) {
     assert_citations_are_complete(&case.id, report);
 }
 
+fn assert_expected_claimability(case: &ClaimabilityCase, report: &ClaimabilityReport) {
+    let expected = &case.expected;
+    assert_eq!(
+        report.candidate_id, case.input.candidate_id,
+        "{} candidate id drifted",
+        case.id
+    );
+    assert_eq!(
+        report.final_verdict, expected.final_verdict,
+        "{} final claimability verdict drifted",
+        case.id
+    );
+    assert_eq!(
+        report.supporting_verdicts, expected.supporting_verdicts,
+        "{} supporting claimability verdicts drifted",
+        case.id
+    );
+    assert_eq!(
+        report.next_action, expected.next_action,
+        "{} next action drifted",
+        case.id
+    );
+
+    for reason_code in &expected.reason_codes {
+        assert!(
+            report.reason_codes.contains(reason_code),
+            "{} missing claimability reason code {} in {:?}",
+            case.id,
+            reason_code,
+            report.reason_codes
+        );
+    }
+    for forbidden_action in &expected.forbidden_actions {
+        assert!(
+            report.forbidden_actions.contains(forbidden_action),
+            "{} missing forbidden action {} in {:?}",
+            case.id,
+            forbidden_action,
+            report.forbidden_actions
+        );
+    }
+
+    assert!(
+        report.sources.iter().all(|source| source.redacted),
+        "{} must keep all claimability sources redacted",
+        case.id
+    );
+    assert!(
+        report
+            .sources
+            .iter()
+            .all(|source| !source.reason_codes.is_empty()),
+        "{} must explain every claimability source",
+        case.id
+    );
+    assert_eq!(
+        report.final_verdict, expected.final_verdict,
+        "{} report final verdict must match expected fixture",
+        case.id
+    );
+}
+
 #[test]
 fn blocker_radar_conformance_matrix_metadata_is_remote_and_deterministic() {
     let matrix = load_matrix();
@@ -797,19 +834,19 @@ fn claimability_fixture_matrix_covers_contract_verdicts_and_observed_mismatch() 
         .map(|case| case.id.as_str())
         .collect::<BTreeSet<_>>();
     let contract_verdicts = BTreeSet::from([
-        "claimable",
-        "no_ready",
-        "dependency_blocked",
-        "owner_blocked",
-        "external_wait",
-        "dirty_overlap",
-        "mail_degraded",
-        "tracker_inconsistent",
+        ClaimabilityVerdict::Claimable,
+        ClaimabilityVerdict::NoReady,
+        ClaimabilityVerdict::DependencyBlocked,
+        ClaimabilityVerdict::OwnerBlocked,
+        ClaimabilityVerdict::ExternalWait,
+        ClaimabilityVerdict::DirtyOverlap,
+        ClaimabilityVerdict::MailDegraded,
+        ClaimabilityVerdict::TrackerInconsistent,
     ]);
     let coverage_verdicts = matrix
         .verdicts
         .iter()
-        .map(|coverage| coverage.verdict.as_str())
+        .map(|coverage| coverage.verdict)
         .collect::<BTreeSet<_>>();
     assert_eq!(
         coverage_verdicts, contract_verdicts,
@@ -819,22 +856,22 @@ fn claimability_fixture_matrix_covers_contract_verdicts_and_observed_mismatch() 
     for coverage in &matrix.verdicts {
         assert!(
             !coverage.covered_by.is_empty(),
-            "{} must name fixture coverage",
+            "{:?} must name fixture coverage",
             coverage.verdict
         );
         for covered_by in &coverage.covered_by {
             assert!(
                 case_ids.contains(covered_by.as_str()),
-                "{} references missing claimability case {}",
+                "{:?} references missing claimability case {}",
                 coverage.verdict,
                 covered_by
             );
             let case = claimability_case_by_id(&matrix, covered_by);
-            let mut verdicts = BTreeSet::from([case.expected.final_verdict.as_str()]);
-            verdicts.extend(case.expected.supporting_verdicts.iter().map(String::as_str));
+            let mut verdicts = BTreeSet::from([case.expected.final_verdict]);
+            verdicts.extend(case.expected.supporting_verdicts.iter().copied());
             assert!(
-                verdicts.contains(coverage.verdict.as_str()),
-                "{} says {} covers {}, but case verdicts were {:?}",
+                verdicts.contains(&coverage.verdict),
+                "{:?} says {} covers {:?}, but case verdicts were {:?}",
                 coverage.verdict,
                 covered_by,
                 coverage.verdict,
@@ -857,15 +894,23 @@ fn claimability_fixture_matrix_covers_contract_verdicts_and_observed_mismatch() 
             .any(|reason| reason.contains("available for work")),
         "observed mismatch must preserve the misleading BV availability reason"
     );
-    assert_eq!(mismatch.expected.final_verdict, "tracker_inconsistent");
-    for verdict in ["owner_blocked", "external_wait", "mail_degraded"] {
+    assert_eq!(
+        mismatch.expected.final_verdict,
+        ClaimabilityVerdict::TrackerInconsistent
+    );
+    for verdict in [
+        ClaimabilityVerdict::OwnerBlocked,
+        ClaimabilityVerdict::ExternalWait,
+        ClaimabilityVerdict::MailDegraded,
+    ] {
         assert!(
             mismatch
                 .expected
                 .supporting_verdicts
                 .iter()
-                .any(|actual| actual == verdict),
-            "mismatch case should retain supporting verdict {verdict}"
+                .any(|actual| actual == &verdict),
+            "mismatch case should retain supporting verdict {:?}",
+            verdict
         );
     }
     for reason in [
@@ -885,7 +930,10 @@ fn claimability_fixture_matrix_covers_contract_verdicts_and_observed_mismatch() 
     }
 
     let claimable = claimability_case_by_id(&matrix, "true_claimable");
-    assert_eq!(claimable.expected.final_verdict, "claimable");
+    assert_eq!(
+        claimable.expected.final_verdict,
+        ClaimabilityVerdict::Claimable
+    );
     assert!(
         claimable
             .input
@@ -900,6 +948,74 @@ fn claimability_fixture_matrix_covers_contract_verdicts_and_observed_mismatch() 
     assert!(claimable.input.dirty_paths.is_empty());
     assert_eq!(claimable.input.mail_state, "ok");
     assert_eq!(claimable.input.external_state, "none");
+}
+
+#[test]
+fn claimability_reconciler_matches_fixture_matrix_and_fails_closed() {
+    let matrix = load_claimability_matrix();
+    for case in &matrix.cases {
+        let report = build_claimability_report(&case.input, matrix.fixed_generated_at_ms);
+        assert_eq!(
+            report.generated_at, matrix.fixed_generated_at_ms,
+            "{} must preserve deterministic generated_at",
+            case.id
+        );
+        assert_expected_claimability(case, &report);
+
+        let report_json =
+            serde_json::to_value(&report).expect("claimability report serializes to JSON");
+        assert_no_sensitive_text(&case.id, &report_json);
+
+        for required_field in [
+            "candidate_id",
+            "generated_at",
+            "sources",
+            "ready_queue_verdict",
+            "dependency_verdict",
+            "owner_verdict",
+            "dirty_path_verdict",
+            "external_wait_verdict",
+            "mail_verdict",
+            "tracker_consistency_verdict",
+            "final_verdict",
+            "reason_codes",
+            "next_action",
+            "forbidden_actions",
+        ] {
+            assert!(
+                report_json.get(required_field).is_some(),
+                "{} missing required claimability field {}",
+                case.id,
+                required_field
+            );
+        }
+    }
+
+    let bad_input = serde_json::json!({
+        "candidate_id": "ft-bad.1",
+        "br_ready_ids": []
+    });
+    let fail_closed =
+        build_claimability_report_from_value(&bad_input, matrix.fixed_generated_at_ms);
+    assert_eq!(
+        fail_closed.final_verdict,
+        ClaimabilityVerdict::TrackerInconsistent
+    );
+    assert!(
+        fail_closed
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "source.parse_error"),
+        "parse errors must be structured as fail-closed reason codes: {:?}",
+        fail_closed.reason_codes
+    );
+    assert!(
+        fail_closed
+            .forbidden_actions
+            .iter()
+            .any(|action| action == "auto_claim"),
+        "parse errors must forbid automatic claim"
+    );
 }
 
 #[test]
