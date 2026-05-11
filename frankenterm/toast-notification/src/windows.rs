@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use crate::ToastNotification as TN;
-use xml::escape::escape_str_pcdata;
+use xml::escape::{escape_str_attribute, escape_str_pcdata};
 
 use windows::core::{Error as WinError, IInspectable, Interface, HSTRING};
 use windows::Data::Xml::Dom::XmlDocument;
@@ -21,14 +21,17 @@ fn unwrap_arg<T>(a: &Option<T>) -> Result<&T, WinError> {
 fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
     let xml = XmlDocument::new()?;
 
-    let url_actions = if toast.url.is_some() {
-        r#"
+    let actions = if toast.has_activation_action() {
+        format!(
+            r#"
         <actions>
-           <action content="Show" arguments="show" />
+           <action content="{}" arguments="show" />
         </actions>
-        "#
+"#,
+            escape_str_attribute(toast.activation_label())
+        )
     } else {
-        ""
+        String::new()
     };
 
     xml.LoadXml(HSTRING::from(format!(
@@ -43,7 +46,7 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
     </toast>"#,
         escape_str_pcdata(&toast.title),
         escape_str_pcdata(&toast.message),
-        url_actions
+        actions
     )))?;
 
     let notif = ToastNotification::CreateToastNotification(xml)?;
@@ -55,10 +58,8 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
 
             let args = result.Arguments()?;
 
-            if args == "show" {
-                if let Some(url) = toast.url.as_ref() {
-                    frankenterm_open_url::open_url(url);
-                }
+            if args == "show" && toast.has_activation_action() {
+                toast.activate();
             }
 
             Ok(())

@@ -1,0 +1,137 @@
+{
+  "exported_at": "2026-05-10T11:12:40Z",
+  "files": [
+    "incident_manifest.json",
+    "README.md",
+    "redaction_report.json",
+    "warnings.jsonl",
+    "sources/rch_timeout_evidence.json",
+    "sources/beads_blocker_snapshot.json"
+  ],
+  "kind": "manual",
+  "path": "tests/fixtures/incident_bundle_goldens/degraded",
+  "swarm": {
+    "bundle_id": "ft-krsq0-4-degraded",
+    "collection_policy": {
+      "agent_mail_repair_allowed": false,
+      "mutating_actions_allowed": false,
+      "pane_text_allowed": "disabled",
+      "process_sampler": "bounded_snapshot",
+      "source_timeout_ms": 5000
+    },
+    "contract_id": "ft.swarm_incident_bundle.v1",
+    "created_at": "2026-05-10T11:12:40Z",
+    "environment": {
+      "arch": "aarch64",
+      "current_dir_available": true,
+      "os": "macos"
+    },
+    "format_version": "1.0",
+    "generator": {
+      "arch": "aarch64",
+      "ft_version": "fixture",
+      "hostname_class": "fixture-host",
+      "os": "macos",
+      "source_surface": "fixture::incident_bundle_golden"
+    },
+    "kind": "manual",
+    "privacy_budget": {
+      "config_summary_max_bytes": 4096,
+      "max_events": 8,
+      "pane_text_allowed": false,
+      "process_sample_allowed": true,
+      "tier": "fixture"
+    },
+    "redaction_summary": {
+      "redacted_files": 0,
+      "total_redactions": 0
+    },
+    "schema_version": 1,
+    "sources": [
+      {
+        "elapsed_ms": 12,
+        "evidence_state": "unavailable",
+        "mutates_state": false,
+        "name": "agent_mail_snapshot",
+        "privacy_tier": "fixture",
+        "redaction": "not_applicable",
+        "size_bytes": 0,
+        "source_surface": "fixture::agent_mail_snapshot",
+        "status": "unavailable",
+        "warning_ids": [
+          "agent_mail.unavailable"
+        ]
+      },
+      {
+        "elapsed_ms": 5,
+        "evidence_state": "unavailable",
+        "mutates_state": false,
+        "name": "process_sample",
+        "privacy_tier": "fixture",
+        "redaction": "not_applicable",
+        "size_bytes": 0,
+        "source_surface": "fixture::process_sample",
+        "status": "unavailable",
+        "warning_ids": [
+          "process_sample.unavailable"
+        ]
+      },
+      {
+        "elapsed_ms": 300000,
+        "evidence_state": "mixed",
+        "file": "sources/rch_timeout_evidence.json",
+        "freshness_ms": 0,
+        "generated_at": "2026-05-10T11:12:40Z",
+        "max_age_ms": 60000,
+        "mutates_state": false,
+        "name": "rch_timeout_evidence",
+        "privacy_tier": "fixture",
+        "redaction": "none",
+        "size_bytes": 346,
+        "source_surface": "fixture::rch_timeout_evidence",
+        "status": "failed",
+        "warning_ids": [
+          "rch.timeout"
+        ]
+      },
+      {
+        "elapsed_ms": 6,
+        "evidence_state": "measured",
+        "file": "sources/beads_blocker_snapshot.json",
+        "freshness_ms": 0,
+        "generated_at": "2026-05-10T11:12:40Z",
+        "max_age_ms": 60000,
+        "mutates_state": false,
+        "name": "beads_blocker_snapshot",
+        "privacy_tier": "fixture",
+        "redaction": "none",
+        "size_bytes": 365,
+        "source_surface": "fixture::beads_blocker_snapshot",
+        "status": "collected"
+      }
+    ],
+    "total_size_bytes": 711,
+    "warnings": [
+      {
+        "id": "agent_mail.unavailable",
+        "message": "Agent Mail database was unavailable; no repair or restart action was attempted.",
+        "severity": "warning",
+        "source": "agent_mail_snapshot"
+      },
+      {
+        "id": "process_sample.unavailable",
+        "message": "Platform sampler was unavailable in this fixture environment.",
+        "severity": "warning",
+        "source": "process_sample"
+      },
+      {
+        "id": "rch.timeout",
+        "message": "RCH proof command exceeded the fixture timeout budget.",
+        "severity": "warning",
+        "source": "rch_timeout_evidence"
+      }
+    ]
+  },
+  "total_size_bytes": 711,
+  "wa_version": "fixture"
+}

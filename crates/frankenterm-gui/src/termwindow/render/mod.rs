@@ -1158,8 +1158,10 @@ mod tests {
         let attrs = CellAttributes::default();
         let palette = ColorPalette::default();
         let config = ConfigHandle::default_config();
-        let mut style = TextStyle::default();
-        style.foreground = Some((0x12, 0x34, 0x56).into());
+        let style = TextStyle {
+            foreground: Some((0x12, 0x34, 0x56).into()),
+            ..Default::default()
+        };
 
         assert_eq!(
             resolve_fg_color_attr(&attrs, ColorAttribute::Default, &palette, &config, &style),
@@ -1217,8 +1219,10 @@ mod tests {
         let attrs = CellAttributes::default();
         let palette = ColorPalette::default();
         let config = ConfigHandle::default_config();
-        let mut style = TextStyle::default();
-        style.foreground = Some((0x12, 0x34, 0x56).into());
+        let style = TextStyle {
+            foreground: Some((0x12, 0x34, 0x56).into()),
+            ..Default::default()
+        };
 
         assert_eq!(
             resolve_fg_color_attr(

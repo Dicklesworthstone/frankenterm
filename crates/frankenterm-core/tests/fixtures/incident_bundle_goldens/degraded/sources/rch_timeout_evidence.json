@@ -1,0 +1,12 @@
+{
+  "ended_at": "2026-05-10T11:12:40Z",
+  "generated_at": "2026-05-10T11:12:40Z",
+  "isolated_target_dir": "/tmp/ft-krsq0-4-target",
+  "provenance": {
+    "mutates_state": false,
+    "source_surface": "fixture::rch_timeout_evidence"
+  },
+  "started_at": "2026-05-10T11:12:40Z",
+  "timeout_ms": 300000,
+  "verdict": "timeout"
+}

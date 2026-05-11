@@ -1,0 +1,754 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-herd-wave.json",
+  "title": "FrankenTerm Herd-Wave",
+  "description": "Versioned operator-facing contract for privacy-bounded synchronized swarm burst detection and dry-run stagger/admission planning.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source",
+    "source_freshness",
+    "evidence_state",
+    "overall_state",
+    "dominant_kind",
+    "event_count",
+    "distinct_panes",
+    "window_ms",
+    "pressure_tier",
+    "admission_action",
+    "reason_codes",
+    "recommended_stagger_ms",
+    "cohort_max_stagger_ms",
+    "wave_summary",
+    "priority_protection",
+    "operator_override",
+    "stagger_plan",
+    "citations",
+    "next_actions",
+    "forbidden_actions",
+    "unavailable_sources",
+    "redaction_policy",
+    "raw_pane_content_stored",
+    "target_class_hardware_proof",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.herd_wave.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_freshness": {
+      "$ref": "#/$defs/source_freshness"
+    },
+    "evidence_state": {
+      "$ref": "#/$defs/evidence_state"
+    },
+    "overall_state": {
+      "$ref": "#/$defs/overall_state"
+    },
+    "dominant_kind": {
+      "$ref": "#/$defs/herd_wave_event_kind"
+    },
+    "event_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "distinct_panes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "window_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "pressure_tier": {
+      "$ref": "#/$defs/pressure_tier"
+    },
+    "admission_action": {
+      "$ref": "#/$defs/admission_action"
+    },
+    "reason_codes": {
+      "$ref": "#/$defs/non_empty_string_array"
+    },
+    "recommended_stagger_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cohort_max_stagger_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "wave_summary": {
+      "$ref": "#/$defs/wave_summary"
+    },
+    "priority_protection": {
+      "$ref": "#/$defs/priority_protection"
+    },
+    "operator_override": {
+      "$ref": "#/$defs/operator_override"
+    },
+    "stagger_plan": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stagger_plan_row"
+      }
+    },
+    "citations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/citation"
+      }
+    },
+    "next_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/next_action"
+      }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "unavailable_sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/unavailable_source"
+      }
+    },
+    "redaction_policy": {
+      "$ref": "#/$defs/redaction_policy"
+    },
+    "raw_pane_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "target_class_hardware_proof": {
+      "$ref": "#/$defs/target_class_hardware_proof"
+    },
+    "artifact_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "evidence_state": {
+      "type": "string",
+      "enum": [
+        "measured",
+        "inferred",
+        "simulated",
+        "stale",
+        "unavailable",
+        "mixed"
+      ]
+    },
+    "overall_state": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "elevated",
+        "critical",
+        "emergency",
+        "missing_telemetry",
+        "stale_evidence",
+        "priority_protected",
+        "operator_override",
+        "cooldown_active",
+        "circuit_breaker_active",
+        "unknown"
+      ]
+    },
+    "pressure_tier": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "elevated",
+        "critical",
+        "emergency",
+        "unknown"
+      ]
+    },
+    "herd_wave_event_kind": {
+      "type": "string",
+      "enum": [
+        "compaction",
+        "retry",
+        "rate_limit_recovery",
+        "search_burst",
+        "workflow_fanout",
+        "wake",
+        "other",
+        "mixed",
+        "none",
+        "unknown"
+      ]
+    },
+    "admission_action": {
+      "type": "string",
+      "enum": [
+        "admit",
+        "defer",
+        "degrade",
+        "shed",
+        "none",
+        "unavailable"
+      ]
+    },
+    "forbidden_action": {
+      "type": "string",
+      "enum": [
+        "no_agent_mail_restart",
+        "no_agent_mail_repair",
+        "no_rch_restart_or_drain_without_approval",
+        "no_pane_mutation",
+        "no_queue_mutation",
+        "no_destructive_git_or_filesystem_operation",
+        "no_raw_pane_content",
+        "no_target_class_claim_without_artifact"
+      ]
+    },
+    "non_empty_string_array": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "string_array": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "source_freshness": {
+      "type": "object",
+      "required": [
+        "generated_at_ms",
+        "freshness_ms",
+        "max_age_ms",
+        "evidence_state",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "generated_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "freshness_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_age_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "wave_summary": {
+      "type": "object",
+      "required": [
+        "detected",
+        "event_count",
+        "distinct_panes",
+        "window_ms",
+        "first_seen_ms",
+        "last_seen_ms",
+        "dominant_kind",
+        "dominant_kind_count",
+        "pressure_tier",
+        "recommended_stagger_ms",
+        "cohort_max_stagger_ms",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "detected": {
+          "type": "boolean"
+        },
+        "event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "distinct_panes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "window_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "first_seen_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "last_seen_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "dominant_kind": {
+          "$ref": "#/$defs/herd_wave_event_kind"
+        },
+        "dominant_kind_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pressure_tier": {
+          "$ref": "#/$defs/pressure_tier"
+        },
+        "recommended_stagger_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cohort_max_stagger_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "priority_protection": {
+      "type": "object",
+      "required": [
+        "protected",
+        "protection_units",
+        "pane_priority_tier",
+        "work_priority",
+        "mission_critical",
+        "effective_admission_action",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "protected": {
+          "type": "boolean"
+        },
+        "protection_units": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pane_priority_tier": {
+          "type": "string",
+          "enum": [
+            "background",
+            "low",
+            "medium",
+            "high",
+            "critical",
+            "unknown"
+          ]
+        },
+        "work_priority": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "mission_critical": {
+          "type": "boolean"
+        },
+        "effective_admission_action": {
+          "$ref": "#/$defs/admission_action"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "operator_override": {
+      "type": "object",
+      "required": [
+        "active",
+        "override_id",
+        "scope",
+        "approved_by",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "override_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "scope": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "approved_by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "stagger_plan_row": {
+      "type": "object",
+      "required": [
+        "action_id",
+        "pane_id",
+        "cohort_rank",
+        "event_kind",
+        "scheduled_after_ms",
+        "admission_action",
+        "mutation_allowed",
+        "reason_codes",
+        "citation_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cohort_rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "event_kind": {
+          "$ref": "#/$defs/herd_wave_event_kind"
+        },
+        "scheduled_after_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "admission_action": {
+          "$ref": "#/$defs/admission_action"
+        },
+        "mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "citation_ids": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "citation": {
+      "type": "object",
+      "required": [
+        "citation_id",
+        "source",
+        "evidence_state",
+        "subject_type",
+        "subject_id",
+        "generated_at_ms",
+        "artifact_path",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "subject_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subject_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "generated_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "artifact_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "next_action": {
+      "type": "object",
+      "required": [
+        "action_id",
+        "action_kind",
+        "operator_summary",
+        "mutation_allowed",
+        "requires_approval",
+        "reason_codes",
+        "citation_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "action_kind": {
+          "type": "string",
+          "enum": [
+            "observe",
+            "collect_incident_bundle",
+            "apply_manual_stagger",
+            "pause_assignment",
+            "reduce_fanout",
+            "inspect_telemetry",
+            "none"
+          ]
+        },
+        "operator_summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "requires_approval": {
+          "type": "boolean"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "citation_ids": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "unavailable_source": {
+      "type": "object",
+      "required": [
+        "source",
+        "evidence_state",
+        "freshness_ms",
+        "max_age_ms",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_state": {
+          "type": "string",
+          "enum": [
+            "stale",
+            "unavailable"
+          ]
+        },
+        "freshness_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_age_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "required": [
+        "raw_pane_content_allowed",
+        "max_excerpt_chars",
+        "secret_redaction_required",
+        "allowed_citation_subjects",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "max_excerpt_chars": {
+          "type": "integer",
+          "const": 0
+        },
+        "secret_redaction_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "allowed_citation_subjects": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "target_class_hardware_proof": {
+      "type": "object",
+      "required": [
+        "available",
+        "cpu_cores",
+        "memory_gib",
+        "host_fingerprint",
+        "rch_worker",
+        "run_id",
+        "artifact_path",
+        "command",
+        "exit_status",
+        "measured_window_ms",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "cpu_cores": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "memory_gib": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "host_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "rch_worker": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "artifact_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "exit_status": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "measured_window_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    }
+  }
+}

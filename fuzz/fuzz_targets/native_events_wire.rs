@@ -38,15 +38,12 @@ fuzz_target!(|data: &[u8]| {
     let Ok(line) = std::str::from_utf8(data) else {
         return;
     };
-    match decode_wire_event_for_fuzz(line) {
-        Ok(Some(NativeEvent::PaneOutput { data, .. })) => {
-            assert!(
-                data.len() <= MAX_OUTPUT_BYTES,
-                "PaneOutput.data length {} exceeded MAX_OUTPUT_BYTES {}",
-                data.len(),
-                MAX_OUTPUT_BYTES
-            );
-        }
-        Ok(_) | Err(_) => {}
+    if let Ok(Some(NativeEvent::PaneOutput { data, .. })) = decode_wire_event_for_fuzz(line) {
+        assert!(
+            data.len() <= MAX_OUTPUT_BYTES,
+            "PaneOutput.data length {} exceeded MAX_OUTPUT_BYTES {}",
+            data.len(),
+            MAX_OUTPUT_BYTES
+        );
     }
 });

@@ -85,6 +85,7 @@ The terminal conformance lane should keep artifacts predictable:
 | `FIXTURED` | Committed fixtures exist, but no no-mock or RCH-backed proof consumes them yet. |
 | `NO_MOCK_PASS` | A no-mock harness consumes the row and passes through RCH where heavy proof is required. |
 | `PARSER_ONLY_PASS` | The behavior is parser-only and a deterministic unit or integration test is the correct proof. |
+| `METADATA_PASS` | Metadata-only fixture validation is the proof; the case is not a passing terminal behavior scenario yet. |
 | `QUARANTINED` | A known case is kept out of the main gate with explicit reason and follow-up Bead. |
 | `BLOCKED` | The row cannot be proven because of an infrastructure or architecture blocker named in the row. |
 
@@ -98,14 +99,14 @@ works". Deferred rows must name a concrete Bead ID.
 | 1 | Contract and coverage matrix | This document | `git diff --check -- docs/terminal-conformance-contract.md` | `ft-hme39.1` | `CONTRACTED` |
 | 2 | No-mock PTY/mux loopback smoke | Harness under `tests/e2e/` plus run artifacts | RCH-backed smoke with real spawn, send, resize, read, and pane/session assertions | `ft-hme39.2` | `CONTRACTED` |
 | 3 | Mux attach/detach and pane lifecycle | Loopback scenario fixture or harness row | RCH-backed no-mock harness if Cargo/e2e is required | `ft-hme39.2` | `CONTRACTED` |
-| 4 | Resize plus wrapped text and reflow | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-resize-wrap-001` | `frankenterm-escape-parser` parser corpus test; no no-mock reflow claim yet | `ft-hme39.3` | `FIXTURED` |
-| 5 | Bracketed paste and focus events | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-bracketed-paste-focus-001` | `frankenterm-escape-parser` parser corpus test with scenario ID | `ft-hme39.3` | `FIXTURED` |
-| 6 | OSC 8 hyperlink | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-osc8-hyperlink-001` | `frankenterm-escape-parser` parser corpus test with scenario ID | `ft-hme39.3` | `FIXTURED` |
-| 7 | CSI cursor shape and terminal modes | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-cursor-mode-001` | `frankenterm-escape-parser` parser corpus test with scenario ID | `ft-hme39.3` | `FIXTURED` |
-| 8 | Alternate screen enter/exit | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-alt-screen-001` | `frankenterm-escape-parser` parser corpus test; no no-mock screen-state claim yet | `ft-hme39.3` | `FIXTURED` |
-| 9 | UTF-8 and grapheme boundaries | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-utf8-grapheme-001` | `frankenterm-escape-parser` parser corpus test; no cell-width/render claim yet | `ft-hme39.3` | `FIXTURED` |
-| 10 | Graphics negative fixture | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-graphics-negative-001` | `frankenterm-escape-parser` parser corpus test; no visual image claim | `ft-hme39.3` | `FIXTURED` |
-| 11 | Failing transcript minimization | Minimized fixture metadata plus quarantine policy | Static fixture validation and, when executable, RCH-backed repro | `ft-hme39.4` | `CONTRACTED` |
+| 4 | Resize plus wrapped text and reflow | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-resize-wrap-001` | `frankenterm-escape-parser` parser corpus test; no no-mock reflow claim yet | `ft-hme39.3` | `PARSER_ONLY_PASS` |
+| 5 | Bracketed paste and focus events | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-bracketed-paste-focus-001` | `frankenterm-escape-parser` parser corpus test with scenario ID | `ft-hme39.3` | `PARSER_ONLY_PASS` |
+| 6 | OSC 8 hyperlink | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-osc8-hyperlink-001` | `frankenterm-escape-parser` parser corpus test with scenario ID | `ft-hme39.3` | `PARSER_ONLY_PASS` |
+| 7 | CSI cursor shape and terminal modes | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-cursor-mode-001` | `frankenterm-escape-parser` parser corpus test with scenario ID | `ft-hme39.3` | `PARSER_ONLY_PASS` |
+| 8 | Alternate screen enter/exit | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-alt-screen-001` | `frankenterm-escape-parser` parser corpus test; no no-mock screen-state claim yet | `ft-hme39.3` | `PARSER_ONLY_PASS` |
+| 9 | UTF-8 and grapheme boundaries | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-utf8-grapheme-001` | `frankenterm-escape-parser` parser corpus test; no cell-width/render claim yet | `ft-hme39.3` | `PARSER_ONLY_PASS` |
+| 10 | Graphics negative fixture | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-graphics-negative-001` | `frankenterm-escape-parser` parser corpus test; no visual image claim | `ft-hme39.3` | `PARSER_ONLY_PASS` |
+| 11 | Failing transcript minimization | `tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json` plus quarantine policy | `frankenterm-escape-parser` corpus metadata validator; no live failure claim yet | `ft-hme39.4` | `METADATA_PASS` |
 | 12 | Large transcript performance budget | Generator or committed scale fixture plus budget thresholds | RCH-backed performance run or operator-gated reproducible lane | `ft-hme39.5` | `CONTRACTED` |
 | 13 | Closeout and proof-ledger usage | Docs tying artifacts to Beads and proof ledger | Static docs check; later proof-ledger validator when available | `ft-hme39.6` | `CONTRACTED` |
 
@@ -152,6 +153,58 @@ for future agents to reason without chat context:
 | `no_mock_boundary` | yes | Which real boundary is exercised, or why parser-only is correct. |
 | `redaction_status` | yes | Confirmation that the fixture contains no secrets or private host paths. |
 | `follow_up_bead` | when deferred | Bead ID for incomplete proof or open artifact work. |
+
+## Failing Transcript Minimization
+
+Large terminal failures should be reduced before they are committed. The goal is
+to keep the smallest transcript that still reproduces the same assertion, while
+preserving enough provenance for another agent to understand the failure without
+chat history.
+
+Manual minimization procedure:
+
+1. Capture or identify the original failing artifact path. Prefer an RCH run
+   artifact under `tests/e2e/logs/terminal-conformance/<bead>/<run_id>/` when the
+   failure came from an executable harness.
+2. Copy the candidate bytes into a scratch location, then remove unrelated
+   prompt text, command echo, idle output, and duplicate protocol sequences one
+   reduction at a time.
+3. After each reduction, rerun the narrow assertion that produced the original
+   failure. The failure signature must remain the same, not merely fail
+   somewhere nearby.
+4. Stop when the next obvious deletion changes the signature or hides the
+   failing assertion.
+5. Commit only the minimized input and metadata. Do not commit a large raw
+   failure log unless a reviewer explicitly asks for it.
+
+Each minimized case must be listed in `manifest.json` under `minimized_cases`
+and must provide:
+
+- `scenario_id`;
+- `original_artifact_path`;
+- `minimized_input_artifact`;
+- `expected_failure.assertion`;
+- `expected_failure.failure_signature`;
+- `expected_failure.preserved_by_minimized_input`;
+- ordered `minimization_steps` with action and evidence;
+- `quarantine.reason`, `quarantine.follow_up_bead`, and
+  `quarantine.promotion_condition`;
+- `promotion.target_manifest`, `promotion.required_proof`, and
+  `promotion.criteria`;
+- `residual_risk`;
+- `redaction_status`.
+
+Quarantine is allowed only when the case is intentionally kept out of the main
+passing corpus because it is flaky, environment-sensitive, synthetic, or blocked
+by a named product or harness defect. A quarantined case must name the reason,
+follow-up Bead, promotion condition, and residual risk. Silent skips are not
+allowed: a transcript that cannot name these fields must not be committed.
+
+Promotion into the main corpus requires replacing synthetic or generated-only
+provenance with a real artifact when applicable, adding a passing expected
+artifact under `expected/`, adding the scenario to `manifest.scenarios`, and
+running the exact RCH proof command that consumes the fixture. Metadata
+validation alone proves the quarantine contract, not terminal correctness.
 
 ## Closeout Template
 

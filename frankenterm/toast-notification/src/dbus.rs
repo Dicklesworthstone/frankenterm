@@ -95,15 +95,25 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
     let proxy = NotificationsProxy::new(&connection).await?;
     let caps = proxy.get_capabilities().await?;
 
-    if notif.url.is_some() && !caps.iter().any(|cap| cap == "actions") {
+    if notif.has_activation_action() && !caps.iter().any(|cap| cap == "actions") {
         // Server doesn't support actions, so skip showing this notification
         // because it might have text that says "click to see more"
         // and that just wouldn't work.
+        log::warn!(
+            "notification server lacks action support; skipping actionable toast: {}",
+            notif.title
+        );
         return Ok(());
     }
 
     let mut hints = HashMap::new();
     hints.insert("urgency", Value::U8(2 /* Critical */));
+    let action_label = notif.activation_label();
+    let actions = if notif.has_activation_action() {
+        vec!["show", action_label]
+    } else {
+        Vec::new()
+    };
     let notification = proxy
         .notify(
             "wezterm",
@@ -111,11 +121,7 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
             "org.wezfurlong.wezterm",
             &notif.title,
             &notif.message,
-            if notif.url.is_some() {
-                &["show", "Show"]
-            } else {
-                &[]
-            },
+            &actions,
             &hints,
             notif.timeout.map(|d| d.as_millis() as _).unwrap_or(0),
         )
@@ -128,12 +134,10 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
         async {
             while let Some(signal) = invoked_stream.next().await {
                 let args = signal.args()?;
-                if args.nid == notification {
-                    if let Some(url) = notif.url.as_ref() {
-                        frankenterm_open_url::open_url(url);
-                        abort_closed.abort();
-                        break;
-                    }
+                if args.nid == notification && notif.has_activation_action() {
+                    notif.activate();
+                    abort_closed.abort();
+                    break;
                 }
             }
             Ok::<(), zbus::Error>(())

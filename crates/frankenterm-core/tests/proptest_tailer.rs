@@ -55,6 +55,7 @@ fn arb_scheduler_snapshot() -> impl Strategy<Value = SchedulerSnapshot> {
                     total_byte_budget_exceeded,
                     total_throttle_events,
                     tracked_panes,
+                    ..SchedulerSnapshot::default()
                 }
             },
         )
@@ -865,6 +866,7 @@ fn scheduler_snapshot_json_includes_all_fields() {
         total_byte_budget_exceeded: 1,
         total_throttle_events: 4,
         tracked_panes: 7,
+        ..SchedulerSnapshot::default()
     };
     let json = serde_json::to_string(&snap).unwrap();
     assert!(json.contains("budget_active"));
@@ -876,6 +878,10 @@ fn scheduler_snapshot_json_includes_all_fields() {
     assert!(json.contains("total_byte_budget_exceeded"));
     assert!(json.contains("total_throttle_events"));
     assert!(json.contains("tracked_panes"));
+    assert!(json.contains("pane_rows_total"));
+    assert!(json.contains("pane_rows_truncated"));
+    assert!(json.contains("panes"));
+    assert!(json.contains("tiers"));
 }
 
 // ─── Anti-starvation tiering properties ──────────────────────────────

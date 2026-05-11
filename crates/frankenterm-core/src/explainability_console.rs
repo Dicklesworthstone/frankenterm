@@ -2232,7 +2232,7 @@ mod tests {
         );
 
         assert_eq!(ledger.node_count(), 3);
-        assert!(ledger.ancestors("old", 4).gaps[0].reason == "missing_root");
+        assert_eq!(ledger.ancestors("old", 4).gaps[0].reason, "missing_root");
         assert_eq!(ledger.edge_count(), 2);
 
         let traversal = ledger.descendants("a", 8);

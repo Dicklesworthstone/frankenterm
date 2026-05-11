@@ -16423,11 +16423,11 @@ mod tests {
             .with_capabilities(PaneCapabilities::prompt());
         let decision = engine.authorize(&input);
         assert!(!decision.is_allowed());
-        assert!(
+        assert_eq!(
             decision
                 .context()
-                .and_then(|c| c.determining_rule.as_deref())
-                == Some("policy.namespace_isolation")
+                .and_then(|c| c.determining_rule.as_deref()),
+            Some("policy.namespace_isolation")
         );
     }
 

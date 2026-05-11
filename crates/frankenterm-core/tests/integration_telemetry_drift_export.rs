@@ -168,7 +168,10 @@ fn collector_snapshot_coherent_with_drift_summary() {
     // Take snapshot.
     let snap: TelemetrySnapshot = collector.snapshot();
     assert_eq!(snap.histograms.len(), 2);
-    assert!(snap.counters.get("frames_rendered").copied().unwrap_or(0) == 50);
+    assert_eq!(
+        snap.counters.get("frames_rendered").copied().unwrap_or(0),
+        50
+    );
 
     // Drift monitor tracks the same rates.
     let mut drift = DriftMonitor::new(DriftConfig::default());

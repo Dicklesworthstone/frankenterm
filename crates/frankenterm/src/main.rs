@@ -14,8 +14,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
+use frankenterm_core::blocker_radar::{
+    BlockerRadarCollectorObservation, BlockerRadarInput, BlockerRadarObservationStatus,
+    BlockerRadarReport, BlockerRadarSourceKind, blocker_radar_input_from_coordination_snapshot,
+    build_blocker_radar_report,
+};
 use frankenterm_core::cass::CassErrorRemediationExt;
 use frankenterm_core::caut::CautErrorRemediationExt;
+use frankenterm_core::context_horizon::{
+    ContextHorizonFailureClass, ContextHorizonReport, context_horizon_unavailable_report,
+    predict_context_horizon_from_sqlite,
+};
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
 use frankenterm_core::plan::mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report;
 #[cfg(test)]
@@ -30,8 +39,13 @@ use frankenterm_core::proof_doctor::{
     PROOF_DOCTOR_SCHEMA_VERSION, ProofDoctorBeadRef, ProofDoctorDirtyPath, ProofDoctorEvidence,
     ProofDoctorPhase, ProofDoctorPreflightInput, classify_proof_doctor,
 };
+use frankenterm_core::proof_handoff::build_proof_handoff;
 use frankenterm_core::proof_lane::{ProofBackend, ProofScope};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
+use frankenterm_core::swarm_scheduler::{
+    AdmissionRequest, HerdWaveDetectionConfig, HerdWaveEventKind, HerdWaveSignal,
+    SwarmAdmissionController, SwarmAdmissionTelemetry,
+};
 
 /// Build metadata captured at compile time.
 mod build_meta {
@@ -2882,10 +2896,42 @@ enum RobotCommands {
         level: u8,
     },
 
+    /// Emit read-only herd-wave contract and dry-run planner output
+    #[command(visible_alias = "herd_wave")]
+    HerdWave {
+        /// Pane IDs to model as the current synchronized cohort
+        #[arg(long = "signal-pane", value_delimiter = ',')]
+        signal_panes: Vec<u64>,
+
+        /// Event kind to apply to supplied signal panes
+        #[arg(long, value_enum, default_value_t = RobotHerdWaveEventKind::Wake)]
+        kind: RobotHerdWaveEventKind,
+
+        /// Stable generation timestamp for deterministic replay
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
+
+        /// Milliseconds between modeled pane signals
+        #[arg(long, default_value_t = 10)]
+        signal_spacing_ms: u64,
+
+        /// Freshness window for evidence rows
+        #[arg(long, default_value_t = 60_000)]
+        max_age_ms: u64,
+    },
+
     /// Emit Agent Mail fallback Beads/git coordination-risk snapshot
     #[command(visible_aliases = ["agent-mail-fallback", "red-mail"])]
     CoordinationRisk {
         /// Swarm session name passed to the fallback producer
+        #[arg(default_value = "frankenterm")]
+        session: String,
+    },
+
+    /// Emit read-only blocker radar across mail, Beads, git, RCH, and CI evidence
+    #[command(visible_alias = "blocker_radar")]
+    BlockerRadar {
+        /// Swarm session name passed to the Agent Mail fallback producer
         #[arg(default_value = "frankenterm")]
         session: String,
     },
@@ -2973,6 +3019,31 @@ enum RobotCommands {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RobotHerdWaveEventKind {
+    Compaction,
+    Retry,
+    RateLimitRecovery,
+    SearchBurst,
+    WorkflowFanout,
+    Wake,
+    Other,
+}
+
+impl From<RobotHerdWaveEventKind> for HerdWaveEventKind {
+    fn from(kind: RobotHerdWaveEventKind) -> Self {
+        match kind {
+            RobotHerdWaveEventKind::Compaction => Self::Compaction,
+            RobotHerdWaveEventKind::Retry => Self::Retry,
+            RobotHerdWaveEventKind::RateLimitRecovery => Self::RateLimitRecovery,
+            RobotHerdWaveEventKind::SearchBurst => Self::SearchBurst,
+            RobotHerdWaveEventKind::WorkflowFanout => Self::WorkflowFanout,
+            RobotHerdWaveEventKind::Wake => Self::Wake,
+            RobotHerdWaveEventKind::Other => Self::Other,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -3599,6 +3670,16 @@ enum RobotContextCommands {
         /// Specific pane ID (omit for fleet-wide summary)
         #[arg(long)]
         pane_id: Option<u64>,
+    },
+    /// Forecast context pressure, compaction, rate-limit, and handoff risk
+    Horizon {
+        /// Specific pane ID (omit for fleet-wide horizon)
+        #[arg(long)]
+        pane_id: Option<u64>,
+
+        /// Forecast window in milliseconds
+        #[arg(long)]
+        horizon_window_ms: Option<u64>,
     },
     /// Trigger context rotation for a pane
     Rotate {
@@ -6000,11 +6081,17 @@ fn build_proof_doctor_payload(
         proof_path_prefixes,
         evidence,
     };
+    build_proof_doctor_payload_from_input(input)
+}
+
+fn build_proof_doctor_payload_from_input(input: ProofDoctorPreflightInput) -> serde_json::Value {
     let verdict = classify_proof_doctor(&input);
+    let handoff = build_proof_handoff(&verdict);
 
     serde_json::json!({
         "schema_version": PROOF_DOCTOR_SCHEMA_VERSION,
         "verdict": verdict,
+        "handoff": handoff,
     })
 }
 
@@ -6084,6 +6171,34 @@ fn load_coordination_risk_snapshot(
     }
 
     parse_coordination_risk_snapshot(&output.stdout)
+}
+
+fn build_blocker_radar_report_from_fallback(
+    workspace_root: &Path,
+    session: &str,
+    generated_at_ms: u64,
+    source: &str,
+) -> BlockerRadarReport {
+    match load_coordination_risk_snapshot(workspace_root, session) {
+        Ok(snapshot) => {
+            let input =
+                blocker_radar_input_from_coordination_snapshot(&snapshot, generated_at_ms, source);
+            build_blocker_radar_report(&input)
+        }
+        Err(err) => build_blocker_radar_report(
+            &BlockerRadarInput::new(generated_at_ms, source).with_observation(
+                BlockerRadarCollectorObservation::new(
+                    "coordination_fallback.unavailable",
+                    BlockerRadarSourceKind::Manual,
+                    BlockerRadarObservationStatus::DegradedUnavailable,
+                    "scripts/swarm-tick.sh --agent-mail-fallback",
+                    format!("Failed to build coordination fallback snapshot: {err}"),
+                )
+                .live(generated_at_ms, 0)
+                .with_reason_code("coordination_fallback.unavailable"),
+            ),
+        ),
+    }
 }
 
 fn estimate_tokens(s: &str) -> usize {
@@ -13122,6 +13237,51 @@ fn robot_context_status_data(
     }))
 }
 
+fn robot_context_horizon_data(
+    db_path: &str,
+    pane_id: Option<u64>,
+    horizon_window_ms: Option<u64>,
+    elapsed_ms: u64,
+) -> RobotJsonResult<serde_json::Value> {
+    let horizon_window_ms = horizon_window_ms.unwrap_or(15 * 60 * 1000);
+    if horizon_window_ms == 0 {
+        return Err(Box::new(robot_context_error_response(
+            ROBOT_ERR_INVALID_ARGS,
+            "horizon_window_ms must be greater than zero.",
+            Some("Omit --horizon-window-ms to use the default 15 minute forecast.".to_string()),
+            elapsed_ms,
+        )));
+    }
+
+    let report = predict_context_horizon_from_sqlite(
+        Path::new(db_path),
+        pane_id,
+        now_ms(),
+        horizon_window_ms,
+        "robot.context.horizon",
+    )
+    .map_err(|err| {
+        robot_context_error_response(
+            ROBOT_ERR_STORAGE,
+            format!("Failed to build context horizon: {err}"),
+            Some(
+                "Check the workspace database path; the context horizon read path is non-mutating."
+                    .to_string(),
+            ),
+            elapsed_ms,
+        )
+    })?;
+
+    serde_json::to_value(report).map_err(|err| {
+        Box::new(robot_context_error_response(
+            "robot.serialization_error",
+            format!("Failed to serialize context horizon: {err}"),
+            None,
+            elapsed_ms,
+        ))
+    })
+}
+
 fn robot_context_rotation_response(
     row: &RobotContextRotationRow,
     is_replay: bool,
@@ -13361,6 +13521,10 @@ fn robot_context_command_response(
         RobotContextCommands::Status { pane_id } => {
             robot_context_status_data(db_path, *pane_id, elapsed_ms)
         }
+        RobotContextCommands::Horizon {
+            pane_id,
+            horizon_window_ms,
+        } => robot_context_horizon_data(db_path, *pane_id, *horizon_window_ms, elapsed_ms),
         RobotContextCommands::Rotate {
             pane_id,
             strategy,
@@ -13523,6 +13687,94 @@ mod robot_context_backend_tests {
         assert_ne!(first["rotation_id"], third["rotation_id"]);
         assert_eq!(third["is_replay"].as_bool(), Some(false));
         assert_eq!(context_rotation_count(&db_path, 42), 2);
+    }
+
+    #[test]
+    fn robot_context_horizon_emits_v1_contract_without_mutation() {
+        let (_dir, db_path) = setup_robot_context_test_db();
+        let conn = robot_context_open_conn(&db_path).expect("open context db");
+        conn.execute(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detected_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .expect("create events table");
+        conn.execute(
+            "INSERT INTO pane_contexts
+             (context_id, pane_id, state, depth, created_at_ms, token_budget,
+              tokens_consumed, pressure_tier, source)
+             VALUES ('ctx-horizon', 9, 'active', 1, ?1, 1000, 910, 'yellow',
+                     'test')",
+            [now_ms_i64().saturating_sub(1_000)],
+        )
+        .expect("insert active context");
+        conn.execute(
+            "INSERT INTO events (pane_id, rule_id, event_type, detected_at)
+             VALUES (9, 'codex.usage.limit', 'rate_limit', ?1)",
+            [now_ms_i64().saturating_sub(500)],
+        )
+        .expect("insert event");
+        drop(conn);
+
+        let horizon = expect_context_ok(robot_context_horizon_data(
+            &db_path,
+            Some(9),
+            Some(60_000),
+            13,
+        ));
+        assert_eq!(
+            horizon["contract_id"].as_str(),
+            Some("ft.context_horizon.v1")
+        );
+        assert_eq!(horizon["source"].as_str(), Some("robot.context.horizon"));
+        assert_eq!(horizon["raw_context_content_stored"].as_bool(), Some(false));
+        assert_eq!(horizon["pane_risks"][0]["pane_id"].as_u64(), Some(9));
+        assert_eq!(
+            horizon["pane_risks"][0]["reason_codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str() == Some("provider.rate_limit_recent")),
+            true
+        );
+        assert!(
+            horizon["recommendations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["mutation_allowed"].as_bool() == Some(false))
+        );
+
+        let response = RobotResponse::success(horizon, 13);
+        let encoded = toon_rust::encode(serde_json::to_value(&response).unwrap(), None);
+        assert!(encoded.contains("pane_risks"));
+        assert!(encoded.contains("reason_codes"));
+        assert!(encoded.contains("raw_context_content_stored"));
+        let decoded_toon = toon_rust::try_decode(&encoded, None).expect("decode horizon toon");
+        let decoded_json =
+            toon_rust::cli::json_stringify::json_stringify_lines(&decoded_toon, 0).join("\n");
+        let decoded: serde_json::Value =
+            serde_json::from_str(&decoded_json).expect("horizon toon roundtrip json");
+        assert_eq!(
+            decoded["data"]["contract_id"].as_str(),
+            Some("ft.context_horizon.v1")
+        );
+        assert_eq!(
+            decoded["data"]["pane_risks"][0]["reason_codes"][0].is_string(),
+            true
+        );
+    }
+
+    #[test]
+    fn robot_context_horizon_rejects_zero_window() {
+        let (_dir, db_path) = setup_robot_context_test_db();
+        let error = expect_context_error(robot_context_horizon_data(&db_path, None, Some(0), 13));
+        assert_eq!(error.error_code.as_deref(), Some(ROBOT_ERR_INVALID_ARGS));
     }
 
     #[test]
@@ -16447,6 +16699,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Emit Agent Mail fallback Beads/git coordination-risk snapshot",
             },
             RobotCommandInfo {
+                name: "blocker-radar",
+                description: "Emit read-only blocker radar across Mail, Beads, git, RCH, and CI evidence",
+            },
+            RobotCommandInfo {
                 name: "resource what-if",
                 description: "Run a read-only resource-control digital-twin simulation",
             },
@@ -16831,6 +17087,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 ],
             },
             QuickStartCommand {
+                name: "blocker-radar",
+                args: "[session]",
+                summary: "Read the v1 blocker-radar contract from read-only coordination evidence",
+                examples: vec![
+                    "ft robot blocker-radar",
+                    "ft robot --format toon blocker-radar frankenterm",
+                ],
+            },
+            QuickStartCommand {
                 name: "tx rollback",
                 args: "[--contract-file <path>] [--fail-compensation-for-step <step_id>]",
                 summary: "Execute compensation phase over committed tx steps",
@@ -16974,6 +17239,158 @@ fn unavailable_swarm_capacity_summary(
         level,
         source,
     )
+}
+
+fn build_herd_wave_surface_report(
+    source: &str,
+    generated_at_ms: u64,
+    signal_panes: &[u64],
+    kind: HerdWaveEventKind,
+    signal_spacing_ms: u64,
+    max_age_ms: u64,
+) -> serde_json::Value {
+    let config = HerdWaveDetectionConfig::default();
+    let signal_tail_len = u64::try_from(signal_panes.len().saturating_sub(1)).unwrap_or(u64::MAX);
+    let first_signal_ms =
+        generated_at_ms.saturating_sub(signal_spacing_ms.saturating_mul(signal_tail_len));
+    let signals = signal_panes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, pane_id)| {
+            let index = u64::try_from(index).unwrap_or(u64::MAX);
+            HerdWaveSignal::pane(
+                pane_id,
+                kind,
+                first_signal_ms.saturating_add(signal_spacing_ms.saturating_mul(index)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let wave_summary = if signals.is_empty() {
+        None
+    } else {
+        Some(frankenterm_core::swarm_scheduler::detect_herd_wave_pressure(&signals, &config))
+    };
+    let telemetry = SwarmAdmissionTelemetry {
+        queue_pressure: None,
+        fleet_pressure: None,
+        memory_tier_budget: None,
+        latency_stage_pressures: None,
+        herd_wave_pressure: wave_summary.clone(),
+    };
+    let estimated_effort = u32::try_from(signal_panes.len().max(1)).unwrap_or(u32::MAX);
+    let admission_request = AdmissionRequest::standard(5, estimated_effort);
+    let admission_decision =
+        SwarmAdmissionController::default().evaluate(&admission_request, &telemetry);
+    let snapshot = frankenterm_core::swarm_scheduler::HerdWaveContractSnapshot::from_telemetry(
+        generated_at_ms,
+        source,
+        &telemetry,
+        Some(&admission_decision),
+        (!signals.is_empty()).then_some(generated_at_ms),
+        max_age_ms,
+    );
+    let dry_run_plan = frankenterm_core::swarm_scheduler::plan_herd_wave_dry_run_actions(
+        generated_at_ms,
+        &signals,
+        &config,
+        Some(&admission_decision),
+        None,
+    );
+
+    let mut report = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut report {
+        map.insert(
+            "dry_run_plan".to_string(),
+            serde_json::to_value(dry_run_plan).unwrap_or(serde_json::Value::Null),
+        );
+        map.insert(
+            "signal_input".to_string(),
+            serde_json::json!({
+                "signal_count": signals.len(),
+                "signal_panes": signal_panes,
+                "kind": kind,
+                "signal_spacing_ms": signal_spacing_ms,
+                "manual_signals_only": true,
+            }),
+        );
+        map.insert(
+            "mcp_resource".to_string(),
+            serde_json::json!({
+                "implemented": false,
+                "deferred_follow_up": "ft-5bwjf.8",
+                "reason": "mcp_resources.rs has active context-horizon edits; herd-wave MCP parity is isolated to a follow-up bead.",
+                "read_only_required": true,
+            }),
+        );
+    }
+    report
+}
+
+fn herd_wave_report_text<'a>(report: &'a serde_json::Value, key: &str) -> &'a str {
+    report
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn print_herd_wave_doctor_section(report: &serde_json::Value) {
+    println!();
+    println!("Herd Wave:");
+    println!(
+        "  State: {}",
+        herd_wave_report_text(report, "overall_state")
+    );
+    println!(
+        "  Pressure: {} (distinct_panes={}, events={})",
+        herd_wave_report_text(report, "pressure_tier"),
+        report
+            .get("distinct_panes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        report
+            .get("event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    );
+    println!(
+        "  Dominant kind: {}",
+        herd_wave_report_text(report, "dominant_kind")
+    );
+    println!(
+        "  Stagger: recommended={}ms max={}ms",
+        report
+            .get("recommended_stagger_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        report
+            .get("cohort_max_stagger_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    );
+    println!(
+        "  Admission: {}",
+        herd_wave_report_text(report, "admission_action")
+    );
+    if let Some(next_actions) = report
+        .pointer("/dry_run_plan/operator_next_actions")
+        .and_then(serde_json::Value::as_array)
+    {
+        let actions = next_actions
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        if !actions.is_empty() {
+            println!("  Next: {}", actions.join(", "));
+        }
+    }
+    let unavailable_count = report
+        .get("unavailable_sources")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    println!("  Unavailable sources: {unavailable_count}");
+    println!("  Raw pane content stored: false");
+    println!("  MCP: deferred to ft-5bwjf.8");
 }
 
 fn print_swarm_capacity_doctor_section(
@@ -23427,6 +23844,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::BlockerRadar { session } => {
+                    let report = build_blocker_radar_report_from_fallback(
+                        &workspace_root,
+                        &session,
+                        now_ms(),
+                        "robot.blocker_radar",
+                    );
+                    let response = RobotResponse::success(report, elapsed_ms(start));
+                    print_robot_response(&response, format, stats)?;
+                }
                 other => {
                     let ctx = match build_robot_context(&config, &workspace_root) {
                         Ok(ctx) => ctx,
@@ -29476,6 +29903,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let response = RobotResponse::success(summary, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
+                        RobotCommands::HerdWave {
+                            signal_panes,
+                            kind,
+                            generated_at_ms,
+                            signal_spacing_ms,
+                            max_age_ms,
+                        } => {
+                            let report = build_herd_wave_surface_report(
+                                "robot.herd_wave",
+                                generated_at_ms.unwrap_or_else(now_ms),
+                                &signal_panes,
+                                kind.into(),
+                                signal_spacing_ms,
+                                max_age_ms,
+                            );
+                            let response = RobotResponse::success(report, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
                         RobotCommands::Resource { command } => match command {
                             RobotResourceCommands::WhatIf {
                                 trace,
@@ -29727,6 +30172,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             unreachable!("handled above")
                         }
                         RobotCommands::CoordinationRisk { .. } => unreachable!("handled above"),
+                        RobotCommands::BlockerRadar { .. } => unreachable!("handled above"),
                         RobotCommands::ProofDoctor { .. } => unreachable!("handled above"),
                     }
                 }
@@ -36349,6 +36795,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| {
                     frankenterm_core::hardware_profile::collect_hardware_profile(&layout.root)
                 });
+            let context_horizon_report = build_context_horizon_doctor_report(&layout.db_path);
+            let blocker_radar_report = build_blocker_radar_report_from_fallback(
+                &workspace_root,
+                "frankenterm",
+                now_ms(),
+                "doctor.blocker_radar",
+            );
+            let herd_wave_report = build_herd_wave_surface_report(
+                "doctor.herd_wave",
+                now_ms(),
+                &[],
+                HerdWaveEventKind::Wake,
+                10,
+                60_000,
+            );
 
             // Determine overall status
             let has_errors = all_checks
@@ -36426,6 +36887,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
                 result["swarm_capacity"] = serde_json::to_value(&swarm_capacity_summary)
                     .unwrap_or(serde_json::Value::Null);
+                result["context_horizon"] = serde_json::to_value(&context_horizon_report)
+                    .unwrap_or(serde_json::Value::Null);
+                result["blocker_radar"] =
+                    serde_json::to_value(&blocker_radar_report).unwrap_or(serde_json::Value::Null);
+                result["herd_wave"] = herd_wave_report.clone();
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
                         serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
@@ -36480,6 +36946,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
 
                 print_swarm_capacity_doctor_section(&swarm_capacity_summary);
+                print_context_horizon_doctor_section(&context_horizon_report);
+                print_blocker_radar_doctor_section(&blocker_radar_report);
+                print_herd_wave_doctor_section(&herd_wave_report);
 
                 println!();
                 println!("Hardware Profile:");
@@ -36788,7 +37257,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 mode,
                 format,
             } => {
-                use frankenterm_core::crash::replay_incident_bundle;
+                use frankenterm_core::crash::{
+                    render_incident_bundle_verification_summary, replay_incident_bundle,
+                    verify_incident_bundle,
+                };
 
                 let replay_mode = match mode.to_lowercase().as_str() {
                     "policy" => frankenterm_core::crash::ReplayMode::Policy,
@@ -36801,8 +37273,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 match replay_incident_bundle(&bundle, replay_mode) {
                     Ok(result) => {
+                        let verification = verify_incident_bundle(&bundle);
                         if format.to_lowercase() == "json" {
-                            let json = serde_json::to_string_pretty(&result)
+                            let payload = match verification {
+                                Ok(verification) => serde_json::json!({
+                                    "replay": result,
+                                    "verification": verification,
+                                }),
+                                Err(error) => serde_json::json!({
+                                    "replay": result,
+                                    "verification_error": error.to_string(),
+                                }),
+                            };
+                            let json = serde_json::to_string_pretty(&payload)
                                 .unwrap_or_else(|_| "{}".to_string());
                             println!("{json}");
                         } else {
@@ -36829,6 +37312,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 println!("\nWarnings:");
                                 for w in &result.warnings {
                                     println!("  - {w}");
+                                }
+                            }
+                            match verification {
+                                Ok(verification) => {
+                                    println!();
+                                    print!(
+                                        "{}",
+                                        render_incident_bundle_verification_summary(&verification)
+                                    );
+                                }
+                                Err(error) => {
+                                    println!("\nVerifier summary unavailable: {error}");
                                 }
                             }
                         }
@@ -49410,6 +49905,249 @@ fn print_operator_guidance(guidance: &OperatorGuidance) {
     }
 }
 
+fn context_horizon_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn build_context_horizon_doctor_report(db_path: &Path) -> ContextHorizonReport {
+    let generated_at_ms = now_ms();
+    let horizon_window_ms = 15 * 60 * 1000;
+    predict_context_horizon_from_sqlite(
+        db_path,
+        None,
+        generated_at_ms,
+        horizon_window_ms,
+        "doctor.context_horizon",
+    )
+    .unwrap_or_else(|_| {
+        context_horizon_unavailable_report(
+            generated_at_ms,
+            horizon_window_ms,
+            "doctor.context_horizon",
+            "native_context_registry",
+            "evidence.context_horizon_read_error",
+            ContextHorizonFailureClass::EnvironmentBlocked,
+        )
+    })
+}
+
+fn print_context_horizon_doctor_section(report: &ContextHorizonReport) {
+    println!();
+    println!("Context Horizon:");
+    println!(
+        "  forecast: evidence={} panes={} red_or_black={} top_move={} raw_context_content_stored={}",
+        context_horizon_label(&report.evidence_state),
+        report.fleet_summary.total_panes,
+        report.fleet_summary.panes_at_red_or_black,
+        report.fleet_summary.top_operator_move,
+        report.raw_context_content_stored,
+    );
+
+    for risk in report.pane_risks.iter().take(8) {
+        println!(
+            "  pane {}: risk={} evidence={} handoff={} reasons={}",
+            risk.pane_id,
+            context_horizon_label(&risk.risk_tier),
+            context_horizon_label(&risk.evidence_state),
+            context_horizon_label(&risk.handoff_readiness),
+            risk.reason_codes.join(","),
+        );
+    }
+    if report.pane_risks.len() > 8 {
+        println!(
+            "  ... {} more pane risk rows",
+            report.pane_risks.len().saturating_sub(8)
+        );
+    }
+
+    for domain in &report.unavailable_domains {
+        println!(
+            "  unavailable {}: evidence={} class={} reasons={}",
+            domain.domain,
+            context_horizon_label(&domain.evidence_state),
+            context_horizon_label(&domain.failure_class),
+            domain.reason_codes.join(","),
+        );
+    }
+
+    for recommendation in report.recommendations.iter().take(5) {
+        println!(
+            "  advice {}: action={} policy={} mutation_allowed={} reasons={}",
+            recommendation.recommendation_id,
+            context_horizon_label(&recommendation.action_kind),
+            context_horizon_label(&recommendation.policy_state),
+            recommendation.mutation_allowed,
+            recommendation.reason_codes.join(","),
+        );
+    }
+    if report.recommendations.len() > 5 {
+        println!(
+            "  ... {} more dry-run advice rows",
+            report.recommendations.len().saturating_sub(5)
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_horizon_doctor_tests {
+    use super::*;
+
+    fn seed_context_horizon_doctor_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("create doctor context tempdir");
+        let db_path = dir.path().join("doctor-context-horizon.db");
+        let db_path_string = db_path.to_string_lossy().to_string();
+        let conn = robot_context_open_conn(&db_path_string).expect("open doctor context db");
+        conn.execute(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detected_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .expect("create events table");
+        conn.execute(
+            "INSERT INTO pane_contexts
+             (context_id, pane_id, state, depth, created_at_ms, token_budget,
+              tokens_consumed, pressure_tier, source)
+             VALUES ('ctx-doctor-horizon', 19, 'active', 2, ?1, 1000, 930,
+                     'red', 'test')",
+            [now_ms_i64().saturating_sub(1_000)],
+        )
+        .expect("insert active context");
+        conn.execute(
+            "INSERT INTO events (pane_id, rule_id, event_type, detected_at)
+             VALUES (19, 'codex.usage.limit', 'rate_limit', ?1)",
+            [now_ms_i64().saturating_sub(500)],
+        )
+        .expect("insert rate-limit event");
+        drop(conn);
+        (dir, db_path)
+    }
+
+    #[test]
+    fn doctor_context_horizon_embeds_v1_contract_as_json() {
+        let (_dir, db_path) = seed_context_horizon_doctor_db();
+
+        let report = build_context_horizon_doctor_report(&db_path);
+        assert_eq!(report.contract_id, "ft.context_horizon.v1");
+        assert_eq!(report.source, "doctor.context_horizon");
+        assert!(!report.raw_context_content_stored);
+        assert_eq!(report.pane_risks[0].pane_id, 19);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .all(|recommendation| !recommendation.mutation_allowed)
+        );
+
+        let payload = serde_json::json!({
+            "context_horizon": serde_json::to_value(&report)
+                .expect("serialize doctor context horizon")
+        });
+        assert_eq!(
+            payload["context_horizon"]["contract_id"].as_str(),
+            Some("ft.context_horizon.v1")
+        );
+        assert_eq!(
+            payload["context_horizon"]["source"].as_str(),
+            Some("doctor.context_horizon")
+        );
+        assert_eq!(
+            payload["context_horizon"]["raw_context_content_stored"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn doctor_context_horizon_missing_storage_fails_closed_without_raw_content() {
+        let dir = tempfile::tempdir().expect("create doctor missing-db tempdir");
+        let db_path = dir.path().join("missing").join("context.db");
+
+        let report = build_context_horizon_doctor_report(&db_path);
+        let json = serde_json::to_string(&report).expect("serialize doctor horizon fallback");
+
+        assert_eq!(report.source, "doctor.context_horizon");
+        assert!(!report.raw_context_content_stored);
+        assert!(
+            report
+                .unavailable_domains
+                .iter()
+                .any(|domain| domain.domain == "native_context_registry")
+        );
+        assert!(json.contains("evidence.context_database_missing"));
+        assert!(!report.redaction_policy.raw_prompt_allowed);
+        assert!(!report.redaction_policy.raw_transcript_allowed);
+        assert!(report.redaction_policy.bounded_citations_only);
+        assert!(report.redaction_policy.secret_redaction_required);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .all(|recommendation| !recommendation.mutation_allowed)
+        );
+    }
+}
+
+fn blocker_radar_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn print_blocker_radar_doctor_section(report: &BlockerRadarReport) {
+    println!();
+    println!("Blocker Radar:");
+    println!(
+        "  state={} blockers={} active_agents={} dirty_overlap={} unavailable_sources={} raw_pane_content_stored={}",
+        blocker_radar_label(&report.overall_state),
+        report.blockers.len(),
+        report.active_agents.len(),
+        report.dirty_overlap.len(),
+        report.unavailable_sources.len(),
+        report.raw_pane_content_stored,
+    );
+
+    for blocker in report.blockers.iter().take(6) {
+        println!(
+            "  blocker {}: state={} severity={} next={} summary={}",
+            blocker.blocker_id,
+            blocker_radar_label(&blocker.evidence_state),
+            blocker_radar_label(&blocker.severity),
+            blocker.next_action_ids.join(","),
+            blocker.summary,
+        );
+    }
+    if report.blockers.len() > 6 {
+        println!(
+            "  ... {} more blocker rows",
+            report.blockers.len().saturating_sub(6)
+        );
+    }
+
+    for action in report.next_actions.iter().take(5) {
+        println!(
+            "  next {}: kind={} mutation_allowed={} command={}",
+            action.action_id,
+            blocker_radar_label(&action.action_kind),
+            action.mutation_allowed,
+            action.suggested_command.as_deref().unwrap_or("n/a"),
+        );
+    }
+    if report.next_actions.len() > 5 {
+        println!(
+            "  ... {} more next-action rows",
+            report.next_actions.len().saturating_sub(5)
+        );
+    }
+}
+
 fn diagnostic_check_named<'a>(
     checks: &'a [DiagnosticCheck],
     name: &str,
@@ -50680,6 +51418,75 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    fn test_health_snapshot_with_swarm_capacity(
+        summary: frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary,
+    ) -> frankenterm_core::crash::HealthSnapshot {
+        frankenterm_core::crash::HealthSnapshot {
+            timestamp: 1_700_000_050_000,
+            observed_panes: 0,
+            capture_queue_depth: 0,
+            write_queue_depth: 0,
+            last_seq_by_pane: Vec::new(),
+            warnings: Vec::new(),
+            ingest_lag_avg_ms: 0.0,
+            ingest_lag_max_ms: 0,
+            db_writable: true,
+            db_last_write_at: Some(1_700_000_049_999),
+            pane_priority_overrides: Vec::new(),
+            scheduler: None,
+            backpressure_tier: None,
+            last_activity_by_pane: Vec::new(),
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
+            fleet_pressure_tier: None,
+            swarm_capacity: Some(summary),
+            leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
+        }
+    }
+
+    fn normalize_integral_toon_numbers(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    normalize_integral_toon_numbers(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (_, nested) in map.iter_mut() {
+                    normalize_integral_toon_numbers(nested);
+                }
+            }
+            serde_json::Value::Number(number) => {
+                // toon_rust currently decodes numbers as floats; normalize integral floats back
+                // to integers so comparisons against serde_json::to_value(...) are stable.
+                if let Some(float) = number.as_f64() {
+                    #[allow(clippy::cast_precision_loss)]
+                    let max_u64 = u64::MAX as f64;
+                    if float.fract() == 0.0 && float >= 0.0 && float <= max_u64 {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let as_u64 = float as u64;
+                        *value = serde_json::Value::Number(serde_json::Number::from(as_u64));
+                    }
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+            }
+        }
+    }
+
+    fn toon_roundtrip_json(value: &serde_json::Value) -> serde_json::Value {
+        let toon = toon_rust::encode(value.clone(), None);
+        let decoded = toon_rust::try_decode(&toon, None).expect("TOON decodes");
+        let json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+        let mut decoded_value: serde_json::Value =
+            serde_json::from_str(&json).expect("decoded TOON JSON parses");
+        normalize_integral_toon_numbers(&mut decoded_value);
+        decoded_value
     }
 
     fn setup_session_show_test_db() -> (String, rusqlite::Connection, tempfile::TempDir) {
@@ -66201,6 +67008,38 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_context_horizon_parses() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "context",
+            "horizon",
+            "--pane-id",
+            "9",
+            "--horizon-window-ms",
+            "60000",
+        ])
+        .expect("robot context horizon should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Context {
+                    command:
+                        RobotContextCommands::Horizon {
+                            pane_id,
+                            horizon_window_ms,
+                        },
+                }) => {
+                    assert_eq!(pane_id, Some(9));
+                    assert_eq!(horizon_window_ms, Some(60_000));
+                }
+                _ => panic!("expected RobotCommands::Context::Horizon"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
     fn cli_robot_agents_list_parses() {
         let cli = Cli::try_parse_from(["ft", "robot", "agents", "list"])
             .expect("robot agents list should parse");
@@ -66225,6 +67064,39 @@ log_level = "debug"
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Capacity { level }) => assert_eq!(level, 3),
                 _ => panic!("expected RobotCommands::Capacity"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_herd_wave_parses_alias_and_signal_panes() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "herd_wave",
+            "--signal-pane",
+            "7,8,9",
+            "--kind",
+            "rate-limit-recovery",
+            "--generated-at-ms",
+            "1770000000000",
+        ])
+        .expect("robot herd-wave alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::HerdWave {
+                    signal_panes,
+                    kind,
+                    generated_at_ms,
+                    ..
+                }) => {
+                    assert_eq!(signal_panes, vec![7, 8, 9]);
+                    assert!(matches!(kind, RobotHerdWaveEventKind::RateLimitRecovery));
+                    assert_eq!(generated_at_ms, Some(1_770_000_000_000));
+                }
+                _ => panic!("expected RobotCommands::HerdWave"),
             },
             _ => panic!("expected Robot command"),
         }
@@ -66260,6 +67132,224 @@ log_level = "debug"
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn cli_robot_blocker_radar_parses_default_and_alias_session() {
+        let cli = Cli::try_parse_from(["ft", "robot", "blocker-radar"])
+            .expect("robot blocker-radar should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::BlockerRadar { session }) => {
+                    assert_eq!(session, "frankenterm");
+                }
+                _ => panic!("expected RobotCommands::BlockerRadar"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+
+        let cli = Cli::try_parse_from(["ft", "robot", "blocker_radar", "staging"])
+            .expect("robot blocker_radar alias should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::BlockerRadar { session }) => {
+                    assert_eq!(session, "staging");
+                }
+                _ => panic!("expected RobotCommands::BlockerRadar"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn robot_help_and_quick_start_list_blocker_radar_surface() {
+        let help = build_robot_help();
+        assert!(help.commands.iter().any(|command| {
+            command.name == "blocker-radar"
+                && command.description.contains("read-only blocker radar")
+        }));
+
+        let quick_start = build_robot_quick_start();
+        let blocker_radar = quick_start
+            .commands
+            .iter()
+            .find(|command| command.name == "blocker-radar")
+            .expect("quick start should list blocker-radar");
+        assert_eq!(blocker_radar.args, "[session]");
+        assert!(
+            blocker_radar
+                .examples
+                .iter()
+                .any(|example| example == &"ft robot --format toon blocker-radar frankenterm")
+        );
+    }
+
+    #[test]
+    fn robot_herd_wave_json_and_toon_preserve_contract_and_dry_run_plan() {
+        let report = build_herd_wave_surface_report(
+            "robot.herd_wave",
+            1_770_000_000_000,
+            &[1, 2, 3],
+            HerdWaveEventKind::Retry,
+            10,
+            60_000,
+        );
+
+        assert_eq!(report["contract_id"].as_str(), Some("ft.herd_wave.v1"));
+        assert_eq!(report["source"].as_str(), Some("robot.herd_wave"));
+        assert_eq!(report["raw_pane_content_stored"].as_bool(), Some(false));
+        assert_eq!(report["distinct_panes"].as_u64(), Some(3));
+        assert_eq!(report["dominant_kind"].as_str(), Some("retry"));
+        assert_eq!(
+            report["dry_run_plan"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            report["dry_run_plan"]["reason_codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str() == Some("herd_wave.dry_run.no_live_mutation"))
+        );
+        assert_eq!(report["mcp_resource"]["implemented"].as_bool(), Some(false));
+
+        let response = RobotResponse::success(report, 17);
+        let json_value = serde_json::to_value(&response).expect("robot response serializes");
+        let roundtripped = toon_roundtrip_json(&json_value);
+        assert_eq!(
+            roundtripped["data"]["contract_id"].as_str(),
+            Some("ft.herd_wave.v1")
+        );
+        assert_eq!(
+            roundtripped["data"]["dry_run_plan"]["calendar"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            roundtripped["data"]["dry_run_plan"]["calendar"][0]["reason_codes"][0].is_string(),
+            true
+        );
+    }
+
+    #[test]
+    fn robot_blocker_radar_unavailable_fallback_still_emits_contract() {
+        let report = build_blocker_radar_report_from_fallback(
+            Path::new("/nonexistent/frankenterm-blocker-radar-test"),
+            "frankenterm",
+            1_770_000_000_001,
+            "robot.blocker_radar",
+        );
+
+        assert_eq!(report.contract_id, "ft.blocker_radar.v1");
+        assert_eq!(report.source, "robot.blocker_radar");
+        assert_eq!(report.raw_pane_content_stored, false);
+        assert!(report.unavailable_sources.iter().any(|source| {
+            source
+                .reason_codes
+                .contains(&"coordination_fallback.unavailable".to_string())
+        }));
+        assert!(
+            report
+                .next_actions
+                .iter()
+                .all(|action| !action.mutation_allowed)
+        );
+
+        let response = RobotResponse::success(report, 17);
+        let json_value = serde_json::to_value(&response).expect("serialize response");
+        let roundtripped = toon_roundtrip_json(&json_value);
+        assert_eq!(
+            roundtripped["data"]["contract_id"].as_str(),
+            Some("ft.blocker_radar.v1")
+        );
+        assert_eq!(
+            roundtripped["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert!(roundtripped["data"]["next_actions"].is_array());
+    }
+
+    #[test]
+    fn robot_blocker_radar_json_and_toon_preserve_contract_rows() {
+        let report = build_blocker_radar_report(
+            &BlockerRadarInput::new(1_770_000_000_001, "robot.blocker_radar")
+                .with_observation(
+                    BlockerRadarCollectorObservation::new(
+                        "beads.ready",
+                        BlockerRadarSourceKind::Beads,
+                        BlockerRadarObservationStatus::PassActionable,
+                        "br ready --json",
+                        "ready bead exists",
+                    )
+                    .with_dependency_id("ft-ready")
+                    .with_reason_code("beads.ready_available"),
+                )
+                .with_observation(
+                    BlockerRadarCollectorObservation::new(
+                        "agent_mail.fallback",
+                        BlockerRadarSourceKind::AgentMail,
+                        BlockerRadarObservationStatus::MailUnavailable,
+                        "scripts/swarm-tick.sh --agent-mail-fallback",
+                        "Agent Mail unavailable; using fallback",
+                    )
+                    .with_reason_code("agent_mail.fallback_mode"),
+                )
+                .with_observation(
+                    BlockerRadarCollectorObservation::new(
+                        "git.dirty.blocker_radar",
+                        BlockerRadarSourceKind::Git,
+                        BlockerRadarObservationStatus::DirtyOverlap,
+                        "git status --short --branch",
+                        "tracked blocker-radar file is dirty",
+                    )
+                    .with_affected_path("crates/frankenterm-core/src/blocker_radar.rs")
+                    .with_dependency_id("ft-9ntud.3")
+                    .with_reason_code("git.tracked_dirty_overlap"),
+                ),
+        );
+        let json_value = serde_json::to_value(RobotResponse::success(report, 17))
+            .expect("serialize blocker-radar response");
+        let roundtripped = toon_roundtrip_json(&json_value);
+        let data = &roundtripped["data"];
+
+        assert_eq!(data["contract_id"].as_str(), Some("ft.blocker_radar.v1"));
+        assert_eq!(data["source"].as_str(), Some("robot.blocker_radar"));
+        assert_eq!(data["raw_pane_content_stored"].as_bool(), Some(false));
+        assert_eq!(data["sources"].as_array().map(Vec::len), Some(3));
+        assert_eq!(data["blockers"].as_array().map(Vec::len), Some(2));
+        assert_eq!(data["citations"].as_array().map(Vec::len), Some(3));
+        assert!(data["sources"].as_array().unwrap().iter().any(|source| {
+            source["source_id"].as_str() == Some("agent_mail.fallback")
+                && source["evidence_state"].as_str() == Some("mail_unavailable")
+                && source["reason_codes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason.as_str() == Some("agent_mail.fallback_mode"))
+        }));
+        assert!(
+            data["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["mutation_allowed"].as_bool() == Some(false))
+        );
+        assert_eq!(
+            data["dirty_overlap"][0]["path"].as_str(),
+            Some("crates/frankenterm-core/src/blocker_radar.rs")
+        );
+        assert!(
+            data["citations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|citation| {
+                    citation["citation_id"].as_str() == Some("citation.git.dirty.blocker_radar")
+                        && citation["redacted"].as_bool() == Some(true)
+                })
+        );
     }
 
     #[test]
@@ -66356,6 +67446,36 @@ log_level = "debug"
         }
     }
 
+    fn proof_doctor_test_payload(
+        bead_id: &str,
+        agent_name: &str,
+        command: Vec<String>,
+        scope: ProofDoctorScopeArg,
+        required_backend: ProofDoctorBackendArg,
+    ) -> serde_json::Value {
+        let input = ProofDoctorPreflightInput {
+            bead_id: Some(bead_id.to_string()),
+            parent_bead_id: None,
+            agent_name: agent_name.to_string(),
+            repo_path: "/tmp/frankenterm".to_string(),
+            git_head: "abc123".to_string(),
+            branch: "main".to_string(),
+            generated_at_utc: "2026-05-10T05:36:00Z".to_string(),
+            intended_target_dir: extract_proof_doctor_target_dir(&command),
+            intended_scope: proof_doctor_scope(scope),
+            required_backend: proof_doctor_backend(required_backend),
+            phase: ProofDoctorPhase::Preflight,
+            proof_path_prefixes: Vec::new(),
+            evidence: ProofDoctorEvidence {
+                local_cargo_detected: proof_doctor_is_local_cargo_command(&command),
+                ..ProofDoctorEvidence::default()
+            },
+            intended_command: command,
+        };
+
+        build_proof_doctor_payload_from_input(input)
+    }
+
     #[test]
     fn proof_doctor_payload_accepts_direct_rch_cargo_shape() {
         let command = vec![
@@ -66370,14 +67490,12 @@ log_level = "debug"
             "frankenterm-core-audit-types".to_string(),
         ];
 
-        let payload = build_proof_doctor_payload(
-            Some("ft-wik9p.2"),
-            Some("MistyBay"),
+        let payload = proof_doctor_test_payload(
+            "ft-wik9p.2",
+            "MistyBay",
+            command,
             ProofDoctorScopeArg::CargoTest,
             ProofDoctorBackendArg::Rch,
-            None,
-            &command,
-            Path::new("."),
         );
 
         assert_eq!(payload["schema_version"].as_i64(), Some(1));
@@ -66394,6 +67512,15 @@ log_level = "debug"
             payload["verdict"]["evidence"]["local_cargo_detected"].as_bool(),
             Some(false)
         );
+        assert_eq!(payload["handoff"]["bead_id"].as_str(), Some("ft-wik9p.2"));
+        assert_eq!(payload["handoff"]["status"].as_str(), Some("runnable"));
+        assert_eq!(payload["handoff"]["safe_to_close"].as_bool(), Some(false));
+        assert_eq!(payload["handoff"]["agent_mail"], serde_json::Value::Null);
+        assert!(
+            payload["handoff"]["beads_comment"]
+                .as_str()
+                .is_some_and(|comment| comment.contains("Proof-doctor handoff for ft-wik9p.2"))
+        );
     }
 
     #[test]
@@ -66405,14 +67532,12 @@ log_level = "debug"
             "frankenterm".to_string(),
         ];
 
-        let payload = build_proof_doctor_payload(
-            Some("ft-wik9p.2"),
-            Some("MistyBay"),
+        let payload = proof_doctor_test_payload(
+            "ft-wik9p.2",
+            "MistyBay",
+            command,
             ProofDoctorScopeArg::CargoTest,
             ProofDoctorBackendArg::Rch,
-            None,
-            &command,
-            Path::new("."),
         );
 
         assert_eq!(payload["verdict"]["status"].as_str(), Some("invalid"));
@@ -66423,6 +67548,83 @@ log_level = "debug"
         assert_eq!(
             payload["verdict"]["evidence"]["local_cargo_detected"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            payload["handoff"]["reason_code"].as_str(),
+            Some("proof.command.local_cargo_invalid")
+        );
+        assert!(
+            payload["handoff"]["beads_comment"]
+                .as_str()
+                .is_some_and(|comment| comment.contains("local_cargo_invalid"))
+        );
+    }
+
+    #[test]
+    fn proof_doctor_payload_includes_agent_mail_handoff_for_other_owner() {
+        let input = ProofDoctorPreflightInput {
+            bead_id: Some("ft-782hw.1".to_string()),
+            parent_bead_id: Some("ft-782hw".to_string()),
+            agent_name: "Codex".to_string(),
+            repo_path: "/tmp/frankenterm".to_string(),
+            git_head: "abc123".to_string(),
+            branch: "main".to_string(),
+            generated_at_utc: "2026-05-10T04:44:00Z".to_string(),
+            intended_command: vec![
+                "rch".to_string(),
+                "exec".to_string(),
+                "--".to_string(),
+                "env".to_string(),
+                "CARGO_TARGET_DIR=/tmp/ft-782hw-1-proof".to_string(),
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "frankenterm".to_string(),
+            ],
+            intended_target_dir: Some("/tmp/ft-782hw-1-proof".to_string()),
+            intended_scope: ProofScope::CargoTest,
+            required_backend: ProofBackend::Rch,
+            phase: ProofDoctorPhase::Preflight,
+            proof_path_prefixes: vec!["crates/frankenterm".to_string()],
+            evidence: ProofDoctorEvidence {
+                dirty_paths: vec![ProofDoctorDirtyPath {
+                    path: "crates/frankenterm/src/main.rs".to_string(),
+                    status: "M".to_string(),
+                    affects_proof: true,
+                    owner: Some(
+                        frankenterm_core::proof_doctor::ProofDoctorOwner::OtherAgent {
+                            agent_name: "BluePike".to_string(),
+                            bead_id: Some("ft-other".to_string()),
+                        },
+                    ),
+                }],
+                ..ProofDoctorEvidence::default()
+            },
+        };
+
+        let payload = build_proof_doctor_payload_from_input(input);
+
+        assert_eq!(
+            payload["verdict"]["status"].as_str(),
+            Some("dirty_tree_blocked")
+        );
+        assert_eq!(
+            payload["handoff"]["reason_code"].as_str(),
+            Some("proof.dirty.active_owned_path_overlap")
+        );
+        assert_eq!(
+            payload["handoff"]["agent_mail"]["to"][0].as_str(),
+            Some("BluePike")
+        );
+        assert!(
+            payload["handoff"]["agent_mail"]["body_md"]
+                .as_str()
+                .is_some_and(|body| body.contains("ft-782hw.1"))
+        );
+        assert!(
+            payload["handoff"]["beads_comment"]
+                .as_str()
+                .is_some_and(|comment| comment.contains("agent BluePike"))
         );
     }
 
@@ -68664,6 +69866,111 @@ A  docs/new-proof.md\n";
 
         assert_eq!(overall, "ok");
         assert!(!has_errors);
+    }
+
+    #[test]
+    fn doctor_swarm_capacity_json_exposes_v1_cockpit_after_level_upgrade_ft_rz0eb_3() {
+        let stored_level_one =
+            frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable(
+                1_700_000_050_001,
+                1,
+                "test.health_snapshot.level_one",
+            );
+        assert!(stored_level_one.resource_cockpit.is_none());
+        let snapshot = test_health_snapshot_with_swarm_capacity(stored_level_one);
+        let summary = swarm_capacity_summary_from_health_snapshot(&snapshot, 2);
+        let mut result = serde_json::json!({
+            "ok": true,
+            "status": "ok",
+            "version": "0.1.0",
+            "checks": [],
+        });
+        result["swarm_capacity"] =
+            serde_json::to_value(&summary).expect("swarm capacity serializes");
+
+        let cockpit = &result["swarm_capacity"]["resource_cockpit"];
+        assert_eq!(result["swarm_capacity"]["transparency_level"], 2);
+        assert_eq!(
+            cockpit["contract_id"],
+            frankenterm_core::runtime_telemetry::SWARM_RESOURCE_COCKPIT_CONTRACT_ID
+        );
+        assert_eq!(cockpit["evidence_state"], "unavailable");
+        for key in [
+            "domains",
+            "run_identity",
+            "residency_buckets",
+            "queue_backpressure",
+            "admission_decisions",
+            "action_receipts",
+            "artifact_paths",
+        ] {
+            assert!(
+                cockpit.get(key).is_some(),
+                "doctor JSON cockpit missing {key}"
+            );
+        }
+        assert_eq!(
+            cockpit["domains"]["rss_residency"]["evidence_state"],
+            "unavailable"
+        );
+        assert!(cockpit["residency_buckets"].is_array());
+        assert!(cockpit["action_receipts"].is_array());
+
+        let rows = summary
+            .resource_cockpit
+            .as_ref()
+            .expect("cockpit attached")
+            .compact_table_rows();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("proof_gate=skipped_proof")),
+            "doctor plain compact rows should preserve cockpit status: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn robot_capacity_level_two_json_and_toon_preserve_v1_cockpit_ft_rz0eb_3() {
+        let stored_level_one =
+            frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable(
+                1_700_000_050_101,
+                1,
+                "test.robot_snapshot.level_one",
+            );
+        let snapshot = test_health_snapshot_with_swarm_capacity(stored_level_one);
+        let summary = swarm_capacity_summary_from_health_snapshot(&snapshot, 2);
+        let response = RobotResponse::success(summary, 17);
+        let json_value = serde_json::to_value(&response).expect("robot response serializes");
+
+        assert_eq!(json_value["ok"], true);
+        assert_eq!(json_value["data"]["transparency_level"], 2);
+        assert_eq!(
+            json_value["data"]["resource_cockpit"]["contract_id"],
+            frankenterm_core::runtime_telemetry::SWARM_RESOURCE_COCKPIT_CONTRACT_ID
+        );
+        assert!(json_value["data"]["resource_cockpit"]["domains"].is_object());
+        assert!(json_value["data"]["resource_cockpit"]["action_receipts"].is_array());
+        assert!(json_value["data"]["resource_cockpit"]["residency_buckets"].is_array());
+
+        let toon = toon_rust::encode(json_value.clone(), None);
+        for needle in [
+            "resource_cockpit",
+            "contract_id",
+            "residency_buckets",
+            "action_receipts",
+            "rss_residency",
+        ] {
+            assert!(toon.contains(needle), "TOON missing {needle}\n{toon}");
+        }
+
+        let roundtripped = toon_roundtrip_json(&json_value);
+        assert_eq!(
+            roundtripped["data"]["resource_cockpit"]["contract_id"],
+            json_value["data"]["resource_cockpit"]["contract_id"]
+        );
+        assert_eq!(
+            roundtripped["data"]["resource_cockpit"]["domains"]["rss_residency"]["evidence_state"],
+            "unavailable"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

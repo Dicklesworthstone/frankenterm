@@ -6919,6 +6919,7 @@ mod tests {
             total_byte_budget_exceeded: 1,
             total_throttle_events: 4,
             tracked_panes: 5,
+            ..SchedulerSnapshot::default()
         };
 
         let snapshot = HealthSnapshot {
@@ -6981,6 +6982,7 @@ mod tests {
                 total_byte_budget_exceeded: 0,
                 total_throttle_events: 0,
                 tracked_panes: 2,
+                ..SchedulerSnapshot::default()
             }),
             backpressure_tier: None,
             last_activity_by_pane: vec![],
@@ -7792,7 +7794,7 @@ mod tests {
         let event = detection_to_stored_event(1, Some("uuid-abc"), &detection, Some(42));
         assert_eq!(event.severity, "critical");
         assert_eq!(event.segment_id, Some(42));
-        assert!(event.matched_text.as_deref() == Some("out of memory"));
+        assert_eq!(event.matched_text.as_deref(), Some("out of memory"));
         assert!(event.extracted.is_some());
     }
 

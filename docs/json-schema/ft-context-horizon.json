@@ -1,0 +1,417 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-context-horizon.json",
+  "title": "FrankenTerm Context Horizon",
+  "description": "Versioned operator-facing contract for privacy-bounded context pressure, compaction, rate-limit, and handoff risk forecasts.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source",
+    "evidence_state",
+    "horizon_window_ms",
+    "fleet_summary",
+    "pane_risks",
+    "recommendations",
+    "citations",
+    "unavailable_domains",
+    "redaction_policy",
+    "raw_context_content_stored",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.context_horizon.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_state": {
+      "$ref": "#/$defs/evidence_state"
+    },
+    "horizon_window_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "fleet_summary": {
+      "$ref": "#/$defs/fleet_summary"
+    },
+    "pane_risks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pane_risk"
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/recommendation"
+      }
+    },
+    "citations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/citation"
+      }
+    },
+    "unavailable_domains": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/unavailable_domain"
+      }
+    },
+    "redaction_policy": {
+      "$ref": "#/$defs/redaction_policy"
+    },
+    "raw_context_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "artifact_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "evidence_state": {
+      "type": "string",
+      "enum": [
+        "measured",
+        "inferred",
+        "simulated",
+        "stale",
+        "unavailable",
+        "mixed"
+      ]
+    },
+    "risk_tier": {
+      "type": "string",
+      "enum": [
+        "green",
+        "yellow",
+        "red",
+        "black",
+        "unknown"
+      ]
+    },
+    "handoff_readiness": {
+      "type": "string",
+      "enum": [
+        "not_needed",
+        "prepare",
+        "ready",
+        "blocked",
+        "unknown"
+      ]
+    },
+    "action_kind": {
+      "type": "string",
+      "enum": [
+        "rotate_context",
+        "prepare_handoff",
+        "reduce_fanout",
+        "pause_assignment",
+        "inspect_prompt",
+        "collect_incident_bundle",
+        "none"
+      ]
+    },
+    "policy_state": {
+      "type": "string",
+      "enum": [
+        "allowed_dry_run",
+        "requires_approval",
+        "blocked",
+        "unavailable"
+      ]
+    },
+    "failure_class": {
+      "type": "string",
+      "enum": [
+        "source_regression",
+        "privacy_violation",
+        "environment_blocked",
+        "unavailable_evidence",
+        "target_hardware_skipped"
+      ]
+    },
+    "fleet_summary": {
+      "type": "object",
+      "required": [
+        "total_panes",
+        "highest_risk_tier",
+        "panes_at_red_or_black",
+        "top_operator_move",
+        "evidence_state"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_panes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "highest_risk_tier": {
+          "$ref": "#/$defs/risk_tier"
+        },
+        "panes_at_red_or_black": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "top_operator_move": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        }
+      }
+    },
+    "pane_risk": {
+      "type": "object",
+      "required": [
+        "pane_id",
+        "risk_tier",
+        "evidence_state",
+        "context_utilization",
+        "tokens_consumed",
+        "token_budget",
+        "rotation_depth",
+        "ms_since_last_rotation",
+        "compaction_pressure",
+        "rate_limit_risk",
+        "handoff_readiness",
+        "reason_codes",
+        "citation_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pane_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "risk_tier": {
+          "$ref": "#/$defs/risk_tier"
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "context_utilization": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "tokens_consumed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "token_budget": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "rotation_depth": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ms_since_last_rotation": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "compaction_pressure": {
+          "$ref": "#/$defs/risk_tier"
+        },
+        "rate_limit_risk": {
+          "$ref": "#/$defs/risk_tier"
+        },
+        "handoff_readiness": {
+          "$ref": "#/$defs/handoff_readiness"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "citation_ids": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "required": [
+        "recommendation_id",
+        "scope",
+        "action_kind",
+        "mutation_allowed",
+        "policy_state",
+        "operator_summary",
+        "reason_codes",
+        "citation_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "recommendation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "pane",
+            "fleet"
+          ]
+        },
+        "pane_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "action_kind": {
+          "$ref": "#/$defs/action_kind"
+        },
+        "mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "policy_state": {
+          "$ref": "#/$defs/policy_state"
+        },
+        "operator_summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "suggested_command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "citation_ids": {
+          "$ref": "#/$defs/non_empty_string_array"
+        }
+      }
+    },
+    "citation": {
+      "type": "object",
+      "required": [
+        "citation_id",
+        "source",
+        "evidence_state",
+        "redacted",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "redacted": {
+          "type": "boolean",
+          "const": true
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "unavailable_domain": {
+      "type": "object",
+      "required": [
+        "domain",
+        "evidence_state",
+        "reason_codes",
+        "failure_class"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/non_empty_string_array"
+        },
+        "failure_class": {
+          "$ref": "#/$defs/failure_class"
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "required": [
+        "raw_transcript_allowed",
+        "raw_prompt_allowed",
+        "bounded_citations_only",
+        "secret_redaction_required"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "raw_transcript_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "raw_prompt_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "bounded_citations_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "secret_redaction_required": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "non_empty_string_array": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

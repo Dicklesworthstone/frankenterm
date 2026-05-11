@@ -105,6 +105,12 @@ use crate::fleet_memory_controller::{
     FleetMemoryTier, FleetMemoryTierBudgetRecord, FleetMemoryTierBudgetSnapshot,
     FleetMemoryTierReclamationAction, FleetPressureTier,
 };
+use crate::memory_pressure::{
+    MacosResidencyBucket, MacosResidencyClassification, MacosResidencyEvidenceState,
+    ResourcePressureAction, ResourcePressureActionReceipt, ResourcePressureActionReceiptReport,
+    ResourcePressureDomain, ResourcePressureEvidenceState, ResourcePressurePolicyDecision,
+    ResourcePressureReceiptStatus,
+};
 use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
 use crate::storage::io_scheduler::{StorageIoOperatorSummary, StorageIoPressureTier};
 use crate::swarm_scheduler::{
@@ -2589,6 +2595,9 @@ pub const SWARM_CAPACITY_OPERATOR_SUMMARY_SCHEMA_VERSION: u32 = 2;
 /// Schema version for nested swarm resource cockpit snapshots.
 pub const SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION: u32 = 1;
 
+/// Contract id for the versioned resource-pressure cockpit root.
+pub const SWARM_RESOURCE_COCKPIT_CONTRACT_ID: &str = "ft.resource_pressure_cockpit.v1";
+
 /// Maximum request decisions surfaced in one operator summary.
 pub const MAX_SWARM_CAPACITY_OPERATOR_DECISIONS: usize = 8;
 
@@ -2601,17 +2610,26 @@ pub const MAX_SWARM_CAPACITY_OPERATOR_STAGES: usize = 8;
 /// Maximum memory-tier rows surfaced in one resource cockpit snapshot.
 pub const MAX_SWARM_RESOURCE_COCKPIT_MEMORY_TIERS: usize = 8;
 
+/// Maximum residency bucket rows surfaced in one resource cockpit snapshot.
+pub const MAX_SWARM_RESOURCE_COCKPIT_RESIDENCY_BUCKETS: usize = 8;
+
 /// Maximum latency cohorts surfaced in one resource cockpit snapshot.
 pub const MAX_SWARM_RESOURCE_COCKPIT_LATENCY_COHORTS: usize = 4;
 
 /// Maximum admission decisions surfaced in one resource cockpit snapshot.
 pub const MAX_SWARM_RESOURCE_COCKPIT_ADMISSION_DECISIONS: usize = 8;
 
+/// Maximum action receipts surfaced in one resource cockpit snapshot.
+pub const MAX_SWARM_RESOURCE_COCKPIT_ACTION_RECEIPTS: usize = 8;
+
 /// Maximum mitigation/drilldown rows surfaced in one resource cockpit snapshot.
 pub const MAX_SWARM_RESOURCE_COCKPIT_DRILLDOWNS: usize = 12;
 
 /// Maximum auto-tune decisions surfaced in one resource cockpit snapshot.
 pub const MAX_SWARM_RESOURCE_COCKPIT_AUTO_TUNE_DECISIONS: usize = 8;
+
+/// Maximum artifact paths surfaced in one resource cockpit snapshot.
+pub const MAX_SWARM_RESOURCE_COCKPIT_ARTIFACT_PATHS: usize = 16;
 
 const SWARM_CAPACITY_HISTOGRAMS_PER_STAGE: usize = 4;
 const SWARM_CAPACITY_TELEMETRY_SHARDS: usize = 64;
@@ -6025,6 +6043,30 @@ impl SwarmCapacityAdmissionControllerState {
     }
 }
 
+impl From<&SwarmCapacityAdmissionControllerState>
+    for crate::swarm_scheduler::HerdWaveCapacityControllerSnapshot
+{
+    fn from(state: &SwarmCapacityAdmissionControllerState) -> Self {
+        let cooldown_or_pressure_active = state.last_pressure_action.is_some();
+        let mut reason_codes = vec![format!(
+            "herd_wave.admission_controller.stage.{}",
+            state.admission_stage.as_str()
+        )];
+        if cooldown_or_pressure_active {
+            reason_codes.push("herd_wave.admission_controller.pressure_active".to_string());
+        }
+        Self {
+            admission_stage: state.admission_stage.as_str().to_string(),
+            last_pressure_action: state
+                .last_pressure_action
+                .map(|action| action.as_str().to_string()),
+            last_pressure_action_at_ms: state.last_pressure_action_at_ms,
+            cooldown_or_pressure_active,
+            reason_codes,
+        }
+    }
+}
+
 /// Side-effect-free input request for the admission/backpressure controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmCapacityAdmissionRequest {
@@ -6418,6 +6460,8 @@ pub struct SwarmResourceCockpitMemoryTierSummary {
     pub tier: FleetMemoryTier,
     /// Stable tier label.
     pub tier_name: String,
+    /// Evidence state for this tier row.
+    pub evidence_state: SwarmResourceCockpitEvidenceState,
     /// Whether bytes in this tier contribute to resident pressure.
     pub resident: bool,
     /// Operator-configured budget.
@@ -6441,6 +6485,8 @@ pub struct SwarmResourceCockpitMemoryTierSummary {
     /// Preferred reclamation operation for this tier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reclamation_action: Option<FleetMemoryTierReclamationAction>,
+    /// Stable reason codes for this tier row.
+    pub reason_codes: Vec<String>,
 }
 
 /// Latency cohort row for the swarm resource cockpit.
@@ -6482,11 +6528,212 @@ pub struct SwarmResourceCockpitDrilldown {
     pub detail: String,
 }
 
+/// Evidence state used by the resource-pressure cockpit contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmResourceCockpitEvidenceState {
+    /// Collected from the live host/process/run represented by this snapshot.
+    Measured,
+    /// Generated by replay, fixture, dry-run, synthetic load, or model-only evaluation.
+    Simulated,
+    /// The producer could not collect the telemetry or the subsystem is not wired.
+    Unavailable,
+    /// Telemetry exists but is older than the freshness budget or from another run.
+    Stale,
+    /// Root object combines domains with different states.
+    Mixed,
+}
+
+impl SwarmResourceCockpitEvidenceState {
+    /// Stable evidence-state label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::Simulated => "simulated",
+            Self::Unavailable => "unavailable",
+            Self::Stale => "stale",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+/// Freshness metadata for a cockpit domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitEvidenceFreshness {
+    /// Evidence state for this source.
+    pub state: SwarmResourceCockpitEvidenceState,
+    /// Producer name.
+    pub source: String,
+    /// Source sample timestamp, when available.
+    pub generated_at_ms: Option<u64>,
+    /// Sample age relative to root generation, when available.
+    pub freshness_ms: Option<u64>,
+    /// Maximum allowed age for this domain.
+    pub max_age_ms: Option<u64>,
+    /// Stable reasons for unavailable, stale, simulated, or non-green state.
+    pub reason_codes: Vec<String>,
+}
+
+/// Domain summary row required by the v1 resource-pressure cockpit contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitDomainSummary {
+    /// Stable domain name.
+    pub name: String,
+    /// Domain evidence state.
+    pub evidence_state: SwarmResourceCockpitEvidenceState,
+    /// Domain pressure tier.
+    pub pressure_tier: String,
+    /// Concise domain summary.
+    pub summary: String,
+    /// Concrete next operator action for this domain.
+    pub operator_action: String,
+    /// Stable reason codes.
+    pub reason_codes: Vec<String>,
+    /// Optional freshness metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<SwarmResourceCockpitEvidenceFreshness>,
+    /// Optional low-cardinality metrics.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metrics: BTreeMap<String, serde_json::Value>,
+}
+
+/// Required domain map for the v1 resource-pressure cockpit contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitDomains {
+    pub memory: SwarmResourceCockpitDomainSummary,
+    pub rss_residency: SwarmResourceCockpitDomainSummary,
+    pub pane_budget: SwarmResourceCockpitDomainSummary,
+    pub queue_backpressure: SwarmResourceCockpitDomainSummary,
+    pub storage_io: SwarmResourceCockpitDomainSummary,
+    pub worker_pool: SwarmResourceCockpitDomainSummary,
+    pub capacity_admission: SwarmResourceCockpitDomainSummary,
+    pub resource_admission: SwarmResourceCockpitDomainSummary,
+    pub action_receipts: SwarmResourceCockpitDomainSummary,
+}
+
+/// Hardware predicate represented in the cockpit run identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitHardwarePredicate {
+    pub logical_cpus: Option<u64>,
+    pub memory_gib: Option<u64>,
+    pub target_class: bool,
+    pub proof_status: String,
+}
+
+/// Run identity represented in the cockpit v1 envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitRunIdentity {
+    pub run_id: String,
+    pub evidence_level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_snapshot_head: Option<String>,
+    pub artifact_paths: Vec<String>,
+    pub hardware_predicate: SwarmResourceCockpitHardwarePredicate,
+}
+
+/// Queue backpressure row for the cockpit v1 envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitQueueBackpressureSummary {
+    pub queue: String,
+    pub evidence_state: SwarmResourceCockpitEvidenceState,
+    pub tier: String,
+    pub depth: Option<u64>,
+    pub capacity: Option<u64>,
+    pub utilization: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_queued_age_ms: Option<u64>,
+    pub operator_action: String,
+    pub reason_codes: Vec<String>,
+}
+
+/// macOS RSS residency bucket row for the cockpit v1 envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitResidencyBucket {
+    pub bucket: MacosResidencyBucket,
+    pub bucket_name: String,
+    pub evidence_state: SwarmResourceCockpitEvidenceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    pub confidence: u8,
+    pub dominant: bool,
+    pub reason_codes: Vec<String>,
+}
+
+/// Admission counters for a cockpit v1 admission decision row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitAdmissionCounters {
+    pub admitted: u64,
+    pub deferred: u64,
+    pub degraded: u64,
+    pub shed: u64,
+}
+
+/// Merged capacity/resource admission decision row for the cockpit v1 envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitAdmissionDecision {
+    pub source: String,
+    pub action: String,
+    pub reason_codes: Vec<String>,
+    pub counters: SwarmResourceCockpitAdmissionCounters,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_pressure_severity: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_pressure_severity: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_protection_units: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_utilization: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_items: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fleet_pressure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_tier_pressure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_latency_over_budget_ratio: Option<f64>,
+}
+
+/// Action receipt row for the cockpit v1 envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmResourceCockpitActionReceipt {
+    pub receipt_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    pub action: String,
+    pub target_domain: String,
+    pub requested_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    pub status: String,
+    pub dry_run: bool,
+    pub policy_decision: String,
+    pub evidence_state: SwarmResourceCockpitEvidenceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<SwarmResourceCockpitEvidenceFreshness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected_bytes: Option<u64>,
+    pub reason_codes: Vec<String>,
+    pub artifact_paths: Vec<String>,
+}
+
 /// Resource cockpit snapshot nested under the existing capacity operator summary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwarmResourceCockpitSnapshot {
     /// Cockpit schema version.
     pub schema_version: u32,
+    /// Stable v1 contract id.
+    pub contract_id: String,
     /// When this cockpit snapshot was generated.
     pub generated_at_ms: u64,
     /// Source surface for this cockpit.
@@ -6495,16 +6742,24 @@ pub struct SwarmResourceCockpitSnapshot {
     pub status: SwarmCapacityOperatorStatus,
     /// Proof gate state for healthy/pressured/degraded/skipped views.
     pub proof_gate: SwarmResourceCockpitProofGate,
+    /// Root evidence state synthesized from required domains.
+    pub evidence_state: SwarmResourceCockpitEvidenceState,
     /// Stable one-line status summary.
     pub summary: String,
     /// Recommended next operator move.
     pub next_operator_move: String,
+    /// Run and hardware predicate identity for this snapshot.
+    pub run_identity: SwarmResourceCockpitRunIdentity,
+    /// Required domain summaries for v1 consumers.
+    pub domains: SwarmResourceCockpitDomains,
     /// Worst memory pressure represented by memory/admission inputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_pressure: Option<FleetPressureTier>,
     /// Hot/warm/cold/cache tier budget rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_tiers: Vec<SwarmResourceCockpitMemoryTierSummary>,
+    /// macOS RSS residency buckets in v1 contract form.
+    pub residency_buckets: Vec<SwarmResourceCockpitResidencyBucket>,
     /// Slowest stage cohorts by observed p99 latency.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slowest_latency_cohorts: Vec<SwarmResourceCockpitLatencyCohort>,
@@ -6517,6 +6772,12 @@ pub struct SwarmResourceCockpitSnapshot {
     /// Storage IO scheduler pressure, separate from CPU and memory pressure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_io: Option<StorageIoOperatorSummary>,
+    /// Queue backpressure rows in v1 contract form.
+    pub queue_backpressure: Vec<SwarmResourceCockpitQueueBackpressureSummary>,
+    /// Merged capacity/resource admission rows in v1 contract form.
+    pub admission_decisions: Vec<SwarmResourceCockpitAdmissionDecision>,
+    /// Action receipts in v1 contract form. Full live receipt bridging lands under ft-rz0eb.2.
+    pub action_receipts: Vec<SwarmResourceCockpitActionReceipt>,
     /// Recent auto-tune decisions, bounded for high-scale operator surfaces.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_tune_decisions: Vec<TuningDecisionRecord>,
@@ -6526,6 +6787,8 @@ pub struct SwarmResourceCockpitSnapshot {
     /// Drilldowns answering why work was deferred/degraded/reclaimed/skipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drilldowns: Vec<SwarmResourceCockpitDrilldown>,
+    /// Retained artifacts that support this snapshot.
+    pub artifact_paths: Vec<String>,
 }
 
 impl SwarmResourceCockpitSnapshot {
@@ -6552,9 +6815,31 @@ impl SwarmResourceCockpitSnapshot {
         resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
         storage_io: Option<&StorageIoOperatorSummary>,
     ) -> Self {
+        Self::from_capacity_summary_with_resource_evidence(
+            summary,
+            memory_budget,
+            resource_admission_decisions,
+            storage_io,
+            None,
+            None,
+        )
+    }
+
+    /// Build a cockpit view with optional storage IO, residency, and action receipt evidence.
+    #[must_use]
+    pub fn from_capacity_summary_with_resource_evidence(
+        summary: &SwarmCapacityOperatorSummary,
+        memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
+        resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
+        storage_io: Option<&StorageIoOperatorSummary>,
+        residency: Option<&MacosResidencyClassification>,
+        action_receipt_report: Option<&ResourcePressureActionReceiptReport>,
+    ) -> Self {
         let memory_tiers = memory_budget
             .map(swarm_resource_cockpit_memory_tiers)
             .unwrap_or_default();
+        let residency_buckets =
+            swarm_resource_cockpit_residency_buckets(residency, summary.generated_at_ms);
         let resource_admission_decisions = resource_admission_decisions
             .iter()
             .take(MAX_SWARM_RESOURCE_COCKPIT_ADMISSION_DECISIONS)
@@ -6571,12 +6856,16 @@ impl SwarmResourceCockpitSnapshot {
             .collect::<Vec<_>>();
         let proof_gate = swarm_resource_cockpit_proof_gate(summary.status);
         let storage_io = storage_io.cloned();
+        let action_receipts =
+            swarm_resource_cockpit_action_receipts(action_receipt_report, summary.generated_at_ms);
+        let artifact_paths = swarm_resource_cockpit_artifact_paths(action_receipt_report);
         let mitigation_history = swarm_resource_cockpit_mitigations(
             proof_gate,
             &memory_tiers,
             &capacity_admission_decisions,
             &resource_admission_decisions,
             storage_io.as_ref(),
+            &action_receipts,
         );
         let drilldowns = swarm_resource_cockpit_drilldowns(
             proof_gate,
@@ -6584,25 +6873,54 @@ impl SwarmResourceCockpitSnapshot {
             &capacity_admission_decisions,
             &resource_admission_decisions,
             storage_io.as_ref(),
+            &action_receipts,
         );
+        let queue_backpressure =
+            swarm_resource_cockpit_queue_backpressure(&resource_admission_decisions);
+        let admission_decisions = swarm_resource_cockpit_admission_decisions(
+            &capacity_admission_decisions,
+            &resource_admission_decisions,
+        );
+        let run_identity = swarm_resource_cockpit_run_identity(summary, &artifact_paths);
+        let domains = swarm_resource_cockpit_domains(
+            summary,
+            memory_pressure,
+            &memory_tiers,
+            residency,
+            &capacity_admission_decisions,
+            &resource_admission_decisions,
+            storage_io.as_ref(),
+            &queue_backpressure,
+            action_receipt_report,
+        );
+        let evidence_state = swarm_resource_cockpit_root_evidence_state(&domains);
 
         Self {
             schema_version: SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION,
+            contract_id: SWARM_RESOURCE_COCKPIT_CONTRACT_ID.to_string(),
             generated_at_ms: summary.generated_at_ms,
             source: "runtime_telemetry.swarm_resource_cockpit".to_string(),
             status: summary.status,
             proof_gate,
+            evidence_state,
             summary: summary.summary.clone(),
             next_operator_move: summary.next_operator_move.clone(),
+            run_identity,
+            domains,
             memory_pressure,
             memory_tiers,
+            residency_buckets,
             slowest_latency_cohorts,
             capacity_admission_decisions,
             resource_admission_decisions,
             storage_io,
+            queue_backpressure,
+            admission_decisions,
+            action_receipts,
             auto_tune_decisions: Vec::new(),
             mitigation_history,
             drilldowns,
+            artifact_paths,
         }
     }
 
@@ -6644,6 +6962,27 @@ impl SwarmResourceCockpitSnapshot {
                 tier.reclaimable_bytes,
                 tier.reclaimed_bytes,
                 tier.refused_bytes
+            ));
+        }
+        for bucket in self
+            .residency_buckets
+            .iter()
+            .filter(|bucket| {
+                bucket.bytes.is_some()
+                    || bucket.evidence_state != SwarmResourceCockpitEvidenceState::Unavailable
+            })
+            .take(3)
+        {
+            rows.push(format!(
+                "rss_residency bucket={} bytes={} confidence={} dominant={} evidence={} reasons={}",
+                bucket.bucket_name,
+                bucket
+                    .bytes
+                    .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string()),
+                bucket.confidence,
+                bucket.dominant,
+                bucket.evidence_state.as_str(),
+                bucket.reason_codes.join(",")
             ));
         }
         for cohort in self.slowest_latency_cohorts.iter().take(3) {
@@ -6693,6 +7032,24 @@ impl SwarmResourceCockpitSnapshot {
                     .as_ref()
                     .map_or("unknown", |window| window.confidence_state.as_str()),
                 auto_tune_reason_codes_label(&decision.reason_codes)
+            ));
+        }
+        for receipt in self
+            .action_receipts
+            .iter()
+            .filter(|receipt| receipt.receipt_id != "action_receipts.unavailable")
+            .take(3)
+        {
+            rows.push(format!(
+                "action_receipt id={} action={} domain={} status={} dry_run={} policy={} evidence={} reasons={}",
+                receipt.receipt_id,
+                receipt.action,
+                receipt.target_domain,
+                receipt.status,
+                receipt.dry_run,
+                receipt.policy_decision,
+                receipt.evidence_state.as_str(),
+                receipt.reason_codes.join(",")
             ));
         }
         for decision in self.capacity_admission_decisions.iter().take(3) {
@@ -6934,18 +7291,40 @@ impl SwarmCapacityOperatorSummary {
     /// Return this summary with resource cockpit inputs and storage IO pressure attached.
     #[must_use]
     pub fn with_resource_cockpit_inputs_and_storage_io(
-        mut self,
+        self,
         memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
         resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
         storage_io: Option<&StorageIoOperatorSummary>,
     ) -> Self {
+        self.with_resource_cockpit_inputs_and_resource_evidence(
+            memory_budget,
+            resource_admission_decisions,
+            storage_io,
+            None,
+            None,
+        )
+    }
+
+    /// Return this summary with all currently supported resource cockpit evidence attached.
+    #[must_use]
+    pub fn with_resource_cockpit_inputs_and_resource_evidence(
+        mut self,
+        memory_budget: Option<&FleetMemoryTierBudgetSnapshot>,
+        resource_admission_decisions: &[ResourceAdmissionDecisionSummary],
+        storage_io: Option<&StorageIoOperatorSummary>,
+        residency: Option<&MacosResidencyClassification>,
+        action_receipt_report: Option<&ResourcePressureActionReceiptReport>,
+    ) -> Self {
         if self.transparency_level >= 2 {
-            let cockpit = SwarmResourceCockpitSnapshot::from_capacity_summary_with_storage_io(
-                &self,
-                memory_budget,
-                resource_admission_decisions,
-                storage_io,
-            );
+            let cockpit =
+                SwarmResourceCockpitSnapshot::from_capacity_summary_with_resource_evidence(
+                    &self,
+                    memory_budget,
+                    resource_admission_decisions,
+                    storage_io,
+                    residency,
+                    action_receipt_report,
+                );
             self.resource_cockpit = Some(cockpit);
         }
         self
@@ -6983,8 +7362,1009 @@ impl SwarmCapacityOperatorSummary {
         }
         if level < 2 {
             summary.resource_cockpit = None;
+        } else if summary.resource_cockpit.is_none() {
+            summary.resource_cockpit = Some(SwarmResourceCockpitSnapshot::from_capacity_summary(
+                &summary,
+                None,
+                &[],
+            ));
         }
         summary
+    }
+}
+
+fn swarm_resource_cockpit_run_identity(
+    summary: &SwarmCapacityOperatorSummary,
+    artifact_paths: &[String],
+) -> SwarmResourceCockpitRunIdentity {
+    SwarmResourceCockpitRunIdentity {
+        run_id: format!("swarm-resource-cockpit-{}", summary.generated_at_ms),
+        evidence_level: "skipped_not_proven".to_string(),
+        git_head: None,
+        repo_snapshot_head: None,
+        artifact_paths: artifact_paths.to_vec(),
+        hardware_predicate: SwarmResourceCockpitHardwarePredicate {
+            logical_cpus: None,
+            memory_gib: None,
+            target_class: false,
+            proof_status: "skipped_not_proven".to_string(),
+        },
+    }
+}
+
+fn swarm_resource_cockpit_domains(
+    summary: &SwarmCapacityOperatorSummary,
+    memory_pressure: Option<FleetPressureTier>,
+    memory_tiers: &[SwarmResourceCockpitMemoryTierSummary],
+    residency: Option<&MacosResidencyClassification>,
+    capacity_decisions: &[SwarmCapacityOperatorDecisionSummary],
+    resource_decisions: &[ResourceAdmissionDecisionSummary],
+    storage_io: Option<&StorageIoOperatorSummary>,
+    queue_backpressure: &[SwarmResourceCockpitQueueBackpressureSummary],
+    action_receipt_report: Option<&ResourcePressureActionReceiptReport>,
+) -> SwarmResourceCockpitDomains {
+    SwarmResourceCockpitDomains {
+        memory: swarm_resource_cockpit_memory_domain(memory_pressure, memory_tiers),
+        rss_residency: swarm_resource_cockpit_rss_residency_domain(residency),
+        pane_budget: swarm_resource_cockpit_unavailable_domain(
+            "pane_budget",
+            "pane budget telemetry is not attached to this cockpit snapshot",
+            "collect_pane_budget_snapshot",
+            "resource.telemetry.unavailable",
+        ),
+        queue_backpressure: swarm_resource_cockpit_queue_domain(queue_backpressure),
+        storage_io: swarm_resource_cockpit_storage_io_domain(storage_io),
+        worker_pool: swarm_resource_cockpit_unavailable_domain(
+            "worker_pool",
+            "worker-pool telemetry is not attached to this cockpit snapshot",
+            "collect_worker_pool_snapshot",
+            "worker_pool.stale_inventory",
+        ),
+        capacity_admission: swarm_resource_cockpit_capacity_domain(summary, capacity_decisions),
+        resource_admission: swarm_resource_cockpit_resource_admission_domain(resource_decisions),
+        action_receipts: swarm_resource_cockpit_action_receipts_domain(action_receipt_report),
+    }
+}
+
+fn swarm_resource_cockpit_root_evidence_state(
+    domains: &SwarmResourceCockpitDomains,
+) -> SwarmResourceCockpitEvidenceState {
+    let states = [
+        domains.memory.evidence_state,
+        domains.rss_residency.evidence_state,
+        domains.pane_budget.evidence_state,
+        domains.queue_backpressure.evidence_state,
+        domains.storage_io.evidence_state,
+        domains.worker_pool.evidence_state,
+        domains.capacity_admission.evidence_state,
+        domains.resource_admission.evidence_state,
+        domains.action_receipts.evidence_state,
+    ];
+    let first = states[0];
+    if states.iter().all(|state| *state == first) {
+        first
+    } else {
+        SwarmResourceCockpitEvidenceState::Mixed
+    }
+}
+
+fn swarm_resource_cockpit_measured_domain(
+    name: &str,
+    pressure_tier: impl Into<String>,
+    summary: impl Into<String>,
+    operator_action: impl Into<String>,
+    reason_codes: Vec<String>,
+    metrics: BTreeMap<String, serde_json::Value>,
+) -> SwarmResourceCockpitDomainSummary {
+    SwarmResourceCockpitDomainSummary {
+        name: name.to_string(),
+        evidence_state: SwarmResourceCockpitEvidenceState::Measured,
+        pressure_tier: pressure_tier.into(),
+        summary: summary.into(),
+        operator_action: operator_action.into(),
+        reason_codes,
+        freshness: None,
+        metrics,
+    }
+}
+
+fn swarm_resource_cockpit_unavailable_domain(
+    name: &str,
+    summary: &str,
+    operator_action: &str,
+    reason_code: &str,
+) -> SwarmResourceCockpitDomainSummary {
+    SwarmResourceCockpitDomainSummary {
+        name: name.to_string(),
+        evidence_state: SwarmResourceCockpitEvidenceState::Unavailable,
+        pressure_tier: "unknown".to_string(),
+        summary: summary.to_string(),
+        operator_action: operator_action.to_string(),
+        reason_codes: vec![reason_code.to_string()],
+        freshness: Some(SwarmResourceCockpitEvidenceFreshness {
+            state: SwarmResourceCockpitEvidenceState::Unavailable,
+            source: "runtime_telemetry.swarm_resource_cockpit".to_string(),
+            generated_at_ms: None,
+            freshness_ms: None,
+            max_age_ms: None,
+            reason_codes: vec![reason_code.to_string()],
+        }),
+        metrics: BTreeMap::new(),
+    }
+}
+
+fn swarm_resource_cockpit_memory_domain(
+    memory_pressure: Option<FleetPressureTier>,
+    memory_tiers: &[SwarmResourceCockpitMemoryTierSummary],
+) -> SwarmResourceCockpitDomainSummary {
+    if let Some(pressure) = memory_pressure {
+        let pressured_tiers = memory_tiers.iter().filter(|tier| tier.has_pressure).count();
+        let pressure_name = fleet_pressure_tier_name(pressure).to_string();
+        let mut metrics = BTreeMap::new();
+        metrics.insert(
+            "tier_rows".to_string(),
+            serde_json::Value::from(u64::try_from(memory_tiers.len()).unwrap_or(u64::MAX)),
+        );
+        metrics.insert(
+            "pressured_tiers".to_string(),
+            serde_json::Value::from(u64::try_from(pressured_tiers).unwrap_or(u64::MAX)),
+        );
+        let reason = if pressured_tiers > 0 {
+            "resource.memory.tier_pressure"
+        } else {
+            "resource.proof.healthy"
+        };
+        return swarm_resource_cockpit_measured_domain(
+            "memory",
+            pressure_name.clone(),
+            format!("memory pressure {pressure_name}; {pressured_tiers} pressured tiers"),
+            if pressured_tiers > 0 {
+                "inspect_memory_tiers"
+            } else {
+                "none"
+            },
+            vec![reason.to_string()],
+            metrics,
+        );
+    }
+
+    swarm_resource_cockpit_unavailable_domain(
+        "memory",
+        "memory-tier telemetry is not attached to this cockpit snapshot",
+        "collect_memory_tier_snapshot",
+        "resource.telemetry.unavailable",
+    )
+}
+
+fn swarm_resource_cockpit_rss_residency_domain(
+    residency: Option<&MacosResidencyClassification>,
+) -> SwarmResourceCockpitDomainSummary {
+    let Some(residency) = residency else {
+        return swarm_resource_cockpit_unavailable_domain(
+            "rss_residency",
+            "residency classifier evidence is not attached to this cockpit snapshot",
+            "capture_residency_evidence",
+            "resource.telemetry.unavailable",
+        );
+    };
+
+    let evidence_state = macos_residency_evidence_state_for_cockpit(residency.evidence_state);
+    let unknown_bytes = residency.unknown_bytes.unwrap_or(0);
+    let pressure_tier = match evidence_state {
+        SwarmResourceCockpitEvidenceState::Unavailable => "unknown",
+        SwarmResourceCockpitEvidenceState::Stale
+        | SwarmResourceCockpitEvidenceState::Mixed
+        | SwarmResourceCockpitEvidenceState::Simulated => "yellow",
+        SwarmResourceCockpitEvidenceState::Measured if unknown_bytes > 0 => "yellow",
+        SwarmResourceCockpitEvidenceState::Measured => "normal",
+    };
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "bucket_rows".to_string(),
+        serde_json::Value::from(u64::try_from(residency.buckets.len()).unwrap_or(u64::MAX)),
+    );
+    metrics.insert(
+        "known_bytes".to_string(),
+        serde_json::Value::from(residency.known_bytes),
+    );
+    if let Some(process_rss_bytes) = residency.process_rss_bytes {
+        metrics.insert(
+            "process_rss_bytes".to_string(),
+            serde_json::Value::from(process_rss_bytes),
+        );
+    }
+    if let Some(unknown_bytes) = residency.unknown_bytes {
+        metrics.insert(
+            "unknown_bytes".to_string(),
+            serde_json::Value::from(unknown_bytes),
+        );
+    }
+    metrics.insert(
+        "dominant_bucket".to_string(),
+        serde_json::Value::String(
+            macos_residency_bucket_name(residency.dominant_bucket).to_string(),
+        ),
+    );
+    let reason_codes = if residency.reason_codes.is_empty() {
+        vec!["resource.proof.healthy".to_string()]
+    } else {
+        residency.reason_codes.clone()
+    };
+    SwarmResourceCockpitDomainSummary {
+        name: "rss_residency".to_string(),
+        evidence_state,
+        pressure_tier: pressure_tier.to_string(),
+        summary: format!(
+            "rss residency {}; dominant_bucket={} known_bytes={} unknown_bytes={}",
+            evidence_state.as_str(),
+            macos_residency_bucket_name(residency.dominant_bucket),
+            residency.known_bytes,
+            residency
+                .unknown_bytes
+                .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string())
+        ),
+        operator_action: if pressure_tier == "normal" {
+            "none"
+        } else {
+            "inspect_rss_residency"
+        }
+        .to_string(),
+        reason_codes: reason_codes.clone(),
+        freshness: swarm_resource_cockpit_freshness(
+            evidence_state,
+            "memory_pressure.classify_macos_residency",
+            None,
+            reason_codes,
+        ),
+        metrics,
+    }
+}
+
+fn swarm_resource_cockpit_residency_buckets(
+    residency: Option<&MacosResidencyClassification>,
+    _generated_at_ms: u64,
+) -> Vec<SwarmResourceCockpitResidencyBucket> {
+    let Some(residency) = residency else {
+        return vec![SwarmResourceCockpitResidencyBucket {
+            bucket: MacosResidencyBucket::Unknown,
+            bucket_name: macos_residency_bucket_name(MacosResidencyBucket::Unknown).to_string(),
+            evidence_state: SwarmResourceCockpitEvidenceState::Unavailable,
+            bytes: None,
+            confidence: 0,
+            dominant: true,
+            reason_codes: vec!["resource.telemetry.unavailable".to_string()],
+        }];
+    };
+
+    let evidence_state = macos_residency_evidence_state_for_cockpit(residency.evidence_state);
+    let mut rows = residency
+        .buckets
+        .iter()
+        .take(MAX_SWARM_RESOURCE_COCKPIT_RESIDENCY_BUCKETS)
+        .map(|bucket| {
+            let mut reason_codes = bucket.reason_codes.clone();
+            if reason_codes.is_empty() {
+                push_bounded_unique_reason(
+                    &mut reason_codes,
+                    "resource.telemetry.unavailable".to_string(),
+                );
+            }
+            SwarmResourceCockpitResidencyBucket {
+                bucket: bucket.bucket,
+                bucket_name: macos_residency_bucket_name(bucket.bucket).to_string(),
+                evidence_state,
+                bytes: bucket.bytes,
+                confidence: bucket.confidence,
+                dominant: bucket.bucket == residency.dominant_bucket,
+                reason_codes,
+            }
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        rows.push(SwarmResourceCockpitResidencyBucket {
+            bucket: MacosResidencyBucket::Unknown,
+            bucket_name: macos_residency_bucket_name(MacosResidencyBucket::Unknown).to_string(),
+            evidence_state: SwarmResourceCockpitEvidenceState::Unavailable,
+            bytes: None,
+            confidence: 0,
+            dominant: true,
+            reason_codes: vec!["resource.telemetry.unavailable".to_string()],
+        });
+    }
+    rows
+}
+
+fn swarm_resource_cockpit_queue_domain(
+    queue_backpressure: &[SwarmResourceCockpitQueueBackpressureSummary],
+) -> SwarmResourceCockpitDomainSummary {
+    if queue_backpressure.is_empty() {
+        return swarm_resource_cockpit_unavailable_domain(
+            "queue_backpressure",
+            "queue backpressure telemetry is not attached to this cockpit snapshot",
+            "collect_queue_backpressure_snapshot",
+            "resource.telemetry.unavailable",
+        );
+    }
+
+    let worst_tier = queue_backpressure
+        .iter()
+        .map(|row| row.tier.as_str())
+        .max_by_key(|tier| match *tier {
+            "black" => 4,
+            "red" => 3,
+            "yellow" => 2,
+            "green" => 1,
+            _ => 0,
+        })
+        .unwrap_or("unknown");
+    let reason_codes = queue_backpressure
+        .iter()
+        .flat_map(|row| row.reason_codes.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "queue_rows".to_string(),
+        serde_json::Value::from(u64::try_from(queue_backpressure.len()).unwrap_or(u64::MAX)),
+    );
+    swarm_resource_cockpit_measured_domain(
+        "queue_backpressure",
+        worst_tier,
+        format!("queue backpressure {worst_tier}"),
+        if worst_tier == "green" {
+            "none"
+        } else {
+            "inspect_queue_backpressure"
+        },
+        if reason_codes.is_empty() {
+            vec!["resource.proof.healthy".to_string()]
+        } else {
+            reason_codes
+        },
+        metrics,
+    )
+}
+
+fn swarm_resource_cockpit_storage_io_domain(
+    storage_io: Option<&StorageIoOperatorSummary>,
+) -> SwarmResourceCockpitDomainSummary {
+    let Some(storage_io) = storage_io else {
+        return swarm_resource_cockpit_unavailable_domain(
+            "storage_io",
+            "storage IO telemetry is not attached to this cockpit snapshot",
+            "collect_storage_io_snapshot",
+            "resource.telemetry.unavailable",
+        );
+    };
+
+    let tier = storage_io_pressure_tier_name(storage_io.io_pressure_tier);
+    let reason = storage_io_cockpit_reason_code(storage_io).to_string();
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "aggregate_queue_depth".to_string(),
+        serde_json::Value::from(storage_io.aggregate_queue_depth),
+    );
+    metrics.insert(
+        "aggregate_bytes_pending".to_string(),
+        serde_json::Value::from(storage_io.aggregate_bytes_pending),
+    );
+    metrics.insert(
+        "write_error_total".to_string(),
+        serde_json::Value::from(storage_io.write_error_total),
+    );
+    swarm_resource_cockpit_measured_domain(
+        "storage_io",
+        tier,
+        format!("storage IO pressure {tier}"),
+        storage_io.operator_action.clone(),
+        vec![reason],
+        metrics,
+    )
+}
+
+fn swarm_resource_cockpit_capacity_domain(
+    summary: &SwarmCapacityOperatorSummary,
+    decisions: &[SwarmCapacityOperatorDecisionSummary],
+) -> SwarmResourceCockpitDomainSummary {
+    if summary.status == SwarmCapacityOperatorStatus::Unavailable {
+        return swarm_resource_cockpit_unavailable_domain(
+            "capacity_admission",
+            "capacity admission telemetry is unavailable",
+            "collect_capacity_summary",
+            "capacity.operator.unavailable",
+        );
+    }
+
+    let pressure = match summary.status {
+        SwarmCapacityOperatorStatus::Ready => "normal",
+        SwarmCapacityOperatorStatus::Watch => "elevated",
+        SwarmCapacityOperatorStatus::Violated => "critical",
+        SwarmCapacityOperatorStatus::Unknown => "unknown",
+        SwarmCapacityOperatorStatus::Unavailable => "unknown",
+    };
+    let reason_codes = if decisions.is_empty() {
+        vec!["resource.proof.healthy".to_string()]
+    } else {
+        decisions
+            .iter()
+            .take(MAX_SWARM_CAPACITY_OPERATOR_DECISIONS)
+            .map(|decision| decision.reason_code.clone())
+            .collect()
+    };
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "decision_rows".to_string(),
+        serde_json::Value::from(u64::try_from(decisions.len()).unwrap_or(u64::MAX)),
+    );
+    swarm_resource_cockpit_measured_domain(
+        "capacity_admission",
+        pressure,
+        format!("capacity admission status {}", summary.status.as_str()),
+        if matches!(
+            summary.status,
+            SwarmCapacityOperatorStatus::Ready | SwarmCapacityOperatorStatus::Unavailable
+        ) {
+            "none"
+        } else {
+            "inspect_capacity_admission"
+        },
+        reason_codes,
+        metrics,
+    )
+}
+
+fn swarm_resource_cockpit_resource_admission_domain(
+    decisions: &[ResourceAdmissionDecisionSummary],
+) -> SwarmResourceCockpitDomainSummary {
+    if decisions.is_empty() {
+        return swarm_resource_cockpit_unavailable_domain(
+            "resource_admission",
+            "resource admission telemetry is not attached to this cockpit snapshot",
+            "collect_resource_admission_snapshot",
+            "resource.telemetry.unavailable",
+        );
+    }
+
+    let worst_pressure = decisions
+        .iter()
+        .flat_map(|decision| [decision.fleet_pressure, decision.memory_tier_pressure])
+        .flatten()
+        .max()
+        .map(fleet_pressure_tier_name)
+        .unwrap_or("normal");
+    let reason_codes = decisions
+        .iter()
+        .flat_map(|decision| decision.reason_codes.iter().copied())
+        .map(resource_admission_reason_code_name)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "decision_rows".to_string(),
+        serde_json::Value::from(u64::try_from(decisions.len()).unwrap_or(u64::MAX)),
+    );
+    swarm_resource_cockpit_measured_domain(
+        "resource_admission",
+        worst_pressure,
+        format!("resource admission pressure {worst_pressure}"),
+        if worst_pressure == "normal" {
+            "none"
+        } else {
+            "inspect_resource_admission"
+        },
+        if reason_codes.is_empty() {
+            vec!["resource.proof.healthy".to_string()]
+        } else {
+            reason_codes
+        },
+        metrics,
+    )
+}
+
+fn swarm_resource_cockpit_action_receipts_domain(
+    report: Option<&ResourcePressureActionReceiptReport>,
+) -> SwarmResourceCockpitDomainSummary {
+    let Some(report) = report else {
+        return swarm_resource_cockpit_unavailable_domain(
+            "action_receipts",
+            "resource action receipts are not attached to this cockpit snapshot",
+            "collect_action_receipts",
+            "action_receipt.missing",
+        );
+    };
+
+    if report.receipts.is_empty() {
+        return swarm_resource_cockpit_unavailable_domain(
+            "action_receipts",
+            "resource action receipt inputs are empty",
+            "collect_action_receipts",
+            "action_receipt.missing",
+        );
+    }
+
+    let evidence_state = swarm_resource_cockpit_receipt_report_evidence_state(report);
+    let pressure = if report.failed_receipts > 0 {
+        "black"
+    } else if report.blocked_receipts > 0 {
+        "red"
+    } else if report.unavailable_receipts > 0 || report.stale_receipts > 0 {
+        "yellow"
+    } else {
+        "green"
+    };
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "receipt_rows".to_string(),
+        serde_json::Value::from(u64::try_from(report.receipts.len()).unwrap_or(u64::MAX)),
+    );
+    metrics.insert(
+        "failed_receipts".to_string(),
+        serde_json::Value::from(report.failed_receipts),
+    );
+    metrics.insert(
+        "blocked_receipts".to_string(),
+        serde_json::Value::from(report.blocked_receipts),
+    );
+    metrics.insert(
+        "unavailable_receipts".to_string(),
+        serde_json::Value::from(report.unavailable_receipts),
+    );
+    metrics.insert(
+        "stale_receipts".to_string(),
+        serde_json::Value::from(report.stale_receipts),
+    );
+    metrics.insert(
+        "receipt_domains".to_string(),
+        serde_json::Value::from(u64::try_from(report.domain_summaries.len()).unwrap_or(u64::MAX)),
+    );
+    let reason_codes = if report.reason_codes.is_empty() {
+        vec!["resource.proof.healthy".to_string()]
+    } else {
+        report.reason_codes.clone()
+    };
+    SwarmResourceCockpitDomainSummary {
+        name: "action_receipts".to_string(),
+        evidence_state,
+        pressure_tier: pressure.to_string(),
+        summary: format!("resource action receipts {pressure}"),
+        operator_action: if pressure == "green" {
+            "none"
+        } else {
+            "inspect_action_receipts"
+        }
+        .to_string(),
+        reason_codes: reason_codes.clone(),
+        freshness: swarm_resource_cockpit_freshness(
+            evidence_state,
+            "memory_pressure.evaluate_resource_pressure_action_receipts",
+            None,
+            reason_codes,
+        ),
+        metrics,
+    }
+}
+
+fn swarm_resource_cockpit_receipt_report_evidence_state(
+    report: &ResourcePressureActionReceiptReport,
+) -> SwarmResourceCockpitEvidenceState {
+    let mut states = report
+        .receipts
+        .iter()
+        .map(|receipt| resource_pressure_evidence_state_for_cockpit(receipt.evidence_state));
+    let Some(first) = states.next() else {
+        return SwarmResourceCockpitEvidenceState::Unavailable;
+    };
+    if states.all(|state| state == first) {
+        first
+    } else {
+        SwarmResourceCockpitEvidenceState::Mixed
+    }
+}
+
+fn swarm_resource_cockpit_action_receipts(
+    report: Option<&ResourcePressureActionReceiptReport>,
+    generated_at_ms: u64,
+) -> Vec<SwarmResourceCockpitActionReceipt> {
+    let Some(report) = report else {
+        return vec![swarm_resource_cockpit_unavailable_action_receipt(
+            generated_at_ms,
+        )];
+    };
+    let rows = report
+        .receipts
+        .iter()
+        .take(MAX_SWARM_RESOURCE_COCKPIT_ACTION_RECEIPTS)
+        .map(swarm_resource_cockpit_action_receipt)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        vec![swarm_resource_cockpit_unavailable_action_receipt(
+            generated_at_ms,
+        )]
+    } else {
+        rows
+    }
+}
+
+fn swarm_resource_cockpit_action_receipt(
+    receipt: &ResourcePressureActionReceipt,
+) -> SwarmResourceCockpitActionReceipt {
+    let evidence_state = resource_pressure_evidence_state_for_cockpit(receipt.evidence_state);
+    let reason_codes = if receipt.reason_codes.is_empty() {
+        vec![resource_pressure_receipt_status_reason_code(receipt.status).to_string()]
+    } else {
+        receipt.reason_codes.clone()
+    };
+    SwarmResourceCockpitActionReceipt {
+        receipt_id: receipt.receipt_id.clone(),
+        correlation_id: receipt.correlation_id.clone(),
+        action: resource_pressure_action_name(receipt.action).to_string(),
+        target_domain: resource_pressure_domain_name(receipt.target_domain).to_string(),
+        requested_at_ms: receipt.requested_at_ms,
+        completed_at_ms: receipt.completed_at_ms,
+        status: resource_pressure_receipt_status_name(receipt.status).to_string(),
+        dry_run: receipt.dry_run,
+        policy_decision: resource_pressure_policy_decision_name(receipt.policy_decision)
+            .to_string(),
+        evidence_state,
+        freshness: swarm_resource_cockpit_freshness(
+            evidence_state,
+            "memory_pressure.resource_pressure_action_receipt",
+            Some(receipt.completed_at_ms.unwrap_or(receipt.requested_at_ms)),
+            reason_codes.clone(),
+        ),
+        pane_id: receipt.attribution.pane_id,
+        agent_name: receipt.attribution.agent_name.clone(),
+        target_dir: receipt.attribution.target_dir.clone(),
+        queue_name: receipt.attribution.queue_name.clone(),
+        affected_bytes: receipt.attribution.affected_bytes,
+        reason_codes,
+        artifact_paths: receipt.artifact_paths.clone(),
+    }
+}
+
+fn swarm_resource_cockpit_unavailable_action_receipt(
+    generated_at_ms: u64,
+) -> SwarmResourceCockpitActionReceipt {
+    let reason_codes = vec![
+        "action_receipt.missing".to_string(),
+        "resource.telemetry.unavailable".to_string(),
+    ];
+    SwarmResourceCockpitActionReceipt {
+        receipt_id: "action_receipts.unavailable".to_string(),
+        correlation_id: None,
+        action: resource_pressure_action_name(ResourcePressureAction::Observe).to_string(),
+        target_domain: resource_pressure_domain_name(ResourcePressureDomain::ActionReceipts)
+            .to_string(),
+        requested_at_ms: generated_at_ms,
+        completed_at_ms: None,
+        status: "unavailable".to_string(),
+        dry_run: true,
+        policy_decision: resource_pressure_policy_decision_name(
+            ResourcePressurePolicyDecision::NotChecked,
+        )
+        .to_string(),
+        evidence_state: SwarmResourceCockpitEvidenceState::Unavailable,
+        freshness: swarm_resource_cockpit_freshness(
+            SwarmResourceCockpitEvidenceState::Unavailable,
+            "memory_pressure.resource_pressure_action_receipt",
+            None,
+            reason_codes.clone(),
+        ),
+        pane_id: None,
+        agent_name: None,
+        target_dir: None,
+        queue_name: None,
+        affected_bytes: None,
+        reason_codes,
+        artifact_paths: Vec::new(),
+    }
+}
+
+fn swarm_resource_cockpit_artifact_paths(
+    report: Option<&ResourcePressureActionReceiptReport>,
+) -> Vec<String> {
+    let mut artifact_paths = Vec::new();
+    let Some(report) = report else {
+        return artifact_paths;
+    };
+    for path in report
+        .receipts
+        .iter()
+        .flat_map(|receipt| receipt.artifact_paths.iter())
+    {
+        if artifact_paths.len() >= MAX_SWARM_RESOURCE_COCKPIT_ARTIFACT_PATHS {
+            break;
+        }
+        if !artifact_paths.contains(path) {
+            artifact_paths.push(path.clone());
+        }
+    }
+    artifact_paths
+}
+
+fn swarm_resource_cockpit_freshness(
+    state: SwarmResourceCockpitEvidenceState,
+    source: &str,
+    generated_at_ms: Option<u64>,
+    reason_codes: Vec<String>,
+) -> Option<SwarmResourceCockpitEvidenceFreshness> {
+    if state == SwarmResourceCockpitEvidenceState::Measured && generated_at_ms.is_none() {
+        return None;
+    }
+    Some(SwarmResourceCockpitEvidenceFreshness {
+        state,
+        source: source.to_string(),
+        generated_at_ms,
+        freshness_ms: None,
+        max_age_ms: None,
+        reason_codes,
+    })
+}
+
+const fn macos_residency_evidence_state_for_cockpit(
+    state: MacosResidencyEvidenceState,
+) -> SwarmResourceCockpitEvidenceState {
+    match state {
+        MacosResidencyEvidenceState::Measured => SwarmResourceCockpitEvidenceState::Measured,
+        MacosResidencyEvidenceState::Simulated => SwarmResourceCockpitEvidenceState::Simulated,
+        MacosResidencyEvidenceState::Unavailable => SwarmResourceCockpitEvidenceState::Unavailable,
+        MacosResidencyEvidenceState::Stale => SwarmResourceCockpitEvidenceState::Stale,
+        MacosResidencyEvidenceState::Mixed => SwarmResourceCockpitEvidenceState::Mixed,
+    }
+}
+
+const fn resource_pressure_evidence_state_for_cockpit(
+    state: ResourcePressureEvidenceState,
+) -> SwarmResourceCockpitEvidenceState {
+    match state {
+        ResourcePressureEvidenceState::Measured => SwarmResourceCockpitEvidenceState::Measured,
+        ResourcePressureEvidenceState::Simulated => SwarmResourceCockpitEvidenceState::Simulated,
+        ResourcePressureEvidenceState::Unavailable => {
+            SwarmResourceCockpitEvidenceState::Unavailable
+        }
+        ResourcePressureEvidenceState::Stale => SwarmResourceCockpitEvidenceState::Stale,
+        ResourcePressureEvidenceState::Mixed => SwarmResourceCockpitEvidenceState::Mixed,
+    }
+}
+
+const fn macos_residency_bucket_name(bucket: MacosResidencyBucket) -> &'static str {
+    match bucket {
+        MacosResidencyBucket::RustHeap => "rust_heap",
+        MacosResidencyBucket::MmapFileBacked => "mmap_file_backed",
+        MacosResidencyBucket::SqlitePageCache => "sqlite_page_cache",
+        MacosResidencyBucket::GraphicsMedia => "graphics_media",
+        MacosResidencyBucket::ScrollbackCache => "scrollback_cache",
+        MacosResidencyBucket::ChildProcesses => "child_processes",
+        MacosResidencyBucket::Unknown => "unknown",
+    }
+}
+
+const fn resource_pressure_domain_name(domain: ResourcePressureDomain) -> &'static str {
+    match domain {
+        ResourcePressureDomain::Memory => "memory",
+        ResourcePressureDomain::RssResidency => "rss_residency",
+        ResourcePressureDomain::PaneBudget => "pane_budget",
+        ResourcePressureDomain::QueueBackpressure => "queue_backpressure",
+        ResourcePressureDomain::StorageIo => "storage_io",
+        ResourcePressureDomain::WorkerPool => "worker_pool",
+        ResourcePressureDomain::CapacityAdmission => "capacity_admission",
+        ResourcePressureDomain::ResourceAdmission => "resource_admission",
+        ResourcePressureDomain::ActionReceipts => "action_receipts",
+    }
+}
+
+const fn resource_pressure_action_name(action: ResourcePressureAction) -> &'static str {
+    match action {
+        ResourcePressureAction::Observe => "observe",
+        ResourcePressureAction::DelayAdmission => "delay_admission",
+        ResourcePressureAction::DegradeCapture => "degrade_capture",
+        ResourcePressureAction::ShedOptionalWork => "shed_optional_work",
+        ResourcePressureAction::CompressScrollback => "compress_scrollback",
+        ResourcePressureAction::EvictScrollback => "evict_scrollback",
+        ResourcePressureAction::ThrottleQueue => "throttle_queue",
+        ResourcePressureAction::BlockAdmission => "block_admission",
+        ResourcePressureAction::Rollback => "rollback",
+        ResourcePressureAction::Compensate => "compensate",
+    }
+}
+
+const fn resource_pressure_receipt_status_name(
+    status: ResourcePressureReceiptStatus,
+) -> &'static str {
+    match status {
+        ResourcePressureReceiptStatus::Planned => "planned",
+        ResourcePressureReceiptStatus::DryRun => "dry_run",
+        ResourcePressureReceiptStatus::Applied => "applied",
+        ResourcePressureReceiptStatus::Succeeded => "succeeded",
+        ResourcePressureReceiptStatus::Blocked => "blocked",
+        ResourcePressureReceiptStatus::Failed => "failed",
+        ResourcePressureReceiptStatus::Compensated => "compensated",
+        ResourcePressureReceiptStatus::CompensationFailed => "compensation_failed",
+        ResourcePressureReceiptStatus::RollbackRequired => "rollback_required",
+    }
+}
+
+const fn resource_pressure_receipt_status_reason_code(
+    status: ResourcePressureReceiptStatus,
+) -> &'static str {
+    match status {
+        ResourcePressureReceiptStatus::Planned => "action_receipt.planned",
+        ResourcePressureReceiptStatus::DryRun => "action_receipt.dry_run",
+        ResourcePressureReceiptStatus::Applied | ResourcePressureReceiptStatus::Succeeded => {
+            "action_receipt.applied"
+        }
+        ResourcePressureReceiptStatus::Blocked => "action_receipt.blocked",
+        ResourcePressureReceiptStatus::Failed
+        | ResourcePressureReceiptStatus::CompensationFailed => "action_receipt.failed",
+        ResourcePressureReceiptStatus::Compensated => "action_receipt.compensated",
+        ResourcePressureReceiptStatus::RollbackRequired => "action_receipt.rollback_required",
+    }
+}
+
+const fn resource_pressure_policy_decision_name(
+    decision: ResourcePressurePolicyDecision,
+) -> &'static str {
+    match decision {
+        ResourcePressurePolicyDecision::Allow => "allow",
+        ResourcePressurePolicyDecision::Deny => "deny",
+        ResourcePressurePolicyDecision::RequireApproval => "require_approval",
+        ResourcePressurePolicyDecision::NotChecked => "not_checked",
+    }
+}
+
+fn swarm_resource_cockpit_queue_backpressure(
+    decisions: &[ResourceAdmissionDecisionSummary],
+) -> Vec<SwarmResourceCockpitQueueBackpressureSummary> {
+    decisions
+        .iter()
+        .filter_map(|decision| {
+            let queue_signal =
+                decision.queue_utilization.is_some() || decision.pending_items.is_some();
+            queue_signal.then(|| SwarmResourceCockpitQueueBackpressureSummary {
+                queue: "resource_admission".to_string(),
+                evidence_state: SwarmResourceCockpitEvidenceState::Measured,
+                tier: queue_tier_from_resource_decision(decision).to_string(),
+                depth: decision.pending_items.map(u64::from),
+                capacity: None,
+                utilization: decision.queue_utilization,
+                oldest_queued_age_ms: None,
+                operator_action: match decision.action {
+                    AdmissionAction::Admit => "none",
+                    AdmissionAction::Defer => "defer_resource_admission",
+                    AdmissionAction::Degrade => "degrade_noncritical_work",
+                    AdmissionAction::Shed => "shed_optional_work",
+                }
+                .to_string(),
+                reason_codes: decision
+                    .reason_codes
+                    .iter()
+                    .copied()
+                    .map(resource_admission_reason_code_name)
+                    .map(ToString::to_string)
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn queue_tier_from_resource_decision(decision: &ResourceAdmissionDecisionSummary) -> &'static str {
+    match decision.action {
+        AdmissionAction::Admit => "green",
+        AdmissionAction::Defer => "yellow",
+        AdmissionAction::Degrade => "red",
+        AdmissionAction::Shed => "black",
+    }
+}
+
+fn swarm_resource_cockpit_admission_decisions(
+    capacity_decisions: &[SwarmCapacityOperatorDecisionSummary],
+    resource_decisions: &[ResourceAdmissionDecisionSummary],
+) -> Vec<SwarmResourceCockpitAdmissionDecision> {
+    let mut rows = capacity_decisions
+        .iter()
+        .take(MAX_SWARM_CAPACITY_OPERATOR_DECISIONS)
+        .map(swarm_resource_cockpit_capacity_admission_decision)
+        .collect::<Vec<_>>();
+    rows.extend(
+        resource_decisions
+            .iter()
+            .take(MAX_SWARM_RESOURCE_COCKPIT_ADMISSION_DECISIONS)
+            .map(swarm_resource_cockpit_resource_admission_decision),
+    );
+    rows
+}
+
+fn swarm_resource_cockpit_capacity_admission_decision(
+    decision: &SwarmCapacityOperatorDecisionSummary,
+) -> SwarmResourceCockpitAdmissionDecision {
+    let action = capacity_admission_action_for_v1(decision.action);
+    SwarmResourceCockpitAdmissionDecision {
+        source: "capacity_admission".to_string(),
+        action: action.to_string(),
+        reason_codes: vec![decision.reason_code.clone()],
+        counters: capacity_admission_counters_for_v1(decision.action),
+        raw_pressure_severity: None,
+        effective_pressure_severity: None,
+        priority_protection_units: None,
+        queue_utilization: None,
+        pending_items: None,
+        fleet_pressure: None,
+        memory_tier_pressure: None,
+        max_latency_over_budget_ratio: None,
+    }
+}
+
+fn swarm_resource_cockpit_resource_admission_decision(
+    decision: &ResourceAdmissionDecisionSummary,
+) -> SwarmResourceCockpitAdmissionDecision {
+    SwarmResourceCockpitAdmissionDecision {
+        source: "resource_admission".to_string(),
+        action: resource_admission_action_name(decision.action).to_string(),
+        reason_codes: decision
+            .reason_codes
+            .iter()
+            .copied()
+            .map(resource_admission_reason_code_name)
+            .map(ToString::to_string)
+            .collect(),
+        counters: SwarmResourceCockpitAdmissionCounters {
+            admitted: decision.counters.admitted,
+            deferred: decision.counters.deferred,
+            degraded: decision.counters.degraded,
+            shed: decision.counters.shed,
+        },
+        raw_pressure_severity: Some(u64::from(decision.raw_pressure_severity)),
+        effective_pressure_severity: Some(u64::from(decision.effective_pressure_severity)),
+        priority_protection_units: Some(u64::from(decision.priority_protection_units)),
+        queue_utilization: decision.queue_utilization,
+        pending_items: decision.pending_items.map(u64::from),
+        fleet_pressure: decision
+            .fleet_pressure
+            .map(fleet_pressure_tier_name)
+            .map(ToString::to_string),
+        memory_tier_pressure: decision
+            .memory_tier_pressure
+            .map(fleet_pressure_tier_name)
+            .map(ToString::to_string),
+        max_latency_over_budget_ratio: decision.max_latency_over_budget_ratio,
+    }
+}
+
+const fn capacity_admission_action_for_v1(action: SwarmCapacityAdmissionAction) -> &'static str {
+    match action {
+        SwarmCapacityAdmissionAction::Admit => "admit",
+        SwarmCapacityAdmissionAction::Defer
+        | SwarmCapacityAdmissionAction::ThrottleCapturePolling
+        | SwarmCapacityAdmissionAction::RequireHumanApproval => "defer",
+        SwarmCapacityAdmissionAction::Shed => "shed",
+    }
+}
+
+const fn capacity_admission_counters_for_v1(
+    action: SwarmCapacityAdmissionAction,
+) -> SwarmResourceCockpitAdmissionCounters {
+    match action {
+        SwarmCapacityAdmissionAction::Admit => SwarmResourceCockpitAdmissionCounters {
+            admitted: 1,
+            deferred: 0,
+            degraded: 0,
+            shed: 0,
+        },
+        SwarmCapacityAdmissionAction::Defer
+        | SwarmCapacityAdmissionAction::ThrottleCapturePolling
+        | SwarmCapacityAdmissionAction::RequireHumanApproval => {
+            SwarmResourceCockpitAdmissionCounters {
+                admitted: 0,
+                deferred: 1,
+                degraded: 0,
+                shed: 0,
+            }
+        }
+        SwarmCapacityAdmissionAction::Shed => SwarmResourceCockpitAdmissionCounters {
+            admitted: 0,
+            deferred: 0,
+            degraded: 0,
+            shed: 1,
+        },
     }
 }
 
@@ -7005,6 +8385,7 @@ fn swarm_resource_cockpit_memory_tier(
     SwarmResourceCockpitMemoryTierSummary {
         tier: record.tier,
         tier_name: fleet_memory_tier_name(record.tier).to_string(),
+        evidence_state: SwarmResourceCockpitEvidenceState::Measured,
         resident: record.tier.is_resident(),
         budget_bytes: record.budget_bytes,
         actual_bytes: record.actual_bytes,
@@ -7016,6 +8397,11 @@ fn swarm_resource_cockpit_memory_tier(
         refused_bytes: record.refused_bytes,
         has_pressure: record.has_pressure(),
         reclamation_action: record.tier.reclamation_action(),
+        reason_codes: if record.has_pressure() {
+            vec!["resource.memory.tier_pressure".to_string()]
+        } else {
+            vec!["resource.proof.healthy".to_string()]
+        },
     }
 }
 
@@ -7106,6 +8492,7 @@ fn swarm_resource_cockpit_mitigations(
     capacity_decisions: &[SwarmCapacityOperatorDecisionSummary],
     resource_decisions: &[ResourceAdmissionDecisionSummary],
     storage_io: Option<&StorageIoOperatorSummary>,
+    action_receipts: &[SwarmResourceCockpitActionReceipt],
 ) -> Vec<SwarmResourceCockpitDrilldown> {
     let mut rows = Vec::new();
     for tier in memory_tiers.iter().filter(|tier| tier.has_pressure) {
@@ -7186,6 +8573,42 @@ fn swarm_resource_cockpit_mitigations(
             ),
         );
     }
+    for receipt in action_receipts.iter().filter(|receipt| {
+        receipt.dry_run
+            || !matches!(receipt.status.as_str(), "applied" | "succeeded")
+            || matches!(
+                receipt.evidence_state,
+                SwarmResourceCockpitEvidenceState::Unavailable
+                    | SwarmResourceCockpitEvidenceState::Stale
+                    | SwarmResourceCockpitEvidenceState::Mixed
+            )
+    }) {
+        push_cockpit_row(
+            &mut rows,
+            receipt.target_domain.clone(),
+            receipt
+                .reason_codes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "action_receipt.status_unknown".to_string()),
+            format!(
+                "receipt_id={} action={} status={} dry_run={} policy={} pane_id={} agent={} queue={} affected_bytes={}",
+                receipt.receipt_id,
+                receipt.action,
+                receipt.status,
+                receipt.dry_run,
+                receipt.policy_decision,
+                receipt
+                    .pane_id
+                    .map_or_else(|| "unknown".to_string(), |pane_id| pane_id.to_string()),
+                receipt.agent_name.as_deref().unwrap_or("unknown"),
+                receipt.queue_name.as_deref().unwrap_or("unknown"),
+                receipt
+                    .affected_bytes
+                    .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string())
+            ),
+        );
+    }
     if proof_gate == SwarmResourceCockpitProofGate::SkippedProof {
         push_cockpit_row(
             &mut rows,
@@ -7203,6 +8626,7 @@ fn swarm_resource_cockpit_drilldowns(
     capacity_decisions: &[SwarmCapacityOperatorDecisionSummary],
     resource_decisions: &[ResourceAdmissionDecisionSummary],
     storage_io: Option<&StorageIoOperatorSummary>,
+    action_receipts: &[SwarmResourceCockpitActionReceipt],
 ) -> Vec<SwarmResourceCockpitDrilldown> {
     let mut rows = swarm_resource_cockpit_mitigations(
         proof_gate,
@@ -7210,6 +8634,7 @@ fn swarm_resource_cockpit_drilldowns(
         capacity_decisions,
         resource_decisions,
         storage_io,
+        action_receipts,
     );
     if rows.is_empty() && proof_gate == SwarmResourceCockpitProofGate::Healthy {
         push_cockpit_row(
@@ -14355,6 +15780,312 @@ mod tests {
                 .proof_gate,
             SwarmResourceCockpitProofGate::SkippedProof
         );
+    }
+
+    #[test]
+    fn swarm_capacity_transparency_upgrade_attaches_v1_cockpit_ft_rz0eb_3() {
+        let level_one =
+            SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 1, "test.missing");
+        assert!(level_one.resource_cockpit.is_none());
+
+        let upgraded = level_one.with_transparency_level(2);
+        let cockpit = upgraded
+            .resource_cockpit
+            .as_ref()
+            .expect("level 2 surface must expose resource cockpit");
+        let json = serde_json::to_value(&upgraded).expect("summary serializes");
+
+        assert_eq!(upgraded.transparency_level, 2);
+        assert_eq!(cockpit.contract_id, SWARM_RESOURCE_COCKPIT_CONTRACT_ID);
+        assert_eq!(
+            json["resource_cockpit"]["contract_id"],
+            SWARM_RESOURCE_COCKPIT_CONTRACT_ID
+        );
+        assert_eq!(
+            json["resource_cockpit"]["domains"]["rss_residency"]["evidence_state"],
+            "unavailable"
+        );
+        assert!(json["resource_cockpit"]["residency_buckets"].is_array());
+        assert!(json["resource_cockpit"]["action_receipts"].is_array());
+    }
+
+    fn cockpit_domain_for_test(
+        name: &str,
+        evidence_state: SwarmResourceCockpitEvidenceState,
+    ) -> SwarmResourceCockpitDomainSummary {
+        SwarmResourceCockpitDomainSummary {
+            name: name.to_string(),
+            evidence_state,
+            pressure_tier: if evidence_state == SwarmResourceCockpitEvidenceState::Measured {
+                "normal".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            summary: format!("{name} test domain"),
+            operator_action: "none".to_string(),
+            reason_codes: vec!["resource.proof.healthy".to_string()],
+            freshness: None,
+            metrics: BTreeMap::new(),
+        }
+    }
+
+    fn cockpit_domains_for_test(
+        evidence_state: SwarmResourceCockpitEvidenceState,
+    ) -> SwarmResourceCockpitDomains {
+        SwarmResourceCockpitDomains {
+            memory: cockpit_domain_for_test("memory", evidence_state),
+            rss_residency: cockpit_domain_for_test("rss_residency", evidence_state),
+            pane_budget: cockpit_domain_for_test("pane_budget", evidence_state),
+            queue_backpressure: cockpit_domain_for_test("queue_backpressure", evidence_state),
+            storage_io: cockpit_domain_for_test("storage_io", evidence_state),
+            worker_pool: cockpit_domain_for_test("worker_pool", evidence_state),
+            capacity_admission: cockpit_domain_for_test("capacity_admission", evidence_state),
+            resource_admission: cockpit_domain_for_test("resource_admission", evidence_state),
+            action_receipts: cockpit_domain_for_test("action_receipts", evidence_state),
+        }
+    }
+
+    #[test]
+    fn swarm_resource_cockpit_v1_unavailable_envelope_pins_required_keys_ft_rz0eb_1() {
+        let summary =
+            SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 2, "test.missing");
+        let cockpit = summary
+            .resource_cockpit
+            .as_ref()
+            .expect("level 2 includes cockpit");
+        let json = serde_json::to_value(cockpit).expect("cockpit serializes");
+
+        assert_eq!(cockpit.contract_id, SWARM_RESOURCE_COCKPIT_CONTRACT_ID);
+        assert_eq!(
+            cockpit.evidence_state,
+            SwarmResourceCockpitEvidenceState::Unavailable
+        );
+        assert_eq!(json["contract_id"], SWARM_RESOURCE_COCKPIT_CONTRACT_ID);
+        assert_eq!(json["evidence_state"], "unavailable");
+        assert_eq!(json["run_identity"]["evidence_level"], "skipped_not_proven");
+        assert_eq!(
+            json["run_identity"]["hardware_predicate"]["proof_status"],
+            "skipped_not_proven"
+        );
+        for key in [
+            "memory",
+            "rss_residency",
+            "pane_budget",
+            "queue_backpressure",
+            "storage_io",
+            "worker_pool",
+            "capacity_admission",
+            "resource_admission",
+            "action_receipts",
+        ] {
+            assert!(
+                json["domains"].get(key).is_some(),
+                "missing cockpit domain {key}"
+            );
+            assert_eq!(json["domains"][key]["evidence_state"], "unavailable");
+            assert_eq!(json["domains"][key]["pressure_tier"], "unknown");
+            assert!(
+                json["domains"][key]["reason_codes"]
+                    .as_array()
+                    .is_some_and(|codes| !codes.is_empty()),
+                "domain {key} must explain unavailable evidence"
+            );
+        }
+        for key in [
+            "queue_backpressure",
+            "residency_buckets",
+            "admission_decisions",
+            "action_receipts",
+            "artifact_paths",
+        ] {
+            assert!(
+                json[key].as_array().is_some(),
+                "cockpit field {key} must serialize as an array"
+            );
+        }
+        assert_eq!(json["residency_buckets"][0]["bucket"], "unknown");
+        assert_eq!(
+            json["action_receipts"][0]["receipt_id"],
+            "action_receipts.unavailable"
+        );
+    }
+
+    #[test]
+    fn swarm_resource_cockpit_skipped_high_scale_predicate_is_explicit_ft_rz0eb_4() {
+        let summary =
+            SwarmCapacityOperatorSummary::unavailable(1_700_000_050_001, 2, "test.missing");
+        let cockpit = summary
+            .resource_cockpit
+            .as_ref()
+            .expect("level 2 includes cockpit");
+        let json = serde_json::to_value(cockpit).expect("cockpit serializes");
+
+        assert_eq!(cockpit.run_identity.evidence_level, "skipped_not_proven");
+        assert!(!cockpit.run_identity.hardware_predicate.target_class);
+        assert_eq!(
+            cockpit.run_identity.hardware_predicate.proof_status,
+            "skipped_not_proven"
+        );
+        assert_eq!(
+            json["run_identity"]["hardware_predicate"]["proof_status"],
+            "skipped_not_proven"
+        );
+    }
+
+    #[test]
+    fn swarm_resource_cockpit_root_evidence_state_distinguishes_stale_and_mixed_ft_rz0eb_1() {
+        let stale_domains = cockpit_domains_for_test(SwarmResourceCockpitEvidenceState::Stale);
+        assert_eq!(
+            swarm_resource_cockpit_root_evidence_state(&stale_domains),
+            SwarmResourceCockpitEvidenceState::Stale
+        );
+
+        let measured_domains =
+            cockpit_domains_for_test(SwarmResourceCockpitEvidenceState::Measured);
+        assert_eq!(
+            swarm_resource_cockpit_root_evidence_state(&measured_domains),
+            SwarmResourceCockpitEvidenceState::Measured
+        );
+
+        let mut mixed_domains = measured_domains;
+        mixed_domains.worker_pool = cockpit_domain_for_test(
+            "worker_pool",
+            SwarmResourceCockpitEvidenceState::Unavailable,
+        );
+        assert_eq!(
+            swarm_resource_cockpit_root_evidence_state(&mixed_domains),
+            SwarmResourceCockpitEvidenceState::Mixed
+        );
+    }
+
+    #[test]
+    fn swarm_resource_cockpit_bridges_residency_and_action_receipts_ft_rz0eb_2() {
+        let residency = crate::memory_pressure::classify_macos_residency(
+            &crate::memory_pressure::MacosResidencyClassifierInput {
+                process_rss_bytes: Some(10 * 1024 * 1024),
+                vmmap_output: Some(
+                    "MALLOC region 2M\nSQLite page cache 1M\nIOSurface surface 1M\nscrollback cache 512K\nmapped file 1M",
+                ),
+                heap_output: Some("all zones: 3 MB"),
+                sample_output: Some("rust_alloc sqlite metal scrollback mmap"),
+                child_process_rss_bytes: Some(1024 * 1024),
+            },
+        );
+        let receipt_report = crate::memory_pressure::evaluate_resource_pressure_action_receipts(&[
+            crate::memory_pressure::ResourcePressureActionReceiptInput {
+                receipt_id: "receipt-dry-run".to_string(),
+                correlation_id: Some("corr-rss-1".to_string()),
+                action: ResourcePressureAction::CompressScrollback,
+                target_domain: ResourcePressureDomain::RssResidency,
+                requested_at_ms: 1_700_000_040_100,
+                completed_at_ms: None,
+                status: ResourcePressureReceiptStatus::Applied,
+                dry_run: true,
+                policy_decision: ResourcePressurePolicyDecision::Allow,
+                evidence_state: ResourcePressureEvidenceState::Measured,
+                attribution: crate::memory_pressure::ResourcePressureAttribution {
+                    pane_id: Some(42),
+                    agent_name: Some("BluePike".to_string()),
+                    target_dir: None,
+                    queue_name: Some("resource-cockpit".to_string()),
+                    affected_bytes: Some(512 * 1024),
+                },
+                reason_codes: vec!["resource.memory.scrollback_cache".to_string()],
+                artifact_paths: vec!["docs/proof/receipt-dry-run.json".to_string()],
+            },
+            crate::memory_pressure::ResourcePressureActionReceiptInput {
+                receipt_id: "receipt-unavailable".to_string(),
+                correlation_id: Some("corr-fail-closed".to_string()),
+                action: ResourcePressureAction::DelayAdmission,
+                target_domain: ResourcePressureDomain::QueueBackpressure,
+                requested_at_ms: 1_700_000_040_200,
+                completed_at_ms: None,
+                status: ResourcePressureReceiptStatus::Planned,
+                dry_run: false,
+                policy_decision: ResourcePressurePolicyDecision::Allow,
+                evidence_state: ResourcePressureEvidenceState::Unavailable,
+                attribution: crate::memory_pressure::ResourcePressureAttribution::default(),
+                reason_codes: Vec::new(),
+                artifact_paths: vec!["docs/proof/receipt-unavailable.json".to_string()],
+            },
+            crate::memory_pressure::ResourcePressureActionReceiptInput {
+                receipt_id: "receipt-stale".to_string(),
+                correlation_id: Some("corr-stale".to_string()),
+                action: ResourcePressureAction::ThrottleQueue,
+                target_domain: ResourcePressureDomain::StorageIo,
+                requested_at_ms: 1_700_000_040_300,
+                completed_at_ms: Some(1_700_000_040_350),
+                status: ResourcePressureReceiptStatus::Planned,
+                dry_run: false,
+                policy_decision: ResourcePressurePolicyDecision::NotChecked,
+                evidence_state: ResourcePressureEvidenceState::Stale,
+                attribution: crate::memory_pressure::ResourcePressureAttribution {
+                    queue_name: Some("storage-write".to_string()),
+                    ..crate::memory_pressure::ResourcePressureAttribution::default()
+                },
+                reason_codes: vec!["resource.telemetry.stale".to_string()],
+                artifact_paths: vec!["docs/proof/receipt-stale.json".to_string()],
+            },
+        ]);
+
+        let summary =
+            SwarmCapacityOperatorSummary::unavailable(1_700_000_040_001, 2, "test.missing")
+                .with_resource_cockpit_inputs_and_resource_evidence(
+                    None,
+                    &[],
+                    None,
+                    Some(&residency),
+                    Some(&receipt_report),
+                );
+        let cockpit = summary.resource_cockpit.as_ref().expect("cockpit present");
+        let json = serde_json::to_value(cockpit).expect("cockpit serializes");
+
+        assert_eq!(
+            cockpit.domains.rss_residency.evidence_state,
+            SwarmResourceCockpitEvidenceState::Measured
+        );
+        assert_eq!(cockpit.domains.rss_residency.pressure_tier, "yellow");
+        assert!(cockpit.residency_buckets.iter().any(|bucket| {
+            bucket.bucket == MacosResidencyBucket::RustHeap
+                && bucket.bytes == Some(3 * 1024 * 1024)
+                && bucket
+                    .reason_codes
+                    .contains(&"resource.memory.heap_growth".to_string())
+        }));
+        assert!(
+            cockpit
+                .residency_buckets
+                .iter()
+                .any(|bucket| { bucket.bucket == residency.dominant_bucket && bucket.dominant })
+        );
+
+        assert_eq!(cockpit.action_receipts.len(), 3);
+        assert_eq!(
+            cockpit.domains.action_receipts.evidence_state,
+            SwarmResourceCockpitEvidenceState::Mixed
+        );
+        assert_eq!(cockpit.domains.action_receipts.pressure_tier, "red");
+        assert_eq!(json["action_receipts"][0]["correlation_id"], "corr-rss-1");
+        assert_eq!(json["action_receipts"][0]["pane_id"], 42);
+        assert_eq!(json["action_receipts"][0]["agent_name"], "BluePike");
+        assert_eq!(json["action_receipts"][0]["status"], "dry_run");
+        assert_eq!(
+            json["action_receipts"][1]["policy_decision"],
+            "require_approval"
+        );
+        assert_eq!(json["action_receipts"][1]["status"], "blocked");
+        assert_eq!(json["action_receipts"][2]["evidence_state"], "stale");
+        assert!(
+            cockpit
+                .artifact_paths
+                .iter()
+                .any(|path| { path == "docs/proof/receipt-unavailable.json" })
+        );
+        assert!(cockpit.mitigation_history.iter().any(|row| {
+            row.subject == "rss_residency"
+                && row.detail.contains("status=dry_run")
+                && row.detail.contains("pane_id=42")
+        }));
     }
 
     #[test]

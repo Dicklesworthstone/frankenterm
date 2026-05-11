@@ -25,12 +25,10 @@
     },
     {
       "category": "perf/competitor-matrix",
-      "path": null,
+      "path": "docs/perf/competitor-matrix.json",
       "media_type": "application/json",
-      "produced_by_bead": "ft-syqcz.4",
-      "deferred_to_bead": "ft-e87u6.9",
-      "deferred_reason": "Recovery bead must publish a manifest-compatible competitor matrix JSON artifact or intentionally correct this slot's provenance.",
-      "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3)."
+      "produced_by_bead": "ft-e87u6.9",
+      "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3). Recovery artifact published by ft-e87u6.9 (closed); substrate provenance traces to the ft-t101b deterministic competitor-bench fixture under ft-syqcz.5. Producer attribution corrected from the original null-slot misattribution to ft-syqcz.4 per the artifact's recommended_produced_by_bead field."
     },
     {
       "category": "perf/lindley-bounds",
@@ -41,12 +39,10 @@
     },
     {
       "category": "tui/render-parity",
-      "path": null,
+      "path": "docs/attestations/tui/render-parity.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-35yac.2",
-      "deferred_to_bead": "ft-e87u6.10",
-      "deferred_reason": "Recovery bead must publish the full ratatui-to-ftui parity JSON report; the populated GPU adjunct is intentionally separate.",
-      "description": "ratatui<->ftui differential render parity report (G5)."
+      "description": "ratatui<->ftui differential render parity report (G5). Recovery artifact published by ft-e87u6.10 (closed) backfilling the original ft-35yac.2 producer slot. The GPU adjunct stays in the sibling slot for ft-35yac.1.2."
     },
     {
       "category": "tui/render-parity",
@@ -57,12 +53,10 @@
     },
     {
       "category": "security/passive-watch",
-      "path": null,
+      "path": "docs/security/passive-watch-attestation.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-x0666.1",
-      "deferred_to_bead": "ft-e87u6.11",
-      "deferred_reason": "Recovery bead must publish the passive-watch read-only fuzz proof as a JSON attestation artifact.",
-      "description": "Passive-watch read-only fuzz proof (G9)."
+      "description": "Passive-watch read-only fuzz proof (G9). Recovery artifact published by ft-e87u6.11 (closed) backfilling the original ft-x0666.1 producer slot."
     },
     {
       "category": "security/redactor-coverage",
@@ -87,12 +81,10 @@
     },
     {
       "category": "proofs/runtime-proof-trait",
-      "path": null,
+      "path": "docs/attestations/proofs/runtime-proof-trait.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-i2eni.1",
-      "deferred_to_bead": "ft-e87u6.13",
-      "deferred_reason": "Recovery bead must publish a machine-readable RuntimeProof seal/adoption attestation JSON artifact.",
-      "description": "RuntimeProof sealed trait + tokio type-level seal (G1)."
+      "description": "RuntimeProof sealed trait + tokio type-level seal (G1). Recovery artifact published by ft-e87u6.13 (closed) backfilling the original ft-i2eni.1 producer slot."
     },
     {
       "category": "proofs/robot-contracts",

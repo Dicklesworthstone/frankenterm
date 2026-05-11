@@ -5603,7 +5603,7 @@ mod tests {
         // After an overflow gap, the cursor is in_gap state.
         // The next capture with content change may produce a Delta or Gap
         // depending on overlap extraction.  Either is valid.
-        assert!(seg.pane_id == 1);
+        assert_eq!(seg.pane_id, 1);
     }
 
     // =========================================================================

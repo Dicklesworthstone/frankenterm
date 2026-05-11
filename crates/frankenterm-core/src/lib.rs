@@ -130,6 +130,7 @@ pub mod bidi_correctness;
 pub mod bimap;
 pub mod binomial_heap;
 pub mod block_mode_terminal;
+pub mod blocker_radar;
 pub mod bloom_filter;
 pub mod bocpd;
 pub mod bounded_edit_distance;
@@ -195,6 +196,7 @@ pub mod connector_testbed;
 pub mod consistent_hash;
 pub mod content_dedup;
 pub mod context_budget;
+pub mod context_horizon;
 // `context_snapshot` extracted to `frankenterm-core-telemetry-types` (ft-yf2am / ft-y0loj.3.2).
 pub mod continuous_backpressure;
 pub mod cooldown_tracker;
@@ -297,6 +299,7 @@ pub use frankenterm_core_audit_types::forensic_export;
 // `proof_lane` extracted to `frankenterm-core-audit-types` (ft-tn6cw.3).
 // Leaf-clean proof attempt DTOs and operator report summaries.
 pub use frankenterm_core_audit_types::proof_doctor;
+pub use frankenterm_core_audit_types::proof_handoff;
 pub use frankenterm_core_audit_types::proof_lane;
 pub mod gc;
 pub mod gpu_pipeline_cache;

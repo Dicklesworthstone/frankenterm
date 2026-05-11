@@ -192,8 +192,9 @@ fn mixed_operations() {
     assert_eq!(snap.classifications, 1);
     assert_eq!(snap.resets, 1);
     // 4 from check_health + 1 from classify = 5 status counts total
-    assert!(
-        snap.status_healthy + snap.status_degraded + snap.status_critical + snap.status_hung == 5
+    assert_eq!(
+        snap.status_healthy + snap.status_degraded + snap.status_critical + snap.status_hung,
+        5
     );
 }
 

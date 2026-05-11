@@ -64,7 +64,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = FtviIndex::from_bytes(&raw);
         }
         Input::Structured(input) => {
-            let Some((bytes, expected)) = input.to_bytes() else {
+            let Some((bytes, expected)) = input.into_bytes() else {
                 return;
             };
 
@@ -93,7 +93,7 @@ struct ExpectedIndex {
 }
 
 impl StructuredInput {
-    fn to_bytes(self) -> Option<(Vec<u8>, Option<ExpectedIndex>)> {
+    fn into_bytes(self) -> Option<(Vec<u8>, Option<ExpectedIndex>)> {
         let dimension = normalized_dimension(self.dimension_seed, &self.records);
         let normalized_records = self
             .records

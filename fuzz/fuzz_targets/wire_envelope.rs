@@ -22,14 +22,14 @@
 //! ## Modes (driven by Arbitrary)
 //!
 //! - **Single**: feed one byte slice into `WireEnvelope::from_json`
-//!    AND `Aggregator::ingest` (which is `from_json` + state machine
-//!    in one call). Hits the JSON parsing surface with no
-//!    scaffolding — malformed UTF-8, deeply-nested arrays, integer
-//!    overflow attempts on `version` / `seq`, adversarial payload
-//!    variants.
+//!   AND `Aggregator::ingest` (which is `from_json` + state machine
+//!   in one call). Hits the JSON parsing surface with no
+//!   scaffolding — malformed UTF-8, deeply-nested arrays, integer
+//!   overflow attempts on `version` / `seq`, adversarial payload
+//!   variants.
 //! - **Sequence**: drive a single Aggregator through up to N
-//!    raw-bytes ingests, letting libFuzzer minimize toward inputs
-//!    that hit the eviction + duplicate-seq + future-clock branches.
+//!   raw-bytes ingests, letting libFuzzer minimize toward inputs
+//!   that hit the eviction + duplicate-seq + future-clock branches.
 //!
 //! ## Not fuzzed here
 //!

@@ -1,4 +1,7 @@
 #![cfg_attr(not(feature = "headless-render"), allow(dead_code))]
+// Keep this in sync with Cargo.toml: the vendored GUI crate is not yet a
+// pedantic-clean primary lint target.
+#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 
 pub mod accessibility_preferences;
 pub mod adaptive_fps_loop;

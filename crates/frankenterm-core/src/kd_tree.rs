@@ -845,7 +845,7 @@ mod tests {
         }
 
         // First should be origin (dist=0)
-        assert!(*results[0].1 == 1);
+        assert_eq!(*results[0].1, 1);
     }
 
     #[test]

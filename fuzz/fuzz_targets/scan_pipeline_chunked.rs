@@ -145,9 +145,7 @@ fuzz_target!(|data: &[u8]| {
     // Flush-pending contract: once the state reports backpressure, a further
     // non-empty append must panic until the caller flushes.
     if !case.data.is_empty() {
-        let pending_capacity = usize::from(case.flush_pending_buffer)
-            .max(1)
-            .min(MAX_BUFFER_BYTES);
+        let pending_capacity = usize::from(case.flush_pending_buffer).clamp(1, MAX_BUFFER_BYTES);
         let mut pending_state = ChunkedPipelineState::new(pending_capacity);
         let first_len = case.data.len().min(pending_capacity);
         let _ = pipeline.process_chunk(&case.data[..first_len], &mut pending_state);

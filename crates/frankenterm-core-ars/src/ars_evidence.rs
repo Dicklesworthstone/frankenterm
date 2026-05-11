@@ -1457,21 +1457,21 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(42_u64.to_le_bytes());
         let category_str = format!("{}", EvidenceCategory::ChangeDetection);
-        hasher.update((category_str.as_bytes().len() as u64).to_le_bytes());
+        hasher.update((category_str.len() as u64).to_le_bytes());
         hasher.update(category_str.as_bytes());
         hasher.update(1_700_000_000_000_000_u64.to_le_bytes());
         let summary = "ft-dl088 known-answer test";
-        hasher.update((summary.as_bytes().len() as u64).to_le_bytes());
+        hasher.update((summary.len() as u64).to_le_bytes());
         hasher.update(summary.as_bytes());
         let payload_json = "{}";
-        hasher.update((payload_json.as_bytes().len() as u64).to_le_bytes());
+        hasher.update((payload_json.len() as u64).to_le_bytes());
         hasher.update(payload_json.as_bytes());
         let prev = "prev-hash-anchor";
-        hasher.update((prev.as_bytes().len() as u64).to_le_bytes());
+        hasher.update((prev.len() as u64).to_le_bytes());
         hasher.update(prev.as_bytes());
         let expected_digest = hasher.finalize();
         let mut expected_hex = String::with_capacity(64);
-        for byte in expected_digest.iter() {
+        for byte in &expected_digest {
             use std::fmt::Write as _;
             let _ = write!(&mut expected_hex, "{:02x}", byte);
         }
@@ -1625,19 +1625,19 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(0_u64.to_le_bytes());
         let category_str = format!("{}", EvidenceCategory::ChangeDetection);
-        hasher.update((category_str.as_bytes().len() as u64).to_le_bytes());
+        hasher.update((category_str.len() as u64).to_le_bytes());
         hasher.update(category_str.as_bytes());
         hasher.update(0_u64.to_le_bytes());
         hasher.update(0_u64.to_le_bytes()); // empty summary len
         hasher.update(b""); // empty summary
         let payload_json = "{}";
-        hasher.update((payload_json.as_bytes().len() as u64).to_le_bytes());
+        hasher.update((payload_json.len() as u64).to_le_bytes());
         hasher.update(payload_json.as_bytes());
         hasher.update(0_u64.to_le_bytes()); // empty prev len
         hasher.update(b""); // empty prev
         let expected = hasher.finalize();
         let mut expected_hex = String::with_capacity(64);
-        for byte in expected.iter() {
+        for byte in &expected {
             use std::fmt::Write as _;
             let _ = write!(&mut expected_hex, "{:02x}", byte);
         }

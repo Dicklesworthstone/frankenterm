@@ -84,6 +84,7 @@ fn arb_scheduler_snapshot() -> impl Strategy<Value = SchedulerSnapshot> {
                 total_byte_budget_exceeded,
                 total_throttle_events,
                 tracked_panes,
+                ..SchedulerSnapshot::default()
             },
         )
 }

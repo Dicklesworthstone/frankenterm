@@ -16,6 +16,9 @@ use crate::mcp_framework::{
     FrameworkResourceTemplate as ResourceTemplate, FrameworkToolHandler as ToolHandler,
 };
 
+use crate::context_horizon::predict_context_horizon_from_sqlite;
+use crate::mcp_error::MCP_ERR_STORAGE;
+
 use super::mcp_tools::{
     WaAccountsTool, WaEventsTool, WaReservationsTool, WaRulesListTool, WaStateTool,
 };
@@ -490,6 +493,66 @@ impl ResourceHandler for WaWorkflowsResource {
     }
 }
 
+pub(super) struct WaContextHorizonResource {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaContextHorizonResource {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ResourceHandler for WaContextHorizonResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://context/horizon".to_string(),
+            name: "ft context horizon".to_string(),
+            description: Some("Read-only context pressure and handoff risk forecast".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "context".to_string(),
+                "horizon".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let envelope = match predict_context_horizon_from_sqlite(
+            self.db_path.as_ref().as_path(),
+            None,
+            generated_at_ms,
+            15 * 60 * 1000,
+            "mcp.context_horizon",
+        ) {
+            Ok(report) => McpEnvelope::success(
+                serde_json::to_value(report).map_err(|err| {
+                    McpError::internal_error(format!("Serialize context horizon: {err}"))
+                })?,
+                elapsed_ms(start),
+            ),
+            Err(err) => McpEnvelope::<serde_json::Value>::error(
+                MCP_ERR_STORAGE,
+                format!("Failed to build context horizon: {err}"),
+                Some(
+                    "Check the workspace database path; this MCP resource is read-only."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            ),
+        };
+        envelope_as_resource("wa://context/horizon", envelope)
+    }
+}
+
 pub(super) struct WaReservationsResource {
     db_path: Arc<PathBuf>,
 }
@@ -578,9 +641,9 @@ impl ResourceHandler for WaReservationsByPaneTemplateResource {
 mod tests {
     use super::McpEnvelope;
     use super::{
-        WaAccountsByServiceTemplateResource, WaAccountsResource, WaEventsResource,
-        WaEventsTemplateResource, WaEventsUnhandledTemplateResource, WaPanesResource,
-        WaReservationsByPaneTemplateResource, WaReservationsResource,
+        WaAccountsByServiceTemplateResource, WaAccountsResource, WaContextHorizonResource,
+        WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
+        WaPanesResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
         WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource, envelope_as_resource,
         tool_output_as_resource,
     };
@@ -711,6 +774,78 @@ mod tests {
     }
 
     #[test]
+    fn context_horizon_resource_definition_uri() {
+        let resource = WaContextHorizonResource::new(db_path());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://context/horizon");
+        assert!(def.tags.contains(&"context".to_string()));
+        assert!(def.tags.contains(&"horizon".to_string()));
+    }
+
+    #[test]
+    fn context_horizon_resource_reads_same_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("context-horizon.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        conn.execute_batch(
+            r"
+            CREATE TABLE pane_contexts (
+                context_id TEXT PRIMARY KEY NOT NULL,
+                pane_id INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                depth INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                archived_at_ms INTEGER,
+                token_budget INTEGER NOT NULL,
+                tokens_consumed INTEGER NOT NULL,
+                pressure_tier TEXT NOT NULL,
+                source TEXT NOT NULL
+            );
+            CREATE TABLE context_rotations (
+                rotation_id TEXT PRIMARY KEY NOT NULL,
+                pane_id INTEGER NOT NULL,
+                previous_context_id TEXT,
+                new_context_id TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                reason TEXT,
+                caller_idempotency_key TEXT,
+                rotated_at_ms INTEGER NOT NULL,
+                tokens_before INTEGER NOT NULL,
+                tokens_after INTEGER NOT NULL,
+                tokens_freed INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            INSERT INTO pane_contexts
+                (context_id, pane_id, state, depth, created_at_ms, token_budget,
+                 tokens_consumed, pressure_tier, source)
+            VALUES ('ctx-mcp', 11, 'active', 1, 1700000000000, 1000, 800,
+                    'yellow', 'test');
+            ",
+        )
+        .expect("seed context horizon db");
+        drop(conn);
+
+        let resource = WaContextHorizonResource::new(Arc::new(db_path));
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let contents = resource.read(&ctx).expect("read context horizon resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["contract_id"].as_str(),
+            Some(crate::context_horizon::CONTEXT_HORIZON_CONTRACT_ID)
+        );
+        assert_eq!(
+            payload["data"]["raw_context_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["pane_risks"][0]["pane_id"].as_u64(),
+            Some(11)
+        );
+    }
+
+    #[test]
     fn reservations_resource_definition_uri() {
         let resource = WaReservationsResource::new(db_path());
         let def = resource.definition();
@@ -752,6 +887,9 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaContextHorizonResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
             WaReservationsResource::new(Arc::clone(&db))
                 .definition()
                 .uri,
@@ -781,6 +919,9 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaContextHorizonResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
             WaReservationsResource::new(Arc::clone(&db))
                 .definition()
                 .uri,
@@ -802,6 +943,7 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaContextHorizonResource::new(Arc::clone(&db)).definition(),
             WaReservationsResource::new(Arc::clone(&db)).definition(),
         ];
         for def in &defs {
@@ -826,6 +968,7 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaContextHorizonResource::new(Arc::clone(&db)).definition(),
             WaReservationsResource::new(Arc::clone(&db)).definition(),
         ];
         for def in &defs {

@@ -832,6 +832,7 @@ proptest! {
             total_size_bytes: total_size,
             wa_version: "0.1.0".to_string(),
             exported_at: "2025-01-01T00:00:00Z".to_string(),
+            swarm: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: IncidentBundleResult = serde_json::from_str(&json).unwrap();

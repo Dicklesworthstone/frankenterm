@@ -1459,7 +1459,7 @@ mod tests {
         let cmd = make_block(0, "cat src/main.rs");
         let error = "error in src/main.rs";
         let result = gzr.generalize(&[cmd], error, 100, 95);
-        assert!(result.pac_bound.n_observations == 100);
+        assert_eq!(result.pac_bound.n_observations, 100);
         assert!(result.pac_bound.empirical_risk < 0.1);
     }
 

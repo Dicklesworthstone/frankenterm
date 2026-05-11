@@ -20,8 +20,8 @@ use codec::{
     GetCodecVersion, GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
     GetPaneRenderChangesResponse, ListPanes, ListPanesResponse, MoveFloatingPane, Pdu,
     RemoveFloatingPane, Resize, SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ,
-    SetLayoutCycle, SwapToLayout, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints,
-    WriteToPane,
+    SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, ToggleFloatingPane,
+    UnitResponse, UpdatePaneConstraints, WriteToPane,
 };
 use config as wezterm_config;
 use frankenterm_term::TerminalSize;
@@ -400,6 +400,62 @@ impl DirectMuxClient {
             Pdu::ListPanesResponse(payload) => Ok(payload),
             other => Err(DirectMuxError::UnexpectedResponse {
                 expected: "ListPanesResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    /// Spawn a new mux pane/tab through the native mux protocol.
+    pub async fn spawn_v2(&mut self, spawn: SpawnV2) -> Result<SpawnResponse, DirectMuxError> {
+        let response = self.send_request(Pdu::SpawnV2(spawn)).await?;
+        match response {
+            Pdu::SpawnResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "SpawnResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    /// Spawn a new mux pane/tab through the native mux protocol with explicit Cx.
+    pub async fn spawn_v2_with_cx(
+        &mut self,
+        cx: &Cx,
+        spawn: SpawnV2,
+    ) -> Result<SpawnResponse, DirectMuxError> {
+        let response = self.send_request_with_cx(cx, Pdu::SpawnV2(spawn)).await?;
+        match response {
+            Pdu::SpawnResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "SpawnResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    /// Split an existing pane through the native mux protocol.
+    pub async fn split_pane(&mut self, split: SplitPane) -> Result<SpawnResponse, DirectMuxError> {
+        let response = self.send_request(Pdu::SplitPane(split)).await?;
+        match response {
+            Pdu::SpawnResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "SpawnResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    /// Split an existing pane through the native mux protocol with explicit Cx.
+    pub async fn split_pane_with_cx(
+        &mut self,
+        cx: &Cx,
+        split: SplitPane,
+    ) -> Result<SpawnResponse, DirectMuxError> {
+        let response = self.send_request_with_cx(cx, Pdu::SplitPane(split)).await?;
+        match response {
+            Pdu::SpawnResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "SpawnResponse".to_string(),
                 got: other.pdu_name().to_string(),
             }),
         }

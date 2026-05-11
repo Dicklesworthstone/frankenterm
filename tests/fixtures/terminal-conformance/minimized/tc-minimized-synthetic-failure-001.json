@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "scenario_id": "tc-minimized-synthetic-failure-001",
+  "matrix_row": 11,
+  "source": "synthetic failing transcript used to demonstrate the ft-hme39.4 minimization and quarantine metadata contract",
+  "original_artifact_path": "tests/e2e/logs/terminal-conformance/ft-hme39.4/synthetic-failure/full-transcript.hex",
+  "minimized_input_artifact": "minimized/tc-minimized-synthetic-failure-001.hex",
+  "expected_failure": {
+    "assertion": "Synthetic parser expectation intentionally asked for a closing OSC 8 hyperlink terminator that the reduced transcript does not contain.",
+    "failure_signature": "missing display hex fragment 1b5d383b3b1b5c",
+    "preserved_by_minimized_input": true
+  },
+  "minimization_steps": [
+    {
+      "step": 1,
+      "action": "Removed unrelated shell prompt and command echo bytes from the full artifact.",
+      "evidence": "Failure signature still reported missing OSC 8 close terminator."
+    },
+    {
+      "step": 2,
+      "action": "Reduced the transcript to the OSC 8 opener, visible payload, and trailing newline.",
+      "evidence": "Reduced fixture kept the same missing display hex fragment while removing nonessential printable text."
+    }
+  ],
+  "quarantine": {
+    "allowed": true,
+    "reason": "This is a synthetic negative fixture that proves the minimization metadata shape; it is not a product bug and must not run in the main passing parser corpus.",
+    "follow_up_bead": "ft-hme39.6",
+    "promotion_condition": "Replace the synthetic original artifact with an RCH run artifact from a real terminal failure and add a passing expected artifact before moving it into manifest.scenarios."
+  },
+  "promotion": {
+    "target_manifest": "tests/fixtures/terminal-conformance/manifest.json",
+    "required_proof": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-terminal-conformance cargo test -p frankenterm-escape-parser --test terminal_conformance_corpus -- --nocapture",
+    "criteria": "The minimized transcript has a non-synthetic source artifact, no secrets, a passing expected artifact, and no open quarantine follow-up bead."
+  },
+  "residual_risk": "The committed case demonstrates metadata validation only; it does not prove a live mux, PTY, or render-path failure until promoted with an RCH artifact.",
+  "redaction_status": "No secrets, hostnames, user paths, tokens, or private data."
+}

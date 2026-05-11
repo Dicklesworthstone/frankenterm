@@ -1158,7 +1158,7 @@ mod coordinator_stress {
         );
 
         // Telemetry should track the progression
-        assert!(coord.telemetry().ticks == 3);
+        assert_eq!(coord.telemetry().ticks, 3);
         assert!(coord.telemetry().elevated_ticks >= 2);
     }
 

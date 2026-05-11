@@ -6,7 +6,7 @@
 //
 // ucd-generate 0.3.1 is available on crates.io.
 
-pub const NAMES: &'static [(&'static str, u32)] = &[
+pub const NAMES: &[(&str, u32)] = &[
     ("ABACUS", 129518),
     ("AC CURRENT", 9190),
     ("ACCORDION", 129687),

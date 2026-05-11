@@ -16,6 +16,7 @@ use window::{KeyCode, Modifiers};
 /// The intent is for this to be used when filtering the items
 /// that should be shown in eg: a context menu.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum ArgType {
     /// Operates on the active pane
     ActivePane,
@@ -116,7 +117,7 @@ impl CommandDef {
                 .resolve(config.key_map_preference)
                 .clone();
 
-            let ukey = DeferredKeyCode::try_from(us_layout_shift(&label))
+            let ukey = DeferredKeyCode::try_from(us_layout_shift(label))
                 .unwrap()
                 .resolve(config.key_map_preference)
                 .clone();
@@ -177,8 +178,8 @@ impl CommandDef {
                     def.permute_keys(config)
                 };
                 Some(ExpandedCommand {
-                    brief: def.brief.into(),
-                    doc: def.doc.into(),
+                    brief: def.brief,
+                    doc: def.doc,
                     keys,
                     action,
                     menubar: def.menubar,
@@ -331,8 +332,8 @@ impl CommandDef {
             }
             if let Some(cmd) = derive_command_from_key_assignment(&entry.action) {
                 result.push(ExpandedCommand {
-                    brief: cmd.brief.into(),
-                    doc: cmd.doc.into(),
+                    brief: cmd.brief,
+                    doc: cmd.doc,
                     keys: vec![(*mods, keycode.clone())],
                     action: entry.action.clone(),
                     menubar: cmd.menubar,
@@ -351,8 +352,8 @@ impl CommandDef {
                 }
                 if let Some(cmd) = derive_command_from_key_assignment(&entry.action) {
                     result.push(ExpandedCommand {
-                        brief: cmd.brief.into(),
-                        doc: cmd.doc.into(),
+                        brief: cmd.brief,
+                        doc: cmd.doc,
                         keys: vec![],
                         action: entry.action.clone(),
                         menubar: cmd.menubar,
@@ -1016,7 +1017,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         ActivateTab(n) => {
             let n = *n;
             let ordinal = english_ordinal(n + 1);
-            let keys = if n >= 0 && n <= 7 {
+            let keys = if (0..=7).contains(&n) {
                 vec![(Modifiers::SUPER, (n + 1).to_string())]
             } else {
                 vec![]
@@ -1043,8 +1044,8 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             }
         }
         SetPaneZoomState(true) => CommandDef {
-            brief: format!("Zooms the current Pane").into(),
-            doc: format!(
+            brief: "Zooms the current Pane".into(),
+            doc: concat!(
                 "Places the current pane into the zoomed state, \
                              filling all of the space in the tab"
             )
@@ -1055,8 +1056,8 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_fullscreen"),
         },
         SetPaneZoomState(false) => CommandDef {
-            brief: format!("Un-Zooms the current Pane").into(),
-            doc: format!("Takes the current pane out of the zoomed state").into(),
+            brief: "Un-Zooms the current Pane".into(),
+            doc: "Takes the current pane out of the zoomed state".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &[],

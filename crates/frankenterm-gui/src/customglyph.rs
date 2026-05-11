@@ -5119,7 +5119,7 @@ impl GlyphCache {
                         &[Poly {
                             path: cmd,
                             intensity: alpha,
-                            style: style,
+                            style,
                         }],
                         &mut buffer,
                         if config::configuration().anti_alias_custom_block_glyphs {
@@ -5351,7 +5351,7 @@ impl GlyphCache {
                         &[Poly {
                             path: cmd,
                             intensity: BlockAlpha::Full,
-                            style: style,
+                            style,
                         }],
                         &mut buffer,
                         if config::configuration().anti_alias_custom_block_glyphs {
@@ -5483,7 +5483,7 @@ impl GlyphCache {
                             &[Poly {
                                 path: cmd,
                                 intensity: BlockAlpha::Full,
-                                style: style,
+                                style,
                             }],
                             &mut buffer,
                             if config::configuration().anti_alias_custom_block_glyphs {
@@ -5652,7 +5652,7 @@ impl GlyphCache {
                             &[Poly {
                                 path: cmd,
                                 intensity: BlockAlpha::Full,
-                                style: style,
+                                style,
                             }],
                             &mut buffer,
                             if config::configuration().anti_alias_custom_block_glyphs {

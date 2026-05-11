@@ -235,10 +235,12 @@ mod alphabet_test {
         );
     }
 
-    fn make_dirty_ranges(ranges: &[Range<StableRowIndex>]) -> RangeSet<StableRowIndex> {
+    fn make_dirty_ranges(
+        ranges: impl IntoIterator<Item = Range<StableRowIndex>>,
+    ) -> RangeSet<StableRowIndex> {
         let mut dirty = RangeSet::default();
         for range in ranges {
-            dirty.add_range(range.clone());
+            dirty.add_range(range);
         }
         dirty
     }
@@ -250,8 +252,8 @@ mod alphabet_test {
     #[test]
     fn test_dirty_rect_merge() {
         let visible = 9..15;
-        let delegate_dirty = make_dirty_ranges(&[10..12]);
-        let overlay_dirty = make_dirty_ranges(&[12..14]);
+        let delegate_dirty = make_dirty_ranges(std::iter::once(10..12));
+        let overlay_dirty = make_dirty_ranges(std::iter::once(12..14));
 
         let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
 
@@ -264,8 +266,8 @@ mod alphabet_test {
         // The merge MUST NOT collapse them into one rect, otherwise rows 12-13
         // would be needlessly repainted on every overlay refresh.
         let visible = 0..30;
-        let delegate_dirty = make_dirty_ranges(&[10..12]);
-        let overlay_dirty = make_dirty_ranges(&[14..16]);
+        let delegate_dirty = make_dirty_ranges(std::iter::once(10..12));
+        let overlay_dirty = make_dirty_ranges(std::iter::once(14..16));
 
         let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
 
@@ -277,8 +279,8 @@ mod alphabet_test {
         // delegate [10..14] and overlay [12..16] overlap at 12,13.
         // RangeSet semantics: overlap collapses into [10..16].
         let visible = 0..30;
-        let delegate_dirty = make_dirty_ranges(&[10..14]);
-        let overlay_dirty = make_dirty_ranges(&[12..16]);
+        let delegate_dirty = make_dirty_ranges(std::iter::once(10..14));
+        let overlay_dirty = make_dirty_ranges(std::iter::once(12..16));
 
         let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
 
@@ -293,8 +295,8 @@ mod alphabet_test {
         // portions survive. This is the invariant that prevents the
         // renderer from invalidating off-screen geometry.
         let visible = 10..20;
-        let delegate_dirty = make_dirty_ranges(&[5..8, 12..14]);
-        let overlay_dirty = make_dirty_ranges(&[18..22]);
+        let delegate_dirty = make_dirty_ranges([5..8, 12..14]);
+        let overlay_dirty = make_dirty_ranges(std::iter::once(18..22));
 
         let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
 
@@ -306,7 +308,7 @@ mod alphabet_test {
         // Common case: overlay is dormant and contributes nothing. The
         // result should be exactly the delegate, clipped to the viewport.
         let visible = 0..10;
-        let delegate_dirty = make_dirty_ranges(&[2..4, 7..15]);
+        let delegate_dirty = make_dirty_ranges([2..4, 7..15]);
         let overlay_dirty = RangeSet::default();
 
         let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
@@ -327,8 +329,8 @@ mod alphabet_test {
         // the next was also dirtied) must collapse into one rect. RangeSet
         // treats {[5..6], [6..7], [7..8]} as the contiguous range [5..8].
         let visible = 0..20;
-        let delegate_dirty = make_dirty_ranges(&[5..6, 6..7]);
-        let overlay_dirty = make_dirty_ranges(&[7..8]);
+        let delegate_dirty = make_dirty_ranges([5..6, 6..7]);
+        let overlay_dirty = make_dirty_ranges(std::iter::once(7..8));
 
         let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
 
@@ -341,7 +343,7 @@ mod alphabet_test {
         // row it actually paints. Clearing idx=5 must remove ONLY row 5
         // from the dirty set; the rest of the marked rows stay queued
         // for the renderer's next pass.
-        let mut dirty = make_dirty_ranges(&[3..4, 5..6, 7..8, 10..11]);
+        let mut dirty = make_dirty_ranges([3..4, 5..6, 7..8, 10..11]);
 
         clear_rendered_dirty_result(&mut dirty, 5);
 
@@ -354,7 +356,7 @@ mod alphabet_test {
         // into [10..12, 13..15]. This is the bookkeeping the renderer
         // depends on when only some of a contiguous range has been
         // painted in a partial frame.
-        let mut dirty = make_dirty_ranges(&[10..15]);
+        let mut dirty = make_dirty_ranges(std::iter::once(10..15));
 
         clear_rendered_dirty_result(&mut dirty, 12);
 
@@ -366,7 +368,7 @@ mod alphabet_test {
         // Clearing a row that was never dirty must be a no-op — no panic,
         // no spurious mutation. Defends against the renderer
         // double-clearing rows after a redraw without re-marking.
-        let mut dirty = make_dirty_ranges(&[3..4, 7..8]);
+        let mut dirty = make_dirty_ranges([3..4, 7..8]);
         let before = collect_ranges(&dirty);
 
         clear_rendered_dirty_result(&mut dirty, 99);
@@ -382,7 +384,7 @@ mod alphabet_test {
         // every in-viewport dirty marker is gone; off-viewport rows
         // (beyond the viewport bottom) remain queued for the next frame.
         let visible: Range<StableRowIndex> = 10..15;
-        let mut dirty = make_dirty_ranges(&[10..15, 20..22]);
+        let mut dirty = make_dirty_ranges([10..15, 20..22]);
 
         for idx in visible {
             clear_rendered_dirty_result(&mut dirty, idx);
@@ -401,7 +403,7 @@ mod alphabet_test {
         // present loop. They stay queued so the next frame still paints
         // them when they scroll into view.
         let visible: Range<StableRowIndex> = 100..110;
-        let mut dirty = make_dirty_ranges(&[50..52, 105..107, 200..201]);
+        let mut dirty = make_dirty_ranges([50..52, 105..107, 200..201]);
 
         for idx in visible {
             clear_rendered_dirty_result(&mut dirty, idx);
@@ -417,8 +419,8 @@ mod alphabet_test {
         // If every dirty range sits entirely outside the visible window,
         // the merge result is empty — nothing to paint.
         let visible = 100..110;
-        let delegate_dirty = make_dirty_ranges(&[5..8]);
-        let overlay_dirty = make_dirty_ranges(&[200..205]);
+        let delegate_dirty = make_dirty_ranges(std::iter::once(5..8));
+        let overlay_dirty = make_dirty_ranges(std::iter::once(200..205));
 
         let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
 

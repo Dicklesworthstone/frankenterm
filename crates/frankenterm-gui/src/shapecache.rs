@@ -164,7 +164,7 @@ mod test {
                     glyph_cache
                         .cached_glyph(
                             info,
-                            &style,
+                            style,
                             followed_by_space,
                             font,
                             render_metrics,
@@ -208,7 +208,7 @@ mod test {
         let fonts = Rc::new(
             FontConfiguration::new(
                 None,
-                config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize,
+                config.dpi.unwrap_or_else(::window::default_dpi) as usize,
             )
             .unwrap(),
         );
@@ -273,8 +273,7 @@ mod test {
                         None,
                         config::configuration()
                             .dpi
-                            .unwrap_or_else(|| ::window::default_dpi())
-                            as usize,
+                            .unwrap_or_else(::window::default_dpi) as usize,
                     )
                     .unwrap(),
                 );
@@ -283,7 +282,7 @@ mod test {
                 let line = Line::from_text(&text, &CellAttributes::default(), SEQ_ZERO, None);
                 let cell_clusters = line.cluster(None);
                 let cluster = &cell_clusters[0];
-                let presentation_width = PresentationWidth::with_cluster(&cluster);
+                let presentation_width = PresentationWidth::with_cluster(cluster);
 
                 measurer.measure(|| {
                     let _x = font
@@ -317,7 +316,7 @@ mod test {
         let fonts = Rc::new(
             FontConfiguration::new(
                 None,
-                config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize,
+                config.dpi.unwrap_or_else(::window::default_dpi) as usize,
             )
             .unwrap(),
         );

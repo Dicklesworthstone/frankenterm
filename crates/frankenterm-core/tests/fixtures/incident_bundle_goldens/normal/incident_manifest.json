@@ -1,0 +1,87 @@
+{
+  "exported_at": "2026-05-10T11:12:40Z",
+  "files": [
+    "incident_manifest.json",
+    "README.md",
+    "redaction_report.json",
+    "warnings.jsonl",
+    "sources/robot_state.json",
+    "sources/resource_pressure.json"
+  ],
+  "kind": "manual",
+  "path": "tests/fixtures/incident_bundle_goldens/normal",
+  "swarm": {
+    "bundle_id": "ft-krsq0-4-normal",
+    "collection_policy": {
+      "agent_mail_repair_allowed": false,
+      "mutating_actions_allowed": false,
+      "pane_text_allowed": "disabled",
+      "process_sampler": "disabled",
+      "source_timeout_ms": 5000
+    },
+    "contract_id": "ft.swarm_incident_bundle.v1",
+    "created_at": "2026-05-10T11:12:40Z",
+    "environment": {
+      "arch": "aarch64",
+      "current_dir_available": true,
+      "os": "macos"
+    },
+    "format_version": "1.0",
+    "generator": {
+      "arch": "aarch64",
+      "ft_version": "fixture",
+      "hostname_class": "fixture-host",
+      "os": "macos",
+      "source_surface": "fixture::incident_bundle_golden"
+    },
+    "kind": "manual",
+    "privacy_budget": {
+      "config_summary_max_bytes": 4096,
+      "max_events": 8,
+      "pane_text_allowed": false,
+      "process_sample_allowed": false,
+      "tier": "fixture"
+    },
+    "redaction_summary": {
+      "redacted_files": 0,
+      "total_redactions": 0
+    },
+    "schema_version": 1,
+    "sources": [
+      {
+        "elapsed_ms": 4,
+        "evidence_state": "measured",
+        "file": "sources/robot_state.json",
+        "freshness_ms": 0,
+        "generated_at": "2026-05-10T11:12:40Z",
+        "max_age_ms": 60000,
+        "mutates_state": false,
+        "name": "robot_state",
+        "privacy_tier": "fixture",
+        "redaction": "none",
+        "size_bytes": 571,
+        "source_surface": "fixture::robot_state",
+        "status": "collected"
+      },
+      {
+        "elapsed_ms": 3,
+        "evidence_state": "measured",
+        "file": "sources/resource_pressure.json",
+        "freshness_ms": 0,
+        "generated_at": "2026-05-10T11:12:40Z",
+        "max_age_ms": 60000,
+        "mutates_state": false,
+        "name": "resource_pressure_snapshot",
+        "privacy_tier": "fixture",
+        "redaction": "none",
+        "size_bytes": 439,
+        "source_surface": "fixture::resource_pressure_snapshot",
+        "status": "collected"
+      }
+    ],
+    "total_size_bytes": 1010,
+    "warnings": []
+  },
+  "total_size_bytes": 1010,
+  "wa_version": "fixture"
+}

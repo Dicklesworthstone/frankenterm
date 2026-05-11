@@ -67,6 +67,36 @@ struct CachedProcInfo {
     cached_is_stateful: Option<bool>,
 }
 
+/// Walks a process tree to find the most-recently-started descendant.
+///
+/// On Windows, children with `console == 0` are skipped so the result reflects
+/// the effective foreground process the user is interacting with (Windows has
+/// no job control / session leader concept; we approximate it by the youngest
+/// console-attached descendant).
+///
+/// Extracted from `LocalPane::divine_process_list` so the off-main-thread
+/// `LocalPane::warm_proc_cache` builds the same `foreground` value the
+/// fetch-immediate path would have built — earlier I had a bug where the warm
+/// worker fell back to `root.clone()` and broke the Windows
+/// `divine_current_working_dir(&fg.cwd)` path. See ft-qhwpq.
+fn find_youngest_descendant(root: &LocalProcessInfo) -> &LocalProcessInfo {
+    fn recurse<'a>(proc: &'a LocalProcessInfo, youngest: &mut &'a LocalProcessInfo) {
+        if proc.start_time >= youngest.start_time {
+            *youngest = proc;
+        }
+        for child in proc.children.values() {
+            #[cfg(windows)]
+            if child.console == 0 {
+                continue;
+            }
+            recurse(child, youngest);
+        }
+    }
+    let mut youngest = root;
+    recurse(root, &mut youngest);
+    youngest
+}
+
 /// This is a bit horrible; it can take 700us to tcgetpgrp, so if we have
 /// 10 tabs open and run the mouse over them, hovering them each in turn,
 /// we can spend 7ms per evaluation of the tab bar state on fetching those
@@ -1741,28 +1771,8 @@ impl LocalPane {
                 // Windows doesn't have any job control or session concept,
                 // so we infer that the equivalent to the process group
                 // leader is the most recently spawned program running
-                // in the console
-                let mut youngest = &root;
-
-                fn find_youngest<'a>(
-                    proc: &'a LocalProcessInfo,
-                    youngest: &mut &'a LocalProcessInfo,
-                ) {
-                    if proc.start_time >= youngest.start_time {
-                        *youngest = proc;
-                    }
-
-                    for child in proc.children.values() {
-                        #[cfg(windows)]
-                        if child.console == 0 {
-                            continue;
-                        }
-                        find_youngest(child, youngest);
-                    }
-                }
-
-                find_youngest(&root, &mut youngest);
-                let mut foreground = youngest.clone();
+                // in the console. See `find_youngest_descendant`.
+                let mut foreground = find_youngest_descendant(&root).clone();
                 foreground.children.clear();
 
                 proc_list.replace(CachedProcInfo {
@@ -1845,7 +1855,11 @@ impl LocalPane {
                         _ => None,
                     };
                     if pid_now == Some(pid_walked) {
-                        let mut foreground = root.clone();
+                        // Build foreground identically to divine_process_list
+                        // so the Windows `divine_current_working_dir(&fg.cwd)`
+                        // path stays correct when the cache is populated by
+                        // this off-main-thread warmer.
+                        let mut foreground = find_youngest_descendant(&root).clone();
                         foreground.children.clear();
                         local.proc_list.lock().replace(CachedProcInfo {
                             root,

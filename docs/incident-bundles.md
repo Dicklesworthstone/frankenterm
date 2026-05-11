@@ -1,5 +1,10 @@
 # Incident Bundles and `ft reproduce`
 
+Status: current replay-bundle contract plus `ft-krsq0` swarm-ops extension
+contract. The replay-bundle files below are implemented today; the swarm
+operator extension is the contract that downstream `ft-krsq0.*` beads must
+converge on before claiming implementation.
+
 Incident bundles are self-contained directories that capture enough context
 to diagnose a problem without access to the original machine. They are
 designed to be **safe to share** by default — secrets are redacted, output
@@ -25,16 +30,25 @@ ft reproduce export --kind crash
 ft reproduce export --kind manual
 
 # Replay a bundle to validate its contents
-ft reproduce replay /path/to/ft_incident_crash_20260206_183000/ --mode policy
+ft reproduce replay /path/to/wa_incident_crash_20260206_183000/ --mode policy
 ```
 
 ## Bundle Layout
 
-Each bundle is a directory following the naming convention
-`ft_incident_{kind}_{YYYYMMDD_HHMMSS}` (legacy: `wa_incident_{kind}_{YYYYMMDD_HHMMSS}`):
+Each bundle is a directory following the naming convention currently emitted by
+the Rust collector:
 
+```text
+wa_incident_{kind}_{YYYYMMDD_HHMMSS}
 ```
-ft_incident_crash_20260206_183000/
+
+Older and future-facing docs may mention `ft_incident_*`, but the live
+`bundle_dirname` helper and `collect_incident_bundle` path still write
+`wa_incident_*`. Until the producer is renamed, closeout evidence must cite the
+actual path emitted by the command under test.
+
+```text
+wa_incident_crash_20260206_183000/
 ├── incident_manifest.json   # versioned metadata (always present)
 ├── README.md                # human-readable instructions (always present)
 ├── redaction_report.json    # what was redacted — counts only, no secrets
@@ -206,6 +220,334 @@ The default tier is used unless overridden. The budget controls:
 The applied budget is recorded in `incident_manifest.json` under the
 `privacy_budget` field so reviewers know what limits were in effect.
 
+## Swarm Operator Extension Contract (`ft-krsq0`)
+
+The current incident bundle is useful for crash, rule, policy, and workflow
+replay. The `ft-krsq0` extension defines the next operator-facing shape for
+black-box swarm triage: a read-only, redacted, portable capture of live
+coordination, proof, resource, and process state when a massive-agent fleet is
+already misbehaving.
+
+This extension does not replace the replay-bundle contract above. It adds
+source-level provenance and degradation semantics so another agent can inspect a
+bundle on a different machine and know exactly what was collected, skipped,
+unavailable, stale, or redacted.
+
+### Non-Mutating Collection Rules
+
+Collectors for this extension must be read-only by default:
+
+- do not send text to panes or otherwise interact with active terminal state
+- do not claim, reopen, close, or reassign Beads
+- do not run `am doctor repair`, `am doctor fix`, service restarts, or process
+  kills for Agent Mail or shared daemons
+- do not run Cargo, RCH proof lanes, benchmarks, or expensive tests while
+  collecting the bundle
+- do not mutate git state; collect dirty-tree status as evidence only
+- do not attach debuggers or sample processes unless the privacy tier and
+  command-line flags explicitly allow the bounded platform sampler
+
+If a source cannot be collected without violating these rules, the collector
+must emit a structured warning and continue with the remaining sources.
+
+### Extension Layout
+
+The extension may be a standalone bundle or a subdirectory inside a current
+incident bundle. The current `collect_incident_bundle` implementation preserves
+the existing `wa_incident_{kind}_{timestamp}` bundle shape and embeds this
+contract under `incident_manifest.json` as the `swarm` object. Standalone future
+collectors may promote the same fields to the manifest top level. The required
+layout is:
+
+```text
+swarm_incident_{kind}_{YYYYMMDDTHHMMSSZ}/
+├── incident_manifest.json
+├── README.md
+├── redaction_report.json
+├── warnings.jsonl
+├── sources/
+│   ├── robot_state.json
+│   ├── pane_text_summaries.json
+│   ├── tailer_capture_health.json
+│   ├── resource_pressure_cockpit.json
+│   ├── proof_rch_evidence.json
+│   ├── beads_coordination_snapshot.json
+│   ├── git_dirty_tree.json
+│   └── process_sample.json
+└── provenance/
+    └── source_commands.json
+```
+
+Only `incident_manifest.json`, `README.md`, `redaction_report.json`, and
+`warnings.jsonl` are mandatory. Every file under `sources/` is optional and
+must have a matching manifest entry with an explicit source status.
+
+### Manifest Fields
+
+The extension manifest must include these fields. In the current in-tree
+collector, read these under `incident_manifest.json` → `swarm` unless the field
+already exists on the legacy top-level incident manifest.
+
+| Field | Meaning |
+| --- | --- |
+| `contract_id` | Stable string, `ft.swarm_incident_bundle.v1`. |
+| `format_version` | Bundle format version. Compatible extensions should use the current major and increment the minor version. |
+| `bundle_id` | Unique id derived from kind, UTC timestamp, and optional operator-supplied label. |
+| `kind` | `crash`, `manual`, `swarm_degraded`, `resource_pressure`, `proof_failure`, or `coordination_failure`. |
+| `created_at` | UTC ISO-8601 timestamp from the collecting host. |
+| `generator` | ft version, git commit if known, hostname class, OS, and command/API surface. |
+| `privacy_budget` | Applied tier and hard limits. Must match the table above unless `tier=custom`. |
+| `collection_policy` | Read-only guarantees, allowed optional samplers, timeout limits, and whether live pane text was permitted. |
+| `environment` | Secret-safe runtime summary such as OS/architecture and whether cwd lookup succeeded; never raw environment variables or local cwd paths. |
+| `sources` | Array of per-source entries described below. |
+| `warnings` | Array of structured warning records also written to `warnings.jsonl`; source entries refer to these by `warning_ids`. |
+| `redaction_summary` | Counts only; no raw secret values. |
+| `total_size_bytes` | Total bytes written after truncation/redaction. |
+
+Each `sources[]` entry must include:
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Stable source name, for example `robot_state` or `beads_coordination_snapshot`. |
+| `file` | Relative path when collected; omitted when unavailable or skipped. |
+| `status` | `collected`, `skipped`, `unavailable`, `failed`, or `stale`. |
+| `evidence_state` | `measured`, `simulated`, `unavailable`, `stale`, or `mixed`. |
+| `source_surface` | Rust API, robot command, Beads command, git command, or platform tool used. |
+| `mutates_state` | Must be `false` for default collection. |
+| `generated_at` | Source timestamp, nullable only for unavailable sources. |
+| `freshness_ms` | Age at bundle creation. |
+| `max_age_ms` | Freshness budget for that source. |
+| `redaction` | `none`, `partial`, `full`, or `not_applicable`. |
+| `privacy_tier` | Tier applied to that source. |
+| `size_bytes` | Bytes written for the source payload, zero when absent. |
+| `warning_ids` | Warnings explaining partial, stale, unavailable, or failed collection. |
+
+### Source Inventory
+
+| Source | Default collection | Required safety behavior |
+| --- | --- | --- |
+| `robot_state` | `ft robot state` or internal equivalent without pane writes. | Include pane ids, titles, domains, cwd where already exposed, state, and timestamps. Do not include full text. |
+| `pane_text_summaries` | Bounded `ft robot get-text --tail` summaries only when privacy tier permits. | Redact and truncate; use placeholders for sensitive or excluded panes. |
+| `tailer_capture_health` | Runtime/tailer/capture health snapshots and lag counters. | Report unavailable fields explicitly instead of synthesizing green health. |
+| `resource_pressure_cockpit` | Current resource cockpit snapshot if the producer is wired. | Preserve `measured`, `simulated`, `unavailable`, and `stale` states from the cockpit contract. |
+| `proof_rch_evidence` | Paths and verdict summaries for existing proof/RCH artifacts. | Do not run new proof commands. Do not treat RCH sync, queue, or transfer logs as proof. |
+| `beads_coordination_snapshot` | `br ready`, `br show`, `bv --robot-*`, or fallback swarm snapshot summaries. | Do not claim or reopen work; include active assignees and stale-bead recommendations as evidence. |
+| `git_dirty_tree` | `git status --short` and optional `git diff --stat`. | Never stage, revert, reset, clean, or delete files. |
+| `process_sample` | Optional bounded OS/process summary. | Off by default for strict/default sharing; when enabled, use timeouts and never kill or restart processes. |
+| `agent_mail` | Health/inbox/list status if the API is available. | On DB/API failure, retry once and record `unavailable`; do not repair or restart Agent Mail. |
+
+### Excluded Data
+
+Default bundles must not include:
+
+- unredacted config, environment variables, credentials, access tokens, or
+  Agent Mail message bodies
+- full pane scrollback or full terminal transcripts
+- raw process memory, core dumps, heap dumps, or debugger dumps
+- private source files unrelated to the active incident
+- new heavy Cargo/RCH logs produced during bundle collection
+- unbounded stdout/stderr, database rows, search index contents, or attachment
+  payloads
+
+An operator may opt in to a more privileged source only when the command line
+and manifest both record the elevated privacy tier and the reason.
+
+### Degraded-Source Example
+
+This fixture shape is intentionally small and deterministic so future golden
+tests can validate schema, warning, redaction, and provenance behavior without
+using live private pane text:
+
+```json
+{
+  "contract_id": "ft.swarm_incident_bundle.v1",
+  "format_version": {"major": 1, "minor": 1},
+  "bundle_id": "swarm_incident_coordination_failure_20260510T111240Z",
+  "kind": "coordination_failure",
+  "created_at": "2026-05-10T11:12:40Z",
+  "generator": {
+    "ft_version": "0.1.0-test",
+    "git_commit": "13b31ede6",
+    "surface": "planned ft reproduce export --kind manual --swarm"
+  },
+  "privacy_budget": {
+    "tier": "default",
+    "max_total_bytes": 1048576,
+    "max_bytes_per_file": 262144,
+    "max_output_excerpt_len": 200
+  },
+  "collection_policy": {
+    "mutating_actions_allowed": false,
+    "pane_text_allowed": "summaries_only",
+    "process_sampler": "disabled",
+    "agent_mail_repair_allowed": false
+  },
+  "sources": [
+    {
+      "name": "robot_state",
+      "file": "sources/robot_state.json",
+      "status": "collected",
+      "evidence_state": "measured",
+      "source_surface": "ft robot state",
+      "mutates_state": false,
+      "generated_at": "2026-05-10T11:12:39Z",
+      "freshness_ms": 1000,
+      "max_age_ms": 30000,
+      "redaction": "not_applicable",
+      "privacy_tier": "default",
+      "size_bytes": 913,
+      "warning_ids": []
+    },
+    {
+      "name": "pane_text_summaries",
+      "file": "sources/pane_text_summaries.json",
+      "status": "collected",
+      "evidence_state": "measured",
+      "source_surface": "ft robot get-text --tail 40",
+      "mutates_state": false,
+      "generated_at": "2026-05-10T11:12:39Z",
+      "freshness_ms": 1000,
+      "max_age_ms": 30000,
+      "redaction": "partial",
+      "privacy_tier": "default",
+      "size_bytes": 512,
+      "warning_ids": ["pane_text.redacted"]
+    },
+    {
+      "name": "agent_mail",
+      "status": "unavailable",
+      "evidence_state": "unavailable",
+      "source_surface": "MCP Agent Mail fetch_inbox/list_agents",
+      "mutates_state": false,
+      "generated_at": null,
+      "freshness_ms": null,
+      "max_age_ms": 30000,
+      "redaction": "not_applicable",
+      "privacy_tier": "default",
+      "size_bytes": 0,
+      "warning_ids": ["agent_mail.database_error"]
+    }
+  ],
+  "warnings": [
+    {
+      "id": "pane_text.redacted",
+      "severity": "info",
+      "message": "Pane text contains scrubbed placeholders such as [REDACTED] and [PANE_TEXT_TRUNCATED]."
+    },
+    {
+      "id": "agent_mail.database_error",
+      "severity": "warning",
+      "message": "Agent Mail was unavailable after the allowed retry; collector did not repair or restart it."
+    }
+  ],
+  "redaction_summary": {
+    "total_redactions": 2,
+    "files_with_redactions": 1
+  },
+  "total_size_bytes": 4096
+}
+```
+
+A matching `sources/pane_text_summaries.json` fixture should use scrubbed
+placeholders rather than raw transcript text:
+
+```json
+[
+  {
+    "pane_id": 7,
+    "title": "codex",
+    "tail_lines": 40,
+    "raw_text_included": false,
+    "redacted_excerpt": "build failed after [REDACTED] ... [PANE_TEXT_TRUNCATED]",
+    "redaction": "partial"
+  }
+]
+```
+
+### Validation Targets
+
+Downstream implementation beads must provide fixtures and checks that fail on:
+
+- raw secret patterns in any bundle file
+- missing required manifest fields or source entries
+- source payloads present without matching manifest provenance
+- unavailable or failed sources that lack warning ids
+- nondeterministic timestamps in committed fixtures
+- privacy-budget truncation that writes more bytes than the configured limit
+- claims that a source was measured when it was simulated, stale, or unavailable
+
+If validation invokes Cargo, clippy, benchmarks, or E2E harnesses, the proof
+must run through RCH and preserve the exact command plus artifact path in the
+closing evidence.
+
+### RCH-Safe Handoff Proof Lane
+
+Use this lane when an incident bundle becomes the handoff artifact between
+agents. Capture first, then verify the captured bundle; do not collect new live
+state while proving the handoff.
+
+Capture timing and privacy tiers:
+
+- Capture after the operator has identified an incident and before any cleanup,
+  restart, Beads reassignment, or pane interaction.
+- Prefer `strict` for external handoff, `default` for normal internal triage,
+  and `verbose` only when the recipient is authorized for larger internal
+  diagnostics.
+- If Agent Mail, RCH, Beads, git, robot, or process data is unavailable, record
+  a degraded source and warning instead of repairing or restarting anything.
+
+Expected handoff artifacts:
+
+- bundle directory path, exactly as emitted by `ft reproduce export`
+- `incident_manifest.json`, `README.md`, `redaction_report.json`, and
+  `warnings.jsonl`
+- optional `sources/*` payloads, each backed by a manifest source entry
+- verifier output from `ft reproduce replay <bundle-dir> --mode policy`
+- exact RCH command and retained log or artifact path for any heavy proof
+
+Verifier use:
+
+```bash
+ft reproduce replay /path/to/wa_incident_manual_20260510_111240 --mode policy
+ft reproduce replay /path/to/wa_incident_manual_20260510_111240 --mode policy --format json
+```
+
+The human summary names degraded sources, active Beads blockers, RCH/proof
+status, process-sampler state, and follow-up commands for the receiving agent.
+The JSON output includes the replay result plus the strict verifier result.
+
+Remote-required source proof must use RCH. This focused lane exercises the
+fixture verifier and generated-bundle verifier without falling back to local
+Cargo:
+
+```bash
+RCH_REQUIRE_REMOTE=1 \
+RCH_NO_UPDATE_CHECK=1 \
+RCH_EXTERNAL_TIMEOUT_ENABLED=false \
+rch exec -- env \
+  CARGO_TARGET_DIR=/tmp/ft-krsq0-6-incident-bundle \
+  CARGO_INCREMENTAL=0 \
+  CARGO_BUILD_JOBS=1 \
+  RUST_TEST_THREADS=1 \
+  cargo test -p frankenterm-core --test incident_bundle_tests verify_ -- --nocapture
+```
+
+Failure classification:
+
+| Failure | Classification | Closeout behavior |
+| --- | --- | --- |
+| `ft reproduce replay` reports failed verifier checks | Product/source regression or privacy defect. Fix the bundle producer, verifier, or fixture before sharing. |
+| RCH fails before remote Cargo starts | Environmental substrate failure. Record worker, reason code, command, and artifact path; do not claim source proof. |
+| RCH reaches Cargo but times out, loses files, or fails package materialization before tests run | RCH substrate/materialization failure. Keep it separate from source regressions and rerun after the substrate is healthy. |
+| Remote Cargo runs the verifier tests and tests fail | Source/test failure. Fix the failing code or fixture. |
+| Local Cargo is used for the heavy lane without explicit fallback approval | Invalid proof. Rerun through RCH before closing the handoff bead. |
+
+During capture and handoff, do not run `am doctor repair`, `am doctor fix`,
+`am service restart`, RCH daemon restarts, pane writes, Beads reopen/claim
+actions, `git reset --hard`, `git clean -fd`, or destructive cleanup. If one of
+those actions appears necessary, file or update a separate blocker bead with the
+diagnosis instead of mutating the incident environment.
+
 ## Redaction
 
 All bundle files pass through the secret redactor before being written.
@@ -254,7 +596,7 @@ $ ft reproduce export --kind crash
 ft reproduce export - Incident bundle exported
 
   Kind:     crash
-  Path:     /home/user/.local/share/ft/crashes/ft_incident_crash_20260206_183000
+  Path:     /home/user/.local/share/ft/crashes/wa_incident_crash_20260206_183000
   Files:    incident_manifest.json, README.md, redaction_report.json,
             crash_report.json, crash_manifest.json, health_snapshot.json,
             config_summary.toml
@@ -265,7 +607,7 @@ ft reproduce export - Incident bundle exported
   3. Run 'ft reproduce replay <path>' to replay
 
 # Validate before sharing
-$ ft reproduce replay ~/.local/share/ft/crashes/ft_incident_crash_20260206_183000 --mode policy
+$ ft reproduce replay ~/.local/share/ft/crashes/wa_incident_crash_20260206_183000 --mode policy
 ```
 
 ### Example 2: Unexpected policy denial
@@ -308,7 +650,7 @@ $ ft reproduce replay /path/to/bundle --mode workflow
 
 ```bash
 # Create a tarball
-tar czf incident_bundle.tar.gz ft_incident_crash_20260206_183000/
+tar czf incident_bundle.tar.gz wa_incident_crash_20260206_183000/
 
 # Attach to the issue or share via a file hosting service
 ```
@@ -377,7 +719,7 @@ The replay command requires a path to an existing bundle directory:
 ft reproduce replay /path/to/incident_manifest.json
 
 # Right — directory path
-ft reproduce replay /path/to/ft_incident_crash_20260206_183000/
+ft reproduce replay /path/to/wa_incident_crash_20260206_183000/
 ```
 
 ### "Incompatible bundle format"

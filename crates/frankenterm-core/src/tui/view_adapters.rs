@@ -2324,7 +2324,7 @@ mod tests {
             u64::MAX.to_string()
         );
         // Very long snippet is NOT truncated by adapt_search (only redacted)
-        assert!(row.snippet.len() == 1000);
+        assert_eq!(row.snippet.len(), 1000);
         // NEG_INFINITY formats as "-inf"
         assert_field!("search", "malformed", "rank_label", row.rank_label, "-inf");
     }

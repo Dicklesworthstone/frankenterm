@@ -18,6 +18,8 @@ operator flow:
 - `docs/perf/swarm-capacity-baseline.md` for the workload taxonomy and artifact contract.
 - `docs/ft-xbnl0-5-3-blessed-tuning-playbook.md` for starting profiles.
 - `docs/ft-xbnl0-verification-contract.md` for proof levels and artifact shape.
+- `docs/resource-pressure-cockpit-contract.md` for the v1 cockpit schema,
+  residual unavailable-domain semantics, and retained conformance artifact.
 - `docs/release/checklist.md` for the high-scale release evidence gate.
 - `ft doctor --json` for `hardware_profile`, `swarm_capacity`, and
   `large_swarm_proof_gauntlet`.
@@ -68,6 +70,10 @@ Interpretation:
   synthetic smoke. Do not promote it to release proof.
 - `large_swarm_proof_gauntlet.status = "proven"` only counts when the manifest
   was collected in real-hardware mode and linked to retained replay artifacts.
+- The retained v1 cockpit conformance artifact
+  `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`
+  proves remote-reduced schema/runtime conformance only. It explicitly keeps
+  target-class hardware at `skipped_not_proven`.
 
 ## Initial Profile
 
@@ -111,6 +117,58 @@ Expected outcomes:
   and any replay artifacts with the run. A chat transcript is not proof.
 - If `rch` fails before cargo starts, record the wrapper failure separately from
   test failure. Follow the repo fallback rules before claiming a code defect.
+
+## Capture Fairness Proof Branch
+
+Use this branch when the high-scale question is whether polling capture remains
+fair across pane priorities and does not silently starve lower-priority panes.
+The contract and operator vocabulary live in
+`docs/capture-fairness-slo-contract.md`.
+
+Run the retained reduced 200-pane proof lane through its wrapper:
+
+```bash
+set -o pipefail
+bash tests/e2e/test_ft_n447z_5_capture_fairness_200.sh \
+  | tee "$FT_HIGH_CORE_RUN_DIR/capture-fairness-wrapper.log"
+grep '^Summary: ' "$FT_HIGH_CORE_RUN_DIR/capture-fairness-wrapper.log" \
+  | tail -1 | sed 's/^Summary: //' \
+  | tee "$FT_HIGH_CORE_RUN_DIR/capture-fairness-summary-path.txt"
+```
+
+Inspect the wrapper summary and Rust source artifact:
+
+```bash
+CAPTURE_SUMMARY="$(cat "$FT_HIGH_CORE_RUN_DIR/capture-fairness-summary-path.txt")"
+RUST_CAPTURE_SUMMARY="$(jq -r '.artifacts.rust_summary' "$CAPTURE_SUMMARY")"
+jq '{status, proof_interpretation, failure_classification, reason_code}' \
+  "$CAPTURE_SUMMARY"
+jq '{status:.pass_fail.status,
+     panes:.inputs.total_panes,
+     target_class:.proof_interpretation.target_class_hardware,
+     every_pane_serviced:.pass_fail.every_pane_serviced,
+     untruncated:.pass_fail.snapshot_rows_untruncated,
+     selected_total:.throughput_counters.selected_total,
+     selected_by_priority:.throughput_counters.selected_by_priority,
+     max_first_service_round:.capture_lag_histograms.max_first_service_round,
+     max_service_gap:.capture_lag_histograms.max_service_gap}' \
+  "$RUST_CAPTURE_SUMMARY"
+```
+
+Interpretation:
+
+- A passing `ft-n447z.5` lane is `remote_reduced` evidence for the retained
+  200-pane scheduler proof. It is useful regression evidence, but it is not
+  target-class 64+ CPU / 256 GiB proof.
+- `proof_interpretation.target_class_hardware = "skipped_not_proven"` forbids
+  high-core support claims even when every pane was serviced.
+- `source_or_test` means the RCH lane reached Cargo/test execution and found a
+  real source or assertion failure. `environment` and `rch_substrate` mean the
+  wrapper did not prove source failure; keep those blockers separate in the
+  bead closeout.
+- To make a target-class capture-fairness claim, retain the same capture
+  fairness artifacts plus `doctor.json` with
+  `hardware_profile.proof_predicates.proof_status = "proven_predicate_met"`.
 
 ## Resource What-If Proof
 
@@ -174,15 +232,18 @@ that target-class hardware accepted the same resource settings.
 The resource cockpit lives under `.swarm_capacity.resource_cockpit` in
 `ft doctor --json` and `ft robot capacity --level 2` output. The schema anchor is
 `SwarmResourceCockpitSnapshot` with `SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION`.
+The v1 root fields that matter for high-core truth are `run_identity`,
+`domains`, `residency_buckets`, `queue_backpressure`, `admission_decisions`,
+`action_receipts`, and `artifact_paths`. Missing telemetry must appear as
+`unavailable` or `skipped_not_proven`; it is not a green result.
 
-Inspect the compact cockpit fields:
+Inspect the v1 cockpit fields:
 
 ```bash
 jq '.swarm_capacity.resource_cockpit |
-    {schema_version, status, proof_gate, memory_pressure,
-     memory_tiers, slowest_latency_cohorts,
-     resource_admission_decisions, storage_io,
-     mitigation_history, drilldowns}' \
+    {schema_version, contract_id, status, proof_gate, evidence_state,
+     run_identity, domains, residency_buckets, queue_backpressure,
+     admission_decisions, action_receipts, artifact_paths}' \
   "$FT_HIGH_CORE_RUN_DIR/doctor.json"
 ```
 
@@ -191,12 +252,13 @@ Operator interpretation:
 | Field | Green path | Escalation path |
 | --- | --- | --- |
 | `proof_gate` | `healthy` or `pressured` during expected bursts | `degraded` or `skipped_proof` needs artifact capture before promotion. |
-| `memory_pressure` | `unknown`, `nominal`, or equivalent low-pressure state | `critical` or `emergency` means reduce concurrency or trigger memory-tier mitigation. |
-| `memory_tiers` | Hot resident, warm compressed, and cold disk stay within budget | Over-budget hot or warm tiers mean demote, compress, or shed noncritical work. |
-| `slowest_latency_cohorts` | Known bottleneck stage with bounded p99 | Repeated p99 over budget means tune or pause fanout before adding panes. |
-| `resource_admission_decisions` | `admit` or planned `degrade` under controlled pressure | `defer`, `degrade`, or `shed` without a planned soak requires triage. |
-| `storage_io` | `io_pressure_tier=green` with bounded queues and zero write errors | `yellow`, `red`, `black`, growing lag, or write errors mean treat storage as its own pressure domain. |
-| `drilldowns` | One clear reason per mitigation | Missing or vague reasons mean collect support artifacts and stop tuning upward. |
+| `run_identity.hardware_predicate.proof_status` | `proven_predicate_met` on a target-class host | `skipped_not_proven` means no 64-core / 256 GiB claim, even if reduced tests passed. |
+| `domains.memory` | `normal` with measured, fresh evidence | `critical`, `emergency`, `unknown`, stale, or unavailable means reduce fanout or collect diagnostics. |
+| `domains.rss_residency` and `residency_buckets` | Heap, mmap, SQLite page cache, graphics/media, scrollback cache, child process, and unknown residency are separated | Missing classifier evidence or non-zero `unknown` requires a diagnostic bundle before calling it a leak. |
+| `domains.queue_backpressure` and `queue_backpressure` | Bounded capture/write/persistence/search queues | `red`, `black`, or stale queue rows mean pause fanout before tuning upward. |
+| `domains.storage_io` | `green` with bounded queues and zero write errors | Growing lag or write errors mean treat storage as its own pressure domain. |
+| `admission_decisions` | `admit` or planned `degrade` under controlled pressure | `defer`, `degrade`, or `shed` without a planned soak requires triage. |
+| `action_receipts` | Applied or succeeded receipts with artifact paths | Missing, failed, rollback, or approval-required receipts are not proof that mitigation happened. |
 
 ## Troubleshooting Branches
 
@@ -206,7 +268,9 @@ Signals:
 
 ```bash
 jq '.hardware_profile.cpu' "$FT_HIGH_CORE_RUN_DIR/doctor.json"
-jq '.swarm_capacity.resource_cockpit.slowest_latency_cohorts' \
+jq '.swarm_capacity.resource_cockpit.domains.worker_pool,
+    .swarm_capacity.resource_cockpit.domains.queue_backpressure,
+    .swarm_capacity.resource_cockpit.queue_backpressure' \
   "$FT_HIGH_CORE_RUN_DIR/doctor.json"
 ```
 
@@ -215,22 +279,28 @@ Actions:
 - If CPU is below the target predicate, mark the run `skipped_not_proven`.
 - If CPU is target-class but latency cohorts keep regressing, reduce fanout,
   hold at `fleet_50`, and rerun `ft robot capacity --level 2`.
-- Keep a note of the stage name and reason code from `slowest_latency_cohorts`.
+- Keep a note of the queue, worker-pool, or drilldown reason code that explains
+  the latency pressure.
 
 ### Memory Pressure
 
 Signals:
 
 ```bash
-jq '.swarm_capacity.resource_cockpit.memory_pressure' "$FT_HIGH_CORE_RUN_DIR/doctor.json"
-jq '.swarm_capacity.resource_cockpit.memory_tiers' "$FT_HIGH_CORE_RUN_DIR/doctor.json"
+jq '.swarm_capacity.resource_cockpit.domains.memory,
+    .swarm_capacity.resource_cockpit.domains.rss_residency,
+    .swarm_capacity.resource_cockpit.residency_buckets,
+    .swarm_capacity.resource_cockpit.action_receipts' \
+  "$FT_HIGH_CORE_RUN_DIR/doctor.json"
 ```
 
 Actions:
 
 - For `critical` or `emergency`, stop adding agents and capture a diagnostic bundle.
-- Prefer demoting hot resident state to warm/cold tiers before killing work.
-- If `refused_bytes` grows, shed optional diagnostics and search fanout first.
+- Prefer demoting hot resident state to warm/cold tiers before killing work, but
+  verify the relevant `action_receipts` before claiming the mitigation happened.
+- If `refused_bytes` grows or `unknown` residency dominates, shed optional
+  diagnostics and search fanout first, then retain `artifact_paths`.
 
 ### IO Stalls
 
@@ -302,6 +372,10 @@ against a live command/schema name or explicitly marked planned.
 | `ft robot capacity --level 2` | Live | `RobotCommands::Capacity` parses `--level`; help advertises `ft robot --format toon capacity --level 2`. |
 | `SwarmResourceCockpitSnapshot` | Live | `runtime_telemetry.rs` exports the cockpit schema and nested summary. |
 | `SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION` | Live | Runtime telemetry tests assert the current schema version. |
+| Retained cockpit v1 conformance summary | Live | `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json` records passed local static and remote-reduced proof, with target hardware still `skipped_not_proven`. |
+| `tests/e2e/test_ft_n447z_5_capture_fairness_200.sh` | Live | Retained reduced 200-pane RCH wrapper emits `summary.json`, `proof-ledger.jsonl`, the raw RCH log, and the Rust capture fairness summary. |
+| `capture_fairness_200_pane_summary.json` | Live | `tailer.rs` proof artifact records pass/fail, selected-by-priority counters, capture lag histograms, skipped-poll reasons, and target hardware `skipped_not_proven`. |
+| Cockpit docs truth smoke | Live | `crates/frankenterm/tests/docs_smoke.rs::resource_pressure_cockpit_docs_truth_gate` guards the v1 field names and legacy default-branch references in live docs. |
 | `large_swarm_replay_corpus release_evidence` | Live | Release checklist and `crates/frankenterm-core/tests/large_swarm_replay_corpus.rs` contain the gate. |
 | `ft config profile apply fleet_200_plus --path ./ft.toml` | Live | `ConfigProfileCommands::Apply` backs the documented blessed-profile workflow. |
 | `ft diag bundle --output ... --events 500` | Live | CLI help and diagnostic command handling expose the support-bundle surface. |

@@ -104,7 +104,7 @@ lazy_static::lazy_static! {
     static ref POSITION: Mutex<Option<GuiPosition>> = Mutex::new(None);
 }
 
-pub const ICON_DATA: &'static [u8] = include_bytes!("../../../../assets/icon/terminal.png");
+pub const ICON_DATA: &[u8] = include_bytes!("../../../../assets/icon/terminal.png");
 
 fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
@@ -1638,7 +1638,7 @@ fn classify_webgpu_surface_error(err: &wgpu::SurfaceError) -> WebGpuSurfaceError
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
         let config = config_with_accessibility_palette(configuration());
-        let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
+        let dpi = config.dpi.unwrap_or_else(::window::default_dpi) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
 
         let mux = Mux::try_get()
@@ -1953,12 +1953,12 @@ impl TermWindow {
                     ResizeIncrementCalculator {
                         x: myself.render_metrics.cell_size.width as u16,
                         y: myself.render_metrics.cell_size.height as u16,
-                        padding_left: padding_left,
-                        padding_top: padding_top,
-                        padding_right: padding_right,
-                        padding_bottom: padding_bottom,
-                        border: border,
-                        tab_bar_height: tab_bar_height,
+                        padding_left,
+                        padding_top,
+                        padding_right,
+                        padding_bottom,
+                        border,
+                        tab_bar_height,
                     }
                     .into(),
                 );
@@ -5785,11 +5785,13 @@ mod tests {
         // Direct assignment on the orchestrator half — substrate
         // exposes pub fields here so the test can simulate any
         // counter state.
-        let mut o = SyncOutputOrchestratorTelemetry::default();
-        o.admissions_accepted = 5;
-        o.admissions_refused = 2;
-        o.bytes_drained_total = 4096;
-        o.drains_watchdog = 1;
+        let o = SyncOutputOrchestratorTelemetry {
+            admissions_accepted: 5,
+            admissions_refused: 2,
+            bytes_drained_total: 4096,
+            drains_watchdog: 1,
+            ..Default::default()
+        };
 
         // Synthesize the snapshot via the same folding logic the
         // production sync_output_telemetry() uses. (TermWindow
@@ -6211,7 +6213,7 @@ mod tests {
         let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
         for pane_id in 1..=4 {
             let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
-            bm.mark(pane_id as usize);
+            bm.mark(pane_id);
             bitmaps.insert(pane_id, bm);
         }
         let mut flag = false;

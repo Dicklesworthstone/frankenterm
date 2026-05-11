@@ -63,7 +63,7 @@ impl RenderMetrics {
     }
 
     pub fn scale_cell_width(&self, scale: f64) -> Self {
-        let mut scaled = self.clone();
+        let mut scaled = *self;
         scaled.cell_size.width = (self.cell_size.width as f64 * scale) as isize;
         scaled
     }

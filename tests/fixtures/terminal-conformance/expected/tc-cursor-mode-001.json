@@ -3,7 +3,7 @@
   "min_actions": 5,
   "required_action_kinds": {
     "CSI": 4,
-    "PrintString": 1
+    "Print": 1
   },
   "required_debug_fragments": [
     "AutoWrap",

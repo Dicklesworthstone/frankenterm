@@ -19,6 +19,9 @@ impl Drop for XcbImage {
 }
 
 impl XcbImage {
+    // Safe wrapper around xcb-image's raw-pointer constructor. The X11 cursor
+    // paths pass live pixel buffers directly through to the C helper.
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn create_native(
         c: &xcb::Connection,
         width: u16,

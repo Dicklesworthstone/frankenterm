@@ -34,6 +34,88 @@ use crate::runtime_health::{RemediationEffort, RemediationHint, RuntimeHealthChe
 /// Number of operator-visible PolicyEngine diagnostics checks.
 pub const POLICY_SUBSYSTEM_COUNT: usize = 14;
 
+/// Operator-visible PolicyEngine diagnostics check ids, in execution order.
+pub const POLICY_DIAGNOSTIC_CHECK_IDS: [&str; POLICY_SUBSYSTEM_COUNT] = [
+    "policy.decision_log",
+    "policy.quarantine",
+    "policy.audit_chain",
+    "policy.compliance",
+    "policy.approvals",
+    "policy.revocations",
+    "policy.namespace",
+    "policy.connector_governor",
+    "policy.connector_registry",
+    "policy.connector_lifecycle",
+    "policy.connector_reliability",
+    "policy.connector_mesh",
+    "policy.bundles",
+    "policy.ingestion",
+];
+
+struct PolicyDiagnosticCheck {
+    check_id: &'static str,
+    run: fn(&mut PolicyEngine, u64) -> RuntimeHealthCheck,
+}
+
+const POLICY_DIAGNOSTIC_CHECKS: [PolicyDiagnosticCheck; POLICY_SUBSYSTEM_COUNT] = [
+    PolicyDiagnosticCheck {
+        check_id: "policy.decision_log",
+        run: run_decision_log_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.quarantine",
+        run: run_quarantine_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.audit_chain",
+        run: run_audit_chain_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.compliance",
+        run: run_compliance_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.approvals",
+        run: run_approvals_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.revocations",
+        run: run_revocations_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.namespace",
+        run: run_namespace_isolation_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.connector_governor",
+        run: run_connector_governor_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.connector_registry",
+        run: run_connector_registry_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.connector_lifecycle",
+        run: run_connector_lifecycle_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.connector_reliability",
+        run: run_connector_reliability_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.connector_mesh",
+        run: run_connector_mesh_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.bundles",
+        run: run_bundles_check,
+    },
+    PolicyDiagnosticCheck {
+        check_id: "policy.ingestion",
+        run: run_ingestion_check,
+    },
+];
+
 /// Run all PolicyEngine health checks and return individual results.
 ///
 /// Each check inspects a specific subsystem and produces a
@@ -46,28 +128,105 @@ pub fn check_policy_engine_health(
     engine: &mut PolicyEngine,
     now_ms: u64,
 ) -> Vec<RuntimeHealthCheck> {
-    let checks = vec![
-        check_decision_log(engine),
-        check_quarantine(engine, now_ms),
-        check_audit_chain(engine, now_ms),
-        check_compliance(engine, now_ms),
-        check_approvals(engine, now_ms),
-        check_revocations(engine),
-        check_namespace_isolation(engine),
-        check_connector_governor(engine, now_ms),
-        check_connector_registry(engine),
-        check_connector_lifecycle(engine),
-        check_connector_reliability(engine),
-        check_connector_mesh(engine),
-        check_bundles(engine, now_ms),
-        check_ingestion(engine, now_ms),
-    ];
+    run_policy_engine_health_checks(engine, now_ms, None)
+}
+
+/// Run PolicyEngine health checks while forcing one check to report degraded.
+///
+/// This is a doc-hidden regression-test seam for ft-5eqd4.4. Production callers
+/// should use [`check_policy_engine_health`].
+#[doc(hidden)]
+pub fn check_policy_engine_health_with_injected_fault(
+    engine: &mut PolicyEngine,
+    now_ms: u64,
+    faulty_check_id: &str,
+) -> Vec<RuntimeHealthCheck> {
+    run_policy_engine_health_checks(engine, now_ms, Some(faulty_check_id))
+}
+
+fn run_policy_engine_health_checks(
+    engine: &mut PolicyEngine,
+    now_ms: u64,
+    injected_fault: Option<&str>,
+) -> Vec<RuntimeHealthCheck> {
+    let mut checks = Vec::with_capacity(POLICY_SUBSYSTEM_COUNT);
+    for spec in &POLICY_DIAGNOSTIC_CHECKS {
+        let check = (spec.run)(engine, now_ms);
+        let check = if injected_fault == Some(spec.check_id) {
+            RuntimeHealthCheck::warn(
+                &check.check_id,
+                &check.display_name,
+                "Injected degraded health response for policy diagnostics count guard",
+            )
+            .with_evidence("fault_injection=ft-5eqd4.4")
+        } else {
+            check
+        };
+        checks.push(check);
+    }
+
     debug_assert_eq!(
         checks.len(),
         POLICY_SUBSYSTEM_COUNT,
         "policy diagnostics enumeration must match POLICY_SUBSYSTEM_COUNT",
     );
     checks
+}
+
+fn run_decision_log_check(engine: &mut PolicyEngine, _now_ms: u64) -> RuntimeHealthCheck {
+    check_decision_log(engine)
+}
+
+fn run_quarantine_check(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
+    check_quarantine(engine, now_ms)
+}
+
+fn run_audit_chain_check(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
+    check_audit_chain(engine, now_ms)
+}
+
+fn run_compliance_check(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
+    check_compliance(engine, now_ms)
+}
+
+fn run_approvals_check(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
+    check_approvals(engine, now_ms)
+}
+
+fn run_revocations_check(engine: &mut PolicyEngine, _now_ms: u64) -> RuntimeHealthCheck {
+    check_revocations(engine)
+}
+
+fn run_namespace_isolation_check(engine: &mut PolicyEngine, _now_ms: u64) -> RuntimeHealthCheck {
+    check_namespace_isolation(engine)
+}
+
+fn run_connector_governor_check(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
+    check_connector_governor(engine, now_ms)
+}
+
+fn run_connector_registry_check(engine: &mut PolicyEngine, _now_ms: u64) -> RuntimeHealthCheck {
+    check_connector_registry(engine)
+}
+
+fn run_connector_lifecycle_check(engine: &mut PolicyEngine, _now_ms: u64) -> RuntimeHealthCheck {
+    check_connector_lifecycle(engine)
+}
+
+fn run_connector_reliability_check(engine: &mut PolicyEngine, _now_ms: u64) -> RuntimeHealthCheck {
+    check_connector_reliability(engine)
+}
+
+fn run_connector_mesh_check(engine: &mut PolicyEngine, _now_ms: u64) -> RuntimeHealthCheck {
+    check_connector_mesh(engine)
+}
+
+fn run_bundles_check(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
+    check_bundles(engine, now_ms)
+}
+
+fn run_ingestion_check(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
+    check_ingestion(engine, now_ms)
 }
 
 // =============================================================================

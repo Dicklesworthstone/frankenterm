@@ -24,9 +24,9 @@ use common::fixtures::RuntimeFixture;
 use common::wezterm_subprocess::{WeztermSubprocessFixture, should_run};
 #[cfg(all(feature = "vendored", unix))]
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
-use frankenterm_core::wezterm::PaneInfo;
 #[cfg(all(feature = "vendored", unix))]
 use frankenterm_core::wezterm::SplitDirection;
+use frankenterm_core::wezterm::{PaneInfo, SpawnTarget, WeztermClient};
 #[cfg(all(feature = "vendored", unix))]
 use frankenterm_term::TerminalSize;
 
@@ -44,6 +44,39 @@ fn log(test: &str, phase: &str, body: serde_json::Value) {
         "data": body,
     });
     eprintln!("{line}");
+}
+
+fn spawn_in_window(runtime: &RuntimeFixture, client: &WeztermClient, window_id: u64) -> u64 {
+    runtime
+        .block_on({
+            let client = client.clone();
+            async move {
+                Box::pin(client.spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: Some(window_id),
+                        new_window: false,
+                    },
+                ))
+                .await
+            }
+        })
+        .expect("spawn pane in fixture window")
+}
+
+fn spawn_in_first_window(runtime: &RuntimeFixture, client: &WeztermClient) -> u64 {
+    let panes = runtime
+        .block_on({
+            let client = client.clone();
+            async move { client.list_panes().await }
+        })
+        .expect("list_panes before targeted spawn");
+    let window_id = panes
+        .first()
+        .expect("fixture should expose an initial pane")
+        .window_id;
+    spawn_in_window(runtime, client, window_id)
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -160,12 +193,7 @@ fn spawn_second_pane_increments_listing() {
     );
     assert_eq!(initial.len(), 1);
 
-    let new_pane_id = runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.spawn(None, Some("ft-test")).await }
-        })
-        .expect("spawn second pane");
+    let new_pane_id = spawn_in_window(&runtime, &client, initial[0].window_id);
     log(
         "two_pane",
         "spawned",
@@ -214,12 +242,7 @@ fn pane_listing_serializes_and_roundtrips() {
     let runtime = RuntimeFixture::current_thread();
 
     // Two-pane snapshot for richer roundtrip surface.
-    runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.spawn(None, Some("ft-test")).await }
-        })
-        .expect("spawn second pane");
+    spawn_in_first_window(&runtime, &client);
     let panes = runtime
         .block_on({
             let client = client.clone();
@@ -272,12 +295,7 @@ fn restart_fixture_yields_independent_pane_state() {
         let socket = fixture.socket_path().to_path_buf();
         let client = fixture.client();
         // Spawn a second pane so the snapshot is non-trivial
-        runtime
-            .block_on({
-                let client = client.clone();
-                async move { client.spawn(None, Some("ft-test")).await }
-            })
-            .expect("spawn second pane in A");
+        spawn_in_first_window(&runtime, &client);
         let panes = runtime
             .block_on({
                 let client = client.clone();
@@ -411,19 +429,14 @@ fn wait_until_pane_count_observes_async_spawn() {
 
     // Issue spawn but immediately probe — the helper must wait for the
     // post-spawn listing to reflect 2 panes (don't race on the renderer).
-    runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.spawn(None, Some("ft-test")).await }
-        })
-        .expect("spawn second pane");
+    spawn_in_window(&runtime, &client, initial[0].window_id);
     let observed = count_at_least(2, std::time::Duration::from_secs(2));
     assert!(observed.len() >= 2);
 }
 
 // ── Test 6: no-mock PTY/mux loopback smoke ──────────────────────────────────
 //
-// Uses a real mux subprocess, a real PTY-backed `/bin/cat`, the CLI-backed
+// Uses a real mux subprocess, a real PTY-backed `/bin/cat`, a strict-socket
 // WeztermClient for spawn/send/read, and the direct mux client for resize.
 
 #[cfg(all(feature = "vendored", unix))]
@@ -458,12 +471,7 @@ fn no_mock_spawn_send_resize_read_loopback() {
         }),
     );
 
-    let spawned_pane_id = runtime
-        .block_on({
-            let client = client.clone();
-            async move { client.spawn(None, Some("ft-test")).await }
-        })
-        .expect("spawn second cat pane");
+    let spawned_pane_id = spawn_in_window(&runtime, &client, source.window_id);
     let split_pane_id = runtime
         .block_on({
             let client = client.clone();
