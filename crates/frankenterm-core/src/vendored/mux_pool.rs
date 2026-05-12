@@ -290,6 +290,50 @@ impl MuxPool {
         }
     }
 
+    async fn execute_once<T, Op>(&self, op_name: &'static str, op: Op) -> Result<T, MuxPoolError>
+    where
+        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
+    {
+        {
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
+            return self.execute_once_with_cx(&cx, op_name, op).await;
+        }
+    }
+
+    async fn execute_once_with_cx<T, Op>(
+        &self,
+        cx: &Cx,
+        op_name: &'static str,
+        mut op: Op,
+    ) -> Result<T, MuxPoolError>
+    where
+        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
+    {
+        let (mut client, _guard) = self.acquire_client_with_cx(cx).await?;
+        let result = op(&mut client).await;
+        match result {
+            Ok(value) => {
+                self.return_client_with_cx(cx, client).await;
+                Ok(value)
+            }
+            Err(err) => {
+                let cancelled = err.is_cancelled();
+                let kind = err.protocol_error_kind();
+                if kind == ProtocolErrorKind::Permanent {
+                    self.permanent_failures.fetch_add(1, Ordering::Relaxed);
+                }
+                tracing::debug!(
+                    op = op_name,
+                    cancelled,
+                    kind = ?kind,
+                    error = %err,
+                    "non-idempotent mux pool op failed; dropping client without retry"
+                );
+                Err(MuxPoolError::Mux(err))
+            }
+        }
+    }
+
     async fn execute_with_recovery_with_cx<T, Op>(
         &self,
         cx: &Cx,
@@ -399,7 +443,7 @@ impl MuxPool {
 
     /// Spawn a new mux pane/tab through a pooled connection.
     pub async fn spawn_v2(&self, spawn: SpawnV2) -> Result<SpawnResponse, MuxPoolError> {
-        self.execute_with_recovery("spawn_v2", move |client| {
+        self.execute_once("spawn_v2", move |client| {
             let spawn = spawn.clone();
             Box::pin(client.spawn_v2(spawn))
         })
@@ -413,7 +457,7 @@ impl MuxPool {
         spawn: SpawnV2,
     ) -> Result<SpawnResponse, MuxPoolError> {
         let op_cx = cx.clone();
-        self.execute_with_recovery_with_cx(cx, "spawn_v2", move |client| {
+        self.execute_once_with_cx(cx, "spawn_v2", move |client| {
             let spawn = spawn.clone();
             let op_cx = op_cx.clone();
             Box::pin(async move { client.spawn_v2_with_cx(&op_cx, spawn).await })
@@ -423,7 +467,7 @@ impl MuxPool {
 
     /// Split an existing pane through a pooled connection.
     pub async fn split_pane(&self, split: SplitPane) -> Result<SpawnResponse, MuxPoolError> {
-        self.execute_with_recovery("split_pane", move |client| {
+        self.execute_once("split_pane", move |client| {
             let split = split.clone();
             Box::pin(client.split_pane(split))
         })
@@ -437,7 +481,7 @@ impl MuxPool {
         split: SplitPane,
     ) -> Result<SpawnResponse, MuxPoolError> {
         let op_cx = cx.clone();
-        self.execute_with_recovery_with_cx(cx, "split_pane", move |client| {
+        self.execute_once_with_cx(cx, "split_pane", move |client| {
             let split = split.clone();
             let op_cx = op_cx.clone();
             Box::pin(async move { client.split_pane_with_cx(&op_cx, split).await })
@@ -826,7 +870,7 @@ mod tests {
 
     use codec::{
         CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse,
-        Pdu, UnitResponse,
+        Pdu, SpawnResponse, SpawnV2, SplitPane, UnitResponse,
     };
 
     async fn unix_stream_read(
@@ -1014,6 +1058,123 @@ mod tests {
         });
 
         socket_path
+    }
+
+    /// Spawn a mock mux server that returns an unexpected response for the first
+    /// SpawnV2 and SplitPane request. Later requests succeed so tests can prove
+    /// non-idempotent operations do not retry after an ambiguous failure.
+    async fn spawn_mock_server_unexpected_non_idempotent_once(
+        temp_dir: &tempfile::TempDir,
+    ) -> PathBuf {
+        let socket_path = temp_dir.path().join("mux-pool-test-non-idempotent.sock");
+        let listener = compat_unix::bind(&socket_path)
+            .await
+            .expect("bind mock mux listener");
+
+        let first_spawn_bad = Arc::new(AtomicBool::new(true));
+        let first_split_bad = Arc::new(AtomicBool::new(true));
+
+        task::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+
+                let first_spawn_bad = Arc::clone(&first_spawn_bad);
+                let first_split_bad = Arc::clone(&first_split_bad);
+                task::spawn(async move {
+                    let mut read_buf = Vec::new();
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = match unix_stream_read(&mut stream, &mut temp).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        read_buf.extend_from_slice(&temp[..read]);
+
+                        let mut responses: Vec<(u64, Pdu)> = Vec::new();
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "mock-mux-pool-non-idempotent-test"
+                                            .to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::SpawnV2(req) => {
+                                    if first_spawn_bad.swap(false, AtomicOrdering::SeqCst) {
+                                        Pdu::UnitResponse(UnitResponse {})
+                                    } else {
+                                        Pdu::SpawnResponse(SpawnResponse {
+                                            pane_id: 42,
+                                            tab_id: 7,
+                                            window_id: req.window_id.unwrap_or(3),
+                                            size: req.size,
+                                        })
+                                    }
+                                }
+                                Pdu::SplitPane(_req) => {
+                                    if first_split_bad.swap(false, AtomicOrdering::SeqCst) {
+                                        Pdu::UnitResponse(UnitResponse {})
+                                    } else {
+                                        Pdu::SpawnResponse(SpawnResponse {
+                                            pane_id: 43,
+                                            tab_id: 7,
+                                            window_id: 3,
+                                            size: frankenterm_term::TerminalSize::default(),
+                                        })
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            responses.push((decoded.serial, response));
+                        }
+
+                        for (serial, pdu) in responses {
+                            if write_response_pdu(&mut stream, &pdu, serial).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        socket_path
+    }
+
+    fn test_spawn_v2() -> SpawnV2 {
+        SpawnV2 {
+            domain: config::keyassignment::SpawnTabDomain::DefaultDomain,
+            window_id: Some(3),
+            command: None,
+            command_dir: None,
+            size: frankenterm_term::TerminalSize::default(),
+            workspace: mux::DEFAULT_WORKSPACE.to_string(),
+        }
+    }
+
+    fn test_split_pane() -> SplitPane {
+        SplitPane {
+            pane_id: 1,
+            split_request: mux::tab::SplitRequest {
+                direction: mux::tab::SplitDirection::Horizontal,
+                target_is_second: true,
+                top_level: false,
+                size: mux::tab::SplitSize::default(),
+            },
+            command: None,
+            command_dir: None,
+            domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+            move_pane_id: None,
+        }
     }
 
     /// Spawn a mock mux server that returns an unexpected response for the first
@@ -1367,6 +1528,100 @@ mod tests {
             assert_eq!(stats.recovery_attempts, 1);
             assert_eq!(stats.recovery_successes, 1);
             assert_eq!(stats.connections_created, 2);
+        });
+    }
+
+    #[test]
+    fn pool_spawn_v2_does_not_retry_after_ambiguous_response() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_non_idempotent_once(&temp_dir).await;
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(2),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+
+            let pool = MuxPool::new(config);
+            let err = pool
+                .spawn_v2(test_spawn_v2())
+                .await
+                .expect_err("ambiguous spawn response must not be retried");
+            assert!(
+                matches!(
+                    err,
+                    MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+                ),
+                "expected unexpected response without retry, got {err}"
+            );
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_created, 1);
+        });
+    }
+
+    #[test]
+    fn pool_split_pane_does_not_retry_after_ambiguous_response() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_non_idempotent_once(&temp_dir).await;
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(2),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+
+            let pool = MuxPool::new(config);
+            let err = pool
+                .split_pane(test_split_pane())
+                .await
+                .expect_err("ambiguous split response must not be retried");
+            assert!(
+                matches!(
+                    err,
+                    MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+                ),
+                "expected unexpected response without retry, got {err}"
+            );
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.connections_created, 1);
         });
     }
 
