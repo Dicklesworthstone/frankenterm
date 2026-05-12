@@ -439,7 +439,6 @@ REMOTE
   rch_rc=$?
   set -e
 
-  e2e_add_file "${execution_log_name}" < "${rch_log}"
   if [[ ${rch_rc} -ne 0 ]]; then
     return "${rch_rc}"
   fi
@@ -461,6 +460,14 @@ REMOTE
     cat "${remote_report_file}" >&2 || true
     return 1
   fi
+
+  # The command log is already written directly into the scenario artifact
+  # directory. Do not feed it back through e2e_add_file with the same target
+  # name: that truncates the source before the report parser can read it.
+  if [[ "${E2E_REDACT_SECRETS}" == "true" ]]; then
+    e2e_redact_secrets "${rch_log}"
+  fi
+  e2e_limit_size "${rch_log}" "${E2E_MAX_FILE_SIZE}"
 
   jq -r '.outputs.install_command // ""' "${remote_report_file}" | e2e_add_file "install-command.txt"
   jq -r '.outputs.install_stdout // ""' "${remote_report_file}" | e2e_add_file "cargo-install.stdout.log"

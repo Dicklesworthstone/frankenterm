@@ -10,6 +10,9 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - '.github/workflows/cargo-install-validation.yml'
+      - 'scripts/lib/e2e_artifacts.sh'
+      - 'tests/e2e/lib_rch_guards.sh'
+      - 'tests/e2e/test_ft_gofz5_1_cargo_install.sh'
   workflow_dispatch:
     inputs:
       git_url:
