@@ -58,7 +58,13 @@ def load_python_lists() -> tuple[set[str], set[tuple[str, str]]]:
 
 
 # Match `("path", "fn"),` entries inside WRAPPER_EXEMPTIONS.
-RUST_TUPLE_RE = re.compile(r'\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)\s*,?')
+# rustfmt expands long tuples as:
+#   (
+#       "path",
+#       "fn",
+#   ),
+# so accept an optional trailing comma inside the tuple as well as after it.
+RUST_TUPLE_RE = re.compile(r'\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,?\s*\)\s*,?')
 # Match `"name.rs",` entries inside EXEMPT_FILES.
 RUST_STRING_RE = re.compile(r'"([^"]+)"\s*,')
 
