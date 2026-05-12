@@ -93,10 +93,15 @@ jobs:
               loom_oneshot \
               loom_notify \
               loom_lockfree \
-              loom_spsc_ring_buffer
+              loom_spsc_ring_buffer \
+              loom_triple_buffer
           do
               echo "::group::cargo test --test ${t} (--cfg loom)"
-              cargo test -p frankenterm-core --test "${t}" --release \
+              # Keep the model lane on the runtime_async surface. Applying
+              # `--cfg loom` to the full default dependency graph makes
+              # transitive crates see `cfg(loom)` without their optional loom
+              # dependencies being selected by Cargo.
+              cargo test -p frankenterm-core --test "${t}" --release --no-default-features \
                   -- --test-threads=1 2>&1 | tee "target/ci-logs/${t}.log"
               echo "::endgroup::"
           done
