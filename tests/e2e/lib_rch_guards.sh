@@ -41,6 +41,8 @@ RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
 # without paying a duplicate full-repo sync for a cargo smoke command.
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-0}"
 RCH_SKIP_QUEUE_PREFLIGHT="${RCH_SKIP_QUEUE_PREFLIGHT:-0}"
+RCH_WORKER_SELECTION_WAIT_SECS="${RCH_WORKER_SELECTION_WAIT_SECS:-0}"
+RCH_WORKER_SELECTION_POLL_SECS="${RCH_WORKER_SELECTION_POLL_SECS:-15}"
 RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS:-}"
 RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
 RCH_GITHUB_ACTIONS_LOCAL_CARGO="${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-0}"
@@ -940,34 +942,54 @@ ensure_rch_remote_only_preflight() {
 ensure_rch_worker_selection_preflight() {
     [[ -n "${_RCH_WORKER_SELECTION_LOG}" ]] || rch_fatal "rch_init must be called before ensure_rch_worker_selection_preflight."
 
-    set +e
-    run_rch --json diagnose --dry-run cargo check --help >"${_RCH_WORKER_SELECTION_LOG}" 2>&1
-    local selection_rc=$?
-    set -e
-    rch_write_meta_json "${_RCH_WORKER_SELECTION_LOG}" "${selection_rc}"
-    rch_emit_proof_ledger_entry \
-        "rch --json diagnose --dry-run cargo check --help" \
-        "${_RCH_WORKER_SELECTION_LOG}" \
-        "${selection_rc}" \
-        "not_applicable" \
-        "not_applicable" \
-        ""
-
-    if [[ ${selection_rc} -ne 0 ]] || ! jq -e . "${_RCH_WORKER_SELECTION_LOG}" >/dev/null 2>&1; then
-        rch_fatal "rch worker-selection preflight failed. See ${_RCH_WORKER_SELECTION_LOG}"
+    local wait_secs poll_secs started_at now elapsed attempt selected_worker selection_rc would_intercept selection_reason
+    wait_secs="${RCH_WORKER_SELECTION_WAIT_SECS}"
+    poll_secs="${RCH_WORKER_SELECTION_POLL_SECS}"
+    rch_is_unsigned_int "${wait_secs}" || wait_secs="0"
+    rch_is_unsigned_int "${poll_secs}" || poll_secs="15"
+    if [[ "${poll_secs}" -eq 0 ]]; then
+        poll_secs="1"
     fi
 
-    local would_intercept selected_worker selection_reason
-    would_intercept="$(jq -r '.data.decision.would_intercept // false' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || true)"
-    selected_worker="$(jq -r '.data.worker_selection.worker // ""' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || true)"
-    selection_reason="$(jq -c '.data.worker_selection.reason // {}' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || printf '{}')"
+    started_at="$(date +%s)"
+    attempt=0
+    while :; do
+        attempt=$((attempt + 1))
+        set +e
+        run_rch --json diagnose --dry-run cargo check --help >"${_RCH_WORKER_SELECTION_LOG}" 2>&1
+        selection_rc=$?
+        set -e
+        rch_write_meta_json "${_RCH_WORKER_SELECTION_LOG}" "${selection_rc}"
+        rch_emit_proof_ledger_entry \
+            "rch --json diagnose --dry-run cargo check --help" \
+            "${_RCH_WORKER_SELECTION_LOG}" \
+            "${selection_rc}" \
+            "not_applicable" \
+            "not_applicable" \
+            ""
 
-    if [[ "${would_intercept}" != "true" ]]; then
-        rch_fatal "rch worker-selection preflight could not prove cargo offload eligibility. See ${_RCH_WORKER_SELECTION_LOG}"
-    fi
-    if [[ -z "${selected_worker}" ]]; then
-        rch_fatal "rch worker-selection preflight blocked: ${selection_reason}. See ${_RCH_WORKER_SELECTION_LOG}"
-    fi
+        if [[ ${selection_rc} -ne 0 ]] || ! jq -e . "${_RCH_WORKER_SELECTION_LOG}" >/dev/null 2>&1; then
+            rch_fatal "rch worker-selection preflight failed. See ${_RCH_WORKER_SELECTION_LOG}"
+        fi
+
+        would_intercept="$(jq -r '.data.decision.would_intercept // false' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || true)"
+        selected_worker="$(jq -r '.data.worker_selection.worker // ""' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || true)"
+        selection_reason="$(jq -c '.data.worker_selection.reason // {}' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || printf '{}')"
+
+        if [[ "${would_intercept}" != "true" ]]; then
+            rch_fatal "rch worker-selection preflight could not prove cargo offload eligibility. See ${_RCH_WORKER_SELECTION_LOG}"
+        fi
+        if [[ -n "${selected_worker}" ]]; then
+            return 0
+        fi
+
+        now="$(date +%s)"
+        elapsed=$((now - started_at))
+        if [[ "${elapsed}" -ge "${wait_secs}" ]]; then
+            rch_fatal "rch worker-selection preflight blocked after ${elapsed}s and ${attempt} attempt(s): ${selection_reason}. See ${_RCH_WORKER_SELECTION_LOG}"
+        fi
+        sleep "${poll_secs}"
+    done
 }
 
 ensure_rch_runtime_capabilities() {
