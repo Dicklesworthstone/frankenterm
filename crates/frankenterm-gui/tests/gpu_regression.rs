@@ -477,7 +477,7 @@ fn run_fuzz(flags: &FuzzCliFlags) -> Result<(), Box<dyn std::error::Error>> {
     let config = FuzzConfig {
         max_cols,
         max_rows,
-        min_axis: max_cols.min(max_rows).min(8).max(1),
+        min_axis: max_cols.min(max_rows).clamp(1, 8),
         event_budget,
         ..FuzzConfig::default()
     };
@@ -519,18 +519,21 @@ fn run_fuzz(flags: &FuzzCliFlags) -> Result<(), Box<dyn std::error::Error>> {
             || event_index % FUZZ_FRAME_INTERVAL_EVENTS == 0
             || stop_after_event
         {
-            render_fuzz_checkpoint(
-                &state,
-                &run_root,
-                &mut stale_hashes,
-                &mut seen_nonblank,
-                &mut violations,
+            let mut context = FuzzRunContext {
+                run_root: &run_root,
+                stale_hashes: &mut stale_hashes,
+                seen_nonblank: &mut seen_nonblank,
+                violations: &mut violations,
                 seed,
                 duration_secs,
-                &runs_dir,
+                runs_dir: &runs_dir,
+            };
+            render_fuzz_checkpoint(
+                &state,
                 event_index,
                 frame_index,
                 &recent_events,
+                &mut context,
             )?;
             frame_index = frame_index.saturating_add(1);
             last_render_event = Some(event_index);
@@ -544,18 +547,21 @@ fn run_fuzz(flags: &FuzzCliFlags) -> Result<(), Box<dyn std::error::Error>> {
     if meta.events_processed > u64::from(start_at) {
         let final_event = meta.events_processed.saturating_sub(1);
         if last_render_event != Some(final_event) {
-            render_fuzz_checkpoint(
-                &state,
-                &run_root,
-                &mut stale_hashes,
-                &mut seen_nonblank,
-                &mut violations,
+            let mut context = FuzzRunContext {
+                run_root: &run_root,
+                stale_hashes: &mut stale_hashes,
+                seen_nonblank: &mut seen_nonblank,
+                violations: &mut violations,
                 seed,
                 duration_secs,
-                &runs_dir,
+                runs_dir: &runs_dir,
+            };
+            render_fuzz_checkpoint(
+                &state,
                 final_event,
                 frame_index,
                 &recent_events,
+                &mut context,
             )?;
         }
     }
@@ -1233,18 +1239,34 @@ impl FuzzHarnessState {
 }
 
 #[cfg(feature = "headless-render")]
-fn render_fuzz_checkpoint(
-    state: &FuzzHarnessState,
-    run_root: &Path,
-    stale_hashes: &mut VecDeque<(u32, u64)>,
-    seen_nonblank: &mut bool,
-    violations: &mut Vec<ViolationRecord>,
+struct FuzzRunContext<'a> {
+    run_root: &'a Path,
+    stale_hashes: &'a mut VecDeque<(u32, u64)>,
+    seen_nonblank: &'a mut bool,
+    violations: &'a mut Vec<ViolationRecord>,
     seed: u64,
     duration_secs: u32,
-    runs_dir: &Path,
+    runs_dir: &'a Path,
+}
+
+#[cfg(feature = "headless-render")]
+struct FuzzViolationInput<'a> {
+    kind: ViolationKind,
+    event_index: u32,
+    frame_index: u32,
+    before: &'a RgbaImage,
+    after: &'a RgbaImage,
+    diff: Option<&'a RgbaImage>,
+    recent_events: &'a VecDeque<String>,
+}
+
+#[cfg(feature = "headless-render")]
+fn render_fuzz_checkpoint(
+    state: &FuzzHarnessState,
     event_index: u64,
     frame_index: u32,
     recent_events: &VecDeque<String>,
+    context: &mut FuzzRunContext<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let input = state.to_input();
     let first = render_headless(&input)?;
@@ -1267,51 +1289,54 @@ fn render_fuzz_checkpoint(
     }));
 
     if is_blank_rgba(&first.rgba) {
-        if *seen_nonblank {
+        if *context.seen_nonblank {
             record_fuzz_violation(
-                run_root,
-                violations,
-                ViolationKind::BlankFrame,
-                seed,
-                duration_secs,
-                runs_dir,
-                event_index_u32,
-                frame_index,
-                &first_image,
-                &second_image,
-                None,
-                recent_events,
+                context,
+                FuzzViolationInput {
+                    kind: ViolationKind::BlankFrame,
+                    event_index: event_index_u32,
+                    frame_index,
+                    before: &first_image,
+                    after: &second_image,
+                    diff: None,
+                    recent_events,
+                },
             )?;
         }
     } else {
-        *seen_nonblank = true;
+        *context.seen_nonblank = true;
     }
 
     let frame_hash = hash_bytes(&first.rgba);
-    if let Some((prior_event, _)) = stale_hashes.iter().find(|(prior_event, prior_hash)| {
-        event_index_u32.saturating_sub(*prior_event) >= FUZZ_STALE_FRAME_EVENT_DISTANCE
-            && *prior_hash == frame_hash
-    }) {
+    let stale_prior = context
+        .stale_hashes
+        .iter()
+        .find(|(prior_event, prior_hash)| {
+            event_index_u32.saturating_sub(*prior_event) >= FUZZ_STALE_FRAME_EVENT_DISTANCE
+                && *prior_hash == frame_hash
+        })
+        .map(|(prior_event, _)| *prior_event);
+    if let Some(prior_event) = stale_prior {
         record_fuzz_violation(
-            run_root,
-            violations,
-            ViolationKind::StaleFullFrame {
-                stale_distance: event_index_u32.saturating_sub(*prior_event),
+            context,
+            FuzzViolationInput {
+                kind: ViolationKind::StaleFullFrame {
+                    stale_distance: event_index_u32.saturating_sub(prior_event),
+                },
+                event_index: event_index_u32,
+                frame_index,
+                before: &first_image,
+                after: &second_image,
+                diff: None,
+                recent_events,
             },
-            seed,
-            duration_secs,
-            runs_dir,
-            event_index_u32,
-            frame_index,
-            &first_image,
-            &second_image,
-            None,
-            recent_events,
         )?;
     }
-    stale_hashes.push_back((event_index_u32, frame_hash));
-    while stale_hashes.len() > FUZZ_MAX_STALE_HASHES {
-        stale_hashes.pop_front();
+    context
+        .stale_hashes
+        .push_back((event_index_u32, frame_hash));
+    while context.stale_hashes.len() > FUZZ_MAX_STALE_HASHES {
+        context.stale_hashes.pop_front();
     }
 
     let comparison = compare_images(&second_image, &first_image, Thresholds::default())?;
@@ -1332,18 +1357,16 @@ fn render_fuzz_checkpoint(
             }
         };
         record_fuzz_violation(
-            run_root,
-            violations,
-            kind,
-            seed,
-            duration_secs,
-            runs_dir,
-            event_index_u32,
-            frame_index,
-            &first_image,
-            &second_image,
-            Some(&comparison.diff),
-            recent_events,
+            context,
+            FuzzViolationInput {
+                kind,
+                event_index: event_index_u32,
+                frame_index,
+                before: &first_image,
+                after: &second_image,
+                diff: Some(&comparison.diff),
+                recent_events,
+            },
         )?;
     }
 
@@ -1352,45 +1375,36 @@ fn render_fuzz_checkpoint(
 
 #[cfg(feature = "headless-render")]
 fn record_fuzz_violation(
-    run_root: &Path,
-    violations: &mut Vec<ViolationRecord>,
-    kind: ViolationKind,
-    seed: u64,
-    duration_secs: u32,
-    runs_dir: &Path,
-    event_index: u32,
-    frame_index: u32,
-    before: &RgbaImage,
-    after: &RgbaImage,
-    diff: Option<&RgbaImage>,
-    recent_events: &VecDeque<String>,
+    context: &mut FuzzRunContext<'_>,
+    input: FuzzViolationInput<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let start_at_event_idx = event_index;
+    let start_at_event_idx = input.event_index;
     let record = ViolationRecord {
-        event_index,
-        frame_index,
-        kind,
-        reproducer_seed: seed,
+        event_index: input.event_index,
+        frame_index: input.frame_index,
+        kind: input.kind,
+        reproducer_seed: context.seed,
         start_at_event_idx,
-        log_excerpt: Some(recent_event_excerpt(recent_events)),
+        log_excerpt: Some(recent_event_excerpt(input.recent_events)),
     };
-    let artifact_dir = run_root.join(record.artifact_subdir());
+    let artifact_dir = context.run_root.join(record.artifact_subdir());
     fs::create_dir_all(&artifact_dir)?;
-    write_png_deterministic(&artifact_dir.join("before.png"), before)?;
-    write_png_deterministic(&artifact_dir.join("after.png"), after)?;
+    write_png_deterministic(&artifact_dir.join("before.png"), input.before)?;
+    write_png_deterministic(&artifact_dir.join("after.png"), input.after)?;
     let generated_diff;
-    let diff_image = match diff {
+    let diff_image = match input.diff {
         Some(diff) => diff,
-        None if before.dimensions() == after.dimensions() => {
-            generated_diff = compare_images(after, before, Thresholds::default())?.diff;
+        None if input.before.dimensions() == input.after.dimensions() => {
+            generated_diff = compare_images(input.after, input.before, Thresholds::default())?.diff;
             &generated_diff
         }
-        None => after,
+        None => input.after,
     };
     write_png_deterministic(&artifact_dir.join("diff.png"), diff_image)?;
     fs::write(
         artifact_dir.join("log.jsonl"),
-        recent_events
+        input
+            .recent_events
             .iter()
             .map(|event| serde_json::to_string(&json!({ "event": event })))
             .collect::<Result<Vec<_>, _>>()?
@@ -1399,12 +1413,12 @@ fn record_fuzz_violation(
     )?;
     write_reproducer(
         &artifact_dir.join("reproducer.sh"),
-        seed,
+        context.seed,
         start_at_event_idx,
-        duration_secs.min(60).max(1),
-        runs_dir,
+        context.duration_secs.clamp(1, 60),
+        context.runs_dir,
     )?;
-    violations.push(record);
+    context.violations.push(record);
     Ok(())
 }
 
