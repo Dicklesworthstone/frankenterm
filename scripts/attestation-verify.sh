@@ -93,11 +93,24 @@ else
 fi
 
 # Required top-level fields.
-for field in release generated_at generator git artifacts required_categories signature; do
+for field in release generated_at generator git artifacts required_categories taxonomy_coverage signature; do
   has="$(jq -e --arg f "$field" 'has($f)' <<<"$bundle_json" >/dev/null 2>&1 && echo true || echo false)"
   if [[ "$has" == "true" ]]; then record_check "field:$field" true "present"
   else record_check "field:$field" false "missing top-level field"; fi
 done
+
+taxonomy_category_count="$(jq '(.taxonomy_coverage.category_counts // []) | length' <<<"$bundle_json")"
+taxonomy_below_threshold="$(jq -r '.taxonomy_coverage.below_threshold_count // empty' <<<"$bundle_json")"
+taxonomy_uncategorized="$(jq -r '.taxonomy_coverage.uncategorized_artifact_count // empty' <<<"$bundle_json")"
+if [[ "$taxonomy_category_count" -lt 10 ]]; then
+  record_check "taxonomy_coverage" false "expected at least 10 taxonomy category rows, got $taxonomy_category_count"
+elif [[ ! "$taxonomy_below_threshold" =~ ^[0-9]+$ ]]; then
+  record_check "taxonomy_coverage" false "taxonomy_coverage.below_threshold_count must be a non-negative integer"
+elif [[ ! "$taxonomy_uncategorized" =~ ^[0-9]+$ ]]; then
+  record_check "taxonomy_coverage" false "taxonomy_coverage.uncategorized_artifact_count must be a non-negative integer"
+else
+  record_check "taxonomy_coverage" true "$taxonomy_category_count categories, $taxonomy_below_threshold below threshold, $taxonomy_uncategorized uncategorized artifact(s)"
+fi
 
 # Strict required-categories check (optional).
 if [[ $STRICT_REQUIRED -eq 1 ]]; then

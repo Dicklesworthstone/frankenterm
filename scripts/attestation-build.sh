@@ -17,11 +17,13 @@
 
 set -euo pipefail
 
-GENERATOR_VERSION="1.2.0"
+GENERATOR_VERSION="1.3.0"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="${FT_ATTESTATION_MANIFEST:-$REPO_ROOT/docs/attestations/manifest.json}"
 OUT_DIR="${FT_ATTESTATION_OUT_DIR:-$REPO_ROOT/docs/attestations}"
 SCHEMA_PATH="${FT_ATTESTATION_SCHEMA:-$REPO_ROOT/docs/attestations/schema.json}"
+TAXONOMY_PATH="${FT_PROOF_TAXONOMY:-$REPO_ROOT/docs/proof-taxonomy.json}"
+PRIOR_BUNDLE_PATH="${FT_ATTESTATION_PRIOR_BUNDLE:-}"
 
 VERSION=""
 CHANNEL="dev"
@@ -55,6 +57,9 @@ Environment:
   ED25519_PRIVATE_KEY_PATH  PEM-encoded Ed25519 private key for --sign ed25519.
   FT_ATTESTATION_MANIFEST   Override manifest path for tests.
   FT_ATTESTATION_OUT_DIR    Override output directory for tests.
+  FT_PROOF_TAXONOMY         Override proof taxonomy registry path.
+  FT_ATTESTATION_PRIOR_BUNDLE
+                           Optional prior bundle path used to compute taxonomy coverage deltas.
   FT_BEAD_ID / FT_SCENARIO_ID / FT_CORRELATION_ID
                            Structured-log identity fields.
 EOF
@@ -106,6 +111,18 @@ sha256_stdin() {
 
 [[ -f "$MANIFEST" ]] || { echo "error: manifest not found: $MANIFEST" >&2; exit 1; }
 [[ -f "$SCHEMA_PATH" ]] || { echo "error: schema not found: $SCHEMA_PATH" >&2; exit 1; }
+[[ -f "$TAXONOMY_PATH" ]] || { echo "error: proof taxonomy not found: $TAXONOMY_PATH" >&2; exit 1; }
+
+if ! jq -e '.categories | type == "array" and length >= 10' "$TAXONOMY_PATH" >/dev/null; then
+  echo "error: proof taxonomy must define at least the 10 core categories: $TAXONOMY_PATH" >&2
+  exit 1
+fi
+
+if [[ "$TAXONOMY_PATH" == "$REPO_ROOT/"* ]]; then
+  TAXONOMY_REL_PATH="${TAXONOMY_PATH#"$REPO_ROOT"/}"
+else
+  TAXONOMY_REL_PATH="$TAXONOMY_PATH"
+fi
 
 GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GIT_TREE="$(git -C "$REPO_ROOT" rev-parse "HEAD^{tree}")"
@@ -165,6 +182,16 @@ emit_build_json() {
 CANONICAL_REQUIRED_JSON="$(jq -c '.required_categories' "$MANIFEST")"
 SLOTS_JSON="$(jq -c '.slots' "$MANIFEST")"
 
+unknown_proof_categories="$(jq -rn \
+  --slurpfile taxonomy "$TAXONOMY_PATH" \
+  --argjson slots "$SLOTS_JSON" \
+  '($taxonomy[0].categories // [] | map(.id)) as $ids
+   | [($slots[]?.proof_categories // [])[] | select(($ids | index(.)) | not)] | unique | map(tostring) | join(", ")')"
+if [[ -n "$unknown_proof_categories" ]]; then
+  echo "error: manifest references unknown proof taxonomy id(s): $unknown_proof_categories" >&2
+  exit 1
+fi
+
 # Enumerate slots, hash each non-null artifact path. Track unfilled categories.
 declare -a artifact_objs=()
 declare -a deferred_objs=()
@@ -181,6 +208,7 @@ for ((i=0; i<slot_count; i++)); do
   deferred_to_bead="$(jq -r '.deferred_to_bead // ""' <<<"$slot")"
   deferred_reason="$(jq -r '.deferred_reason // ""' <<<"$slot")"
   description="$(jq -r '.description // ""' <<<"$slot")"
+  proof_categories_json="$(jq -c '.proof_categories // []' <<<"$slot")"
 
   if [[ -z "$path" ]]; then
     if [[ -n "$deferred_to_bead" ]]; then
@@ -191,8 +219,10 @@ for ((i=0; i<slot_count; i++)); do
         --arg deferred_to_bead "$deferred_to_bead" \
         --arg deferred_reason "$deferred_reason" \
         --arg description "$description" \
+        --argjson proof_categories "$proof_categories_json" \
         '{category:$category, media_type:$media_type, produced_by_bead:$produced_by_bead,
-          deferred_to_bead:$deferred_to_bead, deferred_reason:$deferred_reason}
+          deferred_to_bead:$deferred_to_bead, deferred_reason:$deferred_reason,
+          proof_categories:$proof_categories}
          + (if $description != "" then {description:$description} else {} end)')"
       deferred_objs+=("$deferred_obj")
       deferred_categories+=("$category")
@@ -226,8 +256,10 @@ for ((i=0; i<slot_count; i++)); do
     --argjson size_bytes "$size" \
     --arg produced_by_bead "$produced_by_bead" \
     --arg description "$description" \
+    --argjson proof_categories "$proof_categories_json" \
     '{category:$category, path:$path, media_type:$media_type, sha256:$sha256, size_bytes:$size_bytes}
      + (if $produced_by_bead != "" then {produced_by_bead:$produced_by_bead} else {} end)
+     + {proof_categories:$proof_categories}
      + (if $description       != "" then {description:$description}             else {} end)')"
   artifact_objs+=("$obj")
   emit_build_json "validate.${category}" "passed" "artifact_hashed" "none" "$category" "" "$path"
@@ -311,6 +343,63 @@ else
   deferred_slots_json="$(printf '%s\n' "${deferred_objs[@]}" | jq -c -s '.')"
 fi
 
+if [[ -n "$PRIOR_BUNDLE_PATH" && -f "$PRIOR_BUNDLE_PATH" ]]; then
+  PRIOR_COVERAGE_JSON="$(jq -c '.taxonomy_coverage // null' "$PRIOR_BUNDLE_PATH")"
+  PRIOR_COVERAGE_STATUS="computed"
+elif [[ -n "$PRIOR_BUNDLE_PATH" ]]; then
+  PRIOR_COVERAGE_JSON="null"
+  PRIOR_COVERAGE_STATUS="prior_bundle_missing"
+else
+  PRIOR_COVERAGE_JSON="null"
+  PRIOR_COVERAGE_STATUS="no_prior_bundle"
+fi
+
+taxonomy_coverage_json="$(jq -n \
+  --slurpfile taxonomy "$TAXONOMY_PATH" \
+  --arg taxonomy_path "$TAXONOMY_REL_PATH" \
+  --arg prior_status "$PRIOR_COVERAGE_STATUS" \
+  --argjson prior_coverage "$PRIOR_COVERAGE_JSON" \
+  --argjson artifacts "$artifacts_json" \
+  --argjson deferred_slots "$deferred_slots_json" \
+  '($taxonomy[0].categories // []) as $categories
+   | def coverage_count($items; $id):
+       [$items[]? | select((.proof_categories // []) | index($id))] | length;
+     def prior_count($id; $field):
+       if $prior_coverage == null then 0
+       else (($prior_coverage.category_counts // [])
+         | map(select(.id == $id)) | .[0][$field] // 0)
+       end;
+     ($categories
+       | map(. as $category
+         | (coverage_count($artifacts; $category.id)) as $artifact_count
+         | (coverage_count($deferred_slots; $category.id)) as $deferred_count
+         | {
+             id: $category.id,
+             slug: $category.slug,
+             name: $category.name,
+             bridge_plan_core: ($category.bridge_plan_core // false),
+             artifact_count: $artifact_count,
+             deferred_slot_count: $deferred_count,
+             below_threshold: (($artifact_count + $deferred_count) < 1)
+           })) as $category_counts
+   | {
+       schema_version: "1.0.0",
+       taxonomy_path: $taxonomy_path,
+       category_counts: $category_counts,
+       below_threshold_count: ($category_counts | map(select(.below_threshold)) | length),
+       uncategorized_artifact_count: ([$artifacts[]? | select((.proof_categories // []) | length == 0)] | length),
+       delta_from_prior_release: {
+         status: $prior_status,
+         category_deltas: ($category_counts
+           | map({
+               id,
+               slug,
+               artifact_delta: (.artifact_count - prior_count(.id; "artifact_count")),
+               deferred_slot_delta: (.deferred_slot_count - prior_count(.id; "deferred_slot_count"))
+             }))
+       }
+     }')"
+
 bundle_no_sig="$(jq -n \
   --arg schema_version "1.0.0" \
   --arg version "$VERSION" \
@@ -324,6 +413,7 @@ bundle_no_sig="$(jq -n \
   --argjson artifacts "$artifacts_json" \
   --argjson required_categories "$REQUIRED_CATEGORIES_JSON" \
   --argjson deferred_slots "$deferred_slots_json" \
+  --argjson taxonomy_coverage "$taxonomy_coverage_json" \
   '{
     schema_version: $schema_version,
     release: {
@@ -339,7 +429,8 @@ bundle_no_sig="$(jq -n \
     git: ({commit: $commit, tree: $tree} + (if $branch != "" then {branch: $branch} else {} end)),
     artifacts: $artifacts,
     required_categories: $required_categories,
-    deferred_slots: $deferred_slots
+    deferred_slots: $deferred_slots,
+    taxonomy_coverage: $taxonomy_coverage
   }')"
 
 # Canonical signing payload: bundle (without .signature) sorted-keys + compact.
@@ -440,6 +531,7 @@ echo "  schema_version : 1.0.0"
 echo "  release        : v${VERSION} (${CHANNEL})"
 echo "  git            : ${GIT_COMMIT}"
 echo "  artifacts      : ${#artifact_objs[@]}"
+echo "  taxonomy       : $(jq -r '.below_threshold_count' <<<"$taxonomy_coverage_json") below threshold"
 if [[ ${#deferred_objs[@]} -gt 0 ]]; then
   echo "  deferred slots : ${#deferred_objs[@]}"
 fi

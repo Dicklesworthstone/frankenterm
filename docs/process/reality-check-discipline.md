@@ -73,6 +73,8 @@ Every new plan must include:
 - Predecessor plan links.
 - Bead epic id and child range.
 - Gap table with proof category or substrate/process classification.
+- Matching `proof_category:` lines in the Beads description, using
+  `docs/proof-taxonomy.json` IDs or one of its non-proof classifications.
 - Trigger evidence explaining why the run happened.
 - Current Beads/BV counts and dependency-cycle result.
 - A successor note telling future runs to cross-link this plan.

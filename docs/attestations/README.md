@@ -13,6 +13,7 @@ in [`docs/reality-check-bridge-plan.md`](../reality-check-bridge-plan.md).
 |------|---------|
 | `schema.json` | JSON Schema (2020-12) describing the bundle structure. Semver-stable; new categories require a schema bump. |
 | `manifest.json` | Canonical declarative input list. Per-category slots map to the artifact path the producing bead must emit. The build script reads this. |
+| `../proof-taxonomy.json` | Numeric proof taxonomy registry used by `proof_categories` metadata and bundle coverage summaries. |
 | `<version>.json` | The signed bundle for a specific release. Lists every artifact (path + SHA-256 + size + producing-bead pointer) plus the signature info. |
 | `<version>.sigstore` | (sigstore-signed bundles only) cosign sigstore bundle — Fulcio certificate, Rekor verification material, and signature over the canonical signing payload. |
 
@@ -24,17 +25,22 @@ The producing-bead column is the source of truth for which work item gates the a
 | Category | Producing bead | Bridge-plan section |
 |----------|----------------|---------------------|
 | `perf/headline-claims` | `ft-syqcz.3` | G3 |
-| `perf/competitor-matrix` | `ft-syqcz.4` | G3 |
-| `perf/lindley-bounds` | `ft-syqcz.5` | G3 |
+| `perf/competitor-matrix` | `ft-e87u6.9` | G3 |
+| `perf/lindley-bounds` | `ft-43x69` | G3 |
 | `tui/render-parity` | `ft-35yac.1.2` (GPU visual adjunct) + `ft-35yac.2` (full ratatui<->ftui report) | G5 |
 | `security/passive-watch` | `ft-x0666.1` | G9 |
 | `security/redactor-coverage` | `ft-x0666.2` | G10 |
 | `security/distributed-threat-model` | `ft-x0666.3` | G11 |
-| `proofs/loom-runtime-async` | `ft-syqcz.6` | G8 |
+| `proofs/loom-runtime-async` | `ft-e87u6.12` | G8 |
 | `proofs/runtime-proof-trait` | `ft-i2eni.1` | G1 |
 | `proofs/robot-contracts` | `ft-0elb9` | G2 |
 | `doctrine/agents-md-counts` | `ft-tf6g3.2` | G6 / G17 |
-| `doctrine/vendored-provenance` | `ft-i2eni.6` | G15 |
+| `doctrine/cx-propagation` | `ft-q0tz3` | G14.2 |
+
+The manifest can also include optional slots that are hashed into bundles when
+present but are not in `required_categories` yet. Current optional slots include
+`doctrine/vendored-provenance` (`ft-i2eni.6`) and `perf/atlas-packing`
+(`ft-gtcm9.5`).
 
 `proofs/robot-contracts` was introduced under `ft-q5njp` and refreshed under
 `ft-0elb9`. It is repository evidence: it attests checked-in schema, golden
@@ -67,6 +73,12 @@ Fulcio/Rekor trust model, and third-party verification flow are documented in
 PEM-encoded Ed25519 private key path in `ED25519_PRIVATE_KEY_PATH`; it emits
 `<version>.ed25519.sig.hex` beside the bundle and records the matching raw
 32-byte public key in `signature.public_key`.
+
+Each manifest slot can also declare `proof_categories`, using numeric IDs from
+[`docs/proof-taxonomy.json`](../proof-taxonomy.json). The builder copies those
+IDs onto delivered artifacts/deferred slots and emits `taxonomy_coverage` with
+per-category counts, below-threshold flags, uncategorized artifact count, and an
+optional delta from `FT_ATTESTATION_PRIOR_BUNDLE`.
 
 ## Verifying a bundle
 
@@ -112,8 +124,9 @@ to artifact paths, hashes, sizes, git commits, or release metadata — which is 
 
 1. Update `schema.json`'s `$defs.category` enum and bump `schema_version`.
 2. Update `manifest.json` to add the slot (with `path: null` until the producing bead lands).
-3. Update the table above.
-4. Update README's "Trust & Attestation" section.
+3. Add `proof_categories` IDs from `docs/proof-taxonomy.json` so coverage reports stay meaningful.
+4. Update the table above.
+5. Update README's "Trust & Attestation" section.
 
 Schema versions follow semver. Adding an enum value is a minor bump (existing bundles still
 validate); removing one is a major bump.

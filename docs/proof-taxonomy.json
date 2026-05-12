@@ -1,0 +1,128 @@
+{
+  "schema_version": "1.0.0",
+  "source_bead": "ft-tf6g3.17",
+  "description": "Proof-artifact taxonomy for the ft-tf6g3 reality-check epic. Categories 1-10 are the bridge-plan core taxonomy; category 11 is an extension already referenced by a later child bead.",
+  "categories": [
+    {
+      "id": 1,
+      "slug": "type-level",
+      "name": "Type-Level Proof",
+      "bridge_plan_core": true,
+      "description": "Compile-time proof encoded in Rust types, sealed traits, trait bounds, lint gates, or dependency bans.",
+      "example_path": "docs/attestations/proofs/runtime-proof-trait.json",
+      "accepted_shapes": ["compile-fail gate", "sealed trait audit", "dependency ban", "lint report"]
+    },
+    {
+      "id": 2,
+      "slug": "property",
+      "name": "Property Test",
+      "bridge_plan_core": true,
+      "description": "Generated-input test that asserts an invariant across many cases instead of one hand-picked fixture.",
+      "example_path": "crates/frankenterm-core/tests/proptest_daemon.rs",
+      "accepted_shapes": ["proptest", "quickcheck", "generated corpus", "invariant matrix"]
+    },
+    {
+      "id": 3,
+      "slug": "loom",
+      "name": "Loom Concurrency Proof",
+      "bridge_plan_core": true,
+      "description": "Systematic concurrency interleaving exploration for async or synchronization behavior.",
+      "example_path": "docs/attestations/proofs/loom-runtime-async.json",
+      "accepted_shapes": ["loom model", "interleaving report", "scheduler-state artifact"]
+    },
+    {
+      "id": 4,
+      "slug": "conformance",
+      "name": "Conformance Artifact",
+      "bridge_plan_core": true,
+      "description": "Golden, schema, protocol, contract, visual, or wire-format check against an explicit expected shape.",
+      "example_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+      "accepted_shapes": ["golden fixture", "schema validation", "protocol transcript", "visual parity report"]
+    },
+    {
+      "id": 5,
+      "slug": "quantitative-attestation",
+      "name": "Quantitative Attestation",
+      "bridge_plan_core": true,
+      "description": "Measured result with machine-readable parameters, sample counts, thresholds, and provenance.",
+      "example_path": "docs/perf/headline-claims.json",
+      "accepted_shapes": ["benchmark report", "SLO table", "count stamp", "release attestation"]
+    },
+    {
+      "id": 6,
+      "slug": "formal-method",
+      "name": "Formal Method",
+      "bridge_plan_core": true,
+      "description": "Explicit model, theorem, state-machine proof, or model-checking artifact with a verifiable invariant.",
+      "example_path": "docs/proofs/transaction_model.tla",
+      "accepted_shapes": ["TLA+ spec", "model checker output", "state-machine invariant", "proof obligation report"]
+    },
+    {
+      "id": 7,
+      "slug": "information-theoretic",
+      "name": "Information-Theoretic Bound",
+      "bridge_plan_core": true,
+      "description": "Entropy, leakage, distinguishability, or recall/precision bound with stated assumptions and data.",
+      "example_path": "docs/security/redactor-coverage.json",
+      "accepted_shapes": ["entropy bound", "leakage matrix", "Fano inequality report", "classification metric table"]
+    },
+    {
+      "id": 8,
+      "slug": "network-calculus",
+      "name": "Network Calculus Bound",
+      "bridge_plan_core": true,
+      "description": "Queueing, Lindley recursion, min-plus, arrival/service-curve, or tail-bound analysis for resource claims.",
+      "example_path": "docs/attestations/perf/lindley-bounds.json",
+      "accepted_shapes": ["Lindley bound", "arrival curve", "service curve", "backlog-delay proof"]
+    },
+    {
+      "id": 9,
+      "slug": "differential",
+      "name": "Differential Comparison",
+      "bridge_plan_core": true,
+      "description": "Comparison against another implementation, oracle, previous release, or independent backend.",
+      "example_path": "docs/perf/competitor-matrix.json",
+      "accepted_shapes": ["competitor matrix", "oracle diff", "A/B transcript", "cross-backend parity run"]
+    },
+    {
+      "id": 10,
+      "slug": "cryptographic",
+      "name": "Cryptographic Attestation",
+      "bridge_plan_core": true,
+      "description": "Signature, content-addressed manifest, hash chain, transparency-log, or provenance proof.",
+      "example_path": "docs/attestations/0.0.0-dev.json",
+      "accepted_shapes": ["signed bundle", "sigstore bundle", "hash manifest", "provenance statement"]
+    },
+    {
+      "id": 11,
+      "slug": "topological-invariant",
+      "name": "Topological Invariant",
+      "bridge_plan_core": false,
+      "description": "Graph, topology, reachability, cut-set, or packing invariant that proves structural behavior beyond the core ten categories.",
+      "example_path": "docs/reality-check-bridge-plan-2026-05-12.md",
+      "accepted_shapes": ["graph invariant", "reachability proof", "packing invariant", "structural counterexample"]
+    }
+  ],
+  "non_proof_classifications": [
+    {
+      "slug": "substrate",
+      "description": "Implementation or infrastructure that enables a future proof artifact but is not itself a proof."
+    },
+    {
+      "slug": "process",
+      "description": "Governance, cadence, release, or review discipline that routes proof work without asserting a technical property."
+    },
+    {
+      "slug": "infrastructure",
+      "description": "Tooling, CI, runner, mirror, or operational support needed to execute proof work."
+    },
+    {
+      "slug": "coordination",
+      "description": "Bead graph, ownership, scheduling, or cross-agent routing work."
+    }
+  ],
+  "proof_category_line": {
+    "pattern": "proof_category: <id> (<slug>) [+ <id> ...] OR proof_category: <non_proof_classification>",
+    "required_scope": "ft-tf6g3 parent and children"
+  }
+}

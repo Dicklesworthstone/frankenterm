@@ -25,6 +25,13 @@ and confirm each producing bead has shipped its artifact:
 jq -r '.required_categories[]' docs/attestations/manifest.json
 ```
 
+Also confirm every manifest slot declares proof taxonomy metadata:
+
+```sh
+jq -e '[.slots[] | select((.proof_categories // []) | length == 0)] | length == 0' \
+  docs/attestations/manifest.json
+```
+
 For each category, check the corresponding "producing bead"
 in [`docs/attestations/README.md`](../attestations/README.md)
 "Required artifact categories" table:
@@ -32,16 +39,17 @@ in [`docs/attestations/README.md`](../attestations/README.md)
 | Category                            | Producing bead     | Verify         |
 |-------------------------------------|--------------------|----------------|
 | `perf/headline-claims`              | `ft-syqcz.3`       | `br show ft-syqcz.3` reports closed |
-| `perf/competitor-matrix`            | `ft-syqcz.4`       | `br show ft-syqcz.4` reports closed |
-| `perf/lindley-bounds`               | `ft-syqcz.5`       | `br show ft-syqcz.5` reports closed |
-| `tui/render-parity`                 | `ft-35yac.2`       | `br show ft-35yac.2` reports closed |
+| `perf/competitor-matrix`            | `ft-e87u6.9`       | `br show ft-e87u6.9` reports closed |
+| `perf/lindley-bounds`               | `ft-43x69`         | `br show ft-43x69` reports closed |
+| `tui/render-parity`                 | `ft-35yac.1.2` + `ft-35yac.2` | both beads report closed |
 | `security/passive-watch`            | `ft-x0666.1`       | `br show ft-x0666.1` reports closed |
 | `security/redactor-coverage`        | `ft-x0666.2`       | `br show ft-x0666.2` reports closed |
 | `security/distributed-threat-model` | `ft-x0666.3`       | `br show ft-x0666.3` reports closed |
-| `proofs/loom-runtime-async`         | `ft-syqcz.6`       | `br show ft-syqcz.6` reports closed |
+| `proofs/loom-runtime-async`         | `ft-e87u6.12`      | `br show ft-e87u6.12` reports closed |
 | `proofs/runtime-proof-trait`        | `ft-i2eni.1`       | `br show ft-i2eni.1` reports closed |
-| `proofs/robot-contracts`            | `ft-q5njp`         | `br show ft-q5njp` reports closed |
-| `doctrine/agents-md-counts`         | `ft-i2eni.5`       | `br show ft-i2eni.5` reports closed |
+| `proofs/robot-contracts`            | `ft-0elb9`         | `br show ft-0elb9` reports closed |
+| `doctrine/agents-md-counts`         | `ft-tf6g3.2`       | `br show ft-tf6g3.2` reports closed |
+| `doctrine/cx-propagation`           | `ft-q0tz3`         | `br show ft-q0tz3` reports closed |
 
 If any bead is **not closed**, the release MUST NOT proceed —
 the attestation bundle would either be partial (rejected by
@@ -73,6 +81,8 @@ The build script **fails loudly** on:
 - Any required-category slot with `path: null`.
 - Any artifact path that doesn't exist on disk.
 - Any artifact whose hash differs from what the bead promised.
+- Any manifest `proof_categories` ID that is not declared in
+  `docs/proof-taxonomy.json`.
 
 If the build fails, do NOT manually patch the manifest — fix
 the producing bead's artifact instead. Manual edits silently
@@ -88,10 +98,12 @@ The verifier:
 1. Parses the bundle.
 2. Re-derives every artifact's SHA-256 from disk.
 3. Recomputes the canonical signing payload.
-4. Verifies the sigstore signature against
+4. Checks the `taxonomy_coverage` summary from
+   `docs/proof-taxonomy.json`.
+5. Verifies the sigstore signature against
    `COSIGN_IDENTITY` (the expected workflow ref), or verifies the
    Ed25519 signature against the bundle's `signature.public_key`.
-5. Exits 0 on full pass; non-zero on any check failure.
+6. Exits 0 on full pass; non-zero on any check failure.
 
 For machine-readable output (CI gates):
 
@@ -176,10 +188,13 @@ Net: a bundle that passes this checklist is **complete**
   — JSON Schema 2020-12 for the bundle format.
 - [`docs/attestations/manifest.json`](../attestations/manifest.json)
   — canonical required-categories list.
+- [`docs/proof-taxonomy.json`](../proof-taxonomy.json)
+  — proof category registry used by `proof_categories` and
+  `taxonomy_coverage`.
 - [`scripts/attestation-build.sh`](../../scripts/attestation-build.sh)
-  — bundle assembler (273 lines).
+  — bundle assembler.
 - [`scripts/attestation-verify.sh`](../../scripts/attestation-verify.sh)
-  — bundle verifier (226 lines).
+  — bundle verifier.
 - [`tests/attestation/smoke-test.sh`](../../tests/attestation/smoke-test.sh)
   — positive + tamper-detection smoke test.
 - [`docs/release/checklist.md`](checklist.md) — broader

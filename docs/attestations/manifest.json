@@ -21,6 +21,7 @@
       "path": "docs/perf/headline-claims.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-syqcz.3",
+      "proof_categories": [5],
       "description": "Headline-claim manifest + 5 must-prove benches (G3)."
     },
     {
@@ -28,6 +29,7 @@
       "path": "docs/perf/competitor-matrix.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-e87u6.9",
+      "proof_categories": [9, 5],
       "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3). Recovery artifact published by ft-e87u6.9 (closed); substrate provenance traces to the ft-t101b deterministic competitor-bench fixture under ft-syqcz.5. Producer attribution corrected from the original null-slot misattribution to ft-syqcz.4 per the artifact's recommended_produced_by_bead field."
     },
     {
@@ -35,6 +37,7 @@
       "path": "docs/attestations/perf/lindley-bounds.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-43x69",
+      "proof_categories": [8],
       "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3). Substrate-pass artifact via crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69 substrate-pass; ft-syqcz.5 sibling); the wired-pass cont-bead swaps the hard-coded per-stage rates for live latency_stages.rs telemetry reads + bench-driven empirical_p99_ms + sigstore signing."
     },
     {
@@ -42,6 +45,7 @@
       "path": "docs/attestations/tui/render-parity.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-35yac.2",
+      "proof_categories": [4, 9],
       "description": "ratatui<->ftui differential render parity report (G5). Recovery artifact published by ft-e87u6.10 (closed) backfilling the original ft-35yac.2 producer slot. The GPU adjunct stays in the sibling slot for ft-35yac.1.2."
     },
     {
@@ -49,6 +53,7 @@
       "path": "docs/attestations/tui/render-parity-gpu.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-35yac.1.2",
+      "proof_categories": [4, 9],
       "description": "Headless GPU-renderer visual parity contract for the G5 render-parity category. Runtime runs emit target/gpu-regression/<runner>/render-parity-gpu.json beside summary.json; the full ratatui<->ftui byte-level report remains ft-35yac.2."
     },
     {
@@ -56,6 +61,7 @@
       "path": "docs/security/passive-watch-attestation.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-x0666.1",
+      "proof_categories": [2, 4],
       "description": "Passive-watch read-only fuzz proof (G9). Recovery artifact published by ft-e87u6.11 (closed) backfilling the original ft-x0666.1 producer slot."
     },
     {
@@ -63,6 +69,7 @@
       "path": "docs/security/redactor-coverage.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-x0666.2",
+      "proof_categories": [7, 9],
       "description": "Redactor recall/precision matrix vs gitleaks/trufflehog corpora (G10)."
     },
     {
@@ -70,6 +77,7 @@
       "path": "docs/security/distributed-threat-model.md",
       "media_type": "text/markdown",
       "produced_by_bead": "ft-x0666.3",
+      "proof_categories": [9, 4],
       "description": "Distributed wire-protocol threat model + diff fuzz (G11)."
     },
     {
@@ -77,6 +85,7 @@
       "path": "docs/attestations/proofs/loom-runtime-async.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-e87u6.12",
+      "proof_categories": [3],
       "description": "Loom proof for runtime_async primitives (G8)."
     },
     {
@@ -84,6 +93,7 @@
       "path": "docs/attestations/proofs/runtime-proof-trait.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-i2eni.1",
+      "proof_categories": [1],
       "description": "RuntimeProof sealed trait + tokio type-level seal (G1). Recovery artifact published by ft-e87u6.13 (closed) backfilling the original ft-i2eni.1 producer slot."
     },
     {
@@ -91,6 +101,7 @@
       "path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-0elb9",
+      "proof_categories": [4, 2],
       "description": "Robot/MCP/CLI control-plane golden matrix for schema-backed envelopes, live profile/fleet mutation receipts, and backend-unavailable/policy/approval failure contracts (G2; originally introduced under ft-q5njp)."
     },
     {
@@ -98,6 +109,7 @@
       "path": "docs/attestations/doctrine/agents-md-counts.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-tf6g3.2",
+      "proof_categories": [5],
       "description": "Auto-stamped README/AGENTS module/crate/test counts (G6)."
     },
     {
@@ -105,6 +117,7 @@
       "path": "frankenterm/PROVENANCE.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-i2eni.6",
+      "proof_categories": [10],
       "description": "Vendored fork provenance manifest (G15). Generated by scripts/regen-provenance.py; checked-in copy serves as the attestation source. The CI guard scripts/check-provenance.sh refuses a stale manifest, so the bundle hash always reflects HEAD."
     },
     {
@@ -112,6 +125,7 @@
       "path": "docs/runtime/cx-propagation.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-q0tz3",
+      "proof_categories": [1, 5],
       "description": "Cx-propagation burndown snapshot (G14.2). Per-bucket coverage of asupersync Cx threading across the codebase. The verifier asserts totals.uncovered_sites == 0 — a release with any uncovered cancellation site fails the gate."
     },
     {
@@ -119,6 +133,7 @@
       "path": "docs/perf/atlas-packing.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-gtcm9.5",
+      "proof_categories": [5],
       "description": "Per-(corpus, packer) atlas-packing efficiency report. Generated by `cargo run --release -p frankenterm-core --example atlas_packing_attestation` against the four glyph corpora (Latin, CJK, Nerd Font, emoji) at 2048² with all three packers (Shelf, Skyline, MaximalRectangles). Re-run before each release; this file is sha256-hashed into the per-release bundle. Not in required_categories yet — the attestation surface is opt-in until ft-gtcm9.{2,3} land the GUI wiring + ft doctor surface that consume the underlying packer choice."
     }
   ]

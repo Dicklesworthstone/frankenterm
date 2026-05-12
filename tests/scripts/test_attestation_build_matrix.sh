@@ -116,6 +116,7 @@ json_slot() {
       path: $path,
       media_type: "application/json",
       produced_by_bead: "ft-syqcz.3",
+      proof_categories: [5],
       description: "matrix test slot"
     }
     + (if $deferred_to_bead == "" then {} else {deferred_to_bead: $deferred_to_bead} end)
@@ -284,7 +285,7 @@ run_sigstore_cases() {
     schema_version: "1.0.0",
     release: {version: "0.2.0", tag: "v0.2.0", channel: "stable"},
     generated_at: "2026-05-12T00:00:00Z",
-    generator: {name: "scripts/attestation-build.sh", version: "1.2.0"},
+    generator: {name: "scripts/attestation-build.sh", version: "1.3.0"},
     git: {
       commit: "0123456789abcdef0123456789abcdef01234567",
       tree: "89abcdef0123456789abcdef0123456789abcdef",
@@ -295,10 +296,35 @@ run_sigstore_cases() {
       path: "docs/attestations/schema.json",
       media_type: "application/json",
       sha256: "",
-      size_bytes: 0
+      size_bytes: 0,
+      proof_categories: [5]
     }],
     required_categories: ["doctrine/agents-md-counts"],
-    deferred_slots: []
+    deferred_slots: [],
+    taxonomy_coverage: {
+      schema_version: "1.0.0",
+      taxonomy_path: "docs/proof-taxonomy.json",
+      category_counts: ([range(1; 12) as $id | {
+        id: $id,
+        slug: (if $id == 5 then "quantitative-attestation" else "category-\($id)" end),
+        name: (if $id == 5 then "Quantitative Attestation" else "Category \($id)" end),
+        bridge_plan_core: ($id <= 10),
+        artifact_count: (if $id == 5 then 1 else 0 end),
+        deferred_slot_count: 0,
+        below_threshold: ($id != 5)
+      }]),
+      below_threshold_count: 10,
+      uncategorized_artifact_count: 0,
+      delta_from_prior_release: {
+        status: "no_prior_bundle",
+        category_deltas: ([range(1; 12) as $id | {
+          id: $id,
+          slug: (if $id == 5 then "quantitative-attestation" else "category-\($id)" end),
+          artifact_delta: (if $id == 5 then 1 else 0 end),
+          deferred_slot_delta: 0
+        }])
+      }
+    }
   }')"
   no_sig="$(jq \
     --arg artifact_sha "${sigstore_hash}" \
