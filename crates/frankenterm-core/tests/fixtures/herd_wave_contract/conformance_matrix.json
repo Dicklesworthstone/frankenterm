@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "bead_id": "ft-5bwjf.5",
+  "contract_id": "ft.herd_wave.v1",
+  "requirements": [
+    {
+      "requirement_id": "root.schema_version",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["robot_json", "robot_toon", "doctor_json"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "root.contract_id",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["robot_json", "robot_toon", "doctor_json"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "state.normal_elevated_critical_emergency",
+      "level": "MUST",
+      "fixture_ids": ["normal_no_wave_privacy_guard", "synchronized_compaction", "search_index_burst", "retry_storm"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "state.missing_telemetry",
+      "level": "MUST",
+      "fixture_ids": ["missing_telemetry"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "state.stale_evidence",
+      "level": "MUST",
+      "fixture_ids": ["stale_evidence"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "state.priority_protected",
+      "level": "MUST",
+      "fixture_ids": ["priority_protection", "rate_limit_recovery_wave"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "state.operator_override",
+      "level": "MUST",
+      "fixture_ids": ["operator_override"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "dry_run.no_live_mutation",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["robot_json", "robot_toon", "e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "dry_run.stagger_plan_rows",
+      "level": "MUST",
+      "fixture_ids": ["synchronized_compaction", "retry_storm", "search_index_burst", "mixed_wave"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "reason_codes.stable_prefixes",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "unavailable_sources.missing_and_stale",
+      "level": "MUST",
+      "fixture_ids": ["missing_telemetry", "stale_evidence"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "privacy.raw_pane_content_stored_false",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["robot_json", "robot_toon", "doctor_json", "e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "privacy.no_private_text_emitted",
+      "level": "MUST",
+      "fixture_ids": ["normal_no_wave_privacy_guard"],
+      "surfaces": ["robot_json", "robot_toon", "doctor_json", "e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "golden.json_toon_same_snapshot",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["robot_json", "robot_toon"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "golden.update_gate",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "e2e.structured_jsonl_fields",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "e2e.rch_fail_closed_for_rust",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "mcp.read_only_resource_parity",
+      "level": "SHOULD",
+      "fixture_ids": ["*"],
+      "surfaces": ["mcp_resource"],
+      "status": "planned",
+      "divergence": "Read-only MCP resource parity is intentionally isolated to ft-5bwjf.8."
+    },
+    {
+      "requirement_id": "target_class.no_synthetic_high_scale_claim",
+      "level": "MUST",
+      "fixture_ids": ["*"],
+      "surfaces": ["robot_json", "robot_toon", "e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    }
+  ]
+}

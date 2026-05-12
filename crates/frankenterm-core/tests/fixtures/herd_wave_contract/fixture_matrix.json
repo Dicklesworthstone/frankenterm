@@ -1,0 +1,386 @@
+{
+  "schema_version": 1,
+  "bead_id": "ft-5bwjf.5",
+  "contract_id": "ft.herd_wave.v1",
+  "update_policy": {
+    "environment_gate": "UPDATE_HERD_WAVE_GOLDENS",
+    "default_overwrite_allowed": false,
+    "review_required": true,
+    "update_command": "UPDATE_HERD_WAVE_GOLDENS=1 tests/e2e/test_herd_wave_contract.sh --update-goldens"
+  },
+  "canonicalizers": [
+    "herd_wave_v1_static",
+    "scrub_generated_at_ms",
+    "scrub_run_id",
+    "scrub_selected_worker",
+    "scrub_artifact_root"
+  ],
+  "privacy_sentinel_classes": [
+    "prompt_body",
+    "bearer_token",
+    "session_cookie",
+    "raw_pane_excerpt"
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "synchronized_compaction",
+      "kind": "compaction",
+      "pane_count": 3,
+      "request": "background",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "elevated",
+        "evidence_state": "measured",
+        "pressure_tier": "elevated",
+        "admission_action": "defer",
+        "dominant_kind": "compaction",
+        "min_calendar_rows": 3,
+        "required_reason_codes": [
+          "herd_wave.kind.compaction",
+          "herd_wave.threshold.distinct_panes"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.dry_run.no_live_mutation",
+          "herd_wave.next.defer_until_pressure_drops"
+        ]
+      }
+    },
+    {
+      "scenario_id": "rate_limit_recovery_wave",
+      "kind": "rate_limit_recovery",
+      "pane_count": 16,
+      "request": "mission_critical",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "priority_protected",
+        "evidence_state": "measured",
+        "pressure_tier": "emergency",
+        "admission_action": "defer",
+        "dominant_kind": "rate_limit_recovery",
+        "min_calendar_rows": 16,
+        "required_reason_codes": [
+          "herd_wave.kind.rate_limit_recovery",
+          "herd_wave.priority.protected"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.next.preserve_priority_protected_work",
+          "herd_wave.dry_run.no_live_mutation"
+        ]
+      }
+    },
+    {
+      "scenario_id": "retry_storm",
+      "kind": "retry",
+      "pane_count": 16,
+      "request": "background",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "emergency",
+        "evidence_state": "measured",
+        "pressure_tier": "emergency",
+        "admission_action": "shed",
+        "dominant_kind": "retry",
+        "min_calendar_rows": 16,
+        "required_reason_codes": [
+          "herd_wave.kind.retry",
+          "herd_wave.admission.herd_wave_pressure"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.next.operator_review_before_shed",
+          "herd_wave.next.confirm_noncritical_before_shed"
+        ]
+      }
+    },
+    {
+      "scenario_id": "search_index_burst",
+      "kind": "search_burst",
+      "pane_count": 8,
+      "request": "background",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "critical",
+        "evidence_state": "measured",
+        "pressure_tier": "critical",
+        "admission_action": "degrade",
+        "dominant_kind": "search_burst",
+        "min_calendar_rows": 8,
+        "required_reason_codes": [
+          "herd_wave.kind.search_burst",
+          "herd_wave.admission.herd_wave_pressure"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.next.degrade_after_stagger",
+          "herd_wave.dry_run.no_live_mutation"
+        ]
+      }
+    },
+    {
+      "scenario_id": "mixed_wave",
+      "kind": "mixed",
+      "signal_kinds": [
+        "compaction",
+        "retry",
+        "search_burst",
+        "compaction"
+      ],
+      "pane_count": 4,
+      "request": "background",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "elevated",
+        "evidence_state": "measured",
+        "pressure_tier": "elevated",
+        "admission_action": "defer",
+        "dominant_kind": "compaction",
+        "min_calendar_rows": 4,
+        "required_reason_codes": [
+          "herd_wave.kind.compaction",
+          "herd_wave.threshold.distinct_panes"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.kind.retry",
+          "herd_wave.kind.search_burst"
+        ]
+      }
+    },
+    {
+      "scenario_id": "missing_telemetry",
+      "kind": "wake",
+      "pane_count": 0,
+      "request": "mission_critical",
+      "telemetry_mode": "missing",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "missing_telemetry",
+        "evidence_state": "unavailable",
+        "pressure_tier": "normal",
+        "admission_action": "defer",
+        "dominant_kind": "none",
+        "min_calendar_rows": 0,
+        "required_reason_codes": [
+          "herd_wave.telemetry.missing_queue",
+          "herd_wave.admission.fail_closed_missing_telemetry"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.admission.fail_closed_missing_telemetry"
+        ]
+      }
+    },
+    {
+      "scenario_id": "stale_evidence",
+      "kind": "compaction",
+      "pane_count": 3,
+      "request": "background",
+      "telemetry_mode": "stale",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "stale_evidence",
+        "evidence_state": "stale",
+        "pressure_tier": "elevated",
+        "admission_action": "defer",
+        "dominant_kind": "compaction",
+        "min_calendar_rows": 3,
+        "required_reason_codes": [
+          "herd_wave.telemetry.stale",
+          "herd_wave.kind.compaction"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.dry_run.no_live_mutation"
+        ]
+      }
+    },
+    {
+      "scenario_id": "priority_protection",
+      "kind": "wake",
+      "pane_count": 16,
+      "request": "mission_critical",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "priority_protected",
+        "evidence_state": "measured",
+        "pressure_tier": "emergency",
+        "admission_action": "defer",
+        "dominant_kind": "wake",
+        "min_calendar_rows": 16,
+        "required_reason_codes": [
+          "herd_wave.priority.protected",
+          "herd_wave.kind.wake"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.next.preserve_priority_protected_work"
+        ]
+      }
+    },
+    {
+      "scenario_id": "operator_override",
+      "kind": "workflow_fanout",
+      "pane_count": 8,
+      "request": "operator_override",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "operator_override",
+        "evidence_state": "measured",
+        "pressure_tier": "critical",
+        "admission_action": "admit",
+        "dominant_kind": "workflow_fanout",
+        "min_calendar_rows": 8,
+        "required_reason_codes": [
+          "herd_wave.priority.operator_override",
+          "herd_wave.kind.workflow_fanout"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.priority.operator_override",
+          "herd_wave.dry_run.no_live_mutation"
+        ]
+      }
+    },
+    {
+      "scenario_id": "cooldown_circuit_active",
+      "kind": "retry",
+      "pane_count": 16,
+      "request": "background",
+      "telemetry_mode": "fresh",
+      "controller_state": "pressure_active",
+      "privacy_negative": false,
+      "expected": {
+        "overall_state": "emergency",
+        "evidence_state": "measured",
+        "pressure_tier": "emergency",
+        "admission_action": "shed",
+        "dominant_kind": "retry",
+        "min_calendar_rows": 16,
+        "required_reason_codes": [
+          "herd_wave.kind.retry",
+          "herd_wave.admission.herd_wave_pressure"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.cooldown.pressure_action_active",
+          "herd_wave.circuit_breaker.operator_review_required_before_live_shed"
+        ]
+      }
+    },
+    {
+      "scenario_id": "normal_no_wave_privacy_guard",
+      "kind": "wake",
+      "pane_count": 2,
+      "request": "background",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": true,
+      "expected": {
+        "overall_state": "normal",
+        "evidence_state": "measured",
+        "pressure_tier": "normal",
+        "admission_action": "admit",
+        "dominant_kind": "wake",
+        "min_calendar_rows": 0,
+        "required_reason_codes": [
+          "herd_wave.kind.wake"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.next.noop",
+          "herd_wave.dry_run.no_live_mutation"
+        ]
+      }
+    }
+  ],
+  "golden_confidence_matrix": [
+    {
+      "scenario_id": "*",
+      "surface": "robot_json",
+      "determinism": "deterministic",
+      "platform_dependent": false,
+      "volatility": 2,
+      "comparison_strategy": "canonical_json",
+      "canonicalizer": "herd_wave_v1_static",
+      "contract_requirements": [
+        "root_fields",
+        "reason_codes",
+        "privacy_flags"
+      ],
+      "owner_command": "cargo test -p frankenterm-core --test herd_wave_conformance",
+      "update_command": "UPDATE_HERD_WAVE_GOLDENS=1 tests/e2e/test_herd_wave_contract.sh --update-goldens",
+      "review_required": true
+    },
+    {
+      "scenario_id": "*",
+      "surface": "robot_toon",
+      "determinism": "deterministic",
+      "platform_dependent": false,
+      "volatility": 2,
+      "comparison_strategy": "canonical_toon",
+      "canonicalizer": "herd_wave_v1_static",
+      "contract_requirements": [
+        "toon_roundtrip",
+        "reason_codes",
+        "unavailable_sources"
+      ],
+      "owner_command": "cargo test -p frankenterm-core --test herd_wave_conformance",
+      "update_command": "UPDATE_HERD_WAVE_GOLDENS=1 tests/e2e/test_herd_wave_contract.sh --update-goldens",
+      "review_required": true
+    },
+    {
+      "scenario_id": "*",
+      "surface": "doctor_json",
+      "determinism": "deterministic",
+      "platform_dependent": false,
+      "volatility": 3,
+      "comparison_strategy": "structural",
+      "canonicalizer": "herd_wave_v1_static",
+      "contract_requirements": [
+        "state_distinction",
+        "dry_run_only"
+      ],
+      "owner_command": "cargo test -p frankenterm --bin ft herd_wave",
+      "update_command": "none",
+      "review_required": true
+    },
+    {
+      "scenario_id": "*",
+      "surface": "e2e_jsonl",
+      "determinism": "platform_dependent",
+      "platform_dependent": true,
+      "volatility": 4,
+      "comparison_strategy": "scrubbed_jsonl",
+      "canonicalizer": "scrub_run_id,scrub_selected_worker,scrub_artifact_root",
+      "contract_requirements": [
+        "structured_logs",
+        "rch_fail_closed"
+      ],
+      "owner_command": "tests/e2e/test_herd_wave_contract.sh --run-rust-proof",
+      "update_command": "none",
+      "review_required": true
+    },
+    {
+      "scenario_id": "*",
+      "surface": "mcp_resource",
+      "determinism": "deterministic",
+      "platform_dependent": false,
+      "volatility": 2,
+      "comparison_strategy": "planned_follow_up",
+      "canonicalizer": "herd_wave_v1_static",
+      "contract_requirements": [
+        "read_only_mcp_parity"
+      ],
+      "owner_command": "br show ft-5bwjf.8 --json",
+      "update_command": "none",
+      "review_required": true
+    }
+  ]
+}
