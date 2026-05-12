@@ -1,0 +1,102 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "durable-state-checkpoint-tlc-attestation",
+  "category": "proofs/durable-state-checkpoint",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T14:01:10Z",
+  "produced_by_bead": "ft-tf6g3.18.3",
+  "status": "pass",
+  "proof_category": 6,
+  "scope": "Machine-readable attestation for the durable_state checkpoint and rollback atomicity TLA+ model.",
+  "model": {
+    "spec": "docs/specs/durable-state-checkpoint.tla",
+    "cfg": "docs/specs/durable-state-checkpoint.cfg",
+    "mapping": "docs/specs/durable-state-checkpoint-mapping.md",
+    "release_bundle_slot": "proofs/durable-state-checkpoint.json",
+    "bounded_model": {
+      "entities": 2,
+      "states": ["running", "draining"],
+      "entity_absent_sentinel": "absent",
+      "topology_values": ["none", "base", "expanded"],
+      "max_steps": 3,
+      "covered_transitions": [
+        "checkpoint",
+        "live registry mutation",
+        "live topology mutation",
+        "test-only checkpoint corruption",
+        "successful rollback",
+        "missing target rollback failure",
+        "rolled-back target rollback failure",
+        "invalid checkpoint rollback failure"
+      ]
+    }
+  },
+  "tlc_run": {
+    "status": "pass",
+    "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/durable-state-checkpoint.tla",
+    "local_bounded_run": true,
+    "rch_remote_available": false,
+    "rch_note": "No RCH remote proof was used for this non-Cargo TLC wrapper; no local Cargo or build proof was run.",
+    "state_count": 1804,
+    "distinct_state_count": 479,
+    "time_budget_seconds": 30,
+    "timed_out": false,
+    "artifacts": {
+      "summary": "target/tlc/durable-state-checkpoint/summary.json",
+      "stdout": "target/tlc/durable-state-checkpoint/tlc.stdout.log",
+      "stderr": "target/tlc/durable-state-checkpoint/tlc.stderr.log"
+    }
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/specs/durable-state-checkpoint.tla",
+      "media_type": "text/plain",
+      "sha256": "2d0adf5dee16fc32d37d99ef13c9db7d7d430665ad421adb77f98f46c2277c7e",
+      "size_bytes": 12431
+    },
+    {
+      "path": "docs/specs/durable-state-checkpoint.cfg",
+      "media_type": "text/plain",
+      "sha256": "8cc263652d58e8b107fc9e531e4a70ee822c20055f0af03428c9cf0fa3d03d23",
+      "size_bytes": 132
+    },
+    {
+      "path": "docs/specs/durable-state-checkpoint-mapping.md",
+      "media_type": "text/markdown",
+      "sha256": "6ffcab625e4ee0e196eef89fdfc285261811db3ff1e7ab7a2ea75247636b62e1",
+      "size_bytes": 4392
+    },
+    {
+      "path": "scripts/run-tlc.sh",
+      "media_type": "text/x-shellscript",
+      "sha256": "a245a3c2aa17e216323afc969590c6c0c77127a515e62b7c190ca2191a862164",
+      "size_bytes": 7350
+    }
+  ],
+  "validation": [
+    {
+      "command": "jq empty docs/attestations/proofs/durable-state-checkpoint.json",
+      "status": "pass"
+    },
+    {
+      "command": "scripts/check-spec-conventions.sh",
+      "status": "pass",
+      "result": "7 spec(s) passed"
+    },
+    {
+      "command": "scripts/run-tlc.sh --dry-run docs/specs/durable-state-checkpoint.tla",
+      "status": "pass",
+      "result": "TLC command targets target/tlc/durable-state-checkpoint/module/DurableStateCheckpoint.tla and sibling cfg"
+    },
+    {
+      "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/durable-state-checkpoint.tla",
+      "status": "pass",
+      "result": "1804 states generated; 479 distinct states; no timeout"
+    }
+  ],
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-tf6g3.1",
+    "reason": "ft-tf6g3.18.3 publishes the per-subsystem proof artifact; release-bundle category wiring remains owned by ft-tf6g3.1/G16."
+  }
+}
