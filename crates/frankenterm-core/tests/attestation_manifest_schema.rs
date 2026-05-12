@@ -43,6 +43,14 @@ fn manifest_validator() -> Validator {
         .unwrap_or_else(|err| panic!("manifest schema failed to compile: {err}"))
 }
 
+fn bundle_validator() -> Validator {
+    let schema = load_attestation_schema();
+    Validator::options()
+        .with_draft(Draft::Draft202012)
+        .build(&schema)
+        .unwrap_or_else(|err| panic!("bundle schema failed to compile: {err}"))
+}
+
 fn validate(schema: &Validator, instance: &Value) -> Vec<String> {
     match schema.validate(instance) {
         Ok(()) => Vec::new(),
@@ -67,6 +75,31 @@ fn base_slot(path: Value) -> Value {
         "media_type": "application/json",
         "produced_by_bead": "ft-syqcz.3",
         "description": "headline claims matrix"
+    })
+}
+
+fn base_bundle(signature: Value) -> Value {
+    json!({
+        "schema_version": "1.0.0",
+        "release": {
+            "version": "0.2.0",
+            "tag": "v0.2.0",
+            "channel": "stable"
+        },
+        "generated_at": "2026-05-12T00:00:00Z",
+        "generator": {
+            "name": "scripts/attestation-build.sh",
+            "version": "1.2.0"
+        },
+        "git": {
+            "commit": "0123456789abcdef0123456789abcdef01234567",
+            "tree": "89abcdef0123456789abcdef0123456789abcdef",
+            "branch": "main"
+        },
+        "artifacts": [],
+        "required_categories": [],
+        "deferred_slots": [],
+        "signature": signature
     })
 }
 
@@ -126,5 +159,37 @@ fn checked_in_manifest_validates_against_deferred_slot_schema() {
         errors.is_empty(),
         "checked-in manifest failed validation:\n{}",
         errors.join("\n")
+    );
+}
+
+#[test]
+fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
+    let validator = bundle_validator();
+    let valid = base_bundle(json!({
+        "method": "sigstore-cosign-keyless",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "sigstore_bundle": {
+            "path": "docs/attestations/0.2.0.sigstore",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "size_bytes": 4096
+        },
+        "certificate_identity": "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
+        "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+    }));
+    assert!(
+        validate(&validator, &valid).is_empty(),
+        "sigstore signature with hashed bundle metadata should validate"
+    );
+
+    let legacy_bundle_path_only = base_bundle(json!({
+        "method": "sigstore-cosign-keyless",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "bundle_path": "docs/attestations/0.2.0.sigstore",
+        "certificate_identity": "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
+        "certificate_oidc_issuer": "https://token.actions.githubusercontent.com"
+    }));
+    assert!(
+        !validate(&validator, &legacy_bundle_path_only).is_empty(),
+        "sigstore signature without signature.sigstore_bundle must fail validation"
     );
 }

@@ -269,17 +269,20 @@ jobs:
           scripts/attestation-build.sh \
             --version "${{ steps.version.outputs.version }}" \
             --channel "$channel" \
-            --sign cosign
+            --sign cosign \
+            --strict-deferred
           # Verify what we just built; CI fails the release if anything diverges.
           scripts/attestation-verify.sh \
             "docs/attestations/${{ steps.version.outputs.version }}.json" \
-            --strict-required
+            --strict-required \
+            --strict-deferred
           # Stage attestation files alongside the binary archives so they ship with the release.
           cp \
             "docs/attestations/${{ steps.version.outputs.version }}.json" \
             "docs/attestations/${{ steps.version.outputs.version }}.sigstore" \
             "docs/attestations/${{ steps.version.outputs.version }}.canonical.json" \
             "docs/attestations/schema.json" \
+            "docs/attestations/SIGNING.md" \
             dist/
 
       - uses: softprops/action-gh-release@v2

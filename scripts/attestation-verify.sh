@@ -223,29 +223,56 @@ fi
 sig_method="$(jq -r '.signature.method // ""' <<<"$bundle_json")"
 case "$sig_method" in
   sigstore-cosign-keyless)
-    if ! command -v cosign >/dev/null 2>&1; then
-      record_check "signature" false "cosign not installed; cannot verify sigstore-cosign-keyless"
+    sigstore_path="$(jq -r '.signature.sigstore_bundle.path // ""' <<<"$bundle_json")"
+    sigstore_expected_hash="$(jq -r '.signature.sigstore_bundle.sha256 // ""' <<<"$bundle_json")"
+    sigstore_expected_size="$(jq -r '.signature.sigstore_bundle.size_bytes // ""' <<<"$bundle_json")"
+    sigstore_ok=0
+    if [[ -z "$sigstore_path" || "$sigstore_path" == /* ]]; then
+      record_check "sigstore_bundle" false "signature.sigstore_bundle.path must be repo-relative"
+    elif ! is_hex_len "$sigstore_expected_hash" 64; then
+      record_check "sigstore_bundle" false "signature.sigstore_bundle.sha256 must be a 32-byte hex SHA-256"
+    elif [[ ! "$sigstore_expected_size" =~ ^[0-9]+$ || "$sigstore_expected_size" -lt 1 ]]; then
+      record_check "sigstore_bundle" false "signature.sigstore_bundle.size_bytes must be a positive integer"
     else
-      sigstore_path="$(jq -r '.signature.bundle_path' <<<"$bundle_json")"
-      cert_identity="$(jq -r '.signature.certificate_identity' <<<"$bundle_json")"
-      cert_issuer="$(jq -r '.signature.certificate_oidc_issuer' <<<"$bundle_json")"
       sigstore_abs="$REPO_ROOT/$sigstore_path"
       if [[ ! -f "$sigstore_abs" ]]; then
-        record_check "signature" false "sigstore bundle missing: $sigstore_path"
+        record_check "sigstore_bundle" false "sigstore bundle missing: $sigstore_path"
       else
-        canon_tmp="$(mktemp)"
-        printf '%s' "$canonical_payload" > "$canon_tmp"
-        if cosign verify-blob \
-            --bundle "$sigstore_abs" \
-            --certificate-identity "$cert_identity" \
-            --certificate-oidc-issuer "$cert_issuer" \
-            "$canon_tmp" >/dev/null 2>&1; then
-          record_check "signature" true "cosign verify-blob ok (identity=$cert_identity)"
+        sigstore_actual_hash="$(sha256_file "$sigstore_abs")"
+        sigstore_actual_size="$(wc -c < "$sigstore_abs" | tr -d ' ')"
+        if [[ "$sigstore_actual_hash" != "$sigstore_expected_hash" ]]; then
+          record_check "sigstore_bundle" false "sha256 mismatch (expected $sigstore_expected_hash, got $sigstore_actual_hash)"
+        elif [[ "$sigstore_actual_size" != "$sigstore_expected_size" ]]; then
+          record_check "sigstore_bundle" false "size mismatch (expected $sigstore_expected_size, got $sigstore_actual_size)"
         else
-          record_check "signature" false "cosign verify-blob failed (identity=$cert_identity, issuer=$cert_issuer)"
+          record_check "sigstore_bundle" true "sha256 + size ok"
+          sigstore_ok=1
         fi
-        rm -f "$canon_tmp"
       fi
+    fi
+
+    cert_identity="$(jq -r '.signature.certificate_identity // ""' <<<"$bundle_json")"
+    cert_issuer="$(jq -r '.signature.certificate_oidc_issuer // ""' <<<"$bundle_json")"
+    if [[ -z "$cert_identity" || -z "$cert_issuer" ]]; then
+      record_check "signature" false "sigstore certificate_identity and certificate_oidc_issuer are required"
+    elif [[ "$sigstore_ok" != "1" ]]; then
+      record_check "signature" false "sigstore bundle metadata did not validate"
+    elif ! command -v cosign >/dev/null 2>&1; then
+      record_check "signature" false "cosign not installed; cannot verify sigstore-cosign-keyless"
+    else
+      sigstore_abs="$REPO_ROOT/$sigstore_path"
+      canon_tmp="$(mktemp)"
+      printf '%s' "$canonical_payload" > "$canon_tmp"
+      if cosign verify-blob \
+          --bundle "$sigstore_abs" \
+          --certificate-identity "$cert_identity" \
+          --certificate-oidc-issuer "$cert_issuer" \
+          "$canon_tmp" >/dev/null 2>&1; then
+        record_check "signature" true "cosign verify-blob ok (identity=$cert_identity)"
+      else
+        record_check "signature" false "cosign verify-blob failed (identity=$cert_identity, issuer=$cert_issuer)"
+      fi
+      rm -f "$canon_tmp"
     fi
     ;;
   ed25519)

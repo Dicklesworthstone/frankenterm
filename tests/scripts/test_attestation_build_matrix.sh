@@ -23,6 +23,86 @@ require_cmd() {
   fi
 }
 
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${file}" | awk '{print $1}'
+  else
+    shasum -a 256 "${file}" | awk '{print $1}'
+  fi
+}
+
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+install_fake_cosign() {
+  local fake_bin="$1"
+  mkdir -p "${fake_bin}"
+  cat >"${fake_bin}/cosign" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+cmd="${1:-}"
+shift || true
+case "${cmd}" in
+  sign-blob)
+    bundle=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --yes) shift ;;
+        --bundle) bundle="${2:?--bundle requires a path}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ -n "${bundle}" ]] || { echo "fake cosign: missing --bundle" >&2; exit 2; }
+    mkdir -p "$(dirname "${bundle}")"
+    jq -n '{
+      mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+      verificationMaterial: {
+        certificate: {rawBytes: "ZmFrZS1mdWxjaW8tY2VydA=="},
+        tlogEntries: [{
+          logIndex: "1",
+          inclusionPromise: {signedEntryTimestamp: "ZmFrZS1zZXQ="},
+          inclusionProof: {
+            logIndex: "1",
+            rootHash: "ZmFrZQ==",
+            treeSize: "1",
+            hashes: [],
+            checkpoint: {envelope: "rekor.sigstore.dev fake checkpoint"}
+          }
+        }]
+      },
+      messageSignature: {
+        messageDigest: {algorithm: "SHA2_256", digest: "ZmFrZS1kaWdlc3Q="},
+        signature: "ZmFrZS1zaWduYXR1cmU="
+      }
+    }' >"${bundle}"
+    ;;
+  verify-blob)
+    bundle=""
+    blob=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --bundle) bundle="${2:?--bundle requires a path}"; shift 2 ;;
+        --certificate-identity|--certificate-oidc-issuer) shift 2 ;;
+        *) blob="$1"; shift ;;
+      esac
+    done
+    [[ -f "${bundle}" && -f "${blob}" ]] || exit 1
+    ;;
+  *)
+    echo "fake cosign: unsupported command ${cmd}" >&2
+    exit 2
+    ;;
+esac
+EOS
+  chmod +x "${fake_bin}/cosign"
+}
+
 json_slot() {
   local path_json="$1"
   local deferred_to_bead="$2"
@@ -141,6 +221,137 @@ run_case() {
   echo "PASS ${name}"
 }
 
+run_sigstore_cases() {
+  local fake_bin="${ARTIFACT_ROOT}/fake-cosign-bin"
+  install_fake_cosign "${fake_bin}"
+
+  local build_name="cosign_build_records_sigstore_hash"
+  local build_dir="${ARTIFACT_ROOT}/${build_name}"
+  local manifest="${build_dir}/manifest.json"
+  local out_dir="${build_dir}/out"
+  local version="0.0.0-cosign-metadata"
+  local rc=0
+  mkdir -p "${build_dir}" "${out_dir}"
+  write_manifest "${manifest}" "$(json_slot '"docs/attestations/schema.json"' "" "")"
+
+  set +e
+  PATH="${fake_bin}:$PATH" \
+  COSIGN_IDENTITY="https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v${version}" \
+  COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com" \
+  FT_ATTESTATION_MANIFEST="${manifest}" \
+  FT_ATTESTATION_OUT_DIR="${out_dir}" \
+  FT_BEAD_ID="ft-tf6g3.22" \
+  FT_SCENARIO_ID="attestation_sigstore_metadata_build" \
+    bash "${ROOT_DIR}/scripts/attestation-build.sh" \
+      --version "${version}" \
+      --channel stable \
+      --sign cosign >"${build_dir}/stdout.txt" 2>"${build_dir}/stderr.txt"
+  rc=$?
+  set -e
+
+  total=$((total + 1))
+  if [[ "${rc}" != "0" ]]; then
+    fail=$((fail + 1))
+    record_result "${build_name}" "0" "${rc}" "failed" "${build_dir}"
+    echo "FAIL ${build_name}: build failed" >&2
+    return 0
+  fi
+  local built_bundle="${out_dir}/${version}.json"
+  local built_sigstore="${out_dir}/${version}.sigstore"
+  local recorded_hash recorded_size actual_hash actual_size
+  recorded_hash="$(jq -r '.signature.sigstore_bundle.sha256 // ""' "${built_bundle}")"
+  recorded_size="$(jq -r '.signature.sigstore_bundle.size_bytes // ""' "${built_bundle}")"
+  actual_hash="$(sha256_file "${built_sigstore}")"
+  actual_size="$(wc -c < "${built_sigstore}" | tr -d ' ')"
+  if [[ "${recorded_hash}" != "${actual_hash}" || "${recorded_size}" != "${actual_size}" ]]; then
+    fail=$((fail + 1))
+    record_result "${build_name}" "0" "metadata_mismatch" "failed" "${build_dir}"
+    echo "FAIL ${build_name}: sigstore hash/size metadata mismatch" >&2
+    return 0
+  fi
+  pass=$((pass + 1))
+  record_result "${build_name}" "0" "0" "passed" "${build_dir}"
+  echo "PASS ${build_name}"
+
+  local verify_name="verify_checks_sigstore_hash_before_cosign"
+  local verify_dir="${ARTIFACT_ROOT}/${verify_name}"
+  local sigstore_path="docs/attestations/schema.json"
+  local sigstore_hash sigstore_size no_sig canonical_payload canonical_sha verify_bundle bad_bundle
+  mkdir -p "${verify_dir}"
+  sigstore_hash="$(sha256_file "${ROOT_DIR}/${sigstore_path}")"
+  sigstore_size="$(wc -c < "${ROOT_DIR}/${sigstore_path}" | tr -d ' ')"
+  no_sig="$(jq -n '{
+    schema_version: "1.0.0",
+    release: {version: "0.2.0", tag: "v0.2.0", channel: "stable"},
+    generated_at: "2026-05-12T00:00:00Z",
+    generator: {name: "scripts/attestation-build.sh", version: "1.2.0"},
+    git: {
+      commit: "0123456789abcdef0123456789abcdef01234567",
+      tree: "89abcdef0123456789abcdef0123456789abcdef",
+      branch: "main"
+    },
+    artifacts: [{
+      category: "doctrine/agents-md-counts",
+      path: "docs/attestations/schema.json",
+      media_type: "application/json",
+      sha256: "",
+      size_bytes: 0
+    }],
+    required_categories: ["doctrine/agents-md-counts"],
+    deferred_slots: []
+  }')"
+  no_sig="$(jq \
+    --arg artifact_sha "${sigstore_hash}" \
+    --argjson artifact_size "${sigstore_size}" \
+    '.artifacts[0].sha256 = $artifact_sha | .artifacts[0].size_bytes = $artifact_size' \
+    <<<"${no_sig}")"
+  canonical_payload="$(jq -S -c '.' <<<"${no_sig}")"
+  canonical_sha="$(printf '%s' "${canonical_payload}" | sha256_stdin)"
+  verify_bundle="${verify_dir}/sigstore-valid.json"
+  bad_bundle="${verify_dir}/sigstore-bad-hash.json"
+  jq \
+    --arg canonical_sha "${canonical_sha}" \
+    --arg sigstore_path "${sigstore_path}" \
+    --arg sigstore_hash "${sigstore_hash}" \
+    --argjson sigstore_size "${sigstore_size}" \
+    '. + {signature: {
+      method: "sigstore-cosign-keyless",
+      canonical_sha256: $canonical_sha,
+      sigstore_bundle: {path: $sigstore_path, sha256: $sigstore_hash, size_bytes: $sigstore_size},
+      certificate_identity: "https://github.com/frankensuite/frankenterm/.github/workflows/release.yml@refs/tags/v0.2.0",
+      certificate_oidc_issuer: "https://token.actions.githubusercontent.com"
+    }}' <<<"${no_sig}" >"${verify_bundle}"
+  jq '.signature.sigstore_bundle.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
+    "${verify_bundle}" >"${bad_bundle}"
+
+  set +e
+  PATH="${fake_bin}:$PATH" bash "${ROOT_DIR}/scripts/attestation-verify.sh" "${verify_bundle}" >"${verify_dir}/valid.out" 2>&1
+  rc=$?
+  set -e
+  total=$((total + 1))
+  if [[ "${rc}" != "0" ]]; then
+    fail=$((fail + 1))
+    record_result "${verify_name}" "0" "${rc}" "failed" "${verify_dir}"
+    echo "FAIL ${verify_name}: valid sigstore bundle did not verify" >&2
+    return 0
+  fi
+
+  set +e
+  PATH="${fake_bin}:$PATH" bash "${ROOT_DIR}/scripts/attestation-verify.sh" "${bad_bundle}" >"${verify_dir}/bad.out" 2>&1
+  rc=$?
+  set -e
+  if [[ "${rc}" == "0" ]] || ! grep -q "sigstore_bundle" "${verify_dir}/bad.out"; then
+    fail=$((fail + 1))
+    record_result "${verify_name}" "hash_mismatch_failure" "${rc}" "failed" "${verify_dir}"
+    echo "FAIL ${verify_name}: bad sigstore hash was not rejected" >&2
+    return 0
+  fi
+
+  pass=$((pass + 1))
+  record_result "${verify_name}" "hash_mismatch_failure" "${rc}" "passed" "${verify_dir}"
+  echo "PASS ${verify_name}"
+}
+
 require_cmd bash
 require_cmd jq
 require_cmd git
@@ -211,6 +422,8 @@ run_case \
   "" \
   0 \
   --allow-partial
+
+run_sigstore_cases
 
 jq -n \
   --arg bead_id "ft-e87u6.2" \

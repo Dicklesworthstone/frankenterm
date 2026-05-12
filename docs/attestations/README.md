@@ -14,7 +14,7 @@ in [`docs/reality-check-bridge-plan.md`](../reality-check-bridge-plan.md).
 | `schema.json` | JSON Schema (2020-12) describing the bundle structure. Semver-stable; new categories require a schema bump. |
 | `manifest.json` | Canonical declarative input list. Per-category slots map to the artifact path the producing bead must emit. The build script reads this. |
 | `<version>.json` | The signed bundle for a specific release. Lists every artifact (path + SHA-256 + size + producing-bead pointer) plus the signature info. |
-| `<version>.sigstore` | (sigstore-signed bundles only) cosign sigstore bundle — cert chain + signature over the canonical signing payload. |
+| `<version>.sigstore` | (sigstore-signed bundles only) cosign sigstore bundle — Fulcio certificate, Rekor verification material, and signature over the canonical signing payload. |
 
 ## Required artifact categories
 
@@ -60,7 +60,10 @@ scripts/attestation-build.sh --version 0.0.0-dev --channel dev --sign unsigned -
 
 `--sign cosign` requires `cosign` on PATH and `COSIGN_IDENTITY` in the environment (the
 expected SAN/identity, typically the GitHub Actions workflow ref). The release CI lane
-sets these automatically. `--sign ed25519` requires `openssl`, `xxd`, and a
+sets these automatically and records the emitted `.sigstore` file under
+`signature.sigstore_bundle` with path, SHA-256, and size. The signing identity,
+Fulcio/Rekor trust model, and third-party verification flow are documented in
+[`SIGNING.md`](SIGNING.md). `--sign ed25519` requires `openssl`, `xxd`, and a
 PEM-encoded Ed25519 private key path in `ED25519_PRIVATE_KEY_PATH`; it emits
 `<version>.ed25519.sig.hex` beside the bundle and records the matching raw
 32-byte public key in `signature.public_key`.
@@ -75,8 +78,9 @@ scripts/attestation-verify.sh docs/attestations/0.2.0.json
 # JSON output for AI/tooling consumers.
 scripts/attestation-verify.sh docs/attestations/0.2.0.json --json
 
-# CI mode — also fail if the bundle's required_categories diverges from manifest.json.
-scripts/attestation-verify.sh docs/attestations/0.2.0.json --strict-required
+# CI mode — also fail if required_categories diverges from manifest.json
+# or if any deferred slots remain in the bundle.
+scripts/attestation-verify.sh docs/attestations/0.2.0.json --strict-required --strict-deferred
 ```
 
 Exit code: `0` on full pass, `1` on any failure, `2` on usage error.
@@ -85,6 +89,12 @@ Ed25519 bundles use the same canonical signing payload. The schema records a
 32-byte hex public key in `signature.public_key` and a repo-relative
 `signature.signature_path` file containing the raw 64-byte signature as hex.
 The verifier decodes both and checks the payload with OpenSSL.
+
+Sigstore bundles also use the same canonical payload. The schema records
+`signature.sigstore_bundle.path`, `signature.sigstore_bundle.sha256`, and
+`signature.sigstore_bundle.size_bytes`; the verifier checks those bytes before
+delegating to `cosign verify-blob` with the recorded certificate identity and
+OIDC issuer.
 
 ## Canonical signing payload
 

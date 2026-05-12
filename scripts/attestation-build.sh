@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-GENERATOR_VERSION="1.1.0"
+GENERATOR_VERSION="1.2.0"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="${FT_ATTESTATION_MANIFEST:-$REPO_ROOT/docs/attestations/manifest.json}"
 OUT_DIR="${FT_ATTESTATION_OUT_DIR:-$REPO_ROOT/docs/attestations}"
@@ -361,14 +361,28 @@ case "$SIGN_METHOD" in
       --yes \
       --bundle "$sig_path" \
       "$canon_path"
+    sigstore_hash="$(sha256_file "$sig_path")"
+    sigstore_size="$(wc -c < "$sig_path" | tr -d ' ')"
 
     sig_obj="$(jq -n \
       --arg method "sigstore-cosign-keyless" \
       --arg canonical_sha256 "$canonical_sha" \
-      --arg bundle_path "docs/attestations/${VERSION}.sigstore" \
+      --arg sigstore_path "docs/attestations/${VERSION}.sigstore" \
+      --arg sigstore_sha256 "$sigstore_hash" \
+      --argjson sigstore_size_bytes "$sigstore_size" \
       --arg certificate_identity "$COSIGN_IDENTITY" \
       --arg certificate_oidc_issuer "$COSIGN_OIDC_ISSUER" \
-      '{method:$method, canonical_sha256:$canonical_sha256, bundle_path:$bundle_path, certificate_identity:$certificate_identity, certificate_oidc_issuer:$certificate_oidc_issuer}')"
+      '{
+        method: $method,
+        canonical_sha256: $canonical_sha256,
+        sigstore_bundle: {
+          path: $sigstore_path,
+          sha256: $sigstore_sha256,
+          size_bytes: $sigstore_size_bytes
+        },
+        certificate_identity: $certificate_identity,
+        certificate_oidc_issuer: $certificate_oidc_issuer
+      }')"
     ;;
   ed25519)
     command -v openssl >/dev/null 2>&1 || { echo "error: openssl not installed; required for --sign ed25519" >&2; exit 1; }

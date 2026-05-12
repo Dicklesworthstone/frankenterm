@@ -171,6 +171,27 @@
         "description": { "type": "string" }
       }
     },
+    "sigstoreBundle": {
+      "type": "object",
+      "required": ["path", "sha256", "size_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Repo-relative path to the cosign sigstore bundle emitted beside the release attestation JSON.",
+          "type": "string",
+          "pattern": "^[^/].*$"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the sigstore bundle bytes. This binds the external .sigstore file to the signed JSON bundle.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
     "manifestSlot": {
       "type": "object",
       "required": ["category", "path", "media_type", "produced_by_bead", "description"],
@@ -260,10 +281,7 @@
         {
           "properties": {
             "method": { "const": "sigstore-cosign-keyless" },
-            "bundle_path": {
-              "description": "Repo-relative path to the sigstore bundle (cosign-bundle JSON).",
-              "type": "string"
-            },
+            "sigstore_bundle": { "$ref": "#/$defs/sigstoreBundle" },
             "certificate_identity": {
               "description": "Expected SAN/identity (typically the GitHub Actions workflow ref).",
               "type": "string"
@@ -274,7 +292,7 @@
               "format": "uri"
             }
           },
-          "required": ["method", "bundle_path", "certificate_identity", "certificate_oidc_issuer"]
+          "required": ["method", "sigstore_bundle", "certificate_identity", "certificate_oidc_issuer"]
         },
         {
           "properties": {
