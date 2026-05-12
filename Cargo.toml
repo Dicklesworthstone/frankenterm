@@ -25,6 +25,7 @@ members = [
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
+    "crates/ft-perf-gate",
     "lints/cx_propagation",
     "crates/frankenterm-core-test-macros",
     "fuzz",
@@ -96,6 +97,7 @@ default-members = [
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
+    "crates/ft-perf-gate",
     "fuzz",
 ]
 

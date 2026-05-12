@@ -1062,7 +1062,7 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
 ### Workspace Structure
 
 ```
-frankenterm/                              # <!--count:workspace_members-->74<!--/count--> workspace crates (auto-stamped by scripts/stamp-readme-counts.sh; ft-i2eni.5)
+frankenterm/                              # <!--count:workspace_members-->75<!--/count--> workspace crates (auto-stamped by scripts/stamp-readme-counts.sh; ft-i2eni.5)
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft) — 55k+ lines
 │   ├── frankenterm-core/                 # Core library — <!--count:core_top_level_modules-->504<!--/count--> top-level modules, <!--count:core_loc-->983357<!--/count--> lines
@@ -1559,6 +1559,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*<!--count:workspace_members-->74<!--/count--> workspace crates. <!--count:core_top_level_modules-->504<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->983357<!--/count-->+ lines. <!--count:test_count-->55188<!--/count-->+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
+*<!--count:workspace_members-->75<!--/count--> workspace crates. <!--count:core_top_level_modules-->504<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->983357<!--/count-->+ lines. <!--count:test_count-->55188<!--/count-->+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>
