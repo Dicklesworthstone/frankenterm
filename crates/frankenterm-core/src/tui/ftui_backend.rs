@@ -28,7 +28,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::query::QueryClient;
+use super::command_handoff::quote_command_arg;
+use super::query::{QueryClient, SavedSearchView};
 use super::view_adapters::{
     HealthModel, PaneRow, SearchRow, TimelineRow, TriageRow, WorkflowRow, adapt_event,
     adapt_health, adapt_history, adapt_pane, adapt_search, adapt_timeline_event, adapt_triage,
@@ -538,7 +539,7 @@ pub struct WaModel {
     triage_selected: usize,
     triage_expanded: Option<usize>,
     workflows: Vec<WorkflowRow>,
-    // Queued action command from triage (consumed by the event loop).
+    // Queued action command from view handlers (consumed by the event loop).
     triage_queued_action: Option<String>,
     // Modal overlay state (FTUI-06.3).
     active_modal: Option<ModalState>,
@@ -547,6 +548,8 @@ pub struct WaModel {
     search_last_query: String,
     search_results: Vec<SearchRow>,
     search_selected: usize,
+    saved_searches: Vec<SavedSearchView>,
+    saved_search_selected: usize,
     // Timeline view state (wa-6sk.4).
     timeline_rows: Vec<TimelineRow>,
     timeline_selected: usize,
@@ -580,6 +583,8 @@ impl WaModel {
             search_last_query: String::new(),
             search_results: Vec::new(),
             search_selected: 0,
+            saved_searches: Vec::new(),
+            saved_search_selected: 0,
             timeline_rows: Vec::new(),
             timeline_selected: 0,
             timeline_zoom: 0,
@@ -911,17 +916,40 @@ impl WaModel {
     ///
     /// Text input: chars append to query, Backspace removes, Enter executes,
     /// Escape clears.  Down/Up navigate results.  Ctrl saved-search shortcuts
-    /// are reserved here so they do not corrupt the query text while the FTUI
-    /// saved-search panel is still being wired.
+    /// cycle and queue saved-search actions without corrupting the query text.
     fn handle_search_key(&mut self, key: &ftui::KeyEvent) -> ftui::Cmd<WaMsg> {
         use ftui::KeyCode;
 
         let plain_char = !has_command_modifier(key);
 
         match key.code {
-            KeyCode::Char('n' | 'p' | 'r' | 'e')
-                if key.modifiers.contains(ftui::Modifiers::CTRL) =>
-            {
+            KeyCode::Char('n') if key.modifiers.contains(ftui::Modifiers::CTRL) => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                let count = self.saved_searches.len();
+                if count > 0 {
+                    self.saved_search_selected = (self.saved_search_selected + 1) % count;
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Char('p') if key.modifiers.contains(ftui::Modifiers::CTRL) => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                let count = self.saved_searches.len();
+                if count > 0 {
+                    self.saved_search_selected = self
+                        .saved_search_selected
+                        .checked_sub(1)
+                        .unwrap_or(count - 1);
+                }
+                ftui::Cmd::None
+            }
+            KeyCode::Char('r') if key.modifiers.contains(ftui::Modifiers::CTRL) => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                self.queue_selected_saved_search_run();
+                ftui::Cmd::None
+            }
+            KeyCode::Char('e') if key.modifiers.contains(ftui::Modifiers::CTRL) => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                self.queue_selected_saved_search_toggle();
                 ftui::Cmd::None
             }
             KeyCode::Char(c) if plain_char => {
@@ -1003,6 +1031,44 @@ impl WaModel {
                 ftui::Cmd::None
             }
             _ => ftui::Cmd::None,
+        }
+    }
+
+    fn selected_saved_search(&self) -> Option<&SavedSearchView> {
+        self.saved_searches.get(self.saved_search_selected)
+    }
+
+    fn queue_selected_saved_search_run(&mut self) {
+        if let Some(name) = self.selected_saved_search().map(|saved| saved.name.clone()) {
+            self.triage_queued_action =
+                Some(format!("ft search saved run {}", quote_command_arg(&name)));
+        } else {
+            self.triage_queued_action = None;
+            self.view_state.error_message = Some("No saved search selected".to_string());
+        }
+    }
+
+    fn queue_selected_saved_search_toggle(&mut self) {
+        let Some(saved) = self.selected_saved_search().cloned() else {
+            self.triage_queued_action = None;
+            self.view_state.error_message = Some("No saved search selected".to_string());
+            return;
+        };
+
+        if saved.enabled {
+            self.triage_queued_action = Some(format!(
+                "ft search saved disable {}",
+                quote_command_arg(&saved.name)
+            ));
+        } else if saved.schedule_interval_ms.is_some() {
+            self.triage_queued_action = Some(format!(
+                "ft search saved enable {}",
+                quote_command_arg(&saved.name)
+            ));
+        } else {
+            self.triage_queued_action = None;
+            self.view_state.error_message =
+                Some("Saved search has no schedule; set one via `ft search saved schedule`".into());
         }
     }
 
@@ -1253,6 +1319,25 @@ impl WaModel {
             Err(_) => { /* non-fatal */ }
         }
 
+        // Saved searches for Search view.
+        match self.query.list_saved_searches() {
+            Ok(saved_searches) => {
+                self.saved_searches = saved_searches;
+                if self.saved_searches.is_empty() {
+                    self.saved_search_selected = 0;
+                } else {
+                    self.saved_search_selected = self
+                        .saved_search_selected
+                        .min(self.saved_searches.len() - 1);
+                }
+            }
+            Err(e) => {
+                self.view_state.error_message = Some(format!("Failed to list saved searches: {e}"));
+                self.saved_searches.clear();
+                self.saved_search_selected = 0;
+            }
+        }
+
         // Timeline data (wa-6sk.4): last 30m, zoom-aware limit.
         let timeline_limit = match self.timeline_zoom {
             0 => 50,
@@ -1437,6 +1522,8 @@ impl ftui::Model for WaModel {
                 &self.search_last_query,
                 &self.search_results,
                 self.search_selected,
+                &self.saved_searches,
+                self.saved_search_selected,
             ),
             View::Help => render_help_view(frame, content_y, width, content_h),
             View::Events => {
@@ -2046,6 +2133,8 @@ fn render_search_view(
     last_query: &str,
     results: &[SearchRow],
     selected: usize,
+    saved_searches: &[SavedSearchView],
+    saved_selected: usize,
 ) {
     if height == 0 {
         return;
@@ -2103,6 +2192,67 @@ fn render_search_view(
             write_styled(frame, slen, row, &fill, CellStyle::new());
         }
         row += 1;
+    }
+
+    // -- Saved searches --
+    if row < max_row {
+        let summary = if saved_searches.is_empty() {
+            "  Saved searches: none. Use `ft search save <name> <query>`.".to_string()
+        } else {
+            format!(
+                "  Saved searches ({}): Ctrl+N/P select, Ctrl+R run, Ctrl+E toggle",
+                saved_searches.len()
+            )
+        };
+        write_styled(frame, 0, row, &summary, CellStyle::new().dim());
+        let slen = summary.len() as u16;
+        if slen < width {
+            let fill = " ".repeat((width - slen) as usize);
+            write_styled(frame, slen, row, &fill, CellStyle::new());
+        }
+        row += 1;
+    }
+
+    if !saved_searches.is_empty() {
+        let visible_rows = max_row.saturating_sub(row).min(3);
+        if visible_rows > 0 {
+            let selected_saved = saved_selected.min(saved_searches.len().saturating_sub(1));
+            let start = selected_saved.saturating_sub(visible_rows.saturating_sub(1) as usize);
+            for (idx, saved) in saved_searches
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible_rows as usize)
+            {
+                let marker = if idx == selected_saved { ">" } else { " " };
+                let enabled = if saved.enabled { "on" } else { "off" };
+                let schedule = saved
+                    .schedule_interval_ms
+                    .map_or_else(|| "-".to_string(), |ms| ms.to_string());
+                let line = format!(
+                    "  {marker} {:14} {:3} {:9} {}",
+                    truncate_str(&saved.name, 14),
+                    enabled,
+                    truncate_str(&schedule, 9),
+                    truncate_str(&saved.query, 40),
+                );
+                let style = if idx == selected_saved {
+                    CellStyle::new().reverse()
+                } else {
+                    CellStyle::new()
+                };
+                write_styled(frame, 0, row, &line, style);
+                let llen = line.len() as u16;
+                if llen < width {
+                    let fill = " ".repeat((width - llen) as usize);
+                    write_styled(frame, llen, row, &fill, CellStyle::new());
+                }
+                row += 1;
+                if row >= max_row {
+                    break;
+                }
+            }
+        }
     }
 
     // -- Empty state --
@@ -3211,7 +3361,7 @@ fn render_timeline_view(
                 truncate_str(&trow.summary, detail_width.saturating_sub(2) as usize)
             ),
             String::new(),
-            " Keys: j/k=nav +/-=zoom".to_string(),
+            " Keys: j/k=nav h/l=scroll +/-=zoom".to_string(),
         ];
 
         for line in &detail_lines {
@@ -3499,6 +3649,7 @@ mod tests {
         triage_items_detailed: Vec<TriageItemView>,
         workflows_data: Vec<WorkflowProgressView>,
         search_results: Vec<SearchResultView>,
+        saved_searches: Vec<SavedSearchView>,
         events: Vec<EventView>,
         history_entries: Vec<HistoryEntryView>,
     }
@@ -3513,6 +3664,7 @@ mod tests {
                 triage_items_detailed: Vec::new(),
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
+                saved_searches: Vec::new(),
                 events: vec![],
                 history_entries: vec![],
             }
@@ -3527,6 +3679,7 @@ mod tests {
                 triage_items_detailed: Vec::new(),
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
+                saved_searches: Vec::new(),
                 events: vec![],
                 history_entries: vec![],
             }
@@ -3541,6 +3694,7 @@ mod tests {
                 triage_items_detailed: Vec::new(),
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
+                saved_searches: Vec::new(),
                 history_entries: vec![],
                 events: vec![
                     EventView {
@@ -3585,6 +3739,11 @@ mod tests {
 
         fn with_search_results(mut self, results: Vec<SearchResultView>) -> Self {
             self.search_results = results;
+            self
+        }
+
+        fn with_saved_searches(mut self, saved_searches: Vec<SavedSearchView>) -> Self {
+            self.saved_searches = saved_searches;
             self
         }
 
@@ -3651,6 +3810,7 @@ mod tests {
                     updated_at: 1_700_000_060_000,
                 }],
                 search_results: Vec::new(),
+                saved_searches: Vec::new(),
                 events: vec![],
                 history_entries: vec![],
             }
@@ -3665,6 +3825,7 @@ mod tests {
                 triage_items_detailed: vec![],
                 workflows_data: vec![],
                 search_results: vec![],
+                saved_searches: Vec::new(),
                 events: vec![],
                 history_entries: vec![
                     HistoryEntryView {
@@ -3761,6 +3922,10 @@ mod tests {
 
         fn search(&self, _: &str, _: usize) -> Result<Vec<SearchResultView>, QueryError> {
             Ok(self.search_results.clone())
+        }
+
+        fn list_saved_searches(&self) -> Result<Vec<SavedSearchView>, QueryError> {
+            Ok(self.saved_searches.clone())
         }
 
         fn health(&self) -> Result<HealthStatus, QueryError> {
@@ -4155,6 +4320,16 @@ mod tests {
         model.handle_view_key(&key);
     }
 
+    fn press_modified_key(model: &mut WaModel, code: ftui::KeyCode, modifiers: ftui::Modifiers) {
+        let key = ftui::KeyEvent {
+            code,
+            kind: ftui::KeyEventKind::Press,
+            modifiers,
+        };
+        assert!(model.handle_global_key(&key).is_none());
+        model.handle_view_key(&key);
+    }
+
     #[test]
     fn refresh_data_populates_panes() {
         let mut model = make_model(MockQuery::healthy());
@@ -4355,6 +4530,59 @@ mod tests {
         ]
     }
 
+    fn sample_saved_searches() -> Vec<SavedSearchView> {
+        vec![
+            SavedSearchView {
+                id: "ss-errors".into(),
+                name: "errors".into(),
+                query: "error OR panic".into(),
+                pane_id: None,
+                limit: 50,
+                since_mode: "all".into(),
+                since_ms: None,
+                schedule_interval_ms: Some(60_000),
+                enabled: false,
+                last_run_at: None,
+                last_result_count: None,
+                last_error: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+            SavedSearchView {
+                id: "ss-warnings".into(),
+                name: "warnings".into(),
+                query: "warning".into(),
+                pane_id: Some(42),
+                limit: 50,
+                since_mode: "all".into(),
+                since_ms: None,
+                schedule_interval_ms: Some(60_000),
+                enabled: true,
+                last_run_at: Some(2),
+                last_result_count: Some(3),
+                last_error: None,
+                created_at: 1,
+                updated_at: 2,
+            },
+            SavedSearchView {
+                id: "ss-manual".into(),
+                name: "manual".into(),
+                query: "manual only".into(),
+                pane_id: None,
+                limit: 10,
+                since_mode: "all".into(),
+                since_ms: None,
+                schedule_interval_ms: None,
+                enabled: false,
+                last_run_at: None,
+                last_result_count: None,
+                last_error: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+        ]
+    }
+
     #[test]
     fn search_char_input_appends_to_query() {
         let mut model = make_model(MockQuery::healthy());
@@ -4428,6 +4656,73 @@ mod tests {
     }
 
     #[test]
+    fn refresh_data_populates_saved_searches() {
+        let mut model =
+            make_model(MockQuery::healthy().with_saved_searches(sample_saved_searches()));
+        model.refresh_data();
+
+        assert_eq!(model.saved_searches.len(), 3);
+        assert_eq!(model.saved_search_selected, 0);
+        assert_eq!(model.saved_searches[0].name, "errors");
+    }
+
+    #[test]
+    fn search_ctrl_saved_shortcuts_select_and_queue_actions() {
+        let mut model =
+            make_model(MockQuery::healthy().with_saved_searches(sample_saved_searches()));
+        model.view_state.current_view = View::Search;
+        model.refresh_data();
+        model.search_input.set_text("typed".into());
+
+        press_modified_key(&mut model, ftui::KeyCode::Char('n'), ftui::Modifiers::CTRL);
+        assert_eq!(model.saved_search_selected, 1);
+        assert_eq!(model.search_input.text(), "typed");
+
+        press_modified_key(&mut model, ftui::KeyCode::Char('p'), ftui::Modifiers::CTRL);
+        assert_eq!(model.saved_search_selected, 0);
+
+        press_modified_key(&mut model, ftui::KeyCode::Char('r'), ftui::Modifiers::CTRL);
+        assert_eq!(
+            model.triage_queued_action.as_deref(),
+            Some("ft search saved run errors")
+        );
+
+        press_modified_key(&mut model, ftui::KeyCode::Char('e'), ftui::Modifiers::CTRL);
+        assert_eq!(
+            model.triage_queued_action.as_deref(),
+            Some("ft search saved enable errors")
+        );
+
+        model.saved_search_selected = 1;
+        model.saved_searches[1].name = "warnings now".into();
+        press_modified_key(&mut model, ftui::KeyCode::Char('e'), ftui::Modifiers::CTRL);
+        assert_eq!(
+            model.triage_queued_action.as_deref(),
+            Some("ft search saved disable 'warnings now'")
+        );
+
+        model.saved_search_selected = 0;
+        model.saved_searches[0].name = "errors and $panic".into();
+        press_modified_key(&mut model, ftui::KeyCode::Char('r'), ftui::Modifiers::CTRL);
+        assert_eq!(
+            model.triage_queued_action.as_deref(),
+            Some("ft search saved run 'errors and $panic'")
+        );
+
+        model.saved_search_selected = 2;
+        press_modified_key(&mut model, ftui::KeyCode::Char('e'), ftui::Modifiers::CTRL);
+        assert!(
+            model
+                .view_state
+                .error_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("no schedule")),
+            "manual-only saved search should surface schedule guidance"
+        );
+        assert!(model.triage_queued_action.is_none());
+    }
+
+    #[test]
     fn search_global_q_does_not_quit() {
         let mut model = make_model(MockQuery::healthy());
         model.view_state.current_view = View::Search;
@@ -4490,6 +4785,8 @@ mod tests {
             "",
             &[],
             0,
+            &[],
+            0,
         );
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("Search (FTS5)"));
@@ -4512,9 +4809,41 @@ mod tests {
             "test",
             &[],
             0,
+            &[],
+            0,
         );
         let row1 = read_row(&frame, 1);
         assert!(row1.contains("No results"));
+    }
+
+    #[test]
+    fn render_search_saved_searches_show_selection() {
+        let saved_searches = sample_saved_searches();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+        render_search_view(
+            &mut frame,
+            0,
+            100,
+            22,
+            "",
+            0,
+            FocusRegion::PrimaryList,
+            "",
+            &[],
+            0,
+            &saved_searches,
+            1,
+        );
+
+        let summary_row =
+            first_row_containing(&frame, 22, "Saved searches (3)").expect("saved summary row");
+        assert!(read_row(&frame, summary_row).contains("Ctrl+R run"));
+        let selected_row =
+            first_row_containing(&frame, 22, "> warnings").expect("selected saved search row");
+        let selected_text = read_row(&frame, selected_row);
+        assert!(selected_text.contains("on"));
+        assert!(selected_text.contains("warning"));
     }
 
     #[test]
@@ -4536,13 +4865,17 @@ mod tests {
             "error",
             &rows,
             0,
+            &[],
+            0,
         );
         let header_row = read_row(&frame, 1);
         assert!(header_row.contains("2 matches"));
-        let column_row = read_row(&frame, 2);
+        let column_row_idx =
+            first_row_containing(&frame, 22, "Pane").expect("search column header");
+        let column_row = read_row(&frame, column_row_idx);
         assert!(column_row.contains("Pane"));
         assert!(column_row.contains("Rank"));
-        let data_row = read_row(&frame, 3);
+        let data_row = read_row(&frame, column_row_idx + 1);
         assert!(data_row.contains("P 10"));
         let mut found = false;
         for r in 0..22 {
@@ -4573,6 +4906,8 @@ mod tests {
             "error",
             &rows,
             0,
+            &[],
+            0,
         );
 
         let detail_row = first_row_containing(&frame, 22, "Match Context")
@@ -4596,6 +4931,8 @@ mod tests {
             1,
             FocusRegion::PrimaryList,
             "q",
+            &[],
+            0,
             &[],
             0,
         );

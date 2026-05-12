@@ -22,6 +22,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
 };
 
+use super::command_handoff::quote_command_arg;
 use super::query::{EventFilters, QueryClient, QueryError};
 use super::view_adapters::adapt_timeline_event;
 use super::views::{
@@ -466,8 +467,12 @@ impl<Q: QueryClient> App<Q> {
                     .saved_searches
                     .get(self.view_state.saved_search_selected_index)
                 {
-                    self.pending_command = Some(format!("ft search saved run {}", saved.name));
+                    self.pending_command = Some(format!(
+                        "ft search saved run {}",
+                        quote_command_arg(&saved.name)
+                    ));
                 } else {
+                    self.pending_command = None;
                     self.view_state.set_error("No saved search selected");
                 }
             }
@@ -478,17 +483,23 @@ impl<Q: QueryClient> App<Q> {
                     .get(self.view_state.saved_search_selected_index)
                 {
                     if saved.enabled {
-                        self.pending_command =
-                            Some(format!("ft search saved disable {}", saved.name));
+                        self.pending_command = Some(format!(
+                            "ft search saved disable {}",
+                            quote_command_arg(&saved.name)
+                        ));
                     } else if saved.schedule_interval_ms.is_some() {
-                        self.pending_command =
-                            Some(format!("ft search saved enable {}", saved.name));
+                        self.pending_command = Some(format!(
+                            "ft search saved enable {}",
+                            quote_command_arg(&saved.name)
+                        ));
                     } else {
+                        self.pending_command = None;
                         self.view_state.set_error(
                             "Saved search has no schedule; set one via `ft search saved schedule`",
                         );
                     }
                 } else {
+                    self.pending_command = None;
                     self.view_state.set_error("No saved search selected");
                 }
             }
@@ -790,6 +801,8 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.saved_search_selected_index = 0;
             }
             Err(e) => {
+                self.view_state.saved_searches.clear();
+                self.view_state.saved_search_selected_index = 0;
                 self.view_state
                     .set_error(format!("Failed to list saved searches: {e}"));
             }
@@ -1201,6 +1214,56 @@ mod tests {
         }
     }
 
+    struct SavedSearchFailureQueryClient;
+
+    impl QueryClient for SavedSearchFailureQueryClient {
+        fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_events(&self, _: &EventFilters) -> Result<Vec<EventView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_triage_items(&self) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn search(&self, _: &str, _: usize) -> Result<Vec<SearchResultView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn health(&self) -> Result<HealthStatus, QueryError> {
+            Ok(HealthStatus {
+                watcher_running: true,
+                db_accessible: true,
+                wezterm_accessible: true,
+                wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+                pane_count: 0,
+                event_count: 0,
+                last_capture_ts: None,
+            })
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            true
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_saved_searches(
+            &self,
+        ) -> Result<Vec<crate::tui::query::SavedSearchView>, QueryError> {
+            Err(QueryError::QueryFailed("saved search backend down".into()))
+        }
+    }
+
     #[test]
     fn panes_filters_and_navigation_update_state() {
         let mut app = App::new(MultiPaneQueryClient, AppConfig::default());
@@ -1591,11 +1654,19 @@ mod tests {
             Some("ft search saved enable errors")
         );
 
+        app.view_state.saved_searches[0].name = "errors and $panic".to_string();
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.pending_command.as_deref(),
+            Some("ft search saved run 'errors and $panic'")
+        );
+
         app.view_state.saved_search_selected_index = 1;
+        app.view_state.saved_searches[1].name = "warnings now".to_string();
         app.handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert_eq!(
             app.pending_command.as_deref(),
-            Some("ft search saved disable warnings")
+            Some("ft search saved disable 'warnings now'")
         );
 
         app.view_state.saved_search_selected_index = 2;
@@ -1606,6 +1677,25 @@ mod tests {
                 .as_deref()
                 .is_some_and(|msg| msg.contains("no schedule")),
             "manual-only saved search should surface a schedule guidance error"
+        );
+        assert!(app.pending_command.is_none());
+    }
+
+    #[test]
+    fn refresh_data_clears_stale_saved_searches_after_list_failure() {
+        let mut app = App::new(SavedSearchFailureQueryClient, AppConfig::default());
+        app.view_state.saved_searches = TestQueryClient.list_saved_searches().unwrap();
+        app.view_state.saved_search_selected_index = 2;
+
+        app.refresh_data();
+
+        assert!(app.view_state.saved_searches.is_empty());
+        assert_eq!(app.view_state.saved_search_selected_index, 0);
+        assert!(
+            app.view_state
+                .error_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("Failed to list saved searches"))
         );
     }
 

@@ -2539,7 +2539,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
             Line::from("  [History] type text to filter, u=undoable-only"),
             Line::from("  [Search] Ctrl+N/Ctrl+P select saved, Ctrl+R run, Ctrl+E toggle"),
             Line::from("  [Search] Ctrl+F toggle fast-only mode"),
-            Line::from("  [Timeline] j/k select event, +/- widen or narrow window"),
+            Line::from("  [Timeline] j/k select event, h/l scroll, +/- widen or narrow window"),
             Line::from("  [Triage] e=expand/collapse workflow progress"),
             Line::from(""),
             Line::from(Span::styled(
@@ -2749,7 +2749,7 @@ pub fn render_timeline_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             details.push(Line::from(truncate_str(&row.summary, detail_width)));
             details.push(Line::from(""));
             details.push(Line::from(Span::styled(
-                truncate_str("Keys: j/k nav | +/- zoom", detail_width),
+                truncate_str("Keys: j/k nav | h/l scroll | +/- zoom", detail_width),
                 Style::default().fg(Color::Gray),
             )));
         } else {
@@ -2794,7 +2794,7 @@ pub fn render_timeline_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             details.push(Line::from(""));
             details.push(Line::from(Span::styled(
                 truncate_str(
-                    "Keys: j/k=select event, +/-=widen/narrow timeline window",
+                    "Keys: j/k=select event, h/l=scroll, +/-=widen/narrow timeline window",
                     detail_width,
                 ),
                 Style::default().fg(Color::Gray),
@@ -3818,7 +3818,9 @@ mod tests {
         let text = buffer_text(area, &buf);
         assert!(text.contains("FrankenTerm Operator TUI"));
         assert!(text.contains("1-8        Jump to view by number"));
-        assert!(text.contains("[Timeline] j/k select event, +/- widen or narrow window"));
+        assert!(
+            text.contains("[Timeline] j/k select event, h/l scroll, +/- widen or narrow window")
+        );
         assert!(text.contains("8. Timeline Cross-pane event timeline"));
     }
 

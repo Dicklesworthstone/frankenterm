@@ -541,8 +541,9 @@ fn view_scope(view_name: &str) -> Option<Scope> {
 /// Resolve a key input to an action.
 ///
 /// Resolution order:
-/// 1. Global bindings, except plain-character globals suppressed by the active
-///    input context.
+/// 1. Global bindings, except plain-character globals owned by the active
+///    input context. Search/History keep printable characters, Events/Triage
+///    keep digits, and Tab/BackTab remain global everywhere.
 /// 2. View-specific bindings for the active view.
 /// 3. Fallback heuristics for unbound printable characters:
 ///    - Panes/History: `FilterAppendChar` for non-control chars
@@ -913,6 +914,10 @@ mod tests {
             Some(Action::SearchPrevSaved)
         );
         assert_eq!(
+            resolve(&ki_ctrl(Key::Char('r')), "Search"),
+            Some(Action::SearchRunSaved)
+        );
+        assert_eq!(
             resolve(&ki_ctrl(Key::Char('e')), "Search"),
             Some(Action::SearchToggleSaved)
         );
@@ -962,6 +967,14 @@ mod tests {
         assert_eq!(
             resolve(&ki(Key::Char('4')), "Triage"),
             Some(Action::TriageNumberedAction(4))
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('6')), "Search"),
+            Some(Action::FilterAppendChar('6'))
+        );
+        assert_eq!(
+            resolve(&ki(Key::Char('4')), "History"),
+            Some(Action::FilterAppendChar('4'))
         );
     }
 

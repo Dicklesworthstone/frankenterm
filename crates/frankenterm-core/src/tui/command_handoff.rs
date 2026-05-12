@@ -28,6 +28,10 @@ use std::process::ExitStatus;
 
 use super::terminal_session::{SessionError, SessionPhase, TerminalSession};
 
+pub(crate) fn quote_command_arg(arg: &str) -> String {
+    shell_words::quote(arg).into_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
@@ -222,6 +226,17 @@ mod tests {
         session.enter(ScreenMode::default()).unwrap();
         let err = execute(&mut session, "   ").unwrap_err();
         assert!(matches!(err, HandoffError::EmptyCommand));
+    }
+
+    #[test]
+    fn quote_command_arg_roundtrips_shell_words() {
+        let quoted = quote_command_arg("errors and $panic");
+        let parsed = shlex::split(&format!("ft search saved run {quoted}"))
+            .expect("quoted command must parse");
+        assert_eq!(
+            parsed,
+            vec!["ft", "search", "saved", "run", "errors and $panic"]
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ Each row defines a view and what parity means for it.
 | Events | Filtered list with selection highlight | EventView (id, rule_id, pane_id, severity, handled, ts) | j/k, u (unhandled filter), 0-9/Backspace/Esc (pane filter) | None |
 | Triage | Ranked list with expand/collapse | TriageItemView (ranked issues + workflow progress) | j/k, Enter/a (action), m (mute), e (expand) | None |
 | History | Filtered list with undo indicator | HistoryEntryView (audit id, action, result, undo status) | j/k, u (undoable filter), Backspace/Esc (filter clear), 0-9/alpha (filter input), z (undo action) | None |
-| Search | Input field + results list + saved searches | SearchResultView + SavedSearchView + suggestions | Char input, Enter (execute), Backspace (edit), Esc (clear), Ctrl+n/p (saved search nav), Ctrl+r (run saved), Ctrl+e (edit saved), Down/Up (results nav) | None |
+| Search | Input field + results list + saved searches | SearchResultView + SavedSearchView + suggestions | Char input, Enter (execute), Backspace (edit), Esc (clear), Ctrl+n/p (saved search nav), Ctrl+r (run saved), Ctrl+e (toggle saved enabled state), Down/Up (results nav) | None |
 | Help | Static text | Keybinding reference | (none, display only) | None |
 | Timeline | Cross-pane correlated event timeline with detail panel | TimelineRow (event id, pane, severity, event type, timestamp, correlation, summary) | j/k, +/-, h/l or Left/Right | New ftui-only view; no legacy ratatui parity target |
 
@@ -98,7 +98,7 @@ Plain-character globals are contextual: Search/History keep printable characters
 | `Ctrl+n` | Next saved search | Yes |
 | `Ctrl+p` | Previous saved search | Yes |
 | `Ctrl+r` | Run selected saved search | Yes |
-| `Ctrl+e` | Edit selected saved search | Yes |
+| `Ctrl+e` | Toggle selected saved search enabled state | Yes |
 | `Down` | Next result (when results present) | Yes |
 | `Up` | Previous result (when results present) | Yes |
 
