@@ -15,6 +15,7 @@ MUX_BIN="\${CARGO_TARGET_DIR}/debug/frankenterm-mux-server"
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-7200}"
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
+RCH_SKIP_SELECTION_PREFLIGHT="${RCH_SKIP_SELECTION_PREFLIGHT:-0}"
 export RCH_QUEUE_WHEN_BUSY="${RCH_QUEUE_WHEN_BUSY:-1}"
 export RCH_BUILD_SLOTS="${RCH_BUILD_SLOTS:-2}"
 export RCH_TEST_SLOTS="${RCH_TEST_SLOTS:-2}"
@@ -339,7 +340,6 @@ run_loopback_test() {
     "cargo test -p frankenterm-core --no-default-features --features vendored,asupersync-runtime --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback target_dir=${target_dir}" \
     env FT_REAL_WEZTERM_TESTS=1 \
     CARGO_TARGET_DIR="${target_dir}" \
-    FT_WEZTERM_MUX_SERVER="${target_dir}/debug/frankenterm-mux-server" \
     cargo test --config net.git-fetch-with-cli=true \
       -p frankenterm-core --no-default-features --features vendored,asupersync-runtime \
       --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback -- --nocapture
@@ -355,7 +355,7 @@ emit_event "preflight.rch" "passed" "rch_ready" "none" "$(rch_probe_log_path)" \
   "RCH remote workers reachable; smoke preflight skipped=${RCH_SKIP_SMOKE_PREFLIGHT}"
 
 SELECTION_LOG="${ARTIFACT_DIR}/rch_selection_preflight.log"
-BUILD_LOG="${ARTIFACT_DIR}/mux_server_build.log"
+BUILD_LOG=""
 TEST_LOG="${ARTIFACT_DIR}/loopback_test.log"
 status=0
 failed_log=""
@@ -364,23 +364,29 @@ retry_performed=false
 retry_reason=""
 retry_target_dir=""
 
-if ! run_selection_preflight "${SELECTION_LOG}" "${REMOTE_TARGET_DIR}"; then
+if [[ "${RCH_SKIP_SELECTION_PREFLIGHT}" == "1" ]]; then
+  emit_event "preflight.rch_selection" "skipped" "rch_selection_skipped" \
+    "none" "${EVENT_LOG}" \
+    "selection diagnose skipped; queued remote cargo step remains fail-closed"
+  SELECTION_LOG=""
+elif ! run_selection_preflight "${SELECTION_LOG}" "${REMOTE_TARGET_DIR}"; then
   status=1
   failed_log="${SELECTION_LOG}"
   BUILD_LOG=""
   TEST_LOG=""
-elif ! run_mux_server_build "loopback.mux_server_build" "${BUILD_LOG}" "${REMOTE_TARGET_DIR}"; then
-  status=1
-  failed_log="${BUILD_LOG}"
-elif ! run_loopback_test "loopback.spawn_send_resize_read" "${TEST_LOG}" "${REMOTE_TARGET_DIR}"; then
-  status=1
-  failed_log="${TEST_LOG}"
+fi
+
+if [[ "${status}" -eq 0 ]]; then
+  if ! run_loopback_test "loopback.spawn_send_resize_read" "${TEST_LOG}" "${REMOTE_TARGET_DIR}"; then
+    status=1
+    failed_log="${TEST_LOG}"
+  fi
 fi
 
 if [[ "${status}" -ne 0 ]]; then
   failed_reason="$(failure_reason_for_log "${failed_log}")"
   if [[ "${failed_reason}" =~ ^rch_infrastructure_cargo_(dep_info_missing|git_fetch_tempdir)$ ]]; then
-    RETRY_BUILD_LOG="${ARTIFACT_DIR}/mux_server_build.retry.log"
+    RETRY_BUILD_LOG=""
     RETRY_TEST_LOG="${ARTIFACT_DIR}/loopback_test.retry.log"
     RETRY_TARGET_DIR="${REMOTE_TARGET_DIR}-retry"
     retry_performed=true
@@ -392,11 +398,7 @@ if [[ "${status}" -ne 0 ]]; then
     status=0
     failed_log=""
     failed_reason=""
-    if ! run_mux_server_build "loopback.mux_server_build.retry_after_cargo_infra" \
-      "${RETRY_BUILD_LOG}" "${RETRY_TARGET_DIR}"; then
-      status=1
-      failed_log="${RETRY_BUILD_LOG}"
-    elif ! run_loopback_test "loopback.spawn_send_resize_read.retry_after_cargo_infra" \
+    if ! run_loopback_test "loopback.spawn_send_resize_read.retry_after_cargo_infra" \
       "${RETRY_TEST_LOG}" "${RETRY_TARGET_DIR}"; then
       status=1
       failed_log="${RETRY_TEST_LOG}"
