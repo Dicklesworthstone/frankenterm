@@ -244,8 +244,8 @@ impl WeztermSubprocessFixture {
         }
     }
 
-    /// Construct a `WeztermHandle` (`Arc<dyn MuxInterface>`) for tests that
-    /// need to plug into watchdog/restorer/snapshot APIs.
+    /// Construct a `WeztermHandle` for tests that need to plug into
+    /// watchdog/restorer/snapshot APIs.
     pub fn handle(&self) -> frankenterm_core::wezterm::WeztermHandle {
         std::sync::Arc::new(self.client())
     }

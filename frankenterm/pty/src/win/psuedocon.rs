@@ -22,7 +22,7 @@ use winapi::um::winbase::{
 use winapi::um::wincon::COORD;
 use winapi::um::winnt::HANDLE;
 
-pub type HPCON = HANDLE;
+pub type Hpcon = HANDLE;
 
 pub const PSUEDOCONSOLE_INHERIT_CURSOR: DWORD = 0x1;
 pub const PSEUDOCONSOLE_RESIZE_QUIRK: DWORD = 0x2;
@@ -36,10 +36,10 @@ shared_library!(ConPtyFuncs,
         hInput: HANDLE,
         hOutput: HANDLE,
         flags: DWORD,
-        hpc: *mut HPCON
+        hpc: *mut Hpcon
     ) -> HRESULT,
-    pub fn ResizePseudoConsole(hpc: HPCON, size: COORD) -> HRESULT,
-    pub fn ClosePseudoConsole(hpc: HPCON),
+    pub fn ResizePseudoConsole(hpc: Hpcon, size: COORD) -> HRESULT,
+    pub fn ClosePseudoConsole(hpc: Hpcon),
 );
 
 fn load_conpty() -> ConPtyFuncs {
@@ -64,7 +64,7 @@ lazy_static! {
 }
 
 pub struct PsuedoCon {
-    con: HPCON,
+    con: Hpcon,
 }
 
 unsafe impl Send for PsuedoCon {}
@@ -78,7 +78,7 @@ impl Drop for PsuedoCon {
 
 impl PsuedoCon {
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
-        let mut con: HPCON = INVALID_HANDLE_VALUE;
+        let mut con: Hpcon = INVALID_HANDLE_VALUE;
         let result = unsafe {
             (CONPTY.CreatePseudoConsole)(
                 size,

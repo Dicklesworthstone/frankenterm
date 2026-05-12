@@ -19,9 +19,11 @@ struct EnvEntry {
     is_from_base_env: bool,
 
     /// For case-insensitive platforms, the environment variable key in its preferred casing.
+    #[cfg_attr(feature = "serde_support", serde(with = "os_string_serde"))]
     preferred_key: OsString,
 
     /// The environment variable value.
+    #[cfg_attr(feature = "serde_support", serde(with = "os_string_serde"))]
     value: OsString,
 }
 
@@ -138,56 +140,52 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
         if let Ok(sys_env) = RegKey::predef(HKEY_LOCAL_MACHINE)
             .open_subkey("System\\CurrentControlSet\\Control\\Session Manager\\Environment")
         {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if name.to_ascii_lowercase() == "username" {
-                        continue;
-                    }
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        log::trace!("adding SYS env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
+            for (name, value) in sys_env.enum_values().flatten() {
+                if name.eq_ignore_ascii_case("username") {
+                    continue;
+                }
+                if let Ok(value) = reg_value_to_string(&value) {
+                    log::trace!("adding SYS env: {:?} {:?}", name, value);
+                    env.insert(
+                        EnvEntry::map_key(name.clone().into()),
+                        EnvEntry {
+                            is_from_base_env: true,
+                            preferred_key: name.into(),
+                            value,
+                        },
+                    );
                 }
             }
         }
 
         if let Ok(sys_env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        // Merge the system and user paths together
-                        let value = if name.to_ascii_lowercase() == "path" {
-                            match env.get(&EnvEntry::map_key(name.clone().into())) {
-                                Some(entry) => {
-                                    let mut result = OsString::new();
-                                    result.push(&entry.value);
-                                    result.push(";");
-                                    result.push(&value);
-                                    result
-                                }
-                                None => value,
+            for (name, value) in sys_env.enum_values().flatten() {
+                if let Ok(value) = reg_value_to_string(&value) {
+                    // Merge the system and user paths together
+                    let value = if name.eq_ignore_ascii_case("path") {
+                        match env.get(&EnvEntry::map_key(name.clone().into())) {
+                            Some(entry) => {
+                                let mut result = OsString::new();
+                                result.push(&entry.value);
+                                result.push(";");
+                                result.push(&value);
+                                result
                             }
-                        } else {
-                            value
-                        };
+                            None => value,
+                        }
+                    } else {
+                        value
+                    };
 
-                        log::trace!("adding USER env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
+                    log::trace!("adding USER env: {:?} {:?}", name, value);
+                    env.insert(
+                        EnvEntry::map_key(name.clone().into()),
+                        EnvEntry {
+                            is_from_base_env: true,
+                            preferred_key: name.into(),
+                            value,
+                        },
+                    );
                 }
             }
         }
@@ -201,13 +199,281 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct CommandBuilder {
+    #[cfg_attr(feature = "serde_support", serde(with = "os_string_vec_serde"))]
     args: Vec<OsString>,
     #[cfg_attr(feature = "serde_support", serde(with = "env_map_serde"))]
     envs: BTreeMap<OsString, EnvEntry>,
+    #[cfg_attr(feature = "serde_support", serde(with = "option_os_string_serde"))]
     cwd: Option<OsString>,
     #[cfg(unix)]
     pub(crate) umask: Option<libc::mode_t>,
     controlling_tty: bool,
+}
+
+#[cfg(feature = "serde_support")]
+mod os_string_serde {
+    use super::OsString;
+    use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+    use serde::ser::SerializeStruct;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt;
+
+    pub(super) struct OsStringRef<'a>(pub(super) &'a OsString);
+
+    impl Serialize for OsStringRef<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serialize(self.0, serializer)
+        }
+    }
+
+    pub(super) struct OsStringOwned(pub(super) OsString);
+
+    impl<'de> Deserialize<'de> for OsStringOwned {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserialize(deserializer).map(Self)
+        }
+    }
+
+    pub(super) fn serialize<S>(value: &OsString, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_platform(value, serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<OsString, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_platform(deserializer)
+    }
+
+    #[cfg(unix)]
+    fn serialize_platform<S>(value: &OsString, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut state = serializer.serialize_struct("OsString", 1)?;
+        state.serialize_field("Unix", value.as_os_str().as_bytes())?;
+        state.end()
+    }
+
+    #[cfg(windows)]
+    fn serialize_platform<S>(value: &OsString, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let code_units: Vec<u16> = value.encode_wide().collect();
+        let mut state = serializer.serialize_struct("OsString", 1)?;
+        state.serialize_field("Windows", &code_units)?;
+        state.end()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn serialize_platform<S>(value: &OsString, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("OsString", 1)?;
+        state.serialize_field("String", &value.to_string_lossy())?;
+        state.end()
+    }
+
+    #[cfg(unix)]
+    fn deserialize_platform<'de, D>(deserializer: D) -> Result<OsString, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        struct OsStringVisitor;
+
+        impl<'de> Visitor<'de> for OsStringVisitor {
+            type Value = OsString;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object containing a Unix byte-array field")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut bytes = None;
+
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "Unix" => {
+                            if bytes.is_some() {
+                                return Err(de::Error::duplicate_field("Unix"));
+                            }
+                            bytes = Some(map.next_value::<Vec<u8>>()?);
+                        }
+                        other => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                            return Err(de::Error::unknown_field(other, &["Unix"]));
+                        }
+                    }
+                }
+
+                bytes
+                    .map(OsString::from_vec)
+                    .ok_or_else(|| de::Error::missing_field("Unix"))
+            }
+        }
+
+        deserializer.deserialize_map(OsStringVisitor)
+    }
+
+    #[cfg(windows)]
+    fn deserialize_platform<'de, D>(deserializer: D) -> Result<OsString, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use std::os::windows::ffi::OsStringExt;
+
+        struct OsStringVisitor;
+
+        impl<'de> Visitor<'de> for OsStringVisitor {
+            type Value = OsString;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object containing a Windows UTF-16 code-unit field")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut code_units = None;
+
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "Windows" => {
+                            if code_units.is_some() {
+                                return Err(de::Error::duplicate_field("Windows"));
+                            }
+                            code_units = Some(map.next_value::<Vec<u16>>()?);
+                        }
+                        other => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                            return Err(de::Error::unknown_field(other, &["Windows"]));
+                        }
+                    }
+                }
+
+                code_units
+                    .map(|units| OsString::from_wide(&units))
+                    .ok_or_else(|| de::Error::missing_field("Windows"))
+            }
+        }
+
+        deserializer.deserialize_map(OsStringVisitor)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn deserialize_platform<'de, D>(deserializer: D) -> Result<OsString, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OsStringVisitor;
+
+        impl<'de> Visitor<'de> for OsStringVisitor {
+            type Value = OsString;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object containing a String field")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut string = None;
+
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "String" => {
+                            if string.is_some() {
+                                return Err(de::Error::duplicate_field("String"));
+                            }
+                            string = Some(map.next_value::<String>()?);
+                        }
+                        other => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                            return Err(de::Error::unknown_field(other, &["String"]));
+                        }
+                    }
+                }
+
+                string
+                    .map(OsString::from)
+                    .ok_or_else(|| de::Error::missing_field("String"))
+            }
+        }
+
+        deserializer.deserialize_map(OsStringVisitor)
+    }
+}
+
+#[cfg(feature = "serde_support")]
+mod os_string_vec_serde {
+    use super::{os_string_serde, OsString};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(values: &[OsString], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(values.len()))?;
+        for value in values {
+            seq.serialize_element(&os_string_serde::OsStringRef(value))?;
+        }
+        seq.end()
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<OsString>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values: Vec<os_string_serde::OsStringOwned> = Deserialize::deserialize(deserializer)?;
+        Ok(values.into_iter().map(|value| value.0).collect())
+    }
+}
+
+#[cfg(feature = "serde_support")]
+mod option_os_string_serde {
+    use super::{os_string_serde, OsString};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(value: &Option<OsString>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_some(&os_string_serde::OsStringRef(value)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<OsString>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value: Option<os_string_serde::OsStringOwned> = Deserialize::deserialize(deserializer)?;
+        Ok(value.map(|value| value.0))
+    }
 }
 
 #[cfg(feature = "serde_support")]
@@ -222,13 +488,72 @@ mod env_map_serde {
     //! the roundtripped map.
     //!
     //! To preserve every distinct input key, serialize as a *sequence* of
-    //! `(OsString, EnvEntry)` pairs rather than a map. In a value position
-    //! `OsString`'s derived serde impl is bijective (it emits the enum form
-    //! that carries the raw bytes / code units), so every pair roundtrips
-    //! losslessly regardless of UTF-8 validity.
-    use super::{BTreeMap, EnvEntry, OsString};
-    use serde::de::{Deserialize, Deserializer, Error as DeError};
-    use serde::ser::{SerializeSeq, Serializer};
+    //! `(OsString, EnvEntry)` pairs rather than a map. Each `OsString` is
+    //! encoded through the local platform-tagged adapter, so every pair
+    //! roundtrips losslessly regardless of UTF-8 validity.
+    use super::{os_string_serde, BTreeMap, EnvEntry, OsString};
+    use serde::de::{Deserialize, Deserializer, Error as DeError, SeqAccess, Visitor};
+    use serde::ser::{SerializeSeq, SerializeTuple, Serializer};
+    use serde::Serialize;
+    use std::fmt;
+
+    struct EnvPairRef<'a> {
+        key: &'a OsString,
+        entry: &'a EnvEntry,
+    }
+
+    impl Serialize for EnvPairRef<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut tuple = serializer.serialize_tuple(2)?;
+            tuple.serialize_element(&os_string_serde::OsStringRef(self.key))?;
+            tuple.serialize_element(self.entry)?;
+            tuple.end()
+        }
+    }
+
+    struct EnvPair {
+        key: OsString,
+        entry: EnvEntry,
+    }
+
+    impl<'de> Deserialize<'de> for EnvPair {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct EnvPairVisitor;
+
+            impl<'de> Visitor<'de> for EnvPairVisitor {
+                type Value = EnvPair;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("a two-element env key/value pair")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    let key = seq
+                        .next_element::<os_string_serde::OsStringOwned>()?
+                        .ok_or_else(|| DeError::invalid_length(0, &self))?
+                        .0;
+                    let entry = seq
+                        .next_element::<EnvEntry>()?
+                        .ok_or_else(|| DeError::invalid_length(1, &self))?;
+                    if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                        return Err(DeError::invalid_length(3, &self));
+                    }
+                    Ok(EnvPair { key, entry })
+                }
+            }
+
+            deserializer.deserialize_tuple(2, EnvPairVisitor)
+        }
+    }
 
     pub fn serialize<S>(
         envs: &BTreeMap<OsString, EnvEntry>,
@@ -238,8 +563,8 @@ mod env_map_serde {
         S: Serializer,
     {
         let mut seq = serializer.serialize_seq(Some(envs.len()))?;
-        for entry in envs {
-            seq.serialize_element(&entry)?;
+        for (key, entry) in envs {
+            seq.serialize_element(&EnvPairRef { key, entry })?;
         }
         seq.end()
     }
@@ -248,10 +573,10 @@ mod env_map_serde {
     where
         D: Deserializer<'de>,
     {
-        let pairs: Vec<(OsString, EnvEntry)> = Deserialize::deserialize(deserializer)?;
+        let pairs: Vec<EnvPair> = Deserialize::deserialize(deserializer)?;
         let mut envs = BTreeMap::new();
 
-        for (key, entry) in pairs {
+        for EnvPair { key, entry } in pairs {
             let expected_key = EnvEntry::map_key(entry.preferred_key.clone());
             if key != expected_key {
                 return Err(D::Error::custom(format!(
@@ -661,7 +986,7 @@ impl CommandBuilder {
             let extensions = self.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
             for path in std::env::split_paths(&path) {
                 // Check for exactly the user's string in this path dir
-                let candidate = path.join(&exe);
+                let candidate = path.join(exe);
                 if candidate.exists() {
                     return candidate.into_os_string();
                 }
@@ -673,7 +998,7 @@ impl CommandBuilder {
                     // PATHEXT includes the leading `.`, but `with_extension`
                     // doesn't want that
                     let ext = ext.to_str().expect("PATHEXT entries must be utf8");
-                    let path = path.join(&exe).with_extension(&ext[1..]);
+                    let path = path.join(exe).with_extension(&ext[1..]);
                     if path.exists() {
                         return path.into_os_string();
                     }
@@ -1344,6 +1669,7 @@ mod tests {
     fn serde_rejects_duplicate_env_pairs() {
         let mut payload = serde_json::to_value(CommandBuilder::new("prog")).unwrap();
         let key = EnvEntry::map_key(OsString::from("PATH"));
+        let key_value = serde_json::to_value(os_string_serde::OsStringRef(&key)).unwrap();
         let first = EnvEntry {
             is_from_base_env: false,
             preferred_key: OsString::from("PATH"),
@@ -1357,14 +1683,8 @@ mod tests {
         payload.as_object_mut().unwrap().insert(
             "envs".to_string(),
             json!([
-                [
-                    serde_json::to_value(key.clone()).unwrap(),
-                    serde_json::to_value(first).unwrap()
-                ],
-                [
-                    serde_json::to_value(key).unwrap(),
-                    serde_json::to_value(second).unwrap()
-                ]
+                [key_value.clone(), serde_json::to_value(first).unwrap()],
+                [key_value, serde_json::to_value(second).unwrap()]
             ]),
         );
 
@@ -1381,10 +1701,11 @@ mod tests {
             preferred_key: OsString::from("PATH"),
             value: OsString::from("/tmp/bin"),
         };
+        let mismatched_key = EnvEntry::map_key(OsString::from("HOME"));
         payload.as_object_mut().unwrap().insert(
             "envs".to_string(),
             json!([[
-                serde_json::to_value(EnvEntry::map_key(OsString::from("HOME"))).unwrap(),
+                serde_json::to_value(os_string_serde::OsStringRef(&mismatched_key)).unwrap(),
                 serde_json::to_value(entry).unwrap()
             ]]),
         );

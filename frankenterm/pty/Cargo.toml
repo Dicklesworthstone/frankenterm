@@ -16,7 +16,7 @@ filedescriptor.workspace = true
 libc.workspace = true
 log.workspace = true
 nix = {workspace=true, features=["term", "fs"]}
-serde = {workspace=true, optional=true, features=["derive"]}
+serde = {workspace=true, optional=true, features=["derive", "std", "alloc"]}
 serial2.workspace = true
 shell-words.workspace = true
 

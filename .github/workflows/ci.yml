@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || 'auto' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 permissions:
@@ -39,6 +39,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: lint-${{ matrix.os }}
+
+      - name: Install Linux workspace build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
 
       - name: Environment info
         run: |
@@ -325,6 +329,20 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      - name: Install Linux workspace build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+
+      - name: Install Windows OpenSSL build Perl
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Strawberry\perl\bin\perl.exe")) {
+            choco install strawberryperl --no-progress -y
+          }
+          "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "PERL=C:\Strawberry\perl\bin\perl.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Run tests
         shell: bash
         run: |
@@ -570,6 +588,9 @@ jobs:
         with:
           key: feature-${{ matrix.feature }}
 
+      - name: Install Linux workspace build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+
       - name: Log feature under test
         run: |
           echo "## Feature: \`${{ matrix.feature }}\`" >> $GITHUB_STEP_SUMMARY
@@ -677,6 +698,9 @@ jobs:
         with:
           key: feature-vendored
 
+      - name: Install Linux workspace build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+
       - name: Check vendored compilation
         run: |
           set -exo pipefail
@@ -713,6 +737,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: feature-combination-matrix
+
+      - name: Install Linux workspace build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
 
       - name: Check known-good feature combinations
         run: bash scripts/check_feature_flag_matrix.sh
@@ -1189,6 +1216,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: build-${{ matrix.target }}
+
+      - name: Install Linux workspace build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+
+      - name: Install Windows OpenSSL build Perl
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Strawberry\perl\bin\perl.exe")) {
+            choco install strawberryperl --no-progress -y
+          }
+          "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "PERL=C:\Strawberry\perl\bin\perl.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v7.0.1

@@ -1,4 +1,4 @@
-use crate::win::psuedocon::HPCON;
+use crate::win::psuedocon::Hpcon;
 use anyhow::{ensure, Error};
 use std::io::Error as IoError;
 use std::{mem, ptr};
@@ -22,11 +22,7 @@ impl ProcThreadAttributeList {
                 &mut bytes_required,
             )
         };
-        let mut data = Vec::with_capacity(bytes_required);
-        // We have the right capacity, so force the vec to consider itself
-        // that length.  The contents of those bytes will be maintained
-        // by the win32 apis used in this impl.
-        unsafe { data.set_len(bytes_required) };
+        let mut data = vec![0; bytes_required];
 
         let attr_ptr = data.as_mut_slice().as_mut_ptr() as *mut _;
         let res = unsafe {
@@ -44,14 +40,14 @@ impl ProcThreadAttributeList {
         self.data.as_mut_slice().as_mut_ptr() as *mut _
     }
 
-    pub fn set_pty(&mut self, con: HPCON) -> Result<(), Error> {
+    pub fn set_pty(&mut self, con: Hpcon) -> Result<(), Error> {
         let res = unsafe {
             UpdateProcThreadAttribute(
                 self.as_mut_ptr(),
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                 con,
-                mem::size_of::<HPCON>(),
+                mem::size_of::<Hpcon>(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             )
