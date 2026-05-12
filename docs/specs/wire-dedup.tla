@@ -167,7 +167,7 @@ SafetyInvariants ==
     /\ SenderFrontierMatchesHighSeqAccepted
 
 ----------------------------------------------------------------------------
-\* Convergence
+\* Liveness / convergence
 ----------------------------------------------------------------------------
 
 \* Convergence in TLA+: across all reachable states with the
