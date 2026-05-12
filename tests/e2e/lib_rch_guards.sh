@@ -642,10 +642,20 @@ rch_log_has_cargo_dep_info_missing() {
         && grep -Fq 'No such file or directory (os error 2)' "${output_file}" 2>/dev/null
 }
 
+rch_log_has_worker_selection_all_busy() {
+    local output_file="$1"
+    jq -e '
+        (.data.worker_selection.worker == null)
+        and ((.data.worker_selection.reason // "") == "all_workers_busy")
+    ' "${output_file}" >/dev/null 2>&1
+}
+
 rch_extract_failure_reason_code() {
     local output_file="$1"
 
-    if rch_log_has_cargo_dep_info_missing "${output_file}"; then
+    if rch_log_has_worker_selection_all_busy "${output_file}"; then
+        printf '%s\n' "RCH-WORKER-SELECTION-ALL-BUSY"
+    elif rch_log_has_cargo_dep_info_missing "${output_file}"; then
         printf '%s\n' "RCH-CARGO-DEP-INFO-MISSING"
     elif grep -Fq "can't find crate for \`core\`" "${output_file}" 2>/dev/null; then
         printf '%s\n' "RCH-CROSS-RUST-TARGET-MISSING"
@@ -671,7 +681,9 @@ rch_extract_failure_reason_code() {
 rch_extract_failure_reason_detail() {
     local output_file="$1"
 
-    if rch_log_has_cargo_dep_info_missing "${output_file}"; then
+    if rch_log_has_worker_selection_all_busy "${output_file}"; then
+        jq -r '"worker_selection.reason=" + (.data.worker_selection.reason // "unknown")' "${output_file}" 2>/dev/null
+    elif rch_log_has_cargo_dep_info_missing "${output_file}"; then
         sed -n '/^error: could not parse\/generate dep info at: /p' "${output_file}" 2>/dev/null | tail -n 1
     elif grep -Fq "can't find crate for \`core\`" "${output_file}" 2>/dev/null; then
         grep -F "can't find crate for \`core\`" "${output_file}" 2>/dev/null | tail -n 1

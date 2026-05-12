@@ -100,6 +100,10 @@ worker_for_log() {
 failure_reason_for_log() {
   local log_file="$1"
   local meta_file code
+  if rch_log_has_worker_selection_all_busy "${log_file}"; then
+    printf '%s\n' "rch_infrastructure_worker_selection_all_busy"
+    return
+  fi
   if rch_log_has_cargo_dep_info_missing "${log_file}"; then
     printf '%s\n' "rch_infrastructure_cargo_dep_info_missing"
     return
