@@ -1,7 +1,8 @@
 # Herd-Wave Contract
 
-Status: v1 planning contract. Native robot, doctor, MCP, deterministic fixture,
-and RCH proof surfaces are tracked by the `ft-5bwjf` children.
+Status: v1 contract. Native robot and doctor surfaces, deterministic fixture
+coverage, and RCH proof lanes have shipped under the `ft-5bwjf` children. The
+read-only MCP parity surface remains isolated to `ft-5bwjf.8`.
 
 This document defines the first operator-facing contract for a herd wave: a
 privacy-bounded explanation of synchronized fleet bursts such as compaction
@@ -34,7 +35,7 @@ burst pressure.
 
 ## Output Surfaces
 
-Required implementation surfaces for later children:
+Required implementation surfaces:
 
 | Command or API | Required posture |
 | --- | --- |
@@ -42,7 +43,7 @@ Required implementation surfaces for later children:
 | `ft robot --format toon ...` | Preserves all canonical field names, reason codes, unavailable sources, and action ids. |
 | `ft doctor --json` | May embed a herd-wave summary when telemetry is available. |
 | Doctor/plain output | Shows compact operator rows without implying that any stagger or admission action executed. |
-| MCP resource | Optional read-only resource. If omitted, the implementation bead must explain why and file a scoped follow-up. |
+| MCP resource | Optional read-only resource. Current parity work is isolated to `ft-5bwjf.8`; do not infer MCP coverage from robot or doctor proof. |
 
 ## Versioned Envelope
 
@@ -210,12 +211,13 @@ robot, doctor, MCP, artifact, JSONL e2e, or committed golden output. These
 fixtures should fail closed as `privacy_violation` if redaction or bounded
 citation behavior regresses.
 
-Synthetic scale fixtures are not target-class hardware proof. A deterministic
-200-pane synthetic replay can prove schema behavior, scheduling math, and
-privacy invariants, but it must not set or imply a 64+ CPU / 256+ GiB
-target-class claim. Target-class proof requires retained RCH artifacts that
-record the worker predicate, exact commands, isolated target directory, and
-artifact hashes.
+Synthetic scale fixtures are not target-class hardware proof. The deterministic
+`synthetic_200_pane_high_scale` fixture proves schema behavior, scheduling math,
+output-size budgets, and privacy invariants for a 200-pane cohort, but it must
+not set or imply a 64+ CPU / 256+ GiB target-class claim. Target-class proof
+requires retained RCH artifacts that record the worker predicate, exact
+commands, isolated target directory, exit status, artifact hashes, and a
+matching `target_class_hardware_proof.available=true` row.
 
 ## Failure Classification
 
@@ -229,25 +231,72 @@ Contract and proof artifacts should classify failures as:
 | `unavailable_evidence` | The surface ran but required evidence was missing. |
 | `target_hardware_skipped` | High-scale 64+ CPU / 256+ GiB claims were not proven. |
 
-## Proof Expectations
+## Operator Runbook
 
-The implementation is not complete until later beads add:
+Use the herd-wave surface as an explanation and dry-run planner. It does not
+authorize live pane mutation, Agent Mail repair, RCH fleet mutation, destructive
+git/filesystem actions, or automated queue draining.
 
-- DTO conversion tests from the existing scheduler/admission telemetry types,
-- deterministic fixture cases for compaction, retry, rate-limit recovery,
-  search burst, mixed wave, missing telemetry, stale evidence, priority
-  protection, operator override, cooldown, circuit breaker, and no-wave,
-- Robot JSON and TOON parity tests,
-- privacy fixtures that fail on raw prompt or secret leakage,
-- structured JSONL e2e logs with `bead_id`, `scenario_id`, `surface`, `step`,
-  `outcome`, `reason_code`, `error_code`, `artifact_path`, `selected_worker`,
-  and whether Cargo/rustc/test execution was reached,
-- RCH-backed proof artifacts with exact commands and isolated target dirs,
-- a synthetic 200-pane proof and a separate target-class hardware predicate.
+1. Confirm `source_freshness`, `evidence_state`, `unavailable_sources`, and
+   `raw_pane_content_stored=false` before trusting any recommendation.
+2. Identify `dominant_kind`, `pressure_tier`, `overall_state`, and
+   `admission_action`. Treat `missing_telemetry`, `stale_evidence`, `unknown`,
+   and unavailable target-class proof as fail-closed states.
+3. Inspect `priority_protection`, `operator_override`, cooldown, and
+   circuit-breaker rows before acting. Priority-protected work must be preserved
+   even when raw pressure is high.
+4. Read `stagger_plan` as a deterministic manual-review plan only. If an
+   operator approves action outside this contract, execute it through the
+   appropriate policy-gated workflow, not by copying hidden commands from the
+   herd-wave output.
+5. Retain proof artifacts when citing a run: fixture matrix, conformance
+   matrix, e2e JSONL, RCH cargo log, RCH metadata, worker identity, exact
+   command, isolated target directory, and the Beads closeout.
+6. Keep target-class wording disabled unless the retained artifact has
+   `target_class_hardware_proof.available=true` for a documented 64+ CPU /
+   256+ GiB worker or host. A 200-pane synthetic fixture with
+   `target_class_proof_available=false` is reduced-scale proof only.
 
-Until those land, this document and the schema define the v1 operator contract,
-but they do not claim that the robot, doctor, MCP, or high-scale proof surfaces
-are implemented.
+## Retained Proof
+
+Current retained proof for the v1 contract:
+
+| Bead | Artifact | Result |
+| --- | --- | --- |
+| `ft-5bwjf.5` | `tests/e2e/artifacts/goal-line/ft-5bwjf.5/herd_wave_contract/20260512T1130Z/` | RCH run on `vmi1153651`; `cargo test -j 4 -p frankenterm-core --test herd_wave_conformance -- --nocapture`; 4 tests passed. |
+| `ft-5bwjf.7` | `tests/e2e/artifacts/goal-line/ft-5bwjf.7/herd_wave_contract/20260512T123620Z-rch2/` | RCH run on `vmi1152480`; `tests/e2e/test_herd_wave_contract.sh --run-rust-proof`; 5 tests passed. |
+
+The fixture matrix currently carries 12 deterministic scenarios: synchronized
+compaction, rate-limit recovery, retry storm, search/index burst, mixed wave,
+missing telemetry, stale evidence, priority protection, operator override,
+cooldown/circuit active, synthetic 200-pane high-scale, and normal/no-wave
+privacy guard. The conformance matrix records all `MUST` rows as covered for
+the fixture/e2e surfaces, while MCP parity remains tracked separately by
+`ft-5bwjf.8`.
+
+The high-scale structured event row that must be present in closeout JSONL:
+
+```json
+{
+  "scenario_id": "synthetic_200_pane_high_scale",
+  "pane_count": 200,
+  "cohort_count": 200,
+  "dominant_kind": "retry",
+  "target_class_proof_available": false,
+  "reason_code": "herd_wave.target_class.proof_unavailable",
+  "outcome": "passed"
+}
+```
+
+Closeout proof for `ft-5bwjf.6` must also cite `br dep cycles --json`; the
+2026-05-12 check returned `{"cycles":[],"count":0}`.
+
+## Remaining Work
+
+`ft-5bwjf.8` owns read-only MCP parity. Parent `ft-5bwjf` should not close until
+that bead is complete or explicitly deferred with matching proof. Future
+target-class performance claims require a separate retained 64+ CPU / 256+ GiB
+artifact; the current synthetic 200-pane proof keeps those claims disabled.
 
 ## Static Checks For This Contract
 
