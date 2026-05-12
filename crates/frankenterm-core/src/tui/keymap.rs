@@ -605,14 +605,13 @@ pub fn resolve(input: &KeyInput, view_name: &str) -> Option<Action> {
 }
 
 fn suppresses_global_action(scope: Option<Scope>, action: Action) -> bool {
-    match (scope, action) {
+    matches!(
+        (scope, action),
         (
             Some(Scope::Search | Scope::History),
             Action::Quit | Action::ShowHelp | Action::Refresh | Action::GoToView(_),
-        ) => true,
-        (Some(Scope::Events | Scope::Triage), Action::GoToView(_)) => true,
-        _ => false,
-    }
+        ) | (Some(Scope::Events | Scope::Triage), Action::GoToView(_))
+    )
 }
 
 /// Return a human-readable description of the action (for help text).
