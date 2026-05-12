@@ -93,6 +93,7 @@ brief.md
 helpers.md
 insights.json
 meta.json
+!tests/golden/gpu/**/meta.json
 triage.json
 
 # Proptest regression files (auto-generated, machine-specific)

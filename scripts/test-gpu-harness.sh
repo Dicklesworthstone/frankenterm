@@ -84,6 +84,28 @@ print(json.dumps(sys.argv[1]))
 PY
 }
 
+abs_path() {
+  python3 - "$PROJECT_ROOT" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+project_root = Path(sys.argv[1])
+path = Path(sys.argv[2])
+if path.is_absolute():
+    print(path)
+else:
+    print(project_root / path)
+PY
+}
+
+optional_abs_env() {
+  local name="$1"
+  local value="${!name:-}"
+  if [[ -n "$value" ]]; then
+    abs_path "$value"
+  fi
+}
+
 emit_setup() {
   printf '{"phase":"setup","run_id":%s,"tmpdir":%s,"log":%s,"events":%s,"artifacts":%s}\n' \
     "$(json_string "$RUN_ID")" \
@@ -133,12 +155,21 @@ github_actions_local_cargo_enabled() {
 
 run_github_actions_cargo_logged() {
   : >"$LOG_FILE"
+  local artifact_dir_abs perf_report_abs fixture_root_abs
+  artifact_dir_abs="$(abs_path "$ARTIFACT_DIR")"
+  perf_report_abs="$(abs_path "$PERF_REPORT")"
+  fixture_root_abs="$(optional_abs_env GPU_HARNESS_FIXTURE_ROOT)"
+  local -a harness_env=(
+    "GPU_HARNESS_ARTIFACT_DIR=$artifact_dir_abs"
+    "GPU_HARNESS_PERF_REPORT=$perf_report_abs"
+  )
+  if [[ -n "$fixture_root_abs" ]]; then
+    harness_env+=("GPU_HARNESS_FIXTURE_ROOT=$fixture_root_abs")
+  fi
   set +u
   (
     cd "$PROJECT_ROOT"
-    env \
-      GPU_HARNESS_ARTIFACT_DIR="$ARTIFACT_DIR" \
-      GPU_HARNESS_PERF_REPORT="$PERF_REPORT" \
+    env "${harness_env[@]}" \
       cargo test \
         -p frankenterm-gui \
         --features headless-render \
@@ -456,7 +487,12 @@ else
       set -euo pipefail
       begin="${FT_GPU_HARNESS_ARTIFACTS_BEGIN:?}"
       end="${FT_GPU_HARNESS_ARTIFACTS_END:?}"
-      remote_run_dir="${CARGO_TARGET_DIR}/ft-gpu-harness"
+      remote_project_root="$(pwd)"
+      if [[ "${CARGO_TARGET_DIR}" = /* ]]; then
+        remote_run_dir="${CARGO_TARGET_DIR}/ft-gpu-harness"
+      else
+        remote_run_dir="${remote_project_root}/${CARGO_TARGET_DIR}/ft-gpu-harness"
+      fi
       remote_artifact_dir="${remote_run_dir}/artifacts"
       remote_perf_report="${remote_run_dir}/perf-report.json"
       mkdir -p "$remote_artifact_dir"
