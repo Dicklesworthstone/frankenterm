@@ -40,7 +40,7 @@ the listed child bead.
 | `runtime_async` cancel semantics | Cancelled waits across runtime primitives terminate through the `Cx` path without leaking permits, joins, or messages. | gap | `crates/frankenterm-core/src/runtime_async.rs` | gap | `ft-tf6g3.18.2` |
 | Durable state checkpoint / rollback | Checkpoint creation, pre-rollback checkpointing, rollback validation, and failed rollback remain atomic. | gap | `crates/frankenterm-core/src/durable_state.rs` | gap | `ft-tf6g3.18.3` |
 | Mux session reentry | Reentrant subscriber/session callbacks cannot double-register panes, leak subscribers, or drop terminal session events. | gap | `frankenterm/mux/src/`, `crates/frankenterm-core/src/headless_mux_server.rs` | gap | `ft-tf6g3.18.4` |
-| Blocker-radar source merge | Degraded, stale, conflicting, or unavailable coordination sources always fail closed before work is claimable. | gap | `crates/frankenterm-core/src/blocker_radar.rs` | gap | `ft-tf6g3.18.5` |
+| Blocker-radar source merge | Degraded, stale, conflicting, or unavailable coordination sources always fail closed before work is claimable. | `blocker-radar-merge.tla` | `crates/frankenterm-core/src/blocker_radar.rs` | covered | `ft-tf6g3.18.5` |
 | Herd-wave admission control | Synchronized cohorts produce bounded stagger plans, priority protection, cooldown behavior, and missing-telemetry fail-closed decisions. | gap | `crates/frankenterm-core/src/swarm_scheduler.rs` | gap | `ft-tf6g3.18.6` |
 | Capture-fairness scheduler liveness | Eligible panes cannot starve under documented priority, low-tier floor, budget, and shutdown assumptions. | gap | `docs/capture-fairness-slo-contract.md`, runtime/tailer scheduler code | gap | `ft-tf6g3.18.7` |
 
@@ -100,6 +100,9 @@ path and record their constants in the bead evidence.
 - `scripts/check-spec-conventions.sh` validates this directory.
 - `scripts/run-tlc.sh docs/specs/<spec>.tla` runs TLC with the sibling `.cfg`
   and writes a normalized JSON summary.
+  The wrapper stages a module-named copy under `target/tlc/<spec>/module/` before
+  invoking TLC, because repo files stay kebab-case while TLA+ requires the file
+  passed to TLC to match the PascalCase module name.
 
 `scripts/run-tlc.sh` emits the G35 substrate fields:
 

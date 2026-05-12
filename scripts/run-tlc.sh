@@ -225,7 +225,19 @@ stderr_path="${out_dir}/tlc.stderr.log"
 combined_path="${out_dir}/tlc.combined.log"
 summary_path="${out_dir}/summary.json"
 
-cmd=(java -cp "$jar" tlc2.TLC -deadlock -workers "$workers" -config "$cfg" "$spec")
+tlc_spec="$spec"
+tlc_cfg="$cfg"
+module_name=""
+if [[ -f "$spec" ]]; then
+  module_name="$(sed -nE 's/^-+ MODULE ([A-Za-z][A-Za-z0-9]*) -+$/\1/p' "$spec" | head -n 1)"
+fi
+if [[ -n "$module_name" && "$base" != "$module_name" ]]; then
+  tlc_module_dir="${out_dir}/module"
+  tlc_spec="${tlc_module_dir}/${module_name}.tla"
+  tlc_cfg="${tlc_module_dir}/${module_name}.cfg"
+fi
+
+cmd=(java -cp "$jar" tlc2.TLC -deadlock -workers "$workers" -config "$tlc_cfg" "$tlc_spec")
 command_text="$(join_command "${cmd[@]}")"
 
 if [[ "$dry_run" -eq 1 ]]; then
@@ -247,6 +259,11 @@ if [[ ! -f "$jar" ]]; then
 fi
 
 mkdir -p "$out_dir"
+if [[ "$tlc_spec" != "$spec" ]]; then
+  mkdir -p "$(dirname "$tlc_spec")"
+  cp "$spec" "$tlc_spec"
+  cp "$cfg" "$tlc_cfg"
+fi
 
 timeout_bin=""
 if command -v timeout >/dev/null 2>&1; then

@@ -1,0 +1,98 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "blocker-radar-merge-tlc-attestation",
+  "category": "proofs/blocker-radar-merge",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T13:43:18Z",
+  "produced_by_bead": "ft-tf6g3.18.5",
+  "status": "pass",
+  "proof_category": 6,
+  "scope": "Machine-readable attestation for the blocker-radar claimability source-merge TLA+ model.",
+  "model": {
+    "spec": "docs/specs/blocker-radar-merge.tla",
+    "cfg": "docs/specs/blocker-radar-merge.cfg",
+    "mapping": "docs/specs/blocker-radar-merge-mapping.md",
+    "release_bundle_slot": "proofs/blocker-radar-merge.json",
+    "bounded_model": {
+      "candidates": ["normal", "coordination-snapshot"],
+      "max_history": 2,
+      "source_verdict_families": [
+        "ready",
+        "dependency",
+        "owner",
+        "dirty",
+        "external",
+        "mail",
+        "tracker"
+      ]
+    }
+  },
+  "tlc_run": {
+    "status": "pass",
+    "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/blocker-radar-merge.tla",
+    "local_bounded_run": true,
+    "rch_remote_available": false,
+    "rch_note": "RCH exec is compilation-command oriented in this environment and treated the TLC wrapper as a non-compilation local hook path; no local Cargo or build proof was run.",
+    "state_count": 131329,
+    "distinct_state_count": 65793,
+    "time_budget_seconds": 30,
+    "timed_out": false,
+    "artifacts": {
+      "summary": "target/tlc/blocker-radar-merge/summary.json",
+      "stdout": "target/tlc/blocker-radar-merge/tlc.stdout.log",
+      "stderr": "target/tlc/blocker-radar-merge/tlc.stderr.log"
+    }
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/specs/blocker-radar-merge.tla",
+      "media_type": "text/plain",
+      "sha256": "cae0a61395dc5577daa4cdf6daafca0ccec1feb5b29978754a6fddd799a56d7e",
+      "size_bytes": 7721
+    },
+    {
+      "path": "docs/specs/blocker-radar-merge.cfg",
+      "media_type": "text/plain",
+      "sha256": "00ad2f1fd3a572b4e65d24af855135430f37c1dfee6976a69735a3f5e613f22f",
+      "size_bytes": 193
+    },
+    {
+      "path": "docs/specs/blocker-radar-merge-mapping.md",
+      "media_type": "text/markdown",
+      "sha256": "c4a59b85d853bc14595e1a070504470fdfe2c471f8878a3fb4d46aac91aacaa7",
+      "size_bytes": 4333
+    },
+    {
+      "path": "scripts/run-tlc.sh",
+      "media_type": "text/x-shellscript",
+      "sha256": "a245a3c2aa17e216323afc969590c6c0c77127a515e62b7c190ca2191a862164",
+      "size_bytes": 7350
+    }
+  ],
+  "validation": [
+    {
+      "command": "bash -n scripts/run-tlc.sh",
+      "status": "pass"
+    },
+    {
+      "command": "scripts/check-spec-conventions.sh",
+      "status": "pass",
+      "result": "6 spec(s) passed"
+    },
+    {
+      "command": "scripts/run-tlc.sh --dry-run docs/specs/blocker-radar-merge.tla",
+      "status": "pass",
+      "result": "TLC command targets target/tlc/blocker-radar-merge/module/BlockerRadarMerge.tla and sibling cfg"
+    },
+    {
+      "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/blocker-radar-merge.tla",
+      "status": "pass",
+      "result": "131329 states generated; 65793 distinct states; no timeout"
+    }
+  ],
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-tf6g3.1",
+    "reason": "ft-tf6g3.18.5 publishes the per-subsystem proof artifact; release-bundle category wiring remains owned by ft-tf6g3.1/G16."
+  }
+}
