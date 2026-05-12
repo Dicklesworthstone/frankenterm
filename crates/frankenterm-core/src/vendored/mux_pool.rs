@@ -290,16 +290,6 @@ impl MuxPool {
         }
     }
 
-    async fn execute_once<T, Op>(&self, op_name: &'static str, op: Op) -> Result<T, MuxPoolError>
-    where
-        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
-    {
-        {
-            let cx = Cx::current().unwrap_or_else(cx::for_request);
-            return self.execute_once_with_cx(&cx, op_name, op).await;
-        }
-    }
-
     async fn execute_once_with_cx<T, Op>(
         &self,
         cx: &Cx,
