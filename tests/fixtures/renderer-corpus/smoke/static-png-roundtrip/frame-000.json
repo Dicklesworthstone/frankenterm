@@ -1,0 +1,37 @@
+{
+  "schema_version": "renderer-corpus-frame.v1",
+  "group": "smoke",
+  "scenario": "static-png-roundtrip",
+  "frame": "frame-000",
+  "source_png": "tests/golden/gpu/_smoketest/golden.png",
+  "viewport": {
+    "width_px": 64,
+    "height_px": 64,
+    "scale_factor": 1.0
+  },
+  "monitors": [
+    {
+      "id": "main",
+      "origin_x": 0,
+      "origin_y": 0,
+      "width_px": 64,
+      "height_px": 64,
+      "scale_factor": 1.0
+    }
+  ],
+  "cursor": null,
+  "selection": null,
+  "png_compression": {
+    "color_type": "rgba8",
+    "bit_depth": 8,
+    "interlace": "none",
+    "encoder": "source-bytes",
+    "zlib_level": "preserved",
+    "filter": "preserved"
+  },
+  "content_hash": "sha256:1a245fbd8825c63c4d0a572ff25db103802dd428509d4cb4b5855dc32ad3c17c",
+  "seed": {
+    "path": "tests/fixtures/renderer-corpus/seed.yaml",
+    "scenario_revision": 1
+  }
+}

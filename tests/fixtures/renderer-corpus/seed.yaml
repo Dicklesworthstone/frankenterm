@@ -1,0 +1,30 @@
+schema_version: renderer-corpus-seed.v1
+output_root: tests/fixtures/renderer-corpus
+png_compression:
+  color_type: rgba8
+  bit_depth: 8
+  interlace: none
+  encoder: source-bytes
+  zlib_level: preserved
+  filter: preserved
+groups:
+  - id: smoke
+    scenarios:
+      - id: static-png-roundtrip
+        revision: 1
+        viewport:
+          width_px: 64
+          height_px: 64
+          scale_factor: 1.0
+        monitors:
+          - id: main
+            origin_x: 0
+            origin_y: 0
+            width_px: 64
+            height_px: 64
+            scale_factor: 1.0
+        frames:
+          - id: frame-000
+            source_png: tests/golden/gpu/_smoketest/golden.png
+            cursor: null
+            selection: null

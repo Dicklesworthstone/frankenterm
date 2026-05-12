@@ -98,6 +98,15 @@ jobs:
       - name: Regenerate docs/types and check drift
         run: scripts/check_generated_artifacts.sh
 
+      # ft-tf6g3.33 — renderer bitmap corpus guard. A corpus PNG under
+      # tests/fixtures/renderer-corpus must carry a sibling metadata
+      # sidecar with deterministic viewport/monitor/cursor/selection
+      # state and a content_hash matching the PNG bytes. When Git diff
+      # context is available, changed PNGs must update their sidecar in
+      # the same diff.
+      - name: Renderer bitmap corpus drift guard (ft-tf6g3.33)
+        run: scripts/check-renderer-corpus-drift.sh
+
       # ft-zoxxq.4 — fail CI if any new file outside the mux module
       # introduces `dyn MuxInterface` / `dyn WeztermInterface`. Codifies
       # the wezterm-fork stance from docs/proposals/ft-zoxxq-mux-boundary-truth.md
