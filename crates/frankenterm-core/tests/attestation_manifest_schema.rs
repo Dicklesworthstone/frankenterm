@@ -99,7 +99,44 @@ fn base_bundle(signature: Value) -> Value {
         "artifacts": [],
         "required_categories": [],
         "deferred_slots": [],
+        "confidence_summary": base_confidence_summary(),
         "signature": signature
+    })
+}
+
+fn base_confidence_record() -> Value {
+    json!({
+        "proof_id": "release-bundle.quantitative-attestation.best-confidence",
+        "proof_category": 5,
+        "claim": "Best available confidence for Quantitative Attestation in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+            "status": "not_quantified",
+            "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record."
+        },
+        "sample_size_or_state_count": {
+            "kind": "artifact_count",
+            "value": 1,
+            "unit": "delivered_artifacts"
+        },
+        "time_budget_consumed": {
+            "seconds": 0,
+            "budget_seconds": null,
+            "status": "not_reported"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#quantitative-attestation",
+        "source_artifact_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+        "source_artifact_path": "docs/attestations/schema.json"
+    })
+}
+
+fn base_confidence_summary() -> Value {
+    let record = base_confidence_record();
+    json!({
+        "schema_version": "1.0.0",
+        "schema_path": "docs/proofs/confidence-format-schema.json",
+        "records": [record.clone()],
+        "best_confidence_by_category": [record]
     })
 }
 
@@ -191,5 +228,37 @@ fn bundle_schema_requires_hashed_sigstore_bundle_metadata() {
     assert!(
         !validate(&validator, &legacy_bundle_path_only).is_empty(),
         "sigstore signature without signature.sigstore_bundle must fail validation"
+    );
+}
+
+#[test]
+fn bundle_schema_requires_canonical_confidence_summary() {
+    let validator = bundle_validator();
+    let valid = base_bundle(json!({
+        "method": "unsigned",
+        "canonical_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "reason": "dev bundle"
+    }));
+    assert!(
+        validate(&validator, &valid).is_empty(),
+        "bundle with canonical confidence summary should validate"
+    );
+
+    let mut missing_summary = valid.clone();
+    missing_summary
+        .as_object_mut()
+        .expect("base bundle is an object")
+        .remove("confidence_summary");
+    assert!(
+        !validate(&validator, &missing_summary).is_empty(),
+        "bundle without confidence_summary should fail validation"
+    );
+
+    let mut bad_hash = valid;
+    bad_hash["confidence_summary"]["best_confidence_by_category"][0]["source_artifact_hash"] =
+        json!("not-a-sha256");
+    assert!(
+        !validate(&validator, &bad_hash).is_empty(),
+        "confidence record without a SHA-256 source hash should fail validation"
     );
 }

@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/proofs/confidence-format/v1.json",
+  "title": "FrankenTerm Proof Confidence Format",
+  "description": "Canonical confidence/bound record shape for proof-emitting beads and release-attestation confidence summaries. Defined by ft-tf6g3.34.",
+  "oneOf": [
+    { "$ref": "#/$defs/confidenceRecord" },
+    { "$ref": "#/$defs/confidenceSummary" }
+  ],
+  "$defs": {
+    "confidenceType": {
+      "description": "Method family that gives meaning to confidence_value.",
+      "enum": ["frequentist", "bayesian", "formal", "topological"]
+    },
+    "confidenceValue": {
+      "description": "Quantified confidence when available, or an explicit non-quantified marker when the artifact has not published a numeric/statistical bound yet.",
+      "oneOf": [
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        {
+          "type": "object",
+          "required": ["status", "reason"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "not_quantified" },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          }
+        }
+      ]
+    },
+    "sampleSizeOrStateCount": {
+      "description": "Sample count, model-state count, explored trace count, artifact count, or an explicit not-applicable value.",
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "object",
+          "required": ["kind", "value"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "sample_size",
+                "state_count",
+                "trace_count",
+                "artifact_count",
+                "not_applicable"
+              ]
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "unit": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          }
+        }
+      ]
+    },
+    "timeBudgetConsumed": {
+      "description": "Runtime budget consumed while producing the confidence claim. Use status=not_reported when the producing artifact does not publish a time budget yet.",
+      "type": "object",
+      "required": ["seconds", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "budget_seconds": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            { "type": "null" }
+          ]
+        },
+        "status": {
+          "enum": ["reported", "not_reported"]
+        }
+      }
+    },
+    "confidenceRecord": {
+      "type": "object",
+      "required": [
+        "proof_id",
+        "proof_category",
+        "claim",
+        "confidence_type",
+        "confidence_value",
+        "sample_size_or_state_count",
+        "time_budget_consumed",
+        "methodology_url",
+        "source_artifact_hash"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "proof_id": {
+          "description": "Stable proof or bundle-summary identifier.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:/-]+$"
+        },
+        "proof_category": {
+          "description": "Numeric proof taxonomy ID from docs/proof-taxonomy.json.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "claim": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "confidence_type": { "$ref": "#/$defs/confidenceType" },
+        "confidence_value": { "$ref": "#/$defs/confidenceValue" },
+        "sample_size_or_state_count": {
+          "$ref": "#/$defs/sampleSizeOrStateCount"
+        },
+        "time_budget_consumed": { "$ref": "#/$defs/timeBudgetConsumed" },
+        "methodology_url": {
+          "description": "Repo-relative documentation URL, fragment, or absolute URI explaining the method.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "source_artifact_hash": {
+          "description": "SHA-256 of the source artifact bytes that support this record.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_artifact_path": {
+          "description": "Optional repo-relative source artifact path for operator navigation.",
+          "type": "string",
+          "pattern": "^[^/].*$"
+        }
+      }
+    },
+    "confidenceSummary": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "schema_path",
+        "records",
+        "best_confidence_by_category"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": "1.0.0" },
+        "schema_path": {
+          "type": "string",
+          "const": "docs/proofs/confidence-format-schema.json"
+        },
+        "records": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/confidenceRecord" }
+        },
+        "best_confidence_by_category": {
+          "description": "One canonical best-available confidence record per proof taxonomy category represented by delivered artifacts in the release bundle.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/confidenceRecord" }
+        }
+      }
+    }
+  }
+}

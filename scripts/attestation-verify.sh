@@ -93,7 +93,7 @@ else
 fi
 
 # Required top-level fields.
-for field in release generated_at generator git artifacts required_categories taxonomy_coverage signature; do
+for field in release generated_at generator git artifacts required_categories taxonomy_coverage confidence_summary signature; do
   has="$(jq -e --arg f "$field" 'has($f)' <<<"$bundle_json" >/dev/null 2>&1 && echo true || echo false)"
   if [[ "$has" == "true" ]]; then record_check "field:$field" true "present"
   else record_check "field:$field" false "missing top-level field"; fi
@@ -110,6 +110,33 @@ elif [[ ! "$taxonomy_uncategorized" =~ ^[0-9]+$ ]]; then
   record_check "taxonomy_coverage" false "taxonomy_coverage.uncategorized_artifact_count must be a non-negative integer"
 else
   record_check "taxonomy_coverage" true "$taxonomy_category_count categories, $taxonomy_below_threshold below threshold, $taxonomy_uncategorized uncategorized artifact(s)"
+fi
+
+confidence_schema_path="$(jq -r '.confidence_summary.schema_path // ""' <<<"$bundle_json")"
+confidence_record_count="$(jq '(.confidence_summary.records // []) | length' <<<"$bundle_json")"
+confidence_best_count="$(jq '(.confidence_summary.best_confidence_by_category // []) | length' <<<"$bundle_json")"
+confidence_category_count="$(jq '[.artifacts[]? | (.proof_categories // [])[]] | unique | length' <<<"$bundle_json")"
+confidence_bad_records="$(jq '
+  [
+    ((.confidence_summary.records // []) + (.confidence_summary.best_confidence_by_category // []))[]
+    | . as $record
+    | select(
+        ($record.proof_id | type != "string")
+        or ($record.proof_category | type != "number")
+        or ((["frequentist", "bayesian", "formal", "topological"] | index($record.confidence_type)) == null)
+        or ($record.source_artifact_hash | type != "string")
+        or (($record.source_artifact_hash // "") | test("^[0-9a-f]{64}$") | not)
+      )
+  ] | length
+' <<<"$bundle_json")"
+if [[ "$confidence_schema_path" != "docs/proofs/confidence-format-schema.json" ]]; then
+  record_check "confidence_summary" false "unexpected schema_path: $confidence_schema_path"
+elif [[ "$confidence_best_count" -lt "$confidence_category_count" ]]; then
+  record_check "confidence_summary" false "expected at least $confidence_category_count best-confidence category row(s), got $confidence_best_count"
+elif [[ "$confidence_bad_records" != "0" ]]; then
+  record_check "confidence_summary" false "$confidence_bad_records malformed best-confidence record(s)"
+else
+  record_check "confidence_summary" true "$confidence_record_count record(s), $confidence_best_count best-by-category row(s)"
 fi
 
 # Strict required-categories check (optional).

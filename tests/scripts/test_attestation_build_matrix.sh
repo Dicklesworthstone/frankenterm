@@ -206,6 +206,14 @@ run_case() {
       echo "FAIL ${name}: expected ${expected_deferred_count} deferred slots, got ${deferred_count}" >&2
       return 0
     fi
+    local confidence_schema_path
+    confidence_schema_path="$(jq -r '.confidence_summary.schema_path // ""' "${bundle}")"
+    if [[ "${confidence_schema_path}" != "docs/proofs/confidence-format-schema.json" ]]; then
+      fail=$((fail + 1))
+      record_result "${name}" "${expected_rc}" "${rc}" "failed" "${case_dir}"
+      echo "FAIL ${name}: missing confidence_summary schema path" >&2
+      return 0
+    fi
   fi
 
   if [[ "${name}" == deferred_* ]]; then
@@ -277,7 +285,7 @@ run_sigstore_cases() {
   local verify_name="verify_checks_sigstore_hash_before_cosign"
   local verify_dir="${ARTIFACT_ROOT}/${verify_name}"
   local sigstore_path="docs/attestations/schema.json"
-  local sigstore_hash sigstore_size no_sig canonical_payload canonical_sha verify_bundle bad_bundle
+  local sigstore_hash sigstore_size no_sig canonical_payload canonical_sha verify_bundle bad_bundle bad_confidence_bundle
   mkdir -p "${verify_dir}"
   sigstore_hash="$(sha256_file "${ROOT_DIR}/${sigstore_path}")"
   sigstore_size="$(wc -c < "${ROOT_DIR}/${sigstore_path}" | tr -d ' ')"
@@ -285,7 +293,7 @@ run_sigstore_cases() {
     schema_version: "1.0.0",
     release: {version: "0.2.0", tag: "v0.2.0", channel: "stable"},
     generated_at: "2026-05-12T00:00:00Z",
-    generator: {name: "scripts/attestation-build.sh", version: "1.3.0"},
+    generator: {name: "scripts/attestation-build.sh", version: "1.4.0"},
     git: {
       commit: "0123456789abcdef0123456789abcdef01234567",
       tree: "89abcdef0123456789abcdef0123456789abcdef",
@@ -324,12 +332,65 @@ run_sigstore_cases() {
           deferred_slot_delta: 0
         }])
       }
+    },
+    confidence_summary: {
+      schema_version: "1.0.0",
+      schema_path: "docs/proofs/confidence-format-schema.json",
+      records: [{
+        proof_id: "release-bundle.quantitative-attestation.best-confidence",
+        proof_category: 5,
+        claim: "Best available confidence for Quantitative Attestation in this release bundle.",
+        confidence_type: "frequentist",
+        confidence_value: {
+          status: "not_quantified",
+          reason: "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record."
+        },
+        sample_size_or_state_count: {
+          kind: "artifact_count",
+          value: 1,
+          unit: "delivered_artifacts"
+        },
+        time_budget_consumed: {
+          seconds: 0,
+          budget_seconds: null,
+          status: "not_reported"
+        },
+        methodology_url: "docs/proof-taxonomy.json#quantitative-attestation",
+        source_artifact_hash: "",
+        source_artifact_path: "docs/attestations/schema.json"
+      }],
+      best_confidence_by_category: [{
+        proof_id: "release-bundle.quantitative-attestation.best-confidence",
+        proof_category: 5,
+        claim: "Best available confidence for Quantitative Attestation in this release bundle.",
+        confidence_type: "frequentist",
+        confidence_value: {
+          status: "not_quantified",
+          reason: "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record."
+        },
+        sample_size_or_state_count: {
+          kind: "artifact_count",
+          value: 1,
+          unit: "delivered_artifacts"
+        },
+        time_budget_consumed: {
+          seconds: 0,
+          budget_seconds: null,
+          status: "not_reported"
+        },
+        methodology_url: "docs/proof-taxonomy.json#quantitative-attestation",
+        source_artifact_hash: "",
+        source_artifact_path: "docs/attestations/schema.json"
+      }]
     }
   }')"
   no_sig="$(jq \
     --arg artifact_sha "${sigstore_hash}" \
     --argjson artifact_size "${sigstore_size}" \
-    '.artifacts[0].sha256 = $artifact_sha | .artifacts[0].size_bytes = $artifact_size' \
+    '.artifacts[0].sha256 = $artifact_sha
+     | .artifacts[0].size_bytes = $artifact_size
+     | .confidence_summary.records[0].source_artifact_hash = $artifact_sha
+     | .confidence_summary.best_confidence_by_category[0].source_artifact_hash = $artifact_sha' \
     <<<"${no_sig}")"
   canonical_payload="$(jq -S -c '.' <<<"${no_sig}")"
   canonical_sha="$(printf '%s' "${canonical_payload}" | sha256_stdin)"
@@ -349,6 +410,9 @@ run_sigstore_cases() {
     }}' <<<"${no_sig}" >"${verify_bundle}"
   jq '.signature.sigstore_bundle.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
     "${verify_bundle}" >"${bad_bundle}"
+  bad_confidence_bundle="${verify_dir}/sigstore-bad-confidence.json"
+  jq 'del(.confidence_summary.records[0].source_artifact_hash)' \
+    "${verify_bundle}" >"${bad_confidence_bundle}"
 
   set +e
   PATH="${fake_bin}:$PATH" bash "${ROOT_DIR}/scripts/attestation-verify.sh" "${verify_bundle}" >"${verify_dir}/valid.out" 2>&1
@@ -373,8 +437,19 @@ run_sigstore_cases() {
     return 0
   fi
 
+  set +e
+  PATH="${fake_bin}:$PATH" bash "${ROOT_DIR}/scripts/attestation-verify.sh" "${bad_confidence_bundle}" >"${verify_dir}/bad-confidence.out" 2>&1
+  rc=$?
+  set -e
+  if [[ "${rc}" == "0" ]] || ! grep -q "confidence_summary" "${verify_dir}/bad-confidence.out"; then
+    fail=$((fail + 1))
+    record_result "${verify_name}" "confidence_failure" "${rc}" "failed" "${verify_dir}"
+    echo "FAIL ${verify_name}: malformed confidence record was not rejected" >&2
+    return 0
+  fi
+
   pass=$((pass + 1))
-  record_result "${verify_name}" "hash_mismatch_failure" "${rc}" "passed" "${verify_dir}"
+  record_result "${verify_name}" "hash_and_confidence_failures" "${rc}" "passed" "${verify_dir}"
   echo "PASS ${verify_name}"
 }
 

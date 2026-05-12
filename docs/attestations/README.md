@@ -14,6 +14,7 @@ in [`docs/reality-check-bridge-plan.md`](../reality-check-bridge-plan.md).
 | `schema.json` | JSON Schema (2020-12) describing the bundle structure. Semver-stable; new categories require a schema bump. |
 | `manifest.json` | Canonical declarative input list. Per-category slots map to the artifact path the producing bead must emit. The build script reads this. |
 | `../proof-taxonomy.json` | Numeric proof taxonomy registry used by `proof_categories` metadata and bundle coverage summaries. |
+| `../proofs/confidence-format-schema.json` | Canonical confidence/bound record shape used by `confidence_summary` and by proof-emitting beads that publish statistical, formal, or topological confidence records. |
 | `<version>.json` | The signed bundle for a specific release. Lists every artifact (path + SHA-256 + size + producing-bead pointer) plus the signature info. |
 | `<version>.sigstore` | (sigstore-signed bundles only) cosign sigstore bundle — Fulcio certificate, Rekor verification material, and signature over the canonical signing payload. |
 
@@ -79,6 +80,17 @@ Each manifest slot can also declare `proof_categories`, using numeric IDs from
 IDs onto delivered artifacts/deferred slots and emits `taxonomy_coverage` with
 per-category counts, below-threshold flags, uncategorized artifact count, and an
 optional delta from `FT_ATTESTATION_PRIOR_BUNDLE`.
+
+Bundles also emit `confidence_summary`, generated from delivered artifacts that
+declare `proof_categories`. Each row conforms to
+[`docs/proofs/confidence-format-schema.json`](../proofs/confidence-format-schema.json)
+and records the best available confidence surface per proof taxonomy category.
+When an artifact is hash-attested but does not yet publish a numeric bound, the
+row uses `confidence_value.status = "not_quantified"` instead of inventing a
+false confidence score. Future proof-emitting beads should publish their own
+records in this same shape so release bundles can replace the conservative
+hash-only row with a quantified frequentist, Bayesian, formal, or topological
+bound.
 
 ## Verifying a bundle
 

@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-GENERATOR_VERSION="1.3.0"
+GENERATOR_VERSION="1.4.0"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="${FT_ATTESTATION_MANIFEST:-$REPO_ROOT/docs/attestations/manifest.json}"
 OUT_DIR="${FT_ATTESTATION_OUT_DIR:-$REPO_ROOT/docs/attestations}"
@@ -400,6 +400,53 @@ taxonomy_coverage_json="$(jq -n \
        }
      }')"
 
+confidence_summary_json="$(jq -n \
+  --slurpfile taxonomy "$TAXONOMY_PATH" \
+  --arg schema_path "docs/proofs/confidence-format-schema.json" \
+  --argjson artifacts "$artifacts_json" \
+  '($taxonomy[0].categories // []) as $categories
+   | def confidence_type($id; $slug):
+       if $slug == "topological-invariant" then "topological"
+       elif ([1, 3, 6, 7, 8, 10] | index($id)) then "formal"
+       else "frequentist"
+       end;
+     def matching_artifacts($id):
+       [$artifacts[]? | select((.proof_categories // []) | index($id))];
+     ($categories
+       | map(. as $category
+         | (matching_artifacts($category.id)) as $matches
+         | select(($matches | length) > 0)
+         | ($matches | sort_by(.path) | .[0]) as $source
+         | {
+             proof_id: ("release-bundle." + $category.slug + ".best-confidence"),
+             proof_category: $category.id,
+             claim: ("Best available confidence for " + $category.name + " in this release bundle."),
+             confidence_type: confidence_type($category.id; $category.slug),
+             confidence_value: {
+               status: "not_quantified",
+               reason: "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record."
+             },
+             sample_size_or_state_count: {
+               kind: "artifact_count",
+               value: ($matches | length),
+               unit: "delivered_artifacts"
+             },
+             time_budget_consumed: {
+               seconds: 0,
+               budget_seconds: null,
+               status: "not_reported"
+             },
+             methodology_url: ("docs/proof-taxonomy.json#" + $category.slug),
+             source_artifact_hash: $source.sha256,
+             source_artifact_path: $source.path
+           })) as $records
+   | {
+       schema_version: "1.0.0",
+       schema_path: $schema_path,
+       records: $records,
+       best_confidence_by_category: $records
+     }')"
+
 bundle_no_sig="$(jq -n \
   --arg schema_version "1.0.0" \
   --arg version "$VERSION" \
@@ -414,6 +461,7 @@ bundle_no_sig="$(jq -n \
   --argjson required_categories "$REQUIRED_CATEGORIES_JSON" \
   --argjson deferred_slots "$deferred_slots_json" \
   --argjson taxonomy_coverage "$taxonomy_coverage_json" \
+  --argjson confidence_summary "$confidence_summary_json" \
   '{
     schema_version: $schema_version,
     release: {
@@ -430,7 +478,8 @@ bundle_no_sig="$(jq -n \
     artifacts: $artifacts,
     required_categories: $required_categories,
     deferred_slots: $deferred_slots,
-    taxonomy_coverage: $taxonomy_coverage
+    taxonomy_coverage: $taxonomy_coverage,
+    confidence_summary: $confidence_summary
   }')"
 
 # Canonical signing payload: bundle (without .signature) sorted-keys + compact.
@@ -532,6 +581,7 @@ echo "  release        : v${VERSION} (${CHANNEL})"
 echo "  git            : ${GIT_COMMIT}"
 echo "  artifacts      : ${#artifact_objs[@]}"
 echo "  taxonomy       : $(jq -r '.below_threshold_count' <<<"$taxonomy_coverage_json") below threshold"
+echo "  confidence     : $(jq -r '.best_confidence_by_category | length' <<<"$confidence_summary_json") category record(s)"
 if [[ ${#deferred_objs[@]} -gt 0 ]]; then
   echo "  deferred slots : ${#deferred_objs[@]}"
 fi
