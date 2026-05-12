@@ -79,6 +79,26 @@ Every new plan must include:
 - Current Beads/BV counts and dependency-cycle result.
 - A successor note telling future runs to cross-link this plan.
 
+## Closeout Evidence Comments
+
+Closing a reality-check or proof-producing bead requires a Beads comment that
+names the concrete artifact path(s), the exact verifier command(s), and the
+proof context: RCH, CI, local non-heavy, skipped_not_proven, or superseded-by-X.
+The close reason may summarize the result, but the comment is the audit record
+future agents use when they need to verify a release bundle without rebuilding
+the whole session history.
+
+Use this gate before closing or auditing `ft-tf6g3` children:
+
+```bash
+scripts/validate-proof-taxonomy.sh --require-close-comments
+scripts/validate-proof-taxonomy.sh --json --require-close-comments
+```
+
+If the gate reports a closed bead without an evidence comment, either add the
+missing comment with the artifact and verifier evidence or reopen the bead when
+the artifact is absent or unverifiable.
+
 The 2026-04-30 bridge plan is the first instance:
 `docs/reality-check-bridge-plan.md`.
 

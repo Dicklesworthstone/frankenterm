@@ -6,20 +6,25 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAXONOMY_PATH="${ROOT_DIR}/docs/proof-taxonomy.json"
 BEADS_PATH="${ROOT_DIR}/.beads/issues.jsonl"
 JSON_OUTPUT=0
+REQUIRE_CLOSE_COMMENTS=0
 
 usage() {
   cat <<EOF
-Usage: $0 [--json] [--taxonomy <path>] [--beads <path>]
+Usage: $0 [--json] [--require-close-comments] [--taxonomy <path>] [--beads <path>]
 
 Checks every ft-tf6g3 parent/child bead for a proof_category line. Numeric
 references must resolve to docs/proof-taxonomy.json category IDs. Non-proof
 work may instead use one of the taxonomy's non_proof_classifications.
+
+With --require-close-comments, also checks closed ft-tf6g3 beads for at least
+one evidence-bearing comment naming proof/artifact/verification context.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) JSON_OUTPUT=1; shift ;;
+    --require-close-comments) REQUIRE_CLOSE_COMMENTS=1; shift ;;
     --taxonomy) TAXONOMY_PATH="${2:?--taxonomy requires a path}"; shift 2 ;;
     --beads) BEADS_PATH="${2:?--beads requires a path}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -31,7 +36,7 @@ done
 [[ -f "$BEADS_PATH" ]] || { echo "error: beads JSONL not found: $BEADS_PATH" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required" >&2; exit 1; }
 
-python3 - "$TAXONOMY_PATH" "$BEADS_PATH" "$JSON_OUTPUT" <<'PY'
+python3 - "$TAXONOMY_PATH" "$BEADS_PATH" "$JSON_OUTPUT" "$REQUIRE_CLOSE_COMMENTS" <<'PY'
 import json
 import re
 import sys
@@ -41,6 +46,7 @@ from pathlib import Path
 taxonomy_path = Path(sys.argv[1])
 beads_path = Path(sys.argv[2])
 json_output = sys.argv[3] == "1"
+require_close_comments = sys.argv[4] == "1"
 
 taxonomy = json.loads(taxonomy_path.read_text())
 categories = taxonomy.get("categories", [])
@@ -50,6 +56,11 @@ non_proof = {item["slug"].lower(): item for item in taxonomy.get("non_proof_clas
 issue_re = re.compile(r"^ft-tf6g3(?:\.(\d+))?$")
 line_re = re.compile(r"^proof_category:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 number_re = re.compile(r"(?<![\w.])(\d+)(?![\w.])")
+evidence_comment_re = re.compile(
+    r"(artifact-present|artifact path|verified|verification|verifier|proof:|"
+    r"validated:|validated|rch|ci|command|scripts/|docs/|crates/|tests/)",
+    re.IGNORECASE,
+)
 
 issues = []
 for lineno, line in enumerate(beads_path.read_text().splitlines(), start=1):
@@ -66,6 +77,8 @@ for lineno, line in enumerate(beads_path.read_text().splitlines(), start=1):
 violations = []
 category_counts = Counter()
 non_proof_counts = Counter()
+close_comment_checked = 0
+close_comment_missing = []
 checked = 0
 
 for issue in sorted(issues, key=lambda item: [int(part) if part.isdigit() else part for part in item["id"].replace("ft-tf6g3.", "ft-tf6g3.0.").split(".")]):
@@ -81,6 +94,22 @@ for issue in sorted(issues, key=lambda item: [int(part) if part.isdigit() else p
             "message": "missing proof_category line"
         })
         continue
+
+    if require_close_comments and issue.get("status") == "closed":
+        close_comment_checked += 1
+        comments = issue.get("comments") or []
+        evidence_comments = [
+            comment
+            for comment in comments
+            if evidence_comment_re.search(str(comment.get("text") or ""))
+        ]
+        if not evidence_comments:
+            close_comment_missing.append({
+                "id": issue_id,
+                "title": issue.get("title", ""),
+                "kind": "missing_close_comment",
+                "message": "closed bead lacks an evidence-bearing comment naming artifact/proof/verification context",
+            })
 
     value = match.group(1).strip()
     numbers = [int(item) for item in number_re.findall(value)]
@@ -113,6 +142,9 @@ for issue in sorted(issues, key=lambda item: [int(part) if part.isdigit() else p
             "proof_category": value
         })
 
+if close_comment_missing:
+    violations.extend(close_comment_missing)
+
 core_count = sum(1 for item in categories if item.get("bridge_plan_core") is True)
 summary = {
     "schema_version": "1.0.0",
@@ -125,6 +157,9 @@ summary = {
     "non_proof_classification_count": len(non_proof),
     "category_counts": dict(sorted(category_counts.items(), key=lambda item: int(item[0]))),
     "non_proof_counts": dict(sorted(non_proof_counts.items())),
+    "close_comment_check_enabled": require_close_comments,
+    "close_comment_checked_count": close_comment_checked,
+    "close_comment_missing_count": len(close_comment_missing),
     "violation_count": len(violations),
     "violations": violations,
 }
@@ -140,6 +175,8 @@ else:
         print(f"OK: {checked} ft-tf6g3 bead(s) have valid proof_category lines")
         print(f"  taxonomy categories: {len(categories)} ({core_count} core, {len(categories) - core_count} extension)")
         print(f"  non-proof classifications: {len(non_proof)}")
+        if require_close_comments:
+            print(f"  closed-bead evidence comments: {close_comment_checked} checked")
 
 sys.exit(1 if violations else 0)
 PY
