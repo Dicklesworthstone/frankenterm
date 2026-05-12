@@ -300,6 +300,10 @@ impl<Q: QueryClient> App<Q> {
             }
             KeyCode::Esc => {
                 self.view_state.panes_filter_query.clear();
+                self.view_state.panes_unhandled_only = false;
+                self.view_state.panes_bookmarked_only = false;
+                self.view_state.panes_agent_filter = None;
+                self.view_state.panes_domain_filter = None;
                 self.view_state.selected_index = 0;
             }
             KeyCode::Char('p') if plain_char => {
@@ -320,8 +324,10 @@ impl<Q: QueryClient> App<Q> {
                     )
                     && selected.name != profile_state.active_profile
                 {
-                    self.pending_command =
-                        Some(format!("ft rules profile apply {}", selected.name));
+                    self.pending_command = Some(format!(
+                        "ft rules profile apply {}",
+                        quote_command_arg(&selected.name)
+                    ));
                 }
             }
             KeyCode::Char(c) if plain_char && !c.is_control() => {
@@ -1019,11 +1025,13 @@ pub fn run_tui<Q: QueryClient>(query_client: Q, config: AppConfig) -> TuiResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rulesets::RulesetProfileSummary;
     use crate::storage::{
         CorrelationRef, CorrelationType, PaneInfo as TimelinePaneInfo, Timeline, TimelineEvent,
     };
     use crate::tui::query::{
-        EventView, HealthStatus, HistoryEntryView, PaneView, SearchResultView, WorkflowProgressView,
+        EventView, HealthStatus, HistoryEntryView, PaneView, RulesetProfileState, SearchResultView,
+        WorkflowProgressView,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::{Arc, Mutex};
@@ -1285,6 +1293,48 @@ mod tests {
 
         app.handle_panes_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.view_state.selected_index, 0);
+
+        app.view_state.panes_bookmarked_only = true;
+        app.view_state.panes_domain_filter = Some("local".to_string());
+        app.handle_panes_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.view_state.panes_filter_query.is_empty());
+        assert!(!app.view_state.panes_unhandled_only);
+        assert!(!app.view_state.panes_bookmarked_only);
+        assert!(app.view_state.panes_agent_filter.is_none());
+        assert!(app.view_state.panes_domain_filter.is_none());
+    }
+
+    #[test]
+    fn panes_profile_apply_command_quotes_selected_name() {
+        let mut app = App::new(MultiPaneQueryClient, AppConfig::default());
+        app.view_state.ruleset_profile_state = Some(RulesetProfileState {
+            active_profile: "default".to_string(),
+            active_last_applied_at: None,
+            profiles: vec![
+                RulesetProfileSummary {
+                    name: "default".to_string(),
+                    description: None,
+                    path: None,
+                    last_applied_at: None,
+                    implicit: true,
+                },
+                RulesetProfileSummary {
+                    name: "ops profile".to_string(),
+                    description: None,
+                    path: None,
+                    last_applied_at: None,
+                    implicit: false,
+                },
+            ],
+        });
+        app.view_state.selected_ruleset_profile_index = 1;
+
+        app.handle_panes_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.pending_command.as_deref(),
+            Some("ft rules profile apply 'ops profile'")
+        );
     }
 
     // -----------------------------------------------------------------------

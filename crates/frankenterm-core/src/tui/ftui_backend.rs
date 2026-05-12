@@ -29,7 +29,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::command_handoff::quote_command_arg;
-use super::query::{QueryClient, SavedSearchView};
+use super::query::{
+    PaneBookmarkView, QueryClient, QueryError, RulesetProfileState, SavedSearchView,
+};
 use super::view_adapters::{
     HealthModel, PaneRow, SearchRow, TimelineRow, TriageRow, WorkflowRow, adapt_event,
     adapt_health, adapt_history, adapt_pane, adapt_search, adapt_timeline_event, adapt_triage,
@@ -533,7 +535,14 @@ pub struct WaModel {
     // Panes view state.
     panes: Vec<PaneRow>,
     panes_selected: usize,
+    pane_bookmarks: Vec<PaneBookmarkView>,
+    panes_filter: TextInput,
+    panes_unhandled_only: bool,
+    panes_bookmarked_only: bool,
+    panes_agent_filter: Option<String>,
     panes_domain_filter: Option<String>,
+    panes_profile_index: usize,
+    ruleset_profile_state: Option<RulesetProfileState>,
     // Triage view state.
     triage_items: Vec<TriageRow>,
     triage_selected: usize,
@@ -572,7 +581,14 @@ impl WaModel {
             triage_count: 0,
             panes: Vec::new(),
             panes_selected: 0,
+            pane_bookmarks: Vec::new(),
+            panes_filter: TextInput::new(),
+            panes_unhandled_only: false,
+            panes_bookmarked_only: false,
+            panes_agent_filter: None,
             panes_domain_filter: None,
+            panes_profile_index: 0,
+            ruleset_profile_state: None,
             triage_items: Vec::new(),
             triage_selected: 0,
             triage_expanded: None,
@@ -619,41 +635,146 @@ impl WaModel {
 
         match key.code {
             KeyCode::Down | KeyCode::Char('j') if plain_char => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.panes_selected = (self.panes_selected + 1) % count;
                 }
                 ftui::Cmd::None
             }
             KeyCode::Up | KeyCode::Char('k') if plain_char => {
+                self.view_state.focus = FocusRegion::PrimaryList;
                 if count > 0 {
                     self.panes_selected = self.panes_selected.checked_sub(1).unwrap_or(count - 1);
                 }
                 ftui::Cmd::None
             }
+            KeyCode::Char('u') if plain_char => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                self.panes_unhandled_only = !self.panes_unhandled_only;
+                self.panes_selected = 0;
+                ftui::Cmd::None
+            }
+            KeyCode::Char('b') if plain_char => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                self.panes_bookmarked_only = !self.panes_bookmarked_only;
+                self.panes_selected = 0;
+                ftui::Cmd::None
+            }
+            KeyCode::Char('a') if plain_char => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                self.panes_agent_filter =
+                    Self::next_agent_filter(self.panes_agent_filter.as_deref());
+                self.panes_selected = 0;
+                ftui::Cmd::None
+            }
             KeyCode::Char('d') if plain_char => {
-                // Cycle domain filter
-                let domains = self.unique_domains();
-                self.panes_domain_filter = match &self.panes_domain_filter {
-                    None if !domains.is_empty() => Some(domains[0].clone()),
-                    Some(current) => {
-                        let idx = domains.iter().position(|d| d == current);
-                        match idx {
-                            Some(i) if i + 1 < domains.len() => Some(domains[i + 1].clone()),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
+                self.view_state.focus = FocusRegion::PrimaryList;
+                self.panes_domain_filter =
+                    Self::next_domain_filter(self.panes_domain_filter.as_deref());
+                self.panes_selected = 0;
+                ftui::Cmd::None
+            }
+            KeyCode::Char('p') if plain_char => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                self.cycle_panes_profile();
+                ftui::Cmd::None
+            }
+            KeyCode::Enter => {
+                self.view_state.focus = FocusRegion::PrimaryList;
+                self.queue_selected_ruleset_profile_apply();
+                ftui::Cmd::None
+            }
+            KeyCode::Backspace => {
+                self.view_state.focus = FocusRegion::FilterBar;
+                self.panes_filter.delete_back();
                 self.panes_selected = 0;
                 ftui::Cmd::None
             }
             KeyCode::Escape => {
-                self.panes_domain_filter = None;
+                self.clear_panes_filters();
+                ftui::Cmd::None
+            }
+            KeyCode::Char(c) if plain_char && !c.is_control() => {
+                self.view_state.focus = FocusRegion::FilterBar;
+                self.panes_filter.insert_char(c);
                 self.panes_selected = 0;
                 ftui::Cmd::None
             }
             _ => ftui::Cmd::None,
         }
+    }
+
+    fn next_agent_filter(current: Option<&str>) -> Option<String> {
+        match current {
+            None => Some("codex".to_string()),
+            Some("codex") => Some("claude".to_string()),
+            Some("claude") => Some("gemini".to_string()),
+            Some("gemini") => Some("unknown".to_string()),
+            _ => None,
+        }
+    }
+
+    fn next_domain_filter(current: Option<&str>) -> Option<String> {
+        match current {
+            None => Some("local".to_string()),
+            Some("local") => Some("ssh".to_string()),
+            _ => None,
+        }
+    }
+
+    fn clear_panes_filters(&mut self) {
+        self.view_state.focus = FocusRegion::PrimaryList;
+        self.panes_filter.clear();
+        self.panes_unhandled_only = false;
+        self.panes_bookmarked_only = false;
+        self.panes_agent_filter = None;
+        self.panes_domain_filter = None;
+        self.panes_selected = 0;
+    }
+
+    fn cycle_panes_profile(&mut self) {
+        let profile_count = self
+            .ruleset_profile_state
+            .as_ref()
+            .map_or(0, |profile_state| profile_state.profiles.len());
+        if profile_count > 0 {
+            self.panes_profile_index = (self.panes_profile_index + 1) % profile_count;
+        }
+    }
+
+    fn selected_ruleset_profile_name(&self) -> Option<&str> {
+        let profile_state = self.ruleset_profile_state.as_ref()?;
+        profile_state
+            .profiles
+            .get(
+                self.panes_profile_index
+                    .min(profile_state.profiles.len().saturating_sub(1)),
+            )
+            .map(|profile| profile.name.as_str())
+    }
+
+    fn active_ruleset_profile_name(&self) -> Option<&str> {
+        self.ruleset_profile_state
+            .as_ref()
+            .map(|profile_state| profile_state.active_profile.as_str())
+    }
+
+    fn queue_selected_ruleset_profile_apply(&mut self) {
+        let Some(selected_name) = self.selected_ruleset_profile_name().map(ToOwned::to_owned)
+        else {
+            self.triage_queued_action = None;
+            return;
+        };
+        let active_name = self.active_ruleset_profile_name().unwrap_or_default();
+        if selected_name == active_name {
+            self.triage_queued_action = None;
+            return;
+        }
+
+        self.triage_queued_action = Some(format!(
+            "ft rules profile apply {}",
+            quote_command_arg(&selected_name)
+        ));
     }
 
     /// Handle keys specific to the Triage view.
@@ -1202,31 +1323,65 @@ impl WaModel {
         }
     }
 
-    /// Return indices of panes matching the current domain filter.
+    /// Return indices of panes matching the current Panes filters.
     fn filtered_pane_indices(&self) -> Vec<usize> {
+        let query = self.panes_filter.text().trim().to_ascii_lowercase();
+        let bookmarked_panes: std::collections::BTreeSet<String> = self
+            .pane_bookmarks
+            .iter()
+            .map(|bookmark| bookmark.pane_id.to_string())
+            .collect();
+
         self.panes
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                self.panes_domain_filter
-                    .as_ref()
-                    .is_none_or(|f| p.domain == *f)
+                if self.panes_unhandled_only && p.unhandled_badge.is_empty() {
+                    return false;
+                }
+
+                if self.panes_bookmarked_only && !bookmarked_panes.contains(&p.pane_id) {
+                    return false;
+                }
+
+                if let Some(agent_filter) = &self.panes_agent_filter
+                    && !p.agent_label.eq_ignore_ascii_case(agent_filter)
+                {
+                    return false;
+                }
+
+                if let Some(domain_filter) = &self.panes_domain_filter {
+                    let domain = p.domain.to_ascii_lowercase();
+                    let filter = domain_filter.to_ascii_lowercase();
+                    if filter == "ssh" {
+                        if !domain.contains("ssh") {
+                            return false;
+                        }
+                    } else if !domain.contains(&filter) {
+                        return false;
+                    }
+                }
+
+                if query.is_empty() {
+                    return true;
+                }
+
+                p.pane_id.to_ascii_lowercase().contains(&query)
+                    || p.title.to_ascii_lowercase().contains(&query)
+                    || p.domain.to_ascii_lowercase().contains(&query)
+                    || p.cwd.to_ascii_lowercase().contains(&query)
             })
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// Collect unique domain names from pane data.
-    fn unique_domains(&self) -> Vec<String> {
-        let mut domains: Vec<String> = self
-            .panes
-            .iter()
-            .map(|p| p.domain.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        domains.sort();
-        domains
+    fn clamp_panes_selection(&mut self) {
+        let filtered_len = self.filtered_pane_indices().len();
+        if filtered_len > 0 {
+            self.panes_selected = self.panes_selected.min(filtered_len - 1);
+        } else {
+            self.panes_selected = 0;
+        }
     }
 
     /// Refresh dashboard data from the QueryClient.
@@ -1248,14 +1403,49 @@ impl WaModel {
             Ok(panes) => {
                 self.unhandled_count = panes.iter().map(|p| p.unhandled_event_count as usize).sum();
                 self.panes = panes.iter().map(adapt_pane).collect();
-                // Clamp selection
-                if !self.panes.is_empty() {
-                    self.panes_selected = self.panes_selected.min(self.panes.len() - 1);
-                } else {
-                    self.panes_selected = 0;
-                }
+                self.clamp_panes_selection();
             }
             Err(_) => { /* health query already reports errors */ }
+        }
+
+        // Pane bookmarks feed the Panes bookmarked-only filter.
+        match self.query.list_pane_bookmarks() {
+            Ok(bookmarks) => {
+                self.pane_bookmarks = bookmarks;
+                self.clamp_panes_selection();
+            }
+            Err(QueryError::DatabaseNotInitialized(_)) => {
+                self.pane_bookmarks.clear();
+                self.clamp_panes_selection();
+            }
+            Err(e) => {
+                self.view_state.error_message = Some(format!("Failed to list pane bookmarks: {e}"));
+            }
+        }
+
+        // Ruleset profiles feed the Panes profile selector.
+        match self.query.ruleset_profile_state() {
+            Ok(profile_state) => {
+                let active_index = profile_state
+                    .profiles
+                    .iter()
+                    .position(|profile| profile.name == profile_state.active_profile)
+                    .unwrap_or(0);
+                if self.panes_profile_index >= profile_state.profiles.len() {
+                    self.panes_profile_index = active_index;
+                }
+                if self.panes_profile_index == 0
+                    && !profile_state.profiles.is_empty()
+                    && self.ruleset_profile_state.is_none()
+                {
+                    self.panes_profile_index = active_index;
+                }
+                self.ruleset_profile_state = Some(profile_state);
+            }
+            Err(e) => {
+                self.view_state.error_message =
+                    Some(format!("Failed to resolve ruleset profiles: {e}"));
+            }
         }
 
         // Triage items (used for both count on Home and Triage view)
@@ -1500,6 +1690,20 @@ impl ftui::Model for WaModel {
             ),
             View::Panes => {
                 let filtered = self.filtered_pane_indices();
+                let profile_count = self
+                    .ruleset_profile_state
+                    .as_ref()
+                    .map_or(0, |profile_state| profile_state.profiles.len());
+                let filters = PaneRenderFilters {
+                    query: self.panes_filter.text(),
+                    unhandled_only: self.panes_unhandled_only,
+                    bookmarked_only: self.panes_bookmarked_only,
+                    agent_filter: self.panes_agent_filter.as_deref(),
+                    domain_filter: self.panes_domain_filter.as_deref(),
+                    selected_profile: self.selected_ruleset_profile_name(),
+                    active_profile: self.active_ruleset_profile_name(),
+                    profile_count,
+                };
                 render_panes_view(
                     frame,
                     content_y,
@@ -1508,7 +1712,7 @@ impl ftui::Model for WaModel {
                     &self.panes,
                     &filtered,
                     self.panes_selected,
-                    self.panes_domain_filter.as_deref(),
+                    filters,
                 );
             }
             View::Search => render_search_view(
@@ -1919,6 +2123,33 @@ fn render_home_view(
 /// Responsive pane layout:
 ///   Regular/wide: left list + right detail panel.
 ///   Compact: full-width list with a stacked detail panel below it.
+#[derive(Debug, Clone, Copy)]
+struct PaneRenderFilters<'a> {
+    query: &'a str,
+    unhandled_only: bool,
+    bookmarked_only: bool,
+    agent_filter: Option<&'a str>,
+    domain_filter: Option<&'a str>,
+    selected_profile: Option<&'a str>,
+    active_profile: Option<&'a str>,
+    profile_count: usize,
+}
+
+impl Default for PaneRenderFilters<'_> {
+    fn default() -> Self {
+        Self {
+            query: "",
+            unhandled_only: false,
+            bookmarked_only: false,
+            agent_filter: None,
+            domain_filter: None,
+            selected_profile: None,
+            active_profile: None,
+            profile_count: 0,
+        }
+    }
+}
+
 fn render_panes_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -1927,7 +2158,7 @@ fn render_panes_view(
     panes: &[PaneRow],
     filtered_indices: &[usize],
     selected: usize,
-    domain_filter: Option<&str>,
+    filters: PaneRenderFilters<'_>,
 ) {
     if height == 0 {
         return;
@@ -1939,19 +2170,35 @@ fn render_panes_view(
     let mut row = layout.list_y;
 
     // -- Header: count and filter status --
+    let selected_profile = filters.selected_profile.unwrap_or("default");
+    let active_profile = filters.active_profile.unwrap_or("default");
     let header = if layout.stacked {
         format!(
-            "  Panes {}/{}  domain={}  [compact]",
+            "  Panes {}/{}  filter='{}' u={} b={} agent={} domain={} profile={} active={} ({}) [compact]",
             filtered_indices.len(),
             panes.len(),
-            domain_filter.unwrap_or("all"),
+            filters.query,
+            filters.unhandled_only,
+            filters.bookmarked_only,
+            filters.agent_filter.unwrap_or("all"),
+            filters.domain_filter.unwrap_or("all"),
+            selected_profile,
+            active_profile,
+            filters.profile_count,
         )
     } else {
         format!(
-            "  Panes ({}/{})  domain={}",
+            "  Panes ({}/{})  filter='{}' unhandled={} bookmarked={} agent={} domain={} profile={} active={} ({})",
             filtered_indices.len(),
             panes.len(),
-            domain_filter.unwrap_or("all"),
+            filters.query,
+            filters.unhandled_only,
+            filters.bookmarked_only,
+            filters.agent_filter.unwrap_or("all"),
+            filters.domain_filter.unwrap_or("all"),
+            selected_profile,
+            active_profile,
+            filters.profile_count,
         )
     };
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
@@ -2076,7 +2323,8 @@ fn render_panes_view(
                 }
             ),
             String::new(),
-            " Keys: j/k=nav d=domain Esc=clear".to_string(),
+            " Keys: j/k=nav u/b/a/d filters p=profile Enter=apply".to_string(),
+            "       type=filter Backspace=edit Esc=clear".to_string(),
         ];
 
         for line in &detail_lines {
@@ -3633,10 +3881,12 @@ pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(
 mod tests {
     use super::*;
     use crate::circuit_breaker::CircuitBreakerStatus;
-    use crate::tui::ftui_compat::StyleSpec;
+    use crate::rulesets::RulesetProfileSummary;
+    use crate::tui::ftui_compat::{Key, KeyInput, StyleSpec};
+    use crate::tui::keymap::{self, Action};
     use crate::tui::query::{
-        EventFilters, EventView, HealthStatus, HistoryEntryView, PaneView, QueryError,
-        SearchResultView, TriageItemView, WorkflowProgressView,
+        EventFilters, EventView, HealthStatus, HistoryEntryView, PaneBookmarkView, PaneView,
+        QueryError, RulesetProfileState, SearchResultView, TriageItemView, WorkflowProgressView,
     };
 
     // -- Mock QueryClient --
@@ -3650,6 +3900,8 @@ mod tests {
         workflows_data: Vec<WorkflowProgressView>,
         search_results: Vec<SearchResultView>,
         saved_searches: Vec<SavedSearchView>,
+        pane_bookmarks: Vec<PaneBookmarkView>,
+        ruleset_profile_state: RulesetProfileState,
         events: Vec<EventView>,
         history_entries: Vec<HistoryEntryView>,
     }
@@ -3665,6 +3917,8 @@ mod tests {
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
                 saved_searches: Vec::new(),
+                pane_bookmarks: Vec::new(),
+                ruleset_profile_state: RulesetProfileState::default(),
                 events: vec![],
                 history_entries: vec![],
             }
@@ -3680,6 +3934,8 @@ mod tests {
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
                 saved_searches: Vec::new(),
+                pane_bookmarks: Vec::new(),
+                ruleset_profile_state: RulesetProfileState::default(),
                 events: vec![],
                 history_entries: vec![],
             }
@@ -3695,6 +3951,8 @@ mod tests {
                 workflows_data: Vec::new(),
                 search_results: Vec::new(),
                 saved_searches: Vec::new(),
+                pane_bookmarks: Vec::new(),
+                ruleset_profile_state: RulesetProfileState::default(),
                 history_entries: vec![],
                 events: vec![
                     EventView {
@@ -3744,6 +4002,19 @@ mod tests {
 
         fn with_saved_searches(mut self, saved_searches: Vec<SavedSearchView>) -> Self {
             self.saved_searches = saved_searches;
+            self
+        }
+
+        fn with_pane_bookmarks(mut self, pane_bookmarks: Vec<PaneBookmarkView>) -> Self {
+            self.pane_bookmarks = pane_bookmarks;
+            self
+        }
+
+        fn with_ruleset_profile_state(
+            mut self,
+            ruleset_profile_state: RulesetProfileState,
+        ) -> Self {
+            self.ruleset_profile_state = ruleset_profile_state;
             self
         }
 
@@ -3811,6 +4082,8 @@ mod tests {
                 }],
                 search_results: Vec::new(),
                 saved_searches: Vec::new(),
+                pane_bookmarks: Vec::new(),
+                ruleset_profile_state: RulesetProfileState::default(),
                 events: vec![],
                 history_entries: vec![],
             }
@@ -3826,6 +4099,8 @@ mod tests {
                 workflows_data: vec![],
                 search_results: vec![],
                 saved_searches: Vec::new(),
+                pane_bookmarks: Vec::new(),
+                ruleset_profile_state: RulesetProfileState::default(),
                 events: vec![],
                 history_entries: vec![
                     HistoryEntryView {
@@ -3926,6 +4201,14 @@ mod tests {
 
         fn list_saved_searches(&self) -> Result<Vec<SavedSearchView>, QueryError> {
             Ok(self.saved_searches.clone())
+        }
+
+        fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkView>, QueryError> {
+            Ok(self.pane_bookmarks.clone())
+        }
+
+        fn ruleset_profile_state(&self) -> Result<RulesetProfileState, QueryError> {
+            Ok(self.ruleset_profile_state.clone())
         }
 
         fn health(&self) -> Result<HealthStatus, QueryError> {
@@ -4330,6 +4613,40 @@ mod tests {
         model.handle_view_key(&key);
     }
 
+    fn pane_bookmark(pane_id: u64) -> PaneBookmarkView {
+        PaneBookmarkView {
+            pane_id,
+            alias: format!("pane-{pane_id}"),
+            tags: vec!["watch".to_string()],
+            description: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn sample_ruleset_profiles() -> RulesetProfileState {
+        RulesetProfileState {
+            active_profile: "default".to_string(),
+            active_last_applied_at: None,
+            profiles: vec![
+                RulesetProfileSummary {
+                    name: "default".to_string(),
+                    description: Some("Base".to_string()),
+                    path: None,
+                    last_applied_at: None,
+                    implicit: true,
+                },
+                RulesetProfileSummary {
+                    name: "ops profile".to_string(),
+                    description: Some("Ops".to_string()),
+                    path: None,
+                    last_applied_at: None,
+                    implicit: false,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn refresh_data_populates_panes() {
         let mut model = make_model(MockQuery::healthy());
@@ -4394,11 +4711,100 @@ mod tests {
         model.refresh_data();
         model.view_state.current_view = View::Panes;
 
+        model.panes_filter.set_text("pane".to_string());
+        model.panes_unhandled_only = true;
+        model.panes_bookmarked_only = true;
+        model.panes_agent_filter = Some("codex".to_string());
         model.panes_domain_filter = Some("local".to_string());
         model.panes_selected = 2;
         press_key(&mut model, ftui::KeyCode::Escape);
+        assert!(model.panes_filter.is_empty());
+        assert!(!model.panes_unhandled_only);
+        assert!(!model.panes_bookmarked_only);
+        assert!(model.panes_agent_filter.is_none());
         assert!(model.panes_domain_filter.is_none());
         assert_eq!(model.panes_selected, 0);
+    }
+
+    #[test]
+    fn panes_backend_honors_canonical_filter_actions() {
+        let mut model = make_model(
+            MockQuery::healthy()
+                .with_pane_bookmarks(vec![pane_bookmark(1)])
+                .with_ruleset_profile_state(sample_ruleset_profiles()),
+        );
+        model.refresh_data();
+        model.view_state.current_view = View::Panes;
+        model.panes_selected = 2;
+
+        assert_eq!(
+            keymap::resolve(&KeyInput::new(Key::Char('u')), "Panes"),
+            Some(Action::ToggleUnhandledOnly)
+        );
+        press_key(&mut model, ftui::KeyCode::Char('u'));
+        assert!(model.panes_unhandled_only);
+        assert_eq!(model.panes_selected, 0);
+
+        assert_eq!(
+            keymap::resolve(&KeyInput::new(Key::Char('b')), "Panes"),
+            Some(Action::ToggleBookmarkedOnly)
+        );
+        press_key(&mut model, ftui::KeyCode::Char('b'));
+        assert!(model.panes_bookmarked_only);
+        assert_eq!(model.filtered_pane_indices(), vec![1]);
+
+        assert_eq!(
+            keymap::resolve(&KeyInput::new(Key::Char('a')), "Panes"),
+            Some(Action::CycleAgentFilter)
+        );
+        press_key(&mut model, ftui::KeyCode::Char('a'));
+        assert_eq!(model.panes_agent_filter.as_deref(), Some("codex"));
+
+        assert_eq!(
+            keymap::resolve(&KeyInput::new(Key::Char('d')), "Panes"),
+            Some(Action::CycleDomainFilter)
+        );
+        press_key(&mut model, ftui::KeyCode::Char('d'));
+        assert_eq!(model.panes_domain_filter.as_deref(), Some("local"));
+
+        assert_eq!(
+            keymap::resolve(&KeyInput::new(Key::Char('x')), "Panes"),
+            Some(Action::FilterAppendChar('x'))
+        );
+        press_key(&mut model, ftui::KeyCode::Char('x'));
+        assert_eq!(model.panes_filter.text(), "x");
+
+        assert_eq!(
+            keymap::resolve(&KeyInput::new(Key::Backspace), "Panes"),
+            Some(Action::FilterDeleteChar)
+        );
+        press_key(&mut model, ftui::KeyCode::Backspace);
+        assert!(model.panes_filter.is_empty());
+    }
+
+    #[test]
+    fn panes_backend_honors_canonical_profile_actions() {
+        let mut model =
+            make_model(MockQuery::healthy().with_ruleset_profile_state(sample_ruleset_profiles()));
+        model.refresh_data();
+        model.view_state.current_view = View::Panes;
+
+        assert_eq!(
+            keymap::resolve(&KeyInput::new(Key::Char('p')), "Panes"),
+            Some(Action::CycleRulesetProfile)
+        );
+        press_key(&mut model, ftui::KeyCode::Char('p'));
+        assert_eq!(model.selected_ruleset_profile_name(), Some("ops profile"));
+
+        assert_eq!(
+            keymap::resolve(&KeyInput::new(Key::Enter), "Panes"),
+            Some(Action::ApplyRulesetProfile)
+        );
+        press_key(&mut model, ftui::KeyCode::Enter);
+        assert_eq!(
+            model.triage_queued_action.as_deref(),
+            Some("ft rules profile apply 'ops profile'")
+        );
     }
 
     #[test]
@@ -4410,7 +4816,16 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(&mut frame, 0, 100, 28, &model.panes, &filtered, 0, None);
+        render_panes_view(
+            &mut frame,
+            0,
+            100,
+            28,
+            &model.panes,
+            &filtered,
+            0,
+            PaneRenderFilters::default(),
+        );
 
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("Panes (3/3)"));
@@ -4431,7 +4846,16 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(&mut frame, 0, 100, 22, &model.panes, &filtered, 0, None);
+        render_panes_view(
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.panes,
+            &filtered,
+            0,
+            PaneRenderFilters::default(),
+        );
 
         // Pane rows start at row 2
         let row2 = read_row(&frame, 2);
@@ -4448,7 +4872,16 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(&mut frame, 0, 100, 22, &model.panes, &filtered, 0, None);
+        render_panes_view(
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.panes,
+            &filtered,
+            0,
+            PaneRenderFilters::default(),
+        );
 
         // Detail panel is in the right 1/3 — check rows for "Pane Details"
         let mut found_detail = false;
@@ -4471,7 +4904,16 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(&mut frame, 0, 80, 22, &model.panes, &filtered, 0, None);
+        render_panes_view(
+            &mut frame,
+            0,
+            80,
+            22,
+            &model.panes,
+            &filtered,
+            0,
+            PaneRenderFilters::default(),
+        );
 
         let detail_row = first_row_containing(&frame, 22, "Pane Details")
             .expect("compact panes layout should still show detail header");
@@ -4486,7 +4928,16 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(100, 24, &mut pool);
 
-        render_panes_view(&mut frame, 0, 100, 22, &[], &[], 0, None);
+        render_panes_view(
+            &mut frame,
+            0,
+            100,
+            22,
+            &[],
+            &[],
+            0,
+            PaneRenderFilters::default(),
+        );
 
         let mut found_msg = false;
         for r in 0..22 {
@@ -4508,7 +4959,16 @@ mod tests {
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(&mut frame, 0, 40, 1, &model.panes, &filtered, 0, None);
+        render_panes_view(
+            &mut frame,
+            0,
+            40,
+            1,
+            &model.panes,
+            &filtered,
+            0,
+            PaneRenderFilters::default(),
+        );
     }
 
     // -- Search view tests --
