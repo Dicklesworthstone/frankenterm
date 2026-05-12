@@ -105,6 +105,14 @@
       "description": "RuntimeProof sealed trait + tokio type-level seal (G1). Recovery artifact published by ft-e87u6.13 (closed) backfilling the original ft-i2eni.1 producer slot."
     },
     {
+      "category": "proofs/runtime-proof-trait",
+      "path": "docs/attestations/doctrine/tokio-eradication-status.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-tf6g3.7",
+      "proof_categories": [1, 5],
+      "description": "Tokio-eradication doctrine status for the G1 runtime-proof category: direct-dependency ban, supported-path #[tokio::test] classification, asupersync-test-only lint, LabRuntime/asupersync_test substrate, and CI wiring."
+    },
+    {
       "category": "proofs/robot-contracts",
       "path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
       "media_type": "application/json",

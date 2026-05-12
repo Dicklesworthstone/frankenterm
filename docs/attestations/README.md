@@ -40,8 +40,10 @@ The producing-bead column is the source of truth for which work item gates the a
 
 The manifest can also include optional slots that are hashed into bundles when
 present but are not in `required_categories` yet. Current optional slots include
-`doctrine/vendored-provenance` (`ft-i2eni.6`) and `perf/atlas-packing`
-(`ft-gtcm9.5`).
+`doctrine/vendored-provenance` (`ft-i2eni.6`), the G1
+`docs/attestations/doctrine/tokio-eradication-status.json` substrate
+(`ft-tf6g3.7`, under `proofs/runtime-proof-trait`), and
+`perf/atlas-packing` (`ft-gtcm9.5`).
 
 `proofs/robot-contracts` was introduced under `ft-q5njp` and refreshed under
 `ft-0elb9`. It is repository evidence: it attests checked-in schema, golden

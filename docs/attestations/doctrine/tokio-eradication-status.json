@@ -1,0 +1,93 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "tokio-eradication-status",
+  "category": "proofs/runtime-proof-trait",
+  "doctrine_artifact": "doctrine/tokio-eradication-status",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T12:45:00Z",
+  "produced_by_bead": "ft-tf6g3.7",
+  "status": "pass",
+  "scope": "Machine-readable doctrine snapshot for direct tokio dependency bans and supported-path #[tokio::test] eradication.",
+  "policy": {
+    "direct_tokio_usage": "forbidden in first-party supported paths",
+    "async_test_policy": "new async tests use common::asupersync_test!, RuntimeFixture, or run_lab_test instead of #[tokio::test]",
+    "supported_paths": [
+      "crates/**/*.rs",
+      "frankenterm/**/*.rs",
+      "tests/**/*.rs"
+    ]
+  },
+  "classification": {
+    "document": "docs/tokio-test-classification.md",
+    "supported_path_active_tokio_test_attributes": 0,
+    "class_a_converted_port_files": 40,
+    "class_b_requires_cx_refactor_active_attributes": 0,
+    "class_c_deliberate_quarantine_active_attributes": 0,
+    "quarantine_policy": "No supported-path quarantine exists at this HEAD; future exceptions must update the classification document and lint in the same change."
+  },
+  "enforcement_layers": [
+    {
+      "id": "runtime-proof-sealed-trait",
+      "status": "live",
+      "evidence_path": "docs/attestations/proofs/runtime-proof-trait.json",
+      "ci_surface": "RuntimeProof coverage ratchet (ft-3kv6e)"
+    },
+    {
+      "id": "asupersync-test-only-shell-lint",
+      "status": "live",
+      "evidence_path": "scripts/check_asupersync_test_only.sh",
+      "ci_surface": "asupersync-test-only tokio-test guard (ft-tf6g3.7)"
+    },
+    {
+      "id": "supported-path-rust-test-guard",
+      "status": "live",
+      "evidence_path": "crates/frankenterm-core/tests/wa_22x4r_no_tokio_test_in_supported_paths.rs",
+      "ci_surface": "Cargo test suites"
+    },
+    {
+      "id": "asupersync-test-macro",
+      "status": "live",
+      "evidence_path": "crates/frankenterm-core/tests/common/asupersync_test.rs",
+      "demo_path": "crates/frankenterm-core/tests/asupersync_test_macro_demo.rs"
+    },
+    {
+      "id": "source-pattern-guards",
+      "status": "live",
+      "evidence_path": "crates/frankenterm-core/src/dependency_eradication.rs",
+      "secondary_path": "crates/frankenterm-core/tests/ft_xbnl0_2_6_no_runtime_regression_gate.rs"
+    },
+    {
+      "id": "cargo-deny-direct-dependency-ban",
+      "status": "live",
+      "evidence_path": "deny.toml",
+      "ci_surface": "Cargo-deny tokio ban (ft-i2eni.3)"
+    }
+  ],
+  "validation": [
+    {
+      "command": "rg -n '^\\s*#\\[tokio::test' crates frankenterm tests -g '*.rs'",
+      "status": "pass",
+      "result": "no active supported-path tokio test attributes"
+    },
+    {
+      "command": "find crates/frankenterm-core/tests -maxdepth 1 -name '*_labruntime.rs' | wc -l",
+      "status": "pass",
+      "result": "40"
+    },
+    {
+      "command": "scripts/check_asupersync_test_only.sh",
+      "status": "pass"
+    },
+    {
+      "command": "jq empty docs/attestations/doctrine/tokio-eradication-status.json docs/attestations/manifest.json docs/attestations/schema.json docs/proof-taxonomy.json",
+      "status": "pass"
+    }
+  ],
+  "manifest_wiring": {
+    "category": "proofs/runtime-proof-trait",
+    "manifest_path": "docs/attestations/manifest.json",
+    "required_category": true,
+    "slot_path": "docs/attestations/doctrine/tokio-eradication-status.json",
+    "proof_categories": [1, 5]
+  }
+}

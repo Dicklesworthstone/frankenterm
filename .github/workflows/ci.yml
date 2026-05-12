@@ -142,6 +142,14 @@ jobs:
       - name: RuntimeProof coverage ratchet (ft-3kv6e)
         run: python3 scripts/check_runtime_proof_coverage.py
 
+      # ft-tf6g3.7 — fast asupersync-test-only lint. The Rust test
+      # wa_22x4r_no_tokio_test_in_supported_paths.rs catches the same
+      # invariant in Cargo test lanes, but this shell guard fails the
+      # generated-artifacts job before any heavy build if a supported
+      # path reintroduces an active #[tokio::test] attribute.
+      - name: asupersync-test-only tokio-test guard (ft-tf6g3.7)
+        run: scripts/check_asupersync_test_only.sh
+
       # ft-tf6g3.2 — Auto-stamped README/AGENTS counts. Hand-edited
       # workspace counts in README.md / AGENTS.md drift fast (ft-d3awp
       # / ft-hdvvo). The stamper at scripts/stamp-readme-counts.sh

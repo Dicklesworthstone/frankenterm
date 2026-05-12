@@ -236,18 +236,23 @@ This project must use **asupersync** for async operations. The intended runtime 
 
 **Policy:** direct `tokio` usage is forbidden. `runtime_async` (formerly `runtime_compat`) is the **canonical async API surface** of the project — asupersync wrappers (`Mutex`, `RwLock`, `Semaphore`, `mpsc`, `watch`, `broadcast`, `oneshot`) plus project-curated ergonomic helpers (`sleep_with_cx`, `timeout_with_cx`, `RuntimeBuilder`). Use it; don't reach for `asupersync::*` directly. The deprecated `runtime_compat` alias has been removed; all code must import via `crate::runtime_async`. See `docs/proposals/ft-7iof6-runtime-compat-canonical-surface.md` for the rationale.
 
-**Enforcement (ft-i2eni.3):** the policy is enforced at four layers.
+**Enforcement (ft-i2eni.3 + ft-tf6g3.7):** the policy is enforced by
+live type, source, test, dependency, and release-bundle gates.
 (1) `runtime_proof::Sealed` — sealed trait makes `tokio::sync::*` types
 fail to compile in `RuntimeProof`-bounded API surfaces (foundation
-shipped under ft-i2eni.1; full adoption sweep closed under ft-3kv6e at
-0 uncovered pub async fn). (2) `tests/wa_22x4r_no_tokio_test_in_supported_paths.rs`
-— cargo-test-time check that no `#[tokio::test]` attribute lands in
-supported paths. (3) `dependency_eradication.rs` / `forbidden_dep_guards.rs`
-— source-level grep guards for `use tokio::` and friends. (4)
-`deny.toml` `[bans]` rule + the `Cargo-deny tokio ban (ft-i2eni.3)`
-CI step — fails the build if any first-party `Cargo.toml` declares
-`tokio` as a direct dependency. Layers (1) + (4) close the
-type-level and dep-graph-level escape paths respectively.
+shipped under ft-i2eni.1; full adoption sweep closed under ft-3kv6e at 0
+uncovered pub async fn). (2) `scripts/check_asupersync_test_only.sh` plus
+`tests/wa_22x4r_no_tokio_test_in_supported_paths.rs` — CI and
+cargo-test-time checks that no active `#[tokio::test]` attribute lands in
+supported paths. (3) `crates/frankenterm-core/tests/common/asupersync_test.rs`
+and the LabRuntime helpers — the supported async-test substrate. (4)
+`dependency_eradication.rs` / `forbidden_dep_guards.rs` — source-level grep
+guards for `use tokio::` and friends. (5) `deny.toml` `[bans]` rule + the
+`Cargo-deny tokio ban (ft-i2eni.3)` CI step — fails the build if any
+first-party `Cargo.toml` declares `tokio` as a direct dependency. The
+classification and release-bundle evidence live at
+`docs/tokio-test-classification.md` and
+`docs/attestations/doctrine/tokio-eradication-status.json`.
 
 ### Key Dependencies
 
