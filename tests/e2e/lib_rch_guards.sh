@@ -635,10 +635,19 @@ rch_log_has_remote_mirror_missing_file() {
         "${output_file}" 2>/dev/null
 }
 
+rch_log_has_cargo_dep_info_missing() {
+    local output_file="$1"
+    rch_log_has_remote_execution_marker "${output_file}" || return 1
+    sed -n 's/^error: could not parse\/generate dep info at: //p' "${output_file}" 2>/dev/null | grep -q . \
+        && grep -Fq 'No such file or directory (os error 2)' "${output_file}" 2>/dev/null
+}
+
 rch_extract_failure_reason_code() {
     local output_file="$1"
 
-    if grep -Fq "can't find crate for \`core\`" "${output_file}" 2>/dev/null; then
+    if rch_log_has_cargo_dep_info_missing "${output_file}"; then
+        printf '%s\n' "RCH-CARGO-DEP-INFO-MISSING"
+    elif grep -Fq "can't find crate for \`core\`" "${output_file}" 2>/dev/null; then
         printf '%s\n' "RCH-CROSS-RUST-TARGET-MISSING"
     elif grep -Fq "x86_64-w64-mingw32-gcc: not found" "${output_file}" 2>/dev/null; then
         printf '%s\n' "RCH-CROSS-CC-MISSING-WINDOWS"
@@ -662,7 +671,9 @@ rch_extract_failure_reason_code() {
 rch_extract_failure_reason_detail() {
     local output_file="$1"
 
-    if grep -Fq "can't find crate for \`core\`" "${output_file}" 2>/dev/null; then
+    if rch_log_has_cargo_dep_info_missing "${output_file}"; then
+        sed -n '/^error: could not parse\/generate dep info at: /p' "${output_file}" 2>/dev/null | tail -n 1
+    elif grep -Fq "can't find crate for \`core\`" "${output_file}" 2>/dev/null; then
         grep -F "can't find crate for \`core\`" "${output_file}" 2>/dev/null | tail -n 1
     elif grep -Fq "x86_64-w64-mingw32-gcc: not found" "${output_file}" 2>/dev/null; then
         grep -F "x86_64-w64-mingw32-gcc: not found" "${output_file}" 2>/dev/null | tail -n 1

@@ -157,6 +157,8 @@ BAD_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_fail_open_${RUN_ID}.log"
 GOOD_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_clean_${RUN_ID}.log"
 MISSING_FILE_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_remote_mirror_missing_file_${RUN_ID}.log"
 MISSING_LIB_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_remote_mirror_missing_lib_${RUN_ID}.log"
+DEP_INFO_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_cargo_dep_info_missing_${RUN_ID}.log"
+LOCAL_DEP_INFO_GUARD_LOG="${ARTIFACT_DIR}/shared_guard_local_cargo_dep_info_${RUN_ID}.log"
 BAD_GUARD_ERR="${ARTIFACT_DIR}/shared_guard_fail_open_${RUN_ID}.stderr.log"
 GOOD_GUARD_ERR="${ARTIFACT_DIR}/shared_guard_clean_${RUN_ID}.stderr.log"
 printf '%s\n' '[RCH] local: Remote execution failed: ssh transport unavailable; running locally' > "${BAD_GUARD_LOG}"
@@ -171,6 +173,18 @@ printf '%s\n' \
   'Sync complete: 25817 files, 13009434 bytes in 134270ms' \
   "error: can't find lib \`frankenterm_core\` at path \`/data/projects/frankenterm/crates/frankenterm-core/src/lib.rs\`" \
   > "${MISSING_LIB_GUARD_LOG}"
+printf '%s\n' \
+  'Selected worker: vmi1293453 at 100.64.0.11' \
+  'Sync complete: 28413 files, 17490321 bytes in 142220ms' \
+  'error: could not parse/generate dep info at: /data/projects/frankenterm/target/rch-ft/debug/deps/frankenterm_core-16de6415c3b736e3.d' \
+  'Caused by:' \
+  '  No such file or directory (os error 2)' \
+  > "${DEP_INFO_GUARD_LOG}"
+printf '%s\n' \
+  'error: could not parse/generate dep info at: /tmp/frankenterm/target/debug/deps/frankenterm_core-local.d' \
+  'Caused by:' \
+  '  No such file or directory (os error 2)' \
+  > "${LOCAL_DEP_INFO_GUARD_LOG}"
 set +e
 (check_rch_fallback "${BAD_GUARD_LOG}") >/dev/null 2>"${BAD_GUARD_ERR}"
 BAD_GUARD_RC=$?
@@ -181,6 +195,9 @@ MISSING_FILE_REASON_CODE="$(rch_extract_failure_reason_code "${MISSING_FILE_GUAR
 MISSING_FILE_REASON_DETAIL="$(rch_extract_failure_reason_detail "${MISSING_FILE_GUARD_LOG}")"
 MISSING_LIB_REASON_CODE="$(rch_extract_failure_reason_code "${MISSING_LIB_GUARD_LOG}")"
 MISSING_LIB_REASON_DETAIL="$(rch_extract_failure_reason_detail "${MISSING_LIB_GUARD_LOG}")"
+DEP_INFO_REASON_CODE="$(rch_extract_failure_reason_code "${DEP_INFO_GUARD_LOG}")"
+DEP_INFO_REASON_DETAIL="$(rch_extract_failure_reason_detail "${DEP_INFO_GUARD_LOG}")"
+LOCAL_DEP_INFO_REASON_CODE="$(rch_extract_failure_reason_code "${LOCAL_DEP_INFO_GUARD_LOG}")"
 
 GUARD_SURFACE_OK="true"
 for token in \
@@ -190,6 +207,7 @@ for token in \
   "too long for Unix domain socket" \
   "RCH_REQUIRE_REMOTE" \
   "RCH-REMOTE-MIRROR-MISSING-FILE" \
+  "RCH-CARGO-DEP-INFO-MISSING" \
   "check_rch_fallback" \
   "rch_init" \
   "run_rch_cargo_logged"; do
@@ -204,11 +222,14 @@ if [ "${BAD_GUARD_RC}" -ne 0 ] \
   && [[ "${MISSING_FILE_REASON_DETAIL}" == *"couldn't read crates/frankenterm-core-fleet/src/lib.rs"* ]] \
   && [ "${MISSING_LIB_REASON_CODE}" = "RCH-REMOTE-MIRROR-MISSING-FILE" ] \
   && [[ "${MISSING_LIB_REASON_DETAIL}" == *"can't find lib \`frankenterm_core\` at path"* ]] \
+  && [ "${DEP_INFO_REASON_CODE}" = "RCH-CARGO-DEP-INFO-MISSING" ] \
+  && [[ "${DEP_INFO_REASON_DETAIL}" == *"could not parse/generate dep info at:"* ]] \
+  && [ -z "${LOCAL_DEP_INFO_REASON_CODE}" ] \
   && [ "${GUARD_SURFACE_OK}" = "true" ]; then
   record_result "shared_rch_guard_coverage" "true"
 else
-  echo "    bad_guard_rc=${BAD_GUARD_RC} good_guard_rc=${GOOD_GUARD_RC} missing_file_reason_code=${MISSING_FILE_REASON_CODE} missing_lib_reason_code=${MISSING_LIB_REASON_CODE}"
-  record_result "shared_rch_guard_coverage" "false" "precondition_failed" "config" "shared guard missing local-fallback or remote-mirror coverage"
+  echo "    bad_guard_rc=${BAD_GUARD_RC} good_guard_rc=${GOOD_GUARD_RC} missing_file_reason_code=${MISSING_FILE_REASON_CODE} missing_lib_reason_code=${MISSING_LIB_REASON_CODE} dep_info_reason_code=${DEP_INFO_REASON_CODE} local_dep_info_reason_code=${LOCAL_DEP_INFO_REASON_CODE}"
+  record_result "shared_rch_guard_coverage" "false" "precondition_failed" "config" "shared guard missing local-fallback, remote-mirror, or dep-info coverage"
 fi
 
 # Summary

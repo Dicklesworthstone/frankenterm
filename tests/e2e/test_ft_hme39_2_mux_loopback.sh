@@ -100,8 +100,7 @@ worker_for_log() {
 failure_reason_for_log() {
   local log_file="$1"
   local meta_file code
-  if sed -n 's/^error: could not parse\/generate dep info at: //p' "${log_file}" | grep -q . \
-    && grep -Fq 'No such file or directory (os error 2)' "${log_file}"; then
+  if rch_log_has_cargo_dep_info_missing "${log_file}"; then
     printf '%s\n' "rch_infrastructure_cargo_dep_info_missing"
     return
   fi
@@ -230,9 +229,15 @@ write_summary() {
   local build_log="$2"
   local test_log="$3"
   local selection_log="${4:-}"
+  local failed_log="${5:-}"
+  local failed_reason="${6:-}"
+  local retry_performed="${7:-false}"
+  local retry_reason="${8:-}"
+  local retry_target_dir="${9:-}"
   local build_meta=""
   local test_meta=""
   local selection_meta=""
+  local failed_meta=""
 
   if [[ -n "${build_log}" ]]; then
     build_meta="$(rch_log_meta_path "${build_log}" | sed "s#^${ROOT_DIR}/##")"
@@ -242,6 +247,9 @@ write_summary() {
   fi
   if [[ -n "${selection_log}" ]]; then
     selection_meta="$(rch_log_meta_path "${selection_log}" | sed "s#^${ROOT_DIR}/##")"
+  fi
+  if [[ -n "${failed_log}" ]]; then
+    failed_meta="$(rch_log_meta_path "${failed_log}" | sed "s#^${ROOT_DIR}/##")"
   fi
 
   jq -cn \
@@ -258,8 +266,14 @@ write_summary() {
     --arg test_meta "${test_meta}" \
     --arg selection_log "${selection_log#"${ROOT_DIR}"/}" \
     --arg selection_meta "${selection_meta}" \
+    --arg failed_log "${failed_log#"${ROOT_DIR}"/}" \
+    --arg failed_meta "${failed_meta}" \
+    --arg failed_reason "${failed_reason}" \
+    --arg retry_reason "${retry_reason}" \
+    --arg retry_target_dir "${retry_target_dir}" \
     --arg remote_target_dir "${SUMMARY_REMOTE_TARGET_DIR}" \
     --arg mux_bin "${MUX_BIN}" \
+    --argjson retry_performed "${retry_performed}" \
     '{
       bead_id: $bead_id,
       scenario_id: $scenario_id,
@@ -284,7 +298,20 @@ write_summary() {
         rch_selection_preflight_log: $selection_log,
         rch_selection_preflight_meta: $selection_meta
       } end))
-    }' >"${SUMMARY_FILE}"
+    }
+    + (if $failed_reason == "" then {} else {
+      final_failure: {
+        reason_code: $failed_reason,
+        log: $failed_log,
+        meta: $failed_meta
+      }
+    } end)
+    + (if $retry_performed then {
+      retry: {
+        reason_code: $retry_reason,
+        remote_target_dir: $retry_target_dir
+      }
+    } else {} end)' >"${SUMMARY_FILE}"
 }
 
 run_mux_server_build() {
@@ -327,6 +354,10 @@ BUILD_LOG="${ARTIFACT_DIR}/mux_server_build.log"
 TEST_LOG="${ARTIFACT_DIR}/loopback_test.log"
 status=0
 failed_log=""
+failed_reason=""
+retry_performed=false
+retry_reason=""
+retry_target_dir=""
 
 if ! run_selection_preflight "${SELECTION_LOG}" "${REMOTE_TARGET_DIR}"; then
   status=1
@@ -347,10 +378,15 @@ if [[ "${status}" -ne 0 ]]; then
     RETRY_BUILD_LOG="${ARTIFACT_DIR}/mux_server_build.retry.log"
     RETRY_TEST_LOG="${ARTIFACT_DIR}/loopback_test.retry.log"
     RETRY_TARGET_DIR="${REMOTE_TARGET_DIR}-retry"
+    retry_performed=true
+    retry_reason="${failed_reason}"
+    retry_target_dir="${RETRY_TARGET_DIR}"
     BUILD_LOG="${RETRY_BUILD_LOG}"
     TEST_LOG="${RETRY_TEST_LOG}"
     SUMMARY_REMOTE_TARGET_DIR="${RETRY_TARGET_DIR}"
     status=0
+    failed_log=""
+    failed_reason=""
     if ! run_mux_server_build "loopback.mux_server_build.retry_after_cargo_infra" \
       "${RETRY_BUILD_LOG}" "${RETRY_TARGET_DIR}"; then
       status=1
@@ -363,14 +399,22 @@ if [[ "${status}" -ne 0 ]]; then
   fi
 fi
 
+if [[ "${status}" -ne 0 && -n "${failed_log}" ]]; then
+  failed_reason="$(failure_reason_for_log "${failed_log}")"
+else
+  failed_reason=""
+fi
+
 if [[ "${status}" -eq 0 ]]; then
   emit_event "suite.complete" "passed" "all_assertions_satisfied" "none" "${SUMMARY_FILE}" \
     "no-mock spawn/send/resize/read loopback passed"
-  write_summary "passed" "${BUILD_LOG}" "${TEST_LOG}" "${SELECTION_LOG}"
+  write_summary "passed" "${BUILD_LOG}" "${TEST_LOG}" "${SELECTION_LOG}" "" "" \
+    "${retry_performed}" "${retry_reason}" "${retry_target_dir}"
 else
   emit_event "suite.complete" "failed" "loopback_harness_failed" "E2E-TERMINAL-CONFORMANCE" "${SUMMARY_FILE}" \
     "see step logs and rch metadata"
-  write_summary "failed" "${BUILD_LOG}" "${TEST_LOG}" "${SELECTION_LOG}"
+  write_summary "failed" "${BUILD_LOG}" "${TEST_LOG}" "${SELECTION_LOG}" \
+    "${failed_log}" "${failed_reason}" "${retry_performed}" "${retry_reason}" "${retry_target_dir}"
 fi
 
 printf 'summary=%s\n' "${SUMMARY_FILE#"${ROOT_DIR}"/}"
