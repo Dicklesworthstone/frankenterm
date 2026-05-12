@@ -35,6 +35,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: '-D warnings'
+  RCH_GITHUB_ACTIONS_LOCAL_CARGO: "1"
 
 jobs:
   # ── Gate 1: Smoke (<30s) ──────────────────────────────────────────────

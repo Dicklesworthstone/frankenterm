@@ -128,7 +128,9 @@ if [[ "$TARGET_DIR" == /* ]]; then
     TARGET_DIR="$DEFAULT_TARGET_DIR"
 fi
 
-if [[ -z "$CHECK_ONLY_DIR" ]] && ! command -v rch >/dev/null 2>&1; then
+if [[ -z "$CHECK_ONLY_DIR" ]] \
+    && ! rch_github_actions_local_cargo_enabled \
+    && ! command -v rch >/dev/null 2>&1; then
     echo "[resize-gates] ERROR: rch is required for cargo execution" >&2
     exit 5
 fi

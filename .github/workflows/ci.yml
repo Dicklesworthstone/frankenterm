@@ -20,6 +20,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  RCH_GITHUB_ACTIONS_LOCAL_CARGO: "1"
 
 jobs:
   lint:
