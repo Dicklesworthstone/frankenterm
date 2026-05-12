@@ -2,13 +2,19 @@
 #
 # [BR-TERM-EMULATOR-UPLIFT.1.6.cont] / ft-n0hpo
 #
-# Nightly 24h adversarial fuzz against the headless GPU
+# Nightly 24h adversarial fuzz against the headless software
 # renderer. The harness binary at
 # `crates/frankenterm-gui/tests/gpu_regression.rs` accepts
 # `--fuzz-seed=<u64>` / `--fuzz-duration=<secs>` /
 # `--fuzz-start-at=<event_idx>` / `--runs-dir=<path>` and emits
 # the runs/<run_id>/ artifact tree contracted in
 # `crates/frankenterm-core/src/gpu_regression_fuzz_report.rs`.
+#
+# This job intentionally uses the standard GitHub-hosted
+# `ubuntu-24.04` runner plus Mesa llvmpipe setup below. Do not move
+# it back to an unprovisioned custom GPU label; queue-only jobs are
+# not renderer proof. The preflight step fails clearly until the
+# harness fuzz CLI wiring lands.
 #
 # Acceptance (RQ-S4 in docs/perf/resize-quality-slo.md):
 # 0 critical artifacts over 24h. Minor artifacts are budgeted
@@ -33,7 +39,7 @@ on:
         type: number
         default: 10800
       seed_override:
-        description: "Optional single seed for triage runs"
+        description: "Optional single seed label or 0x-prefixed seed for triage runs"
         type: string
 
 permissions:
@@ -48,30 +54,31 @@ env:
 
 jobs:
   fuzz:
-    name: 24h adversarial fuzz
-    runs-on: ubuntu-24.04-gpu
+    name: 24h adversarial fuzz (Linux llvmpipe)
+    runs-on: ubuntu-24.04
     timeout-minutes: 1500 # 25h, gives 1h buffer over 24h budget
+    env:
+      GPU_HARNESS_GITHUB_ACTIONS_LOCAL_CARGO: "1"
+      FT_GPU_HARNESS_FORCE_SOFTWARE: "1"
+      FT_GPU_HARNESS_EXPECT_SOFTWARE: "1"
+      FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING: llvmpipe
+      WGPU_BACKEND: vulkan
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      GALLIUM_DRIVER: llvmpipe
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+      MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE: "1"
     strategy:
       fail-fast: false
       matrix:
         # 8 fixed seeds + 1 date-derived random.
-        seed_label:
-          - "a5a5a5a5"
-          - "deadbeef"
-          - "cafebabe"
-          - "feedface"
-          - "12345678"
-          - "87654321"
-          - "0badc0de"
-          - "f00dface"
-          - "random"
+        seed_label: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.seed_override != '') && format('[{0}]', toJSON(inputs.seed_override)) || '["a5a5a5a5","deadbeef","cafebabe","feedface","12345678","87654321","0badc0de","f00dface","random"]') }}
     steps:
       - uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
 
@@ -80,15 +87,49 @@ jobs:
         with:
           shared-key: renderer-fuzz
 
+      - name: Validate fuzz harness wiring
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+
+          harness = Path("crates/frankenterm-gui/tests/gpu_regression.rs")
+          source = harness.read_text()
+          required = ("--fuzz-seed", "--fuzz-duration", "--fuzz-start-at", "--runs-dir")
+          missing = [flag for flag in required if flag not in source]
+          if missing:
+              print(
+                  "::error title=Renderer fuzz harness not wired::"
+                  "The scheduled renderer fuzz lane is on a standard ubuntu-24.04 llvmpipe runner now, "
+                  "but gpu_regression.rs still lacks parser support for "
+                  + ", ".join(missing)
+                  + ". Land the harness fuzz CLI integration before treating this workflow as RQ-S4 proof."
+              )
+              sys.exit(1)
+          PY
+
+      - name: Install Mesa software Vulkan stack
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-tools libgl1-mesa-dri libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev libcairo2-dev pkg-config jq
+          mkdir -p target/ci-logs
+          ls -l /usr/share/vulkan/icd.d | tee target/ci-logs/renderer-fuzz-icd-files.log
+          vulkaninfo --summary 2>&1 | tee target/ci-logs/renderer-fuzz-vulkaninfo.log || true
+
       - name: Resolve seed
         id: seed
         shell: bash
         run: |
-          if [ "${{ matrix.seed_label }}" = "random" ]; then
+          seed_label="${{ matrix.seed_label }}"
+          if [ "$seed_label" = "random" ]; then
             # Date-derived random seed for reproducibility.
             seed=$(printf "0x%016x" $(($(date -u +%s) ^ 0xc0ffeebabe)))
+          elif [[ "$seed_label" == 0x* ]]; then
+            seed="$seed_label"
           else
-            seed="0x${{ matrix.seed_label }}"
+            seed="0x${seed_label}"
           fi
           echo "value=${seed}" >> "$GITHUB_OUTPUT"
 
@@ -98,7 +139,7 @@ jobs:
               --release \
               -p frankenterm-gui \
               --test gpu_regression \
-              --features tui-oracle
+              --features headless-render
 
       - name: Run fuzz lane
         id: fuzz
@@ -110,7 +151,7 @@ jobs:
               --release \
               -p frankenterm-gui \
               --test gpu_regression \
-              --features tui-oracle \
+              --features headless-render \
               -- \
               --nocapture \
               --fuzz-seed=${{ steps.seed.outputs.value }} \

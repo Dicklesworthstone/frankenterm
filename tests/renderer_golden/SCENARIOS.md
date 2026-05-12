@@ -111,9 +111,11 @@ the contract module agree on `tests/golden/gpu/`.
   `cafebabe`, `feedface`, `12345678`, `87654321`, `0badc0de`,
   `f00dface`) + 1 date-derived random. 3h budget per seed × 9
   seeds = 27h total compute, 24h wall (matrix runs in parallel
-  on `ubuntu-24.04-gpu`). Aggregates `violations.jsonl` across
-  runs, posts next-day commit-status check, **fails on any
-  critical violation** (RQ-S4: zero criticals).
+  on standard `ubuntu-24.04` with Mesa llvmpipe). The workflow
+  fails fast until the harness binary accepts the fuzz CLI flags.
+  Once wired, it aggregates `violations.jsonl` across runs, posts
+  next-day commit-status check, and **fails on any critical
+  violation** (RQ-S4: zero criticals).
 - [`docs/security/renderer-fuzz-validation.md`](../../docs/security/renderer-fuzz-validation.md) —
   audit doc with the failure-artifact taxonomy, run-layout
   reference, GHA workflow description, RQ-S4 trace, and bead

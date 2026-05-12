@@ -33,7 +33,7 @@ runs/<run_id>/
         ├── after.png      # offending frame
         ├── diff.png       # pixel diff visualization (red = changed)
         ├── log.jsonl      # structured-log slice covering the event
-        └── reproducer.sh  # `cargo test ... --fuzz-seed=<seed> --start-at=<event_idx>`
+        └── reproducer.sh  # `cargo test ... --fuzz-seed=<seed> --fuzz-start-at=<event_idx>`
 ```
 
 ## Event distribution (current)
@@ -78,20 +78,24 @@ The integration bead wires this. The intended ergonomics:
 
 ```bash
 # 60-second smoke run with a fixed seed
-cargo test -p frankenterm-gui --bin frankenterm-gui -- \
+cargo test -p frankenterm-gui --features headless-render --test gpu_regression -- \
     --fuzz-seed=0xCAFE_F00D \
-    --fuzz-duration=60s \
+    --fuzz-duration=60 \
     --runs-dir=tests/renderer_golden/fuzz/runs
 
 # Reproduce a recorded violation
-cargo test -p frankenterm-gui --bin frankenterm-gui -- \
+cargo test -p frankenterm-gui --features headless-render --test gpu_regression -- \
     --fuzz-seed=$(jq -r .seed runs/<id>/meta.json) \
     --fuzz-start-at=$(jq -r .event_idx runs/<id>/violations.jsonl | head -1) \
-    --fuzz-duration=10s
+    --fuzz-duration=10
 ```
 
 Until the wiring lands the generator is exercised by its inline
 unit tests (`cargo test -p frankenterm-gui --lib gpu_regression_fuzz`).
+The scheduled GitHub Actions lane runs on standard `ubuntu-24.04`
+with Mesa llvmpipe and fails fast in a preflight until the harness
+accepts these `--fuzz-*` flags; it no longer queues on an
+unprovisioned GPU runner label.
 
 ## What is deferred
 

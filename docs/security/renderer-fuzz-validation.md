@@ -7,9 +7,10 @@
 — 24h adversarial fuzz, **0 critical artifacts**.
 **Status:** Foundation slice shipped — failure-artifact
 contract + GitHub Actions workflow + scenario manifest + audit
-doc + path consolidation. Production harness CLI wiring +
-12 gap fixtures land once a Linux GPU CI runner is
-provisioned.
+doc + path consolidation. The GitHub Actions workflow now uses
+the standard `ubuntu-24.04` hosted runner with Mesa llvmpipe
+setup, and it fails fast with a configuration error until the
+production harness CLI wiring lands.
 
 ## Headline rule
 
@@ -92,10 +93,21 @@ consolidation resolved — the bead's reference to
 `.github/workflows/renderer-fuzz.yml`:
 
 - **Trigger:** nightly at 03:00 UTC + manual `workflow_dispatch`.
+- **Runner strategy:** standard GitHub-hosted `ubuntu-24.04`
+  with Mesa llvmpipe (`FT_GPU_HARNESS_FORCE_SOFTWARE=1`).
+  The retired custom GPU label is not used because this repository
+  has no provisioned runner for it, and queue-only jobs are not
+  renderer proof.
+- **Readiness gate:** before any Cargo build, the workflow checks
+  that `crates/frankenterm-gui/tests/gpu_regression.rs` accepts
+  `--fuzz-seed`, `--fuzz-duration`, `--fuzz-start-at`, and
+  `--runs-dir`. Until that integration lands, the scheduled run
+  exits with a clear "Renderer fuzz harness not wired" error.
 - **Matrix:** 8 fixed seeds + 1 date-derived random
   (`a5a5a5a5`, `deadbeef`, `cafebabe`, `feedface`, `12345678`,
   `87654321`, `0badc0de`, `f00dface`, plus `random` derived
-  from `date -u +%s ^ 0xc0ffeebabe`).
+  from `date -u +%s ^ 0xc0ffeebabe`). Manual dispatch can
+  set `seed_override` to run exactly one seed for triage.
 - **Per-seed budget:** 3h (configurable via
   `workflow_dispatch.duration_secs` input). 9 parallel jobs
   run within a 24h wall-clock window.
@@ -115,7 +127,7 @@ cargo test \
     --release \
     -p frankenterm-gui \
     --test gpu_regression \
-    --features tui \
+    --features headless-render \
     -- \
     --nocapture \
     --fuzz-seed=<seed-from-meta.json> \
@@ -148,9 +160,9 @@ the doctor wires it to a WARN-level message when
 |---|---|
 | Failure-artifact contract (`runs/<run_id>/` layout, classification) | ✓ `gpu_regression_fuzz_report` module + 17 lib tests |
 | Scenario manifest with status (shipped/partial/gap/blocked) | ✓ `scenario_manifest()` + `coverage_snapshot()` |
-| 12 missing scenario fixtures | ⏳ requires GPU runtime; ships on Linux GPU CI runner |
+| 12 missing scenario fixtures | ⏳ requires headless llvmpipe/GPU runtime; ships once harness integration lands |
 | Harness CLI flag wiring (`--fuzz-seed`, `--fuzz-duration`, etc.) | ⏳ contract layer (`FuzzCliFlags`) shipped; harness-binary clap wiring is integration follow-on |
-| GitHub Actions workflow | ✓ `.github/workflows/renderer-fuzz.yml` |
+| GitHub Actions workflow | ✓ `.github/workflows/renderer-fuzz.yml` uses `ubuntu-24.04` llvmpipe preflight and fails clearly until CLI wiring lands |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |
 | Path consolidation (renderer_golden/scenarios → golden/gpu) | ✓ SCENARIOS.md updated |
 | `dead_code` allow removed in `gpu_regression_fuzz.rs` | ⏳ removed when callers wire in (integration follow-on) |
