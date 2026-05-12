@@ -158,6 +158,12 @@ Allowed during worker-specific RCH incidents:
   `rch_mirror.missing_tracked_file`,
   `rch_mirror.tracked_file_hash_mismatch`, and
   `rch_mirror.worker_unreachable`.
+- Pool-level mirror preflight may accept partial pool freshness when at least
+  `RCH_MIRROR_MIN_PASSING_WORKERS` workers pass the required-file attestation.
+  The default threshold is `1`. Stale or missing mirrors on other healthy
+  workers remain in the JSON artifact as residual evidence; the material
+  `rch exec` run must still prove remote execution on the scheduler-selected
+  worker.
 - Reopening or blocking a bead with exact artifact paths and reason codes when
   the worker-specific proof cannot be trusted.
 

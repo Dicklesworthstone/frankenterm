@@ -46,6 +46,7 @@ RCH_WORKER_SELECTION_POLL_SECS="${RCH_WORKER_SELECTION_POLL_SECS:-15}"
 RCH_REMOTE_PREFLIGHT_WAIT_SECS="${RCH_REMOTE_PREFLIGHT_WAIT_SECS:-${RCH_WORKER_SELECTION_WAIT_SECS}}"
 RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS:-}"
 RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
+RCH_MIRROR_MIN_PASSING_WORKERS="${RCH_MIRROR_MIN_PASSING_WORKERS:-1}"
 RCH_GITHUB_ACTIONS_LOCAL_CARGO="${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-0}"
 
 # Populated by rch_init().
@@ -1087,9 +1088,14 @@ ensure_rch_mirror_preflight() {
 
     local worker_ids worker_id worker_dir worker_json worker_rc failures total bead_arg=()
     local block_on_stale_head="false"
+    local min_passing_workers
     local scheduler_worker_ids scheduler_status_rc scheduler_filter_active="false"
     worker_ids="$(rch_extract_probe_worker_ids "${_RCH_PROBE_LOG}")"
     [[ -n "${worker_ids}" ]] || rch_fatal "mirror preflight requested but worker probe did not expose worker ids. See ${_RCH_PROBE_LOG}"
+    min_passing_workers="${RCH_MIRROR_MIN_PASSING_WORKERS}"
+    if ! rch_is_unsigned_int "${min_passing_workers}" || [[ "${min_passing_workers}" -eq 0 ]]; then
+        rch_fatal "RCH_MIRROR_MIN_PASSING_WORKERS must be a positive integer; got '${RCH_MIRROR_MIN_PASSING_WORKERS}'."
+    fi
 
     set +e
     run_rch --json status --workers >"${_RCH_SCHEDULER_WORKERS_LOG}" 2>&1
@@ -1145,6 +1151,7 @@ ensure_rch_mirror_preflight() {
         --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
         --argjson total "${total}" \
         --argjson failures "${failures}" \
+        --argjson min_passing_workers "${min_passing_workers}" \
         --argjson block_on_stale_head "$(rch_json_bool "${block_on_stale_head}")" \
         --argjson scheduler_filter_active "$(rch_json_bool "${scheduler_filter_active}")" \
         --arg probe_log "$(rch_repo_relative_path "${_RCH_PROBE_LOG}")" \
@@ -1153,15 +1160,31 @@ ensure_rch_mirror_preflight() {
           .status != "passed"
           and ($block_on_stale_head or .reason_code != "rch_mirror.head_mismatch");
         ([.[] | select(blocking_failure($block_on_stale_head))] | length) as $blocking_failures
+        | ($total - $blocking_failures) as $passing_workers
+        | ($passing_workers >= $min_passing_workers) as $pool_ready
         | {
           schema_version: $schema_version,
           kind: $kind,
           generated_at: $generated_at,
-          status: (if $blocking_failures == 0 then "passed" else "blocked" end),
-          reason_code: (if $blocking_failures == 0 then "source_mirror_ready" else "source_mirror_blocked" end),
-          detail: (if $blocking_failures == 0 then "all blocking source mirror checks passed; Git metadata drift is recorded separately when required file hashes match" else "at least one probed worker failed a blocking source mirror attestation" end),
+          status: (if $pool_ready then "passed" else "blocked" end),
+          reason_code: (
+            if $pool_ready and $blocking_failures == 0 then "source_mirror_ready"
+            elif $pool_ready then "source_mirror_minimum_ready"
+            else "source_mirror_blocked" end
+          ),
+          detail: (
+            if $pool_ready and $blocking_failures == 0 then
+              "all blocking source mirror checks passed; Git metadata drift is recorded separately when required file hashes match"
+            elif $pool_ready then
+              "the source mirror pool met the minimum ready-worker threshold; stale worker mirrors are retained as residual evidence"
+            else
+              "too few probed workers passed blocking source mirror attestation"
+            end
+          ),
           total_workers_checked: $total,
           failed_workers: $failures,
+          passing_workers: $passing_workers,
+          required_passing_workers: $min_passing_workers,
           blocking_failed_workers: $blocking_failures,
           block_on_stale_head: $block_on_stale_head,
           scheduler_filter_active: $scheduler_filter_active,
@@ -1172,10 +1195,12 @@ ensure_rch_mirror_preflight() {
           worker_results: .
         }' "${worker_dir}"/*.json >"${_RCH_MIRROR_PREFLIGHT_LOG}"
 
-    local blocking_failures
+    local blocking_failures passing_workers required_passing_workers
     blocking_failures="$(jq -r '.blocking_failed_workers // 0' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
-    if [[ "${blocking_failures}" -ne 0 ]]; then
-        rch_fatal "rch source mirror preflight blocked: ${blocking_failures}/${total} workers failed blocking attestation. See ${_RCH_MIRROR_PREFLIGHT_LOG}"
+    passing_workers="$(jq -r '.passing_workers // 0' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
+    required_passing_workers="$(jq -r '.required_passing_workers // 1' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
+    if [[ "${passing_workers}" -lt "${required_passing_workers}" ]]; then
+        rch_fatal "rch source mirror preflight blocked: only ${passing_workers}/${total} workers passed blocking attestation; required ${required_passing_workers}; ${blocking_failures} workers failed. See ${_RCH_MIRROR_PREFLIGHT_LOG}"
     fi
 }
 
