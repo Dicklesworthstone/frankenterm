@@ -82,7 +82,7 @@ Current implementation reality:
 | **Intelligent Detection** | Multi-agent pattern engine detects rate limits, errors, prompts, completions across Codex, Claude Code, and Gemini |
 | **Event-Driven Automation** | Workflows trigger on patterns, not sleep loops or polling heuristics |
 | **Robot Mode API** | JSON/TOON interface optimized for AI agents to control other AI agents |
-| **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output |
+| **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output; future-query recall is currently a vacuous PAC-Bayes bound until production held-out data lands ([derivation](docs/perf/semantic-search-pac-bayes-derivation.md), [artifact](docs/attestations/proofs/semantic-search-pac-bayes.json)) |
 | **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
 | **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; the resource-pressure cockpit now has a retained remote-reduced conformance artifact and a fail-closed [target-class hardware gate](docs/perf/target-class-hardware.md) with the current [gate artifact](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json) still `skipped_not_proven`; 200+ pane memory-envelope claims still require passing target-hardware proof |
