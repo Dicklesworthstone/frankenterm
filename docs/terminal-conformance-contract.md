@@ -82,6 +82,7 @@ The terminal conformance lane should keep artifacts predictable:
 | Status | Meaning |
 |---|---|
 | `CONTRACTED` | The row is specified here but implementation artifacts are deferred to a named Bead. |
+| `DOCS_PASS` | The row is documentation/process-only and its static docs proof passed. |
 | `FIXTURED` | Committed fixtures exist, but no no-mock or RCH-backed proof consumes them yet. |
 | `NO_MOCK_PASS` | A no-mock harness consumes the row and passes through RCH where heavy proof is required. |
 | `PARSER_ONLY_PASS` | The behavior is parser-only and a deterministic unit or integration test is the correct proof. |
@@ -97,7 +98,7 @@ works". Deferred rows must name a concrete Bead ID.
 
 | Row | Family | Required artifact | Proof lane | Owner | Status |
 |---|---|---|---|---|---|
-| 1 | Contract and coverage matrix | This document | `git diff --check -- docs/terminal-conformance-contract.md` | `ft-hme39.1` | `CONTRACTED` |
+| 1 | Contract and coverage matrix | This document | `git diff --check -- docs/terminal-conformance-contract.md` | `ft-hme39.1` | `DOCS_PASS` |
 | 2 | No-mock PTY/mux loopback smoke | Harness under `tests/e2e/` plus run artifacts | RCH-backed smoke with real spawn, send, resize, read, and pane/session assertions | `ft-hme39.2` | `CONTRACTED` |
 | 3 | Mux attach/detach and pane lifecycle | Loopback scenario fixture or harness row | RCH-backed no-mock harness if Cargo/e2e is required | `ft-hme39.2` | `CONTRACTED` |
 | 4 | Resize plus wrapped text and reflow | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-resize-wrap-001` | `frankenterm-escape-parser` parser corpus test; no no-mock reflow claim yet | `ft-hme39.3` | `PARSER_ONLY_PASS` |
@@ -109,7 +110,7 @@ works". Deferred rows must name a concrete Bead ID.
 | 10 | Graphics negative fixture | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-graphics-negative-001` | `frankenterm-escape-parser` parser corpus test; no visual image claim | `ft-hme39.3` | `PARSER_ONLY_PASS` |
 | 11 | Failing transcript minimization | `tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json` plus quarantine policy | `frankenterm-escape-parser` corpus metadata validator; no live failure claim yet | `ft-hme39.4` | `METADATA_PASS` |
 | 12 | Large transcript performance budget | `LargeSwarmScenario::required_scale_points()` plus `tests/e2e/test_ft_hme39_5_large_transcript_budget.sh` | RCH-backed `large_transcript_budget::terminal_conformance_large_transcript_budget` run with retained JSONL metrics | `ft-hme39.5` | `BUDGET_PASS` |
-| 13 | Closeout and proof-ledger usage | Docs tying artifacts to Beads and proof ledger | Static docs check; later proof-ledger validator when available | `ft-hme39.6` | `CONTRACTED` |
+| 13 | Closeout and proof-ledger usage | Docs tying artifacts to Beads and proof ledger | Static docs check; later proof-ledger validator when available | `ft-hme39.6` | `DOCS_PASS` |
 
 ## Large Transcript Budget
 
@@ -255,6 +256,37 @@ validation alone proves the quarantine contract, not terminal correctness.
 
 ## Closeout Template
 
+Terminal conformance closeout comments are the handoff surface until the
+repository-wide proof ledger can ingest every terminal harness directly. When a
+`ProofAttemptRecord` or validated proof-ledger JSONL row exists, cite it before
+the prose summary. When it does not exist yet, cite the retained run artifact
+paths that contain the same facts:
+
+- `summary.json` for final outcome, artifact index, worker id, and metrics;
+- the RCH log plus `.rch_meta.json` for selected worker, remote exit status,
+  timeout state, and fail-open detection;
+- harness-specific metric JSONL such as `budget_events.jsonl`;
+- fixture metadata paths for parser-only or minimized-transcript work;
+- the exact Bead id and matrix row ids covered by the claim.
+
+Use the proof taxonomy in
+`docs/proposals/ft-tn6cw-proof-lane-evidence-taxonomy.md` when classifying a
+terminal proof attempt. The important states for this lane are:
+
+| State | Terminal conformance meaning |
+|---|---|
+| `PASS` | The intended terminal assertion ran on the intended backend, exited 0, and retained the artifacts needed for the claimed rows. |
+| `INFRA_BLOCKED_PRE_CARGO` | RCH queueing, worker selection, mirror preflight, sync, command classification, or remote launch blocked before Cargo or the harness assertion started. This is not a source verdict. |
+| `INFRA_BLOCKED_POST_CARGO` | Remote Cargo or the harness started, but worker environment, artifact retrieval, timeout, or wrapper behavior prevented complete evidence. Record what was reached, but do not close as green. |
+| `SOURCE_COMPILE_FAIL` | Remote Cargo/rustc reached first-party code and reported source, feature, lint, or build-script errors. Fix the source or leave the bead red. |
+| `TEST_FAIL` | The terminal assertion ran and failed. Fix behavior or record a quarantined minimized follow-up. |
+| `LOCAL_INVALID` | A local Cargo run or RCH fail-open is being offered as remote proof. It cannot close an RCH-required terminal conformance bead. |
+
+Do not treat RCH setup, sync, worker-selection chatter, cache downloads, or a
+source mirror preflight as proof that a terminal assertion passed. Those logs
+can prove infrastructure state. The terminal claim starts only when the relevant
+static check, parser test, no-mock harness, or RCH-backed budget assertion runs.
+
 Terminal conformance closeout comments should include:
 
 ```text
@@ -268,6 +300,71 @@ Proof:
 - <exact RCH command if any>
 Remote proof status: <not required for docs-only | worker id and result>
 Residual risk: <none | named blocker and follow-up bead>
+```
+
+### Passing RCH-Backed Closeout Example
+
+Use this shape when the RCH-backed harness reached the terminal assertion and
+returned success:
+
+```text
+Closed by fa96ec86d.
+Rows covered: 12.
+Artifacts:
+- tests/e2e/test_ft_hme39_5_large_transcript_budget.sh
+- tests/e2e/logs/terminal-conformance/ft-hme39.5/20260512T231714Z/summary.json
+- tests/e2e/logs/terminal-conformance/ft-hme39.5/20260512T231714Z/budget_events.jsonl
+- tests/e2e/logs/terminal-conformance/ft-hme39.5/20260512T231714Z/large_transcript_budget.log.rch_meta.json
+Proof:
+- bash -n tests/e2e/lib_rch_guards.sh tests/e2e/test_ft_hme39_5_large_transcript_budget.sh
+- shellcheck -x tests/e2e/lib_rch_guards.sh tests/e2e/test_ft_hme39_5_large_transcript_budget.sh
+- git diff --check -- tests/e2e/lib_rch_guards.sh docs/asupersync-rch-execution-policy.md
+- RCH_STEP_TIMEOUT_SECS=3600 RCH_REQUIRE_REMOTE=1 tests/e2e/test_ft_hme39_5_large_transcript_budget.sh
+Remote proof status: PASS, worker vmi1156319, remote_exit_code=0, fail_open_detected=false, timed_out=false.
+Metrics: failed_count=0; 1000-pane point produced 7080 events in 64ms, artifact_bytes=3928117, memory_proxy_bytes=6252597.
+Residual risk: stale worker mirrors were retained in rch_mirror_preflight.json as residual pool evidence; RCH refreshed the selected worker before Cargo.
+```
+
+This example may be copied only when the cited artifact actually exists and the
+numbers match the retained run. A future run should cite its own run id and
+worker id.
+
+### RCH Infrastructure Blocked Example
+
+Use this shape when the harness fails before terminal assertions start:
+
+```text
+Not closed.
+Rows intended: 12.
+Artifacts:
+- tests/e2e/logs/terminal-conformance/ft-hme39.5/20260512T222300Z/summary.json
+- tests/e2e/logs/terminal-conformance/ft-hme39.5/20260512T222300Z/ft_hme39_5_large_transcript_budget_20260512T222300Z.rch_worker_selection.json
+Proof:
+- RCH_STEP_TIMEOUT_SECS=3600 RCH_REQUIRE_REMOTE=1 tests/e2e/test_ft_hme39_5_large_transcript_budget.sh
+Remote proof status: INFRA_BLOCKED_PRE_CARGO, final_failure.reason_code=rch_infrastructure_worker_selection_blocked.
+Source verdict: none. large_transcript_budget.log was empty, so Cargo and the test binary did not start locally or remotely.
+Next action: fix or wait out the RCH worker-selection blocker, then rerun the same harness.
+```
+
+This is a valid Beads progress comment, not closure evidence.
+
+### Minimized Transcript Follow-Up Example
+
+Use this shape when a failing terminal transcript has been reduced but not yet
+promoted into the passing corpus:
+
+```text
+Not closed as terminal correctness proof.
+Rows affected: 11 and the eventual promoted behavior row.
+Artifacts:
+- tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json
+- tests/fixtures/terminal-conformance/manifest.json
+Proof:
+- jq empty tests/fixtures/terminal-conformance/manifest.json tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json
+- git diff --check -- tests/fixtures/terminal-conformance/manifest.json tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json
+Proof status: METADATA_PASS for quarantine/provenance only.
+Residual risk: terminal behavior remains unproven until the minimized input has a passing expected artifact, appears in manifest.scenarios, and the fixture consumer proof command passes through RCH when heavy proof is required.
+Follow-up bead: <bead id that will fix/promote the case>.
 ```
 
 For this contract bead, docs-only closure is sufficient because it creates the
