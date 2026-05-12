@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-capture-fairness.json",
+  "title": "FrankenTerm Capture Fairness",
+  "description": "Versioned operator-facing contract for capture scheduler fairness and privacy-bounded capture-budget telemetry.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source",
+    "budget",
+    "ready_panes_total",
+    "available_permits",
+    "selected_panes",
+    "scheduler_snapshot",
+    "pass_fail",
+    "redaction_policy",
+    "raw_pane_content_stored",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.capture_fairness.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "budget": {
+      "type": "object",
+      "required": [
+        "max_captures_per_sec",
+        "max_bytes_per_sec"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "max_captures_per_sec": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_bytes_per_sec": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "ready_panes_total": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "available_permits": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "selected_panes": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "scheduler_snapshot": {
+      "$ref": "#/$defs/scheduler_snapshot"
+    },
+    "pass_fail": {
+      "type": "object",
+      "required": [
+        "selected_within_permits",
+        "selected_within_ready_set",
+        "no_raw_content"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "selected_within_permits": {
+          "type": "boolean",
+          "const": true
+        },
+        "selected_within_ready_set": {
+          "type": "boolean",
+          "const": true
+        },
+        "no_raw_content": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "required": [
+        "raw_pane_content_allowed",
+        "bounded_counters_only",
+        "secret_redaction_required"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "bounded_counters_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "secret_redaction_required": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "raw_pane_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "artifact_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "scheduler_snapshot": {
+      "type": "object",
+      "required": [
+        "budget_active",
+        "max_captures_per_sec",
+        "max_bytes_per_sec",
+        "captures_remaining",
+        "bytes_remaining",
+        "total_rate_limited",
+        "total_byte_budget_exceeded",
+        "total_throttle_events",
+        "tracked_panes",
+        "pane_rows_total",
+        "pane_rows_truncated",
+        "panes",
+        "tiers"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "budget_active": {
+          "type": "boolean"
+        },
+        "max_captures_per_sec": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_bytes_per_sec": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "captures_remaining": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes_remaining": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_rate_limited": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_byte_budget_exceeded": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_throttle_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tracked_panes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pane_rows_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pane_rows_truncated": {
+          "type": "boolean"
+        },
+        "panes": {
+          "type": "array"
+        },
+        "tiers": {
+          "type": "array"
+        }
+      }
+    }
+  }
+}

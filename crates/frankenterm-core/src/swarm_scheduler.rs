@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 
 use crate::fleet_memory_controller::{FleetMemoryTierBudgetSnapshot, FleetPressureTier};
 use crate::latency_stages::StagePressure;
@@ -155,6 +155,49 @@ impl HerdWaveSignal {
     }
 }
 
+fn serialize_optional_herd_wave_kind<S>(
+    value: &Option<HerdWaveEventKind>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(kind) => kind.serialize(serializer),
+        None => serializer.serialize_str("none"),
+    }
+}
+
+fn serialize_optional_admission_action<S>(
+    value: &Option<AdmissionAction>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(action) => action.serialize(serializer),
+        None => serializer.serialize_str("none"),
+    }
+}
+
+fn herd_wave_summary_reason_codes(
+    dominant_kind: Option<HerdWaveEventKind>,
+    detected: bool,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if let Some(kind) = dominant_kind {
+        push_string_reason(&mut reasons, herd_wave_event_reason_code(kind));
+    }
+    if detected {
+        push_string_reason(&mut reasons, "herd_wave.threshold.distinct_panes");
+    }
+    if reasons.is_empty() {
+        push_string_reason(&mut reasons, "herd_wave.admission.healthy");
+    }
+    reasons
+}
+
 /// Deterministic policy for detecting and staggering herd waves.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HerdWaveDetectionConfig {
@@ -206,6 +249,7 @@ pub struct HerdWavePressureSummary {
     /// Last signal timestamp in the active window.
     pub last_seen_ms: Option<u64>,
     /// Most common event family in the active window.
+    #[serde(serialize_with = "serialize_optional_herd_wave_kind")]
     pub dominant_kind: Option<HerdWaveEventKind>,
     /// Count of the dominant family.
     pub dominant_kind_count: u32,
@@ -213,6 +257,8 @@ pub struct HerdWavePressureSummary {
     pub recommended_stagger_ms: u64,
     /// Maximum delay assigned to the final action in this cohort.
     pub cohort_max_stagger_ms: u64,
+    /// Stable machine reasons for this summary.
+    pub reason_codes: Vec<String>,
 }
 
 /// One pane action scheduled after smoothing a synchronized herd wave.
@@ -300,6 +346,7 @@ pub struct HerdWaveDryRunPlan {
     /// Detection summary that produced this calendar.
     pub summary: HerdWavePressureSummary,
     /// Final admission action, when an admission decision was supplied.
+    #[serde(serialize_with = "serialize_optional_admission_action")]
     pub admission_action: Option<AdmissionAction>,
     /// Final pressure severity after protection and fail-closed gates.
     pub effective_pressure_severity: Option<u8>,
@@ -445,8 +492,10 @@ pub enum HerdWaveOverallState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HerdWaveSourceFreshness {
     /// Stable source name.
+    #[serde(skip_serializing)]
     pub source: String,
     /// Source class.
+    #[serde(skip_serializing)]
     pub source_kind: HerdWaveTelemetrySourceKind,
     /// Source evidence posture.
     pub evidence_state: HerdWaveEvidenceState,
@@ -546,6 +595,43 @@ impl HerdWaveSourceFreshness {
     }
 }
 
+fn serialize_source_freshness_summary<S>(
+    sources: &[HerdWaveSourceFreshness],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let generated_at_ms = sources
+        .iter()
+        .filter_map(|source| source.generated_at_ms)
+        .min();
+    let freshness_ms = sources
+        .iter()
+        .filter_map(|source| source.freshness_ms)
+        .max();
+    let max_age_ms = sources
+        .iter()
+        .map(|source| source.max_age_ms)
+        .max()
+        .unwrap_or(0);
+    let evidence_state = root_evidence_state(sources);
+    let mut reason_codes = Vec::new();
+    for source in sources {
+        for reason in &source.reason_codes {
+            push_string_reason(&mut reason_codes, reason);
+        }
+    }
+
+    let mut map = serializer.serialize_map(Some(5))?;
+    map.serialize_entry("generated_at_ms", &generated_at_ms)?;
+    map.serialize_entry("freshness_ms", &freshness_ms)?;
+    map.serialize_entry("max_age_ms", &max_age_ms)?;
+    map.serialize_entry("evidence_state", &evidence_state)?;
+    map.serialize_entry("reason_codes", &reason_codes)?;
+    map.end()
+}
+
 /// One unavailable source projected into the v1 contract.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HerdWaveUnavailableSource {
@@ -584,6 +670,12 @@ pub struct HerdWaveCapacityControllerSnapshot {
 pub struct HerdWavePriorityProtectionSnapshot {
     pub protected: bool,
     pub protection_units: u8,
+    pub pane_priority_tier: String,
+    pub work_priority: Option<u32>,
+    pub mission_critical: bool,
+    #[serde(serialize_with = "serialize_optional_admission_action")]
+    pub effective_admission_action: Option<AdmissionAction>,
+    #[serde(skip)]
     pub operator_override_active: bool,
     pub reason_codes: Vec<String>,
 }
@@ -594,6 +686,10 @@ impl HerdWavePriorityProtectionSnapshot {
             return Self {
                 protected: false,
                 protection_units: 0,
+                pane_priority_tier: "unknown".to_string(),
+                work_priority: None,
+                mission_critical: false,
+                effective_admission_action: None,
                 operator_override_active: false,
                 reason_codes: Vec::new(),
             };
@@ -615,8 +711,133 @@ impl HerdWavePriorityProtectionSnapshot {
         Self {
             protected,
             protection_units: decision.priority_protection_units,
+            pane_priority_tier: if protected { "critical" } else { "unknown" }.to_string(),
+            work_priority: None,
+            mission_critical: protected,
+            effective_admission_action: Some(decision.action),
             operator_override_active,
             reason_codes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveOperatorOverrideSnapshot {
+    pub active: bool,
+    pub override_id: Option<String>,
+    pub scope: Option<String>,
+    pub approved_by: Option<String>,
+    pub reason_codes: Vec<String>,
+}
+
+impl HerdWaveOperatorOverrideSnapshot {
+    fn from_priority_protection(priority: &HerdWavePriorityProtectionSnapshot) -> Self {
+        Self {
+            active: priority.operator_override_active,
+            override_id: None,
+            scope: priority
+                .operator_override_active
+                .then(|| "herd_wave_admission".to_string()),
+            approved_by: None,
+            reason_codes: priority
+                .operator_override_active
+                .then(|| "herd_wave.priority.operator_override".to_string())
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveStaggerPlanRow {
+    pub action_id: String,
+    pub pane_id: Option<u64>,
+    pub cohort_rank: u32,
+    pub event_kind: HerdWaveEventKind,
+    pub scheduled_after_ms: u64,
+    pub admission_action: AdmissionAction,
+    pub mutation_allowed: bool,
+    pub reason_codes: Vec<String>,
+    pub citation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveCitation {
+    pub citation_id: String,
+    pub source: String,
+    pub evidence_state: HerdWaveEvidenceState,
+    pub subject_type: String,
+    pub subject_id: Option<String>,
+    pub generated_at_ms: Option<u64>,
+    pub artifact_path: Option<String>,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveNextAction {
+    pub action_id: String,
+    pub action_kind: String,
+    pub operator_summary: String,
+    pub mutation_allowed: bool,
+    pub requires_approval: bool,
+    pub reason_codes: Vec<String>,
+    pub citation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveRedactionPolicy {
+    pub raw_pane_content_allowed: bool,
+    pub max_excerpt_chars: u32,
+    pub secret_redaction_required: bool,
+    pub allowed_citation_subjects: Vec<String>,
+    pub reason_codes: Vec<String>,
+}
+
+impl Default for HerdWaveRedactionPolicy {
+    fn default() -> Self {
+        Self {
+            raw_pane_content_allowed: false,
+            max_excerpt_chars: 0,
+            secret_redaction_required: true,
+            allowed_citation_subjects: vec![
+                "pane_id".to_string(),
+                "event_counter".to_string(),
+                "artifact_path".to_string(),
+            ],
+            reason_codes: vec!["herd_wave.privacy.raw_pane_content_forbidden".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveTargetClassHardwareProof {
+    pub available: bool,
+    pub cpu_cores: Option<u32>,
+    pub memory_gib: Option<u32>,
+    pub host_fingerprint: Option<String>,
+    pub rch_worker: Option<String>,
+    pub run_id: Option<String>,
+    pub artifact_path: Option<String>,
+    pub command: Option<String>,
+    pub exit_status: Option<i32>,
+    pub measured_window_ms: Option<u64>,
+    pub reason_codes: Vec<String>,
+}
+
+impl HerdWaveTargetClassHardwareProof {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            cpu_cores: None,
+            memory_gib: None,
+            host_fingerprint: None,
+            rch_worker: None,
+            run_id: None,
+            artifact_path: None,
+            command: None,
+            exit_status: None,
+            measured_window_ms: None,
+            reason_codes: vec!["herd_wave.safety.no_target_class_artifact".to_string()],
         }
     }
 }
@@ -628,22 +849,32 @@ pub struct HerdWaveContractSnapshot {
     pub contract_id: &'static str,
     pub generated_at_ms: u64,
     pub source: String,
+    #[serde(serialize_with = "serialize_source_freshness_summary")]
     pub source_freshness: Vec<HerdWaveSourceFreshness>,
     pub evidence_state: HerdWaveEvidenceState,
     pub overall_state: HerdWaveOverallState,
+    #[serde(serialize_with = "serialize_optional_herd_wave_kind")]
     pub dominant_kind: Option<HerdWaveEventKind>,
     pub event_count: u32,
     pub distinct_panes: u32,
     pub window_ms: u64,
     pub pressure_tier: FleetPressureTier,
+    #[serde(serialize_with = "serialize_optional_admission_action")]
     pub admission_action: Option<AdmissionAction>,
     pub reason_codes: Vec<String>,
     pub recommended_stagger_ms: u64,
     pub cohort_max_stagger_ms: u64,
     pub wave_summary: HerdWavePressureSummary,
     pub priority_protection: HerdWavePriorityProtectionSnapshot,
+    pub operator_override: HerdWaveOperatorOverrideSnapshot,
+    pub stagger_plan: Vec<HerdWaveStaggerPlanRow>,
+    pub citations: Vec<HerdWaveCitation>,
+    pub next_actions: Vec<HerdWaveNextAction>,
+    pub forbidden_actions: Vec<String>,
     pub unavailable_sources: Vec<HerdWaveUnavailableSource>,
+    pub redaction_policy: HerdWaveRedactionPolicy,
     pub raw_pane_content_stored: bool,
+    pub target_class_hardware_proof: HerdWaveTargetClassHardwareProof,
     pub artifact_paths: Vec<String>,
 }
 
@@ -706,6 +937,10 @@ impl HerdWaveContractSnapshot {
         for reason in &priority_protection.reason_codes {
             push_string_reason(&mut reason_codes, reason);
         }
+        let operator_override =
+            HerdWaveOperatorOverrideSnapshot::from_priority_protection(&priority_protection);
+        let citations =
+            herd_wave_contract_citations(generated_at_ms, &source_freshness, &unavailable_sources);
 
         Self {
             schema_version: HERD_WAVE_SCHEMA_VERSION,
@@ -726,8 +961,15 @@ impl HerdWaveContractSnapshot {
             cohort_max_stagger_ms: wave_summary.cohort_max_stagger_ms,
             wave_summary,
             priority_protection,
+            operator_override,
+            stagger_plan: Vec::new(),
+            citations,
+            next_actions: herd_wave_contract_next_actions(overall_state, admission_action),
+            forbidden_actions: herd_wave_contract_forbidden_actions(),
             unavailable_sources,
+            redaction_policy: HerdWaveRedactionPolicy::default(),
             raw_pane_content_stored: false,
+            target_class_hardware_proof: HerdWaveTargetClassHardwareProof::unavailable(),
             artifact_paths: Vec::new(),
         }
     }
@@ -739,6 +981,142 @@ pub fn herd_wave_stagger_delay_ms(cohort_rank: u32, config: &HerdWaveDetectionCo
     u64::from(cohort_rank)
         .saturating_mul(config.base_stagger_ms.max(1))
         .min(config.max_stagger_ms)
+}
+
+fn herd_wave_contract_citations(
+    generated_at_ms: u64,
+    source_freshness: &[HerdWaveSourceFreshness],
+    unavailable_sources: &[HerdWaveUnavailableSource],
+) -> Vec<HerdWaveCitation> {
+    let mut citations = source_freshness
+        .iter()
+        .enumerate()
+        .map(|(index, source)| HerdWaveCitation {
+            citation_id: format!("source.{index}"),
+            source: source.source.clone(),
+            evidence_state: source.evidence_state,
+            subject_type: "source_freshness".to_string(),
+            subject_id: Some(source.source.clone()),
+            generated_at_ms: Some(generated_at_ms),
+            artifact_path: None,
+            reason_codes: source.reason_codes.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    for unavailable in unavailable_sources {
+        citations.push(HerdWaveCitation {
+            citation_id: format!("unavailable.{}", unavailable.source),
+            source: unavailable.source.clone(),
+            evidence_state: unavailable.evidence_state,
+            subject_type: "unavailable_source".to_string(),
+            subject_id: Some(unavailable.source.clone()),
+            generated_at_ms: Some(generated_at_ms),
+            artifact_path: None,
+            reason_codes: unavailable.reason_codes.clone(),
+        });
+    }
+
+    citations
+}
+
+fn herd_wave_contract_next_actions(
+    overall_state: HerdWaveOverallState,
+    admission_action: Option<AdmissionAction>,
+) -> Vec<HerdWaveNextAction> {
+    let (action_kind, operator_summary, requires_approval, reason_code) = match overall_state {
+        HerdWaveOverallState::Normal => (
+            "observe",
+            "continue observing herd-wave telemetry",
+            false,
+            "herd_wave.action.observe",
+        ),
+        HerdWaveOverallState::MissingTelemetry | HerdWaveOverallState::StaleEvidence => (
+            "inspect_telemetry",
+            "inspect missing or stale herd-wave evidence before acting",
+            false,
+            "herd_wave.action.inspect_telemetry",
+        ),
+        HerdWaveOverallState::Critical | HerdWaveOverallState::Emergency => (
+            "apply_manual_stagger",
+            "review the dry-run stagger plan before any manual intervention",
+            true,
+            "herd_wave.action.review_manual_stagger",
+        ),
+        HerdWaveOverallState::PriorityProtected | HerdWaveOverallState::OperatorOverride => (
+            "inspect_telemetry",
+            "inspect priority protection before changing admission posture",
+            true,
+            "herd_wave.action.inspect_priority",
+        ),
+        HerdWaveOverallState::CooldownActive | HerdWaveOverallState::CircuitBreakerActive => (
+            "inspect_telemetry",
+            "inspect admission controller safety posture",
+            true,
+            "herd_wave.action.inspect_safety_posture",
+        ),
+        HerdWaveOverallState::Elevated | HerdWaveOverallState::Unknown => (
+            "observe",
+            "observe the dry-run plan and collect more evidence if pressure rises",
+            false,
+            "herd_wave.action.observe_pressure",
+        ),
+    };
+    let mut reason_codes = vec![reason_code.to_string()];
+    if let Some(action) = admission_action {
+        push_string_reason(
+            &mut reason_codes,
+            dry_run_admission_action_reason_code(action),
+        );
+    }
+
+    vec![HerdWaveNextAction {
+        action_id: "herd_wave.next.safe_operator_review".to_string(),
+        action_kind: action_kind.to_string(),
+        operator_summary: operator_summary.to_string(),
+        mutation_allowed: false,
+        requires_approval,
+        reason_codes,
+        citation_ids: Vec::new(),
+    }]
+}
+
+fn herd_wave_contract_forbidden_actions() -> Vec<String> {
+    [
+        "no_agent_mail_restart",
+        "no_agent_mail_repair",
+        "no_rch_restart_or_drain_without_approval",
+        "no_pane_mutation",
+        "no_queue_mutation",
+        "no_destructive_git_or_filesystem_operation",
+        "no_raw_pane_content",
+        "no_target_class_claim_without_artifact",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn herd_wave_contract_stagger_plan_from_dry_run(
+    plan: &HerdWaveDryRunPlan,
+) -> Vec<HerdWaveStaggerPlanRow> {
+    plan.calendar
+        .iter()
+        .map(|entry| HerdWaveStaggerPlanRow {
+            action_id: format!("herd_wave.stagger.{}", entry.pane_id),
+            pane_id: Some(entry.pane_id),
+            cohort_rank: entry.cohort_rank,
+            event_kind: entry.kind,
+            scheduled_after_ms: entry.delay_ms,
+            admission_action: entry.admission_action,
+            mutation_allowed: false,
+            reason_codes: if entry.reason_codes.is_empty() {
+                vec!["herd_wave.safety.dry_run_only".to_string()]
+            } else {
+                entry.reason_codes.clone()
+            },
+            citation_ids: Vec::new(),
+        })
+        .collect()
 }
 
 /// Detect synchronized herd-wave pressure from timestamped pane signals.
@@ -760,6 +1138,7 @@ pub fn detect_herd_wave_pressure(
             dominant_kind_count: 0,
             recommended_stagger_ms: 0,
             cohort_max_stagger_ms: 0,
+            reason_codes: vec!["herd_wave.telemetry.no_signals".to_string()],
         };
     };
 
@@ -811,6 +1190,7 @@ pub fn detect_herd_wave_pressure(
         dominant_kind_count,
         recommended_stagger_ms,
         cohort_max_stagger_ms,
+        reason_codes: herd_wave_summary_reason_codes(dominant_kind, detected),
     }
 }
 
@@ -2474,7 +2854,7 @@ pub fn build_herd_wave_surface_report(
     let admission_request = AdmissionRequest::standard(5, estimated_effort);
     let admission_decision =
         SwarmAdmissionController::default().evaluate(&admission_request, &telemetry);
-    let snapshot = HerdWaveContractSnapshot::from_telemetry(
+    let mut snapshot = HerdWaveContractSnapshot::from_telemetry(
         generated_at_ms,
         source,
         &telemetry,
@@ -2489,6 +2869,7 @@ pub fn build_herd_wave_surface_report(
         Some(&admission_decision),
         None,
     );
+    snapshot.stagger_plan = herd_wave_contract_stagger_plan_from_dry_run(&dry_run_plan);
     let signal_input = HerdWaveSignalInput {
         signal_count: signals.len(),
         signal_panes: signal_panes.to_vec(),
@@ -2616,13 +2997,14 @@ fn missing_herd_wave_summary() -> HerdWavePressureSummary {
         detected: false,
         event_count: 0,
         distinct_panes: 0,
-        window_ms: 0,
+        window_ms: 1,
         first_seen_ms: None,
         last_seen_ms: None,
         dominant_kind: None,
         dominant_kind_count: 0,
         recommended_stagger_ms: 0,
         cohort_max_stagger_ms: 0,
+        reason_codes: vec!["herd_wave.telemetry.missing".to_string()],
     }
 }
 
@@ -2684,6 +3066,9 @@ fn root_reason_codes(
     }
     if let Some(kind) = wave_summary.dominant_kind {
         push_string_reason(&mut reasons, herd_wave_event_reason_code(kind));
+    }
+    for reason in &wave_summary.reason_codes {
+        push_string_reason(&mut reasons, reason);
     }
     if wave_summary.detected {
         push_string_reason(&mut reasons, "herd_wave.threshold.distinct_panes");

@@ -356,5 +356,35 @@ path = "fuzz_targets/mcp_request_params.rs"
 doc = false
 required-features = ["mcp-fuzz-targets"]
 
+[[bin]]
+name = "contract_context_horizon"
+path = "contract_context_horizon/fuzz_target.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "contract_capture_fairness"
+path = "contract_capture_fairness/fuzz_target.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "contract_herd_wave"
+path = "contract_herd_wave/fuzz_target.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "contract_blocker_radar"
+path = "contract_blocker_radar/fuzz_target.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "contract_resource_cockpit"
+path = "contract_resource_cockpit/fuzz_target.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
 [profile.release]
 debug = 1

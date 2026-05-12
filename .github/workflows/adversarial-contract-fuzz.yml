@@ -1,0 +1,77 @@
+name: Adversarial Contract Fuzz
+
+on:
+  pull_request:
+    paths:
+      - 'crates/frankenterm-core/**'
+      - 'docs/json-schema/**'
+      - 'fuzz/**'
+      - '.github/workflows/adversarial-contract-fuzz.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  pr-fuzz:
+    name: PR 30m fuzz (${{ matrix.target }})
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: contract_context_horizon
+            corpus: fuzz/contract_context_horizon/corpus
+          - target: contract_capture_fairness
+            corpus: fuzz/contract_capture_fairness/corpus
+          - target: contract_herd_wave
+            corpus: fuzz/contract_herd_wave/corpus
+          - target: contract_blocker_radar
+            corpus: fuzz/contract_blocker_radar/corpus
+          - target: contract_resource_cockpit
+            corpus: fuzz/contract_resource_cockpit/corpus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build target
+        run: cargo fuzz build ${{ matrix.target }}
+      - name: Run target for 30 minutes
+        env:
+          CARGO_TARGET_DIR: /tmp/frankenterm-contract-fuzz-${{ matrix.target }}
+        run: |
+          cargo fuzz run ${{ matrix.target }} ${{ matrix.corpus }} -- -max_total_time=1800
+
+  release-fuzz:
+    name: Release 24h fuzz (${{ matrix.target }})
+    if: ${{ github.event_name == 'release' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1500
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: contract_context_horizon
+            corpus: fuzz/contract_context_horizon/corpus
+          - target: contract_capture_fairness
+            corpus: fuzz/contract_capture_fairness/corpus
+          - target: contract_herd_wave
+            corpus: fuzz/contract_herd_wave/corpus
+          - target: contract_blocker_radar
+            corpus: fuzz/contract_blocker_radar/corpus
+          - target: contract_resource_cockpit
+            corpus: fuzz/contract_resource_cockpit/corpus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build target
+        run: cargo fuzz build ${{ matrix.target }}
+      - name: Run target for 24 hours
+        env:
+          CARGO_TARGET_DIR: /tmp/frankenterm-contract-fuzz-${{ matrix.target }}
+        run: |
+          cargo fuzz run ${{ matrix.target }} ${{ matrix.corpus }} -- -max_total_time=86400

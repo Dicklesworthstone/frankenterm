@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "contract_id": "security.adversarial_contract_fuzz.v1",
+  "bead_id": "ft-tf6g3.19",
+  "generated_at": "2026-05-12T00:00:00Z",
+  "status": "harness_and_ci_wired",
+  "release_bundle_artifact": "security/adversarial-contract-fuzz.json",
+  "privacy_invariant": {
+    "raw_context_content_stored": false,
+    "raw_pane_content_stored": false,
+    "raw_content_allowed": false,
+    "assertion": "Every target recursively fails on raw_*_stored=true or raw_*_allowed=true."
+  },
+  "targets": [
+    {
+      "family": "context_horizon",
+      "cargo_fuzz_target": "contract_context_horizon",
+      "path": "fuzz/contract_context_horizon/fuzz_target.rs",
+      "schema": "docs/json-schema/ft-context-horizon.json",
+      "seed_corpus": "fuzz/contract_context_horizon/corpus/",
+      "production_entry_points": [
+        "frankenterm_core::context_horizon::predict_context_horizon",
+        "frankenterm_core::context_horizon::advise_context_horizon"
+      ]
+    },
+    {
+      "family": "capture_fairness",
+      "cargo_fuzz_target": "contract_capture_fairness",
+      "path": "fuzz/contract_capture_fairness/fuzz_target.rs",
+      "schema": "docs/json-schema/ft-capture-fairness.json",
+      "seed_corpus": "fuzz/contract_capture_fairness/corpus/",
+      "production_entry_points": [
+        "frankenterm_core::tailer::CaptureScheduler::select_panes",
+        "frankenterm_core::tailer::CaptureScheduler::snapshot"
+      ]
+    },
+    {
+      "family": "herd_wave",
+      "cargo_fuzz_target": "contract_herd_wave",
+      "path": "fuzz/contract_herd_wave/fuzz_target.rs",
+      "schema": "docs/json-schema/ft-herd-wave.json",
+      "seed_corpus": "fuzz/contract_herd_wave/corpus/",
+      "production_entry_points": [
+        "frankenterm_core::swarm_scheduler::build_herd_wave_surface_report"
+      ]
+    },
+    {
+      "family": "blocker_radar",
+      "cargo_fuzz_target": "contract_blocker_radar",
+      "path": "fuzz/contract_blocker_radar/fuzz_target.rs",
+      "schema": "docs/json-schema/ft-blocker-radar.json",
+      "seed_corpus": "fuzz/contract_blocker_radar/corpus/",
+      "production_entry_points": [
+        "frankenterm_core::blocker_radar::blocker_radar_input_from_coordination_snapshot",
+        "frankenterm_core::blocker_radar::build_blocker_radar_report"
+      ]
+    },
+    {
+      "family": "resource_cockpit",
+      "cargo_fuzz_target": "contract_resource_cockpit",
+      "path": "fuzz/contract_resource_cockpit/fuzz_target.rs",
+      "schema": "docs/json-schema/ft-resource-pressure-cockpit.json",
+      "seed_corpus": "fuzz/contract_resource_cockpit/corpus/",
+      "production_entry_points": [
+        "frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable",
+        "frankenterm_core::runtime_telemetry::SwarmResourceCockpitSnapshot::from_capacity_summary"
+      ]
+    }
+  ],
+  "ci": {
+    "workflow": ".github/workflows/adversarial-contract-fuzz.yml",
+    "pull_request_seconds_per_target": 1800,
+    "release_seconds_per_target": 86400,
+    "release_campaign_status": "not_run_in_this_bead"
+  },
+  "local_proof": {
+    "status": "passed_static_and_compile",
+    "checked_at": "2026-05-12T17:15:59-04:00",
+    "cargo_execution_policy": "run through rch only",
+    "commands": [
+      {
+        "command": "jq empty docs/security/adversarial-contract-fuzz.json docs/json-schema/ft-capture-fairness.json docs/json-schema/ft-herd-wave.json",
+        "status": "passed"
+      },
+      {
+        "command": "ruby -e 'require \"yaml\"; YAML.load_file(\".github/workflows/adversarial-contract-fuzz.yml\")'",
+        "status": "passed"
+      },
+      {
+        "command": "git diff --check -- crates/frankenterm-core/src/swarm_scheduler.rs fuzz/Cargo.toml",
+        "status": "passed"
+      },
+      {
+        "command": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-19-contract-fuzz CARGO_BUILD_JOBS=2 cargo check -j 2 --manifest-path fuzz/Cargo.toml --no-default-features --features core-fuzz-targets --bin contract_context_horizon --bin contract_capture_fairness --bin contract_herd_wave --bin contract_blocker_radar --bin contract_resource_cockpit",
+        "status": "passed",
+        "worker": "vmi1153651",
+        "rch_job": "j-29839818837983294"
+      }
+    ],
+    "fuzz_campaign_status": "ci_wired_not_run_locally"
+  }
+}
