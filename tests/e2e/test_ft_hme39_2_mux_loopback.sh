@@ -339,6 +339,7 @@ run_loopback_test() {
     "cargo test -p frankenterm-core --no-default-features --features vendored,asupersync-runtime --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback target_dir=${target_dir}" \
     env FT_REAL_WEZTERM_TESTS=1 \
     CARGO_TARGET_DIR="${target_dir}" \
+    FT_WEZTERM_MUX_SERVER="${target_dir}/debug/frankenterm-mux-server" \
     cargo test --config net.git-fetch-with-cli=true \
       -p frankenterm-core --no-default-features --features vendored,asupersync-runtime \
       --test snapshot_real_mux no_mock_spawn_send_resize_read_loopback -- --nocapture

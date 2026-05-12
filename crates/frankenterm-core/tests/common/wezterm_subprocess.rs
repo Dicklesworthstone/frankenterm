@@ -136,8 +136,8 @@ impl WeztermSubprocessFixture {
     /// scenarios to choose an interactive echo program such as `/bin/cat`.
     pub fn spawn_with_default_prog(default_prog: &[&str]) -> Result<Self, FixtureError> {
         let bin = locate_explicit_mux_binary()
-            .or_else(build_mux_binary)
             .or_else(locate_current_mux_binary)
+            .or_else(build_mux_binary)
             .or_else(locate_system_mux_binary)
             .ok_or_else(|| {
                 FixtureError::BinaryNotFound(
