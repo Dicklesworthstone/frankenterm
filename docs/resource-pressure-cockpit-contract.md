@@ -350,6 +350,19 @@ RCH logs are not proof by themselves. The retained artifact must show the comman
 reached Cargo/test/runtime as appropriate, and high-scale claims must show the
 target hardware predicate.
 
+The target-class hardware contract is
+[`docs/perf/target-class-hardware.md`](perf/target-class-hardware.md). The gate
+harness is:
+
+```bash
+FT_TARGET_CLASS_SKU=linux-x86_64-high-core scripts/run-target-class-cockpit.sh
+```
+
+It writes per-SKU summaries at
+`tests/e2e/artifacts/target-class/<sku>/<run_id>/summary.json`. A
+`skipped_not_proven` summary is a retained blocker artifact, not proof for
+high-scale wording.
+
 The current v1 retained conformance artifact is:
 
 ```text
@@ -362,6 +375,16 @@ Its status is `passed`, with `local_static = "passed"`,
 `test_binary_reached = true`. Cite it only for schema/runtime conformance and
 remote-reduced proof. A 64-core / 256 GiB or 200+ pane resource claim still
 requires a separate target-class hardware artifact.
+
+The current retained target-class gate artifact is:
+
+```text
+tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json
+```
+
+It is intentionally `skipped_not_proven` because the observed host and current
+RCH worker capability set do not satisfy the 64 logical CPU / 256 GiB
+predicate.
 
 ### RCH Soak Harness
 

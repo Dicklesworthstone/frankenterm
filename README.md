@@ -85,9 +85,9 @@ Current implementation reality:
 | **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output |
 | **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
-| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; the resource-pressure cockpit now has a retained remote-reduced conformance artifact, while 200+ pane memory-envelope claims still require target-hardware proof |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; the resource-pressure cockpit now has a retained remote-reduced conformance artifact and a fail-closed [target-class hardware gate](docs/perf/target-class-hardware.md) with the current [gate artifact](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json) still `skipped_not_proven`; 200+ pane memory-envelope claims still require passing target-hardware proof |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing; the shipped recorder backend is currently `append_log`, while `frankensqlite` remains rollout/test-only until live bootstrap support lands |
-| **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis; high-scale claims must cite cockpit proof artifacts and a target-class hardware predicate in `docs/resource-pressure-cockpit-contract.md` |
+| **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis; high-scale claims must cite cockpit proof artifacts, the target-class hardware predicate in [`docs/resource-pressure-cockpit-contract.md`](docs/resource-pressure-cockpit-contract.md), and a retained summary under `tests/e2e/artifacts/target-class/` |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning |
 
 ---
@@ -1311,7 +1311,7 @@ When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
 
 | Operation | Target | Notes |
 |-----------|--------|-------|
-| Delta capture latency | <50ms benchmark target | 4KB overlap matching; 200-pane or target-class claims must cite the capture fairness proof artifact and runbook |
+| Delta capture latency | <50ms benchmark target | 4KB overlap matching; 200-pane or target-class claims must cite the capture fairness proof artifact and runbook; resource-cockpit high-scale claims also require the [target-class hardware gate](docs/perf/target-class-hardware.md) and a non-skipped target-class artifact |
 | Pattern detection | <1ms per rule pack | Bloom filter pre-rejection |
 | FTS5 query | <10ms | SQLite full-text search |
 | Robot Mode response | <5ms | JSON envelope generation |
@@ -1539,7 +1539,13 @@ For 200 panes, stock terminal emulators keep all scrollback uncompressed in RAM 
 The default settings are designed to keep hot scrollback small and shift older
 content into compressed or on-demand tiers. Treat any 200-pane memory envelope
 as hardware- and workload-dependent until the run cites a live cockpit artifact
-with the target hardware predicate from `docs/resource-pressure-cockpit-contract.md`.
+with the target hardware predicate from
+[`docs/resource-pressure-cockpit-contract.md`](docs/resource-pressure-cockpit-contract.md)
+and the per-SKU target-class artifact contract in
+[`docs/perf/target-class-hardware.md`](docs/perf/target-class-hardware.md).
+The current target-class gate artifact is
+[`skipped_not_proven`](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json),
+so it does not unlock high-scale wording.
 The retained `ft-rz0eb.4` cockpit conformance artifact proves the v1
 schema/runtime lane only; it is still `skipped_not_proven` for target hardware.
 

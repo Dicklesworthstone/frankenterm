@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "resource-cockpit-target-class-gate",
+  "category": "perf/resource-cockpit-target-class",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T15:00:00Z",
+  "produced_by_bead": "ft-tf6g3.14",
+  "status": "skipped_not_proven",
+  "proof_categories": [4, 5],
+  "scope": "Machine-readable pointer for the resource-pressure cockpit target-class hardware gate.",
+  "contract": {
+    "target_class_doc": "docs/perf/target-class-hardware.md",
+    "harness": "scripts/run-target-class-cockpit.sh",
+    "artifact_pattern": "tests/e2e/artifacts/target-class/<sku>/<run_id>/summary.json",
+    "major_skus": [
+      "macos-apple-silicon-dev",
+      "linux-x86_64-high-core"
+    ]
+  },
+  "current_artifact": {
+    "path": "tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json",
+    "status": "skipped_not_proven",
+    "reason": "The current local host and RCH worker pool do not satisfy the 64 logical CPU / 256 GiB high-scale predicate."
+  },
+  "release_bundle_wiring": {
+    "required_per_major_sku": true,
+    "status": "rule_published_for_g16",
+    "bead": "ft-tf6g3.1",
+    "reason": "G16 owns final release-bundle materialization; this artifact publishes the per-SKU target-class rule and current blocked state."
+  },
+  "validation": [
+    {
+      "command": "jq empty docs/attestations/proofs/resource-cockpit-target-class.json",
+      "status": "pass"
+    },
+    {
+      "command": "bash -n scripts/run-target-class-cockpit.sh",
+      "status": "pass"
+    },
+    {
+      "command": "FT_TARGET_CLASS_RUN_ID=20260512T150000Z FT_TARGET_CLASS_SKU=linux-x86_64-high-core FT_TARGET_CLASS_ALLOW_SKIP=1 scripts/run-target-class-cockpit.sh",
+      "status": "pass",
+      "result": "Retained skipped_not_proven artifact because the observed host has 14 logical CPUs and 64 GiB RAM, and the observed RCH capability set tops out at 10 logical CPUs."
+    }
+  ]
+}

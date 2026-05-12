@@ -1,0 +1,11 @@
+{
+  "os_family": "Darwin",
+  "arch": "arm64",
+  "kernel_release": "25.2.0",
+  "os_name": "macOS",
+  "os_version": "26.2",
+  "os_build": "25C56",
+  "logical_cpus": 14,
+  "memory_gib": 64,
+  "disk_free_gib": 285
+}

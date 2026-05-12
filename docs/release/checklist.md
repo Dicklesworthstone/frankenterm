@@ -81,6 +81,12 @@ catch common omissions.
    `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`
    artifact is remote-reduced schema/runtime evidence only; target hardware
    remains `skipped_not_proven` until a target-class live artifact is retained.
+   Run `scripts/run-target-class-cockpit.sh` once per documented major SKU from
+   [`docs/perf/target-class-hardware.md`](../perf/target-class-hardware.md);
+   a release bundle that publishes resource-cockpit high-scale wording must
+   retain at least one target-class summary for `macos` and one for `linux`.
+   Only a summary with `hardware_predicate.proof_status = "proven_predicate_met"`
+   satisfies high-scale wording.
    For capture-lag or capture-fairness claims, cite the retained `ft-n447z.5`
    200-pane reduced RCH artifact and keep target-class wording blocked unless
    the same run also retains a passing high-core hardware predicate.
