@@ -42,6 +42,8 @@ pub const EVIDENCE_SAMPLE_SCHEMA_VERSION: &str = "ft.perf.evidence-sample.v1";
 /// Schema marker for proof-gate telemetry events emitted for Robot Mode.
 pub const GATE_METRIC_EVENT_SCHEMA_VERSION: &str = "ft.perf.gate-event.v1";
 
+const INVALID_EVIDENCE_REASON: &str = "sample failed required field validation";
+
 /// One normalized measurement in a per-claim evidence JSONL stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceSample {
@@ -152,7 +154,7 @@ pub enum PerfGateError {
         /// 1-based line number.
         line: usize,
         /// Operator-facing reason.
-        reason: String,
+        reason: &'static str,
     },
 }
 
@@ -193,7 +195,7 @@ impl EvidenceStream for JsonlEvidenceStream {
             }
             return Err(PerfGateError::InvalidEvidence {
                 line: self.line_number,
-                reason: "sample failed required field validation".to_string(),
+                reason: INVALID_EVIDENCE_REASON,
             });
         }
         Ok(None)
