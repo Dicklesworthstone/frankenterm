@@ -1,11 +1,11 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, PaneId};
+use crate::pane::{PaneId, alloc_pane_id};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{Cursor, CSI};
+use termwiz::escape::csi::{CSI, Cursor};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 
@@ -1323,9 +1323,7 @@ mod tests {
     use super::*;
     use crate::domain::Domain;
     use promise::spawn::ScopedExecutor;
-    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
-
-    static MUX_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    use std::sync::MutexGuard as StdMutexGuard;
 
     struct ScopedMux {
         prior: Option<Arc<Mux>>,
@@ -1335,7 +1333,9 @@ mod tests {
 
     impl ScopedMux {
         fn install(mux: Arc<Mux>) -> Self {
-            let guard = MUX_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let guard = crate::MUX_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             let executor = ScopedExecutor::new();
             let prior = Mux::try_get();
             Mux::set_mux(&mux);
@@ -1593,11 +1593,13 @@ mod tests {
 
         cmd.process_result(domain_id, &result)?;
 
-        assert!(tmux_domain
-            .inner
-            .support_commands
-            .lock()
-            .contains_key("list-windows"));
+        assert!(
+            tmux_domain
+                .inner
+                .support_commands
+                .lock()
+                .contains_key("list-windows")
+        );
 
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert_eq!(queue.len(), 1);

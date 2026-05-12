@@ -1,6 +1,6 @@
+use crate::DomainId;
 use crate::tmux::{RefTmuxRemotePane, TmuxCmdQueue, TmuxDomainState};
 use crate::tmux_commands::{KillPane, Resize, SendKeys};
-use crate::DomainId;
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty};
@@ -241,9 +241,7 @@ mod tests {
     use super::*;
     use crate::Mux;
     use promise::spawn::ScopedExecutor;
-    use std::sync::{Arc as StdArc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
-
-    static MUX_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    use std::sync::{Arc as StdArc, MutexGuard as StdMutexGuard};
 
     struct ScopedMux {
         prior: Option<StdArc<Mux>>,
@@ -253,7 +251,9 @@ mod tests {
 
     impl ScopedMux {
         fn install(mux: StdArc<Mux>) -> Self {
-            let guard = MUX_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let guard = crate::MUX_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             let executor = ScopedExecutor::new();
             let prior = Mux::try_get();
             Mux::set_mux(&mux);

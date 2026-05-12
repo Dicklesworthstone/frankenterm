@@ -1,5 +1,5 @@
 use crate::activity::Activity;
-use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
+use crate::domain::{Domain, DomainId, DomainState, SplitSource, alloc_domain_id};
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand};
@@ -663,13 +663,12 @@ mod tests {
     use promise::spawn::block_on;
     use rangeset::RangeSet;
     use std::ops::Range;
-    use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
     use termwiz::surface::{Line, SEQ_ZERO};
     use url::Url;
 
     fn mux_test_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
+        &crate::MUX_TEST_LOCK
     }
 
     struct ScopedMux {

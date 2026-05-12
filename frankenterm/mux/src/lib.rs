@@ -63,14 +63,14 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -91,7 +91,7 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -560,6 +560,9 @@ fn read_from_pane_pty(
 lazy_static::lazy_static! {
     static ref MUX: Mutex<Option<Arc<Mux>>> = Mutex::new(None);
 }
+
+#[cfg(test)]
+pub(crate) static MUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct MuxWindowBuilder {
     window_id: WindowId,
@@ -1874,10 +1877,14 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::sync::MutexGuard as StdMutexGuard;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Mutex as StdMutex;
 
-    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    fn global_test_lock() -> StdMutexGuard<'static, ()> {
+        crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
 
     #[test]
     fn default_workspace_value() {
@@ -2171,7 +2178,7 @@ mod tests {
 
     #[test]
     fn pane_output_notifications_coalesce_until_flushed() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = global_test_lock();
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Mux::new(None);
         let pane_outputs = Arc::new(Mutex::new(Vec::new()));
@@ -2214,7 +2221,7 @@ mod tests {
 
     #[test]
     fn discarded_pane_output_notification_is_not_flushed() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = global_test_lock();
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Mux::new(None);
         let pane_outputs = Arc::new(Mutex::new(Vec::new()));
@@ -2252,7 +2259,7 @@ mod tests {
 
     #[test]
     fn pane_output_reentrant_enqueue_is_drained_before_returning() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = global_test_lock();
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let pane_outputs = Arc::new(Mutex::new(Vec::new()));
@@ -2313,7 +2320,7 @@ mod tests {
 
     #[test]
     fn window_builder_drop_after_mux_shutdown_does_not_panic() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = global_test_lock();
         Mux::shutdown();
 
         let mux = Arc::new(Mux::new(None));
@@ -2326,7 +2333,7 @@ mod tests {
 
     #[test]
     fn window_builder_non_main_drop_without_scheduler_notifies() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = global_test_lock();
         Mux::shutdown();
         if promise::spawn::is_scheduler_configured() {
             return;
@@ -2358,7 +2365,7 @@ mod tests {
 
     #[test]
     fn new_empty_window_without_global_mux_uses_instance_workspace() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = global_test_lock();
         Mux::shutdown();
 
         let mux = Arc::new(Mux::new(None));
@@ -2380,7 +2387,7 @@ mod tests {
 
     #[test]
     fn window_invalidated_notification_runs_after_window_lock_released() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = global_test_lock();
         Mux::shutdown();
 
         let executor = promise::spawn::SimpleExecutor::new();

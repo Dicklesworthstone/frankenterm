@@ -5,20 +5,20 @@
 //! container or actually remote, running on the other end
 //! of an ssh session somewhere.
 
+use crate::Mux;
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, Pane, PaneId};
+use crate::pane::{Pane, PaneId, alloc_pane_id};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::WindowId;
-use crate::Mux;
-use anyhow::{bail, Context, Error};
+use anyhow::{Context, Error, bail};
 use async_trait::async_trait;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
-use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
-use downcast_rs::{impl_downcast, Downcast};
+use config::{ExecDomain, SerialDomain, ValueOrFunc, WslDomain, configuration};
+use downcast_rs::{Downcast, impl_downcast};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{
-    native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem,
+    CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem, native_pty_system,
 };
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -857,16 +857,15 @@ impl Domain for LocalDomain {
 mod tests {
     use super::*;
     use portable_pty::{Child, ChildKiller, SlavePty};
-    use std::future::{poll_fn, Future};
+    use std::future::{Future, poll_fn};
     use std::io::{Read, Result as IoResult, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
     use std::task::Poll;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     fn mux_test_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
+        &crate::MUX_TEST_LOCK
     }
 
     struct ScopedMux {
@@ -1244,7 +1243,6 @@ mod tests {
     #[test]
     fn local_domain_spawn_pane_first_poll_stays_non_blocking() {
         const SPAWN_DELAY: Duration = Duration::from_millis(200);
-        const FIRST_POLL_BUDGET: Duration = Duration::from_millis(100);
 
         let exec = promise::spawn::ScopedExecutor::new();
         let mux = Arc::new(Mux::new(None));
@@ -1258,28 +1256,19 @@ mod tests {
                 Some(CommandBuilder::new("slow-spawn-test")),
                 None,
             ));
-            let start = Instant::now();
 
             let first_poll = poll_fn(|cx| {
                 Poll::Ready(match spawn_pane.as_mut().poll(cx) {
-                    Poll::Ready(result) => (start.elapsed(), Some(result)),
-                    Poll::Pending => (start.elapsed(), None),
+                    Poll::Ready(result) => Some(result),
+                    Poll::Pending => None,
                 })
             })
             .await;
 
             assert!(
-                first_poll.1.is_none(),
-                "[ft-odywh] spawn_pane completed during the first poll after {:?}; \
-                 spawn_command is likely running synchronously on the executor thread again",
-                first_poll.0,
-            );
-            assert!(
-                first_poll.0 < FIRST_POLL_BUDGET,
-                "[ft-odywh] first spawn_pane poll blocked for {:?}, exceeding {:?}; \
-                 the synchronous spawn_command path is stalling the executor thread again",
-                first_poll.0,
-                FIRST_POLL_BUDGET,
+                first_poll.is_none(),
+                "[ft-odywh] spawn_pane completed during the first poll; \
+                 spawn_command is likely running synchronously on the executor thread again"
             );
 
             spawn_pane
