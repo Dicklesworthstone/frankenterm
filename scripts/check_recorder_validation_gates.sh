@@ -10,6 +10,13 @@
 #   - load harness (compile-only in CI, optional run in nightly)
 #
 # Artifacts are written under target/recorder-validation-gates/.
+#
+# Environment:
+#   FT_RECORDER_VALIDATION_GITHUB_ACTIONS_LOCAL_CARGO
+#                           set to 1 only in GitHub Actions recorder jobs, where
+#                           the GitHub-hosted runner is the CI execution target
+#                           and the local agent/operator RCH offload policy is
+#                           not available.
 # =============================================================================
 
 set -euo pipefail
@@ -18,9 +25,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+github_actions_local_cargo_enabled() {
+    case "${FT_RECORDER_VALIDATION_GITHUB_ACTIONS_LOCAL_CARGO:-}" in
+        1|true|TRUE|yes|YES) ;;
+        *) return 1 ;;
+    esac
+
+    [[ "${GITHUB_ACTIONS:-}" == "true" ]]
+}
+
 RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")-$$"
 ARTIFACT_DIR="${FT_RECORDER_VALIDATION_ARTIFACT_DIR:-target/recorder-validation-gates}"
-DEFAULT_TARGET_DIR="target/rch-recorder-validation-gates-${RUN_ID}"
+if github_actions_local_cargo_enabled; then
+    EXECUTION_MODE="github_actions_local_cargo"
+    DEFAULT_TARGET_DIR="target/github-actions-recorder-validation-gates-${RUN_ID}"
+else
+    EXECUTION_MODE="rch"
+    DEFAULT_TARGET_DIR="target/rch-recorder-validation-gates-${RUN_ID}"
+fi
 REQUESTED_TARGET_DIR="${FT_RECORDER_VALIDATION_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
 if [[ -n "$REQUESTED_TARGET_DIR" && "$REQUESTED_TARGET_DIR" != /* ]]; then
     TARGET_DIR="$REQUESTED_TARGET_DIR"
@@ -33,10 +55,14 @@ mkdir -p "$ARTIFACT_DIR"
 
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 RCH_STEP_TIMEOUT_SECS="${FT_RECORDER_VALIDATION_RCH_TIMEOUT_SECS:-${RCH_STEP_TIMEOUT_SECS:-1800}}"
-# shellcheck source=tests/e2e/lib_rch_guards.sh
-source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
-rch_init "$ARTIFACT_DIR" "$RUN_ID" "recorder_validation_gates" "$PROJECT_ROOT"
-ensure_rch_ready
+if github_actions_local_cargo_enabled; then
+    echo "[recorder-gates] GitHub Actions local Cargo mode enabled"
+else
+    # shellcheck source=tests/e2e/lib_rch_guards.sh
+    source "$PROJECT_ROOT/tests/e2e/lib_rch_guards.sh"
+    rch_init "$ARTIFACT_DIR" "$RUN_ID" "recorder_validation_gates" "$PROJECT_ROOT"
+    ensure_rch_ready
+fi
 
 # Explicit gate thresholds
 MIN_CHAOS_SUMMARY_ARTIFACTS=1
@@ -60,15 +86,19 @@ run_step() {
     shift 2
 
     local log_file="$ARTIFACT_DIR/${step_name}.log"
-    local rch_log_file="$ARTIFACT_DIR/${step_name}.rch.log"
+    local runner_log_file="$ARTIFACT_DIR/${step_name}.${EXECUTION_MODE}.log"
     echo "[recorder-gates] === ${step_name} ==="
     echo "[recorder-gates] cmd: $*" > "$log_file"
 
     set +e
-    run_rch_cargo_logged "$rch_log_file" "$@"
+    if github_actions_local_cargo_enabled; then
+        "$@" > "$runner_log_file" 2>&1
+    else
+        run_rch_cargo_logged "$runner_log_file" "$@"
+    fi
     local rc=$?
     set -e
-    cat "$rch_log_file" | tee -a "$log_file"
+    cat "$runner_log_file" | tee -a "$log_file"
 
     if [[ "$rc" -eq 0 ]]; then
         printf -v "$status_var" '%s' "pass"
@@ -81,6 +111,7 @@ run_step() {
 }
 
 echo "[recorder-gates] Artifacts: $ARTIFACT_DIR"
+echo "[recorder-gates] Execution mode: $EXECUTION_MODE"
 echo "[recorder-gates] CARGO_TARGET_DIR: $TARGET_DIR"
 echo "[recorder-gates] RUN_LOAD_BENCH: $RUN_LOAD_BENCH"
 echo ""
@@ -173,6 +204,7 @@ cat > "$REPORT_FILE" <<EOF
   "version": "1",
   "format": "recorder-validation-gates",
   "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "execution_mode": "$EXECUTION_MODE",
   "run_load_bench": $([[ "$RUN_LOAD_BENCH" == "1" ]] && echo true || echo false),
   "thresholds": {
     "min_chaos_summary_artifacts": $MIN_CHAOS_SUMMARY_ARTIFACTS,

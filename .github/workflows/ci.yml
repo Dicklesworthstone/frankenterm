@@ -913,6 +913,8 @@ jobs:
           key: recorder-validation-gates
 
       - name: Run recorder validation gates (CI mode)
+        env:
+          FT_RECORDER_VALIDATION_GITHUB_ACTIONS_LOCAL_CARGO: "1"
         run: scripts/check_recorder_validation_gates.sh
 
       - name: Upload recorder validation artifacts

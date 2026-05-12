@@ -31,6 +31,7 @@ jobs:
       - name: Run recorder validation gates (nightly mode)
         env:
           FT_RECORDER_GATE_RUN_LOAD_BENCH: "1"
+          FT_RECORDER_VALIDATION_GITHUB_ACTIONS_LOCAL_CARGO: "1"
         run: scripts/check_recorder_validation_gates.sh
 
       - name: Aggregate visual artifact summaries (if present)
