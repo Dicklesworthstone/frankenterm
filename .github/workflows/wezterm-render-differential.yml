@@ -39,8 +39,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUN_DIR"
-          git fetch --depth=1 https://github.com/wez/wezterm.git main:refs/remotes/wezterm-upstream/main
-          git rev-parse refs/remotes/wezterm-upstream/main | tee "$RUN_DIR/upstream-wezterm-head.txt"
+          upstream_src="$RUNNER_TEMP/wezterm-upstream-src-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git clone \
+            --branch main \
+            --depth=1 \
+            --recurse-submodules \
+            --shallow-submodules \
+            https://github.com/wez/wezterm.git \
+            "$upstream_src"
+          git -C "$upstream_src" rev-parse HEAD | tee "$RUN_DIR/upstream-wezterm-head.txt"
+          echo "WEZTERM_UPSTREAM_SRC=$upstream_src" >> "$GITHUB_ENV"
 
       - name: Build FrankenTerm GUI
         run: |
@@ -51,9 +59,7 @@ jobs:
       - name: Build upstream WezTerm GUI
         run: |
           set -euo pipefail
-          upstream_src="$RUNNER_TEMP/wezterm-upstream-src"
-          mkdir -p "$upstream_src"
-          git archive refs/remotes/wezterm-upstream/main | tar -x -C "$upstream_src"
+          upstream_src="${WEZTERM_UPSTREAM_SRC:?WEZTERM_UPSTREAM_SRC must be set by Fetch upstream WezTerm HEAD}"
           cargo build --manifest-path "$upstream_src/Cargo.toml" -p wezterm-gui --bin wezterm-gui
           echo "WEZTERM_GUI=$upstream_src/target/debug/wezterm-gui" >> "$GITHUB_ENV"
 
