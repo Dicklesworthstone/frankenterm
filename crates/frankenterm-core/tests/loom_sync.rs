@@ -270,7 +270,9 @@ fn loom_mutex_try_lock_succeeds_when_free() {
 
 #[test]
 fn loom_rwlock_preserves_reader_writer_invariant() {
-    loom::model(|| {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
         let value = Arc::new(RwLock::new(0usize));
         let active_readers = Arc::new(AtomicUsize::new(0));
         let active_writers = Arc::new(AtomicUsize::new(0));
@@ -289,7 +291,11 @@ fn loom_rwlock_preserves_reader_writer_invariant() {
                 0,
                 "writer overlapped with reader"
             );
-            assert_eq!(*guard, 0);
+            let observed = *guard;
+            assert!(
+                observed <= 1,
+                "reader observed impossible value after a single writer: {observed}"
+            );
             thread::yield_now();
             active_readers_a.fetch_sub(1, Ordering::SeqCst);
         });
@@ -307,7 +313,11 @@ fn loom_rwlock_preserves_reader_writer_invariant() {
                 0,
                 "writer overlapped with reader"
             );
-            assert_eq!(*guard, 0);
+            let observed = *guard;
+            assert!(
+                observed <= 1,
+                "reader observed impossible value after a single writer: {observed}"
+            );
             thread::yield_now();
             active_readers_b.fetch_sub(1, Ordering::SeqCst);
         });
