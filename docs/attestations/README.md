@@ -44,7 +44,11 @@ present but are not in `required_categories` yet. Current optional slots include
 `doctrine/vendored-provenance` (`ft-i2eni.6`), the G1
 `docs/attestations/doctrine/tokio-eradication-status.json` substrate
 (`ft-tf6g3.7`, under `proofs/runtime-proof-trait`), and
-`perf/atlas-packing` (`ft-gtcm9.5`).
+`perf/atlas-packing` (`ft-gtcm9.5`). The
+`docs/attestations/tui/wezterm-divergence.json` slot (`ft-tf6g3.21`,
+under `tui/render-parity`) records the upstream-WezTerm differential gate and
+is release evidence only after a run reports `frames_compared_total > 0` and
+`novel_divergence_count == 0`.
 
 `proofs/tx-killswitch` hashes
 `docs/attestations/proofs/tx-killswitch.json`, which points at the

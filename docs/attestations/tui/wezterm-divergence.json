@@ -1,0 +1,34 @@
+{
+  "allowlist": {
+    "entry_count": 0,
+    "path": "docs/wezterm-divergence-allowlist.md",
+    "schema_version": "wezterm-divergence-allowlist.v1"
+  },
+  "category": "tui/render-parity",
+  "ci_contract": {
+    "fixed_corpus_seed": "tests/fixtures/terminal-conformance/manifest.json",
+    "new_divergence_policy": "fail",
+    "ssim_infra": "crates/frankenterm-gui/src/gpu_regression.rs::compare_images",
+    "workflow": ".github/workflows/wezterm-render-differential.yml"
+  },
+  "comparison_report": null,
+  "counts": {
+    "allowlisted_count": 0,
+    "divergence_count": 0,
+    "frames_compared_total": 0,
+    "novel_divergence_count": 0
+  },
+  "divergences": [],
+  "kind": "frankenterm-vs-wezterm-render-differential",
+  "latest_run_status": "adapter_contract_ready_no_upstream_frame_report_yet",
+  "novel_divergences": [],
+  "pass_condition": "latest_run_status == passed && novel_divergence_count == 0",
+  "produced_by_bead": "ft-tf6g3.21",
+  "residual_blocker": {
+    "summary": "Current upstream WezTerm exposes CLI text capture but no public headless PNG frame exporter. The gate is present and fails closed once the frame-comparison report exists; the render adapter must supply that report before this artifact is production evidence.",
+    "tracking_bead": "ft-tf6g3.36"
+  },
+  "run_id": null,
+  "schema_version": "wezterm-divergence.v1",
+  "upstream_wezterm_ref": null
+}

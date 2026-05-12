@@ -58,6 +58,14 @@
       "description": "Headless GPU-renderer visual parity contract for the G5 render-parity category. Runtime runs emit target/gpu-regression/<runner>/render-parity-gpu.json beside summary.json; the full ratatui<->ftui byte-level report remains ft-35yac.2."
     },
     {
+      "category": "tui/render-parity",
+      "path": "docs/attestations/tui/wezterm-divergence.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-tf6g3.21",
+      "proof_categories": [9],
+      "description": "Continuous FrankenTerm-vs-upstream-WezTerm render differential slot. The checked-in artifact records the allowlist gate and current adapter blocker; production evidence requires a workflow run with frames_compared_total > 0 and novel_divergence_count == 0."
+    },
+    {
       "category": "security/passive-watch",
       "path": "docs/security/passive-watch-attestation.json",
       "media_type": "application/json",

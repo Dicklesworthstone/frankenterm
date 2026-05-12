@@ -1,0 +1,84 @@
+name: WezTerm Render Differential
+
+on:
+  schedule:
+    - cron: "42 8 * * *"
+  workflow_dispatch:
+    inputs:
+      comparison_report:
+        description: "Optional repo-relative comparison report to gate"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wezterm-render-differential-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate WezTerm render differential report
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      RUN_DIR: target/wezterm-differential
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wezterm-render-differential
+
+      - name: Fetch upstream WezTerm HEAD
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUN_DIR"
+          git fetch --depth=1 https://github.com/wez/wezterm.git main:refs/remotes/wezterm-upstream/main
+          git rev-parse refs/remotes/wezterm-upstream/main | tee "$RUN_DIR/upstream-wezterm-head.txt"
+
+      - name: Build FrankenTerm GUI
+        run: |
+          set -euo pipefail
+          cargo build -p frankenterm-gui --bin frankenterm-gui
+
+      - name: Build upstream WezTerm GUI
+        run: |
+          set -euo pipefail
+          upstream_src="$RUNNER_TEMP/wezterm-upstream-src"
+          mkdir -p "$upstream_src"
+          git archive refs/remotes/wezterm-upstream/main | tar -x -C "$upstream_src"
+          cargo build --manifest-path "$upstream_src/Cargo.toml" -p wezterm-gui --bin wezterm-gui
+
+      - name: Validate differential gate self-test
+        run: scripts/wezterm-render-differential.sh --self-test
+
+      - name: Gate supplied comparison report
+        env:
+          COMPARISON_REPORT: ${{ inputs.comparison_report }}
+        run: |
+          set -euo pipefail
+          upstream_ref="$(cat "$RUN_DIR/upstream-wezterm-head.txt")"
+          if [ -z "${COMPARISON_REPORT:-}" ]; then
+            echo "::error title=WezTerm frame adapter missing::No comparison_report input was supplied. The upstream checkout and both GUI builds completed, but this lane still needs a frame exporter that writes schema_version=wezterm-render-comparison.v1 with comparisons[]."
+            exit 1
+          fi
+          scripts/wezterm-render-differential.sh \
+            --comparison-report "$COMPARISON_REPORT" \
+            --upstream-ref "$upstream_ref" \
+            --output "$RUN_DIR/wezterm-divergence.json"
+
+      - name: Upload differential artifacts
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: wezterm-render-differential
+          path: |
+            target/wezterm-differential/
+          if-no-files-found: ignore
+          retention-days: 14
