@@ -86,6 +86,7 @@ The terminal conformance lane should keep artifacts predictable:
 | `NO_MOCK_PASS` | A no-mock harness consumes the row and passes through RCH where heavy proof is required. |
 | `PARSER_ONLY_PASS` | The behavior is parser-only and a deterministic unit or integration test is the correct proof. |
 | `METADATA_PASS` | Metadata-only fixture validation is the proof; the case is not a passing terminal behavior scenario yet. |
+| `BUDGET_PASS` | The row has a structured, RCH-backed performance or resource-budget lane with retained metric artifacts. |
 | `QUARANTINED` | A known case is kept out of the main gate with explicit reason and follow-up Bead. |
 | `BLOCKED` | The row cannot be proven because of an infrastructure or architecture blocker named in the row. |
 
@@ -107,8 +108,54 @@ works". Deferred rows must name a concrete Bead ID.
 | 9 | UTF-8 and grapheme boundaries | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-utf8-grapheme-001` | `frankenterm-escape-parser` parser corpus test; no cell-width/render claim yet | `ft-hme39.3` | `PARSER_ONLY_PASS` |
 | 10 | Graphics negative fixture | `tests/fixtures/terminal-conformance/manifest.json` scenario `tc-graphics-negative-001` | `frankenterm-escape-parser` parser corpus test; no visual image claim | `ft-hme39.3` | `PARSER_ONLY_PASS` |
 | 11 | Failing transcript minimization | `tests/fixtures/terminal-conformance/minimized/tc-minimized-synthetic-failure-001.json` plus quarantine policy | `frankenterm-escape-parser` corpus metadata validator; no live failure claim yet | `ft-hme39.4` | `METADATA_PASS` |
-| 12 | Large transcript performance budget | Generator or committed scale fixture plus budget thresholds | RCH-backed performance run or operator-gated reproducible lane | `ft-hme39.5` | `CONTRACTED` |
+| 12 | Large transcript performance budget | `LargeSwarmScenario::required_scale_points()` plus `tests/e2e/test_ft_hme39_5_large_transcript_budget.sh` | RCH-backed `large_transcript_budget::terminal_conformance_large_transcript_budget` run with retained JSONL metrics | `ft-hme39.5` | `BUDGET_PASS` |
 | 13 | Closeout and proof-ledger usage | Docs tying artifacts to Beads and proof ledger | Static docs check; later proof-ledger validator when available | `ft-hme39.6` | `CONTRACTED` |
+
+## Large Transcript Budget
+
+`ft-hme39.5` uses the deterministic large-swarm replay generator as the
+terminal-conformance large-transcript scale fixture. The scale factors are the
+required `LargeSwarmScenario` points: 10, 50, 200, and 1 000 panes. Each point
+generates stable recorder events for pane output bursts, compaction waves,
+Robot Mode search traffic, and workflow mission actions, then replays them
+through `ReplaySession` and telemetry collectors.
+
+The budget lane is intentionally optional and operator-gated rather than part of
+the default CI matrix. It is still reproducible and fail-closed:
+
+```bash
+RCH_REQUIRE_REMOTE=1 tests/e2e/test_ft_hme39_5_large_transcript_budget.sh
+```
+
+The harness writes artifacts under
+`tests/e2e/logs/terminal-conformance/ft-hme39.5/<run_id>/`:
+
+- `events.jsonl` for suite/preflight/proof step state;
+- `large_transcript_budget.log` plus `.rch_meta.json` for the RCH Cargo proof;
+- `budget_events.jsonl` containing one JSON metric row per scale point plus a
+  summary row;
+- `summary.json` with artifact paths, worker id, and max observed resource
+  metrics.
+
+The Rust budget test enforces linear, deliberately coarse thresholds so the lane
+catches accidental quadratic behavior and unbounded growth without turning
+ordinary shared-worker noise into a false source failure:
+
+| Metric | Threshold |
+|---|---:|
+| `event_count` | Exact `LargeSwarmRegressionThresholds::for_scenario` count |
+| `duration_ms` | Exact generated source-duration threshold |
+| `output_bytes` | Linear per-pane/per-burst output threshold |
+| `max_events_per_pane` | Linear per-pane event threshold |
+| `wall_time_ms` | `max(1000, event_count * 10)` |
+| `artifact_bytes` | `max(64 KiB, event_count * 4096)` |
+| `memory_proxy_bytes` | `max(128 KiB, event_count * 8192)` |
+
+`memory_proxy_bytes` is not an RSS claim. It is a deterministic in-process
+proxy derived from the serialized corpus/summary size plus event and pane
+counts, suitable for catching resource-shape regressions in this conformance
+lane. Real 64-core / 256 GiB release claims remain governed by the high-scale
+proof gauntlet and must not be promoted from this synthetic replay budget alone.
 
 ## Proof Rules
 
