@@ -238,6 +238,8 @@
     "docs/ft-xbnl0-2-6-no-runtime-regression-validation.json",
     "docs/COMPREHENSIVE_ANALYSIS_OF_coding_agent_usage_tracker.md",
     "docs/adr/0008-query-facade-contract.md",
+    "docs/attestations/doctrine/agents-md-counts.json",
+    "docs/attestations/proofs/runtime-proof-trait.json",
     "docs/audit-checklist.md",
     "docs/contributing/auto-stamped-counts.md",
     "docs/ftui-pty-fixture-strategy.md",
@@ -265,6 +267,16 @@
       "owner": "ft-xbnl0.5.1",
       "reason": "ADR captures migration-era query facade runtime contract; rewritten to native asupersync narrative under ft-xbnl0.5.1 doc sweep.",
       "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/attestations/doctrine/agents-md-counts.json": {
+      "owner": "ft-tf6g3.2",
+      "reason": "Machine-readable count-stamp proof preserves the AGENTS.md command that scans for forbidden Tokio test attributes; this is guard evidence, not implementation usage.",
+      "removal_bead": "ft-tf6g3.2"
+    },
+    "docs/attestations/proofs/runtime-proof-trait.json": {
+      "owner": "ft-e87u6.13",
+      "reason": "RuntimeProof attestation intentionally names tokio::sync::Mutex as the sealed-trait negative canary foreign type.",
+      "removal_bead": "ft-e87u6.13"
     },
     "docs/audit-checklist.md": {
       "owner": "ft-deexl",
