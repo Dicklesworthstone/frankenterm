@@ -1,5 +1,5 @@
 use crate::domain::DomainId;
-use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
+use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{Mux, MuxNotification, WindowId};
@@ -4263,7 +4263,7 @@ mod test {
     use rangeset::RangeSet;
     use std::convert::TryFrom;
     use std::ops::Range;
-    use termwiz::surface::{SEQ_ZERO, SequenceNo};
+    use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use url::Url;
 
     /// Ensure the global Mux singleton is initialized for tests that trigger
@@ -4566,10 +4566,9 @@ mod test {
         assert!(pane.get_logical_lines(0..10).is_empty());
         assert_eq!(pane.get_title(), "fake-pane-42");
         assert!(pane.send_paste("discarded").is_ok());
-        assert!(
-            pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
-                .is_ok()
-        );
+        assert!(pane
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .is_ok());
         assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
         assert!(pane.reader().unwrap().is_none());
         assert!(!pane.is_dead());
@@ -4619,16 +4618,15 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(
-            tab.compute_split_size(
+        assert!(tab
+            .compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none()
-        );
+            .is_none());
 
         let horz_size = tab
             .compute_split_size(
