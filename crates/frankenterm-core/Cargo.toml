@@ -735,6 +735,11 @@ path = "tests/proptest_browser.rs"
 required-features = ["browser"]
 
 [[test]]
+name = "proptest_web_framework"
+path = "tests/proptest_web_framework.rs"
+required-features = ["web"]
+
+[[test]]
 name = "recorder_recovery_drills"
 path = "tests/recorder_recovery_drills.rs"
 required-features = ["recorder-lexical"]
