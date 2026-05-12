@@ -1,0 +1,116 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "capture-fairness-scheduler-tlc-attestation",
+  "category": "proofs/capture-fairness-scheduler",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T14:45:16Z",
+  "produced_by_bead": "ft-tf6g3.18.7",
+  "status": "pass",
+  "proof_category": 6,
+  "scope": "Machine-readable attestation for the capture scheduler fairness and bounded liveness TLA+ model.",
+  "model": {
+    "spec": "docs/specs/capture-fairness-scheduler.tla",
+    "cfg": "docs/specs/capture-fairness-scheduler.cfg",
+    "mapping": "docs/specs/capture-fairness-scheduler-mapping.md",
+    "release_bundle_slot": "proofs/capture-fairness-scheduler.json",
+    "bounded_model": {
+      "panes": 4,
+      "high_panes": 2,
+      "low_primary_panes": 1,
+      "low_secondary_panes": 1,
+      "available_permits": 2,
+      "backpressure_threshold": 5,
+      "max_fair_rounds": 4,
+      "covered_behaviors": [
+        "high_tier_precedence",
+        "equal_priority_rotation",
+        "low_tier_floor",
+        "low_subtier_floor_rotation",
+        "single_slot_priority_without_floor",
+        "capture_budget_exhaustion",
+        "byte_budget_exhaustion",
+        "backpressure_overflow_gap_pending",
+        "overflow_gap_emission_clears_backpressure",
+        "shutdown_terminal_non_admission",
+        "cancelled_terminal_non_admission",
+        "bounded_no_starvation_under_uninterrupted_fair_admission"
+      ]
+    }
+  },
+  "tlc_run": {
+    "status": "pass",
+    "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/capture-fairness-scheduler.tla",
+    "local_bounded_run": true,
+    "rch_remote_available": false,
+    "rch_note": "No RCH remote proof was used for this non-Cargo TLC wrapper; no local Cargo or build proof was run.",
+    "state_count": 175942,
+    "distinct_state_count": 28765,
+    "time_budget_seconds": 30,
+    "timed_out": false,
+    "artifacts": {
+      "summary": "target/tlc/capture-fairness-scheduler/summary.json",
+      "stdout": "target/tlc/capture-fairness-scheduler/tlc.stdout.log",
+      "stderr": "target/tlc/capture-fairness-scheduler/tlc.stderr.log"
+    }
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/specs/capture-fairness-scheduler.tla",
+      "media_type": "text/plain",
+      "sha256": "722e5337053b14a0b2841cb821ae485ee2bb954ffd55096212b5e82eb895672b",
+      "size_bytes": 10623
+    },
+    {
+      "path": "docs/specs/capture-fairness-scheduler.cfg",
+      "media_type": "text/plain",
+      "sha256": "a87cfd7e426c46eb6fbf093f80b5ac4dfffd6cb0cef5d7ac0c63421e254f05bd",
+      "size_bytes": 237
+    },
+    {
+      "path": "docs/specs/capture-fairness-scheduler-mapping.md",
+      "media_type": "text/markdown",
+      "sha256": "209dfcd12c20c26fe7677c8546372453d2d52a4adfe73c861d6ce7c4cceabc16",
+      "size_bytes": 4750
+    },
+    {
+      "path": "scripts/run-tlc.sh",
+      "media_type": "text/x-shellscript",
+      "sha256": "a245a3c2aa17e216323afc969590c6c0c77127a515e62b7c190ca2191a862164",
+      "size_bytes": 7350
+    }
+  ],
+  "validation": [
+    {
+      "command": "jq empty docs/attestations/proofs/capture-fairness-scheduler.json",
+      "status": "pass"
+    },
+    {
+      "command": "bash -n scripts/run-tlc.sh",
+      "status": "pass"
+    },
+    {
+      "command": "scripts/check-spec-conventions.sh",
+      "status": "pass",
+      "result": "11 spec(s) passed"
+    },
+    {
+      "command": "scripts/run-tlc.sh --dry-run docs/specs/capture-fairness-scheduler.tla",
+      "status": "pass",
+      "result": "TLC command targets target/tlc/capture-fairness-scheduler/module/CaptureFairnessScheduler.tla and sibling cfg"
+    },
+    {
+      "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/capture-fairness-scheduler.tla",
+      "status": "pass",
+      "result": "175942 states generated; 28765 distinct states; no timeout"
+    },
+    {
+      "command": "git diff --check -- docs/specs/capture-fairness-scheduler.tla docs/specs/capture-fairness-scheduler.cfg docs/specs/capture-fairness-scheduler-mapping.md docs/attestations/proofs/capture-fairness-scheduler.json docs/specs/README.md",
+      "status": "pass"
+    }
+  ],
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-tf6g3.1",
+    "reason": "ft-tf6g3.18.7 publishes the per-subsystem proof artifact; release-bundle category wiring remains owned by ft-tf6g3.1/G16."
+  }
+}

@@ -42,7 +42,7 @@ the listed child bead.
 | Mux session reentry | Reentrant subscriber/session callbacks cannot double-register panes, leak subscribers, or drop terminal session events. | `mux-session-reentry.tla` | `frankenterm/mux/src/`, `crates/frankenterm-core/src/headless_mux_server.rs` | covered | `ft-tf6g3.18.4` |
 | Blocker-radar source merge | Degraded, stale, conflicting, or unavailable coordination sources always fail closed before work is claimable. | `blocker-radar-merge.tla` | `crates/frankenterm-core/src/blocker_radar.rs` | covered | `ft-tf6g3.18.5` |
 | Herd-wave admission control | Synchronized cohorts produce bounded stagger plans, priority protection, cooldown behavior, and missing-telemetry fail-closed decisions. | `herd-wave-admission.tla` | `crates/frankenterm-core/src/swarm_scheduler.rs` | covered | `ft-tf6g3.18.6` |
-| Capture-fairness scheduler liveness | Eligible panes cannot starve under documented priority, low-tier floor, budget, and shutdown assumptions. | gap | `docs/capture-fairness-slo-contract.md`, runtime/tailer scheduler code | gap | `ft-tf6g3.18.7` |
+| Capture-fairness scheduler liveness | Eligible panes cannot starve under documented priority, low-tier floor, budget, and shutdown assumptions. | `capture-fairness-scheduler.tla` | `docs/capture-fairness-slo-contract.md`, runtime/tailer scheduler code | covered | `ft-tf6g3.18.7` |
 
 Each gap row closes only when its child bead adds the spec trio, records a TLC
 summary with state-space size, wires the release-bundle slot under
