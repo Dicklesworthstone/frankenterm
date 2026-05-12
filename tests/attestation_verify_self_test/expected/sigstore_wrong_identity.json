@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/sigstore_wrong_identity.json",
+  "expected_ok": false,
+  "expected_error_regex": "signature: (cosign not installed|cosign verify-blob failed)",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Fake sigstore material represents the wrong-identity failure class."
+}

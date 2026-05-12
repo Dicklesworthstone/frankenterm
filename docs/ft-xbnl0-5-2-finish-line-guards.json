@@ -62,6 +62,17 @@
         "e2e_missing_summary_json",
         "e2e_missing_structured_log"
       ]
+    },
+    {
+      "guard_id": "attestation_verify_self_test",
+      "invariant": "The offline release-attestation verifier rejects known tampered bundles and accepts the current positive dev-bundle twin.",
+      "script": "tests/attestation/verify-self-test.sh",
+      "upstream_bead": "ft-tf6g3.39",
+      "failure_signatures": [
+        "verdict_mismatch",
+        "expected_error_regex_not_matched",
+        "fixture_missing"
+      ]
     }
   ],
   "ci_binding": {

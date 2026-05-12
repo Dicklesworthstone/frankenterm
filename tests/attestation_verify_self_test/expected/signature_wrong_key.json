@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/signature_wrong_key.json",
+  "expected_ok": false,
+  "expected_error_regex": "signature: ed25519 verify failed",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Bundle declares an Ed25519 key that cannot verify the committed signature bytes."
+}

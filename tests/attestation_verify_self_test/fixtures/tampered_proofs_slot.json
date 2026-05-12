@@ -1,0 +1,984 @@
+{
+  "artifacts": [
+    {
+      "category": "perf/headline-claims",
+      "description": "Headline-claim manifest + 5 must-prove benches (G3).",
+      "media_type": "application/json",
+      "path": "docs/perf/headline-claims.json",
+      "produced_by_bead": "ft-syqcz.3",
+      "proof_categories": [
+        5
+      ],
+      "sha256": "86258aa186f50af2b417d3ccb1d0a4dbe13c658866ca2a337f656958d3bfd63b",
+      "size_bytes": 5985
+    },
+    {
+      "category": "perf/competitor-matrix",
+      "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3). Recovery artifact published by ft-e87u6.9 (closed); substrate provenance traces to the ft-t101b deterministic competitor-bench fixture under ft-syqcz.5. Producer attribution corrected from the original null-slot misattribution to ft-syqcz.4 per the artifact's recommended_produced_by_bead field.",
+      "media_type": "application/json",
+      "path": "docs/perf/competitor-matrix.json",
+      "produced_by_bead": "ft-e87u6.9",
+      "proof_categories": [
+        9,
+        5
+      ],
+      "sha256": "468042a8265f5a582a1408e7506e999f780150cff6e6650ec113c39baf99ac63",
+      "size_bytes": 6947
+    },
+    {
+      "category": "perf/lindley-bounds",
+      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3). Substrate-pass artifact via crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69 substrate-pass; ft-syqcz.5 sibling); the wired-pass cont-bead swaps the hard-coded per-stage rates for live latency_stages.rs telemetry reads + bench-driven empirical_p99_ms + sigstore signing.",
+      "media_type": "application/json",
+      "path": "docs/attestations/perf/lindley-bounds.json",
+      "produced_by_bead": "ft-43x69",
+      "proof_categories": [
+        8
+      ],
+      "sha256": "c583b524127b36d1d85131e4216eb264eff3f3ca65765fee6974b5eeea1ea58b",
+      "size_bytes": 524
+    },
+    {
+      "category": "tui/render-parity",
+      "description": "ratatui<->ftui differential render parity report (G5). Recovery artifact published by ft-e87u6.10 (closed) backfilling the original ft-35yac.2 producer slot. The GPU adjunct stays in the sibling slot for ft-35yac.1.2.",
+      "media_type": "application/json",
+      "path": "docs/attestations/tui/render-parity.json",
+      "produced_by_bead": "ft-35yac.2",
+      "proof_categories": [
+        4,
+        9
+      ],
+      "sha256": "9ac6633ebf80b0e6241a95f57def18bf6ab05a3365d29b39a48340f74bb7b34d",
+      "size_bytes": 7339
+    },
+    {
+      "category": "tui/render-parity",
+      "description": "Headless GPU-renderer visual parity contract for the G5 render-parity category. Runtime runs emit target/gpu-regression/<runner>/render-parity-gpu.json beside summary.json; the full ratatui<->ftui byte-level report remains ft-35yac.2.",
+      "media_type": "application/json",
+      "path": "docs/attestations/tui/render-parity-gpu.json",
+      "produced_by_bead": "ft-35yac.1.2",
+      "proof_categories": [
+        4,
+        9
+      ],
+      "sha256": "961df8a9d5f9addb82455269496ee6ff187cbdbe141bdad2b82001395e67baf8",
+      "size_bytes": 1727
+    },
+    {
+      "category": "tui/render-parity",
+      "description": "Continuous FrankenTerm-vs-upstream-WezTerm render differential slot. The checked-in artifact records the allowlist gate and pending first real frame run; production evidence requires a workflow run with frames_compared_total > 0 and novel_divergence_count == 0.",
+      "media_type": "application/json",
+      "path": "docs/attestations/tui/wezterm-divergence.json",
+      "produced_by_bead": "ft-tf6g3.21",
+      "proof_categories": [
+        9
+      ],
+      "sha256": "74a4e558521d755f651dab0679398ad840855eb4c4148c08cd2d10d482f96717",
+      "size_bytes": 1379
+    },
+    {
+      "category": "tui/render-parity",
+      "description": "Persistent-homology glyph topology adjunct for the G5 render-parity category. The artifact occupies the release-bundle tui/topology-parity.json slot while remaining under the existing tui/render-parity schema category; production evidence requires paired oracle/subject glyph bitmap runs for the terminal-conformance fixtures.",
+      "media_type": "application/json",
+      "path": "docs/attestations/tui/topology-parity.json",
+      "produced_by_bead": "ft-tf6g3.24",
+      "proof_categories": [
+        11
+      ],
+      "sha256": "3a2198d2e2a4b0d031c0ace02e3d9eac4f887e7d8f6d8ef45d1abf8297365fec",
+      "size_bytes": 4082
+    },
+    {
+      "category": "security/passive-watch",
+      "description": "Passive-watch read-only fuzz proof (G9). Recovery artifact published by ft-e87u6.11 (closed) backfilling the original ft-x0666.1 producer slot.",
+      "media_type": "application/json",
+      "path": "docs/security/passive-watch-attestation.json",
+      "produced_by_bead": "ft-x0666.1",
+      "proof_categories": [
+        2,
+        4
+      ],
+      "sha256": "64fdd114f81412fd3fedce561e11c922127231f0cd439616b883da5f885b7af9",
+      "size_bytes": 5846
+    },
+    {
+      "category": "security/redactor-coverage",
+      "description": "Redactor recall/precision matrix vs gitleaks/trufflehog corpora (G10).",
+      "media_type": "application/json",
+      "path": "docs/security/redactor-coverage.json",
+      "produced_by_bead": "ft-x0666.2",
+      "proof_categories": [
+        7,
+        9
+      ],
+      "sha256": "4086804228aeb0b8c09136abf00aeec6632b56c34830a5bb0507d266a5a1fd9a",
+      "size_bytes": 10087
+    },
+    {
+      "category": "security/distributed-threat-model",
+      "description": "Distributed wire-protocol threat model + diff fuzz (G11).",
+      "media_type": "text/markdown",
+      "path": "docs/security/distributed-threat-model.md",
+      "produced_by_bead": "ft-x0666.3",
+      "proof_categories": [
+        9,
+        4
+      ],
+      "sha256": "29591922bb9b9ff6a46744a63c0b68c32ea7b0525fc6a5eb5f46f302029fcc53",
+      "size_bytes": 7050
+    },
+    {
+      "category": "proofs/loom-runtime-async",
+      "description": "Loom proof for runtime_async primitives (G8).",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/loom-runtime-async.json",
+      "produced_by_bead": "ft-e87u6.12",
+      "proof_categories": [
+        3
+      ],
+      "sha256": "f79b31f4b62f1d46b3973a9dd823e88142f6d5d8ae63d6ae6866c4000acf070a",
+      "size_bytes": 10091
+    },
+    {
+      "category": "proofs/loom-runtime-async",
+      "description": "Mazurkiewicz cancel-trace equivalence classes for runtime_async primitive cancellation semantics (G21).",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/runtime-async-cancel-traces.json",
+      "produced_by_bead": "ft-tf6g3.6",
+      "proof_categories": [
+        3,
+        6
+      ],
+      "sha256": "c4131f0dc2f5738f564f52ff38bd748fd173c2ef86fa7175cd9d5792a00e5fea",
+      "size_bytes": 13200
+    },
+    {
+      "category": "proofs/runtime-proof-trait",
+      "description": "RuntimeProof sealed trait + tokio type-level seal (G1). Recovery artifact published by ft-e87u6.13 (closed) backfilling the original ft-i2eni.1 producer slot.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/runtime-proof-trait.json",
+      "produced_by_bead": "ft-i2eni.1",
+      "proof_categories": [
+        1
+      ],
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 4208
+    },
+    {
+      "category": "proofs/runtime-proof-trait",
+      "description": "Tokio-eradication doctrine status for the G1 runtime-proof category: direct-dependency ban, supported-path #[tokio::test] classification, asupersync-test-only lint, LabRuntime/asupersync_test substrate, and CI wiring.",
+      "media_type": "application/json",
+      "path": "docs/attestations/doctrine/tokio-eradication-status.json",
+      "produced_by_bead": "ft-tf6g3.7",
+      "proof_categories": [
+        1,
+        5
+      ],
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size_bytes": 3518
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "description": "Robot/MCP/CLI control-plane golden matrix for schema-backed envelopes, live profile/fleet mutation receipts, and backend-unavailable/policy/approval failure contracts (G2; originally introduced under ft-q5njp).",
+      "media_type": "application/json",
+      "path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+      "produced_by_bead": "ft-0elb9",
+      "proof_categories": [
+        4,
+        2
+      ],
+      "sha256": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
+      "size_bytes": 49620
+    },
+    {
+      "category": "proofs/tx-killswitch",
+      "description": "TX kill-switch formal-method attestation: TLA+ TLC pass, Rust BFS state-space proof, and CI million-schedule random invariant lane.",
+      "media_type": "application/json",
+      "path": "docs/attestations/proofs/tx-killswitch.json",
+      "produced_by_bead": "ft-tf6g3.12",
+      "proof_categories": [
+        6,
+        2
+      ],
+      "sha256": "c6cb5180cb3219df614ce52dc00f0058c7880fe2106261c9752776bd72fba824",
+      "size_bytes": 2734
+    },
+    {
+      "category": "doctrine/agents-md-counts",
+      "description": "Auto-stamped README/AGENTS module/crate/test counts (G6).",
+      "media_type": "application/json",
+      "path": "docs/attestations/doctrine/agents-md-counts.json",
+      "produced_by_bead": "ft-tf6g3.2",
+      "proof_categories": [
+        5
+      ],
+      "sha256": "e9f910eb67cc9a2005fead0825b33d98ec740e9e46f29e260ec10b1632629eee",
+      "size_bytes": 14420
+    },
+    {
+      "category": "doctrine/vendored-provenance",
+      "description": "Vendored fork provenance manifest (G15). Generated by scripts/regen-provenance.py; checked-in copy serves as the attestation source. The CI guard scripts/check-provenance.sh refuses a stale manifest, so the bundle hash always reflects HEAD.",
+      "media_type": "application/json",
+      "path": "frankenterm/PROVENANCE.json",
+      "produced_by_bead": "ft-i2eni.6",
+      "proof_categories": [
+        10
+      ],
+      "sha256": "a1f45b172c15980b3940814f7566f708e5d7111f4b8679e1fe57b0a024465c6a",
+      "size_bytes": 31070
+    },
+    {
+      "category": "doctrine/cx-propagation",
+      "description": "Cx-propagation burndown snapshot (G14.2). Per-bucket coverage of asupersync Cx threading across the codebase. The verifier asserts totals.uncovered_sites == 0 — a release with any uncovered cancellation site fails the gate.",
+      "media_type": "application/json",
+      "path": "docs/runtime/cx-propagation.json",
+      "produced_by_bead": "ft-q0tz3",
+      "proof_categories": [
+        1,
+        5
+      ],
+      "sha256": "e7a58aee6b1c29ab1954b2886ca31a9cad0aefa14eca4d98f11f4c34c7dae5ef",
+      "size_bytes": 4710
+    },
+    {
+      "category": "perf/atlas-packing",
+      "description": "Per-(corpus, packer) atlas-packing efficiency report. Generated by `cargo run --release -p frankenterm-core --example atlas_packing_attestation` against the four glyph corpora (Latin, CJK, Nerd Font, emoji) at 2048² with all three packers (Shelf, Skyline, MaximalRectangles). Re-run before each release; this file is sha256-hashed into the per-release bundle. Not in required_categories yet — the attestation surface is opt-in until ft-gtcm9.{2,3} land the GUI wiring + ft doctor surface that consume the underlying packer choice.",
+      "media_type": "application/json",
+      "path": "docs/perf/atlas-packing.json",
+      "produced_by_bead": "ft-gtcm9.5",
+      "proof_categories": [
+        5
+      ],
+      "sha256": "bbe66c14c5f4d900e54c0649d6b2ec6dcf7f3a087f10deea21aabcddfa7bb8ba",
+      "size_bytes": 3537
+    }
+  ],
+  "confidence_summary": {
+    "best_confidence_by_category": [
+      {
+        "claim": "Best available confidence for Type-Level Proof in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#type-level",
+        "proof_category": 1,
+        "proof_id": "release-bundle.type-level.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 3
+        },
+        "source_artifact_hash": "c36b6d0e50bdc5aba37fc39f6539104b6eedbd0a99d6457bd1d344f939a54cc9",
+        "source_artifact_path": "docs/attestations/doctrine/tokio-eradication-status.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Property Test in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#property",
+        "proof_category": 2,
+        "proof_id": "release-bundle.property.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 3
+        },
+        "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
+        "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Loom Concurrency Proof in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#loom",
+        "proof_category": 3,
+        "proof_id": "release-bundle.loom.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 2
+        },
+        "source_artifact_hash": "f79b31f4b62f1d46b3973a9dd823e88142f6d5d8ae63d6ae6866c4000acf070a",
+        "source_artifact_path": "docs/attestations/proofs/loom-runtime-async.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Conformance Artifact in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#conformance",
+        "proof_category": 4,
+        "proof_id": "release-bundle.conformance.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 5
+        },
+        "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
+        "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Quantitative Attestation in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#quantitative-attestation",
+        "proof_category": 5,
+        "proof_id": "release-bundle.quantitative-attestation.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 6
+        },
+        "source_artifact_hash": "e9f910eb67cc9a2005fead0825b33d98ec740e9e46f29e260ec10b1632629eee",
+        "source_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Formal Method in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#formal-method",
+        "proof_category": 6,
+        "proof_id": "release-bundle.formal-method.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 2
+        },
+        "source_artifact_hash": "c4131f0dc2f5738f564f52ff38bd748fd173c2ef86fa7175cd9d5792a00e5fea",
+        "source_artifact_path": "docs/attestations/proofs/runtime-async-cancel-traces.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Information-Theoretic Bound in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Redactor coverage publishes the 99% recall sample floor but is under-sampled: current minimum 3 positive vectors per class; required 459.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/security/redactor-recall-derivation.md",
+        "proof_category": 7,
+        "proof_id": "release-bundle.information-theoretic.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "sample_size",
+          "unit": "positive_examples_per_secret_class_floor",
+          "value": 459
+        },
+        "source_artifact_hash": "4086804228aeb0b8c09136abf00aeec6632b56c34830a5bb0507d266a5a1fd9a",
+        "source_artifact_path": "docs/security/redactor-coverage.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Network Calculus Bound in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#network-calculus",
+        "proof_category": 8,
+        "proof_id": "release-bundle.network-calculus.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 1
+        },
+        "source_artifact_hash": "c583b524127b36d1d85131e4216eb264eff3f3ca65765fee6974b5eeea1ea58b",
+        "source_artifact_path": "docs/attestations/perf/lindley-bounds.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Differential Comparison in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#differential",
+        "proof_category": 9,
+        "proof_id": "release-bundle.differential.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 6
+        },
+        "source_artifact_hash": "961df8a9d5f9addb82455269496ee6ff187cbdbe141bdad2b82001395e67baf8",
+        "source_artifact_path": "docs/attestations/tui/render-parity-gpu.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Cryptographic Attestation in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#cryptographic",
+        "proof_category": 10,
+        "proof_id": "release-bundle.cryptographic.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 1
+        },
+        "source_artifact_hash": "a1f45b172c15980b3940814f7566f708e5d7111f4b8679e1fe57b0a024465c6a",
+        "source_artifact_path": "frankenterm/PROVENANCE.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Topological Invariant in this release bundle.",
+        "confidence_type": "topological",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#topological-invariant",
+        "proof_category": 11,
+        "proof_id": "release-bundle.topological-invariant.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 1
+        },
+        "source_artifact_hash": "3a2198d2e2a4b0d031c0ace02e3d9eac4f887e7d8f6d8ef45d1abf8297365fec",
+        "source_artifact_path": "docs/attestations/tui/topology-parity.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      }
+    ],
+    "records": [
+      {
+        "claim": "Best available confidence for Type-Level Proof in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#type-level",
+        "proof_category": 1,
+        "proof_id": "release-bundle.type-level.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 3
+        },
+        "source_artifact_hash": "c36b6d0e50bdc5aba37fc39f6539104b6eedbd0a99d6457bd1d344f939a54cc9",
+        "source_artifact_path": "docs/attestations/doctrine/tokio-eradication-status.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Property Test in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#property",
+        "proof_category": 2,
+        "proof_id": "release-bundle.property.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 3
+        },
+        "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
+        "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Loom Concurrency Proof in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#loom",
+        "proof_category": 3,
+        "proof_id": "release-bundle.loom.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 2
+        },
+        "source_artifact_hash": "f79b31f4b62f1d46b3973a9dd823e88142f6d5d8ae63d6ae6866c4000acf070a",
+        "source_artifact_path": "docs/attestations/proofs/loom-runtime-async.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Conformance Artifact in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#conformance",
+        "proof_category": 4,
+        "proof_id": "release-bundle.conformance.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 5
+        },
+        "source_artifact_hash": "016b3fd176321cf08e78bfcf4e10efe47bf5a82a3a3f26c6848432e15d4110a2",
+        "source_artifact_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Quantitative Attestation in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#quantitative-attestation",
+        "proof_category": 5,
+        "proof_id": "release-bundle.quantitative-attestation.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 6
+        },
+        "source_artifact_hash": "e9f910eb67cc9a2005fead0825b33d98ec740e9e46f29e260ec10b1632629eee",
+        "source_artifact_path": "docs/attestations/doctrine/agents-md-counts.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Formal Method in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#formal-method",
+        "proof_category": 6,
+        "proof_id": "release-bundle.formal-method.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 2
+        },
+        "source_artifact_hash": "c4131f0dc2f5738f564f52ff38bd748fd173c2ef86fa7175cd9d5792a00e5fea",
+        "source_artifact_path": "docs/attestations/proofs/runtime-async-cancel-traces.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Information-Theoretic Bound in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Redactor coverage publishes the 99% recall sample floor but is under-sampled: current minimum 3 positive vectors per class; required 459.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/security/redactor-recall-derivation.md",
+        "proof_category": 7,
+        "proof_id": "release-bundle.information-theoretic.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "sample_size",
+          "unit": "positive_examples_per_secret_class_floor",
+          "value": 459
+        },
+        "source_artifact_hash": "4086804228aeb0b8c09136abf00aeec6632b56c34830a5bb0507d266a5a1fd9a",
+        "source_artifact_path": "docs/security/redactor-coverage.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Network Calculus Bound in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#network-calculus",
+        "proof_category": 8,
+        "proof_id": "release-bundle.network-calculus.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 1
+        },
+        "source_artifact_hash": "c583b524127b36d1d85131e4216eb264eff3f3ca65765fee6974b5eeea1ea58b",
+        "source_artifact_path": "docs/attestations/perf/lindley-bounds.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Differential Comparison in this release bundle.",
+        "confidence_type": "frequentist",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#differential",
+        "proof_category": 9,
+        "proof_id": "release-bundle.differential.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 6
+        },
+        "source_artifact_hash": "961df8a9d5f9addb82455269496ee6ff187cbdbe141bdad2b82001395e67baf8",
+        "source_artifact_path": "docs/attestations/tui/render-parity-gpu.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Cryptographic Attestation in this release bundle.",
+        "confidence_type": "formal",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#cryptographic",
+        "proof_category": 10,
+        "proof_id": "release-bundle.cryptographic.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 1
+        },
+        "source_artifact_hash": "a1f45b172c15980b3940814f7566f708e5d7111f4b8679e1fe57b0a024465c6a",
+        "source_artifact_path": "frankenterm/PROVENANCE.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      },
+      {
+        "claim": "Best available confidence for Topological Invariant in this release bundle.",
+        "confidence_type": "topological",
+        "confidence_value": {
+          "reason": "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record.",
+          "status": "not_quantified"
+        },
+        "methodology_url": "docs/proof-taxonomy.json#topological-invariant",
+        "proof_category": 11,
+        "proof_id": "release-bundle.topological-invariant.best-confidence",
+        "sample_size_or_state_count": {
+          "kind": "artifact_count",
+          "unit": "delivered_artifacts",
+          "value": 1
+        },
+        "source_artifact_hash": "3a2198d2e2a4b0d031c0ace02e3d9eac4f887e7d8f6d8ef45d1abf8297365fec",
+        "source_artifact_path": "docs/attestations/tui/topology-parity.json",
+        "time_budget_consumed": {
+          "budget_seconds": null,
+          "seconds": 0,
+          "status": "not_reported"
+        }
+      }
+    ],
+    "schema_path": "docs/proofs/confidence-format-schema.json",
+    "schema_version": "1.0.0"
+  },
+  "deferred_slots": [],
+  "generated_at": "2026-05-12T18:30:51Z",
+  "generator": {
+    "name": "scripts/attestation-build.sh",
+    "version": "1.4.0"
+  },
+  "git": {
+    "branch": "main",
+    "commit": "835b80f5b0dafa8b27896dcb55fe57d261b5456b",
+    "tree": "d880d6bf922ecc0c543814b1924b53df65d8a5cc"
+  },
+  "release": {
+    "channel": "dev",
+    "tag": "v0.0.0-dev",
+    "version": "0.0.0-dev"
+  },
+  "required_categories": [
+    "perf/headline-claims",
+    "perf/competitor-matrix",
+    "perf/lindley-bounds",
+    "tui/render-parity",
+    "security/passive-watch",
+    "security/redactor-coverage",
+    "security/distributed-threat-model",
+    "proofs/loom-runtime-async",
+    "proofs/runtime-proof-trait",
+    "proofs/robot-contracts",
+    "proofs/tx-killswitch",
+    "doctrine/agents-md-counts",
+    "doctrine/cx-propagation"
+  ],
+  "schema_version": "1.0.0",
+  "signature": {
+    "canonical_sha256": "9b85ce40e8160d6de49adf91cb0358ac9dbd8be3b75df5c416ee7a619a8b96cb",
+    "method": "unsigned",
+    "reason": "dev channel bundle — production releases must use --sign cosign or --sign ed25519"
+  },
+  "taxonomy_coverage": {
+    "below_threshold_count": 0,
+    "category_counts": [
+      {
+        "artifact_count": 3,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 1,
+        "name": "Type-Level Proof",
+        "slug": "type-level"
+      },
+      {
+        "artifact_count": 3,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 2,
+        "name": "Property Test",
+        "slug": "property"
+      },
+      {
+        "artifact_count": 2,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 3,
+        "name": "Loom Concurrency Proof",
+        "slug": "loom"
+      },
+      {
+        "artifact_count": 5,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 4,
+        "name": "Conformance Artifact",
+        "slug": "conformance"
+      },
+      {
+        "artifact_count": 6,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 5,
+        "name": "Quantitative Attestation",
+        "slug": "quantitative-attestation"
+      },
+      {
+        "artifact_count": 2,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 6,
+        "name": "Formal Method",
+        "slug": "formal-method"
+      },
+      {
+        "artifact_count": 1,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 7,
+        "name": "Information-Theoretic Bound",
+        "slug": "information-theoretic"
+      },
+      {
+        "artifact_count": 1,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 8,
+        "name": "Network Calculus Bound",
+        "slug": "network-calculus"
+      },
+      {
+        "artifact_count": 6,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 9,
+        "name": "Differential Comparison",
+        "slug": "differential"
+      },
+      {
+        "artifact_count": 1,
+        "below_threshold": false,
+        "bridge_plan_core": true,
+        "deferred_slot_count": 0,
+        "id": 10,
+        "name": "Cryptographic Attestation",
+        "slug": "cryptographic"
+      },
+      {
+        "artifact_count": 1,
+        "below_threshold": false,
+        "bridge_plan_core": false,
+        "deferred_slot_count": 0,
+        "id": 11,
+        "name": "Topological Invariant",
+        "slug": "topological-invariant"
+      }
+    ],
+    "delta_from_prior_release": {
+      "category_deltas": [
+        {
+          "artifact_delta": 3,
+          "deferred_slot_delta": 0,
+          "id": 1,
+          "slug": "type-level"
+        },
+        {
+          "artifact_delta": 3,
+          "deferred_slot_delta": 0,
+          "id": 2,
+          "slug": "property"
+        },
+        {
+          "artifact_delta": 2,
+          "deferred_slot_delta": 0,
+          "id": 3,
+          "slug": "loom"
+        },
+        {
+          "artifact_delta": 5,
+          "deferred_slot_delta": 0,
+          "id": 4,
+          "slug": "conformance"
+        },
+        {
+          "artifact_delta": 6,
+          "deferred_slot_delta": 0,
+          "id": 5,
+          "slug": "quantitative-attestation"
+        },
+        {
+          "artifact_delta": 2,
+          "deferred_slot_delta": 0,
+          "id": 6,
+          "slug": "formal-method"
+        },
+        {
+          "artifact_delta": 1,
+          "deferred_slot_delta": 0,
+          "id": 7,
+          "slug": "information-theoretic"
+        },
+        {
+          "artifact_delta": 1,
+          "deferred_slot_delta": 0,
+          "id": 8,
+          "slug": "network-calculus"
+        },
+        {
+          "artifact_delta": 6,
+          "deferred_slot_delta": 0,
+          "id": 9,
+          "slug": "differential"
+        },
+        {
+          "artifact_delta": 1,
+          "deferred_slot_delta": 0,
+          "id": 10,
+          "slug": "cryptographic"
+        },
+        {
+          "artifact_delta": 1,
+          "deferred_slot_delta": 0,
+          "id": 11,
+          "slug": "topological-invariant"
+        }
+      ],
+      "status": "no_prior_bundle"
+    },
+    "schema_version": "1.0.0",
+    "taxonomy_path": "docs/proof-taxonomy.json",
+    "uncategorized_artifact_count": 0
+  }
+}

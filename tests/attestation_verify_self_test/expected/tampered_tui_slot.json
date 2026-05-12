@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/tampered_tui_slot.json",
+  "expected_ok": false,
+  "expected_error_regex": "artifact:docs/attestations/tui/render-parity.json: sha256 mismatch",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "TUI render-parity content hash is intentionally wrong."
+}

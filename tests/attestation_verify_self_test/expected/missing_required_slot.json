@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/missing_required_slot.json",
+  "expected_ok": false,
+  "expected_error_regex": "category:perf/headline-claims: no artifact found for required category",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Required perf/headline-claims category is removed from the artifact list."
+}

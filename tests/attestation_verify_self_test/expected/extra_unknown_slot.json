@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/extra_unknown_slot.json",
+  "expected_ok": false,
+  "expected_error_regex": "artifact_categories_declared: unknown artifact category/categories: unknown/not-real",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Unknown artifact category is added with a real path and correct bytes."
+}

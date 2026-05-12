@@ -124,6 +124,18 @@ scripts/attestation-verify.sh docs/attestations/0.2.0.json --json
 scripts/attestation-verify.sh docs/attestations/0.2.0.json --strict-required --strict-deferred
 ```
 
+The verifier has a self-test corpus under
+`tests/attestation_verify_self_test/`. It includes the current strict-passing
+dev bundle as a positive twin plus known-bad bundles for tampered perf, TUI,
+security, doctrine, proof, missing-slot, unknown-slot, ordering, Ed25519, and
+Sigstore failure classes. Regenerate and run the corpus after intentional schema
+evolution with:
+
+```bash
+scripts/rotate-attestation-self-test.sh
+tests/attestation/verify-self-test.sh
+```
+
 Exit code: `0` on full pass, `1` on any failure, `2` on usage error.
 
 Ed25519 bundles use the same canonical signing payload. The schema records a

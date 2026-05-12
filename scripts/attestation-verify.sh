@@ -155,6 +155,26 @@ if [[ $STRICT_REQUIRED -eq 1 ]]; then
   fi
 fi
 
+# Every artifact category in the bundle must be declared by the local
+# attestation manifest. This catches forged or stale slots even when the
+# canonical payload was recomputed by a broken producer.
+manifest_path="$REPO_ROOT/docs/attestations/manifest.json"
+if [[ -f "$manifest_path" ]]; then
+  manifest_categories="$(jq -c '[.slots[]?.category] | unique' "$manifest_path")"
+  unknown_artifact_categories="$(jq -r --argjson allowed "$manifest_categories" '
+    [.artifacts[]?.category as $category | $category | select(($allowed | index($category)) | not)]
+    | unique
+    | join(", ")
+  ' <<<"$bundle_json")"
+  if [[ -n "$unknown_artifact_categories" ]]; then
+    record_check "artifact_categories_declared" false "unknown artifact category/categories: $unknown_artifact_categories"
+  else
+    record_check "artifact_categories_declared" true "all artifact categories are declared in docs/attestations/manifest.json"
+  fi
+else
+  record_check "artifact_categories_declared" false "manifest.json missing"
+fi
+
 # Required-category coverage: every entry in required_categories must have ≥1 artifact.
 mapfile -t required_cats < <(jq -r '.required_categories[]?' <<<"$bundle_json")
 for cat in "${required_cats[@]}"; do

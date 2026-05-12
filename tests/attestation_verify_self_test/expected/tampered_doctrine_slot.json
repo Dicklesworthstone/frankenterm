@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/tampered_doctrine_slot.json",
+  "expected_ok": false,
+  "expected_error_regex": "artifact:docs/attestations/doctrine/agents-md-counts.json: sha256 mismatch",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Doctrine agents-md-counts content hash is intentionally wrong."
+}

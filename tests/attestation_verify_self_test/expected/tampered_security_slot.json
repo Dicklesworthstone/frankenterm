@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/tampered_security_slot.json",
+  "expected_ok": false,
+  "expected_error_regex": "artifact:docs/security/redactor-coverage.json: sha256 mismatch",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Security redactor-coverage content hash is intentionally wrong."
+}

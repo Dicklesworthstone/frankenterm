@@ -1,0 +1,10 @@
+{
+  "fixture": "tests/attestation_verify_self_test/fixtures/valid_baseline.json",
+  "expected_ok": true,
+  "expected_error_regex": "",
+  "flags": [
+    "--strict-required",
+    "--strict-deferred"
+  ],
+  "note": "Positive twin copied from the current strict-passing dev bundle."
+}
