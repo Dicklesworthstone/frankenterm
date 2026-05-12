@@ -119,6 +119,8 @@ impl std::error::Error for FixtureError {}
 pub struct WeztermSubprocessFixture {
     home_dir: TempDir,
     socket_path: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
     child: Option<Child>,
 }
 
@@ -178,6 +180,8 @@ impl WeztermSubprocessFixture {
                 return Ok(Self {
                     home_dir: home,
                     socket_path,
+                    stdout_path,
+                    stderr_path,
                     child: Some(child),
                 });
             }
@@ -270,6 +274,14 @@ impl Drop for WeztermSubprocessFixture {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if std::thread::panicking() {
+            let (stdout, stderr) = read_child_output(&self.stdout_path, &self.stderr_path);
+            eprintln!(
+                "wezterm-mux-server fixture logs on panic: stdout={}; stderr={}",
+                format_child_output(&stdout),
+                format_child_output(&stderr)
+            );
         }
         // home_dir TempDir's Drop removes the temp directory automatically.
     }
