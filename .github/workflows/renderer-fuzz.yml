@@ -53,8 +53,40 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  preflight:
+    name: Validate renderer fuzz lane
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate fuzz harness wiring
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+
+          harness = Path("crates/frankenterm-gui/tests/gpu_regression.rs")
+          source = harness.read_text()
+          required = ("--fuzz-seed", "--fuzz-duration", "--fuzz-start-at", "--runs-dir")
+          missing = [flag for flag in required if flag not in source]
+          if missing:
+              print(
+                  "::error title=Renderer fuzz harness not wired::"
+                  "The scheduled renderer fuzz lane is on a standard ubuntu-24.04 llvmpipe runner now, "
+                  "but gpu_regression.rs still lacks parser support for "
+                  + ", ".join(missing)
+                  + ". Land the harness fuzz CLI integration before treating this workflow as RQ-S4 proof."
+              )
+              sys.exit(1)
+          PY
+
   fuzz:
     name: 24h adversarial fuzz (Linux llvmpipe)
+    needs: preflight
+    if: ${{ needs.preflight.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 1500 # 25h, gives 1h buffer over 24h budget
     env:
@@ -86,28 +118,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: renderer-fuzz
-
-      - name: Validate fuzz harness wiring
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import sys
-
-          harness = Path("crates/frankenterm-gui/tests/gpu_regression.rs")
-          source = harness.read_text()
-          required = ("--fuzz-seed", "--fuzz-duration", "--fuzz-start-at", "--runs-dir")
-          missing = [flag for flag in required if flag not in source]
-          if missing:
-              print(
-                  "::error title=Renderer fuzz harness not wired::"
-                  "The scheduled renderer fuzz lane is on a standard ubuntu-24.04 llvmpipe runner now, "
-                  "but gpu_regression.rs still lacks parser support for "
-                  + ", ".join(missing)
-                  + ". Land the harness fuzz CLI integration before treating this workflow as RQ-S4 proof."
-              )
-              sys.exit(1)
-          PY
 
       - name: Install Mesa software Vulkan stack
         run: |
@@ -229,7 +239,7 @@ jobs:
   summary:
     name: 24h fuzz summary
     needs: fuzz
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() && !cancelled() && needs.fuzz.result != 'skipped' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
