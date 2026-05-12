@@ -1,0 +1,33 @@
+name: Robot Work Atomicity Model
+
+on:
+  pull_request:
+    paths:
+      - 'tests/robot_work_atomicity_model/**'
+      - 'crates/frankenterm-core/src/robot_work_state_machine.rs'
+      - 'docs/robot-contracts/work.md'
+      - 'docs/robot-contracts/work-stateright-mapping.md'
+      - 'docs/attestations/proofs/robot-work-atomicity.json'
+      - '.github/workflows/robot-work-atomicity-model.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'tests/robot_work_atomicity_model/**'
+      - 'crates/frankenterm-core/src/robot_work_state_machine.rs'
+      - 'docs/robot-contracts/work.md'
+      - 'docs/robot-contracts/work-stateright-mapping.md'
+      - 'docs/attestations/proofs/robot-work-atomicity.json'
+      - '.github/workflows/robot-work-atomicity-model.yml'
+  workflow_dispatch:
+
+jobs:
+  stateright:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Run Stateright model tests
+        run: cargo test --manifest-path tests/robot_work_atomicity_model/Cargo.toml
+      - name: Emit Stateright proof summary
+        run: cargo run --manifest-path tests/robot_work_atomicity_model/Cargo.toml

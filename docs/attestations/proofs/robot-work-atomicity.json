@@ -1,0 +1,121 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "robot-work-atomicity-stateright-attestation",
+  "category": "proofs/robot-work-atomicity",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T15:15:45Z",
+  "produced_by_bead": "ft-tf6g3.13",
+  "status": "pass",
+  "proof_category": 6,
+  "scope": "Machine-readable attestation for the robot work-family claim/release atomicity Stateright model.",
+  "model": {
+    "crate": "tests/robot_work_atomicity_model",
+    "mapping": "docs/robot-contracts/work-stateright-mapping.md",
+    "contract": "docs/robot-contracts/work.md",
+    "release_bundle_slot": "proofs/robot-work-atomicity.json",
+    "stateright_version": "0.31.0",
+    "bounded_model": {
+      "claim_count": 2,
+      "agents": [
+        1,
+        2
+      ],
+      "max_events": 7,
+      "checker_target_max_depth": 14,
+      "covered_paths": [
+        "list and status read actions",
+        "successful claim",
+        "successful completion",
+        "successful release",
+        "failed claim",
+        "failed completion",
+        "failed release",
+        "agent crash and restart",
+        "automatic release on crash"
+      ]
+    }
+  },
+  "stateright_run": {
+    "status": "pass",
+    "test_command": "RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-13-stateright cargo test --manifest-path tests/robot_work_atomicity_model/Cargo.toml",
+    "summary_command": "RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-13-stateright-run cargo run --manifest-path tests/robot_work_atomicity_model/Cargo.toml",
+    "remote_worker": "vmi1149989",
+    "test_result": "1 model test passed; 0 failed; doc-tests 0 passed",
+    "summary_stdout": {
+      "status": "pass",
+      "state_count": 24997,
+      "unique_state_count": 24997,
+      "max_depth": 8
+    },
+    "test_remote_duration_seconds": 476.7,
+    "summary_remote_duration_seconds": 550.7,
+    "rch_note": "Both Cargo proof commands were run through RCH with RCH_REQUIRE_REMOTE=1 on vmi1149989."
+  },
+  "source_artifacts": [
+    {
+      "path": "tests/robot_work_atomicity_model/Cargo.toml",
+      "media_type": "text/x-toml",
+      "sha256": "d31a9364df92213f1889990adfe7e7069054ae08cc5827033029b781afa580ff",
+      "size_bytes": 296
+    },
+    {
+      "path": "tests/robot_work_atomicity_model/src/lib.rs",
+      "media_type": "text/x-rust",
+      "sha256": "c41c9fb55f20742b9bbd379e23e0d918aa7774fdc1c4e64caf6d6872cfe0b5bf",
+      "size_bytes": 5857
+    },
+    {
+      "path": "tests/robot_work_atomicity_model/src/main.rs",
+      "media_type": "text/x-rust",
+      "sha256": "bbd4e6c306ad495462d94ee1175f7131d36535905933adf8c7800010ec084987",
+      "size_bytes": 512
+    },
+    {
+      "path": "docs/robot-contracts/work.md",
+      "media_type": "text/markdown",
+      "sha256": "40d8a265829d21a7bfbe881621b796990f7c1a256c84fc738f2b6781f54fa232",
+      "size_bytes": 10621
+    },
+    {
+      "path": "docs/robot-contracts/work-stateright-mapping.md",
+      "media_type": "text/markdown",
+      "sha256": "678ac56afd46a35c5c1e1aa6d26ddb10c43498d5b7e44b5cb7e5ed1d631cf9f1",
+      "size_bytes": 3608
+    },
+    {
+      "path": ".github/workflows/robot-work-atomicity-model.yml",
+      "media_type": "text/yaml",
+      "sha256": "2e2cf29f5e45e62c95c223a3893309c6a4d259d4297b789853f565b53f80f044",
+      "size_bytes": 1180
+    }
+  ],
+  "validation": [
+    {
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-13-stateright cargo test --manifest-path tests/robot_work_atomicity_model/Cargo.toml",
+      "status": "pass",
+      "result": "1 model test passed; 0 failed"
+    },
+    {
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-13-stateright-run cargo run --manifest-path tests/robot_work_atomicity_model/Cargo.toml",
+      "status": "pass",
+      "result": "24997 states generated; 24997 unique states; max depth 8"
+    },
+    {
+      "command": "cargo fmt --manifest-path tests/robot_work_atomicity_model/Cargo.toml --check",
+      "status": "pass"
+    },
+    {
+      "command": "jq empty docs/attestations/proofs/robot-work-atomicity.json",
+      "status": "pass"
+    },
+    {
+      "command": "ruby -e 'require \"yaml\"; YAML.load_file(\".github/workflows/robot-work-atomicity-model.yml\")'",
+      "status": "pass"
+    }
+  ],
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-tf6g3.1",
+    "reason": "ft-tf6g3.13 publishes the per-subsystem proof artifact; release-bundle category wiring remains owned by ft-tf6g3.1/G16."
+  }
+}

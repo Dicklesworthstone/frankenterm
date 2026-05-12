@@ -256,7 +256,7 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-conformance \
 | Contract at docs/robot-contracts/work.md | ✓ |
 | Schema migration for work_claims | ✓ native SQLite `work_claims` table is created by the Robot work adapter |
 | Handler with claim/release atomicity | ✓ focused `robot_work_backend_tests` cover conflict and serialization behavior |
-| Stateright model proving 3 invariants | ✓ (Rust always-on regression net + TLA+ spec) |
+| Stateright model proving 3 invariants | ✓ `tests/robot_work_atomicity_model` wraps the Rust state machine in `stateright::Model`; the Rust always-on regression net and TLA+ spec remain sibling coverage |
 | Differential test against bv | ⏳ uses ft-hac7w.1.1 DifferentialHarness |
 | README E2E example | ✓ README implementation-status examples include claim/list/complete |
 | Stateright passes ≥1M random schedules | ✓ (12k always-on; ≥1M with CI multiplier) |
@@ -273,6 +273,9 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/ft-bs9uh6-work-conformance \
   (`ft-hac7w.1.1`).
 - **State-machine model:**
   `crates/frankenterm-core/src/robot_work_state_machine.rs`.
+- **Stateright model crate:**
+  `tests/robot_work_atomicity_model` with mapping at
+  `docs/robot-contracts/work-stateright-mapping.md`.
 - **Conformance harness:**
   `crates/frankenterm-core/tests/robot_family_conformance.rs`.
 - **TLA+ spec:** `docs/specs/robot-work.tla`.
