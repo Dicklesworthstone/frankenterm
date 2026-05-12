@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "bead_id": "ft-5bwjf.5",
+  "scale_gate_bead_id": "ft-5bwjf.7",
   "contract_id": "ft.herd_wave.v1",
   "requirements": [
     {
@@ -152,6 +153,30 @@
       "level": "MUST",
       "fixture_ids": ["*"],
       "surfaces": ["robot_json", "robot_toon", "e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "scale.synthetic_200_pane_fixture",
+      "level": "MUST",
+      "fixture_ids": ["synthetic_200_pane_high_scale"],
+      "surfaces": ["robot_json", "robot_toon", "e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "target_class.unavailable_predicate",
+      "level": "MUST",
+      "fixture_ids": ["synthetic_200_pane_high_scale"],
+      "surfaces": ["robot_json", "robot_toon", "e2e_jsonl"],
+      "status": "covered",
+      "divergence": ""
+    },
+    {
+      "requirement_id": "scale.agent_output_size_budget",
+      "level": "MUST",
+      "fixture_ids": ["synthetic_200_pane_high_scale"],
+      "surfaces": ["robot_json", "robot_toon"],
       "status": "covered",
       "divergence": ""
     }

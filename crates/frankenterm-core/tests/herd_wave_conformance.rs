@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 const FIXTURE_MATRIX: &str = include_str!("fixtures/herd_wave_contract/fixture_matrix.json");
 const CONFORMANCE_MATRIX: &str =
     include_str!("fixtures/herd_wave_contract/conformance_matrix.json");
+const TARGET_CLASS_UNAVAILABLE_REASON: &str = "herd_wave.target_class.proof_unavailable";
 
 #[derive(Debug)]
 struct ScenarioReport {
@@ -86,6 +87,12 @@ fn string_array(value: &Value) -> Vec<&str> {
         .iter()
         .map(|entry| entry.as_str().expect("array entry is a string"))
         .collect()
+}
+
+fn u64_field(value: &Value, key: &str) -> u64 {
+    value[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{key} must be an unsigned integer in {value:?}"))
 }
 
 fn enum_json<T>(value: T) -> Value
@@ -524,7 +531,10 @@ fn project_contract(
             "command": null,
             "exit_status": null,
             "measured_window_ms": null,
-            "reason_codes": ["herd_wave.safety.no_target_class_artifact"]
+            "reason_codes": [
+                "herd_wave.safety.no_target_class_artifact",
+                TARGET_CLASS_UNAVAILABLE_REASON
+            ]
         },
         "artifact_paths": [
             "crates/frankenterm-core/tests/fixtures/herd_wave_contract/fixture_matrix.json",
@@ -616,6 +626,7 @@ fn fixture_matrix_is_deterministic_and_covers_required_scenarios() {
         "priority_protection",
         "operator_override",
         "cooldown_circuit_active",
+        "synthetic_200_pane_high_scale",
         "normal_no_wave_privacy_guard",
     ]
     .into_iter()
@@ -760,6 +771,40 @@ fn generated_fixtures_match_expected_contract_states_and_privacy_invariants() {
             "{} must not imply target-class hardware proof",
             report.scenario_id
         );
+        assert!(
+            string_array(&report.projection["target_class_hardware_proof"]["reason_codes"])
+                .contains(&TARGET_CLASS_UNAVAILABLE_REASON),
+            "{} must emit explicit target-class-unavailable reason",
+            report.scenario_id
+        );
+
+        if let Some(scale_proof) = scenario.get("scale_proof") {
+            let expected_panes = u64_field(scale_proof, "pane_count");
+            let expected_cohort = u64_field(scale_proof, "cohort_count");
+            assert_eq!(
+                report.snapshot.distinct_panes, expected_panes as u32,
+                "{} high-scale distinct pane count drifted",
+                report.scenario_id
+            );
+            assert_eq!(
+                report.dry_run_plan.calendar.len(),
+                usize::try_from(expected_cohort).expect("cohort count fits usize"),
+                "{} high-scale cohort rows drifted",
+                report.scenario_id
+            );
+            assert_eq!(
+                scale_proof["target_class_hardware_proof"]["available"].as_bool(),
+                Some(false),
+                "{} fixture must not mark target-class hardware available",
+                report.scenario_id
+            );
+            assert_eq!(
+                scale_proof["target_class_hardware_proof"]["reason_code"].as_str(),
+                Some(TARGET_CLASS_UNAVAILABLE_REASON),
+                "{} fixture must carry the unavailable predicate",
+                report.scenario_id
+            );
+        }
 
         if let Err(errors) = validator.validate(&report.projection) {
             let messages = errors
@@ -816,4 +861,56 @@ fn json_and_toon_goldens_preserve_reason_codes_and_unavailable_sources() {
             report.scenario_id
         );
     }
+}
+
+#[test]
+fn high_scale_fixture_preserves_target_class_predicate_and_output_budget() {
+    let matrix = fixture_matrix();
+    let scenario = scenario_array(&matrix)
+        .iter()
+        .find(|scenario| scenario["scenario_id"].as_str() == Some("synthetic_200_pane_high_scale"))
+        .expect("high-scale scenario exists");
+    let report = build_scenario_report(scenario);
+    let scale_proof = &scenario["scale_proof"];
+    let output_budget = &scale_proof["agent_output_budget"];
+
+    assert_eq!(u64_field(scale_proof, "pane_count"), 200);
+    assert_eq!(u64_field(scale_proof, "cohort_count"), 200);
+    assert_eq!(report.snapshot.distinct_panes, 200);
+    assert_eq!(report.dry_run_plan.calendar.len(), 200);
+    assert_eq!(
+        report.projection["target_class_hardware_proof"]["available"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        report.projection["target_class_hardware_proof"]["cpu_cores"].as_u64(),
+        None
+    );
+    assert_eq!(
+        report.projection["target_class_hardware_proof"]["memory_gib"].as_u64(),
+        None
+    );
+    assert!(
+        string_array(&report.projection["target_class_hardware_proof"]["reason_codes"])
+            .contains(&TARGET_CLASS_UNAVAILABLE_REASON)
+    );
+
+    let robot_json = serde_json::to_string(&report.projection).expect("projection serializes");
+    let robot_toon = toon_rust::encode(report.projection.clone(), None);
+    let max_json = u64_field(output_budget, "max_robot_json_bytes") as usize;
+    let max_toon = u64_field(output_budget, "max_robot_toon_bytes") as usize;
+    assert!(
+        robot_json.len() <= max_json,
+        "high-scale JSON projection exceeded budget: {} > {max_json}",
+        robot_json.len()
+    );
+    assert!(
+        robot_toon.len() <= max_toon,
+        "high-scale TOON projection exceeded budget: {} > {max_toon}",
+        robot_toon.len()
+    );
+    assert!(
+        !robot_toon.is_empty(),
+        "high-scale TOON projection must not be empty"
+    );
 }

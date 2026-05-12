@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "bead_id": "ft-5bwjf.5",
+  "scale_gate_bead_id": "ft-5bwjf.7",
   "contract_id": "ft.herd_wave.v1",
   "update_policy": {
     "environment_gate": "UPDATE_HERD_WAVE_GOLDENS",
@@ -276,6 +277,46 @@
       }
     },
     {
+      "scenario_id": "synthetic_200_pane_high_scale",
+      "kind": "retry",
+      "pane_count": 200,
+      "request": "background",
+      "telemetry_mode": "fresh",
+      "controller_state": "none",
+      "privacy_negative": false,
+      "scale_proof": {
+        "synthetic": true,
+        "pane_count": 200,
+        "cohort_count": 200,
+        "target_class_hardware_proof": {
+          "available": false,
+          "required_cpu_cores": 64,
+          "required_memory_gib": 256,
+          "reason_code": "herd_wave.target_class.proof_unavailable"
+        },
+        "agent_output_budget": {
+          "max_robot_json_bytes": 220000,
+          "max_robot_toon_bytes": 180000
+        }
+      },
+      "expected": {
+        "overall_state": "emergency",
+        "evidence_state": "measured",
+        "pressure_tier": "emergency",
+        "admission_action": "shed",
+        "dominant_kind": "retry",
+        "min_calendar_rows": 200,
+        "required_reason_codes": [
+          "herd_wave.kind.retry",
+          "herd_wave.admission.herd_wave_pressure"
+        ],
+        "required_plan_reason_codes": [
+          "herd_wave.next.operator_review_before_shed",
+          "herd_wave.next.confirm_noncritical_before_shed"
+        ]
+      }
+    },
+    {
       "scenario_id": "normal_no_wave_privacy_guard",
       "kind": "wake",
       "pane_count": 2,
@@ -361,7 +402,8 @@
       "canonicalizer": "scrub_run_id,scrub_selected_worker,scrub_artifact_root",
       "contract_requirements": [
         "structured_logs",
-        "rch_fail_closed"
+        "rch_fail_closed",
+        "target_class_proof_unavailable"
       ],
       "owner_command": "tests/e2e/test_herd_wave_contract.sh --run-rust-proof",
       "update_command": "none",

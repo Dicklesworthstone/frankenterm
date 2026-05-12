@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BEAD_ID="ft-5bwjf.5"
+BEAD_ID="${HERD_WAVE_BEAD_ID:-ft-5bwjf.7}"
 RUN_ID="${HERD_WAVE_RUN_ID:-$(date -u +"%Y%m%dT%H%M%SZ")}"
 ARTIFACT_ROOT="${ROOT_DIR}/tests/e2e/artifacts/goal-line/${BEAD_ID}/herd_wave_contract/${RUN_ID}"
 LOG_FILE="${ARTIFACT_ROOT}/events.jsonl"
@@ -56,6 +56,10 @@ emit_event() {
   local cargo_reached="${9:-false}"
   local rustc_reached="${10:-false}"
   local test_execution_reached="${11:-false}"
+  local pane_count="${12:-null}"
+  local cohort_count="${13:-null}"
+  local dominant_kind="${14:-}"
+  local target_class_proof_available="${15:-null}"
   local ts
 
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -74,6 +78,10 @@ emit_event() {
     --argjson cargo_reached "${cargo_reached}" \
     --argjson rustc_reached "${rustc_reached}" \
     --argjson test_execution_reached "${test_execution_reached}" \
+    --argjson pane_count "${pane_count}" \
+    --argjson cohort_count "${cohort_count}" \
+    --arg dominant_kind "${dominant_kind}" \
+    --argjson target_class_proof_available "${target_class_proof_available}" \
     '{
       timestamp: $timestamp,
       bead_id: $bead_id,
@@ -88,7 +96,11 @@ emit_event() {
       selected_worker: ($selected_worker | if . == "" then null else . end),
       cargo_reached: $cargo_reached,
       rustc_reached: $rustc_reached,
-      test_execution_reached: $test_execution_reached
+      test_execution_reached: $test_execution_reached,
+      pane_count: $pane_count,
+      cohort_count: $cohort_count,
+      dominant_kind: ($dominant_kind | if . == "" then null else . end),
+      target_class_proof_available: $target_class_proof_available
     }' >> "${LOG_FILE}"
 }
 
@@ -133,11 +145,26 @@ scenario_count="$(jq '.scenarios | length' "${FIXTURE_MATRIX}")"
 must_total="$(jq '[.requirements[] | select(.level == "MUST")] | length' "${CONFORMANCE_MATRIX}")"
 must_uncovered="$(jq '[.requirements[] | select(.level == "MUST" and .status != "covered")] | length' "${CONFORMANCE_MATRIX}")"
 
-if [[ "${scenario_count}" -lt 11 ]]; then
+if [[ "${scenario_count}" -lt 12 ]]; then
   emit_event "fixture_matrix" "static" "scenario_count" "failed" "herd_wave.fixture_matrix.too_few_scenarios" "scenario_count_low" "${FIXTURE_MATRIX}"
   exit 1
 fi
 emit_event "fixture_matrix" "static" "scenario_count" "passed" "herd_wave.fixture_matrix.scenario_count" "none" "${FIXTURE_MATRIX}"
+
+high_scale_rows="$(jq '[.scenarios[] | select(.scenario_id == "synthetic_200_pane_high_scale")] | length' "${FIXTURE_MATRIX}")"
+if [[ "${high_scale_rows}" -ne 1 ]]; then
+  emit_event "synthetic_200_pane_high_scale" "static" "fixture_present" "failed" "herd_wave.scale.high_scale_fixture_missing" "high_scale_fixture_missing" "${FIXTURE_MATRIX}"
+  exit 1
+fi
+high_scale_pane_count="$(jq -r '.scenarios[] | select(.scenario_id == "synthetic_200_pane_high_scale") | .pane_count' "${FIXTURE_MATRIX}")"
+high_scale_cohort_count="$(jq -r '.scenarios[] | select(.scenario_id == "synthetic_200_pane_high_scale") | .scale_proof.cohort_count' "${FIXTURE_MATRIX}")"
+high_scale_dominant_kind="$(jq -r '.scenarios[] | select(.scenario_id == "synthetic_200_pane_high_scale") | .expected.dominant_kind' "${FIXTURE_MATRIX}")"
+target_class_available="$(jq -r '.scenarios[] | select(.scenario_id == "synthetic_200_pane_high_scale") | .scale_proof.target_class_hardware_proof.available' "${FIXTURE_MATRIX}")"
+if [[ "${high_scale_pane_count}" -lt 200 || "${high_scale_cohort_count}" -lt 200 || "${target_class_available}" != "false" ]]; then
+  emit_event "synthetic_200_pane_high_scale" "static" "target_class_gate" "failed" "herd_wave.scale.high_scale_fixture_invalid" "high_scale_fixture_invalid" "${FIXTURE_MATRIX}" "" false false false "${high_scale_pane_count}" "${high_scale_cohort_count}" "${high_scale_dominant_kind}" "${target_class_available}"
+  exit 1
+fi
+emit_event "synthetic_200_pane_high_scale" "static" "target_class_gate" "passed" "herd_wave.target_class.proof_unavailable" "none" "${FIXTURE_MATRIX}" "" false false false "${high_scale_pane_count}" "${high_scale_cohort_count}" "${high_scale_dominant_kind}" "${target_class_available}"
 
 if [[ "${must_total}" -eq 0 || "${must_uncovered}" -ne 0 ]]; then
   emit_event "conformance_matrix" "static" "must_coverage" "failed" "herd_wave.conformance.must_not_covered" "must_uncovered" "${CONFORMANCE_MATRIX}"
@@ -162,7 +189,8 @@ if [[ "${RUN_RUST_PROOF}" -eq 1 ]]; then
   ensure_rch_ready
 
   RCH_LOG="${ARTIFACT_ROOT}/herd_wave_contract_${RUN_ID}.cargo_test.log"
-  TARGET_DIR="/tmp/ft-5bwjf-5-herd-wave-contract-${RUN_ID}"
+  SAFE_BEAD_ID="${BEAD_ID//[^[:alnum:]]/-}"
+  TARGET_DIR="/tmp/${SAFE_BEAD_ID}-herd-wave-contract-${RUN_ID}"
   CARGO_BUILD_JOBS="${HERD_WAVE_CARGO_BUILD_JOBS:-2}"
   emit_event "rust_proof" "rch" "cargo_test_start" "running" "herd_wave.rch.cargo_test_started" "none" "${RCH_LOG}" "" false false false
 
@@ -199,6 +227,7 @@ if [[ "${RUN_RUST_PROOF}" -eq 1 ]]; then
     exit "${rch_rc}"
   fi
   emit_event "rust_proof" "rch" "cargo_test_finish" "passed" "herd_wave.rch.remote_test_passed" "none" "${RCH_LOG}" "${selected_worker}" "${cargo_reached}" "${rustc_reached}" "${test_reached}"
+  emit_event "synthetic_200_pane_high_scale" "rch" "target_class_proof_status" "passed" "herd_wave.target_class.proof_unavailable" "none" "${RCH_LOG}" "${selected_worker}" "${cargo_reached}" "${rustc_reached}" "${test_reached}" "${high_scale_pane_count}" "${high_scale_cohort_count}" "${high_scale_dominant_kind}" "${target_class_available}"
 else
   emit_event "rust_proof" "rch" "cargo_test_skip" "skipped" "herd_wave.rch.not_requested" "none" "${LOG_FILE}" "" false false false
 fi
