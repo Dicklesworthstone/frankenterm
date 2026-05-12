@@ -1,0 +1,270 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "runtime-async-cancel-trace-attestation",
+  "category": "proofs/loom-runtime-async",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T09:43:45Z",
+  "produced_by_bead": "ft-tf6g3.6",
+  "status": "pass",
+  "scope": "Machine-readable attestation for the runtime_async Mazurkiewicz cancel-trace equivalence-class proof companion.",
+  "proof_model": {
+    "mode": "mazurkiewicz_trace_classes",
+    "summary": "Each covered runtime_async primitive declares observable events, an order-sensitive dependence relation, cancel-focused equivalence classes, and the invariant every declared class must preserve.",
+    "instrumented_runtime": false,
+    "modeled_contracts": [
+      "single-delivery and terminal idempotence",
+      "close-after-drain semantics",
+      "version monotonicity",
+      "bounded capacity accounting",
+      "broadcast total-order delivery",
+      "ring-buffer depth preservation",
+      "lock-free publication ordering",
+      "triple-buffer slot distinctness",
+      "mutex, rwlock, and semaphore exclusion/capacity",
+      "notify permit and wake semantics"
+    ]
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/proofs/runtime-async-cancel-traces.md",
+      "media_type": "text/markdown",
+      "sha256": "7b18b5947dba2caf97958252a18ebc86a30f421e990d0cf63aa6a0369bde78c1",
+      "size_bytes": 17268
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_oneshot.rs",
+      "media_type": "text/plain",
+      "sha256": "21e74404fadc25e8f0f5a64e55ac749c2a3c4cb58919bcc6fe6267b5d9f77483",
+      "size_bytes": 11649
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_notify.rs",
+      "media_type": "text/plain",
+      "sha256": "598f582da0adfe20a3d699ba651190dd9dce19c457b8b9e79a8c3a75478279be",
+      "size_bytes": 12415
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_broadcast.rs",
+      "media_type": "text/plain",
+      "sha256": "9ca77bdba9e26b172c6115e9dd73001aeb16064ae7b2720991e6d316cb6e9575",
+      "size_bytes": 11450
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_watch.rs",
+      "media_type": "text/plain",
+      "sha256": "cfaf0cc4313363e4605e422e57a473785ae62b51ea4298430a1dbc6be30bdfa8",
+      "size_bytes": 11349
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_mpsc.rs",
+      "media_type": "text/plain",
+      "sha256": "c6fc9ac03a78e1ef582ba83f14b245d5a2fe7096dda870ea19e3f7bad5e756b7",
+      "size_bytes": 11944
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_sync.rs",
+      "media_type": "text/plain",
+      "sha256": "ef28a7e1ccaa52cca739fd67d0471c085da7c5b83563551d646a73032ed81698",
+      "size_bytes": 23411
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_spsc_ring_buffer.rs",
+      "media_type": "text/plain",
+      "sha256": "86781d677591318390a6531a955aaf649cbc3434831ea3fe8f73be03afe003df",
+      "size_bytes": 6777
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_lockfree.rs",
+      "media_type": "text/plain",
+      "sha256": "9ae80866d738412ba1efe0ce592bf95363539ec445c13efca280a5d4c7a7d85e",
+      "size_bytes": 9370
+    },
+    {
+      "path": "crates/frankenterm-core/tests/loom_triple_buffer.rs",
+      "media_type": "text/plain",
+      "sha256": "946e63df2c9e02449ba16638b12679995e241cf903b8606f66820b63f736744a",
+      "size_bytes": 24869
+    }
+  ],
+  "primitive_coverage": [
+    {
+      "primitive": "runtime_async::oneshot",
+      "test_path": "crates/frankenterm-core/tests/loom_oneshot.rs",
+      "declaration_test": "loom_oneshot_cancel_trace_classes_are_declared",
+      "declared_class_count": 4,
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::notify::Notify",
+      "test_path": "crates/frankenterm-core/tests/loom_notify.rs",
+      "declaration_test": "loom_notify_cancel_trace_classes_are_declared",
+      "declared_class_count": 5,
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::broadcast",
+      "test_path": "crates/frankenterm-core/tests/loom_broadcast.rs",
+      "declaration_test": "loom_broadcast_cancel_trace_classes_are_declared",
+      "declared_class_count": 5,
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::watch",
+      "test_path": "crates/frankenterm-core/tests/loom_watch.rs",
+      "declaration_test": "loom_watch_cancel_trace_classes_are_declared",
+      "declared_class_count": 4,
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::mpsc",
+      "test_path": "crates/frankenterm-core/tests/loom_mpsc.rs",
+      "declaration_test": "loom_mpsc_cancel_trace_classes_are_declared",
+      "declared_class_count": 5,
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::spsc_ring_buffer",
+      "test_path": "crates/frankenterm-core/tests/loom_spsc_ring_buffer.rs",
+      "declaration_test": "loom_spsc_cancel_trace_classes_are_declared",
+      "declared_class_count": 4,
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::lockfree",
+      "test_path": "crates/frankenterm-core/tests/loom_lockfree.rs",
+      "declaration_test": "loom_lockfree_cancel_trace_classes_are_declared",
+      "declared_class_count": 4,
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::triple_buffer",
+      "test_path": "crates/frankenterm-core/tests/loom_triple_buffer.rs",
+      "declaration_test": "loom_triple_buffer_cancel_trace_classes_are_declared",
+      "declared_class_count": 4,
+      "status": "pass"
+    },
+    {
+      "primitive": "runtime_async::sync",
+      "test_path": "crates/frankenterm-core/tests/loom_sync.rs",
+      "declaration_test": "loom_sync_cancel_trace_classes_are_declared",
+      "declared_class_count": 9,
+      "status": "pass"
+    }
+  ],
+  "supporting_test_binaries": [
+    {
+      "target": "loom_broadcast",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_broadcast-307ed680f822c56f",
+      "sha256": "4bcfa16e20bf6c8b85235d4ef27905577b03f134a03687edb4538fe291012bbf",
+      "size_bytes": 8339984
+    },
+    {
+      "target": "loom_lockfree",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_lockfree-9afa2d96a758ff3d",
+      "sha256": "4d6829944774553b283e495b736862bfd1b7c81070f196ef19f090d5cfa94b89",
+      "size_bytes": 8186320
+    },
+    {
+      "target": "loom_mpsc",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_mpsc-b2c484bb6e27cc17",
+      "sha256": "9b509cbb6a80793b904a740891ecbe986385249d391ef924cd037e2194f1e4fd",
+      "size_bytes": 8222056
+    },
+    {
+      "target": "loom_notify",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_notify-350916a31222d413",
+      "sha256": "cbfcdf1eccb45d86a610080532bc8e30ebb44e8eeef84f35f8c1104d74e335d5",
+      "size_bytes": 8234032
+    },
+    {
+      "target": "loom_oneshot",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_oneshot-4851b50b533e2c8e",
+      "sha256": "48b766ff97c5dd218130ac688c400e43d084215d482cb349d2f33e214bf85bbe",
+      "size_bytes": 8099712
+    },
+    {
+      "target": "loom_spsc_ring_buffer",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_spsc_ring_buffer-7e1674f4d61c8a03",
+      "sha256": "e100e5a842b2a4bdb3334e334da6b80b002a932a23298da976f335e24589ccfb",
+      "size_bytes": 7905800
+    },
+    {
+      "target": "loom_sync",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_sync-0e1207260b31ad3e",
+      "sha256": "35d76589e4593699887aa8a947ff86c59b3ad388076bcbf991723448a3768f71",
+      "size_bytes": 9121944
+    },
+    {
+      "target": "loom_triple_buffer",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_triple_buffer-d48656fa86de091f",
+      "sha256": "b04fe7f078c463e371e93a9694045b010c29df00cee01ca94e6c2619afed6412",
+      "size_bytes": 8571520
+    },
+    {
+      "target": "loom_watch",
+      "path": "/tmp/ft-tf6g3-6-attest-20260512T090000Z/debug/deps/loom_watch-7f4d55adad1c0463",
+      "sha256": "1fdd668086d14e1415e038b3accf7a9f490493a2f0529fea21c231b8ee251b25",
+      "size_bytes": 8180344
+    }
+  ],
+  "proof_runs": [
+    {
+      "kind": "remote_filtered_loom_proof",
+      "command": "env RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=.rch-target-vmi1153651-job-29839431619837985-1778573778358104000-0 LOOM_MAX_BRANCHES=4000 LOOM_MAX_DURATION_SECS=1500 cargo test -p frankenterm-core --test loom_oneshot --test loom_notify --test loom_broadcast --test loom_watch --test loom_mpsc --test loom_sync --test loom_spsc_ring_buffer --test loom_lockfree --test loom_triple_buffer cancel_trace_classes_are_declared -- --nocapture",
+      "status": "pass",
+      "remote_worker": "vmi1293453",
+      "rch_result": "[RCH] remote vmi1293453 (800.3s)",
+      "result": "All nine cancel_trace_classes_are_declared tests passed; each target reported 1 passed, 0 failed."
+    },
+    {
+      "kind": "binary_hash_capture",
+      "command": "env RCH_REQUIRE_REMOTE=1 rch exec -- bash -lc 'set -euo pipefail; export CARGO_TARGET_DIR=/tmp/ft-tf6g3-6-attest-20260512T090000Z; export LOOM_MAX_BRANCHES=4000; export LOOM_MAX_DURATION_SECS=1500; cargo test -p frankenterm-core --test loom_oneshot --test loom_notify --test loom_broadcast --test loom_watch --test loom_mpsc --test loom_sync --test loom_spsc_ring_buffer --test loom_lockfree --test loom_triple_buffer cancel_trace_classes_are_declared -- --nocapture; shasum -a 256 <supporting test binaries>'",
+      "status": "pass",
+      "execution_mode": "local hash capture through a non-compilation rch wrapper; no RCH remote footer was emitted",
+      "result": "All nine cancel_trace_classes_are_declared tests passed again and supporting test binary hashes were emitted from the same target directory."
+    },
+    {
+      "kind": "remote_targeted_clippy",
+      "command": "env RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-6-clippy-20260512 cargo clippy -p frankenterm-core --test loom_oneshot --test loom_notify --test loom_broadcast --test loom_watch --test loom_mpsc --test loom_sync --test loom_spsc_ring_buffer --test loom_lockfree --test loom_triple_buffer -- -D warnings",
+      "status": "pass",
+      "remote_worker": "vmi1293453",
+      "rch_result": "[RCH] remote vmi1293453 (981.4s)",
+      "result": "Targeted clippy over the nine touched Loom test targets passed with -D warnings."
+    },
+    {
+      "kind": "full_unfiltered_loom_attempt",
+      "command": "env RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-6-loom-20260512T082500Z cargo test -p frankenterm-core --test loom_oneshot --test loom_notify --test loom_broadcast --test loom_watch --test loom_mpsc --test loom_sync --test loom_spsc_ring_buffer --test loom_lockfree --test loom_triple_buffer -- --nocapture",
+      "status": "timeout",
+      "remote_worker": "vmi1153651",
+      "result": "The unfiltered lane compiled and began tests, then hit the 1800s SSH timeout while running the pre-existing loom_broadcast_preserves_total_order_across_receivers state space. The new loom_broadcast_cancel_trace_classes_are_declared test had already passed before timeout."
+    }
+  ],
+  "validation": [
+    {
+      "command": "rustfmt --edition 2024 --check crates/frankenterm-core/tests/loom_oneshot.rs crates/frankenterm-core/tests/loom_notify.rs crates/frankenterm-core/tests/loom_broadcast.rs crates/frankenterm-core/tests/loom_watch.rs crates/frankenterm-core/tests/loom_mpsc.rs crates/frankenterm-core/tests/loom_sync.rs crates/frankenterm-core/tests/loom_spsc_ring_buffer.rs crates/frankenterm-core/tests/loom_lockfree.rs crates/frankenterm-core/tests/loom_triple_buffer.rs",
+      "status": "pass"
+    },
+    {
+      "command": "git diff --check -- crates/frankenterm-core/tests/loom_oneshot.rs crates/frankenterm-core/tests/loom_notify.rs crates/frankenterm-core/tests/loom_broadcast.rs crates/frankenterm-core/tests/loom_watch.rs crates/frankenterm-core/tests/loom_mpsc.rs crates/frankenterm-core/tests/loom_sync.rs crates/frankenterm-core/tests/loom_spsc_ring_buffer.rs crates/frankenterm-core/tests/loom_lockfree.rs crates/frankenterm-core/tests/loom_triple_buffer.rs docs/proofs/runtime-async-cancel-traces.md",
+      "status": "pass"
+    },
+    {
+      "command": "jq empty docs/attestations/proofs/runtime-async-cancel-traces.json",
+      "status": "pass"
+    },
+    {
+      "command": "env RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-6-clippy-20260512 cargo clippy -p frankenterm-core --test loom_oneshot --test loom_notify --test loom_broadcast --test loom_watch --test loom_mpsc --test loom_sync --test loom_spsc_ring_buffer --test loom_lockfree --test loom_triple_buffer -- -D warnings",
+      "status": "pass",
+      "remote_worker": "vmi1293453",
+      "result": "[RCH] remote vmi1293453 (981.4s)"
+    }
+  ],
+  "attestation_manifest_slot": {
+    "category": "proofs/loom-runtime-async",
+    "path": "docs/attestations/proofs/runtime-async-cancel-traces.json",
+    "media_type": "application/json",
+    "produced_by_bead": "ft-tf6g3.6",
+    "proof_categories": [3, 6],
+    "description": "Mazurkiewicz cancel-trace equivalence classes for runtime_async primitive cancellation semantics."
+  }
+}

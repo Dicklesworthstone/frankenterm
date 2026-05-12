@@ -89,6 +89,14 @@
       "description": "Loom proof for runtime_async primitives (G8)."
     },
     {
+      "category": "proofs/loom-runtime-async",
+      "path": "docs/attestations/proofs/runtime-async-cancel-traces.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-tf6g3.6",
+      "proof_categories": [3, 6],
+      "description": "Mazurkiewicz cancel-trace equivalence classes for runtime_async primitive cancellation semantics (G21)."
+    },
+    {
       "category": "proofs/runtime-proof-trait",
       "path": "docs/attestations/proofs/runtime-proof-trait.json",
       "media_type": "application/json",

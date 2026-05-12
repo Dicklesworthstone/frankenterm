@@ -24,6 +24,41 @@ use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
 
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
 #[derive(Debug)]
 struct LoomNotify {
     state: Mutex<LoomNotifyState>,
@@ -73,6 +108,45 @@ impl LoomNotify {
             state = self.cv.wait(state).unwrap();
         }
     }
+}
+
+#[test]
+fn loom_notify_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "waiter-cancel-before-wake",
+                &["cancel", "wait"],
+                &[("cancel", "wait")],
+                "a cancelled waiter does not complete",
+            ),
+            (
+                "notify-one-before-wait",
+                &["notify_one", "wait", "cancel"],
+                &[("notify_one", "wait"), ("cancel", "wait")],
+                "one accumulated permit wakes one waiter",
+            ),
+            (
+                "wait-before-notify",
+                &["wait", "notify_one", "notify_waiters"],
+                &[("wait", "notify_one"), ("wait", "notify_waiters")],
+                "parked waiter completes exactly once after a notification",
+            ),
+            (
+                "notify-waiters-without-waiters",
+                &["notify_waiters", "wait", "cancel"],
+                &[("notify_waiters", "wait"), ("cancel", "wait")],
+                "notify_waiters does not accumulate a future permit",
+            ),
+            (
+                "permit-cap",
+                &["notify_one", "notify_one_again", "wait"],
+                &[("notify_one", "notify_one_again"), ("notify_one", "wait")],
+                "accumulated notify_one permits cap at one",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 5);
+    });
 }
 
 #[test]

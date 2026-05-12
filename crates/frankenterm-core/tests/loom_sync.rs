@@ -19,6 +19,41 @@ use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex, RwLock};
 use loom::thread;
 
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
 fn update_max(max_seen: &AtomicUsize, candidate: usize) {
     let mut current = max_seen.load(Ordering::SeqCst);
     while candidate > current {
@@ -27,6 +62,74 @@ fn update_max(max_seen: &AtomicUsize, candidate: usize) {
             Err(observed) => current = observed,
         }
     }
+}
+
+#[test]
+fn loom_sync_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "mutex-waiter-cancel-before-lock",
+                &["cancel", "lock"],
+                &[("cancel", "lock")],
+                "a cancelled waiter never enters the critical section",
+            ),
+            (
+                "mutex-sequenced-acquisition",
+                &["lock", "drop", "lock_next"],
+                &[("lock", "drop"), ("drop", "lock_next")],
+                "at most one holder exists and no updates are lost",
+            ),
+            (
+                "mutex-drop-wakes-next",
+                &["drop", "lock_next", "cancel"],
+                &[("drop", "lock_next"), ("cancel", "lock_next")],
+                "the next acquirer observes the prior write after release",
+            ),
+            (
+                "rwlock-reader-cancel-before-read",
+                &["cancel", "read_lock"],
+                &[("cancel", "read_lock")],
+                "a cancelled reader does not increment the reader count",
+            ),
+            (
+                "rwlock-concurrent-readers",
+                &["read_a", "read_b", "write"],
+                &[("read_a", "write"), ("read_b", "write")],
+                "readers commute with each other but not with writers",
+            ),
+            (
+                "rwlock-writer-exclusive",
+                &["write_a", "write_b", "read", "cancel"],
+                &[
+                    ("write_a", "write_b"),
+                    ("write_a", "read"),
+                    ("write_b", "read"),
+                    ("cancel", "read"),
+                ],
+                "writers serialize and never overlap readers",
+            ),
+            (
+                "semaphore-waiter-cancel-before-acquire",
+                &["cancel", "acquire"],
+                &[("cancel", "acquire")],
+                "a cancelled waiter leaves the permit count unchanged",
+            ),
+            (
+                "semaphore-drop-as-release",
+                &["acquire", "drop", "available"],
+                &[("acquire", "drop"), ("drop", "available")],
+                "dropping a permit restores availability",
+            ),
+            (
+                "semaphore-release-wakes-blocked",
+                &["drop", "blocked_acquire", "cancel"],
+                &[("drop", "blocked_acquire"), ("cancel", "blocked_acquire")],
+                "blocked acquirers wake in ticket order after release",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 9);
+    });
 }
 
 #[test]

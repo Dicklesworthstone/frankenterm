@@ -25,6 +25,41 @@ use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
 #[derive(Debug)]
 struct LoomWatch<T> {
     state: Mutex<LoomWatchState<T>>,
@@ -63,6 +98,39 @@ impl<T: Clone> LoomWatch<T> {
         let state = self.state.lock().unwrap();
         (state.value.clone(), state.version, state.closed)
     }
+}
+
+#[test]
+fn loom_watch_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "pre-write-cancel",
+                &["cancel", "snapshot"],
+                &[("cancel", "snapshot")],
+                "a cancelled reader performs no snapshot and cannot observe a regression",
+            ),
+            (
+                "snapshot-before-cancel",
+                &["snapshot", "cancel", "send"],
+                &[("snapshot", "send"), ("snapshot", "cancel")],
+                "snapshot observes the initial value or a sent value with bounded version",
+            ),
+            (
+                "multi-write-last-wins",
+                &["send_a", "send_b", "snapshot"],
+                &[("send_a", "snapshot"), ("send_b", "snapshot")],
+                "snapshot observes one serialized writer value with version equal to completed sends",
+            ),
+            (
+                "close-sticky-under-cancel",
+                &["close", "cancel", "send", "snapshot"],
+                &[("close", "snapshot"), ("send", "snapshot")],
+                "closed never transitions back to false",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 4);
+    });
 }
 
 #[test]

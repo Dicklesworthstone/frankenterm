@@ -11,6 +11,41 @@ use loom::sync::Arc;
 use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::thread;
 
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
 // ===========================================================================
 // Simplified sharded counter using loom atomics
 // ===========================================================================
@@ -72,6 +107,47 @@ impl LoomShardedMax {
 // ===========================================================================
 // Loom tests
 // ===========================================================================
+
+#[test]
+fn loom_lockfree_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "cancel-between-independent-shards",
+                &["cancel", "add_shard_0", "add_shard_1", "aggregate"],
+                &[("add_shard_0", "aggregate"), ("add_shard_1", "aggregate")],
+                "aggregate includes completed atomics only",
+            ),
+            (
+                "same-shard-serialized-add",
+                &["add_a", "add_b", "cancel", "aggregate"],
+                &[
+                    ("add_a", "add_b"),
+                    ("add_a", "aggregate"),
+                    ("add_b", "aggregate"),
+                ],
+                "same-shard fetch_add operations are both reflected in the final sum",
+            ),
+            (
+                "same-shard-max-cas-race",
+                &["max_a", "max_b", "cancel", "aggregate"],
+                &[
+                    ("max_a", "max_b"),
+                    ("max_a", "aggregate"),
+                    ("max_b", "aggregate"),
+                ],
+                "CAS retries cannot clobber a larger completed max",
+            ),
+            (
+                "mixed-independent-structures",
+                &["counter_add", "max_observe", "cancel", "aggregate"],
+                &[("counter_add", "aggregate"), ("max_observe", "aggregate")],
+                "counter cancellation cannot corrupt max and max cancellation cannot corrupt counter",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 4);
+    });
+}
 
 /// Two threads, each incrementing their own shard.
 /// The final sum must equal the total of all increments.

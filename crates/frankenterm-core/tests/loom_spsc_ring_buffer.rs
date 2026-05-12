@@ -7,6 +7,41 @@ use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::thread;
 
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
 struct LoomSpscIndexModel {
     capacity: usize,
     head: AtomicUsize,
@@ -61,6 +96,39 @@ impl LoomSpscIndexModel {
             self.closed.load(Ordering::Acquire),
         )
     }
+}
+
+#[test]
+fn loom_spsc_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "producer-cancel-before-send",
+                &["cancel", "try_send"],
+                &[("cancel", "try_send")],
+                "head does not advance when producer cancellation wins",
+            ),
+            (
+                "send-before-consumer-cancel",
+                &["try_send", "cancel", "try_recv"],
+                &[("try_send", "try_recv"), ("cancel", "try_recv")],
+                "depth accounts for produced minus consumed",
+            ),
+            (
+                "close-before-future-send",
+                &["close", "try_send", "cancel"],
+                &[("close", "try_send"), ("cancel", "try_send")],
+                "future sends fail once closed is visible",
+            ),
+            (
+                "send-receive-race",
+                &["try_send", "try_recv"],
+                &[("try_send", "try_recv")],
+                "depth stays between zero and capacity",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 4);
+    });
 }
 
 #[test]

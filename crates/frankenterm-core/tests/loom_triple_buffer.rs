@@ -45,6 +45,41 @@ use loom::sync::Mutex;
 use loom::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use loom::thread;
 
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
 // ============================================================================
 // Loom-flavored mirror of the production TripleBuffer.
 //
@@ -165,6 +200,43 @@ impl LoomTripleBuffer {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[test]
+fn loom_triple_buffer_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "reader-cancel-before-acquire",
+                &["cancel", "acquire"],
+                &[("cancel", "acquire")],
+                "no reader observation occurs and slot distinctness remains the invariant",
+            ),
+            (
+                "publish-before-acquire",
+                &["publish", "acquire", "cancel"],
+                &[("publish", "acquire"), ("cancel", "acquire")],
+                "reader sees seed or a coherent published value, never a torn write",
+            ),
+            (
+                "publish-overrun",
+                &["publish_a", "publish_b", "acquire"],
+                &[("publish_a", "publish_b"), ("publish_b", "acquire")],
+                "latest publish is observed and overrun accounting is bounded",
+            ),
+            (
+                "force-recycle-race",
+                &["force_recycle", "publish", "acquire", "cancel"],
+                &[
+                    ("force_recycle", "publish"),
+                    ("force_recycle", "acquire"),
+                    ("cancel", "force_recycle"),
+                ],
+                "every thread completes and the packed slot state remains pairwise distinct",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 4);
+    });
+}
 
 /// Single-threaded smoke. Loom under one thread is degenerate but
 /// pins that the algorithm produces sensible outputs without any

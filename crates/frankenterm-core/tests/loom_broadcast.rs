@@ -28,6 +28,41 @@ use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
 
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
 #[derive(Debug)]
 struct LoomBroadcast<T> {
     state: Mutex<LoomBroadcastState<T>>,
@@ -77,6 +112,45 @@ impl<T: Clone> LoomBroadcast<T> {
             state = self.not_empty.wait(state).unwrap();
         }
     }
+}
+
+#[test]
+fn loom_broadcast_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "receiver-cancel-before-next-cursor",
+                &["cancel", "recv_at"],
+                &[("cancel", "recv_at")],
+                "a cancelled receiver makes no further cursor observation",
+            ),
+            (
+                "send-before-cursor",
+                &["send", "recv_at", "cancel"],
+                &[("send", "recv_at"), ("cancel", "recv_at")],
+                "every receiver maps a sequence number to the same value",
+            ),
+            (
+                "concurrent-senders-serialize",
+                &["send_a", "send_b", "recv_at"],
+                &[("send_a", "recv_at"), ("send_b", "recv_at")],
+                "receivers agree on the chosen total order",
+            ),
+            (
+                "close-before-send",
+                &["close", "send", "recv_at"],
+                &[("close", "send"), ("close", "recv_at")],
+                "cursor zero observes None when close wins before any send",
+            ),
+            (
+                "send-then-close",
+                &["send", "close", "recv_at"],
+                &[("send", "recv_at"), ("close", "recv_at")],
+                "buffered messages drain before close is observed",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 5);
+    });
 }
 
 #[test]

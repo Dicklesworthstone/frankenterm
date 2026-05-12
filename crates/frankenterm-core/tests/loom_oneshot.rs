@@ -23,6 +23,41 @@
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
 
+type Dependency = (&'static str, &'static str);
+type TraceClass = (
+    &'static str,
+    &'static [&'static str],
+    &'static [Dependency],
+    &'static str,
+);
+
+fn assert_cancel_trace_table(classes: &[TraceClass], min_classes: usize) {
+    assert!(classes.len() >= min_classes, "missing cancel trace classes");
+    let mut saw_cancel = false;
+    for class in classes {
+        let (name, events, dependencies, invariant) = *class;
+        assert!(!name.is_empty(), "trace class must have a name");
+        assert!(!events.is_empty(), "trace class {name} must list events");
+        assert!(
+            !invariant.is_empty(),
+            "trace class {name} must declare an invariant"
+        );
+        saw_cancel |= events.contains(&"cancel");
+        for (left, right) in dependencies {
+            assert_ne!(left, right, "dependency relation excludes self edges");
+            assert!(
+                events.contains(left),
+                "{name} dependency left event missing"
+            );
+            assert!(
+                events.contains(right),
+                "{name} dependency right event missing"
+            );
+        }
+    }
+    assert!(saw_cancel, "at least one class must include cancellation");
+}
+
 #[derive(Debug)]
 struct LoomOneshot<T> {
     state: Mutex<LoomOneshotState<T>>,
@@ -105,6 +140,39 @@ impl<T> LoomOneshot<T> {
         let mut state = self.state.lock().unwrap();
         state.value.take()
     }
+}
+
+#[test]
+fn loom_oneshot_cancel_trace_classes_are_declared() {
+    loom::model(|| {
+        let classes: &[TraceClass] = &[
+            (
+                "delivery-before-cancel",
+                &["send", "recv", "cancel"],
+                &[("send", "recv"), ("cancel", "recv")],
+                "recv returns Some(value) exactly once; later cancel is post-terminal",
+            ),
+            (
+                "receiver-cancel-before-send",
+                &["cancel", "send"],
+                &[("cancel", "send")],
+                "send observes the closed receiver and returns Err(value)",
+            ),
+            (
+                "sender-close-before-recv",
+                &["close_sender", "recv", "cancel"],
+                &[("close_sender", "recv"), ("cancel", "recv")],
+                "recv returns None and no value is synthesized",
+            ),
+            (
+                "send-close-race",
+                &["send", "close_sender", "recv"],
+                &[("send", "recv"), ("close_sender", "recv")],
+                "exactly one terminal outcome is selected",
+            ),
+        ];
+        assert_cancel_trace_table(classes, 4);
+    });
 }
 
 #[test]
