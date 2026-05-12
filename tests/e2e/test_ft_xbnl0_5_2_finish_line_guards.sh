@@ -105,7 +105,9 @@ cd "${ROOT_DIR}"
 require_cmd jq
 require_cmd python3
 require_cmd bash
-require_cmd rch
+if ! rch_github_actions_local_cargo_enabled; then
+  require_cmd rch
+fi
 
 if [[ ! -f "${SCRIPT}" ]]; then
   emit_log "preflight" "required_artifacts" "script=${SCRIPT}" "failed" "missing_artifact" "ARTIFACT-MISSING" "${SCRIPT}"

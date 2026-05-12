@@ -142,7 +142,6 @@ jobs:
 
       - name: Run ft-xbnl0.5.2 composition E2E
         env:
-          FT_XBNL0_5_2_SKIP_RCH: "1"
           FT_XBNL0_5_2_SKIP_CARGO_TEST: "1"
         run: bash tests/e2e/test_ft_xbnl0_5_2_finish_line_guards.sh
 
