@@ -1,0 +1,107 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "mux-session-reentry-tlc-attestation",
+  "category": "proofs/mux-session-reentry",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T14:41:58Z",
+  "produced_by_bead": "ft-tf6g3.18.4",
+  "status": "pass",
+  "proof_category": 6,
+  "scope": "Machine-readable attestation for the mux session reentry and subscriber callback safety TLA+ model.",
+  "model": {
+    "spec": "docs/specs/mux-session-reentry.tla",
+    "cfg": "docs/specs/mux-session-reentry.cfg",
+    "mapping": "docs/specs/mux-session-reentry-mapping.md",
+    "release_bundle_slot": "proofs/mux-session-reentry.json",
+    "bounded_model": {
+      "panes": [
+        1,
+        2
+      ],
+      "windows": [
+        1
+      ],
+      "subscribers": [
+        1,
+        2
+      ],
+      "covered_paths": [
+        "duplicate live pane registration",
+        "pane removal and terminal queue event",
+        "stale pane-output notification",
+        "stale alert notification",
+        "callback-side unsubscribe",
+        "dead subscriber cleanup",
+        "reentrant pane-output enqueue",
+        "dispatch completion"
+      ]
+    }
+  },
+  "tlc_run": {
+    "status": "pass",
+    "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/mux-session-reentry.tla",
+    "local_bounded_run": true,
+    "rch_note": "No Cargo, Rust build, or Rust test proof was run locally. This proof uses the repository TLC wrapper for a bounded non-Cargo spec smoke model.",
+    "state_count": 1287201,
+    "distinct_state_count": 77600,
+    "time_budget_seconds": 30,
+    "timed_out": false,
+    "artifacts": {
+      "summary": "target/tlc/mux-session-reentry/summary.json",
+      "stdout": "target/tlc/mux-session-reentry/tlc.stdout.log",
+      "stderr": "target/tlc/mux-session-reentry/tlc.stderr.log"
+    }
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/specs/mux-session-reentry.tla",
+      "media_type": "text/plain",
+      "sha256": "a6e53e20a3b30b34dba450a714efbf785c62af918825f0f9ccfcecbecba4c990",
+      "size_bytes": 11278
+    },
+    {
+      "path": "docs/specs/mux-session-reentry.cfg",
+      "media_type": "text/plain",
+      "sha256": "89f9cc6be53ccacdc36ee2ebe98eae09be66c0a8eab8df28ba8b189ab3276e94",
+      "size_bytes": 120
+    },
+    {
+      "path": "docs/specs/mux-session-reentry-mapping.md",
+      "media_type": "text/markdown",
+      "sha256": "c9a6b3d7e01fffb254c2b02e2555ce9b837eab6407d520d5cf6ccd1b205619cb",
+      "size_bytes": 5822
+    },
+    {
+      "path": "scripts/run-tlc.sh",
+      "media_type": "text/x-shellscript",
+      "sha256": "a245a3c2aa17e216323afc969590c6c0c77127a515e62b7c190ca2191a862164",
+      "size_bytes": 7350
+    }
+  ],
+  "validation": [
+    {
+      "command": "scripts/check-spec-conventions.sh",
+      "status": "pass",
+      "result": "10 spec(s) passed for the mux slice; later shared-tree rerun also passed with 11 spec(s) after unrelated capture-fairness files appeared"
+    },
+    {
+      "command": "jq empty docs/attestations/proofs/mux-session-reentry.json",
+      "status": "pass"
+    },
+    {
+      "command": "scripts/run-tlc.sh --dry-run docs/specs/mux-session-reentry.tla",
+      "status": "pass",
+      "result": "TLC command targets target/tlc/mux-session-reentry/module/MuxSessionReentry.tla and sibling cfg"
+    },
+    {
+      "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/mux-session-reentry.tla",
+      "status": "pass",
+      "result": "1287201 states generated; 77600 distinct states; no timeout"
+    }
+  ],
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-tf6g3.1",
+    "reason": "ft-tf6g3.18.4 publishes the per-subsystem proof artifact; release-bundle category wiring remains owned by ft-tf6g3.1/G16."
+  }
+}
