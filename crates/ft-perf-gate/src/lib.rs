@@ -377,11 +377,18 @@ mod tests {
             EvidenceSample::new("a", 2.0, "ms", 1, 2),
         ];
         let mut stream = VecEvidenceStream::new(samples);
-        let drained = stream.collect_limited(8).unwrap();
+        let drained = match stream.collect_limited(8) {
+            Ok(samples) => samples,
+            Err(err) => match err {},
+        };
         assert_eq!(drained.len(), 2);
         assert!((drained[0].metric_value - 1.0).abs() < f64::EPSILON);
         assert!((drained[1].metric_value - 2.0).abs() < f64::EPSILON);
-        assert!(stream.next_sample().unwrap().is_none());
+        let next = match stream.next_sample() {
+            Ok(next) => next,
+            Err(err) => match err {},
+        };
+        assert!(next.is_none());
     }
 
     #[test]
@@ -398,24 +405,37 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_stream_rejects_invalid_rows() {
+    fn jsonl_stream_rejects_invalid_rows() -> Result<(), String> {
         let invalid = r#"{"schema_version":"bad","ts_ms":1,"claim_id":"x","metric_value":1.0,"metric_unit":"ms","sample_size":1}"#;
         let mut stream = JsonlEvidenceStream::from_text(invalid);
-        let err = stream.next_sample().unwrap_err();
+        let err = match stream.next_sample() {
+            Ok(sample) => return Err(format!("expected error, got {sample:?}")),
+            Err(err) => err,
+        };
         assert!(matches!(
             err,
             PerfGateError::InvalidEvidence { line: 1, .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn jsonl_stream_parses_valid_rows() {
+    fn jsonl_stream_parses_valid_rows() -> Result<(), String> {
         let sample = EvidenceSample::new("robot.p95", 4.2, "ms", 1, 1_000);
-        let json = serde_json::to_string(&sample).unwrap();
+        let json = serde_json::to_string(&sample).map_err(|err| err.to_string())?;
         let mut stream = JsonlEvidenceStream::from_text(&json);
-        let parsed = stream.next_sample().unwrap().unwrap();
+        let parsed = stream
+            .next_sample()
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "expected one parsed sample".to_string())?;
         assert_eq!(parsed.claim_id, sample.claim_id);
         assert!((parsed.metric_value - sample.metric_value).abs() < f64::EPSILON);
-        assert!(stream.next_sample().unwrap().is_none());
+        assert!(
+            stream
+                .next_sample()
+                .map_err(|err| err.to_string())?
+                .is_none()
+        );
+        Ok(())
     }
 }

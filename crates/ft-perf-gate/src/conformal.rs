@@ -108,11 +108,23 @@ pub fn fit_band_from_samples(
     let claim_id = samples
         .first()
         .map_or_else(|| "unknown".to_string(), |sample| sample.claim_id.clone());
+    let Some(lower) = values.first().copied() else {
+        return Err(GateDecision::LowConfidence {
+            reason: "calibration samples must not be empty".to_string(),
+            confidence: None,
+        });
+    };
+    let Some(upper) = values.last().copied() else {
+        return Err(GateDecision::LowConfidence {
+            reason: "calibration samples must not be empty".to_string(),
+            confidence: None,
+        });
+    };
 
     Ok(ConformalBand {
         claim_id,
-        lower: values[0],
-        upper: values[values.len() - 1],
+        lower,
+        upper,
         calibration_samples: values.len(),
         alpha: config.alpha,
     })
@@ -123,16 +135,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fits_conservative_band() {
+    fn fits_conservative_band() -> Result<(), String> {
         let samples = [
             EvidenceSample::new("robot.p95", 3.0, "ms", 1, 1),
             EvidenceSample::new("robot.p95", 4.0, "ms", 1, 2),
             EvidenceSample::new("robot.p95", 5.0, "ms", 1, 3),
         ];
-        let band = fit_band_from_samples(&samples, &ConformalConfig::default()).unwrap();
+        let band = match fit_band_from_samples(&samples, &ConformalConfig::default()) {
+            Ok(band) => band,
+            Err(decision) => return Err(format!("unexpected decision: {decision:?}")),
+        };
         assert!((band.lower - 3.0).abs() < f64::EPSILON);
         assert!((band.upper - 5.0).abs() < f64::EPSILON);
         assert!(matches!(band.decide(4.5), GateDecision::Accept { .. }));
         assert!(matches!(band.decide(8.0), GateDecision::Reject { .. }));
+        Ok(())
     }
 }

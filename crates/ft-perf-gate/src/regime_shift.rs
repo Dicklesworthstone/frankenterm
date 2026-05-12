@@ -81,11 +81,12 @@ pub fn detect_from_samples(
         };
     }
 
-    let split = samples.len() / 2;
-    let Some(left_mean) = mean_value(&samples[..split]) else {
+    let split_index = samples.len() / 2;
+    let (left_samples, right_samples) = samples.split_at(split_index);
+    let Some(left_mean) = mean_value(left_samples) else {
         return low_confidence_report(claim_id, "left window mean is not finite");
     };
-    let Some(right_mean) = mean_value(&samples[split..]) else {
+    let Some(right_mean) = mean_value(right_samples) else {
         return low_confidence_report(claim_id, "right window mean is not finite");
     };
     let denominator = left_mean.abs().max(f64::EPSILON);
