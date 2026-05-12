@@ -443,11 +443,8 @@ impl MuxPool {
 
     /// Spawn a new mux pane/tab through a pooled connection.
     pub async fn spawn_v2(&self, spawn: SpawnV2) -> Result<SpawnResponse, MuxPoolError> {
-        self.execute_once("spawn_v2", move |client| {
-            let spawn = spawn.clone();
-            Box::pin(client.spawn_v2(spawn))
-        })
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.spawn_v2_with_cx(&cx, spawn).await
     }
 
     /// Spawn a new mux pane/tab through a pooled connection using explicit `Cx`.
@@ -467,11 +464,8 @@ impl MuxPool {
 
     /// Split an existing pane through a pooled connection.
     pub async fn split_pane(&self, split: SplitPane) -> Result<SpawnResponse, MuxPoolError> {
-        self.execute_once("split_pane", move |client| {
-            let split = split.clone();
-            Box::pin(client.split_pane(split))
-        })
-        .await
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.split_pane_with_cx(&cx, split).await
     }
 
     /// Split an existing pane through a pooled connection using explicit `Cx`.

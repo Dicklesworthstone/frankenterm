@@ -165,6 +165,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # whose `_with_cx` variant carries the seal.
     ("vendored/mux_client.rs", "connect"),
     ("vendored/mux_client.rs", "list_panes"),
+    ("vendored/mux_client.rs", "spawn_v2"),
+    ("vendored/mux_client.rs", "split_pane"),
     ("vendored/mux_client.rs", "get_pane_render_changes"),
     ("vendored/mux_client.rs", "get_lines"),
     ("vendored/mux_client.rs", "write_to_pane"),
@@ -187,6 +189,8 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # methods that delegate through to the underlying mux_client's
     # `_with_cx` chain.
     ("vendored/mux_pool.rs", "list_panes"),
+    ("vendored/mux_pool.rs", "spawn_v2"),
+    ("vendored/mux_pool.rs", "split_pane"),
     ("vendored/mux_pool.rs", "get_lines"),
     ("vendored/mux_pool.rs", "get_pane_render_changes"),
     ("vendored/mux_pool.rs", "get_pane_render_changes_batch"),

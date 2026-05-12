@@ -40,7 +40,7 @@
       "wrapper_exempt": 5
     },
     "other": {
-      "covered": 355,
+      "covered": 362,
       "exempt_file": 43,
       "files": [
         "alerts.rs",
@@ -103,9 +103,9 @@
         "web_framework.rs",
         "wezterm.rs"
       ],
-      "total": 751,
+      "total": 765,
       "uncovered": 0,
-      "wrapper_exempt": 353
+      "wrapper_exempt": 360
     },
     "tx": {
       "covered": 0,
@@ -145,7 +145,7 @@
       "wrapper_exempt": 26
     }
   },
-  "generated_at": "2026-05-04T11:51:55Z",
+  "generated_at": "2026-05-12T08:36:06Z",
   "labruntime_coverage": {
     "by_bucket": {
       "capture": {
@@ -203,10 +203,10 @@
   },
   "schema_version": 2,
   "totals": {
-    "covered_sites": 406,
+    "covered_sites": 413,
     "exempt_file_sites": 43,
-    "total_sites": 844,
+    "total_sites": 858,
     "uncovered_sites": 0,
-    "wrapper_exempt_sites": 395
+    "wrapper_exempt_sites": 402
   }
 }

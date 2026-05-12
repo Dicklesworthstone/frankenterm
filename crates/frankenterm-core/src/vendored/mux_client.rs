@@ -407,14 +407,8 @@ impl DirectMuxClient {
 
     /// Spawn a new mux pane/tab through the native mux protocol.
     pub async fn spawn_v2(&mut self, spawn: SpawnV2) -> Result<SpawnResponse, DirectMuxError> {
-        let response = self.send_request(Pdu::SpawnV2(spawn)).await?;
-        match response {
-            Pdu::SpawnResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "SpawnResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
-        }
+        let cx = ambient_mux_cx();
+        self.spawn_v2_with_cx(&cx, spawn).await
     }
 
     /// Spawn a new mux pane/tab through the native mux protocol with explicit Cx.
@@ -435,14 +429,8 @@ impl DirectMuxClient {
 
     /// Split an existing pane through the native mux protocol.
     pub async fn split_pane(&mut self, split: SplitPane) -> Result<SpawnResponse, DirectMuxError> {
-        let response = self.send_request(Pdu::SplitPane(split)).await?;
-        match response {
-            Pdu::SpawnResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "SpawnResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
-        }
+        let cx = ambient_mux_cx();
+        self.split_pane_with_cx(&cx, split).await
     }
 
     /// Split an existing pane through the native mux protocol with explicit Cx.
