@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_stream_drains_in_order() {
+    fn vector_stream_drains_in_order() -> Result<(), String> {
         let samples = vec![
             EvidenceSample::new("a", 1.0, "ms", 1, 1),
             EvidenceSample::new("a", 2.0, "ms", 1, 2),
@@ -382,13 +382,21 @@ mod tests {
             Err(err) => match err {},
         };
         assert_eq!(drained.len(), 2);
-        assert!((drained[0].metric_value - 1.0).abs() < f64::EPSILON);
-        assert!((drained[1].metric_value - 2.0).abs() < f64::EPSILON);
+        let mut drained_iter = drained.iter();
+        let first = drained_iter
+            .next()
+            .ok_or_else(|| "first sample missing after len check".to_string())?;
+        let second = drained_iter
+            .next()
+            .ok_or_else(|| "second sample missing after len check".to_string())?;
+        assert!((first.metric_value - 1.0).abs() < f64::EPSILON);
+        assert!((second.metric_value - 2.0).abs() < f64::EPSILON);
         let next = match stream.next_sample() {
             Ok(next) => next,
             Err(err) => match err {},
         };
         assert!(next.is_none());
+        Ok(())
     }
 
     #[test]
