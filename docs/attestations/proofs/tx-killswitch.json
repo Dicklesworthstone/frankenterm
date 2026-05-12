@@ -1,0 +1,82 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "tx-killswitch-formal-method-attestation",
+  "category": "proofs/tx-killswitch",
+  "release_version": "0.0.0-substrate",
+  "produced_by_bead": "ft-tf6g3.12",
+  "status": "pass",
+  "scope": "Machine-readable release-bundle attestation for the Mission/TX kill-switch formal-method proof. The proof covers the prepare, commit, compensate, kill-switch, and drain transitions modeled by the TX kill-switch TLA+ spec and Rust state-space harness.",
+  "proof_model": {
+    "mode": "tla_plus_and_rust_state_space",
+    "tla_spec": "docs/specs/tx-killswitch.tla",
+    "tla_config": "docs/specs/tx-killswitch.cfg",
+    "rust_model": "crates/frankenterm-core/src/tx_killswitch_model.rs",
+    "rust_harness": "crates/frankenterm-core/tests/tx_killswitch_model.rs",
+    "invariants": [
+      "NoSilentPartialCommit",
+      "NoOrphanCompensation",
+      "StepIdsInBound",
+      "HardStopAdmitsProgress"
+    ],
+    "state_space_bounds": {
+      "tlc_step_count": 2,
+      "rust_exhaustive_step_counts": [2, 3],
+      "ci_random_schedule_count": 1000000,
+      "max_actions_per_random_schedule": 32
+    }
+  },
+  "latest_tlc_summary": {
+    "command": "scripts/run-tlc.sh --timeout-secs 120 --workers auto docs/specs/tx-killswitch.tla",
+    "status": "pass",
+    "state_count": 258,
+    "distinct_state_count": 87,
+    "timed_out": false,
+    "deadlocks": 0,
+    "invariant_violations": 0
+  },
+  "ci_wiring": {
+    "workflow": ".github/workflows/ci.yml",
+    "job": "formal-methods",
+    "tlc_step": "Run TX kill-switch TLC model check",
+    "million_schedule_step": "Run TX kill-switch million-schedule proof",
+    "million_schedule_env": {
+      "FT_TX_KILLSWITCH_RANDOM_SCHEDULES": "1000000"
+    }
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/specs/tx-killswitch.tla",
+      "media_type": "application/x-tla+text"
+    },
+    {
+      "path": "docs/specs/tx-killswitch.cfg",
+      "media_type": "text/plain"
+    },
+    {
+      "path": "docs/specs/tx-killswitch-mapping.md",
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "docs/specs/tx-killswitch.md",
+      "media_type": "text/markdown"
+    },
+    {
+      "path": "crates/frankenterm-core/src/tx_killswitch_model.rs",
+      "media_type": "text/plain"
+    },
+    {
+      "path": "crates/frankenterm-core/tests/tx_killswitch_model.rs",
+      "media_type": "text/plain"
+    },
+    {
+      "path": "scripts/run-tlc.sh",
+      "media_type": "text/plain"
+    }
+  ],
+  "release_bundle": {
+    "manifest_path": "docs/attestations/manifest.json",
+    "manifest_category": "proofs/tx-killswitch",
+    "required_category": true,
+    "bundle_hashing": "scripts/attestation-build.sh hashes this artifact into every strict release bundle."
+  }
+}

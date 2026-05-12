@@ -331,6 +331,40 @@ jobs:
           FT_REPLAY_GOLDEN_MATRIX_TARGET: ${{ matrix.target_triple }}
         run: cargo test -p frankenterm-core-replay golden_matrix
 
+  formal-methods:
+    name: Formal Methods
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: formal-methods
+
+      - name: Install Linux workspace build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+
+      - name: Install TLA+ tools
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -o /tmp/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          echo "742aaa175541332011ff63c0246d5d759d30a620  /tmp/tla2tools.jar" | sha1sum -c -
+          java -version
+
+      - name: Check formal spec conventions
+        run: scripts/check-spec-conventions.sh
+
+      - name: Run TX kill-switch TLC model check
+        run: scripts/run-tlc.sh --timeout-secs 120 --workers auto docs/specs/tx-killswitch.tla
+
+      - name: Run TX kill-switch million-schedule proof
+        env:
+          FT_TX_KILLSWITCH_RANDOM_SCHEDULES: "1000000"
+        run: cargo test -p frankenterm-core --test tx_killswitch_model random_schedule_never_violates_safety_invariants -- --nocapture
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -10,13 +10,17 @@
 //!    safety invariant holds. The state space at `step_count = 3`
 //!    is small enough (~few thousand reachable states) that
 //!    exhaustive exploration finishes in milliseconds.
-//! 2. **Proptest fuzz with random schedules.** 1000 cases × 32
-//!    actions each = 32,000 schedules per CI run. The bead's
-//!    "≥1M random schedules per CI run" target is reached by
-//!    multiplying out (the integration bead's CI lane runs more
-//!    cases per case). Asserts the same invariants on every
+//! 2. **Proptest fuzz with random schedules.** 1000 cases × up
+//!    to 32 actions each keep the always-on local lane cheap.
+//! 3. **Million-schedule CI proof.** The
+//!    `random_schedule_never_violates_safety_invariants` test
+//!    runs a deterministic pseudo-random schedule corpus. Local
+//!    runs default to 1000 schedules; CI sets
+//!    `FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000` to satisfy the
+//!    bead's explicit ≥1M random schedules per CI run target.
+//!    Both random lanes assert the same invariants on every
 //!    visited state.
-//! 3. **Stateright-shape API.** The harness's BFS body has the
+//! 4. **Stateright-shape API.** The harness's BFS body has the
 //!    same shape Stateright would produce — `enabled_actions →
 //!    apply → assert_invariants → enqueue`. If the workspace
 //!    later adopts Stateright, swapping in is mechanical.
@@ -29,6 +33,26 @@ use frankenterm_core::tx_killswitch_model::{
     hard_stop_admits_progress, is_drained,
 };
 use proptest::prelude::*;
+
+const DEFAULT_RANDOM_SCHEDULES: u64 = 1_000;
+const DEFAULT_RANDOM_SCHEDULE_LEN: u8 = 32;
+
+fn configured_random_schedule_count() -> u64 {
+    std::env::var("FT_TX_KILLSWITCH_RANDOM_SCHEDULES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RANDOM_SCHEDULES)
+}
+
+fn next_lcg(seed: &mut u64) -> u64 {
+    // PCG's default LCG constants give a small deterministic corpus
+    // without adding a rand dependency to this proof harness.
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    *seed
+}
 
 // ============================================================================
 // Test 1 — Exhaustive BFS at step_count = 2
@@ -235,7 +259,7 @@ proptest! {
     /// reached by multiplying out across CI tiers; this proptest
     /// is the always-on regression net at 32k.
     #[test]
-    fn random_schedule_never_violates_safety_invariants(
+    fn proptest_random_schedule_never_violates_safety_invariants(
         action_indices in proptest::collection::vec(arb_action_index(), 0..32),
         step_count in 1u8..=3,
     ) {
@@ -317,7 +341,59 @@ proptest! {
 }
 
 // ============================================================================
-// Test 6 — Acyclicity in the projection
+// Test 6 — Deterministic million-schedule random corpus
+// ============================================================================
+
+#[test]
+fn random_schedule_never_violates_safety_invariants() {
+    let explicit_schedule_count = std::env::var("FT_TX_KILLSWITCH_RANDOM_SCHEDULES").ok();
+    let schedule_count = configured_random_schedule_count();
+    let mut schedules_run = 0u64;
+    let mut transitions_checked = 0u64;
+    let mut seed = 0x6674_2d74_782d_6b73u64;
+
+    for schedule_idx in 0..schedule_count {
+        let step_count = (next_lcg(&mut seed) % 3 + 1) as u8;
+        let mut state = KillSwitchModelState::initial(step_count);
+
+        for _ in 0..DEFAULT_RANDOM_SCHEDULE_LEN {
+            let actions = enabled_actions(&state);
+            if actions.is_empty() {
+                break;
+            }
+
+            let action_index = (next_lcg(&mut seed) as usize) % actions.len();
+            state = apply(&state, actions[action_index]);
+            transitions_checked += 1;
+
+            let violations = check_safety(&state);
+            assert!(
+                violations.is_empty(),
+                "safety violation at schedule {schedule_idx}, state {state:?}: {violations:?}"
+            );
+            assert!(
+                hard_stop_admits_progress(&state),
+                "HardStop progress invariant violated at schedule {schedule_idx}, state {state:?}"
+            );
+        }
+
+        schedules_run += 1;
+    }
+
+    assert_eq!(schedules_run, schedule_count);
+    if explicit_schedule_count.is_some() {
+        assert!(
+            schedules_run >= 1_000_000,
+            "explicit TX kill-switch proof lane must run at least 1,000,000 random schedules; ran {schedules_run}"
+        );
+    }
+    println!(
+        "tx kill-switch random corpus: schedules={schedules_run} transitions={transitions_checked}"
+    );
+}
+
+// ============================================================================
+// Test 7 — Acyclicity in the projection
 //
 // Projected onto MissionTxState alone (ignoring kill-switch + step
 // sets), the reachable graph respects the documented forward

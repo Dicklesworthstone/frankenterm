@@ -271,6 +271,7 @@
         "proofs/loom-runtime-async",
         "proofs/runtime-proof-trait",
         "proofs/robot-contracts",
+        "proofs/tx-killswitch",
         "doctrine/agents-md-counts",
         "doctrine/vendored-provenance",
         "doctrine/cx-propagation",

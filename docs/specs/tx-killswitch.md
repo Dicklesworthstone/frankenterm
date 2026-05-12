@@ -137,22 +137,24 @@ state set.
 | BFS exhaustive | 2 | ~hundreds | <10ms | All safety + liveness pass |
 | BFS exhaustive | 3 | ~thousands | <100ms | All safety + liveness pass |
 | Proptest fuzz | 1..3 | up to 32 actions/case × 1000 cases | <100ms | All safety + liveness pass on every visited state |
+| CI random corpus | 1..3 | 1,000,000 deterministic pseudo-random schedules × up to 32 actions | CI lane | All safety + liveness pass on every visited state |
+| TLC model check | 2 | 258 states / 87 distinct states | <120s budget | 0 invariant violations, 0 deadlocks |
 | Adversarial recovery | 2 | random + flip-Off + greedy | <100ms | Always reaches drained within 100 steps |
 
-Total ≈ 32,000 schedule trials per CI run. The bead's "≥1M
-random schedules per CI run" target is reached by multiplying
-across CI tiers (e.g., a heavy lane that runs the proptest at
-30,000 cases produces ~960,000 schedule trials per run).
+Local runs keep the deterministic random corpus at 1000
+schedules. CI sets `FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000`
+in the `formal-methods` workflow job, so the release gate
+executes the bead's explicit ≥1M random schedules per CI run.
 
 ## Bead acceptance status
 
 | Item | Status |
 |---|---|
 | TLA+ spec at docs/specs/tx-killswitch.tla | ✓ |
-| Stateright-shape harness at tests/tx_killswitch_model.rs | ✓ (hand-rolled BFS — same shape Stateright would produce) |
-| Property test ≥1M random schedules per CI run | ✓ at 32k always-on; 1M with multiplied CI tiers |
-| Attestation entry shipped | ⏳ depends on `ft-syqcz.1` — separate bead |
-| TLC checks safety + liveness | ⏳ runner script is the integration follow-on; the spec itself is shipped |
+| Stateright-shape harness at crates/frankenterm-core/tests/tx_killswitch_model.rs | ✓ (hand-rolled BFS — same shape Stateright would produce) |
+| Property test ≥1M random schedules per CI run | ✓ via `.github/workflows/ci.yml` `formal-methods` job |
+| Attestation entry shipped | ✓ `docs/attestations/proofs/tx-killswitch.json` under required `proofs/tx-killswitch` |
+| TLC checks safety + liveness | ✓ `scripts/run-tlc.sh --timeout-secs 120 --workers auto docs/specs/tx-killswitch.tla` |
 | Stateright-in-Rust drives actual tx_execution.rs | ⏳ requires the production engine to be exercised; this bead's Stateright-shape harness drives the model. The integration bead links the harness to the real engine. |
 
 ## Cross-references
@@ -169,10 +171,10 @@ across CI tiers (e.g., a heavy lane that runs the proptest at
 - **Trauma-guard cross-link:** failures observed during
   proptest fuzz feed the trauma-guard catalog (the bead's
   action #4).
-- **Attestation cross-link:** `BR-RC-FOUNDATION.G3.1`
-  (`ft-syqcz.1`) — the attestation graph schema bead. Per-
-  release attestation entry for the kill-switch proof is
-  authored once that schema lands.
+- **Attestation cross-link:**
+  `docs/attestations/proofs/tx-killswitch.json` is wired into
+  the required `proofs/tx-killswitch` manifest category. Strict
+  release builds hash it into the signed bundle.
 
 ## Re-running
 
@@ -183,7 +185,11 @@ CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ \
 cargo test -p frankenterm-core --test tx_killswitch_model \
     --features asupersync-runtime --no-default-features
 
-# TLA+ TLC (operator runs externally; the spec at
-# docs/specs/tx-killswitch.tla is the input).
-java -jar tla2tools.jar -workers auto docs/specs/tx-killswitch.tla
+# CI-grade deterministic random corpus.
+FT_TX_KILLSWITCH_RANDOM_SCHEDULES=1000000 \
+cargo test -p frankenterm-core --test tx_killswitch_model \
+    random_schedule_never_violates_safety_invariants -- --nocapture
+
+# TLA+ TLC.
+scripts/run-tlc.sh --timeout-secs 120 --workers auto docs/specs/tx-killswitch.tla
 ```

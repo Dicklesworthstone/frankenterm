@@ -35,6 +35,7 @@ The producing-bead column is the source of truth for which work item gates the a
 | `proofs/loom-runtime-async` | `ft-e87u6.12` | G8 |
 | `proofs/runtime-proof-trait` | `ft-i2eni.1` | G1 |
 | `proofs/robot-contracts` | `ft-0elb9` | G2 |
+| `proofs/tx-killswitch` | `ft-tf6g3.12` | G27 |
 | `doctrine/agents-md-counts` | `ft-tf6g3.2` | G6 / G17 |
 | `doctrine/cx-propagation` | `ft-q0tz3` | G14.2 |
 
@@ -44,6 +45,12 @@ present but are not in `required_categories` yet. Current optional slots include
 `docs/attestations/doctrine/tokio-eradication-status.json` substrate
 (`ft-tf6g3.7`, under `proofs/runtime-proof-trait`), and
 `perf/atlas-packing` (`ft-gtcm9.5`).
+
+`proofs/tx-killswitch` hashes
+`docs/attestations/proofs/tx-killswitch.json`, which points at the
+TLA+ spec, TLC summary contract, Rust state-space harness, and
+CI million-schedule random invariant lane for the Mission/TX
+kill-switch proof.
 
 `proofs/robot-contracts` was introduced under `ft-q5njp` and refreshed under
 `ft-0elb9`. It is repository evidence: it attests checked-in schema, golden

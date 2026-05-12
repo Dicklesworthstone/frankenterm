@@ -12,6 +12,7 @@
     "proofs/loom-runtime-async",
     "proofs/runtime-proof-trait",
     "proofs/robot-contracts",
+    "proofs/tx-killswitch",
     "doctrine/agents-md-counts",
     "doctrine/cx-propagation"
   ],
@@ -119,6 +120,14 @@
       "produced_by_bead": "ft-0elb9",
       "proof_categories": [4, 2],
       "description": "Robot/MCP/CLI control-plane golden matrix for schema-backed envelopes, live profile/fleet mutation receipts, and backend-unavailable/policy/approval failure contracts (G2; originally introduced under ft-q5njp)."
+    },
+    {
+      "category": "proofs/tx-killswitch",
+      "path": "docs/attestations/proofs/tx-killswitch.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-tf6g3.12",
+      "proof_categories": [6, 2],
+      "description": "TX kill-switch formal-method attestation: TLA+ TLC pass, Rust BFS state-space proof, and CI million-schedule random invariant lane."
     },
     {
       "category": "doctrine/agents-md-counts",
