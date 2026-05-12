@@ -42,10 +42,7 @@ use frankenterm_core::proof_doctor::{
 use frankenterm_core::proof_handoff::build_proof_handoff;
 use frankenterm_core::proof_lane::{ProofBackend, ProofScope};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
-use frankenterm_core::swarm_scheduler::{
-    AdmissionRequest, HerdWaveDetectionConfig, HerdWaveEventKind, HerdWaveSignal,
-    SwarmAdmissionController, SwarmAdmissionTelemetry,
-};
+use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
 
 /// Build metadata captured at compile time.
 mod build_meta {
@@ -17249,82 +17246,18 @@ fn build_herd_wave_surface_report(
     signal_spacing_ms: u64,
     max_age_ms: u64,
 ) -> serde_json::Value {
-    let config = HerdWaveDetectionConfig::default();
-    let signal_tail_len = u64::try_from(signal_panes.len().saturating_sub(1)).unwrap_or(u64::MAX);
-    let first_signal_ms =
-        generated_at_ms.saturating_sub(signal_spacing_ms.saturating_mul(signal_tail_len));
-    let signals = signal_panes
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, pane_id)| {
-            let index = u64::try_from(index).unwrap_or(u64::MAX);
-            HerdWaveSignal::pane(
-                pane_id,
-                kind,
-                first_signal_ms.saturating_add(signal_spacing_ms.saturating_mul(index)),
-            )
-        })
-        .collect::<Vec<_>>();
-    let wave_summary = if signals.is_empty() {
-        None
-    } else {
-        Some(frankenterm_core::swarm_scheduler::detect_herd_wave_pressure(&signals, &config))
-    };
-    let telemetry = SwarmAdmissionTelemetry {
-        queue_pressure: None,
-        fleet_pressure: None,
-        memory_tier_budget: None,
-        latency_stage_pressures: None,
-        herd_wave_pressure: wave_summary.clone(),
-    };
-    let estimated_effort = u32::try_from(signal_panes.len().max(1)).unwrap_or(u32::MAX);
-    let admission_request = AdmissionRequest::standard(5, estimated_effort);
-    let admission_decision =
-        SwarmAdmissionController::default().evaluate(&admission_request, &telemetry);
-    let snapshot = frankenterm_core::swarm_scheduler::HerdWaveContractSnapshot::from_telemetry(
-        generated_at_ms,
-        source,
-        &telemetry,
-        Some(&admission_decision),
-        (!signals.is_empty()).then_some(generated_at_ms),
-        max_age_ms,
-    );
-    let dry_run_plan = frankenterm_core::swarm_scheduler::plan_herd_wave_dry_run_actions(
-        generated_at_ms,
-        &signals,
-        &config,
-        Some(&admission_decision),
-        None,
-    );
-
-    let mut report = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
-    if let serde_json::Value::Object(map) = &mut report {
-        map.insert(
-            "dry_run_plan".to_string(),
-            serde_json::to_value(dry_run_plan).unwrap_or(serde_json::Value::Null),
-        );
-        map.insert(
-            "signal_input".to_string(),
-            serde_json::json!({
-                "signal_count": signals.len(),
-                "signal_panes": signal_panes,
-                "kind": kind,
-                "signal_spacing_ms": signal_spacing_ms,
-                "manual_signals_only": true,
-            }),
-        );
-        map.insert(
-            "mcp_resource".to_string(),
-            serde_json::json!({
-                "implemented": false,
-                "deferred_follow_up": "ft-5bwjf.8",
-                "reason": "mcp_resources.rs has active context-horizon edits; herd-wave MCP parity is isolated to a follow-up bead.",
-                "read_only_required": true,
-            }),
-        );
-    }
-    report
+    serde_json::to_value(
+        frankenterm_core::swarm_scheduler::build_herd_wave_surface_report(
+            source,
+            generated_at_ms,
+            signal_panes,
+            kind,
+            signal_spacing_ms,
+            max_age_ms,
+            HerdWaveMcpResourceSurface::implemented("wa://herd-wave"),
+        ),
+    )
+    .unwrap_or(serde_json::Value::Null)
 }
 
 fn herd_wave_report_text<'a>(report: &'a serde_json::Value, key: &str) -> &'a str {
@@ -67211,7 +67144,15 @@ log_level = "debug"
                 .iter()
                 .any(|reason| reason.as_str() == Some("herd_wave.dry_run.no_live_mutation"))
         );
-        assert_eq!(report["mcp_resource"]["implemented"].as_bool(), Some(false));
+        assert_eq!(report["mcp_resource"]["implemented"].as_bool(), Some(true));
+        assert_eq!(
+            report["mcp_resource"]["uri"].as_str(),
+            Some("wa://herd-wave")
+        );
+        assert_eq!(
+            report["mcp_resource"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
 
         let response = RobotResponse::success(report, 17);
         let json_value = serde_json::to_value(&response).expect("robot response serializes");

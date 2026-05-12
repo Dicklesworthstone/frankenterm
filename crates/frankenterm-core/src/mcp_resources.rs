@@ -18,6 +18,9 @@ use crate::mcp_framework::{
 
 use crate::context_horizon::predict_context_horizon_from_sqlite;
 use crate::mcp_error::MCP_ERR_STORAGE;
+use crate::swarm_scheduler::{
+    HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
+};
 
 use super::mcp_tools::{
     WaAccountsTool, WaEventsTool, WaReservationsTool, WaRulesListTool, WaStateTool,
@@ -493,6 +496,49 @@ impl ResourceHandler for WaWorkflowsResource {
     }
 }
 
+pub(super) struct WaHerdWaveResource;
+
+impl ResourceHandler for WaHerdWaveResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://herd-wave".to_string(),
+            name: "ft herd wave".to_string(),
+            description: Some(
+                "Read-only herd-wave contract and dry-run planner surface".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "herd-wave".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let report = build_herd_wave_surface_report(
+            "mcp.herd_wave",
+            generated_at_ms,
+            &[],
+            HerdWaveEventKind::Wake,
+            10,
+            60_000,
+            HerdWaveMcpResourceSurface::implemented("wa://herd-wave"),
+        );
+        envelope_as_resource(
+            "wa://herd-wave",
+            McpEnvelope::success(report, elapsed_ms(start)),
+        )
+    }
+}
+
 pub(super) struct WaContextHorizonResource {
     db_path: Arc<PathBuf>,
 }
@@ -643,9 +689,9 @@ mod tests {
     use super::{
         WaAccountsByServiceTemplateResource, WaAccountsResource, WaContextHorizonResource,
         WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
-        WaPanesResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
-        WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource, envelope_as_resource,
-        tool_output_as_resource,
+        WaHerdWaveResource, WaPanesResource, WaReservationsByPaneTemplateResource,
+        WaReservationsResource, WaRulesByAgentTemplateResource, WaRulesResource,
+        WaWorkflowsResource, envelope_as_resource, tool_output_as_resource,
     };
     use crate::config::{Config, PaneFilterConfig};
     use crate::mcp_framework::{
@@ -771,6 +817,46 @@ mod tests {
         let def = resource.definition();
         assert_eq!(def.uri, "wa://workflows");
         assert!(def.tags.contains(&"workflows".to_string()));
+    }
+
+    #[test]
+    fn herd_wave_resource_definition_uri() {
+        let def = WaHerdWaveResource.definition();
+        assert_eq!(def.uri, "wa://herd-wave");
+        assert!(def.tags.contains(&"herd-wave".to_string()));
+        assert!(def.tags.contains(&"operator".to_string()));
+    }
+
+    #[test]
+    fn herd_wave_resource_reads_v1_contract_without_mutation() {
+        let resource = WaHerdWaveResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let contents = resource.read(&ctx).expect("read herd-wave resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["contract_id"].as_str(),
+            Some(crate::swarm_scheduler::HERD_WAVE_CONTRACT_ID)
+        );
+        assert_eq!(payload["data"]["source"].as_str(), Some("mcp.herd_wave"));
+        assert_eq!(
+            payload["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["dry_run_plan"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["mcp_resource"]["implemented"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            payload["data"]["mcp_resource"]["uri"].as_str(),
+            Some("wa://herd-wave")
+        );
     }
 
     #[test]

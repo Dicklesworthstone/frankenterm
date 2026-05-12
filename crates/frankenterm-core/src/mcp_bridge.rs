@@ -9,12 +9,13 @@ use super::{
     WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaContextHorizonResource,
     WaEventsAnnotateTool, WaEventsLabelTool, WaEventsResource, WaEventsTemplateResource,
     WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource, WaGetTextTool,
-    WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool,
-    WaMissionStateTool, WaPanesResource, WaReleaseTool, WaReservationsByPaneTemplateResource,
-    WaReservationsResource, WaReservationsTool, WaReserveTool, WaRulesByAgentTemplateResource,
-    WaRulesListTool, WaRulesResource, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
-    WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
-    WaWorkflowStatusTool, WaWorkflowsResource, build_mcp_shared_rate_limiter,
+    WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool,
+    WaMissionResumeTool, WaMissionStateTool, WaPanesResource, WaReleaseTool,
+    WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
+    WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
+    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
+    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+    WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
 use crate::mcp_framework::{
     FrameworkServer as Server, framework_server_builder, run_framework_stdio_server,
@@ -268,6 +269,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             db_path.clone(),
         ))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
+        .resource(WaHerdWaveResource)
         .resource(WaRulesResource)
         .resource(WaRulesByAgentTemplateResource);
 

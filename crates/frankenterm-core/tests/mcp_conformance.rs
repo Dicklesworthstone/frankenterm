@@ -388,3 +388,42 @@ fn mcp_conformance_workflows_resource_returns_counted_json_payload() {
         "workflow items should expose stable metadata"
     );
 }
+
+#[test]
+fn mcp_conformance_herd_wave_resource_matches_robot_contract_shape() {
+    let mut client = spawn_client(None);
+    let resources = client
+        .read_resource("wa://herd-wave")
+        .expect("read wa://herd-wave");
+    let resource = resources.first().expect("herd-wave resource entry");
+
+    assert_eq!(resource.uri, "wa://herd-wave");
+    assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
+    assert!(resource.blob.is_none());
+
+    let envelope = parse_resource_envelope(&resources);
+    assert_success_envelope_shape(&envelope);
+    let data = &envelope["data"];
+    assert_eq!(data["contract_id"].as_str(), Some("ft.herd_wave.v1"));
+    assert_eq!(data["source"].as_str(), Some("mcp.herd_wave"));
+    assert_eq!(data["raw_pane_content_stored"].as_bool(), Some(false));
+    assert_eq!(
+        data["dry_run_plan"]["live_mutation_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        data["dry_run_plan"]["reason_codes"]
+            .as_array()
+            .expect("reason codes array")
+            .iter()
+            .any(|reason| reason.as_str() == Some("herd_wave.dry_run.no_live_mutation")),
+        true
+    );
+    assert_eq!(data["mcp_resource"]["implemented"].as_bool(), Some(true));
+    assert_eq!(data["mcp_resource"]["uri"].as_str(), Some("wa://herd-wave"));
+    assert_eq!(
+        data["mcp_resource"]["live_mutation_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(data["signal_input"]["signal_count"].as_u64(), Some(0));
+}

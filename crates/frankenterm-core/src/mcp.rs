@@ -113,9 +113,9 @@ pub use mcp_proxy::{
 };
 use mcp_resources::{
     WaAccountsByServiceTemplateResource, WaAccountsResource, WaContextHorizonResource,
-    WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource, WaPanesResource,
-    WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
-    WaRulesResource, WaWorkflowsResource,
+    WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
+    WaHerdWaveResource, WaPanesResource, WaReservationsByPaneTemplateResource,
+    WaReservationsResource, WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource,
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,

@@ -321,6 +321,71 @@ pub struct HerdWaveDryRunPlan {
     pub calendar: Vec<HerdWaveDryRunCalendarEntry>,
 }
 
+/// Input echo included in read-only herd-wave surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveSignalInput {
+    /// Number of modeled signal rows consumed by the surface.
+    pub signal_count: usize,
+    /// Pane IDs represented by the modeled signal rows.
+    pub signal_panes: Vec<u64>,
+    /// Modeled event family applied to the signal rows.
+    pub kind: HerdWaveEventKind,
+    /// Milliseconds between modeled pane signals.
+    pub signal_spacing_ms: u64,
+    /// Herd-wave surfaces never read raw pane content.
+    pub manual_signals_only: bool,
+}
+
+/// MCP parity metadata embedded in herd-wave robot/doctor/MCP surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HerdWaveMcpResourceSurface {
+    /// Whether the read-only MCP resource is implemented.
+    pub implemented: bool,
+    /// Resource URI when implemented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// Follow-up bead retained only for old deferred surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_follow_up: Option<String>,
+    /// Operator-facing reason for the current MCP resource state.
+    pub reason: String,
+    /// The MCP parity surface is always read-only.
+    pub read_only_required: bool,
+    /// Hard false sentinel: this surface never mutates panes/RCH/Agent Mail.
+    pub live_mutation_allowed: bool,
+}
+
+impl HerdWaveMcpResourceSurface {
+    /// Metadata for the implemented read-only MCP resource.
+    #[must_use]
+    pub fn implemented(uri: impl Into<String>) -> Self {
+        Self {
+            implemented: true,
+            uri: Some(uri.into()),
+            deferred_follow_up: None,
+            reason:
+                "read-only MCP resource exposes the same herd-wave v1 contract and dry-run planner"
+                    .to_string(),
+            read_only_required: true,
+            live_mutation_allowed: false,
+        }
+    }
+}
+
+/// Full read-only herd-wave surface shared by robot, doctor, and MCP.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HerdWaveSurfaceReport {
+    /// Flattened v1 contract snapshot.
+    #[serde(flatten)]
+    pub snapshot: HerdWaveContractSnapshot,
+    /// Non-mutating operator calendar.
+    pub dry_run_plan: HerdWaveDryRunPlan,
+    /// Modeled signal input for deterministic replay.
+    pub signal_input: HerdWaveSignalInput,
+    /// MCP resource parity state.
+    pub mcp_resource: HerdWaveMcpResourceSurface,
+}
+
 /// Contract id for the v1 herd-wave operator snapshot.
 pub const HERD_WAVE_CONTRACT_ID: &str = "ft.herd_wave.v1";
 
@@ -2359,6 +2424,84 @@ pub fn plan_herd_wave_dry_run_actions(
         cooldown_notes,
         circuit_breaker_notes,
         calendar,
+    }
+}
+
+/// Build the shared read-only herd-wave surface used by robot, doctor, and MCP.
+///
+/// The function consumes only caller-supplied signal metadata. It never reads
+/// pane text and never mutates panes, RCH, Agent Mail, queues, or workflow state.
+#[must_use]
+pub fn build_herd_wave_surface_report(
+    source: &str,
+    generated_at_ms: u64,
+    signal_panes: &[u64],
+    kind: HerdWaveEventKind,
+    signal_spacing_ms: u64,
+    max_age_ms: u64,
+    mcp_resource: HerdWaveMcpResourceSurface,
+) -> HerdWaveSurfaceReport {
+    let config = HerdWaveDetectionConfig::default();
+    let signal_tail_len = u64::try_from(signal_panes.len().saturating_sub(1)).unwrap_or(u64::MAX);
+    let first_signal_ms =
+        generated_at_ms.saturating_sub(signal_spacing_ms.saturating_mul(signal_tail_len));
+    let signals = signal_panes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, pane_id)| {
+            let index = u64::try_from(index).unwrap_or(u64::MAX);
+            HerdWaveSignal::pane(
+                pane_id,
+                kind,
+                first_signal_ms.saturating_add(signal_spacing_ms.saturating_mul(index)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let wave_summary = if signals.is_empty() {
+        None
+    } else {
+        Some(detect_herd_wave_pressure(&signals, &config))
+    };
+    let telemetry = SwarmAdmissionTelemetry {
+        queue_pressure: None,
+        fleet_pressure: None,
+        memory_tier_budget: None,
+        latency_stage_pressures: None,
+        herd_wave_pressure: wave_summary.clone(),
+    };
+    let estimated_effort = u32::try_from(signal_panes.len().max(1)).unwrap_or(u32::MAX);
+    let admission_request = AdmissionRequest::standard(5, estimated_effort);
+    let admission_decision =
+        SwarmAdmissionController::default().evaluate(&admission_request, &telemetry);
+    let snapshot = HerdWaveContractSnapshot::from_telemetry(
+        generated_at_ms,
+        source,
+        &telemetry,
+        Some(&admission_decision),
+        (!signals.is_empty()).then_some(generated_at_ms),
+        max_age_ms,
+    );
+    let dry_run_plan = plan_herd_wave_dry_run_actions(
+        generated_at_ms,
+        &signals,
+        &config,
+        Some(&admission_decision),
+        None,
+    );
+    let signal_input = HerdWaveSignalInput {
+        signal_count: signals.len(),
+        signal_panes: signal_panes.to_vec(),
+        kind,
+        signal_spacing_ms,
+        manual_signals_only: true,
+    };
+
+    HerdWaveSurfaceReport {
+        snapshot,
+        dry_run_plan,
+        signal_input,
+        mcp_resource,
     }
 }
 
