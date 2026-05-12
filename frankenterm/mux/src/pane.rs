@@ -600,24 +600,36 @@ pub fn impl_get_lines_via_with_lines<P: Pane + ?Sized>(
 mod test {
     use super::*;
     use k9::snapshot;
-    use parking_lot::{MappedMutexGuard, Mutex};
+    use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
     use std::borrow::Cow;
     use termwiz::surface::SEQ_ZERO;
 
     struct FakePane {
         lines: Mutex<Vec<Line>>,
+        size: Mutex<TerminalSize>,
+        writes: Mutex<Vec<u8>>,
+    }
+
+    impl FakePane {
+        fn new(lines: Vec<Line>) -> Self {
+            Self {
+                lines: Mutex::new(lines),
+                size: Mutex::new(TerminalSize::default()),
+                writes: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
-            unimplemented!()
+            0
         }
         fn get_cursor_position(&self) -> StableCursorPosition {
-            unimplemented!()
+            StableCursorPosition::default()
         }
 
         fn get_current_seqno(&self) -> SequenceNo {
-            unimplemented!()
+            SEQ_ZERO
         }
 
         fn get_changed_since(
@@ -625,7 +637,7 @@ mod test {
             _: Range<StableRowIndex>,
             _: SequenceNo,
         ) -> RangeSet<StableRowIndex> {
-            unimplemented!()
+            RangeSet::new()
         }
 
         fn with_lines_mut(
@@ -671,36 +683,51 @@ mod test {
             )
         }
         fn get_dimensions(&self) -> RenderableDimensions {
-            unimplemented!()
+            let size = *self.size.lock();
+            RenderableDimensions {
+                cols: size.cols,
+                viewport_rows: size.rows,
+                scrollback_rows: size.rows,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: size.dpi,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
+                reverse_video: false,
+            }
         }
 
         fn get_title(&self) -> String {
-            unimplemented!()
+            "fake-pane".to_string()
         }
         fn send_paste(&self, _: &str) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
         fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
             Ok(None)
         }
         fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
-            unimplemented!()
+            MutexGuard::map(self.writes.lock(), |writes| {
+                let writer: &mut dyn std::io::Write = writes;
+                writer
+            })
         }
-        fn resize(&self, _: TerminalSize) -> anyhow::Result<()> {
-            unimplemented!()
+        fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+            *self.size.lock() = size;
+            Ok(())
         }
 
         fn mouse_event(&self, _: MouseEvent) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
         fn is_dead(&self) -> bool {
-            unimplemented!()
+            false
         }
         fn palette(&self) -> ColorPalette {
-            unimplemented!()
+            ColorPalette::default()
         }
         fn domain_id(&self) -> DomainId {
-            unimplemented!()
+            1
         }
 
         fn is_mouse_grabbed(&self) -> bool {
@@ -713,10 +740,10 @@ mod test {
             None
         }
         fn key_down(&self, _: KeyCode, _: KeyModifiers) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
         fn key_up(&self, _: KeyCode, _: KeyModifiers) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
     }
 
@@ -749,6 +776,49 @@ mod test {
     }
 
     #[test]
+    fn fake_pane_default_methods_do_not_panic() {
+        let pane = FakePane::new(Vec::new());
+
+        assert_eq!(pane.pane_id(), 0);
+        assert_eq!(pane.get_cursor_position(), StableCursorPosition::default());
+        assert_eq!(pane.get_current_seqno(), SEQ_ZERO);
+        assert!(pane.get_changed_since(0..10, SEQ_ZERO).is_empty());
+        assert_eq!(pane.get_title(), "fake-pane");
+        assert!(pane.send_paste("discarded").is_ok());
+        assert!(pane
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .is_ok());
+        assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
+        assert!(pane.reader().unwrap().is_none());
+        assert!(!pane.is_dead());
+        assert_eq!(pane.domain_id(), 1);
+        assert_eq!(pane.palette(), ColorPalette::default());
+
+        let resized = TerminalSize {
+            rows: 7,
+            cols: 13,
+            pixel_width: 130,
+            pixel_height: 70,
+            dpi: 144,
+        };
+        pane.resize(resized).unwrap();
+        let dimensions = pane.get_dimensions();
+        assert_eq!(dimensions.cols, resized.cols);
+        assert_eq!(dimensions.viewport_rows, resized.rows);
+        assert_eq!(dimensions.scrollback_rows, resized.rows);
+        assert_eq!(dimensions.pixel_width, resized.pixel_width);
+        assert_eq!(dimensions.pixel_height, resized.pixel_height);
+        assert_eq!(dimensions.dpi, resized.dpi);
+
+        {
+            let mut writer = pane.writer();
+            writer.write_all(b"captured").unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(&*pane.writes.lock(), b"captured");
+    }
+
+    #[test]
     fn logical_lines() {
         let text = "Hello there this is a long line.\nlogical line two\nanother long line here\nlogical line four\nlogical line five\ncap it off with another long line";
         let width = 20;
@@ -776,9 +846,7 @@ mod test {
 "#
         );
 
-        let pane = FakePane {
-            lines: Mutex::new(physical_lines),
-        };
+        let pane = FakePane::new(physical_lines);
 
         let logical = pane.get_logical_lines(0..30);
         snapshot!(

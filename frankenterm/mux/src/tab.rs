@@ -4258,12 +4258,12 @@ mod test {
     use crate::renderable::*;
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
-    use parking_lot::{MappedMutexGuard, Mutex};
+    use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
     use proptest::prelude::*;
     use rangeset::RangeSet;
     use std::convert::TryFrom;
     use std::ops::Range;
-    use termwiz::surface::SequenceNo;
+    use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use url::Url;
 
     /// Ensure the global Mux singleton is initialized for tests that trigger
@@ -4388,6 +4388,7 @@ mod test {
         size: Mutex<TerminalSize>,
         constraints: PaneConstraints,
         priority: CollapsePriority,
+        writes: Mutex<Vec<u8>>,
     }
 
     impl FakePane {
@@ -4397,6 +4398,7 @@ mod test {
                 size: Mutex::new(size),
                 constraints: PaneConstraints::default(),
                 priority: CollapsePriority::default(),
+                writes: Mutex::new(Vec::new()),
             })
         }
 
@@ -4410,6 +4412,7 @@ mod test {
                 size: Mutex::new(size),
                 constraints,
                 priority: CollapsePriority::default(),
+                writes: Mutex::new(Vec::new()),
             })
         }
 
@@ -4424,6 +4427,7 @@ mod test {
                 size: Mutex::new(size),
                 constraints,
                 priority,
+                writes: Mutex::new(Vec::new()),
             })
         }
     }
@@ -4434,11 +4438,11 @@ mod test {
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
-            unimplemented!();
+            StableCursorPosition::default()
         }
 
         fn get_current_seqno(&self) -> SequenceNo {
-            unimplemented!();
+            SEQ_ZERO
         }
 
         fn get_changed_since(
@@ -4446,7 +4450,7 @@ mod test {
             _lines: Range<StableRowIndex>,
             _: SequenceNo,
         ) -> RangeSet<StableRowIndex> {
-            unimplemented!();
+            RangeSet::new()
         }
 
         fn with_lines_mut(
@@ -4454,7 +4458,6 @@ mod test {
             _stable_range: Range<StableRowIndex>,
             _with_lines: &mut dyn WithPaneLines,
         ) {
-            unimplemented!();
         }
 
         fn for_each_logical_line_in_stable_range_mut(
@@ -4462,15 +4465,14 @@ mod test {
             _lines: Range<StableRowIndex>,
             _for_line: &mut dyn ForEachPaneLogicalLine,
         ) {
-            unimplemented!();
         }
 
         fn get_lines(&self, _lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
-            unimplemented!();
+            (0, Vec::new())
         }
 
         fn get_logical_lines(&self, _lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
-            unimplemented!();
+            Vec::new()
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
@@ -4497,16 +4499,19 @@ mod test {
         }
 
         fn get_title(&self) -> String {
-            unimplemented!()
+            format!("fake-pane-{}", self.id)
         }
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
         fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
             Ok(None)
         }
         fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
-            unimplemented!()
+            MutexGuard::map(self.writes.lock(), |writes| {
+                let writer: &mut dyn std::io::Write = writes;
+                writer
+            })
         }
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
             *self.size.lock() = size;
@@ -4514,19 +4519,19 @@ mod test {
         }
 
         fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
         fn key_up(&self, _: KeyCode, _: KeyModifiers) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
         fn mouse_event(&self, _event: MouseEvent) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
         fn is_dead(&self) -> bool {
             false
         }
         fn palette(&self) -> ColorPalette {
-            unimplemented!()
+            ColorPalette::default()
         }
         fn domain_id(&self) -> DomainId {
             1
@@ -4540,6 +4545,55 @@ mod test {
         fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
             None
         }
+    }
+
+    #[test]
+    fn fake_pane_default_methods_do_not_panic() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let pane = FakePane::new(42, size);
+
+        assert_eq!(pane.pane_id(), 42);
+        assert_eq!(pane.get_cursor_position(), StableCursorPosition::default());
+        assert_eq!(pane.get_current_seqno(), SEQ_ZERO);
+        assert!(pane.get_changed_since(0..10, SEQ_ZERO).is_empty());
+        assert_eq!(pane.get_lines(0..10), (0, Vec::new()));
+        assert!(pane.get_logical_lines(0..10).is_empty());
+        assert_eq!(pane.get_title(), "fake-pane-42");
+        assert!(pane.send_paste("discarded").is_ok());
+        assert!(pane
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .is_ok());
+        assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
+        assert!(pane.reader().unwrap().is_none());
+        assert!(!pane.is_dead());
+        assert_eq!(pane.domain_id(), 1);
+        assert_eq!(pane.palette(), ColorPalette::default());
+
+        let resized = TerminalSize {
+            rows: 7,
+            cols: 13,
+            pixel_width: 130,
+            pixel_height: 70,
+            dpi: 144,
+        };
+        pane.resize(resized).unwrap();
+        let dimensions = pane.get_dimensions();
+        assert_eq!(dimensions.cols, resized.cols);
+        assert_eq!(dimensions.viewport_rows, resized.rows);
+        assert_eq!(dimensions.scrollback_rows, resized.rows);
+        assert_eq!(dimensions.pixel_width, resized.pixel_width);
+        assert_eq!(dimensions.pixel_height, resized.pixel_height);
+        assert_eq!(dimensions.dpi, resized.dpi);
+
+        let mut writer = pane.writer();
+        writer.write_all(b"discarded").unwrap();
+        writer.flush().unwrap();
     }
 
     #[test]
