@@ -43,6 +43,7 @@ RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-0}"
 RCH_SKIP_QUEUE_PREFLIGHT="${RCH_SKIP_QUEUE_PREFLIGHT:-0}"
 RCH_WORKER_SELECTION_WAIT_SECS="${RCH_WORKER_SELECTION_WAIT_SECS:-0}"
 RCH_WORKER_SELECTION_POLL_SECS="${RCH_WORKER_SELECTION_POLL_SECS:-15}"
+RCH_REMOTE_PREFLIGHT_WAIT_SECS="${RCH_REMOTE_PREFLIGHT_WAIT_SECS:-${RCH_WORKER_SELECTION_WAIT_SECS}}"
 RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS:-}"
 RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
 RCH_GITHUB_ACTIONS_LOCAL_CARGO="${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-0}"
@@ -915,26 +916,46 @@ ensure_rch_remote_only_preflight() {
         return 0
     fi
 
-    set +e
-    run_rch --json queue >"${_RCH_QUEUE_LOG}" 2>&1
-    local queue_rc=$?
-    set -e
-    rch_write_meta_json "${_RCH_QUEUE_LOG}" "${queue_rc}"
-    rch_emit_proof_ledger_entry \
-        "rch --json queue" \
-        "${_RCH_QUEUE_LOG}" \
-        "${queue_rc}" \
-        "not_applicable" \
-        "not_applicable" \
-        ""
-
-    rch_write_remote_preflight_json "${_RCH_PROBE_LOG}" "${_RCH_QUEUE_LOG}" "${queue_rc}" "${_RCH_REMOTE_PREFLIGHT_LOG}"
-    local status reason_code
-    status="$(jq -r '.status // ""' "${_RCH_REMOTE_PREFLIGHT_LOG}")"
-    reason_code="$(jq -r '.reason_code // "unknown"' "${_RCH_REMOTE_PREFLIGHT_LOG}")"
-    if [[ "${status}" == "blocked" ]]; then
-        rch_fatal "rch remote-only preflight blocked: ${reason_code}. See ${_RCH_REMOTE_PREFLIGHT_LOG}"
+    local wait_secs poll_secs started_at now elapsed attempt queue_rc status reason_code
+    wait_secs="${RCH_REMOTE_PREFLIGHT_WAIT_SECS}"
+    poll_secs="${RCH_WORKER_SELECTION_POLL_SECS}"
+    rch_is_unsigned_int "${wait_secs}" || wait_secs="0"
+    rch_is_unsigned_int "${poll_secs}" || poll_secs="15"
+    if [[ "${poll_secs}" -eq 0 ]]; then
+        poll_secs="1"
     fi
+
+    started_at="$(date +%s)"
+    attempt=0
+    while :; do
+        attempt=$((attempt + 1))
+        set +e
+        run_rch --json queue >"${_RCH_QUEUE_LOG}" 2>&1
+        queue_rc=$?
+        set -e
+        rch_write_meta_json "${_RCH_QUEUE_LOG}" "${queue_rc}"
+        rch_emit_proof_ledger_entry \
+            "rch --json queue" \
+            "${_RCH_QUEUE_LOG}" \
+            "${queue_rc}" \
+            "not_applicable" \
+            "not_applicable" \
+            ""
+
+        rch_write_remote_preflight_json "${_RCH_PROBE_LOG}" "${_RCH_QUEUE_LOG}" "${queue_rc}" "${_RCH_REMOTE_PREFLIGHT_LOG}"
+        status="$(jq -r '.status // ""' "${_RCH_REMOTE_PREFLIGHT_LOG}")"
+        reason_code="$(jq -r '.reason_code // "unknown"' "${_RCH_REMOTE_PREFLIGHT_LOG}")"
+        if [[ "${status}" != "blocked" ]]; then
+            break
+        fi
+
+        now="$(date +%s)"
+        elapsed=$((now - started_at))
+        if [[ "${elapsed}" -ge "${wait_secs}" ]]; then
+            rch_fatal "rch remote-only preflight blocked after ${elapsed}s and ${attempt} attempt(s): ${reason_code}. See ${_RCH_REMOTE_PREFLIGHT_LOG}"
+        fi
+        sleep "${poll_secs}"
+    done
 
     ensure_rch_worker_selection_preflight
 }
