@@ -41,7 +41,7 @@ the listed child bead.
 | Durable state checkpoint / rollback | Checkpoint creation, pre-rollback checkpointing, rollback validation, and failed rollback remain atomic. | `durable-state-checkpoint.tla` | `crates/frankenterm-core/src/durable_state.rs` | covered | `ft-tf6g3.18.3` |
 | Mux session reentry | Reentrant subscriber/session callbacks cannot double-register panes, leak subscribers, or drop terminal session events. | gap | `frankenterm/mux/src/`, `crates/frankenterm-core/src/headless_mux_server.rs` | gap | `ft-tf6g3.18.4` |
 | Blocker-radar source merge | Degraded, stale, conflicting, or unavailable coordination sources always fail closed before work is claimable. | `blocker-radar-merge.tla` | `crates/frankenterm-core/src/blocker_radar.rs` | covered | `ft-tf6g3.18.5` |
-| Herd-wave admission control | Synchronized cohorts produce bounded stagger plans, priority protection, cooldown behavior, and missing-telemetry fail-closed decisions. | gap | `crates/frankenterm-core/src/swarm_scheduler.rs` | gap | `ft-tf6g3.18.6` |
+| Herd-wave admission control | Synchronized cohorts produce bounded stagger plans, priority protection, cooldown behavior, and missing-telemetry fail-closed decisions. | `herd-wave-admission.tla` | `crates/frankenterm-core/src/swarm_scheduler.rs` | covered | `ft-tf6g3.18.6` |
 | Capture-fairness scheduler liveness | Eligible panes cannot starve under documented priority, low-tier floor, budget, and shutdown assumptions. | gap | `docs/capture-fairness-slo-contract.md`, runtime/tailer scheduler code | gap | `ft-tf6g3.18.7` |
 
 Each gap row closes only when its child bead adds the spec trio, records a TLC

@@ -1,0 +1,111 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "herd-wave-admission-tlc-attestation",
+  "category": "proofs/herd-wave-admission",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-12T14:19:34Z",
+  "produced_by_bead": "ft-tf6g3.18.6",
+  "status": "pass",
+  "proof_category": 6,
+  "scope": "Machine-readable attestation for the herd-wave admission-control and dry-run planner TLA+ model.",
+  "model": {
+    "spec": "docs/specs/herd-wave-admission.tla",
+    "cfg": "docs/specs/herd-wave-admission.cfg",
+    "mapping": "docs/specs/herd-wave-admission-mapping.md",
+    "release_bundle_slot": "proofs/herd-wave-admission.json",
+    "bounded_model": {
+      "panes": 4,
+      "min_distinct": 2,
+      "critical_distinct": 3,
+      "emergency_distinct": 4,
+      "base_stagger_ms": 5,
+      "max_stagger_ms": 10,
+      "missing_telemetry_severity": 1,
+      "max_history": 1,
+      "covered_states": [
+        "normal",
+        "elevated",
+        "critical",
+        "emergency",
+        "missing_telemetry",
+        "stale_evidence",
+        "priority_protected",
+        "operator_override",
+        "cooldown_active",
+        "circuit_breaker_active"
+      ]
+    }
+  },
+  "tlc_run": {
+    "status": "pass",
+    "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/herd-wave-admission.tla",
+    "local_bounded_run": true,
+    "rch_remote_available": false,
+    "rch_note": "No RCH remote proof was used for this non-Cargo TLC wrapper; no local Cargo or build proof was run.",
+    "state_count": 3073,
+    "distinct_state_count": 1537,
+    "time_budget_seconds": 30,
+    "timed_out": false,
+    "artifacts": {
+      "summary": "target/tlc/herd-wave-admission/summary.json",
+      "stdout": "target/tlc/herd-wave-admission/tlc.stdout.log",
+      "stderr": "target/tlc/herd-wave-admission/tlc.stderr.log"
+    }
+  },
+  "source_artifacts": [
+    {
+      "path": "docs/specs/herd-wave-admission.tla",
+      "media_type": "text/plain",
+      "sha256": "aeb87c65dfd509fc683044c995caddd42f9ce64dcd57d9512d64a490ad3ba760",
+      "size_bytes": 14273
+    },
+    {
+      "path": "docs/specs/herd-wave-admission.cfg",
+      "media_type": "text/plain",
+      "sha256": "f31c04851463019b240ed999aa44d04a0d81eb02b5e405daf49bd9607fbf2ece",
+      "size_bytes": 250
+    },
+    {
+      "path": "docs/specs/herd-wave-admission-mapping.md",
+      "media_type": "text/markdown",
+      "sha256": "a31428755852285dc0fc38e4582abf789b3293a8254d8cde0e399b9baec1b576",
+      "size_bytes": 4336
+    },
+    {
+      "path": "scripts/run-tlc.sh",
+      "media_type": "text/x-shellscript",
+      "sha256": "a245a3c2aa17e216323afc969590c6c0c77127a515e62b7c190ca2191a862164",
+      "size_bytes": 7350
+    }
+  ],
+  "validation": [
+    {
+      "command": "jq empty docs/attestations/proofs/herd-wave-admission.json",
+      "status": "pass"
+    },
+    {
+      "command": "bash -n scripts/run-tlc.sh",
+      "status": "pass"
+    },
+    {
+      "command": "scripts/check-spec-conventions.sh",
+      "status": "pass",
+      "result": "9 spec(s) passed"
+    },
+    {
+      "command": "scripts/run-tlc.sh --dry-run docs/specs/herd-wave-admission.tla",
+      "status": "pass",
+      "result": "TLC command targets target/tlc/herd-wave-admission/module/HerdWaveAdmission.tla and sibling cfg"
+    },
+    {
+      "command": "scripts/run-tlc.sh --workers 1 --timeout-secs 30 docs/specs/herd-wave-admission.tla",
+      "status": "pass",
+      "result": "3073 states generated; 1537 distinct states; no timeout"
+    }
+  ],
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-tf6g3.1",
+    "reason": "ft-tf6g3.18.6 publishes the per-subsystem proof artifact; release-bundle category wiring remains owned by ft-tf6g3.1/G16."
+  }
+}
