@@ -32,6 +32,8 @@ jobs:
     # Only notify on push to main, not PRs
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    env:
+      ACFS_DISPATCH_TOKEN: ${{ secrets.ACFS_DISPATCH_TOKEN }}
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -55,9 +57,10 @@ jobs:
           echo "Computed SHA256: $SHA256"
 
       - name: Notify ACFS
+        if: env.ACFS_DISPATCH_TOKEN != ''
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.ACFS_DISPATCH_TOKEN }}
+          token: ${{ env.ACFS_DISPATCH_TOKEN }}
           repository: Dicklesworthstone/agentic_coding_flywheel_setup
           event-type: installer-updated
           client-payload: |
@@ -71,8 +74,17 @@ jobs:
             }
 
       - name: Log notification
+        if: env.ACFS_DISPATCH_TOKEN != ''
         run: |
           echo "::notice::Notified ACFS about installer change"
+          echo "Repository: ${{ github.repository }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "SHA256: ${{ steps.checksum.outputs.sha256 }}"
+
+      - name: Log skipped notification
+        if: env.ACFS_DISPATCH_TOKEN == ''
+        run: |
+          echo "::notice::Skipped ACFS notification because ACFS_DISPATCH_TOKEN is not configured"
           echo "Repository: ${{ github.repository }}"
           echo "Commit: ${{ github.sha }}"
           echo "SHA256: ${{ steps.checksum.outputs.sha256 }}"
