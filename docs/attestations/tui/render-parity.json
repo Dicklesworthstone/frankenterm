@@ -7,7 +7,8 @@
   "source_beads": [
     "ft-35yac.1",
     "ft-35yac.1.2",
-    "ft-35yac.2"
+    "ft-35yac.2",
+    "ft-tf6g3.24"
   ],
   "attestation_manifest_slot": {
     "category": "tui/render-parity",
@@ -28,6 +29,7 @@
     "property_test_harness": "crates/frankenterm-core/tests/tui_parity_oracle.rs",
     "audit_doc": "docs/security/tui-render-parity.md",
     "gpu_adjunct_contract": "docs/attestations/tui/render-parity-gpu.json",
+    "topology_adjunct_contract": "docs/attestations/tui/topology-parity.json",
     "gpu_runtime_writer": "scripts/test-gpu-harness.sh"
   },
   "oracle_contract": {
@@ -170,6 +172,20 @@
     "hard_gate_job": "gpu-regression-macos",
     "soft_pilot_job": "gpu-linux-llvmpipe-pilot"
   },
+  "topological_visual_adjunct": {
+    "path": "docs/attestations/tui/topology-parity.json",
+    "kind": "persistent-homology-render-parity-adjunct",
+    "produced_by_bead": "ft-tf6g3.24",
+    "proof_category": "11 topological-invariant",
+    "implementation_crate": "crates/frankenterm-topo",
+    "distance": "H0/H1 bottleneck distance over glyph alpha/luma persistence diagrams",
+    "default_thresholds": {
+      "max_h0_bottleneck": 2.0,
+      "max_h1_bottleneck": 2.0
+    },
+    "release_bundle_slot": "tui/topology-parity.json",
+    "production_evidence_rule": "release evidence requires paired oracle/subject glyph bitmap runs for tests/fixtures/terminal-conformance/expected with glyphs_compared_total > 0 and topology_failures_total == 0"
+  },
   "targeted_validation": {
     "cargo_status": "not_run_for_recovery_artifact",
     "reason": "This bead publishes the missing JSON artifact from existing checked-in docs and contracts; no source code changed.",
@@ -182,6 +198,7 @@
   "source_documents": [
     "docs/security/tui-render-parity.md",
     "docs/attestations/tui/render-parity-gpu.json",
+    "docs/attestations/tui/topology-parity.json",
     "crates/frankenterm-core/src/tui_parity_oracle.rs",
     "crates/frankenterm-core/tests/tui_parity_oracle.rs",
     "scripts/test-gpu-harness.sh"

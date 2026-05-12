@@ -48,7 +48,11 @@ present but are not in `required_categories` yet. Current optional slots include
 `docs/attestations/tui/wezterm-divergence.json` slot (`ft-tf6g3.21`,
 under `tui/render-parity`) records the upstream-WezTerm differential gate and
 is release evidence only after a run reports `frames_compared_total > 0` and
-`novel_divergence_count == 0`.
+`novel_divergence_count == 0`. The `docs/attestations/tui/topology-parity.json`
+slot (`ft-tf6g3.24`, also under `tui/render-parity`) occupies the logical
+release-bundle `tui/topology-parity.json` slot for persistent-homology glyph
+parity. It is release evidence only after paired oracle/subject glyph bitmap
+runs report `glyphs_compared_total > 0` and `topology_failures_total == 0`.
 
 `proofs/tx-killswitch` hashes
 `docs/attestations/proofs/tx-killswitch.json`, which points at the

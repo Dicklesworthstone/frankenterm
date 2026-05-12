@@ -4297,6 +4297,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-topo"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "frankenterm-uds"
 version = "0.1.0"
 dependencies = [

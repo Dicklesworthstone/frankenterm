@@ -66,6 +66,14 @@
       "description": "Continuous FrankenTerm-vs-upstream-WezTerm render differential slot. The checked-in artifact records the allowlist gate and current adapter blocker; production evidence requires a workflow run with frames_compared_total > 0 and novel_divergence_count == 0."
     },
     {
+      "category": "tui/render-parity",
+      "path": "docs/attestations/tui/topology-parity.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-tf6g3.24",
+      "proof_categories": [11],
+      "description": "Persistent-homology glyph topology adjunct for the G5 render-parity category. The artifact occupies the release-bundle tui/topology-parity.json slot while remaining under the existing tui/render-parity schema category; production evidence requires paired oracle/subject glyph bitmap runs for the terminal-conformance fixtures."
+    },
+    {
       "category": "security/passive-watch",
       "path": "docs/security/passive-watch-attestation.json",
       "media_type": "application/json",

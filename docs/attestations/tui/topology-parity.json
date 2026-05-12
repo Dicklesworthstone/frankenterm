@@ -1,0 +1,93 @@
+{
+  "category": "tui/render-parity",
+  "schema_version": "ft.tui.topology_parity_attestation.v1",
+  "generated_at": "2026-05-12T16:30:00Z",
+  "produced_by_bead": "ft-tf6g3.24",
+  "proof_categories": [11],
+  "release_bundle_slot": {
+    "logical_slot": "tui/topology-parity.json",
+    "manifest_category": "tui/render-parity",
+    "schema_note": "docs/attestations/schema.json does not yet define a separate tui/topology-parity category, so the release bundle hashes this artifact under tui/render-parity while proof_category 11 records the topological-invariant method."
+  },
+  "scope": {
+    "kind": "persistent-homology-render-parity-adjunct",
+    "summary": "Complementary glyph-level visual-regression metric for SSIM parity. It compares H0/H1 persistence diagrams over rendered glyph alpha/luma bitmaps.",
+    "implementation_crate": "crates/frankenterm-topo",
+    "methodology_doc": "docs/tui/topology-parity.md",
+    "fixture_manifest": "tests/fixtures/terminal-conformance/manifest.json",
+    "fixture_expected_dir": "tests/fixtures/terminal-conformance/expected",
+    "live_release_driver_run": false
+  },
+  "metric_contract": {
+    "filtration": "ink-super-level over nonzero grayscale pixel values",
+    "foreground_connectivity": "4-connected foreground components",
+    "h1_definition": "background components that do not touch the image border",
+    "distance": "per-dimension bottleneck distance, equivalent to the W-infinity persistence-diagram matching metric",
+    "pass_rule": "h0_bottleneck <= per_glyph.max_h0_bottleneck && h1_bottleneck <= per_glyph.max_h1_bottleneck",
+    "default_thresholds": {
+      "max_h0_bottleneck": 2.0,
+      "max_h1_bottleneck": 2.0
+    }
+  },
+  "report_shape": {
+    "glyph_key_fields": [
+      "scenario_id",
+      "glyph",
+      "font_family",
+      "font_size_px",
+      "render_backend"
+    ],
+    "per_glyph_fields": [
+      "ssim",
+      "h0_bottleneck",
+      "h1_bottleneck",
+      "max_bottleneck",
+      "max_h0_bottleneck",
+      "max_h1_bottleneck",
+      "passed",
+      "oracle_diagram",
+      "subject_diagram"
+    ],
+    "summary_fields": [
+      "glyphs_compared_total",
+      "ssim_failures_total",
+      "topology_failures_total",
+      "max_h0_bottleneck",
+      "max_h1_bottleneck"
+    ]
+  },
+  "corpus_contract": {
+    "source": "tests/fixtures/terminal-conformance/expected",
+    "fixture_count": 7,
+    "scenario_ids": [
+      "tc-resize-wrap-001",
+      "tc-bracketed-paste-focus-001",
+      "tc-osc8-hyperlink-001",
+      "tc-alt-screen-001",
+      "tc-utf8-grapheme-001",
+      "tc-cursor-mode-001",
+      "tc-graphics-negative-001"
+    ],
+    "oracle_render": "ratatui or upstream WezTerm glyph bitmap emitted by the render-parity harness",
+    "subject_render": "ftui or FrankenTerm glyph bitmap emitted by the render-parity harness"
+  },
+  "current_status": {
+    "state": "metric_substrate_ready",
+    "production_evidence_required": true,
+    "reason": "The repository now contains the topology metric crate and release slot. Full pass/fail evidence requires the render harness to emit paired glyph bitmaps for the terminal-conformance expected fixtures."
+  },
+  "validation_contract": {
+    "crate_tests": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-24-topo cargo test -p frankenterm-topo -- --nocapture",
+    "crate_clippy": "RCH_REQUIRE_REMOTE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-24-topo cargo clippy -p frankenterm-topo --all-targets -- -D warnings",
+    "static_checks": [
+      "jq empty docs/attestations/tui/topology-parity.json docs/attestations/manifest.json docs/proof-taxonomy.json",
+      "git diff --check -- Cargo.toml Cargo.lock crates/frankenterm-topo docs/attestations/tui/topology-parity.json docs/attestations/tui/render-parity.json docs/attestations/manifest.json docs/proof-taxonomy.json docs/tui/topology-parity.md"
+    ]
+  },
+  "source_documents": [
+    "crates/frankenterm-topo/src/lib.rs",
+    "docs/tui/topology-parity.md",
+    "docs/attestations/tui/render-parity.json",
+    "tests/fixtures/terminal-conformance/manifest.json"
+  ]
+}

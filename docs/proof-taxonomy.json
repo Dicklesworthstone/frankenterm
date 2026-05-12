@@ -98,9 +98,9 @@
       "slug": "topological-invariant",
       "name": "Topological Invariant",
       "bridge_plan_core": false,
-      "description": "Graph, topology, reachability, cut-set, or packing invariant that proves structural behavior beyond the core ten categories.",
-      "example_path": "docs/reality-check-bridge-plan-2026-05-12.md",
-      "accepted_shapes": ["graph invariant", "reachability proof", "packing invariant", "structural counterexample"]
+      "description": "Graph, topology, reachability, cut-set, packing, or persistent-homology invariant that proves structural behavior beyond the core ten categories.",
+      "example_path": "docs/attestations/tui/topology-parity.json",
+      "accepted_shapes": ["graph invariant", "reachability proof", "packing invariant", "persistent homology diagram", "Betti curve", "bottleneck distance"]
     }
   ],
   "non_proof_classifications": [
