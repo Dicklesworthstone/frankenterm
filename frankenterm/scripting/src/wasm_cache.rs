@@ -42,10 +42,10 @@ impl ModuleCache {
         let hash = sha256(wasm_bytes);
 
         // Check memory cache
-        if let Ok(cache) = self.memory_cache.lock() {
-            if let Some(module) = cache.get(&hash) {
-                return Ok(module.clone());
-            }
+        if let Ok(cache) = self.memory_cache.lock()
+            && let Some(module) = cache.get(&hash)
+        {
+            return Ok(module.clone());
         }
 
         // Check disk cache
@@ -57,8 +57,8 @@ impl ModuleCache {
         }
 
         // Compile from source
-        let module =
-            Module::new(&self.engine, wasm_bytes).context("failed to compile WASM module")?;
+        let module = Module::new(&self.engine, wasm_bytes)
+            .map_err(|err| err.context("failed to compile WASM module"))?;
 
         // Cache to disk
         self.save_to_disk(&hash, &module)?;
@@ -126,7 +126,7 @@ impl ModuleCache {
 
         let serialized = module
             .serialize()
-            .context("failed to serialize compiled module")?;
+            .map_err(|err| err.context("failed to serialize compiled module"))?;
 
         std::fs::write(&path, &serialized)
             .with_context(|| format!("failed to write cache file {}", path.display()))?;

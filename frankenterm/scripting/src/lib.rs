@@ -48,7 +48,7 @@ pub use wasm_cache::ModuleCache;
 #[cfg(feature = "wasm")]
 pub use wasm_engine::{WasmEngine, WasmEngineConfig};
 #[cfg(feature = "wasm")]
-pub use wasm_host::HostState;
+pub use wasm_host::{HostState, register_host_functions};
 
 /// Unified interface for all scripting engines.
 ///

@@ -89,8 +89,15 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> anyhow::Result
         "frankenterm",
         "ft_return_buffer_read",
         |mut caller: Caller<'_, HostState>, out_ptr: i32, out_len: i32| -> i32 {
+            let Ok(start) = usize::try_from(out_ptr) else {
+                return -1;
+            };
+            let Ok(max_len) = usize::try_from(out_len) else {
+                return -1;
+            };
+
             let buf = caller.data().return_buffer.clone();
-            let to_write = buf.len().min(out_len as usize);
+            let to_write = buf.len().min(max_len);
             if to_write == 0 {
                 return 0;
             }
@@ -100,13 +107,15 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> anyhow::Result
                 _ => return -1,
             };
 
-            let start = out_ptr as usize;
             let data = memory.data_mut(&mut caller);
-            if start + to_write > data.len() {
+            let Some(end) = start.checked_add(to_write) else {
+                return -1;
+            };
+            if end > data.len() {
                 return -1;
             }
 
-            data[start..start + to_write].copy_from_slice(&buf[..to_write]);
+            data[start..end].copy_from_slice(&buf[..to_write]);
             to_write as i32
         },
     )?;
@@ -116,7 +125,10 @@ pub fn register_host_functions(linker: &mut Linker<HostState>) -> anyhow::Result
 
 /// Read a UTF-8 string from WASM linear memory.
 fn read_wasm_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
-    if len <= 0 {
+    if ptr < 0 || len < 0 {
+        return None;
+    }
+    if len == 0 {
         return Some(String::new());
     }
 
@@ -125,8 +137,9 @@ fn read_wasm_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> O
         _ => return None,
     };
 
-    let start = ptr as usize;
-    let end = start + len as usize;
+    let start = usize::try_from(ptr).ok()?;
+    let len = usize::try_from(len).ok()?;
+    let end = start.checked_add(len)?;
     let data = memory.data(caller);
 
     if end > data.len() {
@@ -139,7 +152,17 @@ fn read_wasm_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> O
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        return s;
+    }
+
+    let end = s
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx <= max)
+        .last()
+        .unwrap_or(0);
+    &s[..end]
 }
 
 #[cfg(test)]
@@ -190,5 +213,12 @@ mod tests {
     #[test]
     fn truncate_long_string() {
         assert_eq!(truncate("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_does_not_split_utf8() {
+        assert_eq!(truncate("éclair", 1), "");
+        assert_eq!(truncate("éclair", 2), "é");
+        assert_eq!(truncate("éclair", 3), "éc");
     }
 }

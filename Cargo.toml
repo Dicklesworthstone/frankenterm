@@ -537,8 +537,8 @@ ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankent
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # WASM runtime (optional, for scripting/extensions)
-wasmtime = { version = "41", default-features = false, features = ["cranelift", "async", "component-model", "runtime", "std"] }
-wasmtime-wasi = { version = "41", default-features = false, features = ["p1"] }
+wasmtime = { version = "44.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "44.0.1", default-features = false, features = ["p1"] }
 
 # Benchmarking
 criterion = "0.5"

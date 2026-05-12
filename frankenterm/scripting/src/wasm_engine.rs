@@ -81,7 +81,8 @@ impl WasmEngine {
         engine_config.consume_fuel(true);
         engine_config.wasm_component_model(true);
 
-        let engine = Engine::new(&engine_config).context("failed to create wasmtime engine")?;
+        let engine = Engine::new(&engine_config)
+            .map_err(|err| err.context("failed to create wasmtime engine"))?;
 
         Ok(Self {
             engine,
@@ -110,7 +111,8 @@ impl WasmEngine {
 
     /// Compile a WASM module from bytes.
     fn compile_module(&self, bytes: &[u8]) -> Result<Module> {
-        Module::new(&self.engine, bytes).context("failed to compile WASM module")
+        Ok(Module::new(&self.engine, bytes)
+            .map_err(|err| err.context("failed to compile WASM module"))?)
     }
 
     /// Create a store with fuel and memory limits.
@@ -132,39 +134,44 @@ impl ScriptingEngine for WasmEngine {
 
         let mut linker = Linker::new(&self.engine);
         wasmtime_wasi::p1::add_to_linker_sync(&mut linker, WasmState::wasi_ctx)
-            .context("failed to add WASI to linker")?;
+            .map_err(|err| err.context("failed to add WASI to linker"))?;
 
         let instance = linker
             .instantiate(&mut store, &module)
-            .context("failed to instantiate WASM config module")?;
+            .map_err(|err| err.context("failed to instantiate WASM config module"))?;
 
         // Look for a `configure` export that returns a JSON string pointer.
         // The WASM module should export:
         //   configure() -> i32  (pointer to JSON string in linear memory)
         //   configure_len() -> i32  (length of that string)
         // OR: a `_start` function that writes JSON to stdout.
-        if let Some(configure_fn) = instance
-            .get_typed_func::<(), i32>(&mut store, "configure")
-            .ok()
-        {
+        if let Ok(configure_fn) = instance.get_typed_func::<(), i32>(&mut store, "configure") {
             let ptr = configure_fn
                 .call(&mut store, ())
-                .context("WASM configure() call failed")?;
+                .map_err(|err| err.context("WASM configure() call failed"))?;
 
             let len_fn = instance
                 .get_typed_func::<(), i32>(&mut store, "configure_len")
-                .context("WASM module exports configure() but not configure_len()")?;
+                .map_err(|err| {
+                    err.context("WASM module exports configure() but not configure_len()")
+                })?;
             let len = len_fn
                 .call(&mut store, ())
-                .context("WASM configure_len() call failed")?;
+                .map_err(|err| err.context("WASM configure_len() call failed"))?;
 
             let memory = instance
                 .get_memory(&mut store, "memory")
                 .ok_or_else(|| anyhow!("WASM module has no 'memory' export"))?;
 
             let data = memory.data(&store);
-            let start = ptr as usize;
-            let end = start + len as usize;
+            if ptr < 0 || len < 0 {
+                bail!("WASM configure() returned negative pointer/length: {ptr}/{len}");
+            }
+            let start = usize::try_from(ptr).context("WASM configure() pointer out of range")?;
+            let len = usize::try_from(len).context("WASM configure() length out of range")?;
+            let end = start.checked_add(len).ok_or_else(|| {
+                anyhow!("WASM configure() pointer range overflowed: {start}+{len}")
+            })?;
             if end > data.len() {
                 bail!(
                     "WASM configure() returned out-of-bounds pointer: {}..{} (memory size {})",
@@ -180,12 +187,11 @@ impl ScriptingEngine for WasmEngine {
             let value: serde_json::Value =
                 serde_json::from_str(json_str).context("WASM configure() returned invalid JSON")?;
             json_to_dynamic(&value)
-        } else if let Some(start_fn) = instance.get_typed_func::<(), ()>(&mut store, "_start").ok()
-        {
+        } else if let Ok(start_fn) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
             // WASI _start convention: module writes JSON config to stdout
             start_fn
                 .call(&mut store, ())
-                .context("WASM _start() call failed")?;
+                .map_err(|err| err.context("WASM _start() call failed"))?;
 
             // Read captured stdout
             let stdout_data = &store.data().stdout_buf;
@@ -277,10 +283,12 @@ impl ScriptingEngine for WasmEngine {
 
         match removed {
             Some(loaded) => {
+                let LoadedModule { module, manifest } = loaded;
+                let export_count = module.exports().count();
                 log::info!(
-                    "unloaded WASM extension {}@{} (id={id})",
-                    loaded.manifest.id,
-                    loaded.manifest.version
+                    "unloaded WASM extension {}@{} (id={id}, exports={export_count})",
+                    manifest.id,
+                    manifest.version
                 );
                 Ok(())
             }
@@ -300,7 +308,7 @@ impl ScriptingEngine for WasmEngine {
     }
 
     fn engine_name(&self) -> &str {
-        "wasmtime-41"
+        "wasmtime-44"
     }
 }
 
@@ -345,7 +353,7 @@ mod tests {
     #[test]
     fn engine_creates_successfully() {
         let engine = WasmEngine::with_defaults().unwrap();
-        assert_eq!(engine.engine_name(), "wasmtime-41");
+        assert_eq!(engine.engine_name(), "wasmtime-44");
     }
 
     #[test]
