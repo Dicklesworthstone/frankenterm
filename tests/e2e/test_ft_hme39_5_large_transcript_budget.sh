@@ -100,6 +100,10 @@ failure_reason_for_log() {
     printf '%s\n' "rch_infrastructure_worker_selection_all_busy"
     return
   fi
+  if grep -Eq 'no admissible workers:|active_project_exclusion' "${log_file}" 2>/dev/null; then
+    printf '%s\n' "rch_infrastructure_worker_selection_blocked"
+    return
+  fi
   if grep -Fq '[RCH] local (no workers with Rust installed)' "${log_file}" 2>/dev/null; then
     printf '%s\n' "rch_infrastructure_no_rust_worker_available"
     return
@@ -134,6 +138,7 @@ pre_summary_failure_reason() {
   local mirror_preflight
   local remote_preflight
   local remote_reason
+  local worker_selection
   local probe_log
 
   if [[ -s "${TEST_LOG}" ]]; then
@@ -159,6 +164,22 @@ pre_summary_failure_reason() {
     ' "${remote_preflight}" 2>/dev/null || true)"
     if [[ -n "${remote_reason}" ]]; then
       printf 'rch_infrastructure_%s\n' "${remote_reason}"
+      return
+    fi
+  fi
+
+  worker_selection="$(rch_worker_selection_log_path)"
+  if [[ -s "${worker_selection}" ]]; then
+    if ! jq -e . "${worker_selection}" >/dev/null 2>&1; then
+      printf '%s\n' "rch_infrastructure_worker_selection_failed"
+      return
+    fi
+    if jq -e '(.success // false) != true' "${worker_selection}" >/dev/null 2>&1; then
+      printf '%s\n' "rch_infrastructure_worker_selection_failed"
+      return
+    fi
+    if jq -e '(.data.worker_selection.worker // "") == ""' "${worker_selection}" >/dev/null 2>&1; then
+      printf '%s\n' "rch_infrastructure_worker_selection_blocked"
       return
     fi
   fi
@@ -218,6 +239,7 @@ write_summary() {
     --arg rch_mirror_preflight "$(rch_mirror_preflight_log_path | sed "s#^${ROOT_DIR}/##")" \
     --arg rch_capabilities "$(rch_capabilities_log_path | sed "s#^${ROOT_DIR}/##")" \
     --arg rch_scheduler_workers "$(rch_scheduler_workers_log_path | sed "s#^${ROOT_DIR}/##")" \
+    --arg rch_worker_selection "$(rch_worker_selection_log_path | sed "s#^${ROOT_DIR}/##")" \
     --arg remote_target_dir "${REMOTE_TARGET_DIR}" \
     --arg failed_reason "${failed_reason}" \
     --arg worker "${worker}" \
@@ -239,7 +261,8 @@ write_summary() {
         rch_remote_preflight: $rch_remote_preflight,
         rch_mirror_preflight: $rch_mirror_preflight,
         rch_capabilities: $rch_capabilities,
-        rch_scheduler_workers: $rch_scheduler_workers
+        rch_scheduler_workers: $rch_scheduler_workers,
+        rch_worker_selection: $rch_worker_selection
       },
       budget_summary: $budget_summary
     }

@@ -54,6 +54,7 @@ _RCH_SMOKE_LOG=""
 _RCH_REMOTE_PREFLIGHT_LOG=""
 _RCH_MIRROR_PREFLIGHT_LOG=""
 _RCH_SCHEDULER_WORKERS_LOG=""
+_RCH_WORKER_SELECTION_LOG=""
 _RCH_SMOKE_TARGET_DIR=""
 _RCH_REPO_ROOT=""
 TIMEOUT_BIN=""
@@ -116,6 +117,10 @@ rch_mirror_preflight_log_path() {
 
 rch_scheduler_workers_log_path() {
     printf '%s\n' "${_RCH_SCHEDULER_WORKERS_LOG}"
+}
+
+rch_worker_selection_log_path() {
+    printf '%s\n' "${_RCH_WORKER_SELECTION_LOG}"
 }
 
 rch_log_meta_path() {
@@ -928,6 +933,41 @@ ensure_rch_remote_only_preflight() {
     if [[ "${status}" == "blocked" ]]; then
         rch_fatal "rch remote-only preflight blocked: ${reason_code}. See ${_RCH_REMOTE_PREFLIGHT_LOG}"
     fi
+
+    ensure_rch_worker_selection_preflight
+}
+
+ensure_rch_worker_selection_preflight() {
+    [[ -n "${_RCH_WORKER_SELECTION_LOG}" ]] || rch_fatal "rch_init must be called before ensure_rch_worker_selection_preflight."
+
+    set +e
+    run_rch --json diagnose --dry-run cargo check --help >"${_RCH_WORKER_SELECTION_LOG}" 2>&1
+    local selection_rc=$?
+    set -e
+    rch_write_meta_json "${_RCH_WORKER_SELECTION_LOG}" "${selection_rc}"
+    rch_emit_proof_ledger_entry \
+        "rch --json diagnose --dry-run cargo check --help" \
+        "${_RCH_WORKER_SELECTION_LOG}" \
+        "${selection_rc}" \
+        "not_applicable" \
+        "not_applicable" \
+        ""
+
+    if [[ ${selection_rc} -ne 0 ]] || ! jq -e . "${_RCH_WORKER_SELECTION_LOG}" >/dev/null 2>&1; then
+        rch_fatal "rch worker-selection preflight failed. See ${_RCH_WORKER_SELECTION_LOG}"
+    fi
+
+    local would_intercept selected_worker selection_reason
+    would_intercept="$(jq -r '.data.decision.would_intercept // false' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || true)"
+    selected_worker="$(jq -r '.data.worker_selection.worker // ""' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || true)"
+    selection_reason="$(jq -c '.data.worker_selection.reason // {}' "${_RCH_WORKER_SELECTION_LOG}" 2>/dev/null || printf '{}')"
+
+    if [[ "${would_intercept}" != "true" ]]; then
+        rch_fatal "rch worker-selection preflight could not prove cargo offload eligibility. See ${_RCH_WORKER_SELECTION_LOG}"
+    fi
+    if [[ -z "${selected_worker}" ]]; then
+        rch_fatal "rch worker-selection preflight blocked: ${selection_reason}. See ${_RCH_WORKER_SELECTION_LOG}"
+    fi
 }
 
 ensure_rch_runtime_capabilities() {
@@ -1324,6 +1364,7 @@ rch_init() {
     _RCH_REMOTE_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_preflight.json"
     _RCH_MIRROR_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_mirror_preflight.json"
     _RCH_SCHEDULER_WORKERS_LOG="${log_dir}/${harness_name}_${run_id}.rch_scheduler_workers.json"
+    _RCH_WORKER_SELECTION_LOG="${log_dir}/${harness_name}_${run_id}.rch_worker_selection.json"
     _RCH_SMOKE_TARGET_DIR="target/rch-smoke/${harness_name}/${run_id}"
     mkdir -p "${_RCH_SMOKE_TARGET_DIR}"
 }
