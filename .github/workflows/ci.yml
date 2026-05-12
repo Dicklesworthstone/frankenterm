@@ -840,7 +840,16 @@ jobs:
         with:
           key: benchmarks
 
-      - name: Run benchmarks and check budgets
+      - name: Select PR benchmark subset
+        if: github.event_name == 'pull_request'
+        run: scripts/select-pr-bench-subset.sh --budget-seconds 300 --output target/ci-bench-subset.json
+
+      - name: Run PR benchmark subset and check budgets
+        if: github.event_name == 'pull_request'
+        run: scripts/check_bench_budgets.sh --subset target/ci-bench-subset.json
+
+      - name: Run full benchmarks and check budgets
+        if: github.event_name != 'pull_request'
         run: scripts/check_bench_budgets.sh
 
       # ft-9zzkg — Bench-stats per-PR gate (advisory mode). Reads the
@@ -881,6 +890,7 @@ jobs:
             target/criterion/bench-output.log
             target/criterion/wa-bench-distributions.jsonl
             target/criterion/wa-bench-stats-verdict.json
+            target/ci-bench-subset.json
             target/replay-performance-gates/replay-performance-report.json
             target/replay-performance-gates/replay_performance_baseline.json
             target/replay-performance-gates/replay-performance-bench.log

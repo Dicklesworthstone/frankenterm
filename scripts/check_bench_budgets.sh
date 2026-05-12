@@ -7,8 +7,9 @@
 # its ceiling and fails on gross regressions (order-of-magnitude slowdowns).
 #
 # Usage:
-#   scripts/check_bench_budgets.sh          # run benchmarks then check
-#   scripts/check_bench_budgets.sh --check  # check only (assume bench already ran)
+#   scripts/check_bench_budgets.sh                         # run full benchmarks then check
+#   scripts/check_bench_budgets.sh --check                 # check only (assume bench already ran)
+#   scripts/check_bench_budgets.sh --subset target/ci-bench-subset.json
 #
 # Environment:
 #   FT_BENCH_BUDGETS_TARGET_DIR  repo-relative CARGO_TARGET_DIR for RCH runs
@@ -35,9 +36,23 @@ SUMMARY_FILE="$CRITERION_DIR/ft-budget-report.json"
 BENCH_LOG="$UPLOAD_CRITERION_DIR/bench-output.log"
 
 RUN_BENCH=true
-if [[ "${1:-}" == "--check" ]]; then
-    RUN_BENCH=false
-fi
+SUBSET_FILE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check)
+            RUN_BENCH=false
+            shift
+            ;;
+        --subset)
+            SUBSET_FILE="${2:?missing value for --subset}"
+            shift 2
+            ;;
+        *)
+            echo "[bench-budgets] ERROR: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # =============================================================================
 # Budget table: group_prefix → max median nanoseconds
@@ -114,9 +129,37 @@ if $RUN_BENCH; then
     ensure_rch_ready
 
     echo "[bench-budgets] Running benchmarks..."
-    run_rch_cargo_logged "$BENCH_LOG" \
-        env CARGO_TARGET_DIR="$TARGET_DIR" \
-        cargo bench -p frankenterm-core
+    : > "$BENCH_LOG"
+    if [[ -n "$SUBSET_FILE" ]]; then
+        if [[ ! -f "$SUBSET_FILE" ]]; then
+            echo "[bench-budgets] ERROR: subset file not found: $SUBSET_FILE" >&2
+            exit 1
+        fi
+        mapfile -t subset_benches < <(jq -r '.benches[] | select(.package == "frankenterm-core") | .bench' "$SUBSET_FILE")
+        if (( ${#subset_benches[@]} == 0 )); then
+            echo "[bench-budgets] ERROR: subset file contains no frankenterm-core benches: $SUBSET_FILE" >&2
+            exit 1
+        fi
+        echo "[bench-budgets] PR subset file: $SUBSET_FILE (${#subset_benches[@]} benches)"
+        for bench in "${subset_benches[@]}"; do
+            bench_log="$UPLOAD_CRITERION_DIR/bench-${bench}.log"
+            echo "[bench-budgets] Running subset bench: $bench"
+            if ! run_rch_cargo_logged "$bench_log" \
+                env CARGO_TARGET_DIR="$TARGET_DIR" \
+                cargo bench -p frankenterm-core --bench "$bench" -- --noplot; then
+                cat "$bench_log" | tee -a "$BENCH_LOG"
+                exit 1
+            fi
+            cat "$bench_log" | tee -a "$BENCH_LOG"
+        done
+    else
+        if ! run_rch_cargo_logged "$BENCH_LOG" \
+            env CARGO_TARGET_DIR="$TARGET_DIR" \
+            cargo bench -p frankenterm-core; then
+            cat "$BENCH_LOG"
+            exit 1
+        fi
+    fi
     cat "$BENCH_LOG"
     echo "[bench-budgets] Benchmarks complete."
 
