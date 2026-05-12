@@ -63,7 +63,7 @@
       "media_type": "application/json",
       "produced_by_bead": "ft-tf6g3.21",
       "proof_categories": [9],
-      "description": "Continuous FrankenTerm-vs-upstream-WezTerm render differential slot. The checked-in artifact records the allowlist gate and current adapter blocker; production evidence requires a workflow run with frames_compared_total > 0 and novel_divergence_count == 0."
+      "description": "Continuous FrankenTerm-vs-upstream-WezTerm render differential slot. The checked-in artifact records the allowlist gate and pending first real frame run; production evidence requires a workflow run with frames_compared_total > 0 and novel_divergence_count == 0."
     },
     {
       "category": "tui/render-parity",

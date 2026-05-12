@@ -57,6 +57,9 @@ struct Args {
     perf_threshold_per_fixture_pct: f64,
     perf_threshold_aggregate_pct: f64,
     update_perf_baseline: bool,
+    comparison_report: Option<PathBuf>,
+    comparison_frankenterm_frames: Option<PathBuf>,
+    comparison_wezterm_frames: Option<PathBuf>,
     fuzz: FuzzCliFlags,
     fixture_filters: Vec<String>,
 }
@@ -237,6 +240,25 @@ struct PerfComparison {
     baseline_generated_at_unix_secs: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct WeztermRenderComparisonReport {
+    schema_version: &'static str,
+    comparisons: Vec<WeztermRenderComparisonRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct WeztermRenderComparisonRow {
+    input_id: String,
+    frame_id: String,
+    status: &'static str,
+    metrics: serde_json::Value,
+    thresholds: Thresholds,
+    frankenterm_png: String,
+    wezterm_png: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
@@ -268,6 +290,12 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     if args.fuzz.fuzz_mode_active() {
         return run_fuzz(&args.fuzz);
     }
+    if args.comparison_report.is_some()
+        || args.comparison_frankenterm_frames.is_some()
+        || args.comparison_wezterm_frames.is_some()
+    {
+        return write_wezterm_comparison_report(&args);
+    }
 
     if args.update_goldens {
         require_update_goldens_confirmation()?;
@@ -291,6 +319,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         perf_threshold_per_fixture_pct: DEFAULT_PERF_THRESHOLD_PER_FIXTURE_PCT,
         perf_threshold_aggregate_pct: DEFAULT_PERF_THRESHOLD_AGGREGATE_PCT,
         update_perf_baseline: false,
+        comparison_report: None,
+        comparison_frankenterm_frames: None,
+        comparison_wezterm_frames: None,
         fuzz: FuzzCliFlags::default(),
         fixture_filters: Vec::new(),
     };
@@ -313,6 +344,12 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     args.perf_threshold_per_fixture_pct = parse_pct_arg(other, value)?;
                 } else if let Some(value) = other.strip_prefix("--perf-threshold-aggregate=") {
                     args.perf_threshold_aggregate_pct = parse_pct_arg(other, value)?;
+                } else if let Some(value) = other.strip_prefix("--comparison-report=") {
+                    args.comparison_report = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--comparison-frankenterm-frames=") {
+                    args.comparison_frankenterm_frames = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--comparison-wezterm-frames=") {
+                    args.comparison_wezterm_frames = Some(PathBuf::from(value));
                 } else if let Some(value) = other.strip_prefix("--fuzz-seed=") {
                     args.fuzz.seed = Some(parse_u64_arg(other, value)?);
                 } else if let Some(value) = other.strip_prefix("--fuzz-duration=") {
@@ -770,6 +807,164 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Err(format!("{failed} GPU golden fixture(s) failed").into())
     }
+}
+
+fn write_wezterm_comparison_report(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let output = args
+        .comparison_report
+        .as_deref()
+        .ok_or("--comparison-report is required for WezTerm comparison mode")?;
+    let frankenterm_root = args
+        .comparison_frankenterm_frames
+        .as_deref()
+        .ok_or("--comparison-frankenterm-frames is required for WezTerm comparison mode")?;
+    let wezterm_root = args
+        .comparison_wezterm_frames
+        .as_deref()
+        .ok_or("--comparison-wezterm-frames is required for WezTerm comparison mode")?;
+
+    let frame_paths = discover_png_frames(frankenterm_root)?;
+    if frame_paths.is_empty() {
+        return Err(format!(
+            "no FrankenTerm PNG frames found under {}",
+            frankenterm_root.display()
+        )
+        .into());
+    }
+
+    let mut rows = Vec::with_capacity(frame_paths.len());
+    let thresholds = Thresholds::default();
+    for relative in frame_paths {
+        let frankenterm_png = frankenterm_root.join(&relative);
+        let wezterm_png = wezterm_root.join(&relative);
+        let (input_id, frame_id) = comparison_ids(&relative);
+        if !wezterm_png.is_file() {
+            rows.push(WeztermRenderComparisonRow {
+                input_id,
+                frame_id,
+                status: "diverged",
+                metrics: failed_metrics(thresholds),
+                thresholds,
+                frankenterm_png: path_string(&frankenterm_png),
+                wezterm_png: path_string(&wezterm_png),
+                reason: Some("missing_wezterm_png".to_string()),
+            });
+            continue;
+        }
+
+        let frankenterm_image = load_png_rgba8(&frankenterm_png)?;
+        let wezterm_image = load_png_rgba8(&wezterm_png)?;
+        match compare_images(&frankenterm_image, &wezterm_image, thresholds) {
+            Ok(comparison) => {
+                rows.push(WeztermRenderComparisonRow {
+                    input_id,
+                    frame_id,
+                    status: if comparison.passed {
+                        "pass"
+                    } else {
+                        "diverged"
+                    },
+                    metrics: serde_json::to_value(&comparison.metrics)?,
+                    thresholds,
+                    frankenterm_png: path_string(&frankenterm_png),
+                    wezterm_png: path_string(&wezterm_png),
+                    reason: (!comparison.passed).then(|| "metric_threshold_exceeded".to_string()),
+                });
+            }
+            Err(err) => {
+                rows.push(WeztermRenderComparisonRow {
+                    input_id,
+                    frame_id,
+                    status: "diverged",
+                    metrics: failed_metrics(thresholds),
+                    thresholds,
+                    frankenterm_png: path_string(&frankenterm_png),
+                    wezterm_png: path_string(&wezterm_png),
+                    reason: Some(err.to_string()),
+                });
+            }
+        }
+    }
+
+    let report = WeztermRenderComparisonReport {
+        schema_version: "wezterm-render-comparison.v1",
+        comparisons: rows,
+    };
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output, serde_json::to_string_pretty(&report)? + "\n")?;
+    emit_json(json!({
+        "phase": "wezterm-comparison-report",
+        "status": "written",
+        "output": output,
+        "frames_compared_total": report.comparisons.len(),
+    }));
+    Ok(())
+}
+
+fn discover_png_frames(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    if !root.is_dir() {
+        return Err(format!(
+            "frame root does not exist or is not a directory: {}",
+            root.display()
+        )
+        .into());
+    }
+    let mut frames = Vec::new();
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+        {
+            continue;
+        }
+        frames.push(path.strip_prefix(root)?.to_path_buf());
+    }
+    frames.sort();
+    Ok(frames)
+}
+
+fn comparison_ids(relative: &Path) -> (String, String) {
+    let mut components: Vec<String> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let file_name = components
+        .pop()
+        .unwrap_or_else(|| "frame-000.png".to_string());
+    let frame_id = Path::new(&file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("frame-000")
+        .to_string();
+    let input_id = if components.is_empty() {
+        frame_id.clone()
+    } else {
+        components.join("/")
+    };
+    (input_id, frame_id)
+}
+
+fn failed_metrics(thresholds: Thresholds) -> serde_json::Value {
+    json!({
+        "ssim": 0.0,
+        "l_inf": 255,
+        "changed_pixels": 0,
+        "total_pixels": 0,
+        "changed_pixel_fraction": 1.0,
+        "thresholds": thresholds,
+    })
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
 }
 
 fn discover_fixtures(

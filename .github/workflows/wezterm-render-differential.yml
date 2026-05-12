@@ -46,6 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build -p frankenterm-gui --bin frankenterm-gui
+          echo "FRANKENTERM_GUI=$PWD/target/debug/frankenterm-gui" >> "$GITHUB_ENV"
 
       - name: Build upstream WezTerm GUI
         run: |
@@ -54,9 +55,20 @@ jobs:
           mkdir -p "$upstream_src"
           git archive refs/remotes/wezterm-upstream/main | tar -x -C "$upstream_src"
           cargo build --manifest-path "$upstream_src/Cargo.toml" -p wezterm-gui --bin wezterm-gui
+          echo "WEZTERM_GUI=$upstream_src/target/debug/wezterm-gui" >> "$GITHUB_ENV"
 
       - name: Validate differential gate self-test
         run: scripts/wezterm-render-differential.sh --self-test
+
+      - name: Export frame comparison report
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.comparison_report == '' }}
+        run: |
+          set -euo pipefail
+          scripts/wezterm-render-comparison-macos.sh \
+            --frankenterm-gui "$FRANKENTERM_GUI" \
+            --wezterm-gui "$WEZTERM_GUI" \
+            --frame-root "$RUN_DIR/frames" \
+            --output "$RUN_DIR/comparison-report.json"
 
       - name: Gate supplied comparison report
         env:
@@ -64,12 +76,13 @@ jobs:
         run: |
           set -euo pipefail
           upstream_ref="$(cat "$RUN_DIR/upstream-wezterm-head.txt")"
-          if [ -z "${COMPARISON_REPORT:-}" ]; then
-            echo "::error title=WezTerm frame adapter missing::No comparison_report input was supplied. The upstream checkout and both GUI builds completed, but this lane still needs a frame exporter that writes schema_version=wezterm-render-comparison.v1 with comparisons[]."
+          comparison_report="${COMPARISON_REPORT:-$RUN_DIR/comparison-report.json}"
+          if [ ! -s "$comparison_report" ]; then
+            echo "::error title=WezTerm comparison report missing::Expected $comparison_report to contain schema_version=wezterm-render-comparison.v1 with comparisons[]."
             exit 1
           fi
           scripts/wezterm-render-differential.sh \
-            --comparison-report "$COMPARISON_REPORT" \
+            --comparison-report "$comparison_report" \
             --upstream-ref "$upstream_ref" \
             --output "$RUN_DIR/wezterm-divergence.json"
 

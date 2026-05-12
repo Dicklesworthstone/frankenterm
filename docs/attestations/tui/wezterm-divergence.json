@@ -25,7 +25,7 @@
   "pass_condition": "latest_run_status == passed && novel_divergence_count == 0",
   "produced_by_bead": "ft-tf6g3.21",
   "residual_blocker": {
-    "summary": "Current upstream WezTerm exposes CLI text capture but no public headless PNG frame exporter. The gate is present and fails closed once the frame-comparison report exists; the render adapter must supply that report before this artifact is production evidence.",
+    "summary": "The macOS frame adapter now exists and writes wezterm-render-comparison.v1 reports, but this checked-in placeholder is not production evidence until a scheduled workflow run captures upstream WezTerm and FrankenTerm frames with frames_compared_total > 0.",
     "tracking_bead": "ft-tf6g3.36"
   },
   "run_id": null,
