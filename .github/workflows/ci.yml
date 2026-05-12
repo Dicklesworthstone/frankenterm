@@ -326,12 +326,14 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: Run tests
+        shell: bash
         run: |
           set -eo pipefail
           mkdir -p target/ci-logs
           cargo test --workspace --verbose 2>&1 | tee target/ci-logs/test-workspace.log
 
       - name: Run doc tests
+        shell: bash
         run: |
           set -eo pipefail
           mkdir -p target/ci-logs
