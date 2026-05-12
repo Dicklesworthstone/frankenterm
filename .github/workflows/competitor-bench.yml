@@ -74,7 +74,7 @@ jobs:
           bash scripts/competitor-bench.sh "${args[@]}"
 
       - name: Upload competitor bench artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: competitor-bench-${{ matrix.baseline }}-${{ github.run_id }}
           path: |

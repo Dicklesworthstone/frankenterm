@@ -71,7 +71,7 @@ jobs:
 
       - name: Upload lint logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: lint-logs-${{ matrix.os }}
           path: |
@@ -276,7 +276,7 @@ jobs:
 
       - name: Upload bats logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: operator-shell-tests-logs-${{ matrix.os }}
           path: target/ci-logs/bats-*.log
@@ -339,7 +339,7 @@ jobs:
 
       - name: Upload test logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: test-logs-${{ matrix.os }}
           path: |
@@ -380,7 +380,7 @@ jobs:
 
       - name: Upload macOS GPU artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: gpu-regression-macos-15
           path: |
@@ -504,7 +504,7 @@ jobs:
 
       - name: Upload Linux GPU pilot artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: gpu-linux-llvmpipe-pilot
           path: |
@@ -599,7 +599,7 @@ jobs:
 
       - name: Upload test logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: feature-test-logs-${{ matrix.feature }}
           path: |
@@ -653,7 +653,7 @@ jobs:
 
       - name: Upload runtime logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: runtime-test-logs-${{ matrix.runtime }}
           path: |
@@ -687,7 +687,7 @@ jobs:
 
       - name: Upload test logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: feature-test-logs-vendored
           path: |
@@ -755,7 +755,7 @@ jobs:
 
       - name: Upload FTUI test artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: ftui-test-artifacts
           path: |
@@ -825,7 +825,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: benchmark-results
           path: |
@@ -860,7 +860,7 @@ jobs:
 
       - name: Upload resize gate artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: resize-performance-gates
           path: |
@@ -888,7 +888,7 @@ jobs:
 
       - name: Upload gate report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: frankensqlite-gate-report
           path: |
@@ -916,7 +916,7 @@ jobs:
 
       - name: Upload recorder validation artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: recorder-validation-gates
           path: |
@@ -1056,7 +1056,7 @@ jobs:
 
       - name: Upload E2E artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: e2e-approval-artifacts
           path: |
@@ -1145,7 +1145,7 @@ jobs:
 
       - name: Upload Docker E2E artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -1187,7 +1187,7 @@ jobs:
           key: build-${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: ft-${{ matrix.target }}
           path: |

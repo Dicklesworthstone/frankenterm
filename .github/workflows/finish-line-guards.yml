@@ -63,7 +63,7 @@ jobs:
 
       - name: Upload guard summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: finish-line-guards-summary-shell
           path: |
@@ -186,7 +186,7 @@ jobs:
 
       - name: Upload E2E artifact bundle
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: finish-line-guards-e2e-bundle
           path: tests/e2e/logs/ft_xbnl0_5_2_finish_line_guards_*/
@@ -195,7 +195,7 @@ jobs:
 
       - name: Upload ft-5eqd4.4 policy count artifact bundle
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: ft-5eqd4-4-policy-count-doc-pin
           path: tests/e2e/artifacts/goal-line/ft-5eqd4/policy_count_doc_pin/
@@ -204,7 +204,7 @@ jobs:
 
       - name: Upload ft-5eqd4.5 policy convergence artifact bundle
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: ft-5eqd4-5-policy-convergence
           path: tests/e2e/artifacts/goal-line/ft-5eqd4/convergence/
@@ -213,7 +213,7 @@ jobs:
 
       - name: Upload ft-e87u6.2 attestation build matrix
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: ft-e87u6-2-attestation-build-matrix
           path: ${{ runner.temp }}/ft-e87u6-2-attestation-build-matrix/

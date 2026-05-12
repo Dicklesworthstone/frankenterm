@@ -191,7 +191,7 @@ jobs:
       # when br auto-filing skipped or failed.
       - name: Upload regression-bead draft (br-ft-jfyz7.1)
         if: steps.check.outputs.example_exit != '0'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: lindley-bounds-bead-draft-${{ github.run_id }}
           path: ${{ steps.file_bead.outputs.bead_draft }}
@@ -231,7 +231,7 @@ jobs:
 
       - name: Upload artifact for inspection
         if: ${{ always() && steps.check.outputs.tmp_artifact != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: lindley-bounds-${{ github.run_id }}
           path: ${{ steps.check.outputs.tmp_artifact }}

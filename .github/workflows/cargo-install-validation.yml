@@ -73,13 +73,14 @@ jobs:
       - name: Run cargo install validation (path mode)
         env:
           FT_INSTALL_SOURCE: path
+          FT_INSTALL_EXECUTION: github-actions-local
           FT_INSTALL_PATH: ${{ github.workspace }}/crates/frankenterm
           E2E_ARTIFACTS_BASE: ${{ github.workspace }}/e2e-artifacts
         run: bash tests/e2e/test_ft_gofz5_1_cargo_install.sh
 
       - name: Upload cargo install artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ matrix.artifact }}
           path: e2e-artifacts/**

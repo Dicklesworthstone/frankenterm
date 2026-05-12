@@ -37,6 +37,7 @@ recorded in the report for operator intent.
 
 Environment overrides:
   FT_INSTALL_SOURCE=git|path
+  FT_INSTALL_EXECUTION=rch|github-actions-local
   FT_INSTALL_GIT_URL=<git-url>
   FT_INSTALL_GIT_REF=<rev-or-tag>
   FT_INSTALL_PATH=<local-package-path>
@@ -71,7 +72,8 @@ require_cmd() {
 }
 
 scenario_cargo_install_validation() {
-  local scenario_dir remote_report_file rch_log remote_script remote_install_path rch_rc
+  local execution_label execution_log_name scenario_dir remote_report_file rch_log
+  local remote_script remote_script_file remote_install_path rch_rc
 
   case "${INSTALL_SOURCE}" in
     git|path) ;;
@@ -81,21 +83,41 @@ scenario_cargo_install_validation() {
       ;;
   esac
 
+  case "${FT_INSTALL_EXECUTION:-rch}" in
+    rch)
+      execution_label="rch"
+      execution_log_name="rch-cargo-install.log"
+      ;;
+    github-actions-local)
+      if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
+        echo "FT_INSTALL_EXECUTION=github-actions-local is only allowed under GitHub Actions." >&2
+        return 2
+      fi
+      execution_label="github_actions_local"
+      execution_log_name="github-actions-cargo-install.log"
+      ;;
+    *)
+      echo "FT_INSTALL_EXECUTION must be rch or github-actions-local, got: ${FT_INSTALL_EXECUTION:-}" >&2
+      return 2
+      ;;
+  esac
+
   remote_install_path="${INSTALL_PATH}"
   if [[ "${INSTALL_SOURCE}" == "path" ]]; then
     if [[ "${INSTALL_PATH}" == "${ROOT_DIR}/"* ]]; then
       remote_install_path="${INSTALL_PATH#"${ROOT_DIR}/"}"
     elif [[ "${INSTALL_PATH}" == /* ]]; then
-      echo "FT_INSTALL_PATH must be inside the repo for RCH execution: ${INSTALL_PATH}" >&2
+      echo "FT_INSTALL_PATH must be inside the repo for cargo install validation: ${INSTALL_PATH}" >&2
       return 2
     fi
   fi
 
   scenario_dir="${E2E_SCENARIOS_DIR}/${E2E_CURRENT_SCENARIO}"
-  rch_log="${scenario_dir}/rch-cargo-install.log"
+  rch_log="${scenario_dir}/${execution_log_name}"
   remote_report_file="${scenario_dir}/remote-report.json"
+  remote_script_file="${scenario_dir}/cargo-install-runner.sh"
 
-  remote_script="$(cat <<'REMOTE'
+  cat >"${remote_script_file}" <<'REMOTE'
 set -euo pipefail
 
 require_remote_cmd() {
@@ -279,6 +301,7 @@ jq -n \
   --arg bead_id "${FT_TEST_ID}" \
   --arg mode "${FT_INSTALL_SOURCE}" \
   --arg source "${source_summary}" \
+  --arg execution "${FT_INSTALL_EXECUTION_LABEL:-rch}" \
   --arg advertised_command "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm" \
   --arg install_root "${install_root}" \
   --arg cargo_home "${cargo_home}" \
@@ -321,7 +344,7 @@ jq -n \
       mode: $mode,
       source: $source,
       advertised_command: $advertised_command,
-      execution: "rch"
+      execution: $execution
     },
     platform: {
       os: $os_name,
@@ -374,27 +397,49 @@ printf 'FT_GOFZ5_REPORT_BEGIN\n'
 cat "${report_file}"
 printf '\nFT_GOFZ5_REPORT_END\n'
 REMOTE
-)"
+  remote_script="$(<"${remote_script_file}")"
 
-  ensure_rch_ready
+  if [[ "${execution_label}" == "rch" ]]; then
+    ensure_rch_ready
+  fi
 
   set +e
-  run_rch_cargo_logged "${rch_log}" env \
-    FT_BINARY_NAME="${BINARY_NAME}" \
-    FT_INSTALL_GIT_REF="${INSTALL_GIT_REF}" \
-    FT_INSTALL_GIT_URL="${INSTALL_GIT_URL}" \
-    FT_INSTALL_PATH_REMOTE="${remote_install_path}" \
-    FT_INSTALL_SOURCE="${INSTALL_SOURCE}" \
-    FT_PACKAGE_NAME="${PACKAGE_NAME}" \
-    FT_REMOTE_RUN_ID="${RUN_ID}" \
-    FT_REMOTE_WORK_DIR="target/rch-e2e-ft-gofz5-1/${RUN_ID}" \
-    FT_KEEP_ARTIFACTS="${KEEP_ARTIFACTS}" \
-    FT_TEST_ID="${TEST_ID}" \
-    bash -lc "${remote_script}"
+  if [[ "${execution_label}" == "rch" ]]; then
+    run_rch_cargo_logged "${rch_log}" env \
+      FT_BINARY_NAME="${BINARY_NAME}" \
+      FT_INSTALL_EXECUTION_LABEL="${execution_label}" \
+      FT_INSTALL_GIT_REF="${INSTALL_GIT_REF}" \
+      FT_INSTALL_GIT_URL="${INSTALL_GIT_URL}" \
+      FT_INSTALL_PATH_REMOTE="${remote_install_path}" \
+      FT_INSTALL_SOURCE="${INSTALL_SOURCE}" \
+      FT_PACKAGE_NAME="${PACKAGE_NAME}" \
+      FT_REMOTE_RUN_ID="${RUN_ID}" \
+      FT_REMOTE_WORK_DIR="target/rch-e2e-ft-gofz5-1/${RUN_ID}" \
+      FT_KEEP_ARTIFACTS="${KEEP_ARTIFACTS}" \
+      FT_TEST_ID="${TEST_ID}" \
+      bash -lc "${remote_script}"
+  else
+    (
+      cd "${ROOT_DIR}"
+      env \
+        FT_BINARY_NAME="${BINARY_NAME}" \
+        FT_INSTALL_EXECUTION_LABEL="${execution_label}" \
+        FT_INSTALL_GIT_REF="${INSTALL_GIT_REF}" \
+        FT_INSTALL_GIT_URL="${INSTALL_GIT_URL}" \
+        FT_INSTALL_PATH_REMOTE="${remote_install_path}" \
+        FT_INSTALL_SOURCE="${INSTALL_SOURCE}" \
+        FT_PACKAGE_NAME="${PACKAGE_NAME}" \
+        FT_REMOTE_RUN_ID="${RUN_ID}" \
+        FT_REMOTE_WORK_DIR="target/github-actions-ft-gofz5-1/${RUN_ID}" \
+        FT_KEEP_ARTIFACTS="${KEEP_ARTIFACTS}" \
+        FT_TEST_ID="${TEST_ID}" \
+        bash "${remote_script_file}"
+    ) >"${rch_log}" 2>&1
+  fi
   rch_rc=$?
   set -e
 
-  e2e_add_file "rch-cargo-install.log" < "${rch_log}"
+  e2e_add_file "${execution_log_name}" < "${rch_log}"
   if [[ ${rch_rc} -ne 0 ]]; then
     return "${rch_rc}"
   fi
@@ -405,9 +450,9 @@ REMOTE
     capture { print }
   ' "${rch_log}" > "${remote_report_file}"
 
-  if ! jq -e '
+  if ! jq -e --arg expected_execution "${execution_label}" '
     .schema_version == "ft.cargo_install.validation.v1"
-    and .validation.execution == "rch"
+    and .validation.execution == $expected_execution
     and (.install.exit_code == 0)
     and (.verification.version_exit == 0)
     and (.verification.doctor_ok | type == "boolean")

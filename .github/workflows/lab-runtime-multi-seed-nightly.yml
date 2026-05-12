@@ -130,7 +130,7 @@ jobs:
 
       - name: Upload per-seed log + summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: lab-runtime-seed-${{ matrix.seed }}
           path: target/ci-logs/seed-${{ matrix.seed }}.*
@@ -189,7 +189,7 @@ jobs:
           PY
 
       - name: Upload aggregated summary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: lab-runtime-multi-seed-summary
           path: out/lab-runtime-multi-seed-summary.json
