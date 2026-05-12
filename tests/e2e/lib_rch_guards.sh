@@ -835,10 +835,10 @@ rch_write_remote_preflight_json() {
         worker_queue_state="busy_wait"
         detail="RCH queue reported zero available slots"
     elif rch_is_unsigned_int "${queue_depth}" && [[ "${queue_depth}" -gt 0 ]]; then
-        status="blocked"
-        reason_code="remote_busy_wait"
-        worker_queue_state="busy_wait"
-        detail="RCH queue already has waiting builds"
+        status="warning"
+        reason_code="remote_queue_nonempty"
+        worker_queue_state="queue_nonempty"
+        detail="RCH queue has waiting builds; worker-selection preflight remains authoritative"
     fi
 
     mkdir -p "$(dirname "${output_file}")"
