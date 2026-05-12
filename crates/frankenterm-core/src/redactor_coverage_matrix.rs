@@ -1,7 +1,7 @@
 //! Recall/precision matrix for the secret redactor
 //! ([BR-RC-SAFETY-PROOFS.G10] / `ft-x0666.2`).
 //!
-//! redactor.rs ships 25 regex patterns covering OpenAI,
+//! redactor.rs ships 32 regex patterns covering OpenAI,
 //! Anthropic, GitHub, Google, Slack, Stripe, AWS, generic
 //! key/token/secret, etc. Coverage is *claimed* but, until
 //! this module shipped, not measured. The bead's headline
@@ -25,7 +25,8 @@
 //! - [`RedactorCoverageHealth`] — `ft doctor` counter snapshot
 //!   matching this session's `*Health` shape.
 //! - [`synthesized_corpus`] — in-tree corpus covering each of
-//!   the 25 patterns with at least 3 positives + 1 negative.
+//!   the live redactor patterns with at least 3 positives plus
+//!   targeted lookalike negatives.
 //!   Values are synthetic — random byte sequences shaped like
 //!   the format. None are real credentials.
 //! - JSONL render/parse helpers for the per-release coverage
@@ -40,8 +41,9 @@
 //!   the corpus and the harness re-runs unchanged.
 //! - The Fano's-inequality sample-size derivation. That's
 //!   methodology written up in
-//!   `docs/security/redactor-coverage-methodology.md`. The
-//!   harness side reads the derived bound and applies it.
+//!   `docs/security/redactor-recall-derivation.md`. The
+//!   harness publishes the derived sample floor in the
+//!   per-release report.
 //! - The CI gate. The bead's "≥99% recall floor; fail CI on
 //!   dip" is a property test in
 //!   `tests/redactor_coverage_matrix.rs`.
@@ -460,7 +462,8 @@ fn neg(name: &str, provider: &str, rationale: &str, input: &str) -> RedactorTest
 }
 
 /// Synthesized in-tree test corpus. Each pattern in
-/// `SECRET_PATTERNS` gets at least 3 positives + 1 negative.
+/// `SECRET_PATTERNS` gets at least 3 positives; provider-
+/// specific and cross-cutting negatives cover common lookalikes.
 /// All "secret" values are random byte sequences shaped like
 /// the format — none are real credentials.
 #[must_use]
@@ -571,17 +574,17 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
         pos(
             "github_fg_pat_basic",
             "github",
-            "github_pat_<82+ alnum>",
-            "TOK=github_pat_11ABCDEFG_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "github_pat_11ABCDEFG_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "github_pat_<50+ body chars>",
+            "TOK=github_pat_11ABCDEFG_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAZZZZZZ",
+            "github_pat_11ABCDEFG_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAZZZZZZ",
             "github_fine_grained_pat",
         ),
         pos(
             "github_fg_pat_in_url",
             "github",
             "embedded in a longer line",
-            "url=https://x-access-token:github_pat_11AAAAAA_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB@github.com/x.git",
-            "github_pat_11AAAAAA_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "url=https://x-access-token:github_pat_11AAAAAA_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBYYYYYY@github.com/x.git",
+            "github_pat_11AAAAAA_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBYYYYYY",
             "github_fine_grained_pat",
         ),
         pos(
@@ -591,6 +594,45 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
             "github_pat_11ZZZZZZZZ_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCDDDDDDDDDD",
             "github_pat_11ZZZZZZZZ_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCDDDDDDDDDD",
             "github_fine_grained_pat",
+        ),
+        neg(
+            "github_fg_pat_too_short",
+            "github",
+            "github_pat_ prefix below body threshold",
+            "broken: github_pat_short",
+        ),
+        // -----------------------------------------------------
+        // GitLab
+        // -----------------------------------------------------
+        pos(
+            "gitlab_pat_basic",
+            "gitlab",
+            "glpat-<20+> personal access token",
+            "GITLAB_TOKEN=glpat-AAAAAAAAAAAAAAAAAAAA",
+            "glpat-AAAAAAAAAAAAAAAAAAAA",
+            "gitlab_token",
+        ),
+        pos(
+            "gitlab_pat_in_url",
+            "gitlab",
+            "embedded in clone URL",
+            "url=https://oauth2:glpat-BBBBBBBBBBBBBBBBBBBBB@gitlab.example.com/group/repo.git",
+            "glpat-BBBBBBBBBBBBBBBBBBBBB",
+            "gitlab_token",
+        ),
+        pos(
+            "gitlab_pat_long",
+            "gitlab",
+            "longer GitLab token body",
+            "auth=glpat-CCCCCCCCCCCCCCCCCCCCDDDDDDDDDD",
+            "glpat-CCCCCCCCCCCCCCCCCCCCDDDDDDDDDD",
+            "gitlab_token",
+        ),
+        neg(
+            "gitlab_pat_too_short",
+            "gitlab",
+            "glpat- prefix below {20,} threshold",
+            "broken: glpat-short",
         ),
         // -----------------------------------------------------
         // xAI
@@ -983,6 +1025,105 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
             "stripe_key",
         ),
         // -----------------------------------------------------
+        // Twilio Account SID
+        // -----------------------------------------------------
+        pos(
+            "twilio_sid_basic",
+            "twilio",
+            "AC + 32 hex chars",
+            "TWILIO_ACCOUNT_SID=AC0123456789abcdef0123456789ABCDEF",
+            "AC0123456789abcdef0123456789ABCDEF",
+            "twilio_account_sid",
+        ),
+        pos(
+            "twilio_sid_lower_hex",
+            "twilio",
+            "lowercase hex body",
+            "account_sid: ACabcdefabcdefabcdefabcdefabcdefab",
+            "ACabcdefabcdefabcdefabcdefabcdefab",
+            "twilio_account_sid",
+        ),
+        pos(
+            "twilio_sid_in_log",
+            "twilio",
+            "SID embedded in a log line",
+            "[twilio] sid=AC11112222333344445555666677778888 ok",
+            "AC11112222333344445555666677778888",
+            "twilio_account_sid",
+        ),
+        neg(
+            "twilio_sid_too_short",
+            "twilio",
+            "AC prefix below 32 hex chars",
+            "broken: AC0123456789abcdef",
+        ),
+        // -----------------------------------------------------
+        // SendGrid
+        // -----------------------------------------------------
+        pos(
+            "sendgrid_key_basic",
+            "sendgrid",
+            "SG.<20+>.<40+> API key",
+            "SENDGRID_API_KEY=SG.ABCDEFGHIJKLMNOPQRST.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn",
+            "SG.ABCDEFGHIJKLMNOPQRST.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn",
+            "sendgrid_key",
+        ),
+        pos(
+            "sendgrid_key_underscore",
+            "sendgrid",
+            "SendGrid token body with URL-safe underscore",
+            "api_key=SG.ABCDEFGHIJKLMNOPQRST.ABCDEFGHIJKLMNO_PQRSTUVWXYZabcdefghijklmn",
+            "SG.ABCDEFGHIJKLMNOPQRST.ABCDEFGHIJKLMNO_PQRSTUVWXYZabcdefghijklmn",
+            "sendgrid_key",
+        ),
+        pos(
+            "sendgrid_key_dash",
+            "sendgrid",
+            "SendGrid token body with URL-safe dash",
+            "sendgrid: SG.abcdefghijklmnopqrst.abcdefghijklmnopqrstuvwxyzABCD-EFGHIJKLMN",
+            "SG.abcdefghijklmnopqrst.abcdefghijklmnopqrstuvwxyzABCD-EFGHIJKLMN",
+            "sendgrid_key",
+        ),
+        neg(
+            "sendgrid_key_too_short",
+            "sendgrid",
+            "SG prefix with undersized third segment",
+            "broken: SG.short.too_short",
+        ),
+        // -----------------------------------------------------
+        // Datadog
+        // -----------------------------------------------------
+        pos(
+            "datadog_dd_api_key",
+            "datadog",
+            "DD_API_KEY keyed 32-hex value",
+            "DD_API_KEY=0123456789abcdef0123456789ABCDEF",
+            "0123456789abcdef0123456789ABCDEF",
+            "datadog_api_key",
+        ),
+        pos(
+            "datadog_full_api_key",
+            "datadog",
+            "DATADOG_API_KEY keyed value",
+            "DATADOG_API_KEY: abcdefabcdefabcdefabcdefabcdef12",
+            "abcdefabcdefabcdefabcdefabcdef12",
+            "datadog_api_key",
+        ),
+        pos(
+            "datadog_quoted_api_key",
+            "datadog",
+            "quoted Datadog API key value",
+            r#"DD_API_KEY="ABCDEFABCDEFABCDEFABCDEFABCDEF12""#,
+            "ABCDEFABCDEFABCDEFABCDEFABCDEF12",
+            "datadog_api_key",
+        ),
+        neg(
+            "datadog_api_key_non_hex",
+            "datadog",
+            "DD_API_KEY value with non-hex chars",
+            "DD_API_KEY=nothexnothex",
+        ),
+        // -----------------------------------------------------
         // Database URL
         // -----------------------------------------------------
         pos(
@@ -1008,6 +1149,105 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
             "uri=mongodb://user:secret123@cluster0.example.mongodb.net/db",
             "secret123",
             "database_url",
+        ),
+        // -----------------------------------------------------
+        // SSH / PEM private key blocks
+        // -----------------------------------------------------
+        pos(
+            "ssh_rsa_private_key_block",
+            "ssh_private_key",
+            "RSA private key PEM envelope",
+            "paste:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAaBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890\nEXAMPLE_BODY_NOT_A_REAL_KEY_aBcDeFgHiJkLmNoPqRsTuVwX\n-----END RSA PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAaBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890\nEXAMPLE_BODY_NOT_A_REAL_KEY_aBcDeFgHiJkLmNoPqRsTuVwX\n-----END RSA PRIVATE KEY-----",
+            "ssh_private_key",
+        ),
+        pos(
+            "ssh_openssh_private_key_block",
+            "ssh_private_key",
+            "OpenSSH private key PEM envelope",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEXAMPLE_SYNTHETIC_BODY\n-----END OPENSSH PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEXAMPLE_SYNTHETIC_BODY\n-----END OPENSSH PRIVATE KEY-----",
+            "ssh_private_key",
+        ),
+        pos(
+            "ssh_pkcs8_encrypted_private_key_block",
+            "ssh_private_key",
+            "encrypted PKCS#8 private key envelope",
+            "secret block -----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkqhkiG9w0BBQ0wQTApBgkqhkiG9w0BBQwwHAQIEXAMPLEBODY123456\n-----END ENCRYPTED PRIVATE KEY----- trailing",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkqhkiG9w0BBQ0wQTApBgkqhkiG9w0BBQwwHAQIEXAMPLEBODY123456\n-----END ENCRYPTED PRIVATE KEY-----",
+            "ssh_private_key",
+        ),
+        neg(
+            "ssh_private_key_incomplete_block",
+            "ssh_private_key",
+            "BEGIN marker without matching END marker",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAaBcDeFg",
+        ),
+        // -----------------------------------------------------
+        // PGP / OpenPGP armored blocks
+        // -----------------------------------------------------
+        pos(
+            "pgp_private_key_block",
+            "pgp_block",
+            "PGP private key armored envelope",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: Synthetic\n\nlQOYBGUAAAAABCDEF1234567890SYNTHETIC\n-----END PGP PRIVATE KEY BLOCK-----",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: Synthetic\n\nlQOYBGUAAAAABCDEF1234567890SYNTHETIC\n-----END PGP PRIVATE KEY BLOCK-----",
+            "pgp_block",
+        ),
+        pos(
+            "pgp_message_block",
+            "pgp_block",
+            "PGP message armored envelope",
+            "payload=-----BEGIN PGP MESSAGE-----\n\nwcBMA0EXAMPLESYNTHETICBODY1234567890\n-----END PGP MESSAGE-----",
+            "-----BEGIN PGP MESSAGE-----\n\nwcBMA0EXAMPLESYNTHETICBODY1234567890\n-----END PGP MESSAGE-----",
+            "pgp_block",
+        ),
+        pos(
+            "pgp_signed_message_block",
+            "pgp_block",
+            "PGP signed-message envelope closes with END PGP SIGNATURE",
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhello\n-----BEGIN PGP SIGNATURE-----\nSYNTHETICSIGNATUREBODY\n-----END PGP SIGNATURE-----",
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhello\n-----BEGIN PGP SIGNATURE-----\nSYNTHETICSIGNATUREBODY\n-----END PGP SIGNATURE-----",
+            "pgp_block",
+        ),
+        neg(
+            "pgp_block_incomplete",
+            "pgp_block",
+            "PGP opener without a closing armored marker",
+            "-----BEGIN PGP MESSAGE-----\nmissing trailer",
+        ),
+        // -----------------------------------------------------
+        // JWT
+        // -----------------------------------------------------
+        pos(
+            "jwt_bare_token",
+            "jwt",
+            "bare JWT starts with eyJ header and payload",
+            "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature0123456789",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature0123456789",
+            "jwt_token",
+        ),
+        pos(
+            "jwt_in_log_line",
+            "jwt",
+            "JWT embedded in log output",
+            "DEBUG bearerless token eyJ0eXAiOiJKV1QifQ.eyJpc3MiOiJmdCJ9.syntheticSig end",
+            "eyJ0eXAiOiJKV1QifQ.eyJpc3MiOiJmdCJ9.syntheticSig",
+            "jwt_token",
+        ),
+        pos(
+            "jwt_long_signature",
+            "jwt",
+            "JWT with long base64url signature",
+            "eyJraWQiOiJleGFtcGxlIn0.eyJhdWQiOiJmcmFua2VudGVybSJ9.ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef0123456789",
+            "eyJraWQiOiJleGFtcGxlIn0.eyJhdWQiOiJmcmFua2VudGVybSJ9.ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef0123456789",
+            "jwt_token",
+        ),
+        neg(
+            "jwt_two_segments_only",
+            "jwt",
+            "JWT-looking value without signature segment",
+            "not-a-jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ",
         ),
         // -----------------------------------------------------
         // Device code (OAuth device flow)
@@ -1203,17 +1443,31 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redactor::secret_pattern_names;
 
     #[test]
     fn corpus_has_minimum_size() {
         let corpus = synthesized_corpus();
-        // 25 patterns × ≥3 vectors each = ≥75. The actual
-        // corpus is larger because some patterns get more
-        // coverage and we add cross-cutting negatives.
+        let expected_min = secret_pattern_names().count() * 3;
         assert!(
-            corpus.len() >= 60,
-            "corpus too small: {} (expected ≥60)",
-            corpus.len()
+            corpus.len() >= expected_min,
+            "corpus too small: {} (expected ≥{expected_min})",
+            corpus.len(),
+        );
+    }
+
+    #[test]
+    fn corpus_covers_every_live_secret_pattern() {
+        let covered: std::collections::BTreeSet<String> = synthesized_corpus()
+            .into_iter()
+            .flat_map(|v| v.expected_matches.into_iter().map(|m| m.pattern_name))
+            .collect();
+        let missing = secret_pattern_names()
+            .filter(|name| !covered.contains(*name))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "coverage corpus is missing live redactor pattern classes: {missing:?}"
         );
     }
 
@@ -1259,6 +1513,25 @@ mod tests {
             snap.min_provider_recall(),
             snap.overall,
         );
+    }
+
+    #[test]
+    fn corpus_expected_pattern_names_are_detected_by_name() {
+        let redactor = Redactor::new();
+        for vector in synthesized_corpus() {
+            let detections = redactor.detect(&vector.input);
+            for expected in &vector.expected_matches {
+                let matched_by_name = detections.iter().any(|(name, start, end)| {
+                    *name == expected.pattern_name
+                        && spans_overlap(expected.start, expected.end, *start as u32, *end as u32)
+                });
+                assert!(
+                    matched_by_name,
+                    "vector {} expected pattern {} to detect span {}..{} by name; detections: {:?}",
+                    vector.name, expected.pattern_name, expected.start, expected.end, detections,
+                );
+            }
+        }
     }
 
     #[test]

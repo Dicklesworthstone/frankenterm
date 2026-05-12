@@ -3,20 +3,23 @@
 **Bead:** [BR-RC-SAFETY-PROOFS.G10] / `ft-x0666.2`
 **Status:** Foundation slice shipped. Synthesized in-tree
 corpus + recall/precision matrix + per-provider breakdown +
-deliberate-bless flow + per-release JSON report all live;
-vendoring upstream gitleaks/trufflehog corpora is the follow-on
+deliberate-bless flow + per-release JSON report all live. The
+Fano-derived information floor and zero-miss binomial sample-size
+floor are published in the JSON report; vendoring upstream
+gitleaks/trufflehog corpora remains the follow-on under `ft-tf6g3.35`
 (operator sign-off needed for licensing).
 
 ## Why this matters
 
-`redactor.rs` ships **25 regex patterns** covering OpenAI,
+`redactor.rs` ships **32 regex patterns** covering OpenAI,
 Anthropic, GitHub (classic + fine-grained PAT), Google
 (API key + OAuth), xAI, Groq, Hugging Face, Replicate,
 Anyscale, Perplexity, the cohere/mistral/together/fireworks
 "AI provider keyed value" cluster, AWS (access key + secret),
-Bearer tokens, Slack, Stripe, database URLs, OAuth device
-codes, OAuth URLs, and four generic-shape patterns
-(api_key, token, password, secret).
+Bearer tokens, Slack, Stripe, GitLab, Twilio, SendGrid,
+Datadog, database URLs, SSH/PEM private keys, PGP armored
+blocks, JWTs, OAuth device codes, OAuth URLs, and four
+generic-shape patterns (api_key, token, password, secret).
 
 The README *claims* coverage. Industry standard practice — and
 this bead's headline rule — is to **publish recall and
@@ -53,67 +56,49 @@ Per-provider:
 ### In-tree (this bead)
 
 `crates/frankenterm-core/src/redactor_coverage_matrix.rs::synthesized_corpus`
-provides **83 hand-curated test vectors**:
+provides **112 hand-curated test vectors**:
 
-- ≥3 positive vectors per pattern, exercising the canonical
+- 3 positive vectors per live pattern class, exercising the canonical
   shape, common embeddings (env-var assignment, log line, URL,
   config file), and edge variants (admin/proj/svcacct prefixes,
-  case insensitivity, base64 charsets).
-- 1 negative vector per pattern where the format almost-but-
-  not-quite matches (below `{N,}` threshold, prose mention,
-  lookalike).
-- 3 cross-cutting negatives (UUID, prose-only key reference,
-  too-short value).
+  case insensitivity, base64 charsets, and multiline armored
+  blocks).
+- Provider-specific negatives for high-risk lookalikes where the
+  format almost-but-not-quite matches.
+- Cross-cutting negatives (UUID, prose-only key reference, too-short
+  value).
 
 All "secret" values are **synthetic** — random byte
 sequences shaped like the format. None are real credentials.
 
 ### Vendored (follow-on bead)
 
-The bead's action #1 vendors gitleaks + trufflehog test
-corpora into `tests/redactor_corpus/` (version-pinned).
-Licensing implications need operator sign-off before
-checkout. When vendored, additional `RedactorTestVector` rows
-append to `synthesized_corpus()` (or live in a parallel
-`vendored_corpus()` function) and the harness re-runs
-unchanged.
+`ft-tf6g3.35` tracks the external corpus expansion. Gitleaks
+is MIT-licensed, while TruffleHog is AGPL-3.0-licensed, so this
+slice does not vendor either corpus without operator/license
+sign-off. When approved, additional `RedactorTestVector` rows append
+to `synthesized_corpus()` or live in a parallel `vendored_corpus()`
+function and the harness re-runs unchanged.
 
 ### Sample-size derivation (Fano's inequality)
 
-Per the bead's action #3 (round-3 alien-artifact uplift), the
-recall-floor confidence target is ≥99%. Fano's inequality gives
-the lower bound on the test-corpus size needed for that
-confidence:
+`docs/security/redactor-recall-derivation.md` is the source of truth.
+The important distinction:
 
-> For a binary detector with true recall *r* and observed
-> recall *r̂* on N samples, the (1 - δ)-confidence bound on
-> *r - r̂* is approximately
->
->     |r - r̂| ≤ √( H₂(δ) / N )
->
-> where H₂ is binary entropy.
+- Fano's inequality bounds the minimum mutual information required to
+  distinguish the 32 secret classes plus the clean class at error
+  probability ≤0.01. For the live catalog, the floor is
+  4.913600983 bits.
+- The sample-size floor is the one-sided zero-miss binomial bound. To
+  claim recall ≥0.99 at 99% confidence after observing zero misses,
+  each secret class needs `ceil(log(0.01) / log(0.99)) = 459`
+  positive examples.
 
-For the bead's ≥99% recall floor, observation tolerance ±0.01
-(i.e., we want to be confident at the 0.01 level), and δ =
-0.01:
-
-```text
-H₂(0.01) ≈ 0.0808
-N ≥ H₂(0.01) / 0.01² = 808
-```
-
-The synthesized corpus alone is 83 vectors — **insufficient
-for 99% confidence** by this bound. The bead's vendored
-gitleaks/trufflehog corpora (action #1) bring the count to
-~6,000+ test vectors, comfortably above 808. The synthesized
-corpus is the **always-on regression net**; the vendored
-corpora are the **statistical confidence floor**.
-
-(Note: this is a conservative bound. In practice the
-detector's regex shape is fixed and the recall measurement
-is over a finite test set, so the true confidence is higher
-than Fano predicts. The bound is the floor, not a
-prediction.)
+The synthesized corpus currently has 3 positives per live pattern
+class. It is a mandatory regression net and report substrate, but it
+is **under-sampled** for an honest statistical 99% recall claim. The
+JSON report records this under `sample_size_floor` and
+`by_pattern_class`.
 
 ## Precision floor
 
@@ -133,7 +118,7 @@ hand-shaped to NOT trip any pattern.
 ## Per-provider breakdown
 
 The current coverage report at
-`docs/security/redactor-coverage.json` lists 20 providers:
+`docs/security/redactor-coverage.json` lists 27 providers:
 
 | Provider | Patterns | TP | FN | FP | Recall | Precision |
 |---|---|---|---|---|---|---|
@@ -152,7 +137,14 @@ The current coverage report at
 | bearer | bearer_token | 3 | 0 | 0 | 1.0 | 1.0 |
 | slack | slack_token | 3 | 0 | 0 | 1.0 | 1.0 |
 | stripe | stripe_key | 3 | 0 | 0 | 1.0 | 1.0 |
+| gitlab | gitlab_token | 3 | 0 | 0 | 1.0 | 1.0 |
+| twilio | twilio_account_sid | 3 | 0 | 0 | 1.0 | 1.0 |
+| sendgrid | sendgrid_key | 3 | 0 | 0 | 1.0 | 1.0 |
+| datadog | datadog_api_key | 3 | 0 | 0 | 1.0 | 1.0 |
 | database | database_url | 3 | 0 | 0 | 1.0 | 1.0 |
+| ssh_private_key | ssh_private_key | 3 | 0 | 0 | 1.0 | 1.0 |
+| pgp_block | pgp_block | 3 | 0 | 0 | 1.0 | 1.0 |
+| jwt | jwt_token | 3 | 0 | 0 | 1.0 | 1.0 |
 | device_code | device_code | 3 | 0 | 0 | 1.0 | 1.0 |
 | oauth_url | oauth_url | 3 | 0 | 0 | 1.0 | 1.0 |
 | generic | generic_api_key, generic_token, generic_password, generic_secret | 12 | 0 | 0 | 1.0 | 1.0 |
@@ -224,22 +216,24 @@ cargo test -p frankenterm-core --lib redactor_coverage_matrix:: \
 | Per-provider breakdown | ✓ (20 providers in the JSON report) |
 | ≥99% recall floor enforced | ✓ (CI test + 0.01 drift bound on bless flow) |
 | Per-release JSON artifact | ✓ (`docs/security/redactor-coverage.json` re-blessed per release) |
-| Vendored gitleaks corpus | ⏳ operator sign-off needed for licensing |
-| Vendored trufflehog corpus | ⏳ same |
-| Fano's-inequality sample-size derivation | ✓ (this doc) |
+| Vendored gitleaks corpus | ⏳ `ft-tf6g3.35`, operator sign-off needed for licensing |
+| Vendored trufflehog corpus | ⏳ `ft-tf6g3.35`, AGPL-3.0 license needs operator sign-off |
+| Fano's-inequality sample-size derivation | ✓ (`docs/security/redactor-recall-derivation.md`) |
+| Per-pattern sample-size floor in report | ✓ (`sample_size_floor` + `by_pattern_class`) |
 | FP clustering + regex tightening | ⏳ activates when vendored corpora land |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` schema bead |
 
 ## Cross-references
 
 - **Production redactor:** `crates/frankenterm-core/src/redactor.rs`
-  — 25 regex patterns + `Redactor::detect`/`redact`.
+  — 32 regex patterns + `Redactor::detect`/`redact`.
 - **Coverage matrix module:**
   `crates/frankenterm-core/src/redactor_coverage_matrix.rs`.
 - **Regression harness:**
   `crates/frankenterm-core/tests/redactor_coverage_matrix.rs`.
 - **Coverage report:** `docs/security/redactor-coverage.json`
   (deliberate-bless via `FT_REDACTOR_COVERAGE_BLESS=1`).
+- **Recall derivation:** `docs/security/redactor-recall-derivation.md`.
 - **Sibling fixtures** (same session pattern):
   `a11y_tree`, `color_management`, `ime_caret`,
   `atlas_stability`, `triple_buffer`, `live_resize`,

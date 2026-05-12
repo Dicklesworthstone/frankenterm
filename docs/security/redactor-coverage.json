@@ -1,9 +1,9 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "overall": {
     "recall": 1.0,
     "precision": 1.0,
-    "tp": 75,
+    "tp": 96,
     "fn": 0,
     "fp": 0
   },
@@ -50,6 +50,13 @@
       "fn": 0,
       "fp": 0
     },
+    "datadog": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
     "device_code": {
       "recall": 1.0,
       "precision": 1.0,
@@ -71,6 +78,13 @@
       "fn": 0,
       "fp": 0
     },
+    "gitlab": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
     "google": {
       "recall": 1.0,
       "precision": 1.0,
@@ -86,6 +100,13 @@
       "fp": 0
     },
     "huggingface": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "jwt": {
       "recall": 1.0,
       "precision": 1.0,
       "tp": 3,
@@ -120,7 +141,21 @@
       "fn": 0,
       "fp": 0
     },
+    "pgp_block": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
     "replicate": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "sendgrid": {
       "recall": 1.0,
       "precision": 1.0,
       "tp": 3,
@@ -134,7 +169,21 @@
       "fn": 0,
       "fp": 0
     },
+    "ssh_private_key": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
     "stripe": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "twilio": {
       "recall": 1.0,
       "precision": 1.0,
       "tp": 3,
@@ -149,7 +198,247 @@
       "fp": 0
     }
   },
-  "vectors_total": 83,
+  "sample_size_floor": {
+    "methodology": "docs/security/redactor-recall-derivation.md",
+    "confidence": 0.99,
+    "alpha": 0.01,
+    "recall_floor": 0.99,
+    "secret_pattern_classes": 32,
+    "total_classes_with_clean": 33,
+    "fano_min_mutual_information_bits": 4.913600983462542,
+    "zero_miss_positive_vectors_required_per_class": 459,
+    "current_min_positive_vectors_per_class": 3,
+    "current_status": "under_sampled",
+    "external_corpus_status": "not_vendored_license_signoff_required",
+    "follow_up_bead": "ft-tf6g3.35"
+  },
+  "by_pattern_class": {
+    "ai_provider_keyed_value": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "anthropic_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "anyscale_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "aws_access_key_id": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "aws_secret_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "bearer_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "database_url": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "datadog_api_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "device_code": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "generic_api_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "generic_password": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "generic_secret": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "generic_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "github_fine_grained_pat": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "github_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "gitlab_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "google_api_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "google_oauth_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "groq_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "huggingface_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "jwt_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "oauth_url": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "openai_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "perplexity_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "pgp_block": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "replicate_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "sendgrid_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "slack_token": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "ssh_private_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "stripe_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "twilio_account_sid": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    },
+    "xai_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled"
+    }
+  },
+  "vectors_total": 112,
   "recall_floor": 0.99,
   "bead": "ft-x0666.2"
 }

@@ -559,6 +559,16 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
     },
 ];
 
+/// Names of every live secret pattern in priority order.
+///
+/// The coverage matrix uses this as the catalog source of truth
+/// so newly added redactor patterns cannot silently miss the
+/// per-release recall report.
+#[must_use]
+pub fn secret_pattern_names() -> impl Iterator<Item = &'static str> {
+    SECRET_PATTERNS.iter().map(|pattern| pattern.name)
+}
+
 /// Secret redactor for removing sensitive information from text.
 ///
 /// This redactor uses a conservative set of regex patterns to identify and

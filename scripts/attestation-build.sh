@@ -343,6 +343,12 @@ else
   deferred_slots_json="$(printf '%s\n' "${deferred_objs[@]}" | jq -c -s '.')"
 fi
 
+redactor_confidence_json="null"
+redactor_coverage_path="$REPO_ROOT/docs/security/redactor-coverage.json"
+if [[ -f "$redactor_coverage_path" ]]; then
+  redactor_confidence_json="$(jq -c '.sample_size_floor // null' "$redactor_coverage_path")"
+fi
+
 if [[ -n "$PRIOR_BUNDLE_PATH" && -f "$PRIOR_BUNDLE_PATH" ]]; then
   PRIOR_COVERAGE_JSON="$(jq -c '.taxonomy_coverage // null' "$PRIOR_BUNDLE_PATH")"
   PRIOR_COVERAGE_STATUS="computed"
@@ -404,11 +410,30 @@ confidence_summary_json="$(jq -n \
   --slurpfile taxonomy "$TAXONOMY_PATH" \
   --arg schema_path "docs/proofs/confidence-format-schema.json" \
   --argjson artifacts "$artifacts_json" \
+  --argjson redactor_confidence "$redactor_confidence_json" \
   '($taxonomy[0].categories // []) as $categories
    | def confidence_type($id; $slug):
        if $slug == "topological-invariant" then "topological"
        elif ([1, 3, 6, 7, 8, 10] | index($id)) then "formal"
        else "frequentist"
+       end;
+     def has_redactor_floor($category; $source):
+       $category.id == 7
+       and $source.path == "docs/security/redactor-coverage.json"
+       and $redactor_confidence != null;
+     def redactor_confidence_value:
+       if ($redactor_confidence.current_status == "satisfies_floor")
+       then ($redactor_confidence.confidence // 0.99)
+       else {
+         status: "not_quantified",
+         reason: (
+           "Redactor coverage publishes the 99% recall sample floor but is under-sampled: current minimum "
+           + (($redactor_confidence.current_min_positive_vectors_per_class // 0) | tostring)
+           + " positive vectors per class; required "
+           + (($redactor_confidence.zero_miss_positive_vectors_required_per_class // 0) | tostring)
+           + "."
+         )
+       }
        end;
      def matching_artifacts($id):
        [$artifacts[]? | select((.proof_categories // []) | index($id))];
@@ -422,21 +447,40 @@ confidence_summary_json="$(jq -n \
              proof_category: $category.id,
              claim: ("Best available confidence for " + $category.name + " in this release bundle."),
              confidence_type: confidence_type($category.id; $category.slug),
-             confidence_value: {
-               status: "not_quantified",
-               reason: "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record."
-             },
-             sample_size_or_state_count: {
-               kind: "artifact_count",
-               value: ($matches | length),
-               unit: "delivered_artifacts"
-             },
+             confidence_value: (
+               if has_redactor_floor($category; $source)
+               then redactor_confidence_value
+               else {
+                 status: "not_quantified",
+                 reason: "Source artifact is attested by hash but does not yet publish a canonical numeric confidence record."
+               }
+               end
+             ),
+             sample_size_or_state_count: (
+               if has_redactor_floor($category; $source)
+               then {
+                 kind: "sample_size",
+                 value: ($redactor_confidence.zero_miss_positive_vectors_required_per_class // 0),
+                 unit: "positive_examples_per_secret_class_floor"
+               }
+               else {
+                 kind: "artifact_count",
+                 value: ($matches | length),
+                 unit: "delivered_artifacts"
+               }
+               end
+             ),
              time_budget_consumed: {
                seconds: 0,
                budget_seconds: null,
                status: "not_reported"
              },
-             methodology_url: ("docs/proof-taxonomy.json#" + $category.slug),
+             methodology_url: (
+               if has_redactor_floor($category; $source)
+               then ($redactor_confidence.methodology // "docs/security/redactor-recall-derivation.md")
+               else ("docs/proof-taxonomy.json#" + $category.slug)
+               end
+             ),
              source_artifact_hash: $source.sha256,
              source_artifact_path: $source.path
            })) as $records

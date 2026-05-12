@@ -12,13 +12,20 @@
 //! Set `FT_REDACTOR_COVERAGE_BLESS=1` to overwrite the report
 //! when the corpus changes.
 
+use frankenterm_core::redactor::secret_pattern_names;
 use frankenterm_core::redactor_coverage_matrix::{
-    MatrixSnapshot, RedactorCoverageHealth, fold_snapshot, synthesized_corpus,
+    MatrixSnapshot, RedactorCoverageHealth, RedactorTestVector, fold_snapshot, synthesized_corpus,
 };
 
+const COVERAGE_SCHEMA_VERSION: u32 = 2;
 const RECALL_FLOOR: f64 = 0.99;
 const PRECISION_FLOOR_OVERALL: f64 = 0.50; // see methodology doc
 const COVERAGE_REPORT_PATH: &str = "../../docs/security/redactor-coverage.json";
+const SAMPLE_SIZE_FLOOR_METHODOLOGY: &str = "docs/security/redactor-recall-derivation.md";
+const CONFIDENCE_TARGET: f64 = 0.99;
+const ALPHA: f64 = 0.01;
+const ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS: u32 = 459;
+const SAMPLE_SIZE_FLOOR_FOLLOW_UP_BEAD: &str = "ft-tf6g3.35";
 
 #[test]
 fn synthesized_corpus_meets_recall_floor() {
@@ -94,8 +101,10 @@ fn coverage_report_matches_or_blessed() {
 
     let report_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(COVERAGE_REPORT_PATH);
 
-    let live_json = serde_json::to_string_pretty(&CoverageReportShape::from(&snap))
-        .expect("MatrixSnapshot serializes");
+    let live_json = serde_json::to_string_pretty(&CoverageReportShape::from_snapshot_and_corpus(
+        &snap, &corpus,
+    ))
+    .expect("MatrixSnapshot serializes");
 
     let bless = std::env::var("FT_REDACTOR_COVERAGE_BLESS")
         .map(|v| v == "1")
@@ -154,7 +163,10 @@ fn coverage_report_matches_or_blessed() {
 
     // If any new providers exist or live recall/precision
     // improved, re-bless to reflect the new state.
-    let recompute_needed = live_parsed.by_provider.len() != on_disk_parsed.by_provider.len()
+    let recompute_needed = live_parsed.schema_version != on_disk_parsed.schema_version
+        || live_parsed.sample_size_floor != on_disk_parsed.sample_size_floor
+        || live_parsed.by_pattern_class != on_disk_parsed.by_pattern_class
+        || live_parsed.by_provider.len() != on_disk_parsed.by_provider.len()
         || live_parsed.by_provider.iter().any(|(p, live)| {
             on_disk_parsed
                 .by_provider
@@ -184,6 +196,8 @@ struct CoverageReportShape {
     schema_version: u32,
     overall: ProviderRecord,
     by_provider: std::collections::BTreeMap<String, ProviderRecord>,
+    sample_size_floor: SampleSizeFloorSummary,
+    by_pattern_class: std::collections::BTreeMap<String, PatternClassSampleFloor>,
     vectors_total: u32,
     /// Pinned ≥99% recall floor used to compute is_safe.
     recall_floor: f64,
@@ -200,8 +214,33 @@ struct ProviderRecord {
     fp: u32,
 }
 
-impl From<&MatrixSnapshot> for CoverageReportShape {
-    fn from(snap: &MatrixSnapshot) -> Self {
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SampleSizeFloorSummary {
+    methodology: String,
+    confidence: f64,
+    alpha: f64,
+    recall_floor: f64,
+    secret_pattern_classes: u32,
+    total_classes_with_clean: u32,
+    fano_min_mutual_information_bits: f64,
+    zero_miss_positive_vectors_required_per_class: u32,
+    current_min_positive_vectors_per_class: u32,
+    current_status: String,
+    external_corpus_status: String,
+    follow_up_bead: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PatternClassSampleFloor {
+    observed_positive_vectors: u32,
+    required_positive_vectors: u32,
+    confidence: f64,
+    recall_floor: f64,
+    status: String,
+}
+
+impl CoverageReportShape {
+    fn from_snapshot_and_corpus(snap: &MatrixSnapshot, corpus: &[RedactorTestVector]) -> Self {
         let overall = ProviderRecord {
             recall: snap.overall.recall(),
             precision: snap.overall.precision(),
@@ -225,13 +264,91 @@ impl From<&MatrixSnapshot> for CoverageReportShape {
                 )
             })
             .collect();
+        let by_pattern_class = pattern_class_sample_floors(corpus);
+        let secret_pattern_classes = secret_pattern_names().count() as u32;
+        let current_min_positive_vectors_per_class = by_pattern_class
+            .values()
+            .map(|floor| floor.observed_positive_vectors)
+            .min()
+            .unwrap_or(0);
+        let current_status =
+            if current_min_positive_vectors_per_class >= ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS {
+                "satisfies_floor"
+            } else {
+                "under_sampled"
+            }
+            .to_string();
         Self {
-            schema_version: 1,
+            schema_version: COVERAGE_SCHEMA_VERSION,
             overall,
             by_provider,
+            sample_size_floor: SampleSizeFloorSummary {
+                methodology: SAMPLE_SIZE_FLOOR_METHODOLOGY.to_string(),
+                confidence: CONFIDENCE_TARGET,
+                alpha: ALPHA,
+                recall_floor: RECALL_FLOOR,
+                secret_pattern_classes,
+                total_classes_with_clean: secret_pattern_classes + 1,
+                fano_min_mutual_information_bits: fano_min_mutual_information_bits(
+                    secret_pattern_classes + 1,
+                    ALPHA,
+                ),
+                zero_miss_positive_vectors_required_per_class:
+                    ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS,
+                current_min_positive_vectors_per_class,
+                current_status,
+                external_corpus_status: "not_vendored_license_signoff_required".to_string(),
+                follow_up_bead: SAMPLE_SIZE_FLOOR_FOLLOW_UP_BEAD.to_string(),
+            },
+            by_pattern_class,
             vectors_total: snap.vectors_total,
             recall_floor: RECALL_FLOOR,
             bead: "ft-x0666.2".to_string(),
         }
     }
+}
+
+fn fano_min_mutual_information_bits(class_count: u32, alpha: f64) -> f64 {
+    let classes = f64::from(class_count);
+    classes.log2() - binary_entropy_bits(alpha) - alpha * (classes - 1.0).log2()
+}
+
+fn binary_entropy_bits(p: f64) -> f64 {
+    -(p * p.log2()) - ((1.0 - p) * (1.0 - p).log2())
+}
+
+fn pattern_class_sample_floors(
+    corpus: &[RedactorTestVector],
+) -> std::collections::BTreeMap<String, PatternClassSampleFloor> {
+    let mut observed = secret_pattern_names()
+        .map(|name| (name.to_string(), 0u32))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for vector in corpus {
+        for expected in &vector.expected_matches {
+            *observed.entry(expected.pattern_name.clone()).or_insert(0) += 1;
+        }
+    }
+
+    observed
+        .into_iter()
+        .map(|(pattern_name, observed_positive_vectors)| {
+            let status = if observed_positive_vectors >= ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS {
+                "satisfies_floor"
+            } else {
+                "under_sampled"
+            }
+            .to_string();
+            (
+                pattern_name,
+                PatternClassSampleFloor {
+                    observed_positive_vectors,
+                    required_positive_vectors: ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS,
+                    confidence: CONFIDENCE_TARGET,
+                    recall_floor: RECALL_FLOOR,
+                    status,
+                },
+            )
+        })
+        .collect()
 }
