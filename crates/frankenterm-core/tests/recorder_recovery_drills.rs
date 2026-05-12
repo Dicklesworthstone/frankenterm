@@ -353,7 +353,8 @@ fn recovery_drill_reindex_resume_integrity_consistent() {
         let writer_first = pipeline_first.into_writer();
 
         let recovery_start = Instant::now();
-        let cfg_resume = reindex_config(dir.path(), consumer, 5, 0);
+        let mut cfg_resume = reindex_config(dir.path(), consumer, 5, 0);
+        cfg_resume.clear_before_start = false;
         let mut pipeline_resume = ReindexPipeline::new(DrillWriter::new());
         let resume_progress = pipeline_resume
             .full_reindex(&storage, &cfg_resume)
