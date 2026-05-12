@@ -112,24 +112,23 @@ the contract module agree on `tests/golden/gpu/`.
   `f00dface`) + 1 date-derived random. 3h budget per seed × 9
   seeds = 27h total compute, 24h wall (matrix runs in parallel
   on standard `ubuntu-24.04` with Mesa llvmpipe). The workflow
-  fails fast until the harness binary accepts the fuzz CLI flags.
-  Once wired, it aggregates `violations.jsonl` across runs, posts
-  next-day commit-status check, and **fails on any critical
+  runs a standalone preflight before the matrix. Once the preflight
+  passes, the matrix aggregates `violations.jsonl` across runs,
+  posts the next-day commit-status check, and **fails on any critical
   violation** (RQ-S4: zero criticals).
 - [`docs/security/renderer-fuzz-validation.md`](../../docs/security/renderer-fuzz-validation.md) —
   audit doc with the failure-artifact taxonomy, run-layout
   reference, GHA workflow description, RQ-S4 trace, and bead
   acceptance status.
 
-**Integration follow-on (production wiring):**
+**Remaining follow-on (production proof):**
 
-- Harness-binary CLI flag wiring at
-  `crates/frankenterm-gui/tests/gpu_regression.rs` — clap layer
-  parses argv into `FuzzCliFlags`, dispatches to `FuzzStream` driver
-  on `fuzz_mode_active()`, emits frames via `compare_images` against
-  the analytic reference, writes `runs/<run_id>/` per `RunLayout`.
-  This requires the GPU runtime, so it lands once a Linux Wayland
-  CI runner with a GPU is provisioned.
+- Full 24h renderer-fuzz proof on the scheduled lane. The harness
+  binary at `crates/frankenterm-gui/tests/gpu_regression.rs` now
+  parses argv into `FuzzCliFlags`, dispatches to `FuzzStream` on
+  `fuzz_mode_active()`, emits deterministic duplicate-render frames,
+  and writes `runs/<run_id>/` artifacts. RQ-S4 is not proven until
+  the full seed matrix completes with zero critical violations.
 - Concrete `tests/golden/gpu/<scenario>/` fixtures for every **gap**
   row (12 scenarios). Each fixture needs `input.json`, `meta.json`,
   `expected.json`, and a captured `golden.png` from the headless

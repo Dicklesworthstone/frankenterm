@@ -74,7 +74,7 @@ artifacts is 0.1% of resize-class events (per the bead).
 
 ## Running locally
 
-The integration bead wires this. The intended ergonomics:
+The harness binary accepts the fuzz flags directly:
 
 ```bash
 # 60-second smoke run with a fixed seed
@@ -90,17 +90,14 @@ cargo test -p frankenterm-gui --features headless-render --test gpu_regression -
     --fuzz-duration=10
 ```
 
-Until the wiring lands the generator is exercised by its inline
-unit tests (`cargo test -p frankenterm-gui --lib gpu_regression_fuzz`).
 The scheduled GitHub Actions lane runs on standard `ubuntu-24.04`
-with Mesa llvmpipe and fails fast in a preflight until the harness
-accepts these `--fuzz-*` flags; it no longer queues on an
-unprovisioned GPU runner label.
+with Mesa llvmpipe, runs a preflight before the matrix, and no longer
+queues on an unprovisioned GPU runner label.
 
 ## What is deferred
 
 See the **continuation** entry in
-[`../SCENARIOS.md`](../SCENARIOS.md). The summary: harness binary
-needs `--fuzz-*` flags, failure-artifact emitter needs to write
-the layout above, and the GitHub Actions nightly schedule needs
-to land. The seed generator itself is shippable today.
+[`../SCENARIOS.md`](../SCENARIOS.md). The summary: the CLI/artifact
+path is wired, but RQ-S4 is not production proof until the full
+scheduled seed matrix completes with zero critical violations. The
+scenario corpus gaps remain separate fixture work.

@@ -101,8 +101,9 @@ consolidation resolved — the bead's reference to
 - **Readiness gate:** before any Cargo build, the workflow checks
   that `crates/frankenterm-gui/tests/gpu_regression.rs` accepts
   `--fuzz-seed`, `--fuzz-duration`, `--fuzz-start-at`, and
-  `--runs-dir`. Until that integration lands, the scheduled run
-  exits with a clear "Renderer fuzz harness not wired" error.
+  `--runs-dir`. If the harness regresses and drops one of those
+  flags, the scheduled run exits with a clear "Renderer fuzz
+  harness not wired" error before spending Cargo time.
 - **Matrix:** 8 fixed seeds + 1 date-derived random
   (`a5a5a5a5`, `deadbeef`, `cafebabe`, `feedface`, `12345678`,
   `87654321`, `0badc0de`, `f00dface`, plus `random` derived
@@ -160,12 +161,12 @@ the doctor wires it to a WARN-level message when
 |---|---|
 | Failure-artifact contract (`runs/<run_id>/` layout, classification) | ✓ `gpu_regression_fuzz_report` module + 17 lib tests |
 | Scenario manifest with status (shipped/partial/gap/blocked) | ✓ `scenario_manifest()` + `coverage_snapshot()` |
-| 12 missing scenario fixtures | ⏳ requires headless llvmpipe/GPU runtime; ships once harness integration lands |
-| Harness CLI flag wiring (`--fuzz-seed`, `--fuzz-duration`, etc.) | ⏳ contract layer (`FuzzCliFlags`) shipped; harness-binary clap wiring is integration follow-on |
-| GitHub Actions workflow | ✓ `.github/workflows/renderer-fuzz.yml` uses `ubuntu-24.04` llvmpipe preflight and fails clearly until CLI wiring lands |
+| 12 missing scenario fixtures | ⏳ separate scenario-corpus follow-on; fuzz CLI wiring does not generate golden fixtures |
+| Harness CLI flag wiring (`--fuzz-seed`, `--fuzz-duration`, etc.) | ✓ harness binary parses `FuzzCliFlags`, dispatches to `FuzzStream`, and writes `runs/<run_id>/` artifacts |
+| GitHub Actions workflow | ✓ `.github/workflows/renderer-fuzz.yml` uses `ubuntu-24.04` llvmpipe preflight before the matrix |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |
 | Path consolidation (renderer_golden/scenarios → golden/gpu) | ✓ SCENARIOS.md updated |
-| `dead_code` allow removed in `gpu_regression_fuzz.rs` | ⏳ removed when callers wire in (integration follow-on) |
+| `dead_code` allow removed in `gpu_regression_fuzz.rs` | ✓ removed after `gpu_regression.rs` wired the caller |
 
 ## Cross-references
 

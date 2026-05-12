@@ -4,26 +4,47 @@
 //! can run without GPU readiness. Fixtures with `kind = "headless_terminal"`
 //! call the feature-gated `frankenterm_gui::headless_render` entrypoint.
 
+use frankenterm_core::gpu_regression_fuzz_report::FuzzCliFlags;
+#[cfg(feature = "headless-render")]
+use frankenterm_core::gpu_regression_fuzz_report::{
+    RunId, RunLayout, RunMeta, ViolationKind, ViolationRecord, render_violations_jsonl,
+};
 use frankenterm_gui::gpu_regression::{CompareResult, Thresholds, compare_images};
 #[cfg(feature = "headless-render")]
+use frankenterm_gui::gpu_regression_fuzz::{FuzzConfig, FuzzInputEvent, FuzzStream};
+#[cfg(feature = "headless-render")]
 use frankenterm_gui::headless_render::{
-    HeadlessCursor, HeadlessFixtureInput, HeadlessMonitor, HeadlessRenderError, HeadlessSelection,
-    HeadlessViewport, render_headless, smoketest_input,
+    HeadlessCursor, HeadlessFixtureInput, HeadlessFrame, HeadlessMonitor, HeadlessRenderError,
+    HeadlessSelection, HeadlessViewport, render_headless, smoketest_input,
 };
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder, ImageReader, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(feature = "headless-render")]
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+#[cfg(feature = "headless-render")]
+use std::time::Duration;
 use std::time::Instant;
 
 const HARNESS_VERSION: u32 = 1;
 const DEFAULT_PERF_THRESHOLD_PER_FIXTURE_PCT: f64 = 20.0;
 const DEFAULT_PERF_THRESHOLD_AGGREGATE_PCT: f64 = 10.0;
+#[cfg(feature = "headless-render")]
+const FUZZ_DEFAULT_DURATION_SECS: u32 = 60;
+#[cfg(feature = "headless-render")]
+const FUZZ_EVENTS_PER_SECOND_BUDGET: u64 = 512;
+#[cfg(feature = "headless-render")]
+const FUZZ_FRAME_INTERVAL_EVENTS: u64 = 64;
+#[cfg(feature = "headless-render")]
+const FUZZ_STALE_FRAME_EVENT_DISTANCE: u32 = 200;
+#[cfg(feature = "headless-render")]
+const FUZZ_MAX_STALE_HASHES: usize = 512;
 
 #[derive(Debug)]
 struct Args {
@@ -36,6 +57,7 @@ struct Args {
     perf_threshold_per_fixture_pct: f64,
     perf_threshold_aggregate_pct: f64,
     update_perf_baseline: bool,
+    fuzz: FuzzCliFlags,
     fixture_filters: Vec<String>,
 }
 
@@ -243,6 +265,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     if args.perf_self_test {
         return run_perf_self_test();
     }
+    if args.fuzz.fuzz_mode_active() {
+        return run_fuzz(&args.fuzz);
+    }
 
     if args.update_goldens {
         require_update_goldens_confirmation()?;
@@ -266,6 +291,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         perf_threshold_per_fixture_pct: DEFAULT_PERF_THRESHOLD_PER_FIXTURE_PCT,
         perf_threshold_aggregate_pct: DEFAULT_PERF_THRESHOLD_AGGREGATE_PCT,
         update_perf_baseline: false,
+        fuzz: FuzzCliFlags::default(),
         fixture_filters: Vec::new(),
     };
 
@@ -287,6 +313,18 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     args.perf_threshold_per_fixture_pct = parse_pct_arg(other, value)?;
                 } else if let Some(value) = other.strip_prefix("--perf-threshold-aggregate=") {
                     args.perf_threshold_aggregate_pct = parse_pct_arg(other, value)?;
+                } else if let Some(value) = other.strip_prefix("--fuzz-seed=") {
+                    args.fuzz.seed = Some(parse_u64_arg(other, value)?);
+                } else if let Some(value) = other.strip_prefix("--fuzz-duration=") {
+                    args.fuzz.duration_secs = Some(parse_positive_u32_arg(other, value)?);
+                } else if let Some(value) = other.strip_prefix("--fuzz-start-at=") {
+                    args.fuzz.start_at_event_idx = Some(parse_u32_arg(other, value)?);
+                } else if let Some(value) = other.strip_prefix("--fuzz-cols=") {
+                    args.fuzz.cols = Some(parse_positive_u16_arg(other, value)?);
+                } else if let Some(value) = other.strip_prefix("--fuzz-rows=") {
+                    args.fuzz.rows = Some(parse_positive_u16_arg(other, value)?);
+                } else if let Some(value) = other.strip_prefix("--runs-dir=") {
+                    args.fuzz.runs_dir = Some(value.to_string());
                 } else if other.starts_with('-') {
                     return Err(format!("unsupported gpu_regression argument: {other}").into());
                 } else {
@@ -305,6 +343,46 @@ fn parse_pct_arg(arg: &str, value: &str) -> Result<f64, Box<dyn std::error::Erro
         .map_err(|err| format!("{arg}: invalid percentage `{value}`: {err}"))?;
     if !parsed.is_finite() || parsed < 0.0 {
         return Err(format!("{arg}: percentage must be a finite, non-negative number").into());
+    }
+    Ok(parsed)
+}
+
+fn parse_u64_arg(arg: &str, value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16)
+            .map_err(|err| format!("{arg}: invalid hex seed `{value}`: {err}").into());
+    }
+    value.parse::<u64>().or_else(|decimal_err| {
+        u64::from_str_radix(value, 16).map_err(|hex_err| {
+            format!("{arg}: invalid seed `{value}` as decimal ({decimal_err}) or hex ({hex_err})")
+                .into()
+        })
+    })
+}
+
+fn parse_u32_arg(arg: &str, value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    value
+        .parse()
+        .map_err(|err| format!("{arg}: invalid u32 `{value}`: {err}").into())
+}
+
+fn parse_positive_u32_arg(arg: &str, value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let parsed = parse_u32_arg(arg, value)?;
+    if parsed == 0 {
+        return Err(format!("{arg}: value must be greater than zero").into());
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u16_arg(arg: &str, value: &str) -> Result<u16, Box<dyn std::error::Error>> {
+    let parsed: u16 = value
+        .parse()
+        .map_err(|err| format!("{arg}: invalid u16 `{value}`: {err}"))?;
+    if parsed == 0 {
+        return Err(format!("{arg}: value must be greater than zero").into());
     }
     Ok(parsed)
 }
@@ -357,6 +435,171 @@ fn run_headless_render_self_test() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(feature = "headless-render"))]
 fn run_headless_render_self_test() -> Result<(), Box<dyn std::error::Error>> {
     Err("--headless-render-self-test requires --features headless-render".into())
+}
+
+#[cfg(feature = "headless-render")]
+fn run_fuzz(flags: &FuzzCliFlags) -> Result<(), Box<dyn std::error::Error>> {
+    let seed = flags.seed.unwrap_or(0);
+    let duration_secs = flags.duration_secs.unwrap_or(FUZZ_DEFAULT_DURATION_SECS);
+    let start_at = flags.start_at_event_idx.unwrap_or(0);
+    let started_at_ms = unix_millis_now();
+    let host = fuzz_host();
+    let run_id = RunId::from_parts(seed, started_at_ms, &host);
+    let layout = RunLayout::new(run_id.clone());
+    let runs_dir = flags
+        .runs_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_fuzz_runs_dir);
+    let run_root = runs_dir.join(&run_id.0);
+    fs::create_dir_all(&run_root)?;
+
+    let mut meta = RunMeta {
+        run_id: run_id.clone(),
+        seed,
+        started_at_ms,
+        finished_at_ms: None,
+        host,
+        harness_version: HARNESS_VERSION.to_string(),
+        events_processed: 0,
+        violations_total: 0,
+        critical_count: 0,
+    };
+    write_run_meta(&run_root, &meta)?;
+
+    let max_cols = flags.cols.unwrap_or(160).max(8);
+    let max_rows = flags.rows.unwrap_or(48).max(8);
+    let start_cols = flags.cols.unwrap_or(80).min(max_cols).max(8);
+    let start_rows = flags.rows.unwrap_or(24).min(max_rows).max(8);
+    let event_budget = u64::from(start_at)
+        .saturating_add(u64::from(duration_secs).saturating_mul(FUZZ_EVENTS_PER_SECOND_BUDGET))
+        .saturating_add(1);
+    let config = FuzzConfig {
+        max_cols,
+        max_rows,
+        min_axis: max_cols.min(max_rows).min(8).max(1),
+        event_budget,
+        ..FuzzConfig::default()
+    };
+    let mut stream = FuzzStream::new(seed, config);
+    let mut state = FuzzHarnessState::new(start_cols, start_rows);
+    let started = Instant::now();
+    let duration = Duration::from_secs(u64::from(duration_secs));
+    let mut recent_events: VecDeque<String> = VecDeque::new();
+    let mut stale_hashes: VecDeque<(u32, u64)> = VecDeque::new();
+    let mut seen_nonblank = false;
+    let mut violations = Vec::new();
+    let mut frame_index = 0u32;
+    let mut last_render_event: Option<u64> = None;
+
+    emit_json(json!({
+        "phase": "fuzz-start",
+        "status": "start",
+        "seed": seed,
+        "run_id": run_id.0,
+        "duration_secs": duration_secs,
+        "start_at_event_idx": start_at,
+        "runs_dir": runs_dir,
+        "layout_root": layout.root_dir(),
+    }));
+
+    while let Some(event) = stream.next() {
+        let event_index = stream.emitted().saturating_sub(1);
+        let event_log = state.apply_event(event_index, &event);
+        push_recent_event(&mut recent_events, event_log);
+        meta.events_processed = stream.emitted();
+
+        if event_index < u64::from(start_at) {
+            continue;
+        }
+
+        let elapsed = started.elapsed();
+        let stop_after_event = elapsed >= duration && event_index > u64::from(start_at);
+        if event_index == u64::from(start_at)
+            || event_index % FUZZ_FRAME_INTERVAL_EVENTS == 0
+            || stop_after_event
+        {
+            render_fuzz_checkpoint(
+                &state,
+                &run_root,
+                &mut stale_hashes,
+                &mut seen_nonblank,
+                &mut violations,
+                seed,
+                duration_secs,
+                &runs_dir,
+                event_index,
+                frame_index,
+                &recent_events,
+            )?;
+            frame_index = frame_index.saturating_add(1);
+            last_render_event = Some(event_index);
+        }
+
+        if stop_after_event {
+            break;
+        }
+    }
+
+    if meta.events_processed > u64::from(start_at) {
+        let final_event = meta.events_processed.saturating_sub(1);
+        if last_render_event != Some(final_event) {
+            render_fuzz_checkpoint(
+                &state,
+                &run_root,
+                &mut stale_hashes,
+                &mut seen_nonblank,
+                &mut violations,
+                seed,
+                duration_secs,
+                &runs_dir,
+                final_event,
+                frame_index,
+                &recent_events,
+            )?;
+        }
+    }
+
+    meta.finished_at_ms = Some(unix_millis_now());
+    meta.violations_total = u32::try_from(violations.len()).unwrap_or(u32::MAX);
+    meta.critical_count = u32::try_from(
+        violations
+            .iter()
+            .filter(|record| record.is_critical())
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    write_run_meta(&run_root, &meta)?;
+    fs::write(
+        run_root.join("violations.jsonl"),
+        render_violations_jsonl(&violations),
+    )?;
+
+    emit_json(json!({
+        "phase": "fuzz-summary",
+        "status": if meta.critical_count == 0 { "pass" } else { "fail" },
+        "run_id": run_id.0,
+        "events_processed": meta.events_processed,
+        "violations_total": meta.violations_total,
+        "critical_count": meta.critical_count,
+        "run_root": run_root,
+        "elapsed_ms": started.elapsed().as_millis(),
+    }));
+
+    if meta.critical_count == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "GPU fuzz run {} recorded {} critical violation(s)",
+            run_id.0, meta.critical_count
+        )
+        .into())
+    }
+}
+
+#[cfg(not(feature = "headless-render"))]
+fn run_fuzz(_flags: &FuzzCliFlags) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--fuzz-* mode requires --features headless-render".into())
 }
 
 fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
@@ -791,6 +1034,514 @@ fn render_headless_fixture(
     _fixture: &Fixture,
 ) -> Result<RenderOutcome, Box<dyn std::error::Error>> {
     Err("headless_terminal fixtures require --features headless-render".into())
+}
+
+#[cfg(feature = "headless-render")]
+#[derive(Debug)]
+struct FuzzHarnessState {
+    cols: u16,
+    rows: u16,
+    lines: Vec<String>,
+    cursor_col: u16,
+    cursor_row: u16,
+    selection_anchor: Option<(u16, u16)>,
+    selection: Option<HeadlessSelection>,
+    focused: bool,
+}
+
+#[cfg(feature = "headless-render")]
+impl FuzzHarnessState {
+    fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            cols,
+            rows,
+            lines: vec!["FrankenTerm renderer fuzz lane".to_string()],
+            cursor_col: 0,
+            cursor_row: 0,
+            selection_anchor: None,
+            selection: None,
+            focused: true,
+        }
+    }
+
+    fn apply_event(&mut self, event_index: u64, event: &FuzzInputEvent) -> String {
+        match event {
+            FuzzInputEvent::Resize { cols, rows } => {
+                self.cols = (*cols).max(8);
+                self.rows = (*rows).max(8);
+                self.clamp_cursor_and_selection();
+                format!("{event_index}: resize {}x{}", self.cols, self.rows)
+            }
+            FuzzInputEvent::Write { bytes } => {
+                let text = visible_bytes(bytes);
+                self.append_text(&text);
+                format!("{event_index}: write len={}", bytes.len())
+            }
+            FuzzInputEvent::EscapeBurst { bytes } => {
+                let text = visible_bytes(bytes);
+                self.append_text(&format!("[escape:{text}]"));
+                format!("{event_index}: escape len={}", bytes.len())
+            }
+            FuzzInputEvent::Scroll { lines } => {
+                self.apply_scroll(*lines);
+                format!("{event_index}: scroll {lines}")
+            }
+            FuzzInputEvent::SelectStart { col, row } => {
+                let cell = self.clamp_cell(*col, *row);
+                self.selection_anchor = Some(cell);
+                self.selection = Some(HeadlessSelection {
+                    start_col: u32::from(cell.0),
+                    start_row: u32::from(cell.1),
+                    end_col: u32::from(cell.0),
+                    end_row: u32::from(cell.1),
+                });
+                format!("{event_index}: select-start {},{}", cell.0, cell.1)
+            }
+            FuzzInputEvent::SelectExtend { col, row } => {
+                let end = self.clamp_cell(*col, *row);
+                let start = self.selection_anchor.unwrap_or(end);
+                self.selection = Some(HeadlessSelection {
+                    start_col: u32::from(start.0),
+                    start_row: u32::from(start.1),
+                    end_col: u32::from(end.0),
+                    end_row: u32::from(end.1),
+                });
+                format!("{event_index}: select-extend {},{}", end.0, end.1)
+            }
+            FuzzInputEvent::SelectEnd => {
+                self.selection_anchor = None;
+                self.selection = None;
+                format!("{event_index}: select-end")
+            }
+            FuzzInputEvent::FocusToggle => {
+                self.focused = !self.focused;
+                self.append_text(if self.focused {
+                    "[focus:on]"
+                } else {
+                    "[focus:off]"
+                });
+                format!("{event_index}: focus {}", self.focused)
+            }
+            FuzzInputEvent::Clear => {
+                self.lines.clear();
+                self.lines.push(format!("clear at event {event_index}"));
+                self.cursor_col = 0;
+                self.cursor_row = 0;
+                self.selection_anchor = None;
+                self.selection = None;
+                format!("{event_index}: clear")
+            }
+        }
+    }
+
+    fn append_text(&mut self, text: &str) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let line_limit = usize::from(self.cols).saturating_mul(4).max(32);
+        let tail = self.lines.last_mut().expect("line is present");
+        tail.push_str(text);
+        while self
+            .lines
+            .last()
+            .is_some_and(|line| line.len() > line_limit)
+        {
+            let overflow = self
+                .lines
+                .last_mut()
+                .expect("line is present")
+                .split_off(line_limit);
+            self.lines.push(overflow);
+        }
+        self.trim_lines();
+        let row = self.lines.len().saturating_sub(1);
+        let col = self.lines.last().map_or(0, String::len);
+        self.cursor_row = u16::try_from(row)
+            .unwrap_or(u16::MAX)
+            .min(self.rows.saturating_sub(1));
+        self.cursor_col = u16::try_from(col % usize::from(self.cols.max(1))).unwrap_or(0);
+    }
+
+    fn apply_scroll(&mut self, lines: i32) {
+        if lines > 0 {
+            for step in 0..lines.min(16) {
+                self.lines.push(format!("scroll-forward marker {step}"));
+            }
+        } else if lines < 0 {
+            for step in 0..lines.saturating_abs().min(16) {
+                self.lines.insert(0, format!("scrollback marker {step}"));
+            }
+        }
+        self.trim_lines();
+        self.clamp_cursor_and_selection();
+    }
+
+    fn trim_lines(&mut self) {
+        let cap = usize::from(self.rows).saturating_mul(4).max(32);
+        if self.lines.len() > cap {
+            let drop_count = self.lines.len() - cap;
+            self.lines.drain(0..drop_count);
+        }
+    }
+
+    fn clamp_cursor_and_selection(&mut self) {
+        self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
+        self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
+        if let Some(selection) = self.selection {
+            let start = self.clamp_cell(selection.start_col as u16, selection.start_row as u16);
+            let end = self.clamp_cell(selection.end_col as u16, selection.end_row as u16);
+            self.selection = Some(HeadlessSelection {
+                start_col: u32::from(start.0),
+                start_row: u32::from(start.1),
+                end_col: u32::from(end.0),
+                end_row: u32::from(end.1),
+            });
+        }
+    }
+
+    fn clamp_cell(&self, col: u16, row: u16) -> (u16, u16) {
+        (
+            col.min(self.cols.saturating_sub(1)),
+            row.min(self.rows.saturating_sub(1)),
+        )
+    }
+
+    fn to_input(&self) -> HeadlessFixtureInput {
+        HeadlessFixtureInput {
+            viewport: HeadlessViewport {
+                width: u32::from(self.cols).saturating_mul(8).max(64),
+                height: u32::from(self.rows).saturating_mul(14).max(64),
+                dpi: 96.0,
+            },
+            monitors: Vec::new(),
+            lines: self.lines.clone(),
+            cursor: Some(HeadlessCursor {
+                row: u32::from(self.cursor_row),
+                col: u32::from(self.cursor_col),
+                shape: if self.focused {
+                    frankenterm_gui::headless_render::HeadlessCursorShape::Block
+                } else {
+                    frankenterm_gui::headless_render::HeadlessCursorShape::Beam
+                },
+            }),
+            selection: self.selection,
+            font_set_sha: Some("fuzz-no-font-fetch".to_string()),
+            cursor_blink_disabled: true,
+            ime_disabled: true,
+        }
+    }
+}
+
+#[cfg(feature = "headless-render")]
+fn render_fuzz_checkpoint(
+    state: &FuzzHarnessState,
+    run_root: &Path,
+    stale_hashes: &mut VecDeque<(u32, u64)>,
+    seen_nonblank: &mut bool,
+    violations: &mut Vec<ViolationRecord>,
+    seed: u64,
+    duration_secs: u32,
+    runs_dir: &Path,
+    event_index: u64,
+    frame_index: u32,
+    recent_events: &VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = state.to_input();
+    let first = render_headless(&input)?;
+    let second = render_headless(&input)?;
+    let first_image = image_from_frame(&first)?;
+    let second_image = image_from_frame(&second)?;
+    let event_index_u32 = u32::try_from(event_index).unwrap_or(u32::MAX);
+
+    emit_json(json!({
+        "phase": "fuzz-frame",
+        "event_index": event_index,
+        "frame_index": frame_index,
+        "render_ms": first.render_ms.saturating_add(second.render_ms),
+        "width": first.width,
+        "height": first.height,
+        "glyphs": first.glyphs_cached,
+        "fonts_loaded": first.fonts_loaded,
+        "texture_format": first.texture_format,
+        "gpu": first.gpu,
+    }));
+
+    if is_blank_rgba(&first.rgba) {
+        if *seen_nonblank {
+            record_fuzz_violation(
+                run_root,
+                violations,
+                ViolationKind::BlankFrame,
+                seed,
+                duration_secs,
+                runs_dir,
+                event_index_u32,
+                frame_index,
+                &first_image,
+                &second_image,
+                None,
+                recent_events,
+            )?;
+        }
+    } else {
+        *seen_nonblank = true;
+    }
+
+    let frame_hash = hash_bytes(&first.rgba);
+    if let Some((prior_event, _)) = stale_hashes.iter().find(|(prior_event, prior_hash)| {
+        event_index_u32.saturating_sub(*prior_event) >= FUZZ_STALE_FRAME_EVENT_DISTANCE
+            && *prior_hash == frame_hash
+    }) {
+        record_fuzz_violation(
+            run_root,
+            violations,
+            ViolationKind::StaleFullFrame {
+                stale_distance: event_index_u32.saturating_sub(*prior_event),
+            },
+            seed,
+            duration_secs,
+            runs_dir,
+            event_index_u32,
+            frame_index,
+            &first_image,
+            &second_image,
+            None,
+            recent_events,
+        )?;
+    }
+    stale_hashes.push_back((event_index_u32, frame_hash));
+    while stale_hashes.len() > FUZZ_MAX_STALE_HASHES {
+        stale_hashes.pop_front();
+    }
+
+    let comparison = compare_images(&second_image, &first_image, Thresholds::default())?;
+    if !comparison.passed {
+        let kind = if comparison.metrics.l_inf >= 32 {
+            ViolationKind::TearBand {
+                delta_l_inf: u32::from(comparison.metrics.l_inf),
+            }
+        } else if comparison.metrics.ssim < comparison.metrics.thresholds.min_ssim {
+            ViolationKind::SsimBelowThreshold {
+                ssim: comparison.metrics.ssim,
+                threshold: comparison.metrics.thresholds.min_ssim,
+            }
+        } else {
+            ViolationKind::ExcessivePixelChange {
+                fraction: comparison.metrics.changed_pixel_fraction,
+                threshold: comparison.metrics.thresholds.max_changed_pixel_fraction,
+            }
+        };
+        record_fuzz_violation(
+            run_root,
+            violations,
+            kind,
+            seed,
+            duration_secs,
+            runs_dir,
+            event_index_u32,
+            frame_index,
+            &first_image,
+            &second_image,
+            Some(&comparison.diff),
+            recent_events,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "headless-render")]
+fn record_fuzz_violation(
+    run_root: &Path,
+    violations: &mut Vec<ViolationRecord>,
+    kind: ViolationKind,
+    seed: u64,
+    duration_secs: u32,
+    runs_dir: &Path,
+    event_index: u32,
+    frame_index: u32,
+    before: &RgbaImage,
+    after: &RgbaImage,
+    diff: Option<&RgbaImage>,
+    recent_events: &VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start_at_event_idx = event_index;
+    let record = ViolationRecord {
+        event_index,
+        frame_index,
+        kind,
+        reproducer_seed: seed,
+        start_at_event_idx,
+        log_excerpt: Some(recent_event_excerpt(recent_events)),
+    };
+    let artifact_dir = run_root.join(record.artifact_subdir());
+    fs::create_dir_all(&artifact_dir)?;
+    write_png_deterministic(&artifact_dir.join("before.png"), before)?;
+    write_png_deterministic(&artifact_dir.join("after.png"), after)?;
+    let generated_diff;
+    let diff_image = match diff {
+        Some(diff) => diff,
+        None if before.dimensions() == after.dimensions() => {
+            generated_diff = compare_images(after, before, Thresholds::default())?.diff;
+            &generated_diff
+        }
+        None => after,
+    };
+    write_png_deterministic(&artifact_dir.join("diff.png"), diff_image)?;
+    fs::write(
+        artifact_dir.join("log.jsonl"),
+        recent_events
+            .iter()
+            .map(|event| serde_json::to_string(&json!({ "event": event })))
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n")
+            + "\n",
+    )?;
+    write_reproducer(
+        &artifact_dir.join("reproducer.sh"),
+        seed,
+        start_at_event_idx,
+        duration_secs.min(60).max(1),
+        runs_dir,
+    )?;
+    violations.push(record);
+    Ok(())
+}
+
+#[cfg(feature = "headless-render")]
+fn image_from_frame(frame: &HeadlessFrame) -> Result<RgbaImage, Box<dyn std::error::Error>> {
+    RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone()).ok_or_else(
+        || -> Box<dyn std::error::Error> {
+            format!(
+                "headless renderer returned invalid fuzz RGBA frame {}x{}",
+                frame.width, frame.height
+            )
+            .into()
+        },
+    )
+}
+
+#[cfg(feature = "headless-render")]
+fn is_blank_rgba(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4)
+        .all(|pixel| pixel[0] <= 4 && pixel[1] <= 4 && pixel[2] <= 4)
+}
+
+#[cfg(feature = "headless-render")]
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[cfg(feature = "headless-render")]
+fn push_recent_event(events: &mut VecDeque<String>, event: String) {
+    events.push_back(event);
+    while events.len() > 64 {
+        events.pop_front();
+    }
+}
+
+#[cfg(feature = "headless-render")]
+fn recent_event_excerpt(events: &VecDeque<String>) -> String {
+    let len = events.len();
+    let start = len.saturating_sub(8);
+    events
+        .iter()
+        .skip(start)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(feature = "headless-render")]
+fn visible_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &byte in bytes {
+        match byte {
+            b'\x1b' => out.push_str("<ESC>"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(char::from(byte)),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out
+}
+
+#[cfg(feature = "headless-render")]
+fn write_run_meta(run_root: &Path, meta: &RunMeta) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(run_root)?;
+    let mut encoded = serde_json::to_string_pretty(meta)?;
+    encoded.push('\n');
+    fs::write(run_root.join("meta.json"), encoded)?;
+    Ok(())
+}
+
+#[cfg(feature = "headless-render")]
+fn write_reproducer(
+    path: &Path,
+    seed: u64,
+    start_at_event_idx: u32,
+    duration_secs: u32,
+    runs_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let quoted_runs_dir = shell_quote(&runs_dir.display().to_string());
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         set -euo pipefail\n\
+         cargo test -p frankenterm-gui --features headless-render --test gpu_regression -- \\\n\
+             --nocapture \\\n\
+             --fuzz-seed=0x{seed:016x} \\\n\
+             --fuzz-start-at={start_at_event_idx} \\\n\
+             --fuzz-duration={duration_secs} \\\n\
+             --runs-dir={quoted_runs_dir}\n"
+    );
+    fs::write(path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "headless-render")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(feature = "headless-render")]
+fn default_fuzz_runs_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("gpu-regression")
+        .join("runs")
+}
+
+#[cfg(feature = "headless-render")]
+fn unix_millis_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "headless-render")]
+fn fuzz_host() -> String {
+    env::var("RUNNER_NAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .unwrap_or_else(|_| format!("local-{}", env::consts::OS))
 }
 
 fn write_failure_artifacts(

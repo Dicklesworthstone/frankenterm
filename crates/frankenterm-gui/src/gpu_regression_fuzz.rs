@@ -19,21 +19,12 @@
 //!   seed; the integration bead points the harness binary at this
 //!   to drive a 24h fuzz run.
 //!
-//! ## What is deferred (continuation, see follow-up bead)
+//! ## What remains deferred (continuation, see follow-up bead)
 //!
-//! - wire `FuzzStream` into `crates/frankenterm-gui/tests/gpu_regression.rs`
-//!   behind a `--fuzz <seed> --duration <secs>` mode
-//! - the per-frame comparator integration: every N events emit a
-//!   frame, compare via `gpu_regression::compare_images` against a
-//!   reference frame derived from the post-hoc analytic renderer
-//! - the failure-artifact emitter: on SSIM drop or pixel diff in a
-//!   pristine area, write `runs/<run_id>/violations.jsonl` with the
-//!   seed, event index, before/after PNGs, and structured-log slice
-//! - GitHub Actions workflow: nightly 24h-budget run with seed sweep
+//! - a richer analytic reference renderer/oracle beyond the harness's
+//!   deterministic duplicate-render comparator
 //! - cross-link RQ-S4 (24h fuzz, 0 critical artifacts) in the SLO
 //!   catalog at docs/perf/resize-quality-slo.md
-
-#![allow(dead_code)]
 
 /// Tagged event types the fuzz lane drives into the headless
 /// renderer. Variants intentionally cover the dirty-event sources
