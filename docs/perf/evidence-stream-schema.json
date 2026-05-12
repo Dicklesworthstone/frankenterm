@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.io/schemas/perf/evidence-stream-schema.v1.json",
+  "title": "FrankenTerm per-claim evidence-stream sample",
+  "description": "Canonical JSONL row shape for performance proof-gate evidence consumed by SPRT (G25 ft-tf6g3.10), conformal bands (G26 ft-tf6g3.11), Lindley/SNC latency bounds (G23 ft-tf6g3.8 / G38 ft-tf6g3.23), KL-divergence regime-shift detection (G42 ft-tf6g3.27), causal-DAG attribution (G43 ft-tf6g3.28), and headline-claim attestation (G19 ft-tf6g3.4 children). Source-of-truth Rust struct: crates/ft-perf-gate/src/lib.rs `EvidenceSample`. Schema-version constant: `EVIDENCE_SAMPLE_SCHEMA_VERSION` = `ft.perf.evidence-sample.v1`. Schema evolution notes: docs/perf/evidence-stream-evolution.md. Substrate for ft-tf6g3.32 (G47).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "ts_ms",
+    "claim_id",
+    "metric_value",
+    "metric_unit",
+    "sample_size"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ft.perf.evidence-sample.v1",
+      "description": "Stable schema version for JSONL compatibility. Must match the EVIDENCE_SAMPLE_SCHEMA_VERSION constant in crates/ft-perf-gate/src/lib.rs. Validators must reject rows whose schema_version differs from the version they were built against; migrations are documented in docs/perf/evidence-stream-evolution.md."
+    },
+    "ts_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Event timestamp in Unix milliseconds. Monotone within a single bench run is desirable but not required across runs."
+    },
+    "claim_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$",
+      "description": "Stable claim identifier. Conventional shape: `<subsystem>.<metric>` (for example `robot.p95`, `fts5.query_p95`, `renderer.resize_fps_p99`). Must trim non-empty. The hyphen and underscore are allowed; whitespace and shell metacharacters are not."
+    },
+    "metric_value": {
+      "type": "number",
+      "description": "Numeric measurement value. Must be finite (no NaN, no infinity). Validators must reject rows whose metric_value is not finite."
+    },
+    "metric_unit": {
+      "type": "string",
+      "minLength": 1,
+      "examples": ["ms", "us", "ns", "bytes", "bytes_per_line", "count", "fps", "watts", "ratio"],
+      "description": "Unit of `metric_value`. Free-form string; canonical units suggested in the examples list. Validators should normalize unit comparisons to lower-case before equality checks."
+    },
+    "sample_size": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of observations represented by this sample. For a Criterion p99 row, this is the underlying sample count Criterion drew from. For a single-shot measurement, this is 1."
+    },
+    "commit_sha": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "Commit SHA (short or full hex) that produced the sample. Omit on synthetic / fixture samples; include on every CI-driven measurement."
+    },
+    "hardware_fingerprint": {
+      "type": ["string", "null"],
+      "description": "Stable hardware fingerprint string. Suggested shape: `<cpu-class>-<core-count>-<ram-gb>` (for example `apple-m3-pro-12c-36g`, `intel-xeon-platinum-8488c-4c-16g`). Used by G42 regime-shift and G29 target-class predicate."
+    },
+    "runner_sku": {
+      "type": ["string", "null"],
+      "description": "Runner SKU or target class label. For GitHub Actions: the runner image (`ubuntu-24.04`, `macos-15`). For local: a documented SKU label declared in docs/perf/target-class-hardware.md."
+    },
+    "workload_class": {
+      "type": ["string", "null"],
+      "description": "Workload class used for grouping comparable samples. Examples: `idle-swarm-200-panes`, `resize-storm-20-to-200`, `fts5-fixture-1k-corpus`. Cross-workload-class comparisons require explicit calibration (see G42 regime-shift)."
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "description": "Extensible string metadata kept deterministic for JSON output (BTreeMap on the Rust side). Reserved keys: `feature_flags`, `os_version`, `kernel_version`, `gpu_vendor`, `gpu_model`, `frankenterm_version`. Custom keys must use `<vendor>.<key>` namespacing to avoid collision with future reserved keys."
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "ft.perf.evidence-sample.v1",
+      "ts_ms": 1715520000000,
+      "claim_id": "robot.p95",
+      "metric_value": 4.2,
+      "metric_unit": "ms",
+      "sample_size": 1024,
+      "commit_sha": "ceaee1622",
+      "hardware_fingerprint": "apple-m3-pro-12c-36g",
+      "runner_sku": "macos-15",
+      "workload_class": "idle-swarm-200-panes",
+      "tags": {
+        "frankenterm_version": "0.0.0-dev",
+        "feature_flags": "ftui,rollout"
+      }
+    },
+    {
+      "schema_version": "ft.perf.evidence-sample.v1",
+      "ts_ms": 1715520120000,
+      "claim_id": "fts5.query_p99",
+      "metric_value": 7.8,
+      "metric_unit": "ms",
+      "sample_size": 10000
+    }
+  ]
+}
