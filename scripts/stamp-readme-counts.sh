@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ft-i2eni.5 — Auto-stamp README/AGENTS counts via build-time queries.
+# ft-tf6g3.2 — Auto-stamp README/AGENTS counts via build-time queries.
 #
 # Replaces drift-prone hand-edited counts in README.md / AGENTS.md with
 # values computed from the live workspace tree. Each tracked count is
@@ -15,9 +15,10 @@
 # The script:
 #  - In default (write) mode: rewrites README.md and AGENTS.md so each
 #    placeholder block contains the current live value.
-#  - In `--check` mode: exits 1 if any placeholder's documented value
-#    drifts from the live value by more than the threshold (default
-#    5%). CI uses --check as an advisory guard initially.
+#  - In `--check` mode: exits 1 if any placeholder occurrence's
+#    documented value drifts from the live value by more than the
+#    threshold (default 5%). CI uses --check as an advisory guard
+#    initially.
 #
 # Reproduce locally:
 #     bash scripts/stamp-readme-counts.sh                  # rewrite
@@ -27,7 +28,8 @@
 #
 # Cross-references:
 #   ft-d3awp / ft-hdvvo — drift incidents that motivated this work
-#   ft-i2eni.5 — this bead
+#   ft-tf6g3.2 — current count-drift closure bead
+#   ft-i2eni.5 — original count-stamper substrate
 #   docs/contributing/auto-stamped-counts.md — placeholder convention
 
 set -euo pipefail
@@ -49,7 +51,7 @@ for arg in "$@"; do
             sed -n '1,40p' "$0" | sed -e 's/^# \?//'
             exit 0
             ;;
-        *) echo "ft-i2eni.5: unknown arg: $arg" >&2; exit 2 ;;
+        *) echo "ft-tf6g3.2: unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
 
@@ -66,6 +68,11 @@ MANIFEST=(
     "core_top_level_modules|find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l"
     "core_loc|find crates/frankenterm-core/src -name '*.rs' -exec cat {} + | wc -l"
     "test_count|grep -rE '^[[:space:]]*#\\[(test|tokio::test|asupersync_test::test)' crates/ | wc -l"
+    "core_rust_test_files|find crates/frankenterm-core/tests -type f -name '*.rs' | wc -l"
+    "criterion_bench_files|find crates/frankenterm-core/benches -type f -name '*.rs' | wc -l"
+    "fuzz_targets|find fuzz -type f -path '*/fuzz_targets/*.rs' | wc -l"
+    "doc_markdown_files|find docs -type f -name '*.md' | wc -l"
+    "e2e_scripts|find tests/e2e -type f -name '*.sh' | wc -l"
 )
 
 DOCS=(README.md AGENTS.md)
@@ -98,17 +105,23 @@ if new != text:
 PYEOF
 }
 
-# Read the documented value for `name` from `file` (first match wins).
-# Returns empty string if no placeholder block is present.
-read_documented_value() {
+# Read every documented value for `name` from `file`, one per line.
+# Emits no lines if no placeholder block is present.
+read_documented_values() {
     local file="$1" name="$2"
     python3 - "${file}" "${name}" <<'PYEOF'
 import pathlib, re, sys
 file, name = sys.argv[1], sys.argv[2]
 text = pathlib.Path(file).read_text()
-m = re.search(rf"<!--count:{re.escape(name)}-->([^<]*)<!--/count-->", text)
-print(m.group(1).strip() if m else "")
+pattern = re.compile(rf"<!--count:{re.escape(name)}-->([^<]*)<!--/count-->")
+for match in pattern.finditer(text):
+    print(match.group(1).strip())
 PYEOF
+}
+
+join_values() {
+    local IFS=", "
+    printf '%s' "$*"
 }
 
 # Compute |new - old| as a percentage of max(old, 1). Returns integer
@@ -133,6 +146,7 @@ present_count=0
 missing_placeholder_count=0
 matching_count=0
 within_threshold_count=0
+updated_occurrence_count=0
 
 for entry in "${MANIFEST[@]}"; do
     name="${entry%%|*}"
@@ -146,18 +160,26 @@ for entry in "${MANIFEST[@]}"; do
         if [[ "${MODE}" == "json" ]]; then
             declare -a invalid_doc_reports=()
             for doc in "${DOCS[@]}"; do
-                documented="$(read_documented_value "${doc}" "${name}")"
-                if [[ -z "${documented}" ]]; then
+                documented_values=()
+                while IFS= read -r documented; do
+                    documented_values+=("${documented}")
+                done < <(read_documented_values "${doc}" "${name}")
+                if [[ ${#documented_values[@]} -eq 0 ]]; then
                     missing_placeholder_count=$((missing_placeholder_count + 1))
                     invalid_doc_reports+=("$(jq -cn \
                         --arg path "${doc}" \
-                        '{path:$path, placeholder_present:false, documented_value:null, drift_pct:null, status:"missing_placeholder"}')")
+                        '{path:$path, occurrence:null, placeholder_present:false, documented_value:null, drift_pct:null, status:"missing_placeholder"}')")
                 else
-                    present_count=$((present_count + 1))
-                    invalid_doc_reports+=("$(jq -cn \
-                        --arg path "${doc}" \
-                        --arg documented "${documented}" \
-                        '{path:$path, placeholder_present:true, documented_value:($documented|tonumber), live_value:null, drift_pct:null, status:"command_invalid"}')")
+                    occurrence=0
+                    for documented in "${documented_values[@]}"; do
+                        occurrence=$((occurrence + 1))
+                        present_count=$((present_count + 1))
+                        invalid_doc_reports+=("$(jq -cn \
+                            --arg path "${doc}" \
+                            --arg documented "${documented}" \
+                            --argjson occurrence "${occurrence}" \
+                            '{path:$path, occurrence:$occurrence, placeholder_present:true, documented_value:($documented|tonumber), live_value:null, drift_pct:null, status:"command_invalid"}')")
+                    done
                 fi
             done
             docs_json="$(printf '%s\n' "${invalid_doc_reports[@]}" | jq -c -s '.')"
@@ -172,56 +194,69 @@ for entry in "${MANIFEST[@]}"; do
     fi
     declare -a doc_reports=()
     for doc in "${DOCS[@]}"; do
-        documented="$(read_documented_value "${doc}" "${name}")"
-        if [[ -z "${documented}" ]]; then
+        documented_values=()
+        while IFS= read -r documented; do
+            documented_values+=("${documented}")
+        done < <(read_documented_values "${doc}" "${name}")
+        if [[ ${#documented_values[@]} -eq 0 ]]; then
             missing_placeholder_count=$((missing_placeholder_count + 1))
             if [[ "${MODE}" == "json" ]]; then
                 doc_reports+=("$(jq -cn \
                     --arg path "${doc}" \
-                    '{path:$path, placeholder_present:false, documented_value:null, drift_pct:null, status:"missing_placeholder"}')")
+                    '{path:$path, occurrence:null, placeholder_present:false, documented_value:null, drift_pct:null, status:"missing_placeholder"}')")
             fi
             continue
         fi
-        present_count=$((present_count + 1))
-        drift_pct="$(percent_drift "${documented}" "${live}")"
-        doc_status="matches"
-        if [[ "${documented}" == "${live}" ]]; then
-            matching_count=$((matching_count + 1))
-        elif [[ "${STRICT}" -eq 1 ]]; then
-            doc_status="strict_mismatch"
-        elif [[ "${drift_pct}" -le "${THRESHOLD_PCT}" ]]; then
-            within_threshold_count=$((within_threshold_count + 1))
-            doc_status="drift_within_threshold"
-        else
-            doc_status="drift_exceeded"
-        fi
-        if [[ "${MODE}" == "check" ]]; then
-            if [[ "${STRICT}" -eq 1 ]]; then
-                if [[ "${documented}" != "${live}" ]]; then
-                    violations+=("${doc}::${name}: documented=${documented} live=${live} (strict)")
-                    doc_status="strict_mismatch"
+        occurrence=0
+        declare -a mismatched_values=()
+        for documented in "${documented_values[@]}"; do
+            occurrence=$((occurrence + 1))
+            present_count=$((present_count + 1))
+            drift_pct="$(percent_drift "${documented}" "${live}")"
+            doc_status="matches"
+            if [[ "${documented}" == "${live}" ]]; then
+                matching_count=$((matching_count + 1))
+            elif [[ "${STRICT}" -eq 1 ]]; then
+                doc_status="strict_mismatch"
+            elif [[ "${drift_pct}" -le "${THRESHOLD_PCT}" ]]; then
+                within_threshold_count=$((within_threshold_count + 1))
+                doc_status="drift_within_threshold"
+            else
+                doc_status="drift_exceeded"
+            fi
+            if [[ "${MODE}" == "check" ]]; then
+                if [[ "${STRICT}" -eq 1 ]]; then
+                    if [[ "${documented}" != "${live}" ]]; then
+                        violations+=("${doc}::${name}#${occurrence}: documented=${documented} live=${live} (strict)")
+                        doc_status="strict_mismatch"
+                    fi
+                elif [[ "${drift_pct}" -gt "${THRESHOLD_PCT}" ]]; then
+                    violations+=("${doc}::${name}#${occurrence}: documented=${documented} live=${live} drift=${drift_pct}% > ${THRESHOLD_PCT}%")
                 fi
-            elif [[ "${drift_pct}" -gt "${THRESHOLD_PCT}" ]]; then
-                violations+=("${doc}::${name}: documented=${documented} live=${live} drift=${drift_pct}% > ${THRESHOLD_PCT}%")
+            elif [[ "${MODE}" == "json" ]]; then
+                if [[ "${doc_status}" == "drift_exceeded" ]]; then
+                    violations+=("${doc}::${name}#${occurrence}: documented=${documented} live=${live} drift=${drift_pct}% > ${THRESHOLD_PCT}%")
+                elif [[ "${doc_status}" == "strict_mismatch" ]]; then
+                    violations+=("${doc}::${name}#${occurrence}: documented=${documented} live=${live} (strict)")
+                fi
+                doc_reports+=("$(jq -cn \
+                    --arg path "${doc}" \
+                    --arg documented "${documented}" \
+                    --argjson occurrence "${occurrence}" \
+                    --argjson live "${live}" \
+                    --argjson drift_pct "${drift_pct}" \
+                    --arg status "${doc_status}" \
+                    '{path:$path, occurrence:$occurrence, placeholder_present:true, documented_value:($documented|tonumber), live_value:$live, drift_pct:$drift_pct, status:$status}')")
+            else
+                if [[ "${documented}" != "${live}" ]]; then
+                    mismatched_values+=("${documented}")
+                    updated_occurrence_count=$((updated_occurrence_count + 1))
+                fi
             fi
-        elif [[ "${MODE}" == "json" ]]; then
-            if [[ "${doc_status}" == "drift_exceeded" ]]; then
-                violations+=("${doc}::${name}: documented=${documented} live=${live} drift=${drift_pct}% > ${THRESHOLD_PCT}%")
-            elif [[ "${doc_status}" == "strict_mismatch" ]]; then
-                violations+=("${doc}::${name}: documented=${documented} live=${live} (strict)")
-            fi
-            doc_reports+=("$(jq -cn \
-                --arg path "${doc}" \
-                --arg documented "${documented}" \
-                --argjson live "${live}" \
-                --argjson drift_pct "${drift_pct}" \
-                --arg status "${doc_status}" \
-                '{path:$path, placeholder_present:true, documented_value:($documented|tonumber), live_value:$live, drift_pct:$drift_pct, status:$status}')")
-        else
-            if [[ "${documented}" != "${live}" ]]; then
-                rewrite_placeholders_in_file "${doc}" "${name}" "${live}"
-                updates+=("${doc}::${name}: ${documented} → ${live}")
-            fi
+        done
+        if [[ "${MODE}" == "write" ]] && [[ ${#mismatched_values[@]} -gt 0 ]]; then
+            rewrite_placeholders_in_file "${doc}" "${name}" "${live}"
+            updates+=("${doc}::${name}: [$(join_values "${mismatched_values[@]}")] → ${live}")
         fi
     done
     if [[ "${MODE}" == "json" ]]; then
@@ -254,7 +289,7 @@ if [[ "${MODE}" == "json" ]]; then
     fi
     jq -n \
         --arg schema_version "1.0.0" \
-        --arg bead_id "ft-e87u6.14" \
+        --arg bead_id "ft-tf6g3.2" \
         --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg generator "scripts/stamp-readme-counts.sh --json" \
         --arg check_status "${overall_status}" \
@@ -297,13 +332,13 @@ fi
 if [[ "${MODE}" == "check" ]]; then
     if [[ ${#violations[@]} -eq 0 ]]; then
         if [[ "${STRICT}" -eq 1 ]]; then
-            echo "ft-i2eni.5: ${present_count} placeholder(s) exactly match live values (${total_count} tracked counts)."
+            echo "ft-tf6g3.2: ${present_count} placeholder(s) exactly match live values (${total_count} tracked counts)."
         else
-            echo "ft-i2eni.5: ${present_count} placeholder(s) within ${THRESHOLD_PCT}% drift threshold (${total_count} tracked counts)."
+            echo "ft-tf6g3.2: ${present_count} placeholder(s) within ${THRESHOLD_PCT}% drift threshold (${total_count} tracked counts)."
         fi
         exit 0
     fi
-    echo "ft-i2eni.5: drift threshold exceeded for ${#violations[@]} placeholder(s):" >&2
+    echo "ft-tf6g3.2: drift threshold exceeded for ${#violations[@]} placeholder(s):" >&2
     for v in "${violations[@]}"; do
         printf '  - %s\n' "$v" >&2
     done
@@ -325,10 +360,10 @@ EOF
 fi
 
 if [[ ${#updates[@]} -eq 0 ]]; then
-    echo "ft-i2eni.5: no updates needed (${present_count} placeholder(s) already current)."
+    echo "ft-tf6g3.2: no updates needed (${present_count} placeholder(s) already current)."
     exit 0
 fi
-echo "ft-i2eni.5: updated ${#updates[@]} placeholder(s):"
+echo "ft-tf6g3.2: updated ${updated_occurrence_count} placeholder occurrence(s) across ${#updates[@]} file/name group(s):"
 for u in "${updates[@]}"; do
     printf '  - %s\n' "$u"
 done

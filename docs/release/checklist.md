@@ -14,8 +14,10 @@ catch common omissions.
    stub above it.
 3. **Stamp README/AGENTS counts.** Run
    `bash scripts/stamp-readme-counts.sh` so every documented
-   workspace count matches HEAD (ft-i2eni.5). CI's drift check
-   will block a divergent release.
+   workspace count matches HEAD (ft-tf6g3.2), then refresh the
+   release-attestation snapshot with
+   `bash scripts/stamp-readme-counts.sh --json > docs/attestations/doctrine/agents-md-counts.json`.
+   CI's drift check will block a divergent release.
 4. **Regenerate the vendored-fork provenance manifest.** Run
    `python3 scripts/regen-provenance.py` so
    `frankenterm/PROVENANCE.json` reflects the latest fork-side
@@ -111,7 +113,7 @@ catch common omissions.
 - `.github/workflows/release.yml` — automated artifact build +
   upload on tag push.
 - `scripts/stamp-readme-counts.sh` — count-drift stamper
-  (ft-i2eni.5).
+  (ft-tf6g3.2).
 - `scripts/regen-provenance.py` + `scripts/check-provenance.sh`
   — vendored-fork provenance manifest (ft-i2eni.6).
 - `scripts/demo.tape` — tour VHS recording script (ft-jjvxg).

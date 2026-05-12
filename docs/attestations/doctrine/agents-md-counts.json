@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
-  "bead_id": "ft-e87u6.14",
-  "generated_at": "2026-05-09T22:24:57Z",
+  "bead_id": "ft-tf6g3.2",
+  "generated_at": "2026-05-12T07:27:32Z",
   "generator": "scripts/stamp-readme-counts.sh --json",
   "source": {
     "script": "scripts/stamp-readme-counts.sh",
@@ -16,10 +16,10 @@
     "threshold_pct": 5
   },
   "summary": {
-    "tracked_counts": 7,
-    "placeholder_occurrences": 6,
-    "missing_placeholders": 8,
-    "matching_placeholders": 6,
+    "tracked_counts": 12,
+    "placeholder_occurrences": 39,
+    "missing_placeholders": 9,
+    "matching_placeholders": 39,
     "within_threshold_placeholders": 0,
     "violation_count": 0
   },
@@ -27,19 +27,39 @@
     {
       "name": "workspace_members",
       "command": "awk '/^members = \\[/,/^]/' Cargo.toml | grep -c '^[[:space:]]*\"'",
-      "live_value": 74,
+      "live_value": 75,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
+          "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 74,
-          "live_value": 74,
+          "documented_value": 75,
+          "live_value": 75,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 75,
+          "live_value": 75,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 75,
+          "live_value": 75,
           "drift_pct": 0,
           "status": "matches"
         },
         {
           "path": "AGENTS.md",
+          "occurrence": null,
           "placeholder_present": false,
           "documented_value": null,
           "drift_pct": null,
@@ -55,13 +75,34 @@
       "documents": [
         {
           "path": "README.md",
-          "placeholder_present": false,
-          "documented_value": null,
-          "drift_pct": null,
-          "status": "missing_placeholder"
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 47,
+          "live_value": 47,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 47,
+          "live_value": 47,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 47,
+          "live_value": 47,
+          "drift_pct": 0,
+          "status": "matches"
         },
         {
           "path": "AGENTS.md",
+          "occurrence": 1,
           "placeholder_present": true,
           "documented_value": 47,
           "live_value": 47,
@@ -78,13 +119,34 @@
       "documents": [
         {
           "path": "README.md",
-          "placeholder_present": false,
-          "documented_value": null,
-          "drift_pct": null,
-          "status": "missing_placeholder"
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 42,
+          "live_value": 42,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 42,
+          "live_value": 42,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 42,
+          "live_value": 42,
+          "drift_pct": 0,
+          "status": "matches"
         },
         {
           "path": "AGENTS.md",
+          "occurrence": null,
           "placeholder_present": false,
           "documented_value": null,
           "drift_pct": null,
@@ -100,6 +162,16 @@
       "documents": [
         {
           "path": "README.md",
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 19,
+          "live_value": 19,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
           "placeholder_present": true,
           "documented_value": 19,
           "live_value": 19,
@@ -108,52 +180,95 @@
         },
         {
           "path": "AGENTS.md",
-          "placeholder_present": false,
-          "documented_value": null,
-          "drift_pct": null,
-          "status": "missing_placeholder"
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 19,
+          "live_value": 19,
+          "drift_pct": 0,
+          "status": "matches"
         }
       ]
     },
     {
       "name": "core_top_level_modules",
       "command": "find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l",
-      "live_value": 504,
+      "live_value": 506,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
+          "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 504,
-          "live_value": 504,
+          "documented_value": 506,
+          "live_value": 506,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 506,
+          "live_value": 506,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 506,
+          "live_value": 506,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 4,
+          "placeholder_present": true,
+          "documented_value": 506,
+          "live_value": 506,
           "drift_pct": 0,
           "status": "matches"
         },
         {
           "path": "AGENTS.md",
-          "placeholder_present": false,
-          "documented_value": null,
-          "drift_pct": null,
-          "status": "missing_placeholder"
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 506,
+          "live_value": 506,
+          "drift_pct": 0,
+          "status": "matches"
         }
       ]
     },
     {
       "name": "core_loc",
       "command": "find crates/frankenterm-core/src -name '*.rs' -exec cat {} + | wc -l",
-      "live_value": 983357,
+      "live_value": 996607,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
+          "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 983357,
-          "live_value": 983357,
+          "documented_value": 996607,
+          "live_value": 996607,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 996607,
+          "live_value": 996607,
           "drift_pct": 0,
           "status": "matches"
         },
         {
           "path": "AGENTS.md",
+          "occurrence": null,
           "placeholder_present": false,
           "documented_value": null,
           "drift_pct": null,
@@ -164,19 +279,263 @@
     {
       "name": "test_count",
       "command": "grep -rE '^[[:space:]]*#\\[(test|tokio::test|asupersync_test::test)' crates/ | wc -l",
-      "live_value": 55188,
+      "live_value": 55330,
       "live_status": "ok",
       "documents": [
         {
           "path": "README.md",
+          "occurrence": 1,
           "placeholder_present": true,
-          "documented_value": 55188,
-          "live_value": 55188,
+          "documented_value": 55330,
+          "live_value": 55330,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 55330,
+          "live_value": 55330,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 55330,
+          "live_value": 55330,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 4,
+          "placeholder_present": true,
+          "documented_value": 55330,
+          "live_value": 55330,
           "drift_pct": 0,
           "status": "matches"
         },
         {
           "path": "AGENTS.md",
+          "occurrence": null,
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "core_rust_test_files",
+      "command": "find crates/frankenterm-core/tests -type f -name '*.rs' | wc -l",
+      "live_value": 936,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 936,
+          "live_value": 936,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 936,
+          "live_value": 936,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 936,
+          "live_value": 936,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "occurrence": null,
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "criterion_bench_files",
+      "command": "find crates/frankenterm-core/benches -type f -name '*.rs' | wc -l",
+      "live_value": 108,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 108,
+          "live_value": 108,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 108,
+          "live_value": 108,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 108,
+          "live_value": 108,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 4,
+          "placeholder_present": true,
+          "documented_value": 108,
+          "live_value": 108,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "occurrence": null,
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "fuzz_targets",
+      "command": "find fuzz -type f -path '*/fuzz_targets/*.rs' | wc -l",
+      "live_value": 48,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 48,
+          "live_value": 48,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 48,
+          "live_value": 48,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 48,
+          "live_value": 48,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "occurrence": null,
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "doc_markdown_files",
+      "command": "find docs -type f -name '*.md' | wc -l",
+      "live_value": 393,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 393,
+          "live_value": 393,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 393,
+          "live_value": 393,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "occurrence": null,
+          "placeholder_present": false,
+          "documented_value": null,
+          "drift_pct": null,
+          "status": "missing_placeholder"
+        }
+      ]
+    },
+    {
+      "name": "e2e_scripts",
+      "command": "find tests/e2e -type f -name '*.sh' | wc -l",
+      "live_value": 214,
+      "live_status": "ok",
+      "documents": [
+        {
+          "path": "README.md",
+          "occurrence": 1,
+          "placeholder_present": true,
+          "documented_value": 214,
+          "live_value": 214,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 2,
+          "placeholder_present": true,
+          "documented_value": 214,
+          "live_value": 214,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "README.md",
+          "occurrence": 3,
+          "placeholder_present": true,
+          "documented_value": 214,
+          "live_value": 214,
+          "drift_pct": 0,
+          "status": "matches"
+        },
+        {
+          "path": "AGENTS.md",
+          "occurrence": null,
           "placeholder_present": false,
           "documented_value": null,
           "drift_pct": null,

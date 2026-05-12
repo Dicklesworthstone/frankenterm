@@ -35,14 +35,14 @@
 
 [![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-yellow.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
-[![Lines of Code](https://img.shields.io/badge/core%20library-779k%2B%20lines-blue.svg)]()
-[![Tests](https://img.shields.io/badge/tests-45k%2B-green.svg)]()
+[![Core Counts](https://img.shields.io/badge/core%20library-auto--stamped-blue.svg)](#workspace-structure)
+[![Test Counts](https://img.shields.io/badge/tests-auto--stamped-green.svg)](#testing)
 
 </div>
 
-**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** Tens of workspace crates, hundreds of core-library modules, 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
+**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** <!--count:workspace_members-->75<!--/count--> workspace crates, <!--count:core_top_level_modules-->506<!--/count--> core-library modules, <!--count:test_count-->55330<!--/count-->+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
 
-_Hand-edited workspace counts drift fast (ft-d3awp / ft-hdvvo / ft-1b0rn); the canonical figures are whatever these commands return at HEAD: `ls -d crates/frankenterm-core-* | wc -l` for sub-crate count (currently 19 ft-y0loj.\* extractions), `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` for vendored Cargo workspace member count (currently 47), `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l` for top-level vendored crate directory count (currently 42), and `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l` for core top-level module count (currently 506). The new sub-crates are listed in the Workspace tree below._
+_Hand-edited workspace counts drift fast (ft-d3awp / ft-hdvvo / ft-1b0rn); the canonical figures are whatever these commands return at HEAD: `ls -d crates/frankenterm-core-* | wc -l` for sub-crate count (currently <!--count:core_subcrates-->19<!--/count--> ft-y0loj.\* extractions), `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` for vendored Cargo workspace member count (currently <!--count:vendored_members-->47<!--/count-->), `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l` for top-level vendored crate directory count (currently <!--count:vendored_top_level-->42<!--/count-->), `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l` for core top-level module count (currently <!--count:core_top_level_modules-->506<!--/count-->), `find crates/frankenterm-core/tests -type f -name '*.rs' | wc -l` for core Rust test files (currently <!--count:core_rust_test_files-->936<!--/count-->), `find crates/frankenterm-core/benches -type f -name '*.rs' | wc -l` for Criterion bench files (currently <!--count:criterion_bench_files-->108<!--/count-->), `find fuzz -type f -path '*/fuzz_targets/*.rs' | wc -l` for fuzz targets (currently <!--count:fuzz_targets-->48<!--/count-->), `find docs -type f -name '*.md' | wc -l` for Markdown docs (currently <!--count:doc_markdown_files-->393<!--/count-->), and `find tests/e2e -type f -name '*.sh' | wc -l` for E2E shell scripts (currently <!--count:e2e_scripts-->214<!--/count-->). The new sub-crates are listed in the Workspace tree below._
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -71,7 +71,7 @@ Current implementation reality:
 
 - Core orchestration, storage, policy, workflow, robot, diagnostics, and release-gate logic are native `ft` subsystems in terms of the data structures and algorithms they own — but the **task-spawn, time, channel, and blocking primitives** every one of them uses still transits `runtime_async`. Read "native `ft` subsystem" as "this crate owns its logic," not "this crate has completed the asupersync-native task-spawn migration."
 - `runtime_async` is an audited boundary for runtime lifecycle, channel, time, blocking, and compatibility-shim semantics. In scope: runtime bootstrap, `spawn`/`spawn_with_cx`, `JoinSet`, `mpsc`/`watch`/`broadcast`, `timeout_with_cx`, `sleep`, `block_on`, `Runtime::enter`, plus select/notify utilities. The sheer call-site count is the honest current state — operators reading this README should calibrate their expectations accordingly, not assume Cx-first semantics reach every path they touch today. Cancellation, time, and blocking behavior may still follow tokio-shaped semantics on those paths; the ft-xbnl0 subepics (`ft-xbnl0.2.x`) are collapsing them one subsystem at a time. Use `rg 'runtime_async::'` to see which paths a given feature still transits.
-- `ft` is a wezterm-fork mux runtime, and we now state that explicitly. The in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1, alias preserved) and the vendored `frankenterm/<crate>/` crates are first-class: currently 42 top-level crate directories by `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l`, and 47 Cargo workspace members when nested derive/lua crates are included. We are not chasing a second mux backend — see [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) for the audit and stance.
+- `ft` is a wezterm-fork mux runtime, and we now state that explicitly. The in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1, alias preserved) and the vendored `frankenterm/<crate>/` crates are first-class: currently <!--count:vendored_top_level-->42<!--/count--> top-level crate directories by `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l`, and <!--count:vendored_members-->47<!--/count--> Cargo workspace members when nested derive/lua crates are included. We are not chasing a second mux backend — see [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) for the audit and stance.
 - Repo-wide support/verification truth is anchored by [`docs/ft-xbnl0-verification-contract.md`](docs/ft-xbnl0-verification-contract.md), [`docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`](docs/ft-xbnl0-3-6-supported-path-truth-sweep.md), [`docs/ft-xbnl0-4-6-completion-evidence.md`](docs/ft-xbnl0-4-6-completion-evidence.md), and [`docs/ft-xbnl0-5-7-completion-evidence.md`](docs/ft-xbnl0-5-7-completion-evidence.md).
 
 ### Why Use ft?
@@ -1069,10 +1069,10 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
 ### Workspace Structure
 
 ```
-frankenterm/                              # <!--count:workspace_members-->75<!--/count--> workspace crates (auto-stamped by scripts/stamp-readme-counts.sh; ft-i2eni.5)
+frankenterm/                              # <!--count:workspace_members-->75<!--/count--> workspace crates (auto-stamped by scripts/stamp-readme-counts.sh; ft-tf6g3.2)
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft) — 55k+ lines
-│   ├── frankenterm-core/                 # Core library — <!--count:core_top_level_modules-->504<!--/count--> top-level modules, <!--count:core_loc-->983357<!--/count--> lines
+│   ├── frankenterm-core/                 # Core library — <!--count:core_top_level_modules-->506<!--/count--> top-level modules, <!--count:core_loc-->996607<!--/count--> lines
 │   │   ├── src/
 │   │   │   ├── runtime.rs               # Observation runtime orchestration
 │   │   │   ├── runtime_async.rs         # Canonical async API surface (renamed from runtime_compat under ft-g43fq)
@@ -1091,8 +1091,8 @@ frankenterm/                              # <!--count:workspace_members-->75<!--
 │   │   │   ├── scan_pipeline.rs         # SIMD scan + trigger + compression
 │   │   │   ├── wire_protocol.rs         # Distributed messaging
 │   │   │   └── ...                      # 300+ additional top-level modules
-│   │   ├── tests/                       # 801 Rust test files, 500+ proptest suites
-│   │   └── benches/                     # 94 Criterion benchmark files
+│   │   ├── tests/                       # <!--count:core_rust_test_files-->936<!--/count--> Rust test files, <!--count:test_count-->55330<!--/count-->+ test annotations
+│   │   └── benches/                     # <!--count:criterion_bench_files-->108<!--/count--> Criterion benchmark files
 │   │
 │   │   # ── ft-y0loj.* sub-crates carved out of frankenterm-core (2026-04-25/26) ──
 │   ├── frankenterm-core-tantivy/         # Lexical search stack — ft-y0loj.1 (~16k LOC)
@@ -1112,7 +1112,7 @@ frankenterm/                              # <!--count:workspace_members-->75<!--
 │   ├── frankenterm-gui/                  # GUI binary crate
 │   ├── frankenterm-mux-server/           # Headless mux server
 │   └── frankenterm-alloc/                # Allocator/telemetry support
-├── frankenterm/                          # In-tree vendored crates (42 top-level dirs; 47 Cargo workspace members including nested crates)
+├── frankenterm/                          # In-tree vendored crates (<!--count:vendored_top_level-->42<!--/count--> top-level dirs; <!--count:vendored_members-->47<!--/count--> Cargo workspace members including nested crates)
 │   ├── codec/                           # Wire codec
 │   ├── config/                          # Config subsystem
 │   ├── mux/                             # Multiplexer
@@ -1120,9 +1120,9 @@ frankenterm/                              # <!--count:workspace_members-->75<!--
 │   ├── term/                            # Terminal emulator
 │   ├── termwiz/                         # Terminal primitives
 │   └── ...                              # Additional subsystem crates
-├── fuzz/                                 # 37 fuzzing targets
-├── docs/                                 # 258 Markdown documentation files
-├── tests/e2e/                            # 203 end-to-end script/Rust harness files
+├── fuzz/                                 # <!--count:fuzz_targets-->48<!--/count--> fuzzing targets
+├── docs/                                 # <!--count:doc_markdown_files-->393<!--/count--> Markdown documentation files
+├── tests/e2e/                            # <!--count:e2e_scripts-->214<!--/count--> shell E2E scripts
 └── fixtures/                             # Test fixtures
 ```
 
@@ -1291,7 +1291,7 @@ These states drive GUI pane border colors and enable mass operations like "kill 
 
 ## Performance Benchmarks
 
-Benchmarks live under `crates/frankenterm-core/benches/` (62 Criterion benchmarks) and use human-readable budgets with machine-readable artifacts.
+Benchmarks live under `crates/frankenterm-core/benches/` (<!--count:criterion_bench_files-->108<!--/count--> Criterion bench files) and use human-readable budgets with machine-readable artifacts.
 
 ```bash
 # Compile benches (fast sanity check)
@@ -1334,12 +1334,11 @@ The project maintains extensive test coverage:
 
 | Category | Count | Purpose |
 |----------|-------|---------|
-| Lib unit tests | ~22,000 | Module-level correctness |
-| Property tests (proptest) | ~500 suites | Serde roundtrip, invariants, fuzzing |
-| Integration tests | ~700 files | Cross-module behavior |
-| E2E test harnesses | 149 scripts | Full-pipeline validation |
-| Criterion benchmarks | 62 | Performance regression detection |
-| Fuzz targets | 4 | Security/robustness |
+| Test annotations | <!--count:test_count-->55330<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
+| Core Rust test files | <!--count:core_rust_test_files-->936<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
+| E2E shell scripts | <!--count:e2e_scripts-->214<!--/count--> | Full-pipeline validation |
+| Criterion bench files | <!--count:criterion_bench_files-->108<!--/count--> | Performance regression detection |
+| Fuzz targets | <!--count:fuzz_targets-->48<!--/count--> | Security/robustness |
 
 ```bash
 # Run all tests
@@ -1574,6 +1573,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*<!--count:workspace_members-->75<!--/count--> workspace crates. <!--count:core_top_level_modules-->504<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->983357<!--/count-->+ lines. <!--count:test_count-->55188<!--/count-->+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
+*<!--count:workspace_members-->75<!--/count--> workspace crates. <!--count:core_top_level_modules-->506<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->996607<!--/count-->+ lines. <!--count:test_count-->55330<!--/count-->+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>

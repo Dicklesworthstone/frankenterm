@@ -1,6 +1,6 @@
 # Auto-Stamped Counts in README and AGENTS
 
-**Bead:** `ft-i2eni.5` (BR-RC-DOCTRINE.G6) · **Stamper:** `scripts/stamp-readme-counts.sh` · **CI:** advisory drift check on every PR.
+**Bead:** `ft-tf6g3.2` (G17, extending `ft-i2eni.5` / BR-RC-DOCTRINE.G6) · **Stamper:** `scripts/stamp-readme-counts.sh` · **CI:** drift check on every PR.
 
 ## Why this exists
 
@@ -23,13 +23,15 @@ A tracked count lives between an HTML-comment open/close pair:
 - **HTML comments** keep the marker invisible in rendered Markdown.
 - **`NAME`** is one of the manifest keys defined in
   `scripts/stamp-readme-counts.sh` (e.g. `workspace_members`,
-  `core_top_level_modules`, `test_count`).
+  `core_top_level_modules`, `test_count`, `criterion_bench_files`).
 - **`VALUE`** is whatever the stamper most-recently wrote. It is the
   value a reader sees in the rendered doc, so prose can wrap it
   ("…with `<!--count:workspace_members-->68<!--/count-->` workspace
   crates…").
 - **Multiple placeholders** with the same `NAME` in the same file are
-  allowed and all get rewritten in lockstep.
+  allowed. Rewrite, check, strict-check, and JSON modes inspect every
+  occurrence so a stale repeated footer cannot hide behind an up-to-date
+  first match.
 
 ## Authoring a new tracked count
 
@@ -64,13 +66,16 @@ bash scripts/stamp-readme-counts.sh --check --strict
 
 # Custom drift threshold.
 bash scripts/stamp-readme-counts.sh --check --threshold=10
+
+# Machine-readable attestation snapshot.
+bash scripts/stamp-readme-counts.sh --json > docs/attestations/doctrine/agents-md-counts.json
 ```
 
-CI runs `--check` (5% threshold) advisory on every PR. Failure prints
-the offending placeholder with its documented vs. live values and the
-calculated drift percentage. Re-run the stamper without `--check` to
-fix the doc, then commit alongside the workspace change that moved
-the count.
+CI runs `--check` (5% threshold) on every PR. Failure prints
+the offending placeholder occurrence with its documented vs. live
+values and the calculated drift percentage. Re-run the stamper without
+`--check` to fix the doc, then commit alongside the workspace change
+that moved the count.
 
 ## Tracked counts (current manifest)
 
@@ -83,6 +88,11 @@ the count.
 | `core_top_level_modules` | `*.rs` files in `crates/frankenterm-core/src/` (depth 1) |
 | `core_loc` | summed line count of every `.rs` under `crates/frankenterm-core/src/` |
 | `test_count` | `#[test]` / `#[tokio::test]` / `#[asupersync_test::test]` annotations across `crates/` |
+| `core_rust_test_files` | Rust test files under `crates/frankenterm-core/tests/` |
+| `criterion_bench_files` | Criterion bench files under `crates/frankenterm-core/benches/` |
+| `fuzz_targets` | cargo-fuzz target files under `fuzz/**/fuzz_targets/` |
+| `doc_markdown_files` | Markdown documentation files under `docs/` |
+| `e2e_scripts` | shell E2E scripts under `tests/e2e/` |
 
 The list is intentionally short. Counts that are stable on the order
 of years (e.g. major version numbers) don't belong here; counts that
