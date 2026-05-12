@@ -404,6 +404,7 @@ fn mux_binary_candidates_from(
     manifest_dir: &Path,
 ) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    let workspace_root = manifest_dir.parent().and_then(Path::parent);
 
     if let Some(path) = explicit.filter(|path| !path.as_os_str().is_empty()) {
         candidates.push(path);
@@ -412,9 +413,16 @@ fn mux_binary_candidates_from(
         candidates.push(path);
     }
     if let Some(target_dir) = cargo_target_dir.filter(|path| !path.as_os_str().is_empty()) {
+        let target_dir = if target_dir.is_absolute() {
+            target_dir
+        } else if let Some(workspace_root) = workspace_root {
+            workspace_root.join(target_dir)
+        } else {
+            target_dir
+        };
         candidates.push(target_dir.join("debug").join("frankenterm-mux-server"));
     }
-    if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent) {
+    if let Some(workspace_root) = workspace_root {
         candidates.push(
             workspace_root
                 .join("target")
@@ -448,6 +456,22 @@ mod tests {
                 PathBuf::from("/tmp/target/debug/frankenterm-mux-server"),
                 PathBuf::from("/repo/target/debug/frankenterm-mux-server"),
             ]
+        );
+    }
+
+    #[test]
+    fn mux_binary_candidates_resolve_relative_cargo_target_dir_from_workspace_root() {
+        let manifest_dir = Path::new("/repo/crates/frankenterm-core");
+        let candidates = mux_binary_candidates_from(
+            None,
+            None,
+            Some(PathBuf::from("target/local-mux-proof")),
+            manifest_dir,
+        );
+
+        assert_eq!(
+            candidates[0],
+            PathBuf::from("/repo/target/local-mux-proof/debug/frankenterm-mux-server"),
         );
     }
 }
