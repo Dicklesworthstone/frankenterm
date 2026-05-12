@@ -135,8 +135,9 @@ impl WeztermSubprocessFixture {
     /// This keeps no-mock tests on a real mux/PTY boundary while allowing
     /// scenarios to choose an interactive echo program such as `/bin/cat`.
     pub fn spawn_with_default_prog(default_prog: &[&str]) -> Result<Self, FixtureError> {
-        let bin = locate_current_mux_binary()
+        let bin = locate_explicit_mux_binary()
             .or_else(build_mux_binary)
+            .or_else(locate_current_mux_binary)
             .or_else(locate_system_mux_binary)
             .ok_or_else(|| {
                 FixtureError::BinaryNotFound(
@@ -334,7 +335,18 @@ fn format_child_output(output: &str) -> String {
 }
 
 fn locate_current_mux_binary() -> Option<PathBuf> {
-    mux_binary_candidates()
+    let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    mux_binary_candidates_from(None, None, cargo_target_dir, &manifest_dir)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn locate_explicit_mux_binary() -> Option<PathBuf> {
+    let explicit = std::env::var_os("FT_WEZTERM_MUX_SERVER").map(PathBuf::from);
+    let cargo_bin = std::env::var_os("CARGO_BIN_EXE_frankenterm-mux-server").map(PathBuf::from);
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    mux_binary_candidates_from(explicit, cargo_bin, None, &manifest_dir)
         .into_iter()
         .find(|candidate| candidate.exists())
 }

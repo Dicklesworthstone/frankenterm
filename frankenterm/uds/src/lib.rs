@@ -13,9 +13,9 @@ use std::path::Path;
 #[cfg(feature = "async-asupersync")]
 use std::pin::Pin;
 #[cfg(feature = "async-asupersync")]
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex, OnceLock};
 #[cfg(feature = "async-asupersync")]
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 #[cfg(feature = "async-asupersync")]
 use std::time::Duration;
 #[cfg(windows)]
@@ -62,6 +62,9 @@ pub struct UnixStream {
 #[cfg(feature = "async-asupersync")]
 const FALLBACK_IO_BACKOFF: Duration = Duration::from_millis(1);
 
+#[cfg(feature = "async-asupersync")]
+static FALLBACK_REWAKE_QUEUE: OnceLock<mpsc::Sender<Waker>> = OnceLock::new();
+
 impl std::fmt::Debug for UnixStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("UnixStream").field(&self.inner).finish()
@@ -74,7 +77,39 @@ fn fallback_rewake(cx: &Context<'_>) {
         let deadline = timer.now() + FALLBACK_IO_BACKOFF;
         let _ = timer.register(deadline, cx.waker().clone());
     } else {
-        cx.waker().wake_by_ref();
+        let Some(sender) = fallback_rewake_sender() else {
+            cx.waker().wake_by_ref();
+            return;
+        };
+        if sender.send(cx.waker().clone()).is_err() {
+            cx.waker().wake_by_ref();
+        }
+    }
+}
+
+#[cfg(feature = "async-asupersync")]
+fn fallback_rewake_sender() -> Option<&'static mpsc::Sender<Waker>> {
+    if FALLBACK_REWAKE_QUEUE.get().is_none() {
+        let (tx, rx) = mpsc::channel::<Waker>();
+        let spawned = std::thread::Builder::new()
+            .name("uds-fallback-rewake".to_string())
+            .spawn(move || fallback_rewake_loop(rx))
+            .is_ok();
+        if spawned {
+            let _ = FALLBACK_REWAKE_QUEUE.set(tx);
+        }
+    }
+    FALLBACK_REWAKE_QUEUE.get()
+}
+
+#[cfg(feature = "async-asupersync")]
+fn fallback_rewake_loop(rx: mpsc::Receiver<Waker>) {
+    while let Ok(waker) = rx.recv() {
+        std::thread::sleep(FALLBACK_IO_BACKOFF);
+        waker.wake();
+        while let Ok(waker) = rx.try_recv() {
+            waker.wake();
+        }
     }
 }
 
@@ -87,7 +122,50 @@ impl UnixStream {
         }
     }
 
-    #[cfg(feature = "async-asupersync")]
+    #[cfg(all(feature = "async-asupersync", unix))]
+    pub async fn wait_for_readable(&self) -> std::io::Result<()> {
+        std::future::poll_fn(|cx| {
+            self.inner.set_nonblocking(true)?;
+            match self.poll_readable_without_consuming() {
+                Ok(true) => Poll::Ready(Ok(())),
+                Ok(false) => {
+                    self.register_interest_for_read(cx)?;
+                    Poll::Pending
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    fallback_rewake(cx);
+                    Poll::Pending
+                }
+                Err(err) => Poll::Ready(Err(err)),
+            }
+        })
+        .await
+    }
+
+    #[cfg(all(feature = "async-asupersync", unix))]
+    fn poll_readable_without_consuming(&self) -> std::io::Result<bool> {
+        let mut probe = [0u8; 1];
+        let result = unsafe {
+            libc::recv(
+                self.inner.as_raw_fd(),
+                probe.as_mut_ptr().cast(),
+                probe.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if result >= 0 {
+            return Ok(true);
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    }
+
+    #[cfg(all(feature = "async-asupersync", windows))]
     pub async fn wait_for_readable(&self) -> std::io::Result<()> {
         let mut armed = false;
         std::future::poll_fn(|cx| {
@@ -580,6 +658,39 @@ mod tests {
 
         assert_eq!(received, b"ping");
         assert_eq!(client.join().unwrap().unwrap(), b"pong");
+        cleanup(&path);
+    }
+
+    #[cfg(all(feature = "async-asupersync", unix))]
+    #[test]
+    fn wait_for_readable_without_cx_waits_for_actual_bytes() {
+        let path = temp_socket_path("wait_no_cx");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || -> std::io::Result<()> {
+                let mut stream = UnixStream::connect(&path)?;
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                stream.write_all(b"x")?;
+                stream.flush()
+            }
+        });
+
+        let (server, _) = listener.accept().unwrap();
+        let start = std::time::Instant::now();
+        futures::executor::block_on(server.wait_for_readable()).unwrap();
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(20),
+            "wait_for_readable returned before the delayed writer made the socket readable"
+        );
+
+        let mut server = server;
+        let mut buf = [0u8; 1];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"x");
+        client.join().unwrap().unwrap();
         cleanup(&path);
     }
 
