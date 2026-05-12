@@ -9,6 +9,7 @@
 //! Mail handoffs, and proof-lane ledger projections.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::proof_lane::{ArtifactRetrievalStatus, ProofBackend, ProofScope, ProofState};
 
@@ -359,6 +360,18 @@ pub struct ProofDoctorEvidence {
     pub wrapper_exit_code: Option<i32>,
     /// Remote exit code.
     pub remote_exit_code: Option<i32>,
+    /// Stable RCH failure reason retained by a sidecar artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rch_failure_reason_code: Option<String>,
+    /// Redaction-safe RCH failure detail retained by a sidecar artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rch_failure_reason_detail: Option<String>,
+    /// True when RCH fail-open or local fallback execution was observed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fail_open_detected: bool,
+    /// True when a retained RCH sidecar reports timeout.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_out: bool,
     /// True when remote Cargo started.
     pub remote_cargo_reached: bool,
     /// True when rustc or build execution started.
@@ -406,6 +419,10 @@ impl Default for ProofDoctorEvidence {
             remote_command_duration_ms: None,
             wrapper_exit_code: None,
             remote_exit_code: None,
+            rch_failure_reason_code: None,
+            rch_failure_reason_detail: None,
+            fail_open_detected: false,
+            timed_out: false,
             remote_cargo_reached: false,
             rustc_reached: false,
             test_binary_started: false,
@@ -421,6 +438,272 @@ impl Default for ProofDoctorEvidence {
             scale_lab_artifact: None,
         }
     }
+}
+
+/// Merge a retained RCH or harness JSON sidecar into proof-doctor evidence.
+///
+/// This helper is intentionally permissive over field names because historical
+/// harnesses do not all emit the same schema. It never executes RCH or Cargo; it
+/// only projects already-retained JSON into the stable proof-doctor evidence DTO.
+pub fn merge_proof_doctor_artifact_json(
+    evidence: &mut ProofDoctorEvidence,
+    artifact_path: impl Into<String>,
+    artifact: &Value,
+) {
+    let artifact_path = artifact_path.into();
+    push_unique(&mut evidence.artifact_paths, artifact_path);
+    merge_artifact_paths(evidence, artifact);
+    merge_common_rch_fields(evidence, artifact);
+    merge_preflight_fields(evidence, artifact);
+    merge_harness_summary_fields(evidence, artifact);
+}
+
+fn merge_common_rch_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value) {
+    set_string(
+        &mut evidence.selected_worker,
+        json_str(artifact, "selected_worker"),
+    );
+    set_string(
+        &mut evidence.selected_worker,
+        json_str(artifact, "worker_id"),
+    );
+    set_string(
+        &mut evidence.rch_binary_path,
+        json_str(artifact, "rch_binary_path"),
+    );
+    set_string(&mut evidence.rch_version, json_str(artifact, "rch_version"));
+    set_string(
+        &mut evidence.rch_failure_reason_code,
+        json_str(artifact, "failure_reason_code"),
+    );
+    set_string(
+        &mut evidence.rch_failure_reason_detail,
+        json_str(artifact, "failure_reason_detail"),
+    );
+    set_u64(
+        &mut evidence.sync_duration_ms,
+        json_u64(artifact, "sync_duration_ms"),
+    );
+    set_u64(
+        &mut evidence.remote_command_duration_ms,
+        json_u64(artifact, "remote_duration_ms")
+            .or_else(|| json_u64(artifact, "remote_command_duration_ms")),
+    );
+    set_i32(
+        &mut evidence.wrapper_exit_code,
+        json_i64(artifact, "wrapper_exit_code").and_then(i32_from_i64),
+    );
+    set_i32(
+        &mut evidence.remote_exit_code,
+        json_i64(artifact, "remote_exit_code").and_then(i32_from_i64),
+    );
+    evidence.fail_open_detected |= json_bool(artifact, "fail_open_detected").unwrap_or(false);
+    evidence.timed_out |= json_bool(artifact, "timed_out").unwrap_or(false);
+    evidence.local_cargo_detected |= evidence.fail_open_detected
+        || json_bool(artifact, "local_cargo_detected").unwrap_or(false)
+        || json_bool(artifact, "local_cargo_counted_as_proof").unwrap_or(false);
+    evidence.remote_cargo_reached |= json_bool(artifact, "remote_cargo_reached").unwrap_or(false);
+    evidence.rustc_reached |= json_bool(artifact, "rustc_reached").unwrap_or(false)
+        || json_bool(artifact, "remote_rustc_reached").unwrap_or(false);
+    evidence.test_binary_started |= json_bool(artifact, "test_binary_started").unwrap_or(false)
+        || json_bool(artifact, "test_binary_reached").unwrap_or(false);
+    set_string(
+        &mut evidence.diagnostic_summary,
+        json_str(artifact, "diagnostic_summary")
+            .or_else(|| json_str(artifact, "failure_summary"))
+            .or_else(|| json_str(artifact, "first_error"))
+            .or_else(|| json_str(artifact, "error")),
+    );
+    merge_string_array(
+        &mut evidence.diagnostic_paths,
+        artifact.get("diagnostic_paths"),
+    );
+}
+
+fn merge_preflight_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value) {
+    set_u32_path(
+        &mut evidence.healthy_worker_count,
+        artifact,
+        &["queue", "workers_healthy"],
+    );
+    set_u32_path(
+        &mut evidence.available_worker_slots,
+        artifact,
+        &["queue", "slots_available"],
+    );
+    set_u32_path(
+        &mut evidence.rust_worker_count,
+        artifact,
+        &["workers", "probe_worker_count"],
+    );
+    if let Some(reason_code) = json_str(artifact, "reason_code")
+        && reason_code != "remote_ready"
+    {
+        set_string(&mut evidence.rch_failure_reason_code, Some(reason_code));
+    }
+    set_string(
+        &mut evidence.rch_failure_reason_detail,
+        json_str(artifact, "detail"),
+    );
+}
+
+fn merge_harness_summary_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value) {
+    if let Some(worker) = json_path(artifact, &["remote", "selected_workers"])
+        .and_then(Value::as_array)
+        .and_then(|workers| workers.iter().find_map(Value::as_str))
+    {
+        set_string(&mut evidence.selected_worker, Some(worker));
+    }
+
+    evidence.remote_cargo_reached |=
+        json_path_bool(artifact, &["remote", "remote_cargo_reached"]).unwrap_or(false);
+    evidence.rustc_reached |=
+        json_path_bool(artifact, &["remote", "remote_rustc_reached"]).unwrap_or(false);
+    evidence.test_binary_started |=
+        json_path_bool(artifact, &["remote", "test_binary_reached"]).unwrap_or(false);
+    evidence.local_cargo_detected |=
+        json_path_bool(artifact, &["evidence", "local_cargo_counted_as_proof"]).unwrap_or(false);
+
+    if let Some(classification) = json_str(artifact, "failure_classification")
+        && classification != "not_applicable"
+    {
+        set_string(&mut evidence.rch_failure_reason_code, Some(classification));
+    }
+
+    if let Some(status) = json_str(artifact, "status") {
+        match status {
+            "passed" | "pass" => {
+                set_i32(&mut evidence.remote_exit_code, Some(0));
+                evidence.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+            }
+            "failed" | "fail" => {
+                set_i32(&mut evidence.remote_exit_code, Some(101));
+            }
+            "rch_substrate_blocked" | "blocked" => {
+                set_string(
+                    &mut evidence.rch_failure_reason_code,
+                    Some("rch_substrate_blocked"),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(classification) = evidence.rch_failure_reason_code.as_deref() {
+        let normalized = normalize_rch_reason(classification);
+        if normalized.contains("source") || normalized.contains("compile") {
+            evidence.remote_cargo_reached = true;
+            evidence.rustc_reached = true;
+            set_i32(&mut evidence.remote_exit_code, Some(101));
+        }
+        if normalized.contains("test") || normalized.contains("assert") {
+            evidence.remote_cargo_reached = true;
+            evidence.rustc_reached = true;
+            evidence.test_binary_started = true;
+            set_i32(&mut evidence.remote_exit_code, Some(101));
+        }
+    }
+}
+
+fn merge_artifact_paths(evidence: &mut ProofDoctorEvidence, artifact: &Value) {
+    let artifact_dir = json_str(artifact, "artifact_dir");
+    if let Some(path) = json_str(artifact, "log_file") {
+        push_unique(&mut evidence.artifact_paths, path.to_string());
+    }
+    if let Some(path) = artifact_dir {
+        push_unique(&mut evidence.artifact_paths, path.to_string());
+    }
+    if let Some(paths) = artifact.get("artifacts").and_then(Value::as_object) {
+        for path in paths.values().filter_map(Value::as_str) {
+            let full_path = if path.starts_with('/') {
+                path.to_string()
+            } else if let Some(dir) = artifact_dir {
+                format!("{}/{}", dir.trim_end_matches('/'), path)
+            } else {
+                path.to_string()
+            };
+            push_unique(&mut evidence.artifact_paths, full_path);
+        }
+    }
+}
+
+fn json_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+}
+
+fn json_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key)?.as_str().filter(|value| !value.is_empty())
+}
+
+fn json_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key)?.as_bool()
+}
+
+fn json_path_bool(value: &Value, path: &[&str]) -> Option<bool> {
+    json_path(value, path)?.as_bool()
+}
+
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key)?.as_u64()
+}
+
+fn json_i64(value: &Value, key: &str) -> Option<i64> {
+    value.get(key)?.as_i64()
+}
+
+fn set_string(target: &mut Option<String>, value: Option<&str>) {
+    if target.is_none() {
+        *target = value.map(ToOwned::to_owned);
+    }
+}
+
+fn set_u64(target: &mut Option<u64>, value: Option<u64>) {
+    if target.is_none() {
+        *target = value;
+    }
+}
+
+fn set_u32_path(target: &mut Option<u32>, artifact: &Value, path: &[&str]) {
+    if target.is_none() {
+        *target = json_path(artifact, path)
+            .and_then(Value::as_u64)
+            .and_then(u32_from_u64);
+    }
+}
+
+fn set_i32(target: &mut Option<i32>, value: Option<i32>) {
+    if target.is_none() {
+        *target = value;
+    }
+}
+
+fn i32_from_i64(value: i64) -> Option<i32> {
+    i32::try_from(value).ok()
+}
+
+fn u32_from_u64(value: u64) -> Option<u32> {
+    u32::try_from(value).ok()
+}
+
+fn merge_string_array(target: &mut Vec<String>, value: Option<&Value>) {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for value in values.iter().filter_map(Value::as_str) {
+        push_unique(target, value.to_string());
+    }
+}
+
+fn push_unique(target: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !target.iter().any(|known| known == &value) {
+        target.push(value);
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Durable projection into the existing proof-lane ledger vocabulary.
@@ -751,6 +1034,33 @@ fn classify_execution_evidence(
         return;
     }
 
+    if matches!(
+        evidence.artifact_retrieval_status,
+        ArtifactRetrievalStatus::Failed | ArtifactRetrievalStatus::Stalled
+    ) {
+        let message = evidence
+            .diagnostic_summary
+            .as_deref()
+            .unwrap_or("A retained proof artifact could not be read or retrieved.");
+        let mut blocker = ProofDoctorBlocker::block(
+            ProofDoctorBlockerKind::ArtifactGap,
+            "proof.artifact.retention_failed",
+            message,
+            "Rerun with readable retained artifacts before classifying this proof lane.",
+        )
+        .with_evidence("artifact_retrieval_status");
+        for path in &evidence.artifact_paths {
+            blocker = blocker.with_path(path.clone());
+        }
+        blockers.push(blocker);
+        return;
+    }
+
+    if let Some(blocker) = retained_rch_reason_blocker(evidence) {
+        blockers.push(blocker);
+        return;
+    }
+
     if !evidence.remote_cargo_reached
         && evidence.wrapper_exit_code == Some(127)
         && (evidence.selected_worker.is_some() || evidence.sync_duration_ms.is_some())
@@ -784,6 +1094,112 @@ fn classify_execution_evidence(
             .with_evidence("sync_duration_ms"),
         );
     }
+}
+
+fn retained_rch_reason_blocker(evidence: &ProofDoctorEvidence) -> Option<ProofDoctorBlocker> {
+    let raw_reason = evidence.rch_failure_reason_code.as_deref()?;
+    let reason = normalize_rch_reason(raw_reason);
+    let detail = evidence
+        .rch_failure_reason_detail
+        .as_deref()
+        .or(evidence.diagnostic_summary.as_deref());
+
+    let (kind, reason_code, message, next_action) = if reason.contains("queue_timeout")
+        || reason.contains("timeout_before_assignment")
+        || (reason.contains("timeout") && evidence.selected_worker.is_none())
+    {
+        (
+            ProofDoctorBlockerKind::WorkerCapacity,
+            "proof.rch.queue_timeout_before_assignment",
+            "RCH timed out before assigning a remote worker.",
+            "Retry when worker capacity is available; do not count scheduler wait as proof.",
+        )
+    } else if reason.contains("remote_busy") || reason.contains("busy_wait") {
+        (
+            ProofDoctorBlockerKind::WorkerCapacity,
+            "proof.rch.remote_busy_preflight",
+            "RCH remote-only preflight found the worker queue busy before Cargo started.",
+            "Wait for remote capacity or reduce requested slots before rerunning proof.",
+        )
+    } else if reason.contains("local_fallback_refused")
+        || reason.contains("remote_required")
+        || reason.contains("local_fallback")
+    {
+        (
+            ProofDoctorBlockerKind::WorkerCapacity,
+            "proof.rch.local_fallback_refused",
+            "RCH refused local fallback for a remote-required proof lane.",
+            "Restore remote worker assignment; do not substitute local Cargo proof.",
+        )
+    } else if reason.contains("mirror_missing")
+        || reason.contains("missing_file")
+        || reason.contains("tracked_file_missing")
+    {
+        (
+            ProofDoctorBlockerKind::RemoteSync,
+            "proof.rch.remote_mirror_missing_file",
+            "RCH remote mirror was missing a tracked file before Cargo could prove the lane.",
+            "Repair or refresh the remote mirror, then rerun the proof.",
+        )
+    } else if reason.contains("hash_mismatch") || reason.contains("tracked_file_hash") {
+        (
+            ProofDoctorBlockerKind::RemoteSync,
+            "proof.rch.tracked_file_hash_mismatch",
+            "RCH remote mirror content did not match the local tracked file hash.",
+            "Refresh the remote mirror before trusting any proof result.",
+        )
+    } else if reason.contains("dep_info")
+        || reason.contains("depinfo")
+        || reason.contains("post_cargo")
+        || (reason.contains("substrate") && evidence.remote_cargo_reached)
+    {
+        (
+            ProofDoctorBlockerKind::RemoteSubstrate,
+            "proof.rch.dep_info_lost_after_cargo_started",
+            "Remote Cargo started, but RCH substrate evidence was lost before proof closeout.",
+            "Treat as post-Cargo infrastructure failure and rerun with retained artifacts.",
+        )
+    } else if reason.contains("rch_substrate") || reason.contains("substrate") {
+        (
+            ProofDoctorBlockerKind::RemoteLaunch,
+            "proof.rch.pre_cargo_substrate_blocked",
+            "RCH substrate blocked the proof before retained remote-Cargo evidence appeared.",
+            "Fix RCH substrate evidence before claiming source pass or fail.",
+        )
+    } else {
+        return None;
+    };
+
+    let mut blocker =
+        ProofDoctorBlocker::block(kind, reason_code, detail.unwrap_or(message), next_action)
+            .with_evidence("rch_failure_reason_code");
+
+    if evidence.rch_failure_reason_detail.is_some() {
+        blocker = blocker.with_evidence("rch_failure_reason_detail");
+    }
+    if evidence.selected_worker.is_some() {
+        blocker = blocker.with_evidence("selected_worker");
+    }
+    if evidence.sync_duration_ms.is_some() {
+        blocker = blocker.with_evidence("sync_duration_ms");
+    }
+    if !evidence.artifact_paths.is_empty() {
+        blocker = blocker.with_evidence("artifact_paths");
+    }
+    Some(blocker)
+}
+
+fn normalize_rch_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
 }
 
 fn diagnostic_blocker(
@@ -1167,7 +1583,7 @@ fn projection_for(
         ProofDoctorStatus::Passed => ProofState::Pass,
         ProofDoctorStatus::SourceBlocked => ProofState::SourceCompileFail,
         ProofDoctorStatus::TestBlocked => ProofState::TestFail,
-        ProofDoctorStatus::InfraBlocked => ProofState::InfraBlockedPreCargo,
+        ProofDoctorStatus::InfraBlocked => infra_projection_state(reason_code),
         ProofDoctorStatus::DirtyTreeBlocked
         | ProofDoctorStatus::OwnershipBlocked
         | ProofDoctorStatus::Inconclusive => ProofState::Inconclusive,
@@ -1181,6 +1597,17 @@ fn projection_for(
         summary: summary.to_string(),
         safe_to_close: status == ProofDoctorStatus::Passed,
     })
+}
+
+fn infra_projection_state(reason_code: &str) -> ProofState {
+    if matches!(
+        reason_code,
+        "proof.rch.dep_info_lost_after_cargo_started" | "proof.rch.post_cargo_substrate_failure"
+    ) {
+        ProofState::InfraBlockedPostCargo
+    } else {
+        ProofState::InfraBlockedPreCargo
+    }
 }
 
 fn next_action_code(status: ProofDoctorStatus) -> &'static str {
@@ -2123,6 +2550,227 @@ mod tests {
         assert_eq!(
             verdict.blockers[0].affected_paths,
             vec!["crates/frankenterm-core-audit-types/src/proof_doctor.rs"]
+        );
+    }
+
+    #[test]
+    fn retained_harness_summary_pass_populates_remote_evidence() {
+        let mut input = base_input();
+        merge_proof_doctor_artifact_json(
+            &mut input.evidence,
+            "tests/e2e/artifacts/goal-line/ft-demo/pass/summary.json",
+            &serde_json::json!({
+                "status": "passed",
+                "artifact_dir": "tests/e2e/artifacts/goal-line/ft-demo/pass",
+                "remote": {
+                    "selected_workers": ["vmi1152480"],
+                    "remote_cargo_reached": true,
+                    "remote_rustc_reached": true,
+                    "test_binary_reached": true
+                },
+                "artifacts": {
+                    "stdout": "stdout.txt",
+                    "proof_ledger": "proof-ledger.jsonl"
+                }
+            }),
+        );
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Passed);
+        assert_eq!(
+            verdict.evidence.selected_worker.as_deref(),
+            Some("vmi1152480")
+        );
+        assert!(verdict.evidence.remote_cargo_reached);
+        assert!(verdict.evidence.rustc_reached);
+        assert!(verdict.evidence.test_binary_started);
+        assert_eq!(verdict.evidence.remote_exit_code, Some(0));
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| (projection.state, projection.safe_to_close)),
+            Some((ProofState::Pass, true))
+        );
+        assert!(verdict.evidence.artifact_paths.iter().any(|path| {
+            path == "tests/e2e/artifacts/goal-line/ft-demo/pass/proof-ledger.jsonl"
+        }));
+    }
+
+    #[test]
+    fn retained_rch_meta_pre_cargo_mirror_failure_is_infra_blocked() {
+        let mut input = base_input();
+        input.phase = ProofDoctorPhase::TerminalClassified;
+        merge_proof_doctor_artifact_json(
+            &mut input.evidence,
+            "tests/e2e/artifacts/demo/cargo.log.rch_meta.json",
+            &serde_json::json!({
+                "selected_worker": "vmi1293453",
+                "sync_duration_ms": 140454,
+                "wrapper_exit_code": 1,
+                "failure_reason_code": "RCH-REMOTE-MIRROR-MISSING-FILE",
+                "failure_reason_detail": "missing crates/frankenterm-core-connector-types/Cargo.toml"
+            }),
+        );
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::InfraBlocked);
+        assert_eq!(
+            verdict.blockers[0].blocker_kind,
+            ProofDoctorBlockerKind::RemoteSync
+        );
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.rch.remote_mirror_missing_file"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::InfraBlockedPreCargo)
+        );
+    }
+
+    #[test]
+    fn retained_rch_meta_post_cargo_depinfo_loss_stays_infra_not_source() {
+        let mut input = base_input();
+        input.phase = ProofDoctorPhase::TerminalClassified;
+        merge_proof_doctor_artifact_json(
+            &mut input.evidence,
+            "tests/e2e/artifacts/demo/cargo.log.rch_meta.json",
+            &serde_json::json!({
+                "selected_worker": "vmi1153651",
+                "sync_duration_ms": 176008,
+                "remote_duration_ms": 88000,
+                "remote_cargo_reached": true,
+                "remote_rustc_reached": true,
+                "remote_exit_code": 1,
+                "failure_reason_code": "dep-info-loss-after-cargo-started",
+                "failure_reason_detail": "dep-info files disappeared after rustc started"
+            }),
+        );
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::InfraBlocked);
+        assert_ne!(verdict.status, ProofDoctorStatus::SourceBlocked);
+        assert_eq!(
+            verdict.blockers[0].blocker_kind,
+            ProofDoctorBlockerKind::RemoteSubstrate
+        );
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.rch.dep_info_lost_after_cargo_started"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::InfraBlockedPostCargo)
+        );
+    }
+
+    #[test]
+    fn retained_rch_fail_open_is_invalid_for_rch_required_lane() {
+        let mut input = base_input();
+        merge_proof_doctor_artifact_json(
+            &mut input.evidence,
+            "tests/e2e/artifacts/demo/cargo.log.rch_meta.json",
+            &serde_json::json!({
+                "fail_open_detected": true,
+                "wrapper_exit_code": 0,
+                "remote_exit_code": 0,
+                "failure_reason_code": "local_fallback_refused"
+            }),
+        );
+
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::Invalid);
+        assert!(verdict.evidence.fail_open_detected);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.command.local_cargo_invalid"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::LocalInvalid)
+        );
+    }
+
+    #[test]
+    fn retained_harness_source_and_test_failures_keep_distinct_verdicts() {
+        let mut source = base_input();
+        source.phase = ProofDoctorPhase::TerminalClassified;
+        merge_proof_doctor_artifact_json(
+            &mut source.evidence,
+            "tests/e2e/artifacts/demo/source-summary.json",
+            &serde_json::json!({
+                "status": "failed",
+                "failure_classification": "source_compile_fail",
+                "failure_summary": "remote rustc reported a missing field initializer",
+                "diagnostic_paths": ["crates/frankenterm-core/src/proof_lane.rs"],
+                "remote": {
+                    "selected_workers": ["vmi1156319"],
+                    "remote_cargo_reached": true,
+                    "remote_rustc_reached": true,
+                    "test_binary_reached": false
+                }
+            }),
+        );
+
+        let mut test = base_input();
+        test.phase = ProofDoctorPhase::TerminalClassified;
+        merge_proof_doctor_artifact_json(
+            &mut test.evidence,
+            "tests/e2e/artifacts/demo/test-summary.json",
+            &serde_json::json!({
+                "status": "failed",
+                "failure_classification": "test_assertion_failed",
+                "failure_summary": "remote test assertion failed",
+                "diagnostic_paths": ["crates/frankenterm-core-audit-types/src/proof_doctor.rs"],
+                "remote": {
+                    "selected_workers": ["vmi1149989"],
+                    "remote_cargo_reached": true,
+                    "remote_rustc_reached": true,
+                    "test_binary_reached": true
+                }
+            }),
+        );
+
+        let source_verdict = classify_proof_doctor(&source);
+        let test_verdict = classify_proof_doctor(&test);
+
+        assert_eq!(source_verdict.status, ProofDoctorStatus::SourceBlocked);
+        assert_eq!(
+            source_verdict.blockers[0].reason_code,
+            "proof.source.remote_compile_error"
+        );
+        assert_eq!(
+            source_verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::SourceCompileFail)
+        );
+        assert_eq!(test_verdict.status, ProofDoctorStatus::TestBlocked);
+        assert_eq!(
+            test_verdict.blockers[0].reason_code,
+            "proof.test.remote_assertion_failed"
+        );
+        assert_eq!(
+            test_verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::TestFail)
         );
     }
 

@@ -564,7 +564,6 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
 /// The coverage matrix uses this as the catalog source of truth
 /// so newly added redactor patterns cannot silently miss the
 /// per-release recall report.
-#[must_use]
 pub fn secret_pattern_names() -> impl Iterator<Item = &'static str> {
     SECRET_PATTERNS.iter().map(|pattern| pattern.name)
 }

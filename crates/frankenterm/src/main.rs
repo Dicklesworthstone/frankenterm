@@ -38,9 +38,10 @@ use frankenterm_core::plan::{
 use frankenterm_core::proof_doctor::{
     PROOF_DOCTOR_SCHEMA_VERSION, ProofDoctorBeadRef, ProofDoctorDirtyPath, ProofDoctorEvidence,
     ProofDoctorPhase, ProofDoctorPreflightInput, classify_proof_doctor,
+    merge_proof_doctor_artifact_json,
 };
 use frankenterm_core::proof_handoff::build_proof_handoff;
-use frankenterm_core::proof_lane::{ProofBackend, ProofScope};
+use frankenterm_core::proof_lane::{ArtifactRetrievalStatus, ProofBackend, ProofScope};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
 
@@ -994,6 +995,10 @@ NOTES:
         /// Expected target directory, if known
         #[arg(long)]
         target_dir: Option<String>,
+
+        /// Retained RCH metadata, preflight, or harness summary JSON artifact
+        #[arg(long = "evidence-artifact", value_name = "PATH")]
+        evidence_artifacts: Vec<String>,
 
         /// Output format: plain, json, or toon
         #[arg(long, short = 'f', default_value = "plain")]
@@ -3011,6 +3016,10 @@ enum RobotCommands {
         /// Expected target directory, if known
         #[arg(long)]
         target_dir: Option<String>,
+
+        /// Retained RCH metadata, preflight, or harness summary JSON artifact
+        #[arg(long = "evidence-artifact", value_name = "PATH")]
+        evidence_artifacts: Vec<String>,
 
         /// Intended proof command argv. Use `--` before the command.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -6043,6 +6052,7 @@ fn build_proof_doctor_payload(
     scope: ProofDoctorScopeArg,
     required_backend: ProofDoctorBackendArg,
     target_dir: Option<&str>,
+    evidence_artifacts: &[String],
     command: &[String],
     workspace_root: &Path,
 ) -> serde_json::Value {
@@ -6055,13 +6065,14 @@ fn build_proof_doctor_payload(
         .or_else(|| extract_proof_doctor_target_dir(command));
     let proof_path_prefixes = proof_doctor_package_path_prefixes(workspace_root, command);
 
-    let evidence = ProofDoctorEvidence {
+    let mut evidence = ProofDoctorEvidence {
         local_cargo_detected: proof_doctor_is_local_cargo_command(command),
         dirty_paths: proof_doctor_dirty_paths(workspace_root),
         active_beads: proof_doctor_active_beads(workspace_root),
         reservations: Vec::new(),
         ..ProofDoctorEvidence::default()
     };
+    proof_doctor_merge_evidence_artifacts(&mut evidence, workspace_root, evidence_artifacts);
     let input = ProofDoctorPreflightInput {
         bead_id: bead_id.map(ToOwned::to_owned),
         parent_bead_id: None,
@@ -6079,6 +6090,64 @@ fn build_proof_doctor_payload(
         evidence,
     };
     build_proof_doctor_payload_from_input(input)
+}
+
+fn proof_doctor_merge_evidence_artifacts(
+    evidence: &mut ProofDoctorEvidence,
+    workspace_root: &Path,
+    artifact_paths: &[String],
+) {
+    for artifact_path in artifact_paths {
+        let artifact_path_for_json = artifact_path.to_string();
+        let path = Path::new(artifact_path);
+        let resolved_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace_root.join(path)
+        };
+
+        let raw = match std::fs::read_to_string(&resolved_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                proof_doctor_record_artifact_read_error(
+                    evidence,
+                    artifact_path,
+                    &error.to_string(),
+                );
+                continue;
+            }
+        };
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => merge_proof_doctor_artifact_json(evidence, artifact_path_for_json, &value),
+            Err(error) => {
+                proof_doctor_record_artifact_read_error(
+                    evidence,
+                    artifact_path,
+                    &error.to_string(),
+                );
+            }
+        }
+    }
+}
+
+fn proof_doctor_record_artifact_read_error(
+    evidence: &mut ProofDoctorEvidence,
+    artifact_path: &str,
+    error: &str,
+) {
+    if !evidence
+        .artifact_paths
+        .iter()
+        .any(|known| known == artifact_path)
+    {
+        evidence.artifact_paths.push(artifact_path.to_string());
+    }
+    evidence.artifact_retrieval_status = ArtifactRetrievalStatus::Failed;
+    if evidence.diagnostic_summary.is_none() {
+        evidence.diagnostic_summary = Some(format!(
+            "Could not read proof-doctor evidence artifact {artifact_path}: {error}"
+        ));
+    }
 }
 
 fn build_proof_doctor_payload_from_input(input: ProofDoctorPreflightInput) -> serde_json::Value {
@@ -23747,6 +23816,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     scope,
                     required_backend,
                     target_dir,
+                    evidence_artifacts,
                     command,
                 } => {
                     let payload = build_proof_doctor_payload(
@@ -23755,6 +23825,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         scope,
                         required_backend,
                         target_dir.as_deref(),
+                        &evidence_artifacts,
                         &command,
                         &workspace_root,
                     );
@@ -37016,6 +37087,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             scope,
             required_backend,
             target_dir,
+            evidence_artifacts,
             format,
             command,
         }) => {
@@ -37026,6 +37098,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 scope,
                 required_backend,
                 target_dir.as_deref(),
+                &evidence_artifacts,
                 &command,
                 &workspace_root,
             );
