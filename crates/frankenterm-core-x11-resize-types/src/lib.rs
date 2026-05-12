@@ -110,8 +110,9 @@ impl Default for CoalesceConfig {
 // Coalesce state machine
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum CoalesceStateInner {
+    #[default]
     Idle,
     /// Buffering events. `last_event` holds the most-recent
     /// dimensions (we keep just the last per the bead — coalescing
@@ -124,12 +125,6 @@ enum CoalesceStateInner {
         opened_at_ms: u64,
         events_in_burst: u32,
     },
-}
-
-impl Default for CoalesceStateInner {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
