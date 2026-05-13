@@ -334,6 +334,30 @@ fn osc_8_bel_terminated_link_prints_visible_payload() {
     assert_line_text_and_cursor(&replay_term, "link text", "mux parsed-action replay path");
 }
 
+#[test]
+fn malformed_graphics_sequences_do_not_swallow_following_text() {
+    const PAYLOAD: &[u8] = b"\x1b_Gt=f,S=999999999999999999999;@@@\x1b\\\x1bPq!12\x1b\\after";
+
+    let mut advance_term = test_term();
+    advance_term.advance_bytes(PAYLOAD);
+    assert_plain_line_text_and_cursor(
+        &advance_term,
+        "after",
+        "raw malformed graphics advance_bytes path",
+    );
+
+    let mut replayed_actions = Vec::new();
+    let mut parser = Parser::new();
+    parser.parse(PAYLOAD, |action| action.append_to(&mut replayed_actions));
+    let mut replay_term = test_term();
+    replay_term.perform_actions(replayed_actions);
+    assert_plain_line_text_and_cursor(
+        &replay_term,
+        "after",
+        "malformed graphics parsed-action replay path",
+    );
+}
+
 fn test_term() -> Terminal {
     Terminal::new(
         TerminalSize {
@@ -348,6 +372,25 @@ fn test_term() -> Terminal {
         "test",
         Box::new(Vec::new()),
     )
+}
+
+fn assert_plain_line_text_and_cursor(term: &Terminal, expected: &str, context: &str) {
+    let mut first_line = String::new();
+    term.screen().with_phys_lines(0..1, |lines| {
+        first_line = lines[0].as_str().to_string();
+    });
+    assert_eq!(
+        first_line.trim_end(),
+        expected,
+        "malformed graphics controls must not swallow following printable text via {}",
+        context
+    );
+    assert_eq!(
+        term.cursor_pos().x,
+        expected.len(),
+        "malformed graphics payload must advance the cursor via {}",
+        context
+    );
 }
 
 fn assert_line_text_and_cursor(term: &Terminal, expected: &str, context: &str) {

@@ -39,10 +39,10 @@ fn cluster_paragraph_context(cell_clusters: &[CellCluster]) -> ClusterParagraphC
 }
 
 fn should_shape_cluster_with_paragraph_context(cluster: &CellCluster) -> bool {
-    // Harfbuzz paragraph ranges are useful for complex scripts, but ASCII
-    // terminal text matches upstream more closely when each style cluster is
-    // shaped independently.
-    !cluster.text.is_ascii()
+    // Harfbuzz paragraph ranges are the established default for terminal
+    // text. OSC 8 hyperlink runs are the narrow ASCII case that diverges from
+    // upstream when shaped with adjacent non-hyperlink context.
+    !cluster.text.is_ascii() || cluster.attrs.hyperlink().is_none()
 }
 
 fn any_cluster_needs_paragraph_context(cell_clusters: &[CellCluster]) -> bool {
@@ -951,6 +951,8 @@ impl crate::TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use termwiz::hyperlink::Hyperlink;
     use termwiz::surface::{Line, SEQ_ZERO};
 
     #[test]
@@ -974,14 +976,25 @@ mod tests {
     }
 
     #[test]
-    fn paragraph_context_is_reserved_for_non_ascii_clusters() {
+    fn paragraph_context_skips_only_ascii_hyperlink_clusters() {
         let attrs = CellAttributes::default();
 
         let ascii = Line::from_text("link text", &attrs, SEQ_ZERO, None);
         let ascii_clusters = ascii.cluster(None);
-        assert!(!any_cluster_needs_paragraph_context(&ascii_clusters));
+        assert!(any_cluster_needs_paragraph_context(&ascii_clusters));
         assert!(
             ascii_clusters
+                .iter()
+                .all(should_shape_cluster_with_paragraph_context)
+        );
+
+        let mut hyperlink_attrs = CellAttributes::default();
+        hyperlink_attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        let hyperlink = Line::from_text("link text", &hyperlink_attrs, SEQ_ZERO, None);
+        let hyperlink_clusters = hyperlink.cluster(None);
+        assert!(!any_cluster_needs_paragraph_context(&hyperlink_clusters));
+        assert!(
+            hyperlink_clusters
                 .iter()
                 .all(|cluster| !should_shape_cluster_with_paragraph_context(cluster))
         );
@@ -992,8 +1005,10 @@ mod tests {
         assert!(complex_clusters.iter().any(|cluster| {
             !cluster.text.is_ascii() && should_shape_cluster_with_paragraph_context(cluster)
         }));
-        assert!(complex_clusters.iter().all(|cluster| {
-            !cluster.text.is_ascii() || !should_shape_cluster_with_paragraph_context(cluster)
-        }));
+        assert!(
+            complex_clusters
+                .iter()
+                .all(should_shape_cluster_with_paragraph_context)
+        );
     }
 }
