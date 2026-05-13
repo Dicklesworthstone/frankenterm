@@ -995,6 +995,19 @@ where
                 debug!(pane_id, "Added tailer for new pane");
             }
         }
+
+        let active_priorities: HashSet<u32> = self
+            .tailers
+            .keys()
+            .map(|pane_id| {
+                self.pane_priorities
+                    .get(pane_id)
+                    .copied()
+                    .unwrap_or(u32::MAX)
+            })
+            .collect();
+        self.priority_round_robin_offsets
+            .retain(|priority, _| active_priorities.contains(priority));
     }
 
     /// Update configuration dynamically.
