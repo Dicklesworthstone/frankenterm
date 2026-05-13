@@ -172,7 +172,8 @@ return {
   initial_cols = 80,
   initial_rows = 24,
   font_size = 12.0,
-  font = wezterm.font_with_fallback({ "Pragmasevka", "Menlo", "Monaco" }),
+  -- Use a stock macOS font so absent-font config overlays do not contaminate screenshots.
+  font = wezterm.font("Menlo"),
   window_padding = { left = 0, right = 0, top = 0, bottom = 0 },
   cursor_blink_rate = 0,
   audible_bell = "Disabled",
