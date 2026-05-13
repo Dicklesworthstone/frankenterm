@@ -19,11 +19,11 @@
 //! deterministic Lindley path (G23 / `latency_stages.rs`).
 //!
 //! ```
-//! use ft_perf_gate::snc::{HillEstimator, hill_estimate};
+//! use ft_perf_gate::snc::{HillEstimate, hill_estimate};
 //!
 //! // A clearly heavy-tail sample (Pareto with alpha=1.5).
 //! let samples: Vec<f64> = (1..=200).map(|i| (1.0_f64 / (1.0 - i as f64 / 201.0)).powf(1.0/1.5)).collect();
-//! let est = hill_estimate(&samples, 50);
+//! let est: HillEstimate = hill_estimate(&samples, 50);
 //! assert!(est.alpha < 2.0, "Hill estimator should detect alpha<2 on Pareto-1.5; got {}", est.alpha);
 //! ```
 //!
@@ -130,8 +130,10 @@ pub struct SncConfig {
     /// Tail-index threshold below which we are "heavy-tail" (α<this).
     /// Conventional: 2.0 (Lindley breaks down).
     pub heavy_tail_alpha_threshold: f64,
-    /// Stability margin: utilization ρ = rate / service_rate must be
-    /// strictly below 1; this lets callers enforce ρ < (1 - margin).
+    /// Stability margin — currently unused in the v1 single-stage
+    /// observed-delay form (kept for serde compatibility + reserved for
+    /// the future multi-stage / queueing-composition variant of
+    /// `compute_snc_bound`).
     pub stability_margin: f64,
 }
 
@@ -146,15 +148,27 @@ impl Default for SncConfig {
     }
 }
 
-/// Compute the SNC end-to-end delay bound for a single stage given a
-/// sample of arrival latencies and a configured service curve.
+/// Compute the SNC delay quantile from a slice of latency observations.
 ///
-/// The implementation uses a simplified closed-form bound applicable to
-/// the MGF-bounded arrival / rate-latency service-curve case (Jiang 2008
-/// Theorem 2.4.1, specialized): for heavy-tail Pareto inputs with index
-/// α ∈ (1, 2), the p-quantile delay is bounded by
-/// `xm / ((1 - p)^(1/α)) / service_rate` modulated by the stability
-/// margin. For α ≥ 2, falls back to LindleyDomain.
+/// **Honest simplification.** The classical Jiang 2008 Theorem 2.4.1
+/// formula combines an MGF-bounded arrival envelope with a rate-latency
+/// service curve to give a queueing delay bound. The v1 implementation
+/// here treats `samples` as DIRECT delay observations (their
+/// `metric_value` is the observed end-to-end latency in `metric_unit`,
+/// not an arrival rate in events/sec) and returns the Pareto-tail
+/// quantile fit to those observations.
+///
+/// Concretely: P(X > x) ~ (xm/x)^α for heavy-tail X ⇒ inverting at the
+/// (1 - confidence) tail gives x_p = xm · (1/(1-p))^(1/α), where xm is
+/// the order statistic X_(n-k) the Hill estimator used. For α ≥
+/// `heavy_tail_alpha_threshold`, falls back to [`SncBound::LindleyDomain`]
+/// since the deterministic Lindley path in `latency_stages.rs` is the
+/// right tool there.
+///
+/// The [`MgfServiceCurve`] argument is currently a placeholder for
+/// future multi-stage / queueing composition (G38 follow-on). It is
+/// validated (rate > 0, finite) but its values do not modulate the
+/// returned quantile in the single-stage observed-delay form.
 #[must_use]
 pub fn compute_snc_bound(
     samples: &[EvidenceSample],
@@ -171,13 +185,22 @@ pub fn compute_snc_bound(
             reason: "snc service rate must be positive and finite".to_string(),
         };
     }
-    let values: Vec<f64> = samples.iter().map(|s| s.metric_value).filter(|v| v.is_finite() && *v > 0.0).collect();
-    if values.len() < cfg.hill_k + 1 {
+    // Clamp hill_k to match the internal floor in `hill_estimate`. Without
+    // this, callers setting hill_k < 2 would get an alpha estimate computed
+    // with k=2 but an xm threshold read at sorted[len - hill_k - 1] for
+    // the unclamped k — two inconsistent k values in the same computation.
+    let hill_k = cfg.hill_k.max(2);
+    let values: Vec<f64> = samples
+        .iter()
+        .map(|s| s.metric_value)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    if values.len() < hill_k + 1 {
         return SncBound::OutOfDomain {
-            reason: format!("snc needs at least hill_k+1 = {} positive finite samples", cfg.hill_k + 1),
+            reason: format!("snc needs at least hill_k+1 = {} positive finite samples", hill_k + 1),
         };
     }
-    let hill = hill_estimate(&values, cfg.hill_k);
+    let hill = hill_estimate(&values, hill_k);
     if !hill.alpha.is_finite() {
         return SncBound::OutOfDomain { reason: "hill estimator produced non-finite alpha".to_string() };
     }
@@ -185,25 +208,19 @@ pub fn compute_snc_bound(
         return SncBound::LindleyDomain { alpha: hill.alpha };
     }
 
-    // Pareto tail-quantile bound: P(X > x) ~ (xm/x)^alpha; invert to get
-    // x = xm * (1/(1-p))^(1/alpha). xm is the threshold X_(n-k) from Hill.
+    // Pareto tail-quantile: P(X > x) ~ (xm/x)^alpha
+    // Inverting at the (1 - p) upper tail: x_p = xm * (1/(1-p))^(1/alpha)
     let mut sorted = values.clone();
     sorted.sort_by(f64::total_cmp);
-    let xm = sorted[sorted.len() - cfg.hill_k - 1];
+    let xm = sorted[sorted.len() - hill_k - 1];
     let one_minus_p = 1.0 - cfg.confidence;
-    let quantile = xm * one_minus_p.powf(-1.0 / hill.alpha);
+    let delay_ms = xm * one_minus_p.powf(-1.0 / hill.alpha);
 
-    // Stage delay bound = quantile / service_rate, modulated by stability:
-    // if utilization rho approaches 1 the bound grows; require margin.
-    let mean_arrival_rate = values.iter().sum::<f64>() / (values.len() as f64);
-    let rho = mean_arrival_rate / service.rate;
-    if rho >= 1.0 - cfg.stability_margin {
+    if !delay_ms.is_finite() || delay_ms <= 0.0 {
         return SncBound::OutOfDomain {
-            reason: format!("utilization rho={rho:.3} exceeds stability margin"),
+            reason: format!("snc quantile computation produced non-finite or non-positive delay {delay_ms}"),
         };
     }
-    let stability_factor = 1.0 / (1.0 - rho);
-    let delay_ms = quantile / service.rate * stability_factor + service.burst / service.rate;
 
     SncBound::HeavyTailBound {
         confidence: cfg.confidence,

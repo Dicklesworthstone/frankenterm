@@ -143,25 +143,25 @@ impl TestLogger {
         let test = test.into();
         let run_id = Uuid::now_v7().to_string();
         let base = Self::output_root().join(&area).join(&test);
-        let sink: Box<dyn Write + Send> = match create_dir_all(&base) {
-            Ok(()) => {
-                let path = base.join(format!("{run_id}.jsonl"));
-                match OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    Ok(f) => Box::new(f),
-                    Err(_) => Box::new(Vec::new()),
-                }
-            }
-            Err(_) => Box::new(Vec::new()),
-        };
+        let path = base.join(format!("{run_id}.jsonl"));
+        // Two-step fallback: try to mkdir, then try to open. Both steps may
+        // fail on read-only / sandboxed runners; in that case we fall back
+        // to an in-memory sink AND mark output_path with the in-memory
+        // sentinel so operator inspection of `output_path()` doesn't
+        // promise a file that does not exist.
+        let (sink, resolved_path): (Box<dyn Write + Send>, PathBuf) =
+            match create_dir_all(&base) {
+                Ok(()) => match OpenOptions::new().create(true).append(true).open(&path) {
+                    Ok(f) => (Box::new(f), path),
+                    Err(_) => (Box::new(Vec::new()), PathBuf::from("<in-memory>")),
+                },
+                Err(_) => (Box::new(Vec::new()), PathBuf::from("<in-memory>")),
+            };
         Self {
-            area: area.clone(),
-            test: test.clone(),
-            run_id: run_id.clone(),
-            output_path: base.join(format!("{run_id}.jsonl")),
+            area,
+            test,
+            run_id,
+            output_path: resolved_path,
             sink: Mutex::new(sink),
         }
     }
@@ -176,7 +176,7 @@ impl TestLogger {
         Self {
             area,
             test,
-            run_id: run_id.clone(),
+            run_id,
             output_path: PathBuf::from("<in-memory>"),
             sink: Mutex::new(Box::new(Vec::<u8>::new())),
         }

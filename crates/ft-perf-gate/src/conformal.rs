@@ -169,7 +169,12 @@ impl Default for SplitConformalConfig {
         Self {
             alpha: 0.05,
             calibration_fraction: 0.5,
-            min_calibration_samples: 16,
+            // For alpha=0.05 the finite-sample quantile requires
+            // n_cal >= ceil((1 - alpha)/alpha) = 19 to admit a valid
+            // (1 - alpha)(n+1)-th order statistic. Default to 20 to clear
+            // the boundary with one sample of headroom; callers using
+            // smaller alpha can override.
+            min_calibration_samples: 20,
         }
     }
 }
@@ -224,11 +229,34 @@ pub fn fit_split_conformal_band(
     let mut scores: Vec<f64> = cal.iter().map(|v| (v - mean).abs()).collect();
     scores.sort_by(f64::total_cmp);
 
-    // Conformal quantile: ceil((1 - alpha) * (n + 1)) / n-th order statistic.
-    // Use 1-based indexing per the standard formulation.
+    // Conformal quantile: the ceil((1 - alpha) * (n + 1))-th order statistic
+    // (1-based) is the standard finite-sample quantile that guarantees
+    // marginal coverage >= (1 - alpha). If that index exceeds n, the
+    // finite-sample procedure cannot publish a guaranteed (1 - alpha) band
+    // — the bound would be +infinity. Return Continue requesting enough
+    // additional samples to make the index valid (rather than silently
+    // returning a max-score-based band that technically under-covers).
     let n = n_cal;
     let q_level = ((1.0 - cfg.alpha) * ((n + 1) as f64)).ceil() as usize;
-    let q_idx = q_level.min(n).saturating_sub(1);
+    if q_level > n {
+        // Need n_cal >= ceil((1-alpha)(n+1))  =>  n_cal >= ceil((1-alpha)/alpha)
+        // in the worst case. Compute the smallest n_cal that admits a valid
+        // quantile and request the difference.
+        let required = ((1.0 - cfg.alpha) / cfg.alpha).ceil() as usize;
+        let needed_calibration_extra = required.saturating_sub(n_cal);
+        // Each extra calibration sample requires roughly 1/calibration_fraction
+        // total extra samples; round up to be safe.
+        let needed_total =
+            ((needed_calibration_extra as f64) / cfg.calibration_fraction).ceil() as usize;
+        return Err(GateDecision::Continue {
+            reason: format!(
+                "split-conformal: n_cal={n_cal} too small for alpha={}; need n_cal >= {required} for a valid (1-alpha) quantile",
+                cfg.alpha
+            ),
+            needed_samples: u64::try_from(needed_total.max(1)).ok(),
+        });
+    }
+    let q_idx = q_level - 1; // 1-based -> 0-based
     let radius = scores[q_idx];
 
     Ok(ConformalBand {
@@ -284,11 +312,11 @@ mod tests {
 
     #[test]
     fn split_conformal_fits_a_band_with_reasonable_radius() -> Result<(), String> {
-        // 32 synthesized samples around mean 10 with stddev 0.5; the
-        // 95%-coverage band should sit roughly within [9, 11] depending on
-        // the sample order.
+        // 64 synthesized samples around mean 10 with stddev 0.5. With the
+        // default calibration_fraction=0.5, this gives 32 calibration
+        // samples — well above the alpha=0.05 floor of 19.
         let mut seed: u64 = 0xABCDE;
-        let samples: Vec<EvidenceSample> = (0..32)
+        let samples: Vec<EvidenceSample> = (0..64)
             .map(|i| {
                 let v = 10.0 + gauss_test(&mut seed) * 0.5;
                 EvidenceSample::new("robot.p95", v, "ms", 1, i)
@@ -296,11 +324,37 @@ mod tests {
             .collect();
         let band = fit_split_conformal_band(&samples, &SplitConformalConfig::default())
             .map_err(|d| format!("unexpected decision: {d:?}"))?;
-        assert_eq!(band.calibration_samples, 16);
+        assert_eq!(band.calibration_samples, 32);
         assert!(band.upper > band.lower, "upper > lower");
-        // With sigma=0.5 and ~16 calibration samples the radius should be small.
+        // With sigma=0.5 and ~32 calibration samples the radius should be small.
         assert!(band.upper - band.lower < 4.0, "band too wide: {} to {}", band.lower, band.upper);
         Ok(())
+    }
+
+    #[test]
+    fn split_conformal_returns_continue_when_n_too_small_for_alpha() {
+        // For alpha=0.05 the quantile requires n_cal >= 19; 16 samples
+        // / fraction=0.5 = 8 calibration samples → not enough; the
+        // detector must return Continue rather than silently fall back
+        // to a max-score band that under-covers.
+        let mut seed: u64 = 0xBEEF1;
+        let samples: Vec<EvidenceSample> = (0..16)
+            .map(|i| {
+                let v = 10.0 + gauss_test(&mut seed) * 0.5;
+                EvidenceSample::new("robot.p95", v, "ms", 1, i)
+            })
+            .collect();
+        let cfg = SplitConformalConfig {
+            alpha: 0.05,
+            calibration_fraction: 0.5,
+            min_calibration_samples: 8,  // intentionally below 19
+        };
+        match fit_split_conformal_band(&samples, &cfg) {
+            Err(GateDecision::Continue { needed_samples, .. }) => {
+                assert!(needed_samples.is_some(), "should report needed_samples");
+            }
+            other => panic!("expected Continue for n_cal=8 with alpha=0.05; got {other:?}"),
+        }
     }
 
     #[test]
