@@ -101,6 +101,7 @@ jobs:
       MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE: "1"
     strategy:
       fail-fast: false
+      max-parallel: 3 # Preserve all seeds without monopolizing hosted runner quota.
       matrix:
         # 8 fixed seeds + 1 date-derived random.
         seed_label: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.seed_override != '') && format('[{0}]', toJSON(inputs.seed_override)) || '["a5a5a5a5","deadbeef","cafebabe","feedface","12345678","87654321","0badc0de","f00dface","random"]') }}
