@@ -4398,6 +4398,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ft-test-log"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "ftui"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f2a2c51b8b06ff589e6b905e6a63f5a96"
