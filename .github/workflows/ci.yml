@@ -142,6 +142,17 @@ jobs:
       - name: RuntimeProof coverage ratchet (ft-3kv6e)
         run: python3 scripts/check_runtime_proof_coverage.py
 
+      # ft-tf6g3.29 — mechanized Lean model of the RuntimeProof private
+      # supertrait seal. Elan reads lean-toolchain and installs the exact
+      # Lean release used by the proof checker.
+      - name: Install Lean toolchain (ft-tf6g3.29)
+        run: |
+          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --no-modify-path
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: RuntimeProof mechanized soundness proof (ft-tf6g3.29)
+        run: scripts/check-runtime-proof-soundness.sh
+
       # ft-tf6g3.7 — fast asupersync-test-only lint. The Rust test
       # wa_22x4r_no_tokio_test_in_supported_paths.rs catches the same
       # invariant in Cargo test lanes, but this shell guard fails the

@@ -139,9 +139,20 @@ The canary doctest is what the bridge plan actually demands: a
 mechanical demonstration that "PR introduces `tokio::sync::Mutex` in
 core" is a hard compile error rather than a soft lint.
 
+## Mechanized Soundness Model
+
+`docs/proofs/runtime-proof-soundness.lean` models the private-supertrait
+argument in Lean 4. It proves that a downstream crate cannot implement
+`RuntimeProof` because it cannot name `runtime_proof::sealed::Sealed`,
+and that any modeled `RuntimeProof` implementation must be in the declared
+implementation set. The companion Rust test
+`crates/frankenterm-core/tests/runtime_proof_soundness_model.rs` keeps the
+Lean list synchronized with the live `runtime_proof.rs` impl list.
+
 ## See also
 
 - `docs/reality-check-bridge-plan.md` §G1
 - `docs/proposals/ft-7iof6-runtime-compat-canonical-surface.md` — why `runtime_async` is the canonical async surface
+- `docs/proofs/runtime-proof-soundness.md` — mechanized proof assumptions and theorem inventory
 - `crates/frankenterm-core/src/runtime_proof.rs` — implementation
 - `crates/frankenterm-core/src/runtime_async.rs` — wrapper primitives

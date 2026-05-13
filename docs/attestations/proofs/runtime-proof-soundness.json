@@ -1,0 +1,82 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "runtime-proof-mechanized-soundness-attestation",
+  "category": "proofs/runtime-proof-soundness",
+  "release_bundle_slot": "proofs/runtime-proof-soundness.json",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-13T04:55:00Z",
+  "produced_by_bead": "ft-tf6g3.29",
+  "status": "pass",
+  "proof_category": 6,
+  "proof_categories": [1, 6],
+  "scope": "Lean 4 model of the RuntimeProof private-supertrait seal plus Rust-side model/code consistency check.",
+  "mechanized_proof": {
+    "language": "Lean 4",
+    "toolchain_path": "lean-toolchain",
+    "toolchain": "leanprover/lean4:v4.29.1",
+    "source_path": "docs/proofs/runtime-proof-soundness.lean",
+    "doc_path": "docs/proofs/runtime-proof-soundness.md",
+    "checker_path": "scripts/check-runtime-proof-soundness.sh",
+    "forbidden_escape_hatches": ["axiom", "opaque", "unsafe", "sorry", "admit"],
+    "theorems": [
+      "downstream_cannot_name_private_sealed",
+      "downstream_cannot_implement_sealed",
+      "downstream_cannot_implement_runtime_proof",
+      "runtime_proof_impl_requires_declared_type",
+      "undeclared_type_cannot_implement_runtime_proof",
+      "tokio_mutex_cannot_implement_runtime_proof",
+      "downstream_type_cannot_implement_runtime_proof"
+    ]
+  },
+  "model_assumptions": [
+    "The model covers the private-supertrait sealed-trait rule, not full Rust semantics.",
+    "A downstream crate can name public traits but cannot name private traits owned by frankenterm-core.",
+    "A RuntimeProof implementation requires both the public trait and the private sealed supertrait.",
+    "The declared implementation list is cross-checked against crates/frankenterm-core/src/runtime_proof.rs."
+  ],
+  "rust_consistency_check": {
+    "test_path": "crates/frankenterm-core/tests/runtime_proof_soundness_model.rs",
+    "source_path": "crates/frankenterm-core/src/runtime_proof.rs",
+    "model_list": "RuntimeProofSoundness.rustRuntimeProofImplNames",
+    "assertion": "Lean declared implementation names equal live Rust RuntimeProof impl names, and every RuntimeProof impl has a matching sealed::Sealed impl."
+  },
+  "evidence_paths": [
+    "docs/proofs/runtime-proof-soundness.lean",
+    "docs/proofs/runtime-proof-soundness.md",
+    "scripts/check-runtime-proof-soundness.sh",
+    "tests/e2e/test_runtime_proof_check.sh",
+    "crates/frankenterm-core/tests/runtime_proof_soundness_model.rs",
+    ".github/workflows/ci.yml",
+    "lean-toolchain"
+  ],
+  "validation": [
+    {
+      "command": "scripts/check-runtime-proof-soundness.sh",
+      "status": "pass",
+      "result": "Lean proof checked with leanprover/lean4:v4.29.1"
+    },
+    {
+      "command": "tests/e2e/test_runtime_proof_check.sh",
+      "status": "pass",
+      "result": "Lean proof checked and theorem inventory verified"
+    },
+    {
+      "command": "jq empty docs/attestations/proofs/runtime-proof-soundness.json && bash -n scripts/check-runtime-proof-soundness.sh tests/e2e/test_runtime_proof_check.sh && rustfmt --edition 2024 --check crates/frankenterm-core/tests/runtime_proof_soundness_model.rs",
+      "status": "pass"
+    },
+    {
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-29-runtime-proof-model cargo test -p frankenterm-core --test runtime_proof_soundness_model -- --nocapture",
+      "status": "blocked",
+      "result": "RCH refused local fallback because no admissible remote workers were available; observed insufficient_slots and active_project_exclusion."
+    },
+    {
+      "command": "RCH_VISIBILITY=verbose rch exec -- env CARGO_TARGET_DIR=/tmp/ft-tf6g3-29-runtime-proof-model cargo test -p frankenterm-core --test runtime_proof_soundness_model -- --nocapture",
+      "status": "pass_local_fallback",
+      "result": "RCH-routed local fallback completed in 5m15s; runtime_proof_soundness_model passed 1 test. Not claimed as remote-worker proof."
+    }
+  ],
+  "manifest_wiring": {
+    "status": "artifact_published_manifest_slot_pending",
+    "reason": "This bead publishes the runtime-proof-soundness artifact and release slot name. Manifest enum/schema wiring remains separate release-bundle ownership."
+  }
+}
