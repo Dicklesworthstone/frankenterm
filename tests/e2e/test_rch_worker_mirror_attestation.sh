@@ -67,6 +67,59 @@ cat >"${FAKE_SSH}" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+fixture_sha256() {
+    local path="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "${path}" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "${path}" | awk '{print $1}'
+    else
+        printf '\n'
+    fi
+}
+
+requested_paths() {
+    local command_text payload_b64 payload
+    command_text="${!#}"
+    payload_b64="$(printf '%s\n' "${command_text}" | sed -n "s/^.*-- '\([^']*\)'.*$/\1/p")"
+    [[ -n "${payload_b64}" ]] || return 0
+    payload="$(printf '%s' "${payload_b64}" | base64 -d 2>/dev/null || true)"
+    while IFS=$'\t' read -r kind value; do
+        [[ "${kind}" == "F" && -n "${value}" ]] || continue
+        printf '%s\n' "${value}"
+    done <<<"${payload}"
+}
+
+emit_files() {
+    local mode="$1"
+    shift
+    local path full_path hash
+    while IFS= read -r path; do
+        case "${mode}:${path}" in
+          missing_file:crates/frankenterm-core/src/lib.rs)
+            printf 'FILE\t%s\tmissing\t\n' "${path}"
+            continue
+            ;;
+          missing_workspace_member:crates/frankenterm-core-replay-types/src/lib.rs)
+            printf 'FILE\t%s\tmissing\t\n' "${path}"
+            continue
+            ;;
+          hash_mismatch:crates/frankenterm-core/src/lib.rs)
+            printf 'FILE\t%s\tpresent\t0000000000000000000000000000000000000000000000000000000000000000\n' "${path}"
+            continue
+            ;;
+        esac
+
+        full_path="${FAKE_RCH_MIRROR_REPO_ROOT}/${path}"
+        if [[ -f "${full_path}" ]]; then
+            hash="$(fixture_sha256 "${full_path}")"
+            printf 'FILE\t%s\tpresent\t%s\n' "${path}" "${hash}"
+        else
+            printf 'FILE\t%s\tmissing\t\n' "${path}"
+        fi
+    done < <(requested_paths "$@")
+}
+
 case "${FAKE_RCH_MIRROR_MODE:-success}" in
   unreachable)
     printf 'fixture ssh unreachable\n' >&2
@@ -79,36 +132,37 @@ case "${FAKE_RCH_MIRROR_MODE:-success}" in
     printf 'STATUS\tok\n'
     printf 'ROOT\t/data/projects/frankenterm\n'
     printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD:-0000000000000000000000000000000000000000}"
-    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
-    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CORE_LIB_SHA}"
+    emit_files stale_head "$@"
     ;;
   head_unavailable)
     printf 'STATUS\tok\n'
     printf 'ROOT\t/data/projects/frankenterm\n'
     printf 'HEAD\t\n'
-    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
-    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CORE_LIB_SHA}"
+    emit_files head_unavailable "$@"
     ;;
   hash_mismatch)
     printf 'STATUS\tok\n'
     printf 'ROOT\t/data/projects/frankenterm\n'
     printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD}"
-    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
-    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\t0000000000000000000000000000000000000000000000000000000000000000\n'
+    emit_files hash_mismatch "$@"
     ;;
   missing_file)
     printf 'STATUS\tok\n'
     printf 'ROOT\t/data/projects/frankenterm\n'
     printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD}"
-    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
-    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tmissing\t\n'
+    emit_files missing_file "$@"
+    ;;
+  missing_workspace_member)
+    printf 'STATUS\tok\n'
+    printf 'ROOT\t/data/projects/frankenterm\n'
+    printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD}"
+    emit_files missing_workspace_member "$@"
     ;;
   success)
     printf 'STATUS\tok\n'
     printf 'ROOT\t/data/projects/frankenterm\n'
     printf 'HEAD\t%s\n' "${FAKE_RCH_MIRROR_REMOTE_HEAD}"
-    printf 'FILE\tCargo.toml\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CARGO_TOML_SHA}"
-    printf 'FILE\tcrates/frankenterm-core/src/lib.rs\tpresent\t%s\n' "${FAKE_RCH_MIRROR_CORE_LIB_SHA}"
+    emit_files success "$@"
     ;;
   *)
     printf 'unknown fake mode: %s\n' "${FAKE_RCH_MIRROR_MODE:-}" >&2
@@ -129,6 +183,7 @@ run_fixture() {
     FAKE_RCH_MIRROR_REMOTE_HEAD="${remote_head}" \
     FAKE_RCH_MIRROR_CARGO_TOML_SHA="${CARGO_TOML_SHA}" \
     FAKE_RCH_MIRROR_CORE_LIB_SHA="${CORE_LIB_SHA}" \
+    FAKE_RCH_MIRROR_REPO_ROOT="${ROOT_DIR}" \
     RCH_MIRROR_ATTEST_WORKERS_JSON="${WORKERS_JSON}" \
     RCH_MIRROR_ATTEST_SSH_BIN="${FAKE_SSH}" \
     "${SCRIPT}" \
@@ -160,6 +215,43 @@ if run_fixture success "${SUCCESS_JSON}"; then
     fi
 else
     record_result "success_fixture" "false" "script failed"
+fi
+
+WORKSPACE_ROOTS_JSON="${LOG_DIR}/workspace_member_roots.json"
+if run_fixture success "${WORKSPACE_ROOTS_JSON}" --workspace-member-roots; then
+    if jq -e '
+        .status == "passed"
+        and .reason_code == "rch_mirror.ok"
+        and ([.remote.required_files[].path] | index("crates/frankenterm-core-replay-types/Cargo.toml") != null)
+        and ([.remote.required_files[].path] | index("crates/frankenterm-core-replay-types/src/lib.rs") != null)
+        and ([.remote.required_files[].path] | index("crates/frankenterm-topo/Cargo.toml") != null)
+        and ([.remote.required_files[].path] | index("crates/frankenterm-topo/src/lib.rs") != null)
+        and ([.remote.required_files[].path] | index("frankenterm/config/derive/Cargo.toml") != null)
+        and (.remote.required_files | length > 50)
+        and (.remote.required_files | all(.remote_status == "present" and .hash_matches == true))
+    ' "${WORKSPACE_ROOTS_JSON}" >/dev/null; then
+        record_result "workspace_member_roots_fixture" "true"
+    else
+        record_result "workspace_member_roots_fixture" "false" "unexpected JSON shape"
+    fi
+else
+    record_result "workspace_member_roots_fixture" "false" "script failed"
+fi
+
+WORKSPACE_MISSING_JSON="${LOG_DIR}/workspace_member_missing.json"
+if run_fixture missing_workspace_member "${WORKSPACE_MISSING_JSON}" --workspace-member-roots; then
+    record_result "workspace_member_missing_fixture" "false" "script unexpectedly passed"
+else
+    if jq -e '
+        .status == "failed"
+        and .reason_code == "rch_mirror.missing_tracked_file"
+        and .failure_domain == "source_mirror"
+        and (.remote.required_files[] | select(.path == "crates/frankenterm-core-replay-types/src/lib.rs") | .remote_status == "missing")
+    ' "${WORKSPACE_MISSING_JSON}" >/dev/null; then
+        record_result "workspace_member_missing_fixture" "true"
+    else
+        record_result "workspace_member_missing_fixture" "false" "unexpected JSON shape"
+    fi
 fi
 
 MISSING_JSON="${LOG_DIR}/missing_file.json"

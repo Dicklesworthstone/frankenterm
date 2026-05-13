@@ -22,14 +22,17 @@ COMMAND_TEXT=""
 TARGET_DIR="not_applicable"
 REQUIRED_PATHS=()
 REMOTE_PROJECT_ROOTS=()
+INCLUDE_WORKSPACE_MEMBER_ROOTS="false"
 
 usage() {
     cat <<USAGE
-Usage: ${SCRIPT_NAME} --worker <id> --path <repo-relative-file> [options]
+Usage: ${SCRIPT_NAME} --worker <id> (--path <repo-relative-file> | --workspace-member-roots) [options]
 
 Options:
   --worker <id>              Required RCH worker id to attest.
   --path <file>              Required tracked repo-relative file. Repeatable.
+  --workspace-member-roots   Require every Cargo workspace member manifest plus
+                             declared lib/bin/build source roots that exist locally.
   --bead <id>                Bead id to include in output.
   --command <text>           Intended command context; not executed.
   --target-dir <path>        Intended remote target dir context; not checked.
@@ -88,6 +91,15 @@ jq_escape_array_append() {
         '$current + [$value]'
 }
 
+add_required_path() {
+    local path="$1"
+    local existing
+    for existing in "${REQUIRED_PATHS[@]}"; do
+        [[ "${existing}" == "${path}" ]] && return 0
+    done
+    REQUIRED_PATHS+=("${path}")
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --worker)
@@ -97,8 +109,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --path)
             [[ $# -ge 2 ]] || fatal_usage "--path requires a value"
-            REQUIRED_PATHS+=("$2")
+            add_required_path "$2"
             shift 2
+            ;;
+        --workspace-member-roots)
+            INCLUDE_WORKSPACE_MEMBER_ROOTS="true"
+            shift
             ;;
         --bead)
             [[ $# -ge 2 ]] || fatal_usage "--bead requires a value"
@@ -154,9 +170,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${WORKER_ID}" ]] || fatal_usage "--worker is required"
-[[ "${#REQUIRED_PATHS[@]}" -gt 0 ]] || fatal_usage "at least one --path is required"
 command_exists jq || {
     printf 'FATAL: jq is required for %s\n' "${SCRIPT_NAME}" >&2
+    exit 69
+}
+command_exists python3 || {
+    printf 'FATAL: python3 is required for %s\n' "${SCRIPT_NAME}" >&2
     exit 69
 }
 
@@ -169,6 +188,107 @@ fi
 }
 
 cd "${REPO_ROOT}"
+
+discover_workspace_member_required_paths() {
+    local root="$1"
+    python3 - "${root}" <<'PY'
+import glob
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print("tomllib is required to parse Cargo.toml", file=sys.stderr)
+    raise SystemExit(69)
+
+root = Path(sys.argv[1]).resolve()
+manifest = root / "Cargo.toml"
+try:
+    data = tomllib.loads(manifest.read_text())
+except Exception as exc:
+    print(f"failed to parse {manifest}: {exc}", file=sys.stderr)
+    raise SystemExit(69)
+
+members = data.get("workspace", {}).get("members", [])
+if not isinstance(members, list):
+    print("Cargo.toml [workspace].members must be a list", file=sys.stderr)
+    raise SystemExit(64)
+
+seen = set()
+
+def emit(path: Path) -> None:
+    if not path.is_file():
+        return
+    try:
+        rel = path.relative_to(root).as_posix()
+    except ValueError:
+        print(f"workspace member source escaped repo root: {path}", file=sys.stderr)
+        raise SystemExit(64)
+    if rel not in seen:
+        print(rel)
+        seen.add(rel)
+
+for member in members:
+    if not isinstance(member, str) or not member:
+        print("Cargo.toml workspace member paths must be non-empty strings", file=sys.stderr)
+        raise SystemExit(64)
+    member_path = Path(member)
+    if member_path.is_absolute() or ".." in member_path.parts:
+        print(f"invalid workspace member path: {member}", file=sys.stderr)
+        raise SystemExit(64)
+
+    pattern = str(root / member)
+    matches = sorted(glob.glob(pattern)) or [pattern]
+    for matched in matches:
+        matched_path = Path(matched)
+        try:
+            rel = matched_path.relative_to(root).as_posix()
+        except ValueError:
+            print(f"workspace member escaped repo root: {matched_path}", file=sys.stderr)
+            raise SystemExit(64)
+        cargo_toml = matched_path / "Cargo.toml"
+        emit(cargo_toml)
+
+        try:
+            member_data = tomllib.loads(cargo_toml.read_text())
+        except Exception as exc:
+            print(f"failed to parse {cargo_toml}: {exc}", file=sys.stderr)
+            raise SystemExit(69)
+
+        package = member_data.get("package", {})
+        build_script = package.get("build")
+        if isinstance(build_script, str) and build_script:
+            emit(matched_path / build_script)
+        elif build_script is not False:
+            emit(matched_path / "build.rs")
+
+        lib = member_data.get("lib")
+        if isinstance(lib, dict):
+            emit(matched_path / lib.get("path", "src/lib.rs"))
+        elif lib is not False:
+            emit(matched_path / "src/lib.rs")
+
+        bins = member_data.get("bin", [])
+        if isinstance(bins, dict):
+            bins = [bins]
+        for bin_target in bins:
+            if isinstance(bin_target, dict) and isinstance(bin_target.get("path"), str):
+                emit(matched_path / bin_target["path"])
+
+        emit(matched_path / "src/main.rs")
+PY
+}
+
+if [[ "${INCLUDE_WORKSPACE_MEMBER_ROOTS}" == "true" ]]; then
+    workspace_member_path_list="$(discover_workspace_member_required_paths "${REPO_ROOT}")"
+    while IFS= read -r workspace_member_path; do
+        [[ -n "${workspace_member_path}" ]] || continue
+        add_required_path "${workspace_member_path}"
+    done <<<"${workspace_member_path_list}"
+fi
+
+[[ "${#REQUIRED_PATHS[@]}" -gt 0 ]] || fatal_usage "at least one --path or --workspace-member-roots is required"
 
 load_workers_json() {
     if [[ -n "${WORKERS_JSON_OVERRIDE}" ]]; then
