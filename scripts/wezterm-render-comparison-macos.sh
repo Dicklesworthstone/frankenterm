@@ -26,6 +26,9 @@ Environment:
                               avoids macOS accessibility APIs on GitHub-hosted runners.
   FT_WEZTERM_FRAME_SETTLE_SECS Seconds to wait after transcript readiness before capture.
                               Defaults to 3.
+  FT_WEZTERM_FRAME_CAPTURE_TIMEOUT_SECS
+                              Seconds to allow screencapture to complete.
+                              Defaults to 15.
   FT_WEZTERM_FRAME_EXIT_SECS  Seconds to wait for GUI exit after capture before cleanup.
                               Defaults to 10.
   FT_WEZTERM_FRAME_CLEANUP_SETTLE_SECS
@@ -268,10 +271,47 @@ wait_for_file() {
   done
 }
 
+run_with_timeout() {
+  local label="$1"
+  local timeout_secs="$2"
+  shift 2
+
+  if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]] || [[ "$timeout_secs" -le 0 ]]; then
+    echo "[wezterm-render-adapter] invalid timeout for $label: $timeout_secs; expected positive seconds" >&2
+    exit 75
+  fi
+
+  "$@" &
+  local command_pid=$!
+  (
+    sleep "$timeout_secs"
+    if kill -0 "$command_pid" >/dev/null 2>&1; then
+      echo "[wezterm-render-adapter] timed out after ${timeout_secs}s: $label" >&2
+      kill -TERM "$command_pid" >/dev/null 2>&1 || true
+      sleep 2
+      if kill -0 "$command_pid" >/dev/null 2>&1; then
+        kill -KILL "$command_pid" >/dev/null 2>&1 || true
+      fi
+    fi
+  ) &
+  local watchdog_pid=$!
+  local status=0
+
+  wait "$command_pid" || status=$?
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" >/dev/null 2>&1 || true
+
+  if [[ "$status" -eq 143 || "$status" -eq 137 ]]; then
+    return 124
+  fi
+  return "$status"
+}
+
 capture_window() {
   local title="$1"
   local output="$2"
   local bounds="${FT_WEZTERM_FRAME_RECT:-80,80,960,480}"
+  local capture_timeout_secs="${FT_WEZTERM_FRAME_CAPTURE_TIMEOUT_SECS:-15}"
 
   if [[ ! "$bounds" =~ ^[0-9]+,[0-9]+,[0-9]+,[0-9]+$ ]]; then
     echo "[wezterm-render-adapter] invalid FT_WEZTERM_FRAME_RECT=$bounds; expected x,y,w,h" >&2
@@ -279,7 +319,13 @@ capture_window() {
   fi
   mkdir -p "$(dirname "$output")"
   echo "[wezterm-render-adapter] capture title=$title rect=$bounds output=$output"
-  screencapture -x -R "$bounds" "$output"
+  local status=0
+  run_with_timeout "screencapture title=$title" "$capture_timeout_secs" \
+    screencapture -x -R "$bounds" "$output" || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    echo "[wezterm-render-adapter] screencapture failed title=$title status=$status" >&2
+    exit 75
+  fi
 }
 
 
