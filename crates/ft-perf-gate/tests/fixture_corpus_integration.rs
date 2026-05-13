@@ -15,6 +15,7 @@
 use ft_perf_gate::conformal::{
     audit_coverage, fit_split_conformal_band, SplitConformalConfig,
 };
+use ft_perf_gate::regime_shift::{detect_page_hinkley_kl, PageHinkleyKlConfig};
 use ft_perf_gate::sprt::{
     evaluate_anytime_valid_ci, evaluate_wald_sprt, AnytimeValidCiConfig, AnytimeValidTest,
     WaldSprtConfig,
@@ -257,6 +258,45 @@ fn split_conformal_band_alerts_on_regime_shift() {
     // 30% mean shift + 1.8x sigma bumps post samples well outside the
     // pre-shift band; expect coverage below 0.5.
     assert!(post_coverage < 0.5, "expected miscoverage on regime shift; got {post_coverage}");
+}
+
+#[test]
+fn page_hinkley_alarms_on_regime_shift_fixture() {
+    let samples = load_fixture("robot.p95", "regime-shift");
+    let report = detect_page_hinkley_kl(&samples, &PageHinkleyKlConfig::default());
+    eprintln!(
+        "regime-shift fixture: decision={:?} alarm_at={:?} cusum={:.3}",
+        report.decision, report.alarm_at, report.cusum
+    );
+    assert!(
+        matches!(report.decision, GateDecision::RegimeShift { .. }),
+        "Page-Hinkley must alarm on the G54 regime-shift fixture (labeled change at sample 100); got {:?}",
+        report.decision
+    );
+    // Alarm should fire within a reasonable detection delay after the
+    // labeled change at sample 100. With window=16 + warmup=32 + 30% mean
+    // shift, detection within ~80 samples is expected.
+    let alarm = report.alarm_at.expect("alarm fired => index is set");
+    assert!(
+        (100..200).contains(&alarm),
+        "alarm fired but at unexpected sample {alarm}; expected within [100, 200)"
+    );
+}
+
+#[test]
+fn page_hinkley_does_not_alarm_on_baseline_30d_fixture() {
+    let samples = load_fixture("robot.p95", "baseline-30d");
+    let report = detect_page_hinkley_kl(&samples, &PageHinkleyKlConfig::default());
+    eprintln!(
+        "baseline-30d fixture: decision={:?} cusum={:.3}",
+        report.decision, report.cusum
+    );
+    assert!(
+        matches!(report.decision, GateDecision::Accept { .. }),
+        "Page-Hinkley must NOT alarm on stationary 720-row baseline fixture; got {:?}",
+        report.decision
+    );
+    assert!(report.alarm_at.is_none(), "stationary fixture should yield no alarm index");
 }
 
 #[test]
