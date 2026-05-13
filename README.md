@@ -78,17 +78,22 @@ Current implementation reality:
 
 | Feature | What It Does |
 |---------|--------------|
-| **Perfect Observability** | Captures terminal output across panes with low-latency delta extraction; sub-50ms lag remains the target/benchmark lane rather than an always-on guarantee |
+| **Perfect Observability** | Captures terminal output across panes with low-latency delta extraction; sub-50ms lag remains the target/benchmark lane rather than an always-on guarantee[^ft-attest-perf-headline][^ft-attest-lindley] |
 | **Intelligent Detection** | Multi-agent pattern engine detects rate limits, errors, prompts, completions across Codex, Claude Code, and Gemini |
 | **Event-Driven Automation** | Workflows trigger on patterns, not sleep loops or polling heuristics |
-| **Robot Mode API** | JSON/TOON interface optimized for AI agents to control other AI agents |
-| **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output; future-query recall is currently a vacuous PAC-Bayes bound until production held-out data lands ([derivation](docs/perf/semantic-search-pac-bayes-derivation.md), [artifact](docs/attestations/proofs/semantic-search-pac-bayes.json)) |
+| **Robot Mode API** | JSON/TOON interface optimized for AI agents to control other AI agents[^ft-attest-robot-contracts] |
+| **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output; future-query recall is currently a vacuous PAC-Bayes bound until production held-out data lands ([derivation](docs/perf/semantic-search-pac-bayes-derivation.md), [artifact](docs/attestations/proofs/semantic-search-pac-bayes.json))[^ft-attest-perf-headline] |
 | **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
-| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; the resource-pressure cockpit now has a retained remote-reduced conformance artifact and a fail-closed [target-class hardware gate](docs/perf/target-class-hardware.md) from `ft-tf6g3.14` with the current [gate artifact](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json) still `skipped_not_proven`; high-scale memory-envelope wording cannot graduate before `ft-tf6g3.1` signs a non-skipped target-class artifact |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets[^ft-attest-perf-headline]; the resource-pressure cockpit now has a retained remote-reduced conformance artifact and a fail-closed [target-class hardware gate](docs/perf/target-class-hardware.md) from `ft-tf6g3.14` with the current [gate artifact](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json) still `skipped_not_proven`; high-scale memory-envelope wording cannot graduate before `ft-tf6g3.1` signs a non-skipped target-class artifact |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing; the shipped recorder backend is currently `append_log`, while `frankensqlite` remains rollout/test-only until live bootstrap support lands |
 | **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis; high-scale claims must cite cockpit proof artifacts, the target-class hardware predicate in [`docs/resource-pressure-cockpit-contract.md`](docs/resource-pressure-cockpit-contract.md), and a retained summary under `tests/e2e/artifacts/target-class/` |
-| **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning |
+| **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning[^ft-attest-distributed-threat] |
+
+[^ft-attest-perf-headline]: Verified via the populated [`perf/headline-claims`](docs/perf/headline-claims.json) attestation slot in [`docs/attestations/manifest.json`](docs/attestations/manifest.json); this covers benchmark-lane capture latency, Bloom prefilter speedup, and pane/memory capacity rows while target-class caveats remain governed by their linked artifacts.
+[^ft-attest-lindley]: Verified via the populated [`perf/lindley-bounds`](docs/attestations/perf/lindley-bounds.json) attestation slot for the capture-path Lindley/min-plus latency model.
+[^ft-attest-robot-contracts]: Verified via the populated [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) attestation slot for JSON/TOON control-plane envelope contracts.
+[^ft-attest-distributed-threat]: Verified via the populated [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) attestation slot for distributed wire-protocol safety review and diff-fuzz coverage.
 
 ---
 
@@ -263,6 +268,24 @@ _Latest weekly reality-check drumbeat: [`docs/reports/reality-check-2026-05-02.m
 The canonical manifest is [`docs/attestations/manifest.json`](docs/attestations/manifest.json);
 each slot maps a claim category to its producing-bead artifact, and the
 per-release bundle signs those slot hashes.
+
+The README claim-to-slot map is intentionally limited to populated manifest
+slots:
+
+<!-- attestation-claim-map:start -->
+| README claim | Manifest slot | Producing bead |
+|--------------|---------------|----------------|
+| Capture latency benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
+| Capture-path Lindley/min-plus bound | [`perf/lindley-bounds`](docs/attestations/perf/lindley-bounds.json) | `ft-43x69` |
+| Bloom prefilter search speedup | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
+| 200-pane capacity and memory-budget benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
+| Robot JSON/TOON envelope contract | [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) | `ft-0elb9` |
+| Redactor coverage matrix | [`security/redactor-coverage`](docs/security/redactor-coverage.json) | `ft-x0666.2` |
+| Distributed wire-protocol safety | [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) | `ft-x0666.3` |
+| runtime_async Loom model | [`proofs/loom-runtime-async`](docs/attestations/proofs/loom-runtime-async.json) | `ft-e87u6.12` |
+| RuntimeProof sealed-trait guard | [`proofs/runtime-proof-trait`](docs/attestations/proofs/runtime-proof-trait.json) | `ft-i2eni.1` |
+| Transaction kill-switch proof | [`proofs/tx-killswitch`](docs/attestations/proofs/tx-killswitch.json) | `ft-tf6g3.12` |
+<!-- attestation-claim-map:end -->
 
 Verify a release attestation bundle in one command, offline,
 without trusting GitHub or any registry:
