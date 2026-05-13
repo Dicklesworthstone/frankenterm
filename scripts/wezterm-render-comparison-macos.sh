@@ -19,6 +19,11 @@ Options:
   --output <path>            Comparison report path.
   --timeout-secs <seconds>   Per-window readiness timeout (default: 20).
   --self-test                Exercise comparison-report generation with fixture PNGs only.
+
+Environment:
+  FT_WEZTERM_FRAME_RECT       Capture rectangle as x,y,w,h. Defaults to 80,80,960,480.
+                              The GUI is launched at 80,80 with no decorations, so this
+                              avoids macOS accessibility APIs on GitHub-hosted runners.
   -h, --help                 Show this help.
 EOF
 }
@@ -228,41 +233,17 @@ wait_for_file() {
   done
 }
 
-window_bounds() {
-  local title="$1"
-  osascript - "$title" <<'APPLESCRIPT'
-on run argv
-  set targetTitle to item 1 of argv
-  tell application "System Events"
-    repeat with proc in application processes
-      repeat with win in windows of proc
-        try
-          set winName to name of win as text
-          if winName contains targetTitle then
-            set winPosition to position of win
-            set winSize to size of win
-            return (item 1 of winPosition as text) & "," & (item 2 of winPosition as text) & "," & (item 1 of winSize as text) & "," & (item 2 of winSize as text)
-          end if
-        end try
-      end repeat
-    end repeat
-  end tell
-  return ""
-end run
-APPLESCRIPT
-}
-
 capture_window() {
   local title="$1"
   local output="$2"
-  local bounds
+  local bounds="${FT_WEZTERM_FRAME_RECT:-80,80,960,480}"
 
-  bounds="$(window_bounds "$title")"
-  if [[ -z "$bounds" ]]; then
-    echo "[wezterm-render-adapter] could not locate window titled $title" >&2
+  if [[ ! "$bounds" =~ ^[0-9]+,[0-9]+,[0-9]+,[0-9]+$ ]]; then
+    echo "[wezterm-render-adapter] invalid FT_WEZTERM_FRAME_RECT=$bounds; expected x,y,w,h" >&2
     exit 75
   fi
   mkdir -p "$(dirname "$output")"
+  echo "[wezterm-render-adapter] capture title=$title rect=$bounds output=$output"
   screencapture -x -R "$bounds" "$output"
 }
 
@@ -344,7 +325,6 @@ if [[ -z "$WEZTERM_GUI" ]]; then
 fi
 
 require_tool cargo
-require_tool osascript
 require_tool python3
 require_tool screencapture
 
