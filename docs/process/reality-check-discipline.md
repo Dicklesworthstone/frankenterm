@@ -79,6 +79,38 @@ Every new plan must include:
 - Current Beads/BV counts and dependency-cycle result.
 - A successor note telling future runs to cross-link this plan.
 
+## Bead Notes Updates
+
+`br update <bead> --notes <text>` replaces the whole notes field. It does not
+append. Any reality-check pass that enriches an existing notes field must first
+read the current content, concatenate the new section under a dated H2 header,
+and then write the full merged body back with `br update --notes`.
+
+Use the safe helper for notes changes:
+
+```bash
+scripts/safe-br-update-notes.sh <bead> <new-section-h2-header> <new-section-body>
+```
+
+The helper performs the required read-concat-write sequence:
+
+```bash
+br show <bead> --json | jq -r '.[0].notes // ""'
+br update <bead> --notes "$existing_notes_and_new_section"
+```
+
+Never pass only the new section to raw `br update --notes`; that destroys
+earlier rounds of test companions, operator surfaces, degradation behavior, and
+proof-category context. If a section is already present, leave it in place. If a
+new section would exceed the notes-size budget, split the new evidence into
+Beads comments instead of truncating old notes.
+
+Audit the current epic with:
+
+```bash
+scripts/safe-br-update-notes.sh --audit-notes-regressions --json
+```
+
 ## Closeout Evidence Comments
 
 Closing a reality-check or proof-producing bead requires a Beads comment that
