@@ -42,9 +42,10 @@ use frankenterm_core::proof_doctor::{
 };
 use frankenterm_core::proof_handoff::build_proof_handoff;
 use frankenterm_core::proof_lane::{
-    ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofFindingSeverity,
-    ProofHistoryArtifactInput, ProofHistoryIndex, ProofRedactionStatus, ProofReleaseScoreboard,
-    ProofReleaseScoreboardRow, ProofScope, validate_proof_record,
+    ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofCloseoutLintArtifact,
+    ProofCloseoutLintInput, ProofFindingSeverity, ProofHistoryArtifactInput, ProofHistoryIndex,
+    ProofRedactionStatus, ProofReleaseScoreboard, ProofReleaseScoreboardRow, ProofScope,
+    lint_proof_closeout, validate_proof_record,
 };
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
@@ -1027,6 +1028,50 @@ NOTES:
         /// Intended proof command argv. Use `--` before the command.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Lint Beads closeout text and retained proof artifacts before closure
+    #[command(after_help = r#"EXAMPLES:
+    ft proof-closeout-lint --bead ft-wik9p.2 --closeout-file /tmp/closeout.md --proof-record docs/attestations/proof-ledger/ft-wik9p.2.jsonl -f json
+    ft proof-closeout-lint --closeout-text "Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed."
+
+NOTES:
+    The linter is read-only. It does not call br, cancel CI, execute RCH, or
+    mutate proof artifacts. It rejects sync-only, queued-CI, local-fallback,
+    missing-artifact, and dirty-tree closeout claims before they can be posted
+    as proof."#)]
+    ProofCloseoutLint {
+        /// Bead whose closeout is being linted
+        #[arg(long)]
+        bead: Option<String>,
+
+        /// Proposed closeout text as a direct argument
+        #[arg(long = "closeout-text")]
+        closeout_text: Option<String>,
+
+        /// File containing proposed closeout text
+        #[arg(long = "closeout-file", value_name = "PATH")]
+        closeout_file: Option<String>,
+
+        /// Retained ProofAttemptRecord JSONL artifact path. Repeatable.
+        #[arg(long = "proof-record", value_name = "PATH")]
+        proof_records: Vec<String>,
+
+        /// Retained non-record artifact path cited by the closeout. Repeatable.
+        #[arg(long = "artifact", value_name = "PATH")]
+        artifacts: Vec<String>,
+
+        /// Backend required for the claimed proof
+        #[arg(long, value_enum, default_value = "rch")]
+        required_backend: ProofDoctorBackendArg,
+
+        /// The closeout was produced from or against a shared dirty checkout
+        #[arg(long)]
+        dirty_tree: bool,
+
+        /// Output format: plain, json, or toon
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
     },
 
     /// Build a proof-history release scoreboard from retained proof records
@@ -3139,6 +3184,37 @@ enum RobotCommands {
         /// Intended proof command argv. Use `--` before the command.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Lint Beads closeout text and retained proof artifacts before closure
+    ProofCloseoutLint {
+        /// Bead whose closeout is being linted
+        #[arg(long)]
+        bead: Option<String>,
+
+        /// Proposed closeout text as a direct argument
+        #[arg(long = "closeout-text")]
+        closeout_text: Option<String>,
+
+        /// File containing proposed closeout text
+        #[arg(long = "closeout-file", value_name = "PATH")]
+        closeout_file: Option<String>,
+
+        /// Retained ProofAttemptRecord JSONL artifact path. Repeatable.
+        #[arg(long = "proof-record", value_name = "PATH")]
+        proof_records: Vec<String>,
+
+        /// Retained non-record artifact path cited by the closeout. Repeatable.
+        #[arg(long = "artifact", value_name = "PATH")]
+        artifacts: Vec<String>,
+
+        /// Backend required for the claimed proof
+        #[arg(long, value_enum, default_value = "rch")]
+        required_backend: ProofDoctorBackendArg,
+
+        /// The closeout was produced from or against a shared dirty checkout
+        #[arg(long)]
+        dirty_tree: bool,
     },
 }
 
@@ -6468,6 +6544,144 @@ fn append_proof_record_jsonl(
     Ok(resolved)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_proof_closeout_lint_payload(
+    bead_id: Option<&str>,
+    closeout_text: Option<&str>,
+    closeout_file: Option<&str>,
+    proof_records: &[String],
+    artifacts: &[String],
+    required_backend: ProofDoctorBackendArg,
+    dirty_tree: bool,
+    workspace_root: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let closeout_text =
+        proof_closeout_text_from_sources(workspace_root, closeout_text, closeout_file)?;
+    let mut lint_artifacts = Vec::new();
+    for proof_record in proof_records {
+        lint_artifacts.push(read_proof_closeout_record_artifact(
+            workspace_root,
+            proof_record,
+        ));
+    }
+    for artifact in artifacts {
+        lint_artifacts.push(read_proof_closeout_generic_artifact(
+            workspace_root,
+            artifact,
+        ));
+    }
+
+    let input = ProofCloseoutLintInput {
+        bead_id: bead_id.map(ToOwned::to_owned),
+        closeout_text,
+        required_backend: proof_doctor_backend(required_backend),
+        dirty_tree,
+        artifacts: lint_artifacts,
+    };
+    let report = lint_proof_closeout(&input);
+    serde_json::to_value(report).map_err(|error| anyhow::anyhow!(error))
+}
+
+fn proof_closeout_text_from_sources(
+    workspace_root: &Path,
+    closeout_text: Option<&str>,
+    closeout_file: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let mut parts = Vec::new();
+    if let Some(text) = closeout_text
+        && !text.trim().is_empty()
+    {
+        parts.push(text.to_string());
+    }
+    if let Some(path) = closeout_file {
+        let resolved = proof_closeout_resolve_path(workspace_root, path);
+        let text = fs::read_to_string(&resolved).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read closeout text file {}: {error}",
+                resolved.display()
+            )
+        })?;
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+    }
+
+    Ok(if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    })
+}
+
+fn read_proof_closeout_record_artifact(
+    workspace_root: &Path,
+    artifact_path: &str,
+) -> ProofCloseoutLintArtifact {
+    let resolved = proof_closeout_resolve_path(workspace_root, artifact_path);
+    let raw = match fs::read_to_string(&resolved) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return ProofCloseoutLintArtifact {
+                artifact_path: artifact_path.to_string(),
+                records: Vec::new(),
+                read_error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let mut records = Vec::new();
+    let mut read_error = None;
+    for (line_index, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<ProofAttemptRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                read_error = Some(format!(
+                    "line {} did not parse as ProofAttemptRecord: {error}",
+                    line_index + 1
+                ));
+                break;
+            }
+        }
+    }
+
+    if records.is_empty() && read_error.is_none() {
+        read_error = Some("proof record artifact contained no JSONL records".to_string());
+    }
+
+    ProofCloseoutLintArtifact {
+        artifact_path: artifact_path.to_string(),
+        records,
+        read_error,
+    }
+}
+
+fn read_proof_closeout_generic_artifact(
+    workspace_root: &Path,
+    artifact_path: &str,
+) -> ProofCloseoutLintArtifact {
+    let resolved = proof_closeout_resolve_path(workspace_root, artifact_path);
+    let read_error = fs::metadata(&resolved).err().map(|error| error.to_string());
+    ProofCloseoutLintArtifact {
+        artifact_path: artifact_path.to_string(),
+        records: Vec::new(),
+        read_error,
+    }
+}
+
+fn proof_closeout_resolve_path(workspace_root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ProofHistoryCliMetadata {
     proof_category: Option<String>,
@@ -6745,6 +6959,37 @@ fn print_proof_doctor_plain(payload: &serde_json::Value) {
                 "proof-record: {status} {}",
                 proof_record["reason"].as_str().unwrap_or("unknown")
             ),
+        }
+    }
+}
+
+fn print_proof_closeout_lint_plain(payload: &serde_json::Value) {
+    let closeout = if payload["closeout_eligible"].as_bool().unwrap_or(false) {
+        "eligible"
+    } else {
+        "blocked"
+    };
+    println!("proof-closeout-lint: {closeout}");
+    println!(
+        "summary: {}",
+        payload["operator_summary"]
+            .as_str()
+            .unwrap_or("unavailable")
+    );
+    println!(
+        "suggested: {}",
+        payload["suggested_beads_wording"]
+            .as_str()
+            .unwrap_or("unavailable")
+    );
+    if let Some(findings) = payload["findings"].as_array() {
+        for finding in findings {
+            println!(
+                "finding: {} {} - {}",
+                finding["severity"].as_str().unwrap_or("unknown"),
+                finding["reason_code"].as_str().unwrap_or("unknown"),
+                finding["message"].as_str().unwrap_or("unavailable")
+            );
         }
     }
 }
@@ -24396,6 +24641,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = RobotResponse::success(payload, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::ProofCloseoutLint {
+                    bead,
+                    closeout_text,
+                    closeout_file,
+                    proof_records,
+                    artifacts,
+                    required_backend,
+                    dirty_tree,
+                } => {
+                    let payload = build_proof_closeout_lint_payload(
+                        bead.as_deref(),
+                        closeout_text.as_deref(),
+                        closeout_file.as_deref(),
+                        &proof_records,
+                        &artifacts,
+                        required_backend,
+                        dirty_tree,
+                        &workspace_root,
+                    )?;
+                    let response = RobotResponse::success(payload, elapsed_ms(start));
+                    print_robot_response(&response, format, stats)?;
+                }
                 RobotCommands::CoordinationRisk { session } => {
                     let response = match load_coordination_risk_snapshot(&workspace_root, &session)
                     {
@@ -24438,6 +24705,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
 
                     match other {
+                        RobotCommands::ProofCloseoutLint { .. } => unreachable!("handled above"),
                         RobotCommands::State {
                             include_text,
                             tail,
@@ -37678,6 +37946,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             );
             if !print_snapshot_session_structured_output(&payload, output_format)? {
                 print_proof_doctor_plain(&payload);
+            }
+        }
+
+        Some(Commands::ProofCloseoutLint {
+            bead,
+            closeout_text,
+            closeout_file,
+            proof_records,
+            artifacts,
+            required_backend,
+            dirty_tree,
+            format,
+        }) => {
+            let output_format = resolve_snapshot_session_output_format(&format);
+            let payload = build_proof_closeout_lint_payload(
+                bead.as_deref(),
+                closeout_text.as_deref(),
+                closeout_file.as_deref(),
+                &proof_records,
+                &artifacts,
+                required_backend,
+                dirty_tree,
+                &workspace_root,
+            )?;
+            if !print_snapshot_session_structured_output(&payload, output_format)? {
+                print_proof_closeout_lint_plain(&payload);
             }
         }
 
@@ -68304,6 +68598,59 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_proof_closeout_lint_parses_artifacts_and_text() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "proof-closeout-lint",
+            "--bead",
+            "ft-782hw.7",
+            "--closeout-text",
+            "Proof-doctor: passed; closeout safe.",
+            "--proof-record",
+            "docs/attestations/proof-ledger/ft-782hw.7.jsonl",
+            "--artifact",
+            "tests/e2e/artifacts/goal-line/ft-782hw.7/summary.json",
+            "--required-backend",
+            "rch",
+            "--dirty-tree",
+            "--format",
+            "json",
+        ])
+        .expect("proof-closeout-lint should parse retained artifacts");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::ProofCloseoutLint {
+                bead,
+                closeout_text,
+                proof_records,
+                artifacts,
+                required_backend,
+                dirty_tree,
+                format,
+                ..
+            }) => {
+                assert_eq!(bead.as_deref(), Some("ft-782hw.7"));
+                assert_eq!(
+                    closeout_text.as_deref(),
+                    Some("Proof-doctor: passed; closeout safe.")
+                );
+                assert_eq!(
+                    proof_records,
+                    vec!["docs/attestations/proof-ledger/ft-782hw.7.jsonl"]
+                );
+                assert_eq!(
+                    artifacts,
+                    vec!["tests/e2e/artifacts/goal-line/ft-782hw.7/summary.json"]
+                );
+                assert_eq!(required_backend, ProofDoctorBackendArg::Rch);
+                assert!(dirty_tree);
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected ProofCloseoutLint command"),
+        }
+    }
+
+    #[test]
     fn cli_robot_proof_doctor_parses_trailing_command() {
         let cli = Cli::try_parse_from([
             "ft",
@@ -68352,6 +68699,49 @@ log_level = "debug"
                     assert!(command.iter().any(|token| token == "cargo"));
                 }
                 _ => panic!("expected RobotCommands::ProofDoctor"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_proof_closeout_lint_parses_artifacts() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "proof-closeout-lint",
+            "--bead",
+            "ft-782hw.7",
+            "--closeout-file",
+            "/tmp/ft-782hw.7-closeout.md",
+            "--proof-record",
+            "docs/attestations/proof-ledger/ft-782hw.7.jsonl",
+            "--required-backend",
+            "rch",
+        ])
+        .expect("robot proof-closeout-lint should parse retained artifacts");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::ProofCloseoutLint {
+                    bead,
+                    closeout_file,
+                    proof_records,
+                    required_backend,
+                    ..
+                }) => {
+                    assert_eq!(bead.as_deref(), Some("ft-782hw.7"));
+                    assert_eq!(
+                        closeout_file.as_deref(),
+                        Some("/tmp/ft-782hw.7-closeout.md")
+                    );
+                    assert_eq!(
+                        proof_records,
+                        vec!["docs/attestations/proof-ledger/ft-782hw.7.jsonl"]
+                    );
+                    assert_eq!(required_backend, ProofDoctorBackendArg::Rch);
+                }
+                _ => panic!("expected RobotCommands::ProofCloseoutLint"),
             },
             _ => panic!("expected Robot command"),
         }

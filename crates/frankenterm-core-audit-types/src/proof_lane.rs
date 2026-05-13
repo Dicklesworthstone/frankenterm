@@ -860,6 +860,479 @@ pub fn validate_proof_record(record: &ProofAttemptRecord) -> Vec<ProofLedgerFind
     findings
 }
 
+/// Lint proposed Beads closeout text and retained proof artifacts.
+#[must_use]
+pub fn lint_proof_closeout(input: &ProofCloseoutLintInput) -> ProofCloseoutLintReport {
+    let mut findings = Vec::new();
+    lint_closeout_artifact_availability(input, &mut findings);
+    lint_closeout_records(input, &mut findings);
+    lint_closeout_text(input, &mut findings);
+
+    let proof_records_analyzed = input
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.records.len() as u64)
+        .sum();
+    let artifact_paths = input
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.artifact_path.clone())
+        .collect::<Vec<_>>();
+    let supporting_record = input
+        .artifacts
+        .iter()
+        .flat_map(|artifact| {
+            artifact
+                .records
+                .iter()
+                .map(|record| (artifact.artifact_path.as_str(), record))
+        })
+        .find(|(_, record)| closeout_record_supports_green_claim(record));
+    let text_supports_green_claim = closeout_text_supports_green_claim(input);
+    let has_errors = findings
+        .iter()
+        .any(|finding| finding.severity == ProofFindingSeverity::Error);
+    let closeout_eligible =
+        !has_errors && (supporting_record.is_some() || text_supports_green_claim);
+    let suggested_beads_wording = closeout_suggested_wording(
+        input,
+        supporting_record,
+        text_supports_green_claim,
+        closeout_eligible,
+    );
+    let operator_summary = closeout_lint_operator_summary(
+        closeout_eligible,
+        proof_records_analyzed,
+        findings.len(),
+        has_errors,
+    );
+
+    ProofCloseoutLintReport {
+        schema_version: PROOF_CLOSEOUT_LINTER_SCHEMA_VERSION,
+        bead_id: input.bead_id.clone(),
+        closeout_eligible,
+        proof_records_analyzed,
+        artifact_paths,
+        findings,
+        suggested_beads_wording,
+        operator_summary,
+    }
+}
+
+fn lint_closeout_artifact_availability(
+    input: &ProofCloseoutLintInput,
+    findings: &mut Vec<ProofCloseoutLintFinding>,
+) {
+    for artifact in &input.artifacts {
+        if let Some(error) = artifact.read_error.as_deref() {
+            findings.push(ProofCloseoutLintFinding::error(
+                "proof.closeout.artifact_unavailable",
+                &format!(
+                    "Closeout cites artifact `{}` but it could not be read or parsed: {error}",
+                    artifact.artifact_path
+                ),
+                "Proof-doctor: inconclusive; reason proof.artifact.retention_failed; closeout blocked until the retained artifact is readable.",
+                vec![artifact.artifact_path.clone()],
+            ));
+        }
+    }
+}
+
+fn lint_closeout_records(
+    input: &ProofCloseoutLintInput,
+    findings: &mut Vec<ProofCloseoutLintFinding>,
+) {
+    for artifact in &input.artifacts {
+        for record in &artifact.records {
+            for finding in validate_proof_record(record) {
+                findings.push(ProofCloseoutLintFinding {
+                    severity: finding.severity,
+                    reason_code: format!("proof.closeout.{}", finding.reason_code),
+                    message: finding.message,
+                    suggested_beads_wording: closeout_record_blocked_wording(
+                        record,
+                        &artifact.artifact_path,
+                    ),
+                    evidence_keys: vec![artifact.artifact_path.clone(), record.proof_id.clone()],
+                });
+            }
+
+            if record.state == ProofState::Pass
+                && input.required_backend == ProofBackend::Rch
+                && record.selected_worker.as_deref().is_none_or(str::is_empty)
+            {
+                findings.push(ProofCloseoutLintFinding::error(
+                    "proof.closeout.missing_selected_worker",
+                    "Remote proof pass closeout must retain the selected RCH worker.",
+                    "Proof-doctor: inconclusive; reason proof.closeout.missing_selected_worker; remote Cargo reached; closeout blocked until the selected worker is retained.",
+                    vec![artifact.artifact_path.clone(), record.proof_id.clone()],
+                ));
+            }
+
+            if record.state == ProofState::Pass && !record.safe_to_close_source_bead() {
+                findings.push(ProofCloseoutLintFinding::error(
+                    "proof.closeout.pass_record_not_closeout_safe",
+                    "Proof record is PASS but does not satisfy closeout safety invariants.",
+                    &closeout_record_blocked_wording(record, &artifact.artifact_path),
+                    vec![artifact.artifact_path.clone(), record.proof_id.clone()],
+                ));
+            }
+        }
+    }
+}
+
+fn lint_closeout_text(
+    input: &ProofCloseoutLintInput,
+    findings: &mut Vec<ProofCloseoutLintFinding>,
+) {
+    let text = input.closeout_text.as_deref().unwrap_or_default();
+    let normalized = normalize_closeout_text(text);
+    let green_claim = closeout_text_claims_green(&normalized);
+    let explicit_non_applicable = closeout_text_says_non_applicable(&normalized);
+    let has_records = input
+        .artifacts
+        .iter()
+        .any(|artifact| !artifact.records.is_empty());
+    let has_artifact_paths = !input.artifacts.is_empty();
+
+    if !has_records && !has_artifact_paths && !explicit_non_applicable {
+        findings.push(ProofCloseoutLintFinding::error(
+            "proof.closeout.missing_artifact_path",
+            "Proof closeout has no retained proof record or artifact path.",
+            "Proof-doctor: inconclusive; reason proof.closeout.missing_artifact_path; closeout blocked until retained artifacts are cited.",
+            vec!["artifact_paths".to_string()],
+        ));
+    }
+
+    if !green_claim {
+        return;
+    }
+
+    if input.required_backend == ProofBackend::Rch
+        && closeout_text_mentions_local_fallback(&normalized)
+    {
+        findings.push(ProofCloseoutLintFinding::error(
+            "proof.closeout.local_fallback_claimed_as_proof",
+            "Closeout text promotes local Cargo or local fallback as proof for an RCH-required lane.",
+            "Proof-doctor: invalid; reason proof.command.local_cargo_invalid; remote Cargo not reached; closeout blocked.",
+            vec!["closeout_text".to_string()],
+        ));
+    }
+
+    if closeout_text_mentions_stale_proof_phrase(&normalized)
+        && !closeout_text_says_not_proof(&normalized)
+    {
+        findings.push(ProofCloseoutLintFinding::error(
+            "proof.closeout.sync_or_queue_claimed_as_proof",
+            "Closeout text treats sync, cache warmup, worker selection, or queued CI status as proof.",
+            "Proof-doctor: inconclusive; reason proof.rch.sync_not_proof; remote Cargo not reached; closeout blocked.",
+            vec!["closeout_text".to_string()],
+        ));
+    }
+
+    if input.dirty_tree && !closeout_text_has_dirty_tree_caveat(&normalized) {
+        findings.push(ProofCloseoutLintFinding::error(
+            "proof.closeout.dirty_tree_caveat_missing",
+            "Closeout text claims proof from a shared dirty checkout without a dirty-tree caveat.",
+            "Proof-doctor: dirty_tree_blocked; reason proof.dirty.unowned_path_overlap; closeout blocked unless dirty paths and ownership are named.",
+            vec!["closeout_text".to_string(), "dirty_tree".to_string()],
+        ));
+    }
+
+    if !has_records && !closeout_text_has_remote_proof_fields(&normalized, has_artifact_paths) {
+        findings.push(ProofCloseoutLintFinding::error(
+            "proof.closeout.remote_claim_missing_fields",
+            "Remote proof claim is missing selected worker, command, remote Cargo/rustc/test evidence, classification, or retained artifact path.",
+            "Proof-doctor: inconclusive; reason proof.closeout.remote_claim_missing_fields; closeout blocked until the generated proof-doctor handoff fields are present.",
+            vec!["closeout_text".to_string()],
+        ));
+    }
+}
+
+fn closeout_record_supports_green_claim(record: &ProofAttemptRecord) -> bool {
+    record.safe_to_close_source_bead()
+        && (record.required_backend != ProofBackend::Rch
+            || record
+                .selected_worker
+                .as_deref()
+                .is_some_and(|worker| !worker.trim().is_empty()))
+}
+
+fn closeout_suggested_wording(
+    input: &ProofCloseoutLintInput,
+    supporting_record: Option<(&str, &ProofAttemptRecord)>,
+    text_supports_green_claim: bool,
+    closeout_eligible: bool,
+) -> String {
+    if let Some((artifact_path, record)) = supporting_record {
+        return closeout_record_pass_wording(record, artifact_path, closeout_eligible);
+    }
+
+    if text_supports_green_claim {
+        return closeout_text_pass_wording(input, closeout_eligible);
+    }
+
+    input
+        .artifacts
+        .iter()
+        .flat_map(|artifact| {
+            artifact
+                .records
+                .iter()
+                .map(|record| (artifact.artifact_path.as_str(), record))
+        })
+        .find(|(_, record)| record.state.is_terminal())
+        .map_or_else(
+            || {
+                if closeout_text_says_non_applicable(&normalize_closeout_text(
+                    input.closeout_text.as_deref().unwrap_or_default(),
+                )) {
+                    "Proof-doctor: not applicable; docs-static change only; no Cargo/RCH proof lane claimed.\nProof-record: not_requested; path none; validation not_applicable; closeout blocked.".to_string()
+                } else if input.artifacts.is_empty() {
+                    "Proof-doctor: inconclusive; reason proof.closeout.missing_artifact_path; closeout blocked until retained artifacts are cited.".to_string()
+                } else {
+                    "Proof-doctor: inconclusive; reason proof.closeout.remote_claim_missing_fields; closeout blocked until selected worker, command, remote Cargo/rustc/test evidence, classification, and artifact path are retained.".to_string()
+                }
+            },
+            |(artifact_path, record)| closeout_record_blocked_wording(record, artifact_path),
+        )
+}
+
+fn closeout_record_pass_wording(
+    record: &ProofAttemptRecord,
+    artifact_path: &str,
+    closeout_eligible: bool,
+) -> String {
+    let closeout = if closeout_eligible { "safe" } else { "blocked" };
+    format!(
+        "Proof-doctor: passed; phase {}; reason {}; verdict {}; remote Cargo {}; owner none; target_dir {}; target_lifecycle kept; target_size unknown; closeout {closeout}.\nProof-record: written; path {artifact_path}; validation ok; closeout {closeout}.",
+        record
+            .proof_doctor
+            .as_ref()
+            .map_or("terminal_classified", |snapshot| {
+                proof_phase_label(snapshot.phase)
+            }),
+        record.reason_code,
+        record.proof_id,
+        remote_cargo_closeout_label(record.remote_cargo_reached),
+        record.declared_target_dir.as_deref().unwrap_or("none"),
+    )
+}
+
+fn closeout_text_pass_wording(input: &ProofCloseoutLintInput, closeout_eligible: bool) -> String {
+    let closeout = if closeout_eligible { "safe" } else { "blocked" };
+    let artifact_paths = input
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.artifact_path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Proof-doctor: passed; phase terminal_classified; reason proof.closeout.text_fields_ok; verdict retained-closeout-text; remote Cargo reached; owner none; target_dir unknown; target_lifecycle kept; target_size unknown; closeout {closeout}.\nProof-record: not_provided; artifacts {artifact_paths}; validation text_fields_ok; closeout {closeout}."
+    )
+}
+
+fn closeout_record_blocked_wording(record: &ProofAttemptRecord, artifact_path: &str) -> String {
+    let status = record.proof_doctor.as_ref().map_or_else(
+        || proof_state_status_label(record.state),
+        |snapshot| proof_doctor_status_label(snapshot.status),
+    );
+    format!(
+        "Proof-doctor: {status}; phase {}; reason {}; verdict {}; remote Cargo {}; owner none; target_dir {}; target_lifecycle kept; target_size unknown; closeout blocked.\nProof-record: written; path {artifact_path}; validation {}; closeout blocked.",
+        record
+            .proof_doctor
+            .as_ref()
+            .map_or("terminal_classified", |snapshot| {
+                proof_phase_label(snapshot.phase)
+            }),
+        record.reason_code,
+        record.proof_id,
+        remote_cargo_closeout_label(record.remote_cargo_reached),
+        record.declared_target_dir.as_deref().unwrap_or("none"),
+        if validate_proof_record(record)
+            .iter()
+            .any(|finding| finding.severity == ProofFindingSeverity::Error)
+        {
+            "error"
+        } else {
+            "ok"
+        },
+    )
+}
+
+fn closeout_lint_operator_summary(
+    closeout_eligible: bool,
+    proof_records_analyzed: u64,
+    finding_count: usize,
+    has_errors: bool,
+) -> String {
+    if closeout_eligible {
+        return format!(
+            "Proof closeout is eligible from retained evidence; {proof_records_analyzed} proof record(s) analyzed and {finding_count} finding(s) emitted."
+        );
+    }
+    if has_errors {
+        return format!(
+            "Proof closeout is rejected; {proof_records_analyzed} proof record(s) analyzed and {finding_count} finding(s) emitted."
+        );
+    }
+    format!(
+        "Proof closeout is not green-closeout eligible; {proof_records_analyzed} proof record(s) analyzed and {finding_count} finding(s) emitted."
+    )
+}
+
+fn normalize_closeout_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn closeout_text_claims_green(normalized: &str) -> bool {
+    closeout_text_contains_any(
+        normalized,
+        &[
+            "closeout safe",
+            "proof lane passed",
+            "proof passed",
+            "remote proof passed",
+            "remote rch proof",
+            "rch proof passed",
+            "green claim",
+            "source health proved",
+        ],
+    ) || (normalized.contains("passed") && normalized.contains("remote cargo"))
+}
+
+fn closeout_text_mentions_local_fallback(normalized: &str) -> bool {
+    closeout_text_contains_any(
+        normalized,
+        &[
+            "local fallback",
+            "local cargo",
+            "cargo-local.sh",
+            "scripts/cargo-local.sh",
+        ],
+    ) || (normalized.contains("cargo test")
+        && !normalized.contains("rch exec")
+        && !normalized.contains("local smoke"))
+}
+
+fn closeout_text_mentions_stale_proof_phrase(normalized: &str) -> bool {
+    closeout_text_contains_any(
+        normalized,
+        &[
+            "sync completed",
+            "rsync",
+            "cache warmup",
+            "cache warmed",
+            "workflow queued",
+            "queued workflow",
+            "status queued",
+            "pending workflow",
+            "github actions queued",
+        ],
+    )
+}
+
+fn closeout_text_says_not_proof(normalized: &str) -> bool {
+    closeout_text_contains_any(
+        normalized,
+        &[
+            "not proof",
+            "not a proof",
+            "not source proof",
+            "not a source failure",
+            "no source verdict",
+            "not a source verdict",
+            "not proof by itself",
+        ],
+    )
+}
+
+fn closeout_text_has_dirty_tree_caveat(normalized: &str) -> bool {
+    normalized.contains("dirty")
+        && closeout_text_contains_any(normalized, &["caveat", "blocked", "overlap", "shared"])
+}
+
+fn closeout_text_says_non_applicable(normalized: &str) -> bool {
+    closeout_text_contains_any(
+        normalized,
+        &[
+            "proof-doctor: not applicable",
+            "docs-static change only",
+            "no cargo/rch proof lane claimed",
+            "no cargo proof lane claimed",
+        ],
+    )
+}
+
+fn closeout_text_has_remote_proof_fields(normalized: &str, has_artifact_paths: bool) -> bool {
+    has_artifact_paths
+        && closeout_text_contains_any(normalized, &["selected_worker", "selected worker"])
+        && normalized.contains("command:")
+        && normalized.contains("remote cargo reached")
+        && normalized.contains("rustc")
+        && normalized.contains("test")
+        && closeout_text_contains_any(normalized, &["passed", "source_blocked", "test_blocked"])
+}
+
+fn closeout_text_supports_green_claim(input: &ProofCloseoutLintInput) -> bool {
+    let normalized = normalize_closeout_text(input.closeout_text.as_deref().unwrap_or_default());
+    closeout_text_claims_green(&normalized)
+        && closeout_text_has_remote_proof_fields(&normalized, !input.artifacts.is_empty())
+}
+
+fn closeout_text_contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+const fn proof_doctor_status_label(status: ProofDoctorStatus) -> &'static str {
+    match status {
+        ProofDoctorStatus::Runnable => "runnable",
+        ProofDoctorStatus::Passed => "passed",
+        ProofDoctorStatus::SourceBlocked => "source_blocked",
+        ProofDoctorStatus::TestBlocked => "test_blocked",
+        ProofDoctorStatus::InfraBlocked => "infra_blocked",
+        ProofDoctorStatus::DirtyTreeBlocked => "dirty_tree_blocked",
+        ProofDoctorStatus::OwnershipBlocked => "ownership_blocked",
+        ProofDoctorStatus::Invalid => "invalid",
+        ProofDoctorStatus::SkippedNotProven => "skipped_not_proven",
+        ProofDoctorStatus::Inconclusive => "inconclusive",
+    }
+}
+
+const fn proof_phase_label(phase: ProofDoctorPhase) -> &'static str {
+    match phase {
+        ProofDoctorPhase::Preflight => "preflight",
+        ProofDoctorPhase::LaunchObserved => "launch_observed",
+        ProofDoctorPhase::RemoteCargoObserved => "remote_cargo_observed",
+        ProofDoctorPhase::TerminalClassified => "terminal_classified",
+        ProofDoctorPhase::EvidenceGap => "evidence_gap",
+    }
+}
+
+const fn proof_state_status_label(state: ProofState) -> &'static str {
+    match state {
+        ProofState::NotRun | ProofState::ReachedRemoteCargo => "inconclusive",
+        ProofState::SourceCompileFail => "source_blocked",
+        ProofState::TestFail => "test_blocked",
+        ProofState::Pass => "passed",
+        ProofState::InfraBlockedPreCargo | ProofState::InfraBlockedPostCargo => "infra_blocked",
+        ProofState::LocalInvalid => "invalid",
+        ProofState::SkippedNotProven => "skipped_not_proven",
+        ProofState::Inconclusive => "inconclusive",
+    }
+}
+
+const fn remote_cargo_closeout_label(remote_cargo_reached: bool) -> &'static str {
+    if remote_cargo_reached {
+        "reached"
+    } else {
+        "not reached"
+    }
+}
+
 fn validate_proof_doctor_snapshot(
     record: &ProofAttemptRecord,
     findings: &mut Vec<ProofLedgerFinding>,
@@ -1249,6 +1722,88 @@ pub struct ProofReleaseScoreboard {
     pub high_scale_claim_beads: Vec<String>,
     /// Flattened record-level findings.
     pub findings: Vec<ProofLedgerFinding>,
+    /// Concise operator summary.
+    pub operator_summary: String,
+}
+
+/// Proof closeout linter schema version implemented by this module.
+pub const PROOF_CLOSEOUT_LINTER_SCHEMA_VERSION: u32 = 1;
+
+/// Retained artifact supplied to the proof closeout linter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofCloseoutLintArtifact {
+    /// Repo-relative or absolute artifact path.
+    pub artifact_path: String,
+    /// Parsed proof records from this artifact, if it is a JSONL proof record.
+    pub records: Vec<ProofAttemptRecord>,
+    /// Read or parse error, when the artifact was unavailable or malformed.
+    pub read_error: Option<String>,
+}
+
+/// Input to the proof closeout linter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofCloseoutLintInput {
+    /// Optional Beads issue id whose closeout text is being checked.
+    pub bead_id: Option<String>,
+    /// Proposed Beads closeout or handoff text.
+    pub closeout_text: Option<String>,
+    /// Required backend for this proof lane.
+    pub required_backend: ProofBackend,
+    /// Whether the proof ran or would close against a shared dirty checkout.
+    pub dirty_tree: bool,
+    /// Retained proof records or artifact paths.
+    pub artifacts: Vec<ProofCloseoutLintArtifact>,
+}
+
+/// One proof closeout linter finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofCloseoutLintFinding {
+    /// Finding severity.
+    pub severity: ProofFindingSeverity,
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+    /// Operator-facing explanation.
+    pub message: String,
+    /// Suggested Beads wording that preserves the proof truth.
+    pub suggested_beads_wording: String,
+    /// Evidence keys or paths that triggered this finding.
+    pub evidence_keys: Vec<String>,
+}
+
+impl ProofCloseoutLintFinding {
+    fn error(
+        reason_code: &str,
+        message: &str,
+        suggested_beads_wording: &str,
+        evidence_keys: Vec<String>,
+    ) -> Self {
+        Self {
+            severity: ProofFindingSeverity::Error,
+            reason_code: reason_code.to_string(),
+            message: message.to_string(),
+            suggested_beads_wording: suggested_beads_wording.to_string(),
+            evidence_keys,
+        }
+    }
+}
+
+/// Machine-readable proof closeout linter report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofCloseoutLintReport {
+    /// Linter schema version.
+    pub schema_version: u32,
+    /// Optional Beads issue id whose closeout text was checked.
+    pub bead_id: Option<String>,
+    /// True only when retained evidence supports a green source-bead closeout.
+    pub closeout_eligible: bool,
+    /// Number of proof records parsed from supplied artifacts.
+    pub proof_records_analyzed: u64,
+    /// Artifact paths supplied to the linter.
+    pub artifact_paths: Vec<String>,
+    /// Structured linter findings.
+    pub findings: Vec<ProofCloseoutLintFinding>,
+    /// Suggested Beads wording based on the strongest retained evidence.
+    pub suggested_beads_wording: String,
     /// Concise operator summary.
     pub operator_summary: String,
 }
@@ -2061,6 +2616,35 @@ mod tests {
     ) -> ProofAttemptRecord {
         let verdict = classify_proof_doctor(input);
         ProofAttemptRecord::from_proof_doctor_verdict(&verdict, redaction_status)
+    }
+
+    fn proof_closeout_lint_input(
+        closeout_text: &str,
+        artifacts: Vec<ProofCloseoutLintArtifact>,
+    ) -> ProofCloseoutLintInput {
+        ProofCloseoutLintInput {
+            bead_id: Some("ft-test".into()),
+            closeout_text: Some(closeout_text.into()),
+            required_backend: ProofBackend::Rch,
+            dirty_tree: false,
+            artifacts,
+        }
+    }
+
+    fn lint_artifact(record: ProofAttemptRecord) -> ProofCloseoutLintArtifact {
+        ProofCloseoutLintArtifact {
+            artifact_path: "docs/attestations/proof-ledger/ft-test.jsonl".into(),
+            records: vec![record],
+            read_error: None,
+        }
+    }
+
+    fn lint_finding_codes(report: &ProofCloseoutLintReport) -> Vec<&str> {
+        report
+            .findings
+            .iter()
+            .map(|finding| finding.reason_code.as_str())
+            .collect()
     }
 
     #[test]
@@ -2895,6 +3479,183 @@ mod tests {
                 .iter()
                 .any(|finding| finding.reason_code == "pass_with_unsafe_redaction")
         );
+    }
+
+    #[test]
+    fn proof_closeout_linter_accepts_valid_remote_pass() {
+        let mut record = base_record(ProofState::Pass);
+        record.selected_worker = Some("vmi-proof".into());
+        record.remote_cargo_reached = true;
+        record.rustc_reached = true;
+        record.test_binary_started = true;
+        record.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        let input = proof_closeout_lint_input(
+            "Proof-doctor: passed; closeout safe.",
+            vec![lint_artifact(record)],
+        );
+
+        let report = lint_proof_closeout(&input);
+
+        assert!(report.closeout_eligible);
+        assert_eq!(report.proof_records_analyzed, 1);
+        assert!(report.findings.is_empty());
+        assert!(report.suggested_beads_wording.contains("closeout safe"));
+    }
+
+    #[test]
+    fn proof_closeout_linter_accepts_complete_text_with_artifact_path() {
+        let input = proof_closeout_lint_input(
+            "Proof-doctor: passed; selected_worker vmi-proof; command: rch exec -- cargo test; remote Cargo reached; rustc reached; test binary passed; proof lane passed; closeout safe.",
+            vec![ProofCloseoutLintArtifact {
+                artifact_path: "tests/e2e/artifacts/proof-closeout-text.json".into(),
+                records: Vec::new(),
+                read_error: None,
+            }],
+        );
+
+        let report = lint_proof_closeout(&input);
+
+        assert!(report.closeout_eligible);
+        assert_eq!(report.proof_records_analyzed, 0);
+        assert!(report.findings.is_empty());
+        assert!(
+            report
+                .suggested_beads_wording
+                .contains("validation text_fields_ok")
+        );
+    }
+
+    #[test]
+    fn proof_closeout_linter_accepts_valid_source_failure_handoff() {
+        let mut record = base_record(ProofState::SourceCompileFail);
+        record.remote_cargo_reached = true;
+        record.rustc_reached = true;
+        record.remote_exit_code = Some(101);
+        record.reason_code = "proof.source.remote_compile_error".into();
+        record.summary = "remote rustc reported a first-party source error".into();
+        let input = proof_closeout_lint_input(
+            "Proof-doctor: source_blocked; remote Cargo reached; closeout blocked.",
+            vec![lint_artifact(record)],
+        );
+
+        let report = lint_proof_closeout(&input);
+
+        assert!(!report.closeout_eligible);
+        assert!(report.findings.is_empty());
+        assert!(report.suggested_beads_wording.contains("source_blocked"));
+    }
+
+    #[test]
+    fn proof_closeout_linter_accepts_valid_infra_blocked_handoff() {
+        let mut record = base_record(ProofState::InfraBlockedPreCargo);
+        record.reason_code = "proof.rch.queue_timeout_before_assignment".into();
+        record.summary = "RCH timed out before assigning a remote worker.".into();
+        record.remote_cargo_reached = false;
+        record.artifact_retrieval_status = ArtifactRetrievalStatus::Partial;
+        let input = proof_closeout_lint_input(
+            "Proof-doctor: infra_blocked; remote Cargo not reached; closeout blocked.",
+            vec![lint_artifact(record)],
+        );
+
+        let report = lint_proof_closeout(&input);
+
+        assert!(!report.closeout_eligible);
+        assert!(report.findings.is_empty());
+        assert!(report.suggested_beads_wording.contains("infra_blocked"));
+    }
+
+    #[test]
+    fn proof_closeout_linter_rejects_local_fallback_as_rch_proof() {
+        let input = proof_closeout_lint_input(
+            "Local fallback cargo test passed, so RCH proof passed and closeout safe.",
+            vec![ProofCloseoutLintArtifact {
+                artifact_path: "tests/e2e/artifacts/local-smoke.json".into(),
+                records: Vec::new(),
+                read_error: None,
+            }],
+        );
+
+        let report = lint_proof_closeout(&input);
+        let codes = lint_finding_codes(&report);
+
+        assert!(!report.closeout_eligible);
+        assert!(codes.contains(&"proof.closeout.local_fallback_claimed_as_proof"));
+    }
+
+    #[test]
+    fn proof_closeout_linter_rejects_sync_only_green_claim() {
+        let input = proof_closeout_lint_input(
+            "Selected worker vmi-proof and sync completed; proof lane passed and closeout safe.",
+            vec![ProofCloseoutLintArtifact {
+                artifact_path: "tests/e2e/artifacts/rch-sync.json".into(),
+                records: Vec::new(),
+                read_error: None,
+            }],
+        );
+
+        let report = lint_proof_closeout(&input);
+        let codes = lint_finding_codes(&report);
+
+        assert!(!report.closeout_eligible);
+        assert!(codes.contains(&"proof.closeout.sync_or_queue_claimed_as_proof"));
+    }
+
+    #[test]
+    fn proof_closeout_linter_rejects_stale_ci_rollup_green_claim() {
+        let input = proof_closeout_lint_input(
+            "Queued workflow status is enough: GitHub Actions queued and proof passed, closeout safe.",
+            vec![ProofCloseoutLintArtifact {
+                artifact_path: "tests/e2e/artifacts/queued-ci.json".into(),
+                records: Vec::new(),
+                read_error: None,
+            }],
+        );
+
+        let report = lint_proof_closeout(&input);
+        let codes = lint_finding_codes(&report);
+
+        assert!(!report.closeout_eligible);
+        assert!(codes.contains(&"proof.closeout.sync_or_queue_claimed_as_proof"));
+    }
+
+    #[test]
+    fn proof_closeout_linter_rejects_missing_artifact_path() {
+        let input = proof_closeout_lint_input(
+            "Remote proof passed and closeout safe.",
+            vec![ProofCloseoutLintArtifact {
+                artifact_path: "missing-proof-record.jsonl".into(),
+                records: Vec::new(),
+                read_error: Some("No such file or directory".into()),
+            }],
+        );
+
+        let report = lint_proof_closeout(&input);
+        let codes = lint_finding_codes(&report);
+
+        assert!(!report.closeout_eligible);
+        assert!(codes.contains(&"proof.closeout.artifact_unavailable"));
+        assert!(codes.contains(&"proof.closeout.remote_claim_missing_fields"));
+    }
+
+    #[test]
+    fn proof_closeout_linter_requires_dirty_tree_caveat_for_green_claims() {
+        let mut record = base_record(ProofState::Pass);
+        record.selected_worker = Some("vmi-proof".into());
+        record.remote_cargo_reached = true;
+        record.rustc_reached = true;
+        record.test_binary_started = true;
+        record.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        let mut input = proof_closeout_lint_input(
+            "Proof-doctor: passed; closeout safe.",
+            vec![lint_artifact(record)],
+        );
+        input.dirty_tree = true;
+
+        let report = lint_proof_closeout(&input);
+        let codes = lint_finding_codes(&report);
+
+        assert!(!report.closeout_eligible);
+        assert!(codes.contains(&"proof.closeout.dirty_tree_caveat_missing"));
     }
 
     #[test]
