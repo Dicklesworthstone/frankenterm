@@ -26,6 +26,14 @@ Environment:
                               avoids macOS accessibility APIs on GitHub-hosted runners.
   FT_WEZTERM_FRAME_SETTLE_SECS Seconds to wait after transcript readiness before capture.
                               Defaults to 3.
+  FT_WEZTERM_FRAME_HOLD_SECS   Seconds the transcript driver keeps the GUI alive after
+                              signaling readiness. Defaults to 12.
+  FT_WEZTERM_FRAME_CAPTURE_ATTEMPTS
+                              Per-frame capture attempts when macOS returns a stale
+                              frame already captured for another scenario. Defaults to 3.
+  FT_WEZTERM_FRAME_RETRY_SETTLE_SECS
+                              Seconds to wait before retrying a stale frame capture.
+                              Defaults to 2.
   FT_WEZTERM_FRAME_CAPTURE_TIMEOUT_SECS
                               Seconds to allow screencapture to complete.
                               Defaults to 15.
@@ -211,7 +219,7 @@ import time
 hex_path = pathlib.Path(sys.argv[1])
 title = sys.argv[2]
 ready_path = pathlib.Path(sys.argv[3])
-hold_secs = float(os.environ.get("FT_WEZTERM_FRAME_HOLD_SECS", "8"))
+hold_secs = float(os.environ.get("FT_WEZTERM_FRAME_HOLD_SECS", "12"))
 
 raw_hex = "".join(hex_path.read_text(encoding="utf-8").split())
 payload = bytes.fromhex(raw_hex)
@@ -381,6 +389,59 @@ capture_window() {
   fi
 }
 
+frame_digest() {
+  local output="$1"
+  local digest
+  digest="$(shasum -a 256 "$output")"
+  printf "%s\n" "${digest%% *}"
+}
+
+capture_unique_window() {
+  local title="$1"
+  local output="$2"
+  local scenario_id="$3"
+  local fingerprint_registry="$4"
+  local max_attempts="${FT_WEZTERM_FRAME_CAPTURE_ATTEMPTS:-3}"
+  local retry_settle_secs="${FT_WEZTERM_FRAME_RETRY_SETTLE_SECS:-2}"
+  local attempt=1
+
+  if ! [[ "$max_attempts" =~ ^[0-9]+$ ]] || [[ "$max_attempts" -le 0 ]]; then
+    echo "[wezterm-render-adapter] invalid FT_WEZTERM_FRAME_CAPTURE_ATTEMPTS=$max_attempts; expected positive integer" >&2
+    exit 75
+  fi
+  if ! [[ "$retry_settle_secs" =~ ^[0-9]+$ ]]; then
+    echo "[wezterm-render-adapter] invalid FT_WEZTERM_FRAME_RETRY_SETTLE_SECS=$retry_settle_secs; expected seconds" >&2
+    exit 75
+  fi
+
+  while true; do
+    capture_window "$title" "$output"
+    local digest
+    local duplicate_scenario=""
+    digest="$(frame_digest "$output")"
+
+    if [[ -s "$fingerprint_registry" ]]; then
+      duplicate_scenario="$(
+        awk -v digest="$digest" '$1 == digest { print $2; exit }' "$fingerprint_registry"
+      )"
+    fi
+
+    if [[ -z "$duplicate_scenario" ]]; then
+      printf "%s\t%s\t%s\n" "$digest" "$scenario_id" "$output" >>"$fingerprint_registry"
+      return 0
+    fi
+
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      echo "[wezterm-render-adapter] stale capture suspect: scenario=$scenario_id captured the same frame hash as $duplicate_scenario after $attempt attempt(s): $digest" >&2
+      exit 75
+    fi
+
+    echo "[wezterm-render-adapter] stale capture retry scenario=$scenario_id duplicate_of=$duplicate_scenario attempt=$attempt hash=$digest" >&2
+    sleep "$retry_settle_secs"
+    attempt=$((attempt + 1))
+  done
+}
+
 
 collect_process_tree_pids() {
   local root="$1"
@@ -510,11 +571,12 @@ for frame in frames:
     digest = hashlib.sha256(frame.read_bytes()).hexdigest()
     by_hash.setdefault(digest, []).append(str(frame.relative_to(root)))
 
-if len(frames) > 1 and len(by_hash) == 1:
-    examples = ", ".join(next(iter(by_hash.values()))[:5])
+duplicates = [paths for paths in by_hash.values() if len(paths) > 1]
+if duplicates:
+    examples = ", ".join(duplicates[0][:5])
     raise SystemExit(
-        f"[wezterm-render-adapter] stale capture suspect: all {len(frames)} "
-        f"{engine} frames are byte-identical ({examples})"
+        f"[wezterm-render-adapter] stale capture suspect: {engine} captured "
+        f"the same frame for multiple scenarios ({examples})"
     )
 
 print(
@@ -530,6 +592,7 @@ export_engine_frames() {
   local frame_dir="$3"
   local run_dir="$FRAME_ROOT/run-$engine"
   local driver="$run_dir/render_transcript.py"
+  local fingerprint_registry="$run_dir/$engine-frame-fingerprints.tsv"
 
   if [[ ! -x "$gui" ]]; then
     echo "[wezterm-render-adapter] $engine GUI binary is not executable: $gui" >&2
@@ -541,6 +604,7 @@ export_engine_frames() {
   frame_dir="$(cd "$frame_dir" && pwd -P)"
   driver="$run_dir/render_transcript.py"
   write_driver "$driver"
+  : >"$fingerprint_registry"
 
   while IFS=$'\t' read -r scenario_id transcript; do
     local title="ft-wezterm-diff-$engine-$scenario_id-$RUN_ID"
@@ -574,7 +638,7 @@ export_engine_frames() {
     local gui_pid=$!
     wait_for_file "$ready" "$TIMEOUT_SECS" "" "$log_file"
     sleep "${FT_WEZTERM_FRAME_SETTLE_SECS:-3}"
-    capture_window "$title" "$output"
+    capture_unique_window "$title" "$output" "$scenario_id" "$fingerprint_registry"
     wait_or_terminate_after_capture "$engine" "$scenario_id" "$gui_pid" "$log_file" "$class"
   done < <(manifest_rows)
 }
@@ -599,6 +663,7 @@ require_tool cargo
 require_tool python3
 require_tool screencapture
 require_tool pgrep
+require_tool shasum
 canonicalize_report_paths
 canonicalize_gui_paths
 warm_up_screen_capture_access
