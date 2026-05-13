@@ -34,6 +34,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: wezterm-render-differential
+          cache-bin: "false"
 
       - name: Fetch upstream WezTerm HEAD
         run: |
