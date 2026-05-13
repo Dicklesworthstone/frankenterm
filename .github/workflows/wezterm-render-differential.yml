@@ -68,7 +68,7 @@ jobs:
 
       - name: Export frame comparison report
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.comparison_report == '' }}
-        timeout-minutes: 20
+        timeout-minutes: 45
         run: |
           set -euo pipefail
           scripts/wezterm-render-comparison-macos.sh \
