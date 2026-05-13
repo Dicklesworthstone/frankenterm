@@ -9,6 +9,7 @@ LOG_DIR="${ROOT}/target/test-logs/spec-coverage/release-gate"
 mkdir -p "$LOG_DIR"
 
 fixture="${LOG_DIR}/synthetic-ring-buffer.tla"
+coverage_cfg="${LOG_DIR}/synthetic-ring-buffer.coverage.cfg"
 pass_summary="${LOG_DIR}/tlc-pass-summary.json"
 warn_summary="${LOG_DIR}/tlc-warn-summary.json"
 fail_summary="${LOG_DIR}/tlc-fail-summary.json"
@@ -21,7 +22,20 @@ cat >"$fixture" <<'TLA'
 \*   max-depth: 2
 \*   branching-factor: 1
 \*   threshold-pct: 50
+\*   coverage-cfg: target/test-logs/spec-coverage/release-gate/synthetic-ring-buffer.coverage.cfg
 TLA
+
+cat >"$coverage_cfg" <<'CFG'
+SPECIFICATION Spec
+
+CONSTANTS
+  StateCount = 3
+
+INVARIANT SafetyInvariants
+CFG
+
+dry_run_json="$(bash "${ROOT}/scripts/run-tlc.sh" --dry-run --cfg "$coverage_cfg" "$fixture")"
+jq -e --arg cfg "$coverage_cfg" '.cfg == $cfg' >/dev/null <<<"$dry_run_json"
 
 cat >"$pass_summary" <<'JSON'
 {
@@ -67,6 +81,7 @@ pass_json="$(bash "${ROOT}/scripts/measure-tla-coverage.sh" --summary "$pass_sum
 jq -e '
   .status == "pass"
   and .records[0].state == "complete"
+  and .records[0].cfg == "target/test-logs/spec-coverage/release-gate/synthetic-ring-buffer.coverage.cfg"
   and .records[0].state_space_estimate == 3
   and .records[0].coverage_pct == 100
 ' >/dev/null <<<"$pass_json"

@@ -81,11 +81,16 @@ warning threshold:
 \*   max-depth: 8
 \*   branching-factor: 6
 \*   threshold-pct: 0.002
+\*   coverage-cfg: docs/specs/robot-work.coverage.cfg
 ```
 
 `threshold-pct` is a warning threshold in percentage points. The CI failure
 threshold defaults to half of that value unless the block also declares
-`ci-fail-under-pct`.
+`ci-fail-under-pct`. `coverage-cfg` is optional; when present,
+`scripts/measure-tla-coverage.sh --run-tlc` passes it to `scripts/run-tlc.sh`
+instead of the sibling default config. Use this for deliberately smaller
+coverage profiles when the default proof config is too large for a bounded
+release-gate pass.
 
 ## Mapping Documents
 
@@ -118,6 +123,8 @@ path and record their constants in the bead evidence.
 - `scripts/check-spec-conventions.sh` validates this directory.
 - `scripts/run-tlc.sh docs/specs/<spec>.tla` runs TLC with the sibling `.cfg`
   and writes a normalized JSON summary.
+- `scripts/run-tlc.sh --cfg docs/specs/<spec>.coverage.cfg docs/specs/<spec>.tla`
+  runs the same spec with a named coverage profile.
 - `scripts/measure-tla-coverage.sh docs/specs/<spec>.tla` combines a TLC
   summary with the spec's `coverage-metric` block and emits state-space
   coverage JSON.

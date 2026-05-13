@@ -26,6 +26,7 @@ Each spec must contain a comment block like:
   \*   max-depth: 8
   \*   branching-factor: 6
   \*   threshold-pct: 0.002
+  \*   coverage-cfg: docs/specs/robot-work.coverage.cfg
 
 The threshold is a warning threshold in percentage points. CI failure is
 threshold / 2 unless ci-fail-under-pct is explicitly provided.
@@ -189,6 +190,7 @@ summary_for_spec() {
   local timeout_secs="$4"
   local workers="$5"
   local out_root="$6"
+  local coverage_cfg="$7"
 
   if [[ -n "$summary_override" ]]; then
     abs_path "$summary_override"
@@ -202,12 +204,18 @@ summary_for_spec() {
   if [[ "$run_tlc" -eq 1 ]]; then
     mkdir -p "${PROJECT_ROOT}/${out_root}/${base}"
     local run_stdout="${PROJECT_ROOT}/${out_root}/${base}/coverage-run.stdout.json"
+    local run_cmd=(
+      "${PROJECT_ROOT}/scripts/run-tlc.sh"
+      --workers "$workers"
+      --timeout-secs "$timeout_secs"
+      --out-dir "$out_root/$base"
+    )
+    if [[ -n "$coverage_cfg" ]]; then
+      run_cmd+=(--cfg "$coverage_cfg")
+    fi
+    run_cmd+=("$spec")
     set +e
-    "${PROJECT_ROOT}/scripts/run-tlc.sh" \
-      --workers "$workers" \
-      --timeout-secs "$timeout_secs" \
-      --out-dir "$out_root/$base" \
-      "$spec" >"$run_stdout"
+    "${run_cmd[@]}" >"$run_stdout"
     local rc=$?
     set -e
     if [[ ! -f "$summary" ]]; then
@@ -288,6 +296,7 @@ for spec_input in "${specs[@]}"; do
   max_depth="$(required_metric "$spec" "max-depth")"
   branching_factor="$(required_metric "$spec" "branching-factor")"
   threshold="$(required_metric "$spec" "threshold-pct")"
+  coverage_cfg="$(metric_value "$spec" "coverage-cfg")"
   fail_threshold="$(metric_value "$spec" "ci-fail-under-pct")"
   if [[ -z "$fail_threshold" ]]; then
     fail_threshold="$(half_threshold "$threshold")"
@@ -298,9 +307,17 @@ for spec_input in "${specs[@]}"; do
   awk -v t="$threshold" 'BEGIN { exit !(t >= 0) }' || fail "$(rel_path "$spec") threshold-pct must be >= 0"
   awk -v t="$fail_threshold" 'BEGIN { exit !(t >= 0) }' || fail "$(rel_path "$spec") ci-fail-under-pct must be >= 0"
 
-  summary="$(summary_for_spec "$spec" "$summary_override" "$run_tlc" "$timeout_secs" "$workers" "$out_root")"
+  summary="$(summary_for_spec "$spec" "$summary_override" "$run_tlc" "$timeout_secs" "$workers" "$out_root" "$coverage_cfg")"
   [[ -f "$summary" ]] || fail "missing summary: $summary"
 
+  cfg_path="$(summary_field "$summary" '.cfg // .tlc_run.cfg')"
+  if [[ -z "$cfg_path" ]]; then
+    if [[ -n "$coverage_cfg" ]]; then
+      cfg_path="$(abs_path "$coverage_cfg")"
+    else
+      cfg_path="${spec%.tla}.cfg"
+    fi
+  fi
   state_count="$(summary_field "$summary" '.["state-count"] // .state_count // .tlc_run.state_count')"
   distinct_state_count="$(summary_field "$summary" '.["distinct-state-count"] // .distinct_state_count // .tlc_run.distinct_state_count')"
   time_budget_seconds="$(summary_field "$summary" '.["time-budget"].seconds // .time_budget_seconds // .tlc_run.time_budget_seconds')"
@@ -329,6 +346,7 @@ for spec_input in "${specs[@]}"; do
   record="$(jq -n \
     --arg subsystem "$subsystem" \
     --arg spec "$(rel_path "$spec")" \
+    --arg cfg "$(rel_path "$cfg_path")" \
     --arg summary "$(rel_path "$summary")" \
     --arg state "$state" \
     --arg status "$status" \
@@ -348,6 +366,7 @@ for spec_input in "${specs[@]}"; do
     '{
       subsystem: $subsystem,
       spec: $spec,
+      cfg: $cfg,
       declared_invariants: $declared_invariants,
       max_depth: $max_depth,
       branching_factor: $branching_factor,

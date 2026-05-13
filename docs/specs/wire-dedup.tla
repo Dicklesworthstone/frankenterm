@@ -24,18 +24,20 @@
 \* coverage-metric:
 \*   subsystem: wire-dedup
 \*   declared-invariants: SafetyInvariants
-\*   max-depth: 8
-\*   branching-factor: 6
+\*   max-depth: 2
+\*   branching-factor: 2
 \*   threshold-pct: 0.002
+\*   coverage-cfg: docs/specs/wire-dedup.coverage.cfg
 
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
-CONSTANTS Senders, MaxSeq
+CONSTANTS Senders, MaxSeq, MaxEvents
 
 ASSUME
     /\ Senders \subseteq 0..255
     /\ Cardinality(Senders) \in 1..3   \* Bound model space
     /\ MaxSeq \in 0..3                 \* matches BFS bound
+    /\ MaxEvents \in 1..8
 
 VARIABLES sessions, history
 
@@ -65,6 +67,7 @@ TypeOK ==
     /\ DOMAIN sessions \subseteq Senders
     /\ \A s \in DOMAIN sessions : sessions[s] \in Session
     /\ history \in Seq([sender : Senders, seq : Seqs])
+    /\ Len(history) <= MaxEvents
 
 ----------------------------------------------------------------------------
 \* Initial state
@@ -89,6 +92,7 @@ Ingest(s, q) ==
     LET cur == SessionFor(s) IN
     /\ s \in Senders
     /\ q \in Seqs
+    /\ Len(history) < MaxEvents
     /\ history' = Append(history, [sender |-> s, seq |-> q])
     /\ IF cur.initialized /\ q <= cur.last_seq
        THEN

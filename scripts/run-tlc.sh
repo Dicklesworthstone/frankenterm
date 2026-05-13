@@ -12,6 +12,7 @@ Usage: scripts/run-tlc.sh [options] docs/specs/<spec>.tla
 
 Options:
   --jar <path>            tla2tools.jar path (default: $TLA_TOOLS_JAR or /tmp/tla2tools.jar)
+  --cfg <path>            TLC config path (default: sibling docs/specs/<spec>.cfg)
   --timeout-secs <secs>   Time budget for TLC (default: 300)
   --workers <value>       TLC worker count (default: auto)
   --out-dir <path>        Output directory (default: target/tlc/<spec>)
@@ -156,6 +157,7 @@ jar="${TLA_TOOLS_JAR:-/tmp/tla2tools.jar}"
 timeout_secs=300
 workers="${TLC_WORKERS:-auto}"
 out_dir=""
+cfg_override=""
 dry_run=0
 spec=""
 
@@ -163,6 +165,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --jar)
       jar="$2"
+      shift 2
+      ;;
+    --cfg)
+      cfg_override="$2"
       shift 2
       ;;
     --timeout-secs)
@@ -211,7 +217,15 @@ if [[ "$spec" != /* ]]; then
   spec="${PROJECT_ROOT}/${spec}"
 fi
 spec="$(cd "$(dirname "$spec")" && pwd)/$(basename "$spec")"
-cfg="${spec%.tla}.cfg"
+if [[ -n "$cfg_override" ]]; then
+  cfg="$cfg_override"
+  if [[ "$cfg" != /* ]]; then
+    cfg="${PROJECT_ROOT}/${cfg}"
+  fi
+  cfg="$(cd "$(dirname "$cfg")" && pwd)/$(basename "$cfg")"
+else
+  cfg="${spec%.tla}.cfg"
+fi
 base="$(basename "$spec" .tla)"
 
 if [[ -z "$out_dir" ]]; then

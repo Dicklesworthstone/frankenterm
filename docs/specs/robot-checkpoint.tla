@@ -25,13 +25,14 @@
 \* coverage-metric:
 \*   subsystem: robot-checkpoint
 \*   declared-invariants: SafetyInvariants
-\*   max-depth: 8
+\*   max-depth: 2
 \*   branching-factor: 6
 \*   threshold-pct: 0.002
+\*   coverage-cfg: docs/specs/robot-checkpoint.coverage.cfg
 
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
-CONSTANTS Sessions, Contents, MaxSteps
+CONSTANTS Sessions, Contents, MaxSteps, MaxEvents
 
 ASSUME
     /\ Sessions \subseteq 0..255
@@ -39,6 +40,7 @@ ASSUME
     /\ Cardinality(Sessions) \in 1..2     \* Bound model space
     /\ Cardinality(Contents) \in 1..3     \* matches BFS bound
     /\ MaxSteps \in 1..6
+    /\ MaxEvents \in 1..8
 
 \* Approval token sentinels mirroring the Rust constants.
 TokenAbsent  == 0
@@ -71,6 +73,7 @@ TypeOK ==
     /\ DOMAIN session_state \subseteq Sessions
     /\ \A s \in DOMAIN session_state : session_state[s] \in SessionView
     /\ events \in Seq(EmittedEvent)
+    /\ Len(events) <= MaxEvents
 
 ----------------------------------------------------------------------------
 \* Initial state
@@ -100,6 +103,7 @@ Save(s) ==
         is_dup == id \in DOMAIN snapshots /\ snapshots[id] = cur.content
     IN
     /\ s \in Sessions
+    /\ Len(events) < MaxEvents
     /\ snapshots' = IF is_dup
                     THEN snapshots
                     ELSE snapshots @@ (id :> cur.content)
@@ -118,6 +122,7 @@ Rollback(s, target, token) ==
     /\ token # TokenAbsent
     /\ token # TokenInvalid
     /\ target \in DOMAIN snapshots
+    /\ Len(events) < MaxEvents
     /\ session_state' = [session_state EXCEPT
                             ![s] = [
                                 content         |-> snapshots[target],

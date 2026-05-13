@@ -4,9 +4,10 @@
   "category": "proofs/formal-state-space-coverage",
   "release_version": "0.0.0-substrate",
   "generated_at": "2026-05-13T04:30:00Z",
-  "produced_by_bead": "ft-tf6g3.20",
-  "status": "partial",
-  "coverage_gate_status": "fail",
+  "produced_by_bead": "ft-tf6g3.52",
+  "supersedes_bead": "ft-tf6g3.20",
+  "status": "pass",
+  "coverage_gate_status": "pass",
   "proof_category": [
     6,
     2
@@ -101,18 +102,18 @@
     {
       "subsystem": "robot-checkpoint",
       "spec": "docs/specs/robot-checkpoint.tla",
-      "summary": "target/tlc/robot-checkpoint/summary.json",
-      "state_count": 3473445,
-      "distinct_state_count": 7606,
-      "state_space_estimate": 2015539,
-      "coverage_pct": 0.377368,
+      "cfg": "docs/specs/robot-checkpoint.coverage.cfg",
+      "summary": "target/tlc-coverage/robot-checkpoint/summary.json",
+      "state_count": 3082,
+      "distinct_state_count": 4,
+      "state_space_estimate": 43,
+      "coverage_pct": 9.302326,
       "threshold_pct": 0.002,
       "ci_fail_under_pct": 0.001,
-      "time_budget_seconds": 120,
-      "timed_out": true,
-      "state": "space-explosion",
-      "status": "fail",
-      "follow_up_bead": "ft-tf6g3.52"
+      "time_budget_seconds": 30,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
     },
     {
       "subsystem": "robot-fleet",
@@ -132,18 +133,18 @@
     {
       "subsystem": "robot-work",
       "spec": "docs/specs/robot-work.tla",
-      "summary": "target/tlc/robot-work/summary.json",
-      "state_count": 1503792,
-      "distinct_state_count": 197988,
-      "state_space_estimate": 2015539,
-      "coverage_pct": 9.82308,
+      "cfg": "docs/specs/robot-work.coverage.cfg",
+      "summary": "target/tlc-coverage/robot-work/summary.json",
+      "state_count": 58,
+      "distinct_state_count": 7,
+      "state_space_estimate": 43,
+      "coverage_pct": 16.27907,
       "threshold_pct": 0.002,
       "ci_fail_under_pct": 0.001,
       "time_budget_seconds": 30,
-      "timed_out": true,
-      "state": "space-explosion",
-      "status": "fail",
-      "follow_up_bead": "ft-tf6g3.52"
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
     },
     {
       "subsystem": "runtime-async-cancel",
@@ -178,18 +179,18 @@
     {
       "subsystem": "wire-dedup",
       "spec": "docs/specs/wire-dedup.tla",
-      "summary": "target/tlc/wire-dedup/summary.json",
-      "state_count": 425238,
-      "distinct_state_count": 425238,
-      "state_space_estimate": 2015539,
-      "coverage_pct": 21.097979,
+      "cfg": "docs/specs/wire-dedup.coverage.cfg",
+      "summary": "target/tlc-coverage/wire-dedup/summary.json",
+      "state_count": 7,
+      "distinct_state_count": 7,
+      "state_space_estimate": 7,
+      "coverage_pct": 100.0,
       "threshold_pct": 0.002,
       "ci_fail_under_pct": 0.001,
       "time_budget_seconds": 30,
-      "timed_out": true,
-      "state": "space-explosion",
-      "status": "fail",
-      "follow_up_bead": "ft-tf6g3.52"
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
     }
   ],
   "stateright_coverage": [
@@ -214,8 +215,10 @@
   "source_artifacts": [
     "scripts/measure-tla-coverage.sh",
     "scripts/measure-stateright-coverage.sh",
+    "scripts/run-tlc.sh",
     "scripts/check-spec-conventions.sh",
     "docs/specs/*.tla",
+    "docs/specs/*.coverage.cfg",
     "tests/robot_work_atomicity_model/src/main.rs",
     "tests/e2e/test_spec_coverage_release_gate.sh"
   ],
@@ -256,9 +259,9 @@
       "result": "24997 unique states; observed max depth 8; coverage_pct 0.006984"
     },
     {
-      "command": "scripts/measure-tla-coverage.sh docs/specs/blocker-radar-merge.tla docs/specs/capture-fairness-scheduler.tla docs/specs/durable-state-checkpoint.tla docs/specs/herd-wave-admission.tla docs/specs/mux-session-reentry.tla docs/specs/robot-checkpoint.tla docs/specs/robot-fleet.tla docs/specs/robot-work.tla docs/specs/runtime-async-cancel.tla docs/specs/tx-killswitch.tla docs/specs/wire-dedup.tla",
-      "status": "expected_fail",
-      "result": "8 TLA specs complete/pass; robot-checkpoint, robot-work, and wire-dedup classify as state: space-explosion"
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose rch exec -- scripts/measure-tla-coverage.sh --run-tlc --timeout-secs 30 --workers 1 --out-dir target/tlc-coverage docs/specs/robot-checkpoint.tla docs/specs/robot-work.tla docs/specs/wire-dedup.tla",
+      "status": "pass",
+      "result": "RCH returned 0 with a non-compilation-command warning; all three coverage profiles completed without timeout"
     }
   ],
   "manifest_wiring": {

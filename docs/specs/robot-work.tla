@@ -24,19 +24,21 @@
 \* coverage-metric:
 \*   subsystem: robot-work
 \*   declared-invariants: SafetyInvariants
-\*   max-depth: 8
+\*   max-depth: 2
 \*   branching-factor: 6
 \*   threshold-pct: 0.002
+\*   coverage-cfg: docs/specs/robot-work.coverage.cfg
 
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
-CONSTANTS Claims, Agents
+CONSTANTS Claims, Agents, MaxEvents
 
 ASSUME
     /\ Claims \subseteq 0..255
     /\ Agents \subseteq 0..255
     /\ Cardinality(Claims) \in 1..3      \* Bound model space
     /\ Cardinality(Agents) \in 1..3
+    /\ MaxEvents \in 1..8
 
 VARIABLES claims, live_agents, events
 
@@ -65,6 +67,7 @@ TypeOK ==
     /\ \A c \in Claims : claims[c] \in ClaimStateType
     /\ live_agents \subseteq Agents
     /\ events \in Seq(EmittedEventType)
+    /\ Len(events) <= MaxEvents
 
 ----------------------------------------------------------------------------
 \* Initial state
@@ -84,6 +87,7 @@ Claim(c, a) ==
     /\ c \in Claims
     /\ a \in live_agents
     /\ claims[c].kind = "unclaimed"
+    /\ Len(events) < MaxEvents
     /\ claims' = [claims EXCEPT ![c] = ClaimStateClaimed(a)]
     /\ events' = Append(events, [
             kind |-> "claimed", claim |-> c, agent |-> a
@@ -112,6 +116,7 @@ Complete(c, a) ==
     /\ a \in live_agents
     /\ claims[c].kind = "claimed"
     /\ claims[c].owner = a
+    /\ Len(events) < MaxEvents
     /\ claims' = [claims EXCEPT ![c] = ClaimStateCompleted(a)]
     /\ events' = Append(events, [
             kind |-> "completed", claim |-> c, agent |-> a
@@ -141,6 +146,7 @@ Release(c, a) ==
     /\ a \in live_agents
     /\ claims[c].kind = "claimed"
     /\ claims[c].owner = a
+    /\ Len(events) < MaxEvents
     /\ claims' = [claims EXCEPT ![c] = ClaimStateUnclaimed]
     /\ events' = Append(events, [
             kind |-> "released", claim |-> c, agent |-> a

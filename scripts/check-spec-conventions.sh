@@ -16,6 +16,36 @@ fail() {
   failures=$((failures + 1))
 }
 
+metric_value() {
+  local file="$1"
+  local key="$2"
+  awk -v want="$key" '
+    /coverage-metric:/ { in_block = 1; next }
+    in_block {
+      line = $0
+      if (line ~ /^[[:space:]]*(\\\*|\/\/)/) {
+        sub(/^[[:space:]]*(\\\*|\/\/)[[:space:]]*/, "", line)
+        if (line ~ /^[A-Za-z0-9_-]+:[[:space:]]*/) {
+          pos = index(line, ":")
+          k = substr(line, 1, pos - 1)
+          v = substr(line, pos + 1)
+          gsub(/^[ \t]+|[ \t]+$/, "", k)
+          gsub(/^[ \t]+|[ \t]+$/, "", v)
+          if (k == want) {
+            print v
+            exit
+          }
+        }
+        next
+      }
+      if (line ~ /^[[:space:]]*$/) {
+        next
+      }
+      exit
+    }
+  ' "$file"
+}
+
 require_pattern() {
   local file="$1"
   local pattern="$2"
@@ -68,6 +98,30 @@ validate_cfg() {
   require_no_pattern "$cfg" 'TODO|FIXME|<[^>]+>' "cfg must not contain placeholders"
 }
 
+validate_coverage_cfg() {
+  local spec="$1"
+  local coverage_cfg
+  coverage_cfg="$(metric_value "$spec" "coverage-cfg")"
+  if [[ -z "$coverage_cfg" ]]; then
+    return 0
+  fi
+
+  local coverage_path="$coverage_cfg"
+  if [[ "$coverage_path" != /* ]]; then
+    coverage_path="${PROJECT_ROOT}/${coverage_path}"
+  fi
+
+  if [[ ! -f "$coverage_path" ]]; then
+    fail "$spec" "coverage-cfg does not exist: $coverage_cfg"
+    return
+  fi
+
+  require_pattern "$coverage_path" '^SPECIFICATION[[:space:]]+Spec$' "coverage cfg must use SPECIFICATION Spec"
+  require_pattern "$coverage_path" '^CONSTANTS$' "coverage cfg must declare deterministic constants"
+  require_pattern "$coverage_path" '^INVARIANT[[:space:]]+SafetyInvariants$' "coverage cfg must check SafetyInvariants"
+  require_no_pattern "$coverage_path" 'TODO|FIXME|<[^>]+>' "coverage cfg must not contain placeholders"
+}
+
 shopt -s nullglob
 specs=("${SPEC_DIR}"/*.tla)
 
@@ -103,6 +157,7 @@ for spec in "${specs[@]}"; do
   require_pattern "$spec" 'threshold-pct:' "coverage-metric block missing threshold-pct"
 
   validate_cfg "$spec" "$base"
+  validate_coverage_cfg "$spec"
   validate_mapping "$spec" "$base"
 
   printf 'checked: %s\n' "$rel"
