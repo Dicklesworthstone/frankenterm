@@ -107,6 +107,9 @@ jobs:
       - name: Run ft-e87u6.4 README/AGENTS hedge alignment E2E
         run: bash tests/e2e/test_ft_e87u6_4_hedge_alignment.sh
 
+      - name: Run ft-e87u6.5 attestation manifest completeness E2E
+        run: bash tests/e2e/test_ft_e87u6_5_manifest_completeness.sh
+
       # ft-s2034 / BR-RC-RUNTIME-SEMANTICS.G14.1.cont.ci:
       # Rust-side syn-AST cx-propagation analyzer (ft-t9a6q.1) as
       # a hard PR-CI gate.
@@ -137,6 +140,15 @@ jobs:
         with:
           name: ft-e87u6-4-hedge-alignment
           path: tests/e2e/artifacts/goal-line/ft-e87u6/hedge-alignment/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload ft-e87u6.5 manifest completeness artifact bundle
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ft-e87u6-5-manifest-completeness
+          path: tests/e2e/artifacts/goal-line/ft-e87u6/manifest_completeness/
           if-no-files-found: warn
           retention-days: 30
 
