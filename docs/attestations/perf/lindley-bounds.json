@@ -21,8 +21,54 @@
       "service_latency": 5
     }
   ],
+  "stage_content_hashes": [
+    {
+      "name": "capture",
+      "content_sha256": "99c3aa4fb42b553024b0190baca035894181e9a67a43a9b12eee94a036394fa4"
+    },
+    {
+      "name": "delta_extract",
+      "content_sha256": "906f2f0dca20daf06955a3b5eff1cd2a5e66099f22ba2861fe9b7aa39f764d1b"
+    },
+    {
+      "name": "storage_write",
+      "content_sha256": "f90156cc25d538d5f954236559036528b0000f2744a2e83c696994c94faf18c7"
+    }
+  ],
   "analytical_bound_ms": 8.1,
   "empirical_p99_ms": 8.5,
   "deviation_pct": 4.938271604938276,
-  "within_tolerance": true
+  "within_tolerance": true,
+  "coverage_status": [
+    {
+      "claim_surface": "capture_4kb_overlap_benchmark",
+      "status": "covered",
+      "stage_source": "stages",
+      "empirical_source": "headline capture_latency_p99 benchmark"
+    },
+    {
+      "claim_surface": "end_to_end_capture_path",
+      "status": "modeled_pending_empirical",
+      "stage_source": "LindleyTelemetryModel::documented_end_to_end_capture_default",
+      "required_stages": ["capture", "delta_extract", "storage_write", "pattern_detect", "event_emit"],
+      "pending_reason": "PatternDetection and EventEmission have a deterministic budget-backed service curve, but the release artifact still lacks an empirical agreement row for the full PTY-to-event path"
+    },
+    {
+      "claim_surface": "robot_mode_response_lt_5ms",
+      "status": "pending_service_curve",
+      "evidence_stream": "tests/fixtures/evidence-corpus/per-claim/robot.p95/baseline-30d.jsonl",
+      "pending_reason": "G54 supplies empirical robot.p95 rows, but no release service curve maps ApiResponse plus handler work into this Lindley artifact yet"
+    },
+    {
+      "claim_surface": "fts5_query_lt_10ms",
+      "status": "pending_service_curve",
+      "evidence_stream": "tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/baseline-30d.jsonl",
+      "pending_reason": "G54 supplies empirical fts5.query_p99 rows, but the FTS5 read/query service curve is separate from StorageWrite and is not wired into this artifact yet"
+    },
+    {
+      "claim_surface": "renderer_input_to_photon",
+      "status": "pending_stage_telemetry",
+      "pending_reason": "Renderer input-to-photon coverage must stay pending until G18 publishes renderer stage telemetry"
+    }
+  ]
 }

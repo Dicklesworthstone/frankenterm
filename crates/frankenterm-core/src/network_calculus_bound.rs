@@ -44,6 +44,8 @@
 
 #![allow(dead_code)]
 
+use sha2::{Digest, Sha256};
+
 // ============================================================================
 // Arrival curve (token-bucket model)
 // ============================================================================
@@ -363,9 +365,7 @@ impl LindleyBoundsArtifact {
         out.push_str("{\n");
         out.push_str(&format!(
             "  \"release_version\": \"{}\",\n",
-            self.release_version
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
+            escape_json_string(&self.release_version)
         ));
         out.push_str("  \"arrival\": {\n");
         out.push_str(&format!("    \"burst\": {},\n", self.arrival.burst()));
@@ -376,7 +376,7 @@ impl LindleyBoundsArtifact {
             out.push_str("    {\n");
             out.push_str(&format!(
                 "      \"name\": \"{}\",\n",
-                stage.name.replace('\\', "\\\\").replace('"', "\\\"")
+                escape_json_string(&stage.name)
             ));
             out.push_str(&format!(
                 "      \"service_rate\": {},\n",
@@ -385,6 +385,24 @@ impl LindleyBoundsArtifact {
             out.push_str(&format!(
                 "      \"service_latency\": {}\n",
                 stage.service.latency()
+            ));
+            if i + 1 == self.stages.len() {
+                out.push_str("    }\n");
+            } else {
+                out.push_str("    },\n");
+            }
+        }
+        out.push_str("  ],\n");
+        out.push_str("  \"stage_content_hashes\": [\n");
+        for (i, stage) in self.stages.iter().enumerate() {
+            out.push_str("    {\n");
+            out.push_str(&format!(
+                "      \"name\": \"{}\",\n",
+                escape_json_string(&stage.name)
+            ));
+            out.push_str(&format!(
+                "      \"content_sha256\": \"{}\"\n",
+                sha256_hex(&canonical_lindley_stage_json(stage))
             ));
             if i + 1 == self.stages.len() {
                 out.push_str("    }\n");
@@ -405,12 +423,67 @@ impl LindleyBoundsArtifact {
         let dev = comp.deviation_pct().unwrap_or(0.0);
         out.push_str(&format!("  \"deviation_pct\": {dev},\n"));
         out.push_str(&format!(
-            "  \"within_tolerance\": {}\n",
+            "  \"within_tolerance\": {},\n",
             comp.within_tolerance()
         ));
+        out.push_str(render_lindley_coverage_status_json());
         out.push('}');
         out
     }
+}
+
+fn escape_json_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn canonical_lindley_stage_json(stage: &StageModel) -> String {
+    format!(
+        "{{\"name\":\"{}\",\"service_rate\":{},\"service_latency\":{}}}",
+        escape_json_string(&stage.name),
+        stage.service.rate(),
+        stage.service.latency()
+    )
+}
+
+fn sha256_hex(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn render_lindley_coverage_status_json() -> &'static str {
+    concat!(
+        "  \"coverage_status\": [\n",
+        "    {\n",
+        "      \"claim_surface\": \"capture_4kb_overlap_benchmark\",\n",
+        "      \"status\": \"covered\",\n",
+        "      \"stage_source\": \"stages\",\n",
+        "      \"empirical_source\": \"headline capture_latency_p99 benchmark\"\n",
+        "    },\n",
+        "    {\n",
+        "      \"claim_surface\": \"end_to_end_capture_path\",\n",
+        "      \"status\": \"modeled_pending_empirical\",\n",
+        "      \"stage_source\": \"LindleyTelemetryModel::documented_end_to_end_capture_default\",\n",
+        "      \"required_stages\": [\"capture\", \"delta_extract\", \"storage_write\", \"pattern_detect\", \"event_emit\"],\n",
+        "      \"pending_reason\": \"PatternDetection and EventEmission have a deterministic budget-backed service curve, but the release artifact still lacks an empirical agreement row for the full PTY-to-event path\"\n",
+        "    },\n",
+        "    {\n",
+        "      \"claim_surface\": \"robot_mode_response_lt_5ms\",\n",
+        "      \"status\": \"pending_service_curve\",\n",
+        "      \"evidence_stream\": \"tests/fixtures/evidence-corpus/per-claim/robot.p95/baseline-30d.jsonl\",\n",
+        "      \"pending_reason\": \"G54 supplies empirical robot.p95 rows, but no release service curve maps ApiResponse plus handler work into this Lindley artifact yet\"\n",
+        "    },\n",
+        "    {\n",
+        "      \"claim_surface\": \"fts5_query_lt_10ms\",\n",
+        "      \"status\": \"pending_service_curve\",\n",
+        "      \"evidence_stream\": \"tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/baseline-30d.jsonl\",\n",
+        "      \"pending_reason\": \"G54 supplies empirical fts5.query_p99 rows, but the FTS5 read/query service curve is separate from StorageWrite and is not wired into this artifact yet\"\n",
+        "    },\n",
+        "    {\n",
+        "      \"claim_surface\": \"renderer_input_to_photon\",\n",
+        "      \"status\": \"pending_stage_telemetry\",\n",
+        "      \"pending_reason\": \"Renderer input-to-photon coverage must stay pending until G18 publishes renderer stage telemetry\"\n",
+        "    }\n",
+        "  ]\n"
+    )
 }
 
 #[cfg(test)]
@@ -844,19 +917,86 @@ mod tests {
             analytical_bound_ms: 50.0,
             empirical_p99_ms: 8.5,
         };
+        let expected_stages = artifact.stages.clone();
         let json = artifact.render_attestation_json();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("attestation JSON should parse");
+
         // Expected schema fields all present.
-        assert!(json.contains("\"release_version\": \"0.1.0\""));
-        assert!(json.contains("\"arrival\":"));
-        assert!(json.contains("\"burst\": 10"));
-        assert!(json.contains("\"rate\": 100"));
-        assert!(json.contains("\"stages\":"));
-        assert!(json.contains("\"name\": \"capture\""));
-        assert!(json.contains("\"name\": \"extract\""));
-        assert!(json.contains("\"analytical_bound_ms\": 50"));
-        assert!(json.contains("\"empirical_p99_ms\": 8.5"));
-        assert!(json.contains("\"deviation_pct\":"));
-        assert!(json.contains("\"within_tolerance\":"));
+        assert_eq!(parsed["release_version"].as_str(), Some("0.1.0"));
+        assert_eq!(parsed["arrival"]["burst"].as_f64(), Some(10.0));
+        assert_eq!(parsed["arrival"]["rate"].as_f64(), Some(100.0));
+        assert_eq!(parsed["analytical_bound_ms"].as_f64(), Some(50.0));
+        assert_eq!(parsed["empirical_p99_ms"].as_f64(), Some(8.5));
+        assert!(parsed["deviation_pct"].as_f64().is_some());
+        assert!(parsed["within_tolerance"].as_bool().is_some());
+        let coverage_rows = parsed["coverage_status"]
+            .as_array()
+            .expect("coverage_status array");
+        assert_eq!(coverage_rows.len(), 5);
+        assert_eq!(
+            coverage_rows[0]["claim_surface"].as_str(),
+            Some("capture_4kb_overlap_benchmark")
+        );
+        assert_eq!(coverage_rows[0]["status"].as_str(), Some("covered"));
+        assert_eq!(
+            coverage_rows[1]["claim_surface"].as_str(),
+            Some("end_to_end_capture_path")
+        );
+        assert_eq!(
+            coverage_rows[1]["status"].as_str(),
+            Some("modeled_pending_empirical")
+        );
+        assert_eq!(
+            coverage_rows[2]["claim_surface"].as_str(),
+            Some("robot_mode_response_lt_5ms")
+        );
+        assert_eq!(
+            coverage_rows[2]["status"].as_str(),
+            Some("pending_service_curve")
+        );
+        assert_eq!(
+            coverage_rows[3]["claim_surface"].as_str(),
+            Some("fts5_query_lt_10ms")
+        );
+        assert_eq!(
+            coverage_rows[3]["status"].as_str(),
+            Some("pending_service_curve")
+        );
+        assert_eq!(
+            coverage_rows[4]["claim_surface"].as_str(),
+            Some("renderer_input_to_photon")
+        );
+        assert_eq!(
+            coverage_rows[4]["status"].as_str(),
+            Some("pending_stage_telemetry")
+        );
+
+        let stage_rows = parsed["stages"].as_array().expect("stages array");
+        let hash_rows = parsed["stage_content_hashes"]
+            .as_array()
+            .expect("stage_content_hashes array");
+        assert_eq!(stage_rows.len(), expected_stages.len());
+        assert_eq!(hash_rows.len(), expected_stages.len());
+        for ((stage_row, hash_row), expected) in stage_rows
+            .iter()
+            .zip(hash_rows.iter())
+            .zip(expected_stages.iter())
+        {
+            assert_eq!(stage_row["name"].as_str(), Some(expected.name.as_str()));
+            assert_eq!(hash_row["name"].as_str(), Some(expected.name.as_str()));
+            let expected_hash = sha256_hex(&canonical_lindley_stage_json(expected));
+            let actual_hash = hash_row["content_sha256"]
+                .as_str()
+                .expect("content hash string");
+            assert!(
+                actual_hash
+                    .chars()
+                    .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+            );
+            assert_eq!(actual_hash, expected_hash);
+            assert_eq!(actual_hash.len(), 64);
+        }
     }
 
     #[test]
@@ -910,5 +1050,6 @@ mod tests {
         };
         let json = artifact.render_attestation_json();
         assert!(json.contains("\"stages\": [\n  ],"));
+        assert!(json.contains("\"stage_content_hashes\": [\n  ],"));
     }
 }

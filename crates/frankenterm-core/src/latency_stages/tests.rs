@@ -201,6 +201,37 @@ fn test_lindley_documented_default_builds_substrate_inputs() {
 }
 
 #[test]
+fn test_lindley_end_to_end_capture_model_covers_full_capture_path() {
+    let model = LindleyTelemetryModel::documented_end_to_end_capture_default();
+    let (arrival, stages) = model.to_network_calculus_inputs().unwrap();
+    assert_eq!(
+        model
+            .stages
+            .iter()
+            .map(|stage| stage.stage)
+            .collect::<Vec<_>>(),
+        LatencyStage::CAPTURE_PATH
+    );
+    assert_eq!(
+        stages
+            .iter()
+            .map(|stage| stage.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "capture",
+            "delta_extract",
+            "storage_write",
+            "pattern_detect",
+            "event_emit"
+        ]
+    );
+
+    let bound = crate::network_calculus_bound::pipeline_delay_bound(arrival, &stages).unwrap();
+    assert!((bound - 23.1).abs() < 1e-9, "bound={bound}");
+    assert!(bound < 50.0, "bound={bound}");
+}
+
+#[test]
 fn test_lindley_model_reads_live_enforcer_p99s() {
     let mut enforcer = BudgetEnforcer::with_defaults();
     enforcer.record(LatencyStage::PtyCapture, 1_200.0, "lindley");
@@ -219,7 +250,7 @@ fn test_lindley_model_reads_live_enforcer_p99s() {
     )
     .unwrap();
 
-    assert_eq!(model.arrival_rate_events_per_sec, 80.0);
+    assert_eq!(model.arrival_rate_events_per_ms, 80.0);
     assert_eq!(model.stages[0].p99_latency_ms, 1.2);
     assert_eq!(model.stages[1].p99_latency_ms, 2.3);
     assert_eq!(model.stages[2].p99_latency_ms, 3.4);

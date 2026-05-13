@@ -23,7 +23,7 @@
         "file": "crates/frankenterm-core/benches/delta_extraction.rs",
         "criterion_group": "delta_extraction"
       },
-      "lindley_bound_artifact": "docs/perf/lindley-derivation.md#capture-latency",
+      "lindley_bound_artifact": "docs/perf/latency-derivation.md#capture-latency",
       "hardware_baseline": {
         "ci_runner": "macos-14 (M1, 8 vCPU, 14GB RAM)",
         "local_machine": "Apple M1 Pro / 32GB RAM / macOS 25.x",

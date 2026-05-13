@@ -127,7 +127,7 @@ proptest! {
             prop_assert_eq!(actual.name.as_str(), expected_stage_name(expected.stage));
             prop_assert_eq!(
                 actual.service.rate().to_bits(),
-                expected.service_rate_events_per_sec.to_bits()
+                expected.service_rate_events_per_ms.to_bits()
             );
             prop_assert_eq!(
                 actual.service.latency().to_bits(),
