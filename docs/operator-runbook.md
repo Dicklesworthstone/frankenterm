@@ -253,7 +253,118 @@ Closeout rules:
   when the proof itself passed. Disk pressure is a shared resource issue, not
   cleanup trivia.
 
-### 2.4 RCH target-dir lifecycle fields
+### 2.4 Generated handoff and proof-record workflow
+
+Use the generated handoff package whenever the lane is more than a docs-static
+or script-syntax check. The operator flow is:
+
+1. Run proof-doctor as a classifier, not as the proof command executor. Keep the
+   intended proof command after `--` as argv:
+   ```bash
+   ft proof-doctor -f json \
+     --bead <id> \
+     --agent <agent> \
+     --scope <cargo-test|cargo-check|cargo-clippy|e2e|high-scale|static> \
+     --phase <preflight|launch-observed|remote-cargo-observed|terminal-classified|evidence-gap> \
+     --required-backend <rch|static|local> \
+     --target-dir /tmp/<bead>-<purpose>-target \
+     --evidence-artifact <retained-rch-or-harness-summary.json> \
+     --proof-record-output docs/attestations/proof-ledger/<id>.jsonl \
+     --proof-record-redaction-status <none-needed|redacted> \
+     -- rch exec -- env CARGO_TARGET_DIR=/tmp/<bead>-<purpose>-target cargo test -p <crate> <filter> -- --nocapture \
+     > /tmp/<id>-proof-doctor.json
+   ```
+2. Review `/tmp/<id>-proof-doctor.json` before posting it. The fields that
+   matter for closeout are:
+   - `.verdict.status`, `.verdict.phase`, `.handoff.reason_code`, and
+     `.handoff.safe_to_close`.
+   - `.handoff.beads_comment`, which is the Beads comment body after human
+     review.
+   - `.handoff.agent_mail`, which is the targeted Agent Mail body when the
+     owner is another agent and Agent Mail is usable.
+   - `.proof_record.write_status`, `.proof_record.resolved_path`, and
+     `.proof_record.safe_to_close_source_bead`.
+3. Post the generated Beads handoff text without rewriting the status:
+   ```bash
+   jq -r '.handoff.beads_comment' /tmp/<id>-proof-doctor.json \
+     | br comments add <id> --author <agent> --file -
+   ```
+4. If Agent Mail is reachable and `.handoff.agent_mail` is not null, send that
+   targeted message to the named owner. If Agent Mail is red, keep the
+   generated Beads comment as the handoff contract and do not repair or restart
+   Agent Mail.
+5. Cite the proof-record JSONL path in the closeout only when
+   `.proof_record.write_status == "written"`. A `refused` record is the correct
+   fail-closed result for missing remote evidence, unsafe redaction, invalid
+   local fallback, or incomplete artifacts.
+
+The generated Beads comment has this shape:
+
+```text
+Proof-doctor handoff for <bead>: <status>. Verdict <verdict_id>; phase <phase>; reason <reason_code>; remote Cargo <reached|not reached>; RCH tool state <state>; owner <owner>; <safe to close from this verdict|closeout blocked by this verdict>. Command: `<argv>`. Affected paths: <paths>. Summary: <summary>. Next action: <next action>.
+```
+
+### 2.5 Status examples
+
+Use these examples as closeout language, not as substitutes for the JSON
+artifact. The exact verdict id, target dir, owner, command, and artifact paths
+must come from the generated proof-doctor payload for the current run.
+
+```text
+Proof-doctor: passed; phase terminal_classified; reason proof.runnable; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo reached; owner none; target_dir /tmp/ft-abcd-test-target; target_lifecycle kept; target_size 6.2G; closeout safe.
+Proof-record: written; path docs/attestations/proof-ledger/ft-abcd.jsonl; validation ok; closeout safe.
+Meaning: the intended remote Cargo/test lane exited 0, retained artifacts are complete, redaction status is safe, and ledger validation allows the Bead to close green.
+```
+
+```text
+Proof-doctor: source_blocked; phase terminal_classified; reason proof.source.remote_compile_error; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo reached; owner ft-lmg3g.6/MagentaFalcon; target_dir /tmp/ft-abcd-test-target; target_lifecycle kept; target_size unknown; closeout blocked.
+Proof-record: written; path docs/attestations/proof-ledger/ft-abcd.jsonl; validation ok; closeout blocked.
+Meaning: rustc reached first-party source on the remote worker and reported a source diagnostic. Handoff goes to the source owner; the proof Bead remains red.
+```
+
+```text
+Proof-doctor: test_blocked; phase terminal_classified; reason proof.test.remote_assertion_failed; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo reached; owner ft-hme39.5/SageRobin; target_dir /tmp/ft-abcd-e2e-target; target_lifecycle kept; target_size unknown; closeout blocked.
+Proof-record: written; path docs/attestations/proof-ledger/ft-abcd.jsonl; validation ok; closeout blocked.
+Meaning: the intended test, bench, or E2E assertion started remotely and failed. Fix the behavior or harness before claiming pass.
+```
+
+```text
+Proof-doctor: infra_blocked; phase launch_observed; reason proof.rch.pre_cargo_timeout_exec_missing; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo not reached; owner none; target_dir /tmp/ft-abcd-test-target; target_lifecycle cleanup_requested; target_size unknown; closeout blocked.
+Proof-record: refused; path docs/attestations/proof-ledger/ft-abcd.jsonl; validation error; closeout blocked.
+Meaning: RCH selected a worker or synced, but the wrapper failed before Cargo. This is pre-Cargo infrastructure, not a source verdict.
+```
+
+```text
+Proof-doctor: infra_blocked; phase remote_cargo_observed; reason proof.artifact.required_log_missing; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo reached; owner none; target_dir /tmp/ft-abcd-test-target; target_lifecycle cleanup_requested; target_size unknown; closeout blocked.
+Proof-record: refused; path docs/attestations/proof-ledger/ft-abcd.jsonl; validation error; closeout blocked.
+Meaning: Cargo or the harness started, but worker substrate, timeout, artifact retrieval, or missing logs prevented complete evidence. Preserve what was reached and rerun with complete retention.
+```
+
+```text
+Proof-doctor: dirty_tree_blocked; phase preflight; reason proof.dirty.active_owned_path_overlap; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo not reached; owner ft-1grhq.2/CoralBeaver; target_dir /tmp/ft-abcd-test-target; target_lifecycle not_applicable; target_size unknown; closeout blocked.
+Proof-record: not_requested; path none; validation not_applicable; closeout blocked.
+Meaning: a dirty tracked or untracked path overlaps the intended proof and belongs to another owner. Do not run over it or stage it.
+```
+
+```text
+Proof-doctor: invalid; phase preflight; reason proof.command.local_cargo_invalid; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo not reached; owner current agent; target_dir none; target_lifecycle not_applicable; target_size unknown; closeout blocked.
+Proof-record: refused; path docs/attestations/proof-ledger/ft-abcd.jsonl; validation error; closeout blocked.
+Meaning: a local Cargo command, local fallback script, or fail-open wrapper was offered for an RCH-required proof lane. It can be local smoke only.
+```
+
+```text
+Proof-doctor: skipped_not_proven; phase terminal_classified; reason proof.high_scale.predicate_absent; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo reached; owner none; target_dir /tmp/ft-abcd-high-scale-target; target_lifecycle kept; target_size unknown; closeout blocked.
+Proof-record: written; path docs/attestations/proof-ledger/ft-abcd.jsonl; validation ok; closeout blocked.
+Meaning: the reduced or skipped run may be useful evidence, but it did not satisfy the required 64+ CPU / 256 GiB predicate and cannot prove a target-class claim.
+```
+
+```text
+Proof-doctor: inconclusive; phase evidence_gap; reason proof.rch.sync_not_proof; verdict /tmp/ft-abcd-proof-doctor.json; remote Cargo not reached; owner current agent; target_dir /tmp/ft-abcd-test-target; target_lifecycle cleanup_requested; target_size unknown; closeout blocked.
+Proof-record: refused; path docs/attestations/proof-ledger/ft-abcd.jsonl; validation error; closeout blocked.
+Meaning: retained logs show transfer, worker selection, or partial output, but not enough remote Cargo/rustc/test evidence to classify the lane. Rerun with fail-closed logging.
+```
+
+### 2.6 RCH target-dir lifecycle fields
 
 Every RCH-heavy proof comment must account for the target directory it used.
 Use these fields verbatim so later operators can grep for them:
@@ -288,7 +399,7 @@ Do not turn a lifecycle note into implicit deletion permission. The AGENTS.md
 no-file-deletion rule still applies to `/tmp` target directories and `release`
 subdirectories unless the user gives explicit written authorization.
 
-### 2.5 Owned-file clippy attribution
+### 2.7 Owned-file clippy attribution
 
 When broad clippy is red from inherited workspace debt, use
 `scripts/filter-clippy-owned-files.sh` to separate full-command status from
@@ -322,6 +433,52 @@ Clippy attribution: cargo_status=<status>; workspace_green=<true|false>; owned_e
 Use `owned_files_clean` only to say the touched slice had no clippy diagnostics
 in the retained JSONL stream. Keep the full command failure and first unrelated
 diagnostic in the same Beads comment when `cargo_status != 0`.
+
+### 2.8 Proof-surface adoption points
+
+Use proof-doctor handoffs as the front door for proof closeouts in these
+surfaces:
+
+| Surface | Required proof-doctor adoption |
+| --- | --- |
+| Terminal conformance (`docs/terminal-conformance-contract.md`) | RCH-backed closeouts cite the generated handoff and proof-record JSONL before prose. `LOCAL_INVALID` and pre-Cargo infra states cannot close terminal rows. |
+| Resource cockpit (`docs/resource-pressure-cockpit-contract.md`) | Worker-pool and target-class rows cite proof-doctor status plus proof-record artifacts; cockpit snapshots do not replace remote proof evidence. |
+| Capture fairness (`docs/capture-fairness-slo-contract.md`) | Reduced and target-class runs map `remote_reduced`, `target_class`, and `docs_static` proof strength to proof-doctor status and high-scale predicate evidence. |
+| Release attestations (`docs/attestations/README.md`, `docs/release/attestation-checklist.md`) | Attestation bundles include proof-record JSONL paths and generated handoff summaries for required verification categories. |
+| Proof taxonomy (`docs/proposals/ft-tn6cw-proof-lane-evidence-taxonomy.md`) | New proof lanes reuse `ProofAttemptRecord` states and reason codes instead of inventing release-only labels. |
+
+When updating these downstream docs or closing their Beads, replace ad-hoc
+"RCH looked green" prose with the generated proof-doctor status, reason code,
+phase, remote Cargo evidence, and proof-record write status.
+
+### 2.9 Static stale-wording check
+
+Run this check after editing operator, conformance, resource, fairness, or
+attestation proof docs. It is intentionally wording-focused; it does not prove
+Rust behavior.
+
+```bash
+BAD_SYNC='(sync completed|selected worker|workspace transfer)'
+BAD_SYNC_CLAIM='(proved|proves|green|source pass|tests passed|closed green)'
+BAD_LOCAL='(local Cargo|scripts/cargo-local[.]sh|cargo test [.]{3})'
+BAD_REMOTE_CLAIM='(remote proof|RCH proof|proof lane passed|green claim|closeout safe)'
+DOCS=(
+  docs/operator-runbook.md
+  docs/terminal-conformance-contract.md
+  docs/resource-pressure-cockpit-contract.md
+  docs/capture-fairness-slo-contract.md
+  docs/attestations/README.md
+  docs/release/attestation-checklist.md
+  docs/proposals/ft-tn6cw-proof-lane-evidence-taxonomy.md
+  docs/proposals/ft-wik9p-proof-doctor-verdict-schema.md
+)
+rg -n --pcre2 "${BAD_SYNC}.{0,80}${BAD_SYNC_CLAIM}|${BAD_SYNC_CLAIM}.{0,80}${BAD_SYNC}|${BAD_LOCAL}.{0,80}${BAD_REMOTE_CLAIM}|${BAD_REMOTE_CLAIM}.{0,80}${BAD_LOCAL}" "${DOCS[@]}"
+```
+
+The command should return no matches. If it flags a negative example that is
+deliberately teaching the anti-pattern, rewrite that example so the bad claim
+and the forbidden evidence are not on the same line, then keep the nearby prose
+saying the claim is invalid.
 
 ---
 

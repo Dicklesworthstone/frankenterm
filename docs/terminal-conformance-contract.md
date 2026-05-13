@@ -280,7 +280,7 @@ terminal proof attempt. The important states for this lane are:
 | `INFRA_BLOCKED_POST_CARGO` | Remote Cargo or the harness started, but worker environment, artifact retrieval, timeout, or wrapper behavior prevented complete evidence. Record what was reached, but do not close as green. |
 | `SOURCE_COMPILE_FAIL` | Remote Cargo/rustc reached first-party code and reported source, feature, lint, or build-script errors. Fix the source or leave the bead red. |
 | `TEST_FAIL` | The terminal assertion ran and failed. Fix behavior or record a quarantined minimized follow-up. |
-| `LOCAL_INVALID` | A local Cargo run or RCH fail-open is being offered as remote proof. It cannot close an RCH-required terminal conformance bead. |
+| `LOCAL_INVALID` | A local Cargo run or RCH fail-open is being offered for an RCH-required lane. It cannot close a terminal conformance bead that requires remote evidence. |
 
 Do not treat RCH setup, sync, worker-selection chatter, cache downloads, or a
 source mirror preflight as proof that a terminal assertion passed. Those logs
