@@ -116,7 +116,7 @@ use mcp_resources::{
     WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
     WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
-    WaReservationsByPaneTemplateResource, WaReservationsResource,
+    WaRendererInputToPhotonResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
     WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource,
 };
 use mcp_tools::{
@@ -1472,6 +1472,7 @@ mod tests {
                 "wa://accounts".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://perf/renderer-slo/input_to_photon".to_string(),
                 "wa://proof-history".to_string(),
                 "wa://proof-history/release-blocking".to_string(),
                 "wa://proof-history/template".to_string(),
@@ -1511,6 +1512,7 @@ mod tests {
                 "wa://panes".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://perf/renderer-slo/input_to_photon".to_string(),
                 "wa://proof-history".to_string(),
                 "wa://proof-history/release-blocking".to_string(),
                 "wa://proof-history/template".to_string(),

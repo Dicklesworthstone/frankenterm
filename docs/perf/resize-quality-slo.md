@@ -48,6 +48,7 @@ It is also the schema producers feed into:
 | `frozen` | Numeric target is committed to in the epic. Bench may still be pending; the *number* itself does not move except by a new ADR. |
 | `dependency_bound` | Target is reserved for refresh once measurement plumbing lands. The number is operator-provisional until then. |
 | `bench_pending` | Source bench file does not yet exist; will land alongside the sub-bead that delivers the implementation. |
+| `substrate_wired` | Source bench/test file exists and emits machine-readable measured/degraded evidence; production SLO proof still requires a retained target-run artifact. |
 
 ## SLO catalog
 
@@ -59,8 +60,8 @@ machine-readable JSON, the README, and the attestation bundle.
 | ID | Title | Target | Source bench / test | Owner bead | Status |
 |---|---|---|---|---|---|
 | RQ-S1 | Resize FPS | ≥60 sustained on 200-pane fleet, 5s gesture (p99 frame ≤16.6ms) | `crates/frankenterm-core/benches/resize_storm.rs` | ft-mpc9b.5.1 | bench_pending |
-| RQ-S2 | Input-to-photon (macOS) | p95 < 16ms | `crates/frankenterm-core/benches/input_to_photon_macos.rs` | ft-mpc9b.3.1 | bench_pending |
-| RQ-S3 | Input-to-photon (Wayland) | p95 < 20ms | `crates/frankenterm-core/benches/input_to_photon_wayland.rs` | ft-mpc9b.3.2 | bench_pending |
+| RQ-S2 | Input-to-photon (macOS) | p95 < 16ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired |
+| RQ-S3 | Input-to-photon (Wayland) | p95 < 20ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired |
 | RQ-S4 | Visual artifacts (24h fuzz) | 0 critical from random resize+scroll+content | `tests/renderer_golden/fuzz` | ft-mpc9b.1.6 | bench_pending |
 | RQ-S5 | Idle GPU usage | 0% sustained when no semantic change > 500ms | `crates/frankenterm-core/benches/idle_gpu.rs` | ft-mpc9b.5.1 | bench_pending |
 | RQ-S6 | Heavy-burst input latency | p95 < 50ms with 1MB/s output across 50 panes | `crates/frankenterm-core/benches/heavy_burst.rs` | ft-mpc9b.5.1 | bench_pending |
@@ -95,6 +96,14 @@ ingests without further parsing. The path is per-SLO and listed in
 ```
 
 All values are integer nanoseconds unless `unit` says otherwise.
+
+The input-to-photon substrate emits one `ft.perf.evidence-sample.v1` row to
+`target/criterion/slo-input_to_photon_<platform>.jsonl` before Criterion starts
+sampling. A missing GPU or photon detector is represented as an explicit
+degraded state in the renderer SLO evidence, not as a passing measurement.
+The operator surfaces for this substrate are `ft doctor --json`
+`.renderer_slos.input_to_photon` and the read-only MCP resource
+`wa://perf/renderer-slo/input_to_photon`.
 
 ## CI gate (deferred)
 

@@ -37798,6 +37798,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 60_000,
             );
             let attestation_report = build_attestation_doctor_report(&workspace_root);
+            let renderer_slos_report =
+                frankenterm_core::render_quality::renderer_slos_doctor_report();
             all_checks.push(attestation_doctor_check(&attestation_report));
 
             // Determine overall status
@@ -37882,6 +37884,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     serde_json::to_value(&blocker_radar_report).unwrap_or(serde_json::Value::Null);
                 result["herd_wave"] = herd_wave_report.clone();
                 result["attestation"] = attestation_report;
+                result["renderer_slos"] =
+                    serde_json::to_value(&renderer_slos_report).unwrap_or(serde_json::Value::Null);
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
                         serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
@@ -37940,6 +37944,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 print_blocker_radar_doctor_section(&blocker_radar_report);
                 print_herd_wave_doctor_section(&herd_wave_report);
                 print_attestation_doctor_section(&attestation_report);
+
+                println!();
+                println!("Renderer SLOs:");
+                println!(
+                    "  input_to_photon status={} macos_p95={}us wayland_p95={}us mcp={}",
+                    renderer_slos_report.input_to_photon.status,
+                    renderer_slos_report.input_to_photon.target_p95_us_macos,
+                    renderer_slos_report.input_to_photon.target_p95_us_wayland,
+                    renderer_slos_report.input_to_photon.mcp_resource_uri
+                );
 
                 println!();
                 println!("Hardware Profile:");
@@ -41842,7 +41856,13 @@ fn attestation_sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
     let digest = Sha256::digest(&bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(digest
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, byte| {
+            use std::fmt::Write;
+            let _ = write!(&mut acc, "{byte:02x}");
+            acc
+        }))
 }
 
 fn attestation_retractions_root(workspace_root: &std::path::Path) -> std::path::PathBuf {
@@ -41856,6 +41876,7 @@ fn attestation_retractions_root(workspace_root: &std::path::Path) -> std::path::
         })
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn collect_attestation_retraction_files(
     root: &std::path::Path,
     files: &mut Vec<std::path::PathBuf>,

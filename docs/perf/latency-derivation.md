@@ -69,7 +69,7 @@ and backed by the checked-in `lindley-bounds.json` artifact today.
 |---------------|--------------------------------|----------------|
 | `<50ms` capture benchmark | `PtyCapture`, `DeltaExtraction`, `StorageWrite` | Covered by `docs/attestations/perf/lindley-bounds.json`. |
 | End-to-end capture path | `PtyCapture`, `DeltaExtraction`, `StorageWrite`, `PatternDetection`, `EventEmission` | Modeled, pending empirical: `LindleyTelemetryModel::documented_end_to_end_capture_default()` now covers all five leaves with a 23.1ms budget-backed bound, but the release artifact still lacks an empirical agreement row for the full PTY-to-event path. |
-| Renderer input-to-photon SLOs | Renderer-specific stages are not represented as `LatencyStage` leaves yet | Gap: G18 owns the renderer SLO catalog; this Lindley derivation cannot honestly claim that surface until renderer stage telemetry lands. |
+| Renderer input-to-photon SLOs | Renderer-specific known-key trace stages in `crates/frankenterm-gui/src/renderer_slo.rs` | Substrate wired, pending retained lab run: G18.2 now emits deterministic stage telemetry and `tests/input_to_photon_bound.rs` checks Lindley agreement, but the release artifact must keep the claim non-covered until target-run empirical p95/p99 rows are retained. |
 | Robot Mode response `<5ms` | `ApiResponse` plus handler-specific read/query work | Gap: G19/G54 evidence streams include `robot.p95`, but there is no `LatencyStage` telemetry model for the handler path yet. |
 | FTS5 query `<10ms` | Search/read path plus `ApiResponse`; not the write-side `StorageWrite` leaf | Gap: G19/G54 evidence streams include `fts5.query_p99`, but the FTS5 query service curve is not in `latency_stages.rs` yet. |
 
@@ -77,8 +77,10 @@ The unresolved evidence gaps above are tracked in `ft-tf6g3.51` rather
 than being folded into this artifact with invented numbers. The release
 bundle can use the current artifact for the 4KB overlap benchmark, and
 it can cite the end-to-end capture chain only as `modeled_pending_empirical`
-until a real PTY-to-event empirical row lands. It must not cite this
-artifact as proof for renderer, Robot Mode, or FTS5 read-path SLOs.
+until a real PTY-to-event empirical row lands. It can cite renderer
+input-to-photon only as `stage_telemetry_substrate_wired_pending_lab_run`.
+It must not cite this artifact as proof for renderer, Robot Mode, or FTS5
+read-path SLOs.
 
 ## Capture Latency
 
@@ -220,7 +222,7 @@ Per release, the substrate's
     { "claim_surface": "end_to_end_capture_path", "status": "modeled_pending_empirical" },
     { "claim_surface": "robot_mode_response_lt_5ms", "status": "pending_service_curve" },
     { "claim_surface": "fts5_query_lt_10ms", "status": "pending_service_curve" },
-    { "claim_surface": "renderer_input_to_photon", "status": "pending_stage_telemetry" }
+    { "claim_surface": "renderer_input_to_photon", "status": "stage_telemetry_substrate_wired_pending_lab_run" }
   ]
 }
 ```

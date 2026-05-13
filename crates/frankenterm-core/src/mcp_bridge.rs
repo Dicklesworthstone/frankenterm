@@ -12,7 +12,7 @@ use super::{
     WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool,
     WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaPanesResource,
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
-    WaReleaseTool, WaReservationsByPaneTemplateResource,
+    WaReleaseTool, WaRendererInputToPhotonResource, WaReservationsByPaneTemplateResource,
     WaReservationsResource, WaReservationsTool, WaReserveTool, WaRulesByAgentTemplateResource,
     WaRulesListTool, WaRulesResource, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
     WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
@@ -271,6 +271,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         ))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaHerdWaveResource)
+        .resource(WaRendererInputToPhotonResource)
         .resource(WaProofHistoryResource::new(Arc::clone(&config)))
         .resource(WaProofHistoryReleaseBlockingResource::new(Arc::clone(
             &config,

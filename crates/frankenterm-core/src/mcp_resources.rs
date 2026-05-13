@@ -22,6 +22,9 @@ use crate::proof_lane::{
     ProofHistoryArtifactInput, ProofHistoryIndex, ProofHistoryQuery, ProofReleaseScoreboard,
     ProofState,
 };
+use crate::render_quality::{
+    RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, renderer_slos_doctor_report,
+};
 use crate::swarm_scheduler::{
     HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
 };
@@ -142,6 +145,7 @@ fn attestation_retractions_root(config: &Config) -> Result<(PathBuf, PathBuf), S
     Ok((layout.root, root))
 }
 
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn collect_attestation_retraction_files(
     root: &Path,
     files: &mut Vec<PathBuf>,
@@ -167,7 +171,9 @@ fn collect_attestation_retraction_files(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.ends_with(".json")
+        if std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
             && !name.ends_with(".canonical.json")
             && !name.ends_with(".payload.json")
         {
@@ -235,7 +241,7 @@ fn load_proof_history_query_from_roots(
 
     let artifacts = paths
         .into_iter()
-        .map(|path| proof_history_artifact_input_from_path(&workspace_root, &path))
+        .map(|path| proof_history_artifact_input_from_path(workspace_root, &path))
         .collect::<Vec<_>>();
     let index = ProofHistoryIndex::from_artifacts(&artifacts);
     let scoreboard = ProofReleaseScoreboard::from_history(&index);
@@ -781,6 +787,36 @@ impl ResourceHandler for WaHerdWaveResource {
     }
 }
 
+pub(super) struct WaRendererInputToPhotonResource;
+
+impl ResourceHandler for WaRendererInputToPhotonResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI.to_string(),
+            name: "ft renderer input-to-photon SLO".to_string(),
+            description: Some(
+                "Read-only input-to-photon renderer SLO status and evidence pointers".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "perf".to_string(),
+                "renderer-slo".to_string(),
+                "input-to-photon".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let report = renderer_slos_doctor_report();
+        let envelope = McpEnvelope::success(report.input_to_photon, elapsed_ms(start));
+        envelope_as_resource(RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, envelope)
+    }
+}
+
 pub(super) struct WaProofHistoryResource {
     config: Arc<Config>,
 }
@@ -1179,7 +1215,7 @@ mod tests {
         WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
         WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
         WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
-        WaProofHistoryTemplateResource,
+        WaProofHistoryTemplateResource, WaRendererInputToPhotonResource,
         WaReservationsByPaneTemplateResource, WaReservationsResource,
         WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource, envelope_as_resource,
         load_proof_history_query_from_roots, tool_output_as_resource,
@@ -1351,6 +1387,18 @@ mod tests {
     }
 
     #[test]
+    fn renderer_input_to_photon_resource_definition_uri() {
+        let def = WaRendererInputToPhotonResource.definition();
+        assert_eq!(
+            def.uri,
+            crate::render_quality::RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI
+        );
+        assert!(def.tags.contains(&"perf".to_string()));
+        assert!(def.tags.contains(&"renderer-slo".to_string()));
+        assert!(def.tags.contains(&"input-to-photon".to_string()));
+    }
+
+    #[test]
     fn attestation_retractions_resource_definition_uri() {
         let resource = WaAttestationRetractionsResource::new(Arc::new(Config::default()));
         let def = resource.definition();
@@ -1388,6 +1436,31 @@ mod tests {
         assert_eq!(
             payload["data"]["mcp_resource"]["uri"].as_str(),
             Some("wa://herd-wave")
+        );
+    }
+
+    #[test]
+    fn renderer_input_to_photon_resource_reads_doctor_contract() {
+        let resource = WaRendererInputToPhotonResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let contents = resource
+            .read(&ctx)
+            .expect("read renderer input-to-photon resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["mcp_resource_uri"].as_str(),
+            Some(crate::render_quality::RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI)
+        );
+        assert_eq!(
+            payload["data"]["status"].as_str(),
+            Some(crate::render_quality::RENDERER_INPUT_TO_PHOTON_STATUS)
+        );
+        assert_eq!(
+            payload["data"]["structured_log_template"].as_str(),
+            Some("target/criterion/slo-input_to_photon_<platform>.jsonl")
         );
     }
 
@@ -1574,6 +1647,7 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaRendererInputToPhotonResource.definition().uri,
             WaProofHistoryResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
@@ -1619,6 +1693,7 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaRendererInputToPhotonResource.definition().uri,
             WaProofHistoryResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
@@ -1656,6 +1731,7 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaRendererInputToPhotonResource.definition(),
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
@@ -1686,6 +1762,7 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaRendererInputToPhotonResource.definition(),
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
