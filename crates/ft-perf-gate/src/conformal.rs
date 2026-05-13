@@ -130,6 +130,136 @@ pub fn fit_band_from_samples(
     })
 }
 
+// =============================================================================
+// Split-conformal prediction band (G26 / ft-tf6g3.11)
+// =============================================================================
+//
+// Reference: Angelopoulos & Bates 2022, "A Gentle Introduction to Conformal
+// Prediction and Distribution-Free Uncertainty Quantification"
+// (https://arxiv.org/abs/2107.07511). The split-conformal procedure used here:
+//
+//   1. Split N samples into calibration (~half) and test windows. The
+//      Angelopoulos-Bates tutorial uses ANY consistent point-estimator as
+//      the "predictor"; we use the calibration set's mean since the
+//      claim is a single scalar metric.
+//   2. Score each calibration point with its nonconformity score
+//      s_i = |x_i - mean_calibration|. Other choices are valid (absolute
+//      residual, sign-adjusted residual); absolute deviation is the
+//      simplest sound choice for a symmetric two-sided band.
+//   3. The band's half-radius is the ceiling((1-alpha)(n+1)/n)-th order
+//      statistic of the calibration scores. This is the finite-sample
+//      conformal quantile.
+//   4. The published band is [mean_cal - radius, mean_cal + radius] and
+//      its marginal coverage is at least (1 - alpha) for any
+//      exchangeable test point drawn from the same distribution.
+
+/// Configuration for split-conformal prediction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SplitConformalConfig {
+    /// Target miscoverage rate. Conventional: 0.05 -> 95% coverage.
+    pub alpha: f64,
+    /// Fraction of samples reserved for calibration. Conventional: 0.5.
+    pub calibration_fraction: f64,
+    /// Minimum calibration samples required to publish a band.
+    pub min_calibration_samples: usize,
+}
+
+impl Default for SplitConformalConfig {
+    fn default() -> Self {
+        Self {
+            alpha: 0.05,
+            calibration_fraction: 0.5,
+            min_calibration_samples: 16,
+        }
+    }
+}
+
+/// Fit a finite-sample split-conformal band from collected evidence.
+///
+/// Returns `Ok(band)` when calibration succeeds with the configured
+/// minimum sample count; returns `Err(GateDecision)` when the
+/// pre-calibration check fails. The band's `lower` / `upper` fields
+/// then represent the conformal prediction interval and `alpha`
+/// records the target miscoverage rate.
+#[must_use]
+pub fn fit_split_conformal_band(
+    samples: &[EvidenceSample],
+    cfg: &SplitConformalConfig,
+) -> Result<ConformalBand, GateDecision> {
+    if !(0.0..1.0).contains(&cfg.alpha)
+        || !(0.0..1.0).contains(&cfg.calibration_fraction)
+        || cfg.calibration_fraction <= 0.0
+    {
+        return Err(GateDecision::LowConfidence {
+            reason: "split-conformal config malformed (alpha or calibration_fraction out of (0,1))".to_string(),
+            confidence: None,
+        });
+    }
+    let claim_id = samples
+        .first()
+        .map_or_else(|| "unknown".to_string(), |s| s.claim_id.clone());
+
+    let values: Vec<f64> = samples.iter().map(|s| s.metric_value).collect();
+    if values.iter().any(|v| !v.is_finite()) {
+        return Err(GateDecision::LowConfidence {
+            reason: "calibration samples must be finite".to_string(),
+            confidence: None,
+        });
+    }
+
+    // Calibration / test split — deterministic so reruns produce the same
+    // band. We take the first calibration_fraction of the input in arrival
+    // order; callers wanting random splits should shuffle the input
+    // upstream (the G54 fixture corpus is already deterministic).
+    let n_cal = ((values.len() as f64) * cfg.calibration_fraction).floor() as usize;
+    if n_cal < cfg.min_calibration_samples {
+        return Err(GateDecision::Continue {
+            reason: "not enough calibration samples for split-conformal".to_string(),
+            needed_samples: u64::try_from(cfg.min_calibration_samples.saturating_sub(n_cal)).ok(),
+        });
+    }
+    let cal: &[f64] = &values[..n_cal];
+
+    let mean: f64 = cal.iter().sum::<f64>() / (n_cal as f64);
+    let mut scores: Vec<f64> = cal.iter().map(|v| (v - mean).abs()).collect();
+    scores.sort_by(f64::total_cmp);
+
+    // Conformal quantile: ceil((1 - alpha) * (n + 1)) / n-th order statistic.
+    // Use 1-based indexing per the standard formulation.
+    let n = n_cal;
+    let q_level = ((1.0 - cfg.alpha) * ((n + 1) as f64)).ceil() as usize;
+    let q_idx = q_level.min(n).saturating_sub(1);
+    let radius = scores[q_idx];
+
+    Ok(ConformalBand {
+        claim_id,
+        lower: mean - radius,
+        upper: mean + radius,
+        calibration_samples: n_cal,
+        alpha: cfg.alpha,
+    })
+}
+
+/// Audit the marginal coverage of a fitted band over a held-out test set.
+///
+/// Returns the empirical coverage rate (fraction of test samples whose
+/// `metric_value` lies inside `[band.lower, band.upper]`). The split-conformal
+/// theory guarantees `coverage >= 1 - alpha` in expectation over the random
+/// calibration / test split, with finite-sample deviation bounded by the
+/// number of calibration samples.
+#[must_use]
+pub fn audit_coverage(band: &ConformalBand, test: &[EvidenceSample]) -> f64 {
+    if test.is_empty() {
+        return 0.0;
+    }
+    let inside = test
+        .iter()
+        .filter(|s| s.metric_value.is_finite())
+        .filter(|s| (band.lower..=band.upper).contains(&s.metric_value))
+        .count();
+    (inside as f64) / (test.len() as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +280,88 @@ mod tests {
         assert!(matches!(band.decide(4.5), GateDecision::Accept { .. }));
         assert!(matches!(band.decide(8.0), GateDecision::Reject { .. }));
         Ok(())
+    }
+
+    #[test]
+    fn split_conformal_fits_a_band_with_reasonable_radius() -> Result<(), String> {
+        // 32 synthesized samples around mean 10 with stddev 0.5; the
+        // 95%-coverage band should sit roughly within [9, 11] depending on
+        // the sample order.
+        let mut seed: u64 = 0xABCDE;
+        let samples: Vec<EvidenceSample> = (0..32)
+            .map(|i| {
+                let v = 10.0 + gauss_test(&mut seed) * 0.5;
+                EvidenceSample::new("robot.p95", v, "ms", 1, i)
+            })
+            .collect();
+        let band = fit_split_conformal_band(&samples, &SplitConformalConfig::default())
+            .map_err(|d| format!("unexpected decision: {d:?}"))?;
+        assert_eq!(band.calibration_samples, 16);
+        assert!(band.upper > band.lower, "upper > lower");
+        // With sigma=0.5 and ~16 calibration samples the radius should be small.
+        assert!(band.upper - band.lower < 4.0, "band too wide: {} to {}", band.lower, band.upper);
+        Ok(())
+    }
+
+    #[test]
+    fn split_conformal_continues_below_min_calibration() {
+        let samples: Vec<EvidenceSample> = (0..4)
+            .map(|i| EvidenceSample::new("robot.p95", 10.0 + (i as f64) * 0.1, "ms", 1, i))
+            .collect();
+        match fit_split_conformal_band(&samples, &SplitConformalConfig::default()) {
+            Err(GateDecision::Continue { .. }) => {}
+            other => panic!("expected Continue for 4-sample input; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_conformal_audit_coverage_satisfies_target() {
+        // Calibrate on the first half, audit on the second half. Marginal
+        // coverage should be at or above (1 - alpha) modulo finite-sample noise.
+        let mut seed: u64 = 0x42;
+        let samples: Vec<EvidenceSample> = (0..200)
+            .map(|i| {
+                let v = 10.0 + gauss_test(&mut seed) * 0.5;
+                EvidenceSample::new("robot.p95", v, "ms", 1, i)
+            })
+            .collect();
+        let band = fit_split_conformal_band(&samples, &SplitConformalConfig::default())
+            .expect("band fits cleanly");
+        let test_set: &[EvidenceSample] = &samples[100..];
+        let coverage = audit_coverage(&band, test_set);
+        // With alpha=0.05 the theoretical coverage is >= 0.95; allow 0.85 as a
+        // generous finite-sample lower bound for n=100 calibration samples.
+        assert!(coverage >= 0.85, "coverage {coverage} below 0.85 floor");
+    }
+
+    #[test]
+    fn split_conformal_rejects_malformed_alpha() {
+        let samples: Vec<EvidenceSample> = (0..40)
+            .map(|i| EvidenceSample::new("robot.p95", 10.0, "ms", 1, i))
+            .collect();
+        let cfg = SplitConformalConfig {
+            alpha: 1.5,
+            ..Default::default()
+        };
+        match fit_split_conformal_band(&samples, &cfg) {
+            Err(GateDecision::LowConfidence { .. }) => {}
+            other => panic!("expected LowConfidence for alpha=1.5; got {other:?}"),
+        }
+    }
+
+    fn gauss_test(seed: &mut u64) -> f64 {
+        let u1 = xorshift_uniform(seed);
+        let u2 = xorshift_uniform(seed);
+        let u1 = u1.max(1e-12);
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    fn xorshift_uniform(seed: &mut u64) -> f64 {
+        let mut s = *seed;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *seed = s;
+        (s as f64) / (u64::MAX as f64)
     }
 }

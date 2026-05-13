@@ -12,6 +12,9 @@
 //!
 //! Bead: ft-tf6g3.10 (G25).
 
+use ft_perf_gate::conformal::{
+    audit_coverage, fit_split_conformal_band, SplitConformalConfig,
+};
 use ft_perf_gate::sprt::{
     evaluate_anytime_valid_ci, evaluate_wald_sprt, AnytimeValidCiConfig, AnytimeValidTest,
     WaldSprtConfig,
@@ -174,6 +177,86 @@ fn anytime_valid_ci_rejects_regression_above_threshold() {
         "regression-injected mean must exceed threshold 4.5; got {:?}",
         report.decision
     );
+}
+
+#[test]
+fn split_conformal_band_fits_baseline_30d() {
+    // 720-row stationary baseline; expect a tight band around mean 4.2 with
+    // half-radius proportional to stddev 0.5 at alpha=0.05.
+    let samples = load_fixture("robot.p95", "baseline-30d");
+    let cfg = SplitConformalConfig {
+        alpha: 0.05,
+        calibration_fraction: 0.5,
+        min_calibration_samples: 64,
+    };
+    let band = fit_split_conformal_band(&samples, &cfg).expect("band fits on 720 stationary rows");
+    eprintln!(
+        "baseline-30d conformal: claim={} band=[{:.3}, {:.3}] cal_samples={}",
+        band.claim_id, band.lower, band.upper, band.calibration_samples
+    );
+    // Band must straddle the baseline mean ~4.13 (the synthesized mean, see
+    // tests/fixtures/evidence-corpus/per-claim/robot.p95 manifest).
+    assert!(band.lower < 4.13 && 4.13 < band.upper, "band must contain baseline mean");
+    // Half-radius should not blow up; stddev 0.5 + alpha 0.05 expects radius
+    // roughly 2*sigma ~ 1.0; bound at 3.0 generously.
+    let half = (band.upper - band.lower) / 2.0;
+    assert!(half < 3.0, "band radius {half} too large for sigma=0.5 baseline");
+}
+
+#[test]
+fn split_conformal_band_marginal_coverage_holds() {
+    // Calibrate on the first half, audit on the second half. Empirical
+    // coverage should meet the target 95% rate within finite-sample noise.
+    let samples = load_fixture("robot.p95", "baseline-30d");
+    let cfg = SplitConformalConfig {
+        alpha: 0.05,
+        calibration_fraction: 0.5,
+        min_calibration_samples: 64,
+    };
+    let band = fit_split_conformal_band(&samples, &cfg).expect("band fits");
+    let test_set: &[EvidenceSample] = &samples[(samples.len() / 2)..];
+    let coverage = audit_coverage(&band, test_set);
+    eprintln!(
+        "marginal coverage: {:.3} over {} test samples (target >= 0.95)",
+        coverage,
+        test_set.len()
+    );
+    // 360-sample audit set: finite-sample noise around 95% is around +/- 2%.
+    // Require >= 0.85 as a generous lower bound to keep the test stable on CI.
+    assert!(coverage >= 0.85, "marginal coverage {coverage} below 0.85 floor on stationary fixture");
+}
+
+#[test]
+fn split_conformal_band_alerts_on_regime_shift() {
+    // Calibrate on pre-shift slice; audit on post-shift slice. Coverage
+    // should drop substantially (the band fit on the lower regime cannot
+    // cover the elevated post-shift mean), which is exactly the
+    // miscoverage-detection signal G42's regime-shift gate listens for.
+    let all = load_fixture("robot.p95", "regime-shift");
+    let pre: Vec<EvidenceSample> = all.iter().take(100).cloned().collect();
+    let post: Vec<EvidenceSample> = all.iter().skip(100).cloned().collect();
+    let cfg = SplitConformalConfig {
+        alpha: 0.05,
+        calibration_fraction: 1.0 - f64::EPSILON, // use entire pre-shift as calibration
+        min_calibration_samples: 64,
+    };
+    // calibration_fraction=1.0 is out of (0,1) range; clamp to 0.99 manually
+    // so the entire pre-shift slice (minus 1 sample) is used.
+    let cfg = SplitConformalConfig {
+        calibration_fraction: 0.99,
+        ..cfg
+    };
+    let band = fit_split_conformal_band(&pre, &cfg).expect("band fits on 99 pre-shift samples");
+    let post_coverage = audit_coverage(&band, &post);
+    eprintln!(
+        "post-shift coverage on pre-shift-calibrated band: {:.3} (target: noticeable drop)",
+        post_coverage
+    );
+    // Post-shift coverage should be substantially below the alpha-targeted
+    // 0.95 — the band fit on the lower regime cannot cover the elevated mean.
+    // 30% mean shift + 1.8x sigma bumps post samples well outside the
+    // pre-shift band; expect coverage below 0.5.
+    assert!(post_coverage < 0.5, "expected miscoverage on regime shift; got {post_coverage}");
 }
 
 #[test]
