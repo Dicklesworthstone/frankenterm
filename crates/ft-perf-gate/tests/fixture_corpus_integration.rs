@@ -16,6 +16,7 @@ use ft_perf_gate::conformal::{
     audit_coverage, fit_split_conformal_band, SplitConformalConfig,
 };
 use ft_perf_gate::regime_shift::{detect_page_hinkley_kl, PageHinkleyKlConfig};
+use ft_perf_gate::snc::{compute_snc_bound, hill_estimate, MgfServiceCurve, SncBound, SncConfig};
 use ft_perf_gate::sprt::{
     evaluate_anytime_valid_ci, evaluate_wald_sprt, AnytimeValidCiConfig, AnytimeValidTest,
     WaldSprtConfig,
@@ -297,6 +298,74 @@ fn page_hinkley_does_not_alarm_on_baseline_30d_fixture() {
         report.decision
     );
     assert!(report.alarm_at.is_none(), "stationary fixture should yield no alarm index");
+}
+
+#[test]
+fn snc_hill_detects_heavy_tail_alpha_in_pareto_fixture() {
+    // G54 heavy-tail.jsonl is synthesized with Pareto alpha=1.5
+    // (see scripts/regenerate-evidence-corpus.py heavy-tail branch).
+    // Hill should recover an alpha estimate in the heavy-tail regime.
+    let samples = load_fixture("robot.p95", "heavy-tail");
+    let values: Vec<f64> = samples.iter().map(|s| s.metric_value).collect();
+    let est = hill_estimate(&values, 40);
+    eprintln!(
+        "heavy-tail fixture: hill_alpha={:.3} stderr={:.3} k={}",
+        est.alpha, est.stderr, est.k
+    );
+    // Allow ±0.6 around alpha=1.5 — Hill is consistent but biased
+    // and 200 samples is not enormous. The key signal: alpha must be
+    // FINITE and the bound must clearly distinguish from light-tail.
+    assert!(est.alpha.is_finite(), "hill alpha must be finite");
+    assert!(
+        (0.9..3.0).contains(&est.alpha),
+        "expected hill_alpha in [0.9, 3.0) for a Pareto-1.5 fixture; got {}",
+        est.alpha
+    );
+}
+
+#[test]
+fn snc_returns_heavy_tail_bound_for_pareto_fixture() {
+    let samples = load_fixture("robot.p95", "heavy-tail");
+    // Choose a service rate that comfortably exceeds the fixture's mean
+    // (Pareto-1.5 mean is finite but heavy-tailed; service_rate=10 keeps
+    // utilization below 1).
+    let service = MgfServiceCurve { rate: 10.0, burst: 1.0 };
+    let cfg = SncConfig {
+        confidence: 0.99,
+        hill_k: 40,
+        ..SncConfig::default()
+    };
+    let bound = compute_snc_bound(&samples, &service, &cfg);
+    eprintln!("heavy-tail bound: {:?}", bound);
+    match bound {
+        SncBound::HeavyTailBound { confidence, delay_ms, alpha } => {
+            assert!((0.989..=0.99001).contains(&confidence));
+            assert!(delay_ms.is_finite() && delay_ms > 0.0);
+            assert!((0.9..3.0).contains(&alpha));
+        }
+        // If the fixture's Hill estimate happens to land above the
+        // threshold, that's also acceptable — the path through
+        // LindleyDomain is intentional. We only want to reject OutOfDomain.
+        SncBound::LindleyDomain { alpha } => {
+            assert!(alpha >= 2.0, "LindleyDomain only valid for alpha >= 2; got {alpha}");
+        }
+        SncBound::OutOfDomain { reason } => panic!("did not expect OutOfDomain for heavy-tail fixture: {reason}"),
+    }
+}
+
+#[test]
+fn snc_returns_lindley_domain_for_stationary_baseline() {
+    let samples = load_fixture("robot.p95", "baseline-30d");
+    let service = MgfServiceCurve { rate: 100.0, burst: 1.0 };
+    let cfg = SncConfig::default();
+    let bound = compute_snc_bound(&samples, &service, &cfg);
+    eprintln!("baseline bound: {:?}", bound);
+    // Gaussian baseline is light-tail; Hill on a Gaussian fixture sample
+    // typically returns a large or even Inf alpha. The deriver should
+    // route through LindleyDomain (or HeavyTailBound if Hill mis-classifies,
+    // which is a known limitation of the estimator on Gaussian tails).
+    // Either is acceptable; OutOfDomain is NOT.
+    assert!(!matches!(bound, SncBound::OutOfDomain { .. }));
 }
 
 #[test]
