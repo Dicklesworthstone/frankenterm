@@ -12,14 +12,16 @@
 //!
 //! Bead: ft-tf6g3.10 (G25).
 
-use ft_perf_gate::conformal::{
-    audit_coverage, fit_split_conformal_band, SplitConformalConfig,
+use ft_perf_gate::causal_attribution::{
+    CAUSAL_GRAPH_SCHEMA_VERSION, CausalAttributionConfig, CausalGraphReport,
+    REGRESSION_ATTRIBUTION_SCHEMA_VERSION, RegressionAttributionReport, attribute_regression_event,
 };
-use ft_perf_gate::regime_shift::{detect_page_hinkley_kl, PageHinkleyKlConfig};
-use ft_perf_gate::snc::{compute_snc_bound, hill_estimate, MgfServiceCurve, SncBound, SncConfig};
+use ft_perf_gate::conformal::{SplitConformalConfig, audit_coverage, fit_split_conformal_band};
+use ft_perf_gate::regime_shift::{PageHinkleyKlConfig, detect_page_hinkley_kl};
+use ft_perf_gate::snc::{MgfServiceCurve, SncBound, SncConfig, compute_snc_bound, hill_estimate};
 use ft_perf_gate::sprt::{
-    evaluate_anytime_valid_ci, evaluate_wald_sprt, AnytimeValidCiConfig, AnytimeValidTest,
-    WaldSprtConfig,
+    AnytimeValidCiConfig, AnytimeValidTest, WaldSprtConfig, evaluate_anytime_valid_ci,
+    evaluate_wald_sprt,
 };
 use ft_perf_gate::{EvidenceSample, GateDecision};
 use std::fs;
@@ -37,15 +39,46 @@ fn fixture_path(claim: &str, flavor: &str) -> PathBuf {
     p
 }
 
+fn repo_path(relative: &str) -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop();
+    p.pop();
+    p.push(relative);
+    p
+}
+
 fn load_fixture(claim: &str, flavor: &str) -> Vec<EvidenceSample> {
     let path = fixture_path(claim, flavor);
-    let body = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let body = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     body.lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str::<EvidenceSample>(l)
-            .unwrap_or_else(|e| panic!("parse fixture row: {e}; line={l}")))
+        .map(|l| {
+            serde_json::from_str::<EvidenceSample>(l)
+                .unwrap_or_else(|e| panic!("parse fixture row: {e}; line={l}"))
+        })
         .collect()
+}
+
+fn load_json_fixture<T: serde::de::DeserializeOwned>(relative: &str) -> T {
+    let path = repo_path(relative);
+    let body = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&body).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+fn label_regression_commit(samples: &mut [EvidenceSample], change_point: usize) {
+    for (idx, sample) in samples.iter_mut().enumerate() {
+        sample.commit_sha = Some(
+            if idx < change_point {
+                "fd89ed378-baseline"
+            } else {
+                "g43-regression-commit"
+            }
+            .to_string(),
+        );
+        sample.hardware_fingerprint = Some("fixture-m2-pro".to_string());
+        sample.runner_sku = Some("github-hosted-macos-14-3core".to_string());
+        sample.workload_class = Some("robot-mode-mixed-fixtures".to_string());
+    }
 }
 
 #[test]
@@ -53,7 +86,7 @@ fn wald_sprt_accepts_h0_on_baseline_30d_robot_p95() {
     let samples = load_fixture("robot.p95", "baseline-30d");
     let cfg = WaldSprtConfig {
         mu_null: 4.2,
-        mu_alt: 4.83,   // mu_null * 1.15 — the 15% regression we'd catch
+        mu_alt: 4.83, // mu_null * 1.15 — the 15% regression we'd catch
         sigma: 0.5,
         alpha: 0.05,
         beta: 0.05,
@@ -136,7 +169,7 @@ fn anytime_valid_ci_accepts_baseline_below_threshold() {
     let cfg = AnytimeValidCiConfig {
         sigma: 0.5,
         alpha: 0.05,
-        threshold: 5.0,   // baseline mean 4.2, target SLO 5.0
+        threshold: 5.0, // baseline mean 4.2, target SLO 5.0
         test_kind: AnytimeValidTest::UpperBoundMustHold,
         min_samples: 32,
         max_samples: 720,
@@ -164,7 +197,7 @@ fn anytime_valid_ci_rejects_regression_above_threshold() {
     let cfg = AnytimeValidCiConfig {
         sigma: 0.5,
         alpha: 0.05,
-        threshold: 4.5,   // tight SLO; the post-regression mean ~4.78 exceeds it
+        threshold: 4.5, // tight SLO; the post-regression mean ~4.78 exceeds it
         test_kind: AnytimeValidTest::UpperBoundMustHold,
         min_samples: 32,
         max_samples: 100,
@@ -198,11 +231,17 @@ fn split_conformal_band_fits_baseline_30d() {
     );
     // Band must straddle the baseline mean ~4.13 (the synthesized mean, see
     // tests/fixtures/evidence-corpus/per-claim/robot.p95 manifest).
-    assert!(band.lower < 4.13 && 4.13 < band.upper, "band must contain baseline mean");
+    assert!(
+        band.lower < 4.13 && 4.13 < band.upper,
+        "band must contain baseline mean"
+    );
     // Half-radius should not blow up; stddev 0.5 + alpha 0.05 expects radius
     // roughly 2*sigma ~ 1.0; bound at 3.0 generously.
     let half = (band.upper - band.lower) / 2.0;
-    assert!(half < 3.0, "band radius {half} too large for sigma=0.5 baseline");
+    assert!(
+        half < 3.0,
+        "band radius {half} too large for sigma=0.5 baseline"
+    );
 }
 
 #[test]
@@ -225,7 +264,10 @@ fn split_conformal_band_marginal_coverage_holds() {
     );
     // 360-sample audit set: finite-sample noise around 95% is around +/- 2%.
     // Require >= 0.85 as a generous lower bound to keep the test stable on CI.
-    assert!(coverage >= 0.85, "marginal coverage {coverage} below 0.85 floor on stationary fixture");
+    assert!(
+        coverage >= 0.85,
+        "marginal coverage {coverage} below 0.85 floor on stationary fixture"
+    );
 }
 
 #[test]
@@ -258,7 +300,10 @@ fn split_conformal_band_alerts_on_regime_shift() {
     // 0.95 — the band fit on the lower regime cannot cover the elevated mean.
     // 30% mean shift + 1.8x sigma bumps post samples well outside the
     // pre-shift band; expect coverage below 0.5.
-    assert!(post_coverage < 0.5, "expected miscoverage on regime shift; got {post_coverage}");
+    assert!(
+        post_coverage < 0.5,
+        "expected miscoverage on regime shift; got {post_coverage}"
+    );
 }
 
 #[test]
@@ -297,7 +342,90 @@ fn page_hinkley_does_not_alarm_on_baseline_30d_fixture() {
         "Page-Hinkley must NOT alarm on stationary 720-row baseline fixture; got {:?}",
         report.decision
     );
-    assert!(report.alarm_at.is_none(), "stationary fixture should yield no alarm index");
+    assert!(
+        report.alarm_at.is_none(),
+        "stationary fixture should yield no alarm index"
+    );
+}
+
+#[test]
+fn causal_attribution_implicates_labeled_regression_commit() {
+    let mut samples = load_fixture("robot.p95", "regression-injected");
+    label_regression_commit(&mut samples, 100);
+    let cfg = CausalAttributionConfig {
+        min_samples: 64,
+        baseline: Some(4.2),
+        min_alternative_support: 20,
+        min_risk_lift: 0.20,
+        ..CausalAttributionConfig::default()
+    };
+
+    let report = attribute_regression_event("robot-p95-regression-injected", &samples, &cfg);
+    eprintln!(
+        "causal attribution: implicated_commit={:?} residual={:.3} top={:?} edges={:?}",
+        report.implicated_commit,
+        report.residual_unexplained_variance,
+        report.alternatives.first(),
+        report.graph.edges
+    );
+
+    assert_eq!(
+        report.schema_version, REGRESSION_ATTRIBUTION_SCHEMA_VERSION,
+        "published per-event report schema stays stable"
+    );
+    assert_eq!(
+        report.implicated_commit.as_deref(),
+        Some("g43-regression-commit")
+    );
+    assert!(
+        report.graph.edges.iter().any(|edge| {
+            (edge.left == "commit_sha" && edge.right == "metric_regressed")
+                || (edge.left == "metric_regressed" && edge.right == "commit_sha")
+        }),
+        "PC skeleton should retain the commit/metric edge for the labeled fixture"
+    );
+    assert!(
+        report.residual_unexplained_variance < 0.80,
+        "fixture attribution should explain a meaningful share of regression variance"
+    );
+    assert!(matches!(report.decision, GateDecision::Accept { .. }));
+}
+
+#[test]
+fn published_causal_attribution_artifacts_are_parseable() {
+    let graph: CausalGraphReport = load_json_fixture("docs/perf/causal-graph.json");
+    assert_eq!(graph.schema_version, CAUSAL_GRAPH_SCHEMA_VERSION);
+    assert_eq!(graph.claim_id, "robot.p95");
+    assert!(graph.sample_count >= 200);
+    assert!(
+        graph.edges.iter().any(|edge| {
+            (edge.left == "commit_sha" && edge.right == "metric_regressed")
+                || (edge.left == "metric_regressed" && edge.right == "commit_sha")
+        }),
+        "weekly graph artifact should expose the attribution edge"
+    );
+
+    let attribution: RegressionAttributionReport =
+        load_json_fixture("docs/perf/regression-attribution/robot-p95-regression-injected.json");
+    assert_eq!(
+        attribution.schema_version,
+        REGRESSION_ATTRIBUTION_SCHEMA_VERSION
+    );
+    assert_eq!(attribution.event_id, "robot-p95-regression-injected");
+    assert_eq!(
+        attribution.implicated_commit.as_deref(),
+        Some("g43-regression-commit")
+    );
+    assert!(
+        attribution
+            .alternatives
+            .iter()
+            .any(|candidate| candidate.factor == "commit_sha"
+                && candidate.value == "g43-regression-commit"
+                && candidate.risk_lift > 0.20),
+        "event artifact should rank the injected commit as a positive-risk alternative"
+    );
+    assert!(attribution.residual_unexplained_variance < 0.80);
 }
 
 #[test]
@@ -329,7 +457,10 @@ fn snc_returns_heavy_tail_bound_for_pareto_fixture() {
     // Choose a service rate that comfortably exceeds the fixture's mean
     // (Pareto-1.5 mean is finite but heavy-tailed; service_rate=10 keeps
     // utilization below 1).
-    let service = MgfServiceCurve { rate: 10.0, burst: 1.0 };
+    let service = MgfServiceCurve {
+        rate: 10.0,
+        burst: 1.0,
+    };
     let cfg = SncConfig {
         confidence: 0.99,
         hill_k: 40,
@@ -338,7 +469,11 @@ fn snc_returns_heavy_tail_bound_for_pareto_fixture() {
     let bound = compute_snc_bound(&samples, &service, &cfg);
     eprintln!("heavy-tail bound: {:?}", bound);
     match bound {
-        SncBound::HeavyTailBound { confidence, delay_ms, alpha } => {
+        SncBound::HeavyTailBound {
+            confidence,
+            delay_ms,
+            alpha,
+        } => {
             assert!((0.989..=0.99001).contains(&confidence));
             assert!(delay_ms.is_finite() && delay_ms > 0.0);
             assert!((0.9..3.0).contains(&alpha));
@@ -347,16 +482,24 @@ fn snc_returns_heavy_tail_bound_for_pareto_fixture() {
         // threshold, that's also acceptable — the path through
         // LindleyDomain is intentional. We only want to reject OutOfDomain.
         SncBound::LindleyDomain { alpha } => {
-            assert!(alpha >= 2.0, "LindleyDomain only valid for alpha >= 2; got {alpha}");
+            assert!(
+                alpha >= 2.0,
+                "LindleyDomain only valid for alpha >= 2; got {alpha}"
+            );
         }
-        SncBound::OutOfDomain { reason } => panic!("did not expect OutOfDomain for heavy-tail fixture: {reason}"),
+        SncBound::OutOfDomain { reason } => {
+            panic!("did not expect OutOfDomain for heavy-tail fixture: {reason}")
+        }
     }
 }
 
 #[test]
 fn snc_returns_lindley_domain_for_stationary_baseline() {
     let samples = load_fixture("robot.p95", "baseline-30d");
-    let service = MgfServiceCurve { rate: 100.0, burst: 1.0 };
+    let service = MgfServiceCurve {
+        rate: 100.0,
+        burst: 1.0,
+    };
     let cfg = SncConfig::default();
     let bound = compute_snc_bound(&samples, &service, &cfg);
     eprintln!("baseline bound: {:?}", bound);
@@ -371,14 +514,26 @@ fn snc_returns_lindley_domain_for_stationary_baseline() {
 #[test]
 fn fixture_schema_consistency() {
     // Spot-check that the loaded samples conform to v1 schema invariants.
-    for flavor in ["baseline-30d", "regression-injected", "regime-shift", "heavy-tail", "sparse"] {
+    for flavor in [
+        "baseline-30d",
+        "regression-injected",
+        "regime-shift",
+        "heavy-tail",
+        "sparse",
+    ] {
         let samples = load_fixture("robot.p95", flavor);
-        assert!(!samples.is_empty() || flavor == "sparse-empty", "flavor {flavor} has rows");
+        assert!(
+            !samples.is_empty() || flavor == "sparse-empty",
+            "flavor {flavor} has rows"
+        );
         for s in &samples {
             assert_eq!(s.schema_version, "ft.perf.evidence-sample.v1");
             assert_eq!(s.claim_id, "robot.p95");
             assert_eq!(s.metric_unit, "ms");
-            assert!(s.metric_value.is_finite(), "all fixture metric_values finite");
+            assert!(
+                s.metric_value.is_finite(),
+                "all fixture metric_values finite"
+            );
             assert!(s.sample_size >= 1);
         }
     }

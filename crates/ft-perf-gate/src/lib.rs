@@ -32,10 +32,17 @@ pub mod regime_shift;
 pub mod snc;
 pub mod sprt;
 
-pub use causal_attribution::{AttributionCandidate, AttributionReport};
+pub use causal_attribution::{
+    AttributionCandidate, AttributionReport, CAUSAL_GRAPH_SCHEMA_VERSION, CausalAttributionConfig,
+    CausalEdge, CausalGraphReport, CausalVariable, CausalVariableRole,
+    REGRESSION_ATTRIBUTION_SCHEMA_VERSION, RegressionAttributionReport, SeparatingSet,
+    attribute_regression_event, infer_pc_skeleton,
+};
 pub use conformal::{ConformalBand, ConformalConfig};
 pub use regime_shift::{RegimeShiftConfig, RegimeShiftReport};
-pub use snc::{compute_snc_bound, hill_estimate, HillEstimate, MgfServiceCurve, SncBound, SncConfig};
+pub use snc::{
+    HillEstimate, MgfServiceCurve, SncBound, SncConfig, compute_snc_bound, hill_estimate,
+};
 pub use sprt::{SprtConfig, SprtReport};
 
 /// Schema marker for per-claim evidence samples consumed by proof gates.
