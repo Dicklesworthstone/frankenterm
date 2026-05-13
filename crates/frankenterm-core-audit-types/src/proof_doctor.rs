@@ -456,6 +456,7 @@ pub fn merge_proof_doctor_artifact_json(
     merge_common_rch_fields(evidence, artifact);
     merge_preflight_fields(evidence, artifact);
     merge_harness_summary_fields(evidence, artifact);
+    merge_scale_lab_fields(evidence, artifact);
 }
 
 fn merge_common_rch_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value) {
@@ -601,6 +602,35 @@ fn merge_harness_summary_fields(evidence: &mut ProofDoctorEvidence, artifact: &V
             evidence.rustc_reached = true;
             evidence.test_binary_started = true;
             set_i32(&mut evidence.remote_exit_code, Some(101));
+        }
+    }
+}
+
+fn merge_scale_lab_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value) {
+    if evidence.high_scale_predicate_met.is_none() {
+        evidence.high_scale_predicate_met = json_bool(artifact, "high_scale_predicate_met")
+            .or_else(|| json_path_bool(artifact, &["high_scale_claim", "target_hardware_met"]));
+    }
+
+    if evidence.scale_lab_artifact.is_some() {
+        return;
+    }
+
+    let Some(scale_lab_value) = artifact.get("scale_lab_artifact") else {
+        return;
+    };
+
+    match serde_json::from_value::<ProofDoctorScaleLabArtifactEvidence>(scale_lab_value.clone()) {
+        Ok(scale_lab_artifact) => {
+            evidence.scale_lab_artifact = Some(scale_lab_artifact);
+        }
+        Err(error) => {
+            evidence.artifact_retrieval_status = ArtifactRetrievalStatus::Failed;
+            if evidence.diagnostic_summary.is_none() {
+                evidence.diagnostic_summary = Some(format!(
+                    "Could not parse proof-doctor scale_lab_artifact evidence: {error}"
+                ));
+            }
         }
     }
 }
@@ -2147,6 +2177,51 @@ mod tests {
                 .as_ref()
                 .is_some_and(|projection| projection.safe_to_close),
             "skipped scale-lab evidence must not be safe to close as proven"
+        );
+    }
+
+    #[test]
+    fn merge_artifact_json_imports_scale_lab_skipped_not_proven_evidence() {
+        let mut evidence = ProofDoctorEvidence::default();
+        let mut artifact = scale_lab_artifact();
+        artifact.release_claim_status = Some("skipped_not_proven".to_string());
+        artifact.manifest_status = Some("skipped_not_proven".to_string());
+        artifact.evidence_mode = Some("synthetic_smoke".to_string());
+        artifact.live_mux_available = Some(false);
+        let retained = serde_json::json!({
+            "high_scale_predicate_met": true,
+            "scale_lab_artifact": artifact,
+        });
+
+        merge_proof_doctor_artifact_json(&mut evidence, "scale-lab.json", &retained);
+
+        assert_eq!(evidence.high_scale_predicate_met, Some(true));
+        assert!(evidence.scale_lab_artifact.is_some());
+        assert!(
+            evidence
+                .artifact_paths
+                .iter()
+                .any(|path| path == "scale-lab.json")
+        );
+
+        let mut input = base_input();
+        input
+            .intended_command
+            .push("scale-lab-staged-proof".to_string());
+        input.evidence = evidence;
+        let verdict = classify_proof_doctor(&input);
+
+        assert_eq!(verdict.status, ProofDoctorStatus::SkippedNotProven);
+        assert_eq!(
+            verdict.blockers[0].reason_code,
+            "proof.scale_lab.release_claim_not_proven"
+        );
+        assert_eq!(
+            verdict
+                .ledger_projection
+                .as_ref()
+                .map(|projection| projection.state),
+            Some(ProofState::SkippedNotProven)
         );
     }
 
