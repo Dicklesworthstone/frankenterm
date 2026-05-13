@@ -61,8 +61,9 @@ impl FuzzInput {
         let mut scheduler = CaptureScheduler::new(budget.clone());
         let available_permits = usize::from((self.available_permits % 32).max(1));
         let selected = scheduler.select_panes(&ready_panes, available_permits);
-        for (pane_id, bytes) in selected.iter().zip(self.record_bytes.into_iter()) {
-            scheduler.record_capture(*pane_id, u64::from(bytes));
+        // Update per-pane and global byte tracking
+        for (pane_id, bytes) in selected.iter().zip(self.record_bytes) {
+            scheduler.record_capture(*pane_id, bytes.into());
         }
         let snapshot = scheduler.snapshot();
         let selected_value = selected

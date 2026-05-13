@@ -12,6 +12,8 @@
 //! Set `FT_REDACTOR_COVERAGE_BLESS=1` to overwrite the report
 //! when the corpus changes.
 
+#![allow(clippy::suboptimal_flops)]
+
 use frankenterm_core::redactor::secret_pattern_names;
 use frankenterm_core::redactor_coverage_matrix::{
     MatrixSnapshot, RedactorCoverageHealth, RedactorTestVector, fold_snapshot, synthesized_corpus,

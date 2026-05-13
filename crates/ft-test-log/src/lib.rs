@@ -81,7 +81,7 @@ impl RowKind {
 }
 
 /// One canonical JSONL row.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestLogRow {
     /// Schema version constant. Always `ft.test-log.row.v1`.
     pub schema_version: String,
