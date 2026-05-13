@@ -161,6 +161,19 @@ jobs:
       - name: README/AGENTS count-drift check (ft-tf6g3.2)
         run: bash scripts/stamp-readme-counts.sh --check
 
+      # ft-tf6g3.44 — Reality-check bead structure guard. New
+      # reality-check children must carry the full operator/test/proof
+      # template, every child must declare a machine-readable
+      # proof_category line, and closed children must retain an
+      # evidence-bearing Beads comment. Legacy pre-template gaps are
+      # reported as warnings in docs/reality-check-bead-structure-violations.md
+      # so the migration can be tracked without hiding new regressions.
+      - name: Reality-check bead structure guard (ft-tf6g3.44)
+        run: |
+          tests/e2e/test_reality_check_bead_structure.sh
+          scripts/check-reality-check-bead-structure.sh --write-report docs/reality-check-bead-structure-violations.md
+          git diff --exit-code -- docs/reality-check-bead-structure-violations.md
+
       # ft-i2eni.6 — Vendored-fork provenance manifest drift guard.
       # Each commit that touches frankenterm/<crate>/ shifts the
       # fork-side commit count for that crate; the manifest at
