@@ -2154,16 +2154,23 @@ impl ProofHistoryIndex {
                 if let Some(closeout_timestamp) = artifact.bead_closed_at_utc.as_deref()
                     && proof_record_is_older_than_closeout(&record, closeout_timestamp)
                 {
-                    record_status = ProofHistoryArtifactStatus::Stale;
+                    let prior_status = report.status;
                     promote_artifact_status(&mut report, ProofHistoryArtifactStatus::Stale);
+                    // Don't downgrade record_status when a more severe
+                    // artifact-level status (e.g. HashMismatch) is already set.
+                    if report.status != prior_status {
+                        record_status = report.status;
+                    }
                     record_findings.push(ProofLedgerFinding::error(
                         &record,
                         "artifact_older_than_closeout",
                         "proof artifact predates the current Beads closeout timestamp",
                     ));
-                    report.reason_code = Some("artifact_older_than_closeout".to_string());
-                    report.detail =
-                        Some("one or more records predate the Beads closeout".to_string());
+                    if report.status != prior_status || report.reason_code.is_none() {
+                        report.reason_code = Some("artifact_older_than_closeout".to_string());
+                        report.detail =
+                            Some("one or more records predate the Beads closeout".to_string());
+                    }
                 }
 
                 findings.extend(record_findings.clone());
