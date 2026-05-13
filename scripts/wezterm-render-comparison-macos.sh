@@ -187,10 +187,26 @@ PY
 wait_for_file() {
   local path="$1"
   local timeout_secs="$2"
+  local status_file="${3:-}"
+  local log_file="${4:-}"
   local waited=0
   while [[ ! -f "$path" ]]; do
+    if [[ -n "$status_file" && -f "$status_file" ]]; then
+      local status
+      status="$(cat "$status_file")"
+      echo "[wezterm-render-adapter] GUI exited with status $status before $path was ready" >&2
+      if [[ -n "$log_file" && -s "$log_file" ]]; then
+        echo "[wezterm-render-adapter] GUI log excerpt from $log_file:" >&2
+        sed -n '1,160p' "$log_file" >&2
+      fi
+      exit 75
+    fi
     if [[ "$waited" -ge "$timeout_secs" ]]; then
       echo "[wezterm-render-adapter] timed out waiting for $path" >&2
+      if [[ -n "$log_file" && -s "$log_file" ]]; then
+        echo "[wezterm-render-adapter] GUI log excerpt from $log_file:" >&2
+        sed -n '1,160p' "$log_file" >&2
+      fi
       exit 75
     fi
     sleep 1
@@ -258,18 +274,41 @@ export_engine_frames() {
     local ready="$run_dir/$scenario_id.ready"
     local output="$frame_dir/$scenario_id/frame-000.png"
     local class="ft-wezterm-diff-$engine"
+    local status_file="$run_dir/$scenario_id.status"
+    local log_file="$run_dir/$scenario_id.log"
+    local -a launch_env=()
+
+    if [[ "$engine" == "frankenterm" ]]; then
+      # FrankenTerm defaults to TOML config and only accepts generated Lua
+      # config files when explicitly enabled. The upstream WezTerm side still
+      # requires Lua, so keep the generated file format and opt FrankenTerm in.
+      launch_env+=(FRANKENTERM_LUA_CONFIG=1 FT_MACOS_BACKEND=wgpu)
+    fi
 
     echo "[wezterm-render-adapter] export engine=$engine scenario=$scenario_id"
-    "$gui" --config-file "$config" start \
-      --always-new-process \
-      --class "$class" \
-      --position 80,80 \
-      -- python3 "$driver" "$transcript" "$title" "$ready" &
+    (
+      set +e
+      env "${launch_env[@]}" "$gui" --config-file "$config" start \
+        --always-new-process \
+        --class "$class" \
+        --position 80,80 \
+        -- python3 "$driver" "$transcript" "$title" "$ready" >"$log_file" 2>&1
+      status=$?
+      printf '%s\n' "$status" >"$status_file"
+      exit "$status"
+    ) &
     local gui_pid=$!
-    wait_for_file "$ready" "$TIMEOUT_SECS"
+    wait_for_file "$ready" "$TIMEOUT_SECS" "$status_file" "$log_file"
     sleep "${FT_WEZTERM_FRAME_SETTLE_SECS:-1}"
     capture_window "$title" "$output"
-    wait "$gui_pid" || true
+    if ! wait "$gui_pid"; then
+      echo "[wezterm-render-adapter] GUI exited non-zero after capture for engine=$engine scenario=$scenario_id" >&2
+      if [[ -s "$log_file" ]]; then
+        echo "[wezterm-render-adapter] GUI log excerpt from $log_file:" >&2
+        sed -n '1,160p' "$log_file" >&2
+      fi
+      exit 75
+    fi
   done < <(manifest_rows)
 }
 
