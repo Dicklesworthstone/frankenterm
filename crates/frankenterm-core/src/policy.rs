@@ -3478,6 +3478,11 @@ const COMMAND_TOKENS: &[&str] = &[
     "snap",
     "pacman",
     "zypper",
+    "npx",
+    "bun",
+    "deno",
+    "rustc",
+    "rustup",
     // Common file utils
     "tar",
     "unzip",
@@ -3486,6 +3491,10 @@ const COMMAND_TOKENS: &[&str] = &[
     "jq",
     "yq",
     "mke2fs",
+    "unlink",
+    "alias",
+    "unalias",
+    "source",
 ];
 
 const TRAUMA_BYPASS_ENV: &str = "FT_BYPASS_TRAUMA";
