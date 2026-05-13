@@ -85,7 +85,7 @@ Current implementation reality:
 | **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output; future-query recall is currently a vacuous PAC-Bayes bound until production held-out data lands ([derivation](docs/perf/semantic-search-pac-bayes-derivation.md), [artifact](docs/attestations/proofs/semantic-search-pac-bayes.json)) |
 | **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
-| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; the resource-pressure cockpit now has a retained remote-reduced conformance artifact and a fail-closed [target-class hardware gate](docs/perf/target-class-hardware.md) with the current [gate artifact](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json) still `skipped_not_proven`; 200+ pane memory-envelope claims still require passing target-hardware proof |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; the resource-pressure cockpit now has a retained remote-reduced conformance artifact and a fail-closed [target-class hardware gate](docs/perf/target-class-hardware.md) from `ft-tf6g3.14` with the current [gate artifact](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json) still `skipped_not_proven`; high-scale memory-envelope wording cannot graduate before `ft-tf6g3.1` signs a non-skipped target-class artifact |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing; the shipped recorder backend is currently `append_log`, while `frankensqlite` remains rollout/test-only until live bootstrap support lands |
 | **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis; high-scale claims must cite cockpit proof artifacts, the target-class hardware predicate in [`docs/resource-pressure-cockpit-contract.md`](docs/resource-pressure-cockpit-contract.md), and a retained summary under `tests/e2e/artifacts/target-class/` |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning |
@@ -227,7 +227,7 @@ A file-system lock (via `fs2`) ensures only one watcher can write to the databas
 
 ### 5. Agent-First Interface
 
-Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. TOON (Token-Optimized Object Notation) is the lower-token machine format; savings vary by payload and should be treated as workload-dependent until linked benchmark artifacts are published. Built for machines to parse, not humans to read.
+Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. TOON (Token-Optimized Object Notation) is the lower-token machine format. Payload shape controls savings; the current `ft-0zoq3` benchmark substrate and local artifacts live in [`docs/perf-ledger/toon-encoding.md`](docs/perf-ledger/toon-encoding.md) and `tests/artifacts/perf/toon-encoding-ft-0zoq3/`. The `output-size-savings-real` ledger row remains pending, so avoid fixed percentage claims outside benchmarked payloads. Built for machines to parse, not humans to read.
 
 ### 5.1 Marker Window Bound
 
@@ -259,6 +259,10 @@ The fleet memory controller synthesizes pressure signals from three independent 
 <!-- reality-check-drumbeat:auto -->
 _Latest weekly reality-check drumbeat: [`docs/reports/reality-check-2026-05-02.md`](docs/reports/reality-check-2026-05-02.md) (2026-05-02)._
 <!-- reality-check-drumbeat:auto:end -->
+
+The canonical manifest is [`docs/attestations/manifest.json`](docs/attestations/manifest.json);
+each slot maps a claim category to its producing-bead artifact, and the
+per-release bundle signs those slot hashes.
 
 Verify a release attestation bundle in one command, offline,
 without trusting GitHub or any registry:
@@ -1537,15 +1541,16 @@ For 200 panes, stock terminal emulators keep all scrollback uncompressed in RAM 
 | **Cold** | Evicted (re-fetch from SQLite) | Query on demand | 0KB |
 
 The default settings are designed to keep hot scrollback small and shift older
-content into compressed or on-demand tiers. Treat any 200-pane memory envelope
-as hardware- and workload-dependent until the run cites a live cockpit artifact
-with the target hardware predicate from
+content into compressed or on-demand tiers. A 200-pane memory envelope only
+graduates to high-scale wording when the run cites a live cockpit artifact with
+the target hardware predicate from
 [`docs/resource-pressure-cockpit-contract.md`](docs/resource-pressure-cockpit-contract.md)
 and the per-SKU target-class artifact contract in
 [`docs/perf/target-class-hardware.md`](docs/perf/target-class-hardware.md).
 The current target-class gate artifact is
 [`skipped_not_proven`](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json),
-so it does not unlock high-scale wording.
+as recorded by `ft-tf6g3.14`, so `ft-tf6g3.1` cannot sign high-scale wording
+without a non-skipped target-class artifact.
 The retained `ft-rz0eb.4` cockpit conformance artifact proves the v1
 schema/runtime lane only; it is still `skipped_not_proven` for target hardware.
 

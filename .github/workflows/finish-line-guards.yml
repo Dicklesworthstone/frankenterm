@@ -104,6 +104,9 @@ jobs:
             --no-default-features \
             -- --nocapture
 
+      - name: Run ft-e87u6.4 README/AGENTS hedge alignment E2E
+        run: bash tests/e2e/test_ft_e87u6_4_hedge_alignment.sh
+
       # ft-s2034 / BR-RC-RUNTIME-SEMANTICS.G14.1.cont.ci:
       # Rust-side syn-AST cx-propagation analyzer (ft-t9a6q.1) as
       # a hard PR-CI gate.
@@ -127,6 +130,15 @@ jobs:
       - name: Run cx-propagation lint (br-ft-s2034)
         run: |
           cargo run -q --release -p cx_propagation_lint -- crates/frankenterm-core/src
+
+      - name: Upload ft-e87u6.4 hedge alignment artifact bundle
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ft-e87u6-4-hedge-alignment
+          path: tests/e2e/artifacts/goal-line/ft-e87u6/hedge-alignment/
+          if-no-files-found: warn
+          retention-days: 30
 
   e2e-composition:
     name: E2E composition scenario

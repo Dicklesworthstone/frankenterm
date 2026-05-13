@@ -371,6 +371,13 @@ Current architecture reality:
   - `docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`
   - `docs/ft-xbnl0-4-6-completion-evidence.md`
   - `docs/ft-xbnl0-5-7-completion-evidence.md`
+- The claim-to-artifact doorway is `docs/attestations/manifest.json`: each
+  slot maps a claim category to a producing-bead artifact for the per-release
+  bundle. Current target-class resource-cockpit status is separately pinned in
+  `docs/attestations/proofs/resource-cockpit-target-class.json` under
+  `ft-tf6g3.14`; its latest retained artifact is `skipped_not_proven`, so
+  high-scale memory-envelope wording must wait for `ft-tf6g3.1` to sign a
+  non-skipped target-class artifact.
 
 ### Architecture
 
