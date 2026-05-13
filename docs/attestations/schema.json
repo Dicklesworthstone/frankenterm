@@ -412,7 +412,30 @@
           "type": "integer",
           "minimum": 1
         },
-        "corrected_claim_value": true
+        "corrected_claim_value": true,
+        "retraction_conflict": {
+          "type": "object",
+          "required": [
+            "competing_retractions",
+            "selected_by",
+            "superseded_paths"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "competing_retractions": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "selected_by": {
+              "type": "string",
+              "enum": ["retracted_at_then_path"]
+            },
+            "superseded_paths": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
       }
     },
     "attestationRetraction": {

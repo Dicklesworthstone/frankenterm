@@ -70,6 +70,7 @@ FT_ATTESTATION_RETRACTIONS_ROOT="$RETRACTIONS_ROOT" \
     --allow-partial > "$RUN_ROOT/build-baseline.out" 2>&1
 cat "$RUN_ROOT/build-baseline.out"
 BUNDLE="$OUT_DIR/0.0.0-retraction.json"
+BUNDLE_SHA="$(sha256_file "$BUNDLE")"
 
 echo
 echo "=== verify baseline bundle ==="
@@ -88,6 +89,8 @@ FT_ATTESTATION_RETRACTIONS_ROOT="$RETRACTIONS_ROOT" \
     --retracted-by-release 0.0.1-corrigendum \
     --sign ed25519 > "$RUN_ROOT/retract.out" 2>&1
 cat "$RUN_ROOT/retract.out"
+cp "$RETRACTIONS_ROOT/$BUNDLE_SHA/doctrine__agents-md-counts.json" \
+  "$RETRACTIONS_ROOT/$BUNDLE_SHA/doctrine__agents-md-counts-duplicate.json"
 
 echo
 echo "=== verify returns retracted verdict ==="
@@ -106,6 +109,8 @@ jq -e '
   and .verdict == "retracted"
   and (.retractions | length) == 1
   and .retractions[0].affected_slot == "doctrine/agents-md-counts"
+  and .retractions[0].retraction_conflict.competing_retractions == 2
+  and ([.checks[] | select(.name == "retraction-conflict")] | length) == 1
 ' "$RUN_ROOT/verify-retracted.json" >/dev/null
 
 echo
@@ -121,6 +126,7 @@ FT_ATTESTATION_RETRACTIONS_ROOT="$RETRACTIONS_ROOT" \
 jq -e '
   (.retractions | length) == 1
   and .retractions[0].affected_slot == "doctrine/agents-md-counts"
+  and .retractions[0].retraction_conflict.competing_retractions == 2
 ' "$OUT_DIR/0.0.1-retraction.json" >/dev/null
 
 echo

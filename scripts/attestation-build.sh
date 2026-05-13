@@ -545,7 +545,27 @@ if [[ -d "$RETRACTIONS_ROOT" ]]; then
     retraction_objs+=("$retraction_obj")
   done < <(find "$RETRACTIONS_ROOT" -type f -name '*.json' -print | sort)
   if [[ ${#retraction_objs[@]} -gt 0 ]]; then
-    retractions_json="$(printf '%s\n' "${retraction_objs[@]}" | jq -c -s 'sort_by(.original_bundle_sha256, .affected_slot, .retraction_path)')"
+    retractions_json="$(
+      printf '%s\n' "${retraction_objs[@]}" | jq -c -s '
+        group_by(.original_bundle_sha256 + "\u0000" + .affected_slot)
+        | map(
+            sort_by(.retracted_at, .retraction_path) as $group
+            | ($group | last) as $winner
+            | if ($group | length) > 1 then
+                $winner + {
+                  retraction_conflict: {
+                    competing_retractions: ($group | length),
+                    selected_by: "retracted_at_then_path",
+                    superseded_paths: ($group | map(.retraction_path) - [$winner.retraction_path])
+                  }
+                }
+              else
+                $winner
+              end
+          )
+        | sort_by(.original_bundle_sha256, .affected_slot, .retraction_path)
+      '
+    )"
   fi
 fi
 

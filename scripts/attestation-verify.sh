@@ -312,6 +312,39 @@ scan_retractions_for_bundle() {
     done < <(find "$root" -type f -name '*.json' -print | sort)
   done
 
+  if [[ ${#retraction_results[@]} -gt 0 ]]; then
+    local selected_retractions conflict_count
+    selected_retractions="$(
+      printf '%s\n' "${retraction_results[@]}" | jq -c -s '
+        group_by(.affected_slot)
+        | map(
+            sort_by(.retracted_at, .path) as $group
+            | ($group | last) as $winner
+            | if ($group | length) > 1 then
+                $winner + {
+                  retraction_conflict: {
+                    competing_retractions: ($group | length),
+                    selected_by: "retracted_at_then_path",
+                    superseded_paths: ($group | map(.path) - [$winner.path])
+                  }
+                }
+              else
+                $winner
+              end
+          )
+        | sort_by(.affected_slot)
+      '
+    )"
+    conflict_count="$(jq '[.[] | select(has("retraction_conflict"))] | length' <<<"$selected_retractions")"
+    retraction_results=()
+    while IFS= read -r selected_retraction; do
+      retraction_results+=("$selected_retraction")
+    done < <(jq -c '.[]' <<<"$selected_retractions")
+    if [[ "$conflict_count" -gt 0 ]]; then
+      record_check "retraction-conflict" true "$conflict_count affected slot(s) had competing signed retractions; selected latest retracted_at/path"
+    fi
+  fi
+
   if [[ "$found" -eq 0 ]]; then
     record_check "retractions" true "none found for bundle sha256 $bundle_sha"
   elif [[ "$valid" -gt 0 && "$invalid" -eq 0 ]]; then
