@@ -277,11 +277,81 @@ capture_window() {
   screencapture -x -R "$bounds" "$output"
 }
 
+
+collect_process_tree_pids() {
+  local root="$1"
+  local child
+
+  while IFS= read -r child; do
+    [[ -n "$child" ]] || continue
+    collect_process_tree_pids "$child"
+  done < <(pgrep -P "$root" 2>/dev/null || true)
+
+  printf "%s\n" "$root"
+}
+
+collect_gui_cleanup_pids() {
+  local gui_pid="$1"
+  local class="$2"
+
+  {
+    collect_process_tree_pids "$gui_pid"
+    pgrep -f "$class" 2>/dev/null || true
+  } | sort -un
+}
+
+terminate_gui_cleanup_pids() {
+  local signal="$1"
+  local cleanup_pids="$2"
+  local pid
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill "-$signal" "$pid" >/dev/null 2>&1 || true
+  done <<<"$cleanup_pids"
+}
+
+any_gui_cleanup_pid_alive() {
+  local cleanup_pids="$1"
+  local pid
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      return 0
+    fi
+  done <<<"$cleanup_pids"
+
+  return 1
+}
+
+cleanup_lingering_gui_processes() {
+  local gui_pid="$1"
+  local class="$2"
+  local cleanup_pids
+  local cleanup_pid_list
+
+  cleanup_pids="$(collect_gui_cleanup_pids "$gui_pid" "$class")"
+  [[ -n "$cleanup_pids" ]] || return 0
+
+  cleanup_pid_list="$(printf "%s\n" "$cleanup_pids" | tr "\n" " ")"
+  echo "[wezterm-render-adapter] cleaning GUI process tree class=$class pids=$cleanup_pid_list" >&2
+  terminate_gui_cleanup_pids TERM "$cleanup_pids"
+  sleep 2
+  if any_gui_cleanup_pid_alive "$cleanup_pids"; then
+    terminate_gui_cleanup_pids KILL "$cleanup_pids"
+  fi
+}
+
+settle_after_gui_cleanup() {
+  sleep "${FT_WEZTERM_FRAME_CLEANUP_SETTLE_SECS:-2}"
+}
 wait_or_terminate_after_capture() {
   local engine="$1"
   local scenario_id="$2"
   local gui_pid="$3"
   local log_file="$4"
+  local class="$5"
   local timeout_secs="${FT_WEZTERM_FRAME_EXIT_SECS:-10}"
   local waited=0
 
@@ -292,13 +362,10 @@ wait_or_terminate_after_capture() {
 
   while kill -0 "$gui_pid" >/dev/null 2>&1; do
     if [[ "$waited" -ge "$timeout_secs" ]]; then
-      echo "[wezterm-render-adapter] terminating GUI after capture engine=$engine scenario=$scenario_id pid=$gui_pid" >&2
-      kill "$gui_pid" >/dev/null 2>&1 || true
-      sleep 2
-      if kill -0 "$gui_pid" >/dev/null 2>&1; then
-        kill -KILL "$gui_pid" >/dev/null 2>&1 || true
-      fi
+      echo "[wezterm-render-adapter] terminating GUI after capture engine=$engine scenario=$scenario_id pid=$gui_pid class=$class" >&2
+      cleanup_lingering_gui_processes "$gui_pid" "$class"
       wait "$gui_pid" >/dev/null 2>&1 || true
+      settle_after_gui_cleanup
       return 0
     fi
     sleep 1
@@ -313,6 +380,9 @@ wait_or_terminate_after_capture() {
     fi
     exit 75
   fi
+
+  cleanup_lingering_gui_processes "$gui_pid" "$class"
+  settle_after_gui_cleanup
 }
 
 
@@ -373,7 +443,7 @@ export_engine_frames() {
     local config="$run_dir/$scenario_id.lua"
     local ready="$run_dir/$scenario_id.ready"
     local output="$frame_dir/$scenario_id/frame-000.png"
-    local class="ft-wezterm-diff-$engine"
+    local class="ft-wezterm-diff-$engine-$scenario_id-$RUN_ID"
     local log_file="$run_dir/$scenario_id.log"
     local -a launch_env=()
 
@@ -401,7 +471,7 @@ export_engine_frames() {
     wait_for_file "$ready" "$TIMEOUT_SECS" "" "$log_file"
     sleep "${FT_WEZTERM_FRAME_SETTLE_SECS:-1}"
     capture_window "$title" "$output"
-    wait_or_terminate_after_capture "$engine" "$scenario_id" "$gui_pid" "$log_file"
+    wait_or_terminate_after_capture "$engine" "$scenario_id" "$gui_pid" "$log_file" "$class"
   done < <(manifest_rows)
 }
 
@@ -424,6 +494,7 @@ fi
 require_tool cargo
 require_tool python3
 require_tool screencapture
+require_tool pgrep
 canonicalize_report_paths
 canonicalize_gui_paths
 
