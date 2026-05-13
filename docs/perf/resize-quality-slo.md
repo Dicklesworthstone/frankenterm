@@ -71,6 +71,7 @@ machine-readable JSON, the README, and the attestation bundle.
 | RQ-S10 | Atlas rebuild count | 0 on pure window-size resize | `crates/frankenterm-core/benches/atlas_stability.rs` | ft-mpc9b.1.1 | bench_pending |
 | RQ-S11 | Snap-back delta (Draft → Standard) | SSIM ≥ 0.999 | `tests/renderer_golden/scenarios` | ft-mpc9b.2 | bench_pending |
 | RQ-S12 | Floating-pane overhead | < 0.5ms additional per pane vs tiled | `crates/frankenterm-core/benches/compositor_layers.rs` | ft-mpc9b.4.1 | bench_pending |
+| RQ-S13 | SSIM parity oracle corpus | SSIM ≥ 0.99, L∞ ≤ 8, changed pixels ≤ 0.1% | `crates/frankenterm-gui/tests/ssim_parity.rs` | ft-tf6g3.3.3 | substrate_wired |
 
 The full machine-readable catalog (with scenarios, structured-log paths, and
 `blocked_by` arrays) lives in `docs/perf/resize-quality-slo.json`. That file
@@ -105,6 +106,21 @@ The operator surfaces for this substrate are `ft doctor --json`
 `.renderer_slos.input_to_photon` and the read-only MCP resource
 `wa://perf/renderer-slo/input_to_photon`.
 
+The SSIM parity substrate validates the retained GPU golden corpus and
+adversarial metric-floor samples through
+`frankenterm_gui::gpu_regression::compare_images`, cross-checks the
+terminal-conformance fixture ids against the G39 topology attestation, and
+publishes its current non-claiming status at
+`ft robot perf slo-status --slo ssim_parity`, `ft doctor --json
+.renderer_slos.ssim_parity`, and `wa://perf/renderer-slo/ssim_parity`.
+The current degradation is `oracle-unavailable`: production evidence still
+requires a retained ratatui-vs-ftui release run, with
+`docs/attestations/tui/topology-parity.json` as the topology cross-check for
+near-pixel divergences. The release-gate script fails closed for this
+degraded state after substrate validation unless
+`SSIM_PARITY_ALLOW_DEGRADED_SUBSTRATE=1` is set for an explicitly
+non-release substrate-only run.
+
 ## CI gate (deferred)
 
 A per-PR regression gate is part of the bead's acceptance, but is **not**
@@ -135,6 +151,7 @@ The design is captured in the JSON's `attestation_publishing` block.
 
 - `docs/resize-performance-slos.md` — upstream-of-render budgets (wa-1u90p)
 - `tests/renderer_golden/` — reference frames + SSIM harness (ft-mpc9b.1.6, ft-ombfl)
+- `tests/golden/gpu/` — retained GPU corpus for SSIM parity substrate checks
 - `crates/frankenterm-core/benches/bench_common.rs` — Criterion budget /
   manifest helpers; new SLO benches use this for budget metadata.
 - `BR-RC-FOUNDATION.G3.1` — attestation graph schema (deferred dep)

@@ -1,37 +1,9 @@
 {
   "allowlist": {
-    "entry_count": 2,
+    "entry_count": 0,
     "path": "docs/wezterm-divergence-allowlist.md",
     "schema_version": "wezterm-divergence-allowlist.v1"
   },
-  "allowlisted_divergences": [
-    {
-      "allowlist_bead_id": "ft-tf6g3.54",
-      "allowlist_rationale": "Known current resize-control divergence after CSI 8;4;12t in run 25817861230 artifact 6979206611; the fixed capture rectangle exposes differing post-resize pixels and is tracked for normalization/removal under ft-tf6g3.54.",
-      "frame_id": "frame-000",
-      "frankenterm_png": "target/wezterm-differential/frames/frankenterm/tc-resize-wrap-001/frame-000.png",
-      "input_id": "tc-resize-wrap-001",
-      "metrics": {
-        "changed_pixel_fraction": 0.1880561440677966,
-        "changed_pixels": 85212,
-        "l_inf": 255,
-        "ssim": 0.000772806918622695,
-        "thresholds": {
-          "max_changed_pixel_fraction": 0.001,
-          "max_l_inf": 8,
-          "min_ssim": 0.99
-        },
-        "total_pixels": 453120
-      },
-      "reason": "metric_threshold_exceeded",
-      "thresholds": {
-        "max_changed_pixel_fraction": 0.001,
-        "max_l_inf": 8,
-        "min_ssim": 0.99
-      },
-      "wezterm_png": "target/wezterm-differential/frames/wezterm/tc-resize-wrap-001/frame-000.png"
-    }
-  ],
   "category": "tui/render-parity",
   "ci_contract": {
     "fixed_corpus_seed": "tests/fixtures/terminal-conformance/manifest.json",
@@ -39,55 +11,24 @@
     "ssim_infra": "crates/frankenterm-gui/src/gpu_regression.rs::compare_images",
     "workflow": ".github/workflows/wezterm-render-differential.yml"
   },
-  "comparison_report": "target/wezterm-differential/comparison-report.json",
+  "comparison_report": null,
   "counts": {
-    "allowlisted_count": 1,
-    "divergence_count": 1,
-    "frames_compared_total": 7,
+    "allowlisted_count": 0,
+    "divergence_count": 0,
+    "frames_compared_total": 0,
     "novel_divergence_count": 0
   },
-  "divergences": [
-    {
-      "allowlist_bead_id": "ft-tf6g3.54",
-      "allowlist_rationale": "Known current resize-control divergence after CSI 8;4;12t in run 25817861230 artifact 6979206611; the fixed capture rectangle exposes differing post-resize pixels and is tracked for normalization/removal under ft-tf6g3.54.",
-      "frame_id": "frame-000",
-      "frankenterm_png": "target/wezterm-differential/frames/frankenterm/tc-resize-wrap-001/frame-000.png",
-      "input_id": "tc-resize-wrap-001",
-      "metrics": {
-        "changed_pixel_fraction": 0.1880561440677966,
-        "changed_pixels": 85212,
-        "l_inf": 255,
-        "ssim": 0.000772806918622695,
-        "thresholds": {
-          "max_changed_pixel_fraction": 0.001,
-          "max_l_inf": 8,
-          "min_ssim": 0.99
-        },
-        "total_pixels": 453120
-      },
-      "reason": "metric_threshold_exceeded",
-      "thresholds": {
-        "max_changed_pixel_fraction": 0.001,
-        "max_l_inf": 8,
-        "min_ssim": 0.99
-      },
-      "wezterm_png": "target/wezterm-differential/frames/wezterm/tc-resize-wrap-001/frame-000.png"
-    }
-  ],
+  "divergences": [],
   "kind": "frankenterm-vs-wezterm-render-differential",
+  "latest_run_status": "adapter_contract_ready_no_upstream_frame_report_yet",
   "novel_divergences": [],
-  "pass_condition": "novel_divergence_count == 0",
+  "pass_condition": "latest_run_status == passed && novel_divergence_count == 0",
   "produced_by_bead": "ft-tf6g3.21",
-  "run_id": "20260513T201715Z-40408",
+  "residual_blocker": {
+    "summary": "The macOS frame adapter now exists and writes wezterm-render-comparison.v1 reports, but this checked-in placeholder is not production evidence until a scheduled workflow run captures upstream WezTerm and FrankenTerm frames with frames_compared_total > 0.",
+    "tracking_bead": "ft-tf6g3.36"
+  },
+  "run_id": null,
   "schema_version": "wezterm-divergence.v1",
-  "upstream_wezterm_ref": "577474d89ee61aef4a48145cdec82a638d874751",
-  "latest_run_status": "passed",
-  "latest_run": {
-    "github_run_id": 25821018698,
-    "github_job_id": 75861998355,
-    "github_artifact_id": 6980576204,
-    "head_sha": "3b58746e37b26207074a742d3df870df36a39346",
-    "conclusion": "success",
-    "url": "https://github.com/Dicklesworthstone/frankenterm/actions/runs/25821018698"
-  }
+  "upstream_wezterm_ref": null
 }

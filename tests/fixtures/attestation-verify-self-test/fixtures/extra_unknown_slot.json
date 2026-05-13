@@ -34,8 +34,8 @@
       "proof_categories": [
         8
       ],
-      "sha256": "04a762132f669ef097714c9f25fd53ef62260a20a2532e5a632b24573c74ca26",
-      "size_bytes": 2656
+      "sha256": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
+      "size_bytes": 3192
     },
     {
       "category": "tui/render-parity",
@@ -438,7 +438,7 @@
           "unit": "delivered_artifacts",
           "value": 1
         },
-        "source_artifact_hash": "04a762132f669ef097714c9f25fd53ef62260a20a2532e5a632b24573c74ca26",
+        "source_artifact_hash": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
         "source_artifact_path": "docs/attestations/perf/lindley-bounds.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -693,7 +693,7 @@
           "unit": "delivered_artifacts",
           "value": 1
         },
-        "source_artifact_hash": "04a762132f669ef097714c9f25fd53ef62260a20a2532e5a632b24573c74ca26",
+        "source_artifact_hash": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
         "source_artifact_path": "docs/attestations/perf/lindley-bounds.json",
         "time_budget_consumed": {
           "budget_seconds": null,
@@ -775,15 +775,15 @@
     "schema_version": "1.0.0"
   },
   "deferred_slots": [],
-  "generated_at": "2026-05-13T01:58:36Z",
+  "generated_at": "2026-05-13T23:21:20Z",
   "generator": {
     "name": "scripts/attestation-build.sh",
-    "version": "1.4.0"
+    "version": "1.5.0"
   },
   "git": {
     "branch": "main",
-    "commit": "9071292e333d1304869272090e91cb4675fbfc3a",
-    "tree": "0cb0a33ff957021f58172652b2d4d6af7f712d58"
+    "commit": "0e2d71c9aabaa251385ef137d1a0566b0f6642a9",
+    "tree": "ba3ce8eded7c0a89297cd9a4ff28b1cc922be4ae"
   },
   "release": {
     "channel": "dev",
@@ -805,9 +805,10 @@
     "doctrine/agents-md-counts",
     "doctrine/cx-propagation"
   ],
+  "retractions": [],
   "schema_version": "1.0.0",
   "signature": {
-    "canonical_sha256": "4690c4d7f0b58411acccd11d513ad885905208e31bc4c76af6d66d2379221c2a",
+    "canonical_sha256": "a5f48804f49e5a5da712eef2d8fd32c6a6fe49f2636a7d0510ce0478425c8518",
     "method": "unsigned",
     "reason": "dev channel bundle — production releases must use --sign cosign or --sign ed25519"
   },

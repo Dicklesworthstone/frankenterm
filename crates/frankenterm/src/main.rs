@@ -3088,6 +3088,12 @@ enum RobotCommands {
         command: RobotResourceCommands,
     },
 
+    /// Performance SLO status endpoints
+    Perf {
+        #[command(subcommand)]
+        command: RobotPerfCommands,
+    },
+
     /// Validate an approval code for a pending action
     Approve {
         /// The approval code (8-character alphanumeric)
@@ -3327,6 +3333,26 @@ enum RobotResourceCommands {
         #[arg(long)]
         high_scale_min_memory_bytes: Option<u64>,
     },
+}
+
+#[derive(Subcommand)]
+enum RobotPerfCommands {
+    /// Emit read-only renderer performance SLO status
+    SloStatus {
+        /// SLO selector
+        #[arg(long, value_enum, default_value_t = RobotPerfSloArg::All)]
+        slo: RobotPerfSloArg,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RobotPerfSloArg {
+    #[value(name = "all")]
+    All,
+    #[value(name = "input_to_photon", alias = "input-to-photon")]
+    InputToPhoton,
+    #[value(name = "ssim_parity", alias = "ssim-parity")]
+    SsimParity,
 }
 
 /// Robot event triage/annotation subcommands (bd-2gce)
@@ -6051,6 +6077,31 @@ impl<T> RobotResponse<T> {
             version: frankenterm_core::VERSION.to_string(),
             now: now_ms(),
         }
+    }
+}
+
+const ROBOT_PERF_SLO_STATUS_SCHEMA_VERSION: &str = "ft.robot.perf.slo-status.v1";
+
+fn build_robot_perf_slo_status_payload(slo: RobotPerfSloArg) -> serde_json::Value {
+    let report = frankenterm_core::render_quality::renderer_slos_doctor_report();
+    match slo {
+        RobotPerfSloArg::All => serde_json::json!({
+            "schema_version": ROBOT_PERF_SLO_STATUS_SCHEMA_VERSION,
+            "slo": "all",
+            "renderer_slos": report,
+        }),
+        RobotPerfSloArg::InputToPhoton => serde_json::json!({
+            "schema_version": ROBOT_PERF_SLO_STATUS_SCHEMA_VERSION,
+            "slo": "input_to_photon",
+            "renderer_slos_schema_version": report.schema_version,
+            "status": report.input_to_photon,
+        }),
+        RobotPerfSloArg::SsimParity => serde_json::json!({
+            "schema_version": ROBOT_PERF_SLO_STATUS_SCHEMA_VERSION,
+            "slo": "ssim_parity",
+            "renderer_slos_schema_version": report.schema_version,
+            "status": report.ssim_parity,
+        }),
     }
 }
 
@@ -17689,6 +17740,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Run a read-only resource-control digital-twin simulation",
             },
             RobotCommandInfo {
+                name: "perf slo-status",
+                description: "Emit read-only renderer performance SLO status",
+            },
+            RobotCommandInfo {
                 name: "approve",
                 description: "Validate an approval code for a pending action",
             },
@@ -17922,6 +17977,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot resource what-if --trace fixtures/scale-lab/resource-what-if-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-candidate.v1.toml",
                     "ft robot --format toon resource what-if --trace trace.json --override-package candidate.toml",
+                ],
+            },
+            QuickStartCommand {
+                name: "perf slo-status",
+                args: "[--slo all|input_to_photon|ssim_parity]",
+                summary: "Read renderer SLO substrate status without requiring the watcher",
+                examples: vec![
+                    "ft robot perf slo-status --slo ssim_parity",
+                    "ft robot --format toon perf slo-status --slo input_to_photon",
                 ],
             },
             QuickStartCommand {
@@ -24360,6 +24424,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::Robot {
+        format,
+        stats,
+        command: Some(RobotCommands::Perf { command }),
+    }) = command.as_ref()
+    {
+        let format = resolve_robot_output_format(*format);
+        let payload = match command {
+            RobotPerfCommands::SloStatus { slo } => build_robot_perf_slo_status_payload(*slo),
+        };
+        let response = RobotResponse::success(payload, elapsed_ms(start));
+        print_robot_response(&response, format, *stats)?;
+        return Ok(());
+    }
+
     let mut overrides = frankenterm_core::config::ConfigOverrides::default();
     if verbose > 0 {
         overrides.log_level = Some("debug".to_string());
@@ -24839,6 +24918,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = RobotResponse::success(report, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::Perf { command } => {
+                    let payload = match command {
+                        RobotPerfCommands::SloStatus { slo } => {
+                            build_robot_perf_slo_status_payload(slo)
+                        }
+                    };
+                    let response = RobotResponse::success(payload, elapsed_ms(start));
+                    print_robot_response(&response, format, stats)?;
+                }
                 other => {
                     let ctx = match build_robot_context(&config, &workspace_root) {
                         Ok(ctx) => ctx,
@@ -24857,6 +24945,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     match other {
                         RobotCommands::ProofCloseoutLint { .. } => unreachable!("handled above"),
                         RobotCommands::ProofHistory { .. } => unreachable!("handled above"),
+                        RobotCommands::Perf { .. } => unreachable!("handled above"),
                         RobotCommands::State {
                             include_text,
                             tail,
@@ -37953,6 +38042,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     renderer_slos_report.input_to_photon.target_p95_us_macos,
                     renderer_slos_report.input_to_photon.target_p95_us_wayland,
                     renderer_slos_report.input_to_photon.mcp_resource_uri
+                );
+                println!(
+                    "  ssim_parity status={} degradation={} min_ssim_ppm={} max_l_inf={} mcp={}",
+                    renderer_slos_report.ssim_parity.status,
+                    renderer_slos_report.ssim_parity.current_degradation,
+                    renderer_slos_report.ssim_parity.default_min_ssim_ppm,
+                    renderer_slos_report.ssim_parity.default_max_l_inf,
+                    renderer_slos_report.ssim_parity.mcp_resource_uri
                 );
 
                 println!();
@@ -68357,6 +68454,69 @@ log_level = "debug"
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn cli_robot_perf_slo_status_parses_ssim_parity() {
+        let cli =
+            Cli::try_parse_from(["ft", "robot", "perf", "slo-status", "--slo", "ssim_parity"])
+                .expect("robot perf slo-status should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Perf {
+                    command: RobotPerfCommands::SloStatus { slo },
+                }) => assert_eq!(slo, RobotPerfSloArg::SsimParity),
+                _ => panic!("expected RobotCommands::Perf::SloStatus"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_perf_slo_status_accepts_input_to_photon_alias() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "perf",
+            "slo-status",
+            "--slo",
+            "input-to-photon",
+        ])
+        .expect("robot perf slo-status input-to-photon alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Perf {
+                    command: RobotPerfCommands::SloStatus { slo },
+                }) => assert_eq!(slo, RobotPerfSloArg::InputToPhoton),
+                _ => panic!("expected RobotCommands::Perf::SloStatus"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn robot_perf_slo_status_payload_exposes_ssim_parity_contract() {
+        let payload = build_robot_perf_slo_status_payload(RobotPerfSloArg::SsimParity);
+
+        assert_eq!(
+            payload["schema_version"],
+            ROBOT_PERF_SLO_STATUS_SCHEMA_VERSION
+        );
+        assert_eq!(payload["slo"], "ssim_parity");
+        assert_eq!(
+            payload["status"]["mcp_resource_uri"],
+            frankenterm_core::render_quality::RENDERER_SSIM_PARITY_MCP_RESOURCE_URI
+        );
+        assert_eq!(
+            payload["status"]["status"],
+            frankenterm_core::render_quality::RENDERER_SSIM_PARITY_STATUS
+        );
+        assert_eq!(
+            payload["status"]["current_degradation"],
+            frankenterm_core::render_quality::RENDERER_SSIM_PARITY_CURRENT_DEGRADATION
+        );
     }
 
     #[test]

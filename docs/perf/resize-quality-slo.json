@@ -178,6 +178,22 @@
       "status": "bench_pending",
       "blocked_by": ["ft-mpc9b.4.1"],
       "owner_bead": "ft-mpc9b.4.1"
+    },
+    {
+      "id": "RQ-S13.ssim_parity_oracle_corpus",
+      "title": "SSIM parity oracle corpus",
+      "target": "SSIM ≥ 0.99, L∞ ≤ 8, changed-pixel fraction ≤ 0.001",
+      "scenario": "Retained GPU golden corpus self-compare plus adversarial floor audit now; ratatui oracle vs ftui subject retained release run pending",
+      "measurement": "Per-pixel SSIM, max L∞ channel delta, changed-pixel fraction, and G39 topology fixture cross-check via frankenterm_gui::gpu_regression::compare_images",
+      "source_bench": "crates/frankenterm-gui/tests/ssim_parity.rs",
+      "structured_log": "tests/e2e/logs/ssim_parity_release_gate_<run_id>.proof-ledger.jsonl",
+      "mcp_resource": "wa://perf/renderer-slo/ssim_parity",
+      "operator_surface": "ft robot perf slo-status --slo ssim_parity; ft doctor --json .renderer_slos.ssim_parity",
+      "topology_cross_check": "docs/attestations/tui/topology-parity.json",
+      "status": "substrate_wired",
+      "current_degradation": "oracle-unavailable",
+      "blocked_by": ["ft-tf6g3.3.3"],
+      "owner_bead": "ft-tf6g3.3.3"
     }
   ],
   "ci_gate": {
@@ -219,6 +235,12 @@
       "date": "2026-05-13",
       "bead": "ft-tf6g3.3.2",
       "note": "Input-to-photon macOS/Wayland entries now point at the frankenterm-gui renderer_slo Criterion substrate. The substrate emits measured or degraded evidence rows; target lab proof remains a retained-run requirement."
+    },
+    {
+      "version": "0.1.2",
+      "date": "2026-05-13",
+      "bead": "ft-tf6g3.3.3",
+      "note": "SSIM parity oracle-corpus entry now points at the frankenterm-gui SSIM parity test, adversarial floor audit, robot/doctor/MCP operator surfaces, and the topology cross-check contract. Retained ratatui-vs-ftui release evidence remains pending."
     }
   ]
 }

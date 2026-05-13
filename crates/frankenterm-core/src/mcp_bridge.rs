@@ -12,11 +12,12 @@ use super::{
     WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool,
     WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaPanesResource,
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
-    WaReleaseTool, WaRendererInputToPhotonResource, WaReservationsByPaneTemplateResource,
-    WaReservationsResource, WaReservationsTool, WaReserveTool, WaRulesByAgentTemplateResource,
-    WaRulesListTool, WaRulesResource, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
-    WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
-    WaWorkflowStatusTool, WaWorkflowsResource, build_mcp_shared_rate_limiter,
+    WaReleaseTool, WaRendererInputToPhotonResource, WaRendererSsimParityResource,
+    WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
+    WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
+    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
+    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+    WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
 use crate::mcp_framework::{
     FrameworkServer as Server, framework_server_builder, run_framework_stdio_server,
@@ -272,6 +273,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaHerdWaveResource)
         .resource(WaRendererInputToPhotonResource)
+        .resource(WaRendererSsimParityResource)
         .resource(WaProofHistoryResource::new(Arc::clone(&config)))
         .resource(WaProofHistoryReleaseBlockingResource::new(Arc::clone(
             &config,

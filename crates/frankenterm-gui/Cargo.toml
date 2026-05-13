@@ -13,6 +13,7 @@ build = "build.rs"
 [[bin]]
 name = "frankenterm-gui"
 path = "src/main.rs"
+test = false
 
 [lib]
 name = "frankenterm_gui"
@@ -26,6 +27,10 @@ harness = false
 [[test]]
 name = "input_to_photon_bound"
 path = "../../tests/input_to_photon_bound.rs"
+
+[[test]]
+name = "ssim_parity"
+path = "tests/ssim_parity.rs"
 
 [[bench]]
 name = "input_to_photon"

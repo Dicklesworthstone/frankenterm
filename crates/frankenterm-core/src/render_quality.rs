@@ -458,18 +458,32 @@ pub const RENDERER_SLOS_DOCTOR_SCHEMA_VERSION: &str = "ft.renderer-slos.doctor.v
 /// Read-only MCP resource URI for the input-to-photon SLO status.
 pub const RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI: &str =
     "wa://perf/renderer-slo/input_to_photon";
+/// Read-only MCP resource URI for the SSIM parity SLO status.
+pub const RENDERER_SSIM_PARITY_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/ssim_parity";
 /// Current non-claiming status for the input-to-photon SLO substrate.
 pub const RENDERER_INPUT_TO_PHOTON_STATUS: &str = "stage_telemetry_substrate_wired_pending_lab_run";
+/// Current non-claiming status for the SSIM parity SLO substrate.
+pub const RENDERER_SSIM_PARITY_STATUS: &str =
+    "ssim_oracle_corpus_wired_pending_retained_release_run";
+/// Current degradation state for the SSIM parity SLO substrate.
+pub const RENDERER_SSIM_PARITY_CURRENT_DEGRADATION: &str = "oracle-unavailable";
 /// macOS p95 target from `docs/perf/resize-quality-slo.json`.
 pub const RENDERER_INPUT_TO_PHOTON_MACOS_P95_TARGET_US: u64 = MACOS_P95_TARGET_US;
 /// Wayland p95 target from `docs/perf/resize-quality-slo.json`.
 pub const RENDERER_INPUT_TO_PHOTON_WAYLAND_P95_TARGET_US: u64 = WAYLAND_P95_TARGET_US;
+/// Default SSIM floor from `frankenterm-gui::gpu_regression::Thresholds`.
+pub const RENDERER_SSIM_PARITY_DEFAULT_MIN_SSIM_PPM: u32 = 990_000;
+/// Default maximum per-channel pixel delta from `frankenterm-gui::gpu_regression::Thresholds`.
+pub const RENDERER_SSIM_PARITY_DEFAULT_MAX_L_INF: u8 = 8;
+/// Default changed-pixel fraction floor in parts per million.
+pub const RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM: u32 = 1_000;
 
 /// `ft doctor --json .renderer_slos` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendererSloDoctorReport {
     pub schema_version: String,
     pub input_to_photon: RendererInputToPhotonSloStatus,
+    pub ssim_parity: RendererSsimParitySloStatus,
 }
 
 /// Operator-facing status for the input-to-photon renderer SLO.
@@ -482,6 +496,27 @@ pub struct RendererInputToPhotonSloStatus {
     pub max_instrumentation_overhead_pct: u64,
     pub source_bench: String,
     pub structured_log_template: String,
+    pub mcp_resource_uri: String,
+    pub degradation_states: Vec<String>,
+    pub pending_reason: String,
+}
+
+/// Operator-facing status for the SSIM parity renderer SLO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererSsimParitySloStatus {
+    pub claim_id: String,
+    pub status: String,
+    pub current_degradation: String,
+    pub reference_backend: String,
+    pub subject_backend: String,
+    pub corpus_path: String,
+    pub default_min_ssim_ppm: u32,
+    pub default_max_l_inf: u8,
+    pub default_max_changed_pixel_fraction_ppm: u32,
+    pub comparator_source: String,
+    pub source_test: String,
+    pub release_gate_script: String,
+    pub topology_cross_check: String,
     pub mcp_resource_uri: String,
     pub degradation_states: Vec<String>,
     pub pending_reason: String,
@@ -513,6 +548,32 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
                 "invalid_trace".to_string(),
             ],
             pending_reason: "deterministic known-key stage telemetry substrate is wired; retained target-run empirical p95/p99 remains pending"
+                .to_string(),
+        },
+        ssim_parity: RendererSsimParitySloStatus {
+            claim_id: "renderer.ssim_parity_floor".to_string(),
+            status: RENDERER_SSIM_PARITY_STATUS.to_string(),
+            current_degradation: RENDERER_SSIM_PARITY_CURRENT_DEGRADATION.to_string(),
+            reference_backend: "ratatui_or_recorded_oracle".to_string(),
+            subject_backend: "ftui_headless_renderer".to_string(),
+            corpus_path: "tests/golden/gpu".to_string(),
+            default_min_ssim_ppm: RENDERER_SSIM_PARITY_DEFAULT_MIN_SSIM_PPM,
+            default_max_l_inf: RENDERER_SSIM_PARITY_DEFAULT_MAX_L_INF,
+            default_max_changed_pixel_fraction_ppm:
+                RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM,
+            comparator_source: "crates/frankenterm-gui/src/gpu_regression.rs::compare_images"
+                .to_string(),
+            source_test: "crates/frankenterm-gui/tests/ssim_parity.rs".to_string(),
+            release_gate_script: "tests/e2e/test_ssim_parity_release_gate.sh".to_string(),
+            topology_cross_check: "docs/attestations/tui/topology-parity.json".to_string(),
+            mcp_resource_uri: RENDERER_SSIM_PARITY_MCP_RESOURCE_URI.to_string(),
+            degradation_states: vec![
+                "oracle-unavailable".to_string(),
+                "dimension_mismatch".to_string(),
+                "metric_threshold_exceeded".to_string(),
+                "topology_cross_check_required".to_string(),
+            ],
+            pending_reason: "golden-corpus comparator and operator surfaces are wired; retained ratatui-vs-ftui release run remains pending"
                 .to_string(),
         },
     }
@@ -761,6 +822,42 @@ mod tests {
                 .input_to_photon
                 .degradation_states
                 .contains(&"photon_detection_unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_exposes_ssim_parity_contract() {
+        let report = renderer_slos_doctor_report();
+        assert_eq!(report.ssim_parity.status, RENDERER_SSIM_PARITY_STATUS);
+        assert_eq!(
+            report.ssim_parity.current_degradation,
+            RENDERER_SSIM_PARITY_CURRENT_DEGRADATION
+        );
+        assert_eq!(
+            report.ssim_parity.mcp_resource_uri,
+            RENDERER_SSIM_PARITY_MCP_RESOURCE_URI
+        );
+        assert_eq!(
+            report.ssim_parity.default_min_ssim_ppm,
+            RENDERER_SSIM_PARITY_DEFAULT_MIN_SSIM_PPM
+        );
+        assert_eq!(
+            report.ssim_parity.default_max_l_inf,
+            RENDERER_SSIM_PARITY_DEFAULT_MAX_L_INF
+        );
+        assert_eq!(
+            report.ssim_parity.default_max_changed_pixel_fraction_ppm,
+            RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM
+        );
+        assert_eq!(
+            report.ssim_parity.topology_cross_check,
+            "docs/attestations/tui/topology-parity.json"
+        );
+        assert!(
+            report
+                .ssim_parity
+                .degradation_states
+                .contains(&"oracle-unavailable".to_string())
         );
     }
 

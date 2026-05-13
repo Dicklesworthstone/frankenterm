@@ -116,8 +116,9 @@ use mcp_resources::{
     WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
     WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
-    WaRendererInputToPhotonResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
-    WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource,
+    WaRendererInputToPhotonResource, WaRendererSsimParityResource,
+    WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
+    WaRulesResource, WaWorkflowsResource,
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
@@ -1473,6 +1474,7 @@ mod tests {
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
+                "wa://perf/renderer-slo/ssim_parity".to_string(),
                 "wa://proof-history".to_string(),
                 "wa://proof-history/release-blocking".to_string(),
                 "wa://proof-history/template".to_string(),
@@ -1513,6 +1515,7 @@ mod tests {
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
+                "wa://perf/renderer-slo/ssim_parity".to_string(),
                 "wa://proof-history".to_string(),
                 "wa://proof-history/release-blocking".to_string(),
                 "wa://proof-history/template".to_string(),

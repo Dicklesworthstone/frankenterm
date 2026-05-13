@@ -23,7 +23,8 @@ use crate::proof_lane::{
     ProofState,
 };
 use crate::render_quality::{
-    RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, renderer_slos_doctor_report,
+    RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, RENDERER_SSIM_PARITY_MCP_RESOURCE_URI,
+    renderer_slos_doctor_report,
 };
 use crate::swarm_scheduler::{
     HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
@@ -817,6 +818,36 @@ impl ResourceHandler for WaRendererInputToPhotonResource {
     }
 }
 
+pub(super) struct WaRendererSsimParityResource;
+
+impl ResourceHandler for WaRendererSsimParityResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: RENDERER_SSIM_PARITY_MCP_RESOURCE_URI.to_string(),
+            name: "ft renderer SSIM parity SLO".to_string(),
+            description: Some(
+                "Read-only SSIM parity renderer SLO status and evidence pointers".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "perf".to_string(),
+                "renderer-slo".to_string(),
+                "ssim-parity".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let report = renderer_slos_doctor_report();
+        let envelope = McpEnvelope::success(report.ssim_parity, elapsed_ms(start));
+        envelope_as_resource(RENDERER_SSIM_PARITY_MCP_RESOURCE_URI, envelope)
+    }
+}
+
 pub(super) struct WaProofHistoryResource {
     config: Arc<Config>,
 }
@@ -1216,7 +1247,7 @@ mod tests {
         WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
         WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
         WaProofHistoryTemplateResource, WaRendererInputToPhotonResource,
-        WaReservationsByPaneTemplateResource, WaReservationsResource,
+        WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
         WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource, envelope_as_resource,
         load_proof_history_query_from_roots, tool_output_as_resource,
     };
@@ -1399,6 +1430,18 @@ mod tests {
     }
 
     #[test]
+    fn renderer_ssim_parity_resource_definition_uri() {
+        let def = WaRendererSsimParityResource.definition();
+        assert_eq!(
+            def.uri,
+            crate::render_quality::RENDERER_SSIM_PARITY_MCP_RESOURCE_URI
+        );
+        assert!(def.tags.contains(&"perf".to_string()));
+        assert!(def.tags.contains(&"renderer-slo".to_string()));
+        assert!(def.tags.contains(&"ssim-parity".to_string()));
+    }
+
+    #[test]
     fn attestation_retractions_resource_definition_uri() {
         let resource = WaAttestationRetractionsResource::new(Arc::new(Config::default()));
         let def = resource.definition();
@@ -1461,6 +1504,45 @@ mod tests {
         assert_eq!(
             payload["data"]["structured_log_template"].as_str(),
             Some("target/criterion/slo-input_to_photon_<platform>.jsonl")
+        );
+    }
+
+    #[test]
+    fn renderer_ssim_parity_resource_reads_doctor_contract() {
+        let resource = WaRendererSsimParityResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let contents = resource
+            .read(&ctx)
+            .expect("read renderer SSIM parity resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["mcp_resource_uri"].as_str(),
+            Some(crate::render_quality::RENDERER_SSIM_PARITY_MCP_RESOURCE_URI)
+        );
+        assert_eq!(
+            payload["data"]["status"].as_str(),
+            Some(crate::render_quality::RENDERER_SSIM_PARITY_STATUS)
+        );
+        assert_eq!(
+            payload["data"]["current_degradation"].as_str(),
+            Some(crate::render_quality::RENDERER_SSIM_PARITY_CURRENT_DEGRADATION)
+        );
+        assert_eq!(
+            payload["data"]["corpus_path"].as_str(),
+            Some("tests/golden/gpu")
+        );
+        assert_eq!(
+            payload["data"]["default_min_ssim_ppm"].as_u64(),
+            Some(u64::from(
+                crate::render_quality::RENDERER_SSIM_PARITY_DEFAULT_MIN_SSIM_PPM,
+            ))
+        );
+        assert_eq!(
+            payload["data"]["release_gate_script"].as_str(),
+            Some("tests/e2e/test_ssim_parity_release_gate.sh")
         );
     }
 
@@ -1648,6 +1730,7 @@ mod tests {
                 .definition()
                 .uri,
             WaRendererInputToPhotonResource.definition().uri,
+            WaRendererSsimParityResource.definition().uri,
             WaProofHistoryResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
@@ -1694,6 +1777,7 @@ mod tests {
                 .definition()
                 .uri,
             WaRendererInputToPhotonResource.definition().uri,
+            WaRendererSsimParityResource.definition().uri,
             WaProofHistoryResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
@@ -1732,6 +1816,7 @@ mod tests {
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
             WaRendererInputToPhotonResource.definition(),
+            WaRendererSsimParityResource.definition(),
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
@@ -1763,6 +1848,7 @@ mod tests {
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
             WaRendererInputToPhotonResource.definition(),
+            WaRendererSsimParityResource.definition(),
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),

@@ -7,7 +7,11 @@ pub use frankenterm_core::render_quality::{
     INPUT_TO_PHOTON_CLAIM_ID, INPUT_TO_PHOTON_SCHEMA_VERSION, INPUT_TO_PHOTON_WORKLOAD_CLASS,
     InputToPhotonEvidence, InputToPhotonStage, InputToPhotonStageTrace, InputToPhotonState,
     InputToPhotonTrace, MACOS_P95_TARGET_US, MAX_INSTRUMENTATION_OVERHEAD_PCT,
-    WAYLAND_P95_TARGET_US, known_key_trace_from_stage_durations, summarize_input_to_photon_traces,
+    RENDERER_SSIM_PARITY_CURRENT_DEGRADATION,
+    RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM,
+    RENDERER_SSIM_PARITY_DEFAULT_MAX_L_INF, RENDERER_SSIM_PARITY_DEFAULT_MIN_SSIM_PPM,
+    RENDERER_SSIM_PARITY_MCP_RESOURCE_URI, RENDERER_SSIM_PARITY_STATUS, WAYLAND_P95_TARGET_US,
+    known_key_trace_from_stage_durations, summarize_input_to_photon_traces,
     target_p95_us_for_platform, unavailable_evidence,
 };
 
