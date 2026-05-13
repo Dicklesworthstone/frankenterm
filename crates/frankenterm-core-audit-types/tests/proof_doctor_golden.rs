@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use frankenterm_core_audit_types::proof_doctor::{
     ProofDoctorDirtyPath, ProofDoctorEvidence, ProofDoctorOwner, ProofDoctorPhase,
     ProofDoctorPreflightInput, ProofDoctorScaleLabArtifactEvidence, ProofDoctorToolVersionState,
