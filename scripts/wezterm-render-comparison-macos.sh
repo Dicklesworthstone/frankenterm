@@ -326,10 +326,17 @@ export_engine_frames() {
     echo "[wezterm-render-adapter] export engine=$engine scenario=$scenario_id"
     (
       set +e
-      env "${launch_env[@]}" "$gui" --config-file "$config" start \
-        --always-new-process \
-        --class "$class" \
-        --position 80,80 >"$log_file" 2>&1
+      if ((${#launch_env[@]} > 0)); then
+        env "${launch_env[@]}" "$gui" --config-file "$config" start \
+          --always-new-process \
+          --class "$class" \
+          --position 80,80 >"$log_file" 2>&1
+      else
+        "$gui" --config-file "$config" start \
+          --always-new-process \
+          --class "$class" \
+          --position 80,80 >"$log_file" 2>&1
+      fi
       status=$?
       printf '%s\n' "$status" >"$status_file"
       exit "$status"
