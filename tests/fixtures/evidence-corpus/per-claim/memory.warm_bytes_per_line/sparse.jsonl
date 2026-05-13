@@ -1,0 +1,1 @@
+{"claim_id":"memory.warm_bytes_per_line","commit_sha":"fd89ed378","metric_unit":"bytes_per_line","metric_value":40.5245,"sample_size":200,"schema_version":"ft.perf.evidence-sample.v1","tags":{"fixture_seq":"0","frankenterm_version":"0.0.0-dev"},"ts_ms":1715500000000,"workload_class":"warm-tier-200-panes-target-class"}

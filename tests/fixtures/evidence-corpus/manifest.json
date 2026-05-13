@@ -1,0 +1,382 @@
+{
+  "bead": "ft-tf6g3.42",
+  "claims_supported": [
+    "bloom.speedup_ratio",
+    "fts5.query_p99",
+    "memory.hot_bytes_per_line",
+    "memory.warm_bytes_per_line",
+    "robot.p95"
+  ],
+  "fixtures": [
+    {
+      "claim_id": "bloom.speedup_ratio",
+      "content_hash": "41d190a8e9f4ff47349170de9fd412eef89aaa4ce1f4929b288fc474cffa430a",
+      "flavor": "baseline-30d",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "light"
+      },
+      "label": "stationary baseline for bloom.speedup_ratio",
+      "path": "tests/fixtures/evidence-corpus/per-claim/bloom.speedup_ratio/baseline-30d.jsonl",
+      "row_count": 720,
+      "seed": 1358188205110707042
+    },
+    {
+      "claim_id": "bloom.speedup_ratio",
+      "content_hash": "5b51388d3b51544dc821e47aa58afbfdb01012044fdd9fc87f0973517a5cae64",
+      "flavor": "heavy-tail",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "pareto-alpha-1.5"
+      },
+      "label": "Pareto alpha=1.5 distribution for bloom.speedup_ratio (finite mean, infinite variance)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/bloom.speedup_ratio/heavy-tail.jsonl",
+      "row_count": 200,
+      "seed": 2208345883311851951
+    },
+    {
+      "claim_id": "bloom.speedup_ratio",
+      "content_hash": "2e43172b8db53443d9ebcd96ce4716b750714e4dd3acd1e099e330fd0ecad577",
+      "flavor": "regime-shift",
+      "ground_truth": {
+        "change_point_index": 100,
+        "regression": false,
+        "shift": true,
+        "shift_kind": "mean+variance"
+      },
+      "label": "30% mean + 1.8x stddev shift at sample 100 in bloom.speedup_ratio",
+      "path": "tests/fixtures/evidence-corpus/per-claim/bloom.speedup_ratio/regime-shift.jsonl",
+      "row_count": 200,
+      "seed": 7276317269496040991
+    },
+    {
+      "claim_id": "bloom.speedup_ratio",
+      "content_hash": "19e0f29236f2555d5669cb231b718e5dca62ed3e908d2a21166dcc434e2c3f26",
+      "flavor": "regression-injected",
+      "ground_truth": {
+        "change_point_index": 100,
+        "magnitude_pct": 15,
+        "regression": true,
+        "shift": false
+      },
+      "label": "15% step regression at sample 100 in bloom.speedup_ratio",
+      "path": "tests/fixtures/evidence-corpus/per-claim/bloom.speedup_ratio/regression-injected.jsonl",
+      "row_count": 200,
+      "seed": 12662628392073315978
+    },
+    {
+      "claim_id": "bloom.speedup_ratio",
+      "content_hash": "ab62aba75616e4c5f4ec2e777084b9f6e012c54b7d3efd66ab1adf5e5a9ed7f2",
+      "flavor": "sparse",
+      "ground_truth": {
+        "below_min_samples": true,
+        "regression": false,
+        "shift": false
+      },
+      "label": "single-row stream for bloom.speedup_ratio (sub-min-samples degradation)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/bloom.speedup_ratio/sparse.jsonl",
+      "row_count": 1,
+      "seed": 6549447241069060848
+    },
+    {
+      "claim_id": "fts5.query_p99",
+      "content_hash": "9a902423f8d12cd9347f1bd92edf5768dfd29ea30cd394524db4c5e62f6e35d4",
+      "flavor": "baseline-30d",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "light"
+      },
+      "label": "stationary baseline for fts5.query_p99",
+      "path": "tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/baseline-30d.jsonl",
+      "row_count": 720,
+      "seed": 16146170367902931792
+    },
+    {
+      "claim_id": "fts5.query_p99",
+      "content_hash": "4207129b2e6e223d61ca2da6fb95ec839e13055177e7ddd40f4b0fac3fd12948",
+      "flavor": "heavy-tail",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "pareto-alpha-1.5"
+      },
+      "label": "Pareto alpha=1.5 distribution for fts5.query_p99 (finite mean, infinite variance)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/heavy-tail.jsonl",
+      "row_count": 200,
+      "seed": 9595704028642352974
+    },
+    {
+      "claim_id": "fts5.query_p99",
+      "content_hash": "bffd40cbd3cc338a5d8df9b59be08ca8de5eb6238ab4b61be138344b14957746",
+      "flavor": "regime-shift",
+      "ground_truth": {
+        "change_point_index": 100,
+        "regression": false,
+        "shift": true,
+        "shift_kind": "mean+variance"
+      },
+      "label": "30% mean + 1.8x stddev shift at sample 100 in fts5.query_p99",
+      "path": "tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/regime-shift.jsonl",
+      "row_count": 200,
+      "seed": 4510385593278697900
+    },
+    {
+      "claim_id": "fts5.query_p99",
+      "content_hash": "cfa8e9545bab29ff9008367225ea10f5584bb3c53dae7d354a56a989cd2f5597",
+      "flavor": "regression-injected",
+      "ground_truth": {
+        "change_point_index": 100,
+        "magnitude_pct": 15,
+        "regression": true,
+        "shift": false
+      },
+      "label": "15% step regression at sample 100 in fts5.query_p99",
+      "path": "tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/regression-injected.jsonl",
+      "row_count": 200,
+      "seed": 5199549529394547253
+    },
+    {
+      "claim_id": "fts5.query_p99",
+      "content_hash": "18b9cce2f439109d88ee6765381355755f2a11b16ceec197aecf55bd53f366ed",
+      "flavor": "sparse",
+      "ground_truth": {
+        "below_min_samples": true,
+        "regression": false,
+        "shift": false
+      },
+      "label": "single-row stream for fts5.query_p99 (sub-min-samples degradation)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/sparse.jsonl",
+      "row_count": 1,
+      "seed": 3983394732322003287
+    },
+    {
+      "claim_id": "memory.hot_bytes_per_line",
+      "content_hash": "903a4e03c2aa5b75ade168c1f0a7d931046c5b5f04104a7172cd8dcdbbbacb0e",
+      "flavor": "baseline-30d",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "light"
+      },
+      "label": "stationary baseline for memory.hot_bytes_per_line",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.hot_bytes_per_line/baseline-30d.jsonl",
+      "row_count": 720,
+      "seed": 7644471776726873280
+    },
+    {
+      "claim_id": "memory.hot_bytes_per_line",
+      "content_hash": "14791adc54712edabd335b4476acbafae9e9218b52476f96ceadc9635cafba91",
+      "flavor": "heavy-tail",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "pareto-alpha-1.5"
+      },
+      "label": "Pareto alpha=1.5 distribution for memory.hot_bytes_per_line (finite mean, infinite variance)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.hot_bytes_per_line/heavy-tail.jsonl",
+      "row_count": 200,
+      "seed": 5281669919641952291
+    },
+    {
+      "claim_id": "memory.hot_bytes_per_line",
+      "content_hash": "ee099cc097c603259602560876e1bcf07d16bdf342ee3bbc09fc930ec44a812a",
+      "flavor": "regime-shift",
+      "ground_truth": {
+        "change_point_index": 100,
+        "regression": false,
+        "shift": true,
+        "shift_kind": "mean+variance"
+      },
+      "label": "30% mean + 1.8x stddev shift at sample 100 in memory.hot_bytes_per_line",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.hot_bytes_per_line/regime-shift.jsonl",
+      "row_count": 200,
+      "seed": 452700994535074034
+    },
+    {
+      "claim_id": "memory.hot_bytes_per_line",
+      "content_hash": "9f24c2fab99dc2fa7a54ce6255617a8c24a0373d61a30a2db8559a5faab38840",
+      "flavor": "regression-injected",
+      "ground_truth": {
+        "change_point_index": 100,
+        "magnitude_pct": 15,
+        "regression": true,
+        "shift": false
+      },
+      "label": "15% step regression at sample 100 in memory.hot_bytes_per_line",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.hot_bytes_per_line/regression-injected.jsonl",
+      "row_count": 200,
+      "seed": 8944348808248003571
+    },
+    {
+      "claim_id": "memory.hot_bytes_per_line",
+      "content_hash": "1fb5c500ff5595315dfaf2d39485ac3984d641ccd73fde12f07109158e1259c4",
+      "flavor": "sparse",
+      "ground_truth": {
+        "below_min_samples": true,
+        "regression": false,
+        "shift": false
+      },
+      "label": "single-row stream for memory.hot_bytes_per_line (sub-min-samples degradation)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.hot_bytes_per_line/sparse.jsonl",
+      "row_count": 1,
+      "seed": 15048820184634305097
+    },
+    {
+      "claim_id": "memory.warm_bytes_per_line",
+      "content_hash": "4ed964695a48a429667f9955aff893c1f8118dda53f6d4a0a2041695cb238bcf",
+      "flavor": "baseline-30d",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "light"
+      },
+      "label": "stationary baseline for memory.warm_bytes_per_line",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.warm_bytes_per_line/baseline-30d.jsonl",
+      "row_count": 720,
+      "seed": 17581804097942531667
+    },
+    {
+      "claim_id": "memory.warm_bytes_per_line",
+      "content_hash": "af1505d44ec70237eeb083904fc009f0f89637b20b1699b16aad43c91f8d86c6",
+      "flavor": "heavy-tail",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "pareto-alpha-1.5"
+      },
+      "label": "Pareto alpha=1.5 distribution for memory.warm_bytes_per_line (finite mean, infinite variance)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.warm_bytes_per_line/heavy-tail.jsonl",
+      "row_count": 200,
+      "seed": 12022130189146337362
+    },
+    {
+      "claim_id": "memory.warm_bytes_per_line",
+      "content_hash": "1b2ec8bae1afa3758249a879147620cc623f78f546da700e5a9a6ecab5127e98",
+      "flavor": "regime-shift",
+      "ground_truth": {
+        "change_point_index": 100,
+        "regression": false,
+        "shift": true,
+        "shift_kind": "mean+variance"
+      },
+      "label": "30% mean + 1.8x stddev shift at sample 100 in memory.warm_bytes_per_line",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.warm_bytes_per_line/regime-shift.jsonl",
+      "row_count": 200,
+      "seed": 17792478732183024651
+    },
+    {
+      "claim_id": "memory.warm_bytes_per_line",
+      "content_hash": "45d1817bb03021d7035c83d6c94ac1bf5eb8ec31a908877b794899432093285b",
+      "flavor": "regression-injected",
+      "ground_truth": {
+        "change_point_index": 100,
+        "magnitude_pct": 15,
+        "regression": true,
+        "shift": false
+      },
+      "label": "15% step regression at sample 100 in memory.warm_bytes_per_line",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.warm_bytes_per_line/regression-injected.jsonl",
+      "row_count": 200,
+      "seed": 11258050686950796781
+    },
+    {
+      "claim_id": "memory.warm_bytes_per_line",
+      "content_hash": "65d57dbbce7c273fbc99c24386dbafbaa591deb18abcd71b6d39f90ba900412d",
+      "flavor": "sparse",
+      "ground_truth": {
+        "below_min_samples": true,
+        "regression": false,
+        "shift": false
+      },
+      "label": "single-row stream for memory.warm_bytes_per_line (sub-min-samples degradation)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/memory.warm_bytes_per_line/sparse.jsonl",
+      "row_count": 1,
+      "seed": 10949830239067244956
+    },
+    {
+      "claim_id": "robot.p95",
+      "content_hash": "9997dc3b87190225a014de0dd88f4ae11f97e5a555186862d6b008bf70732561",
+      "flavor": "baseline-30d",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "light"
+      },
+      "label": "stationary baseline for robot.p95",
+      "path": "tests/fixtures/evidence-corpus/per-claim/robot.p95/baseline-30d.jsonl",
+      "row_count": 720,
+      "seed": 12557720110653952445
+    },
+    {
+      "claim_id": "robot.p95",
+      "content_hash": "fc74c95d46cf139587a646b75fb813b48996a8f356d9fe18cdf78322835bf44c",
+      "flavor": "heavy-tail",
+      "ground_truth": {
+        "regression": false,
+        "shift": false,
+        "tail_class": "pareto-alpha-1.5"
+      },
+      "label": "Pareto alpha=1.5 distribution for robot.p95 (finite mean, infinite variance)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/robot.p95/heavy-tail.jsonl",
+      "row_count": 200,
+      "seed": 8052179172564233697
+    },
+    {
+      "claim_id": "robot.p95",
+      "content_hash": "537513b19e6f99daadb6a9758179f3167e1790bb106f0cdbf2377478b4b419ce",
+      "flavor": "regime-shift",
+      "ground_truth": {
+        "change_point_index": 100,
+        "regression": false,
+        "shift": true,
+        "shift_kind": "mean+variance"
+      },
+      "label": "30% mean + 1.8x stddev shift at sample 100 in robot.p95",
+      "path": "tests/fixtures/evidence-corpus/per-claim/robot.p95/regime-shift.jsonl",
+      "row_count": 200,
+      "seed": 10224471217099723197
+    },
+    {
+      "claim_id": "robot.p95",
+      "content_hash": "f74788a44e005524e3188724aad80348270115f6b0ab2c4f3391485c0319ec1b",
+      "flavor": "regression-injected",
+      "ground_truth": {
+        "change_point_index": 100,
+        "magnitude_pct": 15,
+        "regression": true,
+        "shift": false
+      },
+      "label": "15% step regression at sample 100 in robot.p95",
+      "path": "tests/fixtures/evidence-corpus/per-claim/robot.p95/regression-injected.jsonl",
+      "row_count": 200,
+      "seed": 2671357029190526138
+    },
+    {
+      "claim_id": "robot.p95",
+      "content_hash": "769080c4817b40ff7aae419472c697f0a50288771e6c88e79516704e28960a7d",
+      "flavor": "sparse",
+      "ground_truth": {
+        "below_min_samples": true,
+        "regression": false,
+        "shift": false
+      },
+      "label": "single-row stream for robot.p95 (sub-min-samples degradation)",
+      "path": "tests/fixtures/evidence-corpus/per-claim/robot.p95/sparse.jsonl",
+      "row_count": 1,
+      "seed": 3928213961229344453
+    }
+  ],
+  "flavors": [
+    "baseline-30d",
+    "regression-injected",
+    "regime-shift",
+    "heavy-tail",
+    "sparse"
+  ],
+  "generated_by": "scripts/regenerate-evidence-corpus.py",
+  "schema_ref": "docs/perf/evidence-stream-schema.json",
+  "schema_version": "ft.perf.evidence-corpus.v1"
+}

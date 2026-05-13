@@ -1,0 +1,1 @@
+{"claim_id":"fts5.query_p99","commit_sha":"fd89ed378","metric_unit":"ms","metric_value":6.7364,"sample_size":10000,"schema_version":"ft.perf.evidence-sample.v1","tags":{"fixture_seq":"0","frankenterm_version":"0.0.0-dev"},"ts_ms":1715500000000,"workload_class":"fts5-fixture-1k-corpus"}
