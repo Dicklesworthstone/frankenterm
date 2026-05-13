@@ -155,6 +155,8 @@ impl HerdWaveSignal {
     }
 }
 
+// serde serialize_with passes fields as &Option<T>.
+#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
 fn serialize_optional_herd_wave_kind<S>(
     value: &Option<HerdWaveEventKind>,
     serializer: S,
@@ -168,6 +170,8 @@ where
     }
 }
 
+// serde serialize_with passes fields as &Option<T>.
+#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
 fn serialize_optional_admission_action<S>(
     value: &Option<AdmissionAction>,
     serializer: S,
