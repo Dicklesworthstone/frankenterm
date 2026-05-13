@@ -109,9 +109,22 @@ run_self_test() {
   echo "[wezterm-render-adapter] self-test PASS output=$OUTPUT"
 }
 
+lua_string_array() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+print("{ " + ", ".join(json.dumps(arg) for arg in sys.argv[1:]) + " }")
+PY
+}
+
 write_config() {
   local path="$1"
-  cat >"$path" <<'LUA'
+  shift
+  local default_prog
+  default_prog="$(lua_string_array "$@")"
+
+  cat >"$path" <<LUA
 local wezterm = require 'wezterm'
 
 return {
@@ -132,6 +145,7 @@ return {
   animation_fps = 1,
   max_fps = 60,
   front_end = "WebGpu",
+  default_prog = $default_prog,
   colors = {
     background = "#000000",
     foreground = "#ffffff",
@@ -175,11 +189,11 @@ import pathlib
 import sys
 
 manifest = pathlib.Path(sys.argv[1])
-root = manifest.parent
+root = manifest.parent.resolve()
 data = json.loads(manifest.read_text(encoding="utf-8"))
 for scenario in data.get("scenarios", []):
     scenario_id = scenario["scenario_id"]
-    transcript = root / scenario["input_artifact"]
+    transcript = (root / scenario["input_artifact"]).resolve()
     print(f"{scenario_id}\t{transcript}")
 PY
 }
@@ -257,7 +271,6 @@ export_engine_frames() {
   local gui="$2"
   local frame_dir="$3"
   local run_dir="$FRAME_ROOT/run-$engine"
-  local config="$run_dir/wezterm.lua"
   local driver="$run_dir/render_transcript.py"
 
   if [[ ! -x "$gui" ]]; then
@@ -266,11 +279,14 @@ export_engine_frames() {
   fi
 
   mkdir -p "$run_dir" "$frame_dir"
-  write_config "$config"
+  run_dir="$(cd "$run_dir" && pwd -P)"
+  frame_dir="$(cd "$frame_dir" && pwd -P)"
+  driver="$run_dir/render_transcript.py"
   write_driver "$driver"
 
   while IFS=$'\t' read -r scenario_id transcript; do
     local title="ft-wezterm-diff-$engine-$scenario_id-$RUN_ID"
+    local config="$run_dir/$scenario_id.lua"
     local ready="$run_dir/$scenario_id.ready"
     local output="$frame_dir/$scenario_id/frame-000.png"
     local class="ft-wezterm-diff-$engine"
@@ -285,14 +301,14 @@ export_engine_frames() {
       launch_env+=(FRANKENTERM_LUA_CONFIG=1 FT_MACOS_BACKEND=wgpu)
     fi
 
+    write_config "$config" python3 "$driver" "$transcript" "$title" "$ready"
     echo "[wezterm-render-adapter] export engine=$engine scenario=$scenario_id"
     (
       set +e
       env "${launch_env[@]}" "$gui" --config-file "$config" start \
         --always-new-process \
         --class "$class" \
-        --position 80,80 \
-        -- python3 "$driver" "$transcript" "$title" "$ready" >"$log_file" 2>&1
+        --position 80,80 >"$log_file" 2>&1
       status=$?
       printf '%s\n' "$status" >"$status_file"
       exit "$status"
