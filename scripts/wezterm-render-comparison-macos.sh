@@ -92,6 +92,33 @@ require_tool() {
   fi
 }
 
+
+abspath_parented() {
+  local path="$1"
+  local dir
+  local base
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+  if [[ ! -d "$dir" ]]; then
+    echo "[wezterm-render-adapter] path parent does not exist: $dir" >&2
+    exit 66
+  fi
+  dir="$(cd "$dir" && pwd -P)"
+  printf "%s/%s\n" "$dir" "$base"
+}
+
+canonicalize_report_paths() {
+  mkdir -p "$FRAME_ROOT" "$(dirname "$OUTPUT")"
+  FRAME_ROOT="$(abspath_parented "$FRAME_ROOT")"
+  OUTPUT="$(abspath_parented "$OUTPUT")"
+  MANIFEST="$(abspath_parented "$MANIFEST")"
+}
+
+canonicalize_gui_paths() {
+  FRANKENTERM_GUI="$(abspath_parented "$FRANKENTERM_GUI")"
+  WEZTERM_GUI="$(abspath_parented "$WEZTERM_GUI")"
+}
+
 write_comparison_report() {
   local frankenterm_frames="$1"
   local wezterm_frames="$2"
@@ -351,6 +378,7 @@ export_engine_frames() {
 
 if [[ "$SELF_TEST" -eq 1 ]]; then
   require_tool cargo
+  canonicalize_report_paths
   run_self_test
   exit 0
 fi
@@ -367,6 +395,8 @@ fi
 require_tool cargo
 require_tool python3
 require_tool screencapture
+canonicalize_report_paths
+canonicalize_gui_paths
 
 FRANKENTERM_FRAME_ROOT="$FRAME_ROOT/frankenterm"
 WEZTERM_FRAME_ROOT="$FRAME_ROOT/wezterm"
