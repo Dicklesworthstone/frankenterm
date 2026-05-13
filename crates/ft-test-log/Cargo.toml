@@ -1,0 +1,22 @@
+[package]
+name = "ft-test-log"
+description = "Centralized test-logging convention for FrankenTerm: canonical JSONL row shape, time-ordered run_id, per-kind helpers consumed by reality-check evidence-stream tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "testing", "logging"]
+categories = ["development-tools::testing"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7", "serde"] }
+chrono = { workspace = true }

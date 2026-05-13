@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.io/schemas/testing/log-format-schema.v1.json",
+  "title": "FrankenTerm canonical test-log row",
+  "description": "Canonical JSONL row shape emitted by ft-test-log (crates/ft-test-log/src/lib.rs TestLogger). G52 substrate for reality-check epic ft-tf6g3. Schema-version constant: ROW_SCHEMA_VERSION = ft.test-log.row.v1. Default output path: target/test-logs/<area>/<test>/<run_id>.jsonl (overridable via FT_TEST_LOG_DIR env var). Bead: ft-tf6g3.40.",
+  "type": "object",
+  "required": ["schema_version", "ts", "area", "test", "kind", "payload", "run_id"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ft.test-log.row.v1",
+      "description": "Stable schema version. Must match ROW_SCHEMA_VERSION in crates/ft-test-log/src/lib.rs."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 UTC timestamp of when the row was emitted."
+    },
+    "area": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable test-area category. Conventional values: 'sprt', 'conformal', 'regime-shift', 'causal-attribution', 'renderer-slo', 'taxonomy', 'reality-check-cli', 'cross-family', 'attestation-verify', 'evidence-stream', 'fixture-corpus'."
+    },
+    "test": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Test function name (Rust #[test] fn name) or doctest origin string. Used for grouping rows within an area."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["assertion", "stage_enter", "stage_exit", "measurement", "error", "decision", "evidence_emit"],
+      "description": "One of the 7 canonical row kinds. Test authors should prefer the named helpers on TestLogger (.assertion, .stage_enter, .stage_exit, .measurement, .error, .decision, .evidence_emit) over emitting kind strings manually."
+    },
+    "payload": {
+      "description": "Caller-supplied JSON payload. Shape depends on the kind; conventional fields per kind:\n- assertion: { label: string, detail: any }\n- stage_enter / stage_exit: { stage: string, detail: any }\n- measurement: { metric: string, detail: any (typically { value: number, unit: string, ... }) }\n- error: { reason: string, detail: any }\n- decision: { verdict: string, detail: any }\n- evidence_emit: { claim_id: string, detail: any (typically a pointer to the emitted G47 evidence-stream sample) }"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "UUIDv7 identifier (time-ordered). Generated once per TestLogger instance so rows from the same test naturally sort and rows across instances don't collide. The '7' in the third hex group anchors the version."
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "ft.test-log.row.v1",
+      "ts": "2026-05-12T23:50:00Z",
+      "area": "sprt",
+      "test": "continues_until_minimum_sample_count",
+      "kind": "assertion",
+      "payload": {
+        "label": "decision matches expected",
+        "detail": { "expected": "Continue", "actual": "Continue" }
+      },
+      "run_id": "01957a7c-3b2e-7c89-a1d3-4e5f1234abcd"
+    },
+    {
+      "schema_version": "ft.test-log.row.v1",
+      "ts": "2026-05-12T23:50:01.412Z",
+      "area": "sprt",
+      "test": "continues_until_minimum_sample_count",
+      "kind": "measurement",
+      "payload": {
+        "metric": "llr",
+        "detail": { "value": -0.42, "samples_collected": 8, "samples_needed": 32 }
+      },
+      "run_id": "01957a7c-3b2e-7c89-a1d3-4e5f1234abcd"
+    }
+  ]
+}
