@@ -36,6 +36,11 @@ export RCH_CHECK_SLOTS="${RCH_CHECK_SLOTS:-1}"
 export RCH_PROOF_LEDGER_FILE="${PROOF_LEDGER_FILE}"
 export RCH_PROOF_LEDGER_BEAD_ID="${BEAD_ID}"
 export RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}"
+if [[ -n "${RCH_MIRROR_REQUIRED_PATHS:-}" ]]; then
+    export RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS}:crates/frankenterm-core/tests/readme_footnotes_resolve.rs"
+else
+    export RCH_MIRROR_REQUIRED_PATHS="crates/frankenterm-core/tests/readme_footnotes_resolve.rs"
+fi
 
 # shellcheck source=tests/e2e/lib_rch_guards.sh
 source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
