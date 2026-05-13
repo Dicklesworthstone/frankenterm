@@ -1440,6 +1440,46 @@ If `br dep cycles --json` reports only closed/legacy `wa-*` cycles and no
 active `ft-*` cycles, say that explicitly instead of claiming the whole graph
 is cycle-free.
 
+### Robot-Suggest Hygiene Checkpoint
+
+Run `bv --robot-suggest` after large planning, reality-check, or idea-wizard
+batches, and before closing a Beads graph-hygiene lane. Treat the output as an
+advisory worksheet only. A high-confidence suggestion is not enough evidence to
+mutate the graph.
+
+Required classification workflow:
+
+1. Capture the `generated_at`, `data_hash`, total suggestion counts, per-type
+   counts, and high-confidence/actionable counts from `bv --robot-suggest`.
+2. For each candidate dependency edge, inspect both sides with `br show --json`
+   and use `br dep tree <id>` when hierarchy or historical closure could make
+   the edge redundant.
+3. Apply edges only when descriptions, acceptance criteria, comments, or
+   artifact flow prove a real ordering relationship. Shared labels, shared
+   keywords, or duplicate-looking acceptance text are not enough.
+4. Classify every rejected or deferred live `ft-*` dependency suggestion as one
+   of: `already_implied`, `status_mismatch`, `closed_historical_only`,
+   `needs_human_or_domain_context`, or `pure_keyword_collision`.
+5. Never run legacy `bd` `action_command` strings printed by old tooling in
+   this repo. Recreate any accepted mutation with the current `br` command
+   after verification.
+6. Stop without mutating the graph when the evidence is ambiguous or when the
+   change would make the ready queue less truthful.
+
+Closeout proof footer for this checkpoint:
+
+```text
+bv --robot-suggest generated_at=<timestamp> data_hash=<hash>
+suggestions: total=<n> missing_dependency=<n> potential_duplicate=<n> label_suggestion=<n> high_confidence=<n> actionable=<n>
+br dep cycles --json: count=<n>; active_ft_cycles=<yes|no>
+br sync --flush-only --json: errors=<n> success_rate=<float>
+```
+
+The first audit example is the `ft-uicx9` lane: `ft-uicx9.1` captured and
+classified the worksheet, `ft-uicx9.2` verified high-confidence dependency
+edges before declining mutations, and `ft-uicx9.3` documented repeated false
+positive families.
+
 ### jq Quick Reference
 
 ```bash
