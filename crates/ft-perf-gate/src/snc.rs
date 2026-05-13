@@ -109,7 +109,14 @@ pub enum SncBound {
     HeavyTailBound {
         /// Confidence p (probability that the delay is at most `delay_ms`).
         confidence: f64,
-        /// Worst-case delay bound at confidence `p`.
+        /// Worst-case delay bound at confidence `p`. The numeric value is
+        /// in **the same unit as the input samples' `metric_unit`** —
+        /// typically ms, but callers passing samples in `us` or
+        /// `bytes_per_line` (etc.) receive a bound in that unit. The
+        /// field name retains the `_ms` suffix for serde wire-format
+        /// compatibility with the v1 wire format, but consumers should
+        /// look up the unit from the originating evidence stream's
+        /// `metric_unit`.
         delay_ms: f64,
         /// Tail-index estimate that produced the bound.
         alpha: f64,
@@ -125,10 +132,24 @@ pub enum SncBound {
 pub struct SncConfig {
     /// Target confidence p for the delay bound (e.g., 0.9999).
     pub confidence: f64,
-    /// Hill estimator k (upper-order statistics used).
+    /// Hill estimator k (upper-order statistics used). Internally clamped
+    /// to a minimum of 2 by both [`hill_estimate`] and
+    /// [`compute_snc_bound`] to avoid degenerate single-point estimates.
     pub hill_k: usize,
     /// Tail-index threshold below which we are "heavy-tail" (α<this).
     /// Conventional: 2.0 (Lindley breaks down).
+    ///
+    /// **Important caveat.** The Hill estimator is a tail-index estimator
+    /// that assumes the underlying distribution IS Pareto in its upper
+    /// tail. Applied to Gaussian or other light-tail data, Hill can
+    /// produce small finite-sample α estimates (sometimes below 2.0!)
+    /// due to estimator bias, which would route truly-Gaussian samples
+    /// through the heavy-tail branch. Callers that need a strict
+    /// heavy-tail-vs-light-tail classification SHOULD pair this with a
+    /// goodness-of-fit test (e.g. Kolmogorov-Smirnov against the empirical
+    /// distribution) before trusting the routing verdict. For pure
+    /// heavy-tail vs known-light-tail discrimination at the bound-quality
+    /// level (rather than routing-verdict level) the Hill α serves well.
     pub heavy_tail_alpha_threshold: f64,
     /// Stability margin — currently unused in the v1 single-stage
     /// observed-delay form (kept for serde compatibility + reserved for

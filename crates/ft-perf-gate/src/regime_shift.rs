@@ -135,29 +135,41 @@ fn mean_value(samples: &[EvidenceSample]) -> Option<f64> {
 }
 
 // =============================================================================
-// Page-Hinkley CUSUM with KL-divergence shift statistic (G42 / ft-tf6g3.27)
+// One-sided CUSUM with KL-divergence shift statistic (G42 / ft-tf6g3.27)
 // =============================================================================
 //
-// Reference: Page (1954) "Continuous Inspection Schemes". The Page-Hinkley
-// test maintains a running CUSUM of (deviation - delta) and triggers when
-// the gap between the current CUSUM and its historical minimum exceeds a
-// threshold. The classical formulation tracks mean shifts; we extend it
-// with a KL-divergence-based shift statistic between rolling pre/post
-// windows of fixed size, which is more sensitive to *distribution* shifts
-// (mean + variance), the regime the G54 regime-shift fixture exhibits.
+// Reference: Page (1954) "Continuous Inspection Schemes". The classical
+// Page-Hinkley test maintains a running CUSUM of (deviation - delta) and
+// triggers when the gap between the current CUSUM and its historical
+// minimum exceeds a threshold. This implementation uses the simpler
+// **one-sided CUSUM** variant: the cumulative sum is clamped at 0 from
+// below, which is equivalent to the strict Page-Hinkley test in the
+// regime where the underlying process is in-control AND drifts are
+// upward; the clamp eliminates the need for separate min-tracking.
 //
-// Page-Hinkley with KL-augmented stat (one-sided up):
+// We extend the classical Page CUSUM with a **KL-divergence shift
+// statistic** between two rolling Gaussian-summary windows (pre/post),
+// which is more sensitive to *distribution* shifts (mean + variance)
+// than the classical mean-only deviation. This is the regime the G54
+// regime-shift fixture exhibits.
+//
+// One-sided CUSUM with KL-augmented stat:
 //
 //   S_t = max(0, S_{t-1} + KL(post || pre) - delta)
-//   m_t = min_{0..t} S_t
-//   alarm: S_t - m_t > lambda
+//   alarm: S_t > lambda
 //
-// where KL is computed between Gaussian summary statistics of two sliding
-// windows. delta is the in-control tolerance; lambda is the alarm
-// threshold. Both have closed-form ranges given desired ARL_0 (average
-// run length under no shift) and ARL_1 (mean detection delay under
-// shift) — the defaults below target ARL_0 ~ 1000 with ARL_1 < 50 for
-// 30%+ mean shifts.
+// where KL is computed between Gaussian summary statistics of two
+// sliding windows. delta is the in-control tolerance; lambda is the
+// alarm threshold. Both have closed-form ranges given desired ARL_0
+// (average run length under no shift) and ARL_1 (mean detection delay
+// under shift) — the defaults below target ARL_0 ~ 1000 with ARL_1 < 50
+// for 30%+ mean shifts (empirically calibrated against the G54
+// baseline-30d and regime-shift fixtures).
+//
+// Future work (out of scope for v1): the strict two-sided Page-Hinkley
+// allows the CUSUM to go negative and tracks both min and max; that
+// variant is more robust to downward shifts at the cost of extra
+// state and a slightly different threshold calibration.
 
 /// Configuration for the Page-Hinkley KL-augmented regime-shift detector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -245,7 +257,6 @@ pub fn detect_page_hinkley_kl(
     }
 
     let mut cusum: f64 = 0.0;
-    let mut min_cusum: f64 = 0.0;
     let mut alarm_at: Option<usize> = None;
 
     for t in (cfg.window * 2)..n {
@@ -254,12 +265,12 @@ pub fn detect_page_hinkley_kl(
         let (m1, v1) = gauss_summary(pre);
         let (m2, v2) = gauss_summary(post);
         let kl = gauss_kl(m1, v1, m2, v2);
-        // Page-Hinkley one-sided update on the KL stat.
+        // One-sided CUSUM: clamp at 0 from below. Since cusum cannot
+        // go negative, the historical minimum is always 0, so the
+        // strict Page-Hinkley test S_t - min(S_*) > lambda reduces
+        // to S_t > lambda.
         cusum = (cusum + kl - cfg.delta).max(0.0);
-        if cusum < min_cusum {
-            min_cusum = cusum;
-        }
-        if t >= cfg.warmup && cusum - min_cusum > cfg.lambda {
+        if t >= cfg.warmup && cusum > cfg.lambda {
             alarm_at = Some(t);
             break;
         }
@@ -267,7 +278,7 @@ pub fn detect_page_hinkley_kl(
 
     let decision = match alarm_at {
         Some(_idx) => GateDecision::RegimeShift {
-            reason: "page-hinkley + kl-divergence alarm crossed lambda".to_string(),
+            reason: "one-sided cusum + kl-divergence alarm crossed lambda".to_string(),
             divergence: cusum,
         },
         None => GateDecision::Accept {
