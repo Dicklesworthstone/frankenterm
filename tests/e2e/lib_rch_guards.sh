@@ -45,6 +45,7 @@ RCH_WORKER_SELECTION_WAIT_SECS="${RCH_WORKER_SELECTION_WAIT_SECS:-0}"
 RCH_WORKER_SELECTION_POLL_SECS="${RCH_WORKER_SELECTION_POLL_SECS:-15}"
 RCH_REMOTE_PREFLIGHT_WAIT_SECS="${RCH_REMOTE_PREFLIGHT_WAIT_SECS:-${RCH_WORKER_SELECTION_WAIT_SECS}}"
 RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS:-}"
+RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS="${RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS:-auto}"
 RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
 RCH_MIRROR_MIN_PASSING_WORKERS="${RCH_MIRROR_MIN_PASSING_WORKERS:-1}"
 RCH_GITHUB_ACTIONS_LOCAL_CARGO="${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-0}"
@@ -1077,11 +1078,31 @@ rch_mirror_required_paths() {
 
 ensure_rch_mirror_preflight() {
     local required_paths=()
+    local workspace_member_arg=()
+    local require_workspace_member_roots="false"
     local path
     while IFS= read -r path; do
         required_paths+=("--path" "${path}")
     done < <(rch_mirror_required_paths)
-    [[ "${#required_paths[@]}" -gt 0 ]] || return 0
+
+    case "${RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS}" in
+        auto)
+            [[ "${#required_paths[@]}" -gt 0 ]] && require_workspace_member_roots="true"
+            ;;
+        1|true|TRUE|yes|YES)
+            require_workspace_member_roots="true"
+            ;;
+        0|false|FALSE|no|NO|"")
+            require_workspace_member_roots="false"
+            ;;
+        *)
+            rch_fatal "RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS must be auto, true, or false; got '${RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS}'."
+            ;;
+    esac
+    if [[ "${require_workspace_member_roots}" == "true" ]]; then
+        workspace_member_arg=("--workspace-member-roots")
+    fi
+    [[ "${#required_paths[@]}" -gt 0 || "${#workspace_member_arg[@]}" -gt 0 ]] || return 0
 
     local attest_script="${_RCH_REPO_ROOT}/scripts/attest_rch_worker_mirror.sh"
     [[ -x "${attest_script}" ]] || rch_fatal "mirror attestation script is not executable: ${attest_script}"
@@ -1135,6 +1156,7 @@ ensure_rch_mirror_preflight() {
             --worker "${worker_id}" \
             "${bead_arg[@]}" \
             "${required_paths[@]}" \
+            "${workspace_member_arg[@]}" \
             --command "remote-only preflight mirror attestation" \
             --json >"${worker_json}"
         worker_rc=$?
@@ -1158,7 +1180,7 @@ ensure_rch_mirror_preflight() {
         --arg scheduler_workers_log "$(rch_repo_relative_path "${_RCH_SCHEDULER_WORKERS_LOG}")" \
         'def blocking_failure($block_on_stale_head):
           .status != "passed"
-          and ($block_on_stale_head or .reason_code != "rch_mirror.head_mismatch");
+          and ($block_on_stale_head or .reason_code != "rch_mirror.required_files_ok_head_mismatch");
         ([.[] | select(blocking_failure($block_on_stale_head))] | length) as $blocking_failures
         | ($total - $blocking_failures) as $passing_workers
         | ($passing_workers >= $min_passing_workers) as $pool_ready

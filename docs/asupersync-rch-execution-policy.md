@@ -151,10 +151,14 @@ Allowed during worker-specific RCH incidents:
   excluded from transfer, so matching required-file hashes are the readiness
   signal for mirror preflight; HEAD mismatch/unavailability is retained in the
   artifact as residual context. Use
-  `scripts/attest_rch_worker_mirror.sh --worker <id> --path <tracked-file> ...`
-  for this static-only evidence; it emits
+  `scripts/attest_rch_worker_mirror.sh --worker <id> --workspace-member-roots --path <tracked-file> ...`
+  for this static-only evidence; `--workspace-member-roots` expands every
+  `[workspace].members` root to its tracked `Cargo.toml` plus declared
+  lib/bin/build entrypoints that exist locally, so dropped workspace crates fail
+  before remote Cargo starts. The script emits
   `kind: "rch_selected_worker_mirror_attestation"` with reason codes such as
-  `rch_mirror.project_path_absent`, `rch_mirror.head_mismatch`,
+  `rch_mirror.project_path_absent`,
+  `rch_mirror.required_files_ok_head_mismatch`,
   `rch_mirror.missing_tracked_file`,
   `rch_mirror.tracked_file_hash_mismatch`, and
   `rch_mirror.worker_unreachable`.

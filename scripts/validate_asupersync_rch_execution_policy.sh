@@ -1383,7 +1383,7 @@ JSON
   fi
 
   local mirror_cmd mirror_cmd_fp mirror_worker mirror_worker_fp mirror_residual mirror_residual_fp
-  mirror_cmd="bash scripts/attest_rch_worker_mirror.sh --worker mock-1 --path Cargo.toml --output ${tmp_artifact_rel}"
+  mirror_cmd="bash scripts/attest_rch_worker_mirror.sh --worker mock-1 --workspace-member-roots --path Cargo.toml --json > ${tmp_artifact_rel}"
   mirror_cmd_fp="$(fingerprint_text "${mirror_cmd}")"
   mirror_worker="worker=mock-1"
   mirror_worker_fp="$(fingerprint_text "${mirror_worker}")"

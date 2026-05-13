@@ -890,7 +890,7 @@ expect_validation_failure \
   "target-worker remote proof with missing source mirror must fail validation"
 
 mock_rch_log_rel="${mock_rch_log#"${ROOT_DIR}"/}"
-mirror_cmd="bash scripts/attest_rch_worker_mirror.sh --worker contabo-2 --path Cargo.toml --output ${mock_rch_log_rel}"
+mirror_cmd="bash scripts/attest_rch_worker_mirror.sh --worker contabo-2 --workspace-member-roots --path Cargo.toml --json > ${mock_rch_log_rel}"
 mirror_worker="worker=contabo-2"
 mirror_residual="mirror attestation showed the named worker is missing a tracked file; no material Cargo proof ran"
 jq --arg cmd "${mirror_cmd}" \
