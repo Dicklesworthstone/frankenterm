@@ -29,9 +29,12 @@
 use std::path::PathBuf;
 
 use frankenterm_core::atlas_stability::{
-    AtlasOp, AtlasStabilityEvent, AtlasStabilityHealth, AtlasStabilityResize, check_invariants,
-    check_pure_resize, parse_events_jsonl, render_events_jsonl,
+    ATLAS_RECOVER_SSIM_FLOOR_PPM, AtlasOp, AtlasRecoverCycle, AtlasStabilityEvent,
+    AtlasStabilityHealth, AtlasStabilityResize, check_invariants, check_pure_resize,
+    check_recover_cycle, check_recover_cycles, parse_events_jsonl, parse_recover_cycles_jsonl,
+    render_events_jsonl, render_recover_cycles_jsonl,
 };
+use frankenterm_core::atlas_tiered_swap::{AtlasTier, TieredAtlasRegion, select_eviction_target};
 use proptest::prelude::*;
 
 fn golden_dir() -> PathBuf {
@@ -185,6 +188,56 @@ fn grow_path_stream() -> Vec<AtlasStabilityEvent> {
     ]
 }
 
+/// Synthetic glyph corpus for the G18.4 cache-evict/recover SLO.
+/// The glyph IDs describe the render class without embedding font-
+/// dependent glyph bytes in this pure-logic fixture.
+fn recover_cycle_corpus() -> Vec<AtlasRecoverCycle> {
+    vec![
+        recover_cycle("ascii_A", 10, "sha256:ascii-a", "sha256:ascii-a", 1_000_000),
+        recover_cycle(
+            "emoji_grinning",
+            11,
+            "sha256:emoji-grinning-pre",
+            "sha256:emoji-grinning-post",
+            ATLAS_RECOVER_SSIM_FLOOR_PPM,
+        ),
+        recover_cycle(
+            "cjk_water",
+            12,
+            "sha256:cjk-water",
+            "sha256:cjk-water",
+            1_000_000,
+        ),
+        recover_cycle(
+            "latin_combining_acute",
+            13,
+            "sha256:combining-acute",
+            "sha256:combining-acute",
+            1_000_000,
+        ),
+    ]
+}
+
+fn recover_cycle(
+    glyph_id: &str,
+    region_id: u64,
+    pre_evict_hash: &str,
+    post_recover_hash: &str,
+    ssim_ppm: u32,
+) -> AtlasRecoverCycle {
+    AtlasRecoverCycle {
+        ts_ms: region_id * 10,
+        glyph_id: glyph_id.to_string(),
+        region_id,
+        eviction_frame: 120,
+        recover_frame: 121,
+        pre_evict_hash: pre_evict_hash.to_string(),
+        post_recover_hash: post_recover_hash.to_string(),
+        ssim_ppm,
+        ssim_floor_ppm: ATLAS_RECOVER_SSIM_FLOOR_PPM,
+    }
+}
+
 // ============================================================================
 // Test 1 — synthetic streams satisfy the invariants.
 // ============================================================================
@@ -232,6 +285,11 @@ fn golden_grow_path() {
     snapshot_golden("grow_path", &grow_path_stream());
 }
 
+#[test]
+fn golden_recover_cycle_corpus() {
+    snapshot_recover_cycles_golden("recover_cycle_corpus", &recover_cycle_corpus());
+}
+
 fn snapshot_golden(scenario: &str, events: &[AtlasStabilityEvent]) {
     let rendered = render_events_jsonl(events);
     let path = golden_path(scenario);
@@ -262,6 +320,41 @@ fn snapshot_golden(scenario: &str, events: &[AtlasStabilityEvent]) {
 
     let parsed = parse_events_jsonl(&rendered).expect("parse");
     assert_eq!(parsed, events, "JSONL round-trip drift for {scenario}");
+}
+
+fn snapshot_recover_cycles_golden(scenario: &str, cycles: &[AtlasRecoverCycle]) {
+    let rendered = render_recover_cycles_jsonl(cycles);
+    let path = golden_path(scenario);
+
+    if bless_enabled() {
+        ensure_golden_dir_exists();
+        std::fs::write(&path, &rendered).expect("write blessed golden");
+        panic!(
+            "{scenario}: golden blessed at {}; re-run without FT_ATLAS_BLESS to validate",
+            path.display()
+        );
+    }
+
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "missing golden for {scenario} at {}: {err} \
+             (re-run with FT_ATLAS_BLESS=1 to generate)",
+            path.display()
+        )
+    });
+
+    assert_eq!(
+        rendered,
+        expected,
+        "{scenario} drifted from golden at {}",
+        path.display()
+    );
+
+    let parsed = parse_recover_cycles_jsonl(&rendered).expect("parse");
+    assert_eq!(
+        parsed, cycles,
+        "recover-cycle JSONL round-trip drift for {scenario}"
+    );
 }
 
 // ============================================================================
@@ -313,7 +406,61 @@ fn health_snapshot_stays_resize_stable_through_storm() {
 }
 
 // ============================================================================
-// Test 5 — proptest properties.
+// Test 5 — cache-evict/recover SLO.
+// ============================================================================
+
+#[test]
+fn cache_evict_recover_cycle_preserves_glyph_fingerprints() {
+    let cycles = recover_cycle_corpus();
+    let violations = check_recover_cycles(&cycles);
+    assert!(
+        violations.is_empty(),
+        "recover-cycle violations: {violations:?}"
+    );
+}
+
+#[test]
+fn cache_evict_recover_cycle_rejects_visible_drift() {
+    let cycle = recover_cycle(
+        "emoji_grinning",
+        11,
+        "sha256:emoji-grinning-pre",
+        "sha256:emoji-grinning-drifted",
+        ATLAS_RECOVER_SSIM_FLOOR_PPM - 1,
+    );
+    let violations = check_recover_cycle(&cycle);
+    assert!(
+        violations.iter().any(|violation| matches!(
+            violation,
+            frankenterm_core::atlas_stability::AtlasStabilityViolation::RecoverVisualDrift { .. }
+        )),
+        "expected visible drift violation, got {violations:?}"
+    );
+}
+
+#[test]
+fn pressure_eviction_selects_lru_region_and_recovers_without_flicker() {
+    let candidates = vec![
+        TieredAtlasRegion::new(10, AtlasTier::Vram, 10, 4096),
+        TieredAtlasRegion::new(11, AtlasTier::Vram, 80, 4096),
+        TieredAtlasRegion::new(12, AtlasTier::HostRam, 1, 4096),
+    ];
+
+    let victim = select_eviction_target(&candidates, AtlasTier::Vram, 120).expect("vram victim");
+    assert_eq!(victim.id, 10, "oldest VRAM region should evict first");
+
+    let cycle = recover_cycle(
+        "ascii_A",
+        victim.id,
+        "sha256:ascii-a",
+        "sha256:ascii-a",
+        1_000_000,
+    );
+    assert!(check_recover_cycle(&cycle).is_empty());
+}
+
+// ============================================================================
+// Test 6 — proptest properties.
 // ============================================================================
 
 prop_compose! {

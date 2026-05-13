@@ -112,6 +112,58 @@ pub struct AtlasStabilityResize {
 }
 
 // ============================================================================
+// Evict/recover cycle
+// ============================================================================
+
+/// SSIM floor for an atlas cache evict/recover cycle, represented in
+/// parts per million so the contract remains deterministic in JSON.
+///
+/// `999_000` means `0.999`.
+pub const ATLAS_RECOVER_SSIM_FLOOR_PPM: u32 = 999_000;
+
+/// One glyph-region evict/recover observation.
+///
+/// The integration layer computes the frame hashes from tightly packed
+/// RGBA output around the glyph's cell. The pure contract here only
+/// decides whether the recovered glyph is equivalent to the pre-evict
+/// render: either byte-identical by hash or similar enough by SSIM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtlasRecoverCycle {
+    /// Monotonic timestamp (ms since fixture start).
+    pub ts_ms: u64,
+    /// Stable glyph/cell identifier from the fixture corpus.
+    pub glyph_id: String,
+    /// Stable atlas region identifier that was evicted and recovered.
+    pub region_id: u64,
+    /// Frame index where the region left the hot atlas tier.
+    pub eviction_frame: u64,
+    /// Frame index where the region was recovered and re-rendered.
+    pub recover_frame: u64,
+    /// Hash of the glyph render before eviction.
+    pub pre_evict_hash: String,
+    /// Hash of the glyph render after recovery.
+    pub post_recover_hash: String,
+    /// SSIM between pre-evict and post-recover glyph pixels in ppm.
+    pub ssim_ppm: u32,
+    /// Required SSIM floor in ppm.
+    pub ssim_floor_ppm: u32,
+}
+
+impl AtlasRecoverCycle {
+    /// Whether the recovered glyph is byte-identical to the pre-evict render.
+    #[must_use]
+    pub fn pixel_identical(&self) -> bool {
+        self.pre_evict_hash == self.post_recover_hash
+    }
+
+    /// Whether the recovered glyph satisfies the visual-equivalence rule.
+    #[must_use]
+    pub fn passes_visual_floor(&self) -> bool {
+        self.pixel_identical() || self.ssim_ppm >= self.ssim_floor_ppm
+    }
+}
+
+// ============================================================================
 // Invariants
 // ============================================================================
 
@@ -147,6 +199,20 @@ pub enum AtlasStabilityViolation {
     /// Pure resize (`AtlasStabilityResize`) reported `> 0`
     /// re-uploaded glyphs. The bead's headline correctness rule.
     PureResizeReUploaded { glyphs_re_uploaded: u64, ts_ms: u64 },
+    /// Recovery was recorded before the eviction frame.
+    RecoverFrameBeforeEviction {
+        glyph_id: String,
+        eviction_frame: u64,
+        recover_frame: u64,
+    },
+    /// Recovered glyph pixels diverged below the accepted SSIM floor.
+    RecoverVisualDrift {
+        glyph_id: String,
+        pre_evict_hash: String,
+        post_recover_hash: String,
+        ssim_ppm: u32,
+        ssim_floor_ppm: u32,
+    },
 }
 
 /// Run all invariant checks against a captured event stream.
@@ -215,6 +281,40 @@ pub fn check_pure_resize(resize: &AtlasStabilityResize) -> Vec<AtlasStabilityVio
     v
 }
 
+/// Check one evict/recover cycle against the atlas-stability SLO:
+/// recovered glyph pixels must be byte-identical to the pre-evict
+/// render or meet the declared SSIM floor.
+#[must_use]
+pub fn check_recover_cycle(cycle: &AtlasRecoverCycle) -> Vec<AtlasStabilityViolation> {
+    let mut v = Vec::new();
+    if cycle.recover_frame < cycle.eviction_frame {
+        v.push(AtlasStabilityViolation::RecoverFrameBeforeEviction {
+            glyph_id: cycle.glyph_id.clone(),
+            eviction_frame: cycle.eviction_frame,
+            recover_frame: cycle.recover_frame,
+        });
+    }
+    if !cycle.passes_visual_floor() {
+        v.push(AtlasStabilityViolation::RecoverVisualDrift {
+            glyph_id: cycle.glyph_id.clone(),
+            pre_evict_hash: cycle.pre_evict_hash.clone(),
+            post_recover_hash: cycle.post_recover_hash.clone(),
+            ssim_ppm: cycle.ssim_ppm,
+            ssim_floor_ppm: cycle.ssim_floor_ppm,
+        });
+    }
+    v
+}
+
+/// Check a batch of evict/recover observations.
+#[must_use]
+pub fn check_recover_cycles(cycles: &[AtlasRecoverCycle]) -> Vec<AtlasStabilityViolation> {
+    cycles
+        .iter()
+        .flat_map(check_recover_cycle)
+        .collect::<Vec<_>>()
+}
+
 // ============================================================================
 // Health diagnostics surface
 // ============================================================================
@@ -280,6 +380,33 @@ pub fn render_events_jsonl(events: &[AtlasStabilityEvent]) -> String {
 
 /// Parse a JSONL string back into events.
 pub fn parse_events_jsonl(jsonl: &str) -> Result<Vec<AtlasStabilityEvent>, serde_json::Error> {
+    let mut out = Vec::new();
+    for line in jsonl.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push(serde_json::from_str(trimmed)?);
+    }
+    Ok(out)
+}
+
+/// Serialize evict/recover observations as JSONL.
+#[must_use]
+pub fn render_recover_cycles_jsonl(cycles: &[AtlasRecoverCycle]) -> String {
+    let mut out = String::new();
+    for cycle in cycles {
+        let line = serde_json::to_string(cycle).expect("AtlasRecoverCycle always serializes");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse evict/recover observations from JSONL.
+pub fn parse_recover_cycles_jsonl(
+    jsonl: &str,
+) -> Result<Vec<AtlasRecoverCycle>, serde_json::Error> {
     let mut out = Vec::new();
     for line in jsonl.lines() {
         let trimmed = line.trim();
@@ -495,6 +622,72 @@ mod tests {
         let rendered = render_events_jsonl(&events);
         let parsed = parse_events_jsonl(&rendered).expect("parse");
         assert_eq!(parsed, events);
+    }
+
+    fn recover_cycle(
+        pre_evict_hash: &str,
+        post_recover_hash: &str,
+        ssim_ppm: u32,
+    ) -> AtlasRecoverCycle {
+        AtlasRecoverCycle {
+            ts_ms: 10,
+            glyph_id: "ascii_A".to_string(),
+            region_id: 7,
+            eviction_frame: 4,
+            recover_frame: 8,
+            pre_evict_hash: pre_evict_hash.to_string(),
+            post_recover_hash: post_recover_hash.to_string(),
+            ssim_ppm,
+            ssim_floor_ppm: ATLAS_RECOVER_SSIM_FLOOR_PPM,
+        }
+    }
+
+    #[test]
+    fn recover_cycle_pixel_identical_is_clean() {
+        let cycle = recover_cycle("hash-a", "hash-a", 1_000_000);
+        assert!(cycle.pixel_identical());
+        assert!(cycle.passes_visual_floor());
+        assert!(check_recover_cycle(&cycle).is_empty());
+    }
+
+    #[test]
+    fn recover_cycle_ssim_floor_accepts_equivalent_recover() {
+        let cycle = recover_cycle("hash-a", "hash-b", ATLAS_RECOVER_SSIM_FLOOR_PPM);
+        assert!(!cycle.pixel_identical());
+        assert!(cycle.passes_visual_floor());
+        assert!(check_recover_cycle(&cycle).is_empty());
+    }
+
+    #[test]
+    fn recover_cycle_visual_drift_violates() {
+        let cycle = recover_cycle("hash-a", "hash-b", ATLAS_RECOVER_SSIM_FLOOR_PPM - 1);
+        let v = check_recover_cycle(&cycle);
+        assert!(
+            v.iter()
+                .any(|x| matches!(x, AtlasStabilityViolation::RecoverVisualDrift { .. }))
+        );
+    }
+
+    #[test]
+    fn recover_frame_before_eviction_violates() {
+        let mut cycle = recover_cycle("hash-a", "hash-a", 1_000_000);
+        cycle.recover_frame = cycle.eviction_frame - 1;
+        let v = check_recover_cycle(&cycle);
+        assert!(v.iter().any(|x| matches!(
+            x,
+            AtlasStabilityViolation::RecoverFrameBeforeEviction { .. }
+        )));
+    }
+
+    #[test]
+    fn recover_cycle_jsonl_roundtrip() {
+        let cycles = vec![
+            recover_cycle("hash-a", "hash-a", 1_000_000),
+            recover_cycle("hash-b", "hash-c", ATLAS_RECOVER_SSIM_FLOOR_PPM),
+        ];
+        let rendered = render_recover_cycles_jsonl(&cycles);
+        let parsed = parse_recover_cycles_jsonl(&rendered).expect("parse");
+        assert_eq!(parsed, cycles);
     }
 
     #[test]
