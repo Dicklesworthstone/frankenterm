@@ -991,6 +991,10 @@ NOTES:
         #[arg(long, value_enum, default_value = "cargo-test")]
         scope: ProofDoctorScopeArg,
 
+        /// Proof-doctor phase represented by retained evidence
+        #[arg(long, value_enum, default_value = "preflight")]
+        phase: ProofDoctorPhaseArg,
+
         /// Backend required for the claimed proof
         #[arg(long, value_enum, default_value = "rch")]
         required_backend: ProofDoctorBackendArg,
@@ -3023,6 +3027,10 @@ enum RobotCommands {
         /// Intended proof scope
         #[arg(long, value_enum, default_value = "cargo-test")]
         scope: ProofDoctorScopeArg,
+
+        /// Proof-doctor phase represented by retained evidence
+        #[arg(long, value_enum, default_value = "preflight")]
+        phase: ProofDoctorPhaseArg,
 
         /// Backend required for the claimed proof
         #[arg(long, value_enum, default_value = "rch")]
@@ -5206,11 +5214,25 @@ enum SearchModeArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum ProofDoctorScopeArg {
+    E2e,
     CargoTest,
     CargoCheck,
     CargoClippy,
     CargoBuild,
+    CargoBench,
+    ReleaseGate,
+    HighScale,
     Static,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum ProofDoctorPhaseArg {
+    Preflight,
+    LaunchObserved,
+    RemoteCargoObserved,
+    TerminalClassified,
+    EvidenceGap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
@@ -5843,11 +5865,25 @@ fn proof_doctor_git_branch(workspace_root: &Path) -> String {
 
 fn proof_doctor_scope(scope: ProofDoctorScopeArg) -> ProofScope {
     match scope {
+        ProofDoctorScopeArg::E2e => ProofScope::E2e,
         ProofDoctorScopeArg::CargoTest => ProofScope::CargoTest,
         ProofDoctorScopeArg::CargoCheck => ProofScope::CargoCheck,
         ProofDoctorScopeArg::CargoClippy => ProofScope::CargoClippy,
         ProofDoctorScopeArg::CargoBuild => ProofScope::CargoBuild,
+        ProofDoctorScopeArg::CargoBench => ProofScope::CargoBench,
+        ProofDoctorScopeArg::ReleaseGate => ProofScope::ReleaseGate,
+        ProofDoctorScopeArg::HighScale => ProofScope::HighScale,
         ProofDoctorScopeArg::Static => ProofScope::DocsStatic,
+    }
+}
+
+fn proof_doctor_phase(phase: ProofDoctorPhaseArg) -> ProofDoctorPhase {
+    match phase {
+        ProofDoctorPhaseArg::Preflight => ProofDoctorPhase::Preflight,
+        ProofDoctorPhaseArg::LaunchObserved => ProofDoctorPhase::LaunchObserved,
+        ProofDoctorPhaseArg::RemoteCargoObserved => ProofDoctorPhase::RemoteCargoObserved,
+        ProofDoctorPhaseArg::TerminalClassified => ProofDoctorPhase::TerminalClassified,
+        ProofDoctorPhaseArg::EvidenceGap => ProofDoctorPhase::EvidenceGap,
     }
 }
 
@@ -6098,6 +6134,7 @@ fn build_proof_doctor_payload(
     bead_id: Option<&str>,
     agent: Option<&str>,
     scope: ProofDoctorScopeArg,
+    phase: ProofDoctorPhaseArg,
     required_backend: ProofDoctorBackendArg,
     target_dir: Option<&str>,
     evidence_artifacts: &[String],
@@ -6135,7 +6172,7 @@ fn build_proof_doctor_payload(
         intended_target_dir,
         intended_scope: proof_doctor_scope(scope),
         required_backend: proof_doctor_backend(required_backend),
-        phase: ProofDoctorPhase::Preflight,
+        phase: proof_doctor_phase(phase),
         proof_path_prefixes,
         evidence,
     };
@@ -24020,6 +24057,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     bead,
                     agent,
                     scope,
+                    phase,
                     required_backend,
                     target_dir,
                     evidence_artifacts,
@@ -24031,6 +24069,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         bead.as_deref(),
                         agent.as_deref(),
                         scope,
+                        phase,
                         required_backend,
                         target_dir.as_deref(),
                         &evidence_artifacts,
@@ -37295,6 +37334,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             bead,
             agent,
             scope,
+            phase,
             required_backend,
             target_dir,
             evidence_artifacts,
@@ -37308,6 +37348,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 bead.as_deref(),
                 agent.as_deref(),
                 scope,
+                phase,
                 required_backend,
                 target_dir.as_deref(),
                 &evidence_artifacts,

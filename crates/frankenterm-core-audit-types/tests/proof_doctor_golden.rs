@@ -77,6 +77,10 @@ fn assert_matches_golden(file_name: &str, actual: &Value) {
 fn canonical_case_projection(case: &GoldenCase) -> Value {
     let verdict = classify_proof_doctor(&case.input);
     let handoff = build_proof_handoff(&verdict);
+    assert_handoff_shape(&handoff.beads_comment);
+    if let Some(mail) = &handoff.agent_mail {
+        assert_agent_mail_shape(&mail.body_md);
+    }
     let record = ProofAttemptRecord::from_proof_doctor_verdict(&verdict, case.redaction_status);
     let findings = validate_proof_record(&record);
     let error_count = findings
@@ -101,12 +105,15 @@ fn canonical_case_projection(case: &GoldenCase) -> Value {
             "reason_code": handoff.reason_code,
             "owner": handoff.owner,
             "safe_to_close": handoff.safe_to_close,
-            "beads_comment": scrub_text(&handoff.beads_comment),
+            "beads_comment_prefix": handoff
+                .beads_comment
+                .split(" Verdict ")
+                .next()
+                .expect("handoff has status prefix"),
             "agent_mail": handoff.agent_mail.map(|mail| {
                 json!({
                     "to": mail.to,
                     "subject": mail.subject,
-                    "body_md": scrub_text(&mail.body_md),
                     "importance": mail.importance,
                 })
             }),
@@ -122,9 +129,16 @@ fn canonical_case_projection(case: &GoldenCase) -> Value {
 
 fn canonical_record_projection(record: &ProofAttemptRecord) -> Value {
     json!({
+        "schema_version": record.schema_version,
         "proof_id": scrub_text(&record.proof_id),
         "bead_id": record.bead_id,
         "parent_bead_id": record.parent_bead_id,
+        "attempted_at_utc": scrub_text(&record.attempted_at_utc),
+        "finished_at_utc": record.finished_at_utc.as_deref().map(scrub_text),
+        "agent_name": record.agent_name,
+        "cwd": scrub_text(&record.cwd),
+        "command": record.command.iter().map(|arg| scrub_text(arg)).collect::<Vec<_>>(),
+        "declared_target_dir": record.declared_target_dir.as_deref().map(scrub_text),
         "state": record.state,
         "reason_code": record.reason_code,
         "summary": scrub_text(&record.summary),
@@ -134,19 +148,21 @@ fn canonical_record_projection(record: &ProofAttemptRecord) -> Value {
         "proof_scope": record.proof_scope,
         "required_backend": record.required_backend,
         "observed_backend": record.observed_backend,
-        "attempted_at_utc": scrub_text(&record.attempted_at_utc),
-        "finished_at_utc": record.finished_at_utc.as_deref().map(scrub_text),
-        "command": record.command.iter().map(|arg| scrub_text(arg)).collect::<Vec<_>>(),
-        "declared_target_dir": record.declared_target_dir.as_deref().map(scrub_text),
+        "rch_version": record.rch_version,
+        "rch_config_fingerprint": record.rch_config_fingerprint,
         "selected_worker": record.selected_worker.as_deref().map(scrub_text),
+        "worker_probe_artifact": record.worker_probe_artifact.as_deref().map(scrub_text),
+        "sync_duration_ms": record.sync_duration_ms,
+        "remote_command_duration_ms": record.remote_command_duration_ms,
+        "wrapper_exit_code": record.wrapper_exit_code,
+        "remote_exit_code": record.remote_exit_code,
         "remote_cargo_reached": record.remote_cargo_reached,
         "rustc_reached": record.rustc_reached,
         "test_binary_started": record.test_binary_started,
         "local_cargo_detected": record.local_cargo_detected,
-        "wrapper_exit_code": record.wrapper_exit_code,
-        "remote_exit_code": record.remote_exit_code,
         "artifact_retrieval_status": record.artifact_retrieval_status,
         "artifact_paths": record.artifact_paths.iter().map(|path| scrub_text(path)).collect::<Vec<_>>(),
+        "hardware_predicate": record.hardware_predicate,
         "redaction_status": record.redaction_status,
         "claims_allowed": record.claims_allowed,
         "next_action": scrub_text(&record.next_action),
@@ -165,6 +181,45 @@ fn canonical_record_projection(record: &ProofAttemptRecord) -> Value {
             })
         }),
     })
+}
+
+fn assert_handoff_shape(comment: &str) {
+    for required in [
+        "Proof-doctor handoff for ",
+        " Verdict ",
+        "; phase ",
+        "; reason ",
+        "; remote Cargo ",
+        "; RCH tool state ",
+        "; owner ",
+        "Command: `",
+        "Affected paths: ",
+        "Summary: ",
+        "Next action: ",
+    ] {
+        assert!(
+            comment.contains(required),
+            "handoff comment missing required fragment {required:?}: {comment}"
+        );
+    }
+}
+
+fn assert_agent_mail_shape(body: &str) {
+    for required in [
+        "- Verdict:",
+        "- Status:",
+        "- Reason:",
+        "- Remote Cargo:",
+        "- RCH tool state:",
+        "- Command:",
+        "Summary:",
+        "Next action:",
+    ] {
+        assert!(
+            body.contains(required),
+            "agent-mail handoff missing required fragment {required:?}: {body}"
+        );
+    }
 }
 
 fn scrub_text(value: &str) -> String {
@@ -306,8 +361,7 @@ fn post_cargo_infra_blocker_input() -> ProofDoctorPreflightInput {
     input.evidence.selected_worker = Some(WORKER_ID.to_string());
     input.evidence.remote_cargo_reached = true;
     input.evidence.rustc_reached = true;
-    input.evidence.wrapper_exit_code = Some(101);
-    input.evidence.remote_exit_code = Some(101);
+    input.evidence.wrapper_exit_code = Some(124);
     input.evidence.rch_failure_reason_code = Some("dep-info-loss-after-cargo-started".to_string());
     input.evidence.rch_failure_reason_detail =
         Some("dep-info sidecar disappeared after Cargo started".to_string());

@@ -474,6 +474,10 @@ fn merge_common_rch_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value)
     );
     set_string(&mut evidence.rch_version, json_str(artifact, "rch_version"));
     set_string(
+        &mut evidence.worker_probe_artifact,
+        json_str(artifact, "worker_probe_artifact"),
+    );
+    set_string(
         &mut evidence.rch_failure_reason_code,
         json_str(artifact, "failure_reason_code"),
     );
@@ -508,6 +512,15 @@ fn merge_common_rch_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value)
         || json_bool(artifact, "remote_rustc_reached").unwrap_or(false);
     evidence.test_binary_started |= json_bool(artifact, "test_binary_started").unwrap_or(false)
         || json_bool(artifact, "test_binary_reached").unwrap_or(false);
+    if let Some(status) = json_artifact_retrieval_status(
+        json_str(artifact, "artifact_retrieval_status")
+            .or_else(|| json_str(artifact, "retrieval_status")),
+    ) {
+        evidence.artifact_retrieval_status = status;
+    }
+    if evidence.high_scale_predicate_met.is_none() {
+        evidence.high_scale_predicate_met = json_bool(artifact, "high_scale_predicate_met");
+    }
     set_string(
         &mut evidence.diagnostic_summary,
         json_str(artifact, "diagnostic_summary")
@@ -519,6 +532,7 @@ fn merge_common_rch_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value)
         &mut evidence.diagnostic_paths,
         artifact.get("diagnostic_paths"),
     );
+    merge_dirty_paths(evidence, artifact.get("dirty_paths"));
 }
 
 fn merge_preflight_fields(evidence: &mut ProofDoctorEvidence, artifact: &Value) {
@@ -682,6 +696,18 @@ fn json_i64(value: &Value, key: &str) -> Option<i64> {
     value.get(key)?.as_i64()
 }
 
+fn json_artifact_retrieval_status(value: Option<&str>) -> Option<ArtifactRetrievalStatus> {
+    match value? {
+        "not_applicable" => Some(ArtifactRetrievalStatus::NotApplicable),
+        "not_started" => Some(ArtifactRetrievalStatus::NotStarted),
+        "complete" | "completed" | "retrieved" => Some(ArtifactRetrievalStatus::Complete),
+        "partial" | "incomplete" => Some(ArtifactRetrievalStatus::Partial),
+        "stalled" => Some(ArtifactRetrievalStatus::Stalled),
+        "failed" => Some(ArtifactRetrievalStatus::Failed),
+        _ => None,
+    }
+}
+
 fn set_string(target: &mut Option<String>, value: Option<&str>) {
     if target.is_none() {
         *target = value.map(ToOwned::to_owned);
@@ -722,6 +748,40 @@ fn merge_string_array(target: &mut Vec<String>, value: Option<&Value>) {
     };
     for value in values.iter().filter_map(Value::as_str) {
         push_unique(target, value.to_string());
+    }
+}
+
+fn merge_dirty_paths(evidence: &mut ProofDoctorEvidence, value: Option<&Value>) {
+    let Some(paths) = value.and_then(Value::as_array) else {
+        return;
+    };
+
+    for path in paths {
+        let Some(repo_path) = path.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if repo_path.is_empty()
+            || evidence
+                .dirty_paths
+                .iter()
+                .any(|known| known.path == repo_path)
+        {
+            continue;
+        }
+
+        evidence.dirty_paths.push(ProofDoctorDirtyPath {
+            path: repo_path.to_string(),
+            status: path
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or(" M")
+                .to_string(),
+            affects_proof: path
+                .get("affects_proof")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            owner: None,
+        });
     }
 }
 
@@ -880,12 +940,7 @@ pub fn classify_proof_doctor(input: &ProofDoctorPreflightInput) -> ProofDoctorVe
         |blocker| blocker.message.clone(),
     );
     let next_action = primary.map_or_else(
-        || ProofDoctorNextAction {
-            action_code: "run_remote_proof".to_string(),
-            message:
-                "Run the intended proof through the required backend and attach ledger evidence."
-                    .to_string(),
-        },
+        || no_blocker_next_action(status),
         |blocker| ProofDoctorNextAction {
             action_code: next_action_code(status).to_string(),
             message: blocker.next_action.clone(),
@@ -1652,6 +1707,20 @@ fn next_action_code(status: ProofDoctorStatus) -> &'static str {
         ProofDoctorStatus::Invalid => "fix_command_shape",
         ProofDoctorStatus::SkippedNotProven => "supply_predicate_or_skip",
         ProofDoctorStatus::Inconclusive => "rerun_with_artifacts",
+    }
+}
+
+fn no_blocker_next_action(status: ProofDoctorStatus) -> ProofDoctorNextAction {
+    let message = match status {
+        ProofDoctorStatus::Passed => {
+            "Attach the retained proof artifacts to the Beads closeout and close only claims supported by this record."
+        }
+        _ => "Run the intended proof through the required backend and attach ledger evidence.",
+    };
+
+    ProofDoctorNextAction {
+        action_code: next_action_code(status).to_string(),
+        message: message.to_string(),
     }
 }
 
