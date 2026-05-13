@@ -324,6 +324,7 @@ fn gauss_kl(m1: f64, v1: f64, m2: f64, v2: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::suboptimal_flops)]
     use super::*;
 
     #[test]

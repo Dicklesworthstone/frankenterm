@@ -124,6 +124,7 @@ fn mean_value(samples: &[EvidenceSample]) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::suboptimal_flops)]
     use super::*;
 
     #[test]
@@ -371,6 +372,7 @@ pub fn evaluate_wald_sprt(samples: &[EvidenceSample], cfg: &WaldSprtConfig) -> W
         };
     }
 
+    #[allow(clippy::suspicious_operation_groupings)]
     let coefficient = (cfg.mu_alt - cfg.mu_null) / (cfg.sigma * cfg.sigma);
     let midpoint = 0.5 * (cfg.mu_null + cfg.mu_alt);
     let max_n = cfg.max_samples.max(cfg.min_samples).max(1);
@@ -386,7 +388,7 @@ pub fn evaluate_wald_sprt(samples: &[EvidenceSample], cfg: &WaldSprtConfig) -> W
             // the next terminal decision.
             continue;
         }
-        llr += coefficient * (x - midpoint);
+        llr = coefficient.mul_add(x - midpoint, llr);
         consumed = i + 1;
         if consumed < cfg.min_samples {
             continue;
@@ -542,7 +544,7 @@ pub fn evaluate_anytime_valid_ci(samples: &[EvidenceSample], cfg: &AnytimeValidC
         let mean = sum / n;
         // r(n) = sigma * sqrt( 2 * (ln(1/alpha) + ln(ln(e*n)+1)) / n )
         let inv_alpha = (1.0_f64 / cfg.alpha).ln();
-        let log_log_term = ((std::f64::consts::E * n).ln() + 1.0).ln();
+        let log_log_term = (std::f64::consts::E * n).ln().ln_1p();
         let radius = cfg.sigma * (2.0 * (inv_alpha + log_log_term) / n).sqrt();
         last_mean = mean;
         last_radius = radius;

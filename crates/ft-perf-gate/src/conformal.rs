@@ -186,7 +186,6 @@ impl Default for SplitConformalConfig {
 /// pre-calibration check fails. The band's `lower` / `upper` fields
 /// then represent the conformal prediction interval and `alpha`
 /// records the target miscoverage rate.
-#[must_use]
 pub fn fit_split_conformal_band(
     samples: &[EvidenceSample],
     cfg: &SplitConformalConfig,
@@ -304,6 +303,7 @@ pub fn audit_coverage(band: &ConformalBand, test: &[EvidenceSample]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::suboptimal_flops)]
     use super::*;
 
     #[test]
