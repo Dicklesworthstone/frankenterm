@@ -133,7 +133,15 @@ def synthesize(spec: FixtureSpec, cfg: dict) -> list[dict]:
         alpha = 1.5
         xm = mean * (alpha - 1) / alpha  # scale to keep mean at baseline
         for i in range(spec.row_count):
-            u = rng.random()
+            # random.random() is half-open [0, 1); the inverse-CDF transform
+            # x = xm / U^(1/alpha) diverges to +Inf as U -> 0. Clamping U
+            # below at 1e-12 keeps the worst-case x bounded at
+            # xm * 1e12^(1/1.5) ≈ xm * 1e8, which is a large but finite tail
+            # sample and JSON-serializable. The probability of hitting the
+            # clamp on the current seeds is ~2e-14 per call so the committed
+            # fixtures are bit-stable; the clamp is purely defensive against
+            # future seed / row-count changes.
+            u = max(rng.random(), 1e-12)
             value = xm / (u ** (1.0 / alpha))
             rows.append(_row(spec.claim_id, base_ts + i * 60_000, value, cfg, i))
     elif spec.flavor == "sparse":

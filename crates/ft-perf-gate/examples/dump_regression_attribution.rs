@@ -1,10 +1,19 @@
 use ft_perf_gate::causal_attribution::{attribute_regression_event, CausalAttributionConfig};
 use ft_perf_gate::EvidenceSample;
 use std::fs;
+use std::path::PathBuf;
 
 fn main() {
-    let body = fs::read_to_string("tests/fixtures/evidence-corpus/per-claim/robot.p95/regression-injected.jsonl")
-        .expect("fixture exists");
+    // Anchor the fixture path on CARGO_MANIFEST_DIR (= crates/ft-perf-gate)
+    // and navigate up two parents to reach the workspace root. The
+    // previous form used a CWD-relative path which only worked when
+    // cargo was invoked from the workspace root.
+    let mut fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    fixture_path.pop();
+    fixture_path.pop();
+    fixture_path.push("tests/fixtures/evidence-corpus/per-claim/robot.p95/regression-injected.jsonl");
+    let body = fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("read fixture at {}: {e}", fixture_path.display()));
     let mut samples: Vec<EvidenceSample> = body.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap())
