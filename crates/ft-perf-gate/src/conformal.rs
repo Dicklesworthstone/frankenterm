@@ -191,7 +191,14 @@ pub fn fit_split_conformal_band(
     samples: &[EvidenceSample],
     cfg: &SplitConformalConfig,
 ) -> Result<ConformalBand, GateDecision> {
+    // Note: `(0.0..1.0)` is half-open (start-inclusive, end-exclusive) in
+    // Rust, so it accepts 0.0. We want alpha and calibration_fraction
+    // STRICTLY in (0, 1) — an alpha of 0 is degenerate (asks for 100%
+    // coverage which forces an infinite band) and would also cause
+    // division-by-zero in the under-coverage diagnostic below. Add the
+    // explicit > 0 guards.
     if !(0.0..1.0).contains(&cfg.alpha)
+        || cfg.alpha <= 0.0
         || !(0.0..1.0).contains(&cfg.calibration_fraction)
         || cfg.calibration_fraction <= 0.0
     {
@@ -277,15 +284,22 @@ pub fn fit_split_conformal_band(
 /// number of calibration samples.
 #[must_use]
 pub fn audit_coverage(band: &ConformalBand, test: &[EvidenceSample]) -> f64 {
-    if test.is_empty() {
-        return 0.0;
-    }
-    let inside = test
+    // Filter non-finite samples out of BOTH the numerator and denominator.
+    // The previous form kept non-finite samples in `test.len()` while
+    // excluding them from `inside`, biasing the coverage rate downward
+    // whenever the test set contained any NaN / Inf observations.
+    let finite: Vec<&EvidenceSample> = test
         .iter()
         .filter(|s| s.metric_value.is_finite())
+        .collect();
+    if finite.is_empty() {
+        return 0.0;
+    }
+    let inside = finite
+        .iter()
         .filter(|s| (band.lower..=band.upper).contains(&s.metric_value))
         .count();
-    (inside as f64) / (test.len() as f64)
+    (inside as f64) / (finite.len() as f64)
 }
 
 #[cfg(test)]
@@ -401,6 +415,51 @@ mod tests {
             Err(GateDecision::LowConfidence { .. }) => {}
             other => panic!("expected LowConfidence for alpha=1.5; got {other:?}"),
         }
+    }
+
+    #[test]
+    fn split_conformal_rejects_zero_alpha() {
+        // alpha=0 is degenerate (asks for 100% coverage which forces an
+        // infinite band) and would cause division-by-zero in the
+        // under-coverage diagnostic. The half-open Range<f64>::contains
+        // accepts 0.0; the explicit > 0 guard is what rejects it.
+        let samples: Vec<EvidenceSample> = (0..40)
+            .map(|i| EvidenceSample::new("robot.p95", 10.0, "ms", 1, i))
+            .collect();
+        let cfg = SplitConformalConfig {
+            alpha: 0.0,
+            ..Default::default()
+        };
+        match fit_split_conformal_band(&samples, &cfg) {
+            Err(GateDecision::LowConfidence { .. }) => {}
+            other => panic!("expected LowConfidence for alpha=0.0; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_coverage_excludes_nan_from_denominator() {
+        // 8 finite samples (4 inside band, 4 outside) + 2 NaN samples.
+        // Coverage should be 4/8 = 0.5, NOT 4/10 = 0.4 (which is what the
+        // old buggy code returned because NaN samples were excluded from
+        // the numerator but kept in the denominator).
+        let band = ConformalBand {
+            claim_id: "test".to_string(),
+            lower: 0.0,
+            upper: 10.0,
+            calibration_samples: 8,
+            alpha: 0.05,
+        };
+        let mut samples: Vec<EvidenceSample> = (0..4)
+            .map(|i| EvidenceSample::new("test", 5.0, "ms", 1, i))
+            .collect(); // 4 inside
+        samples.extend((4..8).map(|i| EvidenceSample::new("test", 100.0, "ms", 1, i))); // 4 outside
+        samples.push(EvidenceSample::new("test", f64::NAN, "ms", 1, 100));
+        samples.push(EvidenceSample::new("test", f64::INFINITY, "ms", 1, 101));
+        let coverage = audit_coverage(&band, &samples);
+        assert!(
+            (coverage - 0.5).abs() < 1e-9,
+            "expected 0.5 (4 inside / 8 finite); got {coverage}"
+        );
     }
 
     fn gauss_test(seed: &mut u64) -> f64 {
