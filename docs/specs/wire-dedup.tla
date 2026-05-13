@@ -21,6 +21,13 @@
     java -jar tla2tools.jar -workers auto WireDedup.tla
 *)
 
+\* coverage-metric:
+\*   subsystem: wire-dedup
+\*   declared-invariants: SafetyInvariants
+\*   max-depth: 8
+\*   branching-factor: 6
+\*   threshold-pct: 0.002
+
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 CONSTANTS Senders, MaxSeq
@@ -128,8 +135,11 @@ MonotonicFrontier ==
 \* NoReplay: messages_received per sender is at most the number
 \* of distinct seqs delivered for that sender. Computed from
 \* `history`.
+HistoryIndexesFor(s) ==
+    {i \in DOMAIN history : history[i].sender = s}
+
 DistinctSeqsFor(s) ==
-    Cardinality({history[i].seq : i \in DOMAIN history /\ history[i].sender = s})
+    Cardinality({history[i].seq : i \in HistoryIndexesFor(s)})
 
 NoReplay ==
     \A s \in DOMAIN sessions :

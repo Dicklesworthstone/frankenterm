@@ -12,6 +12,13 @@
     java -jar tla2tools.jar -workers auto HerdWaveAdmission.tla
 *)
 
+\* coverage-metric:
+\*   subsystem: herd-wave-admission
+\*   declared-invariants: SafetyInvariants
+\*   max-depth: 8
+\*   branching-factor: 6
+\*   threshold-pct: 0.002
+
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 CONSTANTS Panes, MinDistinct, CriticalDistinct, EmergencyDistinct,

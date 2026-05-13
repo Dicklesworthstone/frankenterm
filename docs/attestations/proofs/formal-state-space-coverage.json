@@ -1,0 +1,269 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "formal-state-space-coverage-attestation",
+  "category": "proofs/formal-state-space-coverage",
+  "release_version": "0.0.0-substrate",
+  "generated_at": "2026-05-13T04:30:00Z",
+  "produced_by_bead": "ft-tf6g3.20",
+  "status": "partial",
+  "coverage_gate_status": "fail",
+  "proof_category": [
+    6,
+    2
+  ],
+  "scope": "Machine-readable state-space coverage measurements for formal-method proof lanes. TLC summaries come from scripts/run-tlc.sh; Stateright summaries come from the model stats API wrapper.",
+  "tools": {
+    "tla": "scripts/measure-tla-coverage.sh",
+    "stateright": "scripts/measure-stateright-coverage.sh",
+    "spec_conventions": "scripts/check-spec-conventions.sh"
+  },
+  "threshold_semantics": {
+    "threshold_pct": "warning threshold in percentage points",
+    "ci_fail_under_pct": "defaults to threshold_pct / 2 unless the coverage-metric block declares an override",
+    "timed_out": "classified as state: space-explosion and status: fail"
+  },
+  "tla_coverage": [
+    {
+      "subsystem": "blocker-radar-merge",
+      "spec": "docs/specs/blocker-radar-merge.tla",
+      "summary": "target/tlc/blocker-radar-merge/summary.json",
+      "state_count": 131329,
+      "distinct_state_count": 65793,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 3.264288,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
+    },
+    {
+      "subsystem": "capture-fairness-scheduler",
+      "spec": "docs/specs/capture-fairness-scheduler.tla",
+      "summary": "target/tlc/capture-fairness-scheduler/summary.json",
+      "state_count": 175942,
+      "distinct_state_count": 28765,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 1.427162,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
+    },
+    {
+      "subsystem": "durable-state-checkpoint",
+      "spec": "docs/specs/durable-state-checkpoint.tla",
+      "summary": "target/tlc/durable-state-checkpoint/summary.json",
+      "state_count": 1804,
+      "distinct_state_count": 479,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 0.023765,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
+    },
+    {
+      "subsystem": "herd-wave-admission",
+      "spec": "docs/specs/herd-wave-admission.tla",
+      "summary": "target/tlc/herd-wave-admission/summary.json",
+      "state_count": 3073,
+      "distinct_state_count": 1537,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 0.076258,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
+    },
+    {
+      "subsystem": "mux-session-reentry",
+      "spec": "docs/specs/mux-session-reentry.tla",
+      "summary": "target/tlc/mux-session-reentry/summary.json",
+      "state_count": 1287201,
+      "distinct_state_count": 77600,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 3.850087,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
+    },
+    {
+      "subsystem": "robot-checkpoint",
+      "spec": "docs/specs/robot-checkpoint.tla",
+      "summary": "target/tlc/robot-checkpoint/summary.json",
+      "state_count": 3473445,
+      "distinct_state_count": 7606,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 0.377368,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 120,
+      "timed_out": true,
+      "state": "space-explosion",
+      "status": "fail",
+      "follow_up_bead": "ft-tf6g3.52"
+    },
+    {
+      "subsystem": "robot-fleet",
+      "spec": "docs/specs/robot-fleet.tla",
+      "summary": "target/tlc/robot-fleet/summary.json",
+      "state_count": 100867,
+      "distinct_state_count": 12327,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 0.611598,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
+    },
+    {
+      "subsystem": "robot-work",
+      "spec": "docs/specs/robot-work.tla",
+      "summary": "target/tlc/robot-work/summary.json",
+      "state_count": 1503792,
+      "distinct_state_count": 197988,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 9.82308,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": true,
+      "state": "space-explosion",
+      "status": "fail",
+      "follow_up_bead": "ft-tf6g3.52"
+    },
+    {
+      "subsystem": "runtime-async-cancel",
+      "spec": "docs/specs/runtime-async-cancel.tla",
+      "summary": "target/tlc/runtime-async-cancel/summary.json",
+      "state_count": 5407,
+      "distinct_state_count": 2962,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 0.146958,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
+    },
+    {
+      "subsystem": "tx-killswitch",
+      "spec": "docs/specs/tx-killswitch.tla",
+      "summary": "target/tlc/tx-killswitch/summary.json",
+      "state_count": 258,
+      "distinct_state_count": 87,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 0.004316,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 120,
+      "timed_out": false,
+      "state": "complete",
+      "status": "pass"
+    },
+    {
+      "subsystem": "wire-dedup",
+      "spec": "docs/specs/wire-dedup.tla",
+      "summary": "target/tlc/wire-dedup/summary.json",
+      "state_count": 425238,
+      "distinct_state_count": 425238,
+      "state_space_estimate": 2015539,
+      "coverage_pct": 21.097979,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "time_budget_seconds": 30,
+      "timed_out": true,
+      "state": "space-explosion",
+      "status": "fail",
+      "follow_up_bead": "ft-tf6g3.52"
+    }
+  ],
+  "stateright_coverage": [
+    {
+      "model": "robot-work-atomicity",
+      "source": "tests/robot_work_atomicity_model/src/main.rs",
+      "summary": "docs/attestations/proofs/robot-work-atomicity.json",
+      "state_count": 24997,
+      "unique_state_count": 24997,
+      "declared_max_depth": 14,
+      "observed_max_depth": 8,
+      "branching_factor": 4,
+      "state_space_estimate": 357913941,
+      "coverage_pct": 0.006984,
+      "threshold_pct": 0.002,
+      "ci_fail_under_pct": 0.001,
+      "elapsed_seconds": 550.7,
+      "state": "complete",
+      "status": "pass"
+    }
+  ],
+  "source_artifacts": [
+    "scripts/measure-tla-coverage.sh",
+    "scripts/measure-stateright-coverage.sh",
+    "scripts/check-spec-conventions.sh",
+    "docs/specs/*.tla",
+    "tests/robot_work_atomicity_model/src/main.rs",
+    "tests/e2e/test_spec_coverage_release_gate.sh"
+  ],
+  "validation": [
+    {
+      "command": "bash -n scripts/measure-tla-coverage.sh scripts/measure-stateright-coverage.sh tests/e2e/test_spec_coverage_release_gate.sh",
+      "status": "pass"
+    },
+    {
+      "command": "scripts/check-spec-conventions.sh",
+      "status": "pass",
+      "result": "11 spec(s) passed"
+    },
+    {
+      "command": "tests/e2e/test_spec_coverage_release_gate.sh",
+      "status": "pass"
+    },
+    {
+      "command": "jq empty docs/attestations/proofs/formal-state-space-coverage.json",
+      "status": "pass"
+    },
+    {
+      "command": "cargo fmt --manifest-path tests/robot_work_atomicity_model/Cargo.toml --check",
+      "status": "pass"
+    },
+    {
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose rch exec -- bash tests/e2e/test_spec_coverage_release_gate.sh",
+      "status": "pass",
+      "result": "rch returned 0 but warned that this shell E2E is a non-compilation command"
+    },
+    {
+      "command": "git diff --check -- owned formal-coverage paths",
+      "status": "pass"
+    },
+    {
+      "command": "scripts/measure-stateright-coverage.sh --summary docs/attestations/proofs/robot-work-atomicity.json tests/robot_work_atomicity_model/src/main.rs",
+      "status": "pass",
+      "result": "24997 unique states; observed max depth 8; coverage_pct 0.006984"
+    },
+    {
+      "command": "scripts/measure-tla-coverage.sh docs/specs/blocker-radar-merge.tla docs/specs/capture-fairness-scheduler.tla docs/specs/durable-state-checkpoint.tla docs/specs/herd-wave-admission.tla docs/specs/mux-session-reentry.tla docs/specs/robot-checkpoint.tla docs/specs/robot-fleet.tla docs/specs/robot-work.tla docs/specs/runtime-async-cancel.tla docs/specs/tx-killswitch.tla docs/specs/wire-dedup.tla",
+      "status": "expected_fail",
+      "result": "8 TLA specs complete/pass; robot-checkpoint, robot-work, and wire-dedup classify as state: space-explosion"
+    }
+  ],
+  "manifest_wiring": {
+    "status": "deferred_to_active_bead",
+    "bead": "ft-tf6g3.1",
+    "reason": "This artifact publishes the coverage proof slot; release-bundle assembly and manifest hashing remain owned by the active release-attestation bead."
+  }
+}

@@ -13,6 +13,13 @@
     java -jar tla2tools.jar -workers auto MuxSessionReentry.tla
 *)
 
+\* coverage-metric:
+\*   subsystem: mux-session-reentry
+\*   declared-invariants: SafetyInvariants
+\*   max-depth: 8
+\*   branching-factor: 6
+\*   threshold-pct: 0.002
+
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Panes, Windows, Subscribers

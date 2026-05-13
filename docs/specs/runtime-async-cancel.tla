@@ -12,6 +12,13 @@
     java -jar tla2tools.jar -workers auto RuntimeAsyncCancel.tla
 *)
 
+\* coverage-metric:
+\*   subsystem: runtime-async-cancel
+\*   declared-invariants: SafetyInvariants
+\*   max-depth: 8
+\*   branching-factor: 6
+\*   threshold-pct: 0.002
+
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 CONSTANTS Primitives, MaxHistory

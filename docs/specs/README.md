@@ -68,6 +68,24 @@ Every `.tla` file must contain these sections or definitions:
 - Liveness/progress block: temporal properties, fairness notes, convergence, or
   an explicit reason the spec is safety-only.
 - TLC run note: a `Run with TLC` comment that points operators at the wrapper.
+- Coverage metric comment: a `coverage-metric` block consumed by
+  `scripts/measure-tla-coverage.sh`.
+
+The coverage metric block declares the bounded estimate inputs and per-spec
+warning threshold:
+
+```tla
+\* coverage-metric:
+\*   subsystem: robot-work
+\*   declared-invariants: SafetyInvariants
+\*   max-depth: 8
+\*   branching-factor: 6
+\*   threshold-pct: 0.002
+```
+
+`threshold-pct` is a warning threshold in percentage points. The CI failure
+threshold defaults to half of that value unless the block also declares
+`ci-fail-under-pct`.
 
 ## Mapping Documents
 
@@ -100,6 +118,9 @@ path and record their constants in the bead evidence.
 - `scripts/check-spec-conventions.sh` validates this directory.
 - `scripts/run-tlc.sh docs/specs/<spec>.tla` runs TLC with the sibling `.cfg`
   and writes a normalized JSON summary.
+- `scripts/measure-tla-coverage.sh docs/specs/<spec>.tla` combines a TLC
+  summary with the spec's `coverage-metric` block and emits state-space
+  coverage JSON.
   The wrapper stages a module-named copy under `target/tlc/<spec>/module/` before
   invoking TLC, because repo files stay kebab-case while TLA+ requires the file
   passed to TLC to match the PascalCase module name.

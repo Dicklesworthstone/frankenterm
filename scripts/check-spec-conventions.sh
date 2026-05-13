@@ -95,6 +95,12 @@ for spec in "${specs[@]}"; do
   require_pattern "$spec" '\[\]\[Next\]_vars' "Spec definition must include [][Next]_vars"
   require_pattern "$spec" '^SafetyInvariants[[:space:]]*==' "missing SafetyInvariants block"
   require_pattern "$spec" 'Liveness' "missing liveness/progress block"
+  require_pattern "$spec" 'coverage-metric:' "missing coverage-metric comment block"
+  require_pattern "$spec" 'subsystem:' "coverage-metric block missing subsystem"
+  require_pattern "$spec" 'declared-invariants:' "coverage-metric block missing declared-invariants"
+  require_pattern "$spec" 'max-depth:' "coverage-metric block missing max-depth"
+  require_pattern "$spec" 'branching-factor:' "coverage-metric block missing branching-factor"
+  require_pattern "$spec" 'threshold-pct:' "coverage-metric block missing threshold-pct"
 
   validate_cfg "$spec" "$base"
   validate_mapping "$spec" "$base"

@@ -11,6 +11,13 @@
     java -jar tla2tools.jar -workers auto BlockerRadarMerge.tla
 *)
 
+\* coverage-metric:
+\*   subsystem: blocker-radar-merge
+\*   declared-invariants: SafetyInvariants
+\*   max-depth: 8
+\*   branching-factor: 6
+\*   threshold-pct: 0.002
+
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 CONSTANTS Candidates, MaxHistory

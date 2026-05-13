@@ -12,6 +12,13 @@
     java -jar tla2tools.jar -workers auto CaptureFairnessScheduler.tla
 *)
 
+\* coverage-metric:
+\*   subsystem: capture-fairness-scheduler
+\*   declared-invariants: SafetyInvariants
+\*   max-depth: 8
+\*   branching-factor: 6
+\*   threshold-pct: 0.002
+
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Panes, HighPanes, LowPrimaryPanes, LowSecondaryPanes,
