@@ -7,15 +7,17 @@
 use frankenterm_core::gpu_regression_fuzz_report::FuzzCliFlags;
 #[cfg(feature = "headless-render")]
 use frankenterm_core::gpu_regression_fuzz_report::{
-    RunId, RunLayout, RunMeta, ViolationKind, ViolationRecord, render_violations_jsonl,
+    render_violations_jsonl, RunId, RunLayout, RunMeta, ViolationKind, ViolationRecord,
 };
-use frankenterm_gui::gpu_regression::{CompareResult, Thresholds, compare_images};
+use frankenterm_gui::gpu_regression::{
+    compare_images, detect_macos_screen_capture_prompt_contamination, CompareResult, Thresholds,
+};
 #[cfg(feature = "headless-render")]
 use frankenterm_gui::gpu_regression_fuzz::{FuzzConfig, FuzzInputEvent, FuzzStream};
 #[cfg(feature = "headless-render")]
 use frankenterm_gui::headless_render::{
-    HeadlessCursor, HeadlessFixtureInput, HeadlessFrame, HeadlessMonitor, HeadlessRenderError,
-    HeadlessSelection, HeadlessViewport, render_headless, smoketest_input,
+    render_headless, smoketest_input, HeadlessCursor, HeadlessFixtureInput, HeadlessFrame,
+    HeadlessMonitor, HeadlessRenderError, HeadlessSelection, HeadlessViewport,
 };
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder, ImageReader, Rgba, RgbaImage};
@@ -854,6 +856,24 @@ fn write_wezterm_comparison_report(args: &Args) -> Result<(), Box<dyn std::error
 
         let frankenterm_image = load_png_rgba8(&frankenterm_png)?;
         let wezterm_image = load_png_rgba8(&wezterm_png)?;
+        let frankenterm_contaminated =
+            detect_macos_screen_capture_prompt_contamination(&frankenterm_image);
+        let wezterm_contaminated = detect_macos_screen_capture_prompt_contamination(&wezterm_image);
+        if frankenterm_contaminated || wezterm_contaminated {
+            rows.push(WeztermRenderComparisonRow {
+                input_id,
+                frame_id,
+                status: "diverged",
+                metrics: failed_metrics(thresholds),
+                thresholds,
+                frankenterm_png: path_string(&frankenterm_png),
+                wezterm_png: path_string(&wezterm_png),
+                reason: Some(format!(
+                    "capture_contamination_macos_screen_capture_prompt: frankenterm={frankenterm_contaminated} wezterm={wezterm_contaminated}"
+                )),
+            });
+            continue;
+        }
         match compare_images(&frankenterm_image, &wezterm_image, thresholds) {
             Ok(comparison) => {
                 rows.push(WeztermRenderComparisonRow {

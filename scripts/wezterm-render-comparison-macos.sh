@@ -307,6 +307,59 @@ run_with_timeout() {
   return "$status"
 }
 
+dismiss_macos_screen_capture_prompt() {
+  if ! command -v osascript >/dev/null 2>&1; then
+    return 0
+  fi
+
+  osascript <<'APPLESCRIPT' >/dev/null 2>&1 || true
+tell application "System Events"
+  set promptText to "requesting to bypass the system private window picker"
+  repeat with processName in {"CoreServicesUIAgent", "UserNotificationCenter"}
+    if exists process processName then
+      tell process processName
+        repeat with candidateWindow in windows
+          try
+            set textBlob to ""
+            repeat with candidateText in static texts of candidateWindow
+              set textBlob to textBlob & " " & value of candidateText
+            end repeat
+            if textBlob contains promptText then
+              click button "Allow" of candidateWindow
+              return
+            end if
+          end try
+        end repeat
+      end tell
+    end if
+  end repeat
+end tell
+APPLESCRIPT
+}
+
+warm_up_screen_capture_access() {
+  local bounds="${FT_WEZTERM_FRAME_RECT:-80,80,960,480}"
+  local capture_timeout_secs="${FT_WEZTERM_FRAME_CAPTURE_TIMEOUT_SECS:-15}"
+
+  if [[ ! "$bounds" =~ ^[0-9]+,[0-9]+,[0-9]+,[0-9]+$ ]]; then
+    echo "[wezterm-render-adapter] invalid FT_WEZTERM_FRAME_RECT=$bounds; expected x,y,w,h" >&2
+    exit 75
+  fi
+
+  echo "[wezterm-render-adapter] warming macOS screen-capture access rect=$bounds" >&2
+  for attempt in 1 2 3; do
+    dismiss_macos_screen_capture_prompt
+    local status=0
+    run_with_timeout "screen-capture access warm-up attempt=$attempt" "$capture_timeout_secs" \
+      screencapture -x -R "$bounds" /dev/null || status=$?
+    if [[ "$status" -ne 0 ]]; then
+      echo "[wezterm-render-adapter] screen-capture warm-up attempt=$attempt failed status=$status; continuing to controlled capture" >&2
+    fi
+    dismiss_macos_screen_capture_prompt
+    sleep 2
+  done
+}
+
 capture_window() {
   local title="$1"
   local output="$2"
@@ -548,6 +601,7 @@ require_tool screencapture
 require_tool pgrep
 canonicalize_report_paths
 canonicalize_gui_paths
+warm_up_screen_capture_access
 
 FRANKENTERM_FRAME_ROOT="$FRAME_ROOT/frankenterm"
 WEZTERM_FRAME_ROOT="$FRAME_ROOT/wezterm"

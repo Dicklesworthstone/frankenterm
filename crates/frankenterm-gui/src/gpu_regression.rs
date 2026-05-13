@@ -142,6 +142,55 @@ pub fn compare_images(
     })
 }
 
+/// Detect the macOS 15 screen-capture permission dialog in a captured frame.
+///
+/// The WezTerm differential adapter compares screenshots from a black, fixed
+/// terminal scene. If macOS overlays the "private window picker" permission
+/// prompt, two contaminated frames can compare as equal and produce a false
+/// render pass. This detector is deliberately narrow: it requires both a large
+/// neutral light dialog body and the characteristic blue button/red recording
+/// badge in the central capture region.
+pub fn detect_macos_screen_capture_prompt_contamination(image: &RgbaImage) -> bool {
+    let width = image.width();
+    let height = image.height();
+    if width < 200 || height < 200 {
+        return false;
+    }
+
+    let x_start = width / 4;
+    let x_end = width.saturating_mul(3) / 4;
+    let y_end = height.saturating_mul(85) / 100;
+    let total_pixels = u64::from(width) * u64::from(height);
+    let mut light_panel_pixels = 0u64;
+    let mut blue_button_pixels = 0u64;
+    let mut red_badge_pixels = 0u64;
+
+    for y in 0..y_end {
+        for x in x_start..x_end {
+            let [red, green, blue, alpha] = image.get_pixel(x, y).0;
+            if alpha < 220 {
+                continue;
+            }
+
+            let max_channel = red.max(green).max(blue);
+            let min_channel = red.min(green).min(blue);
+            if min_channel >= 215 && max_channel.saturating_sub(min_channel) <= 30 {
+                light_panel_pixels += 1;
+            }
+            if red <= 80 && (80..=180).contains(&green) && blue >= 180 {
+                blue_button_pixels += 1;
+            }
+            if red >= 200 && green <= 90 && blue <= 90 {
+                red_badge_pixels += 1;
+            }
+        }
+    }
+
+    light_panel_pixels.saturating_mul(100) >= total_pixels.saturating_mul(5)
+        && blue_button_pixels.saturating_mul(1_000) >= total_pixels.saturating_mul(3)
+        && red_badge_pixels.saturating_mul(10_000) >= total_pixels.saturating_mul(2)
+}
+
 /// Single-window SSIM over the luma channel. Identical inputs produce 1.0;
 /// constant images on both sides also produce 1.0 (handled by the `c1`/`c2`
 /// stabilization terms in the standard SSIM formula).
@@ -218,6 +267,14 @@ mod tests {
     /// Return the count of pure-red diff pixels (R=255,G=0,B=0,A=255).
     fn red_pixels(img: &RgbaImage) -> u64 {
         img.pixels().filter(|p| p.0 == [255, 0, 0, 255]).count() as u64
+    }
+
+    fn fill_rect(img: &mut RgbaImage, x0: u32, y0: u32, w: u32, h: u32, rgba: [u8; 4]) {
+        for y in y0..y0.saturating_add(h).min(img.height()) {
+            for x in x0..x0.saturating_add(w).min(img.width()) {
+                img.put_pixel(x, y, Rgba(rgba));
+            }
+        }
     }
 
     // ── 1. Identical images → PASS ───────────────────────────────────────────
@@ -628,7 +685,27 @@ mod tests {
         assert_eq!(t, back);
     }
 
-    // ── 16. Property-based: noise within tolerance always passes ─────────────
+    // ── 16. macOS screen-capture prompt contamination guard ─────────────────
+
+    #[test]
+    fn macos_screen_capture_prompt_detector_rejects_plain_terminal_frame() {
+        let mut terminal = solid(944, 480, [0, 0, 0, 255]);
+        fill_rect(&mut terminal, 0, 0, 120, 24, [255, 255, 255, 255]);
+
+        assert!(!detect_macos_screen_capture_prompt_contamination(&terminal));
+    }
+
+    #[test]
+    fn macos_screen_capture_prompt_detector_finds_permission_dialog_shape() {
+        let mut frame = solid(944, 480, [0, 0, 0, 255]);
+        fill_rect(&mut frame, 302, 25, 259, 328, [238, 238, 238, 255]);
+        fill_rect(&mut frame, 318, 276, 228, 28, [0, 122, 255, 255]);
+        fill_rect(&mut frame, 437, 78, 27, 27, [255, 69, 58, 255]);
+
+        assert!(detect_macos_screen_capture_prompt_contamination(&frame));
+    }
+
+    // ── 17. Property-based: noise within tolerance always passes ─────────────
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
@@ -715,7 +792,7 @@ mod tests {
         }
     }
 
-    // ── 17. CompareMetrics shape stable for downstream JSON consumers ────────
+    // ── 18. CompareMetrics shape stable for downstream JSON consumers ────────
 
     #[test]
     fn metrics_serializes_to_expected_keys() {
