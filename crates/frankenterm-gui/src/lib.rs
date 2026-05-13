@@ -11,6 +11,7 @@ pub mod gpu_regression_fuzz;
 pub mod input_loop;
 pub mod osc8_gui;
 pub mod plugins;
+pub mod renderer_slo;
 pub mod rollout_env;
 pub mod smart_selection_a11y;
 pub mod status_bar;

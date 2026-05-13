@@ -23,6 +23,16 @@ name = "gpu_regression"
 path = "tests/gpu_regression.rs"
 harness = false
 
+[[test]]
+name = "input_to_photon_bound"
+path = "../../tests/input_to_photon_bound.rs"
+
+[[bench]]
+name = "input_to_photon"
+path = "benches/renderer_slo/input_to_photon.rs"
+harness = false
+required-features = ["headless-render"]
+
 [features]
 # `jemalloc` ships in the default set so release builds get the same
 # fragmentation-resistant allocator as `frankenterm` and `frankenterm-mux-server`.
@@ -149,6 +159,7 @@ windows = { workspace = true, features = [
 
 [dev-dependencies]
 benchmarking = "0.4.13"
+criterion.workspace = true
 k9.workspace = true
 proptest = "1.8.0"
 

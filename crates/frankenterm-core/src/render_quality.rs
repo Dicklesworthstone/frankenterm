@@ -51,6 +51,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::live_resize::LiveResizeState;
+pub use frankenterm_core_audit_types::input_to_photon::{
+    INPUT_TO_PHOTON_CLAIM_ID, INPUT_TO_PHOTON_SCHEMA_VERSION, INPUT_TO_PHOTON_WORKLOAD_CLASS,
+    InputToPhotonEvidence, InputToPhotonStage, InputToPhotonStageTrace, InputToPhotonState,
+    InputToPhotonTrace, MACOS_P95_TARGET_US, MAX_INSTRUMENTATION_OVERHEAD_PCT,
+    WAYLAND_P95_TARGET_US, known_key_trace_from_stage_durations, summarize_input_to_photon_traces,
+    target_p95_us_for_platform, unavailable_evidence,
+};
 
 // ============================================================================
 // Render quality enum
@@ -446,6 +453,71 @@ impl RenderQualityHealth {
     }
 }
 
+/// JSON schema version for the renderer SLO doctor block.
+pub const RENDERER_SLOS_DOCTOR_SCHEMA_VERSION: &str = "ft.renderer-slos.doctor.v1";
+/// Read-only MCP resource URI for the input-to-photon SLO status.
+pub const RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI: &str =
+    "wa://perf/renderer-slo/input_to_photon";
+/// Current non-claiming status for the input-to-photon SLO substrate.
+pub const RENDERER_INPUT_TO_PHOTON_STATUS: &str = "stage_telemetry_substrate_wired_pending_lab_run";
+/// macOS p95 target from `docs/perf/resize-quality-slo.json`.
+pub const RENDERER_INPUT_TO_PHOTON_MACOS_P95_TARGET_US: u64 = MACOS_P95_TARGET_US;
+/// Wayland p95 target from `docs/perf/resize-quality-slo.json`.
+pub const RENDERER_INPUT_TO_PHOTON_WAYLAND_P95_TARGET_US: u64 = WAYLAND_P95_TARGET_US;
+
+/// `ft doctor --json .renderer_slos` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererSloDoctorReport {
+    pub schema_version: String,
+    pub input_to_photon: RendererInputToPhotonSloStatus,
+}
+
+/// Operator-facing status for the input-to-photon renderer SLO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererInputToPhotonSloStatus {
+    pub claim_id: String,
+    pub status: String,
+    pub target_p95_us_macos: u64,
+    pub target_p95_us_wayland: u64,
+    pub max_instrumentation_overhead_pct: u64,
+    pub source_bench: String,
+    pub structured_log_template: String,
+    pub mcp_resource_uri: String,
+    pub degradation_states: Vec<String>,
+    pub pending_reason: String,
+}
+
+/// Build the stable renderer SLO doctor block.
+///
+/// This surface is deliberately non-claiming until a retained target-run
+/// publishes empirical p95/p99 rows from the renderer SLO bench.
+#[must_use]
+pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
+    RendererSloDoctorReport {
+        schema_version: RENDERER_SLOS_DOCTOR_SCHEMA_VERSION.to_string(),
+        input_to_photon: RendererInputToPhotonSloStatus {
+            claim_id: "renderer.input_to_photon_p95".to_string(),
+            status: RENDERER_INPUT_TO_PHOTON_STATUS.to_string(),
+            target_p95_us_macos: RENDERER_INPUT_TO_PHOTON_MACOS_P95_TARGET_US,
+            target_p95_us_wayland: RENDERER_INPUT_TO_PHOTON_WAYLAND_P95_TARGET_US,
+            max_instrumentation_overhead_pct: 5,
+            source_bench: "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs"
+                .to_string(),
+            structured_log_template: "target/criterion/slo-input_to_photon_<platform>.jsonl"
+                .to_string(),
+            mcp_resource_uri: RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI.to_string(),
+            degradation_states: vec![
+                "instrumentation_unavailable".to_string(),
+                "photon_detection_unavailable".to_string(),
+                "instrumentation_overhead_exceeded".to_string(),
+                "invalid_trace".to_string(),
+            ],
+            pending_reason: "deterministic known-key stage telemetry substrate is wired; retained target-run empirical p95/p99 remains pending"
+                .to_string(),
+        },
+    }
+}
+
 /// Render a slice of frame events as JSONL.
 #[must_use]
 pub fn render_events_jsonl(events: &[RenderQualityFrameEvent]) -> String {
@@ -662,6 +734,175 @@ mod tests {
         };
         // 60 / 100 = 0.6
         assert!((h.draft_ratio() - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_exposes_input_to_photon_contract() {
+        let report = renderer_slos_doctor_report();
+        assert_eq!(report.schema_version, RENDERER_SLOS_DOCTOR_SCHEMA_VERSION);
+        assert_eq!(
+            report.input_to_photon.status,
+            RENDERER_INPUT_TO_PHOTON_STATUS
+        );
+        assert_eq!(
+            report.input_to_photon.mcp_resource_uri,
+            RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI
+        );
+        assert_eq!(
+            report.input_to_photon.target_p95_us_macos,
+            RENDERER_INPUT_TO_PHOTON_MACOS_P95_TARGET_US
+        );
+        assert_eq!(
+            report.input_to_photon.target_p95_us_wayland,
+            RENDERER_INPUT_TO_PHOTON_WAYLAND_P95_TARGET_US
+        );
+        assert!(
+            report
+                .input_to_photon
+                .degradation_states
+                .contains(&"photon_detection_unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn input_to_photon_summary_reports_percentiles_and_target() {
+        let traces = [
+            known_key_trace_from_stage_durations(
+                0,
+                "a",
+                "macos",
+                [100, 200, 300, 400, 100],
+                20,
+                None,
+                None,
+            ),
+            known_key_trace_from_stage_durations(
+                1,
+                "a",
+                "macos",
+                [200, 300, 400, 500, 200],
+                25,
+                None,
+                None,
+            ),
+            known_key_trace_from_stage_durations(
+                2,
+                "a",
+                "macos",
+                [300, 400, 500, 600, 300],
+                30,
+                None,
+                None,
+            ),
+        ];
+
+        let evidence = summarize_input_to_photon_traces("macos", &traces);
+
+        assert_eq!(evidence.state, InputToPhotonState::Measured);
+        assert_eq!(evidence.sample_count, 3);
+        assert_eq!(evidence.target_p95_us, MACOS_P95_TARGET_US);
+        assert_eq!(evidence.p50_us, Some(1600));
+        assert_eq!(evidence.p95_us, Some(2100));
+        assert_eq!(evidence.p99_us, Some(2100));
+        assert_eq!(evidence.within_target, Some(true));
+        assert!(
+            evidence
+                .stage_breakdown_p50
+                .contains_key("term_update_to_render_submit")
+        );
+    }
+
+    #[test]
+    fn excessive_instrumentation_overhead_degrades_input_to_photon_evidence() {
+        let trace = known_key_trace_from_stage_durations(
+            0,
+            "a",
+            "linux",
+            [100, 100, 100, 100, 100],
+            100,
+            None,
+            None,
+        );
+
+        let evidence = summarize_input_to_photon_traces("linux", &[trace]);
+
+        assert_eq!(
+            evidence.state,
+            InputToPhotonState::InstrumentationOverheadExceeded
+        );
+        assert!(
+            evidence
+                .degradation_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("instrumentation overhead")
+        );
+        assert_eq!(evidence.within_target, None);
+    }
+
+    #[test]
+    fn empty_input_to_photon_summary_is_degraded_not_measured() {
+        let evidence = summarize_input_to_photon_traces("linux", &[]);
+
+        assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
+        assert_eq!(evidence.sample_count, 0);
+        assert_eq!(evidence.p95_us, None);
+        assert_eq!(evidence.within_target, None);
+        assert!(
+            evidence
+                .degradation_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no input-to-photon traces")
+        );
+    }
+
+    #[test]
+    fn input_to_photon_empirical_p99_agrees_with_lindley_bound() {
+        use crate::network_calculus_bound::{
+            ArrivalCurve, EmpiricalComparison, ServiceCurve, StageModel, TOLERANCE_PCT,
+            pipeline_delay_bound,
+        };
+
+        let trace = known_key_trace_from_stage_durations(
+            0,
+            "a",
+            "macos",
+            [250, 400, 750, 600, 250],
+            20,
+            Some(1),
+            Some("deterministic-test-adapter".to_string()),
+        );
+        let evidence = summarize_input_to_photon_traces("macos", std::slice::from_ref(&trace));
+        let empirical_p99_ms = evidence.p99_us.expect("p99 present") as f64 / 1_000.0;
+        let stages: Vec<StageModel> = trace
+            .stages
+            .windows(2)
+            .map(|window| {
+                let from = window[0].stage;
+                let to = window[1].stage;
+                let service_latency_ms = window[1].duration_us as f64 / 1_000.0;
+                StageModel::new(
+                    format!("{from}_to_{to}"),
+                    ServiceCurve::new(1_000.0, service_latency_ms),
+                )
+            })
+            .collect();
+        let analytical_bound_ms = pipeline_delay_bound(ArrivalCurve::new(0.0, 1.0), &stages)
+            .expect("stable input-to-photon service curve");
+        let comparison = EmpiricalComparison {
+            analytical_bound_ms,
+            empirical_p99_ms,
+        };
+
+        assert!(
+            comparison.within_tolerance(),
+            "empirical p99 {empirical_p99_ms:.3}ms should stay within {TOLERANCE_PCT:.1}% of Lindley bound {analytical_bound_ms:.3}ms"
+        );
+        assert!(
+            comparison.deviation_pct().unwrap_or(f64::INFINITY) <= 1.0,
+            "deterministic known-key trace should be nearly exact"
+        );
     }
 
     #[test]

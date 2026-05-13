@@ -3991,6 +3991,7 @@ dependencies = [
  "codec",
  "colorgrad",
  "config",
+ "criterion 0.5.1",
  "dhat",
  "dirs-next",
  "downcast-rs 1.2.1",

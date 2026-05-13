@@ -58,6 +58,10 @@
 //! - [`proof_handoff`] — Beads and Agent Mail handoff templates derived
 //!   from proof-doctor verdicts without creating a second taxonomy.
 //!
+//! Renderer SLO evidence:
+//! - [`input_to_photon`] — portable input-to-photon trace/evidence DTOs and
+//!   known-key summarization used by renderer SLO proof lanes.
+//!
 //! ## Re-export contract
 //!
 //! `frankenterm-core` re-exports each module via `pub use` so the
@@ -68,6 +72,7 @@
 pub mod canary_rehearsal;
 pub mod cutover_evidence;
 pub mod forensic_export;
+pub mod input_to_photon;
 pub mod migration_rehearsal;
 // [ft-nsoxc / ft-8nqx0 Phase 5] Reasoning-contract types consumed by
 // `frankenterm-core-ars`. Moved here so ARS depends on this leaf crate

@@ -67,8 +67,13 @@
     },
     {
       "claim_surface": "renderer_input_to_photon",
-      "status": "pending_stage_telemetry",
-      "pending_reason": "Renderer input-to-photon coverage must stay pending until G18 publishes renderer stage telemetry"
+      "status": "stage_telemetry_substrate_wired_pending_lab_run",
+      "evidence_source": "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs",
+      "agreement_test": "tests/input_to_photon_bound.rs",
+      "operator_surface": "ft doctor --json .renderer_slos.input_to_photon",
+      "mcp_resource": "wa://perf/renderer-slo/input_to_photon",
+      "structured_log": "target/criterion/slo-input_to_photon_<platform>.jsonl",
+      "pending_reason": "G18.2 now has deterministic known-key stage telemetry and explicit degraded-state evidence wiring, but the release Lindley agreement row remains pending until a retained target-run publishes empirical p95/p99 from the renderer SLO bench."
     }
   ]
 }
