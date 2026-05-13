@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "bead_id": "ft-tf6g3.46",
+  "proof_category": [
+    "4-conformance",
+    "9-differential"
+  ],
+  "sample_workload_class": "deterministic-6-state-cross-product",
+  "invariants_doc": "docs/contract-families-cross-invariants.md",
+  "invariants_sha256": "782b3bc8ea75fd38d751ae0b30bd21382459df353097722725200a33e20fbcec",
+  "matrix": {
+    "family_count": 5,
+    "canonical_evidence_state_count": 6,
+    "tuple_count": 7776,
+    "tuples_exercised": 7776,
+    "schema_validated_family_outputs": 38880,
+    "toon_shape_parity_checks": 38880,
+    "pass_rate": 1.0,
+    "runtime_budget_secs": 300,
+    "status": "passed"
+  },
+  "per_invariant_pass_count": {
+    "CF-001": 7776,
+    "CF-002": 7776,
+    "CF-003": 7776,
+    "CF-004": 7776,
+    "CF-005": 7776,
+    "CF-006": 7776,
+    "CF-007": 7776
+  },
+  "families": [
+    {
+      "family": "context-horizon",
+      "schema": "docs/json-schema/ft-context-horizon.json",
+      "bead": "ft-r920m"
+    },
+    {
+      "family": "capture-fairness",
+      "schema": "docs/json-schema/ft-capture-fairness.json",
+      "bead": "ft-n447z"
+    },
+    {
+      "family": "herd-wave",
+      "schema": "docs/json-schema/ft-herd-wave.json",
+      "bead": "ft-5bwjf"
+    },
+    {
+      "family": "blocker-radar",
+      "schema": "docs/json-schema/ft-blocker-radar.json",
+      "bead": "ft-9ntud"
+    },
+    {
+      "family": "resource-cockpit",
+      "schema": "docs/json-schema/ft-resource-pressure-cockpit.json",
+      "bead": "ft-rz0eb"
+    }
+  ],
+  "degradation_policy": {
+    "minimum_tuple_coverage_pct": 90,
+    "family_unavailable_state": "family-unavailable",
+    "matrix_incomplete_state": "matrix-incomplete"
+  },
+  "verification_commands": [
+    "cargo test -p frankenterm-core --test contract_families_invariant_parser --test contract_families_integration_matrix -- --nocapture",
+    "tests/e2e/test_cross_family_integration.sh"
+  ]
+}

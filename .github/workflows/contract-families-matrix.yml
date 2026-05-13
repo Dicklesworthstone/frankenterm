@@ -1,0 +1,55 @@
+name: Contract Families Matrix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/frankenterm-core/src/context_horizon.rs"
+      - "crates/frankenterm-core/src/capture_fairness*.rs"
+      - "crates/frankenterm-core/src/herd_wave*.rs"
+      - "crates/frankenterm-core/src/blocker_radar*.rs"
+      - "crates/frankenterm-core/src/resource_*.rs"
+      - "crates/frankenterm-core/tests/contract_families_*.rs"
+      - "docs/contract-families-cross-invariants.md"
+      - "docs/attestations/contracts/cross-family-matrix.json"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/frankenterm-core/src/context_horizon.rs"
+      - "crates/frankenterm-core/src/capture_fairness*.rs"
+      - "crates/frankenterm-core/src/herd_wave*.rs"
+      - "crates/frankenterm-core/src/blocker_radar*.rs"
+      - "crates/frankenterm-core/src/resource_*.rs"
+      - "crates/frankenterm-core/tests/contract_families_*.rs"
+      - "docs/contract-families-cross-invariants.md"
+      - "docs/attestations/contracts/cross-family-matrix.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  matrix:
+    name: Cross-family JSON/TOON conformance matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: contract-families-matrix
+
+      - name: Install Linux workspace build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcairo2-dev libx11-dev libx11-xcb-dev libxcb-util-dev libxcb-image0-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+
+      - name: Cross-family contract matrix
+        run: |
+          cargo test -p frankenterm-core \
+            --test contract_families_invariant_parser \
+            --test contract_families_integration_matrix \
+            -- --nocapture
