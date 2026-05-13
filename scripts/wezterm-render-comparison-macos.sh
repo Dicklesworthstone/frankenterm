@@ -314,6 +314,41 @@ wait_or_terminate_after_capture() {
   fi
 }
 
+
+validate_frame_capture_fingerprints() {
+  local engine="$1"
+  local frame_dir="$2"
+
+  python3 - "$engine" "$frame_dir" <<\PY
+import hashlib
+import pathlib
+import sys
+
+engine = sys.argv[1]
+root = pathlib.Path(sys.argv[2])
+frames = sorted(root.glob("*/frame-*.png"))
+if not frames:
+    raise SystemExit(f"[wezterm-render-adapter] no captured frames for {engine} under {root}")
+
+by_hash = {}
+for frame in frames:
+    digest = hashlib.sha256(frame.read_bytes()).hexdigest()
+    by_hash.setdefault(digest, []).append(str(frame.relative_to(root)))
+
+if len(frames) > 1 and len(by_hash) == 1:
+    examples = ", ".join(next(iter(by_hash.values()))[:5])
+    raise SystemExit(
+        f"[wezterm-render-adapter] stale capture suspect: all {len(frames)} "
+        f"{engine} frames are byte-identical ({examples})"
+    )
+
+print(
+    f"[wezterm-render-adapter] frame fingerprints engine={engine} "
+    f"frames={len(frames)} unique_hashes={len(by_hash)}"
+)
+PY
+}
+
 export_engine_frames() {
   local engine="$1"
   local gui="$2"
@@ -338,7 +373,6 @@ export_engine_frames() {
     local ready="$run_dir/$scenario_id.ready"
     local output="$frame_dir/$scenario_id/frame-000.png"
     local class="ft-wezterm-diff-$engine"
-    local status_file="$run_dir/$scenario_id.status"
     local log_file="$run_dir/$scenario_id.log"
     local -a launch_env=()
 
@@ -351,25 +385,19 @@ export_engine_frames() {
 
     write_config "$config" python3 "$driver" "$transcript" "$title" "$ready"
     echo "[wezterm-render-adapter] export engine=$engine scenario=$scenario_id"
-    (
-      set +e
-      if ((${#launch_env[@]} > 0)); then
-        env "${launch_env[@]}" "$gui" --config-file "$config" start \
-          --always-new-process \
-          --class "$class" \
-          --position 80,80 >"$log_file" 2>&1
-      else
-        "$gui" --config-file "$config" start \
-          --always-new-process \
-          --class "$class" \
-          --position 80,80 >"$log_file" 2>&1
-      fi
-      status=$?
-      printf '%s\n' "$status" >"$status_file"
-      exit "$status"
-    ) &
+    if ((${#launch_env[@]} > 0)); then
+      env "${launch_env[@]}" "$gui" --config-file "$config" start \
+        --always-new-process \
+        --class "$class" \
+        --position 80,80 >"$log_file" 2>&1 &
+    else
+      "$gui" --config-file "$config" start \
+        --always-new-process \
+        --class "$class" \
+        --position 80,80 >"$log_file" 2>&1 &
+    fi
     local gui_pid=$!
-    wait_for_file "$ready" "$TIMEOUT_SECS" "$status_file" "$log_file"
+    wait_for_file "$ready" "$TIMEOUT_SECS" "" "$log_file"
     sleep "${FT_WEZTERM_FRAME_SETTLE_SECS:-1}"
     capture_window "$title" "$output"
     wait_or_terminate_after_capture "$engine" "$scenario_id" "$gui_pid" "$log_file"
@@ -402,7 +430,9 @@ FRANKENTERM_FRAME_ROOT="$FRAME_ROOT/frankenterm"
 WEZTERM_FRAME_ROOT="$FRAME_ROOT/wezterm"
 
 export_engine_frames "frankenterm" "$FRANKENTERM_GUI" "$FRANKENTERM_FRAME_ROOT"
+validate_frame_capture_fingerprints "frankenterm" "$FRANKENTERM_FRAME_ROOT"
 export_engine_frames "wezterm" "$WEZTERM_GUI" "$WEZTERM_FRAME_ROOT"
+validate_frame_capture_fingerprints "wezterm" "$WEZTERM_FRAME_ROOT"
 write_comparison_report "$FRANKENTERM_FRAME_ROOT" "$WEZTERM_FRAME_ROOT" "$OUTPUT"
 
 echo "[wezterm-render-adapter] output=$OUTPUT"
