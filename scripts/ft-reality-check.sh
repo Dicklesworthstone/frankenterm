@@ -117,8 +117,14 @@ cmd_status() {
   emit_json "$result"
   emit_human "  open=$open_children blocked=$blocked_children in_progress=$in_progress_children closed=$closed_children"
 
-  # Exit 1 if there are open or blocked children — epic is not done.
-  [[ "${open_children:-0}" -eq 0 && "${blocked_children:-0}" -eq 0 ]] || exit 1
+  # Exit 1 if any child is open, blocked, OR in_progress — the epic is not
+  # done. The previous form ignored in_progress, so an epic with 0 open + 0
+  # blocked + N sibling-in-flight beads falsely reported exit 0. (Deferred
+  # children intentionally don't fail the doneness check — they're
+  # "out-of-scope" by operator decision, not work-in-flight.)
+  [[ "${open_children:-0}" -eq 0 \
+     && "${blocked_children:-0}" -eq 0 \
+     && "${in_progress_children:-0}" -eq 0 ]] || exit 1
 }
 
 cmd_next() {
