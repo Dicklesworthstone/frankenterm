@@ -44,6 +44,9 @@
 
 #![allow(dead_code)]
 
+use crate::render_quality::{
+    RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, RENDERER_INPUT_TO_PHOTON_STATUS,
+};
 use sha2::{Digest, Sha256};
 
 // ============================================================================
@@ -426,7 +429,7 @@ impl LindleyBoundsArtifact {
             "  \"within_tolerance\": {},\n",
             comp.within_tolerance()
         ));
-        out.push_str(render_lindley_coverage_status_json());
+        out.push_str(&render_lindley_coverage_status_json());
         out.push('}');
         out
     }
@@ -449,41 +452,54 @@ fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn render_lindley_coverage_status_json() -> &'static str {
-    concat!(
-        "  \"coverage_status\": [\n",
-        "    {\n",
-        "      \"claim_surface\": \"capture_4kb_overlap_benchmark\",\n",
-        "      \"status\": \"covered\",\n",
-        "      \"stage_source\": \"stages\",\n",
-        "      \"empirical_source\": \"headline capture_latency_p99 benchmark\"\n",
-        "    },\n",
-        "    {\n",
-        "      \"claim_surface\": \"end_to_end_capture_path\",\n",
-        "      \"status\": \"modeled_pending_empirical\",\n",
-        "      \"stage_source\": \"LindleyTelemetryModel::documented_end_to_end_capture_default\",\n",
-        "      \"required_stages\": [\"capture\", \"delta_extract\", \"storage_write\", \"pattern_detect\", \"event_emit\"],\n",
-        "      \"pending_reason\": \"PatternDetection and EventEmission have a deterministic budget-backed service curve, but the release artifact still lacks an empirical agreement row for the full PTY-to-event path\"\n",
-        "    },\n",
-        "    {\n",
-        "      \"claim_surface\": \"robot_mode_response_lt_5ms\",\n",
-        "      \"status\": \"pending_service_curve\",\n",
-        "      \"evidence_stream\": \"tests/fixtures/evidence-corpus/per-claim/robot.p95/baseline-30d.jsonl\",\n",
-        "      \"pending_reason\": \"G54 supplies empirical robot.p95 rows, but no release service curve maps ApiResponse plus handler work into this Lindley artifact yet\"\n",
-        "    },\n",
-        "    {\n",
-        "      \"claim_surface\": \"fts5_query_lt_10ms\",\n",
-        "      \"status\": \"pending_service_curve\",\n",
-        "      \"evidence_stream\": \"tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/baseline-30d.jsonl\",\n",
-        "      \"pending_reason\": \"G54 supplies empirical fts5.query_p99 rows, but the FTS5 read/query service curve is separate from StorageWrite and is not wired into this artifact yet\"\n",
-        "    },\n",
-        "    {\n",
-        "      \"claim_surface\": \"renderer_input_to_photon\",\n",
-        "      \"status\": \"pending_stage_telemetry\",\n",
-        "      \"pending_reason\": \"Renderer input-to-photon coverage must stay pending until G18 publishes renderer stage telemetry\"\n",
-        "    }\n",
-        "  ]\n"
-    )
+fn render_lindley_coverage_status_json() -> String {
+    let mut out = String::new();
+    out.push_str("  \"coverage_status\": [\n");
+    out.push_str("    {\n");
+    out.push_str("      \"claim_surface\": \"capture_4kb_overlap_benchmark\",\n");
+    out.push_str("      \"status\": \"covered\",\n");
+    out.push_str("      \"stage_source\": \"stages\",\n");
+    out.push_str("      \"empirical_source\": \"headline capture_latency_p99 benchmark\"\n");
+    out.push_str("    },\n");
+    out.push_str("    {\n");
+    out.push_str("      \"claim_surface\": \"end_to_end_capture_path\",\n");
+    out.push_str("      \"status\": \"modeled_pending_empirical\",\n");
+    out.push_str("      \"stage_source\": \"LindleyTelemetryModel::documented_end_to_end_capture_default\",\n");
+    out.push_str("      \"required_stages\": [\"capture\", \"delta_extract\", \"storage_write\", \"pattern_detect\", \"event_emit\"],\n");
+    out.push_str("      \"pending_reason\": \"PatternDetection and EventEmission have a deterministic budget-backed service curve, but the release artifact still lacks an empirical agreement row for the full PTY-to-event path\"\n");
+    out.push_str("    },\n");
+    out.push_str("    {\n");
+    out.push_str("      \"claim_surface\": \"robot_mode_response_lt_5ms\",\n");
+    out.push_str("      \"status\": \"pending_service_curve\",\n");
+    out.push_str("      \"evidence_stream\": \"tests/fixtures/evidence-corpus/per-claim/robot.p95/baseline-30d.jsonl\",\n");
+    out.push_str("      \"pending_reason\": \"G54 supplies empirical robot.p95 rows, but no release service curve maps ApiResponse plus handler work into this Lindley artifact yet\"\n");
+    out.push_str("    },\n");
+    out.push_str("    {\n");
+    out.push_str("      \"claim_surface\": \"fts5_query_lt_10ms\",\n");
+    out.push_str("      \"status\": \"pending_service_curve\",\n");
+    out.push_str("      \"evidence_stream\": \"tests/fixtures/evidence-corpus/per-claim/fts5.query_p99/baseline-30d.jsonl\",\n");
+    out.push_str("      \"pending_reason\": \"G54 supplies empirical fts5.query_p99 rows, but the FTS5 read/query service curve is separate from StorageWrite and is not wired into this artifact yet\"\n");
+    out.push_str("    },\n");
+    out.push_str("    {\n");
+    out.push_str("      \"claim_surface\": \"renderer_input_to_photon\",\n");
+    out.push_str("      \"status\": \"");
+    out.push_str(RENDERER_INPUT_TO_PHOTON_STATUS);
+    out.push_str("\",\n");
+    out.push_str("      \"evidence_source\": \"crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs\",\n");
+    out.push_str("      \"agreement_test\": \"tests/input_to_photon_bound.rs\",\n");
+    out.push_str(
+        "      \"operator_surface\": \"ft doctor --json .renderer_slos.input_to_photon\",\n",
+    );
+    out.push_str("      \"mcp_resource\": \"");
+    out.push_str(RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI);
+    out.push_str("\",\n");
+    out.push_str(
+        "      \"structured_log\": \"target/criterion/slo-input_to_photon_<platform>.jsonl\",\n",
+    );
+    out.push_str("      \"pending_reason\": \"G18.2 now has deterministic known-key stage telemetry and explicit degraded-state evidence wiring, but the release Lindley agreement row remains pending until a retained target-run publishes empirical p95/p99 from the renderer SLO bench.\"\n");
+    out.push_str("    }\n");
+    out.push_str("  ]\n");
+    out
 }
 
 #[cfg(test)]
@@ -969,7 +985,15 @@ mod tests {
         );
         assert_eq!(
             coverage_rows[4]["status"].as_str(),
-            Some("pending_stage_telemetry")
+            Some(RENDERER_INPUT_TO_PHOTON_STATUS)
+        );
+        assert_eq!(
+            coverage_rows[4]["mcp_resource"].as_str(),
+            Some(RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI)
+        );
+        assert_eq!(
+            coverage_rows[4]["agreement_test"].as_str(),
+            Some("tests/input_to_photon_bound.rs")
         );
 
         let stage_rows = parsed["stages"].as_array().expect("stages array");
