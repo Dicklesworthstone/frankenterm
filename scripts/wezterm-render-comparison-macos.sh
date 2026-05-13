@@ -24,8 +24,13 @@ Environment:
   FT_WEZTERM_FRAME_RECT       Capture rectangle as x,y,w,h. Defaults to 80,80,960,480.
                               The GUI is launched at 80,80 with no decorations, so this
                               avoids macOS accessibility APIs on GitHub-hosted runners.
+  FT_WEZTERM_FRAME_SETTLE_SECS Seconds to wait after transcript readiness before capture.
+                              Defaults to 3.
   FT_WEZTERM_FRAME_EXIT_SECS  Seconds to wait for GUI exit after capture before cleanup.
                               Defaults to 10.
+  FT_WEZTERM_FRAME_CLEANUP_SETTLE_SECS
+                              Seconds to wait after GUI cleanup before the next capture.
+                              Defaults to 2.
   -h, --help                 Show this help.
 EOF
 }
@@ -469,7 +474,7 @@ export_engine_frames() {
     fi
     local gui_pid=$!
     wait_for_file "$ready" "$TIMEOUT_SECS" "" "$log_file"
-    sleep "${FT_WEZTERM_FRAME_SETTLE_SECS:-1}"
+    sleep "${FT_WEZTERM_FRAME_SETTLE_SECS:-3}"
     capture_window "$title" "$output"
     wait_or_terminate_after_capture "$engine" "$scenario_id" "$gui_pid" "$log_file" "$class"
   done < <(manifest_rows)
