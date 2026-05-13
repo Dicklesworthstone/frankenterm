@@ -459,6 +459,82 @@ impl ProofAttemptRecord {
         }
     }
 
+    /// Project a proof-doctor verdict into the durable proof-lane record schema.
+    ///
+    /// The resulting record still needs [`validate_proof_record`] before it is
+    /// used for closeout or persisted as proof evidence. This mapper copies the
+    /// observed proof-doctor evidence without strengthening it: missing Bead ids,
+    /// incomplete artifacts, local fallback, or unknown redaction remain visible
+    /// to validation instead of being papered over here.
+    #[must_use]
+    pub fn from_proof_doctor_verdict(
+        verdict: &ProofDoctorVerdict,
+        redaction_status: ProofRedactionStatus,
+    ) -> Self {
+        let projection = verdict
+            .ledger_projection
+            .as_ref()
+            .map_or_else(inconclusive_projection, Clone::clone);
+        let projected_state = projection.state;
+        let mut record = Self::new(
+            verdict.verdict_id.clone(),
+            verdict.bead_id.clone().unwrap_or_default(),
+            projected_state,
+            projection.reason_code,
+            projection.summary,
+        );
+
+        record.parent_bead_id.clone_from(&verdict.parent_bead_id);
+        if projected_state != ProofState::NotRun {
+            record
+                .attempted_at_utc
+                .clone_from(&verdict.generated_at_utc);
+        }
+        if projected_state.is_terminal() {
+            record.finished_at_utc = Some(verdict.generated_at_utc.clone());
+        }
+        record.agent_name.clone_from(&verdict.agent_name);
+        record.cwd.clone_from(&verdict.repo_path);
+        record.command.clone_from(&verdict.intended_command);
+        record
+            .declared_target_dir
+            .clone_from(&verdict.intended_target_dir);
+        record.proof_scope = verdict.intended_scope;
+        record.required_backend = verdict.required_backend;
+        record.observed_backend = observed_backend_from_verdict(verdict);
+        record.rch_version.clone_from(&verdict.evidence.rch_version);
+        record
+            .selected_worker
+            .clone_from(&verdict.evidence.selected_worker);
+        record
+            .worker_probe_artifact
+            .clone_from(&verdict.evidence.worker_probe_artifact);
+        record.sync_duration_ms = verdict.evidence.sync_duration_ms;
+        record.remote_command_duration_ms = verdict.evidence.remote_command_duration_ms;
+        record.wrapper_exit_code = verdict.evidence.wrapper_exit_code;
+        record.remote_exit_code = verdict.evidence.remote_exit_code;
+        record.remote_cargo_reached = verdict.evidence.remote_cargo_reached;
+        record.local_cargo_detected =
+            verdict.evidence.local_cargo_detected || verdict.evidence.fail_open_detected;
+        record.rustc_reached = verdict.evidence.rustc_reached;
+        record.test_binary_started = verdict.evidence.test_binary_started;
+        record.artifact_retrieval_status = verdict.evidence.artifact_retrieval_status;
+        record
+            .artifact_paths
+            .clone_from(&verdict.evidence.artifact_paths);
+        record.next_action.clone_from(&verdict.next_action.message);
+        record.redaction_status = redaction_status;
+        record = record.with_proof_doctor_verdict(verdict);
+
+        if record.safe_to_close_source_bead() {
+            record
+                .claims_allowed
+                .push("focused_remote_proof_passed".to_string());
+        }
+
+        record
+    }
+
     /// Attach a compact proof-doctor verdict snapshot to this record.
     #[must_use]
     pub fn with_proof_doctor_verdict(mut self, verdict: &ProofDoctorVerdict) -> Self {
@@ -502,6 +578,30 @@ impl ProofAttemptRecord {
     #[must_use]
     pub fn command_display(&self) -> String {
         self.command.join(" ")
+    }
+}
+
+fn inconclusive_projection() -> crate::proof_doctor::ProofAttemptProjection {
+    crate::proof_doctor::ProofAttemptProjection {
+        state: ProofState::Inconclusive,
+        reason_code: "proof.doctor.missing_projection".to_string(),
+        summary: "Proof-doctor did not emit a proof-lane projection.".to_string(),
+        safe_to_close: false,
+    }
+}
+
+fn observed_backend_from_verdict(verdict: &ProofDoctorVerdict) -> ProofBackend {
+    if verdict.evidence.local_cargo_detected || verdict.evidence.fail_open_detected {
+        ProofBackend::LocalShell
+    } else if verdict.required_backend == ProofBackend::None {
+        ProofBackend::None
+    } else if verdict.evidence.remote_cargo_reached
+        || verdict.evidence.selected_worker.is_some()
+        || verdict.evidence.sync_duration_ms.is_some()
+    {
+        ProofBackend::Rch
+    } else {
+        ProofBackend::Unknown
     }
 }
 
@@ -1318,6 +1418,14 @@ mod tests {
         record
     }
 
+    fn projected_record_from_doctor(
+        input: &ProofDoctorPreflightInput,
+        redaction_status: ProofRedactionStatus,
+    ) -> ProofAttemptRecord {
+        let verdict = classify_proof_doctor(input);
+        ProofAttemptRecord::from_proof_doctor_verdict(&verdict, redaction_status)
+    }
+
     #[test]
     fn proof_state_terminal_flags_cover_contract() {
         assert!(!ProofState::NotRun.is_terminal());
@@ -1380,6 +1488,89 @@ mod tests {
         assert_eq!(record.report_bucket(), ProofReportBucket::RemoteProofPassed);
         assert!(record.safe_to_close_source_bead());
         assert!(validate_proof_record(&record).is_empty());
+    }
+
+    #[test]
+    fn proof_doctor_pass_projection_validates_and_round_trips() {
+        let mut input = base_doctor_input();
+        input.evidence.remote_cargo_reached = true;
+        input.evidence.rustc_reached = true;
+        input.evidence.test_binary_started = true;
+        input.evidence.remote_exit_code = Some(0);
+        input.evidence.wrapper_exit_code = Some(0);
+        input.evidence.selected_worker = Some("vmi1153651".into());
+        input.evidence.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        input.evidence.artifact_paths = vec!["tests/e2e/artifacts/proof/pass/summary.json".into()];
+
+        let record = projected_record_from_doctor(&input, ProofRedactionStatus::NoneNeeded);
+        let serialized = serde_json::to_string(&record).expect("record serializes");
+        let round_trip: ProofAttemptRecord =
+            serde_json::from_str(&serialized).expect("record deserializes");
+
+        assert_eq!(round_trip.state, ProofState::Pass);
+        assert!(round_trip.safe_to_close_source_bead());
+        assert_eq!(
+            round_trip
+                .proof_doctor
+                .as_ref()
+                .map(|snapshot| snapshot.status),
+            Some(ProofDoctorStatus::Passed)
+        );
+        assert!(validate_proof_record(&round_trip).is_empty());
+    }
+
+    #[test]
+    fn proof_doctor_infra_source_and_test_projection_records_validate() {
+        let mut infra = base_doctor_input();
+        infra.evidence.selected_worker = Some("vmi1293453".into());
+        infra.evidence.sync_duration_ms = Some(140_454);
+        infra.evidence.wrapper_exit_code = Some(1);
+        infra.evidence.rch_failure_reason_code = Some("RCH-REMOTE-MIRROR-MISSING-FILE".into());
+        infra.evidence.rch_failure_reason_detail =
+            Some("missing crates/frankenterm-alloc/Cargo.toml".into());
+
+        let mut source = base_doctor_input();
+        source.evidence.remote_cargo_reached = true;
+        source.evidence.rustc_reached = true;
+        source.evidence.remote_exit_code = Some(101);
+        source.evidence.diagnostic_summary = Some("missing field initializer".into());
+        source.evidence.diagnostic_paths = vec!["crates/frankenterm-core/src/proof_lane.rs".into()];
+
+        let mut test = source.clone();
+        test.evidence.test_binary_started = true;
+        test.evidence.diagnostic_summary = Some("assertion failed".into());
+
+        let records = [
+            (
+                projected_record_from_doctor(&infra, ProofRedactionStatus::Unknown),
+                ProofState::InfraBlockedPreCargo,
+                ProofDoctorStatus::InfraBlocked,
+            ),
+            (
+                projected_record_from_doctor(&source, ProofRedactionStatus::Unknown),
+                ProofState::SourceCompileFail,
+                ProofDoctorStatus::SourceBlocked,
+            ),
+            (
+                projected_record_from_doctor(&test, ProofRedactionStatus::Unknown),
+                ProofState::TestFail,
+                ProofDoctorStatus::TestBlocked,
+            ),
+        ];
+
+        for (record, state, doctor_status) in records {
+            assert_eq!(record.state, state);
+            assert_eq!(
+                record.proof_doctor.as_ref().map(|snapshot| snapshot.status),
+                Some(doctor_status)
+            );
+            assert!(
+                validate_proof_record(&record)
+                    .iter()
+                    .all(|finding| finding.severity != ProofFindingSeverity::Error),
+                "{state:?} projection should not have validation errors"
+            );
+        }
     }
 
     #[test]

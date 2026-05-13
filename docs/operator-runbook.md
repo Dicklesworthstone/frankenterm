@@ -141,6 +141,12 @@ Use proof-doctor for every Bead whose closeout depends on RCH, Cargo, clippy,
 tests, benches, E2E, high-scale worker predicates, or proof-lane evidence. It
 is the operator vocabulary for separating RCH/tooling blockers, source
 failures, dirty-tree ownership, invalid command shapes, and inconclusive logs.
+When retained evidence is ready for durable closeout, pass
+`--proof-record-output <path>.jsonl` so proof-doctor appends a validated
+`ProofAttemptRecord` row instead of leaving future agents to parse prose. Use
+`--proof-record-redaction-status none-needed` or `redacted` when the retained
+artifact bundle has been reviewed; the default `unknown` keeps closeout
+eligibility conservative.
 
 Primary anchors:
 
@@ -219,6 +225,7 @@ Every future proof-lane Bead closeout must include either:
 
 ```text
 Proof-doctor: <status>; phase <phase>; reason <reason_code>; verdict <verdict_id or artifact>; remote Cargo <reached|not reached>; owner <owner or none>; target_dir <path|none>; target_lifecycle <kept|cleanup_requested|deletion_authorized|cleaned|not_applicable>; target_size <size|unknown>; closeout <safe|blocked>.
+Proof-record: <written|refused|write_failed|not_requested>; path <jsonl artifact path|none>; validation <ok|warning|error>; closeout <safe|blocked>.
 ```
 
 or an explicit non-applicability sentence:
@@ -239,6 +246,9 @@ Closeout rules:
   Cargo/rustc/test execution is positively observed.
 - Beads comments and Agent Mail handoffs should carry the same status,
   reason code, command, worker/sync/Cargo evidence, owner, and next action.
+- If `--proof-record-output` is used, cite the JSONL path in the Beads comment.
+  A `refused` or `write_failed` proof record is evidence that the lane is not
+  closeout-ready; do not rewrite it by hand to make the closeout green.
 - RCH-heavy closeouts without target-dir lifecycle fields are incomplete even
   when the proof itself passed. Disk pressure is a shared resource issue, not
   cleanup trivia.

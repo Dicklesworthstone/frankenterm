@@ -41,7 +41,10 @@ use frankenterm_core::proof_doctor::{
     merge_proof_doctor_artifact_json,
 };
 use frankenterm_core::proof_handoff::build_proof_handoff;
-use frankenterm_core::proof_lane::{ArtifactRetrievalStatus, ProofBackend, ProofScope};
+use frankenterm_core::proof_lane::{
+    ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofFindingSeverity,
+    ProofRedactionStatus, ProofScope, validate_proof_record,
+};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
 
@@ -999,6 +1002,18 @@ NOTES:
         /// Retained RCH metadata, preflight, or harness summary JSON artifact
         #[arg(long = "evidence-artifact", value_name = "PATH")]
         evidence_artifacts: Vec<String>,
+
+        /// Append a validated ProofAttemptRecord JSONL row to this path
+        #[arg(long = "proof-record-output", value_name = "PATH")]
+        proof_record_output: Option<String>,
+
+        /// Redaction status for retained proof artifacts
+        #[arg(
+            long = "proof-record-redaction-status",
+            value_enum,
+            default_value = "unknown"
+        )]
+        proof_record_redaction_status: ProofRecordRedactionStatusArg,
 
         /// Output format: plain, json, or toon
         #[arg(long, short = 'f', default_value = "plain")]
@@ -3020,6 +3035,18 @@ enum RobotCommands {
         /// Retained RCH metadata, preflight, or harness summary JSON artifact
         #[arg(long = "evidence-artifact", value_name = "PATH")]
         evidence_artifacts: Vec<String>,
+
+        /// Append a validated ProofAttemptRecord JSONL row to this path
+        #[arg(long = "proof-record-output", value_name = "PATH")]
+        proof_record_output: Option<String>,
+
+        /// Redaction status for retained proof artifacts
+        #[arg(
+            long = "proof-record-redaction-status",
+            value_enum,
+            default_value = "unknown"
+        )]
+        proof_record_redaction_status: ProofRecordRedactionStatusArg,
 
         /// Intended proof command argv. Use `--` before the command.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -5194,6 +5221,15 @@ enum ProofDoctorBackendArg {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum ProofRecordRedactionStatusArg {
+    NoneNeeded,
+    Redacted,
+    UnsafeMissing,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RobotMissionKillSwitchLevelArg {
     Off,
@@ -5823,6 +5859,17 @@ fn proof_doctor_backend(required_backend: ProofDoctorBackendArg) -> ProofBackend
     }
 }
 
+fn map_proof_record_redaction_status(
+    redaction_status: ProofRecordRedactionStatusArg,
+) -> ProofRedactionStatus {
+    match redaction_status {
+        ProofRecordRedactionStatusArg::NoneNeeded => ProofRedactionStatus::NoneNeeded,
+        ProofRecordRedactionStatusArg::Redacted => ProofRedactionStatus::Redacted,
+        ProofRecordRedactionStatusArg::UnsafeMissing => ProofRedactionStatus::UnsafeMissing,
+        ProofRecordRedactionStatusArg::Unknown => ProofRedactionStatus::Unknown,
+    }
+}
+
 fn proof_doctor_dirty_paths(workspace_root: &Path) -> Vec<ProofDoctorDirtyPath> {
     let Some(output) = proof_doctor_git_stdout(workspace_root, &["status", "--porcelain=v1"])
     else {
@@ -6046,6 +6093,7 @@ fn extract_proof_doctor_target_dir(command: &[String]) -> Option<String> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_proof_doctor_payload(
     bead_id: Option<&str>,
     agent: Option<&str>,
@@ -6053,6 +6101,8 @@ fn build_proof_doctor_payload(
     required_backend: ProofDoctorBackendArg,
     target_dir: Option<&str>,
     evidence_artifacts: &[String],
+    proof_record_output: Option<&str>,
+    proof_record_redaction_status: ProofRecordRedactionStatusArg,
     command: &[String],
     workspace_root: &Path,
 ) -> serde_json::Value {
@@ -6089,7 +6139,12 @@ fn build_proof_doctor_payload(
         proof_path_prefixes,
         evidence,
     };
-    build_proof_doctor_payload_from_input(input)
+    build_proof_doctor_payload_from_input_with_record(
+        input,
+        proof_record_output,
+        proof_record_redaction_status,
+        workspace_root,
+    )
 }
 
 fn proof_doctor_merge_evidence_artifacts(
@@ -6150,15 +6205,150 @@ fn proof_doctor_record_artifact_read_error(
     }
 }
 
+#[cfg(test)]
 fn build_proof_doctor_payload_from_input(input: ProofDoctorPreflightInput) -> serde_json::Value {
+    build_proof_doctor_payload_from_input_with_record(
+        input,
+        None,
+        ProofRecordRedactionStatusArg::Unknown,
+        Path::new("."),
+    )
+}
+
+fn build_proof_doctor_payload_from_input_with_record(
+    input: ProofDoctorPreflightInput,
+    proof_record_output: Option<&str>,
+    proof_record_redaction_status: ProofRecordRedactionStatusArg,
+    workspace_root: &Path,
+) -> serde_json::Value {
     let verdict = classify_proof_doctor(&input);
     let handoff = build_proof_handoff(&verdict);
+    let proof_record = proof_doctor_record_output(
+        &verdict,
+        proof_record_output,
+        proof_record_redaction_status,
+        workspace_root,
+    );
 
     serde_json::json!({
         "schema_version": PROOF_DOCTOR_SCHEMA_VERSION,
         "verdict": verdict,
         "handoff": handoff,
+        "proof_record": proof_record,
     })
+}
+
+fn proof_doctor_record_output(
+    verdict: &frankenterm_core::proof_doctor::ProofDoctorVerdict,
+    proof_record_output: Option<&str>,
+    proof_record_redaction_status: ProofRecordRedactionStatusArg,
+    workspace_root: &Path,
+) -> serde_json::Value {
+    let Some(output_path) = proof_record_output else {
+        return serde_json::json!({
+            "requested": false,
+            "write_status": "not_requested",
+        });
+    };
+
+    let record = ProofAttemptRecord::from_proof_doctor_verdict(
+        verdict,
+        map_proof_record_redaction_status(proof_record_redaction_status),
+    );
+    let validation_findings = validate_proof_record(&record);
+    let has_errors = validation_findings
+        .iter()
+        .any(|finding| finding.severity == ProofFindingSeverity::Error);
+    let safe_to_close_source_bead = record.safe_to_close_source_bead();
+
+    if has_errors {
+        return serde_json::json!({
+            "requested": true,
+            "write_status": "refused",
+            "path": output_path,
+            "reason": "validation_errors",
+            "validation_findings": validation_findings,
+            "safe_to_close_source_bead": safe_to_close_source_bead,
+            "record": record,
+        });
+    }
+
+    match append_proof_record_jsonl(workspace_root, output_path, &record) {
+        Ok(written_path) => serde_json::json!({
+            "requested": true,
+            "write_status": "written",
+            "path": output_path,
+            "resolved_path": written_path.display().to_string(),
+            "validation_findings": validation_findings,
+            "safe_to_close_source_bead": safe_to_close_source_bead,
+            "record": record,
+        }),
+        Err(error) => serde_json::json!({
+            "requested": true,
+            "write_status": "write_failed",
+            "path": output_path,
+            "reason": error,
+            "validation_findings": validation_findings,
+            "safe_to_close_source_bead": safe_to_close_source_bead,
+            "record": record,
+        }),
+    }
+}
+
+fn append_proof_record_jsonl(
+    workspace_root: &Path,
+    output_path: &str,
+    record: &ProofAttemptRecord,
+) -> Result<PathBuf, String> {
+    let output = Path::new(output_path);
+    let resolved = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        workspace_root.join(output)
+    };
+
+    if resolved
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("jsonl")
+    {
+        return Err(format!(
+            "proof record output must be a .jsonl path to avoid appending to unrelated artifacts: {}",
+            resolved.display()
+        ));
+    }
+
+    if let Some(parent) = resolved.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create proof record parent directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let row = serde_json::to_string(record)
+        .map_err(|error| format!("failed to serialize proof record: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&resolved)
+        .map_err(|error| {
+            format!(
+                "failed to open proof record JSONL {} for append: {error}",
+                resolved.display()
+            )
+        })?;
+    writeln!(file, "{row}").map_err(|error| {
+        format!(
+            "failed to append proof record JSONL {}: {error}",
+            resolved.display()
+        )
+    })?;
+
+    Ok(resolved)
 }
 
 fn print_proof_doctor_plain(payload: &serde_json::Value) {
@@ -6187,6 +6377,22 @@ fn print_proof_doctor_plain(payload: &serde_json::Value) {
                 blocker["severity"].as_str().unwrap_or("unknown"),
                 blocker["message"].as_str().unwrap_or("unavailable")
             );
+        }
+    }
+    let proof_record = &payload["proof_record"];
+    if proof_record["requested"].as_bool().unwrap_or(false) {
+        match proof_record["write_status"].as_str().unwrap_or("unknown") {
+            "written" => println!(
+                "proof-record: written {}",
+                proof_record["resolved_path"]
+                    .as_str()
+                    .or_else(|| proof_record["path"].as_str())
+                    .unwrap_or("unknown")
+            ),
+            status => println!(
+                "proof-record: {status} {}",
+                proof_record["reason"].as_str().unwrap_or("unknown")
+            ),
         }
     }
 }
@@ -23817,6 +24023,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     required_backend,
                     target_dir,
                     evidence_artifacts,
+                    proof_record_output,
+                    proof_record_redaction_status,
                     command,
                 } => {
                     let payload = build_proof_doctor_payload(
@@ -23826,6 +24034,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         required_backend,
                         target_dir.as_deref(),
                         &evidence_artifacts,
+                        proof_record_output.as_deref(),
+                        proof_record_redaction_status,
                         &command,
                         &workspace_root,
                     );
@@ -37088,6 +37298,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             required_backend,
             target_dir,
             evidence_artifacts,
+            proof_record_output,
+            proof_record_redaction_status,
             format,
             command,
         }) => {
@@ -37099,6 +37311,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 required_backend,
                 target_dir.as_deref(),
                 &evidence_artifacts,
+                proof_record_output.as_deref(),
+                proof_record_redaction_status,
                 &command,
                 &workspace_root,
             );
@@ -67375,6 +67589,10 @@ log_level = "debug"
             "ft-wik9p.2",
             "--agent",
             "MistyBay",
+            "--proof-record-output",
+            "artifacts/proof/ft-wik9p.2.jsonl",
+            "--proof-record-redaction-status",
+            "redacted",
             "--",
             "rch",
             "exec",
@@ -67394,6 +67612,8 @@ log_level = "debug"
                 agent,
                 scope,
                 required_backend,
+                proof_record_output,
+                proof_record_redaction_status,
                 command,
                 ..
             }) => {
@@ -67401,6 +67621,14 @@ log_level = "debug"
                 assert_eq!(agent.as_deref(), Some("MistyBay"));
                 assert_eq!(scope, ProofDoctorScopeArg::CargoTest);
                 assert_eq!(required_backend, ProofDoctorBackendArg::Rch);
+                assert_eq!(
+                    proof_record_output.as_deref(),
+                    Some("artifacts/proof/ft-wik9p.2.jsonl")
+                );
+                assert_eq!(
+                    proof_record_redaction_status,
+                    ProofRecordRedactionStatusArg::Redacted
+                );
                 assert_eq!(
                     command,
                     vec![
@@ -67428,6 +67656,10 @@ log_level = "debug"
             "proof-doctor",
             "--bead",
             "ft-wik9p.2",
+            "--proof-record-output",
+            "artifacts/proof/ft-wik9p.2.jsonl",
+            "--proof-record-redaction-status",
+            "none-needed",
             "--",
             "rch",
             "exec",
@@ -67445,12 +67677,22 @@ log_level = "debug"
                     bead,
                     scope,
                     required_backend,
+                    proof_record_output,
+                    proof_record_redaction_status,
                     command,
                     ..
                 }) => {
                     assert_eq!(bead.as_deref(), Some("ft-wik9p.2"));
                     assert_eq!(scope, ProofDoctorScopeArg::CargoTest);
                     assert_eq!(required_backend, ProofDoctorBackendArg::Rch);
+                    assert_eq!(
+                        proof_record_output.as_deref(),
+                        Some("artifacts/proof/ft-wik9p.2.jsonl")
+                    );
+                    assert_eq!(
+                        proof_record_redaction_status,
+                        ProofRecordRedactionStatusArg::NoneNeeded
+                    );
                     assert_eq!(command.first().map(String::as_str), Some("rch"));
                     assert!(command.iter().any(|token| token == "cargo"));
                 }
@@ -67639,6 +67881,139 @@ log_level = "debug"
             payload["handoff"]["beads_comment"]
                 .as_str()
                 .is_some_and(|comment| comment.contains("agent BluePike"))
+        );
+    }
+
+    #[test]
+    fn proof_doctor_payload_writes_valid_proof_record_jsonl() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let input = ProofDoctorPreflightInput {
+            bead_id: Some("ft-782hw.5".to_string()),
+            parent_bead_id: Some("ft-782hw".to_string()),
+            agent_name: "Codex".to_string(),
+            repo_path: tempdir.path().display().to_string(),
+            git_head: "abc123".to_string(),
+            branch: "main".to_string(),
+            generated_at_utc: "2026-05-12T16:00:00Z".to_string(),
+            intended_command: vec![
+                "rch".to_string(),
+                "exec".to_string(),
+                "--".to_string(),
+                "env".to_string(),
+                "CARGO_TARGET_DIR=/tmp/ft-782hw-5-proof".to_string(),
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "frankenterm-core-audit-types".to_string(),
+                "proof_lane".to_string(),
+            ],
+            intended_target_dir: Some("/tmp/ft-782hw-5-proof".to_string()),
+            intended_scope: ProofScope::CargoTest,
+            required_backend: ProofBackend::Rch,
+            phase: ProofDoctorPhase::TerminalClassified,
+            proof_path_prefixes: vec!["crates/frankenterm-core-audit-types".to_string()],
+            evidence: ProofDoctorEvidence {
+                selected_worker: Some("vmi1153651".to_string()),
+                remote_cargo_reached: true,
+                rustc_reached: true,
+                test_binary_started: true,
+                wrapper_exit_code: Some(0),
+                remote_exit_code: Some(0),
+                artifact_retrieval_status: ArtifactRetrievalStatus::Complete,
+                artifact_paths: vec!["tests/e2e/artifacts/proof/pass/summary.json".to_string()],
+                ..ProofDoctorEvidence::default()
+            },
+        };
+
+        let payload = build_proof_doctor_payload_from_input_with_record(
+            input,
+            Some("artifacts/proof-records.jsonl"),
+            ProofRecordRedactionStatusArg::NoneNeeded,
+            tempdir.path(),
+        );
+
+        assert_eq!(
+            payload["proof_record"]["write_status"].as_str(),
+            Some("written")
+        );
+        assert_eq!(
+            payload["proof_record"]["safe_to_close_source_bead"].as_bool(),
+            Some(true)
+        );
+        let jsonl_path = tempdir.path().join("artifacts/proof-records.jsonl");
+        let jsonl = fs::read_to_string(&jsonl_path).expect("record JSONL written");
+        let mut lines = jsonl.lines();
+        let record_line = lines.next().expect("record JSONL has one line");
+        assert!(lines.next().is_none(), "record JSONL should have one line");
+        let record: ProofAttemptRecord =
+            serde_json::from_str(record_line).expect("record line deserializes");
+        assert_eq!(record.bead_id, "ft-782hw.5");
+        assert_eq!(record.observed_backend, ProofBackend::Rch);
+        assert!(record.safe_to_close_source_bead());
+    }
+
+    #[test]
+    fn proof_doctor_payload_refuses_invalid_proof_record_without_writing() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let input = ProofDoctorPreflightInput {
+            bead_id: None,
+            parent_bead_id: Some("ft-782hw".to_string()),
+            agent_name: "Codex".to_string(),
+            repo_path: tempdir.path().display().to_string(),
+            git_head: "abc123".to_string(),
+            branch: "main".to_string(),
+            generated_at_utc: "2026-05-12T16:00:00Z".to_string(),
+            intended_command: vec![
+                "rch".to_string(),
+                "exec".to_string(),
+                "--".to_string(),
+                "cargo".to_string(),
+                "test".to_string(),
+            ],
+            intended_target_dir: None,
+            intended_scope: ProofScope::CargoTest,
+            required_backend: ProofBackend::Rch,
+            phase: ProofDoctorPhase::TerminalClassified,
+            proof_path_prefixes: Vec::new(),
+            evidence: ProofDoctorEvidence {
+                selected_worker: Some("vmi1153651".to_string()),
+                remote_cargo_reached: true,
+                rustc_reached: true,
+                test_binary_started: true,
+                wrapper_exit_code: Some(0),
+                remote_exit_code: Some(0),
+                artifact_retrieval_status: ArtifactRetrievalStatus::Complete,
+                ..ProofDoctorEvidence::default()
+            },
+        };
+
+        let payload = build_proof_doctor_payload_from_input_with_record(
+            input,
+            Some("artifacts/proof-records.jsonl"),
+            ProofRecordRedactionStatusArg::NoneNeeded,
+            tempdir.path(),
+        );
+
+        assert_eq!(
+            payload["proof_record"]["write_status"].as_str(),
+            Some("refused")
+        );
+        assert_eq!(
+            payload["proof_record"]["reason"].as_str(),
+            Some("validation_errors")
+        );
+        assert!(
+            payload["proof_record"]["validation_findings"]
+                .as_array()
+                .is_some_and(|findings| findings
+                    .iter()
+                    .any(|finding| finding["reason_code"].as_str() == Some("missing_bead_id")))
+        );
+        assert!(
+            !tempdir
+                .path()
+                .join("artifacts/proof-records.jsonl")
+                .exists()
         );
     }
 
