@@ -18,6 +18,10 @@ use crate::mcp_framework::{
 
 use crate::context_horizon::predict_context_horizon_from_sqlite;
 use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_STORAGE};
+use crate::proof_lane::{
+    ProofHistoryArtifactInput, ProofHistoryIndex, ProofHistoryQuery, ProofReleaseScoreboard,
+    ProofState,
+};
 use crate::swarm_scheduler::{
     HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
 };
@@ -27,6 +31,9 @@ use super::mcp_tools::{
 };
 use super::{McpEnvelope, McpWorkflowItem, McpWorkflowsData, builtin_workflows, elapsed_ms};
 use crate::config::{Config, PaneFilterConfig};
+
+const PROOF_HISTORY_RESOURCE_URI: &str = "wa://proof-history";
+const PROOF_HISTORY_RELEASE_BLOCKING_URI: &str = "wa://proof-history/release-blocking";
 
 fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
     let text = contents
@@ -194,6 +201,164 @@ fn load_attestation_retractions_for_resource(
         rows.push(value);
     }
     Ok(rows)
+}
+
+fn proof_history_artifact_roots(config: &Config) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    let layout = config
+        .workspace_layout(None)
+        .map_err(|err| format!("resolve workspace layout: {err}"))?;
+    let roots = std::env::var_os("FT_PROOF_HISTORY_ROOT")
+        .map(|root| vec![PathBuf::from(root)])
+        .unwrap_or_else(|| vec![layout.root.join("tests").join("e2e").join("artifacts")]);
+    Ok((layout.root, roots))
+}
+
+fn load_proof_history_query_for_resource(
+    config: &Config,
+    query: ProofHistoryQuery,
+) -> Result<crate::proof_lane::ProofHistoryQueryResult, String> {
+    let (workspace_root, roots) = proof_history_artifact_roots(config)?;
+    load_proof_history_query_from_roots(&workspace_root, roots, query)
+}
+
+fn load_proof_history_query_from_roots(
+    workspace_root: &Path,
+    roots: Vec<PathBuf>,
+    query: ProofHistoryQuery,
+) -> Result<crate::proof_lane::ProofHistoryQueryResult, String> {
+    let mut paths = Vec::new();
+    for root in roots {
+        collect_proof_history_jsonl_paths(&root, &mut paths)?;
+    }
+    paths.sort();
+    paths.dedup();
+
+    let artifacts = paths
+        .into_iter()
+        .map(|path| proof_history_artifact_input_from_path(&workspace_root, &path))
+        .collect::<Vec<_>>();
+    let index = ProofHistoryIndex::from_artifacts(&artifacts);
+    let scoreboard = ProofReleaseScoreboard::from_history(&index);
+    Ok(scoreboard.query(&query))
+}
+
+fn collect_proof_history_jsonl_paths(path: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+    if path.is_file() {
+        if is_proof_history_jsonl(path) {
+            paths.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !path.is_dir() {
+        paths.push(path.to_path_buf());
+        return Ok(());
+    }
+
+    let entries =
+        std::fs::read_dir(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read entry in {}: {err}", path.display()))?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_proof_history_jsonl_paths(&entry_path, paths)?;
+        } else if is_proof_history_jsonl(&entry_path) {
+            paths.push(entry_path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_proof_history_jsonl(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        && (file_name.contains("proof-record") || file_name.contains("proof_record"))
+}
+
+fn proof_history_artifact_input_from_path(
+    workspace_root: &Path,
+    path: &Path,
+) -> ProofHistoryArtifactInput {
+    let artifact_path = path
+        .strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let content_sha256 = proof_history_sha256_hex(&bytes);
+            match String::from_utf8(bytes) {
+                Ok(content) => {
+                    let mut input = ProofHistoryArtifactInput::new(artifact_path, content);
+                    input.content_sha256 = Some(content_sha256);
+                    input
+                }
+                Err(error) => ProofHistoryArtifactInput::unavailable(
+                    artifact_path,
+                    Some(format!("artifact is not UTF-8: {error}")),
+                ),
+            }
+        }
+        Err(error) => {
+            ProofHistoryArtifactInput::unavailable(artifact_path, Some(error.to_string()))
+        }
+    }
+}
+
+fn proof_history_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
+fn proof_history_state_from_resource_param(value: &str) -> Option<ProofState> {
+    match percent_decode_resource_param(value)
+        .replace('-', "_")
+        .as_str()
+    {
+        "not_run" => Some(ProofState::NotRun),
+        "reached_remote_cargo" => Some(ProofState::ReachedRemoteCargo),
+        "source_compile_fail" => Some(ProofState::SourceCompileFail),
+        "test_fail" => Some(ProofState::TestFail),
+        "pass" => Some(ProofState::Pass),
+        "infra_blocked_pre_cargo" => Some(ProofState::InfraBlockedPreCargo),
+        "infra_blocked_post_cargo" => Some(ProofState::InfraBlockedPostCargo),
+        "local_invalid" => Some(ProofState::LocalInvalid),
+        "skipped_not_proven" => Some(ProofState::SkippedNotProven),
+        "inconclusive" => Some(ProofState::Inconclusive),
+        _ => None,
+    }
+}
+
+fn percent_decode_resource_param(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push((high << 4) | low);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| value.to_string())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub(super) struct WaPanesResource {
@@ -616,6 +781,192 @@ impl ResourceHandler for WaHerdWaveResource {
     }
 }
 
+pub(super) struct WaProofHistoryResource {
+    config: Arc<Config>,
+}
+
+impl WaProofHistoryResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaProofHistoryResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PROOF_HISTORY_RESOURCE_URI.to_string(),
+            name: "ft proof history".to_string(),
+            description: Some(
+                "Read-only proof-history rows with release-blocking summary".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "proof".to_string(),
+                "proof-history".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let payload = load_proof_history_query_for_resource(
+            &self.config,
+            ProofHistoryQuery {
+                limit: 100,
+                ..ProofHistoryQuery::default()
+            },
+        )
+        .map_err(|err| McpError::internal_error(format!("Load proof history: {err}")))?;
+        let envelope = McpEnvelope::success(payload, elapsed_ms(start));
+        envelope_as_resource(PROOF_HISTORY_RESOURCE_URI, envelope)
+    }
+}
+
+pub(super) struct WaProofHistoryReleaseBlockingResource {
+    config: Arc<Config>,
+}
+
+impl WaProofHistoryReleaseBlockingResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaProofHistoryReleaseBlockingResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PROOF_HISTORY_RELEASE_BLOCKING_URI.to_string(),
+            name: "ft proof history release blockers".to_string(),
+            description: Some("Read-only proof-history rows blocking release".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "proof".to_string(),
+                "proof-history".to_string(),
+                "release-blocking".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let payload = load_proof_history_query_for_resource(
+            &self.config,
+            ProofHistoryQuery {
+                release_blocking_only: true,
+                limit: 100,
+                ..ProofHistoryQuery::default()
+            },
+        )
+        .map_err(|err| McpError::internal_error(format!("Load proof history: {err}")))?;
+        let envelope = McpEnvelope::success(payload, elapsed_ms(start));
+        envelope_as_resource(PROOF_HISTORY_RELEASE_BLOCKING_URI, envelope)
+    }
+}
+
+pub(super) struct WaProofHistoryTemplateResource {
+    config: Arc<Config>,
+}
+
+impl WaProofHistoryTemplateResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaProofHistoryTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://proof-history/template".to_string(),
+            name: "ft proof history template".to_string(),
+            description: Some("Template for filtered proof-history rows".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "proof".to_string(),
+                "proof-history".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://proof-history/{filter}/{value}/{limit}".to_string(),
+            name: "ft proof history filtered".to_string(),
+            description: Some(
+                "Filter proof history by bead, category, status, or release-blocking".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "proof".to_string(),
+                "proof-history".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        WaProofHistoryResource::new(Arc::clone(&self.config)).read(ctx)
+    }
+
+    fn read_with_uri(
+        &self,
+        _ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let filter = params.get("filter").map(String::as_str).unwrap_or("all");
+        let value = params
+            .get("value")
+            .map(|value| percent_decode_resource_param(value))
+            .unwrap_or_default();
+        let limit = params
+            .get("limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(1, 1000);
+        let mut query = ProofHistoryQuery {
+            limit,
+            ..ProofHistoryQuery::default()
+        };
+
+        match filter {
+            "all" => {}
+            "bead" => query.bead_id = Some(value),
+            "category" => query.proof_category = Some(value),
+            "status" => {
+                query.status = proof_history_state_from_resource_param(&value);
+                if query.status.is_none() {
+                    return Err(McpError::invalid_params(
+                        "Unsupported proof-history status filter",
+                    ));
+                }
+            }
+            "release-blocking" => query.release_blocking_only = true,
+            _ => {
+                return Err(McpError::invalid_params(
+                    "Unsupported proof-history filter. Use all, bead, category, status, or release-blocking.",
+                ));
+            }
+        }
+
+        let start = Instant::now();
+        let payload = load_proof_history_query_for_resource(&self.config, query)
+            .map_err(|err| McpError::internal_error(format!("Load proof history: {err}")))?;
+        let envelope = McpEnvelope::success(payload, elapsed_ms(start));
+        envelope_as_resource(uri, envelope)
+    }
+}
+
 pub(super) struct WaAttestationRetractionsResource {
     config: Arc<Config>,
 }
@@ -827,13 +1178,19 @@ mod tests {
         WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
         WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
         WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
+        WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
+        WaProofHistoryTemplateResource,
         WaReservationsByPaneTemplateResource, WaReservationsResource,
         WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource, envelope_as_resource,
-        tool_output_as_resource,
+        load_proof_history_query_from_roots, tool_output_as_resource,
     };
     use crate::config::{Config, PaneFilterConfig};
     use crate::mcp_framework::{
         FrameworkContent as Content, FrameworkResourceHandler as ResourceHandler,
+    };
+    use crate::proof_lane::{
+        ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofHistoryQuery,
+        ProofRedactionStatus, ProofScope, ProofState,
     };
     use proptest::prelude::*;
     use std::path::PathBuf;
@@ -841,6 +1198,34 @@ mod tests {
 
     fn db_path() -> Arc<PathBuf> {
         Arc::new(PathBuf::from("/tmp/test-mcp.db"))
+    }
+
+    fn proof_history_test_record(state: ProofState, bead_id: &str) -> ProofAttemptRecord {
+        let mut record = ProofAttemptRecord::new(
+            format!("proof-{bead_id}"),
+            bead_id,
+            state,
+            "proof.test",
+            "test proof record",
+        );
+        record.attempted_at_utc = "2026-05-13T00:00:00Z".into();
+        record.finished_at_utc = Some("2026-05-13T00:01:00Z".into());
+        record.agent_name = "McpTest".into();
+        record.cwd = "/repo".into();
+        record.command = vec!["rch".into(), "exec".into(), "cargo".into(), "test".into()];
+        record.proof_scope = ProofScope::CargoTest;
+        record.required_backend = ProofBackend::Rch;
+        record.observed_backend = ProofBackend::Rch;
+        record
+    }
+
+    fn proof_records_to_jsonl(records: &[ProofAttemptRecord]) -> String {
+        let mut jsonl = String::new();
+        for record in records {
+            jsonl.push_str(&serde_json::to_string(record).expect("serialize proof record"));
+            jsonl.push('\n');
+        }
+        jsonl
     }
 
     // ========================================================================
@@ -1007,6 +1392,74 @@ mod tests {
     }
 
     #[test]
+    fn proof_history_resources_define_read_only_surfaces() {
+        let config = Arc::new(Config::default());
+
+        let def = WaProofHistoryResource::new(Arc::clone(&config)).definition();
+        assert_eq!(def.uri, "wa://proof-history");
+        assert!(def.tags.contains(&"proof-history".to_string()));
+
+        let blocking = WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition();
+        assert_eq!(blocking.uri, "wa://proof-history/release-blocking");
+        assert!(blocking.tags.contains(&"release-blocking".to_string()));
+
+        let template = WaProofHistoryTemplateResource::new(config)
+            .template()
+            .expect("template definition");
+        assert_eq!(
+            template.uri_template,
+            "wa://proof-history/{filter}/{value}/{limit}"
+        );
+    }
+
+    #[test]
+    fn proof_history_resource_loader_uses_canonical_query_contract() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let artifact_root = root.join("tests").join("e2e").join("artifacts");
+        std::fs::create_dir_all(&artifact_root).expect("artifact root");
+
+        let mut pass = proof_history_test_record(ProofState::Pass, "ft-mcp-pass");
+        pass.proof_id = "proof-mcp-pass".into();
+        pass.selected_worker = Some("vmi-proof".into());
+        pass.remote_cargo_reached = true;
+        pass.rustc_reached = true;
+        pass.test_binary_started = true;
+        pass.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        pass.redaction_status = ProofRedactionStatus::NoneNeeded;
+
+        let mut blocked =
+            proof_history_test_record(ProofState::InfraBlockedPreCargo, "ft-mcp-blocked");
+        blocked.proof_id = "proof-mcp-blocked".into();
+        blocked.reason_code = "proof.rch.pre_cargo_timeout_exec_missing".into();
+
+        let proof_path = artifact_root.join("proof-records.jsonl");
+        std::fs::write(&proof_path, proof_records_to_jsonl(&[pass, blocked]))
+            .expect("write proof records");
+
+        let result = load_proof_history_query_from_roots(
+            root,
+            vec![artifact_root],
+            ProofHistoryQuery {
+                release_blocking_only: true,
+                limit: 10,
+                ..ProofHistoryQuery::default()
+            },
+        )
+        .expect("load proof history");
+
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.rows[0].bead_id, "ft-mcp-blocked");
+        assert_eq!(result.release_blocking_summary.total_blocking_rows, 1);
+        assert!(
+            result.rows[0]
+                .artifact_path
+                .ends_with("proof-records.jsonl")
+        );
+        assert!(!result.rows[0].artifact_path.starts_with('/'));
+    }
+
+    #[test]
     fn context_horizon_resource_definition_uri() {
         let resource = WaContextHorizonResource::new(db_path());
         let def = resource.definition();
@@ -1100,6 +1553,7 @@ mod tests {
     #[test]
     fn all_resource_uris_are_unique() {
         let db = db_path();
+        let config = Arc::new(Config::default());
         let uris = [
             WaPanesResource::new(PaneFilterConfig::default(), None)
                 .definition()
@@ -1118,6 +1572,15 @@ mod tests {
             WaRulesResource.definition().uri,
             WaRulesByAgentTemplateResource.definition().uri,
             WaWorkflowsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaProofHistoryResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaProofHistoryTemplateResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
             WaAttestationRetractionsResource::new(Arc::new(Config::default()))
@@ -1146,6 +1609,7 @@ mod tests {
     #[test]
     fn all_resource_uris_use_wa_scheme() {
         let db = db_path();
+        let config = Arc::new(Config::default());
         let uris = [
             WaPanesResource::new(PaneFilterConfig::default(), None)
                 .definition()
@@ -1153,6 +1617,15 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
             WaRulesResource.definition().uri,
             WaWorkflowsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaProofHistoryResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config))
+                .definition()
+                .uri,
+            WaProofHistoryTemplateResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
             WaAttestationRetractionsResource::new(Arc::new(Config::default()))
@@ -1177,11 +1650,15 @@ mod tests {
     #[test]
     fn all_definitions_have_json_mime_type() {
         let db = db_path();
+        let config = Arc::new(Config::default());
         let defs = [
             WaPanesResource::new(PaneFilterConfig::default(), None).definition(),
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaProofHistoryResource::new(Arc::clone(&config)).definition(),
+            WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
+            WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
             WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
             WaContextHorizonResource::new(Arc::clone(&db)).definition(),
             WaReservationsResource::new(Arc::clone(&db)).definition(),
@@ -1203,11 +1680,15 @@ mod tests {
     #[test]
     fn all_definitions_have_version() {
         let db = db_path();
+        let config = Arc::new(Config::default());
         let defs = [
             WaPanesResource::new(PaneFilterConfig::default(), None).definition(),
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaProofHistoryResource::new(Arc::clone(&config)).definition(),
+            WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
+            WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
             WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
             WaContextHorizonResource::new(Arc::clone(&db)).definition(),
             WaReservationsResource::new(Arc::clone(&db)).definition(),

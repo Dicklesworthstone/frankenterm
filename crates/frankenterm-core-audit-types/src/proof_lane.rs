@@ -14,7 +14,7 @@
 //! taxonomy operators saw at runtime, while `PASS` still requires retained
 //! remote Cargo/rustc/test evidence on the ledger record itself.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -1726,6 +1726,81 @@ pub struct ProofReleaseScoreboard {
     pub operator_summary: String,
 }
 
+/// Query parameters for read-only proof-history surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofHistoryQuery {
+    /// Restrict rows to one Beads id.
+    pub bead_id: Option<String>,
+    /// Restrict rows to one proof category.
+    pub proof_category: Option<String>,
+    /// Restrict rows to one terminal/intermediate proof state.
+    pub status: Option<ProofState>,
+    /// Return only rows that block release or source closeout.
+    pub release_blocking_only: bool,
+    /// Preserve absolute local paths in returned artifact paths.
+    pub include_local_paths: bool,
+    /// Maximum rows to return.
+    pub limit: usize,
+    /// Number of matching rows to skip.
+    pub offset: usize,
+}
+
+impl Default for ProofHistoryQuery {
+    fn default() -> Self {
+        Self {
+            bead_id: None,
+            proof_category: None,
+            status: None,
+            release_blocking_only: false,
+            include_local_paths: false,
+            limit: 100,
+            offset: 0,
+        }
+    }
+}
+
+/// Release-blocking summary included with proof-history query results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofHistoryReleaseBlockingSummary {
+    /// Number of blocking rows.
+    pub total_blocking_rows: u64,
+    /// Blocking row counts by report bucket.
+    pub by_bucket: BTreeMap<String, u64>,
+    /// Blocking row counts by proof category.
+    pub by_proof_category: BTreeMap<String, u64>,
+    /// Beads that currently have blocking rows.
+    pub blocking_beads: Vec<String>,
+    /// Number of artifact-level issues.
+    pub artifact_issue_count: u64,
+    /// Number of validation findings.
+    pub validation_finding_count: u64,
+}
+
+/// Paged read-only proof-history response shared by robot and MCP surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofHistoryQueryResult {
+    /// Response schema version.
+    pub schema_version: u32,
+    /// Query that produced this response.
+    pub query: ProofHistoryQuery,
+    /// Total rows matching the filters before pagination.
+    pub total_matches: u64,
+    /// Number of rows returned in this page.
+    pub returned_rows: u64,
+    /// Next offset when more rows are available.
+    pub next_offset: Option<usize>,
+    /// Latest row for `query.bead_id`, when a bead filter was supplied.
+    pub latest_for_bead: Option<ProofReleaseScoreboardRow>,
+    /// Paged canonical scoreboard rows.
+    pub rows: Vec<ProofReleaseScoreboardRow>,
+    /// Artifact issues such as missing, unreadable, stale, or invalid files.
+    pub artifact_issues: Vec<ProofHistoryArtifactReport>,
+    /// Release-blocking rollup independent of the page filters.
+    pub release_blocking_summary: ProofHistoryReleaseBlockingSummary,
+    /// Concise operator summary.
+    pub operator_summary: String,
+}
+
 /// Proof closeout linter schema version implemented by this module.
 pub const PROOF_CLOSEOUT_LINTER_SCHEMA_VERSION: u32 = 1;
 
@@ -2236,6 +2311,95 @@ impl ProofReleaseScoreboard {
     pub fn release_blockers(&self) -> &[ProofReleaseScoreboardRow] {
         &self.blocking_rows
     }
+
+    /// Query canonical proof-history rows with filtering, pagination, and
+    /// remote-safe path redaction.
+    #[must_use]
+    pub fn query(&self, query: &ProofHistoryQuery) -> ProofHistoryQueryResult {
+        let limit = query.limit.clamp(1, 1000);
+        let offset = query.offset;
+        let candidates = if query.release_blocking_only {
+            &self.blocking_rows
+        } else {
+            &self.rows
+        };
+        let matching_rows = candidates
+            .iter()
+            .filter(|row| proof_history_row_matches_query(row, query))
+            .cloned()
+            .map(|row| redact_scoreboard_row(row, query.include_local_paths))
+            .collect::<Vec<_>>();
+        let total_matches = matching_rows.len();
+        let rows = matching_rows
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_offset = (offset + rows.len() < total_matches).then_some(offset + rows.len());
+        let latest_for_bead = query
+            .bead_id
+            .as_deref()
+            .and_then(|bead_id| self.latest_for_bead(bead_id))
+            .cloned()
+            .map(|row| redact_scoreboard_row(row, query.include_local_paths));
+        let artifact_issues = self
+            .artifact_issues
+            .iter()
+            .cloned()
+            .map(|artifact| redact_artifact_report(artifact, query.include_local_paths))
+            .collect::<Vec<_>>();
+        let release_blocking_summary = self.release_blocking_summary();
+        let operator_summary = proof_history_query_operator_summary(
+            total_matches,
+            rows.len(),
+            next_offset,
+            query.release_blocking_only,
+        );
+
+        ProofHistoryQueryResult {
+            schema_version: PROOF_LANE_SCHEMA_VERSION,
+            query: ProofHistoryQuery {
+                limit,
+                ..query.clone()
+            },
+            total_matches: total_matches as u64,
+            returned_rows: rows.len() as u64,
+            next_offset,
+            latest_for_bead,
+            rows,
+            artifact_issues,
+            release_blocking_summary,
+            operator_summary,
+        }
+    }
+
+    /// Summarize the rows that block release or source closeout.
+    #[must_use]
+    pub fn release_blocking_summary(&self) -> ProofHistoryReleaseBlockingSummary {
+        let mut by_bucket = BTreeMap::new();
+        let mut by_proof_category = BTreeMap::new();
+        let mut blocking_beads = Vec::new();
+
+        for row in &self.blocking_rows {
+            *by_bucket
+                .entry(row.bucket.as_str().to_string())
+                .or_insert(0) += 1;
+            *by_proof_category
+                .entry(row.proof_category.clone())
+                .or_insert(0) += 1;
+            push_unique_non_empty(&mut blocking_beads, &row.bead_id);
+        }
+
+        ProofHistoryReleaseBlockingSummary {
+            total_blocking_rows: self.blocking_rows.len() as u64,
+            by_bucket,
+            by_proof_category,
+            blocking_beads,
+            artifact_issue_count: self.artifact_issues.len() as u64,
+            validation_finding_count: self.findings.len() as u64,
+        }
+    }
 }
 
 impl ProofReleaseScoreboardRow {
@@ -2500,6 +2664,71 @@ fn proof_scoreboard_row_is_newer(
         || (candidate_ts == selected_ts
             && proof_state_rank(candidate.latest_verdict)
                 > proof_state_rank(selected.latest_verdict))
+}
+
+fn proof_history_row_matches_query(
+    row: &ProofReleaseScoreboardRow,
+    query: &ProofHistoryQuery,
+) -> bool {
+    query
+        .bead_id
+        .as_deref()
+        .is_none_or(|bead_id| row.bead_id == bead_id)
+        && query
+            .proof_category
+            .as_deref()
+            .is_none_or(|category| row.proof_category == category)
+        && query
+            .status
+            .is_none_or(|status| row.latest_verdict == status)
+}
+
+fn redact_scoreboard_row(
+    mut row: ProofReleaseScoreboardRow,
+    include_local_paths: bool,
+) -> ProofReleaseScoreboardRow {
+    row.artifact_path = redact_local_path(&row.artifact_path, include_local_paths);
+    row
+}
+
+fn redact_artifact_report(
+    mut report: ProofHistoryArtifactReport,
+    include_local_paths: bool,
+) -> ProofHistoryArtifactReport {
+    report.artifact_path = redact_local_path(&report.artifact_path, include_local_paths);
+    report
+}
+
+fn redact_local_path(path: &str, include_local_paths: bool) -> String {
+    if include_local_paths || !path.starts_with('/') {
+        return path.to_string();
+    }
+
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("artifact");
+    format!("<local>/{file_name}")
+}
+
+fn proof_history_query_operator_summary(
+    total_matches: usize,
+    returned_rows: usize,
+    next_offset: Option<usize>,
+    release_blocking_only: bool,
+) -> String {
+    let mode = if release_blocking_only {
+        "release_blocking"
+    } else {
+        "all"
+    };
+    match next_offset {
+        Some(next) => format!(
+            "mode={mode}; matches={total_matches}; returned={returned_rows}; next_offset={next}"
+        ),
+        None => format!("mode={mode}; matches={total_matches}; returned={returned_rows}"),
+    }
 }
 
 fn proof_history_operator_summary(
@@ -3249,6 +3478,111 @@ mod tests {
             .expect("latest row for bead");
         assert_eq!(latest.latest_verdict, ProofState::InfraBlockedPreCargo);
         assert!(!latest.closeout_eligible);
+    }
+
+    #[test]
+    fn proof_history_query_filters_paginates_and_redacts_absolute_paths() {
+        let mut pass = base_record(ProofState::Pass);
+        pass.proof_id = "pass-query".into();
+        pass.bead_id = "ft-query-pass".into();
+        pass.remote_cargo_reached = true;
+        pass.rustc_reached = true;
+        pass.test_binary_started = true;
+        pass.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        pass.selected_worker = Some("vmi-query".into());
+
+        let mut blocked = base_record(ProofState::InfraBlockedPreCargo);
+        blocked.proof_id = "blocked-query".into();
+        blocked.bead_id = "ft-query-blocked".into();
+        blocked.reason_code = "proof.rch.queue_timeout_before_assignment".into();
+
+        let mut pass_artifact = ProofHistoryArtifactInput::new(
+            "/Users/operator/frankenterm/proof-pass.jsonl",
+            records_to_jsonl(&[pass]),
+        );
+        pass_artifact.content_sha256 = Some("sha256:pass".into());
+        pass_artifact.proof_category = Some("release/proof-handoff".into());
+        let mut blocked_artifact = ProofHistoryArtifactInput::new(
+            "tests/e2e/artifacts/proof-blocked.jsonl",
+            records_to_jsonl(&[blocked]),
+        );
+        blocked_artifact.proof_category = Some("release/proof-handoff".into());
+
+        let index = ProofHistoryIndex::from_artifacts(&[pass_artifact, blocked_artifact]);
+        let scoreboard = ProofReleaseScoreboard::from_history(&index);
+        let page = scoreboard.query(&ProofHistoryQuery {
+            proof_category: Some("release/proof-handoff".into()),
+            status: Some(ProofState::Pass),
+            limit: 1,
+            ..ProofHistoryQuery::default()
+        });
+
+        assert_eq!(page.total_matches, 1);
+        assert_eq!(page.returned_rows, 1);
+        assert_eq!(page.rows[0].bead_id, "ft-query-pass");
+        assert_eq!(page.rows[0].artifact_path, "<local>/proof-pass.jsonl");
+        assert_eq!(
+            page.rows[0].artifact_sha256,
+            Some("sha256:pass".to_string())
+        );
+        assert!(page.next_offset.is_none());
+
+        let local_paths = scoreboard.query(&ProofHistoryQuery {
+            bead_id: Some("ft-query-pass".into()),
+            include_local_paths: true,
+            ..ProofHistoryQuery::default()
+        });
+        assert_eq!(
+            local_paths
+                .latest_for_bead
+                .expect("latest row")
+                .artifact_path,
+            "/Users/operator/frankenterm/proof-pass.jsonl"
+        );
+    }
+
+    #[test]
+    fn proof_history_query_reports_release_blockers_and_missing_artifacts() {
+        let mut blocked = base_record(ProofState::InfraBlockedPreCargo);
+        blocked.proof_id = "blocked-release".into();
+        blocked.bead_id = "ft-blocking".into();
+        blocked.reason_code = "proof.rch.pre_cargo_timeout_exec_missing".into();
+
+        let artifact = ProofHistoryArtifactInput::new(
+            "tests/e2e/artifacts/proof-blocking.jsonl",
+            records_to_jsonl(&[blocked]),
+        );
+        let missing = ProofHistoryArtifactInput::unavailable("/var/tmp/missing-proof.jsonl", None);
+        let index = ProofHistoryIndex::from_artifacts(&[artifact, missing]);
+        let scoreboard = ProofReleaseScoreboard::from_history(&index);
+        let blockers = scoreboard.query(&ProofHistoryQuery {
+            release_blocking_only: true,
+            limit: 10,
+            ..ProofHistoryQuery::default()
+        });
+
+        assert_eq!(blockers.total_matches, 1);
+        assert_eq!(blockers.rows[0].bead_id, "ft-blocking");
+        assert_eq!(
+            blockers.rows[0].residual_blocker.as_deref(),
+            Some("pre_cargo_infra_blocked")
+        );
+        assert_eq!(blockers.artifact_issues.len(), 1);
+        assert_eq!(
+            blockers.artifact_issues[0].artifact_path,
+            "<local>/missing-proof.jsonl"
+        );
+        assert_eq!(
+            blockers.release_blocking_summary.total_blocking_rows,
+            scoreboard.blocking_rows.len() as u64
+        );
+        assert_eq!(blockers.release_blocking_summary.artifact_issue_count, 1);
+        assert!(
+            blockers
+                .release_blocking_summary
+                .blocking_beads
+                .contains(&"ft-blocking".to_string())
+        );
     }
 
     fn records_to_jsonl(records: &[ProofAttemptRecord]) -> String {

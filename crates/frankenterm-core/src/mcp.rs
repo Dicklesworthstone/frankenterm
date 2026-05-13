@@ -115,8 +115,9 @@ use mcp_resources::{
     WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
     WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
     WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
-    WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
-    WaRulesResource, WaWorkflowsResource,
+    WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
+    WaReservationsByPaneTemplateResource, WaReservationsResource,
+    WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource,
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
@@ -1471,6 +1472,9 @@ mod tests {
                 "wa://accounts".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://proof-history".to_string(),
+                "wa://proof-history/release-blocking".to_string(),
+                "wa://proof-history/template".to_string(),
                 "wa://attestation/retractions".to_string(),
                 "wa://context/horizon".to_string(),
                 "wa://reservations".to_string(),
@@ -1484,6 +1488,7 @@ mod tests {
                 "wa://accounts/{service}".to_string(),
                 "wa://rules/{agent_type}".to_string(),
                 "wa://reservations/{pane_id}".to_string(),
+                "wa://proof-history/{filter}/{value}/{limit}".to_string(),
             ])
         );
     }
@@ -1506,10 +1511,19 @@ mod tests {
                 "wa://panes".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://proof-history".to_string(),
+                "wa://proof-history/release-blocking".to_string(),
+                "wa://proof-history/template".to_string(),
                 "wa://attestation/retractions".to_string(),
             ])
         );
-        assert_eq!(templates, uri_set(["wa://rules/{agent_type}".to_string()]));
+        assert_eq!(
+            templates,
+            uri_set([
+                "wa://rules/{agent_type}".to_string(),
+                "wa://proof-history/{filter}/{value}/{limit}".to_string(),
+            ])
+        );
     }
 
     // ── Error code stability tests (wa-nu4.3.1.3) ────────────────────────

@@ -44,8 +44,8 @@ use frankenterm_core::proof_handoff::build_proof_handoff;
 use frankenterm_core::proof_lane::{
     ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofCloseoutLintArtifact,
     ProofCloseoutLintInput, ProofFindingSeverity, ProofHistoryArtifactInput, ProofHistoryIndex,
-    ProofRedactionStatus, ProofReleaseScoreboard, ProofReleaseScoreboardRow, ProofScope,
-    lint_proof_closeout, validate_proof_record,
+    ProofHistoryQuery, ProofRedactionStatus, ProofReleaseScoreboard, ProofReleaseScoreboardRow,
+    ProofScope, ProofState, lint_proof_closeout, validate_proof_record,
 };
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
@@ -3216,6 +3216,61 @@ enum RobotCommands {
         #[arg(long)]
         dirty_tree: bool,
     },
+
+    /// Query retained proof-history records and release blockers
+    ProofHistory {
+        /// ProofAttemptRecord JSONL artifact path. Repeatable.
+        #[arg(long = "record", value_name = "PATH")]
+        records: Vec<String>,
+
+        /// Directory to scan recursively for *.jsonl proof artifacts.
+        #[arg(long = "artifact-root", value_name = "DIR")]
+        artifact_roots: Vec<String>,
+
+        /// Proof category attached to supplied artifacts.
+        #[arg(long)]
+        proof_category: Option<String>,
+
+        /// Source commit attached to supplied artifacts.
+        #[arg(long)]
+        source_commit: Option<String>,
+
+        /// Expected source commit for mismatch detection.
+        #[arg(long)]
+        expected_source_commit: Option<String>,
+
+        /// Expected artifact SHA-256 for mismatch detection.
+        #[arg(long)]
+        expected_sha256: Option<String>,
+
+        /// Current Beads closeout timestamp for stale-artifact detection.
+        #[arg(long)]
+        bead_closed_at: Option<String>,
+
+        /// Return rows for a single Beads id.
+        #[arg(long)]
+        bead: Option<String>,
+
+        /// Return rows for a single proof state.
+        #[arg(long, value_enum)]
+        status: Option<ProofHistoryStatusArg>,
+
+        /// Return only rows that block release or source closeout.
+        #[arg(long)]
+        release_blocking: bool,
+
+        /// Preserve local absolute paths in artifact paths.
+        #[arg(long)]
+        include_local_paths: bool,
+
+        /// Maximum rows to return.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+
+        /// Number of matching rows to skip.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -5401,6 +5456,21 @@ enum ProofDoctorBackendArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
+enum ProofHistoryStatusArg {
+    NotRun,
+    ReachedRemoteCargo,
+    SourceCompileFail,
+    TestFail,
+    Pass,
+    InfraBlockedPreCargo,
+    InfraBlockedPostCargo,
+    LocalInvalid,
+    SkippedNotProven,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 enum ProofRecordRedactionStatusArg {
     NoneNeeded,
     Redacted,
@@ -6048,6 +6118,21 @@ fn proof_doctor_backend(required_backend: ProofDoctorBackendArg) -> ProofBackend
         ProofDoctorBackendArg::Rch => ProofBackend::Rch,
         ProofDoctorBackendArg::Static => ProofBackend::None,
         ProofDoctorBackendArg::Local => ProofBackend::LocalShell,
+    }
+}
+
+fn proof_history_status(status: ProofHistoryStatusArg) -> ProofState {
+    match status {
+        ProofHistoryStatusArg::NotRun => ProofState::NotRun,
+        ProofHistoryStatusArg::ReachedRemoteCargo => ProofState::ReachedRemoteCargo,
+        ProofHistoryStatusArg::SourceCompileFail => ProofState::SourceCompileFail,
+        ProofHistoryStatusArg::TestFail => ProofState::TestFail,
+        ProofHistoryStatusArg::Pass => ProofState::Pass,
+        ProofHistoryStatusArg::InfraBlockedPreCargo => ProofState::InfraBlockedPreCargo,
+        ProofHistoryStatusArg::InfraBlockedPostCargo => ProofState::InfraBlockedPostCargo,
+        ProofHistoryStatusArg::LocalInvalid => ProofState::LocalInvalid,
+        ProofHistoryStatusArg::SkippedNotProven => ProofState::SkippedNotProven,
+        ProofHistoryStatusArg::Inconclusive => ProofState::Inconclusive,
     }
 }
 
@@ -6702,6 +6787,34 @@ fn build_proof_history_payload(
     let index = ProofHistoryIndex::from_artifacts(&artifacts);
     let scoreboard = ProofReleaseScoreboard::from_history(&index);
     Ok((index, scoreboard))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_proof_history_query_payload(
+    records: &[String],
+    artifact_roots: &[String],
+    metadata: ProofHistoryCliMetadata,
+    bead: Option<String>,
+    status: Option<ProofHistoryStatusArg>,
+    release_blocking: bool,
+    include_local_paths: bool,
+    limit: usize,
+    offset: usize,
+    workspace_root: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let proof_category_filter = metadata.proof_category.clone();
+    let (_index, scoreboard) =
+        build_proof_history_payload(records, artifact_roots, metadata, workspace_root)?;
+    let query = ProofHistoryQuery {
+        bead_id: bead,
+        proof_category: proof_category_filter,
+        status: status.map(proof_history_status),
+        release_blocking_only: release_blocking,
+        include_local_paths,
+        limit,
+        offset,
+    };
+    serde_json::to_value(scoreboard.query(&query)).map_err(|error| anyhow::anyhow!(error))
 }
 
 fn collect_proof_history_artifacts(
@@ -24663,6 +24776,43 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = RobotResponse::success(payload, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                RobotCommands::ProofHistory {
+                    records,
+                    artifact_roots,
+                    proof_category,
+                    source_commit,
+                    expected_source_commit,
+                    expected_sha256,
+                    bead_closed_at,
+                    bead,
+                    status,
+                    release_blocking,
+                    include_local_paths,
+                    limit,
+                    offset,
+                } => {
+                    let metadata = ProofHistoryCliMetadata {
+                        proof_category,
+                        source_commit,
+                        expected_source_commit,
+                        expected_sha256,
+                        bead_closed_at,
+                    };
+                    let payload = build_proof_history_query_payload(
+                        &records,
+                        &artifact_roots,
+                        metadata,
+                        bead,
+                        status,
+                        release_blocking,
+                        include_local_paths,
+                        limit,
+                        offset,
+                        &workspace_root,
+                    )?;
+                    let response = RobotResponse::success(payload, elapsed_ms(start));
+                    print_robot_response(&response, format, stats)?;
+                }
                 RobotCommands::CoordinationRisk { session } => {
                     let response = match load_coordination_risk_snapshot(&workspace_root, &session)
                     {
@@ -24706,6 +24856,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                     match other {
                         RobotCommands::ProofCloseoutLint { .. } => unreachable!("handled above"),
+                        RobotCommands::ProofHistory { .. } => unreachable!("handled above"),
                         RobotCommands::State {
                             include_text,
                             tail,
@@ -68743,6 +68894,68 @@ log_level = "debug"
                 }
                 _ => panic!("expected RobotCommands::ProofCloseoutLint"),
             },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_proof_history_parses_filters_and_pagination() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "--format",
+            "toon",
+            "proof-history",
+            "--record",
+            "tests/e2e/artifacts/proof-records.jsonl",
+            "--artifact-root",
+            "tests/e2e/artifacts",
+            "--proof-category",
+            "release/proof-handoff",
+            "--bead",
+            "ft-782hw.9",
+            "--status",
+            "pass",
+            "--release-blocking",
+            "--limit",
+            "25",
+            "--offset",
+            "50",
+        ])
+        .expect("robot proof-history should parse query filters");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot {
+                format, command, ..
+            }) => {
+                assert_eq!(format, Some(RobotOutputFormat::Toon));
+                match command {
+                    Some(RobotCommands::ProofHistory {
+                        records,
+                        artifact_roots,
+                        proof_category,
+                        bead,
+                        status,
+                        release_blocking,
+                        limit,
+                        offset,
+                        ..
+                    }) => {
+                        assert_eq!(
+                            records,
+                            vec!["tests/e2e/artifacts/proof-records.jsonl".to_string()]
+                        );
+                        assert_eq!(artifact_roots, vec!["tests/e2e/artifacts".to_string()]);
+                        assert_eq!(proof_category.as_deref(), Some("release/proof-handoff"));
+                        assert_eq!(bead.as_deref(), Some("ft-782hw.9"));
+                        assert_eq!(status, Some(ProofHistoryStatusArg::Pass));
+                        assert!(release_blocking);
+                        assert_eq!(limit, 25);
+                        assert_eq!(offset, 50);
+                    }
+                    _ => panic!("expected RobotCommands::ProofHistory"),
+                }
+            }
             _ => panic!("expected Robot command"),
         }
     }
