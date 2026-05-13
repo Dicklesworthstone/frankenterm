@@ -24,6 +24,8 @@ Environment:
   FT_WEZTERM_FRAME_RECT       Capture rectangle as x,y,w,h. Defaults to 80,80,960,480.
                               The GUI is launched at 80,80 with no decorations, so this
                               avoids macOS accessibility APIs on GitHub-hosted runners.
+  FT_WEZTERM_FRAME_EXIT_SECS  Seconds to wait for GUI exit after capture before cleanup.
+                              Defaults to 10.
   -h, --help                 Show this help.
 EOF
 }
@@ -247,6 +249,44 @@ capture_window() {
   screencapture -x -R "$bounds" "$output"
 }
 
+wait_or_terminate_after_capture() {
+  local engine="$1"
+  local scenario_id="$2"
+  local gui_pid="$3"
+  local log_file="$4"
+  local timeout_secs="${FT_WEZTERM_FRAME_EXIT_SECS:-10}"
+  local waited=0
+
+  if ! [[ "$timeout_secs" =~ ^[0-9]+$ ]]; then
+    echo "[wezterm-render-adapter] invalid FT_WEZTERM_FRAME_EXIT_SECS=$timeout_secs; expected seconds" >&2
+    exit 75
+  fi
+
+  while kill -0 "$gui_pid" >/dev/null 2>&1; do
+    if [[ "$waited" -ge "$timeout_secs" ]]; then
+      echo "[wezterm-render-adapter] terminating GUI after capture engine=$engine scenario=$scenario_id pid=$gui_pid" >&2
+      kill "$gui_pid" >/dev/null 2>&1 || true
+      sleep 2
+      if kill -0 "$gui_pid" >/dev/null 2>&1; then
+        kill -KILL "$gui_pid" >/dev/null 2>&1 || true
+      fi
+      wait "$gui_pid" >/dev/null 2>&1 || true
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if ! wait "$gui_pid"; then
+    echo "[wezterm-render-adapter] GUI exited non-zero after capture for engine=$engine scenario=$scenario_id" >&2
+    if [[ -s "$log_file" ]]; then
+      echo "[wezterm-render-adapter] GUI log excerpt from $log_file:" >&2
+      sed -n '1,160p' "$log_file" >&2
+    fi
+    exit 75
+  fi
+}
+
 export_engine_frames() {
   local engine="$1"
   local gui="$2"
@@ -298,14 +338,7 @@ export_engine_frames() {
     wait_for_file "$ready" "$TIMEOUT_SECS" "$status_file" "$log_file"
     sleep "${FT_WEZTERM_FRAME_SETTLE_SECS:-1}"
     capture_window "$title" "$output"
-    if ! wait "$gui_pid"; then
-      echo "[wezterm-render-adapter] GUI exited non-zero after capture for engine=$engine scenario=$scenario_id" >&2
-      if [[ -s "$log_file" ]]; then
-        echo "[wezterm-render-adapter] GUI log excerpt from $log_file:" >&2
-        sed -n '1,160p' "$log_file" >&2
-      fi
-      exit 75
-    fi
+    wait_or_terminate_after_capture "$engine" "$scenario_id" "$gui_pid" "$log_file"
   done < <(manifest_rows)
 }
 
