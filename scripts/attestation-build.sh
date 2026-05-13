@@ -17,13 +17,14 @@
 
 set -euo pipefail
 
-GENERATOR_VERSION="1.4.0"
+GENERATOR_VERSION="1.5.0"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="${FT_ATTESTATION_MANIFEST:-$REPO_ROOT/docs/attestations/manifest.json}"
 OUT_DIR="${FT_ATTESTATION_OUT_DIR:-$REPO_ROOT/docs/attestations}"
 SCHEMA_PATH="${FT_ATTESTATION_SCHEMA:-$REPO_ROOT/docs/attestations/schema.json}"
 TAXONOMY_PATH="${FT_PROOF_TAXONOMY:-$REPO_ROOT/docs/proof-taxonomy.json}"
 PRIOR_BUNDLE_PATH="${FT_ATTESTATION_PRIOR_BUNDLE:-}"
+RETRACTIONS_ROOT="${FT_ATTESTATION_RETRACTIONS_ROOT:-$REPO_ROOT/docs/attestations/retractions}"
 
 VERSION=""
 CHANNEL="dev"
@@ -60,6 +61,8 @@ Environment:
   FT_PROOF_TAXONOMY         Override proof taxonomy registry path.
   FT_ATTESTATION_PRIOR_BUNDLE
                            Optional prior bundle path used to compute taxonomy coverage deltas.
+  FT_ATTESTATION_RETRACTIONS_ROOT
+                           Override active retraction root. Defaults to docs/attestations/retractions.
   FT_BEAD_ID / FT_SCENARIO_ID / FT_CORRELATION_ID
                            Structured-log identity fields.
 EOF
@@ -491,6 +494,61 @@ confidence_summary_json="$(jq -n \
        best_confidence_by_category: $records
      }')"
 
+retractions_json="[]"
+if [[ -d "$RETRACTIONS_ROOT" ]]; then
+  declare -a retraction_objs=()
+  while IFS= read -r retraction_path; do
+    case "$retraction_path" in
+      *.canonical.json|*.payload.json|*/archive/*) continue ;;
+    esac
+    if ! retraction_payload="$(jq -c '.' "$retraction_path" 2>/dev/null)"; then
+      build_log "warning: skipping unreadable retraction JSON: $retraction_path"
+      continue
+    fi
+    original_bundle_sha256="$(jq -r '.original_bundle_sha256 // ""' <<<"$retraction_payload")"
+    affected_slot="$(jq -r '.affected_slot // ""' <<<"$retraction_payload")"
+    retracted_at="$(jq -r '.retracted_at // ""' <<<"$retraction_payload")"
+    retracted_by_release="$(jq -r '.retracted_by_release // ""' <<<"$retraction_payload")"
+    retraction_rationale="$(jq -r '.retraction_rationale // ""' <<<"$retraction_payload")"
+    if [[ ! "$original_bundle_sha256" =~ ^[0-9a-f]{64}$ || -z "$affected_slot" || -z "$retracted_at" || -z "$retracted_by_release" || -z "$retraction_rationale" ]]; then
+      build_log "warning: skipping malformed retraction metadata: $retraction_path"
+      continue
+    fi
+    retraction_hash="$(sha256_file "$retraction_path")"
+    retraction_size="$(wc -c < "$retraction_path" | tr -d ' ')"
+    if [[ "$retraction_path" == "$REPO_ROOT/"* ]]; then
+      retraction_rel_path="${retraction_path#"$REPO_ROOT"/}"
+    else
+      retraction_rel_path="$retraction_path"
+    fi
+    retraction_obj="$(jq -n \
+      --arg original_bundle_sha256 "$original_bundle_sha256" \
+      --arg affected_slot "$affected_slot" \
+      --arg retracted_at "$retracted_at" \
+      --arg retracted_by_release "$retracted_by_release" \
+      --arg retraction_rationale "$retraction_rationale" \
+      --arg retraction_path "$retraction_rel_path" \
+      --arg retraction_sha256 "$retraction_hash" \
+      --argjson size_bytes "$retraction_size" \
+      --argjson corrected_claim_value "$(jq -c '.corrected_claim_value // null' <<<"$retraction_payload")" \
+      '{
+        original_bundle_sha256: $original_bundle_sha256,
+        affected_slot: $affected_slot,
+        retracted_at: $retracted_at,
+        retracted_by_release: $retracted_by_release,
+        retraction_rationale: $retraction_rationale,
+        retraction_path: $retraction_path,
+        retraction_sha256: $retraction_sha256,
+        size_bytes: $size_bytes,
+        corrected_claim_value: $corrected_claim_value
+      }')"
+    retraction_objs+=("$retraction_obj")
+  done < <(find "$RETRACTIONS_ROOT" -type f -name '*.json' -print | sort)
+  if [[ ${#retraction_objs[@]} -gt 0 ]]; then
+    retractions_json="$(printf '%s\n' "${retraction_objs[@]}" | jq -c -s 'sort_by(.original_bundle_sha256, .affected_slot, .retraction_path)')"
+  fi
+fi
+
 bundle_no_sig="$(jq -n \
   --arg schema_version "1.0.0" \
   --arg version "$VERSION" \
@@ -504,6 +562,7 @@ bundle_no_sig="$(jq -n \
   --argjson artifacts "$artifacts_json" \
   --argjson required_categories "$REQUIRED_CATEGORIES_JSON" \
   --argjson deferred_slots "$deferred_slots_json" \
+  --argjson retractions "$retractions_json" \
   --argjson taxonomy_coverage "$taxonomy_coverage_json" \
   --argjson confidence_summary "$confidence_summary_json" \
   '{
@@ -522,6 +581,7 @@ bundle_no_sig="$(jq -n \
     artifacts: $artifacts,
     required_categories: $required_categories,
     deferred_slots: $deferred_slots,
+    retractions: $retractions,
     taxonomy_coverage: $taxonomy_coverage,
     confidence_summary: $confidence_summary
   }')"
@@ -624,6 +684,7 @@ echo "  schema_version : 1.0.0"
 echo "  release        : v${VERSION} (${CHANNEL})"
 echo "  git            : ${GIT_COMMIT}"
 echo "  artifacts      : ${#artifact_objs[@]}"
+echo "  retractions    : $(jq 'length' <<<"$retractions_json")"
 echo "  taxonomy       : $(jq -r '.below_threshold_count' <<<"$taxonomy_coverage_json") below threshold"
 echo "  confidence     : $(jq -r '.best_confidence_by_category | length' <<<"$confidence_summary_json") category record(s)"
 if [[ ${#deferred_objs[@]} -gt 0 ]]; then

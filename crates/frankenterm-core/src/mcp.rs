@@ -112,10 +112,11 @@ pub use mcp_proxy::{
     mcp_proxy_mount_failure_count, mcp_proxy_unaudited_degraded_skip_count,
 };
 use mcp_resources::{
-    WaAccountsByServiceTemplateResource, WaAccountsResource, WaContextHorizonResource,
-    WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
-    WaHerdWaveResource, WaPanesResource, WaReservationsByPaneTemplateResource,
-    WaReservationsResource, WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource,
+    WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
+    WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
+    WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
+    WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
+    WaRulesResource, WaWorkflowsResource,
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
@@ -1470,6 +1471,7 @@ mod tests {
                 "wa://accounts".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://attestation/retractions".to_string(),
                 "wa://context/horizon".to_string(),
                 "wa://reservations".to_string(),
             ])
@@ -1504,6 +1506,7 @@ mod tests {
                 "wa://panes".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://attestation/retractions".to_string(),
             ])
         );
         assert_eq!(templates, uri_set(["wa://rules/{agent_type}".to_string()]));

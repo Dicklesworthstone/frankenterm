@@ -56,8 +56,10 @@ expect_verdict() {
   local fixture="$1" expected_ok="$2" expected_pattern="$3"
   local label="fixture=$fixture expected_ok=$expected_ok"
   local out rc
+  set +e
   out=$("$VERIFIER" "$FIX_ROOT/$fixture" --json 2>&1)
   rc=$?
+  set -e
   # If the verifier exited non-zero without JSON, only the malformed /
   # empty fixtures should hit this path. Accept rc != 0 + non-empty out
   # as "verifier rejected" for those.
@@ -70,7 +72,7 @@ expect_verdict() {
     return
   fi
   local actual_ok
-  actual_ok=$(printf '%s' "$out" | jq -r '.ok // "null"')
+  actual_ok=$(printf '%s' "$out" | jq -r 'if has("ok") then (.ok | tostring) else "null" end')
   if [[ "$actual_ok" != "$expected_ok" ]]; then
     fail "$label" "ok expected=$expected_ok got=$actual_ok"
     return

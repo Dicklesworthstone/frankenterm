@@ -6,11 +6,11 @@
 use super::{
     AuditedToolHandler, Config, FormatAwareToolHandler, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
-    WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaContextHorizonResource,
-    WaEventsAnnotateTool, WaEventsLabelTool, WaEventsResource, WaEventsTemplateResource,
-    WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource, WaGetTextTool,
-    WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool,
-    WaMissionResumeTool, WaMissionStateTool, WaPanesResource, WaReleaseTool,
+    WaAttestationRetractionsResource, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
+    WaContextHorizonResource, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsResource,
+    WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource,
+    WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool,
+    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaPanesResource, WaReleaseTool,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
@@ -270,6 +270,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         ))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaHerdWaveResource)
+        .resource(WaAttestationRetractionsResource::new(Arc::clone(&config)))
         .resource(WaRulesResource)
         .resource(WaRulesByAgentTemplateResource);
 

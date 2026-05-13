@@ -3,7 +3,7 @@
 //! This module is extraction-only and keeps resource behavior/URIs stable.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,7 +17,7 @@ use crate::mcp_framework::{
 };
 
 use crate::context_horizon::predict_context_horizon_from_sqlite;
-use crate::mcp_error::MCP_ERR_STORAGE;
+use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_STORAGE};
 use crate::swarm_scheduler::{
     HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
 };
@@ -117,6 +117,83 @@ fn read_reservations_resource(
     };
     let contents = tool.call(ctx, args)?;
     tool_output_as_resource(uri, contents)
+}
+
+fn attestation_retractions_root(config: &Config) -> Result<(PathBuf, PathBuf), String> {
+    let layout = config
+        .workspace_layout(None)
+        .map_err(|err| format!("resolve workspace layout: {err}"))?;
+    let root = std::env::var_os("FT_ATTESTATION_RETRACTIONS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            layout
+                .root
+                .join("docs")
+                .join("attestations")
+                .join("retractions")
+        });
+    Ok((layout.root, root))
+}
+
+fn collect_attestation_retraction_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let entries =
+        std::fs::read_dir(root).map_err(|err| format!("read {}: {err}", root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read entry in {}: {err}", root.display()))?;
+        let path = entry.path();
+        if path
+            .components()
+            .any(|component| component.as_os_str() == std::ffi::OsStr::new("archive"))
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_attestation_retraction_files(&path, files)?;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".json")
+            && !name.ends_with(".canonical.json")
+            && !name.ends_with(".payload.json")
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn load_attestation_retractions_for_resource(
+    workspace_root: &Path,
+    root: &Path,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut files = Vec::new();
+    collect_attestation_retraction_files(root, &mut files)?;
+    files.sort();
+
+    let mut rows = Vec::new();
+    for path in files {
+        let bytes =
+            std::fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|err| format!("parse {} as JSON: {err}", path.display()))?;
+        let rel = path
+            .strip_prefix(workspace_root)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+        if let Some(object) = value.as_object_mut() {
+            object.insert("path".to_string(), serde_json::Value::String(rel));
+        }
+        rows.push(value);
+    }
+    Ok(rows)
 }
 
 pub(super) struct WaPanesResource {
@@ -539,6 +616,66 @@ impl ResourceHandler for WaHerdWaveResource {
     }
 }
 
+pub(super) struct WaAttestationRetractionsResource {
+    config: Arc<Config>,
+}
+
+impl WaAttestationRetractionsResource {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ResourceHandler for WaAttestationRetractionsResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://attestation/retractions".to_string(),
+            name: "ft attestation retractions".to_string(),
+            description: Some("Active signed attestation retractions".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "attestation".to_string(),
+                "retractions".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let envelope = match attestation_retractions_root(&self.config) {
+            Ok((workspace_root, root)) => {
+                match load_attestation_retractions_for_resource(&workspace_root, &root) {
+                    Ok(retractions) => {
+                        let payload = serde_json::json!({
+                            "schema_version": "ft.attestation.retractions.resource.v1",
+                            "root": root.to_string_lossy(),
+                            "active_retractions": retractions.len(),
+                            "retractions": retractions,
+                        });
+                        McpEnvelope::success(payload, elapsed_ms(start))
+                    }
+                    Err(err) => McpEnvelope::<serde_json::Value>::error(
+                        MCP_ERR_CONFIG,
+                        format!("Failed to load attestation retractions: {err}"),
+                        Some("Check docs/attestations/retractions JSON records.".to_string()),
+                        elapsed_ms(start),
+                    ),
+                }
+            }
+            Err(err) => McpEnvelope::<serde_json::Value>::error(
+                MCP_ERR_CONFIG,
+                format!("Failed to resolve attestation retractions root: {err}"),
+                Some("Set FT_WORKSPACE or run the MCP server from the workspace root.".to_string()),
+                elapsed_ms(start),
+            ),
+        };
+        envelope_as_resource("wa://attestation/retractions", envelope)
+    }
+}
+
 pub(super) struct WaContextHorizonResource {
     db_path: Arc<PathBuf>,
 }
@@ -687,11 +824,12 @@ impl ResourceHandler for WaReservationsByPaneTemplateResource {
 mod tests {
     use super::McpEnvelope;
     use super::{
-        WaAccountsByServiceTemplateResource, WaAccountsResource, WaContextHorizonResource,
-        WaEventsResource, WaEventsTemplateResource, WaEventsUnhandledTemplateResource,
-        WaHerdWaveResource, WaPanesResource, WaReservationsByPaneTemplateResource,
-        WaReservationsResource, WaRulesByAgentTemplateResource, WaRulesResource,
-        WaWorkflowsResource, envelope_as_resource, tool_output_as_resource,
+        WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
+        WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
+        WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
+        WaReservationsByPaneTemplateResource, WaReservationsResource,
+        WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource, envelope_as_resource,
+        tool_output_as_resource,
     };
     use crate::config::{Config, PaneFilterConfig};
     use crate::mcp_framework::{
@@ -825,6 +963,15 @@ mod tests {
         assert_eq!(def.uri, "wa://herd-wave");
         assert!(def.tags.contains(&"herd-wave".to_string()));
         assert!(def.tags.contains(&"operator".to_string()));
+    }
+
+    #[test]
+    fn attestation_retractions_resource_definition_uri() {
+        let resource = WaAttestationRetractionsResource::new(Arc::new(Config::default()));
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://attestation/retractions");
+        assert!(def.tags.contains(&"attestation".to_string()));
+        assert!(def.tags.contains(&"retractions".to_string()));
     }
 
     #[test]
@@ -973,6 +1120,9 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaAttestationRetractionsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
             WaContextHorizonResource::new(Arc::clone(&db))
                 .definition()
                 .uri,
@@ -1005,6 +1155,9 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaAttestationRetractionsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
             WaContextHorizonResource::new(Arc::clone(&db))
                 .definition()
                 .uri,
@@ -1029,6 +1182,7 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
             WaContextHorizonResource::new(Arc::clone(&db)).definition(),
             WaReservationsResource::new(Arc::clone(&db)).definition(),
         ];
@@ -1054,6 +1208,7 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
             WaContextHorizonResource::new(Arc::clone(&db)).definition(),
             WaReservationsResource::new(Arc::clone(&db)).definition(),
         ];

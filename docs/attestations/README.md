@@ -109,6 +109,17 @@ records in this same shape so release bundles can replace the conservative
 hash-only row with a quantified frequentist, Bayesian, formal, or topological
 bound.
 
+Bundles also emit `retractions`, an index of active signed corrigenda under
+`docs/attestations/retractions/`. This field lets offline consumers learn that
+a prior slot claim has been rescinded even when they only inspect the newest
+bundle. The retraction workflow and authority rules are documented in
+[`retraction-policy.md`](retraction-policy.md).
+
+Operator surfaces expose the same active index: `ft attestation retractions`
+prints it for local maintainers, `ft doctor --json` embeds it under
+`.attestation.retractions`, and MCP exposes `wa://attestation/retractions` for
+read-only agent consumers.
+
 ## Verifying a bundle
 
 ```bash
@@ -136,7 +147,13 @@ scripts/rotate-attestation-self-test.sh
 tests/attestation/verify-self-test.sh
 ```
 
-Exit code: `0` on full pass, `1` on any failure, `2` on usage error.
+If a signed retraction targets the bundle's SHA-256, verification returns
+`verdict: "retracted"` in JSON and exits `3`. That state is distinct from both
+pass and fail: the original bundle bytes may still verify, but at least one slot
+claim has been rescinded. Unsigned retractions are rejected as verifier failures.
+
+Exit code: `0` on full pass, `1` on any failure, `2` on usage error, `3` on a
+valid signed retraction.
 
 Ed25519 bundles use the same canonical signing payload. The schema records a
 32-byte hex public key in `signature.public_key` and a repo-relative

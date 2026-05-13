@@ -83,6 +83,12 @@
       "items": { "$ref": "#/$defs/deferredSlot" },
       "default": []
     },
+    "retractions": {
+      "description": "Active signed retractions for prior bundle slots that remain in effect at the time this bundle was generated. Archived records remain under docs/attestations/retractions/archive/ for verifier cache misses.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/retractionSummary" },
+      "default": []
+    },
     "taxonomy_coverage": {
       "$ref": "#/$defs/taxonomyCoverage"
     },
@@ -360,6 +366,95 @@
         "description": { "type": "string" }
       }
     },
+    "retractionSummary": {
+      "type": "object",
+      "required": [
+        "original_bundle_sha256",
+        "affected_slot",
+        "retracted_at",
+        "retracted_by_release",
+        "retraction_rationale",
+        "retraction_path",
+        "retraction_sha256",
+        "size_bytes",
+        "corrected_claim_value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "original_bundle_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "affected_slot": { "$ref": "#/$defs/category" },
+        "retracted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "retracted_by_release": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "retraction_rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "retraction_path": {
+          "type": "string",
+          "pattern": "^[^/].*$"
+        },
+        "retraction_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "corrected_claim_value": true
+      }
+    },
+    "attestationRetraction": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "retracted_at",
+        "retracted_by_release",
+        "retraction_rationale",
+        "affected_slot",
+        "original_bundle_sha256",
+        "original_claim_value",
+        "corrected_claim_value",
+        "retraction_signature"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": "1.0.0" },
+        "retracted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "retracted_by_release": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "retraction_rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "affected_slot": { "$ref": "#/$defs/category" },
+        "original_bundle_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "original_claim_value": true,
+        "corrected_claim_value": true,
+        "retraction_signature": { "$ref": "#/$defs/retractionSignature" }
+      }
+    },
     "taxonomyCoverage": {
       "type": "object",
       "required": [
@@ -610,6 +705,20 @@
             }
           },
           "required": ["method", "reason"]
+        }
+      ]
+    },
+    "retractionSignature": {
+      "allOf": [
+        { "$ref": "#/$defs/signature" },
+        {
+          "not": {
+            "type": "object",
+            "required": ["method"],
+            "properties": {
+              "method": { "const": "unsigned" }
+            }
+          }
         }
       ]
     }

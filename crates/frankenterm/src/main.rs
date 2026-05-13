@@ -43,7 +43,8 @@ use frankenterm_core::proof_doctor::{
 use frankenterm_core::proof_handoff::build_proof_handoff;
 use frankenterm_core::proof_lane::{
     ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofFindingSeverity,
-    ProofRedactionStatus, ProofScope, validate_proof_record,
+    ProofHistoryArtifactInput, ProofHistoryIndex, ProofRedactionStatus, ProofReleaseScoreboard,
+    ProofReleaseScoreboardRow, ProofScope, validate_proof_record,
 };
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
@@ -1028,6 +1029,49 @@ NOTES:
         command: Vec<String>,
     },
 
+    /// Build a proof-history release scoreboard from retained proof records
+    #[command(after_help = r#"EXAMPLES:
+    ft proof-history --record tests/e2e/artifacts/proof-records.jsonl --format json
+    ft proof-history --artifact-root tests/e2e/artifacts --format toon
+
+NOTES:
+    This command consumes durable ProofAttemptRecord JSONL artifacts. It does
+    not parse Beads prose comments and does not promote CI or RCH chatter into
+    proof unless a retained record supports the claim."#)]
+    ProofHistory {
+        /// ProofAttemptRecord JSONL artifact path. Repeatable.
+        #[arg(long = "record", value_name = "PATH")]
+        records: Vec<String>,
+
+        /// Directory to scan recursively for *.jsonl proof artifacts.
+        #[arg(long = "artifact-root", value_name = "DIR")]
+        artifact_roots: Vec<String>,
+
+        /// Proof category attached to supplied artifacts.
+        #[arg(long)]
+        proof_category: Option<String>,
+
+        /// Source commit attached to supplied artifacts.
+        #[arg(long)]
+        source_commit: Option<String>,
+
+        /// Expected source commit for mismatch detection.
+        #[arg(long)]
+        expected_source_commit: Option<String>,
+
+        /// Expected artifact SHA-256 for mismatch detection.
+        #[arg(long)]
+        expected_sha256: Option<String>,
+
+        /// Current Beads closeout timestamp for stale-artifact detection.
+        #[arg(long)]
+        bead_closed_at: Option<String>,
+
+        /// Output format: plain, json, or toon
+        #[arg(long, short = 'f', default_value = "plain")]
+        format: String,
+    },
+
     /// Generate a diagnostic bundle for bug reports
     #[command(after_help = r#"EXAMPLES:
     ft diag bundle                        Generate diagnostic bundle
@@ -1807,6 +1851,42 @@ enum AttestationCommands {
         /// does not match the canonical manifest.
         #[arg(long)]
         strict_required: bool,
+    },
+    /// Create a signed retraction for one slot in a published bundle.
+    Retract {
+        /// Path to the original bundle JSON.
+        #[arg(long)]
+        bundle: std::path::PathBuf,
+
+        /// Affected attestation slot/category, e.g. perf/lindley-bounds.
+        #[arg(long)]
+        slot: String,
+
+        /// Text file explaining the invalidated claim and evidence.
+        #[arg(long, value_name = "PATH")]
+        rationale_file: std::path::PathBuf,
+
+        /// Release or corrigendum that publishes the retraction.
+        #[arg(long)]
+        retracted_by_release: String,
+
+        /// Optional JSON file with the corrected claim value.
+        #[arg(long, value_name = "PATH")]
+        corrected_claim_file: Option<std::path::PathBuf>,
+
+        /// Signing backend for the retraction.
+        #[arg(long, default_value = "ed25519")]
+        sign: String,
+    },
+    /// List active attestation retractions.
+    Retractions {
+        /// Optional bundle JSON to filter by its SHA-256.
+        #[arg(long)]
+        bundle: Option<std::path::PathBuf>,
+
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
     /// Show a release attestation bundle's structure
     /// without re-verifying. Pretty-prints the JSON for
@@ -6386,6 +6466,241 @@ fn append_proof_record_jsonl(
     })?;
 
     Ok(resolved)
+}
+
+#[derive(Debug, Clone)]
+struct ProofHistoryCliMetadata {
+    proof_category: Option<String>,
+    source_commit: Option<String>,
+    expected_source_commit: Option<String>,
+    expected_sha256: Option<String>,
+    bead_closed_at: Option<String>,
+}
+
+fn build_proof_history_payload(
+    records: &[String],
+    artifact_roots: &[String],
+    metadata: ProofHistoryCliMetadata,
+    workspace_root: &Path,
+) -> anyhow::Result<(ProofHistoryIndex, ProofReleaseScoreboard)> {
+    let artifacts =
+        collect_proof_history_artifacts(records, artifact_roots, &metadata, workspace_root)?;
+    let index = ProofHistoryIndex::from_artifacts(&artifacts);
+    let scoreboard = ProofReleaseScoreboard::from_history(&index);
+    Ok((index, scoreboard))
+}
+
+fn collect_proof_history_artifacts(
+    records: &[String],
+    artifact_roots: &[String],
+    metadata: &ProofHistoryCliMetadata,
+    workspace_root: &Path,
+) -> anyhow::Result<Vec<ProofHistoryArtifactInput>> {
+    let mut paths = Vec::new();
+    for record in records {
+        paths.push(resolve_workspace_path(workspace_root, record));
+    }
+
+    let roots = if records.is_empty() && artifact_roots.is_empty() {
+        vec![workspace_root.join("tests/e2e/artifacts")]
+    } else {
+        artifact_roots
+            .iter()
+            .map(|root| resolve_workspace_path(workspace_root, root))
+            .collect::<Vec<_>>()
+    };
+    for root in roots {
+        collect_proof_history_jsonl_paths(&root, &mut paths)?;
+    }
+
+    paths.sort();
+    paths.dedup();
+
+    Ok(paths
+        .into_iter()
+        .map(|path| proof_history_artifact_input_from_path(workspace_root, &path, metadata))
+        .collect())
+}
+
+fn resolve_workspace_path(workspace_root: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    }
+}
+
+fn collect_proof_history_jsonl_paths(path: &Path, paths: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    if path.is_file() {
+        if is_proof_history_jsonl(path) {
+            paths.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !path.is_dir() {
+        paths.push(path.to_path_buf());
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_proof_history_jsonl_paths(&entry_path, paths)?;
+        } else if is_proof_history_jsonl(&entry_path) {
+            paths.push(entry_path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_proof_history_jsonl(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        && (file_name.contains("proof-record") || file_name.contains("proof_record"))
+}
+
+fn proof_history_artifact_input_from_path(
+    workspace_root: &Path,
+    path: &Path,
+    metadata: &ProofHistoryCliMetadata,
+) -> ProofHistoryArtifactInput {
+    let artifact_path = proof_history_display_path(workspace_root, path);
+    let mut input = match fs::read(path) {
+        Ok(bytes) => {
+            let content_sha256 = proof_history_sha256_hex(&bytes);
+            match String::from_utf8(bytes) {
+                Ok(content) => {
+                    let mut input = ProofHistoryArtifactInput::new(artifact_path, content);
+                    input.content_sha256 = Some(content_sha256);
+                    input
+                }
+                Err(error) => ProofHistoryArtifactInput::unavailable(
+                    artifact_path,
+                    Some(format!("artifact is not UTF-8: {error}")),
+                ),
+            }
+        }
+        Err(error) => {
+            ProofHistoryArtifactInput::unavailable(artifact_path, Some(error.to_string()))
+        }
+    };
+
+    input.proof_category.clone_from(&metadata.proof_category);
+    input.source_commit.clone_from(&metadata.source_commit);
+    input
+        .expected_source_commit
+        .clone_from(&metadata.expected_source_commit);
+    input.expected_sha256.clone_from(&metadata.expected_sha256);
+    input
+        .bead_closed_at_utc
+        .clone_from(&metadata.bead_closed_at);
+    input
+}
+
+fn proof_history_display_path(workspace_root: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn proof_history_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
+fn print_proof_history_output(
+    index: &ProofHistoryIndex,
+    scoreboard: &ProofReleaseScoreboard,
+    format: &str,
+) -> anyhow::Result<()> {
+    match format {
+        "plain" => {
+            print!("{}", render_proof_history_plain(index, scoreboard));
+        }
+        "json" => {
+            let payload = serde_json::json!({
+                "schema_version": scoreboard.schema_version,
+                "index": index,
+                "scoreboard": scoreboard,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        "toon" => {
+            let payload = serde_json::json!({
+                "schema_version": scoreboard.schema_version,
+                "index": index,
+                "scoreboard": scoreboard,
+            });
+            println!("{}", toon_rust::encode(payload, None));
+        }
+        other => anyhow::bail!("Unknown proof-history format '{other}'. Use plain, json, or toon."),
+    }
+
+    Ok(())
+}
+
+fn render_proof_history_plain(
+    index: &ProofHistoryIndex,
+    scoreboard: &ProofReleaseScoreboard,
+) -> String {
+    let mut out = String::new();
+    out.push_str("proof-history scoreboard\n");
+    out.push_str(&format!("{}\n", scoreboard.operator_summary));
+    out.push_str("category\tbead\tstate\tbucket\tcloseout\tworker\tartifact\tblocker\n");
+    for row in &scoreboard.latest_by_bead {
+        out.push_str(&format_proof_history_row(row));
+        out.push('\n');
+    }
+
+    if !scoreboard.artifact_issues.is_empty() {
+        out.push_str("\nartifact issues\n");
+        for artifact in &scoreboard.artifact_issues {
+            out.push_str(&format!(
+                "{}\t{}\t{}\n",
+                artifact.status.as_str(),
+                artifact.artifact_path,
+                artifact.detail.as_deref().unwrap_or("")
+            ));
+        }
+    }
+
+    if !index.findings.is_empty() {
+        out.push_str("\nfindings\n");
+        for finding in &index.findings {
+            out.push_str(&format!(
+                "{:?}\t{}\t{}\t{}\n",
+                finding.severity, finding.bead_id, finding.reason_code, finding.message
+            ));
+        }
+    }
+
+    out
+}
+
+fn format_proof_history_row(row: &ProofReleaseScoreboardRow) -> String {
+    format!(
+        "{}\t{}\t{:?}\t{}\t{}\t{}\t{}\t{}",
+        row.proof_category,
+        row.bead_id,
+        row.latest_verdict,
+        row.bucket.as_str(),
+        if row.closeout_eligible {
+            "eligible"
+        } else {
+            "blocked"
+        },
+        row.selected_worker.as_deref().unwrap_or("-"),
+        row.artifact_path,
+        row.residual_blocker.as_deref().unwrap_or("-"),
+    )
 }
 
 fn print_proof_doctor_plain(payload: &serde_json::Value) {
@@ -37063,6 +37378,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 10,
                 60_000,
             );
+            let attestation_report = build_attestation_doctor_report(&workspace_root);
+            all_checks.push(attestation_doctor_check(&attestation_report));
 
             // Determine overall status
             let has_errors = all_checks
@@ -37145,6 +37462,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 result["blocker_radar"] =
                     serde_json::to_value(&blocker_radar_report).unwrap_or(serde_json::Value::Null);
                 result["herd_wave"] = herd_wave_report.clone();
+                result["attestation"] = attestation_report;
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
                         serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
@@ -37202,6 +37520,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 print_context_horizon_doctor_section(&context_horizon_report);
                 print_blocker_radar_doctor_section(&blocker_radar_report);
                 print_herd_wave_doctor_section(&herd_wave_report);
+                print_attestation_doctor_section(&attestation_report);
 
                 println!();
                 println!("Hardware Profile:");
@@ -37360,6 +37679,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             if !print_snapshot_session_structured_output(&payload, output_format)? {
                 print_proof_doctor_plain(&payload);
             }
+        }
+
+        Some(Commands::ProofHistory {
+            records,
+            artifact_roots,
+            proof_category,
+            source_commit,
+            expected_source_commit,
+            expected_sha256,
+            bead_closed_at,
+            format,
+        }) => {
+            let metadata = ProofHistoryCliMetadata {
+                proof_category,
+                source_commit,
+                expected_source_commit,
+                expected_sha256,
+                bead_closed_at,
+            };
+            let (index, scoreboard) =
+                build_proof_history_payload(&records, &artifact_roots, metadata, &workspace_root)?;
+            print_proof_history_output(&index, &scoreboard, &format)?;
         }
 
         Some(Commands::Diag { command }) => {
@@ -41050,6 +41391,150 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 /// delegates the canonical verification logic to one place. The
 /// shell script is repository-relative, so the handler resolves it
 /// against `workspace_root`.
+fn attestation_sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    let digest = Sha256::digest(&bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn attestation_retractions_root(workspace_root: &std::path::Path) -> std::path::PathBuf {
+    std::env::var_os("FT_ATTESTATION_RETRACTIONS_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            workspace_root
+                .join("docs")
+                .join("attestations")
+                .join("retractions")
+        })
+}
+
+fn collect_attestation_retraction_files(
+    root: &std::path::Path,
+    files: &mut Vec<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", root.display()))?
+    {
+        let entry = entry
+            .map_err(|e| anyhow::anyhow!("failed to read entry in {}: {e}", root.display()))?;
+        let path = entry.path();
+        if path
+            .components()
+            .any(|component| component.as_os_str() == std::ffi::OsStr::new("archive"))
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_attestation_retraction_files(&path, files)?;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".json")
+            && !name.ends_with(".canonical.json")
+            && !name.ends_with(".payload.json")
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn load_attestation_retractions(
+    workspace_root: &std::path::Path,
+    bundle_filter: Option<&std::path::Path>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let filter_sha = bundle_filter.map(attestation_sha256_file).transpose()?;
+    let root = attestation_retractions_root(workspace_root);
+    let mut files = Vec::new();
+    collect_attestation_retraction_files(&root, &mut files)?;
+    files.sort();
+
+    let mut rows = Vec::new();
+    for path in files {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("failed to parse {} as JSON: {e}", path.display()))?;
+        if let Some(filter_sha) = &filter_sha {
+            let original = value
+                .get("original_bundle_sha256")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if original != filter_sha {
+                continue;
+            }
+        }
+        let rel = path
+            .strip_prefix(workspace_root)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+        if let Some(object) = value.as_object_mut() {
+            object.insert("path".to_string(), serde_json::Value::String(rel));
+        }
+        rows.push(value);
+    }
+    Ok(rows)
+}
+
+fn build_attestation_doctor_report(workspace_root: &std::path::Path) -> serde_json::Value {
+    let root = attestation_retractions_root(workspace_root);
+    match load_attestation_retractions(workspace_root, None) {
+        Ok(retractions) => serde_json::json!({
+            "schema_version": "ft.attestation.doctor.v1",
+            "retractions_root": root.to_string_lossy(),
+            "active_retractions": retractions.len(),
+            "retractions": retractions,
+        }),
+        Err(error) => serde_json::json!({
+            "schema_version": "ft.attestation.doctor.v1",
+            "retractions_root": root.to_string_lossy(),
+            "active_retractions": 0,
+            "retractions": [],
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn attestation_doctor_check(report: &serde_json::Value) -> DiagnosticCheck {
+    if let Some(error) = report.get("error").and_then(serde_json::Value::as_str) {
+        return DiagnosticCheck::warning(
+            "Attestation retractions",
+            format!("Could not load active retractions: {error}"),
+            "Check docs/attestations/retractions JSON records",
+        );
+    }
+
+    let active_retractions = report
+        .get("active_retractions")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    DiagnosticCheck::ok_with_detail(
+        "Attestation retractions",
+        format!("{active_retractions} active signed retraction(s) indexed"),
+    )
+}
+
+fn print_attestation_doctor_section(report: &serde_json::Value) {
+    println!();
+    println!("Attestations:");
+    let active_retractions = report
+        .get("active_retractions")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    println!("  active retractions: {active_retractions}");
+    if let Some(error) = report.get("error").and_then(serde_json::Value::as_str) {
+        println!("  error: {error}");
+    }
+}
+
 fn handle_attestation_command(
     command: AttestationCommands,
     workspace_root: &std::path::Path,
@@ -41078,6 +41563,84 @@ fn handle_attestation_command(
                 .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", script.display()))?;
             if !status.success() {
                 std::process::exit(status.code().unwrap_or(1));
+            }
+            Ok(())
+        }
+        AttestationCommands::Retract {
+            bundle,
+            slot,
+            rationale_file,
+            retracted_by_release,
+            corrected_claim_file,
+            sign,
+        } => {
+            let script = workspace_root
+                .join("scripts")
+                .join("retract-bundle-slot.sh");
+            if !script.exists() {
+                anyhow::bail!("retract-bundle-slot.sh not found at {}", script.display());
+            }
+            let mut cmd = Command::new("bash");
+            cmd.arg(&script)
+                .arg("--bundle")
+                .arg(&bundle)
+                .arg("--slot")
+                .arg(&slot)
+                .arg("--rationale-file")
+                .arg(&rationale_file)
+                .arg("--retracted-by-release")
+                .arg(&retracted_by_release)
+                .arg("--sign")
+                .arg(&sign);
+            if let Some(corrected_claim_file) = corrected_claim_file {
+                cmd.arg("--corrected-claim-file").arg(&corrected_claim_file);
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", script.display()))?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            Ok(())
+        }
+        AttestationCommands::Retractions { bundle, json } => {
+            let rows = load_attestation_retractions(workspace_root, bundle.as_deref())?;
+            if json {
+                let root = attestation_retractions_root(workspace_root)
+                    .to_string_lossy()
+                    .to_string();
+                let bundle_sha256 = bundle.as_deref().map(attestation_sha256_file).transpose()?;
+                let payload = serde_json::json!({
+                    "ok": true,
+                    "root": root,
+                    "bundle_sha256": bundle_sha256,
+                    "retractions": rows,
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if rows.is_empty() {
+                println!("No active attestation retractions.");
+            } else {
+                for row in rows {
+                    let slot = row
+                        .get("affected_slot")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<unknown>");
+                    let original = row
+                        .get("original_bundle_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<unknown>");
+                    let rationale = row
+                        .get("retraction_rationale")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let path = row
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    println!("{slot} retracted for {original}");
+                    println!("  path: {path}");
+                    println!("  rationale: {rationale}");
+                }
             }
             Ok(())
         }
@@ -67686,6 +68249,57 @@ log_level = "debug"
                 );
             }
             _ => panic!("expected ProofDoctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_proof_history_parses_records_and_metadata() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "proof-history",
+            "--record",
+            "tests/e2e/artifacts/proof-records.jsonl",
+            "--artifact-root",
+            "tests/e2e/artifacts",
+            "--proof-category",
+            "release/proof-handoff",
+            "--source-commit",
+            "651d8a538",
+            "--expected-source-commit",
+            "651d8a538",
+            "--expected-sha256",
+            "abc123",
+            "--bead-closed-at",
+            "2026-05-13T02:31:31Z",
+            "--format",
+            "toon",
+        ])
+        .expect("proof-history should parse record artifacts");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::ProofHistory {
+                records,
+                artifact_roots,
+                proof_category,
+                source_commit,
+                expected_source_commit,
+                expected_sha256,
+                bead_closed_at,
+                format,
+            }) => {
+                assert_eq!(
+                    records,
+                    vec!["tests/e2e/artifacts/proof-records.jsonl".to_string()]
+                );
+                assert_eq!(artifact_roots, vec!["tests/e2e/artifacts".to_string()]);
+                assert_eq!(proof_category.as_deref(), Some("release/proof-handoff"));
+                assert_eq!(source_commit.as_deref(), Some("651d8a538"));
+                assert_eq!(expected_source_commit.as_deref(), Some("651d8a538"));
+                assert_eq!(expected_sha256.as_deref(), Some("abc123"));
+                assert_eq!(bead_closed_at.as_deref(), Some("2026-05-13T02:31:31Z"));
+                assert_eq!(format, "toon");
+            }
+            _ => panic!("expected ProofHistory command"),
         }
     }
 

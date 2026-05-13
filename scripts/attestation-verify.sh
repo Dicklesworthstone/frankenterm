@@ -10,14 +10,17 @@
 #   scripts/attestation-verify.sh docs/attestations/0.2.0.json
 #   scripts/attestation-verify.sh docs/attestations/0.2.0.json --json
 #
-# Exit code: 0 on full pass, 1 on any failure, 2 on usage error.
-# JSON output (with --json) is machine-readable: {"ok": bool, "checks": [...], "errors": [...]}.
+# Exit code: 0 on full pass, 1 on any failure, 2 on usage error, 3 when the
+# bundle is validly retracted.
+# JSON output (with --json) is machine-readable:
+# {"ok": bool, "verdict": "pass|fail|retracted", "checks": [...], "errors": [...]}.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE=""
 JSON_OUTPUT=0
+RETRACTIONS_ROOT="${FT_ATTESTATION_RETRACTIONS_ROOT:-$REPO_ROOT/docs/attestations/retractions}"
 
 usage() {
   cat <<EOF
@@ -28,6 +31,12 @@ Usage: $0 <bundle.json> [--json] [--strict-required] [--strict-deferred]
                      the canonical list in docs/attestations/manifest.json, allowing
                      deferred_slots to satisfy categories in non-release checks.
   --strict-deferred  Fail if the bundle declares any deferred_slots.
+
+Environment:
+  FT_ATTESTATION_RETRACTIONS_ROOT
+                     Override active retraction root. Defaults to
+                     docs/attestations/retractions. The verifier also
+                     consults <root>/archive/<bundle-sha>/ on cache misses.
 EOF
 }
 
@@ -71,6 +80,9 @@ is_hex_len() {
 
 declare -a checks=()
 declare -a errors=()
+declare -a retraction_results=()
+VALID_RETRACTION_COUNT=0
+INVALID_RETRACTION_COUNT=0
 record_check() {
   # name, ok(true|false), detail
   local name="$1" ok="$2" detail="$3"
@@ -81,7 +93,237 @@ record_check() {
   if [[ "$ok" != "true" ]]; then errors+=("$name: $detail"); fi
 }
 
+add_retraction_result() {
+  local obj="$1"
+  retraction_results+=("$obj")
+}
+
 bundle_json="$(cat "$BUNDLE")"
+
+verify_retraction_signature() {
+  local retraction_path="$1"
+  local retraction_json="$2"
+  local affected_slot="$3"
+  local canonical_payload
+  local computed_canonical_sha
+  local declared_canonical_sha
+  local sig_method
+
+  canonical_payload="$(jq -S -c 'del(.retraction_signature)' <<<"$retraction_json")"
+  computed_canonical_sha="$(printf '%s' "$canonical_payload" | sha256_stdin)"
+  declared_canonical_sha="$(jq -r '.retraction_signature.canonical_sha256 // ""' <<<"$retraction_json")"
+  if [[ "$computed_canonical_sha" != "$declared_canonical_sha" ]]; then
+    record_check "retraction_signature:$affected_slot" false "canonical_sha256 mismatch in $retraction_path"
+    return 1
+  fi
+
+  sig_method="$(jq -r '.retraction_signature.method // ""' <<<"$retraction_json")"
+  case "$sig_method" in
+    sigstore-cosign-keyless)
+      local sigstore_path sigstore_expected_hash sigstore_expected_size sigstore_abs
+      local cert_identity cert_issuer canon_tmp
+      sigstore_path="$(jq -r '.retraction_signature.sigstore_bundle.path // ""' <<<"$retraction_json")"
+      sigstore_expected_hash="$(jq -r '.retraction_signature.sigstore_bundle.sha256 // ""' <<<"$retraction_json")"
+      sigstore_expected_size="$(jq -r '.retraction_signature.sigstore_bundle.size_bytes // ""' <<<"$retraction_json")"
+      cert_identity="$(jq -r '.retraction_signature.certificate_identity // ""' <<<"$retraction_json")"
+      cert_issuer="$(jq -r '.retraction_signature.certificate_oidc_issuer // ""' <<<"$retraction_json")"
+      if [[ -z "$sigstore_path" || "$sigstore_path" == /* ]]; then
+        record_check "retraction_signature:$affected_slot" false "sigstore_bundle.path must be repo-relative in $retraction_path"
+        return 1
+      elif ! is_hex_len "$sigstore_expected_hash" 64; then
+        record_check "retraction_signature:$affected_slot" false "sigstore_bundle.sha256 must be a 32-byte hex SHA-256 in $retraction_path"
+        return 1
+      elif [[ ! "$sigstore_expected_size" =~ ^[0-9]+$ || "$sigstore_expected_size" -lt 1 ]]; then
+        record_check "retraction_signature:$affected_slot" false "sigstore_bundle.size_bytes must be a positive integer in $retraction_path"
+        return 1
+      elif [[ -z "$cert_identity" || -z "$cert_issuer" ]]; then
+        record_check "retraction_signature:$affected_slot" false "sigstore certificate_identity and certificate_oidc_issuer are required in $retraction_path"
+        return 1
+      elif ! command -v cosign >/dev/null 2>&1; then
+        record_check "retraction_signature:$affected_slot" false "cosign not installed; cannot verify retraction sigstore bundle"
+        return 1
+      fi
+
+      sigstore_abs="$REPO_ROOT/$sigstore_path"
+      if [[ ! -f "$sigstore_abs" ]]; then
+        record_check "retraction_signature:$affected_slot" false "sigstore bundle missing: $sigstore_path"
+        return 1
+      fi
+      local sigstore_actual_hash sigstore_actual_size
+      sigstore_actual_hash="$(sha256_file "$sigstore_abs")"
+      sigstore_actual_size="$(wc -c < "$sigstore_abs" | tr -d ' ')"
+      if [[ "$sigstore_actual_hash" != "$sigstore_expected_hash" ]]; then
+        record_check "retraction_signature:$affected_slot" false "sigstore sha256 mismatch in $retraction_path"
+        return 1
+      elif [[ "$sigstore_actual_size" != "$sigstore_expected_size" ]]; then
+        record_check "retraction_signature:$affected_slot" false "sigstore size mismatch in $retraction_path"
+        return 1
+      fi
+
+      canon_tmp="$(mktemp)"
+      printf '%s' "$canonical_payload" > "$canon_tmp"
+      if cosign verify-blob \
+          --bundle "$sigstore_abs" \
+          --certificate-identity "$cert_identity" \
+          --certificate-oidc-issuer "$cert_issuer" \
+          "$canon_tmp" >/dev/null 2>&1; then
+        record_check "retraction_signature:$affected_slot" true "cosign verify-blob ok (identity=$cert_identity)"
+        rm -f "$canon_tmp"
+        return 0
+      fi
+      rm -f "$canon_tmp"
+      record_check "retraction_signature:$affected_slot" false "cosign verify-blob failed for $retraction_path"
+      return 1
+      ;;
+    ed25519)
+      local signature_path public_key signature_abs signature_hex
+      local canon_tmp pubkey_der_tmp sig_tmp key_fingerprint
+      signature_path="$(jq -r '.retraction_signature.signature_path // ""' <<<"$retraction_json")"
+      public_key="$(jq -r '.retraction_signature.public_key // ""' <<<"$retraction_json")"
+      if ! command -v openssl >/dev/null 2>&1; then
+        record_check "retraction_signature:$affected_slot" false "openssl not installed; cannot verify ed25519 retraction"
+        return 1
+      elif ! command -v xxd >/dev/null 2>&1; then
+        record_check "retraction_signature:$affected_slot" false "xxd not installed; cannot decode ed25519 retraction"
+        return 1
+      elif [[ -z "$signature_path" || "$signature_path" == /* ]]; then
+        record_check "retraction_signature:$affected_slot" false "ed25519 signature_path must be repo-relative in $retraction_path"
+        return 1
+      elif ! is_hex_len "$public_key" 64; then
+        record_check "retraction_signature:$affected_slot" false "ed25519 public_key must be 32 bytes hex-encoded in $retraction_path"
+        return 1
+      fi
+
+      signature_abs="$REPO_ROOT/$signature_path"
+      if [[ ! -f "$signature_abs" ]]; then
+        record_check "retraction_signature:$affected_slot" false "ed25519 signature file missing: $signature_path"
+        return 1
+      fi
+      signature_hex="$(tr -d '[:space:]' < "$signature_abs")"
+      if ! is_hex_len "$signature_hex" 128; then
+        record_check "retraction_signature:$affected_slot" false "ed25519 signature file must contain a 64-byte hex signature"
+        return 1
+      fi
+
+      canon_tmp="$(mktemp)"
+      pubkey_der_tmp="$(mktemp)"
+      sig_tmp="$(mktemp)"
+      printf '%s' "$canonical_payload" > "$canon_tmp"
+      printf '302a300506032b6570032100%s' "$public_key" | xxd -r -p > "$pubkey_der_tmp"
+      printf '%s' "$signature_hex" | xxd -r -p > "$sig_tmp"
+      if openssl pkeyutl \
+          -verify \
+          -rawin \
+          -pubin \
+          -keyform DER \
+          -inkey "$pubkey_der_tmp" \
+          -sigfile "$sig_tmp" \
+          -in "$canon_tmp" >/dev/null 2>&1; then
+        key_fingerprint="$(printf '%s' "$public_key" | sha256_stdin)"
+        record_check "retraction_signature:$affected_slot" true "ed25519 verify ok (public_key_sha256=$key_fingerprint)"
+        rm -f "$canon_tmp" "$pubkey_der_tmp" "$sig_tmp"
+        return 0
+      fi
+      rm -f "$canon_tmp" "$pubkey_der_tmp" "$sig_tmp"
+      record_check "retraction_signature:$affected_slot" false "ed25519 verify failed for $retraction_path"
+      return 1
+      ;;
+    unsigned)
+      record_check "retraction_signature:$affected_slot" false "unsigned retractions are rejected: $retraction_path"
+      return 1
+      ;;
+    "")
+      record_check "retraction_signature:$affected_slot" false "missing retraction_signature.method in $retraction_path"
+      return 1
+      ;;
+    *)
+      record_check "retraction_signature:$affected_slot" false "unknown retraction_signature.method '$sig_method' in $retraction_path"
+      return 1
+      ;;
+  esac
+}
+
+scan_retractions_for_bundle() {
+  local bundle_sha="$1"
+  local found=0
+  local valid=0
+  local invalid=0
+  local roots=(
+    "$RETRACTIONS_ROOT/$bundle_sha"
+    "$RETRACTIONS_ROOT/archive/$bundle_sha"
+  )
+  local root retraction_path retraction_json original_sha affected_slot rationale
+  local retracted_at retracted_by_release retraction_obj corrected_claim_value
+
+  VALID_RETRACTION_COUNT=0
+  INVALID_RETRACTION_COUNT=0
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r retraction_path; do
+      case "$retraction_path" in
+        *.canonical.json|*.payload.json) continue ;;
+      esac
+      found=$((found + 1))
+      if ! retraction_json="$(jq -c '.' "$retraction_path" 2>/dev/null)"; then
+        record_check "retraction:$retraction_path" false "retraction JSON is unreadable"
+        invalid=$((invalid + 1))
+        continue
+      fi
+      original_sha="$(jq -r '.original_bundle_sha256 // ""' <<<"$retraction_json")"
+      affected_slot="$(jq -r '.affected_slot // ""' <<<"$retraction_json")"
+      rationale="$(jq -r '.retraction_rationale // ""' <<<"$retraction_json")"
+      retracted_at="$(jq -r '.retracted_at // ""' <<<"$retraction_json")"
+      retracted_by_release="$(jq -r '.retracted_by_release // ""' <<<"$retraction_json")"
+      if [[ "$original_sha" != "$bundle_sha" ]]; then
+        record_check "retraction:$retraction_path" false "original_bundle_sha256 does not match bundle hash"
+        invalid=$((invalid + 1))
+        continue
+      elif [[ -z "$affected_slot" || -z "$rationale" || -z "$retracted_at" || -z "$retracted_by_release" ]]; then
+        record_check "retraction:$retraction_path" false "missing affected_slot/retracted_at/retracted_by_release/retraction_rationale"
+        invalid=$((invalid + 1))
+        continue
+      fi
+
+      if verify_retraction_signature "$retraction_path" "$retraction_json" "$affected_slot"; then
+        corrected_claim_value="$(jq -c '.corrected_claim_value // null' <<<"$retraction_json")"
+        retraction_obj="$(jq -n \
+          --arg path "$retraction_path" \
+          --arg original_bundle_sha256 "$original_sha" \
+          --arg affected_slot "$affected_slot" \
+          --arg retracted_at "$retracted_at" \
+          --arg retracted_by_release "$retracted_by_release" \
+          --arg retraction_rationale "$rationale" \
+          --argjson corrected_claim_value "$corrected_claim_value" \
+          '{
+            path: $path,
+            original_bundle_sha256: $original_bundle_sha256,
+            affected_slot: $affected_slot,
+            retracted_at: $retracted_at,
+            retracted_by_release: $retracted_by_release,
+            retraction_rationale: $retraction_rationale,
+            corrected_claim_value: $corrected_claim_value
+          }')"
+        add_retraction_result "$retraction_obj"
+        record_check "retraction:$affected_slot" true "valid retraction in $retraction_path"
+        valid=$((valid + 1))
+      else
+        invalid=$((invalid + 1))
+      fi
+    done < <(find "$root" -type f -name '*.json' -print | sort)
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    record_check "retractions" true "none found for bundle sha256 $bundle_sha"
+  elif [[ "$valid" -gt 0 && "$invalid" -eq 0 ]]; then
+    record_check "retractions" true "$valid valid retraction(s) found for bundle sha256 $bundle_sha"
+  elif [[ "$valid" -gt 0 ]]; then
+    record_check "retractions" false "$valid valid and $invalid invalid retraction(s) found for bundle sha256 $bundle_sha"
+  else
+    record_check "retractions" false "$invalid invalid retraction(s) found for bundle sha256 $bundle_sha"
+  fi
+  VALID_RETRACTION_COUNT="$valid"
+  INVALID_RETRACTION_COUNT="$invalid"
+}
 
 # Schema-shape sanity (we re-validate against schema.json only structurally; full JSON Schema
 # validation would require an external validator. We keep this lightweight on purpose.)
@@ -395,6 +637,9 @@ case "$sig_method" in
     ;;
 esac
 
+bundle_file_sha256="$(sha256_file "$BUNDLE")"
+scan_retractions_for_bundle "$bundle_file_sha256"
+
 # Aggregate.
 ok=true
 for c in "${checks[@]}"; do
@@ -402,15 +647,36 @@ for c in "${checks[@]}"; do
   [[ "$cok" == "true" ]] || ok=false
 done
 
+verdict="fail"
+output_ok=false
+exit_code=1
+if [[ "$VALID_RETRACTION_COUNT" -gt 0 && "$INVALID_RETRACTION_COUNT" -eq 0 ]]; then
+  verdict="retracted"
+  output_ok=false
+  exit_code=3
+elif [[ "$ok" == "true" ]]; then
+  verdict="pass"
+  output_ok=true
+  exit_code=0
+fi
+
 if [[ $JSON_OUTPUT -eq 1 ]]; then
   checks_arr="$(printf '%s\n' "${checks[@]}" | jq -c -s '.')"
   errors_arr="$(printf '%s\n' "${errors[@]}" | jq -R -c -s 'split("\n") | map(select(. != ""))')"
+  if [[ ${#retraction_results[@]} -eq 0 ]]; then
+    retractions_arr="[]"
+  else
+    retractions_arr="$(printf '%s\n' "${retraction_results[@]}" | jq -c -s '.')"
+  fi
   jq -n \
-    --argjson ok "$ok" \
+    --argjson ok "$output_ok" \
+    --arg verdict "$verdict" \
     --arg bundle "$BUNDLE" \
+    --arg bundle_sha256 "$bundle_file_sha256" \
     --argjson checks "$checks_arr" \
     --argjson errors "$errors_arr" \
-    '{ok:$ok, bundle:$bundle, checks:$checks, errors:$errors}'
+    --argjson retractions "$retractions_arr" \
+    '{ok:$ok, verdict:$verdict, bundle:$bundle, bundle_sha256:$bundle_sha256, checks:$checks, errors:$errors, retractions:$retractions}'
 else
   for c in "${checks[@]}"; do
     cok="$(jq -r '.ok' <<<"$c")"
@@ -419,8 +685,22 @@ else
     if [[ "$cok" == "true" ]]; then printf "  PASS  %-40s %s\n" "$cname" "$cdet"
     else                            printf "  FAIL  %-40s %s\n" "$cname" "$cdet"; fi
   done
-  if [[ "$ok" == "true" ]]; then echo "OK: $BUNDLE"
-  else echo "FAIL: $BUNDLE (${#errors[@]} error(s))"; fi
+  if [[ "$verdict" == "pass" ]]; then
+    echo "OK: $BUNDLE"
+  elif [[ "$verdict" == "retracted" ]]; then
+    echo "RETRACTED: $BUNDLE (${#retraction_results[@]} retraction(s))"
+    for r in "${retraction_results[@]}"; do
+      slot="$(jq -r '.affected_slot' <<<"$r")"
+      rationale="$(jq -r '.retraction_rationale' <<<"$r")"
+      corrected="$(jq -c '.corrected_claim_value' <<<"$r")"
+      echo "  - $slot: $rationale"
+      if [[ "$corrected" != "null" ]]; then
+        echo "    corrected_claim_value: $corrected"
+      fi
+    done
+  else
+    echo "FAIL: $BUNDLE (${#errors[@]} error(s))"
+  fi
 fi
 
-[[ "$ok" == "true" ]] || exit 1
+exit "$exit_code"

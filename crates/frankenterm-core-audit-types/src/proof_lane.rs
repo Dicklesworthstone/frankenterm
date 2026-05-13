@@ -1028,6 +1028,231 @@ pub struct ProofCloseoutReport {
     pub operator_summary: String,
 }
 
+/// Input artifact supplied to the proof-history indexer.
+///
+/// The indexer is intentionally independent of filesystem access so callers
+/// can feed checked-in fixtures, retained E2E artifacts, or remote-collected
+/// content while keeping hash/source/closeout metadata explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofHistoryArtifactInput {
+    /// Repo-relative or absolute artifact path.
+    pub artifact_path: String,
+    /// Artifact content. `None` means the caller could not provide the file.
+    pub content: Option<String>,
+    /// Read error surfaced by the caller when content is unavailable.
+    pub read_error: Option<String>,
+    /// SHA-256 or equivalent content hash computed by the caller.
+    pub content_sha256: Option<String>,
+    /// Expected artifact hash, when a manifest or closeout declared one.
+    pub expected_sha256: Option<String>,
+    /// Source commit associated with this artifact.
+    pub source_commit: Option<String>,
+    /// Expected source commit, when a closeout or release gate declared one.
+    pub expected_source_commit: Option<String>,
+    /// Machine-readable proof category, such as `4` or `release/attestation`.
+    pub proof_category: Option<String>,
+    /// Current Beads closeout timestamp for stale-artifact detection.
+    pub bead_closed_at_utc: Option<String>,
+}
+
+impl ProofHistoryArtifactInput {
+    /// Construct an artifact input with content and no external expectations.
+    #[must_use]
+    pub fn new(artifact_path: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            artifact_path: artifact_path.into(),
+            content: Some(content.into()),
+            read_error: None,
+            content_sha256: None,
+            expected_sha256: None,
+            source_commit: None,
+            expected_source_commit: None,
+            proof_category: None,
+            bead_closed_at_utc: None,
+        }
+    }
+
+    /// Construct a missing/unreadable artifact input.
+    #[must_use]
+    pub fn unavailable(artifact_path: impl Into<String>, read_error: Option<String>) -> Self {
+        Self {
+            artifact_path: artifact_path.into(),
+            content: None,
+            read_error,
+            content_sha256: None,
+            expected_sha256: None,
+            source_commit: None,
+            expected_source_commit: None,
+            proof_category: None,
+            bead_closed_at_utc: None,
+        }
+    }
+}
+
+/// Artifact-level status for proof-history ingestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofHistoryArtifactStatus {
+    /// Artifact was parsed and indexed without artifact-level problems.
+    Indexed,
+    /// Artifact exists but has no proof records.
+    Empty,
+    /// Artifact records predate the current Beads closeout timestamp.
+    Stale,
+    /// Artifact source commit disagrees with the expected source commit.
+    SourceCommitMismatch,
+    /// Artifact hash disagrees with the expected hash.
+    HashMismatch,
+    /// Artifact content was present but could not be parsed as proof JSONL.
+    InvalidJson,
+    /// Caller reported that the artifact could not be read.
+    Unreadable,
+    /// Caller could not provide the artifact content.
+    MissingFile,
+}
+
+impl ProofHistoryArtifactStatus {
+    /// Stable string key for reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Indexed => "indexed",
+            Self::Empty => "empty",
+            Self::Stale => "stale",
+            Self::SourceCommitMismatch => "source_commit_mismatch",
+            Self::HashMismatch => "hash_mismatch",
+            Self::InvalidJson => "invalid_json",
+            Self::Unreadable => "unreadable",
+            Self::MissingFile => "missing_file",
+        }
+    }
+}
+
+/// Per-artifact ingestion report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofHistoryArtifactReport {
+    /// Artifact path supplied by the caller.
+    pub artifact_path: String,
+    /// Artifact ingestion status.
+    pub status: ProofHistoryArtifactStatus,
+    /// Number of proof records parsed from this artifact.
+    pub rows_indexed: u64,
+    /// Actual content hash supplied by the caller.
+    pub content_sha256: Option<String>,
+    /// Source commit associated with this artifact.
+    pub source_commit: Option<String>,
+    /// Proof category associated with this artifact.
+    pub proof_category: Option<String>,
+    /// Stable reason code for non-indexed status.
+    pub reason_code: Option<String>,
+    /// Operator-facing detail for non-indexed status.
+    pub detail: Option<String>,
+}
+
+/// Indexed proof record plus the artifact metadata needed for release rollups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofHistoryRecord {
+    /// Artifact path that supplied the record.
+    pub artifact_path: String,
+    /// Artifact content hash supplied by the caller.
+    pub artifact_sha256: Option<String>,
+    /// Source commit associated with the artifact.
+    pub source_commit: Option<String>,
+    /// Proof category associated with the artifact.
+    pub proof_category: Option<String>,
+    /// Artifact status after hash/source/staleness checks.
+    pub artifact_status: ProofHistoryArtifactStatus,
+    /// Parsed durable proof record.
+    pub record: ProofAttemptRecord,
+    /// Validation and artifact findings scoped to this record.
+    pub findings: Vec<ProofLedgerFinding>,
+}
+
+/// Machine-readable proof-history index from retained artifact content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofHistoryIndex {
+    /// Index schema version.
+    pub schema_version: u32,
+    /// Per-artifact reports.
+    pub artifacts: Vec<ProofHistoryArtifactReport>,
+    /// Indexed records with artifact metadata.
+    pub records: Vec<ProofHistoryRecord>,
+    /// Flattened record-level findings.
+    pub findings: Vec<ProofLedgerFinding>,
+    /// Concise operator summary.
+    pub operator_summary: String,
+}
+
+/// One release scoreboard row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofReleaseScoreboardRow {
+    /// Proof category or `uncategorized`.
+    pub proof_category: String,
+    /// Beads issue id.
+    pub bead_id: String,
+    /// Parent proof program or epic id.
+    pub parent_bead_id: Option<String>,
+    /// Source commit associated with the artifact.
+    pub source_commit: Option<String>,
+    /// Artifact path that supplied the record.
+    pub artifact_path: String,
+    /// Artifact content hash supplied by the caller.
+    pub artifact_sha256: Option<String>,
+    /// Latest proof state for this row.
+    pub latest_verdict: ProofState,
+    /// Stable report bucket.
+    pub bucket: ProofReportBucket,
+    /// Stable reason code.
+    pub reason_code: String,
+    /// True only when the row can support closing the source bead.
+    pub closeout_eligible: bool,
+    /// True only when the row can support high-scale claims.
+    pub high_scale_claim_allowed: bool,
+    /// Selected RCH worker, when retained.
+    pub selected_worker: Option<String>,
+    /// Residual blocker reason for non-closeable rows.
+    pub residual_blocker: Option<String>,
+    /// Start timestamp.
+    pub attempted_at_utc: String,
+    /// Finish timestamp.
+    pub finished_at_utc: Option<String>,
+    /// Artifact status.
+    pub artifact_status: ProofHistoryArtifactStatus,
+    /// Record validation error count.
+    pub validation_error_count: u64,
+    /// Record validation warning count.
+    pub validation_warning_count: u64,
+}
+
+/// Release scoreboard derived from retained proof-history artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofReleaseScoreboard {
+    /// Scoreboard schema version.
+    pub schema_version: u32,
+    /// Number of indexed proof records.
+    pub total_records: u64,
+    /// All scoreboard rows.
+    pub rows: Vec<ProofReleaseScoreboardRow>,
+    /// Latest row per Beads id.
+    pub latest_by_bead: Vec<ProofReleaseScoreboardRow>,
+    /// Non-closeable rows and rows with artifact/validation issues.
+    pub blocking_rows: Vec<ProofReleaseScoreboardRow>,
+    /// Artifact reports with non-indexed status.
+    pub artifact_issues: Vec<ProofHistoryArtifactReport>,
+    /// Counts by report bucket key.
+    pub by_bucket: BTreeMap<String, u64>,
+    /// Counts by proof category.
+    pub by_proof_category: BTreeMap<String, u64>,
+    /// Beads with enough evidence to support source closeout.
+    pub closeable_source_beads: Vec<String>,
+    /// Beads with enough evidence to support high-scale claims.
+    pub high_scale_claim_beads: Vec<String>,
+    /// Flattened record-level findings.
+    pub findings: Vec<ProofLedgerFinding>,
+    /// Concise operator summary.
+    pub operator_summary: String,
+}
+
 impl ProofLaneReport {
     /// Build an aggregate report from proof records.
     #[must_use]
@@ -1189,6 +1414,325 @@ impl ProofCloseoutReport {
     }
 }
 
+impl ProofHistoryIndex {
+    /// Build a proof-history index from retained JSONL proof artifacts.
+    ///
+    /// Each non-empty line in `content` must be a [`ProofAttemptRecord`].
+    /// Artifact metadata is checked separately from record truthfulness so a
+    /// pass record in a stale or hash-mismatched artifact cannot become release
+    /// evidence accidentally.
+    #[must_use]
+    pub fn from_artifacts(artifacts: &[ProofHistoryArtifactInput]) -> Self {
+        let mut artifact_reports = Vec::new();
+        let mut records = Vec::new();
+        let mut findings = Vec::new();
+
+        for artifact in artifacts {
+            let mut report = ProofHistoryArtifactReport {
+                artifact_path: artifact.artifact_path.clone(),
+                status: ProofHistoryArtifactStatus::Indexed,
+                rows_indexed: 0,
+                content_sha256: artifact.content_sha256.clone(),
+                source_commit: artifact.source_commit.clone(),
+                proof_category: artifact.proof_category.clone(),
+                reason_code: None,
+                detail: None,
+            };
+
+            if artifact.content.is_none() {
+                report.status = if artifact.read_error.is_some() {
+                    ProofHistoryArtifactStatus::Unreadable
+                } else {
+                    ProofHistoryArtifactStatus::MissingFile
+                };
+                report.reason_code = Some(report.status.as_str().to_string());
+                report.detail = artifact
+                    .read_error
+                    .clone()
+                    .or_else(|| Some("artifact content was not supplied".to_string()));
+                artifact_reports.push(report);
+                continue;
+            }
+
+            let artifact_hash_mismatch = artifact
+                .content_sha256
+                .as_ref()
+                .zip(artifact.expected_sha256.as_ref())
+                .is_some_and(|(actual, expected)| actual != expected);
+            let artifact_source_commit_mismatch = artifact
+                .source_commit
+                .as_ref()
+                .zip(artifact.expected_source_commit.as_ref())
+                .is_some_and(|(actual, expected)| actual != expected);
+
+            if artifact_hash_mismatch {
+                promote_artifact_status(&mut report, ProofHistoryArtifactStatus::HashMismatch);
+                report.reason_code = Some("artifact_hash_mismatch".to_string());
+                report.detail = Some("artifact hash does not match expected hash".to_string());
+            }
+
+            if artifact_source_commit_mismatch {
+                let prior_status = report.status;
+                promote_artifact_status(
+                    &mut report,
+                    ProofHistoryArtifactStatus::SourceCommitMismatch,
+                );
+                if report.status != prior_status || report.reason_code.is_none() {
+                    report.reason_code = Some("artifact_source_commit_mismatch".to_string());
+                    report.detail =
+                        Some("artifact source commit does not match expected commit".to_string());
+                }
+            }
+
+            let content = artifact.content.as_deref().unwrap_or_default();
+            let mut saw_line = false;
+            for (line_index, line) in content.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                saw_line = true;
+
+                let parsed = serde_json::from_str::<ProofAttemptRecord>(line);
+                let Ok(record) = parsed else {
+                    promote_artifact_status(&mut report, ProofHistoryArtifactStatus::InvalidJson);
+                    report.reason_code = Some("artifact_invalid_json".to_string());
+                    report.detail = Some(format!(
+                        "line {} did not parse as ProofAttemptRecord",
+                        line_index + 1
+                    ));
+                    continue;
+                };
+
+                let mut record_status = report.status;
+                let mut record_findings = validate_proof_record(&record);
+
+                if artifact_hash_mismatch {
+                    record_findings.push(ProofLedgerFinding::error(
+                        &record,
+                        "artifact_hash_mismatch",
+                        "proof artifact hash does not match the expected hash",
+                    ));
+                }
+                if artifact_source_commit_mismatch {
+                    record_findings.push(ProofLedgerFinding::error(
+                        &record,
+                        "artifact_source_commit_mismatch",
+                        "proof artifact source commit does not match the expected commit",
+                    ));
+                }
+                if let Some(closeout_timestamp) = artifact.bead_closed_at_utc.as_deref()
+                    && proof_record_is_older_than_closeout(&record, closeout_timestamp)
+                {
+                    record_status = ProofHistoryArtifactStatus::Stale;
+                    promote_artifact_status(&mut report, ProofHistoryArtifactStatus::Stale);
+                    record_findings.push(ProofLedgerFinding::error(
+                        &record,
+                        "artifact_older_than_closeout",
+                        "proof artifact predates the current Beads closeout timestamp",
+                    ));
+                    report.reason_code = Some("artifact_older_than_closeout".to_string());
+                    report.detail =
+                        Some("one or more records predate the Beads closeout".to_string());
+                }
+
+                findings.extend(record_findings.clone());
+                report.rows_indexed += 1;
+                records.push(ProofHistoryRecord {
+                    artifact_path: artifact.artifact_path.clone(),
+                    artifact_sha256: artifact.content_sha256.clone(),
+                    source_commit: artifact.source_commit.clone(),
+                    proof_category: artifact.proof_category.clone(),
+                    artifact_status: record_status,
+                    record,
+                    findings: record_findings,
+                });
+            }
+
+            if !saw_line {
+                promote_artifact_status(&mut report, ProofHistoryArtifactStatus::Empty);
+                report.reason_code = Some("artifact_empty".to_string());
+                report.detail = Some("artifact contained no proof records".to_string());
+            }
+
+            artifact_reports.push(report);
+        }
+
+        let operator_summary =
+            proof_history_operator_summary(artifact_reports.len(), records.len(), findings.len());
+
+        Self {
+            schema_version: PROOF_LANE_SCHEMA_VERSION,
+            artifacts: artifact_reports,
+            records,
+            findings,
+            operator_summary,
+        }
+    }
+}
+
+impl ProofReleaseScoreboard {
+    /// Build a release scoreboard from an indexed proof history.
+    #[must_use]
+    pub fn from_history(index: &ProofHistoryIndex) -> Self {
+        let mut rows = index
+            .records
+            .iter()
+            .map(ProofReleaseScoreboardRow::from_history_record)
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            (
+                &left.proof_category,
+                &left.bead_id,
+                &left.source_commit,
+                &left.artifact_sha256,
+                &left.artifact_path,
+            )
+                .cmp(&(
+                    &right.proof_category,
+                    &right.bead_id,
+                    &right.source_commit,
+                    &right.artifact_sha256,
+                    &right.artifact_path,
+                ))
+        });
+
+        let mut by_bucket = BTreeMap::new();
+        let mut by_proof_category = BTreeMap::new();
+        let mut latest_by_bead_map = BTreeMap::<String, ProofReleaseScoreboardRow>::new();
+        let mut closeable_source_beads = Vec::new();
+        let mut high_scale_claim_beads = Vec::new();
+
+        for row in &rows {
+            *by_bucket
+                .entry(row.bucket.as_str().to_string())
+                .or_insert(0) += 1;
+            *by_proof_category
+                .entry(row.proof_category.clone())
+                .or_insert(0) += 1;
+
+            if row.closeout_eligible {
+                push_unique_non_empty(&mut closeable_source_beads, &row.bead_id);
+            }
+            if row.high_scale_claim_allowed {
+                push_unique_non_empty(&mut high_scale_claim_beads, &row.bead_id);
+            }
+
+            latest_by_bead_map
+                .entry(row.bead_id.clone())
+                .and_modify(|selected| {
+                    if proof_scoreboard_row_is_newer(row, selected) {
+                        *selected = row.clone();
+                    }
+                })
+                .or_insert_with(|| row.clone());
+        }
+
+        let mut latest_by_bead = latest_by_bead_map.into_values().collect::<Vec<_>>();
+        latest_by_bead.sort_by(|left, right| left.bead_id.cmp(&right.bead_id));
+
+        let blocking_rows = rows
+            .iter()
+            .filter(|row| !row.closeout_eligible)
+            .cloned()
+            .collect::<Vec<_>>();
+        let artifact_issues = index
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.status != ProofHistoryArtifactStatus::Indexed)
+            .cloned()
+            .collect::<Vec<_>>();
+        let operator_summary = proof_scoreboard_operator_summary(
+            rows.len(),
+            latest_by_bead.len(),
+            closeable_source_beads.len(),
+            high_scale_claim_beads.len(),
+            blocking_rows.len(),
+            artifact_issues.len(),
+            index.findings.len(),
+        );
+
+        Self {
+            schema_version: PROOF_LANE_SCHEMA_VERSION,
+            total_records: rows.len() as u64,
+            rows,
+            latest_by_bead,
+            blocking_rows,
+            artifact_issues,
+            by_bucket,
+            by_proof_category,
+            closeable_source_beads,
+            high_scale_claim_beads,
+            findings: index.findings.clone(),
+            operator_summary,
+        }
+    }
+
+    /// Return the latest scoreboard row for a Beads id.
+    #[must_use]
+    pub fn latest_for_bead(&self, bead_id: &str) -> Option<&ProofReleaseScoreboardRow> {
+        self.latest_by_bead
+            .iter()
+            .find(|row| row.bead_id == bead_id)
+    }
+
+    /// Return all rows that block release or closeout eligibility.
+    #[must_use]
+    pub fn release_blockers(&self) -> &[ProofReleaseScoreboardRow] {
+        &self.blocking_rows
+    }
+}
+
+impl ProofReleaseScoreboardRow {
+    fn from_history_record(history: &ProofHistoryRecord) -> Self {
+        let record = &history.record;
+        let validation_error_count = history
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == ProofFindingSeverity::Error)
+            .count() as u64;
+        let validation_warning_count = history.findings.len() as u64 - validation_error_count;
+        let artifact_clean = history.artifact_status == ProofHistoryArtifactStatus::Indexed;
+        let closeout_eligible =
+            artifact_clean && validation_error_count == 0 && record.safe_to_close_source_bead();
+        let high_scale_claim_allowed = closeout_eligible && record.allows_high_scale_claim();
+        let residual_blocker = if closeout_eligible {
+            None
+        } else {
+            history
+                .findings
+                .iter()
+                .find(|finding| finding.severity == ProofFindingSeverity::Error)
+                .map(|finding| finding.reason_code.clone())
+                .or_else(|| Some(record.report_bucket().as_str().to_string()))
+        };
+
+        Self {
+            proof_category: history
+                .proof_category
+                .clone()
+                .unwrap_or_else(|| "uncategorized".to_string()),
+            bead_id: record.bead_id.clone(),
+            parent_bead_id: record.parent_bead_id.clone(),
+            source_commit: history.source_commit.clone(),
+            artifact_path: history.artifact_path.clone(),
+            artifact_sha256: history.artifact_sha256.clone(),
+            latest_verdict: record.state,
+            bucket: record.report_bucket(),
+            reason_code: record.reason_code.clone(),
+            closeout_eligible,
+            high_scale_claim_allowed,
+            selected_worker: record.selected_worker.clone(),
+            residual_blocker,
+            attempted_at_utc: record.attempted_at_utc.clone(),
+            finished_at_utc: record.finished_at_utc.clone(),
+            artifact_status: history.artifact_status,
+            validation_error_count,
+            validation_warning_count,
+        }
+    }
+}
+
 impl ProofAttemptRecord {
     /// Evidence class used by release and swarm closeout reports.
     #[must_use]
@@ -1332,6 +1876,99 @@ fn push_unique_non_empty(values: &mut Vec<String>, value: &str) {
     if !value.trim().is_empty() && !values.iter().any(|existing| existing == value) {
         values.push(value.to_string());
     }
+}
+
+fn promote_artifact_status(
+    report: &mut ProofHistoryArtifactReport,
+    candidate: ProofHistoryArtifactStatus,
+) {
+    if proof_history_status_rank(candidate) > proof_history_status_rank(report.status) {
+        report.status = candidate;
+    }
+}
+
+const fn proof_history_status_rank(status: ProofHistoryArtifactStatus) -> u8 {
+    match status {
+        ProofHistoryArtifactStatus::Indexed => 0,
+        ProofHistoryArtifactStatus::Empty => 10,
+        ProofHistoryArtifactStatus::Stale => 20,
+        ProofHistoryArtifactStatus::SourceCommitMismatch => 30,
+        ProofHistoryArtifactStatus::HashMismatch => 40,
+        ProofHistoryArtifactStatus::InvalidJson => 50,
+        ProofHistoryArtifactStatus::Unreadable => 60,
+        ProofHistoryArtifactStatus::MissingFile => 70,
+    }
+}
+
+fn proof_record_is_older_than_closeout(
+    record: &ProofAttemptRecord,
+    closeout_timestamp: &str,
+) -> bool {
+    let closeout_timestamp = closeout_timestamp.trim();
+    if closeout_timestamp.is_empty() {
+        return false;
+    }
+
+    proof_record_observed_at(record).is_some_and(|observed| observed < closeout_timestamp)
+}
+
+fn proof_record_observed_at(record: &ProofAttemptRecord) -> Option<&str> {
+    record
+        .finished_at_utc
+        .as_deref()
+        .filter(|timestamp| !timestamp.trim().is_empty())
+        .or_else(|| {
+            if record.attempted_at_utc.trim().is_empty() {
+                None
+            } else {
+                Some(record.attempted_at_utc.as_str())
+            }
+        })
+}
+
+fn proof_scoreboard_row_is_newer(
+    candidate: &ProofReleaseScoreboardRow,
+    selected: &ProofReleaseScoreboardRow,
+) -> bool {
+    let candidate_ts = candidate
+        .finished_at_utc
+        .as_deref()
+        .filter(|timestamp| !timestamp.trim().is_empty())
+        .unwrap_or(&candidate.attempted_at_utc);
+    let selected_ts = selected
+        .finished_at_utc
+        .as_deref()
+        .filter(|timestamp| !timestamp.trim().is_empty())
+        .unwrap_or(&selected.attempted_at_utc);
+
+    candidate_ts > selected_ts
+        || (candidate_ts == selected_ts
+            && proof_state_rank(candidate.latest_verdict)
+                > proof_state_rank(selected.latest_verdict))
+}
+
+fn proof_history_operator_summary(
+    artifact_count: usize,
+    record_count: usize,
+    finding_count: usize,
+) -> String {
+    format!("artifacts={artifact_count}; records={record_count}; findings={finding_count}")
+}
+
+fn proof_scoreboard_operator_summary(
+    row_count: usize,
+    latest_count: usize,
+    closeable_count: usize,
+    high_scale_count: usize,
+    blocker_count: usize,
+    artifact_issue_count: usize,
+    finding_count: usize,
+) -> String {
+    format!(
+        "rows={row_count}; latest_beads={latest_count}; closeable_source_beads={closeable_count}; \
+         high_scale_claim_beads={high_scale_count}; blockers={blocker_count}; \
+         artifact_issues={artifact_issue_count}; findings={finding_count}"
+    )
 }
 
 #[cfg(test)]
@@ -1802,6 +2439,241 @@ mod tests {
         assert!(report.operator_summary.contains("high_scale_not_proven=1"));
         assert!(report.operator_summary.contains("remote_reduced=1"));
         assert!(report.operator_summary.contains("local_reduced=1"));
+    }
+
+    #[test]
+    fn proof_history_scoreboard_indexes_jsonl_and_preserves_blocker_taxonomy() {
+        let mut pass = base_record(ProofState::Pass);
+        pass.proof_id = "pass".into();
+        pass.bead_id = "ft-pass".into();
+        pass.parent_bead_id = Some("ft-parent".into());
+        pass.remote_cargo_reached = true;
+        pass.rustc_reached = true;
+        pass.test_binary_started = true;
+        pass.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+        pass.remote_exit_code = Some(0);
+        pass.wrapper_exit_code = Some(0);
+        pass.selected_worker = Some("vmi1152480".into());
+
+        let mut source = base_record(ProofState::SourceCompileFail);
+        source.proof_id = "source".into();
+        source.bead_id = "ft-source".into();
+        source.remote_cargo_reached = true;
+        source.rustc_reached = true;
+        source.remote_exit_code = Some(101);
+        source.wrapper_exit_code = Some(101);
+        source.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+
+        let mut infra = base_record(ProofState::InfraBlockedPreCargo);
+        infra.proof_id = "infra".into();
+        infra.bead_id = "ft-infra".into();
+
+        let mut dirty = base_record(ProofState::Inconclusive);
+        dirty.proof_id = "dirty".into();
+        dirty.bead_id = "ft-dirty".into();
+        dirty.reason_code = "proof.dirty.active_owned_path_overlap".into();
+        dirty.summary = "dirty path overlaps proof lane".into();
+        dirty = dirty.with_proof_doctor_verdict(&classify_proof_doctor(&{
+            let mut input = base_doctor_input();
+            input.evidence.dirty_paths.push(ProofDoctorDirtyPath {
+                path: "crates/frankenterm-core/src/storage.rs".into(),
+                status: " M".into(),
+                affects_proof: true,
+                owner: Some(ProofDoctorOwner::Bead {
+                    bead_id: "ft-owner".into(),
+                    assignee: Some("SageRobin".into()),
+                }),
+            });
+            input
+        }));
+
+        let mut skipped = base_record(ProofState::SkippedNotProven);
+        skipped.proof_id = "skipped".into();
+        skipped.bead_id = "ft-high-scale".into();
+        skipped.hardware_predicate = Some(ProofHardwarePredicate::SkippedNotProven);
+        skipped.reason_code = "proof.high_scale.predicate_absent".into();
+
+        let content = records_to_jsonl(&[pass, source, infra, dirty, skipped]);
+        let mut artifact =
+            ProofHistoryArtifactInput::new("tests/e2e/artifacts/proof/records.jsonl", content);
+        artifact.content_sha256 = Some("sha256:fixture".into());
+        artifact.source_commit = Some("651d8a538".into());
+        artifact.proof_category = Some("release/proof-handoff".into());
+
+        let index = ProofHistoryIndex::from_artifacts(&[artifact]);
+        let scoreboard = ProofReleaseScoreboard::from_history(&index);
+
+        assert_eq!(index.records.len(), 5);
+        assert_eq!(scoreboard.total_records, 5);
+        assert_eq!(
+            scoreboard
+                .by_bucket
+                .get(ProofReportBucket::RemoteProofPassed.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            scoreboard
+                .by_bucket
+                .get(ProofReportBucket::SourceRed.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            scoreboard
+                .by_bucket
+                .get(ProofReportBucket::DirtyTreeBlocked.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            scoreboard
+                .by_bucket
+                .get(ProofReportBucket::SkippedNotProven.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            scoreboard.closeable_source_beads,
+            vec!["ft-pass".to_string()]
+        );
+        assert!(scoreboard.high_scale_claim_beads.is_empty());
+        assert_eq!(
+            scoreboard
+                .latest_for_bead("ft-pass")
+                .expect("latest pass row")
+                .selected_worker
+                .as_deref(),
+            Some("vmi1152480")
+        );
+        assert!(
+            scoreboard
+                .blocking_rows
+                .iter()
+                .any(|row| row.bead_id == "ft-high-scale"
+                    && row.residual_blocker.as_deref() == Some("skipped_not_proven"))
+        );
+    }
+
+    #[test]
+    fn proof_history_detects_missing_invalid_hash_source_and_stale_artifacts() {
+        let mut record = base_record(ProofState::Pass);
+        record.proof_id = "stale-pass".into();
+        record.bead_id = "ft-stale".into();
+        record.remote_cargo_reached = true;
+        record.rustc_reached = true;
+        record.test_binary_started = true;
+        record.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+
+        let mut stale_artifact = ProofHistoryArtifactInput::new(
+            "stale.jsonl",
+            records_to_jsonl(std::slice::from_ref(&record)),
+        );
+        stale_artifact.bead_closed_at_utc = Some("2026-05-05T00:00:02Z".into());
+
+        let mut hash_source_artifact =
+            ProofHistoryArtifactInput::new("hash-source.jsonl", records_to_jsonl(&[record]));
+        hash_source_artifact.content_sha256 = Some("sha256:actual".into());
+        hash_source_artifact.expected_sha256 = Some("sha256:expected".into());
+        hash_source_artifact.source_commit = Some("newer".into());
+        hash_source_artifact.expected_source_commit = Some("older".into());
+
+        let invalid_artifact = ProofHistoryArtifactInput::new("invalid.jsonl", "{not json}");
+        let missing_artifact = ProofHistoryArtifactInput::unavailable("missing.jsonl", None);
+        let unreadable_artifact = ProofHistoryArtifactInput::unavailable(
+            "unreadable.jsonl",
+            Some("permission denied".into()),
+        );
+
+        let index = ProofHistoryIndex::from_artifacts(&[
+            stale_artifact,
+            hash_source_artifact,
+            invalid_artifact,
+            missing_artifact,
+            unreadable_artifact,
+        ]);
+        let scoreboard = ProofReleaseScoreboard::from_history(&index);
+
+        assert_eq!(index.artifacts.len(), 5);
+        assert!(
+            index
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.status == ProofHistoryArtifactStatus::Stale)
+        );
+        assert!(
+            index
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.status == ProofHistoryArtifactStatus::HashMismatch)
+        );
+        assert!(
+            index
+                .findings
+                .iter()
+                .any(|finding| finding.reason_code == "artifact_source_commit_mismatch")
+        );
+        assert!(
+            index
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.status == ProofHistoryArtifactStatus::InvalidJson)
+        );
+        assert!(
+            index
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.status == ProofHistoryArtifactStatus::MissingFile)
+        );
+        assert!(
+            index
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.status == ProofHistoryArtifactStatus::Unreadable)
+        );
+        assert!(
+            scoreboard
+                .latest_for_bead("ft-stale")
+                .is_some_and(|row| !row.closeout_eligible
+                    && row.residual_blocker.as_deref() == Some("artifact_older_than_closeout"))
+        );
+        assert_eq!(scoreboard.artifact_issues.len(), 5);
+    }
+
+    #[test]
+    fn proof_history_latest_for_bead_uses_newest_timestamp_not_strongest_state() {
+        let mut older_pass = base_record(ProofState::Pass);
+        older_pass.proof_id = "older-pass".into();
+        older_pass.bead_id = "ft-latest".into();
+        older_pass.finished_at_utc = Some("2026-05-05T00:00:01Z".into());
+        older_pass.remote_cargo_reached = true;
+        older_pass.rustc_reached = true;
+        older_pass.test_binary_started = true;
+        older_pass.artifact_retrieval_status = ArtifactRetrievalStatus::Complete;
+
+        let mut newer_infra = base_record(ProofState::InfraBlockedPreCargo);
+        newer_infra.proof_id = "newer-infra".into();
+        newer_infra.bead_id = "ft-latest".into();
+        newer_infra.attempted_at_utc = "2026-05-05T00:01:00Z".into();
+        newer_infra.finished_at_utc = Some("2026-05-05T00:01:30Z".into());
+
+        let artifact = ProofHistoryArtifactInput::new(
+            "latest.jsonl",
+            records_to_jsonl(&[older_pass, newer_infra]),
+        );
+        let index = ProofHistoryIndex::from_artifacts(&[artifact]);
+        let scoreboard = ProofReleaseScoreboard::from_history(&index);
+
+        let latest = scoreboard
+            .latest_for_bead("ft-latest")
+            .expect("latest row for bead");
+        assert_eq!(latest.latest_verdict, ProofState::InfraBlockedPreCargo);
+        assert!(!latest.closeout_eligible);
+    }
+
+    fn records_to_jsonl(records: &[ProofAttemptRecord]) -> String {
+        let mut jsonl = String::new();
+        for record in records {
+            jsonl.push_str(&serde_json::to_string(record).expect("serialize proof record"));
+            jsonl.push('\n');
+        }
+        jsonl
     }
 
     #[test]
