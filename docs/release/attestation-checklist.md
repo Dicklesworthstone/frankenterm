@@ -14,6 +14,34 @@ file is the focused closer for `BR-RC-ATTESTATION-CLOSURE`
 - **After** the release CI workflow lands the signed bundle —
   re-verify offline as a third party would.
 
+## Producing-bead closing convention
+
+Every bead that produces or updates an attestation artifact MUST close with the
+same manifest wiring discipline the release gate later enforces. Before closing
+that bead, verify:
+
+- [ ] Artifact file is at the path declared in
+  [`docs/attestations/manifest.json`](../attestations/manifest.json), or the
+  manifest path is updated in the same commit.
+- [ ] `bash scripts/attestation-build.sh --version 0.0.0-dev --channel dev --sign unsigned`
+  exits 0 without `--allow-partial` for non-deferred slots.
+- [ ] `bash scripts/attestation-build.sh --version 0.0.0-dev --channel dev --sign unsigned --strict-deferred`
+  exits 0 only if every previously deferred slot is now resolved.
+- [ ] `bash scripts/attestation-verify.sh <bundle>` round-trip exits 0.
+- [ ] `cargo test -p frankenterm-core --test readme_hedge_alignment` exits 0
+  when the artifact changes README/AGENTS claim wording.
+- [ ] `cargo test -p frankenterm-core --test attestation_manifest_completeness --no-default-features`
+  exits 0.
+- [ ] The closing comment cites the manifest slot category, artifact path,
+  build/verify exit codes, and retained RCH artifact bundle path.
+
+Use
+[`docs/release/attestation-bead-closing-template.md`](attestation-bead-closing-template.md)
+for the closing-comment shape. This convention exists because a bead that ships
+an artifact but forgets the manifest slot can recreate the `ft-e87u6` NO_BEAD
+gap. If you skip this checklist, the `ft-e87u6.5`
+`attestation_manifest_completeness` regression test will fail CI.
+
 ## Pre-flight: every category has a producing bead
 
 The canonical required-category list lives in

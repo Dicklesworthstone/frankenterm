@@ -378,6 +378,9 @@ Current architecture reality:
   `ft-tf6g3.14`; its latest retained artifact is `skipped_not_proven`, so
   high-scale memory-envelope wording must wait for `ft-tf6g3.1` to sign a
   non-skipped target-class artifact.
+- Any bead that creates or updates an attestation artifact must use
+  `docs/release/attestation-checklist.md` and its producing-bead closing
+  template before closing.
 
 ### Architecture
 
