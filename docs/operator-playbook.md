@@ -217,7 +217,7 @@ it proves remote execution and artifact shape, but it deliberately leaves
 200-pane/high-scale claims as `skipped_not_proven` unless the host has at least
 64 logical CPUs and 256 GiB memory and a live cockpit artifact is retained.
 The retained v1 conformance summary at
-`tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`
+`tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json`
 proves the schema/runtime lane at `remote_reduced` only. During memory
 incidents, also preserve `domains.rss_residency`, `domains.storage_io`,
 `domains.action_receipts`, `residency_buckets`, `action_receipts`, and

@@ -16,7 +16,7 @@ The JSON schema sketch lives at
 `docs/json-schema/ft-resource-pressure-cockpit.json`.
 
 Current retained v1 conformance evidence lives at
-`tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`.
+`tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json`.
 That run passed local static checks and the remote-reduced schema/runtime lane,
 with remote Cargo, rustc, and test-binary execution observed on an RCH worker. It
 is the reference artifact for this contract's schema and runtime conformance
@@ -366,7 +366,7 @@ high-scale wording.
 The current v1 retained conformance artifact is:
 
 ```text
-tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json
+tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json
 ```
 
 Its status is `passed`, with `local_static = "passed"`,
@@ -455,7 +455,7 @@ bucket to hide in a leak summary.
     "evidence_level": "remote_reduced",
     "git_head": "unknown",
     "artifact_paths": [
-      "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json"
+      "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json"
     ],
     "hardware_predicate": {
       "logical_cpus": 16,
@@ -565,7 +565,7 @@ bucket to hide in a leak summary.
       "evidence_state": "measured",
       "reason_codes": ["action_receipt.applied"],
       "artifact_paths": [
-        "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json"
+        "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json"
       ]
     }
   ],
@@ -578,7 +578,7 @@ bucket to hide in a leak summary.
     }
   ],
   "artifact_paths": [
-    "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json"
+    "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json"
   ]
 }
 ```

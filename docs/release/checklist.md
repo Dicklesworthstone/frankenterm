@@ -78,7 +78,7 @@ catch common omissions.
    `SKIPPED_NOT_PROVEN`; only a real-hardware proof-gauntlet manifest
    with linked replay artifacts may render as proven. For resource-cockpit
    claims, the retained
-   `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`
+   `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json`
    artifact is remote-reduced schema/runtime evidence only; target hardware
    remains `skipped_not_proven` until a target-class live artifact is retained.
    Run `scripts/run-target-class-cockpit.sh` once per documented major SKU from

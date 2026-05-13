@@ -269,7 +269,8 @@ fn install_docs_use_package_name_and_bin() {
 
 #[test]
 fn resource_pressure_cockpit_docs_truth_gate() {
-    const CONFORMANCE_SUMMARY: &str = "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json";
+    const CONFORMANCE_SUMMARY: &str = "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json";
+    const STALE_CONFORMANCE_SUMMARY: &str = "tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json";
 
     let readme = read_repo_doc("README.md");
     let contract = read_repo_doc("docs/resource-pressure-cockpit-contract.md");
@@ -359,6 +360,7 @@ fn resource_pressure_cockpit_docs_truth_gate() {
         &readme,
         &[
             "retained remote-reduced conformance artifact",
+            CONFORMANCE_SUMMARY,
             "`rust_heap`",
             "`sqlite_page_cache`",
             "`scrollback_cache`",
@@ -421,6 +423,10 @@ fn resource_pressure_cockpit_docs_truth_gate() {
         format!("{legacy_branch} branch"),
     ];
     for (path, doc) in live_docs {
+        assert!(
+            !doc.contains(STALE_CONFORMANCE_SUMMARY),
+            "{path} should not contain stale cockpit conformance artifact `{STALE_CONFORMANCE_SUMMARY}`"
+        );
         for pattern in &legacy_branch_patterns {
             assert!(
                 !doc.contains(pattern),

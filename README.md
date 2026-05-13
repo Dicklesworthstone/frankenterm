@@ -85,7 +85,7 @@ Current implementation reality:
 | **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output; future-query recall is currently a vacuous PAC-Bayes bound until production held-out data lands ([derivation](docs/perf/semantic-search-pac-bayes-derivation.md), [artifact](docs/attestations/proofs/semantic-search-pac-bayes.json))[^ft-attest-perf-headline] |
 | **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
-| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets[^ft-attest-perf-headline]; the resource-pressure cockpit now has a retained remote-reduced conformance artifact and a fail-closed [target-class hardware gate](docs/perf/target-class-hardware.md) from `ft-tf6g3.14` with the current [gate artifact](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json) still `skipped_not_proven`; high-scale memory-envelope wording cannot graduate before `ft-tf6g3.1` signs a non-skipped target-class artifact |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets[^ft-attest-perf-headline]; the resource-pressure cockpit now has a retained remote-reduced conformance artifact ([summary](tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json)) and a fail-closed [target-class hardware gate](docs/perf/target-class-hardware.md) from `ft-tf6g3.14` with the current [gate artifact](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json) still `skipped_not_proven`; high-scale memory-envelope wording cannot graduate before `ft-tf6g3.1` signs a non-skipped target-class artifact |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing; the shipped recorder backend is currently `append_log`, while `frankensqlite` remains rollout/test-only until live bootstrap support lands |
 | **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis; high-scale claims must cite cockpit proof artifacts, the target-class hardware predicate in [`docs/resource-pressure-cockpit-contract.md`](docs/resource-pressure-cockpit-contract.md), and a retained summary under `tests/e2e/artifacts/target-class/` |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning[^ft-attest-distributed-threat] |
@@ -1574,8 +1574,9 @@ The current target-class gate artifact is
 [`skipped_not_proven`](tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json),
 as recorded by `ft-tf6g3.14`, so `ft-tf6g3.1` cannot sign high-scale wording
 without a non-skipped target-class artifact.
-The retained `ft-rz0eb.4` cockpit conformance artifact proves the v1
-schema/runtime lane only; it is still `skipped_not_proven` for target hardware.
+The retained [`ft-rz0eb.4` cockpit conformance artifact](tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json)
+proves the v1 schema/runtime lane only; it is still `skipped_not_proven` for
+target hardware.
 
 ### What agents does ft detect?
 

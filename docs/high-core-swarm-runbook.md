@@ -71,7 +71,7 @@ Interpretation:
 - `large_swarm_proof_gauntlet.status = "proven"` only counts when the manifest
   was collected in real-hardware mode and linked to retained replay artifacts.
 - The retained v1 cockpit conformance artifact
-  `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json`
+  `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json`
   proves remote-reduced schema/runtime conformance only. It explicitly keeps
   target-class hardware at `skipped_not_proven`.
 
@@ -372,7 +372,7 @@ against a live command/schema name or explicitly marked planned.
 | `ft robot capacity --level 2` | Live | `RobotCommands::Capacity` parses `--level`; help advertises `ft robot --format toon capacity --level 2`. |
 | `SwarmResourceCockpitSnapshot` | Live | `runtime_telemetry.rs` exports the cockpit schema and nested summary. |
 | `SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION` | Live | Runtime telemetry tests assert the current schema version. |
-| Retained cockpit v1 conformance summary | Live | `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260510T125418Z/summary.json` records passed local static and remote-reduced proof, with target hardware still `skipped_not_proven`. |
+| Retained cockpit v1 conformance summary | Live | `tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json` records passed local static and remote-reduced proof, with target hardware still `skipped_not_proven`. |
 | `tests/e2e/test_ft_n447z_5_capture_fairness_200.sh` | Live | Retained reduced 200-pane RCH wrapper emits `summary.json`, `proof-ledger.jsonl`, the raw RCH log, and the Rust capture fairness summary. |
 | `capture_fairness_200_pane_summary.json` | Live | `tailer.rs` proof artifact records pass/fail, selected-by-priority counters, capture lag histograms, skipped-poll reasons, and target hardware `skipped_not_proven`. |
 | Cockpit docs truth smoke | Live | `crates/frankenterm/tests/docs_smoke.rs::resource_pressure_cockpit_docs_truth_gate` guards the v1 field names and legacy default-branch references in live docs. |
