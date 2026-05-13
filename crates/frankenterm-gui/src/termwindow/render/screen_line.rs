@@ -38,6 +38,19 @@ fn cluster_paragraph_context(cell_clusters: &[CellCluster]) -> ClusterParagraphC
     ClusterParagraphContext { text, ranges }
 }
 
+fn should_shape_cluster_with_paragraph_context(cluster: &CellCluster) -> bool {
+    // Harfbuzz paragraph ranges are useful for complex scripts, but ASCII
+    // terminal text matches upstream more closely when each style cluster is
+    // shaped independently.
+    !cluster.text.is_ascii()
+}
+
+fn any_cluster_needs_paragraph_context(cell_clusters: &[CellCluster]) -> bool {
+    cell_clusters
+        .iter()
+        .any(should_shape_cluster_with_paragraph_context)
+}
+
 impl crate::TermWindow {
     /// "Render" a line of the terminal screen into the vertex buffer.
     /// This is nominally a matter of setting the fg/bg color and the
@@ -756,7 +769,8 @@ impl crate::TermWindow {
         } else {
             params.line.cluster(bidi_hint)
         };
-        let paragraph_context = cluster_paragraph_context(&cell_clusters);
+        let paragraph_context = any_cluster_needs_paragraph_context(&cell_clusters)
+            .then(|| cluster_paragraph_context(&cell_clusters));
 
         let gl_state = self
             .render_state
@@ -768,7 +782,7 @@ impl crate::TermWindow {
         let mut expires = None;
         let mut invalidate_on_hover_change = false;
 
-        for (cluster, paragraph_range) in cell_clusters.iter().zip(&paragraph_context.ranges) {
+        for (idx, cluster) in cell_clusters.iter().enumerate() {
             if !matches!(last_style.as_ref(), Some(ClusterStyleCache{attrs,..}) if *attrs == &cluster.attrs)
             {
                 let attrs = &cluster.attrs;
@@ -877,13 +891,21 @@ impl crate::TermWindow {
 
             let style_params = last_style.as_ref().expect("we just set it up").clone();
 
+            let cluster_paragraph_context = paragraph_context.as_ref().and_then(|context| {
+                if should_shape_cluster_with_paragraph_context(cluster) {
+                    Some((context.text.as_str(), context.ranges[idx].clone()))
+                } else {
+                    None
+                }
+            });
+
             let glyph_info = self.cached_cluster_shape(
                 style_params.style,
                 &cluster,
                 &gl_state,
                 None,
                 &self.render_metrics,
-                Some((&paragraph_context.text, paragraph_range.clone())),
+                cluster_paragraph_context,
             )?;
             let pixel_width = glyph_info
                 .iter()
@@ -949,5 +971,29 @@ mod tests {
             expected_start = range.end;
         }
         assert_eq!(expected_start, context.text.len());
+    }
+
+    #[test]
+    fn paragraph_context_is_reserved_for_non_ascii_clusters() {
+        let attrs = CellAttributes::default();
+
+        let ascii = Line::from_text("link text", &attrs, SEQ_ZERO, None);
+        let ascii_clusters = ascii.cluster(None);
+        assert!(!any_cluster_needs_paragraph_context(&ascii_clusters));
+        assert!(
+            ascii_clusters
+                .iter()
+                .all(|cluster| !should_shape_cluster_with_paragraph_context(cluster))
+        );
+
+        let complex = Line::from_text("abc שלום नमस्ते", &attrs, SEQ_ZERO, None);
+        let complex_clusters = complex.cluster(None);
+        assert!(any_cluster_needs_paragraph_context(&complex_clusters));
+        assert!(complex_clusters.iter().any(|cluster| {
+            !cluster.text.is_ascii() && should_shape_cluster_with_paragraph_context(cluster)
+        }));
+        assert!(complex_clusters.iter().all(|cluster| {
+            !cluster.text.is_ascii() || !should_shape_cluster_with_paragraph_context(cluster)
+        }));
     }
 }

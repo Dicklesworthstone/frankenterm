@@ -21,6 +21,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use frankenterm_escape_parser::parser::Parser;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
     Alert, AlertHandler, Clipboard, ClipboardSelection, Terminal, TerminalConfiguration,
@@ -314,6 +315,80 @@ fn osc_8_set_does_not_panic_or_break_subsequent_dispatch() {
         "OSC 8 dispatch must not wedge subsequent OSC 2 (set title) handling"
     );
     assert_eq!(title_after, "new title");
+}
+
+#[test]
+fn osc_8_bel_terminated_link_prints_visible_payload() {
+    const PAYLOAD: &[u8] =
+        b"\x1b]2;ft-wezterm-diff\x07\x1b]8;id=ft-link;https://example.com/ft\x07link text\x1b]8;;\x07";
+
+    let mut advance_term = test_term();
+    advance_term.advance_bytes(PAYLOAD);
+    assert_line_text_and_cursor(&advance_term, "link text", "raw advance_bytes parser path");
+
+    let mut replayed_actions = Vec::new();
+    let mut parser = Parser::new();
+    parser.parse(PAYLOAD, |action| action.append_to(&mut replayed_actions));
+    let mut replay_term = test_term();
+    replay_term.perform_actions(replayed_actions);
+    assert_line_text_and_cursor(&replay_term, "link text", "mux parsed-action replay path");
+}
+
+fn test_term() -> Terminal {
+    Terminal::new(
+        TerminalSize {
+            rows: 4,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 64,
+            dpi: 96,
+        },
+        Arc::new(TestConfig),
+        "WezTerm",
+        "test",
+        Box::new(Vec::new()),
+    )
+}
+
+fn assert_line_text_and_cursor(term: &Terminal, expected: &str, context: &str) {
+    let mut first_line = String::new();
+    let mut hyperlink_flags = Vec::new();
+    let mut following_cell_has_hyperlink = None;
+    term.screen().with_phys_lines(0..1, |lines| {
+        first_line = lines[0].as_str().to_string();
+        hyperlink_flags = lines[0]
+            .visible_cells()
+            .take(expected.len())
+            .map(|cell| cell.attrs().hyperlink().is_some())
+            .collect();
+        following_cell_has_hyperlink = lines[0]
+            .get_cell(expected.len())
+            .map(|cell| cell.attrs().hyperlink().is_some());
+    });
+    assert_eq!(
+        first_line.trim_end(),
+        expected,
+        "BEL-terminated OSC 8 opener must not swallow printable payload via {}",
+        context
+    );
+    assert!(
+        hyperlink_flags.iter().all(|linked| *linked),
+        "BEL-terminated OSC 8 payload cells must retain hyperlink attrs via {}: {:?}",
+        context,
+        hyperlink_flags
+    );
+    assert_ne!(
+        following_cell_has_hyperlink,
+        Some(true),
+        "OSC 8 clear must stop hyperlink attrs after payload via {}",
+        context
+    );
+    assert_eq!(
+        term.cursor_pos().x,
+        expected.len(),
+        "BEL-terminated OSC 8 payload must advance the cursor via {}",
+        context
+    );
 }
 
 #[test]

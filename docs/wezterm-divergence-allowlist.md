@@ -23,16 +23,6 @@ The machine-readable block below is consumed by
 ```json
 {
   "schema_version": "wezterm-divergence-allowlist.v1",
-  "entries": [
-    {
-      "input_pattern": "tc-osc8-hyperlink-001",
-      "frame_pattern": "frame-000",
-      "rationale": "Known current OSC 8 hyperlink glyph/style divergence from upstream WezTerm, confined to the top-left hyperlink text pixels in run 25817861230 artifact 6979206611; tracked for removal under ft-tf6g3.55.",
-      "bead_id": "ft-tf6g3.55",
-      "max_changed_pixel_fraction": 0.001,
-      "max_l_inf": 255,
-      "min_ssim": 0.997
-    }
-  ]
+  "entries": []
 }
 ```
