@@ -37,9 +37,9 @@ export RCH_PROOF_LEDGER_FILE="${PROOF_LEDGER_FILE}"
 export RCH_PROOF_LEDGER_BEAD_ID="${BEAD_ID}"
 export RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}"
 if [[ -n "${RCH_MIRROR_REQUIRED_PATHS:-}" ]]; then
-    export RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS}:README.md:docs/attestations/manifest.json:.beads/issues.jsonl:crates/frankenterm-core/tests/readme_footnotes_resolve.rs"
+    export RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS}:README.md:docs/attestations/manifest.json:crates/frankenterm-core/tests/readme_footnotes_resolve.rs"
 else
-    export RCH_MIRROR_REQUIRED_PATHS="README.md:docs/attestations/manifest.json:.beads/issues.jsonl:crates/frankenterm-core/tests/readme_footnotes_resolve.rs"
+    export RCH_MIRROR_REQUIRED_PATHS="README.md:docs/attestations/manifest.json:crates/frankenterm-core/tests/readme_footnotes_resolve.rs"
 fi
 
 # shellcheck source=tests/e2e/lib_rch_guards.sh

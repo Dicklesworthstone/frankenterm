@@ -23,11 +23,6 @@ struct ManifestSlot {
     deferred_to_bead: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct BeadIssue {
-    id: String,
-}
-
 #[derive(Debug)]
 struct ClaimMapRow {
     index: usize,
@@ -73,25 +68,47 @@ fn valid_bead_ids() -> BTreeSet<String> {
         .collect()
 }
 
-fn local_beads_db_ids() -> Option<BTreeSet<String>> {
+fn collect_beads_graph_ids(value: &serde_json::Value, ids: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if matches!(key.as_str(), "id" | "issue_id" | "depends_on_id") {
+                    if let Some(id) = value.as_str() {
+                        if id.starts_with("ft-") {
+                            ids.insert(id.to_string());
+                        }
+                    }
+                }
+                collect_beads_graph_ids(value, ids);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_beads_graph_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn local_beads_graph_ids() -> Option<BTreeSet<String>> {
     let beads_path = workspace_root().join(".beads/issues.jsonl");
     let contents = fs::read_to_string(&beads_path).ok()?;
-    Some(
-        contents
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim().is_empty())
-            .map(|(line_index, line)| {
-                serde_json::from_str::<BeadIssue>(line).unwrap_or_else(|err| {
-                    panic!(
-                        ".beads/issues.jsonl line {} does not parse as a bead issue: {err}",
-                        line_index + 1
-                    )
-                })
-            })
-            .map(|issue| issue.id)
-            .collect(),
-    )
+    let mut ids = BTreeSet::new();
+    for (line_index, line) in contents
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+    {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|err| {
+            panic!(
+                ".beads/issues.jsonl line {} does not parse as JSON: {err}",
+                line_index + 1
+            )
+        });
+        collect_beads_graph_ids(&value, &mut ids);
+    }
+    Some(ids)
 }
 
 fn why_use_section(readme: &str) -> &str {
@@ -259,7 +276,7 @@ fn trust_attestation_claim_map_matches_manifest_and_beads_db() {
     let readme = read_workspace_file("README.md");
     let slots_by_category = manifest_slots_by_category();
     let bead_ids = valid_bead_ids();
-    let local_beads_db_ids = local_beads_db_ids();
+    let local_beads_graph_ids = local_beads_graph_ids();
     let rows = claim_map_rows(&readme);
 
     assert!(
@@ -294,10 +311,10 @@ fn trust_attestation_claim_map_matches_manifest_and_beads_db() {
             "Trust & Attestation row {} cites bead {bead}, which is not a produced_by_bead value in manifest.json",
             row.index
         );
-        if let Some(local_beads_db_ids) = &local_beads_db_ids {
+        if let Some(local_beads_graph_ids) = &local_beads_graph_ids {
             assert!(
-                local_beads_db_ids.contains(bead),
-                "Trust & Attestation row {} cites bead {bead}, which is absent from .beads/issues.jsonl",
+                local_beads_graph_ids.contains(bead),
+                "Trust & Attestation row {} cites bead {bead}, which is absent from .beads/issues.jsonl graph references",
                 row.index
             );
         }
