@@ -1904,7 +1904,7 @@ fn render_tab_bar(frame: &mut ftui::Frame, row: u16, width: u16, active: View) {
 /// Render the Home dashboard view.
 ///
 /// Layout (rows from content_y):
-///   Row 0:      Title — "WezTerm Automata" + aggregate health badge
+///   Row 0:      Title — "FrankenTerm Control Center" + aggregate health badge
 ///   Rows 1-2:   blank separator
 ///   Rows 3-8:   System status detail (watcher, db, wezterm, circuit)
 ///   Rows 9-10:  blank separator
@@ -1927,7 +1927,7 @@ fn render_home_view(
     let max_row = y.saturating_add(height);
 
     // -- Title + aggregate health badge --
-    let title = "  WezTerm Automata";
+    let title = "  FrankenTerm Control Center";
     write_styled(frame, 0, row, title, CellStyle::new().bold());
 
     let (badge, badge_style) = match health {
@@ -2636,7 +2636,7 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
     let blank_line = " ".repeat(width as usize);
 
     let help_lines: &[(&str, bool)] = &[
-        ("  WezTerm Automata TUI", true), // bold
+        ("  FrankenTerm Control Center", true), // bold
         ("", false),
         ("  Global Keybindings:", true),
         ("    q          Quit", false),
@@ -2663,7 +2663,7 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
         ("", false),
         ("  Views:", true),
         ("    1. Home    System overview and health", false),
-        ("    2. Panes   List all WezTerm panes", false),
+        ("    2. Panes   List all FrankenTerm panes", false),
         ("    3. Events  Recent detection events", false),
         ("    4. Triage  Prioritized issues + actions", false),
         ("    5. History Audit action timeline", false),
@@ -4431,7 +4431,7 @@ mod tests {
         );
 
         let row0 = read_row(&frame, 0);
-        assert!(row0.contains("WezTerm Automata"));
+        assert!(row0.contains("FrankenTerm Control Center"));
         assert!(row0.contains("OK"));
     }
 
@@ -5431,7 +5431,7 @@ mod tests {
         let mut frame = ftui::Frame::new(80, 40, &mut pool);
         render_help_view(&mut frame, 0, 80, 38);
         let row0 = read_row(&frame, 0);
-        assert!(row0.contains("WezTerm Automata TUI"));
+        assert!(row0.contains("FrankenTerm Control Center"));
         let mut g = false;
         let mut v = false;
         let mut s = false;
@@ -5465,7 +5465,7 @@ mod tests {
         let mut frame = ftui::Frame::new(40, 5, &mut pool);
         render_help_view(&mut frame, 0, 40, 3);
         let row0 = read_row(&frame, 0);
-        assert!(row0.contains("WezTerm Automata"));
+        assert!(row0.contains("FrankenTerm Control Center"));
     }
 
     // -- Events view tests --
@@ -7942,7 +7942,7 @@ mod tests {
         assert_tab_bar(&text, View::Help);
         assert_footer_present(&text, View::Help);
         assert!(
-            text.contains("WezTerm Automata")
+            text.contains("FrankenTerm Control Center")
                 || text.contains("Keybindings")
                 || text.contains("Tab")
                 || text.contains("help"),
@@ -8460,7 +8460,7 @@ mod tests {
         s.char('1');
         s.assert_view(View::Home);
         s.capture();
-        s.assert_contains("WezTerm Automata");
+        s.assert_contains("FrankenTerm Control Center");
     }
 
     // -- Resize stress --
@@ -8617,7 +8617,7 @@ mod tests {
         // 1. Home
         s.capture();
         s.assert_view(View::Home);
-        s.assert_contains("WezTerm Automata");
+        s.assert_contains("FrankenTerm Control Center");
 
         // 2. Events (from Home, digit '3' works)
         s.char('3');

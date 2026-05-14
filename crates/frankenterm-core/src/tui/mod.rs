@@ -1,6 +1,6 @@
 //! TUI module for ft
 //!
-//! Provides an optional interactive terminal UI for WezTerm Automata.
+//! Provides an optional interactive terminal UI for FrankenTerm.
 //! Behind the `tui` (ratatui) or `ftui` (FrankenTUI) feature flag.
 //!
 //! # Architecture

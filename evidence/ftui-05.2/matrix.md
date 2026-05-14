@@ -8,7 +8,7 @@
 
 | id | category | description | severity | legacy_behavior | ftui_behavior | verdict | evidence | delta_id | notes |
 |----|----------|-------------|----------|-----------------|---------------|---------|----------|----------|-------|
-| P-HOME-001 | layout | Title row shows "WezTerm Automata" at top | blocking | Bold title at row 0 | Bold title at row 0 via `write_styled` | pass | ftui_stub.rs `render_home_shows_title` | | |
+| P-HOME-001 | layout | Title row shows "FrankenTerm Control Center" at top | blocking | Bold title at row 0 | Bold title at row 0 via `write_styled` | pass | ftui_stub.rs `render_home_shows_title` | | |
 | P-HOME-002 | render | Health badge shows OK/ERROR/WARNING/LOADING | blocking | Badge right of title, color-coded | Badge right of title, style via `CellStyle::bold()` / `.dim()` | pass | ftui_stub.rs `render_home_shows_title`, `render_home_degraded_shows_error_badge`, `render_home_no_health_shows_loading` | | |
 | P-HOME-003 | data | Watcher status label (running/stopped) | blocking | From HealthStatus.watcher_running via adapter | Same: `adapt_health()` → `HealthModel.watcher_label` | pass | view_adapters.rs `adapt_health_all_healthy`, `adapt_health_degraded`, `fixture_health_all_down_fields` | | |
 | P-HOME-004 | data | Database status label (ok/unavailable) | blocking | From HealthStatus.db_accessible via adapter | Same | pass | view_adapters.rs `adapt_health_all_healthy`, `adapt_health_degraded` | | |
