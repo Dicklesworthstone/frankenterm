@@ -46,6 +46,7 @@ pub struct PaneRow {
     pub title: String,
     pub domain: String,
     pub cwd: String,
+    pub last_activity_label: String,
     pub agent_label: String,
     pub state_label: String,
     pub unhandled_badge: String,
@@ -85,12 +86,16 @@ pub fn adapt_pane(pane: &PaneView) -> PaneRow {
     } else {
         StyleSpec::new()
     };
+    let last_activity_label = pane
+        .last_activity_ts
+        .map_or_else(|| "unknown".to_string(), |ts| ts.to_string());
 
     PaneRow {
         pane_id: pane.pane_id.to_string(),
         title: truncate(&pane.title, 40),
         domain: pane.domain.clone(),
         cwd: pane.cwd.clone().unwrap_or_default(),
+        last_activity_label,
         agent_label,
         state_label,
         unhandled_badge,
@@ -764,12 +769,16 @@ fn severity_to_style(severity: &str) -> StyleSpec {
 
 /// Truncate a string to `max_len` characters, appending "..." if truncated.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if max_len == 0 {
+        String::new()
+    } else if s.chars().count() <= max_len {
         s.to_string()
     } else if max_len > 3 {
-        format!("{}...", &s[..max_len - 3])
+        let mut truncated: String = s.chars().take(max_len - 3).collect();
+        truncated.push_str("...");
+        truncated
     } else {
-        s[..max_len].to_string()
+        s.chars().take(max_len).collect()
     }
 }
 
@@ -1164,6 +1173,13 @@ mod tests {
     }
 
     #[test]
+    fn truncate_handles_unicode_boundaries() {
+        assert_eq!(truncate("héllo wörld", 7), "héll...");
+        assert_eq!(truncate("hello", 0), "");
+        assert_eq!(truncate("abcdef", 3), "abc");
+    }
+
+    #[test]
     fn severity_styles_are_distinct() {
         let error_style = severity_to_style("error");
         let warning_style = severity_to_style("warning");
@@ -1385,6 +1401,13 @@ mod tests {
         );
         assert_field!("pane", "normal", "domain", row.domain, "local");
         assert_field!("pane", "normal", "cwd", row.cwd, "/data/projects/foo");
+        assert_field!(
+            "pane",
+            "normal",
+            "last_activity_label",
+            row.last_activity_label,
+            "1700000000000"
+        );
         assert_field!("pane", "normal", "agent_label", row.agent_label, "claude");
         assert_field!(
             "pane",
@@ -1437,6 +1460,13 @@ mod tests {
         assert_field!("pane", "missing", "title", row.title, "");
         assert_field!("pane", "missing", "domain", row.domain, "");
         assert_field!("pane", "missing", "cwd", row.cwd, "");
+        assert_field!(
+            "pane",
+            "missing",
+            "last_activity_label",
+            row.last_activity_label,
+            "unknown"
+        );
         assert_field!("pane", "missing", "agent_label", row.agent_label, "unknown");
         assert_field!("pane", "missing", "state_label", row.state_label, "");
         assert_field!(

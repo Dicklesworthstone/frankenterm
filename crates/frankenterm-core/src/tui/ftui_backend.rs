@@ -261,28 +261,31 @@ impl TextInput {
 
     /// Insert a character at the cursor position and advance cursor.
     fn insert_char(&mut self, c: char) {
-        self.text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+        let cursor = char_boundary_at_or_before(&self.text, self.cursor);
+        self.text.insert(cursor, c);
+        self.cursor = cursor + c.len_utf8();
     }
 
     /// Delete the character before the cursor (backspace).
     fn delete_back(&mut self) {
-        if self.cursor > 0 {
-            // Find previous char boundary.
-            let prev = self.text[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+        let cursor = char_boundary_at_or_before(&self.text, self.cursor);
+        if cursor > 0 {
+            let prev = previous_char_start(&self.text, cursor);
             self.text.remove(prev);
             self.cursor = prev;
+        } else {
+            self.cursor = 0;
         }
     }
 
     /// Delete the character at the cursor (forward delete).
     fn delete_forward(&mut self) {
-        if self.cursor < self.text.len() {
-            self.text.remove(self.cursor);
+        let cursor = char_boundary_at_or_before(&self.text, self.cursor);
+        if cursor < self.text.len() {
+            self.text.remove(cursor);
+            self.cursor = cursor;
+        } else {
+            self.cursor = self.text.len();
         }
     }
 
@@ -294,23 +297,21 @@ impl TextInput {
 
     /// Move cursor one character left.
     fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor = self.text[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
+        let cursor = char_boundary_at_or_before(&self.text, self.cursor);
+        self.cursor = if cursor > 0 {
+            previous_char_start(&self.text, cursor)
+        } else {
+            0
+        };
     }
 
     /// Move cursor one character right.
     fn move_right(&mut self) {
-        if self.cursor < self.text.len() {
-            self.cursor = self.text[self.cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor + i)
-                .unwrap_or(self.text.len());
+        let cursor = char_boundary_at_or_before(&self.text, self.cursor);
+        if cursor < self.text.len() {
+            self.cursor = next_char_boundary_after(&self.text, cursor);
+        } else {
+            self.cursor = self.text.len();
         }
     }
 
@@ -329,6 +330,39 @@ impl TextInput {
         self.cursor = text.len();
         self.text = text;
     }
+}
+
+fn char_boundary_at_or_before(s: &str, index: usize) -> usize {
+    let capped = index.min(s.len());
+    if s.is_char_boundary(capped) {
+        return capped;
+    }
+
+    s.char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx < capped)
+        .last()
+        .unwrap_or(0)
+}
+
+fn previous_char_start(s: &str, cursor: usize) -> usize {
+    s.char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx < cursor)
+        .last()
+        .unwrap_or(0)
+}
+
+fn next_char_boundary_after(s: &str, cursor: usize) -> usize {
+    let cursor = char_boundary_at_or_before(s, cursor);
+    if cursor >= s.len() {
+        return s.len();
+    }
+
+    s[cursor..]
+        .char_indices()
+        .nth(1)
+        .map_or(s.len(), |(idx, _)| cursor + idx)
 }
 
 // ---------------------------------------------------------------------------
@@ -2731,7 +2765,10 @@ fn render_panes_view(
                 CellStyle::new(),
             ));
             rows.push((
-                truncate_str("Last Activity: unknown", detail_width as usize),
+                truncate_str(
+                    &format!("Last Activity: {}", pane.last_activity_label),
+                    detail_width as usize,
+                ),
                 CellStyle::new(),
             ));
             rows.push((
@@ -2841,17 +2878,14 @@ fn render_search_view(
     } else {
         '_'
     };
-    let (before_cursor, after_cursor) = if cursor_pos <= query.len() {
-        (&query[..cursor_pos], &query[cursor_pos..])
-    } else {
-        (query, "")
-    };
+    let cursor_pos = char_boundary_at_or_before(query, cursor_pos);
+    let (before_cursor, after_cursor) = query.split_at(cursor_pos);
     let input_line = format!("  {prompt}: {before_cursor}{cursor_char}{after_cursor}");
     write_styled(frame, 0, row, &input_line, CellStyle::new().bold());
-    let ilen = input_line.len() as u16;
-    if ilen < width {
-        let fill = " ".repeat((width - ilen) as usize);
-        write_styled(frame, ilen, row, &fill, CellStyle::new());
+    let ilen = input_line.chars().count();
+    if ilen < width as usize {
+        let fill = " ".repeat(width as usize - ilen);
+        write_styled(frame, ilen as u16, row, &fill, CellStyle::new());
     }
     row += 1;
 
@@ -2871,10 +2905,10 @@ fn render_search_view(
             )
         };
         write_styled(frame, 0, row, &status, CellStyle::new().dim());
-        let slen = status.len() as u16;
-        if slen < width {
-            let fill = " ".repeat((width - slen) as usize);
-            write_styled(frame, slen, row, &fill, CellStyle::new());
+        let slen = status.chars().count();
+        if slen < width as usize {
+            let fill = " ".repeat(width as usize - slen);
+            write_styled(frame, slen as u16, row, &fill, CellStyle::new());
         }
         row += 1;
     }
@@ -3872,12 +3906,16 @@ fn render_history_view(
 
 /// Truncate a string for display.
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if max == 0 {
+        String::new()
+    } else if s.chars().count() <= max {
         s.to_string()
-    } else if max > 2 {
-        format!("{}..", &s[..max - 2])
+    } else if max > 3 {
+        let mut truncated: String = s.chars().take(max - 3).collect();
+        truncated.push_str("...");
+        truncated
     } else {
-        s[..max].to_string()
+        s.chars().take(max).collect()
     }
 }
 
@@ -4862,6 +4900,15 @@ mod tests {
 
     fn first_row_containing(frame: &ftui::Frame, height: u16, needle: &str) -> Option<u16> {
         (0..height).find(|&row| read_row(frame, row).contains(needle))
+    }
+
+    #[test]
+    fn truncate_str_matches_ratatui_display_contract() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 8), "hello...");
+        assert_eq!(truncate_str("abcdef", 3), "abc");
+        assert_eq!(truncate_str("héllo wörld", 7), "héll...");
+        assert_eq!(truncate_str("hello", 0), "");
     }
 
     // -- View navigation tests --
@@ -5863,6 +5910,54 @@ mod tests {
         );
         let row1 = read_row(&frame, 1);
         assert!(row1.contains("No results"));
+    }
+
+    #[test]
+    fn render_search_non_boundary_cursor_does_not_panic() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        render_search_view(
+            &mut frame,
+            0,
+            80,
+            22,
+            "éx",
+            1,
+            FocusRegion::FilterBar,
+            "éx",
+            &[],
+            0,
+            &[],
+            0,
+        );
+        assert!(read_row(&frame, 0).contains("Search (FTS5)"));
+    }
+
+    #[test]
+    fn render_search_unicode_lines_clear_stale_tail_cells() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(72, 24, &mut pool);
+        let stale = "~".repeat(72);
+        write_styled(&mut frame, 0, 0, &stale, CellStyle::new());
+        write_styled(&mut frame, 0, 1, &stale, CellStyle::new());
+
+        render_search_view(
+            &mut frame,
+            0,
+            72,
+            22,
+            "é",
+            1,
+            FocusRegion::FilterBar,
+            "éé",
+            &[],
+            0,
+            &[],
+            0,
+        );
+
+        assert!(!read_row(&frame, 0).contains('~'));
+        assert!(!read_row(&frame, 1).contains('~'));
     }
 
     #[test]
@@ -7663,6 +7758,24 @@ mod tests {
         assert_ti(&ti, "aéb", 1, "left twice (past é, 2 bytes)");
         ti.move_right();
         assert_ti(&ti, "aéb", 3, "right once (past é)");
+    }
+
+    #[test]
+    fn text_input_recovers_from_non_boundary_cursor() {
+        let mut ti = TextInput {
+            text: "éx".to_string(),
+            cursor: 1,
+        };
+        ti.move_right();
+        assert_ti(&ti, "éx", 2, "right from invalid middle byte");
+
+        ti.cursor = 1;
+        ti.insert_char('a');
+        assert_ti(&ti, "aéx", 1, "insert from invalid middle byte");
+
+        ti.cursor = 2;
+        ti.delete_forward();
+        assert_ti(&ti, "ax", 1, "delete forward from invalid middle byte");
     }
 
     #[test]
