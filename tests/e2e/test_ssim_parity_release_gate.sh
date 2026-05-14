@@ -56,7 +56,7 @@ ensure_rch_ready
 
 run_rch_cargo_logged "${RCH_LOG}" \
   env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="${TARGET_DIR}" \
-  cargo test -p frankenterm-gui --test ssim_parity -- --nocapture
+  cargo test -p frankenterm-gui --lib ssim_parity -- --nocapture
 
 grep -q 'test result: ok' "${RCH_LOG}"
 validation_dir="$(rch_validate_proof_ledger_file "${PROOF_LEDGER_FILE}")"

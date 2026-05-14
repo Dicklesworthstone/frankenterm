@@ -31,6 +31,7 @@ path = "../../tests/input_to_photon_bound.rs"
 [[test]]
 name = "ssim_parity"
 path = "tests/ssim_parity.rs"
+required-features = ["gui-system-libs"]
 
 [[bench]]
 name = "input_to_photon"
@@ -54,6 +55,10 @@ dhat-ad-hoc = ["dep:dhat"]
 debug-cell-crc = []
 debug-cell-diff = ["debug-cell-crc"]
 fail-on-cell-mismatch = ["debug-cell-crc", "debug-cell-diff"]
+# Integration tests in this crate cause Cargo to link the GUI executable.
+# Keep the SSIM corpus proof available through the lib test harness on workers
+# that intentionally lack XCB/xkb runtime development packages.
+gui-system-libs = []
 
 [build-dependencies]
 anyhow.workspace = true

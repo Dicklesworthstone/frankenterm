@@ -22,3 +22,10 @@ pub mod cell_crc;
 
 #[cfg(feature = "headless-render")]
 pub mod headless_render;
+
+#[cfg(test)]
+extern crate self as frankenterm_gui;
+
+#[cfg(test)]
+#[path = "../tests/ssim_parity.rs"]
+mod ssim_parity;
