@@ -242,12 +242,20 @@ impl TimeSeries {
     /// which then cascades through `(NaN as usize) == 0` and silently
     /// returns the smallest sample. Fail closed on NaN so callers see
     /// `None` rather than a plausible-looking wrong value.
+    ///
+    /// NaN values in the stored data are skipped before sorting — they
+    /// have no defined order (`partial_cmp` returns `None` for NaN), so
+    /// including them would let the chosen index land on a NaN
+    /// non-deterministically. Infinity values are preserved, since
+    /// ±∞ sort consistently against finite samples and represent valid
+    /// extremes (e.g., a saturated latency probe).
     #[must_use]
     pub fn percentile_range(&self, p: f64, start_ms: u64, end_ms: u64) -> Option<f64> {
         let mut values: Vec<f64> = self
             .range(start_ms, end_ms)
             .iter()
             .map(|dp| dp.value)
+            .filter(|v| !v.is_nan())
             .collect();
         if values.is_empty() || p.is_nan() {
             return None;
@@ -259,6 +267,14 @@ impl TimeSeries {
     }
 
     /// Downsample to at most `target_points` by averaging adjacent groups.
+    ///
+    /// The input range `[0, n)` is partitioned into `target_points`
+    /// contiguous chunks using integer arithmetic, so chunks neither
+    /// overlap nor leave gaps and every input point contributes to
+    /// exactly one chunk. (A prior implementation mixed floating-point
+    /// truncation for `start` with `.round()` for `end`, which produced
+    /// overlapping chunks — e.g. `n=10, target=3` yielded `[0..3]`,
+    /// `[3..7]`, `[6..10]`, double-counting position 6.)
     #[must_use]
     pub fn downsample(&self, target_points: usize) -> TimeSeries {
         if target_points == 0 || self.data.is_empty() {
@@ -277,19 +293,18 @@ impl TimeSeries {
         });
 
         let points: Vec<DataPoint> = self.data.iter().copied().collect();
-        let step = n as f64 / target_points as f64;
 
         for i in 0..target_points {
-            let start = (i as f64 * step) as usize;
-            let mut end = ((i + 1) as f64 * step).round() as usize;
-            end = end.max(start + 1).min(n); // ensure we make progress and don't panic
+            // Integer-math partition: each chunk is
+            // `[i*n/target, (i+1)*n/target)`. Guaranteed non-overlapping
+            // and covering `[0, n)` exactly. With `n > target_points`,
+            // every chunk has at least one element.
+            let start = (i * n) / target_points;
+            let end = ((i + 1) * n) / target_points;
             if start >= end {
                 continue;
             }
             let chunk = &points[start..end];
-            if chunk.is_empty() {
-                continue;
-            }
             let avg_ts = chunk.iter().map(|dp| dp.timestamp_ms).sum::<u64>() / chunk.len() as u64;
             let avg_val = chunk.iter().map(|dp| dp.value).sum::<f64>() / chunk.len() as f64;
             result.push(avg_ts, avg_val);
@@ -742,5 +757,113 @@ mod tests {
         assert_eq!(ts.percentile(f64::INFINITY), Some(50.0));
         // -inf → clamp to 0.0 → min sample (10.0).
         assert_eq!(ts.percentile(f64::NEG_INFINITY), Some(10.0));
+    }
+
+    /// NaN values in the data must not poison the percentile output.
+    /// Without the filter, NaN compares Equal to everything via the
+    /// `partial_cmp.unwrap_or(Equal)` fallback, lands at an
+    /// unpredictable index after sort, and `values[idx]` returns
+    /// NaN — a plausible-looking wrong value that callers may not
+    /// notice. After the filter, NaN values are skipped and the
+    /// percentile reflects only the finite samples.
+    #[test]
+    fn percentile_skips_nan_values() {
+        let mut ts = TimeSeries::new();
+        ts.push(10, 1.0);
+        ts.push(20, f64::NAN);
+        ts.push(30, 2.0);
+        ts.push(40, f64::NAN);
+        ts.push(50, 3.0);
+        // After filtering NaN the surviving samples are [1.0, 2.0, 3.0];
+        // every percentile must be one of those values, never NaN.
+        for p in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let v = ts.percentile(p).expect("finite samples remain");
+            assert!(
+                !v.is_nan(),
+                "percentile p={p} returned NaN despite the filter"
+            );
+            assert!(
+                [1.0, 2.0, 3.0].contains(&v),
+                "got {v}, expected one of [1.0, 2.0, 3.0]"
+            );
+        }
+    }
+
+    /// All-NaN input has no finite samples to percentile over —
+    /// fail-closed with `None` rather than a non-deterministic NaN.
+    #[test]
+    fn percentile_all_nan_returns_none() {
+        let mut ts = TimeSeries::new();
+        ts.push(10, f64::NAN);
+        ts.push(20, f64::NAN);
+        assert!(ts.percentile(0.5).is_none());
+        assert!(ts.percentile_range(0.5, 0, u64::MAX).is_none());
+    }
+
+    /// Downsample must partition the input into non-overlapping
+    /// chunks that cover every point exactly once. Pre-fix, mixing
+    /// `as usize` (truncate) for `start` with `.round()` for `end`
+    /// produced overlapping chunks at non-divisible ratios, so the
+    /// final averaged values were skewed toward the boundary points
+    /// that got double-counted.
+    #[test]
+    fn downsample_partition_is_disjoint_and_complete() {
+        // Use n=10, target=3 — the classic case where the pre-fix
+        // overlap manifested at position 6.
+        let mut ts = TimeSeries::new();
+        for i in 0..10u64 {
+            ts.push(i * 10, i as f64);
+        }
+        let ds = ts.downsample(3);
+        assert_eq!(ds.len(), 3, "exactly 3 downsampled buckets");
+
+        // With non-overlapping integer-math partition the chunks
+        // are [0..3], [3..6], [6..10]; averages are 1.0, 4.0, 7.5.
+        let points = ds.to_vec();
+        assert!(
+            (points[0].value - 1.0).abs() < 1e-9,
+            "got {}",
+            points[0].value
+        );
+        assert!(
+            (points[1].value - 4.0).abs() < 1e-9,
+            "got {}",
+            points[1].value
+        );
+        assert!(
+            (points[2].value - 7.5).abs() < 1e-9,
+            "got {}",
+            points[2].value
+        );
+    }
+
+    /// Downsample preserves the total information content: the sum
+    /// of `(bucket_avg * bucket_size)` across buckets must equal
+    /// the sum of the original values. This is the operational
+    /// definition of "no overlap, no gap" — if a position were
+    /// double-counted or omitted, the equality would fail.
+    #[test]
+    fn downsample_conserves_total_value_across_buckets() {
+        let mut ts = TimeSeries::new();
+        let n: u64 = 17; // prime so most target_points produce uneven chunks
+        for i in 0..n {
+            ts.push(i * 10, i as f64);
+        }
+        let original_sum: f64 = (0..n).map(|i| i as f64).sum();
+        for target in [3usize, 5, 7, 11] {
+            let ds = ts.downsample(target);
+            // Reconstruct chunk sizes from the integer partition.
+            let mut reconstructed = 0.0;
+            for (i, p) in ds.to_vec().iter().enumerate() {
+                let start = (i * n as usize) / target;
+                let end = ((i + 1) * n as usize) / target;
+                let size = (end - start) as f64;
+                reconstructed += p.value * size;
+            }
+            assert!(
+                (reconstructed - original_sum).abs() < 1e-6,
+                "target={target}: reconstructed {reconstructed} != original {original_sum}"
+            );
+        }
     }
 }
