@@ -143,7 +143,7 @@ impl Rgba {
         a: 0xFF,
     };
 
-    #[cfg(any(feature = "tui", feature = "ftui"))]
+    #[cfg(any(feature = "tui", test))]
     const fn opaque(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 0xFF }
     }
@@ -332,13 +332,6 @@ pub fn render_frame_from_ratatui_buffer(buffer: &ratatui::buffer::Buffer) -> Ren
 fn ftui_color_to_rgba(color: ftui::PackedRgba, default: Rgba) -> Rgba {
     if color.a() == 0 {
         default
-    } else if default == Rgba::DEFAULT_FG && color == ftui::PackedRgba::WHITE {
-        // ftui::Cell::default() stores WHITE as the foreground
-        // for otherwise default cells; ratatui represents the
-        // same terminal-default foreground as Color::Reset.
-        // The oracle compares rendered output, so normalize that
-        // backend-local sentinel to the shared default foreground.
-        default
     } else {
         Rgba {
             r: color.r(),
@@ -346,6 +339,26 @@ fn ftui_color_to_rgba(color: ftui::PackedRgba, default: Rgba) -> Rgba {
             b: color.b(),
             a: color.a(),
         }
+    }
+}
+
+#[cfg(feature = "ftui")]
+#[inline]
+#[must_use]
+fn ftui_fg_to_rgba(cell: &ftui::Cell) -> Rgba {
+    if cell.fg == ftui::PackedRgba::WHITE && cell.bg.a() == 0 && cell.attrs == ftui::CellAttrs::NONE
+    {
+        // ftui::Cell::default() and ftui::Cell::from_char()
+        // store WHITE as the foreground for otherwise-default
+        // cells; ratatui represents the same terminal-default
+        // foreground as Color::Reset. The ftui cell shape cannot
+        // distinguish an unstyled explicit WHITE fg from the
+        // default sentinel, so keep this branch limited to the
+        // exact unstyled transparent-bg default-cell shape and
+        // preserve styled explicit WHITE cells below.
+        Rgba::DEFAULT_FG
+    } else {
+        ftui_color_to_rgba(cell.fg, Rgba::DEFAULT_FG)
     }
 }
 
@@ -393,7 +406,7 @@ pub fn render_frame_from_ftui_buffer(
                 col,
                 RenderCell {
                     ch,
-                    fg: ftui_color_to_rgba(cell.fg, Rgba::DEFAULT_FG),
+                    fg: ftui_fg_to_rgba(cell),
                     bg: ftui_color_to_rgba(cell.bg, Rgba::DEFAULT_BG),
                     bold: flags.contains(StyleFlags::BOLD),
                     italic: flags.contains(StyleFlags::ITALIC),
@@ -1239,6 +1252,32 @@ mod tests {
 
         assert_eq!(projected.cell(0, 0).unwrap().fg, Rgba::DEFAULT_FG);
         assert_eq!(projected.cell(0, 1).unwrap().fg, Rgba::DEFAULT_FG);
+    }
+
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_styled_explicit_white_foreground_stays_opaque_white() {
+        use ftui::render::cell::StyleFlags;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(1, 1, &mut pool);
+        frame.buffer.set(
+            0,
+            0,
+            ftui::Cell::from_char('W')
+                .with_fg(ftui::PackedRgba::WHITE)
+                .with_attrs(ftui::CellAttrs::new(
+                    StyleFlags::BOLD,
+                    ftui::CellAttrs::LINK_ID_NONE,
+                )),
+        );
+
+        let projected = render_frame_from_ftui_frame(&frame);
+
+        assert_eq!(
+            projected.cell(0, 0).unwrap().fg,
+            Rgba::opaque(255, 255, 255)
+        );
     }
 
     #[cfg(all(feature = "tui", feature = "ftui"))]
