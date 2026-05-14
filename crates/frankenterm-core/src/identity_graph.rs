@@ -949,8 +949,21 @@ impl IdentityGraph {
             });
         }
 
-        // Check for cycles in delegation chain
-        if self.has_delegation_path(&delegation.delegate, &delegation.delegator) {
+        // Check for cycles in the delegation chain. Adding the edge
+        // `delegator -> delegate` would close a cycle iff the new
+        // delegate is already reachable *forward* from the new
+        // delegator (i.e. an existing chain
+        // delegator -> ... -> delegate exists). `has_delegation_path`
+        // walks the index in the delegate -> delegator direction
+        // (`delegations_by_delegate`), so checking "is `delegate`
+        // reachable upstream from `delegator`" is equivalent to "is
+        // `delegator` reachable forward from `delegate`" — which is
+        // the cycle direction we want to block. (A previous version
+        // swapped these arguments and silently let a 2-hop cycle
+        // like A->B->A through, because A — the new edge's delegate
+        // — was never the target of an existing delegation, so the
+        // upstream walk from A terminated immediately.)
+        if self.has_delegation_path(&delegation.delegator, &delegation.delegate) {
             return Err(IdentityGraphError::CircularDelegation {
                 chain: vec![delegator_key, delegate_key],
             });
@@ -2025,6 +2038,122 @@ mod tests {
             Err(IdentityGraphError::CircularDelegation { .. })
         );
         assert!(is_circular);
+    }
+
+    #[test]
+    fn delegation_two_hop_cycle_rejected() {
+        // A delegates to B, then B tries to delegate to A — the
+        // resulting graph would have a 2-hop cycle A->B->A.
+        // Pre-fix the check passed the wrong direction to the
+        // upstream walker and let this through silently; the
+        // self-loop guard only catches the 1-hop degenerate case.
+        let mut g = IdentityGraph::new();
+        let a = PrincipalId::agent("a");
+        let b = PrincipalId::agent("b");
+        g.register_principal(a.clone()).unwrap();
+        g.register_principal(b.clone()).unwrap();
+
+        let d1 = Delegation {
+            delegation_id: "d1".into(),
+            delegator: a.clone(),
+            delegate: b.clone(),
+            scope: DelegationScope::AllNonAdmin,
+            active: true,
+            created_at_ms: now_epoch_ms(),
+            expires_at_ms: None,
+        };
+        g.add_delegation(d1).expect("first delegation a->b is fine");
+
+        let d2 = Delegation {
+            delegation_id: "d2".into(),
+            delegator: b.clone(),
+            delegate: a.clone(),
+            scope: DelegationScope::AllNonAdmin,
+            active: true,
+            created_at_ms: now_epoch_ms(),
+            expires_at_ms: None,
+        };
+        let is_circular = matches!(
+            g.add_delegation(d2),
+            Err(IdentityGraphError::CircularDelegation { .. })
+        );
+        assert!(
+            is_circular,
+            "adding b->a after a->b must be rejected as a cycle"
+        );
+    }
+
+    #[test]
+    fn delegation_three_hop_cycle_rejected() {
+        // A->B, B->C exist; adding C->A would close a 3-hop cycle.
+        // This is the canonical "transitive cycle" case the cycle
+        // detector must handle beyond the trivial self-loop.
+        let mut g = IdentityGraph::new();
+        let a = PrincipalId::agent("a");
+        let b = PrincipalId::agent("b");
+        let c = PrincipalId::agent("c");
+        for p in [&a, &b, &c] {
+            g.register_principal(p.clone()).unwrap();
+        }
+
+        for (id, from, to) in [("d1", &a, &b), ("d2", &b, &c)] {
+            g.add_delegation(Delegation {
+                delegation_id: id.into(),
+                delegator: from.clone(),
+                delegate: to.clone(),
+                scope: DelegationScope::AllNonAdmin,
+                active: true,
+                created_at_ms: now_epoch_ms(),
+                expires_at_ms: None,
+            })
+            .unwrap_or_else(|e| panic!("non-cycle delegation {id} should succeed: {e}"));
+        }
+
+        let d3 = Delegation {
+            delegation_id: "d3".into(),
+            delegator: c.clone(),
+            delegate: a.clone(),
+            scope: DelegationScope::AllNonAdmin,
+            active: true,
+            created_at_ms: now_epoch_ms(),
+            expires_at_ms: None,
+        };
+        let is_circular = matches!(
+            g.add_delegation(d3),
+            Err(IdentityGraphError::CircularDelegation { .. })
+        );
+        assert!(is_circular, "adding c->a after a->b->c must be rejected");
+    }
+
+    #[test]
+    fn delegation_non_cycle_chain_still_accepted() {
+        // Regression: the strengthened cycle check must NOT block
+        // legitimate transitive chains. A->B, then B->C, then C->D
+        // must all succeed — none of those edges closes a cycle.
+        let mut g = IdentityGraph::new();
+        let a = PrincipalId::agent("a");
+        let b = PrincipalId::agent("b");
+        let c = PrincipalId::agent("c");
+        let d = PrincipalId::agent("d");
+        for p in [&a, &b, &c, &d] {
+            g.register_principal(p.clone()).unwrap();
+        }
+        for (id, from, to) in [
+            ("d1", &a, &b),
+            ("d2", &b, &c),
+            ("d3", &c, &d),
+        ] {
+            g.add_delegation(Delegation {
+                delegation_id: id.into(),
+                delegator: from.clone(),
+                delegate: to.clone(),
+                scope: DelegationScope::AllNonAdmin,
+                active: true,
+                created_at_ms: now_epoch_ms(),
+                expires_at_ms: None,
+            })
+            .unwrap_or_else(|e| panic!("legitimate chain delegation {id} should succeed: {e}"));
+        }
     }
 
     // ── Group membership ──
