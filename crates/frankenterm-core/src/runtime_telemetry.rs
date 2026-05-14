@@ -5700,6 +5700,26 @@ impl SwarmCapacityAdmissionAction {
         }
     }
 
+    /// Conservative ordering for composing independent capacity gates.
+    #[must_use]
+    pub const fn conservatism_rank(self) -> u8 {
+        match self {
+            Self::Admit => 0,
+            Self::ThrottleCapturePolling => 1,
+            Self::Defer => 2,
+            Self::RequireHumanApproval => 3,
+            Self::Shed => 4,
+        }
+    }
+
+    const fn max_conservative(self, other: Self) -> Self {
+        if self.conservatism_rank() >= other.conservatism_rank() {
+            self
+        } else {
+            other
+        }
+    }
+
     const fn retryable(self) -> bool {
         matches!(self, Self::Defer | Self::ThrottleCapturePolling)
     }
@@ -6164,6 +6184,721 @@ impl SwarmCapacityAdmissionRequest {
         request.workflow_lock_available = self.workflow_lock_available;
         request
     }
+}
+
+/// Versioned contract id for the workload-class admission model.
+pub const SWARM_CAPACITY_WORKLOAD_ADMISSION_CONTRACT_ID: &str =
+    "ft.swarm_capacity_workload_admission.v1";
+/// Schema version for [`SwarmCapacityWorkloadAdmissionPlan`].
+pub const SWARM_CAPACITY_WORKLOAD_ADMISSION_SCHEMA_VERSION: u16 = 1;
+
+/// Per-agent workload class used by the high-core swarm capacity planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityAgentWorkloadClass {
+    /// Active coding or implementation work.
+    Coding,
+    /// Review, audit, or read-heavy checking work.
+    Reviewing,
+    /// Build or compile-heavy work.
+    Building,
+    /// Test, fuzz, or verifier execution.
+    Testing,
+    /// Idle pane or wait-only loop.
+    Idle,
+    /// Pane is blocked on external ownership, infra, or a dependency.
+    Blocked,
+    /// Pane is rate-limited and should not receive more fanout.
+    RateLimited,
+    /// Pane is near or past the context horizon.
+    ContextSaturated,
+    /// TUI-heavy or stuck pane that increases render/capture pressure.
+    StuckTuiHeavy,
+}
+
+impl Default for SwarmCapacityAgentWorkloadClass {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl SwarmCapacityAgentWorkloadClass {
+    /// Stable class order used for deterministic fixture rows.
+    pub const ALL: [Self; 9] = [
+        Self::Coding,
+        Self::Reviewing,
+        Self::Building,
+        Self::Testing,
+        Self::Idle,
+        Self::Blocked,
+        Self::RateLimited,
+        Self::ContextSaturated,
+        Self::StuckTuiHeavy,
+    ];
+
+    /// Stable class label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coding => "coding",
+            Self::Reviewing => "reviewing",
+            Self::Building => "building",
+            Self::Testing => "testing",
+            Self::Idle => "idle",
+            Self::Blocked => "blocked",
+            Self::RateLimited => "rate_limited",
+            Self::ContextSaturated => "context_saturated",
+            Self::StuckTuiHeavy => "stuck_tui_heavy",
+        }
+    }
+
+    /// Existing capacity-certificate workload surface used by this class.
+    #[must_use]
+    pub const fn capacity_workload_class(self) -> SwarmCapacityWorkloadClass {
+        match self {
+            Self::Building | Self::Testing => SwarmCapacityWorkloadClass::CapacityGovernor,
+            Self::Idle => SwarmCapacityWorkloadClass::IdleObservation,
+            Self::StuckTuiHeavy => SwarmCapacityWorkloadClass::HeavyCapture,
+            Self::Coding
+            | Self::Reviewing
+            | Self::Blocked
+            | Self::RateLimited
+            | Self::ContextSaturated => SwarmCapacityWorkloadClass::BackpressureEscalation,
+        }
+    }
+
+    /// Existing fairness/pressure class used by this workload class.
+    #[must_use]
+    pub const fn capacity_work_class(self) -> SwarmCapacityWorkClass {
+        match self {
+            Self::Idle => SwarmCapacityWorkClass::OptionalDiagnostics,
+            Self::StuckTuiHeavy => SwarmCapacityWorkClass::BackgroundCapture,
+            Self::Coding
+            | Self::Reviewing
+            | Self::Building
+            | Self::Testing
+            | Self::Blocked
+            | Self::RateLimited
+            | Self::ContextSaturated => SwarmCapacityWorkClass::ClaimedAgentTask,
+        }
+    }
+
+    /// Baseline action when all composed evidence is fresh and green.
+    #[must_use]
+    pub const fn baseline_admission_action(self) -> SwarmCapacityAdmissionAction {
+        match self {
+            Self::Coding | Self::Reviewing | Self::Building | Self::Testing | Self::Idle => {
+                SwarmCapacityAdmissionAction::Admit
+            }
+            Self::Blocked | Self::RateLimited | Self::ContextSaturated => {
+                SwarmCapacityAdmissionAction::Defer
+            }
+            Self::StuckTuiHeavy => SwarmCapacityAdmissionAction::ThrottleCapturePolling,
+        }
+    }
+
+    /// Default capacity units requested by one request in this class.
+    #[must_use]
+    pub const fn default_requested_units(self) -> u32 {
+        match self {
+            Self::Coding => 2,
+            Self::Reviewing | Self::Idle | Self::Blocked | Self::RateLimited => 1,
+            Self::Building => 8,
+            Self::Testing => 6,
+            Self::ContextSaturated => 2,
+            Self::StuckTuiHeavy => 4,
+        }
+    }
+}
+
+impl fmt::Display for SwarmCapacityAgentWorkloadClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Evidence freshness for one workload-admission signal family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityWorkloadEvidenceState {
+    /// Directly measured by an existing live DTO or retained artifact.
+    Measured,
+    /// Inferred from another measured surface.
+    Inferred,
+    /// Synthetic or fixture-backed only.
+    Simulated,
+    /// Source exists, but freshness is outside the contract window.
+    Stale,
+    /// Required source is absent or intentionally not collected.
+    Unavailable,
+}
+
+impl SwarmCapacityWorkloadEvidenceState {
+    /// Stable state order for conformance tests and docs.
+    pub const ALL: [Self; 5] = [
+        Self::Measured,
+        Self::Inferred,
+        Self::Simulated,
+        Self::Stale,
+        Self::Unavailable,
+    ];
+
+    /// Stable evidence label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::Inferred => "inferred",
+            Self::Simulated => "simulated",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Measured => 0,
+            Self::Inferred => 1,
+            Self::Simulated => 2,
+            Self::Stale => 3,
+            Self::Unavailable => 4,
+        }
+    }
+
+    const fn fail_closed_floor(self) -> Option<SwarmCapacityAdmissionAction> {
+        match self {
+            Self::Measured | Self::Inferred | Self::Simulated => None,
+            Self::Stale | Self::Unavailable => Some(SwarmCapacityAdmissionAction::Defer),
+        }
+    }
+
+    fn combine(states: impl IntoIterator<Item = Self>) -> Self {
+        states
+            .into_iter()
+            .max_by_key(|state| state.rank())
+            .unwrap_or(Self::Unavailable)
+    }
+}
+
+/// Signal family consumed by workload-class admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityWorkloadSignalKind {
+    /// Context-horizon risk for the pane/fleet.
+    ContextHorizon,
+    /// Blocker-radar claimability and stale-owner evidence.
+    BlockerRadar,
+    /// Herd-wave burst pressure and dry-run stagger evidence.
+    HerdWave,
+    /// Resource-pressure cockpit and admission summary evidence.
+    ResourcePressure,
+}
+
+impl SwarmCapacityWorkloadSignalKind {
+    /// Stable signal order for deterministic plans.
+    pub const ALL: [Self; 4] = [
+        Self::ContextHorizon,
+        Self::BlockerRadar,
+        Self::HerdWave,
+        Self::ResourcePressure,
+    ];
+
+    /// Stable signal label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextHorizon => "context_horizon",
+            Self::BlockerRadar => "blocker_radar",
+            Self::HerdWave => "herd_wave",
+            Self::ResourcePressure => "resource_pressure",
+        }
+    }
+}
+
+/// One bounded signal row for workload admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityWorkloadAdmissionSignal {
+    /// Signal family.
+    pub kind: SwarmCapacityWorkloadSignalKind,
+    /// Freshness/availability state.
+    pub evidence_state: SwarmCapacityWorkloadEvidenceState,
+    /// Pressure tier projected into the shared 4-tier health vocabulary.
+    pub pressure_tier: HealthTier,
+    /// Stable reason codes. No raw pane content is allowed.
+    pub reason_codes: Vec<String>,
+}
+
+impl SwarmCapacityWorkloadAdmissionSignal {
+    /// Build a signal row with a stable default reason code.
+    #[must_use]
+    pub fn new(
+        kind: SwarmCapacityWorkloadSignalKind,
+        evidence_state: SwarmCapacityWorkloadEvidenceState,
+        pressure_tier: HealthTier,
+    ) -> Self {
+        Self {
+            kind,
+            evidence_state,
+            pressure_tier,
+            reason_codes: vec![format!(
+                "capacity.workload.{}.{}",
+                kind.as_str(),
+                evidence_state.as_str()
+            )],
+        }
+    }
+
+    /// Add a stable bounded reason code.
+    #[must_use]
+    pub fn with_reason_code(mut self, reason_code: impl Into<String>) -> Self {
+        push_bounded_unique_reason(&mut self.reason_codes, reason_code.into());
+        self
+    }
+}
+
+/// Bounded evidence snapshot composed by workload-class admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityWorkloadAdmissionSignals {
+    /// Context-horizon signal.
+    pub context_horizon: SwarmCapacityWorkloadAdmissionSignal,
+    /// Blocker-radar signal.
+    pub blocker_radar: SwarmCapacityWorkloadAdmissionSignal,
+    /// Herd-wave signal.
+    pub herd_wave: SwarmCapacityWorkloadAdmissionSignal,
+    /// Resource-pressure signal.
+    pub resource_pressure: SwarmCapacityWorkloadAdmissionSignal,
+}
+
+impl Default for SwarmCapacityWorkloadAdmissionSignals {
+    fn default() -> Self {
+        Self::measured_green()
+    }
+}
+
+impl SwarmCapacityWorkloadAdmissionSignals {
+    /// Fresh green evidence for all required signal families.
+    #[must_use]
+    pub fn measured_green() -> Self {
+        Self {
+            context_horizon: SwarmCapacityWorkloadAdmissionSignal::new(
+                SwarmCapacityWorkloadSignalKind::ContextHorizon,
+                SwarmCapacityWorkloadEvidenceState::Measured,
+                HealthTier::Green,
+            ),
+            blocker_radar: SwarmCapacityWorkloadAdmissionSignal::new(
+                SwarmCapacityWorkloadSignalKind::BlockerRadar,
+                SwarmCapacityWorkloadEvidenceState::Measured,
+                HealthTier::Green,
+            ),
+            herd_wave: SwarmCapacityWorkloadAdmissionSignal::new(
+                SwarmCapacityWorkloadSignalKind::HerdWave,
+                SwarmCapacityWorkloadEvidenceState::Measured,
+                HealthTier::Green,
+            ),
+            resource_pressure: SwarmCapacityWorkloadAdmissionSignal::new(
+                SwarmCapacityWorkloadSignalKind::ResourcePressure,
+                SwarmCapacityWorkloadEvidenceState::Measured,
+                HealthTier::Green,
+            ),
+        }
+    }
+
+    fn rows(&self) -> [&SwarmCapacityWorkloadAdmissionSignal; 4] {
+        [
+            &self.context_horizon,
+            &self.blocker_radar,
+            &self.herd_wave,
+            &self.resource_pressure,
+        ]
+    }
+
+    fn evidence_state(&self) -> SwarmCapacityWorkloadEvidenceState {
+        SwarmCapacityWorkloadEvidenceState::combine(
+            self.rows().into_iter().map(|signal| signal.evidence_state),
+        )
+    }
+}
+
+/// Side-effect-free workload-class admission input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityWorkloadAdmissionInput {
+    /// Stable opaque id for the request.
+    pub stable_id: String,
+    /// Fleet pane count represented by the dry-run row.
+    pub pane_scale: u32,
+    /// Per-agent workload class.
+    pub workload_class: SwarmCapacityAgentWorkloadClass,
+    /// Current queue depth for the relevant subsystem.
+    pub queue_depth: u64,
+    /// Current backlog depth for the relevant subsystem.
+    pub backlog_depth: u64,
+    /// Pane-local priority.
+    pub pane_priority: u8,
+    /// Workflow priority.
+    pub workflow_priority: u8,
+    /// Requested capacity units.
+    pub requested_units: u32,
+    /// Composed signal snapshot.
+    pub signals: SwarmCapacityWorkloadAdmissionSignals,
+}
+
+impl SwarmCapacityWorkloadAdmissionInput {
+    /// Build a workload-admission row with conservative class defaults.
+    #[must_use]
+    pub fn new(
+        stable_id: impl Into<String>,
+        pane_scale: u32,
+        workload_class: SwarmCapacityAgentWorkloadClass,
+    ) -> Self {
+        let stable_id = stable_id.into();
+        Self {
+            stable_id: if stable_id.is_empty() {
+                format!("workload.{}", workload_class.as_str())
+            } else {
+                stable_id
+            },
+            pane_scale,
+            workload_class,
+            queue_depth: 0,
+            backlog_depth: 0,
+            pane_priority: 0,
+            workflow_priority: 0,
+            requested_units: workload_class.default_requested_units(),
+            signals: SwarmCapacityWorkloadAdmissionSignals::measured_green(),
+        }
+    }
+
+    /// Convert the workload row into the existing capacity admission request.
+    #[must_use]
+    pub fn admission_request(&self, arrival_sequence: u64) -> SwarmCapacityAdmissionRequest {
+        let mut request = SwarmCapacityAdmissionRequest::new(
+            self.stable_id.clone(),
+            self.workload_class.capacity_workload_class(),
+            self.workload_class.capacity_work_class(),
+            arrival_sequence,
+        );
+        request.queue_depth = self.queue_depth;
+        request.backlog_depth = self.backlog_depth;
+        request.pane_priority = self.pane_priority;
+        request.workflow_priority = self.workflow_priority;
+        request.requested_units = self.requested_units.max(1);
+        request
+    }
+}
+
+/// Contract table row for a workload class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityWorkloadAdmissionTableRow {
+    /// Per-agent workload class.
+    pub workload_class: SwarmCapacityAgentWorkloadClass,
+    /// Existing capacity workload class used for certificates.
+    pub capacity_workload_class: SwarmCapacityWorkloadClass,
+    /// Existing fairness/pressure class used by the admission controller.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Action with fresh green evidence.
+    pub measured_green_action: SwarmCapacityAdmissionAction,
+    /// Minimum action when any required signal is stale.
+    pub stale_evidence_action: SwarmCapacityAdmissionAction,
+    /// Minimum action when any required signal is unavailable.
+    pub unavailable_evidence_action: SwarmCapacityAdmissionAction,
+    /// Default requested capacity units.
+    pub requested_units: u32,
+    /// Stable reason codes for this row.
+    pub reason_codes: Vec<String>,
+}
+
+/// Deterministic admission table for all workload classes.
+#[must_use]
+pub fn swarm_capacity_workload_admission_table() -> Vec<SwarmCapacityWorkloadAdmissionTableRow> {
+    SwarmCapacityAgentWorkloadClass::ALL
+        .into_iter()
+        .map(|workload_class| SwarmCapacityWorkloadAdmissionTableRow {
+            workload_class,
+            capacity_workload_class: workload_class.capacity_workload_class(),
+            work_class: workload_class.capacity_work_class(),
+            measured_green_action: workload_class.baseline_admission_action(),
+            stale_evidence_action: workload_class
+                .baseline_admission_action()
+                .max_conservative(SwarmCapacityAdmissionAction::Defer),
+            unavailable_evidence_action: workload_class
+                .baseline_admission_action()
+                .max_conservative(SwarmCapacityAdmissionAction::Defer),
+            requested_units: workload_class.default_requested_units(),
+            reason_codes: vec![format!(
+                "capacity.workload.class.{}",
+                workload_class.as_str()
+            )],
+        })
+        .collect()
+}
+
+/// Decision for one workload-admission row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityWorkloadAdmissionDecision {
+    /// Stable request id.
+    pub stable_id: String,
+    /// Fleet pane count represented by this decision.
+    pub pane_scale: u32,
+    /// Per-agent workload class.
+    pub workload_class: SwarmCapacityAgentWorkloadClass,
+    /// Existing fairness/pressure class.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Final dry-run action after signal floors.
+    pub action: SwarmCapacityAdmissionAction,
+    /// Combined evidence state.
+    pub evidence_state: SwarmCapacityWorkloadEvidenceState,
+    /// Stable reason codes.
+    pub reason_codes: Vec<String>,
+    /// Suggested herd-wave stagger delay when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_stagger_ms: Option<u64>,
+    /// Capacity units requested.
+    pub requested_units: u32,
+    /// Capacity units admitted in this dry-run row.
+    pub admitted_units: u32,
+    /// Planning never executes side effects.
+    pub side_effects_executed: bool,
+}
+
+/// Complete side-effect-free workload-class admission plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityWorkloadAdmissionPlan {
+    /// Schema version.
+    pub schema_version: u16,
+    /// Stable contract id.
+    pub contract_id: String,
+    /// Snapshot timestamp in epoch milliseconds.
+    pub generated_at_ms: u64,
+    /// Producer path.
+    pub source: String,
+    /// Plan is dry-run only.
+    pub dry_run: bool,
+    /// Raw pane content is forbidden.
+    pub raw_pane_content_stored: bool,
+    /// Planning never executes side effects.
+    pub side_effects_executed: bool,
+    /// Class table used by this plan.
+    pub admission_table: Vec<SwarmCapacityWorkloadAdmissionTableRow>,
+    /// Request decisions in deterministic order.
+    pub decisions: Vec<SwarmCapacityWorkloadAdmissionDecision>,
+    /// Flattened stable reason codes.
+    pub reason_codes: Vec<String>,
+}
+
+/// Build a dry-run workload-class admission plan.
+#[must_use]
+pub fn plan_swarm_capacity_workload_admission(
+    generated_at_ms: u64,
+    source: impl Into<String>,
+    inputs: &[SwarmCapacityWorkloadAdmissionInput],
+) -> SwarmCapacityWorkloadAdmissionPlan {
+    let decisions = inputs
+        .iter()
+        .map(plan_swarm_capacity_workload_admission_row)
+        .collect::<Vec<_>>();
+    let mut reason_codes = Vec::new();
+    for decision in &decisions {
+        for reason_code in &decision.reason_codes {
+            push_bounded_unique_reason(&mut reason_codes, reason_code.clone());
+        }
+    }
+
+    let source = source.into();
+    SwarmCapacityWorkloadAdmissionPlan {
+        schema_version: SWARM_CAPACITY_WORKLOAD_ADMISSION_SCHEMA_VERSION,
+        contract_id: SWARM_CAPACITY_WORKLOAD_ADMISSION_CONTRACT_ID.to_string(),
+        generated_at_ms,
+        source: if source.is_empty() {
+            "swarm_capacity.workload_admission".to_string()
+        } else {
+            source
+        },
+        dry_run: true,
+        raw_pane_content_stored: false,
+        side_effects_executed: false,
+        admission_table: swarm_capacity_workload_admission_table(),
+        decisions,
+        reason_codes,
+    }
+}
+
+/// Deterministic 50/100/200/500-pane examples for docs and e2e smoke.
+#[must_use]
+pub fn swarm_capacity_workload_admission_dry_run_examples(
+    generated_at_ms: u64,
+) -> SwarmCapacityWorkloadAdmissionPlan {
+    let mut hundred = SwarmCapacityWorkloadAdmissionInput::new(
+        "example.100.reviewing",
+        100,
+        SwarmCapacityAgentWorkloadClass::Reviewing,
+    );
+    hundred.signals.herd_wave = SwarmCapacityWorkloadAdmissionSignal::new(
+        SwarmCapacityWorkloadSignalKind::HerdWave,
+        SwarmCapacityWorkloadEvidenceState::Measured,
+        HealthTier::Yellow,
+    )
+    .with_reason_code("capacity.workload.herd_wave.stagger_recommended");
+
+    let mut two_hundred = SwarmCapacityWorkloadAdmissionInput::new(
+        "example.200.building",
+        200,
+        SwarmCapacityAgentWorkloadClass::Building,
+    );
+    two_hundred.signals.resource_pressure = SwarmCapacityWorkloadAdmissionSignal::new(
+        SwarmCapacityWorkloadSignalKind::ResourcePressure,
+        SwarmCapacityWorkloadEvidenceState::Measured,
+        HealthTier::Red,
+    )
+    .with_reason_code("capacity.workload.resource_pressure.reduce_builds");
+
+    let mut five_hundred = SwarmCapacityWorkloadAdmissionInput::new(
+        "example.500.context",
+        500,
+        SwarmCapacityAgentWorkloadClass::ContextSaturated,
+    );
+    five_hundred.signals.context_horizon = SwarmCapacityWorkloadAdmissionSignal::new(
+        SwarmCapacityWorkloadSignalKind::ContextHorizon,
+        SwarmCapacityWorkloadEvidenceState::Stale,
+        HealthTier::Red,
+    )
+    .with_reason_code("capacity.workload.context_horizon.fail_closed");
+    five_hundred.signals.herd_wave = SwarmCapacityWorkloadAdmissionSignal::new(
+        SwarmCapacityWorkloadSignalKind::HerdWave,
+        SwarmCapacityWorkloadEvidenceState::Measured,
+        HealthTier::Red,
+    )
+    .with_reason_code("capacity.workload.herd_wave.defer_fanout");
+
+    plan_swarm_capacity_workload_admission(
+        generated_at_ms,
+        "swarm_capacity.workload_admission.examples",
+        &[
+            SwarmCapacityWorkloadAdmissionInput::new(
+                "example.50.coding",
+                50,
+                SwarmCapacityAgentWorkloadClass::Coding,
+            ),
+            hundred,
+            two_hundred,
+            five_hundred,
+        ],
+    )
+}
+
+fn plan_swarm_capacity_workload_admission_row(
+    input: &SwarmCapacityWorkloadAdmissionInput,
+) -> SwarmCapacityWorkloadAdmissionDecision {
+    let mut action = input.workload_class.baseline_admission_action();
+    let mut reason_codes = vec![format!(
+        "capacity.workload.class.{}",
+        input.workload_class.as_str()
+    )];
+    let mut recommended_stagger_ms = None;
+
+    for signal in input.signals.rows() {
+        for reason_code in &signal.reason_codes {
+            push_bounded_unique_reason(&mut reason_codes, reason_code.clone());
+        }
+        if let Some(floor) = signal.evidence_state.fail_closed_floor() {
+            action = action.max_conservative(floor);
+            push_bounded_unique_reason(
+                &mut reason_codes,
+                format!(
+                    "capacity.workload.{}.fail_closed_{}",
+                    signal.kind.as_str(),
+                    signal.evidence_state.as_str()
+                ),
+            );
+        }
+        if let Some((signal_action, reason_code)) =
+            signal_pressure_action(input.workload_class, signal)
+        {
+            action = action.max_conservative(signal_action);
+            push_bounded_unique_reason(&mut reason_codes, reason_code);
+        }
+        if signal.kind == SwarmCapacityWorkloadSignalKind::HerdWave
+            && signal.pressure_tier >= HealthTier::Yellow
+        {
+            recommended_stagger_ms = Some(stagger_ms_for_pane_scale(
+                input.pane_scale,
+                signal.pressure_tier,
+            ));
+        }
+    }
+
+    let requested_units = input.requested_units.max(1);
+    let admitted_units = if action == SwarmCapacityAdmissionAction::Admit {
+        requested_units
+    } else {
+        0
+    };
+
+    SwarmCapacityWorkloadAdmissionDecision {
+        stable_id: input.stable_id.clone(),
+        pane_scale: input.pane_scale,
+        workload_class: input.workload_class,
+        work_class: input.workload_class.capacity_work_class(),
+        action,
+        evidence_state: input.signals.evidence_state(),
+        reason_codes,
+        recommended_stagger_ms,
+        requested_units,
+        admitted_units,
+        side_effects_executed: false,
+    }
+}
+
+fn signal_pressure_action(
+    workload_class: SwarmCapacityAgentWorkloadClass,
+    signal: &SwarmCapacityWorkloadAdmissionSignal,
+) -> Option<(SwarmCapacityAdmissionAction, String)> {
+    match (signal.kind, signal.pressure_tier) {
+        (SwarmCapacityWorkloadSignalKind::ContextHorizon, HealthTier::Red | HealthTier::Black) => {
+            Some((
+                SwarmCapacityAdmissionAction::Defer,
+                "capacity.workload.context_horizon.defer_saturated".to_string(),
+            ))
+        }
+        (
+            SwarmCapacityWorkloadSignalKind::BlockerRadar,
+            HealthTier::Yellow | HealthTier::Red | HealthTier::Black,
+        ) => Some((
+            SwarmCapacityAdmissionAction::Defer,
+            "capacity.workload.blocker_radar.defer_unclaimable".to_string(),
+        )),
+        (SwarmCapacityWorkloadSignalKind::HerdWave, HealthTier::Red | HealthTier::Black) => Some((
+            SwarmCapacityAdmissionAction::Defer,
+            "capacity.workload.herd_wave.defer_burst".to_string(),
+        )),
+        (SwarmCapacityWorkloadSignalKind::ResourcePressure, HealthTier::Red) => Some((
+            if workload_class == SwarmCapacityAgentWorkloadClass::StuckTuiHeavy {
+                SwarmCapacityAdmissionAction::ThrottleCapturePolling
+            } else {
+                SwarmCapacityAdmissionAction::Defer
+            },
+            "capacity.workload.resource_pressure.reduce_admission".to_string(),
+        )),
+        (SwarmCapacityWorkloadSignalKind::ResourcePressure, HealthTier::Black) => Some((
+            if workload_class == SwarmCapacityAgentWorkloadClass::Idle {
+                SwarmCapacityAdmissionAction::Shed
+            } else {
+                SwarmCapacityAdmissionAction::Defer
+            },
+            "capacity.workload.resource_pressure.fail_closed".to_string(),
+        )),
+        _ => None,
+    }
+}
+
+fn stagger_ms_for_pane_scale(pane_scale: u32, pressure_tier: HealthTier) -> u64 {
+    let base_ms = match pressure_tier {
+        HealthTier::Green => 0,
+        HealthTier::Yellow => 250,
+        HealthTier::Red => 1_000,
+        HealthTier::Black => 2_500,
+    };
+    let scale_steps = u64::from(pane_scale.saturating_sub(1) / 50);
+    (base_ms + scale_steps.saturating_mul(250)).min(60_000)
 }
 
 /// Redacted audit record attached to each admission decision.

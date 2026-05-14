@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.swarm_capacity_workload_admission.v1",
+  "generated_at_ms": 1700000000000,
+  "source": "swarm_capacity.workload_admission.examples",
+  "dry_run": true,
+  "raw_pane_content_stored": false,
+  "side_effects_executed": false,
+  "required_workload_classes": [
+    "coding",
+    "reviewing",
+    "building",
+    "testing",
+    "idle",
+    "blocked",
+    "rate_limited",
+    "context_saturated",
+    "stuck_tui_heavy"
+  ],
+  "required_signal_kinds": [
+    "context_horizon",
+    "blocker_radar",
+    "herd_wave",
+    "resource_pressure"
+  ],
+  "expected_decisions": [
+    {
+      "stable_id": "example.50.coding",
+      "pane_scale": 50,
+      "workload_class": "coding",
+      "work_class": "claimed_agent_task",
+      "action": "admit",
+      "evidence_state": "measured",
+      "requested_units": 2,
+      "admitted_units": 2,
+      "recommended_stagger_ms": null
+    },
+    {
+      "stable_id": "example.100.reviewing",
+      "pane_scale": 100,
+      "workload_class": "reviewing",
+      "work_class": "claimed_agent_task",
+      "action": "admit",
+      "evidence_state": "measured",
+      "requested_units": 1,
+      "admitted_units": 1,
+      "recommended_stagger_ms": 500
+    },
+    {
+      "stable_id": "example.200.building",
+      "pane_scale": 200,
+      "workload_class": "building",
+      "work_class": "claimed_agent_task",
+      "action": "defer",
+      "evidence_state": "measured",
+      "requested_units": 8,
+      "admitted_units": 0,
+      "recommended_stagger_ms": null
+    },
+    {
+      "stable_id": "example.500.context",
+      "pane_scale": 500,
+      "workload_class": "context_saturated",
+      "work_class": "claimed_agent_task",
+      "action": "defer",
+      "evidence_state": "stale",
+      "requested_units": 2,
+      "admitted_units": 0,
+      "recommended_stagger_ms": 3250
+    }
+  ]
+}
