@@ -332,6 +332,13 @@ pub fn render_frame_from_ratatui_buffer(buffer: &ratatui::buffer::Buffer) -> Ren
 fn ftui_color_to_rgba(color: ftui::PackedRgba, default: Rgba) -> Rgba {
     if color.a() == 0 {
         default
+    } else if default == Rgba::DEFAULT_FG && color == ftui::PackedRgba::WHITE {
+        // ftui::Cell::default() stores WHITE as the foreground
+        // for otherwise default cells; ratatui represents the
+        // same terminal-default foreground as Color::Reset.
+        // The oracle compares rendered output, so normalize that
+        // backend-local sentinel to the shared default foreground.
+        default
     } else {
         Rgba {
             r: color.r(),
@@ -1218,6 +1225,20 @@ mod tests {
         assert!(cell.italic);
         assert!(cell.underline);
         assert!(cell.reverse);
+    }
+
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_default_white_foreground_projects_to_shared_default_fg() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(2, 1, &mut pool);
+        frame.buffer.set(0, 0, ftui::Cell::from_char('D'));
+        frame.buffer.set(1, 0, ftui::Cell::default());
+
+        let projected = render_frame_from_ftui_frame(&frame);
+
+        assert_eq!(projected.cell(0, 0).unwrap().fg, Rgba::DEFAULT_FG);
+        assert_eq!(projected.cell(0, 1).unwrap().fg, Rgba::DEFAULT_FG);
     }
 
     #[cfg(all(feature = "tui", feature = "ftui"))]
