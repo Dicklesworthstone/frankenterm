@@ -114,12 +114,13 @@ the ratatui and ftui TUI backends through a retained deterministic state
 fixture, and publishes its current non-claiming status at
 `ft robot perf slo-status --slo ssim_parity`, `ft doctor --json
 .renderer_slos.ssim_parity`, and `wa://perf/renderer-slo/ssim_parity`.
-The current degradation is `backend-driver-divergence`: the byte-level
-backend driver now reaches both renderers, but production evidence still
-requires a clean retained ratatui-vs-ftui release run. The retained driver
+The current degradation is `retained-release-run-pending`: the byte-level
+backend driver now reaches both renderers with matched deterministic Home/Panes
+state and reports clean frames, but production evidence still requires a clean
+retained ratatui-vs-ftui release run. The retained driver
 prints one per-case divergent-cell summary in `--nocapture` RCH logs, including
-glyph-vs-style and top/body/last-row buckets, so each release-gate run names the
-remaining backend layout/style gap, with
+glyph-vs-style and top/body/last-row buckets if a regression reappears, so each
+release-gate run names any backend layout/style gap, with
 `docs/attestations/tui/topology-parity.json` as the topology cross-check for
 near-pixel divergences. The release-gate script fails closed for this
 degraded state after substrate validation unless

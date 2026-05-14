@@ -594,7 +594,7 @@ mod backend_driver_parity_tests {
                 wezterm_circuit: CircuitBreakerStatus::default(),
                 pane_count: 2,
                 event_count: 1,
-                last_capture_ts: Some(1_700_000_000_000),
+                last_capture_ts: None,
             })
         }
 
@@ -832,8 +832,8 @@ mod backend_driver_parity_tests {
         }
 
         assert!(
-            !divergent_cases.is_empty(),
-            "SSIM parity status says backend-driver-divergence; update the SLO status if all driver cases become clean"
+            divergent_cases.is_empty(),
+            "backend-driver parity cases should be clean; remaining release status is retained-release-run-pending: {divergent_cases:?}"
         );
     }
 }

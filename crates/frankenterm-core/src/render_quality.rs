@@ -466,7 +466,7 @@ pub const RENDERER_INPUT_TO_PHOTON_STATUS: &str = "stage_telemetry_substrate_wir
 pub const RENDERER_SSIM_PARITY_STATUS: &str =
     "ssim_oracle_corpus_wired_pending_retained_release_run";
 /// Current degradation state for the SSIM parity SLO substrate.
-pub const RENDERER_SSIM_PARITY_CURRENT_DEGRADATION: &str = "backend-driver-divergence";
+pub const RENDERER_SSIM_PARITY_CURRENT_DEGRADATION: &str = "retained-release-run-pending";
 /// macOS p95 target from `docs/perf/resize-quality-slo.json`.
 pub const RENDERER_INPUT_TO_PHOTON_MACOS_P95_TARGET_US: u64 = MACOS_P95_TARGET_US;
 /// Wayland p95 target from `docs/perf/resize-quality-slo.json`.
@@ -570,11 +570,12 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
             degradation_states: vec![
                 "oracle-unavailable".to_string(),
                 "backend-driver-divergence".to_string(),
+                "retained-release-run-pending".to_string(),
                 "dimension_mismatch".to_string(),
                 "metric_threshold_exceeded".to_string(),
                 "topology_cross_check_required".to_string(),
             ],
-            pending_reason: "backend-driver oracle reaches ratatui and ftui with matched state and currently reports divergence; retained clean ratatui-vs-ftui release run remains pending"
+            pending_reason: "backend-driver oracle reaches ratatui and ftui with matched deterministic Home/Panes state and reports clean frames; retained release-run evidence remains pending"
                 .to_string(),
         },
     }
@@ -864,7 +865,7 @@ mod tests {
             report
                 .ssim_parity
                 .degradation_states
-                .contains(&"backend-driver-divergence".to_string())
+                .contains(&"retained-release-run-pending".to_string())
         );
     }
 

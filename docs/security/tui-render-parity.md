@@ -252,13 +252,13 @@ cargo test -p frankenterm-core --test tui_parity_oracle \
 | Item | Status |
 |---|---|
 | Harness exists, runs in CI | Partial: regression net is always-on; the retained backend driver now reaches real ratatui and ftui renderers and is invoked by the SSIM release gate |
-| Reports zero divergence on parity corpus | Partial: degenerate self-compare stays clean across 256 random frames per property; retained ratatui-vs-ftui driver evidence still reports `backend-driver-divergence` |
+| Reports zero divergence on parity corpus | Partial: degenerate self-compare stays clean across 256 random frames per property; retained ratatui-vs-ftui driver is clean for the deterministic Home/Panes cases, while the full retained release corpus remains pending |
 | Property-based parity using keymap | ✓ (32 KeymapAction kinds; full alphabet swept in proptest) |
 | ratatui as reference oracle | ✓ (documented as "always an ftui bug" semantics) |
 | vhs/asciinema corpus from real sessions | ⏳ sub-bead `ft-35yac.1.1` |
 | Headless GPU-renderer parity | ✓ `scripts/test-gpu-harness.sh` runs the headless GPU harness and emits `render-parity-gpu.json`; CI uploads the run directory from the macOS Metal gate and Linux llvmpipe pilot |
 | Per-release render-parity JSON | Partial: GPU visual adjunct is attested by `docs/attestations/tui/render-parity-gpu.json`; the full ratatui<->ftui byte-level report remains `ft-35yac.2` |
-| Backend driver wiring | Partial: retained driver reaches both real backends and reports current divergence; full clean script/corpus run remains pending |
+| Backend driver wiring | Partial: retained driver reaches both real backends and reports clean deterministic Home/Panes frames; full clean script/corpus run remains pending |
 
 ## Cross-references
 

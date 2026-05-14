@@ -183,7 +183,7 @@
       "id": "RQ-S13.ssim_parity_oracle_corpus",
       "title": "SSIM parity oracle corpus",
       "target": "SSIM ≥ 0.99, L∞ ≤ 8, changed-pixel fraction ≤ 0.001",
-      "scenario": "Retained GPU golden corpus self-compare plus adversarial floor audit now; ratatui oracle vs ftui subject retained driver emits per-case glyph/style/chrome divergence summaries pending a clean release run",
+      "scenario": "Retained GPU golden corpus self-compare plus adversarial floor audit now; ratatui oracle vs ftui subject retained driver reports clean deterministic Home/Panes frames pending a clean release run",
       "measurement": "Per-pixel SSIM, max L∞ channel delta, changed-pixel fraction, and G39 topology fixture cross-check via frankenterm_gui::gpu_regression::compare_images",
       "source_bench": "crates/frankenterm-gui/tests/ssim_parity.rs",
       "backend_driver_test": "crates/frankenterm-core/src/tui/mod.rs::backend_driver_harness_reaches_real_ratatui_and_ftui_renderers",
@@ -192,7 +192,7 @@
       "operator_surface": "ft robot perf slo-status --slo ssim_parity; ft doctor --json .renderer_slos.ssim_parity",
       "topology_cross_check": "docs/attestations/tui/topology-parity.json",
       "status": "substrate_wired",
-      "current_degradation": "backend-driver-divergence",
+      "current_degradation": "retained-release-run-pending",
       "blocked_by": ["ft-tf6g3.3.3"],
       "owner_bead": "ft-tf6g3.3.3"
     }

@@ -24,7 +24,7 @@ grep -q 'ft robot perf slo-status --slo ssim_parity' crates/frankenterm/src/main
 grep -q 'adversarial_large_patch_violates_default_floor' crates/frankenterm-gui/tests/ssim_parity.rs
 grep -q 'topology_cross_check_covers_terminal_conformance_expected_corpus' crates/frankenterm-gui/tests/ssim_parity.rs
 grep -q 'backend_driver_harness_reaches_real_ratatui_and_ftui_renderers' crates/frankenterm-core/src/tui/mod.rs
-grep -q 'backend-driver-divergence' crates/frankenterm-core/src/render_quality.rs
+grep -q 'retained-release-run-pending' crates/frankenterm-core/src/render_quality.rs
 
 jq -e '
   [.slos[] | select(.id == "RQ-S13.ssim_parity_oracle_corpus")]
@@ -36,7 +36,7 @@ jq -e '
   and (.[0].operator_surface | contains("ft doctor --json .renderer_slos.ssim_parity"))
   and .[0].topology_cross_check == "docs/attestations/tui/topology-parity.json"
   and .[0].status == "substrate_wired"
-  and .[0].current_degradation == "backend-driver-divergence"
+  and .[0].current_degradation == "retained-release-run-pending"
   and .[0].owner_bead == "ft-tf6g3.3.3"
 ' docs/perf/resize-quality-slo.json >/dev/null
 
