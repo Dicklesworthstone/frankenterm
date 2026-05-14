@@ -267,7 +267,7 @@ run_rust_cross_link_test() {
     fi
 
     if [[ -f "${CARGO_LOG}.rch_meta.json" ]] \
-        && jq -e '.timed_out == true or .failure_reason_code == "RCH-REMOTE-MIRROR-MISSING-FILE" or .failure_reason_code == "RCH-REMOTE-STALL" or .wrapper_exit_code == 124' "${CARGO_LOG}.rch_meta.json" >/dev/null 2>&1
+        && jq -e '.timed_out == true or .failure_reason_code == "RCH-REMOTE-MIRROR-MISSING-FILE" or .failure_reason_code == "RCH-REMOTE-STALL" or .failure_reason_code == "RCH-CARGO-DEP-INFO-MISSING" or .wrapper_exit_code == 124' "${CARGO_LOG}.rch_meta.json" >/dev/null 2>&1
     then
         RCH_SUBSTRATE_BLOCKED=true
         record_result "rust.readme_cross_links" "false" "rch_substrate_blocked" "readme_cross_link_rch_substrate_blocked" "${CARGO_LOG}" "RCH substrate blocked before a trustworthy README cross-link verdict."
