@@ -148,9 +148,12 @@ impl CheckpointWorld {
 
     /// Derive a checkpoint id from a content hash. Production
     /// uses BLAKE3 over the serialized session contents; the
-    /// model uses `content + 1` (so id 0 means "no checkpoint")
-    /// to keep the state space tiny while preserving
-    /// content-addressing semantics.
+    /// model uses `content + 1` (wrapping) to keep the state
+    /// space tiny while preserving content-addressing semantics:
+    /// the mapping is a bijection on `u8`, so each content has a
+    /// unique id and vice versa. "No checkpoint" is represented
+    /// by `Option<CheckpointId>::None` in [`SessionView`], not by
+    /// a sentinel id value.
     #[must_use]
     pub fn derive_checkpoint_id(content: ContentHash) -> CheckpointId {
         content.0.wrapping_add(1)
@@ -400,17 +403,20 @@ pub fn check_invariants(
 
     // NoUnauthorizedRollback: a rollback that succeeded MUST
     // have carried a token (token != ABSENT and != INVALID).
+    // The check applies to both real and dry-run rollbacks: a
+    // dry-run reporting RollbackSucceeded with an absent/invalid
+    // token misrepresents auth state (a dry-run should report
+    // "would be Denied", not "Succeeded") — a regression that
+    // emitted RollbackSucceeded under dry-run + no-token would
+    // be a real defect, so the defense covers it.
     if let (
         CheckpointAction::Rollback {
-            session_id,
-            token,
-            dry_run,
-            ..
+            session_id, token, ..
         },
         ActionOutcome::RollbackSucceeded { checkpoint_id },
     ) = (last_action, last_outcome)
     {
-        if (token == TOKEN_ABSENT || token == TOKEN_INVALID) && !dry_run {
+        if token == TOKEN_ABSENT || token == TOKEN_INVALID {
             out.push(CheckpointSafetyViolation::UnauthorizedRollback {
                 session_id,
                 checkpoint_id,

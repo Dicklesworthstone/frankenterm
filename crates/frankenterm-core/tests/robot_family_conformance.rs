@@ -688,6 +688,33 @@ fn state_machine_unauthorized_rollback_invariant_fires_when_violated() {
 }
 
 #[test]
+fn state_machine_unauthorized_rollback_invariant_fires_under_dry_run_too() {
+    // Even a dry-run rollback reporting RollbackSucceeded with
+    // no token is a contract violation — a dry-run should
+    // report "would be Denied" if auth fails. Strengthens the
+    // defense beyond the {non-dry-run + invalid token} case.
+    let mut w = CheckpointWorld::with_session(1, ContentHash(7));
+    apply_action(&mut w, CheckpointAction::Save { session_id: 1 });
+    let cp_id = CheckpointWorld::derive_checkpoint_id(ContentHash(7));
+
+    let prior = w.clone();
+    let bad_action = CheckpointAction::Rollback {
+        session_id: 1,
+        target: cp_id,
+        token: TOKEN_ABSENT,
+        dry_run: true,
+    };
+    let bad_outcome = ActionOutcome::RollbackSucceeded {
+        checkpoint_id: cp_id,
+    };
+    let v = check_invariants(&prior, &w, bad_action, bad_outcome);
+    assert!(
+        !v.is_empty(),
+        "UnauthorizedRollback must fire for dry-run + token-absent succeeding too",
+    );
+}
+
+#[test]
 fn state_machine_random_schedule_sweep_is_clean() {
     // Deterministic xorshift64* sweep over 256 schedules of
     // length 10 each. Asserts NO invariant fires across any
