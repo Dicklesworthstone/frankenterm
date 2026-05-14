@@ -194,7 +194,10 @@ proptest! {
             || (flags.contains(KittyKbdFlag::Disambiguate) && matches!(event.key, 8 | 9 | 13 | 27))
             || flags.contains(KittyKbdFlag::ReportAlternateKeys)
             || (flags.contains(KittyKbdFlag::ReportAssociatedText)
-                && event.associated_text.is_some());
+                && event
+                    .associated_text
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty()));
 
         if csi_forced {
             prop_assert!(encoded.starts_with(b"\x1b["));
@@ -229,5 +232,31 @@ proptest! {
         let expected = format!("\x1b[{key};{expected_payload}u").into_bytes();
 
         prop_assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn proptest_empty_associated_text_matches_absent_associated_text(
+        key in 0x20u32..=0x7eu32,
+        all_keys_as_escapes in any::<bool>(),
+    ) {
+        let mut flags = KittyKbdFlagSet::empty();
+        flags.set(KittyKbdFlag::ReportAssociatedText);
+        if all_keys_as_escapes {
+            flags.set(KittyKbdFlag::ReportAllKeysAsEscapes);
+        }
+
+        let absent = KeyEvent {
+            key,
+            modifiers: 0,
+            event_kind: KeyEventKind::Press,
+            alternate: None,
+            associated_text: None,
+        };
+        let empty = KeyEvent {
+            associated_text: Some(String::new()),
+            ..absent.clone()
+        };
+
+        prop_assert_eq!(encode_key_event(&empty, flags), encode_key_event(&absent, flags));
     }
 }

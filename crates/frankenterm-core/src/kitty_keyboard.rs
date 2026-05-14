@@ -334,10 +334,9 @@ impl KeyEventKind {
 /// - **Flag 8 (ReportAllKeysAsEscapes)**: all keys —
 ///   including printable codepoints — emit
 ///   `CSI <key> ; <event> u`.
-/// - **Flag 16 (ReportAssociatedText)**: the
-///   `associated_text` field is appended as an extra CSI
-///   parameter. (Production routes this through IME
-///   composition.)
+/// - **Flag 16 (ReportAssociatedText)**: non-empty
+///   `associated_text` is appended as an extra CSI parameter.
+///   (Production routes this through IME composition.)
 #[must_use]
 pub fn encode_key_event(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
     // Release events under no-flag mode produce no bytes
@@ -350,10 +349,17 @@ pub fn encode_key_event(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
     // Flag 8 (ReportAllKeysAsEscapes) routes everything
     // through the CSI form; Flag 1 (Disambiguate) routes
     // collapsing keys through the CSI form. Flag 16 only needs
-    // CSI when there is associated text to carry.
+    // CSI when there is non-empty associated text to carry:
+    // a `Some("")` composition is treated the same as `None`,
+    // since emitting a trailing `;u` parameter separator with
+    // no value is a malformed CSI sequence.
+    let has_associated_text = event
+        .associated_text
+        .as_ref()
+        .is_some_and(|t| !t.is_empty());
     let needs_csi_form = flags.contains(KittyKbdFlag::ReportAllKeysAsEscapes)
         || (flags.contains(KittyKbdFlag::Disambiguate) && is_collapsing_key(event.key))
-        || (flags.contains(KittyKbdFlag::ReportAssociatedText) && event.associated_text.is_some());
+        || (flags.contains(KittyKbdFlag::ReportAssociatedText) && has_associated_text);
 
     if !needs_csi_form && !flags.contains(KittyKbdFlag::ReportAlternateKeys) {
         return legacy_encoding(event);
@@ -408,10 +414,13 @@ fn csi_form_encoding(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
 
     if flags.contains(KittyKbdFlag::ReportAssociatedText) {
         if let Some(ref text) = event.associated_text {
-            out.push(';');
-            // Codepoints, semicolon-joined.
-            let codepoints: Vec<String> = text.chars().map(|c| (c as u32).to_string()).collect();
-            out.push_str(&codepoints.join(":"));
+            if !text.is_empty() {
+                out.push(';');
+                // Codepoints, colon-joined.
+                let codepoints: Vec<String> =
+                    text.chars().map(|c| (c as u32).to_string()).collect();
+                out.push_str(&codepoints.join(":"));
+            }
         }
     }
 
@@ -781,6 +790,36 @@ mod tests {
         ev.associated_text = Some("x".to_string());
         let bytes = encode_key_event(&ev, flags);
         assert_eq!(bytes, b"\x1b[97;120u");
+    }
+
+    #[test]
+    fn report_associated_empty_string_treated_like_none() {
+        // `Some("")` must NOT force CSI form (an empty
+        // composition is semantically equivalent to "no
+        // composition") and must not emit a trailing
+        // `;u` malformed parameter separator.
+        let mut flags = KittyKbdFlagSet::empty();
+        flags.set(KittyKbdFlag::ReportAssociatedText);
+        let mut ev = press(b'a' as u32);
+        ev.associated_text = Some(String::new());
+        let bytes = encode_key_event(&ev, flags);
+        // Falls back to legacy because the empty-string
+        // composition no longer triggers needs_csi_form.
+        assert_eq!(bytes, b"a");
+    }
+
+    #[test]
+    fn report_associated_empty_string_under_csi_form_omits_separator() {
+        // Even when ReportAllKeysAsEscapes already forces
+        // CSI form, an empty composition must not emit the
+        // trailing `;` separator.
+        let mut flags = KittyKbdFlagSet::empty();
+        flags.set(KittyKbdFlag::ReportAllKeysAsEscapes);
+        flags.set(KittyKbdFlag::ReportAssociatedText);
+        let mut ev = press(b'a' as u32);
+        ev.associated_text = Some(String::new());
+        let bytes = encode_key_event(&ev, flags);
+        assert_eq!(bytes, b"\x1b[97u");
     }
 
     #[test]
