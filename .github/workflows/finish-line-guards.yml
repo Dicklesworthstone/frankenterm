@@ -267,3 +267,35 @@ jobs:
           path: ${{ runner.temp }}/ft-e87u6-2-attestation-build-matrix/
           if-no-files-found: error
           retention-days: 30
+
+  ft-e87u6-convergence:
+    name: ft-e87u6.8 attestation convergence
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs:
+      - shell-guards
+      - cargo-guards
+      - e2e-composition
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: finish-line-guards-attestation-convergence
+
+      - name: Install jq + python3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3
+
+      - name: Run ft-e87u6.8 epic convergence E2E
+        run: bash tests/e2e/test_ft_e87u6_8_epic_convergence.sh
+
+      - name: Upload ft-e87u6.8 convergence artifact bundle
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ft-e87u6-8-epic-convergence
+          path: tests/e2e/artifacts/goal-line/ft-e87u6/convergence/
+          if-no-files-found: error
+          retention-days: 30
