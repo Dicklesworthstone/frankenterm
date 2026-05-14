@@ -189,7 +189,8 @@ The retained rollout-gated driver test now:
   `render_frame_from_ratatui_buffer` and
   `render_frame_from_ftui_frame`.
 - Calls `compute_diff(ratatui_frame, ftui_frame)` and asserts
-  any divergence emits an actionable insta-style summary.
+  any divergence emits an actionable insta-style summary plus
+  glyph-vs-style and top/body/last-row buckets.
 
 This changes the honest blocker from "oracle unavailable" to
 "backend-driver divergence." The remaining integration work is

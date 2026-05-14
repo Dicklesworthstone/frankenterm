@@ -117,8 +117,9 @@ fixture, and publishes its current non-claiming status at
 The current degradation is `backend-driver-divergence`: the byte-level
 backend driver now reaches both renderers, but production evidence still
 requires a clean retained ratatui-vs-ftui release run. The retained driver
-prints one per-case divergent-cell summary in `--nocapture` RCH logs so each
-release-gate run names the remaining backend layout/style gap, with
+prints one per-case divergent-cell summary in `--nocapture` RCH logs, including
+glyph-vs-style and top/body/last-row buckets, so each release-gate run names the
+remaining backend layout/style gap, with
 `docs/attestations/tui/topology-parity.json` as the topology cross-check for
 near-pixel divergences. The release-gate script fails closed for this
 degraded state after substrate validation unless

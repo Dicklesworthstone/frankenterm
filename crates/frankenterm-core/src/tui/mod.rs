@@ -513,7 +513,7 @@ mod backend_driver_parity_tests {
         EventFilters, EventView, HealthStatus, PaneView, QueryClient, QueryError, SearchResultView,
         TriageAction, TriageItemView, WorkflowProgressView,
     };
-    use crate::tui_parity_oracle::{RenderFrame, compute_diff};
+    use crate::tui_parity_oracle::{CellDiff, FrameDiff, RenderFrame, compute_diff};
 
     #[derive(Clone, Copy)]
     struct DriverQuery;
@@ -636,17 +636,78 @@ mod backend_driver_parity_tests {
         right_dim: (u16, u16),
         dimension_mismatch: bool,
         divergent_cells: usize,
+        breakdown: DivergenceBreakdown,
         summary: String,
     }
 
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct DivergenceBreakdown {
+        glyph_cells: usize,
+        style_cells: usize,
+        style_only_cells: usize,
+        blank_style_only_cells: usize,
+        top_chrome_cells: usize,
+        body_cells: usize,
+        last_row_cells: usize,
+    }
+
+    impl DivergenceBreakdown {
+        fn from_diff(diff: &FrameDiff) -> Self {
+            let mut breakdown = Self::default();
+            let last_row = diff.left_dim.1.saturating_sub(1);
+
+            for cell in &diff.cells {
+                if cell.row <= 1 {
+                    breakdown.top_chrome_cells += 1;
+                } else if cell.row == last_row {
+                    breakdown.last_row_cells += 1;
+                } else {
+                    breakdown.body_cells += 1;
+                }
+
+                let glyph_changed = cell.left.ch != cell.right.ch;
+                let style_changed = style_changed(cell);
+
+                if glyph_changed {
+                    breakdown.glyph_cells += 1;
+                }
+                if style_changed {
+                    breakdown.style_cells += 1;
+                }
+                if !glyph_changed && style_changed {
+                    breakdown.style_only_cells += 1;
+                    if cell.left.ch == ' ' && cell.right.ch == ' ' {
+                        breakdown.blank_style_only_cells += 1;
+                    }
+                }
+            }
+
+            breakdown
+        }
+
+        fn region_total(self) -> usize {
+            self.top_chrome_cells + self.body_cells + self.last_row_cells
+        }
+    }
+
+    fn style_changed(cell: &CellDiff) -> bool {
+        cell.left.fg != cell.right.fg
+            || cell.left.bg != cell.right.bg
+            || cell.left.bold != cell.right.bold
+            || cell.left.italic != cell.right.italic
+            || cell.left.underline != cell.right.underline
+            || cell.left.reverse != cell.right.reverse
+    }
+
     impl DriverCaseReport {
-        fn from_diff(name: &'static str, diff: &crate::tui_parity_oracle::FrameDiff) -> Self {
+        fn from_diff(name: &'static str, diff: &FrameDiff) -> Self {
             Self {
                 name,
                 left_dim: diff.left_dim,
                 right_dim: diff.right_dim,
                 dimension_mismatch: diff.dimension_mismatch,
                 divergent_cells: diff.divergent_cell_count(),
+                breakdown: DivergenceBreakdown::from_diff(diff),
                 summary: diff.render_summary(8),
             }
         }
@@ -655,13 +716,22 @@ mod backend_driver_parity_tests {
             eprintln!(
                 "ssim backend-driver case={name} degradation={degradation} \
                  left_dim={left:?} right_dim={right:?} dimension_mismatch={mismatch} \
-                 divergent_cells={cells}",
+                 divergent_cells={cells} glyph_cells={glyph} style_cells={style} \
+                 style_only_cells={style_only} blank_style_only_cells={blank_style_only} \
+                 top_chrome_cells={top_chrome} body_cells={body} last_row_cells={last_row}",
                 name = self.name,
                 degradation = crate::render_quality::RENDERER_SSIM_PARITY_CURRENT_DEGRADATION,
                 left = self.left_dim,
                 right = self.right_dim,
                 mismatch = self.dimension_mismatch,
-                cells = self.divergent_cells
+                cells = self.divergent_cells,
+                glyph = self.breakdown.glyph_cells,
+                style = self.breakdown.style_cells,
+                style_only = self.breakdown.style_only_cells,
+                blank_style_only = self.breakdown.blank_style_only_cells,
+                top_chrome = self.breakdown.top_chrome_cells,
+                body = self.breakdown.body_cells,
+                last_row = self.breakdown.last_row_cells
             );
             eprintln!(
                 "ssim backend-driver summary {}:\n{}",
@@ -739,6 +809,12 @@ mod backend_driver_parity_tests {
             let diff = compute_diff(&ratatui_frame, &ftui_frame);
             let report = DriverCaseReport::from_diff(case.name, &diff);
             report.log();
+            assert_eq!(
+                report.breakdown.region_total(),
+                report.divergent_cells,
+                "{} divergence region counts should cover every divergent cell",
+                case.name
+            );
             assert!(
                 !diff.dimension_mismatch,
                 "{} frame dimensions should match",
