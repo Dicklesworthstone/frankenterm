@@ -148,9 +148,12 @@ impl CapabilityProbe for ToolAvailabilityProbe {
 }
 
 /// Pure-function probe: checks whether `actual_cwd` is `declared_scope`
-/// or a descendant. Strict prefix-of-canonical-path semantics — does
-/// NOT follow symlinks (intentional: a sym-pointed-elsewhere cwd
-/// should NOT count as "inside" the declared scope).
+/// or a descendant. Both paths MUST be absolute and are normalized
+/// logically (without filesystem access) — `.` is collapsed and `..`
+/// is resolved against the in-memory component stack. Symlinks are
+/// NOT followed (intentional: a sym-pointed-elsewhere cwd should NOT
+/// count as "inside" the declared scope), and relative paths
+/// fail-closed (the probe returns `Failed`).
 #[derive(Debug, Clone)]
 pub struct FilesystemScopeProbe {
     declared_scope: PathBuf,
@@ -190,18 +193,54 @@ impl CapabilityProbe for FilesystemScopeProbe {
     }
 }
 
-/// Strict path-prefix check: `child` is the same as `parent` or a
-/// descendant. Component-wise comparison so `/foo/bar` is NOT inside
-/// `/foo/ba` (string-prefix would say yes; we say no).
+/// Strict path-prefix check on logically-normalized absolute paths.
+///
+/// Returns `true` iff `child` is the same path as `parent` or a
+/// descendant of it, with `.` collapsed and `..` resolved against an
+/// in-memory component stack. Symlinks are NOT followed. Both inputs
+/// MUST be absolute; relative paths and paths whose `..` underflow the
+/// root return `false` (fail-closed).
+///
+/// Without normalization, an attacker-controlled cwd like
+/// `/foo/bar/../baz` would falsely match parent `/foo/bar` under naive
+/// component-prefix comparison, escaping the declared scope.
 fn path_is_within(child: &Path, parent: &Path) -> bool {
-    let mut child_iter = child.components();
-    for parent_component in parent.components() {
-        match child_iter.next() {
-            Some(c) if c == parent_component => {}
-            _ => return false,
+    let Some(child_parts) = normalize_absolute_path(child) else {
+        return false;
+    };
+    let Some(parent_parts) = normalize_absolute_path(parent) else {
+        return false;
+    };
+    if parent_parts.len() > child_parts.len() {
+        return false;
+    }
+    child_parts
+        .iter()
+        .zip(parent_parts.iter())
+        .all(|(c, p)| c == p)
+}
+
+/// Logically normalize `path` to an absolute component sequence.
+///
+/// Returns `None` if `path` is not absolute, contains a Windows-style
+/// `Prefix` component (unsupported here — capability scope is Unix
+/// paths today), or its `..` components underflow past the root.
+fn normalize_absolute_path(path: &Path) -> Option<Vec<std::ffi::OsString>> {
+    use std::path::Component;
+    let mut saw_root = false;
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => saw_root = true,
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::Prefix(_) => return None,
         }
     }
-    true
+    if saw_root { Some(parts) } else { None }
 }
 
 /// Promotes Declared / Unknown entries to Verified by running each
@@ -444,6 +483,61 @@ mod tests {
     fn fs_scope_probe_class_carries_declared_scope_string() {
         let probe = FilesystemScopeProbe::new("/srv/scope", "/srv/scope/sub");
         assert_eq!(probe.class(), Cap::FilesystemScope("/srv/scope".into()));
+    }
+
+    #[test]
+    fn fs_scope_probe_rejects_parent_dir_escape() {
+        // /foo/bar/../baz logically resolves to /foo/baz, which is
+        // NOT inside /foo/bar. Without normalization, naive
+        // component-prefix matching would let this through and fail
+        // OPEN — the fail-closed contract says no.
+        let probe = FilesystemScopeProbe::new("/foo/bar", "/foo/bar/../baz");
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn fs_scope_probe_accepts_self_canceling_parent_dir() {
+        // /foo/bar/sub/../leaf logically resolves to /foo/bar/leaf,
+        // which IS inside /foo/bar. Normalization should accept this.
+        let probe = FilesystemScopeProbe::new("/foo/bar", "/foo/bar/sub/../leaf");
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn fs_scope_probe_rejects_relative_cwd() {
+        // Relative actual_cwd cannot be reasoned about — fail-closed.
+        let probe = FilesystemScopeProbe::new("/foo/bar", "foo/bar");
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn fs_scope_probe_rejects_root_parent_dir_underflow() {
+        // `..` past the root has no logical meaning — fail-closed.
+        let probe = FilesystemScopeProbe::new("/foo", "/..");
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn fs_scope_probe_accepts_current_dir_component() {
+        // `.` is collapsed during normalization, so /foo/./bar
+        // matches /foo/bar.
+        let probe = FilesystemScopeProbe::new("/foo/bar", "/foo/./bar");
+        assert!(matches!(
+            probe.probe(deadline_in(100)),
+            ProbeOutcome::Verified(_)
+        ));
     }
 
     // ── ProbeRunner promotion semantics ──────────────────────────────────
