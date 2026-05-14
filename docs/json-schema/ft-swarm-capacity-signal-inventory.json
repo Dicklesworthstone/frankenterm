@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-swarm-capacity-signal-inventory.json",
+  "title": "FrankenTerm Swarm Capacity Signal Inventory",
+  "description": "Versioned contract for high-core swarm capacity planner signal inventory, source mapping, privacy posture, and telemetry-gap behavior.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "generated_at_ms",
+    "source",
+    "raw_pane_content_stored",
+    "evidence_vocab",
+    "signals",
+    "gap_map",
+    "non_overlap",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.swarm_capacity_signal_inventory.v1"
+    },
+    "bead_id": {
+      "type": "string",
+      "const": "ft-b94bx.1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "raw_pane_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "evidence_vocab": {
+      "type": "array",
+      "minItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/evidence_state"
+      }
+    },
+    "signals": {
+      "type": "array",
+      "minItems": 12,
+      "items": {
+        "$ref": "#/$defs/signal"
+      }
+    },
+    "gap_map": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "$ref": "#/$defs/gap"
+      }
+    },
+    "non_overlap": {
+      "$ref": "#/$defs/non_overlap"
+    },
+    "artifact_paths": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "$ref": "#/$defs/repo_path"
+      }
+    }
+  },
+  "$defs": {
+    "evidence_state": {
+      "type": "string",
+      "enum": [
+        "measured",
+        "inferred",
+        "simulated",
+        "stale",
+        "unavailable",
+        "mixed"
+      ]
+    },
+    "domain": {
+      "type": "string",
+      "enum": [
+        "attestation",
+        "blocker_radar",
+        "build",
+        "capture",
+        "child_process",
+        "context",
+        "fleet_memory",
+        "herd_wave",
+        "host",
+        "mux_render",
+        "process",
+        "storage",
+        "workload"
+      ]
+    },
+    "privacy_posture": {
+      "type": "string",
+      "enum": [
+        "aggregate_only",
+        "bounded_identifier",
+        "no_raw_content",
+        "redacted_artifact_path",
+        "safe_counter",
+        "sensitive_unavailable"
+      ]
+    },
+    "telemetry_gap_behavior": {
+      "type": "string",
+      "enum": [
+        "defer_target_class_claim",
+        "emit_stale",
+        "emit_unavailable",
+        "fail_closed",
+        "lower_bound_only",
+        "not_a_gap"
+      ]
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "artifact",
+        "cli",
+        "doc",
+        "external_tool",
+        "rust",
+        "schema",
+        "script"
+      ]
+    },
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+"
+    },
+    "source_ref": {
+      "type": "object",
+      "required": [
+        "path",
+        "source_kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repo_path"
+        },
+        "source_kind": {
+          "$ref": "#/$defs/source_kind"
+        },
+        "symbol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contract": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "signal": {
+      "type": "object",
+      "required": [
+        "signal_id",
+        "domain",
+        "capacity_question",
+        "source_refs",
+        "current_evidence_state",
+        "privacy_posture",
+        "telemetry_gap_behavior",
+        "reason_codes",
+        "downstream_consumers"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "signal_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+        },
+        "domain": {
+          "$ref": "#/$defs/domain"
+        },
+        "capacity_question": {
+          "type": "string",
+          "minLength": 8
+        },
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/source_ref"
+          }
+        },
+        "current_evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "privacy_posture": {
+          "$ref": "#/$defs/privacy_posture"
+        },
+        "telemetry_gap_behavior": {
+          "$ref": "#/$defs/telemetry_gap_behavior"
+        },
+        "reason_codes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 3
+          }
+        },
+        "downstream_consumers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^ft-[a-z0-9]+(\\.[0-9]+)?$"
+          }
+        }
+      }
+    },
+    "gap": {
+      "type": "object",
+      "required": [
+        "gap_id",
+        "required_for",
+        "current_state",
+        "missing_sources",
+        "fail_closed_behavior",
+        "planned_consumer_beads"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "gap_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "required_for": {
+          "type": "string",
+          "minLength": 1
+        },
+        "current_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "missing_sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "fail_closed_behavior": {
+          "type": "string",
+          "minLength": 1
+        },
+        "planned_consumer_beads": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^ft-[a-z0-9]+(\\.[0-9]+)?$"
+          }
+        }
+      }
+    },
+    "non_overlap": {
+      "type": "object",
+      "required": [
+        "external_bead",
+        "owned_by_this_contract",
+        "owned_by_external_bead",
+        "handoff_rule"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "external_bead": {
+          "type": "string",
+          "const": "ft-tf6g3.46"
+        },
+        "owned_by_this_contract": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "owned_by_external_bead": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "handoff_rule": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

@@ -236,6 +236,7 @@ fn schema_files_have_id() {
         let expected_domain = if name == "ft-config.json"
             || name == "ft-pattern-pack.json"
             || name == "ft-resource-pressure-cockpit.json"
+            || name == "ft-swarm-capacity-signal-inventory.json"
         {
             "frankenterm.dev"
         } else {
@@ -961,7 +962,8 @@ fn registry_covers_all_disk_schemas() {
     let registry = SchemaRegistry::canonical();
     // Exclude non-endpoint schemas: the envelopes are response wrappers,
     // ft-config documents ft.toml, ft-pattern-pack documents extension files,
-    // and the resource cockpit is nested under doctor/robot capacity output.
+    // and the capacity contract files are nested operator artifacts rather
+    // than standalone robot endpoints.
     let disk_names: Vec<String> = schemas
         .iter()
         .map(|(name, _)| name.clone())
@@ -971,6 +973,7 @@ fn registry_covers_all_disk_schemas() {
                 && name != "ft-config.json"
                 && name != "ft-pattern-pack.json"
                 && name != "ft-resource-pressure-cockpit.json"
+                && name != "ft-swarm-capacity-signal-inventory.json"
         })
         .collect();
 

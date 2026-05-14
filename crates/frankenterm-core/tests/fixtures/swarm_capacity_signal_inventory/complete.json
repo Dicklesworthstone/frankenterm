@@ -1,0 +1,538 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.swarm_capacity_signal_inventory.v1",
+  "bead_id": "ft-b94bx.1",
+  "generated_at_ms": 1778788800000,
+  "source": "docs/swarm-capacity-signal-inventory.md",
+  "raw_pane_content_stored": false,
+  "evidence_vocab": [
+    "measured",
+    "inferred",
+    "simulated",
+    "stale",
+    "unavailable",
+    "mixed"
+  ],
+  "signals": [
+    {
+      "signal_id": "host.logical_cpu_count",
+      "domain": "host",
+      "capacity_question": "How many logical cores can admission divide across?",
+      "source_refs": [
+        {
+          "path": "docs/perf/swarm-capacity-baseline.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "simulated",
+      "privacy_posture": "safe_counter",
+      "telemetry_gap_behavior": "lower_bound_only",
+      "reason_codes": [
+        "capacity.host.cpu_count.synthetic"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.5"
+      ]
+    },
+    {
+      "signal_id": "host.cpu_saturation",
+      "domain": "host",
+      "capacity_question": "Is the operator host CPU saturated before adding panes or builds?",
+      "source_refs": [
+        {
+          "path": "docs/perf/swarm-capacity-baseline.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "unavailable",
+      "privacy_posture": "safe_counter",
+      "telemetry_gap_behavior": "emit_unavailable",
+      "reason_codes": [
+        "capacity.host.cpu_saturation.unavailable"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "signal_id": "host.memory_total_bytes",
+      "domain": "host",
+      "capacity_question": "Is the host in a high-memory target class such as 256 GiB?",
+      "source_refs": [
+        {
+          "path": "docs/perf/swarm-capacity-baseline.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "simulated",
+      "privacy_posture": "safe_counter",
+      "telemetry_gap_behavior": "lower_bound_only",
+      "reason_codes": [
+        "capacity.host.memory.synthetic"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.5"
+      ]
+    },
+    {
+      "signal_id": "process.rss_residency_buckets",
+      "domain": "process",
+      "capacity_question": "Which residency buckets are pressuring the process?",
+      "source_refs": [
+        {
+          "path": "crates/frankenterm-core/src/memory_pressure.rs",
+          "source_kind": "rust",
+          "symbol": "MacosResidencyBucket"
+        }
+      ],
+      "current_evidence_state": "measured",
+      "privacy_posture": "aggregate_only",
+      "telemetry_gap_behavior": "emit_unavailable",
+      "reason_codes": [
+        "capacity.process.residency_bucket"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "signal_id": "fleet.memory_tiers",
+      "domain": "fleet_memory",
+      "capacity_question": "Which fleet memory tier is the limiting resource?",
+      "source_refs": [
+        {
+          "path": "crates/frankenterm-core/src/fleet_memory_controller.rs",
+          "source_kind": "rust",
+          "symbol": "FleetMemoryTier"
+        }
+      ],
+      "current_evidence_state": "measured",
+      "privacy_posture": "aggregate_only",
+      "telemetry_gap_behavior": "fail_closed",
+      "reason_codes": [
+        "capacity.fleet.memory_tier"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.6"
+      ]
+    },
+    {
+      "signal_id": "capture.scheduler_budget",
+      "domain": "capture",
+      "capacity_question": "Is capture work respecting global and per-pane budgets?",
+      "source_refs": [
+        {
+          "path": "crates/frankenterm-core/src/tailer.rs",
+          "source_kind": "rust",
+          "symbol": "CaptureScheduler"
+        },
+        {
+          "path": "docs/capture-fairness-slo-contract.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "measured",
+      "privacy_posture": "bounded_identifier",
+      "telemetry_gap_behavior": "emit_stale",
+      "reason_codes": [
+        "capacity.capture.scheduler_budget"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.6"
+      ]
+    },
+    {
+      "signal_id": "capture.skipped_poll_reasons",
+      "domain": "capture",
+      "capacity_question": "Why did a pane miss capture service?",
+      "source_refs": [
+        {
+          "path": "docs/capture-fairness-slo-contract.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "mixed",
+      "privacy_posture": "bounded_identifier",
+      "telemetry_gap_behavior": "emit_unavailable",
+      "reason_codes": [
+        "capacity.capture.skip_reason_vocab"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.7",
+        "ft-b94bx.10"
+      ]
+    },
+    {
+      "signal_id": "context.horizon_risk",
+      "domain": "context",
+      "capacity_question": "Which panes are context-saturated or near rotation thresholds?",
+      "source_refs": [
+        {
+          "path": "crates/frankenterm-core/src/context_horizon.rs",
+          "source_kind": "rust"
+        },
+        {
+          "path": "docs/context-horizon-contract.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "measured",
+      "privacy_posture": "no_raw_content",
+      "telemetry_gap_behavior": "fail_closed",
+      "reason_codes": [
+        "capacity.context.horizon_risk"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.2",
+        "ft-b94bx.6"
+      ]
+    },
+    {
+      "signal_id": "herd.wave_pressure",
+      "domain": "herd_wave",
+      "capacity_question": "Is synchronized swarm activity creating burst pressure?",
+      "source_refs": [
+        {
+          "path": "crates/frankenterm-core/src/swarm_scheduler.rs",
+          "source_kind": "rust",
+          "symbol": "HerdWaveSignal"
+        },
+        {
+          "path": "docs/herd-wave-contract.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "measured",
+      "privacy_posture": "bounded_identifier",
+      "telemetry_gap_behavior": "fail_closed",
+      "reason_codes": [
+        "capacity.herd.wave_pressure"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.2",
+        "ft-b94bx.6"
+      ]
+    },
+    {
+      "signal_id": "blocker.claimability",
+      "domain": "blocker_radar",
+      "capacity_question": "Are apparent ready beads actually claimable and non-overlapping?",
+      "source_refs": [
+        {
+          "path": "crates/frankenterm-core/src/blocker_radar.rs",
+          "source_kind": "rust"
+        },
+        {
+          "path": "scripts/swarm-tick.sh",
+          "source_kind": "script"
+        },
+        {
+          "path": "docs/blocker-radar-contract.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "inferred",
+      "privacy_posture": "bounded_identifier",
+      "telemetry_gap_behavior": "emit_stale",
+      "reason_codes": [
+        "capacity.blocker.claimability"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.2",
+        "ft-b94bx.9"
+      ]
+    },
+    {
+      "signal_id": "storage.io_pressure",
+      "domain": "storage",
+      "capacity_question": "Is storage I/O the limiting resource for capture or search?",
+      "source_refs": [
+        {
+          "path": "crates/frankenterm-core/src/storage/io_scheduler.rs",
+          "source_kind": "rust",
+          "symbol": "StorageIoOperatorSummary"
+        }
+      ],
+      "current_evidence_state": "measured",
+      "privacy_posture": "aggregate_only",
+      "telemetry_gap_behavior": "fail_closed",
+      "reason_codes": [
+        "capacity.storage.io_pressure"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "signal_id": "sqlite.persistence_pressure",
+      "domain": "storage",
+      "capacity_question": "Are SQLite page-cache, write-lag, or search-index paths reducing safe fanout?",
+      "source_refs": [
+        {
+          "path": "docs/resource-pressure-cockpit-contract.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "mixed",
+      "privacy_posture": "aggregate_only",
+      "telemetry_gap_behavior": "emit_unavailable",
+      "reason_codes": [
+        "capacity.sqlite.persistence_pressure.mixed"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "signal_id": "build.rch_worker_pool",
+      "domain": "build",
+      "capacity_question": "Can heavy proof and build work be offloaded without local fallback?",
+      "source_refs": [
+        {
+          "path": "tests/e2e/lib_rch_guards.sh",
+          "source_kind": "script",
+          "symbol": "run_rch_cargo_logged"
+        }
+      ],
+      "current_evidence_state": "measured",
+      "privacy_posture": "redacted_artifact_path",
+      "telemetry_gap_behavior": "fail_closed",
+      "reason_codes": [
+        "capacity.build.rch_worker_pool"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.5",
+        "ft-b94bx.10"
+      ]
+    },
+    {
+      "signal_id": "build.local_slot_pressure",
+      "domain": "build",
+      "capacity_question": "Are local build slots or compiler jobs competing with pane capacity?",
+      "source_refs": [
+        {
+          "path": "scripts/validate_asupersync_rch_execution_policy.sh",
+          "source_kind": "script"
+        }
+      ],
+      "current_evidence_state": "unavailable",
+      "privacy_posture": "safe_counter",
+      "telemetry_gap_behavior": "emit_unavailable",
+      "reason_codes": [
+        "capacity.build.local_slot_pressure.unavailable"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "signal_id": "mux.render_pressure",
+      "domain": "mux_render",
+      "capacity_question": "Is mux or render work saturating before the capture or storage layers do?",
+      "source_refs": [
+        {
+          "path": "docs/resource-pressure-cockpit-contract.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "unavailable",
+      "privacy_posture": "aggregate_only",
+      "telemetry_gap_behavior": "emit_unavailable",
+      "reason_codes": [
+        "capacity.mux_render.pressure.unavailable"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "signal_id": "child_process.pressure",
+      "domain": "child_process",
+      "capacity_question": "Are child processes consuming RSS or CPU outside the parent process budget?",
+      "source_refs": [
+        {
+          "path": "docs/resource-pressure-cockpit-contract.md",
+          "source_kind": "doc"
+        }
+      ],
+      "current_evidence_state": "mixed",
+      "privacy_posture": "aggregate_only",
+      "telemetry_gap_behavior": "lower_bound_only",
+      "reason_codes": [
+        "capacity.child_process.pressure.mixed"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "signal_id": "attestation.capacity_artifacts",
+      "domain": "attestation",
+      "capacity_question": "Are high-scale claims tied to retained artifacts?",
+      "source_refs": [
+        {
+          "path": "docs/attestations/manifest.json",
+          "source_kind": "artifact"
+        },
+        {
+          "path": "docs/attestations/proofs/resource-cockpit-target-class.json",
+          "source_kind": "artifact"
+        }
+      ],
+      "current_evidence_state": "measured",
+      "privacy_posture": "redacted_artifact_path",
+      "telemetry_gap_behavior": "defer_target_class_claim",
+      "reason_codes": [
+        "capacity.attestation.artifacts"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.5",
+        "ft-b94bx.8",
+        "ft-b94bx.10"
+      ]
+    },
+    {
+      "signal_id": "workload.classification",
+      "domain": "workload",
+      "capacity_question": "Which panes are coding, reviewing, building, blocked, idle, rate-limited, context-saturated, or TUI-heavy?",
+      "source_refs": [
+        {
+          "path": "crates/frankenterm-core/src/runtime_telemetry.rs",
+          "source_kind": "rust",
+          "symbol": "SwarmCapacityWorkClass"
+        }
+      ],
+      "current_evidence_state": "simulated",
+      "privacy_posture": "bounded_identifier",
+      "telemetry_gap_behavior": "lower_bound_only",
+      "reason_codes": [
+        "capacity.workload.classification.synthetic"
+      ],
+      "downstream_consumers": [
+        "ft-b94bx.2",
+        "ft-b94bx.4"
+      ]
+    }
+  ],
+  "gap_map": [
+    {
+      "gap_id": "cpu_core_saturation",
+      "required_for": "Core-aware budget rows and 64+ CPU claims.",
+      "current_state": "unavailable",
+      "missing_sources": [
+        "host load",
+        "per-core utilization",
+        "pane and build attribution"
+      ],
+      "fail_closed_behavior": "Report unavailable and refuse target-class safety claims.",
+      "planned_consumer_beads": [
+        "ft-b94bx.3",
+        "ft-b94bx.5"
+      ]
+    },
+    {
+      "gap_id": "per_agent_workload_class",
+      "required_for": "Workload-class admission and stagger decisions.",
+      "current_state": "simulated",
+      "missing_sources": [
+        "per-pane class snapshot",
+        "classifier freshness"
+      ],
+      "fail_closed_behavior": "Use lower-bound assumptions and never upgrade stale evidence.",
+      "planned_consumer_beads": [
+        "ft-b94bx.2",
+        "ft-b94bx.4"
+      ]
+    },
+    {
+      "gap_id": "build_pressure",
+      "required_for": "Capacity planning while tests or builds run.",
+      "current_state": "mixed",
+      "missing_sources": [
+        "local compiler job inventory",
+        "remote queue depth"
+      ],
+      "fail_closed_behavior": "Refuse local-heavy proof and emit unavailable for local slots.",
+      "planned_consumer_beads": [
+        "ft-b94bx.3",
+        "ft-b94bx.5"
+      ]
+    },
+    {
+      "gap_id": "mux_render_pressure",
+      "required_for": "GUI and mux saturation detection before capture falls behind.",
+      "current_state": "unavailable",
+      "missing_sources": [
+        "frame latency",
+        "mux event-loop lag",
+        "graphics or media pressure"
+      ],
+      "fail_closed_behavior": "Lower confidence and never treat capture health as render health.",
+      "planned_consumer_beads": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "gap_id": "disk_sqlite_pressure",
+      "required_for": "Storage-aware pane fanout and persistence safety.",
+      "current_state": "mixed",
+      "missing_sources": [
+        "SQLite page-cache pressure",
+        "write-ahead log growth",
+        "search index lag"
+      ],
+      "fail_closed_behavior": "Emit mixed or unavailable and fail closed on write errors.",
+      "planned_consumer_beads": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    },
+    {
+      "gap_id": "child_process_pressure",
+      "required_for": "Correct host-level budget for agent subprocesses.",
+      "current_state": "mixed",
+      "missing_sources": [
+        "child-process CPU",
+        "per-agent descendant ownership",
+        "stale-process lifetime"
+      ],
+      "fail_closed_behavior": "Use lower-bound RSS only and refuse exact headroom claims.",
+      "planned_consumer_beads": [
+        "ft-b94bx.3",
+        "ft-b94bx.7"
+      ]
+    }
+  ],
+  "non_overlap": {
+    "external_bead": "ft-tf6g3.46",
+    "owned_by_this_contract": [
+      "capacity signal inventory",
+      "source-path map",
+      "privacy posture",
+      "telemetry-gap behavior"
+    ],
+    "owned_by_external_bead": [
+      "cross-family invariant pass/fail evidence",
+      "invariant matrix completeness",
+      "cross-family proof acceptance"
+    ],
+    "handoff_rule": "Capacity rows may cite ft-tf6g3.46 invariant evidence as an input, but must not duplicate the invariant matrix acceptance criteria."
+  },
+  "artifact_paths": [
+    "docs/swarm-capacity-signal-inventory.md",
+    "docs/json-schema/ft-swarm-capacity-signal-inventory.json",
+    "crates/frankenterm-core/tests/fixtures/swarm_capacity_signal_inventory/complete.json"
+  ]
+}
