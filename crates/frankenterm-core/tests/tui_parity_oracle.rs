@@ -229,6 +229,174 @@ fn every_synthesized_script_is_well_formed() {
     }
 }
 
+#[cfg(feature = "tui")]
+#[test]
+fn ratatui_buffer_normalizes_cells_and_styles() {
+    use frankenterm_core::tui_parity_oracle::render_frame_from_ratatui_buffer;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Modifier};
+
+    let mut buffer = Buffer::empty(Rect::new(10, 20, 2, 1));
+    let cell = buffer.cell_mut((10, 20)).expect("first ratatui cell");
+    cell.set_symbol("A");
+    cell.fg = Color::Rgb(1, 2, 3);
+    cell.bg = Color::Indexed(160);
+    cell.modifier = Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED | Modifier::REVERSED;
+
+    let frame = render_frame_from_ratatui_buffer(&buffer);
+
+    assert_eq!(frame.width, 2);
+    assert_eq!(frame.height, 1);
+    let normalized = frame.cell(0, 0).expect("normalized first cell");
+    assert_eq!(normalized.ch, 'A');
+    assert_eq!(
+        normalized.fg,
+        Rgba {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 255,
+        }
+    );
+    assert_eq!(
+        normalized.bg,
+        Rgba {
+            r: 215,
+            g: 0,
+            b: 0,
+            a: 255,
+        }
+    );
+    assert!(normalized.bold);
+    assert!(normalized.italic);
+    assert!(normalized.underline);
+    assert!(normalized.reverse);
+    assert!(!normalized.continuation);
+}
+
+#[cfg(feature = "ftui")]
+#[test]
+fn ftui_buffer_normalizes_cells_styles_and_graphemes() {
+    use frankenterm_core::tui_parity_oracle::render_frame_from_ftui_buffer;
+    use ftui::render::cell::{CellContent, StyleFlags};
+    use ftui::{Buffer, Cell, CellAttrs, GraphemePool, PackedRgba};
+
+    let mut pool = GraphemePool::new();
+    let grapheme_id = pool.intern("é", 1);
+    let mut buffer = Buffer::new(3, 1);
+    buffer.set_raw(
+        0,
+        0,
+        Cell::new(CellContent::from_grapheme(grapheme_id))
+            .with_fg(PackedRgba::rgb(1, 2, 3))
+            .with_bg(PackedRgba::rgb(4, 5, 6))
+            .with_attrs(CellAttrs::new(
+                StyleFlags::BOLD | StyleFlags::ITALIC | StyleFlags::UNDERLINE | StyleFlags::REVERSE,
+                0,
+            )),
+    );
+    buffer.set_raw(1, 0, Cell::CONTINUATION);
+
+    let frame = render_frame_from_ftui_buffer(&buffer, &pool);
+
+    assert_eq!(frame.width, 3);
+    assert_eq!(frame.height, 1);
+    let normalized = frame.cell(0, 0).expect("normalized ftui cell");
+    assert_eq!(normalized.ch, 'é');
+    assert_eq!(
+        normalized.fg,
+        Rgba {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 255,
+        }
+    );
+    assert_eq!(
+        normalized.bg,
+        Rgba {
+            r: 4,
+            g: 5,
+            b: 6,
+            a: 255,
+        }
+    );
+    assert!(normalized.bold);
+    assert!(normalized.italic);
+    assert!(normalized.underline);
+    assert!(normalized.reverse);
+
+    let continuation = frame.cell(0, 1).expect("normalized continuation cell");
+    assert_eq!(continuation.ch, ' ');
+    assert!(continuation.continuation);
+}
+
+#[cfg(feature = "ftui")]
+#[test]
+fn ftui_frame_normalizes_through_frame_api() {
+    use frankenterm_core::tui_parity_oracle::render_frame_from_ftui_frame;
+    use ftui::{Cell, Frame, GraphemePool, PackedRgba};
+
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(1, 1, &mut pool);
+    frame.buffer.set_raw(
+        0,
+        0,
+        Cell::from_char('F')
+            .with_fg(PackedRgba::rgb(11, 12, 13))
+            .with_bg(PackedRgba::rgb(14, 15, 16)),
+    );
+
+    let normalized = render_frame_from_ftui_frame(&frame);
+    assert_eq!(
+        normalized.cell(0, 0).expect("normalized frame cell").ch,
+        'F'
+    );
+}
+
+#[cfg(all(feature = "tui", feature = "ftui"))]
+#[test]
+fn ratatui_and_ftui_normalized_frames_compare_clean_for_matching_cells() {
+    use frankenterm_core::tui_parity_oracle::{
+        render_frame_from_ftui_buffer, render_frame_from_ratatui_buffer,
+    };
+    use ftui::render::cell::StyleFlags;
+    use ftui::{Buffer as FtuiBuffer, Cell, CellAttrs, GraphemePool, PackedRgba};
+    use ratatui::buffer::Buffer as RatatuiBuffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Modifier};
+
+    let mut ratatui_buffer = RatatuiBuffer::empty(Rect::new(0, 0, 1, 1));
+    let ratatui_cell = ratatui_buffer.cell_mut((0, 0)).expect("ratatui cell");
+    ratatui_cell.set_symbol("X");
+    ratatui_cell.fg = Color::Rgb(31, 32, 33);
+    ratatui_cell.bg = Color::Rgb(34, 35, 36);
+    ratatui_cell.modifier = Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED;
+
+    let pool = GraphemePool::new();
+    let mut ftui_buffer = FtuiBuffer::new(1, 1);
+    ftui_buffer.set_raw(
+        0,
+        0,
+        Cell::from_char('X')
+            .with_fg(PackedRgba::rgb(31, 32, 33))
+            .with_bg(PackedRgba::rgb(34, 35, 36))
+            .with_attrs(CellAttrs::new(
+                StyleFlags::BOLD | StyleFlags::ITALIC | StyleFlags::UNDERLINE,
+                0,
+            )),
+    );
+
+    let left = render_frame_from_ratatui_buffer(&ratatui_buffer);
+    let right = render_frame_from_ftui_buffer(&ftui_buffer, &pool);
+
+    assert!(
+        compute_diff(&left, &right).is_clean(),
+        "matching backend-normalized frames should compare clean"
+    );
+}
+
 #[test]
 fn every_keymap_action_kind_appears_in_corpus_or_is_explicitly_omitted() {
     // Bead requires "every input action covered" by the

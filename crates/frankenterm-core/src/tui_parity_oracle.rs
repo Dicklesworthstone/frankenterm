@@ -41,12 +41,11 @@
 //!
 //! ## What this module is NOT
 //!
-//! - Not the actual backend drivers. Wiring `views.rs::render_*`
-//!   and `ftui_backend.rs::render_*` into a normalized
-//!   `RenderFrame` requires concrete state fixtures and
-//!   feature-gated compilation; that's the integration
-//!   follow-on. This module ships the comparator + corpus +
-//!   types the integration consumes.
+//! - Not the full backend-driver harness. This module can
+//!   normalize ratatui and ftui frame buffers into `RenderFrame`,
+//!   but driving `views.rs::render_*` and
+//!   `ftui_backend.rs::render_*` with matched concrete state
+//!   fixtures is the integration follow-on.
 //! - Not the vhs/asciinema corpus recording. Sub-bead
 //!   `ft-35yac.1.1` records real-session corpora; this module
 //!   ships an in-tree synthesized corpus the harness uses
@@ -140,6 +139,11 @@ impl Rgba {
         b: 0x00,
         a: 0xFF,
     };
+
+    #[cfg(any(feature = "tui", feature = "ftui"))]
+    const fn opaque(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b, a: 0xFF }
+    }
 }
 
 /// `width × height` cell grid. Cells are row-major
@@ -199,6 +203,207 @@ impl RenderFrame {
     pub fn is_well_shaped(&self) -> bool {
         self.cells.len() == self.cell_count()
     }
+}
+
+// ============================================================================
+// Backend frame normalizers
+// ============================================================================
+
+#[inline]
+#[must_use]
+#[cfg(any(feature = "tui", feature = "ftui"))]
+fn first_scalar(symbol: &str) -> char {
+    symbol.chars().next().unwrap_or(' ')
+}
+
+#[inline]
+#[must_use]
+#[cfg(feature = "tui")]
+fn xterm_indexed_color(index: u8) -> Rgba {
+    const ANSI_16: [Rgba; 16] = [
+        Rgba::opaque(0x00, 0x00, 0x00),
+        Rgba::opaque(0x80, 0x00, 0x00),
+        Rgba::opaque(0x00, 0x80, 0x00),
+        Rgba::opaque(0x80, 0x80, 0x00),
+        Rgba::opaque(0x00, 0x00, 0x80),
+        Rgba::opaque(0x80, 0x00, 0x80),
+        Rgba::opaque(0x00, 0x80, 0x80),
+        Rgba::opaque(0xC0, 0xC0, 0xC0),
+        Rgba::opaque(0x80, 0x80, 0x80),
+        Rgba::opaque(0xFF, 0x00, 0x00),
+        Rgba::opaque(0x00, 0xFF, 0x00),
+        Rgba::opaque(0xFF, 0xFF, 0x00),
+        Rgba::opaque(0x00, 0x00, 0xFF),
+        Rgba::opaque(0xFF, 0x00, 0xFF),
+        Rgba::opaque(0x00, 0xFF, 0xFF),
+        Rgba::opaque(0xFF, 0xFF, 0xFF),
+    ];
+
+    if index < 16 {
+        return ANSI_16[index as usize];
+    }
+
+    if index < 232 {
+        let n = index - 16;
+        let steps = [0, 95, 135, 175, 215, 255];
+        return Rgba::opaque(
+            steps[(n / 36) as usize],
+            steps[((n % 36) / 6) as usize],
+            steps[(n % 6) as usize],
+        );
+    }
+
+    let gray = 8u8.saturating_add((index - 232).saturating_mul(10));
+    Rgba::opaque(gray, gray, gray)
+}
+
+#[cfg(feature = "tui")]
+#[inline]
+#[must_use]
+fn ratatui_color_to_rgba(color: ratatui::style::Color, default: Rgba) -> Rgba {
+    use ratatui::style::Color;
+
+    match color {
+        Color::Reset => default,
+        Color::Black => xterm_indexed_color(0),
+        Color::Red => xterm_indexed_color(1),
+        Color::Green => xterm_indexed_color(2),
+        Color::Yellow => xterm_indexed_color(3),
+        Color::Blue => xterm_indexed_color(4),
+        Color::Magenta => xterm_indexed_color(5),
+        Color::Cyan => xterm_indexed_color(6),
+        Color::Gray => xterm_indexed_color(7),
+        Color::DarkGray => xterm_indexed_color(8),
+        Color::LightRed => xterm_indexed_color(9),
+        Color::LightGreen => xterm_indexed_color(10),
+        Color::LightYellow => xterm_indexed_color(11),
+        Color::LightBlue => xterm_indexed_color(12),
+        Color::LightMagenta => xterm_indexed_color(13),
+        Color::LightCyan => xterm_indexed_color(14),
+        Color::White => xterm_indexed_color(15),
+        Color::Rgb(r, g, b) => Rgba::opaque(r, g, b),
+        Color::Indexed(index) => xterm_indexed_color(index),
+    }
+}
+
+/// Normalize a ratatui [`ratatui::buffer::Buffer`] into the
+/// backend-agnostic frame shape consumed by the parity oracle.
+#[cfg(feature = "tui")]
+#[must_use]
+pub fn render_frame_from_ratatui_buffer(buffer: &ratatui::buffer::Buffer) -> RenderFrame {
+    use ratatui::style::Modifier;
+
+    let width = buffer.area.width;
+    let height = buffer.area.height;
+    let mut frame = RenderFrame::blank(width, height);
+
+    for row in 0..height {
+        for col in 0..width {
+            let Some(cell) = buffer.cell((buffer.area.x + col, buffer.area.y + row)) else {
+                continue;
+            };
+            let modifier = cell.modifier;
+            frame.set_cell(
+                row,
+                col,
+                RenderCell {
+                    ch: first_scalar(cell.symbol()),
+                    fg: ratatui_color_to_rgba(cell.fg, Rgba::DEFAULT_FG),
+                    bg: ratatui_color_to_rgba(cell.bg, Rgba::DEFAULT_BG),
+                    bold: modifier.contains(Modifier::BOLD),
+                    italic: modifier.contains(Modifier::ITALIC),
+                    underline: modifier.contains(Modifier::UNDERLINED),
+                    reverse: modifier.contains(Modifier::REVERSED),
+                    continuation: false,
+                },
+            );
+        }
+    }
+
+    frame
+}
+
+#[cfg(feature = "ftui")]
+#[inline]
+#[must_use]
+fn ftui_color_to_rgba(color: ftui::PackedRgba, default: Rgba) -> Rgba {
+    if color.a() == 0 {
+        default
+    } else {
+        Rgba {
+            r: color.r(),
+            g: color.g(),
+            b: color.b(),
+            a: color.a(),
+        }
+    }
+}
+
+#[cfg(feature = "ftui")]
+#[must_use]
+fn ftui_cell_char(cell: &ftui::Cell, pool: &ftui::GraphemePool) -> (char, bool) {
+    if cell.content.is_continuation() {
+        return (' ', true);
+    }
+    if cell.content.is_empty() {
+        return (' ', false);
+    }
+    if let Some(ch) = cell.content.as_char() {
+        return (ch, false);
+    }
+    if let Some(id) = cell.content.grapheme_id() {
+        return (pool.get(id).map(first_scalar).unwrap_or(' '), false);
+    }
+    (' ', false)
+}
+
+/// Normalize an ftui [`ftui::Buffer`] plus its grapheme pool into
+/// the backend-agnostic frame shape consumed by the parity oracle.
+#[cfg(feature = "ftui")]
+#[must_use]
+pub fn render_frame_from_ftui_buffer(
+    buffer: &ftui::Buffer,
+    pool: &ftui::GraphemePool,
+) -> RenderFrame {
+    use ftui::render::cell::StyleFlags;
+
+    let width = buffer.width();
+    let height = buffer.height();
+    let mut frame = RenderFrame::blank(width, height);
+
+    for row in 0..height {
+        for col in 0..width {
+            let Some(cell) = buffer.get(col, row) else {
+                continue;
+            };
+            let (ch, continuation) = ftui_cell_char(cell, pool);
+            let flags = cell.attrs.flags();
+            frame.set_cell(
+                row,
+                col,
+                RenderCell {
+                    ch,
+                    fg: ftui_color_to_rgba(cell.fg, Rgba::DEFAULT_FG),
+                    bg: ftui_color_to_rgba(cell.bg, Rgba::DEFAULT_BG),
+                    bold: flags.contains(StyleFlags::BOLD),
+                    italic: flags.contains(StyleFlags::ITALIC),
+                    underline: flags.contains(StyleFlags::UNDERLINE),
+                    reverse: flags.contains(StyleFlags::REVERSE),
+                    continuation,
+                },
+            );
+        }
+    }
+
+    frame
+}
+
+/// Normalize an ftui [`ftui::Frame`] into the backend-agnostic frame shape.
+#[cfg(feature = "ftui")]
+#[must_use]
+pub fn render_frame_from_ftui_frame(frame: &ftui::Frame<'_>) -> RenderFrame {
+    let pool: &ftui::GraphemePool = &*frame.pool;
+    render_frame_from_ftui_buffer(&frame.buffer, pool)
 }
 
 // ============================================================================
@@ -938,6 +1143,127 @@ mod tests {
         let d_ba = compute_diff(&b, &a);
         assert_eq!(d_ab.divergent_cell_count(), d_ba.divergent_cell_count());
         assert_eq!(d_ab.divergent_cell_count(), 2);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn ratatui_buffer_projection_preserves_cells_and_style() {
+        use ratatui::{
+            buffer::Buffer,
+            layout::{Position, Rect},
+            style::{Color, Modifier, Style},
+        };
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer
+            .cell_mut(Position::new(0, 0))
+            .unwrap()
+            .set_char('R')
+            .set_style(
+                Style::default()
+                    .fg(Color::Rgb(1, 2, 3))
+                    .bg(Color::Rgb(4, 5, 6))
+                    .add_modifier(
+                        Modifier::BOLD
+                            | Modifier::ITALIC
+                            | Modifier::UNDERLINED
+                            | Modifier::REVERSED,
+                    ),
+            );
+
+        let frame = render_frame_from_ratatui_buffer(&buffer);
+        let cell = frame.cell(0, 0).unwrap();
+        assert_eq!(frame.width, 2);
+        assert_eq!(frame.height, 1);
+        assert_eq!(cell.ch, 'R');
+        assert_eq!(cell.fg, Rgba::opaque(1, 2, 3));
+        assert_eq!(cell.bg, Rgba::opaque(4, 5, 6));
+        assert!(cell.bold);
+        assert!(cell.italic);
+        assert!(cell.underline);
+        assert!(cell.reverse);
+    }
+
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_frame_projection_preserves_cells_and_style() {
+        use ftui::render::cell::StyleFlags;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(2, 1, &mut pool);
+        let attrs = ftui::CellAttrs::new(
+            StyleFlags::BOLD | StyleFlags::ITALIC | StyleFlags::UNDERLINE | StyleFlags::REVERSE,
+            ftui::CellAttrs::LINK_ID_NONE,
+        );
+        frame.buffer.set(
+            0,
+            0,
+            ftui::Cell::from_char('F')
+                .with_fg(ftui::PackedRgba::rgba(1, 2, 3, 255))
+                .with_bg(ftui::PackedRgba::rgba(4, 5, 6, 255))
+                .with_attrs(attrs),
+        );
+
+        let projected = render_frame_from_ftui_frame(&frame);
+        let cell = projected.cell(0, 0).unwrap();
+        assert_eq!(projected.width, 2);
+        assert_eq!(projected.height, 1);
+        assert_eq!(cell.ch, 'F');
+        assert_eq!(cell.fg, Rgba::opaque(1, 2, 3));
+        assert_eq!(cell.bg, Rgba::opaque(4, 5, 6));
+        assert!(cell.bold);
+        assert!(cell.italic);
+        assert!(cell.underline);
+        assert!(cell.reverse);
+    }
+
+    #[cfg(all(feature = "tui", feature = "ftui"))]
+    #[test]
+    fn projected_backend_frames_are_diff_comparable() {
+        use ftui::render::cell::StyleFlags;
+        use ratatui::{
+            buffer::Buffer,
+            layout::{Position, Rect},
+            style::{Color, Modifier, Style},
+        };
+
+        let mut ratatui_buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        ratatui_buffer
+            .cell_mut(Position::new(0, 0))
+            .unwrap()
+            .set_char('O')
+            .set_style(
+                Style::default()
+                    .fg(Color::Rgb(10, 20, 30))
+                    .bg(Color::Rgb(40, 50, 60))
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            );
+        ratatui_buffer
+            .cell_mut(Position::new(1, 0))
+            .unwrap()
+            .set_char('K');
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut ftui_frame = ftui::Frame::new(2, 1, &mut pool);
+        let attrs = ftui::CellAttrs::new(
+            StyleFlags::BOLD | StyleFlags::UNDERLINE,
+            ftui::CellAttrs::LINK_ID_NONE,
+        );
+        ftui_frame.buffer.set(
+            0,
+            0,
+            ftui::Cell::from_char('O')
+                .with_fg(ftui::PackedRgba::rgba(10, 20, 30, 255))
+                .with_bg(ftui::PackedRgba::rgba(40, 50, 60, 255))
+                .with_attrs(attrs),
+        );
+        ftui_frame.buffer.set(1, 0, ftui::Cell::from_char('K'));
+
+        let ratatui_frame = render_frame_from_ratatui_buffer(&ratatui_buffer);
+        let ftui_frame = render_frame_from_ftui_frame(&ftui_frame);
+        let diff = compute_diff(&ratatui_frame, &ftui_frame);
+
+        assert!(diff.is_clean(), "{}", diff.render_summary(10));
     }
 
     #[test]
