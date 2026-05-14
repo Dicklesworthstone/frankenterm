@@ -33,8 +33,10 @@ release/v0.X.Y
   ├── proofs/loom-runtime-async.<hash>.json (G8)
   ├── proofs/runtime-proof-trait.<hash>.json(G1, type-seal)
   ├── proofs/robot-contracts.<hash>.json    (G2)
+  ├── proofs/tx-killswitch.<hash>.json      (G27)
   ├── doctrine/agents-md-counts.<hash>.json (G6)
-  └── ed25519-signature.sig
+  ├── doctrine/cx-propagation.<hash>.json   (G14.2)
+  └── signature metadata + sigstore/ed25519 sidecar
 ```
 
 **Single principle:** if it is not in the attestation graph, the claim is not shipped. The README and AGENTS.md both link to the latest attestation. CI fails any release that omits a required artifact.
