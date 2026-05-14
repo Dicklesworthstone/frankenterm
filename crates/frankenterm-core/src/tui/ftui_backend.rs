@@ -24,6 +24,7 @@
 //! WaModel::view()    →  Frame (tab bar + content)
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1743,6 +1744,7 @@ impl ftui::Model for WaModel {
                     width,
                     content_h,
                     &self.panes,
+                    &self.pane_bookmarks,
                     &filtered,
                     self.panes_selected,
                     filters,
@@ -2466,6 +2468,7 @@ fn render_panes_view(
     width: u16,
     height: u16,
     panes: &[PaneRow],
+    pane_bookmarks: &[PaneBookmarkView],
     filtered_indices: &[usize],
     selected: usize,
     filters: PaneRenderFilters<'_>,
@@ -2501,6 +2504,14 @@ fn render_panes_view(
     let list_inner = list_area.inner_all();
     if list_inner.height == 0 {
         return;
+    }
+
+    let mut bookmarks_by_pane: HashMap<u64, Vec<&PaneBookmarkView>> = HashMap::new();
+    for bookmark in pane_bookmarks {
+        bookmarks_by_pane
+            .entry(bookmark.pane_id)
+            .or_default()
+            .push(bookmark);
     }
 
     let selected_profile = filters.selected_profile.unwrap_or("default");
@@ -2596,7 +2607,7 @@ fn render_panes_view(
                 break;
             }
             let pane = &panes[pane_idx];
-            let bookmark_summary = "-";
+            let bookmark_summary = pane_list_bookmark_summary(&bookmarks_by_pane, &pane.pane_id);
             let line = if ultra_compact {
                 format!(
                     "{:>3} {:6} {:4} {:>2} {}",
@@ -2675,6 +2686,7 @@ fn render_panes_view(
     if let Some(pane) = selected_pane {
         let detail_width = detail_inner.width.saturating_sub(1).max(1);
         let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 34;
+        let bookmark_summary = pane_detail_bookmark_summary(&bookmarks_by_pane, &pane.pane_id);
         let next_action = if selected_profile != active_profile {
             format!("Apply selected profile: ft rules profile apply {selected_profile}")
         } else if !pane.unhandled_badge.is_empty() {
@@ -2709,7 +2721,10 @@ fn render_panes_view(
                 CellStyle::new(),
             ));
             rows.push((
-                truncate_str("Bookmarks none", detail_width as usize),
+                truncate_str(
+                    &format!("Bookmarks {}", truncate_str(&bookmark_summary, 30)),
+                    detail_width as usize,
+                ),
                 CellStyle::new(),
             ));
             rows.push((
@@ -2786,7 +2801,10 @@ fn render_panes_view(
                 CellStyle::new(),
             ));
             rows.push((
-                truncate_str("Bookmarks: none", detail_width as usize),
+                truncate_str(
+                    &format!("Bookmarks: {}", truncate_str(&bookmark_summary, 80)),
+                    detail_width as usize,
+                ),
                 CellStyle::new(),
             ));
             rows.push((
@@ -2835,6 +2853,52 @@ fn render_panes_view(
             detail_inner.width,
         );
     }
+}
+
+fn pane_list_bookmark_summary(
+    bookmarks_by_pane: &HashMap<u64, Vec<&PaneBookmarkView>>,
+    pane_id: &str,
+) -> String {
+    let Ok(pane_id) = pane_id.parse::<u64>() else {
+        return "-".to_string();
+    };
+
+    let Some(bookmarks) = bookmarks_by_pane.get(&pane_id) else {
+        return "-".to_string();
+    };
+
+    match bookmarks.as_slice() {
+        [] => "-".to_string(),
+        [bookmark] => truncate_str(&bookmark.alias, 6),
+        _ => format!("{}*", bookmarks.len()),
+    }
+}
+
+fn pane_detail_bookmark_summary(
+    bookmarks_by_pane: &HashMap<u64, Vec<&PaneBookmarkView>>,
+    pane_id: &str,
+) -> String {
+    let Ok(pane_id) = pane_id.parse::<u64>() else {
+        return "none".to_string();
+    };
+    let Some(bookmarks) = bookmarks_by_pane.get(&pane_id) else {
+        return "none".to_string();
+    };
+    if bookmarks.is_empty() {
+        return "none".to_string();
+    }
+
+    bookmarks
+        .iter()
+        .map(|bookmark| {
+            if bookmark.tags.is_empty() {
+                bookmark.alias.clone()
+            } else {
+                format!("{} [{}]", bookmark.alias, bookmark.tags.join(","))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Render the Search view.
@@ -5458,6 +5522,7 @@ mod tests {
             100,
             28,
             &model.panes,
+            &model.pane_bookmarks,
             &filtered,
             0,
             PaneRenderFilters::default(),
@@ -5488,6 +5553,7 @@ mod tests {
             100,
             22,
             &model.panes,
+            &model.pane_bookmarks,
             &filtered,
             0,
             PaneRenderFilters::default(),
@@ -5514,6 +5580,7 @@ mod tests {
             100,
             22,
             &model.panes,
+            &model.pane_bookmarks,
             &filtered,
             0,
             PaneRenderFilters::default(),
@@ -5532,6 +5599,41 @@ mod tests {
     }
 
     #[test]
+    fn render_panes_surfaces_bookmarks_in_list_and_detail() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+
+        let mut bookmark = pane_bookmark(0);
+        bookmark.alias = "fav".to_string();
+        bookmark.tags = vec!["ops".to_string(), "watch".to_string()];
+        let mut model = make_model(MockQuery::healthy().with_pane_bookmarks(vec![bookmark]));
+        model.refresh_data();
+
+        let filtered = model.filtered_pane_indices();
+        render_panes_view(
+            &mut frame,
+            0,
+            100,
+            22,
+            &model.panes,
+            &model.pane_bookmarks,
+            &filtered,
+            0,
+            PaneRenderFilters::default(),
+        );
+
+        let rendered = (0..22)
+            .map(|row| read_row(&frame, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("fav"), "{rendered}");
+        assert!(
+            rendered.contains("Bookmarks: fav [ops,watch]"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn render_panes_narrow_stacks_detail_below_list() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
@@ -5546,6 +5648,7 @@ mod tests {
             80,
             22,
             &model.panes,
+            &model.pane_bookmarks,
             &filtered,
             0,
             PaneRenderFilters::default(),
@@ -5569,6 +5672,7 @@ mod tests {
             0,
             100,
             22,
+            &[],
             &[],
             &[],
             0,
@@ -5601,6 +5705,7 @@ mod tests {
             40,
             1,
             &model.panes,
+            &model.pane_bookmarks,
             &filtered,
             0,
             PaneRenderFilters::default(),
