@@ -5,11 +5,14 @@
 (`RenderFrame` / `RenderCell` / `FrameDiff` / `KeymapAction` /
 `EventScript` / `OracleHealth`) + comparator + synthesized
 event corpus + property-test scaffold (256 cases × 6
-properties) all live; backend driver wiring (calling actual
-`views.rs::render_*` and `ftui_backend.rs::render_*` to
-produce normalized `RenderFrame`s) is the integration follow-
-on. vhs/asciinema-derived corpora is sub-bead `ft-35yac.1.1`;
-GPU-renderer parity is sub-bead `ft-35yac.1.2`.
+properties) all live. The retained backend-driver slice now
+calls the actual ratatui app/views path and the ftui
+`WaModel::view` path with matched deterministic state, then
+normalizes both buffers into `RenderFrame`; the current driver
+evidence reports a backend divergence rather than a clean
+parity pass. vhs/asciinema-derived corpora is sub-bead
+`ft-35yac.1.1`; GPU-renderer parity is sub-bead
+`ft-35yac.1.2`.
 
 ## Why this matters
 
@@ -172,23 +175,36 @@ Plus 2 proptests on the input alphabet:
 8. `event_script_serde_roundtrip` — random `EventScript`s
    round-trip stably.
 
+## Backend-driver status
+
+The retained rollout-gated driver test now:
+
+- Constructs a deterministic `QueryClient` fixture shared by
+  both backends.
+- Drives `app.rs`/`views.rs` through the real ratatui
+  `App::render` path.
+- Drives `ftui_backend.rs` through the real `WaModel::view`
+  path.
+- Captures both buffers as normalized `RenderFrame`s via
+  `render_frame_from_ratatui_buffer` and
+  `render_frame_from_ftui_frame`.
+- Calls `compute_diff(ratatui_frame, ftui_frame)` and asserts
+  any divergence emits an actionable insta-style summary.
+
+This changes the honest blocker from "oracle unavailable" to
+"backend-driver divergence." The remaining integration work is
+not availability of a driver; it is making the retained driver
+clean across the full script/corpus set and then publishing the
+release evidence.
+
 ## What the foundation slice does NOT do
 
-- Does not call `views.rs::render_home_view` or
-  `ftui_backend::render_home_view` directly. Both functions
-  take live `ViewState` fixtures + buffer types behind
-  `#[cfg(feature = "tui")]`. The integration follow-on wires
-  these by:
-  - Constructing a deterministic `ViewState` fixture per
-    script.
-  - Driving the backend's event loop with the script's
-    `KeymapAction`s (translated to `KeyInput`).
-  - Capturing the post-step buffer contents as a normalized
-    `RenderFrame` (a small adapter per backend).
-  - Calling `compute_diff(ratatui_frame, ftui_frame)` per
-    step.
-  - Asserting `is_clean()`; on divergence, emitting the
-    insta-style summary.
+- Does not yet drive every `EventScript` step through both
+  event loops. The current retained driver covers deterministic
+  Home and Panes state fixtures; the follow-on extends that to
+  the whole `synthesized_event_corpus()` action stream.
+- Does not yet assert `is_clean()` for all ratatui-vs-ftui
+  frames. Current status is an explicit divergence blocker.
 - Does not record vhs/asciinema corpora — that's
   `ft-35yac.1.1`.
 - Does not assert GPU-renderer parity — that's
@@ -241,7 +257,7 @@ cargo test -p frankenterm-core --test tui_parity_oracle \
 | vhs/asciinema corpus from real sessions | ⏳ sub-bead `ft-35yac.1.1` |
 | Headless GPU-renderer parity | ✓ `scripts/test-gpu-harness.sh` runs the headless GPU harness and emits `render-parity-gpu.json`; CI uploads the run directory from the macOS Metal gate and Linux llvmpipe pilot |
 | Per-release render-parity JSON | Partial: GPU visual adjunct is attested by `docs/attestations/tui/render-parity-gpu.json`; the full ratatui<->ftui byte-level report remains `ft-35yac.2` |
-| Backend driver wiring | ⏳ integration follow-on (uses `tui` feature gate; depends on a deterministic `ViewState` fixture) |
+| Backend driver wiring | Partial: retained driver reaches both real backends and reports current divergence; full clean script/corpus run remains pending |
 
 ## Cross-references
 

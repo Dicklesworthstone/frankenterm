@@ -503,3 +503,219 @@ mod import_guardrail_tests {
         assert!(is_exempt_line("\t\t// tab-indented comment"));
     }
 }
+
+#[cfg(all(test, feature = "rollout"))]
+mod backend_driver_parity_tests {
+    use std::sync::Arc;
+
+    use crate::circuit_breaker::CircuitBreakerStatus;
+    use crate::tui::query::{
+        EventFilters, EventView, HealthStatus, PaneView, QueryClient, QueryError, SearchResultView,
+        TriageAction, TriageItemView, WorkflowProgressView,
+    };
+    use crate::tui_parity_oracle::{RenderFrame, compute_diff};
+
+    #[derive(Clone, Copy)]
+    struct DriverQuery;
+
+    impl QueryClient for DriverQuery {
+        fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
+            Ok(vec![
+                PaneView {
+                    pane_id: 7,
+                    title: "pane-0".to_string(),
+                    domain: "local".to_string(),
+                    cwd: Some("/tmp/pane-0".to_string()),
+                    is_excluded: false,
+                    agent_type: Some("codex".to_string()),
+                    pane_state: "PromptActive".to_string(),
+                    last_activity_ts: Some(1_700_000_000_000),
+                    unhandled_event_count: 1,
+                },
+                PaneView {
+                    pane_id: 8,
+                    title: "pane-1".to_string(),
+                    domain: "ssh:test-host".to_string(),
+                    cwd: Some("/srv/pane-1".to_string()),
+                    is_excluded: false,
+                    agent_type: Some("claude".to_string()),
+                    pane_state: "CommandRunning".to_string(),
+                    last_activity_ts: Some(1_700_000_060_000),
+                    unhandled_event_count: 0,
+                },
+            ])
+        }
+
+        fn list_events(&self, _: &EventFilters) -> Result<Vec<EventView>, QueryError> {
+            Ok(vec![EventView {
+                id: 1,
+                rule_id: "rate_limit_detected".to_string(),
+                pane_id: 7,
+                severity: "warning".to_string(),
+                message: "Rate limit detected".to_string(),
+                timestamp: 1_700_000_120_000,
+                handled: false,
+                triage_state: Some("open".to_string()),
+                labels: vec!["api".to_string()],
+                note: Some("deterministic parity fixture".to_string()),
+            }])
+        }
+
+        fn list_triage_items(&self) -> Result<Vec<TriageItemView>, QueryError> {
+            Ok(vec![TriageItemView {
+                section: "health".to_string(),
+                severity: "warning".to_string(),
+                title: "Deterministic fixture".to_string(),
+                detail: "Used by the ratatui-vs-ftui backend-driver harness".to_string(),
+                actions: vec![TriageAction {
+                    label: "Inspect".to_string(),
+                    command: "ft doctor --json".to_string(),
+                }],
+                event_id: Some(1),
+                pane_id: Some(7),
+                workflow_id: Some("wf-parity".to_string()),
+            }])
+        }
+
+        fn search(&self, query: &str, _: usize) -> Result<Vec<SearchResultView>, QueryError> {
+            Ok(vec![SearchResultView {
+                pane_id: 7,
+                timestamp: 1_700_000_180_000,
+                snippet: format!("deterministic result for {query}"),
+                rank: 1.0,
+            }])
+        }
+
+        fn health(&self) -> Result<HealthStatus, QueryError> {
+            Ok(HealthStatus {
+                watcher_running: true,
+                db_accessible: true,
+                wezterm_accessible: true,
+                wezterm_circuit: CircuitBreakerStatus::default(),
+                pane_count: 2,
+                event_count: 1,
+                last_capture_ts: Some(1_700_000_000_000),
+            })
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            true
+        }
+
+        fn mark_event_muted(&self, _: i64) -> Result<(), QueryError> {
+            Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(vec![WorkflowProgressView {
+                id: "wf-parity".to_string(),
+                workflow_name: "parity fixture".to_string(),
+                pane_id: 7,
+                current_step: 1,
+                total_steps: 3,
+                status: "running".to_string(),
+                error: None,
+                started_at: 1_700_000_000_000,
+                updated_at: 1_700_000_060_000,
+            }])
+        }
+    }
+
+    struct DriverCase {
+        name: &'static str,
+        ratatui_view: super::views::View,
+        ftui_view: super::ftui_backend::View,
+        marker: &'static str,
+        width: u16,
+        height: u16,
+    }
+
+    fn frame_text(frame: &RenderFrame) -> String {
+        let mut text = String::new();
+        for row in 0..frame.height {
+            for col in 0..frame.width {
+                text.push(frame.cell(row, col).expect("well-shaped frame").ch);
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn render_ftui(case: &DriverCase) -> RenderFrame {
+        let query: Arc<dyn QueryClient + Send + Sync> = Arc::new(DriverQuery);
+        super::ftui_backend::render_driver_frame(query, case.ftui_view, case.width, case.height)
+    }
+
+    #[test]
+    fn backend_driver_harness_reaches_real_ratatui_and_ftui_renderers() {
+        let cases = [
+            DriverCase {
+                name: "home",
+                ratatui_view: super::views::View::Home,
+                ftui_view: super::ftui_backend::View::Home,
+                marker: "Home",
+                width: 80,
+                height: 24,
+            },
+            DriverCase {
+                name: "panes",
+                ratatui_view: super::views::View::Panes,
+                ftui_view: super::ftui_backend::View::Panes,
+                marker: "pane-0",
+                width: 100,
+                height: 30,
+            },
+        ];
+
+        let mut divergent_cases = Vec::new();
+        for case in cases {
+            let ratatui_frame = super::app::render_driver_frame(
+                DriverQuery,
+                case.ratatui_view,
+                case.width,
+                case.height,
+            );
+            let ftui_frame = render_ftui(&case);
+
+            assert!(
+                ratatui_frame.is_well_shaped(),
+                "{} ratatui frame",
+                case.name
+            );
+            assert!(ftui_frame.is_well_shaped(), "{} ftui frame", case.name);
+            assert!(
+                frame_text(&ratatui_frame).contains(case.marker),
+                "{} ratatui frame missing marker `{}`",
+                case.name,
+                case.marker
+            );
+            assert!(
+                frame_text(&ftui_frame).contains(case.marker),
+                "{} ftui frame missing marker `{}`",
+                case.name,
+                case.marker
+            );
+
+            let diff = compute_diff(&ratatui_frame, &ftui_frame);
+            assert!(
+                !diff.dimension_mismatch,
+                "{} frame dimensions should match",
+                case.name
+            );
+            if !diff.is_clean() {
+                let summary = diff.render_summary(4);
+                assert!(
+                    summary.contains('(') && summary.contains("Rgba"),
+                    "{} diff summary should be actionable: {summary}",
+                    case.name
+                );
+                divergent_cases.push(case.name);
+            }
+        }
+
+        assert!(
+            !divergent_cases.is_empty(),
+            "SSIM parity status says backend-driver-divergence; update the SLO status if all driver cases become clean"
+        );
+    }
+}

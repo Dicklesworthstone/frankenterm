@@ -3873,6 +3873,31 @@ pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(
     Ok(())
 }
 
+#[cfg(all(test, feature = "rollout"))]
+pub(super) fn render_driver_frame(
+    query: Arc<dyn QueryClient + Send + Sync>,
+    view: View,
+    width: u16,
+    height: u16,
+) -> crate::tui_parity_oracle::RenderFrame {
+    use ftui::Model as _;
+
+    let mut model = WaModel::new(
+        query,
+        AppConfig {
+            refresh_interval: Duration::from_secs(5),
+            debug: false,
+        },
+    );
+    model.view_state.current_view = view;
+    model.refresh_data();
+
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(width, height, &mut pool);
+    model.view(&mut frame);
+    crate::tui_parity_oracle::render_frame_from_ftui_frame(&frame)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

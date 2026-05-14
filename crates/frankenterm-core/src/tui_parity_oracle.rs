@@ -41,11 +41,14 @@
 //!
 //! ## What this module is NOT
 //!
-//! - Not the full backend-driver harness. This module can
-//!   normalize ratatui and ftui frame buffers into `RenderFrame`,
-//!   but driving `views.rs::render_*` and
-//!   `ftui_backend.rs::render_*` with matched concrete state
-//!   fixtures is the integration follow-on.
+//! - Not the full clean backend-driver harness. This module can
+//!   normalize ratatui and ftui frame buffers into `RenderFrame`;
+//!   the rollout-gated retained driver now reaches
+//!   `views.rs`/`app.rs` and `ftui_backend.rs` with matched
+//!   deterministic state, but current evidence still reports a
+//!   backend divergence rather than a clean parity pass. Extending
+//!   that driver to every `EventScript` and making the diff clean
+//!   is the integration follow-on.
 //! - Not the vhs/asciinema corpus recording. Sub-bead
 //!   `ft-35yac.1.1` records real-session corpora; this module
 //!   ships an in-tree synthesized corpus the harness uses

@@ -160,7 +160,7 @@ fn ssim_surface_constants_match_default_thresholds() {
     );
     assert_eq!(
         RENDERER_SSIM_PARITY_CURRENT_DEGRADATION,
-        "oracle-unavailable"
+        "backend-driver-divergence"
     );
     assert!((thresholds.min_ssim - 0.99).abs() <= f64::EPSILON);
     assert_eq!(

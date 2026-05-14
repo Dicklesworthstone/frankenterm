@@ -109,12 +109,14 @@ The operator surfaces for this substrate are `ft doctor --json`
 The SSIM parity substrate validates the retained GPU golden corpus and
 adversarial metric-floor samples through
 `frankenterm_gui::gpu_regression::compare_images`, cross-checks the
-terminal-conformance fixture ids against the G39 topology attestation, and
-publishes its current non-claiming status at
+terminal-conformance fixture ids against the G39 topology attestation, drives
+the ratatui and ftui TUI backends through a retained deterministic state
+fixture, and publishes its current non-claiming status at
 `ft robot perf slo-status --slo ssim_parity`, `ft doctor --json
 .renderer_slos.ssim_parity`, and `wa://perf/renderer-slo/ssim_parity`.
-The current degradation is `oracle-unavailable`: production evidence still
-requires a retained ratatui-vs-ftui release run, with
+The current degradation is `backend-driver-divergence`: the byte-level
+backend driver now reaches both renderers, but production evidence still
+requires a clean retained ratatui-vs-ftui release run, with
 `docs/attestations/tui/topology-parity.json` as the topology cross-check for
 near-pixel divergences. The release-gate script fails closed for this
 degraded state after substrate validation unless

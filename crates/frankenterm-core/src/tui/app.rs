@@ -1005,6 +1005,23 @@ impl<Q: QueryClient> App<Q> {
     }
 }
 
+#[cfg(all(test, feature = "rollout"))]
+pub(super) fn render_driver_frame<Q: QueryClient>(
+    query_client: Q,
+    view: View,
+    width: u16,
+    height: u16,
+) -> crate::tui_parity_oracle::RenderFrame {
+    let mut app = App::new(query_client, AppConfig::default());
+    app.current_view = view;
+    app.refresh_data();
+
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    app.render(area, &mut buffer);
+    crate::tui_parity_oracle::render_frame_from_ratatui_buffer(&buffer)
+}
+
 /// Run the TUI application
 ///
 /// This is the main entry point for starting the TUI.
