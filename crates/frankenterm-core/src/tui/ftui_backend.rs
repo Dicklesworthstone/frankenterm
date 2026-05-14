@@ -2330,7 +2330,7 @@ fn render_home_help_block(frame: &mut ftui::Frame, area: UiRect, viewport: Viewp
     }
     let lines: &[(&str, CellStyle)] = match viewport {
         ViewportClass::Wide => &[
-            ("Desktop workflow:", CellStyle::new().bold()),
+            ("Desktop workflow:", bold_default_style()),
             (
                 "  Tab/Shift+Tab switch views | j/k move | Enter act | / search",
                 CellStyle::new(),
@@ -2341,14 +2341,14 @@ fn render_home_help_block(frame: &mut ftui::Frame, area: UiRect, viewport: Viewp
             ),
         ],
         ViewportClass::Regular => &[
-            ("Navigation:", CellStyle::new().bold()),
+            ("Navigation:", bold_default_style()),
             (
                 "  Tab views | j/k move | Enter action | ? help | q quit",
                 CellStyle::new(),
             ),
         ],
         ViewportClass::Compact => &[
-            ("Compact controls:", CellStyle::new().bold()),
+            ("Compact controls:", bold_default_style()),
             (
                 "  Tab views | j/k move | Enter | ? help | q quit",
                 CellStyle::new(),
@@ -2607,6 +2607,7 @@ fn render_panes_view(
                 break;
             }
             let pane = &panes[pane_idx];
+            let unhandled_label = pane_unhandled_label(pane);
             let bookmark_summary = pane_list_bookmark_summary(&bookmarks_by_pane, &pane.pane_id);
             let line = if ultra_compact {
                 format!(
@@ -2614,7 +2615,7 @@ fn render_panes_view(
                     pane.pane_id,
                     truncate_str(&pane.agent_label, 6),
                     truncate_str(&pane.state_label, 4),
-                    pane.unhandled_badge,
+                    unhandled_label,
                     truncate_str(&pane.title, 18)
                 )
             } else if stacked_mode {
@@ -2624,7 +2625,7 @@ fn render_panes_view(
                     bookmark_summary,
                     truncate_str(&pane.agent_label, 6),
                     truncate_str(&pane.state_label, 8),
-                    pane.unhandled_badge,
+                    unhandled_label,
                     truncate_str(&pane.title, 20)
                 )
             } else {
@@ -2634,7 +2635,7 @@ fn render_panes_view(
                     bookmark_summary,
                     truncate_str(&pane.agent_label, 8),
                     truncate_str(&pane.state_label, 12),
-                    pane.unhandled_badge,
+                    unhandled_label,
                     truncate_str(&pane.title, 24)
                 )
             };
@@ -2735,7 +2736,7 @@ fn render_panes_view(
                 CellStyle::new(),
             ));
             rows.push((String::new(), CellStyle::new()));
-            rows.push(("Next best action:".to_string(), CellStyle::new().bold()));
+            rows.push(("Next best action:".to_string(), bold_default_style()));
             rows.push((
                 truncate_str(&next_action, detail_width as usize),
                 CellStyle::new(),
@@ -2822,7 +2823,7 @@ fn render_panes_view(
                 CellStyle::new(),
             ));
             rows.push((String::new(), CellStyle::new()));
-            rows.push(("Next best action:".to_string(), CellStyle::new().bold()));
+            rows.push(("Next best action:".to_string(), bold_default_style()));
             rows.push((
                 truncate_str(&next_action, detail_width as usize),
                 CellStyle::new(),
@@ -2852,6 +2853,14 @@ fn render_panes_view(
             CellStyle::new().fg(color_yellow()),
             detail_inner.width,
         );
+    }
+}
+
+fn pane_unhandled_label(pane: &PaneRow) -> &str {
+    if pane.unhandled_badge.is_empty() {
+        "0"
+    } else {
+        &pane.unhandled_badge
     }
 }
 
@@ -4508,6 +4517,10 @@ fn color_dark_gray() -> ftui::PackedRgba {
 
 fn color_default_fg() -> ftui::PackedRgba {
     ftui::PackedRgba::rgba(0xCC, 0xCC, 0xCC, 0xFF)
+}
+
+fn bold_default_style() -> CellStyle {
+    CellStyle::new().fg(color_default_fg()).bold()
 }
 
 // ---------------------------------------------------------------------------
