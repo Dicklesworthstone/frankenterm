@@ -474,8 +474,8 @@ impl FrameDiff {
     }
 
     /// Insta-style printable summary for triage. The format
-    /// is one line per divergence: `(row,col): 'L' fg/bg →
-    /// 'R' fg/bg`.
+    /// is one line per divergence with glyph, color, style,
+    /// and continuation state for both cells.
     #[must_use]
     pub fn render_summary(&self, max_lines: usize) -> String {
         if self.dimension_mismatch {
@@ -497,19 +497,29 @@ impl FrameDiff {
                 break;
             }
             s.push_str(&format!(
-                "({},{}): {:?} {:?}/{:?} → {:?} {:?}/{:?}\n",
+                "({},{}): {} → {}\n",
                 cd.row,
                 cd.col,
-                cd.left.ch,
-                cd.left.fg,
-                cd.left.bg,
-                cd.right.ch,
-                cd.right.fg,
-                cd.right.bg,
+                format_render_cell_for_summary(cd.left),
+                format_render_cell_for_summary(cd.right)
             ));
         }
         s
     }
+}
+
+fn format_render_cell_for_summary(cell: RenderCell) -> String {
+    format!(
+        "{:?} fg={:?} bg={:?} bold={} italic={} underline={} reverse={} continuation={}",
+        cell.ch,
+        cell.fg,
+        cell.bg,
+        cell.bold,
+        cell.italic,
+        cell.underline,
+        cell.reverse,
+        cell.continuation
+    )
 }
 
 /// Compute the per-cell diff between two frames. The cells

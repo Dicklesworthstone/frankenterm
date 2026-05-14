@@ -229,6 +229,63 @@ fn every_synthesized_script_is_well_formed() {
     }
 }
 
+#[test]
+fn render_summary_reports_style_flags_for_style_only_diffs() {
+    let mut left = RenderFrame::blank(1, 1);
+    let mut right = left.clone();
+    left.set_cell(
+        0,
+        0,
+        RenderCell {
+            ch: 'S',
+            fg: Rgba {
+                r: 11,
+                g: 12,
+                b: 13,
+                a: 255,
+            },
+            bg: Rgba {
+                r: 21,
+                g: 22,
+                b: 23,
+                a: 255,
+            },
+            ..RenderCell::space()
+        },
+    );
+    right.set_cell(
+        0,
+        0,
+        RenderCell {
+            ch: 'S',
+            fg: Rgba {
+                r: 11,
+                g: 12,
+                b: 13,
+                a: 255,
+            },
+            bg: Rgba {
+                r: 21,
+                g: 22,
+                b: 23,
+                a: 255,
+            },
+            bold: true,
+            reverse: true,
+            ..RenderCell::space()
+        },
+    );
+
+    let summary = compute_diff(&left, &right).render_summary(10);
+
+    assert!(summary.contains("fg=Rgba"));
+    assert!(summary.contains("bg=Rgba"));
+    assert!(summary.contains("bold=false"));
+    assert!(summary.contains("bold=true"));
+    assert!(summary.contains("reverse=false"));
+    assert!(summary.contains("reverse=true"));
+}
+
 #[cfg(feature = "tui")]
 #[test]
 fn ratatui_buffer_normalizes_cells_and_styles() {

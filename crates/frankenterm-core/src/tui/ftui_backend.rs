@@ -7,7 +7,6 @@
 //! - Tab bar rendering with highlighted active view
 //! - Global keybindings (Tab always; character shortcuts when the active view
 //!   does not own that character input)
-//! - Status footer with view name and refresh indicator
 //! - Periodic data refresh via background tasks
 //!
 //! All view bodies (Home, Panes, Search, Help, Events, Triage, History,
@@ -22,7 +21,7 @@
 //!   ↓
 //! WaModel::update()  →  Cmd (side effects)
 //!   ↓
-//! WaModel::view()    →  Frame (tab bar + content + footer)
+//! WaModel::view()    →  Frame (tab bar + content)
 //! ```
 
 use std::sync::Arc;
@@ -1663,16 +1662,16 @@ impl ftui::Model for WaModel {
         let width = frame.width();
         let height = frame.height();
 
-        if height < 3 {
+        if height < 2 {
             // Terminal too small — render nothing meaningful
             return;
         }
 
-        // Layout: [tab bar: 1 row] [content: remaining] [footer: 1 row]
+        // Layout matches the ratatui oracle:
+        // [tab bar + bottom border: 2 rows] [content: remaining].
         let tab_row = 0u16;
-        let content_y = 1u16;
+        let content_y = 2u16;
         let content_h = height.saturating_sub(2);
-        let footer_row = height.saturating_sub(1);
 
         // -- Tab bar --
         render_tab_bar(frame, tab_row, width, self.view_state.current_view);
@@ -1780,15 +1779,6 @@ impl ftui::Model for WaModel {
             ),
         }
 
-        // -- Footer / status bar --
-        render_footer(
-            frame,
-            footer_row,
-            width,
-            self.view_state.current_view,
-            self.view_state.error_message.as_deref(),
-        );
-
         // -- Modal overlay (drawn last so it's on top) --
         if let Some(ref modal) = self.active_modal {
             render_modal_overlay(frame, width, height, modal);
@@ -1827,6 +1817,32 @@ struct ListDetailLayout {
     detail_width: u16,
     detail_height: u16,
     stacked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UiRect {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+impl UiRect {
+    const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn inner_all(self) -> Self {
+        if self.width < 2 || self.height < 2 {
+            return Self::new(self.x.saturating_add(1), self.y.saturating_add(1), 0, 0);
+        }
+        Self::new(self.x + 1, self.y + 1, self.width - 2, self.height - 2)
+    }
 }
 
 fn list_detail_layout(
@@ -1869,26 +1885,33 @@ fn list_detail_layout(
 /// Render the tab bar at the given row.
 fn render_tab_bar(frame: &mut ftui::Frame, row: u16, width: u16, active: View) {
     let mut col = 0u16;
-    for &view in View::all() {
-        let label = format!(" {} {} ", view.shortcut(), view.name());
-        let label_width = label.len() as u16;
+    let views = View::all();
+    for (idx, &view) in views.iter().enumerate() {
+        let label = view.name();
+        let label_width = text_width(label);
+        let segment_width = label_width.saturating_add(2);
 
-        if col + label_width > width {
+        if col.saturating_add(segment_width) > width {
             break;
         }
 
         let style = if view == active {
-            CellStyle::new().bold().reverse()
-        } else {
             CellStyle::new()
+                .fg(ftui::PackedRgba::rgba(0x80, 0x80, 0x00, 0xFF))
+                .bold()
+        } else {
+            CellStyle::new().fg(ftui::PackedRgba::rgba(0xC0, 0xC0, 0xC0, 0xFF))
         };
 
-        write_styled(frame, col, row, &label, style);
+        write_styled(frame, col, row, " ", CellStyle::new());
+        col += 1;
+        write_styled(frame, col, row, label, style);
         col += label_width;
+        write_styled(frame, col, row, " ", CellStyle::new());
+        col += 1;
 
-        // Separator
-        if col < width {
-            write_styled(frame, col, row, "|", CellStyle::new().dim());
+        if idx + 1 < views.len() && col < width {
+            write_styled(frame, col, row, "│", CellStyle::new());
             col += 1;
         }
     }
@@ -1899,17 +1922,23 @@ fn render_tab_bar(frame: &mut ftui::Frame, row: u16, width: u16, active: View) {
         let fill = " ".repeat(remaining as usize);
         write_styled(frame, col, row, &fill, CellStyle::new());
     }
+
+    if row + 1 < frame.height() {
+        write_styled(
+            frame,
+            0,
+            row + 1,
+            &"─".repeat(width as usize),
+            CellStyle::new(),
+        );
+    }
+}
+
+fn text_width(text: &str) -> u16 {
+    text.chars().count().try_into().unwrap_or(u16::MAX)
 }
 
 /// Render the Home dashboard view.
-///
-/// Layout (rows from content_y):
-///   Row 0:      Title — "FrankenTerm Control Center" + aggregate health badge
-///   Rows 1-2:   blank separator
-///   Rows 3-8:   System status detail (watcher, db, wezterm, circuit)
-///   Rows 9-10:  blank separator
-///   Rows 11-14: Metrics snapshot (panes, events, unhandled, triage)
-///   Remaining:  Quick help
 fn render_home_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -1923,198 +1952,411 @@ fn render_home_view(
         return;
     }
 
-    let mut row = y;
-    let max_row = y.saturating_add(height);
+    let viewport = viewport_class(width, height);
+    let compact = matches!(viewport, ViewportClass::Compact);
+    let chunks = home_chunks(y, width, height, false, viewport);
 
-    // -- Title + aggregate health badge --
-    let title = "  FrankenTerm Control Center";
-    write_styled(frame, 0, row, title, CellStyle::new().bold());
+    render_home_title(frame, chunks[0], health, viewport);
+    render_home_status_block(frame, chunks[1], health, compact);
+    render_home_metrics_block(
+        frame,
+        chunks[2],
+        health,
+        unhandled_count,
+        triage_count,
+        compact,
+    );
+    render_home_help_block(frame, chunks[3], viewport);
+    render_home_footer(frame, chunks[4], None, compact);
+}
 
-    let (badge, badge_style) = match health {
-        None => ("  LOADING", CellStyle::new().dim()),
-        Some(h) if h.watcher_label == "stopped" || h.db_label == "unavailable" => {
-            ("  ERROR", CellStyle::new().bold())
-        }
-        Some(h) if h.circuit_label == "OPEN" => ("  WARNING", CellStyle::new().bold()),
-        Some(_) => ("  OK", CellStyle::new().bold()),
+fn home_chunks(
+    y: u16,
+    width: u16,
+    height: u16,
+    has_dashboard: bool,
+    viewport: ViewportClass,
+) -> [UiRect; 6] {
+    let lengths: [u16; 6] = match (has_dashboard, viewport) {
+        (true, ViewportClass::Wide) => [3, 9, 7, 10, 4, 3],
+        (true, ViewportClass::Regular) => [3, 8, 6, 7, 3, 3],
+        (true, ViewportClass::Compact) => [3, 6, 5, 4, 3, 2],
+        (false, ViewportClass::Wide) => [3, 9, 7, 0, 3, 3],
+        (false, ViewportClass::Regular) => [3, 8, 6, 0, 3, 3],
+        (false, ViewportClass::Compact) => [3, 6, 5, 0, 3, 2],
     };
-    let badge_col = title.len() as u16;
-    write_styled(frame, badge_col, row, badge, badge_style);
-    // Fill rest of title row
-    let used = badge_col + badge.len() as u16;
-    if used < width {
-        let fill = " ".repeat((width - used) as usize);
-        write_styled(frame, used, row, &fill, CellStyle::new());
+    let min_index = if has_dashboard { 3 } else { 3 };
+    let used_fixed = lengths
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != min_index)
+        .map(|(_, len)| *len)
+        .fold(0u16, u16::saturating_add);
+    let min_len = lengths[min_index];
+    let min_actual = height.saturating_sub(used_fixed).max(min_len);
+
+    let mut rects = [UiRect::new(0, y, width, 0); 6];
+    let mut row = y;
+    let end = y.saturating_add(height);
+    for idx in 0..6 {
+        let wanted = if idx == min_index {
+            min_actual
+        } else {
+            lengths[idx]
+        };
+        let actual = wanted.min(end.saturating_sub(row));
+        rects[idx] = UiRect::new(0, row, width, actual);
+        row = row.saturating_add(actual);
+    }
+    rects
+}
+
+fn render_home_title(
+    frame: &mut ftui::Frame,
+    area: UiRect,
+    health: Option<&HealthModel>,
+    viewport: ViewportClass,
+) {
+    if area.height == 0 {
+        return;
     }
 
-    row += 1;
-
-    // Blank separator
-    if row < max_row {
-        let blank = " ".repeat(width as usize);
-        write_styled(frame, 0, row, &blank, CellStyle::new());
-        row += 1;
-    }
-
-    // -- System status section --
-    if let Some(h) = health {
-        let status_lines: &[(&str, &str, bool)] = &[
-            (
-                "  Watcher:        ",
-                &h.watcher_label,
-                h.watcher_label == "running",
-            ),
-            ("  Database:       ", &h.db_label, h.db_label == "ok"),
-            (
-                "  WezTerm CLI:    ",
-                &h.wezterm_label,
-                h.wezterm_label == "ok",
-            ),
-            (
-                "  Circuit Breaker:",
-                &h.circuit_label,
-                h.circuit_label == "closed",
-            ),
-        ];
-
-        for &(label, value, ok) in status_lines {
-            if row >= max_row {
-                break;
-            }
-            write_styled(frame, 0, row, label, CellStyle::new());
-            let val_col = label.len() as u16;
-            let val_style = if ok {
-                CellStyle::new()
-            } else {
-                CellStyle::new().bold()
-            };
-            write_styled(frame, val_col, row, &format!(" {value}"), val_style);
-            // Fill rest
-            let end = val_col + 1 + value.len() as u16;
-            if end < width {
-                let fill = " ".repeat((width - end) as usize);
-                write_styled(frame, end, row, &fill, CellStyle::new());
-            }
-            row += 1;
+    let (label, style) = match health {
+        None => ("LOADING", CellStyle::new().fg(color_yellow())),
+        Some(h)
+            if h.watcher_label == "stopped"
+                || h.db_label == "unavailable"
+                || h.circuit_label == "OPEN" =>
+        {
+            ("ERROR", CellStyle::new().fg(color_red()).bold())
         }
-    } else if row < max_row {
-        write_styled(
+        Some(h) if h.wezterm_label == "unavailable" || h.circuit_label == "half-open" => {
+            ("WARNING", CellStyle::new().fg(color_yellow()))
+        }
+        Some(_) => ("OK", CellStyle::new().fg(color_green())),
+    };
+    let viewport_label = match viewport {
+        ViewportClass::Compact => "COMPACT",
+        ViewportClass::Regular => "STANDARD",
+        ViewportClass::Wide => "DESKTOP",
+    };
+    write_segments(
+        frame,
+        area.x,
+        area.y,
+        area.width,
+        &[
+            (
+                "FrankenTerm Control Center  ",
+                CellStyle::new().fg(color_cyan()).bold(),
+            ),
+            (label, style),
+            ("  [", CellStyle::new().fg(color_dark_gray())),
+            (viewport_label, CellStyle::new().fg(color_dark_gray())),
+            ("]", CellStyle::new().fg(color_dark_gray())),
+        ],
+    );
+}
+
+fn render_home_status_block(
+    frame: &mut ftui::Frame,
+    area: UiRect,
+    health: Option<&HealthModel>,
+    compact: bool,
+) {
+    if area.height == 0 {
+        return;
+    }
+    draw_block_all(frame, area, Some("System Status"));
+    let inner = area.inner_all();
+    if inner.height == 0 {
+        return;
+    }
+
+    let mut row = inner.y;
+    if let Some(h) = health {
+        let watcher = status_word(&h.watcher_label, "RUNNING", "STOPPED");
+        let db = status_word(&h.db_label, "OK", "NOT FOUND");
+        let wezterm = status_word(&h.wezterm_label, "OK", "ERROR");
+        let circuit = match h.circuit_label.as_str() {
+            "closed" => "CLOSED",
+            "half-open" if compact => "HALF",
+            "half-open" => "HALF-OPEN",
+            _ => "OPEN",
+        };
+        if compact {
+            write_segments(
+                frame,
+                inner.x,
+                row,
+                inner.width,
+                &[
+                    ("  Watcher ", CellStyle::new()),
+                    (watcher, status_style(&h.watcher_label)),
+                    ("  DB ", CellStyle::new()),
+                    (db, status_style(&h.db_label)),
+                ],
+            );
+            row += 1;
+            if row < inner.y.saturating_add(inner.height) {
+                write_segments(
+                    frame,
+                    inner.x,
+                    row,
+                    inner.width,
+                    &[
+                        ("  WezTerm ", CellStyle::new()),
+                        (wezterm, status_style(&h.wezterm_label)),
+                        ("  Circuit ", CellStyle::new()),
+                        (circuit, status_style(&h.circuit_label)),
+                    ],
+                );
+                row += 1;
+            }
+            if row < inner.y.saturating_add(inner.height) {
+                write_segments(
+                    frame,
+                    inner.x,
+                    row,
+                    inner.width,
+                    &[
+                        ("  Capture ", CellStyle::new()),
+                        ("no captures yet", CellStyle::new().fg(color_gray())),
+                        ("  Failures ", CellStyle::new()),
+                        ("0/0", CellStyle::new()),
+                    ],
+                );
+            }
+        } else {
+            let lines = [
+                ("  Watcher:       ", watcher, status_style(&h.watcher_label)),
+                ("  Database:      ", db, status_style(&h.db_label)),
+                ("  WezTerm CLI:   ", wezterm, status_style(&h.wezterm_label)),
+                ("  Circuit:       ", circuit, status_style(&h.circuit_label)),
+                (
+                    "  Capture lag:   ",
+                    "no captures yet",
+                    CellStyle::new().fg(color_gray()),
+                ),
+                ("  Failures:      ", "0/0", CellStyle::new()),
+            ];
+            for (label, value, style) in lines {
+                if row >= inner.y.saturating_add(inner.height) {
+                    break;
+                }
+                write_segments(
+                    frame,
+                    inner.x,
+                    row,
+                    inner.width,
+                    &[(label, CellStyle::new()), (value, style)],
+                );
+                row += 1;
+            }
+        }
+    } else {
+        write_segments(
             frame,
-            0,
-            row,
-            "  Loading health data...",
-            CellStyle::new().dim(),
+            inner.x,
+            inner.y,
+            inner.width,
+            &[("Loading...", CellStyle::new().fg(color_yellow()))],
         );
-        let used = 24u16;
-        if used < width {
-            let fill = " ".repeat((width - used) as usize);
-            write_styled(frame, used, row, &fill, CellStyle::new());
+    }
+}
+
+fn render_home_metrics_block(
+    frame: &mut ftui::Frame,
+    area: UiRect,
+    health: Option<&HealthModel>,
+    unhandled_count: usize,
+    triage_count: usize,
+    compact: bool,
+) {
+    if area.height == 0 {
+        return;
+    }
+    draw_block_all(frame, area, Some("Metrics"));
+    let inner = area.inner_all();
+    if inner.height == 0 {
+        return;
+    }
+
+    let Some(h) = health else {
+        write_segments(
+            frame,
+            inner.x,
+            inner.y,
+            inner.width,
+            &[("...", CellStyle::new().fg(color_gray()))],
+        );
+        return;
+    };
+
+    let pane_style = if h.pane_count == "0" {
+        CellStyle::new().fg(color_yellow())
+    } else {
+        CellStyle::new().fg(color_green())
+    };
+    let event_style = h
+        .event_count
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count > 100)
+        .map_or_else(
+            || CellStyle::new().fg(color_green()),
+            |_| CellStyle::new().fg(color_yellow()),
+        );
+    let unhandled_style = if unhandled_count > 0 {
+        CellStyle::new().fg(color_yellow()).bold()
+    } else {
+        CellStyle::new().fg(color_green())
+    };
+    let triage_style = if triage_count > 0 {
+        CellStyle::new().fg(color_yellow())
+    } else {
+        CellStyle::new().fg(color_green())
+    };
+    let unhandled_label = unhandled_count.to_string();
+    let triage_label = triage_count.to_string();
+
+    if compact {
+        write_segments(
+            frame,
+            inner.x,
+            inner.y,
+            inner.width,
+            &[
+                ("  Panes ", CellStyle::new()),
+                (&h.pane_count, pane_style),
+                ("  Events ", CellStyle::new()),
+                (&h.event_count, event_style),
+            ],
+        );
+        if inner.height > 1 {
+            write_segments(
+                frame,
+                inner.x,
+                inner.y + 1,
+                inner.width,
+                &[
+                    ("  Unhandled ", CellStyle::new()),
+                    (&unhandled_label, unhandled_style),
+                    ("  Triage ", CellStyle::new()),
+                    (&triage_label, triage_style),
+                ],
+            );
         }
-        row += 1;
-    }
-
-    // Blank separator
-    if row < max_row {
-        let blank = " ".repeat(width as usize);
-        write_styled(frame, 0, row, &blank, CellStyle::new());
-        row += 1;
-    }
-
-    // -- Metrics section --
-    if let Some(h) = health {
-        let metrics: &[(&str, &str, bool)] = &[
-            ("  Panes:          ", &h.pane_count, h.pane_count != "0"),
-            ("  Events:         ", &h.event_count, true),
+    } else {
+        let lines = [
+            ("  Panes:         ", h.pane_count.as_str(), pane_style),
+            ("  Events:        ", h.event_count.as_str(), event_style),
+            (
+                "  Unhandled:     ",
+                unhandled_label.as_str(),
+                unhandled_style,
+            ),
+            ("  Triage items:  ", triage_label.as_str(), triage_style),
         ];
-        for &(label, value, _ok) in metrics {
-            if row >= max_row {
+        for (idx, (label, value, style)) in lines.iter().enumerate() {
+            let row = inner.y.saturating_add(idx as u16);
+            if row >= inner.y.saturating_add(inner.height) {
                 break;
             }
-            write_styled(frame, 0, row, label, CellStyle::new());
-            let val_col = label.len() as u16;
-            write_styled(frame, val_col, row, &format!(" {value}"), CellStyle::new());
-            let end = val_col + 1 + value.len() as u16;
-            if end < width {
-                let fill = " ".repeat((width - end) as usize);
-                write_styled(frame, end, row, &fill, CellStyle::new());
-            }
-            row += 1;
+            write_segments(
+                frame,
+                inner.x,
+                row,
+                inner.width,
+                &[(label, CellStyle::new()), (value, *style)],
+            );
         }
     }
+}
 
-    // Unhandled events
-    if row < max_row {
-        let label = "  Unhandled:      ";
-        let value = unhandled_count.to_string();
-        write_styled(frame, 0, row, label, CellStyle::new());
-        let val_col = label.len() as u16;
-        let val_style = if unhandled_count > 0 {
-            CellStyle::new().bold()
-        } else {
-            CellStyle::new()
-        };
-        write_styled(frame, val_col, row, &format!(" {value}"), val_style);
-        let end = val_col + 1 + value.len() as u16;
-        if end < width {
-            let fill = " ".repeat((width - end) as usize);
-            write_styled(frame, end, row, &fill, CellStyle::new());
+fn render_home_help_block(frame: &mut ftui::Frame, area: UiRect, viewport: ViewportClass) {
+    if area.height == 0 {
+        return;
+    }
+    draw_block_all(frame, area, Some("Quick Help"));
+    let inner = area.inner_all();
+    if inner.height == 0 {
+        return;
+    }
+    let lines: &[(&str, CellStyle)] = match viewport {
+        ViewportClass::Wide => &[
+            ("Desktop workflow:", CellStyle::new().bold()),
+            (
+                "  Tab/Shift+Tab switch views | j/k move | Enter act | / search",
+                CellStyle::new(),
+            ),
+            (
+                "  r refresh | u mark handled | p cycle profile | q quit",
+                CellStyle::new(),
+            ),
+        ],
+        ViewportClass::Regular => &[
+            ("Navigation:", CellStyle::new().bold()),
+            (
+                "  Tab views | j/k move | Enter action | ? help | q quit",
+                CellStyle::new(),
+            ),
+        ],
+        ViewportClass::Compact => &[
+            ("Compact controls:", CellStyle::new().bold()),
+            (
+                "  Tab views | j/k move | Enter | ? help | q quit",
+                CellStyle::new(),
+            ),
+        ],
+    };
+    for (idx, (text, style)) in lines.iter().enumerate() {
+        let row = inner.y.saturating_add(idx as u16);
+        if row >= inner.y.saturating_add(inner.height) {
+            break;
         }
-        row += 1;
+        write_styled_clipped(frame, inner.x, row, text, *style, inner.width);
     }
+}
 
-    // Triage items
-    if row < max_row {
-        let label = "  Triage Items:   ";
-        let value = triage_count.to_string();
-        write_styled(frame, 0, row, label, CellStyle::new());
-        let val_col = label.len() as u16;
-        let val_style = if triage_count > 0 {
-            CellStyle::new().bold()
-        } else {
-            CellStyle::new()
-        };
-        write_styled(frame, val_col, row, &format!(" {value}"), val_style);
-        let end = val_col + 1 + value.len() as u16;
-        if end < width {
-            let fill = " ".repeat((width - end) as usize);
-            write_styled(frame, end, row, &fill, CellStyle::new());
-        }
-        row += 1;
+fn render_home_footer(frame: &mut ftui::Frame, area: UiRect, error: Option<&str>, compact: bool) {
+    if area.height == 0 {
+        return;
     }
+    draw_block_top(frame, area);
+    if area.height < 2 {
+        return;
+    }
+    let width = area.width.max(1) as usize;
+    let msg = if let Some(error) = error {
+        truncate_str(error, width)
+    } else if compact {
+        "No active errors | Press r to refresh".to_string()
+    } else {
+        "Ready | Home shows fleet health, cost, and throttling state".to_string()
+    };
+    let style = if error.is_some() {
+        CellStyle::new().fg(color_red())
+    } else {
+        CellStyle::new().fg(color_dark_gray())
+    };
+    write_styled_clipped(frame, area.x, area.y + 1, &msg, style, area.width);
+}
 
-    // Blank separator
-    if row < max_row {
-        let blank = " ".repeat(width as usize);
-        write_styled(frame, 0, row, &blank, CellStyle::new());
-        row += 1;
+fn status_word<'a>(label: &str, ok: &'a str, bad: &'a str) -> &'a str {
+    if label == "ok" || label == "running" || label == "closed" {
+        ok
+    } else {
+        bad
     }
+}
 
-    // -- Quick help --
-    if row < max_row {
-        write_styled(frame, 0, row, "  Navigation:", CellStyle::new().bold());
-        let rest = width.saturating_sub(14);
-        if rest > 0 {
-            let fill = " ".repeat(rest as usize);
-            write_styled(frame, 14, row, &fill, CellStyle::new());
-        }
-        row += 1;
-    }
-    if row < max_row {
-        let help = "    Tab/Shift+Tab: Switch views   q: Quit   r: Refresh   ?: Help";
-        write_styled(frame, 0, row, help, CellStyle::new().dim());
-        let help_len = help.len() as u16;
-        if help_len < width {
-            let fill = " ".repeat((width - help_len) as usize);
-            write_styled(frame, help_len, row, &fill, CellStyle::new());
-        }
-        row += 1;
-    }
-
-    // Fill remaining rows
-    let blank = " ".repeat(width as usize);
-    while row < max_row {
-        write_styled(frame, 0, row, &blank, CellStyle::new());
-        row += 1;
+fn status_style(label: &str) -> CellStyle {
+    match label {
+        "running" | "ok" | "closed" => CellStyle::new().fg(color_green()),
+        "half-open" => CellStyle::new().fg(color_yellow()),
+        "stopped" | "unavailable" | "OPEN" => CellStyle::new().fg(color_red()).bold(),
+        _ => CellStyle::new(),
     }
 }
 
@@ -2164,19 +2406,40 @@ fn render_panes_view(
         return;
     }
 
-    let layout = list_detail_layout(y, width, height, 67, 8);
-    let list_width = layout.list_width;
-    let list_end = layout.list_y.saturating_add(layout.list_height);
-    let mut row = layout.list_y;
+    let stacked_mode = width < 96 || height < 18;
+    let ultra_compact = width < 68;
+    let (list_area, detail_area) = if stacked_mode {
+        let detail_height = if height >= 22 { 10 } else { 8 }.min(height);
+        let list_height = height.saturating_sub(detail_height);
+        (
+            UiRect::new(0, y, width, list_height),
+            UiRect::new(0, y.saturating_add(list_height), width, detail_height),
+        )
+    } else {
+        let list_width = (((width as u32) * 62) / 100) as u16;
+        (
+            UiRect::new(0, y, list_width, height),
+            UiRect::new(list_width, y, width.saturating_sub(list_width), height),
+        )
+    };
 
-    // -- Header: count and filter status --
+    let list_title = format!(
+        "Panes ({}/{}){}",
+        filtered_indices.len(),
+        panes.len(),
+        if stacked_mode { " [compact]" } else { "" }
+    );
+    draw_block_all(frame, list_area, Some(&list_title));
+    let list_inner = list_area.inner_all();
+    if list_inner.height == 0 {
+        return;
+    }
+
     let selected_profile = filters.selected_profile.unwrap_or("default");
     let active_profile = filters.active_profile.unwrap_or("default");
-    let header = if layout.stacked {
+    let filter_summary = if stacked_mode {
         format!(
-            "  Panes {}/{}  filter='{}' u={} b={} agent={} domain={} profile={} active={} ({}) [compact]",
-            filtered_indices.len(),
-            panes.len(),
+            "q='{}' uh={} bm={} ag={} dom={} prof={}/{} ({})",
             filters.query,
             filters.unhandled_only,
             filters.bookmarked_only,
@@ -2188,9 +2451,7 @@ fn render_panes_view(
         )
     } else {
         format!(
-            "  Panes ({}/{})  filter='{}' unhandled={} bookmarked={} agent={} domain={} profile={} active={} ({})",
-            filtered_indices.len(),
-            panes.len(),
+            "filter='{}' unhandled={} bookmarked={} agent={} domain={} profile={} active={} ({})",
             filters.query,
             filters.unhandled_only,
             filters.bookmarked_only,
@@ -2201,165 +2462,304 @@ fn render_panes_view(
             filters.profile_count,
         )
     };
-    write_styled(frame, 0, row, &header, CellStyle::new().bold());
-    let hlen = header.len() as u16;
-    if hlen < list_width {
-        let fill = " ".repeat((list_width - hlen) as usize);
-        write_styled(frame, hlen, row, &fill, CellStyle::new());
-    }
-    row += 1;
 
-    // -- Column headers --
-    if row < list_end {
-        let col_header = format!(
-            "  {:>3} {:8} {:12} {:>9}  {}",
-            "ID", "Agent", "State", "Unhandled", "Title"
-        );
-        write_styled(frame, 0, row, &col_header, CellStyle::new().dim());
-        let clen = col_header.len() as u16;
-        if clen < list_width {
-            let fill = " ".repeat((list_width - clen) as usize);
-            write_styled(frame, clen, row, &fill, CellStyle::new());
-        }
-        row += 1;
-    }
-
-    // -- Pane rows --
-    if filtered_indices.is_empty() && row < list_end {
-        write_styled(
-            frame,
-            0,
-            row,
-            "  No panes match current filters.",
-            CellStyle::new().dim(),
-        );
-        let msg_len = 34u16;
-        if msg_len < list_width {
-            let fill = " ".repeat((list_width - msg_len) as usize);
-            write_styled(frame, msg_len, row, &fill, CellStyle::new());
-        }
-        row += 1;
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
     } else {
+        3
+    }
+    .min(list_inner.height);
+    let header_area = UiRect::new(
+        list_inner.x,
+        list_inner.y,
+        list_inner.width,
+        list_header_height,
+    );
+    let rows_area = UiRect::new(
+        list_inner.x,
+        list_inner.y.saturating_add(list_header_height),
+        list_inner.width,
+        list_inner.height.saturating_sub(list_header_height),
+    );
+    let header_width = header_area.width.saturating_sub(1).max(1);
+    let columns = if ultra_compact {
+        "id ag st u title"
+    } else if stacked_mode {
+        "id bm ag state u title"
+    } else {
+        "id  bm      agent    state          unhandled  title"
+    };
+    write_styled_clipped(
+        frame,
+        header_area.x,
+        header_area.y,
+        &truncate_str(columns, header_width as usize),
+        CellStyle::new(),
+        header_area.width,
+    );
+    if header_area.height > 1 {
+        write_styled_clipped(
+            frame,
+            header_area.x,
+            header_area.y + 1,
+            &truncate_str(&filter_summary, header_width as usize),
+            CellStyle::new().fg(color_gray()),
+            header_area.width,
+        );
+    }
+
+    if filtered_indices.is_empty() {
+        if rows_area.height > 0 {
+            write_styled_clipped(
+                frame,
+                rows_area.x,
+                rows_area.y,
+                "No panes match the current filters.",
+                CellStyle::new().fg(color_yellow()),
+                rows_area.width,
+            );
+        }
+    } else {
+        let selected = selected.min(filtered_indices.len().saturating_sub(1));
+        let row_width = rows_area.width.saturating_sub(1).max(1);
         for (pos, &pane_idx) in filtered_indices.iter().enumerate() {
-            if row >= list_end {
+            let row = rows_area.y.saturating_add(pos as u16);
+            if row >= rows_area.y.saturating_add(rows_area.height) {
                 break;
             }
             let pane = &panes[pane_idx];
-            let line = format!(
-                "  {:>3} {:8} {:12} {:>9}  {}",
-                pane.pane_id,
-                truncate_str(&pane.agent_label, 8),
-                truncate_str(&pane.state_label, 12),
-                pane.unhandled_badge,
-                truncate_str(&pane.title, 24),
-            );
+            let bookmark_summary = "-";
+            let line = if ultra_compact {
+                format!(
+                    "{:>3} {:6} {:4} {:>2} {}",
+                    pane.pane_id,
+                    truncate_str(&pane.agent_label, 6),
+                    truncate_str(&pane.state_label, 4),
+                    pane.unhandled_badge,
+                    truncate_str(&pane.title, 18)
+                )
+            } else if stacked_mode {
+                format!(
+                    "{:>3} {:4} {:6} {:8} {:>2} {}",
+                    pane.pane_id,
+                    bookmark_summary,
+                    truncate_str(&pane.agent_label, 6),
+                    truncate_str(&pane.state_label, 8),
+                    pane.unhandled_badge,
+                    truncate_str(&pane.title, 20)
+                )
+            } else {
+                format!(
+                    "{:>3} {:6} {:8} {:12} {:>9}  {}",
+                    pane.pane_id,
+                    bookmark_summary,
+                    truncate_str(&pane.agent_label, 8),
+                    truncate_str(&pane.state_label, 12),
+                    pane.unhandled_badge,
+                    truncate_str(&pane.title, 24)
+                )
+            };
             let style = if pos == selected {
-                CellStyle::new().bold().reverse()
+                CellStyle::new().bg(color_dark_gray()).bold()
             } else if !pane.unhandled_badge.is_empty() {
-                CellStyle::new().bold()
+                CellStyle::new().fg(color_yellow())
+            } else if pane.state_label == "AltScreen" {
+                CellStyle::new().fg(color_magenta())
             } else {
                 CellStyle::new()
             };
-            write_styled(frame, 0, row, &line, style);
-            let llen = line.len() as u16;
-            if llen < list_width {
-                let fill = " ".repeat((list_width - llen) as usize);
-                write_styled(frame, llen, row, &fill, style);
-            }
-            row += 1;
+            write_styled_clipped(
+                frame,
+                rows_area.x,
+                row,
+                &truncate_str(&line, row_width as usize),
+                style,
+                rows_area.width,
+            );
         }
     }
 
-    // Fill remaining list area
-    let blank_list = " ".repeat(list_width as usize);
-    while row < list_end {
-        write_styled(frame, 0, row, &blank_list, CellStyle::new());
-        row += 1;
-    }
-
-    if layout.detail_width == 0 || layout.detail_height == 0 {
+    if detail_area.width == 0 || detail_area.height == 0 {
         return;
     }
 
-    // -- Detail panel --
+    draw_block_all(
+        frame,
+        detail_area,
+        Some(if stacked_mode {
+            "Selected Pane"
+        } else {
+            "Pane Details"
+        }),
+    );
+    let detail_inner = detail_area.inner_all();
+    if detail_inner.height == 0 {
+        return;
+    }
+
     let selected_pane = filtered_indices
-        .get(selected)
+        .get(selected.min(filtered_indices.len().saturating_sub(1)))
         .and_then(|&idx| panes.get(idx));
 
-    let detail_x = layout.detail_x;
-    let detail_width = layout.detail_width;
-    let detail_end = layout.detail_y.saturating_add(layout.detail_height);
-    let mut drow = layout.detail_y;
-
-    // Detail header
-    write_styled(
-        frame,
-        detail_x,
-        drow,
-        " Pane Details",
-        CellStyle::new().bold(),
-    );
-    let dhlen = 13u16;
-    if dhlen < detail_width {
-        let fill = " ".repeat((detail_width - dhlen) as usize);
-        write_styled(frame, detail_x + dhlen, drow, &fill, CellStyle::new());
-    }
-    drow += 1;
-
     if let Some(pane) = selected_pane {
-        let detail_lines: Vec<String> = vec![
-            format!(" ID:       {}", pane.pane_id),
-            format!(" Title:    {}", pane.title),
-            format!(" Domain:   {}", pane.domain),
-            format!(" Agent:    {}", pane.agent_label),
-            format!(" State:    {}", pane.state_label),
-            format!(" CWD:      {}", pane.cwd),
-            format!(
-                " Unhandled:{}",
-                if pane.unhandled_badge.is_empty() {
-                    " 0".to_string()
-                } else {
-                    format!(" {}", pane.unhandled_badge)
-                }
-            ),
-            String::new(),
-            " Keys: j/k=nav u/b/a/d filters p=profile Enter=apply".to_string(),
-            "       type=filter Backspace=edit Esc=clear".to_string(),
-        ];
-
-        for line in &detail_lines {
-            if drow >= detail_end {
+        let detail_width = detail_inner.width.saturating_sub(1).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 34;
+        let next_action = if selected_profile != active_profile {
+            format!("Apply selected profile: ft rules profile apply {selected_profile}")
+        } else if !pane.unhandled_badge.is_empty() {
+            format!("Run: ft workflow list --pane {}", pane.pane_id)
+        } else {
+            format!("Inspect: ft robot get-text {} --tail 120", pane.pane_id)
+        };
+        let mut rows: Vec<(String, CellStyle)> = Vec::new();
+        if compact_details {
+            rows.push((
+                truncate_str(
+                    &format!("#{} {}", pane.pane_id, pane.title),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(
+                    &format!("State {} | Agent {}", pane.state_label, pane.agent_label),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(
+                    &format!(
+                        "Domain {} | Unhandled {}",
+                        pane.domain, pane.unhandled_badge
+                    ),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str("Bookmarks none", detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(
+                    &format!("Ruleset {selected_profile}/{active_profile}"),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((String::new(), CellStyle::new()));
+            rows.push(("Next best action:".to_string(), CellStyle::new().bold()));
+            rows.push((
+                truncate_str(&next_action, detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((String::new(), CellStyle::new()));
+            rows.push((
+                truncate_str(
+                    "Keys: j/k nav | p profile | Enter apply | b bookmarked",
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+        } else {
+            rows.push((
+                truncate_str(&format!("Pane ID: {}", pane.pane_id), detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(&format!("Title: {}", pane.title), detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(&format!("Domain: {}", pane.domain), detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(
+                    &format!("Agent: {}", pane.agent_label),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(
+                    &format!("State: {}", pane.state_label),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(&format!("CWD: {}", pane.cwd), detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str("Last Activity: unknown", detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(
+                    &format!(
+                        "Unhandled Events: {}",
+                        if pane.unhandled_badge.is_empty() {
+                            "0"
+                        } else {
+                            &pane.unhandled_badge
+                        }
+                    ),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str("Bookmarks: none", detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(
+                    &format!("Ruleset Active: {active_profile}"),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((
+                truncate_str(
+                    &format!("Ruleset Selected: {selected_profile}"),
+                    detail_width as usize,
+                ),
+                CellStyle::new(),
+            ));
+            rows.push((String::new(), CellStyle::new()));
+            rows.push(("Next best action:".to_string(), CellStyle::new().bold()));
+            rows.push((
+                truncate_str(&next_action, detail_width as usize),
+                CellStyle::new(),
+            ));
+            rows.push((String::new(), CellStyle::new()));
+            rows.push((
+                truncate_str(
+                    "Keys: p=cycle profile, Enter=apply selected profile, b=bookmarked only",
+                    detail_width as usize,
+                ),
+                CellStyle::new().fg(color_gray()),
+            ));
+        }
+        for (idx, (text, style)) in rows.iter().enumerate() {
+            let row = detail_inner.y.saturating_add(idx as u16);
+            if row >= detail_inner.y.saturating_add(detail_inner.height) {
                 break;
             }
-            write_styled(frame, detail_x, drow, line, CellStyle::new());
-            let llen = line.len() as u16;
-            if llen < detail_width {
-                let fill = " ".repeat((detail_width - llen) as usize);
-                write_styled(frame, detail_x + llen, drow, &fill, CellStyle::new());
-            }
-            drow += 1;
+            write_styled_clipped(frame, detail_inner.x, row, text, *style, detail_inner.width);
         }
-    } else if drow < detail_end {
-        write_styled(
+    } else {
+        write_styled_clipped(
             frame,
-            detail_x,
-            drow,
-            " No pane selected.",
-            CellStyle::new().dim(),
+            detail_inner.x,
+            detail_inner.y,
+            "No pane selected.",
+            CellStyle::new().fg(color_yellow()),
+            detail_inner.width,
         );
-        let msg_len = 19u16;
-        if msg_len < detail_width {
-            let fill = " ".repeat((detail_width - msg_len) as usize);
-            write_styled(frame, detail_x + msg_len, drow, &fill, CellStyle::new());
-        }
-        drow += 1;
-    }
-
-    // Fill remaining detail area
-    let blank_detail = " ".repeat(detail_width as usize);
-    while drow < detail_end {
-        write_styled(frame, detail_x, drow, &blank_detail, CellStyle::new());
-        drow += 1;
     }
 }
 
@@ -3648,38 +4048,6 @@ fn render_timeline_view(
     }
 }
 
-/// Render the status footer.
-fn render_footer(frame: &mut ftui::Frame, row: u16, width: u16, view: View, error: Option<&str>) {
-    let left = if let Some(err) = error {
-        format!(" ERR: {err}")
-    } else {
-        format!(" {}", view.name())
-    };
-
-    let right = " q:quit  Tab:nav  ?:help  r:refresh ";
-    let left_len = left.len() as u16;
-    let right_len = right.len() as u16;
-
-    let style = if error.is_some() {
-        CellStyle::new().bold()
-    } else {
-        CellStyle::new().reverse()
-    };
-
-    write_styled(frame, 0, row, &left, style);
-
-    // Fill middle
-    let mid = width.saturating_sub(left_len + right_len);
-    if mid > 0 {
-        let fill = " ".repeat(mid as usize);
-        write_styled(frame, left_len, row, &fill, style);
-    }
-
-    if left_len + mid + right_len <= width {
-        write_styled(frame, left_len + mid, row, right, style);
-    }
-}
-
 /// Render a modal overlay centered on the screen.
 ///
 /// The modal is a bordered box with title, body text, and action hints.
@@ -3777,6 +4145,8 @@ struct CellStyle {
     bold: bool,
     dim: bool,
     reverse: bool,
+    fg: Option<ftui::PackedRgba>,
+    bg: Option<ftui::PackedRgba>,
 }
 
 impl CellStyle {
@@ -3785,6 +4155,8 @@ impl CellStyle {
             bold: false,
             dim: false,
             reverse: false,
+            fg: None,
+            bg: None,
         }
     }
 
@@ -3800,6 +4172,16 @@ impl CellStyle {
 
     const fn reverse(mut self) -> Self {
         self.reverse = true;
+        self
+    }
+
+    fn fg(mut self, color: ftui::PackedRgba) -> Self {
+        self.fg = Some(color);
+        self
+    }
+
+    fn bg(mut self, color: ftui::PackedRgba) -> Self {
+        self.bg = Some(color);
         self
     }
 
@@ -3837,11 +4219,152 @@ fn write_styled(frame: &mut ftui::Frame, col: u16, row: u16, text: &str, style: 
         if x >= w {
             break;
         }
-        if let Some(cell) = buf.get_mut(x, row) {
-            cell.content = ftui::render::cell::CellContent::from_char(ch);
-            cell.attrs = ftui::CellAttrs::new(flags, 0);
+        let mut cell = ftui::Cell::from_char(ch).with_attrs(ftui::CellAttrs::new(flags, 0));
+        if let Some(fg) = style.fg {
+            cell = cell.with_fg(fg);
+        }
+        if let Some(bg) = style.bg {
+            cell = cell.with_bg(bg);
+        }
+        buf.set(x, row, cell);
+    }
+}
+
+fn write_styled_clipped(
+    frame: &mut ftui::Frame,
+    col: u16,
+    row: u16,
+    text: &str,
+    style: CellStyle,
+    max_width: u16,
+) {
+    if max_width == 0 {
+        return;
+    }
+    let clipped = truncate_str(text, max_width as usize);
+    write_styled(frame, col, row, &clipped, style);
+}
+
+fn write_segments(
+    frame: &mut ftui::Frame,
+    col: u16,
+    row: u16,
+    max_width: u16,
+    segments: &[(&str, CellStyle)],
+) {
+    let mut x = col;
+    let end = col.saturating_add(max_width);
+    for (text, style) in segments {
+        if x >= end {
+            break;
+        }
+        let remaining = end.saturating_sub(x);
+        write_styled_clipped(frame, x, row, text, *style, remaining);
+        x = x.saturating_add(text.chars().count().min(remaining as usize) as u16);
+    }
+}
+
+fn draw_block_all(frame: &mut ftui::Frame, area: UiRect, title: Option<&str>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    if area.width == 1 {
+        for row in area.y..area.y.saturating_add(area.height) {
+            write_styled(frame, area.x, row, "│", CellStyle::new());
+        }
+        return;
+    }
+
+    let right = area.x + area.width - 1;
+    let bottom = area.y + area.height - 1;
+    write_styled(frame, area.x, area.y, "┌", CellStyle::new());
+    if let Some(title) = title {
+        let title_width = area.width.saturating_sub(2) as usize;
+        let clipped = truncate_str(title, title_width);
+        write_styled(frame, area.x + 1, area.y, &clipped, CellStyle::new());
+        let used = clipped.chars().count() as u16;
+        if used + 2 < area.width {
+            write_styled(
+                frame,
+                area.x + 1 + used,
+                area.y,
+                &"─".repeat((area.width - 2 - used) as usize),
+                CellStyle::new(),
+            );
+        }
+    } else if area.width > 2 {
+        write_styled(
+            frame,
+            area.x + 1,
+            area.y,
+            &"─".repeat((area.width - 2) as usize),
+            CellStyle::new(),
+        );
+    }
+    write_styled(frame, right, area.y, "┐", CellStyle::new());
+
+    if area.height > 2 {
+        for row in (area.y + 1)..bottom {
+            write_styled(frame, area.x, row, "│", CellStyle::new());
+            write_styled(frame, right, row, "│", CellStyle::new());
         }
     }
+
+    if area.height > 1 {
+        write_styled(frame, area.x, bottom, "└", CellStyle::new());
+        if area.width > 2 {
+            write_styled(
+                frame,
+                area.x + 1,
+                bottom,
+                &"─".repeat((area.width - 2) as usize),
+                CellStyle::new(),
+            );
+        }
+        write_styled(frame, right, bottom, "┘", CellStyle::new());
+    }
+}
+
+fn draw_block_top(frame: &mut ftui::Frame, area: UiRect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    write_styled(
+        frame,
+        area.x,
+        area.y,
+        &"─".repeat(area.width as usize),
+        CellStyle::new(),
+    );
+}
+
+fn color_red() -> ftui::PackedRgba {
+    ftui::PackedRgba::rgba(0x80, 0x00, 0x00, 0xFF)
+}
+
+fn color_green() -> ftui::PackedRgba {
+    ftui::PackedRgba::rgba(0x00, 0x80, 0x00, 0xFF)
+}
+
+fn color_yellow() -> ftui::PackedRgba {
+    ftui::PackedRgba::rgba(0x80, 0x80, 0x00, 0xFF)
+}
+
+fn color_magenta() -> ftui::PackedRgba {
+    ftui::PackedRgba::rgba(0x80, 0x00, 0x80, 0xFF)
+}
+
+fn color_cyan() -> ftui::PackedRgba {
+    ftui::PackedRgba::rgba(0x00, 0x80, 0x80, 0xFF)
+}
+
+fn color_gray() -> ftui::PackedRgba {
+    ftui::PackedRgba::rgba(0xC0, 0xC0, 0xC0, 0xFF)
+}
+
+fn color_dark_gray() -> ftui::PackedRgba {
+    ftui::PackedRgba::rgba(0x80, 0x80, 0x80, 0xFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -7689,18 +8212,13 @@ mod tests {
             "Tab bar missing 'Home' in: {first_line}"
         );
         assert!(
-            first_line.contains('|'),
+            first_line.contains('│'),
             "Tab bar missing separators in: {first_line}"
         );
-    }
-
-    fn assert_footer_present(text: &str, active_view: View) {
-        let last_line = text.lines().last().expect("non-empty frame");
-        // Footer should mention the current view name
+        let border_line = text.lines().nth(1).expect("tab border row");
         assert!(
-            last_line.contains(active_view.name()),
-            "Footer missing '{name}': {last_line}",
-            name = active_view.name()
+            border_line.contains('─'),
+            "Tab bar missing bottom border in: {border_line}"
         );
     }
 
@@ -7710,7 +8228,6 @@ mod tests {
     fn snapshot_home_healthy_80x24() {
         let text = snapshot_view(MockQuery::healthy(), View::Home, 80, 24);
         assert_tab_bar(&text, View::Home);
-        assert_footer_present(&text, View::Home);
         assert!(
             text.contains("ok")
                 || text.contains("OK")
@@ -7724,7 +8241,6 @@ mod tests {
     fn snapshot_home_degraded_80x24() {
         let text = snapshot_view(MockQuery::degraded(), View::Home, 80, 24);
         assert_tab_bar(&text, View::Home);
-        assert_footer_present(&text, View::Home);
         // Degraded state should show ERROR badge, "stopped" watcher, or "unavailable" db
         assert!(
             text.contains("ERROR") || text.contains("stopped") || text.contains("unavailable"),
@@ -7736,12 +8252,12 @@ mod tests {
     fn snapshot_home_all_sizes() {
         for &(w, h) in SNAPSHOT_SIZES {
             let text = snapshot_view(MockQuery::healthy(), View::Home, w, h);
-            if h >= 3 {
+            if h >= 2 {
                 assert_tab_bar(&text, View::Home);
             }
             // Should not panic at any size
             assert!(
-                !text.is_empty() || h < 3,
+                !text.is_empty() || h < 2,
                 "Frame should be non-empty for h={h}"
             );
         }
@@ -7753,7 +8269,6 @@ mod tests {
     fn snapshot_panes_populated_80x24() {
         let text = snapshot_view(MockQuery::healthy(), View::Panes, 80, 24);
         assert_tab_bar(&text, View::Panes);
-        assert_footer_present(&text, View::Panes);
         // MockQuery::healthy() has pane_count=3
         assert!(
             text.contains("pane") || text.contains("Pane"),
@@ -7779,7 +8294,7 @@ mod tests {
     fn snapshot_panes_all_sizes() {
         for &(w, h) in SNAPSHOT_SIZES {
             let text = snapshot_view(MockQuery::healthy(), View::Panes, w, h);
-            if h >= 3 {
+            if h >= 2 {
                 assert_tab_bar(&text, View::Panes);
             }
         }
@@ -7791,7 +8306,6 @@ mod tests {
     fn snapshot_events_populated_80x24() {
         let text = snapshot_view(MockQuery::with_events(), View::Events, 80, 24);
         assert_tab_bar(&text, View::Events);
-        assert_footer_present(&text, View::Events);
         assert!(
             text.contains("Rate limit")
                 || text.contains("rate_limit")
@@ -7812,7 +8326,7 @@ mod tests {
     fn snapshot_events_all_sizes() {
         for &(w, h) in SNAPSHOT_SIZES {
             let text = snapshot_view(MockQuery::with_events(), View::Events, w, h);
-            if h >= 3 {
+            if h >= 2 {
                 assert_tab_bar(&text, View::Events);
             }
         }
@@ -7824,7 +8338,6 @@ mod tests {
     fn snapshot_triage_populated_80x24() {
         let text = snapshot_view(MockQuery::with_triage(), View::Triage, 80, 24);
         assert_tab_bar(&text, View::Triage);
-        assert_footer_present(&text, View::Triage);
         assert!(
             text.contains("crash")
                 || text.contains("Fatal")
@@ -7844,7 +8357,7 @@ mod tests {
     fn snapshot_triage_all_sizes() {
         for &(w, h) in SNAPSHOT_SIZES {
             let text = snapshot_view(MockQuery::with_triage(), View::Triage, w, h);
-            if h >= 3 {
+            if h >= 2 {
                 assert_tab_bar(&text, View::Triage);
             }
         }
@@ -7856,7 +8369,6 @@ mod tests {
     fn snapshot_history_populated_80x24() {
         let text = snapshot_view(MockQuery::with_history(), View::History, 80, 24);
         assert_tab_bar(&text, View::History);
-        assert_footer_present(&text, View::History);
         assert!(
             text.contains("send_text") || text.contains("History"),
             "History view should show action data"
@@ -7877,7 +8389,7 @@ mod tests {
     fn snapshot_history_all_sizes() {
         for &(w, h) in SNAPSHOT_SIZES {
             let text = snapshot_view(MockQuery::with_history(), View::History, w, h);
-            if h >= 3 {
+            if h >= 2 {
                 assert_tab_bar(&text, View::History);
             }
         }
@@ -7889,7 +8401,6 @@ mod tests {
     fn snapshot_search_empty_80x24() {
         let text = snapshot_view(MockQuery::healthy(), View::Search, 80, 24);
         assert_tab_bar(&text, View::Search);
-        assert_footer_present(&text, View::Search);
     }
 
     #[test]
@@ -7928,7 +8439,7 @@ mod tests {
     fn snapshot_search_all_sizes() {
         for &(w, h) in SNAPSHOT_SIZES {
             let text = snapshot_view(MockQuery::healthy(), View::Search, w, h);
-            if h >= 3 {
+            if h >= 2 {
                 assert_tab_bar(&text, View::Search);
             }
         }
@@ -7940,7 +8451,6 @@ mod tests {
     fn snapshot_help_80x24() {
         let text = snapshot_view(MockQuery::healthy(), View::Help, 80, 24);
         assert_tab_bar(&text, View::Help);
-        assert_footer_present(&text, View::Help);
         assert!(
             text.contains("FrankenTerm Control Center")
                 || text.contains("Keybindings")
@@ -7954,7 +8464,7 @@ mod tests {
     fn snapshot_help_all_sizes() {
         for &(w, h) in SNAPSHOT_SIZES {
             let text = snapshot_view(MockQuery::healthy(), View::Help, w, h);
-            if h >= 3 {
+            if h >= 2 {
                 assert_tab_bar(&text, View::Help);
             }
         }
@@ -7973,27 +8483,27 @@ mod tests {
 
     #[test]
     fn snapshot_all_views_no_panic_very_small() {
-        // Minimum viable: 3 rows (tab + 1 content + footer)
+        // Minimum viable: 2 rows (tab + border).
         for &view in View::all() {
-            let _text = snapshot_view(MockQuery::healthy(), view, 30, 3);
+            let _text = snapshot_view(MockQuery::healthy(), view, 30, 2);
         }
     }
 
     #[test]
-    fn snapshot_all_views_height_2_renders_empty() {
+    fn snapshot_all_views_height_1_renders_empty() {
         use ftui::Model as _;
-        // height < 3 → view() returns early, frame should be all spaces
+        // height < 2 → view() returns early, frame should be all spaces
         for &view in View::all() {
             let mut model = make_model(MockQuery::healthy());
             model.view_state.current_view = view;
             let mut pool = ftui::GraphemePool::new();
-            let mut frame = ftui::Frame::new(80, 2, &mut pool);
+            let mut frame = ftui::Frame::new(80, 1, &mut pool);
             model.view(&mut frame);
             let text = frame_to_text(&frame);
-            // Should be empty or whitespace-only since height < 3
+            // Should be empty or whitespace-only since height < 2
             assert!(
                 text.trim().is_empty(),
-                "Height 2 should produce empty frame for {view:?}: '{text}'"
+                "Height 1 should produce empty frame for {view:?}: '{text}'"
             );
         }
     }
@@ -8010,7 +8520,6 @@ mod tests {
             };
             let text = snapshot_view(query, view, 120, 40);
             assert_tab_bar(&text, view);
-            assert_footer_present(&text, view);
         }
     }
 
@@ -8044,12 +8553,11 @@ mod tests {
         let text = snapshot_view(MockQuery::healthy(), View::Home, 80, 24);
         let tab_line = text.lines().next().unwrap();
         // Verify separator characters between tabs
-        assert!(tab_line.contains('|'), "Tab bar should have separators");
-        // Verify shortcut numbers for tabs that fit at 80 columns.
-        // The render_tab_bar function truncates when tabs exceed the width,
-        // so at 80 cols not all 8 tabs may be visible.
+        assert!(tab_line.contains('│'), "Tab bar should have separators");
+        // Verify view names for tabs that fit at 80 columns. Shortcut keys
+        // remain active but are not part of the ratatui-oracle tab chrome.
         for (i, view) in View::all().iter().enumerate() {
-            let expected = format!("{} {}", i + 1, view.name());
+            let expected = view.name();
             if tab_line.contains(&expected) {
                 // Tab is visible — good
             } else {
@@ -8063,13 +8571,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_footer_shows_view_name() {
+    fn snapshot_tab_bar_shows_view_name() {
         for &view in View::all() {
             let text = snapshot_view(MockQuery::healthy(), view, 80, 24);
-            let last_line = text.lines().last().unwrap();
+            let tab_line = text.lines().next().unwrap();
             assert!(
-                last_line.contains(view.name()),
-                "Footer should show '{name}' for {view:?}: {last_line}",
+                tab_line.contains(view.name()),
+                "Tab bar should show '{name}' for {view:?}: {tab_line}",
                 name = view.name()
             );
         }
@@ -8079,11 +8587,11 @@ mod tests {
 
     #[test]
     fn snapshot_content_fills_frame() {
-        // In an 80x24 frame, we expect tab (1) + content (22) + footer (1) = 24 lines
+        // In an 80x24 frame, we expect tab chrome (2) + content (22).
         let text = snapshot_view(MockQuery::healthy(), View::Home, 80, 24);
         let line_count = text.lines().count();
         // The last lines may be trimmed if blank, but we should have at least
-        // tab + some content + footer
+        // tab chrome + some content.
         assert!(
             line_count >= 3,
             "Should have at least 3 lines in 80x24 frame, got {line_count}"
