@@ -630,6 +630,46 @@ mod backend_driver_parity_tests {
         height: u16,
     }
 
+    struct DriverCaseReport {
+        name: &'static str,
+        left_dim: (u16, u16),
+        right_dim: (u16, u16),
+        dimension_mismatch: bool,
+        divergent_cells: usize,
+        summary: String,
+    }
+
+    impl DriverCaseReport {
+        fn from_diff(name: &'static str, diff: &crate::tui_parity_oracle::FrameDiff) -> Self {
+            Self {
+                name,
+                left_dim: diff.left_dim,
+                right_dim: diff.right_dim,
+                dimension_mismatch: diff.dimension_mismatch,
+                divergent_cells: diff.divergent_cell_count(),
+                summary: diff.render_summary(8),
+            }
+        }
+
+        fn log(&self) {
+            eprintln!(
+                "ssim backend-driver case={name} degradation={degradation} \
+                 left_dim={left:?} right_dim={right:?} dimension_mismatch={mismatch} \
+                 divergent_cells={cells}",
+                name = self.name,
+                degradation = crate::render_quality::RENDERER_SSIM_PARITY_CURRENT_DEGRADATION,
+                left = self.left_dim,
+                right = self.right_dim,
+                mismatch = self.dimension_mismatch,
+                cells = self.divergent_cells
+            );
+            eprintln!(
+                "ssim backend-driver summary {}:\n{}",
+                self.name, self.summary
+            );
+        }
+    }
+
     fn frame_text(frame: &RenderFrame) -> String {
         let mut text = String::new();
         for row in 0..frame.height {
@@ -697,6 +737,8 @@ mod backend_driver_parity_tests {
             );
 
             let diff = compute_diff(&ratatui_frame, &ftui_frame);
+            let report = DriverCaseReport::from_diff(case.name, &diff);
+            report.log();
             assert!(
                 !diff.dimension_mismatch,
                 "{} frame dimensions should match",
