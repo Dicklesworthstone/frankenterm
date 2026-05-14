@@ -26,6 +26,7 @@ FOOTNOTES_LOG="${ARTIFACT_DIR}/readme-footnotes-resolve-rch.log"
 PROOF_LEDGER_FILE="${ARTIFACT_DIR}/proof-ledger.jsonl"
 RESOLUTION_FILE="${ARTIFACT_DIR}/original-null-slot-resolution.json"
 HEDGE_SCAN_FILE="${ARTIFACT_DIR}/memory-envelope-hedge-scan.txt"
+HEDGE_PATTERN_SOURCE="${ROOT_DIR}/crates/frankenterm-core/tests/readme_hedge_alignment.rs"
 CHECKLIST_SCAN_FILE="${ARTIFACT_DIR}/closing-checklist-regression-refs.txt"
 BUILD_DIR="${ARTIFACT_DIR}/bundle-dev"
 STRICT_BUILD_DIR="${ARTIFACT_DIR}/bundle-dev-strict"
@@ -195,6 +196,7 @@ write_summary() {
         --arg proof_ledger "$(relative_path "${PROOF_LEDGER_FILE}")" \
         --arg resolution_file "$(relative_path "${RESOLUTION_FILE}")" \
         --arg hedge_scan "$(relative_path "${HEDGE_SCAN_FILE}")" \
+        --arg hedge_pattern_source "$(relative_path "${HEDGE_PATTERN_SOURCE}")" \
         --arg checklist_scan "$(relative_path "${CHECKLIST_SCAN_FILE}")" \
         --argjson pass_count "${PASS}" \
         --argjson fail_count "${FAIL}" \
@@ -268,6 +270,7 @@ write_summary() {
             proof_ledger: $proof_ledger,
             original_null_slot_resolution: $resolution_file,
             memory_envelope_hedge_scan: $hedge_scan,
+            canonical_hedge_pattern_source: $hedge_pattern_source,
             closing_checklist_scan: $checklist_scan
           },
           final_statement: "the 2026-05-09 reality-check NO_BEAD gap (manifest.json had 9 of 14 slots null) is closed; remaining null slots, if any, carry deferred_to_bead references documented in convergence_summary.json"
@@ -503,37 +506,169 @@ run_rust_guard() {
 }
 
 run_memory_envelope_hedge_check() {
-    local deferred_beads
-    deferred_beads="$(
-        jq -r '.slots[]? | select(.path == null and .deferred_to_bead != null) | .deferred_to_bead' \
-            "${ROOT_DIR}/docs/attestations/manifest.json" \
-            | sort -u
-    )"
+    set +e
+    python3 - \
+        "${HEDGE_PATTERN_SOURCE}" \
+        "${ROOT_DIR}/docs/attestations/manifest.json" \
+        "${ROOT_DIR}/README.md" \
+        "${ROOT_DIR}/AGENTS.md" >"${HEDGE_SCAN_FILE}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
 
-    grep -nH "memory-envelope claims should be treated as benchmark-dependent until linked artifacts are published" \
-        "${ROOT_DIR}/README.md" "${ROOT_DIR}/AGENTS.md" >"${HEDGE_SCAN_FILE}" 2>/dev/null || true
-    HEDGE_MATCH_COUNT="$(awk 'NF { count++ } END { print count + 0 }' "${HEDGE_SCAN_FILE}")"
+source_path = Path(sys.argv[1])
+manifest_path = Path(sys.argv[2])
+doc_paths = [Path(path) for path in sys.argv[3:]]
 
-    if [[ "${HEDGE_MATCH_COUNT}" -eq 0 ]]; then
-        record_result "convergence.memory_envelope_hedge" "passed" "legacy_hedge_lifted" "none" "${HEDGE_SCAN_FILE}" "Legacy memory-envelope hedge is absent from README.md and AGENTS.md."
+errors = []
+source = source_path.read_text(encoding="utf-8")
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+table_match = re.search(
+    r"const\s+HEDGE_PATTERNS:\s*&\[HedgePattern\]\s*=\s*&\[(?P<body>.*?)\];",
+    source,
+    re.S,
+)
+patterns = []
+if table_match is None:
+    errors.append({"kind": "missing_pattern_table", "source": str(source_path)})
+else:
+    for block in re.finditer(r"HedgePattern\s*\{(?P<body>.*?)\}", table_match.group("body"), re.S):
+        body = block.group("body")
+        category_match = re.search(r'category:\s*"(?P<category>[^"]+)"', body)
+        regex_match = re.search(r'regex:\s*r(?P<hashes>#*)"(?P<regex>.*?)"(?P=hashes)', body, re.S)
+        if category_match is None or regex_match is None:
+            errors.append({"kind": "unparsed_pattern_block", "block": body.strip()})
+            continue
+        patterns.append(
+            {
+                "category": category_match.group("category"),
+                "regex": regex_match.group("regex"),
+            }
+        )
+
+if not patterns:
+    errors.append({"kind": "empty_pattern_table", "source": str(source_path)})
+
+slots = {slot.get("category"): slot for slot in manifest.get("slots", [])}
+docs = [(path.name, path.read_text(encoding="utf-8")) for path in doc_paths]
+
+def line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+def surrounding_paragraph(text: str, start: int, end: int) -> str:
+    before = text.rfind("\n\n", 0, start)
+    before = 0 if before == -1 else before + 2
+    after = text.find("\n\n", end)
+    after = len(text) if after == -1 else after
+    return text[before:after]
+
+match_count = 0
+violations = []
+for pattern in patterns:
+    try:
+        compiled = re.compile(pattern["regex"])
+    except re.error as err:
+        errors.append(
+            {
+                "kind": "invalid_python_regex",
+                "category": pattern["category"],
+                "regex": pattern["regex"],
+                "error": str(err),
+            }
+        )
+        continue
+
+    matches = []
+    for file_name, text in docs:
+        for found in compiled.finditer(text):
+            paragraph = surrounding_paragraph(text, found.start(), found.end())
+            matches.append(
+                {
+                    "file": file_name,
+                    "line": line_number(text, found.start()),
+                    "match": found.group(0),
+                    "paragraph": paragraph,
+                }
+            )
+    pattern["matches"] = matches
+    match_count += len(matches)
+
+    slot = slots.get(pattern["category"])
+    if slot is None:
+        pattern["manifest_slot"] = None
+        continue
+
+    pattern["manifest_slot"] = {
+        "path": slot.get("path"),
+        "deferred_to_bead": slot.get("deferred_to_bead"),
+    }
+    if slot.get("path") is not None:
+        for match in matches:
+            violations.append(
+                {
+                    "kind": "populated_slot_has_hedge",
+                    "category": pattern["category"],
+                    "file": match["file"],
+                    "line": match["line"],
+                    "paragraph": match["paragraph"],
+                }
+            )
+    elif slot.get("deferred_to_bead") is not None:
+        bead_id = slot["deferred_to_bead"]
+        for match in matches:
+            if bead_id not in match["paragraph"]:
+                violations.append(
+                    {
+                        "kind": "deferred_hedge_missing_bead_reference",
+                        "category": pattern["category"],
+                        "deferred_to_bead": bead_id,
+                        "file": match["file"],
+                        "line": match["line"],
+                        "paragraph": match["paragraph"],
+                    }
+                )
+    elif matches:
+        violations.append(
+            {
+                "kind": "unresolved_slot_has_hedge",
+                "category": pattern["category"],
+                "matches": matches,
+            }
+        )
+
+json.dump(
+    {
+        "source": str(source_path),
+        "manifest": str(manifest_path),
+        "pattern_count": len(patterns),
+        "match_count": match_count,
+        "patterns": patterns,
+        "errors": errors,
+        "violations": violations,
+    },
+    sys.stdout,
+    indent=2,
+    sort_keys=True,
+)
+print()
+sys.exit(1 if errors or violations else 0)
+PY
+    local scan_rc=$?
+    set -e
+
+    HEDGE_MATCH_COUNT="$(jq '.match_count // 0' "${HEDGE_SCAN_FILE}")"
+
+    if [[ "${scan_rc}" -eq 0 && "${HEDGE_MATCH_COUNT}" -eq 0 ]]; then
+        record_result "convergence.memory_envelope_hedge" "passed" "canonical_hedge_patterns_clear" "none" "${HEDGE_SCAN_FILE}" "Canonical HEDGE_PATTERNS table has no README.md or AGENTS.md matches."
+        return 0
+    fi
+    if [[ "${scan_rc}" -eq 0 ]]; then
+        record_result "convergence.memory_envelope_hedge" "passed" "canonical_hedge_patterns_deferred" "none" "${HEDGE_SCAN_FILE}" "Canonical HEDGE_PATTERNS matches are justified by deferred-bead references."
         return 0
     fi
 
-    if [[ "${DEFERRED_SLOT_COUNT}" -gt 0 ]]; then
-        local bad_count=0
-        while IFS= read -r line; do
-            [[ -z "${line}" ]] && continue
-            if ! grep -Ff <(printf '%s\n' "${deferred_beads}") <<<"${line}" >/dev/null 2>&1; then
-                bad_count=$((bad_count + 1))
-            fi
-        done <"${HEDGE_SCAN_FILE}"
-        if [[ "${bad_count}" -eq 0 ]]; then
-            record_result "convergence.memory_envelope_hedge" "passed" "legacy_hedge_cites_deferred_bead" "none" "${HEDGE_SCAN_FILE}" "Legacy hedge remains only with deferred-bead citations."
-            return 0
-        fi
-    fi
-
-    record_result "convergence.memory_envelope_hedge" "failed" "legacy_hedge_unjustified" "convergence_failed_memory_envelope_hedge" "${HEDGE_SCAN_FILE}" "Legacy memory-envelope hedge remains without live deferred-slot justification."
+    record_result "convergence.memory_envelope_hedge" "failed" "canonical_hedge_patterns_unjustified" "convergence_failed_memory_envelope_hedge" "${HEDGE_SCAN_FILE}" "Canonical HEDGE_PATTERNS scan found unjustified hedge text or could not parse the source table."
     return 1
 }
 
@@ -563,6 +698,7 @@ cd "${ROOT_DIR}"
 require_cmd jq
 require_cmd grep
 require_cmd bash
+require_cmd python3
 if ! rch_github_actions_local_cargo_enabled; then
     require_cmd rch
 fi
