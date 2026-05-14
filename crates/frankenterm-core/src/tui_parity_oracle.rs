@@ -143,7 +143,7 @@ impl Rgba {
         a: 0xFF,
     };
 
-    #[cfg(any(feature = "tui", test))]
+    #[cfg(any(feature = "tui", feature = "ftui"))]
     const fn opaque(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 0xFF }
     }

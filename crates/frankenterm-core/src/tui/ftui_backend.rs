@@ -2017,11 +2017,11 @@ fn home_chunks(
         (true, ViewportClass::Wide) => [3, 9, 7, 10, 4, 3],
         (true, ViewportClass::Regular) => [3, 8, 6, 7, 3, 3],
         (true, ViewportClass::Compact) => [3, 6, 5, 4, 3, 2],
-        (false, ViewportClass::Wide) => [3, 9, 7, 0, 3, 3],
-        (false, ViewportClass::Regular) => [3, 8, 6, 0, 3, 3],
-        (false, ViewportClass::Compact) => [3, 6, 5, 0, 3, 2],
+        (false, ViewportClass::Wide) => [3, 9, 7, 3, 3, 0],
+        (false, ViewportClass::Regular) => [3, 8, 6, 3, 3, 0],
+        (false, ViewportClass::Compact) => [3, 6, 5, 3, 2, 0],
     };
-    let min_index = if has_dashboard { 3 } else { 3 };
+    let min_index = 3;
     let used_fixed = lengths
         .iter()
         .enumerate()
@@ -4995,6 +4995,33 @@ mod tests {
         assert_eq!(viewport_class(150, 40), ViewportClass::Wide);
         assert_eq!(viewport_class(100, 30), ViewportClass::Regular);
         assert_eq!(viewport_class(80, 24), ViewportClass::Compact);
+    }
+
+    #[test]
+    fn home_chunks_no_dashboard_matches_ratatui_distribution() {
+        let compact = home_chunks(0, 80, 24, false, ViewportClass::Compact);
+        assert_eq!(compact[0], UiRect::new(0, 0, 80, 3));
+        assert_eq!(compact[1], UiRect::new(0, 3, 80, 6));
+        assert_eq!(compact[2], UiRect::new(0, 9, 80, 5));
+        assert_eq!(compact[3], UiRect::new(0, 14, 80, 8));
+        assert_eq!(compact[4], UiRect::new(0, 22, 80, 2));
+        assert_eq!(compact[5], UiRect::new(0, 24, 80, 0));
+
+        let regular = home_chunks(0, 100, 30, false, ViewportClass::Regular);
+        assert_eq!(regular[0], UiRect::new(0, 0, 100, 3));
+        assert_eq!(regular[1], UiRect::new(0, 3, 100, 8));
+        assert_eq!(regular[2], UiRect::new(0, 11, 100, 6));
+        assert_eq!(regular[3], UiRect::new(0, 17, 100, 10));
+        assert_eq!(regular[4], UiRect::new(0, 27, 100, 3));
+        assert_eq!(regular[5], UiRect::new(0, 30, 100, 0));
+
+        let wide = home_chunks(0, 150, 40, false, ViewportClass::Wide);
+        assert_eq!(wide[0], UiRect::new(0, 0, 150, 3));
+        assert_eq!(wide[1], UiRect::new(0, 3, 150, 9));
+        assert_eq!(wide[2], UiRect::new(0, 12, 150, 7));
+        assert_eq!(wide[3], UiRect::new(0, 19, 150, 18));
+        assert_eq!(wide[4], UiRect::new(0, 37, 150, 3));
+        assert_eq!(wide[5], UiRect::new(0, 40, 150, 0));
     }
 
     #[test]
