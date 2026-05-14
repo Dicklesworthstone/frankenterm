@@ -2079,11 +2079,20 @@ fn render_home_status_block(
         let db = status_word(&h.db_label, "OK", "NOT FOUND");
         let wezterm = status_word(&h.wezterm_label, "OK", "ERROR");
         let circuit = match h.circuit_label.as_str() {
-            "closed" => "CLOSED",
-            "half-open" if compact => "HALF",
-            "half-open" => "HALF-OPEN",
-            _ => "OPEN",
+            "closed" => "CLOSED".to_string(),
+            "half-open" if compact => "HALF".to_string(),
+            "half-open" => "HALF-OPEN".to_string(),
+            _ if compact => "OPEN".to_string(),
+            _ => format!(
+                "OPEN ({} ms cooldown)",
+                h.circuit_cooldown_remaining_ms.unwrap_or(0)
+            ),
         };
+        let (capture_lag, capture_style) = capture_lag_label(h.last_capture_ts);
+        let failures = format!(
+            "{}/{}",
+            h.circuit_consecutive_failures, h.circuit_failure_threshold
+        );
         if compact {
             write_segments(
                 frame,
@@ -2108,7 +2117,7 @@ fn render_home_status_block(
                         ("  WezTerm ", CellStyle::new()),
                         (wezterm, status_style(&h.wezterm_label)),
                         ("  Circuit ", CellStyle::new()),
-                        (circuit, status_style(&h.circuit_label)),
+                        (circuit.as_str(), status_style(&h.circuit_label)),
                     ],
                 );
                 row += 1;
@@ -2121,9 +2130,9 @@ fn render_home_status_block(
                     inner.width,
                     &[
                         ("  Capture ", CellStyle::new()),
-                        ("no captures yet", CellStyle::new().fg(color_gray())),
+                        (&capture_lag, capture_style),
                         ("  Failures ", CellStyle::new()),
-                        ("0/0", CellStyle::new()),
+                        (&failures, CellStyle::new()),
                     ],
                 );
             }
@@ -2132,13 +2141,13 @@ fn render_home_status_block(
                 ("  Watcher:       ", watcher, status_style(&h.watcher_label)),
                 ("  Database:      ", db, status_style(&h.db_label)),
                 ("  WezTerm CLI:   ", wezterm, status_style(&h.wezterm_label)),
-                ("  Circuit:       ", circuit, status_style(&h.circuit_label)),
                 (
-                    "  Capture lag:   ",
-                    "no captures yet",
-                    CellStyle::new().fg(color_gray()),
+                    "  Circuit:       ",
+                    circuit.as_str(),
+                    status_style(&h.circuit_label),
                 ),
-                ("  Failures:      ", "0/0", CellStyle::new()),
+                ("  Capture lag:   ", capture_lag.as_str(), capture_style),
+                ("  Failures:      ", failures.as_str(), CellStyle::new()),
             ];
             for (label, value, style) in lines {
                 if row >= inner.y.saturating_add(inner.height) {
@@ -2360,6 +2369,31 @@ fn status_style(label: &str) -> CellStyle {
     }
 }
 
+fn capture_lag_label(last_capture_ts: Option<i64>) -> (String, CellStyle) {
+    last_capture_ts.map_or_else(
+        || {
+            (
+                "no captures yet".to_string(),
+                CellStyle::new().fg(color_gray()),
+            )
+        },
+        |ts| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| i64::try_from(d.as_millis()).ok())
+                .unwrap_or(0);
+            let lag_ms = now_ms.saturating_sub(ts);
+            let style = if lag_ms > 10_000 {
+                CellStyle::new().fg(color_yellow())
+            } else {
+                CellStyle::new().fg(color_green())
+            };
+            (format!("{lag_ms} ms"), style)
+        },
+    )
+}
+
 /// Render the Panes view.
 ///
 /// Responsive pane layout:
@@ -2560,7 +2594,10 @@ fn render_panes_view(
                 )
             };
             let style = if pos == selected {
-                CellStyle::new().bg(color_dark_gray()).bold()
+                CellStyle::new()
+                    .fg(color_default_fg())
+                    .bg(color_dark_gray())
+                    .bold()
             } else if !pane.unhandled_badge.is_empty() {
                 CellStyle::new().fg(color_yellow())
             } else if pane.state_label == "AltScreen" {
@@ -4365,6 +4402,10 @@ fn color_gray() -> ftui::PackedRgba {
 
 fn color_dark_gray() -> ftui::PackedRgba {
     ftui::PackedRgba::rgba(0x80, 0x80, 0x80, 0xFF)
+}
+
+fn color_default_fg() -> ftui::PackedRgba {
+    ftui::PackedRgba::rgba(0xCC, 0xCC, 0xCC, 0xFF)
 }
 
 // ---------------------------------------------------------------------------

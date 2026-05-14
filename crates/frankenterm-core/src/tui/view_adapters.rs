@@ -461,6 +461,10 @@ pub struct HealthModel {
     pub circuit_style: StyleSpec,
     pub pane_count: String,
     pub event_count: String,
+    pub last_capture_ts: Option<i64>,
+    pub circuit_consecutive_failures: u32,
+    pub circuit_failure_threshold: u32,
+    pub circuit_cooldown_remaining_ms: Option<u64>,
 }
 
 /// Adapt a HealthStatus from QueryClient into a render-ready HealthModel.
@@ -516,6 +520,10 @@ pub fn adapt_health(health: &HealthStatus) -> HealthModel {
         circuit_style,
         pane_count: health.pane_count.to_string(),
         event_count: health.event_count.to_string(),
+        last_capture_ts: health.last_capture_ts,
+        circuit_consecutive_failures: health.wezterm_circuit.consecutive_failures,
+        circuit_failure_threshold: health.wezterm_circuit.failure_threshold,
+        circuit_cooldown_remaining_ms: health.wezterm_circuit.cooldown_remaining_ms,
     }
 }
 
@@ -1194,6 +1202,19 @@ mod tests {
         assert_eq!(model.watcher_style.fg, Some(ColorSpec::Green));
         assert_eq!(model.pane_count, "5");
         assert_eq!(model.event_count, "42");
+        assert_eq!(model.last_capture_ts, health.last_capture_ts);
+        assert_eq!(
+            model.circuit_consecutive_failures,
+            health.wezterm_circuit.consecutive_failures
+        );
+        assert_eq!(
+            model.circuit_failure_threshold,
+            health.wezterm_circuit.failure_threshold
+        );
+        assert_eq!(
+            model.circuit_cooldown_remaining_ms,
+            health.wezterm_circuit.cooldown_remaining_ms
+        );
     }
 
     #[test]
