@@ -41,6 +41,7 @@ RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
 # without paying a duplicate full-repo sync for a cargo smoke command.
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-0}"
 RCH_SKIP_QUEUE_PREFLIGHT="${RCH_SKIP_QUEUE_PREFLIGHT:-0}"
+RCH_SKIP_WORKER_SELECTION_PREFLIGHT="${RCH_SKIP_WORKER_SELECTION_PREFLIGHT:-0}"
 RCH_WORKER_SELECTION_WAIT_SECS="${RCH_WORKER_SELECTION_WAIT_SECS:-0}"
 RCH_WORKER_SELECTION_POLL_SECS="${RCH_WORKER_SELECTION_POLL_SECS:-15}"
 RCH_REMOTE_PREFLIGHT_WAIT_SECS="${RCH_REMOTE_PREFLIGHT_WAIT_SECS:-${RCH_WORKER_SELECTION_WAIT_SECS}}"
@@ -964,6 +965,19 @@ ensure_rch_remote_only_preflight() {
 
 ensure_rch_worker_selection_preflight() {
     [[ -n "${_RCH_WORKER_SELECTION_LOG}" ]] || rch_fatal "rch_init must be called before ensure_rch_worker_selection_preflight."
+
+    if [[ "${RCH_SKIP_WORKER_SELECTION_PREFLIGHT}" == "1" ]]; then
+        printf '%s\n' "Worker-selection preflight skipped because RCH_SKIP_WORKER_SELECTION_PREFLIGHT=1" >"${_RCH_WORKER_SELECTION_LOG}"
+        rch_write_meta_json "${_RCH_WORKER_SELECTION_LOG}" "0"
+        rch_emit_proof_ledger_entry \
+            "RCH_SKIP_WORKER_SELECTION_PREFLIGHT=1 ensure_rch_ready" \
+            "${_RCH_WORKER_SELECTION_LOG}" \
+            "0" \
+            "not_applicable" \
+            "not_applicable" \
+            "worker-selection dry-run skipped because first material verifier uses run_rch_cargo_logged"
+        return 0
+    fi
 
     local wait_secs poll_secs started_at now elapsed attempt selected_worker selection_rc would_intercept selection_reason
     wait_secs="${RCH_WORKER_SELECTION_WAIT_SECS}"
