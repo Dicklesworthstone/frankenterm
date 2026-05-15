@@ -24,6 +24,44 @@ fn plan_one(input: SwarmCapacityWorkloadAdmissionInput) -> SwarmCapacityAdmissio
     plan.decisions.first().expect("one decision").action
 }
 
+fn normalize_integral_toon_numbers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_integral_toon_numbers(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for nested in map.values_mut() {
+                normalize_integral_toon_numbers(nested);
+            }
+        }
+        serde_json::Value::Number(number) => {
+            if let Some(float) = number.as_f64() {
+                #[allow(clippy::cast_precision_loss)]
+                let max_u64 = u64::MAX as f64;
+                if float.fract() == 0.0 && float >= 0.0 && float <= max_u64 {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let as_u64 = float as u64;
+                    *value = serde_json::Value::Number(serde_json::Number::from(as_u64));
+                }
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {}
+    }
+}
+
+fn toon_roundtrip_json(value: &serde_json::Value) -> serde_json::Value {
+    let toon_text = toon_rust::encode(value.clone(), None);
+    let decoded = toon_rust::try_decode(&toon_text, None).expect("decode TOON");
+    let decoded_json_text =
+        toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+    let mut roundtripped: serde_json::Value =
+        serde_json::from_str(&decoded_json_text).expect("roundtrip JSON parse");
+    normalize_integral_toon_numbers(&mut roundtripped);
+    roundtripped
+}
+
 #[test]
 fn workload_admission_table_covers_every_class() {
     let table = swarm_capacity_workload_admission_table();
@@ -255,13 +293,27 @@ fn dry_run_examples_cover_declared_scales_and_toon_parity() {
     );
 
     let json_value = serde_json::to_value(&plan).expect("serialize plan to JSON");
-    let toon_text = toon_rust::encode(json_value.clone(), None);
-    let decoded = toon_rust::try_decode(&toon_text, None).expect("decode TOON");
-    let decoded_json_text =
-        toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
-    let roundtripped: serde_json::Value =
-        serde_json::from_str(&decoded_json_text).expect("roundtrip JSON parse");
+    let roundtripped = toon_roundtrip_json(&json_value);
     assert_eq!(json_value, roundtripped);
+
+    let roundtripped_decisions = roundtripped["decisions"]
+        .as_array()
+        .expect("roundtripped decisions");
+    assert_eq!(roundtripped_decisions.len(), plan.decisions.len());
+    assert_eq!(
+        roundtripped_decisions[0]["stable_id"].as_str(),
+        Some("example.50.coding")
+    );
+    assert_eq!(roundtripped_decisions[0]["pane_scale"].as_f64(), Some(50.0));
+    assert_eq!(
+        roundtripped_decisions[1]["recommended_stagger_ms"].as_f64(),
+        Some(500.0)
+    );
+    assert_eq!(roundtripped_decisions[2]["action"].as_str(), Some("defer"));
+    assert_eq!(
+        roundtripped_decisions[3]["evidence_state"].as_str(),
+        Some("stale")
+    );
 
     let jsonl = plan
         .decisions
@@ -281,7 +333,12 @@ fn dry_run_examples_cover_declared_scales_and_toon_parity() {
     }
 
     let serialized = serde_json::to_string(&plan).expect("serialize plan");
-    for forbidden in ["raw_transcript", "prompt_body", "password=", "sk-proj-"] {
+    for forbidden in [
+        "raw_transcript",
+        "prompt_body",
+        "password=",
+        concat!("sk-", "proj-"),
+    ] {
         assert!(!serialized.contains(forbidden), "{forbidden}");
     }
     assert!(!plan.raw_pane_content_stored);

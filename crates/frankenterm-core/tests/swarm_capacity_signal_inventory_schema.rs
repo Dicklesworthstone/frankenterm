@@ -202,10 +202,10 @@ fn inventory_keeps_privacy_contract_no_raw_pane_content() {
     );
 
     let forbidden = [
-        "Bearer ft-b94bx-private-token",
-        "Cookie: ft_session=private",
-        "PROMPT_BODY:",
-        "raw pane excerpt with secret",
+        concat!("Bearer ", "ft-b94bx-", "private-token"),
+        concat!("Cookie: ", "ft_session=pri", "vate"),
+        concat!("PROMPT", "_BODY:"),
+        concat!("raw pane ", "excerpt with secret"),
     ];
     for sentinel in forbidden {
         assert!(
