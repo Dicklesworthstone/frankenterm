@@ -302,6 +302,9 @@ tmp_missing_is_heavy="${tmp_dir}/missing-is-heavy.json"
 tmp_secret_command="${tmp_dir}/secret-command.json"
 tmp_secret_path="${tmp_dir}/secret-path.json"
 tmp_fallback_record="${tmp_dir}/fallback-required.json"
+tmp_refused_fallback_record="${tmp_dir}/fallback-refused.json"
+tmp_refused_fallback_ledger="${tmp_dir}/fallback-refused-ledger.jsonl"
+tmp_refused_fallback_report="${tmp_dir}/fallback-refused-report.json"
 tmp_timeout_record="${tmp_dir}/timeout.json"
 tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
@@ -439,7 +442,8 @@ RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
     "retained" \
     "local fallback marker detected"
 tail -n 1 "${wrapper_ledger}" >"${tmp_fallback_record}"
-if [[ "$(jq -r '.runs[0].validation_status' "${tmp_fallback_record}")" != "fallback_required" ]]; then
+if [[ "$(jq -r '.runs[0].validation_status' "${tmp_fallback_record}")" != "fallback_required" ]] \
+  || [[ "$(jq -r '.runs[0].execution_mode' "${tmp_fallback_record}")" != "local_fallback" ]]; then
   emit_log \
     "failed" \
     "wrapper_ledger" \
@@ -447,7 +451,7 @@ if [[ "$(jq -r '.runs[0].validation_status' "${tmp_fallback_record}")" != "fallb
     "fallback_not_marked" \
     "unexpected_validation_status" \
     "$(basename "${tmp_fallback_record}")" \
-    "local fallback record must be marked fallback_required"
+    "local fallback record must be marked local_fallback/fallback_required"
   exit 1
 fi
 expect_validation_failure \
@@ -455,6 +459,81 @@ expect_validation_failure \
   "wrapper_ledger" \
   "local_fallback_detection" \
   "wrapper-emitted local fallback record must not validate as passing proof"
+
+refused_fallback_log="${tmp_dir}/refused-fallback.log"
+{
+  printf '%s\n' "[RCH] local (no admissible workers: active_project_exclusion=1)"
+  printf '%s\n' "[RCH] remote required; refusing local fallback (no worker assigned)"
+} >"${refused_fallback_log}"
+rch_write_meta_json "${refused_fallback_log}" "1"
+RCH_PROOF_LEDGER_FILE="${wrapper_ledger}" \
+RCH_PROOF_LEDGER_BEAD_ID="ft-kvs1e" \
+RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
+  rch_emit_proof_ledger_entry \
+    "run_rch_cargo_logged ${refused_fallback_log} env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace" \
+    "${refused_fallback_log}" \
+    "1" \
+    "target/rch-proof" \
+    "retained" \
+    "remote-required fallback refusal fixture"
+tail -n 1 "${wrapper_ledger}" >"${tmp_refused_fallback_record}"
+if [[ "$(jq -r '.runs[0].execution_mode' "${tmp_refused_fallback_record}")" != "refused_local_fallback" ]] \
+  || [[ "$(jq -r '.runs[0].validation_status' "${tmp_refused_fallback_record}")" != "fallback_refused" ]] \
+  || [[ "$(jq -r '.runs[0].fallback_reason_code' "${tmp_refused_fallback_record}")" != "RCH-REMOTE-REQUIRED-FALLBACK-REFUSED" ]] \
+  || [[ "$(jq -r '.runs[0].worker_context' "${tmp_refused_fallback_record}")" != "local_fallback_refused" ]] \
+  || [[ "$(jq -r '.runs[0].worker_queue_state' "${tmp_refused_fallback_record}")" != "busy_wait" ]]; then
+  emit_log \
+    "failed" \
+    "wrapper_ledger" \
+    "remote_required_refusal_detection" \
+    "refusal_not_marked" \
+    "unexpected_refusal_status" \
+    "$(basename "${tmp_refused_fallback_record}")" \
+    "remote-required fallback refusal must not be marked as approved local fallback"
+  exit 1
+fi
+expect_validation_failure \
+  "${tmp_refused_fallback_record}" \
+  "wrapper_ledger" \
+  "remote_required_refusal_detection" \
+  "remote-required fallback refusal must not validate as passing proof"
+
+jq -c . "${tmp_refused_fallback_record}" > "${tmp_refused_fallback_ledger}"
+set +e
+"${VALIDATOR}" --aggregate-ledger "${tmp_refused_fallback_ledger}" > "${tmp_refused_fallback_report}" 2>/dev/null
+aggregate_refused_rc=$?
+set -e
+if [[ "${aggregate_refused_rc}" -eq 0 ]]; then
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "remote_required_refusal" \
+    "negative_guardrail_not_enforced" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_refused_fallback_report}")" \
+    "aggregate gate must block remote-required fallback refusals"
+  exit 1
+fi
+jq -e '
+  .quality_gate_passed == false and
+  .blocking_failure_count == 1 and
+  .counts.blocked_verifier == 1 and
+  .entries[0].category == "blocked_verifier" and
+  .entries[0].reason_code == "aggregate.blocked_verifier" and
+  .entries[0].worker_context == "local_fallback_refused" and
+  .entries[0].worker_queue_state == "busy_wait" and
+  (.entries[0].reason_detail | contains("remote-required local fallback was refused"))
+' "${tmp_refused_fallback_report}" >/dev/null || {
+  emit_log \
+    "failed" \
+    "aggregate_quality_gate" \
+    "remote_required_refusal" \
+    "missing_operator_fields" \
+    "aggregate_report_mismatch" \
+    "$(basename "${tmp_refused_fallback_report}")" \
+    "blocked-verifier aggregate entry must preserve refusal reason, queue state, and worker context"
+  exit 1
+}
 
 strict_rch_dir="${tmp_dir}/strict-remote-bin"
 strict_rch_env_log="${tmp_dir}/strict-remote-env.log"
@@ -1296,6 +1375,8 @@ for required_term in \
   "remote RCH proof" \
   "light local proof" \
   "approved local fallback" \
+  "blocked_verifier" \
+  "refused_local_fallback" \
   "invalid local-heavy claim" \
   "worker_evidence_confidence" \
   "target_worker_remote_proof" \

@@ -496,14 +496,31 @@ validate_evidence_file() {
       echo "run[$i] used_rch must be boolean" >&2
       return 1
     }
-    [[ "${execution_mode}" =~ ^(remote_rch|local_light|approved_local_fallback)$ ]] || {
-      echo "run[$i] execution_mode must be remote_rch, local_light, or approved_local_fallback" >&2
+    [[ "${execution_mode}" =~ ^(remote_rch|local_light|approved_local_fallback|local_fallback|refused_local_fallback)$ ]] || {
+      echo "run[$i] execution_mode must be remote_rch, local_light, approved_local_fallback, local_fallback, or refused_local_fallback" >&2
       return 1
     }
-    [[ "${validation_status}" =~ ^(valid|approved_fallback)$ ]] || {
-      echo "run[$i] validation_status must be valid or approved_fallback" >&2
+    [[ "${validation_status}" =~ ^(valid|approved_fallback|fallback_required|fallback_refused|timeout|invalid)$ ]] || {
+      echo "run[$i] validation_status must be valid, approved_fallback, fallback_required, fallback_refused, timeout, or invalid" >&2
       return 1
     }
+
+    if [[ "${execution_mode}" == "refused_local_fallback" || "${validation_status}" == "fallback_refused" ]]; then
+      echo "run[$i] remote-required local fallback was refused; blocked verifier evidence is not valid proof" >&2
+      return 1
+    fi
+    if [[ "${validation_status}" == "timeout" ]]; then
+      echo "run[$i] remote verifier timed out; blocked verifier evidence is not valid proof" >&2
+      return 1
+    fi
+    if [[ "${execution_mode}" == "local_fallback" || "${validation_status}" == "fallback_required" ]]; then
+      echo "run[$i] local fallback requires explicit fallback approval before it can validate" >&2
+      return 1
+    fi
+    if [[ "${validation_status}" == "invalid" ]]; then
+      echo "run[$i] wrapper exited without valid proof evidence" >&2
+      return 1
+    fi
 
     jq -e '.artifact_paths | type == "array" and length > 0' <<<"${run}" >/dev/null || {
       echo "run[$i] artifact_paths must be non-empty array" >&2
@@ -627,6 +644,10 @@ aggregate_reason_for_validation_error() {
 
   if [[ "${error_text}" == *"artifact_paths["* && "${error_text}" == *"does not exist"* ]]; then
     printf '%s\n' "aggregate.missing_artifact"
+  elif [[ "${error_text}" == *"remote-required local fallback was refused"* || "${error_text}" == *"remote verifier timed out"* || "${error_text}" == *"wrapper exited without valid proof evidence"* ]]; then
+    printf '%s\n' "aggregate.blocked_verifier"
+  elif [[ "${error_text}" == *"local fallback requires explicit fallback approval"* ]]; then
+    printf '%s\n' "aggregate.rejected_local_heavy"
   elif [[ "${error_text}" == *"heavy run requires fallback_reason_code"* ]]; then
     printf '%s\n' "aggregate.rejected_local_heavy"
   else
@@ -637,6 +658,7 @@ aggregate_reason_for_validation_error() {
 aggregate_category_for_reason() {
   case "$1" in
     aggregate.missing_artifact) printf '%s\n' "missing_artifact" ;;
+    aggregate.blocked_verifier) printf '%s\n' "blocked_verifier" ;;
     aggregate.rejected_local_heavy) printf '%s\n' "rejected_local_heavy" ;;
     *) printf '%s\n' "malformed" ;;
   esac
@@ -905,6 +927,7 @@ aggregate_ledger_file() {
           proven_remote: countcat("proven_remote"),
           light_local: countcat("light_local"),
           approved_fallback: countcat("approved_fallback"),
+          blocked_verifier: countcat("blocked_verifier"),
           rejected_local_heavy: countcat("rejected_local_heavy"),
           malformed: countcat("malformed"),
           missing_artifact: countcat("missing_artifact"),
@@ -922,7 +945,7 @@ aggregate_ledger_file() {
         }
       }
       | .blocking_failure_count = (
-          .counts.rejected_local_heavy + .counts.malformed + .counts.missing_artifact
+          .counts.blocked_verifier + .counts.rejected_local_heavy + .counts.malformed + .counts.missing_artifact
         )
       | .risk_count = (.counts.approved_fallback + .counts.residual_risk_only)
       | .quality_gate_passed = (.blocking_failure_count == 0)
@@ -981,6 +1004,7 @@ aggregate_ledger_files() {
           proven_remote: countcat("proven_remote"),
           light_local: countcat("light_local"),
           approved_fallback: countcat("approved_fallback"),
+          blocked_verifier: countcat("blocked_verifier"),
           rejected_local_heavy: countcat("rejected_local_heavy"),
           malformed: countcat("malformed"),
           missing_artifact: countcat("missing_artifact"),
@@ -998,7 +1022,7 @@ aggregate_ledger_files() {
         }
       }
       | .blocking_failure_count = (
-          .counts.rejected_local_heavy + .counts.malformed + .counts.missing_artifact
+          .counts.blocked_verifier + .counts.rejected_local_heavy + .counts.malformed + .counts.missing_artifact
         )
       | .risk_count = (.counts.approved_fallback + .counts.residual_risk_only)
       | .quality_gate_passed = (.blocking_failure_count == 0)

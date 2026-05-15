@@ -178,7 +178,9 @@
             "enum": [
               "remote_rch",
               "local_light",
-              "approved_local_fallback"
+              "approved_local_fallback",
+              "local_fallback",
+              "refused_local_fallback"
             ]
           },
           "target_dir": {
@@ -228,7 +230,11 @@
             "type": "string",
             "enum": [
               "valid",
-              "approved_fallback"
+              "approved_fallback",
+              "fallback_required",
+              "fallback_refused",
+              "timeout",
+              "invalid"
             ]
           },
           "fallback_reason_code": {

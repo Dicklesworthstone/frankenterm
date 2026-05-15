@@ -59,7 +59,7 @@ blocked verifier.
 | Approved local fallback | Heavy command evidence with `execution_mode: "approved_local_fallback"`, `validation_status: "approved_fallback"`, `fallback_reason_code`, and `fallback_approved_by`. | Human-approved degraded evidence. It is partial-risk evidence and must not be described as clean remote proof. |
 | Invalid local-heavy claim | Heavy command evidence without remote RCH confirmation and without fallback approval metadata. | The validator and aggregate gate must reject this as `rejected_local_heavy`; keep the bead open or rerun remotely. |
 | Static-only check | A light proof or non-Cargo static guard that never compiles, tests, benches, soaks, or runs the product. | Useful for docs, schemas, shell syntax, JSON shape, and grep-style assertions. It cannot close a source-behavior claim by itself. |
-| Blocked verifier | The intended verifier could not produce valid evidence because workers were unavailable, the selected worker mirror was stale, artifacts were missing, the command timed out, or policy forbade fallback. | Report the blocker with reason code and retained logs. Do not convert the blocked verifier into a pass. |
+| Blocked verifier | Evidence with `execution_mode: "refused_local_fallback"` or `validation_status: "fallback_refused"`/`"timeout"` records that the intended verifier could not produce valid proof because workers were unavailable, the selected worker mirror was stale, artifacts were missing, the command timed out, or policy forbade fallback. | Report the blocker with reason code and retained logs. Do not convert the blocked verifier into a pass or approved fallback. |
 
 ## Mandatory Rule
 
@@ -356,7 +356,8 @@ Every proof-ledger run must be logged with fields:
 16. Optional `remote_cargo_reached`
 17. Optional `remote_rustc_reached`
 18. Optional `test_binary_reached`
-19. `execution_mode` (`remote_rch`, `local_light`, or `approved_local_fallback`)
+19. `execution_mode` (`remote_rch`, `local_light`, `approved_local_fallback`,
+   `local_fallback`, or `refused_local_fallback`)
 20. `target_dir`
 21. `target_dir_fingerprint`
 22. `target_dir_lifecycle` (`not_applicable`, `retained`, `inventory_only`, or `cleanup_approved`)
@@ -366,7 +367,8 @@ Every proof-ledger run must be logged with fields:
 26. `exit_status`
 27. `residual_risk_notes`
 28. `residual_risk_notes_fingerprint`
-29. `validation_status` (`valid` or `approved_fallback`)
+29. `validation_status` (`valid`, `approved_fallback`, `fallback_required`,
+    `fallback_refused`, `timeout`, or `invalid`)
 30. Optional fallback fields when a heavy run is not confirmed as remote RCH:
    - `fallback_reason_code`
    - `fallback_approved_by`
@@ -491,6 +493,21 @@ proof_closeout{
 }
 ```
 
+Remote-required fallback refusals are blocked verifier evidence, not approved
+fallbacks:
+
+```toon
+proof_closeout{
+  bead_id: ft-example.3
+  category: blocked_verifier
+  blocked_verifier: true
+  execution_mode: refused_local_fallback
+  validation_status: fallback_refused
+  reason_code: RCH-REMOTE-REQUIRED-FALLBACK-REFUSED
+  action: "Keep the bead open and wait for an admissible remote worker; no local heavy proof ran."
+}
+```
+
 ## Closeout Migration Rule
 
 Older closeouts sometimes treated RCH setup, sync, transfer, worker selection,
@@ -499,14 +516,15 @@ must cite proof-ledger artifacts instead:
 
 1. Cite the proof-ledger JSONL path and aggregate report path.
 2. Name the category from the aggregate gate: `proven_remote`, `light_local`,
-   `approved_fallback`, `rejected_local_heavy`, `missing_artifact`,
-   `malformed`, or `residual_risk_only`.
+   `approved_fallback`, `blocked_verifier`, `rejected_local_heavy`,
+   `missing_artifact`, `malformed`, or `residual_risk_only`.
 3. For a clean source/test claim, require `proven_remote` for the material
    heavy command. `light_local` is acceptable only for static-only checks.
 4. For `approved_fallback` or `residual_risk_only`, state the residual risk in
    the closeout. Do not claim a clean pass.
-5. For `rejected_local_heavy`, `missing_artifact`, or `malformed`, keep the
-   bead open or reopen it with the retained failure report.
+5. For `blocked_verifier`, `rejected_local_heavy`, `missing_artifact`, or
+   `malformed`, keep the bead open or reopen it with the retained failure
+   report.
 
 ## Validation Tooling
 
@@ -554,12 +572,15 @@ Aggregate quality gate:
   - `proven_remote`: heavy Cargo proof ran through an RCH-recognized remote path.
   - `light_local`: local non-heavy checks such as formatting.
   - `approved_fallback`: heavy local fallback with explicit approval metadata.
+  - `blocked_verifier`: remote-required fallback was refused, the verifier
+    timed out, or the wrapper exited without valid proof evidence.
   - `rejected_local_heavy`: heavy local proof without required fallback approval.
   - `malformed`: invalid JSON, stale schema, missing required fields, or malformed bead IDs.
   - `missing_artifact`: an artifact path named by evidence is not retained.
   - `residual_risk_only`: otherwise valid evidence with residual risk notes.
-- Blocking categories are `rejected_local_heavy`, `malformed`, and
-  `missing_artifact`. They make the aggregate command exit non-zero.
+- Blocking categories are `blocked_verifier`, `rejected_local_heavy`,
+  `malformed`, and `missing_artifact`. They make the aggregate command exit
+  non-zero.
 - `approved_fallback` and `residual_risk_only` produce an `overall_verdict` of
   `partial_risk`; this is acceptable evidence only when the operator-facing
   closeout names the residual risk instead of claiming a clean pass.

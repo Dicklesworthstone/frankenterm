@@ -263,6 +263,16 @@ rch_log_test_binary_reached() {
     grep -Eq "running [0-9]+ tests?|test result:" "${output_file}" 2>/dev/null
 }
 
+rch_log_remote_required_refused_local_fallback() {
+    local output_file="$1"
+    grep -Fq "remote required; refusing local fallback" "${output_file}" 2>/dev/null
+}
+
+rch_log_blocked_by_active_project_exclusion() {
+    local output_file="$1"
+    grep -Fq "active_project_exclusion=1" "${output_file}" 2>/dev/null
+}
+
 rch_emit_proof_ledger_entry() {
     local command_text="$1"
     local log_file="$2"
@@ -283,6 +293,7 @@ rch_emit_proof_ledger_entry() {
     local intended_worker repo_snapshot_head source_mirror_status source_mirror_reason_code
     local worker_queue_state worker_evidence_confidence
     local remote_cargo_reached remote_rustc_reached test_binary_reached
+    local remote_required_refused
 
     validator="$(rch_proof_ledger_validator)"
     meta_file="$(rch_log_meta_path "${log_file}")"
@@ -307,8 +318,14 @@ rch_emit_proof_ledger_entry() {
     remote_exit_status="$(rch_meta_json_field "${meta_file}" '.remote_exit_code')"
     intended_worker="${RCH_PROOF_LEDGER_INTENDED_WORKER_ID:-}"
     repo_snapshot_head="$(rch_current_repo_snapshot_head)"
+    remote_required_refused="false"
+    if [[ -f "${log_file}" ]] && rch_log_remote_required_refused_local_fallback "${log_file}"; then
+        remote_required_refused="true"
+    fi
 
-    if [[ "${fail_open}" == "true" ]]; then
+    if [[ "${remote_required_refused}" == "true" ]]; then
+        worker_context="local_fallback_refused"
+    elif [[ "${fail_open}" == "true" ]]; then
         worker_context="local_fallback"
     elif [[ -n "${selected_worker}" ]]; then
         worker_context="worker=${selected_worker}"
@@ -334,9 +351,15 @@ rch_emit_proof_ledger_entry() {
     if [[ "${is_heavy}" == "false" && "${used_rch}" == "false" ]]; then
         execution_mode="local_light"
     elif [[ "${fail_open}" == "true" ]]; then
-        execution_mode="approved_local_fallback"
-        validation_status="fallback_required"
-        failure_reason_code="${failure_reason_code:-RCH-LOCAL-FALLBACK}"
+        if [[ "${remote_required_refused}" == "true" ]]; then
+            execution_mode="refused_local_fallback"
+            validation_status="fallback_refused"
+            failure_reason_code="${failure_reason_code:-RCH-REMOTE-REQUIRED-FALLBACK-REFUSED}"
+        else
+            execution_mode="local_fallback"
+            validation_status="fallback_required"
+            failure_reason_code="${failure_reason_code:-RCH-LOCAL-FALLBACK}"
+        fi
     elif [[ "${timed_out}" == "true" ]]; then
         validation_status="timeout"
         failure_reason_code="${failure_reason_code:-RCH-REMOTE-STALL}"
@@ -350,6 +373,10 @@ rch_emit_proof_ledger_entry() {
 
     worker_queue_state="unknown"
     if [[ "${timed_out}" == "true" ]]; then
+        worker_queue_state="queue_timeout"
+    elif [[ "${remote_required_refused}" == "true" && -f "${log_file}" ]] && rch_log_blocked_by_active_project_exclusion "${log_file}"; then
+        worker_queue_state="busy_wait"
+    elif [[ "${remote_required_refused}" == "true" && -f "${log_file}" ]] && grep -Fq "queue_timeout" "${log_file}" 2>/dev/null; then
         worker_queue_state="queue_timeout"
     elif [[ "${fail_open}" == "true" ]]; then
         worker_queue_state="unsupported_worker_selection"
