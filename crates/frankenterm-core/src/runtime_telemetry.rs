@@ -7748,6 +7748,13 @@ impl SwarmCapacityAdmissionPlan {
     }
 }
 
+/// Versioned robot/operator contract id for the swarm-capacity status/plan/explain surface.
+pub const ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID: &str = "ft.robot.swarm_capacity.operator.v1";
+/// MCP resource URI for the latest redacted swarm-capacity operator snapshot.
+pub const SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI: &str = "wa://swarm-capacity/current";
+/// MCP resource template for retained per-run swarm-capacity operator artifacts.
+pub const SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE: &str = "wa://swarm-capacity/runs/{run_id}";
+
 /// Operator-facing capacity status for robot, status, and doctor surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

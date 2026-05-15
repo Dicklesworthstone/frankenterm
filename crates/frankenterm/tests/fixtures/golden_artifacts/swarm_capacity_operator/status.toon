@@ -1,0 +1,8 @@
+contract_id: ft.robot.swarm_capacity.operator.v1
+dry_run: true
+live_mutation_allowed: false
+mcp_resources[1]{kind,uri}:
+  current,wa://swarm-capacity/current
+raw_pane_content_stored: false
+side_effects_executed: false
+surface: status

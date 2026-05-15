@@ -47,6 +47,15 @@ use frankenterm_core::proof_lane::{
     ProofHistoryQuery, ProofRedactionStatus, ProofReleaseScoreboard, ProofReleaseScoreboardRow,
     ProofScope, ProofState, lint_proof_closeout, validate_proof_record,
 };
+use frankenterm_core::runtime_telemetry::{
+    HealthTier, ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID, SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
+    SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE, SwarmCapacityAgentWorkloadClass,
+    SwarmCapacityBudgetWorkloadMixRow, SwarmCapacityHardwareFingerprint,
+    SwarmCapacityOperatorStatus, SwarmCapacityOperatorSummary, SwarmCapacityWorkloadAdmissionInput,
+    SwarmCapacityWorkloadAdmissionSignal, SwarmCapacityWorkloadEvidenceState,
+    SwarmCapacityWorkloadSignalKind, plan_swarm_capacity_resource_budget,
+    plan_swarm_capacity_workload_admission,
+};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 use frankenterm_core::swarm_scheduler::{HerdWaveEventKind, HerdWaveMcpResourceSurface};
 
@@ -3042,6 +3051,13 @@ enum RobotCommands {
         level: u8,
     },
 
+    /// Operator capacity status, planning, and decision explanation surfaces
+    #[command(name = "swarm-capacity", visible_alias = "swarm_capacity")]
+    SwarmCapacity {
+        #[command(subcommand)]
+        command: RobotSwarmCapacityCommands,
+    },
+
     /// Emit read-only herd-wave contract and dry-run planner output
     #[command(visible_alias = "herd_wave")]
     HerdWave {
@@ -3302,6 +3318,49 @@ impl From<RobotHerdWaveEventKind> for HerdWaveEventKind {
             RobotHerdWaveEventKind::Other => Self::Other,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum RobotSwarmCapacityCommands {
+    /// Read the current redacted swarm-capacity operator status
+    Status {
+        /// Transparency level: 0=status, 1=reasons, 2=metrics, 3=proof pointers
+        #[arg(long, default_value_t = 2)]
+        level: u8,
+
+        /// Stable generation timestamp for deterministic replay and fixtures
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
+    },
+
+    /// Dry-run the capacity planner for adding panes
+    Plan {
+        /// Number of panes to model as newly added work
+        #[arg(long = "add-panes", value_parser = clap::value_parser!(u32).range(1..))]
+        add_panes: u32,
+
+        /// Transparency level for the nested status summary
+        #[arg(long, default_value_t = 2)]
+        level: u8,
+
+        /// Stable generation timestamp for deterministic replay and fixtures
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
+    },
+
+    /// Explain a redacted capacity admission decision id
+    Explain {
+        /// Redacted decision id, stable-id hash, or audit record id
+        decision_id: String,
+
+        /// Transparency level for the nested status summary
+        #[arg(long, default_value_t = 2)]
+        level: u8,
+
+        /// Stable generation timestamp for deterministic replay and fixtures
+        #[arg(long)]
+        generated_at_ms: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -17728,6 +17787,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Get swarm capacity certificate/controller summary",
             },
             RobotCommandInfo {
+                name: "swarm-capacity",
+                description: "Read swarm capacity status, dry-run add-pane plans, and decision explanations",
+            },
+            RobotCommandInfo {
                 name: "coordination-risk",
                 description: "Emit Agent Mail fallback Beads/git coordination-risk snapshot",
             },
@@ -18124,6 +18187,16 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 ],
             },
             QuickStartCommand {
+                name: "swarm-capacity",
+                args: "status|plan --add-panes N|explain <decision-id>",
+                summary: "Read operator capacity status, dry-run add-pane plans, and redacted decision explanations",
+                examples: vec![
+                    "ft robot swarm-capacity status",
+                    "ft robot swarm-capacity plan --add-panes 16",
+                    "ft robot --format toon swarm-capacity explain sha256:<decision>",
+                ],
+            },
+            QuickStartCommand {
                 name: "coordination-risk",
                 args: "[session]",
                 summary: "Read the Agent Mail fallback Beads/git coordination-risk snapshot",
@@ -18285,6 +18358,311 @@ fn unavailable_swarm_capacity_summary(
         level,
         source,
     )
+}
+
+fn unavailable_swarm_capacity_summary_at(
+    generated_at_ms: u64,
+    level: u8,
+    source: &str,
+) -> SwarmCapacityOperatorSummary {
+    SwarmCapacityOperatorSummary::unavailable(generated_at_ms, level, source)
+}
+
+fn robot_swarm_capacity_run_id(generated_at_ms: u64) -> String {
+    format!("swarm-capacity-{generated_at_ms}")
+}
+
+fn robot_swarm_capacity_run_uri(run_id: &str) -> String {
+    format!("wa://swarm-capacity/runs/{run_id}")
+}
+
+fn robot_swarm_capacity_mcp_resources(generated_at_ms: u64) -> serde_json::Value {
+    let run_id = robot_swarm_capacity_run_id(generated_at_ms);
+    serde_json::json!([
+        {
+            "kind": "current",
+            "uri": SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        },
+        {
+            "kind": "run_artifact",
+            "uri": robot_swarm_capacity_run_uri(&run_id),
+            "uri_template": SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE,
+            "run_id": run_id,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        }
+    ])
+}
+
+fn robot_swarm_capacity_doctor(summary: &SwarmCapacityOperatorSummary) -> serde_json::Value {
+    let evidence_state = summary
+        .resource_cockpit
+        .as_ref()
+        .map(|cockpit| cockpit.evidence_state.as_str())
+        .unwrap_or("unavailable");
+    let status = match summary.status {
+        SwarmCapacityOperatorStatus::Ready => "ok",
+        SwarmCapacityOperatorStatus::Watch => "watch",
+        SwarmCapacityOperatorStatus::Violated => "violated",
+        SwarmCapacityOperatorStatus::Unknown => "fail_closed",
+        SwarmCapacityOperatorStatus::Unavailable => "stale_or_missing_evidence",
+    };
+    let mut reason_codes = summary.reason_codes.clone();
+    if reason_codes.is_empty() {
+        reason_codes.push("capacity.operator.no_level_one_reasons".to_string());
+    }
+
+    serde_json::json!({
+        "status": status,
+        "evidence_state": evidence_state,
+        "stale_evidence": matches!(
+            summary.status,
+            SwarmCapacityOperatorStatus::Unknown | SwarmCapacityOperatorStatus::Unavailable
+        ),
+        "safe_remediation": [
+            {
+                "command": "ft robot health",
+                "reason_code": "capacity.operator.refresh_runtime_health",
+                "live_mutation_allowed": false
+            },
+            {
+                "command": "ft doctor --json",
+                "reason_code": "capacity.operator.inspect_doctor_context",
+                "live_mutation_allowed": false
+            }
+        ],
+        "reason_codes": reason_codes,
+    })
+}
+
+fn build_robot_swarm_capacity_status_payload(
+    summary: &SwarmCapacityOperatorSummary,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "contract_id": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "surface": "status",
+        "generated_at_ms": summary.generated_at_ms,
+        "source": "robot.swarm_capacity.status",
+        "dry_run": true,
+        "raw_pane_content_stored": false,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+        "summary": summary,
+        "mcp_resources": robot_swarm_capacity_mcp_resources(summary.generated_at_ms),
+        "doctor": robot_swarm_capacity_doctor(summary),
+    })
+}
+
+fn robot_swarm_capacity_resource_signal(
+    summary: &SwarmCapacityOperatorSummary,
+) -> SwarmCapacityWorkloadAdmissionSignal {
+    let (evidence_state, pressure_tier, reason_code) = match summary.status {
+        SwarmCapacityOperatorStatus::Ready => (
+            SwarmCapacityWorkloadEvidenceState::Measured,
+            HealthTier::Green,
+            "capacity.operator.status.ready",
+        ),
+        SwarmCapacityOperatorStatus::Watch => (
+            SwarmCapacityWorkloadEvidenceState::Measured,
+            HealthTier::Yellow,
+            "capacity.operator.status.watch",
+        ),
+        SwarmCapacityOperatorStatus::Violated => (
+            SwarmCapacityWorkloadEvidenceState::Measured,
+            HealthTier::Red,
+            "capacity.operator.status.violated",
+        ),
+        SwarmCapacityOperatorStatus::Unknown => (
+            SwarmCapacityWorkloadEvidenceState::Stale,
+            HealthTier::Red,
+            "capacity.operator.status.unknown_fail_closed",
+        ),
+        SwarmCapacityOperatorStatus::Unavailable => (
+            SwarmCapacityWorkloadEvidenceState::Unavailable,
+            HealthTier::Red,
+            "capacity.operator.status.unavailable_fail_closed",
+        ),
+    };
+
+    SwarmCapacityWorkloadAdmissionSignal::new(
+        SwarmCapacityWorkloadSignalKind::ResourcePressure,
+        evidence_state,
+        pressure_tier,
+    )
+    .with_reason_code(reason_code)
+}
+
+fn robot_swarm_capacity_hardware(
+    summary: &SwarmCapacityOperatorSummary,
+) -> SwarmCapacityHardwareFingerprint {
+    let predicate = summary
+        .resource_cockpit
+        .as_ref()
+        .map(|cockpit| &cockpit.run_identity.hardware_predicate);
+    let logical_cpus = predicate
+        .and_then(|predicate| predicate.logical_cpus)
+        .and_then(|cpus| u32::try_from(cpus).ok());
+    let memory_bytes = predicate
+        .and_then(|predicate| predicate.memory_gib)
+        .and_then(|gib| gib.checked_mul(1_073_741_824));
+
+    SwarmCapacityHardwareFingerprint::new(logical_cpus, memory_bytes)
+}
+
+fn build_robot_swarm_capacity_plan_payload(
+    summary: &SwarmCapacityOperatorSummary,
+    add_panes: u32,
+    generated_at_ms: u64,
+) -> serde_json::Value {
+    let current_pane_scale = summary.pane_scale.unwrap_or(0);
+    let target_pane_scale = current_pane_scale.saturating_add(add_panes);
+    let mut admission_input = SwarmCapacityWorkloadAdmissionInput::new(
+        "robot.swarm_capacity.plan.add_panes",
+        target_pane_scale,
+        SwarmCapacityAgentWorkloadClass::Coding,
+    );
+    admission_input.queue_depth = u64::from(current_pane_scale);
+    admission_input.backlog_depth = u64::from(add_panes);
+    admission_input.requested_units = add_panes
+        .max(1)
+        .saturating_mul(SwarmCapacityAgentWorkloadClass::Coding.default_requested_units());
+    admission_input.signals.resource_pressure = robot_swarm_capacity_resource_signal(summary);
+
+    let workload_admission_plan = plan_swarm_capacity_workload_admission(
+        generated_at_ms,
+        "robot.swarm_capacity.plan",
+        &[admission_input],
+    );
+
+    let mut workload_mix = Vec::new();
+    if current_pane_scale > 0 {
+        workload_mix.push(SwarmCapacityBudgetWorkloadMixRow::new(
+            SwarmCapacityAgentWorkloadClass::Idle,
+            current_pane_scale,
+        ));
+    }
+    if add_panes > 0 {
+        workload_mix.push(SwarmCapacityBudgetWorkloadMixRow::new(
+            SwarmCapacityAgentWorkloadClass::Coding,
+            add_panes,
+        ));
+    }
+    let resource_budget_plan = plan_swarm_capacity_resource_budget(
+        generated_at_ms,
+        "robot.swarm_capacity.plan",
+        robot_swarm_capacity_hardware(summary),
+        &workload_mix,
+    );
+    let planned_action = workload_admission_plan
+        .decisions
+        .first()
+        .map_or("unknown", |decision| decision.action.as_str());
+
+    serde_json::json!({
+        "schema_version": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "contract_id": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "surface": "plan",
+        "generated_at_ms": generated_at_ms,
+        "source": "robot.swarm_capacity.plan",
+        "dry_run": true,
+        "raw_pane_content_stored": false,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+        "requested_add_panes": add_panes,
+        "current_pane_scale": current_pane_scale,
+        "target_pane_scale": target_pane_scale,
+        "planned_action": planned_action,
+        "summary": summary,
+        "workload_admission_plan": workload_admission_plan,
+        "resource_budget_plan": resource_budget_plan,
+        "mcp_resources": robot_swarm_capacity_mcp_resources(generated_at_ms),
+        "doctor": robot_swarm_capacity_doctor(summary),
+    })
+}
+
+fn robot_swarm_capacity_sha256_prefixed(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(value.as_bytes());
+    format!("sha256:{}", hex::encode(digest))
+}
+
+fn build_robot_swarm_capacity_explain_payload(
+    summary: &SwarmCapacityOperatorSummary,
+    decision_id: &str,
+    generated_at_ms: u64,
+) -> serde_json::Value {
+    let hashed_query = robot_swarm_capacity_sha256_prefixed(decision_id);
+    let (decision, matched_by) = summary
+        .decisions
+        .iter()
+        .find_map(|decision| {
+            if decision.audit_record_id == decision_id {
+                Some((decision, "audit_record_id"))
+            } else if decision.stable_id_hash == decision_id {
+                Some((decision, "stable_id_hash"))
+            } else if decision.stable_id_hash == hashed_query {
+                Some((decision, "hashed_query"))
+            } else {
+                None
+            }
+        })
+        .map_or((None, "none"), |(decision, matched_by)| {
+            (Some(decision), matched_by)
+        });
+    let explanation_status = if decision.is_some() {
+        "matched"
+    } else {
+        "not_found"
+    };
+    let explanation = decision.map_or_else(
+        || {
+            serde_json::json!({
+                "status": explanation_status,
+                "reason_code": "capacity.operator.decision_not_found",
+                "operator_action": "refresh ft robot swarm-capacity status --level 2 and use a redacted decision id from data.summary.decisions",
+            })
+        },
+        |decision| {
+            serde_json::json!({
+                "status": explanation_status,
+                "reason_code": decision.reason_code,
+                "action": decision.action,
+                "would_apply": decision.would_apply,
+                "retry_after_secs": decision.retry_after_secs,
+                "operator_action": "follow the redacted capacity admission action; no pane mutation is performed by explain",
+            })
+        },
+    );
+
+    serde_json::json!({
+        "schema_version": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "contract_id": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "surface": "explain",
+        "generated_at_ms": generated_at_ms,
+        "source": "robot.swarm_capacity.explain",
+        "dry_run": true,
+        "raw_pane_content_stored": false,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+        "lookup": {
+            "matched": decision.is_some(),
+            "matched_by": matched_by,
+            "redacted_query_hash": hashed_query,
+        },
+        "decision": decision,
+        "explanation": explanation,
+        "summary": summary,
+        "mcp_resources": robot_swarm_capacity_mcp_resources(generated_at_ms),
+        "doctor": robot_swarm_capacity_doctor(summary),
+    })
 }
 
 fn build_herd_wave_surface_report(
@@ -30977,6 +31355,71 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     )
                                 });
                             let response = RobotResponse::success(summary, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
+                        RobotCommands::SwarmCapacity { command } => {
+                            let generated_at_ms = match &command {
+                                RobotSwarmCapacityCommands::Status {
+                                    generated_at_ms, ..
+                                }
+                                | RobotSwarmCapacityCommands::Plan {
+                                    generated_at_ms, ..
+                                }
+                                | RobotSwarmCapacityCommands::Explain {
+                                    generated_at_ms, ..
+                                } => generated_at_ms.unwrap_or_else(now_ms),
+                            };
+                            let level = match &command {
+                                RobotSwarmCapacityCommands::Status { level, .. }
+                                | RobotSwarmCapacityCommands::Plan { level, .. }
+                                | RobotSwarmCapacityCommands::Explain { level, .. } => *level,
+                            };
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let summary = load_runtime_health_snapshot(&layout)
+                                .await
+                                .map(|snapshot| {
+                                    swarm_capacity_summary_from_health_snapshot(&snapshot, level)
+                                })
+                                .unwrap_or_else(|| {
+                                    unavailable_swarm_capacity_summary_at(
+                                        generated_at_ms,
+                                        level,
+                                        "runtime_health_snapshot.missing",
+                                    )
+                                });
+                            let payload = match command {
+                                RobotSwarmCapacityCommands::Status { .. } => {
+                                    build_robot_swarm_capacity_status_payload(&summary)
+                                }
+                                RobotSwarmCapacityCommands::Plan { add_panes, .. } => {
+                                    build_robot_swarm_capacity_plan_payload(
+                                        &summary,
+                                        add_panes,
+                                        generated_at_ms,
+                                    )
+                                }
+                                RobotSwarmCapacityCommands::Explain { decision_id, .. } => {
+                                    build_robot_swarm_capacity_explain_payload(
+                                        &summary,
+                                        &decision_id,
+                                        generated_at_ms,
+                                    )
+                                }
+                            };
+                            let response = RobotResponse::success(payload, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::HerdWave {
@@ -68457,6 +68900,228 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_swarm_capacity_parses_status_plan_explain() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "swarm-capacity",
+            "status",
+            "--level",
+            "3",
+            "--generated-at-ms",
+            "1770000000000",
+        ])
+        .expect("robot swarm-capacity status should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::SwarmCapacity {
+                    command:
+                        RobotSwarmCapacityCommands::Status {
+                            level,
+                            generated_at_ms,
+                        },
+                }) => {
+                    assert_eq!(level, 3);
+                    assert_eq!(generated_at_ms, Some(1_770_000_000_000));
+                }
+                _ => panic!("expected RobotCommands::SwarmCapacity::Status"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["ft", "robot", "swarm_capacity", "plan", "--add-panes", "12"])
+                .expect("robot swarm_capacity plan alias should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::SwarmCapacity {
+                    command: RobotSwarmCapacityCommands::Plan { add_panes, .. },
+                }) => assert_eq!(add_panes, 12),
+                _ => panic!("expected RobotCommands::SwarmCapacity::Plan"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+
+        let Err(zero_panes) =
+            Cli::try_parse_from(["ft", "robot", "swarm-capacity", "plan", "--add-panes", "0"])
+        else {
+            panic!("robot swarm-capacity plan should reject zero added panes");
+        };
+        assert_eq!(zero_panes.kind(), clap::error::ErrorKind::ValueValidation);
+
+        let cli = Cli::try_parse_from(["ft", "robot", "swarm-capacity", "explain", "sha256:abcd"])
+            .expect("robot swarm-capacity explain should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::SwarmCapacity {
+                    command: RobotSwarmCapacityCommands::Explain { decision_id, .. },
+                }) => assert_eq!(decision_id, "sha256:abcd"),
+                _ => panic!("expected RobotCommands::SwarmCapacity::Explain"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn robot_swarm_capacity_status_plan_explain_are_dry_run_redacted_and_toon_safe() {
+        let summary =
+            frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable(
+                1_770_000_000_001,
+                2,
+                "test.swarm_capacity.operator",
+            );
+
+        let status = build_robot_swarm_capacity_status_payload(&summary);
+        assert_eq!(
+            status["contract_id"].as_str(),
+            Some(frankenterm_core::runtime_telemetry::ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID)
+        );
+        assert_eq!(status["surface"].as_str(), Some("status"));
+        assert_eq!(
+            status["mcp_resources"][0]["uri"].as_str(),
+            Some(frankenterm_core::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI)
+        );
+        assert_eq!(
+            status["mcp_resources"][1]["uri_template"].as_str(),
+            Some(frankenterm_core::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE)
+        );
+        assert_eq!(status["raw_pane_content_stored"].as_bool(), Some(false));
+        assert_eq!(status["live_mutation_allowed"].as_bool(), Some(false));
+        assert_eq!(status["side_effects_executed"].as_bool(), Some(false));
+
+        let plan = build_robot_swarm_capacity_plan_payload(&summary, 12, 1_770_000_000_002);
+        assert_eq!(plan["surface"].as_str(), Some("plan"));
+        assert_eq!(plan["requested_add_panes"].as_u64(), Some(12));
+        assert_eq!(plan["target_pane_scale"].as_u64(), Some(12));
+        assert_eq!(
+            plan["workload_admission_plan"]["dry_run"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            plan["workload_admission_plan"]["side_effects_executed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            plan["resource_budget_plan"]["side_effects_executed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(plan["live_mutation_allowed"].as_bool(), Some(false));
+
+        let raw_decision_query = concat!(
+            "PROMPT_",
+            "BODY: ",
+            "sk-",
+            "proj-ft-b94bx-",
+            "private-token ",
+            "Cookie: ft_session",
+            "=pri",
+            "vate"
+        );
+        let explain = build_robot_swarm_capacity_explain_payload(
+            &summary,
+            raw_decision_query,
+            1_770_000_000_003,
+        );
+        assert_eq!(explain["surface"].as_str(), Some("explain"));
+        assert_eq!(explain["lookup"]["matched"].as_bool(), Some(false));
+        assert_ne!(
+            explain["lookup"]["redacted_query_hash"].as_str(),
+            Some(raw_decision_query)
+        );
+
+        let response = RobotResponse::success(
+            serde_json::json!({
+                "status": status,
+                "plan": plan,
+                "explain": explain,
+            }),
+            17,
+        );
+        let json_value = serde_json::to_value(&response).expect("robot response serializes");
+        let rendered_json = serde_json::to_string(&json_value).expect("render json");
+        for forbidden in [
+            concat!("PROMPT_", "BODY:"),
+            concat!("sk-", "proj-ft-b94bx-", "private-token"),
+            concat!("Cookie: ft_session", "=pri", "vate"),
+        ] {
+            assert!(
+                !rendered_json.contains(forbidden),
+                "swarm-capacity JSON leaked {forbidden}: {rendered_json}"
+            );
+        }
+
+        let roundtripped = toon_roundtrip_json(&json_value);
+        assert_eq!(
+            roundtripped["data"]["status"]["mcp_resources"][0]["uri"].as_str(),
+            Some(frankenterm_core::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI)
+        );
+        assert_eq!(
+            roundtripped["data"]["plan"]["workload_admission_plan"]["dry_run"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            roundtripped["data"]["explain"]["lookup"]["matched"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn robot_swarm_capacity_operator_fixture_files_cover_json_and_toon_surfaces() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("golden_artifacts")
+            .join("swarm_capacity_operator");
+
+        for surface in ["status", "plan", "explain"] {
+            let json_path = dir.join(format!("{surface}.json"));
+            let json_fixture: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&json_path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", json_path.display())),
+            )
+            .unwrap_or_else(|err| panic!("parse {}: {err}", json_path.display()));
+            assert_eq!(
+                json_fixture["contract_id"].as_str(),
+                Some(
+                    frankenterm_core::runtime_telemetry::ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID
+                )
+            );
+            assert_eq!(json_fixture["surface"].as_str(), Some(surface));
+            assert_eq!(json_fixture["dry_run"].as_bool(), Some(true));
+            assert_eq!(
+                json_fixture["raw_pane_content_stored"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(json_fixture["live_mutation_allowed"].as_bool(), Some(false));
+            assert_eq!(json_fixture["side_effects_executed"].as_bool(), Some(false));
+
+            let toon_path = dir.join(format!("{surface}.toon"));
+            let toon = std::fs::read_to_string(&toon_path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", toon_path.display()));
+            let decoded = toon_rust::try_decode(&toon, None)
+                .unwrap_or_else(|err| panic!("decode {}: {err}", toon_path.display()));
+            let decoded_json =
+                toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+            let toon_fixture: serde_json::Value = serde_json::from_str(&decoded_json)
+                .unwrap_or_else(|err| panic!("parse decoded {}: {err}", toon_path.display()));
+            assert_eq!(
+                toon_fixture["contract_id"].as_str(),
+                Some(
+                    frankenterm_core::runtime_telemetry::ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID
+                )
+            );
+            assert_eq!(toon_fixture["surface"].as_str(), Some(surface));
+            assert_eq!(toon_fixture["dry_run"].as_bool(), Some(true));
+            assert_eq!(
+                toon_fixture["raw_pane_content_stored"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(toon_fixture["live_mutation_allowed"].as_bool(), Some(false));
+            assert_eq!(toon_fixture["side_effects_executed"].as_bool(), Some(false));
+        }
+    }
+
+    #[test]
     fn cli_robot_perf_slo_status_parses_ssim_parity() {
         let cli =
             Cli::try_parse_from(["ft", "robot", "perf", "slo-status", "--slo", "ssim_parity"])
@@ -68618,6 +69283,10 @@ log_level = "debug"
             command.name == "blocker-radar"
                 && command.description.contains("read-only blocker radar")
         }));
+        assert!(help.commands.iter().any(|command| {
+            command.name == "swarm-capacity"
+                && command.description.contains("decision explanations")
+        }));
 
         let quick_start = build_robot_quick_start();
         let blocker_radar = quick_start
@@ -68631,6 +69300,21 @@ log_level = "debug"
                 .examples
                 .iter()
                 .any(|example| example == &"ft robot --format toon blocker-radar frankenterm")
+        );
+        let swarm_capacity = quick_start
+            .commands
+            .iter()
+            .find(|command| command.name == "swarm-capacity")
+            .expect("quick start should list swarm-capacity");
+        assert_eq!(
+            swarm_capacity.args,
+            "status|plan --add-panes N|explain <decision-id>"
+        );
+        assert!(
+            swarm_capacity
+                .examples
+                .iter()
+                .any(|example| example == &"ft robot swarm-capacity plan --add-panes 16")
         );
     }
 

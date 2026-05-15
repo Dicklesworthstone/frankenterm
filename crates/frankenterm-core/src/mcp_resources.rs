@@ -26,6 +26,10 @@ use crate::render_quality::{
     RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, RENDERER_SSIM_PARITY_MCP_RESOURCE_URI,
     renderer_slos_doctor_report,
 };
+use crate::runtime_telemetry::{
+    ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID, SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
+    SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE, SwarmCapacityOperatorSummary,
+};
 use crate::swarm_scheduler::{
     HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
 };
@@ -788,6 +792,199 @@ impl ResourceHandler for WaHerdWaveResource {
     }
 }
 
+fn swarm_capacity_resource_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn swarm_capacity_resource_run_id(generated_at_ms: u64) -> String {
+    format!("swarm-capacity-{generated_at_ms}")
+}
+
+fn swarm_capacity_resource_run_uri(run_id: &str) -> String {
+    format!("wa://swarm-capacity/runs/{run_id}")
+}
+
+fn swarm_capacity_resource_mcp_resources(generated_at_ms: u64) -> serde_json::Value {
+    let run_id = swarm_capacity_resource_run_id(generated_at_ms);
+    serde_json::json!([
+        {
+            "kind": "current",
+            "uri": SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        },
+        {
+            "kind": "run_artifact",
+            "uri": swarm_capacity_resource_run_uri(&run_id),
+            "uri_template": SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE,
+            "run_id": run_id,
+            "implemented": true,
+            "read_only": true,
+            "live_mutation_allowed": false,
+            "mime_type": "application/json",
+        }
+    ])
+}
+
+fn swarm_capacity_resource_sha256_prefixed(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(value.as_bytes());
+    format!("sha256:{}", hex::encode(digest))
+}
+
+fn swarm_capacity_resource_payload(
+    source: &str,
+    generated_at_ms: u64,
+    run_id: Option<&str>,
+) -> serde_json::Value {
+    let summary = SwarmCapacityOperatorSummary::unavailable(generated_at_ms, 2, source);
+    let run_id_hash = swarm_capacity_resource_sha256_prefixed(run_id.unwrap_or("current"));
+    serde_json::json!({
+        "schema_version": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "contract_id": ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID,
+        "surface": "mcp_resource",
+        "generated_at_ms": generated_at_ms,
+        "source": source,
+        "dry_run": true,
+        "raw_pane_content_stored": false,
+        "live_mutation_allowed": false,
+        "side_effects_executed": false,
+        "run_id_hash": run_id_hash,
+        "run_id_redacted": true,
+        "summary": summary,
+        "mcp_resources": swarm_capacity_resource_mcp_resources(generated_at_ms),
+        "doctor": {
+            "status": "stale_or_missing_evidence",
+            "evidence_state": "unavailable",
+            "stale_evidence": true,
+            "safe_remediation": [
+                {
+                    "command": "ft robot swarm-capacity status",
+                    "reason_code": "capacity.operator.refresh_robot_status",
+                    "live_mutation_allowed": false
+                },
+                {
+                    "command": "ft doctor --json",
+                    "reason_code": "capacity.operator.inspect_doctor_context",
+                    "live_mutation_allowed": false
+                }
+            ],
+            "reason_codes": ["capacity.operator.unavailable"]
+        }
+    })
+}
+
+pub(super) struct WaSwarmCapacityCurrentResource;
+
+impl ResourceHandler for WaSwarmCapacityCurrentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI.to_string(),
+            name: "ft swarm capacity current".to_string(),
+            description: Some(
+                "Read-only swarm-capacity status, doctor, and MCP resource shape".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm-capacity".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = swarm_capacity_resource_now_ms();
+        envelope_as_resource(
+            SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
+            McpEnvelope::success(
+                swarm_capacity_resource_payload(
+                    "mcp.swarm_capacity.current",
+                    generated_at_ms,
+                    None,
+                ),
+                elapsed_ms(start),
+            ),
+        )
+    }
+}
+
+pub(super) struct WaSwarmCapacityRunTemplateResource;
+
+impl ResourceHandler for WaSwarmCapacityRunTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://swarm-capacity/runs/template".to_string(),
+            name: "ft swarm capacity run artifact template".to_string(),
+            description: Some(
+                "Template for read-only per-run swarm-capacity operator artifacts".to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm-capacity".to_string(),
+                "operator".to_string(),
+            ],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE.to_string(),
+            name: "ft swarm capacity run artifact".to_string(),
+            description: Some("Read-only swarm-capacity run artifact shape".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm-capacity".to_string(),
+                "operator".to_string(),
+            ],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.read_with_uri(ctx, "wa://swarm-capacity/runs/current", &HashMap::new())
+    }
+
+    fn read_with_uri(
+        &self,
+        _ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = swarm_capacity_resource_now_ms();
+        let run_id = params
+            .get("run_id")
+            .map(String::as_str)
+            .unwrap_or("current");
+        envelope_as_resource(
+            uri,
+            McpEnvelope::success(
+                swarm_capacity_resource_payload(
+                    "mcp.swarm_capacity.run_artifact",
+                    generated_at_ms,
+                    Some(run_id),
+                ),
+                elapsed_ms(start),
+            ),
+        )
+    }
+}
+
 pub(super) struct WaRendererInputToPhotonResource;
 
 impl ResourceHandler for WaRendererInputToPhotonResource {
@@ -1248,7 +1445,8 @@ mod tests {
         WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
         WaProofHistoryTemplateResource, WaRendererInputToPhotonResource,
         WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
-        WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource, envelope_as_resource,
+        WaRulesByAgentTemplateResource, WaRulesResource, WaSwarmCapacityCurrentResource,
+        WaSwarmCapacityRunTemplateResource, WaWorkflowsResource, envelope_as_resource,
         load_proof_history_query_from_roots, tool_output_as_resource,
     };
     use crate::config::{Config, PaneFilterConfig};
@@ -1418,6 +1616,26 @@ mod tests {
     }
 
     #[test]
+    fn swarm_capacity_resources_define_current_and_run_template() {
+        let current = WaSwarmCapacityCurrentResource.definition();
+        assert_eq!(
+            current.uri,
+            crate::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI
+        );
+        assert!(current.tags.contains(&"swarm-capacity".to_string()));
+        assert!(current.tags.contains(&"operator".to_string()));
+
+        let template = WaSwarmCapacityRunTemplateResource
+            .template()
+            .expect("swarm-capacity run template");
+        assert_eq!(
+            template.uri_template,
+            crate::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE
+        );
+        assert!(template.tags.contains(&"swarm-capacity".to_string()));
+    }
+
+    #[test]
     fn renderer_input_to_photon_resource_definition_uri() {
         let def = WaRendererInputToPhotonResource.definition();
         assert_eq!(
@@ -1480,6 +1698,51 @@ mod tests {
             payload["data"]["mcp_resource"]["uri"].as_str(),
             Some("wa://herd-wave")
         );
+    }
+
+    #[test]
+    fn swarm_capacity_current_resource_reads_without_pane_mutation_or_raw_content() {
+        let resource = WaSwarmCapacityCurrentResource;
+        let ctx = crate::mcp_framework::FrameworkMcpContext::new(fastmcp::Cx::for_testing(), 1);
+        let contents = resource
+            .read(&ctx)
+            .expect("read swarm-capacity current resource");
+        let payload: serde_json::Value =
+            serde_json::from_str(contents[0].text.as_ref().unwrap()).expect("resource json");
+
+        assert_eq!(payload["ok"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["contract_id"].as_str(),
+            Some(crate::runtime_telemetry::ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID)
+        );
+        assert_eq!(payload["data"]["dry_run"].as_bool(), Some(true));
+        assert_eq!(
+            payload["data"]["raw_pane_content_stored"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["live_mutation_allowed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["side_effects_executed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            payload["data"]["mcp_resources"][0]["uri"].as_str(),
+            Some(crate::runtime_telemetry::SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI)
+        );
+        let rendered = serde_json::to_string(&payload).expect("render payload");
+        for forbidden in [
+            concat!("PROMPT_", "BODY:"),
+            concat!("sk-", "proj-"),
+            concat!("Cookie: ft_session", "="),
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "swarm-capacity MCP payload leaked {forbidden}: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1729,6 +1992,8 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaSwarmCapacityCurrentResource.definition().uri,
+            WaSwarmCapacityRunTemplateResource.definition().uri,
             WaRendererInputToPhotonResource.definition().uri,
             WaRendererSsimParityResource.definition().uri,
             WaProofHistoryResource::new(Arc::clone(&config))
@@ -1776,6 +2041,8 @@ mod tests {
             WaWorkflowsResource::new(Arc::new(Config::default()))
                 .definition()
                 .uri,
+            WaSwarmCapacityCurrentResource.definition().uri,
+            WaSwarmCapacityRunTemplateResource.definition().uri,
             WaRendererInputToPhotonResource.definition().uri,
             WaRendererSsimParityResource.definition().uri,
             WaProofHistoryResource::new(Arc::clone(&config))
@@ -1815,6 +2082,8 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaSwarmCapacityCurrentResource.definition(),
+            WaSwarmCapacityRunTemplateResource.definition(),
             WaRendererInputToPhotonResource.definition(),
             WaRendererSsimParityResource.definition(),
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),
@@ -1847,6 +2116,8 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaSwarmCapacityCurrentResource.definition(),
+            WaSwarmCapacityRunTemplateResource.definition(),
             WaRendererInputToPhotonResource.definition(),
             WaRendererSsimParityResource.definition(),
             WaProofHistoryResource::new(Arc::clone(&config)).definition(),

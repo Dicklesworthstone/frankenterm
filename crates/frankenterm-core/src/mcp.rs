@@ -118,7 +118,8 @@ use mcp_resources::{
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
     WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
-    WaRulesResource, WaWorkflowsResource,
+    WaRulesResource, WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource,
+    WaWorkflowsResource,
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
@@ -1473,6 +1474,8 @@ mod tests {
                 "wa://accounts".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://swarm-capacity/current".to_string(),
+                "wa://swarm-capacity/runs/template".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
                 "wa://perf/renderer-slo/ssim_parity".to_string(),
                 "wa://proof-history".to_string(),
@@ -1490,6 +1493,7 @@ mod tests {
                 "wa://events/unhandled/{limit}".to_string(),
                 "wa://accounts/{service}".to_string(),
                 "wa://rules/{agent_type}".to_string(),
+                "wa://swarm-capacity/runs/{run_id}".to_string(),
                 "wa://reservations/{pane_id}".to_string(),
                 "wa://proof-history/{filter}/{value}/{limit}".to_string(),
             ])
@@ -1514,6 +1518,8 @@ mod tests {
                 "wa://panes".to_string(),
                 "wa://rules".to_string(),
                 "wa://workflows".to_string(),
+                "wa://swarm-capacity/current".to_string(),
+                "wa://swarm-capacity/runs/template".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
                 "wa://perf/renderer-slo/ssim_parity".to_string(),
                 "wa://proof-history".to_string(),
@@ -1526,6 +1532,7 @@ mod tests {
             templates,
             uri_set([
                 "wa://rules/{agent_type}".to_string(),
+                "wa://swarm-capacity/runs/{run_id}".to_string(),
                 "wa://proof-history/{filter}/{value}/{limit}".to_string(),
             ])
         );
