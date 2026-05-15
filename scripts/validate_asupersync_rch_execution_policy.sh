@@ -32,9 +32,23 @@ has_rch_cargo_wrapper() {
   [[ "${trimmed}" =~ ^([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+)*run_rch_cargo_logged(_with_timeout)?[[:space:]] ]]
 }
 
+is_rch_diagnose_dry_run() {
+  local cmd="$1"
+  local trimmed
+  local normalized
+
+  trimmed="$(printf '%s' "${cmd}" | sed -E 's/^[[:space:]]+//')"
+  normalized="$(printf '%s' "${trimmed}" | tr '[:upper:]' '[:lower:]')"
+  [[ "${normalized}" =~ ^([a-z_][a-z0-9_]*=[^[:space:]]+[[:space:]]+)*(env[[:space:]]+([a-z_][a-z0-9_]*=[^[:space:]]+[[:space:]]+)*)?rch([[:space:]]+--[a-z0-9_-]+)*[[:space:]]+diagnose[[:space:]]+--dry-run([[:space:]]|$) ]]
+}
+
 is_heavy_command() {
   local cmd="$1"
   local normalized
+
+  if is_rch_diagnose_dry_run "${cmd}"; then
+    return 1
+  fi
 
   normalized="$(echo "${cmd}" | tr '[:upper:]' '[:lower:]')"
   if [[ ! "${normalized}" =~ (^|[[:space:]])cargo([[:space:]]|$) ]]; then
@@ -1026,6 +1040,20 @@ run_self_test() {
   out="$(classify_command_json "rch exec -- cargo test --workspace")"
   [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
     echo "self-test failed: rch-wrapped heavy command should not be violation" >&2
+    return 1
+  }
+
+  out="$(classify_command_json "rch exec -- cargo test diagnose --dry-run")"
+  [[ "$(jq -r '.is_heavy' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: dry-run words after rch exec must not hide a cargo test" >&2
+    return 1
+  }
+  [[ "$(jq -r '.used_rch' <<<"${out}")" == "true" ]] || {
+    echo "self-test failed: dry-run words after rch exec should still count as rch usage" >&2
+    return 1
+  }
+  [[ "$(jq -r '.policy_violation' <<<"${out}")" == "false" ]] || {
+    echo "self-test failed: rch exec cargo test with dry-run words should remain policy-compliant" >&2
     return 1
   }
 

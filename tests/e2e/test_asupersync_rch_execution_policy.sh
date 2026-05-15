@@ -254,6 +254,32 @@ if [[ "$(jq -r '.is_heavy' <<<"${light_cmd}")" != "false" ]]; then
   exit 1
 fi
 
+dry_run_diagnose="$("${VALIDATOR}" --classify "rch --json diagnose --dry-run cargo check --help")"
+if [[ "$(jq -r '.is_heavy' <<<"${dry_run_diagnose}")" != "false" || "$(jq -r '.policy_violation' <<<"${dry_run_diagnose}")" != "false" ]]; then
+  emit_log \
+    "failed" \
+    "unit_classifier" \
+    "command_classification" \
+    "classifier_mismatch" \
+    "unexpected_classifier_result" \
+    "$(basename "${VALIDATOR}")" \
+    "rch diagnose --dry-run cargo preflight should be light inventory, not a heavy cargo run"
+  exit 1
+fi
+
+dry_run_words_after_exec="$("${VALIDATOR}" --classify "rch exec -- cargo test diagnose --dry-run")"
+if [[ "$(jq -r '.is_heavy' <<<"${dry_run_words_after_exec}")" != "true" || "$(jq -r '.used_rch' <<<"${dry_run_words_after_exec}")" != "true" || "$(jq -r '.policy_violation' <<<"${dry_run_words_after_exec}")" != "false" ]]; then
+  emit_log \
+    "failed" \
+    "unit_classifier" \
+    "command_classification" \
+    "classifier_mismatch" \
+    "unexpected_classifier_result" \
+    "$(basename "${VALIDATOR}")" \
+    "dry-run words after rch exec must not hide a real cargo test"
+  exit 1
+fi
+
 emit_log \
   "passed" \
   "unit_classifier" \
