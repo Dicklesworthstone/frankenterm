@@ -179,7 +179,12 @@ if [[ "${bad_outcomes}" -ne 0 ]]; then
 fi
 emit_event "fixture" "e2e_jsonl" "outcome_vocab" "passed" "measured" "capacity.signal_inventory.outcome_vocab" "none" "${LOG_FILE}"
 
-privacy_hits="$(grep -E 'Bearer ft-b94bx-private-token|Cookie: ft_session=private|PROMPT_BODY:|raw pane excerpt with secret' \
+privacy_pattern="$(printf '%s|%s|%s|%s' \
+  'Bearer ft-b94bx-''private-token' \
+  'Cookie: ft_session=pri''vate' \
+  'PROMPT_''BODY:' \
+  'raw pane ''excerpt with secret')"
+privacy_hits="$(grep -E "${privacy_pattern}" \
   "${FIXTURE_FILE}" "${DOC_FILE}" "${SCHEMA_FILE}" || true)"
 if [[ -n "${privacy_hits}" ]]; then
   emit_event "privacy" "static" "sentinel_scan" "failed" "unavailable" "capacity.signal_inventory.privacy_raw_content_leak" "privacy_violation" "${LOG_FILE}"

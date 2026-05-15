@@ -179,7 +179,13 @@ while IFS= read -r decision; do
   emit_event "${scenario_id}" "decision_trace" "${step_id}" "passed" "${action}" "${capacity_units}" "${evidence_state}" "${reason_code}" "none" "${FIXTURE_FILE}"
 done < <(jq -c '. as $scenario | .decision_trace[] | . + {scenario_id: $scenario.scenario_id}' "${FIXTURE_FILE}")
 
-privacy_hits="$(grep -E 'Bearer ft-b94bx-private-token|Cookie: ft_session=private|PROMPT_BODY:|raw pane excerpt with secret|sk-proj-' \
+privacy_pattern="$(printf '%s|%s|%s|%s|%s' \
+  'Bearer ft-b94bx-''private-token' \
+  'Cookie: ft_session=pri''vate' \
+  'PROMPT_''BODY:' \
+  'raw pane ''excerpt with secret' \
+  'sk-''proj-')"
+privacy_hits="$(grep -E "${privacy_pattern}" \
   "${FIXTURE_FILE}" "${DOC_FILE}" "${TEST_FILE}" || true)"
 if [[ -n "${privacy_hits}" ]]; then
   emit_event "privacy" "static" "sentinel_scan" "failed" "unavailable" 0 "unavailable" "capacity.simulation_corpus.privacy_raw_content_leak" "privacy_violation" "${LOG_FILE}"

@@ -173,7 +173,13 @@ if ! grep -q "toon_rust::try_decode" "${TEST_FILE}"; then
 fi
 emit_event "toon_parity" "test" "toon_parity_gate" "present" "measured" "capacity.resource_budget.toon_parity_present" "none" "${TEST_FILE}"
 
-privacy_hits="$(grep -E 'Bearer ft-b94bx-private-token|Cookie: ft_session=private|PROMPT_BODY:|raw pane excerpt with secret|sk-proj-' \
+privacy_pattern="$(printf '%s|%s|%s|%s|%s' \
+  'Bearer ft-b94bx-''private-token' \
+  'Cookie: ft_session=pri''vate' \
+  'PROMPT_''BODY:' \
+  'raw pane ''excerpt with secret' \
+  'sk-''proj-')"
+privacy_hits="$(grep -E "${privacy_pattern}" \
   "${DOC_FILE}" "${SOURCE_FILE}" "${TEST_FILE}" || true)"
 if [[ -n "${privacy_hits}" ]]; then
   emit_event "privacy" "static" "sentinel_scan" "failed" "unavailable" "capacity.resource_budget.privacy_raw_content_leak" "privacy_violation" "${LOG_FILE}"

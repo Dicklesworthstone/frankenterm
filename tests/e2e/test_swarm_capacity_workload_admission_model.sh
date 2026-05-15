@@ -173,7 +173,13 @@ if ! grep -q "evidence_degradation_never_upgrades_admission" "${TEST_FILE}"; the
 fi
 emit_event "degradation_property" "test" "property_gate" "present" "measured" "capacity.workload_admission.property_present" "none" "${TEST_FILE}"
 
-privacy_hits="$(grep -E 'Bearer ft-b94bx-private-token|Cookie: ft_session=private|PROMPT_BODY:|raw pane excerpt with secret|sk-proj-' \
+privacy_pattern="$(printf '%s|%s|%s|%s|%s' \
+  'Bearer ft-b94bx-''private-token' \
+  'Cookie: ft_session=pri''vate' \
+  'PROMPT_''BODY:' \
+  'raw pane ''excerpt with secret' \
+  'sk-''proj-')"
+privacy_hits="$(grep -E "${privacy_pattern}" \
   "${DOC_FILE}" "${SOURCE_FILE}" || true)"
 if [[ -n "${privacy_hits}" ]]; then
   emit_event "privacy" "static" "sentinel_scan" "failed" "unavailable" "capacity.workload_admission.privacy_raw_content_leak" "privacy_violation" "${LOG_FILE}"
