@@ -99,8 +99,33 @@ fn base_bundle(signature: Value) -> Value {
         "artifacts": [],
         "required_categories": [],
         "deferred_slots": [],
+        "taxonomy_coverage": base_taxonomy_coverage(),
         "confidence_summary": base_confidence_summary(),
         "signature": signature
+    })
+}
+
+fn base_taxonomy_coverage() -> Value {
+    json!({
+        "schema_version": "1.0.0",
+        "taxonomy_path": "docs/proof-taxonomy.json",
+        "category_counts": [
+            {
+                "id": 5,
+                "slug": "quantitative-attestation",
+                "name": "Quantitative Attestation",
+                "bridge_plan_core": true,
+                "artifact_count": 1,
+                "deferred_slot_count": 0,
+                "below_threshold": false
+            }
+        ],
+        "below_threshold_count": 0,
+        "uncategorized_artifact_count": 0,
+        "delta_from_prior_release": {
+            "status": "no_prior_bundle",
+            "category_deltas": []
+        }
     })
 }
 

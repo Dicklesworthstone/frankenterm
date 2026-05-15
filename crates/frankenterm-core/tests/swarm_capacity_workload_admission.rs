@@ -47,6 +47,33 @@ fn load_json(path: &Path) -> Value {
         .unwrap_or_else(|err| panic!("failed to parse JSON {}: {err}", path.display()))
 }
 
+fn normalize_integral_toon_numbers(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                normalize_integral_toon_numbers(item);
+            }
+        }
+        Value::Object(map) => {
+            for nested in map.values_mut() {
+                normalize_integral_toon_numbers(nested);
+            }
+        }
+        Value::Number(number) => {
+            if let Some(float) = number.as_f64() {
+                #[allow(clippy::cast_precision_loss)]
+                let max_u64 = u64::MAX as f64;
+                if float.fract() == 0.0 && float >= 0.0 && float <= max_u64 {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let as_u64 = float as u64;
+                    *value = Value::Number(serde_json::Number::from(as_u64));
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
+    }
+}
+
 fn arb_workload_class() -> impl Strategy<Value = SwarmCapacityAgentWorkloadClass> {
     prop_oneof![
         Just(SwarmCapacityAgentWorkloadClass::Coding),
@@ -362,7 +389,8 @@ fn decision_dto_round_trips_through_json_and_toon() {
     let toon = toon_rust::encode(json_value.clone(), None);
     let decoded = toon_rust::try_decode(&toon, None).expect("decode workload decision toon");
     let json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
-    let roundtripped: Value = serde_json::from_str(&json).expect("toon decoded json");
+    let mut roundtripped: Value = serde_json::from_str(&json).expect("toon decoded json");
+    normalize_integral_toon_numbers(&mut roundtripped);
 
     for key in [
         "stable_id",

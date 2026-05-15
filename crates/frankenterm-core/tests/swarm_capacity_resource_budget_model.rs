@@ -15,6 +15,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const FIXTURE_GENERATED_AT_MS: u64 = 1_700_000_000_000;
 const CAPACITY_ENVELOPE_REL_PATH: &str = "docs/attestations/perf/swarm-capacity-envelope.json";
 const TARGET_CLASS_SUMMARY_FALLBACK: &str = r#"{
+  "status": "skipped_not_proven",
   "hardware_predicate": {
     "target_class": false,
     "proof_status": "skipped_not_proven"
@@ -22,6 +23,9 @@ const TARGET_CLASS_SUMMARY_FALLBACK: &str = r#"{
   "observed_host": {
     "logical_cpus": 14,
     "memory_gib": 64
+  },
+  "evidence": {
+    "high_scale_claim_allowed": false
   }
 }"#;
 
