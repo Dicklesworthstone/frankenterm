@@ -679,6 +679,75 @@ run_pool_mirror_fixture "mirror_pool_strict_stale_head_blocks_fixture" \
     "stale_head" "success" "2" "0" "1" "1" \
     "blocked" "source_mirror_blocked"
 
+run_pinned_mirror_fixture() {
+    local name="$1"
+    local pinned_worker="$2"
+    local mode_a="$3"
+    local mode_b="$4"
+    local require_all_checked="$5"
+    local expected_rc="$6"
+    local expected_status="$7"
+    local expected_reason="$8"
+    local probe_file="${LOG_DIR}/${name}_probe.json"
+    local scheduler_file="${LOG_DIR}/${name}_scheduler.json"
+    local output_file="${LOG_DIR}/${name}_mirror_preflight.json"
+    local rc
+
+    write_pool_probe_fixture "${probe_file}"
+    write_pool_scheduler_fixture "${scheduler_file}"
+
+    _RCH_PROBE_LOG="${probe_file}"
+    _RCH_MIRROR_PREFLIGHT_LOG="${output_file}"
+    _RCH_SCHEDULER_WORKERS_LOG="${LOG_DIR}/${name}_scheduler_capture.json"
+
+    set +e
+    (
+        export RCH_MIRROR_ATTEST_WORKERS_JSON="${POOL_WORKERS_JSON}"
+        export RCH_MIRROR_ATTEST_SSH_BIN="${FAKE_SSH}"
+        export FAKE_RCH_STATUS_JSON="${scheduler_file}"
+        export FAKE_RCH_MIRROR_MODE="${mode_a}"
+        export FAKE_RCH_MIRROR_MODE_WORKER_B="${mode_b}"
+        export FAKE_RCH_MIRROR_REMOTE_HEAD="${HEAD_SHA}"
+        export FAKE_RCH_MIRROR_REPO_ROOT="${ROOT_DIR}"
+        RCH_WORKER="${pinned_worker}"
+        RCH_MIRROR_REQUIRED_PATHS="Cargo.toml,crates/frankenterm-core/src/lib.rs"
+        RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS=0
+        RCH_MIRROR_MIN_PASSING_WORKERS="1"
+        RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS="${require_all_checked}"
+        RCH_MIRROR_BLOCK_ON_STALE_HEAD=0
+        ensure_rch_mirror_preflight
+    ) >"${LOG_DIR}/${name}.stdout" 2>"${LOG_DIR}/${name}.stderr"
+    rc=$?
+    set -e
+
+    if [[ "${rc}" -ne "${expected_rc}" ]]; then
+        record_result "${name}" "false" "expected rc ${expected_rc}, got ${rc}"
+        return
+    fi
+
+    if jq -e \
+        --arg status "${expected_status}" \
+        --arg reason "${expected_reason}" \
+        --arg worker "${pinned_worker}" \
+        '.status == $status
+         and .reason_code == $reason
+         and .total_workers_checked == 1
+         and .worker_results[0].worker.id == $worker' \
+        "${output_file}" >/dev/null; then
+        record_result "${name}" "true"
+    else
+        record_result "${name}" "false" "unexpected pinned mirror preflight JSON shape"
+    fi
+}
+
+run_pinned_mirror_fixture "mirror_pool_pinned_worker_only_fixture" \
+    "worker-b" "hash_mismatch" "success" "1" "0" \
+    "passed" "source_mirror_ready"
+
+run_pinned_mirror_fixture "mirror_pool_pinned_worker_missing_blocks_fixture" \
+    "worker-b" "success" "missing_file" "0" "1" \
+    "blocked" "source_mirror_blocked"
+
 jq -cn \
   --arg test "rch_worker_mirror_attestation" \
   --arg log_dir "${LOG_DIR}" \

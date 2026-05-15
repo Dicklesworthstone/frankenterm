@@ -1127,8 +1127,10 @@ ensure_rch_mirror_preflight() {
     local require_all_checked_workers="false"
     local min_passing_workers
     local scheduler_worker_ids scheduler_status_rc scheduler_filter_active="false"
+    local pinned_worker
     worker_ids="$(rch_extract_probe_worker_ids "${_RCH_PROBE_LOG}")"
     [[ -n "${worker_ids}" ]] || rch_fatal "mirror preflight requested but worker probe did not expose worker ids. See ${_RCH_PROBE_LOG}"
+    pinned_worker="${RCH_WORKER:-}"
     min_passing_workers="${RCH_MIRROR_MIN_PASSING_WORKERS}"
     if ! rch_is_unsigned_int "${min_passing_workers}" || [[ "${min_passing_workers}" -eq 0 ]]; then
         rch_fatal "RCH_MIRROR_MIN_PASSING_WORKERS must be a positive integer; got '${RCH_MIRROR_MIN_PASSING_WORKERS}'."
@@ -1147,6 +1149,16 @@ ensure_rch_mirror_preflight() {
         if [[ -n "${scheduler_worker_ids}" ]]; then
             scheduler_filter_active="true"
         fi
+    fi
+    if [[ -n "${pinned_worker}" ]]; then
+        if ! grep -Fxq "${pinned_worker}" <<<"${worker_ids}"; then
+            rch_fatal "mirror preflight requested for pinned RCH_WORKER=${pinned_worker}, but probe did not expose that worker. See ${_RCH_PROBE_LOG}"
+        fi
+        if [[ "${scheduler_filter_active}" == "true" ]] \
+            && ! grep -Fxq "${pinned_worker}" <<<"${scheduler_worker_ids}"; then
+            rch_fatal "mirror preflight requested for pinned RCH_WORKER=${pinned_worker}, but scheduler does not mark that worker healthy. See ${_RCH_SCHEDULER_WORKERS_LOG}"
+        fi
+        worker_ids="${pinned_worker}"
     fi
 
     worker_dir="${_RCH_MIRROR_PREFLIGHT_LOG%.json}.workers"
