@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use frankenterm_core::runtime_telemetry::{
     HealthTier, SWARM_CAPACITY_WORKLOAD_ADMISSION_CONTRACT_ID,
     SWARM_CAPACITY_WORKLOAD_ADMISSION_SCHEMA_VERSION, SwarmCapacityAdmissionAction,
-    SwarmCapacityAgentWorkloadClass, SwarmCapacityWorkloadAdmissionInput,
-    SwarmCapacityWorkloadAdmissionSignal, SwarmCapacityWorkloadAdmissionSignals,
-    SwarmCapacityWorkloadEvidenceState, SwarmCapacityWorkloadSignalKind,
-    plan_swarm_capacity_workload_admission, swarm_capacity_workload_admission_dry_run_examples,
-    swarm_capacity_workload_admission_table,
+    SwarmCapacityAgentWorkloadClass, SwarmCapacityTelemetryGapState,
+    SwarmCapacityWorkloadAdmissionInput, SwarmCapacityWorkloadAdmissionSignal,
+    SwarmCapacityWorkloadAdmissionSignals, SwarmCapacityWorkloadEvidenceState,
+    SwarmCapacityWorkloadSignalKind, plan_swarm_capacity_workload_admission,
+    swarm_capacity_workload_admission_dry_run_examples, swarm_capacity_workload_admission_table,
 };
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -64,6 +64,8 @@ fn arb_workload_class() -> impl Strategy<Value = SwarmCapacityAgentWorkloadClass
 fn arb_degraded_evidence_state() -> impl Strategy<Value = SwarmCapacityWorkloadEvidenceState> {
     prop_oneof![
         Just(SwarmCapacityWorkloadEvidenceState::Stale),
+        Just(SwarmCapacityWorkloadEvidenceState::Redacted),
+        Just(SwarmCapacityWorkloadEvidenceState::Contradictory),
         Just(SwarmCapacityWorkloadEvidenceState::Unavailable),
     ]
 }
@@ -258,6 +260,29 @@ fn fixture_and_doc_cover_required_classes_signals_and_examples() {
         );
         assert!(doc.contains(label), "doc omits signal kind {label}");
     }
+    for state in SwarmCapacityTelemetryGapState::ALL {
+        let label = state.as_str();
+        assert!(
+            fixture["telemetry_gap_states"]
+                .as_array()
+                .expect("telemetry gap states")
+                .iter()
+                .any(|value| value.as_str() == Some(label)),
+            "fixture omits telemetry gap state {label}"
+        );
+        assert!(doc.contains(label), "doc omits telemetry gap state {label}");
+    }
+    for reason_code in fixture["fail_closed_reason_codes"]
+        .as_array()
+        .expect("fail closed reason code catalog")
+        .iter()
+        .filter_map(Value::as_str)
+    {
+        assert!(
+            doc.contains(reason_code),
+            "doc omits fail-closed reason code {reason_code}"
+        );
+    }
 }
 
 #[test]
@@ -346,6 +371,9 @@ fn decision_dto_round_trips_through_json_and_toon() {
         "work_class",
         "action",
         "evidence_state",
+        "telemetry_gap_state",
+        "pause_admission",
+        "kill_switch_active",
         "recommended_stagger_ms",
         "requested_units",
         "admitted_units",

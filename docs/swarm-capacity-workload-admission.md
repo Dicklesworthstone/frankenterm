@@ -43,9 +43,33 @@ radar instead of creating a competing scheduler.
 | `resource_pressure` | `docs/resource-pressure-cockpit-contract.md` and admission summaries | Red reduces admission; black sheds idle optional work and defers non-idle work. | Fail closed to at least `defer`. |
 
 Evidence states are ordered from strongest to weakest: `measured`, `inferred`,
-`simulated`, `stale`, `unavailable`. A weaker state may only preserve or
+`simulated`, `stale`, `redacted`, `contradictory`, `unavailable`. A weaker state may only preserve or
 increase conservatism. It must never upgrade a request from `defer`,
 `throttle_capture_polling`, `require_human_approval`, or `shed` to `admit`.
+
+## Fail-Closed State Machine
+
+Every plan and decision carries `telemetry_gap_state`, `pause_admission`, and
+`kill_switch_active`.
+
+| State | Trigger | Operator semantics |
+| --- | --- | --- |
+| `open` | Required signals are usable and no pressure gate is red/black. | Admit according to the workload-class baseline. |
+| `stagger_recommended` | Herd-wave evidence is measured yellow. | Admission can remain open, but burst fanout should use the emitted stagger hint. |
+| `pause_admission` | Any required signal is `stale` or `redacted`, or any pressure tier is red. | Pause new fanout/admission and retry from a refreshed dry-run plan. |
+| `kill_switch` | Any required signal is `unavailable` or `contradictory`, or any pressure tier is black. | Hold admission closed until the missing or contradictory core signal recovers. |
+
+Reason-code catalog:
+
+- `capacity.workload.context_horizon.fail_closed_stale`
+- `capacity.workload.context_horizon.fail_closed_redacted`
+- `capacity.workload.context_horizon.fail_closed_contradictory`
+- `capacity.workload.context_horizon.fail_closed_unavailable`
+- `capacity.workload.herd_wave.fail_closed_stale`
+- `capacity.workload.resource_pressure.fail_closed_unavailable`
+
+These reason codes are stable, low-cardinality, and intentionally avoid raw pane
+text or prompt material.
 
 ## Dry-Run Examples
 

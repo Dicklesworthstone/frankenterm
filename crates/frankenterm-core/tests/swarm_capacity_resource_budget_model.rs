@@ -13,6 +13,7 @@ use serde_json::Value;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const FIXTURE_GENERATED_AT_MS: u64 = 1_700_000_000_000;
+const CAPACITY_ENVELOPE_REL_PATH: &str = "docs/attestations/perf/swarm-capacity-envelope.json";
 const TARGET_CLASS_SUMMARY_FALLBACK: &str = r#"{
   "hardware_predicate": {
     "target_class": false,
@@ -44,6 +45,10 @@ fn target_class_summary_path() -> PathBuf {
         .join("summary.json")
 }
 
+fn capacity_envelope_path() -> PathBuf {
+    workspace_root().join(CAPACITY_ENVELOPE_REL_PATH)
+}
+
 fn parse_json_text(path: &Path, text: &str) -> Value {
     serde_json::from_str(&text)
         .unwrap_or_else(|err| panic!("failed to parse JSON {}: {err}", path.display()))
@@ -55,6 +60,23 @@ fn load_target_class_summary() -> Value {
         Ok(text) => parse_json_text(&path, &text),
         Err(_) => parse_json_text(&path, TARGET_CLASS_SUMMARY_FALLBACK),
     }
+}
+
+fn load_capacity_envelope() -> Value {
+    let path = capacity_envelope_path();
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    parse_json_text(&path, &text)
+}
+
+fn load_manifest() -> Value {
+    let path = workspace_root()
+        .join("docs")
+        .join("attestations")
+        .join("manifest.json");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    parse_json_text(&path, &text)
 }
 
 fn subsystem_budget<'a>(
@@ -225,6 +247,172 @@ fn skipped_target_class_artifact_does_not_grant_high_core_budget() {
         subsystem_budget(&plan, SwarmCapacityBudgetSubsystem::BuildSlots).budget
             < subsystem_budget(high_core, SwarmCapacityBudgetSubsystem::BuildSlots).budget
     );
+}
+
+#[test]
+fn capacity_envelope_schema_is_fail_closed_until_target_class_proof() {
+    let envelope = load_capacity_envelope();
+
+    assert_eq!(envelope["schema_version"].as_str(), Some("1.0.0"));
+    assert_eq!(envelope["kind"].as_str(), Some("swarm-capacity-envelope"));
+    assert_eq!(envelope["category"].as_str(), Some("perf/headline-claims"));
+    assert_eq!(envelope["produced_by_bead"].as_str(), Some("ft-b94bx.8"));
+    assert_eq!(
+        envelope["status"].as_str(),
+        Some("blocked_target_class_not_proven")
+    );
+
+    let required = envelope["schema"]["required_top_level_fields"]
+        .as_array()
+        .expect("capacity envelope required_top_level_fields array");
+    for field in [
+        "release_claim_posture",
+        "source_artifacts",
+        "capacity_envelope",
+        "regression_gate",
+    ] {
+        assert!(
+            required
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(field)),
+            "capacity envelope schema must require {field}"
+        );
+        assert!(
+            envelope.get(field).is_some(),
+            "capacity envelope is missing required top-level field {field}"
+        );
+    }
+
+    assert_eq!(
+        envelope["release_claim_posture"]["high_scale_memory_envelope"]["allowed"].as_bool(),
+        Some(false),
+        "checked-in envelope must not graduate high-scale memory-envelope wording"
+    );
+    assert_eq!(
+        envelope["release_claim_posture"]["high_scale_memory_envelope"]
+            ["required_target_class_status"]
+            .as_str(),
+        Some("proven_predicate_met")
+    );
+    assert_eq!(
+        envelope["capacity_envelope"]["target_class"]["claim_allowed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        envelope["capacity_envelope"]["target_class"]["proof_status"].as_str(),
+        Some("skipped_not_proven")
+    );
+}
+
+#[test]
+fn capacity_envelope_manifest_slot_is_optional_until_non_skipped_target_class_artifact() {
+    let manifest = load_manifest();
+    let slots = manifest["slots"].as_array().expect("manifest slots array");
+    let slot = slots
+        .iter()
+        .find(|slot| slot["path"].as_str() == Some(CAPACITY_ENVELOPE_REL_PATH))
+        .expect("manifest slot for swarm capacity envelope");
+
+    assert_eq!(slot["category"].as_str(), Some("perf/headline-claims"));
+    assert_eq!(slot["media_type"].as_str(), Some("application/json"));
+    assert_eq!(slot["produced_by_bead"].as_str(), Some("ft-b94bx.8"));
+
+    let proof_categories = slot["proof_categories"]
+        .as_array()
+        .expect("capacity envelope proof_categories array")
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect::<Vec<_>>();
+    assert!(
+        proof_categories.contains(&4) && proof_categories.contains(&5),
+        "capacity envelope slot must contribute conformance and quantitative-attestation proof categories"
+    );
+
+    let required_categories = manifest["required_categories"]
+        .as_array()
+        .expect("manifest required_categories array");
+    assert!(
+        !required_categories
+            .iter()
+            .any(|category| category.as_str() == Some("perf/swarm-capacity-envelope")),
+        "capacity envelope must remain an optional adjunct until target-class proof is non-skipped"
+    );
+}
+
+#[test]
+fn capacity_envelope_rejects_skipped_target_class_graduation() {
+    let envelope = load_capacity_envelope();
+    let summary = load_target_class_summary();
+
+    assert_eq!(
+        envelope["source_artifacts"]["current_target_class_summary"]["path"].as_str(),
+        Some(
+            "tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json"
+        )
+    );
+    assert_eq!(
+        envelope["source_artifacts"]["current_target_class_summary"]["status"].as_str(),
+        summary["status"].as_str()
+    );
+    assert_eq!(
+        summary["hardware_predicate"]["proof_status"].as_str(),
+        Some("skipped_not_proven")
+    );
+    assert_eq!(
+        summary["evidence"]["high_scale_claim_allowed"].as_bool(),
+        Some(false)
+    );
+
+    let required_status = envelope["release_claim_posture"]["high_scale_memory_envelope"]
+        ["required_target_class_status"]
+        .as_str()
+        .expect("capacity envelope required target-class status");
+    let summary_status = summary["hardware_predicate"]["proof_status"]
+        .as_str()
+        .expect("target-class proof status");
+    let summary_allows_claim = summary["evidence"]["high_scale_claim_allowed"]
+        .as_bool()
+        .unwrap_or(false);
+    let envelope_allows_claim =
+        envelope["release_claim_posture"]["high_scale_memory_envelope"]["allowed"]
+            .as_bool()
+            .unwrap_or(false);
+
+    assert_ne!(
+        summary_status, required_status,
+        "fixture should remain a skipped target-class artifact"
+    );
+    assert!(
+        !(summary_status == required_status && summary_allows_claim),
+        "skipped target-class artifact must not satisfy the release claim predicate"
+    );
+    assert!(
+        !envelope_allows_claim,
+        "capacity envelope must keep high-scale README wording fail-closed"
+    );
+}
+
+#[test]
+fn capacity_envelope_regression_gate_names_shrinkage_telemetry_and_regime_failures() {
+    let envelope = load_capacity_envelope();
+    let fail_codes = envelope["regression_gate"]["fail_conditions"]
+        .as_array()
+        .expect("capacity envelope fail_conditions array")
+        .iter()
+        .filter_map(|condition| condition["code"].as_str())
+        .collect::<Vec<_>>();
+
+    for required_code in [
+        "target_class_skipped_or_stale",
+        "capacity_envelope_shrinkage",
+        "telemetry_gap",
+        "regime_shift",
+    ] {
+        assert!(
+            fail_codes.contains(&required_code),
+            "capacity envelope regression gate must fail closed for {required_code}"
+        );
+    }
 }
 
 #[test]

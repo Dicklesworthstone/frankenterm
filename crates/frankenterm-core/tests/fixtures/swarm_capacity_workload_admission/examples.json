@@ -23,6 +23,20 @@
     "herd_wave",
     "resource_pressure"
   ],
+  "telemetry_gap_states": [
+    "open",
+    "stagger_recommended",
+    "pause_admission",
+    "kill_switch"
+  ],
+  "fail_closed_reason_codes": [
+    "capacity.workload.context_horizon.fail_closed_stale",
+    "capacity.workload.context_horizon.fail_closed_redacted",
+    "capacity.workload.context_horizon.fail_closed_contradictory",
+    "capacity.workload.context_horizon.fail_closed_unavailable",
+    "capacity.workload.herd_wave.fail_closed_stale",
+    "capacity.workload.resource_pressure.fail_closed_unavailable"
+  ],
   "expected_decisions": [
     {
       "stable_id": "example.50.coding",
@@ -31,6 +45,9 @@
       "work_class": "claimed_agent_task",
       "action": "admit",
       "evidence_state": "measured",
+      "telemetry_gap_state": "open",
+      "pause_admission": false,
+      "kill_switch_active": false,
       "requested_units": 2,
       "admitted_units": 2,
       "recommended_stagger_ms": null
@@ -42,6 +59,9 @@
       "work_class": "claimed_agent_task",
       "action": "admit",
       "evidence_state": "measured",
+      "telemetry_gap_state": "stagger_recommended",
+      "pause_admission": false,
+      "kill_switch_active": false,
       "requested_units": 1,
       "admitted_units": 1,
       "recommended_stagger_ms": 500
@@ -53,6 +73,9 @@
       "work_class": "claimed_agent_task",
       "action": "defer",
       "evidence_state": "measured",
+      "telemetry_gap_state": "pause_admission",
+      "pause_admission": true,
+      "kill_switch_active": false,
       "requested_units": 8,
       "admitted_units": 0,
       "recommended_stagger_ms": null
@@ -64,6 +87,9 @@
       "work_class": "claimed_agent_task",
       "action": "defer",
       "evidence_state": "stale",
+      "telemetry_gap_state": "pause_admission",
+      "pause_admission": true,
+      "kill_switch_active": false,
       "requested_units": 2,
       "admitted_units": 0,
       "recommended_stagger_ms": 3250

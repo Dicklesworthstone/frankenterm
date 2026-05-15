@@ -126,6 +126,27 @@ if [[ "${signal_count}" -ne 4 ]]; then
 fi
 emit_event "fixture" "signal_count" "passed" "measured" "capacity.workload_admission.signal_count" "none" "${FIXTURE_FILE}"
 
+gap_state_count="$(jq '.telemetry_gap_states | length' "${FIXTURE_FILE}")"
+if [[ "${gap_state_count}" -ne 4 ]]; then
+  emit_event "fixture" "telemetry_gap_state_count" "failed" "unavailable" "capacity.workload_admission.telemetry_gap_state_count_invalid" "telemetry_gap_state_count_invalid" "${FIXTURE_FILE}"
+  exit 1
+fi
+emit_event "fixture" "telemetry_gap_state_count" "passed" "measured" "capacity.workload_admission.telemetry_gap_state_count" "none" "${FIXTURE_FILE}"
+
+missing_gap_state_count="$(jq '["open","stagger_recommended","pause_admission","kill_switch"] as $required | [.telemetry_gap_states[]] as $actual | [$required[] | select(. as $state | $actual | index($state) | not)] | length' "${FIXTURE_FILE}")"
+if [[ "${missing_gap_state_count}" -ne 0 ]]; then
+  emit_event "fixture" "telemetry_gap_state_coverage" "failed" "unavailable" "capacity.workload_admission.telemetry_gap_state_missing" "telemetry_gap_state_missing" "${FIXTURE_FILE}"
+  exit 1
+fi
+emit_event "fixture" "telemetry_gap_state_coverage" "passed" "measured" "capacity.workload_admission.telemetry_gap_state_coverage" "none" "${FIXTURE_FILE}"
+
+fail_closed_reason_count="$(jq '.fail_closed_reason_codes | length' "${FIXTURE_FILE}")"
+if [[ "${fail_closed_reason_count}" -lt 4 ]]; then
+  emit_event "fixture" "fail_closed_reason_catalog" "failed" "unavailable" "capacity.workload_admission.fail_closed_reason_catalog_invalid" "fail_closed_reason_catalog_invalid" "${FIXTURE_FILE}"
+  exit 1
+fi
+emit_event "fixture" "fail_closed_reason_catalog" "passed" "measured" "capacity.workload_admission.fail_closed_reason_catalog" "none" "${FIXTURE_FILE}"
+
 decision_count="$(jq '.expected_decisions | length' "${FIXTURE_FILE}")"
 if [[ "${decision_count}" -ne 4 ]]; then
   emit_event "fixture" "decision_count" "failed" "unavailable" "capacity.workload_admission.decision_count_invalid" "decision_count_invalid" "${FIXTURE_FILE}"
@@ -146,6 +167,21 @@ if [[ "${bad_units}" -ne 0 ]]; then
   exit 1
 fi
 emit_event "fixture" "admitted_units" "passed" "measured" "capacity.workload_admission.units_consistent" "none" "${FIXTURE_FILE}"
+
+bad_gap_flags="$(jq '[.expected_decisions[] | select((.telemetry_gap_state == "open" and (.pause_admission or .kill_switch_active)) or (.telemetry_gap_state == "stagger_recommended" and (.pause_admission or .kill_switch_active)) or (.telemetry_gap_state == "pause_admission" and ((.pause_admission | not) or .kill_switch_active)) or (.telemetry_gap_state == "kill_switch" and ((.pause_admission | not) or (.kill_switch_active | not))))] | length' "${FIXTURE_FILE}")"
+if [[ "${bad_gap_flags}" -ne 0 ]]; then
+  emit_event "fixture" "telemetry_gap_flags" "failed" "unavailable" "capacity.workload_admission.telemetry_gap_flags_invalid" "telemetry_gap_flags_invalid" "${FIXTURE_FILE}"
+  exit 1
+fi
+emit_event "fixture" "telemetry_gap_flags" "passed" "measured" "capacity.workload_admission.telemetry_gap_flags" "none" "${FIXTURE_FILE}"
+
+while IFS= read -r reason_code; do
+  if ! grep -Fq "${reason_code}" "${DOC_FILE}"; then
+    emit_event "doc" "fail_closed_reason_catalog" "failed" "unavailable" "capacity.workload_admission.doc_reason_missing" "doc_reason_missing" "${DOC_FILE}"
+    exit 1
+  fi
+done < <(jq -r '.fail_closed_reason_codes[]' "${FIXTURE_FILE}")
+emit_event "doc" "fail_closed_reason_catalog" "passed" "measured" "capacity.workload_admission.doc_reason_catalog" "none" "${DOC_FILE}"
 
 while IFS= read -r decision; do
   class_id="$(jq -r '.workload_class' <<<"${decision}")"

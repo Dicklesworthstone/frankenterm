@@ -6329,17 +6329,23 @@ pub enum SwarmCapacityWorkloadEvidenceState {
     Simulated,
     /// Source exists, but freshness is outside the contract window.
     Stale,
+    /// Evidence was collected but privacy redaction removed required planning fields.
+    Redacted,
+    /// Required sources disagree, so the planner cannot trust either value.
+    Contradictory,
     /// Required source is absent or intentionally not collected.
     Unavailable,
 }
 
 impl SwarmCapacityWorkloadEvidenceState {
     /// Stable state order for conformance tests and docs.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Measured,
         Self::Inferred,
         Self::Simulated,
         Self::Stale,
+        Self::Redacted,
+        Self::Contradictory,
         Self::Unavailable,
     ];
 
@@ -6351,6 +6357,8 @@ impl SwarmCapacityWorkloadEvidenceState {
             Self::Inferred => "inferred",
             Self::Simulated => "simulated",
             Self::Stale => "stale",
+            Self::Redacted => "redacted",
+            Self::Contradictory => "contradictory",
             Self::Unavailable => "unavailable",
         }
     }
@@ -6361,14 +6369,19 @@ impl SwarmCapacityWorkloadEvidenceState {
             Self::Inferred => 1,
             Self::Simulated => 2,
             Self::Stale => 3,
-            Self::Unavailable => 4,
+            Self::Redacted => 4,
+            Self::Contradictory => 5,
+            Self::Unavailable => 6,
         }
     }
 
     const fn fail_closed_floor(self) -> Option<SwarmCapacityAdmissionAction> {
         match self {
             Self::Measured | Self::Inferred | Self::Simulated => None,
-            Self::Stale | Self::Unavailable => Some(SwarmCapacityAdmissionAction::Defer),
+            Self::Stale | Self::Redacted | Self::Unavailable => {
+                Some(SwarmCapacityAdmissionAction::Defer)
+            }
+            Self::Contradictory => Some(SwarmCapacityAdmissionAction::RequireHumanApproval),
         }
     }
 
@@ -6377,6 +6390,64 @@ impl SwarmCapacityWorkloadEvidenceState {
             .into_iter()
             .max_by_key(|state| state.rank())
             .unwrap_or(Self::Unavailable)
+    }
+}
+
+/// Operator-visible fail-closed state for workload admission telemetry gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityTelemetryGapState {
+    /// Required signals are usable for the requested dry-run decision.
+    Open,
+    /// Admission can remain open, but the operator should stagger burst fanout.
+    StaggerRecommended,
+    /// New admission should pause/defer until evidence or pressure recovers.
+    PauseAdmission,
+    /// Required evidence is absent/contradictory or pressure is black; hold admission closed.
+    KillSwitch,
+}
+
+impl SwarmCapacityTelemetryGapState {
+    /// Stable state order for conformance tests and docs.
+    pub const ALL: [Self; 4] = [
+        Self::Open,
+        Self::StaggerRecommended,
+        Self::PauseAdmission,
+        Self::KillSwitch,
+    ];
+
+    /// Stable state label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::StaggerRecommended => "stagger_recommended",
+            Self::PauseAdmission => "pause_admission",
+            Self::KillSwitch => "kill_switch",
+        }
+    }
+
+    const fn pause_admission(self) -> bool {
+        matches!(self, Self::PauseAdmission | Self::KillSwitch)
+    }
+
+    const fn kill_switch_active(self) -> bool {
+        matches!(self, Self::KillSwitch)
+    }
+
+    const fn max_conservative(self, other: Self) -> Self {
+        if self as u8 >= other as u8 {
+            self
+        } else {
+            other
+        }
+    }
+
+    fn combine(states: impl IntoIterator<Item = Self>) -> Self {
+        states
+            .into_iter()
+            .max_by_key(|state| *state as u8)
+            .unwrap_or(Self::Open)
     }
 }
 
@@ -6647,6 +6718,12 @@ pub struct SwarmCapacityWorkloadAdmissionDecision {
     pub action: SwarmCapacityAdmissionAction,
     /// Combined evidence state.
     pub evidence_state: SwarmCapacityWorkloadEvidenceState,
+    /// Combined fail-closed state for the signal set.
+    pub telemetry_gap_state: SwarmCapacityTelemetryGapState,
+    /// Whether new admission should pause until evidence/pressure recovers.
+    pub pause_admission: bool,
+    /// Whether admission is held closed because core evidence is unusable or pressure is black.
+    pub kill_switch_active: bool,
     /// Stable reason codes.
     pub reason_codes: Vec<String>,
     /// Suggested herd-wave stagger delay when applicable.
@@ -6677,6 +6754,12 @@ pub struct SwarmCapacityWorkloadAdmissionPlan {
     pub raw_pane_content_stored: bool,
     /// Planning never executes side effects.
     pub side_effects_executed: bool,
+    /// Worst fail-closed state across request decisions.
+    pub telemetry_gap_state: SwarmCapacityTelemetryGapState,
+    /// Whether any decision pauses new admission.
+    pub pause_admission: bool,
+    /// Whether any decision activated the admission kill-switch state.
+    pub kill_switch_active: bool,
     /// Class table used by this plan.
     pub admission_table: Vec<SwarmCapacityWorkloadAdmissionTableRow>,
     /// Request decisions in deterministic order.
@@ -6696,6 +6779,13 @@ pub fn plan_swarm_capacity_workload_admission(
         .iter()
         .map(plan_swarm_capacity_workload_admission_row)
         .collect::<Vec<_>>();
+    let telemetry_gap_state = SwarmCapacityTelemetryGapState::combine(
+        decisions
+            .iter()
+            .map(|decision| decision.telemetry_gap_state),
+    );
+    let pause_admission = decisions.iter().any(|decision| decision.pause_admission);
+    let kill_switch_active = decisions.iter().any(|decision| decision.kill_switch_active);
     let mut reason_codes = Vec::new();
     for decision in &decisions {
         for reason_code in &decision.reason_codes {
@@ -6716,6 +6806,9 @@ pub fn plan_swarm_capacity_workload_admission(
         dry_run: true,
         raw_pane_content_stored: false,
         side_effects_executed: false,
+        telemetry_gap_state,
+        pause_admission,
+        kill_switch_active,
         admission_table: swarm_capacity_workload_admission_table(),
         decisions,
         reason_codes,
@@ -6794,8 +6887,11 @@ fn plan_swarm_capacity_workload_admission_row(
         input.workload_class.as_str()
     )];
     let mut recommended_stagger_ms = None;
+    let mut telemetry_gap_state = SwarmCapacityTelemetryGapState::Open;
 
     for signal in input.signals.rows() {
+        telemetry_gap_state =
+            telemetry_gap_state.max_conservative(telemetry_gap_state_for_signal(signal));
         for reason_code in &signal.reason_codes {
             push_bounded_unique_reason(&mut reason_codes, reason_code.clone());
         }
@@ -6832,6 +6928,8 @@ fn plan_swarm_capacity_workload_admission_row(
     } else {
         0
     };
+    let pause_admission = telemetry_gap_state.pause_admission();
+    let kill_switch_active = telemetry_gap_state.kill_switch_active();
 
     SwarmCapacityWorkloadAdmissionDecision {
         stable_id: input.stable_id.clone(),
@@ -6840,11 +6938,39 @@ fn plan_swarm_capacity_workload_admission_row(
         work_class: input.workload_class.capacity_work_class(),
         action,
         evidence_state: input.signals.evidence_state(),
+        telemetry_gap_state,
+        pause_admission,
+        kill_switch_active,
         reason_codes,
         recommended_stagger_ms,
         requested_units,
         admitted_units,
         side_effects_executed: false,
+    }
+}
+
+fn telemetry_gap_state_for_signal(
+    signal: &SwarmCapacityWorkloadAdmissionSignal,
+) -> SwarmCapacityTelemetryGapState {
+    match (signal.evidence_state, signal.pressure_tier) {
+        (SwarmCapacityWorkloadEvidenceState::Unavailable, _)
+        | (SwarmCapacityWorkloadEvidenceState::Contradictory, _)
+        | (_, HealthTier::Black) => SwarmCapacityTelemetryGapState::KillSwitch,
+        (
+            SwarmCapacityWorkloadEvidenceState::Stale
+            | SwarmCapacityWorkloadEvidenceState::Redacted,
+            _,
+        )
+        | (_, HealthTier::Red) => SwarmCapacityTelemetryGapState::PauseAdmission,
+        (
+            SwarmCapacityWorkloadEvidenceState::Measured
+            | SwarmCapacityWorkloadEvidenceState::Inferred
+            | SwarmCapacityWorkloadEvidenceState::Simulated,
+            HealthTier::Yellow,
+        ) if signal.kind == SwarmCapacityWorkloadSignalKind::HerdWave => {
+            SwarmCapacityTelemetryGapState::StaggerRecommended
+        }
+        _ => SwarmCapacityTelemetryGapState::Open,
     }
 }
 

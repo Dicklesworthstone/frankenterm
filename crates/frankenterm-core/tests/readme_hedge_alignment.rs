@@ -70,15 +70,18 @@ fn read_workspace_file(path: &str) -> String {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", full_path.display()))
 }
 
-fn manifest_slots_by_category() -> HashMap<String, ManifestSlot> {
+fn manifest_slots_by_category() -> HashMap<String, Vec<ManifestSlot>> {
     let manifest: Manifest =
         serde_json::from_str(&read_workspace_file("docs/attestations/manifest.json"))
             .expect("docs/attestations/manifest.json parses");
-    manifest
-        .slots
-        .into_iter()
-        .map(|slot| (slot.category.clone(), slot))
-        .collect()
+    let mut slots_by_category = HashMap::new();
+    for slot in manifest.slots {
+        slots_by_category
+            .entry(slot.category.clone())
+            .or_insert_with(Vec::new)
+            .push(slot);
+    }
+    slots_by_category
 }
 
 fn docs() -> Vec<(&'static str, String)> {
@@ -111,7 +114,7 @@ fn populated_manifest_slots_do_not_carry_legacy_linked_artifact_hedges() {
     let docs = docs();
 
     for pattern in HEDGE_PATTERNS {
-        let Some(slot) = slots.get(pattern.category) else {
+        let Some(category_slots) = slots.get(pattern.category) else {
             continue;
         };
         let regex = Regex::new(pattern.regex).expect("hedge regex compiles");
@@ -126,28 +129,39 @@ fn populated_manifest_slots_do_not_carry_legacy_linked_artifact_hedges() {
             }
         }
 
-        match (&slot.path, &slot.deferred_to_bead) {
-            (Some(_), _) => assert!(
+        if category_slots.iter().any(|slot| slot.path.is_some()) {
+            assert!(
                 matches.is_empty(),
                 "slot {} has a populated path but still carries legacy hedge text:\n{}",
                 pattern.category,
                 matches.join("\n---\n")
-            ),
-            (None, Some(bead_id)) => {
-                for entry in matches {
-                    assert!(
-                        entry.contains(bead_id),
-                        "slot {} is deferred to {} but hedge does not cite it:\n{}",
-                        pattern.category,
-                        bead_id,
-                        entry
-                    );
-                }
+            );
+        } else if category_slots
+            .iter()
+            .all(|slot| slot.deferred_to_bead.is_some())
+        {
+            let deferred_beads = category_slots
+                .iter()
+                .map(|slot| {
+                    slot.deferred_to_bead
+                        .as_deref()
+                        .expect("all category slots are deferred")
+                })
+                .collect::<Vec<_>>();
+            for entry in &matches {
+                assert!(
+                    deferred_beads.iter().any(|bead_id| entry.contains(bead_id)),
+                    "slot {} is deferred to one of {:?} but hedge does not cite any producer:\n{}",
+                    pattern.category,
+                    deferred_beads,
+                    entry
+                );
             }
-            (None, None) => panic!(
+        } else {
+            panic!(
                 "manifest slot {} has neither path nor deferred_to_bead",
                 pattern.category
-            ),
+            );
         }
     }
 }

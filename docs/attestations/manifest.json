@@ -26,6 +26,14 @@
       "description": "Headline-claim manifest + 5 must-prove benches (G3)."
     },
     {
+      "category": "perf/headline-claims",
+      "path": "docs/attestations/perf/swarm-capacity-envelope.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-b94bx.8",
+      "proof_categories": [4, 5],
+      "description": "Fail-closed high-core swarm capacity envelope. Optional until the target-class gauntlet retains a non-skipped linux-x86_64-high-core artifact; while status is blocked_target_class_not_proven it documents why high-scale memory-envelope wording cannot graduate."
+    },
+    {
       "category": "perf/competitor-matrix",
       "path": "docs/perf/competitor-matrix.json",
       "media_type": "application/json",

@@ -1,6 +1,6 @@
 use frankenterm_core::runtime_telemetry::{
     HealthTier, SwarmCapacityAdmissionAction, SwarmCapacityAgentWorkloadClass,
-    SwarmCapacityWorkClass, SwarmCapacityWorkloadAdmissionInput,
+    SwarmCapacityTelemetryGapState, SwarmCapacityWorkClass, SwarmCapacityWorkloadAdmissionInput,
     SwarmCapacityWorkloadAdmissionSignal, SwarmCapacityWorkloadAdmissionSignals,
     SwarmCapacityWorkloadEvidenceState, SwarmCapacityWorkloadSignalKind,
     plan_swarm_capacity_workload_admission, swarm_capacity_workload_admission_dry_run_examples,
@@ -123,6 +123,8 @@ fn stale_and_unavailable_signal_states_fail_closed_for_every_class() {
         for kind in SwarmCapacityWorkloadSignalKind::ALL {
             for evidence_state in [
                 SwarmCapacityWorkloadEvidenceState::Stale,
+                SwarmCapacityWorkloadEvidenceState::Redacted,
+                SwarmCapacityWorkloadEvidenceState::Contradictory,
                 SwarmCapacityWorkloadEvidenceState::Unavailable,
             ] {
                 let mut input = SwarmCapacityWorkloadAdmissionInput::new(
@@ -159,9 +161,118 @@ fn stale_and_unavailable_signal_states_fail_closed_for_every_class() {
                     "{:?}",
                     decision.reason_codes
                 );
+                assert!(decision.pause_admission, "{decision:?}");
+                if matches!(
+                    evidence_state,
+                    SwarmCapacityWorkloadEvidenceState::Contradictory
+                        | SwarmCapacityWorkloadEvidenceState::Unavailable
+                ) {
+                    assert_eq!(
+                        decision.telemetry_gap_state,
+                        SwarmCapacityTelemetryGapState::KillSwitch
+                    );
+                    assert!(decision.kill_switch_active, "{decision:?}");
+                } else {
+                    assert_eq!(
+                        decision.telemetry_gap_state,
+                        SwarmCapacityTelemetryGapState::PauseAdmission
+                    );
+                    assert!(!decision.kill_switch_active, "{decision:?}");
+                }
             }
         }
     }
+}
+
+#[test]
+fn telemetry_gap_state_machine_covers_open_stagger_pause_and_kill_switch() {
+    let green = SwarmCapacityWorkloadAdmissionInput::new(
+        "gap.green",
+        50,
+        SwarmCapacityAgentWorkloadClass::Coding,
+    );
+    let green_plan = plan_swarm_capacity_workload_admission(1_700_000_000_000, "test", &[green]);
+    assert_eq!(
+        green_plan.telemetry_gap_state,
+        SwarmCapacityTelemetryGapState::Open
+    );
+    assert!(!green_plan.pause_admission);
+    assert!(!green_plan.kill_switch_active);
+
+    let mut herd_yellow = SwarmCapacityWorkloadAdmissionInput::new(
+        "gap.herd_yellow",
+        100,
+        SwarmCapacityAgentWorkloadClass::Reviewing,
+    );
+    herd_yellow.signals.herd_wave = SwarmCapacityWorkloadAdmissionSignal::new(
+        SwarmCapacityWorkloadSignalKind::HerdWave,
+        SwarmCapacityWorkloadEvidenceState::Measured,
+        HealthTier::Yellow,
+    );
+    let herd_plan =
+        plan_swarm_capacity_workload_admission(1_700_000_000_001, "test", &[herd_yellow]);
+    let herd_decision = herd_plan.decisions.first().expect("herd decision");
+    assert_eq!(
+        herd_plan.telemetry_gap_state,
+        SwarmCapacityTelemetryGapState::StaggerRecommended
+    );
+    assert_eq!(
+        herd_decision.telemetry_gap_state,
+        SwarmCapacityTelemetryGapState::StaggerRecommended
+    );
+    assert!(!herd_plan.pause_admission);
+    assert!(!herd_plan.kill_switch_active);
+    assert_eq!(herd_decision.recommended_stagger_ms, Some(500));
+
+    let mut stale_context = SwarmCapacityWorkloadAdmissionInput::new(
+        "gap.stale_context",
+        500,
+        SwarmCapacityAgentWorkloadClass::Coding,
+    );
+    stale_context.signals.context_horizon = SwarmCapacityWorkloadAdmissionSignal::new(
+        SwarmCapacityWorkloadSignalKind::ContextHorizon,
+        SwarmCapacityWorkloadEvidenceState::Stale,
+        HealthTier::Green,
+    );
+    let stale_plan =
+        plan_swarm_capacity_workload_admission(1_700_000_000_002, "test", &[stale_context]);
+    let stale_decision = stale_plan.decisions.first().expect("stale decision");
+    assert_eq!(
+        stale_plan.telemetry_gap_state,
+        SwarmCapacityTelemetryGapState::PauseAdmission
+    );
+    assert!(stale_plan.pause_admission);
+    assert!(!stale_plan.kill_switch_active);
+    assert_eq!(stale_decision.action, SwarmCapacityAdmissionAction::Defer);
+    assert_eq!(stale_decision.admitted_units, 0);
+
+    let mut unavailable_resource = SwarmCapacityWorkloadAdmissionInput::new(
+        "gap.unavailable_resource",
+        500,
+        SwarmCapacityAgentWorkloadClass::Building,
+    );
+    unavailable_resource.signals.resource_pressure = SwarmCapacityWorkloadAdmissionSignal::new(
+        SwarmCapacityWorkloadSignalKind::ResourcePressure,
+        SwarmCapacityWorkloadEvidenceState::Unavailable,
+        HealthTier::Green,
+    );
+    let unavailable_plan =
+        plan_swarm_capacity_workload_admission(1_700_000_000_003, "test", &[unavailable_resource]);
+    let unavailable_decision = unavailable_plan
+        .decisions
+        .first()
+        .expect("unavailable decision");
+    assert_eq!(
+        unavailable_plan.telemetry_gap_state,
+        SwarmCapacityTelemetryGapState::KillSwitch
+    );
+    assert!(unavailable_plan.pause_admission);
+    assert!(unavailable_plan.kill_switch_active);
+    assert_eq!(
+        unavailable_decision.action,
+        SwarmCapacityAdmissionAction::Defer
+    );
+    assert_eq!(unavailable_decision.admitted_units, 0);
 }
 
 #[test]

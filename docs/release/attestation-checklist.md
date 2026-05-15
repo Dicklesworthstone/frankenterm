@@ -32,6 +32,10 @@ that bead, verify:
   when the artifact changes README/AGENTS claim wording.
 - [ ] `cargo test -p frankenterm-core --test attestation_manifest_completeness --no-default-features`
   exits 0.
+- [ ] Capacity or memory-envelope wording changes also run
+  `cargo test -p frankenterm-core --test swarm_capacity_resource_budget_model --no-default-features`
+  and confirm `docs/attestations/perf/swarm-capacity-envelope.json` still keeps
+  high-scale claims fail-closed unless the target-class artifact is non-skipped.
 - [ ] The closing comment cites the manifest slot category, artifact path,
   build/verify exit codes, and retained RCH artifact bundle path.
 

@@ -41,6 +41,9 @@ The producing-bead column is the source of truth for which work item gates the a
 
 The manifest can also include optional slots that are hashed into bundles when
 present but are not in `required_categories` yet. Current optional slots include
+the `docs/attestations/perf/swarm-capacity-envelope.json` adjunct under
+`perf/headline-claims` (`ft-b94bx.8`), which keeps high-core swarm capacity
+wording fail-closed until a non-skipped linux target-class artifact is retained,
 `doctrine/vendored-provenance` (`ft-i2eni.6`), the G1
 `docs/attestations/doctrine/tokio-eradication-status.json` substrate
 (`ft-tf6g3.7`, under `proofs/runtime-proof-trait`), and

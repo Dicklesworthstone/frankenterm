@@ -18406,12 +18406,14 @@ fn robot_swarm_capacity_doctor(summary: &SwarmCapacityOperatorSummary) -> serde_
         .as_ref()
         .map(|cockpit| cockpit.evidence_state.as_str())
         .unwrap_or("unavailable");
-    let status = match summary.status {
-        SwarmCapacityOperatorStatus::Ready => "ok",
-        SwarmCapacityOperatorStatus::Watch => "watch",
-        SwarmCapacityOperatorStatus::Violated => "violated",
-        SwarmCapacityOperatorStatus::Unknown => "fail_closed",
-        SwarmCapacityOperatorStatus::Unavailable => "stale_or_missing_evidence",
+    let (status, telemetry_gap_state, pause_admission, kill_switch_active) = match summary.status {
+        SwarmCapacityOperatorStatus::Ready => ("ok", "open", false, false),
+        SwarmCapacityOperatorStatus::Watch => ("watch", "stagger_recommended", false, false),
+        SwarmCapacityOperatorStatus::Violated => ("violated", "pause_admission", true, false),
+        SwarmCapacityOperatorStatus::Unknown => ("fail_closed", "kill_switch", true, true),
+        SwarmCapacityOperatorStatus::Unavailable => {
+            ("stale_or_missing_evidence", "kill_switch", true, true)
+        }
     };
     let mut reason_codes = summary.reason_codes.clone();
     if reason_codes.is_empty() {
@@ -18421,6 +18423,9 @@ fn robot_swarm_capacity_doctor(summary: &SwarmCapacityOperatorSummary) -> serde_
     serde_json::json!({
         "status": status,
         "evidence_state": evidence_state,
+        "telemetry_gap_state": telemetry_gap_state,
+        "pause_admission": pause_admission,
+        "kill_switch_active": kill_switch_active,
         "stale_evidence": matches!(
             summary.status,
             SwarmCapacityOperatorStatus::Unknown | SwarmCapacityOperatorStatus::Unavailable
@@ -68988,13 +68993,44 @@ log_level = "debug"
         assert_eq!(status["raw_pane_content_stored"].as_bool(), Some(false));
         assert_eq!(status["live_mutation_allowed"].as_bool(), Some(false));
         assert_eq!(status["side_effects_executed"].as_bool(), Some(false));
+        assert_eq!(
+            status["doctor"]["telemetry_gap_state"].as_str(),
+            Some("kill_switch")
+        );
+        assert_eq!(status["doctor"]["pause_admission"].as_bool(), Some(true));
+        assert_eq!(status["doctor"]["kill_switch_active"].as_bool(), Some(true));
+        let remediation = status["doctor"]["safe_remediation"]
+            .as_array()
+            .expect("doctor remediation array");
+        for step in remediation {
+            let command = step["command"].as_str().expect("safe command");
+            assert!(
+                !command.contains("restart")
+                    && !command.contains("repair")
+                    && !command.contains("kill"),
+                "doctor remediation must remain non-destructive: {command}"
+            );
+        }
 
         let plan = build_robot_swarm_capacity_plan_payload(&summary, 12, 1_770_000_000_002);
         assert_eq!(plan["surface"].as_str(), Some("plan"));
         assert_eq!(plan["requested_add_panes"].as_u64(), Some(12));
         assert_eq!(plan["target_pane_scale"].as_u64(), Some(12));
+        assert_eq!(plan["planned_action"].as_str(), Some("defer"));
         assert_eq!(
             plan["workload_admission_plan"]["dry_run"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            plan["workload_admission_plan"]["telemetry_gap_state"].as_str(),
+            Some("kill_switch")
+        );
+        assert_eq!(
+            plan["workload_admission_plan"]["pause_admission"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            plan["workload_admission_plan"]["kill_switch_active"].as_bool(),
             Some(true)
         );
         assert_eq!(
@@ -69058,6 +69094,10 @@ log_level = "debug"
         assert_eq!(
             roundtripped["data"]["plan"]["workload_admission_plan"]["dry_run"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            roundtripped["data"]["plan"]["workload_admission_plan"]["telemetry_gap_state"].as_str(),
+            Some("kill_switch")
         );
         assert_eq!(
             roundtripped["data"]["explain"]["lookup"]["matched"].as_bool(),
