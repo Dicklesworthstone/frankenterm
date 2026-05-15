@@ -6901,6 +6901,680 @@ fn stagger_ms_for_pane_scale(pane_scale: u32, pressure_tier: HealthTier) -> u64 
     (base_ms + scale_steps.saturating_mul(250)).min(60_000)
 }
 
+/// Versioned contract id for the core-aware swarm resource budget model.
+pub const SWARM_CAPACITY_RESOURCE_BUDGET_CONTRACT_ID: &str = "ft.swarm_capacity_resource_budget.v1";
+/// Schema version for [`SwarmCapacityResourceBudgetPlan`].
+pub const SWARM_CAPACITY_RESOURCE_BUDGET_SCHEMA_VERSION: u16 = 1;
+
+const SWARM_CAPACITY_BUDGET_GIB: u64 = 1024 * 1024 * 1024;
+const SWARM_CAPACITY_BUDGET_MIB: u64 = 1024 * 1024;
+
+/// Conservative hardware class used by the resource budget planner.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityHardwareClass {
+    /// Small or partially known host; all unknown telemetry degrades here.
+    #[default]
+    Low,
+    /// General development host with moderate CPU and memory.
+    Mid,
+    /// Large host, but below the high-core proof predicate.
+    High,
+    /// Target-class host for 64+ CPU / 256 GiB+ swarm claims.
+    HighCore,
+}
+
+impl SwarmCapacityHardwareClass {
+    /// Stable class order for docs and tests.
+    pub const ALL: [Self; 4] = [Self::Low, Self::Mid, Self::High, Self::HighCore];
+
+    /// Stable class label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Mid => "mid",
+            Self::High => "high",
+            Self::HighCore => "high_core",
+        }
+    }
+
+    /// Select the conservative class for known CPU and memory facts.
+    #[must_use]
+    pub fn from_known_resources(logical_cpus: u32, memory_bytes: u64) -> Self {
+        if logical_cpus >= 64 && memory_bytes >= 256 * SWARM_CAPACITY_BUDGET_GIB {
+            Self::HighCore
+        } else if logical_cpus >= 32 && memory_bytes >= 128 * SWARM_CAPACITY_BUDGET_GIB {
+            Self::High
+        } else if logical_cpus >= 8 && memory_bytes >= 32 * SWARM_CAPACITY_BUDGET_GIB {
+            Self::Mid
+        } else {
+            Self::Low
+        }
+    }
+
+    fn defaults(self) -> SwarmCapacityHardwareBudgetDefaults {
+        match self {
+            Self::Low => SwarmCapacityHardwareBudgetDefaults {
+                logical_cpu_floor: 4,
+                memory_bytes_floor: 16 * SWARM_CAPACITY_BUDGET_GIB,
+                build_slots: 1,
+                child_process_slots: 8,
+                memory_tier_budget_bytes: 8 * SWARM_CAPACITY_BUDGET_GIB,
+                sqlite_cache_budget_bytes: 256 * SWARM_CAPACITY_BUDGET_MIB,
+                mux_render_budget_bytes: 512 * SWARM_CAPACITY_BUDGET_MIB,
+                rch_offload_slots: 1,
+            },
+            Self::Mid => SwarmCapacityHardwareBudgetDefaults {
+                logical_cpu_floor: 8,
+                memory_bytes_floor: 32 * SWARM_CAPACITY_BUDGET_GIB,
+                build_slots: 3,
+                child_process_slots: 32,
+                memory_tier_budget_bytes: 20 * SWARM_CAPACITY_BUDGET_GIB,
+                sqlite_cache_budget_bytes: 2 * SWARM_CAPACITY_BUDGET_GIB,
+                mux_render_budget_bytes: 4 * SWARM_CAPACITY_BUDGET_GIB,
+                rch_offload_slots: 4,
+            },
+            Self::High => SwarmCapacityHardwareBudgetDefaults {
+                logical_cpu_floor: 32,
+                memory_bytes_floor: 128 * SWARM_CAPACITY_BUDGET_GIB,
+                build_slots: 6,
+                child_process_slots: 64,
+                memory_tier_budget_bytes: 72 * SWARM_CAPACITY_BUDGET_GIB,
+                sqlite_cache_budget_bytes: 4 * SWARM_CAPACITY_BUDGET_GIB,
+                mux_render_budget_bytes: 8 * SWARM_CAPACITY_BUDGET_GIB,
+                rch_offload_slots: 8,
+            },
+            Self::HighCore => SwarmCapacityHardwareBudgetDefaults {
+                logical_cpu_floor: 64,
+                memory_bytes_floor: 256 * SWARM_CAPACITY_BUDGET_GIB,
+                build_slots: 12,
+                child_process_slots: 128,
+                memory_tier_budget_bytes: 160 * SWARM_CAPACITY_BUDGET_GIB,
+                sqlite_cache_budget_bytes: 8 * SWARM_CAPACITY_BUDGET_GIB,
+                mux_render_budget_bytes: 16 * SWARM_CAPACITY_BUDGET_GIB,
+                rch_offload_slots: 16,
+            },
+        }
+    }
+}
+
+impl fmt::Display for SwarmCapacityHardwareClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwarmCapacityHardwareBudgetDefaults {
+    logical_cpu_floor: u32,
+    memory_bytes_floor: u64,
+    build_slots: u64,
+    child_process_slots: u64,
+    memory_tier_budget_bytes: u64,
+    sqlite_cache_budget_bytes: u64,
+    mux_render_budget_bytes: u64,
+    rch_offload_slots: u64,
+}
+
+/// Hardware facts used by the core-aware budget model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityHardwareFingerprint {
+    /// Observed logical CPU count, when known and non-zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_cpus: Option<u32>,
+    /// Observed total memory bytes, when known and non-zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    /// Conservative hardware class chosen by the planner.
+    pub hardware_class: SwarmCapacityHardwareClass,
+    /// CPU floor for the selected conservative hardware class.
+    pub class_logical_cpu_floor: u32,
+    /// Memory floor for the selected conservative hardware class.
+    pub class_memory_bytes_floor: u64,
+    /// Evidence state for CPU/memory facts.
+    pub evidence_state: SwarmCapacityWorkloadEvidenceState,
+    /// True when missing CPU or memory telemetry forced the low default.
+    pub lower_bound: bool,
+    /// Stable reason codes. No hostnames, usernames, or raw command output.
+    pub reason_codes: Vec<String>,
+}
+
+impl SwarmCapacityHardwareFingerprint {
+    /// Build a hardware fingerprint from optional CPU and memory facts.
+    #[must_use]
+    pub fn new(logical_cpus: Option<u32>, memory_bytes: Option<u64>) -> Self {
+        let logical_cpus = logical_cpus.filter(|cores| *cores > 0);
+        let memory_bytes = memory_bytes.filter(|bytes| *bytes > 0);
+        let lower_bound = logical_cpus.is_none() || memory_bytes.is_none();
+        let evidence_state = if lower_bound {
+            SwarmCapacityWorkloadEvidenceState::Unavailable
+        } else {
+            SwarmCapacityWorkloadEvidenceState::Measured
+        };
+        let hardware_class = match (logical_cpus, memory_bytes) {
+            (Some(cores), Some(bytes)) => {
+                SwarmCapacityHardwareClass::from_known_resources(cores, bytes)
+            }
+            _ => SwarmCapacityHardwareClass::Low,
+        };
+        let mut reason_codes = Vec::new();
+        if logical_cpus.is_none() {
+            push_bounded_unique_reason(
+                &mut reason_codes,
+                "capacity.budget.hardware.lower_bound_missing_cpu".to_string(),
+            );
+        }
+        if memory_bytes.is_none() {
+            push_bounded_unique_reason(
+                &mut reason_codes,
+                "capacity.budget.hardware.lower_bound_missing_memory".to_string(),
+            );
+        }
+        if !lower_bound {
+            push_bounded_unique_reason(
+                &mut reason_codes,
+                format!("capacity.budget.hardware.class.{}", hardware_class.as_str()),
+            );
+        }
+        let defaults = hardware_class.defaults();
+
+        Self {
+            logical_cpus,
+            memory_bytes,
+            hardware_class,
+            class_logical_cpu_floor: defaults.logical_cpu_floor,
+            class_memory_bytes_floor: defaults.memory_bytes_floor,
+            evidence_state,
+            lower_bound,
+            reason_codes,
+        }
+    }
+
+    /// Build from the existing capacity-certificate machine shape.
+    #[must_use]
+    pub fn from_machine_class(machine: &SwarmCapacityMachineClass) -> Self {
+        Self::new(machine.cpu_count, machine.memory_bytes)
+    }
+}
+
+/// Workload mix row consumed by the core-aware budget model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityBudgetWorkloadMixRow {
+    /// Per-agent workload class.
+    pub workload_class: SwarmCapacityAgentWorkloadClass,
+    /// Number of agents or panes in this class.
+    pub agent_count: u32,
+    /// Capacity units requested by one agent in this class.
+    pub requested_units_per_agent: u32,
+    /// Saturating aggregate units for this row.
+    pub total_requested_units: u64,
+}
+
+impl SwarmCapacityBudgetWorkloadMixRow {
+    /// Build a row using the workload-class default unit weight.
+    #[must_use]
+    pub fn new(workload_class: SwarmCapacityAgentWorkloadClass, agent_count: u32) -> Self {
+        let requested_units_per_agent = workload_class.default_requested_units();
+        Self {
+            workload_class,
+            agent_count,
+            requested_units_per_agent,
+            total_requested_units: u64::from(agent_count)
+                .saturating_mul(u64::from(requested_units_per_agent)),
+        }
+    }
+}
+
+/// Subsystem budget surface represented by a budget row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityBudgetSubsystem {
+    /// Local compile/test slots admitted on the host.
+    BuildSlots,
+    /// Child process load across agents and tool invocations.
+    ChildProcesses,
+    /// Fleet memory tier budget.
+    MemoryTiers,
+    /// SQLite, FTS, lexical, and semantic cache pressure.
+    SqliteCache,
+    /// Mux/render cache and frame-production pressure.
+    MuxRender,
+    /// RCH/offloaded build pressure.
+    RchOffload,
+}
+
+impl SwarmCapacityBudgetSubsystem {
+    /// Stable row order.
+    pub const ALL: [Self; 6] = [
+        Self::BuildSlots,
+        Self::ChildProcesses,
+        Self::MemoryTiers,
+        Self::SqliteCache,
+        Self::MuxRender,
+        Self::RchOffload,
+    ];
+
+    /// Stable label for docs and artifacts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BuildSlots => "build_slots",
+            Self::ChildProcesses => "child_processes",
+            Self::MemoryTiers => "memory_tiers",
+            Self::SqliteCache => "sqlite_cache",
+            Self::MuxRender => "mux_render",
+            Self::RchOffload => "rch_offload",
+        }
+    }
+}
+
+/// Unit carried by one budget row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityBudgetUnit {
+    /// Concurrent slot count.
+    Slots,
+    /// Process count.
+    Processes,
+    /// Byte budget.
+    Bytes,
+}
+
+/// Per-subsystem core-aware budget row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacitySubsystemBudgetRow {
+    /// Subsystem represented by this row.
+    pub subsystem: SwarmCapacityBudgetSubsystem,
+    /// Unit for budget/used/available fields.
+    pub unit: SwarmCapacityBudgetUnit,
+    /// Conservative budget in row units.
+    pub budget: u64,
+    /// Current modeled use in row units.
+    pub used: u64,
+    /// Saturating remaining budget.
+    pub available: u64,
+    /// Saturating used/budget ratio multiplied by 1000.
+    pub saturation_per_1000: u32,
+    /// Fleet pressure tier implied by this row.
+    pub pressure_tier: FleetPressureTier,
+    /// Stable reason codes.
+    pub reason_codes: Vec<String>,
+}
+
+impl SwarmCapacitySubsystemBudgetRow {
+    fn new(
+        subsystem: SwarmCapacityBudgetSubsystem,
+        unit: SwarmCapacityBudgetUnit,
+        budget: u64,
+        used: u64,
+        lower_bound: bool,
+    ) -> Self {
+        let saturation_per_1000 = saturation_per_1000(used, budget);
+        let pressure_tier = pressure_tier_for_saturation(used, budget, saturation_per_1000);
+        let mut reason_codes = vec![format!("capacity.budget.subsystem.{}", subsystem.as_str())];
+        if lower_bound {
+            push_bounded_unique_reason(
+                &mut reason_codes,
+                "capacity.budget.hardware.lower_bound".to_string(),
+            );
+        }
+        if pressure_tier >= FleetPressureTier::Critical {
+            push_bounded_unique_reason(
+                &mut reason_codes,
+                format!("capacity.budget.{}.critical", subsystem.as_str()),
+            );
+        }
+
+        Self {
+            subsystem,
+            unit,
+            budget,
+            used,
+            available: budget.saturating_sub(used),
+            saturation_per_1000,
+            pressure_tier,
+            reason_codes,
+        }
+    }
+}
+
+/// Complete dry-run resource budget plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityResourceBudgetPlan {
+    /// Schema version.
+    pub schema_version: u16,
+    /// Stable contract id.
+    pub contract_id: String,
+    /// Snapshot timestamp in epoch milliseconds.
+    pub generated_at_ms: u64,
+    /// Producer path.
+    pub source: String,
+    /// Plan is dry-run only.
+    pub dry_run: bool,
+    /// Planning never executes side effects.
+    pub side_effects_executed: bool,
+    /// Hardware facts and conservative class choice.
+    pub hardware: SwarmCapacityHardwareFingerprint,
+    /// Normalized workload mix in stable class order.
+    pub workload_mix: Vec<SwarmCapacityBudgetWorkloadMixRow>,
+    /// Total agents represented by the workload mix.
+    pub total_agent_count: u64,
+    /// Total requested workload units represented by the mix.
+    pub total_requested_units: u64,
+    /// Per-subsystem budget rows.
+    pub subsystem_budgets: Vec<SwarmCapacitySubsystemBudgetRow>,
+    /// Worst subsystem pressure tier.
+    pub pressure_tier: FleetPressureTier,
+    /// True when missing CPU or memory telemetry forced low defaults.
+    pub lower_bound: bool,
+    /// Flattened stable reason codes.
+    pub reason_codes: Vec<String>,
+}
+
+/// Build a dry-run core-aware resource budget plan.
+#[must_use]
+pub fn plan_swarm_capacity_resource_budget(
+    generated_at_ms: u64,
+    source: impl Into<String>,
+    hardware: SwarmCapacityHardwareFingerprint,
+    workload_mix: &[SwarmCapacityBudgetWorkloadMixRow],
+) -> SwarmCapacityResourceBudgetPlan {
+    let workload_mix = normalize_budget_workload_mix(workload_mix);
+    let total_agent_count = workload_mix.iter().fold(0u64, |total, row| {
+        total.saturating_add(u64::from(row.agent_count))
+    });
+    let total_requested_units = workload_mix.iter().fold(0u64, |total, row| {
+        total.saturating_add(row.total_requested_units)
+    });
+    let subsystem_budgets = budget_rows_for_mix(&hardware, &workload_mix);
+    let pressure_tier = subsystem_budgets
+        .iter()
+        .map(|row| row.pressure_tier)
+        .max()
+        .unwrap_or(FleetPressureTier::Normal);
+    let mut reason_codes = Vec::new();
+    for reason in &hardware.reason_codes {
+        push_bounded_unique_reason(&mut reason_codes, reason.clone());
+    }
+    for row in &subsystem_budgets {
+        for reason in &row.reason_codes {
+            push_bounded_unique_reason(&mut reason_codes, reason.clone());
+        }
+    }
+    let source = source.into();
+
+    SwarmCapacityResourceBudgetPlan {
+        schema_version: SWARM_CAPACITY_RESOURCE_BUDGET_SCHEMA_VERSION,
+        contract_id: SWARM_CAPACITY_RESOURCE_BUDGET_CONTRACT_ID.to_string(),
+        generated_at_ms,
+        source: if source.is_empty() {
+            "swarm_capacity.resource_budget".to_string()
+        } else {
+            source
+        },
+        dry_run: true,
+        side_effects_executed: false,
+        lower_bound: hardware.lower_bound,
+        hardware,
+        workload_mix,
+        total_agent_count,
+        total_requested_units,
+        subsystem_budgets,
+        pressure_tier,
+        reason_codes,
+    }
+}
+
+/// Deterministic examples for docs and e2e smoke checks.
+#[must_use]
+pub fn swarm_capacity_resource_budget_dry_run_examples(
+    generated_at_ms: u64,
+) -> Vec<SwarmCapacityResourceBudgetPlan> {
+    [
+        (
+            "example.low",
+            SwarmCapacityHardwareFingerprint::new(Some(4), Some(16 * SWARM_CAPACITY_BUDGET_GIB)),
+            vec![
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Coding, 4),
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Idle, 8),
+            ],
+        ),
+        (
+            "example.mid",
+            SwarmCapacityHardwareFingerprint::new(Some(16), Some(64 * SWARM_CAPACITY_BUDGET_GIB)),
+            vec![
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Coding, 12),
+                SwarmCapacityBudgetWorkloadMixRow::new(
+                    SwarmCapacityAgentWorkloadClass::Building,
+                    2,
+                ),
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Idle, 20),
+            ],
+        ),
+        (
+            "example.high",
+            SwarmCapacityHardwareFingerprint::new(Some(32), Some(128 * SWARM_CAPACITY_BUDGET_GIB)),
+            vec![
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Coding, 24),
+                SwarmCapacityBudgetWorkloadMixRow::new(
+                    SwarmCapacityAgentWorkloadClass::Reviewing,
+                    16,
+                ),
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Testing, 4),
+            ],
+        ),
+        (
+            "example.high_core",
+            SwarmCapacityHardwareFingerprint::new(Some(64), Some(256 * SWARM_CAPACITY_BUDGET_GIB)),
+            vec![
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Coding, 96),
+                SwarmCapacityBudgetWorkloadMixRow::new(
+                    SwarmCapacityAgentWorkloadClass::Reviewing,
+                    64,
+                ),
+                SwarmCapacityBudgetWorkloadMixRow::new(
+                    SwarmCapacityAgentWorkloadClass::Building,
+                    8,
+                ),
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Testing, 8),
+                SwarmCapacityBudgetWorkloadMixRow::new(
+                    SwarmCapacityAgentWorkloadClass::StuckTuiHeavy,
+                    4,
+                ),
+                SwarmCapacityBudgetWorkloadMixRow::new(SwarmCapacityAgentWorkloadClass::Idle, 96),
+            ],
+        ),
+    ]
+    .into_iter()
+    .map(|(source, hardware, mix)| {
+        plan_swarm_capacity_resource_budget(generated_at_ms, source, hardware, &mix)
+    })
+    .collect()
+}
+
+fn normalize_budget_workload_mix(
+    workload_mix: &[SwarmCapacityBudgetWorkloadMixRow],
+) -> Vec<SwarmCapacityBudgetWorkloadMixRow> {
+    let mut counts: BTreeMap<SwarmCapacityAgentWorkloadClass, u32> = BTreeMap::new();
+    for row in workload_mix {
+        if row.agent_count == 0 {
+            continue;
+        }
+        let entry = counts.entry(row.workload_class).or_default();
+        *entry = entry.saturating_add(row.agent_count);
+    }
+
+    SwarmCapacityAgentWorkloadClass::ALL
+        .into_iter()
+        .filter_map(|class| {
+            counts
+                .get(&class)
+                .copied()
+                .map(|count| SwarmCapacityBudgetWorkloadMixRow::new(class, count))
+        })
+        .collect()
+}
+
+fn budget_rows_for_mix(
+    hardware: &SwarmCapacityHardwareFingerprint,
+    workload_mix: &[SwarmCapacityBudgetWorkloadMixRow],
+) -> Vec<SwarmCapacitySubsystemBudgetRow> {
+    let defaults = hardware.hardware_class.defaults();
+    let lower_bound = hardware.lower_bound;
+    vec![
+        SwarmCapacitySubsystemBudgetRow::new(
+            SwarmCapacityBudgetSubsystem::BuildSlots,
+            SwarmCapacityBudgetUnit::Slots,
+            defaults.build_slots,
+            build_slot_use(workload_mix),
+            lower_bound,
+        ),
+        SwarmCapacitySubsystemBudgetRow::new(
+            SwarmCapacityBudgetSubsystem::ChildProcesses,
+            SwarmCapacityBudgetUnit::Processes,
+            defaults.child_process_slots,
+            child_process_use(workload_mix),
+            lower_bound,
+        ),
+        SwarmCapacitySubsystemBudgetRow::new(
+            SwarmCapacityBudgetSubsystem::MemoryTiers,
+            SwarmCapacityBudgetUnit::Bytes,
+            defaults.memory_tier_budget_bytes,
+            memory_tier_use_bytes(workload_mix),
+            lower_bound,
+        ),
+        SwarmCapacitySubsystemBudgetRow::new(
+            SwarmCapacityBudgetSubsystem::SqliteCache,
+            SwarmCapacityBudgetUnit::Bytes,
+            defaults.sqlite_cache_budget_bytes,
+            sqlite_cache_use_bytes(workload_mix),
+            lower_bound,
+        ),
+        SwarmCapacitySubsystemBudgetRow::new(
+            SwarmCapacityBudgetSubsystem::MuxRender,
+            SwarmCapacityBudgetUnit::Bytes,
+            defaults.mux_render_budget_bytes,
+            mux_render_use_bytes(workload_mix),
+            lower_bound,
+        ),
+        SwarmCapacitySubsystemBudgetRow::new(
+            SwarmCapacityBudgetSubsystem::RchOffload,
+            SwarmCapacityBudgetUnit::Slots,
+            defaults.rch_offload_slots,
+            rch_offload_use(workload_mix),
+            lower_bound,
+        ),
+    ]
+}
+
+fn agents_for_mix(
+    workload_mix: &[SwarmCapacityBudgetWorkloadMixRow],
+    class: SwarmCapacityAgentWorkloadClass,
+) -> u64 {
+    workload_mix
+        .iter()
+        .filter(|row| row.workload_class == class)
+        .fold(0u64, |total, row| {
+            total.saturating_add(u64::from(row.agent_count))
+        })
+}
+
+fn total_agents_for_mix(workload_mix: &[SwarmCapacityBudgetWorkloadMixRow]) -> u64 {
+    workload_mix.iter().fold(0u64, |total, row| {
+        total.saturating_add(u64::from(row.agent_count))
+    })
+}
+
+fn total_units_for_mix(workload_mix: &[SwarmCapacityBudgetWorkloadMixRow]) -> u64 {
+    workload_mix.iter().fold(0u64, |total, row| {
+        total.saturating_add(row.total_requested_units)
+    })
+}
+
+fn build_slot_use(workload_mix: &[SwarmCapacityBudgetWorkloadMixRow]) -> u64 {
+    agents_for_mix(workload_mix, SwarmCapacityAgentWorkloadClass::Building).saturating_add(
+        agents_for_mix(workload_mix, SwarmCapacityAgentWorkloadClass::Testing),
+    )
+}
+
+fn child_process_use(workload_mix: &[SwarmCapacityBudgetWorkloadMixRow]) -> u64 {
+    total_agents_for_mix(workload_mix)
+        .saturating_add(
+            agents_for_mix(workload_mix, SwarmCapacityAgentWorkloadClass::Building)
+                .saturating_mul(4),
+        )
+        .saturating_add(
+            agents_for_mix(workload_mix, SwarmCapacityAgentWorkloadClass::Testing)
+                .saturating_mul(3),
+        )
+}
+
+fn memory_tier_use_bytes(workload_mix: &[SwarmCapacityBudgetWorkloadMixRow]) -> u64 {
+    workload_mix.iter().fold(0u64, |total, row| {
+        total.saturating_add(
+            u64::from(row.agent_count).saturating_mul(memory_bytes_per_agent(row.workload_class)),
+        )
+    })
+}
+
+fn memory_bytes_per_agent(class: SwarmCapacityAgentWorkloadClass) -> u64 {
+    match class {
+        SwarmCapacityAgentWorkloadClass::Coding => 384 * SWARM_CAPACITY_BUDGET_MIB,
+        SwarmCapacityAgentWorkloadClass::Reviewing => 256 * SWARM_CAPACITY_BUDGET_MIB,
+        SwarmCapacityAgentWorkloadClass::Building => 768 * SWARM_CAPACITY_BUDGET_MIB,
+        SwarmCapacityAgentWorkloadClass::Testing => 512 * SWARM_CAPACITY_BUDGET_MIB,
+        SwarmCapacityAgentWorkloadClass::Idle => 64 * SWARM_CAPACITY_BUDGET_MIB,
+        SwarmCapacityAgentWorkloadClass::Blocked => 96 * SWARM_CAPACITY_BUDGET_MIB,
+        SwarmCapacityAgentWorkloadClass::RateLimited => 64 * SWARM_CAPACITY_BUDGET_MIB,
+        SwarmCapacityAgentWorkloadClass::ContextSaturated => 512 * SWARM_CAPACITY_BUDGET_MIB,
+        SwarmCapacityAgentWorkloadClass::StuckTuiHeavy => SWARM_CAPACITY_BUDGET_GIB,
+    }
+}
+
+fn sqlite_cache_use_bytes(workload_mix: &[SwarmCapacityBudgetWorkloadMixRow]) -> u64 {
+    total_units_for_mix(workload_mix).saturating_mul(16 * SWARM_CAPACITY_BUDGET_MIB)
+}
+
+fn mux_render_use_bytes(workload_mix: &[SwarmCapacityBudgetWorkloadMixRow]) -> u64 {
+    total_agents_for_mix(workload_mix)
+        .saturating_mul(32 * SWARM_CAPACITY_BUDGET_MIB)
+        .saturating_add(
+            agents_for_mix(workload_mix, SwarmCapacityAgentWorkloadClass::StuckTuiHeavy)
+                .saturating_mul(512 * SWARM_CAPACITY_BUDGET_MIB),
+        )
+}
+
+fn rch_offload_use(workload_mix: &[SwarmCapacityBudgetWorkloadMixRow]) -> u64 {
+    build_slot_use(workload_mix)
+}
+
+fn saturation_per_1000(used: u64, budget: u64) -> u32 {
+    if budget == 0 {
+        return if used == 0 { 0 } else { 1_000 };
+    }
+    let ratio = (u128::from(used).saturating_mul(1_000)) / u128::from(budget);
+    ratio.min(u128::from(u32::MAX)) as u32
+}
+
+fn pressure_tier_for_saturation(
+    used: u64,
+    budget: u64,
+    saturation_per_1000: u32,
+) -> FleetPressureTier {
+    if budget == 0 && used > 0 {
+        return FleetPressureTier::Emergency;
+    }
+    match saturation_per_1000 {
+        0..=750 => FleetPressureTier::Normal,
+        751..=900 => FleetPressureTier::Elevated,
+        901..=1_000 => FleetPressureTier::Critical,
+        _ => FleetPressureTier::Emergency,
+    }
+}
+
 /// Redacted audit record attached to each admission decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmCapacityAdmissionAuditRecord {
