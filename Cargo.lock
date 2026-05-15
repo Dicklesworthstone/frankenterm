@@ -3416,6 +3416,7 @@ dependencies = [
  "frankenterm-alloc",
  "frankenterm-core",
  "frankenterm-core-replay",
+ "hex",
  "predicates",
  "rusqlite",
  "serde",
