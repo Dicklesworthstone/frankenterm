@@ -1,0 +1,28 @@
+{
+  "fixture_kind": "swarm_capacity_gauntlet_negative_rch_meta",
+  "selected_worker": "vmi-stale-mirror",
+  "probe_worker_count": 1,
+  "probe_worker_ids": [
+    "vmi-stale-mirror"
+  ],
+  "sync_duration_ms": null,
+  "remote_duration_ms": null,
+  "remote_exit_code": null,
+  "wrapper_exit_code": 124,
+  "failure_reason_code": "RCH-REMOTE-MIRROR-MISSING-FILE",
+  "failure_reason_detail": "required checkout telemetry paths were absent from the worker mirror before Cargo execution",
+  "reachable_workers_detected": true,
+  "fail_open_detected": false,
+  "timed_out": true,
+  "material_execution": {
+    "cargo_reached": false,
+    "rustc_reached": false,
+    "test_execution_reached": false
+  },
+  "hardware": {
+    "target_class": "linux-x86_64-high-core",
+    "telemetry_state": "stale",
+    "high_scale_claim_allowed": false
+  },
+  "expected_classification": "infrastructure_blocked"
+}
