@@ -682,14 +682,10 @@ pub mod tui_parity_oracle;
 // Re-export so `crate::tuning_config::*` and `frankenterm_core::tuning_config::*` paths
 // keep resolving unchanged. Leaf-clean: zero `crate::*` deps.
 pub use frankenterm_core_config_types::tuning_config;
-#[cfg(feature = "subprocess-bridge")]
 pub mod tx_execution;
-#[cfg(feature = "subprocess-bridge")]
 pub mod tx_idempotency;
 pub mod tx_killswitch_model;
-#[cfg(feature = "subprocess-bridge")]
 pub mod tx_observability;
-#[cfg(feature = "subprocess-bridge")]
 pub mod tx_plan_compiler;
 pub mod ucb1_bandit;
 pub mod undo;
