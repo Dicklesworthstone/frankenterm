@@ -159,12 +159,18 @@ pub struct ScaleFactor {
 
 impl ScaleFactor {
     /// Construct, reducing by GCD. Returns `None` for zero
-    /// denominator.
+    /// numerator or zero denominator — a display scale factor is
+    /// strictly positive (every named constant `ONE_X`, `TWO_X`,
+    /// etc. satisfies this), so `0/x` and `x/0` are both invalid
+    /// and the constructor is the only entry point for arbitrary
+    /// pairs (fields are private per ft-1mktd).
     #[must_use]
     pub fn new(numerator: u32, denominator: u32) -> Option<Self> {
-        if denominator == 0 {
+        if numerator == 0 || denominator == 0 {
             return None;
         }
+        // gcd(n, d) >= 1 when both are non-zero, so `.max(1)` is
+        // defensive but the division never underflows.
         let g = gcd_u32(numerator, denominator);
         Some(Self {
             numerator: numerator / g.max(1),
@@ -690,6 +696,19 @@ mod tests {
         assert!(ScaleFactor::new(1, 0).is_none());
         assert!(ScaleFactor::new(0, 0).is_none());
         assert!(ScaleFactor::new(1000, 0).is_none());
+    }
+
+    /// A zero numerator yields a degenerate scale factor whose
+    /// `as_f64()` is exactly 0.0 — meaningless as a display scale
+    /// (every named constant is strictly positive) and a footgun
+    /// for any downstream consumer that divides by the scale.
+    /// `new()` must reject it for the same reason it rejects a
+    /// zero denominator.
+    #[test]
+    fn scale_factor_new_rejects_zero_numerator() {
+        assert!(ScaleFactor::new(0, 1).is_none());
+        assert!(ScaleFactor::new(0, 4).is_none());
+        assert!(ScaleFactor::new(0, 1000).is_none());
     }
 
     #[test]
