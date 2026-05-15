@@ -101,6 +101,12 @@ worker_for_log() {
 failure_reason_for_log() {
   local log_file="$1"
   local meta_file code
+  local mirror_code
+  if jq -e '.kind == "rch_selected_worker_mirror_attestation" and .status == "failed"' "${log_file}" >/dev/null 2>&1; then
+    mirror_code="$(jq -r '.reason_code // "selected_worker_mirror_failed"' "${log_file}" 2>/dev/null || true)"
+    printf 'rch_infrastructure_%s\n' "${mirror_code//./_}"
+    return
+  fi
   if rch_log_has_worker_selection_all_busy "${log_file}"; then
     printf '%s\n' "rch_infrastructure_worker_selection_all_busy"
     return
@@ -143,10 +149,32 @@ failure_reason_for_log() {
   printf '%s\n' "source_or_test_failure"
 }
 
+attest_selected_worker_mirror() {
+  local worker="$1"
+  local output_file="$2"
+  local path raw_path
+  local raw_paths=()
+  local path_args=()
+
+  IFS=',' read -ra raw_paths <<<"${RCH_MIRROR_REQUIRED_PATHS:-}"
+  for raw_path in "${raw_paths[@]}"; do
+    path="${raw_path//[[:space:]]/}"
+    [[ -n "${path}" ]] || continue
+    path_args+=("--path" "${path}")
+  done
+
+  "${ROOT_DIR}/scripts/attest_rch_worker_mirror.sh" \
+    --worker "${worker}" \
+    --bead "${BEAD_ID}" \
+    "${path_args[@]}" \
+    --command "terminal loopback selected-worker preflight" \
+    --json >"${output_file}"
+}
+
 run_selection_preflight() {
   local log_file="$1"
   local target_dir="$2"
-  local worker reason
+  local worker reason mirror_log
 
   set +e
   run_rch --json diagnose \
@@ -160,6 +188,7 @@ run_selection_preflight() {
   rch_write_meta_json "${log_file}" "${rc}"
 
   if [[ "${rc}" -ne 0 ]]; then
+    SELECTION_FAILURE_LOG="${log_file}"
     emit_event "preflight.rch_selection" "failed" "rch_selection_diagnose_failed" \
       "RCH-SELECTION-PREFLIGHT" "${log_file}" \
       "diagnose failed for cargo build -p frankenterm-mux-server target_dir=${target_dir}"
@@ -167,6 +196,7 @@ run_selection_preflight() {
   fi
 
   if ! jq -e . "${log_file}" >/dev/null 2>&1; then
+    SELECTION_FAILURE_LOG="${log_file}"
     emit_event "preflight.rch_selection" "failed" "rch_selection_diagnose_invalid_json" \
       "RCH-SELECTION-PREFLIGHT" "${log_file}" \
       "diagnose did not emit valid JSON for cargo build -p frankenterm-mux-server target_dir=${target_dir}"
@@ -175,6 +205,21 @@ run_selection_preflight() {
 
   worker="$(jq -r '.data.worker_selection.worker.id // ""' "${log_file}" 2>/dev/null || true)"
   if [[ -n "${worker}" ]]; then
+    mirror_log="${log_file%.log}.selected_worker_mirror.json"
+    if ! attest_selected_worker_mirror "${worker}" "${mirror_log}"; then
+      SELECTION_FAILURE_LOG="${mirror_log}"
+      emit_event "preflight.rch_selection_mirror" "failed" \
+        "rch_selection_mirror_attestation_failed" \
+        "RCH-MIRROR-PREFLIGHT" "${mirror_log}" \
+        "scheduler-selected worker ${worker} failed required-file mirror attestation before cargo build target_dir=${target_dir}" \
+        "${worker}"
+      return 1
+    fi
+
+    emit_event "preflight.rch_selection_mirror" "passed" \
+      "rch_selection_mirror_ready" "none" "${mirror_log}" \
+      "scheduler-selected worker ${worker} passed required-file mirror attestation before cargo build target_dir=${target_dir}" \
+      "${worker}"
     emit_event "preflight.rch_selection" "passed" "rch_selection_ready" "none" "${log_file}" \
       "worker selection ready for cargo build -p frankenterm-mux-server target_dir=${target_dir}" \
       "${worker}"
@@ -199,6 +244,7 @@ run_selection_preflight() {
   emit_event "preflight.rch_selection" "failed" "rch_selection_no_worker" \
     "RCH-SELECTION-PREFLIGHT" "${log_file}" \
     "daemon selection rejected cargo build -p frankenterm-mux-server target_dir=${target_dir}; reason=${reason}${capability_summary}"
+  SELECTION_FAILURE_LOG="${log_file}"
   return 1
 }
 
@@ -355,6 +401,7 @@ emit_event "preflight.rch" "passed" "rch_ready" "none" "$(rch_probe_log_path)" \
   "RCH remote workers reachable; smoke preflight skipped=${RCH_SKIP_SMOKE_PREFLIGHT}"
 
 SELECTION_LOG="${ARTIFACT_DIR}/rch_selection_preflight.log"
+SELECTION_FAILURE_LOG=""
 BUILD_LOG=""
 TEST_LOG="${ARTIFACT_DIR}/loopback_test.log"
 status=0
@@ -371,7 +418,7 @@ if [[ "${RCH_SKIP_SELECTION_PREFLIGHT}" == "1" ]]; then
   SELECTION_LOG=""
 elif ! run_selection_preflight "${SELECTION_LOG}" "${REMOTE_TARGET_DIR}"; then
   status=1
-  failed_log="${SELECTION_LOG}"
+  failed_log="${SELECTION_FAILURE_LOG:-${SELECTION_LOG}}"
   BUILD_LOG=""
   TEST_LOG=""
 fi

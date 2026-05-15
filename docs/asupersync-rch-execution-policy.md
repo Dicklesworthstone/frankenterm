@@ -168,6 +168,16 @@ Allowed during worker-specific RCH incidents:
   workers remain in the JSON artifact as residual evidence; the material
   `rch exec` run must still prove remote execution on the scheduler-selected
   worker.
+- Harnesses that cannot tolerate scheduler selection of any stale checked
+  worker can set `RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS=1`. That mode blocks
+  before Cargo when any scheduler-eligible checked worker has missing or
+  mismatched required files. `RCH_MIRROR_BLOCK_ON_STALE_HEAD=1` additionally
+  treats matching required-file hashes with unverifiable or mismatched Git
+  metadata as blocking evidence.
+- Harnesses with a concrete scheduler-selection preflight should also attest
+  the selected worker's required files before starting Cargo. This keeps a
+  partially stale pool from becoming a false source-test verdict when the
+  daemon would otherwise choose a stale worker.
 - Reopening or blocking a bead with exact artifact paths and reason codes when
   the worker-specific proof cannot be trusted.
 

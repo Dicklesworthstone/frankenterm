@@ -120,7 +120,14 @@ emit_files() {
     done < <(requested_paths "$@")
 }
 
-case "${FAKE_RCH_MIRROR_MODE:-success}" in
+mode="${FAKE_RCH_MIRROR_MODE:-success}"
+case " $* " in
+  *"203.0.113.11"*)
+    mode="${FAKE_RCH_MIRROR_MODE_WORKER_B:-${mode}}"
+    ;;
+esac
+
+case "${mode}" in
   unreachable)
     printf 'fixture ssh unreachable\n' >&2
     exit 255
@@ -165,7 +172,7 @@ case "${FAKE_RCH_MIRROR_MODE:-success}" in
     emit_files success "$@"
     ;;
   *)
-    printf 'unknown fake mode: %s\n' "${FAKE_RCH_MIRROR_MODE:-}" >&2
+    printf 'unknown fake mode: %s\n' "${mode}" >&2
     exit 2
     ;;
 esac
@@ -515,6 +522,162 @@ run_preflight_fixture "remote_preflight_unsupported_fixture" "ok" "unsupported" 
     "warning" "unsupported_worker_selection" "unsupported_worker_selection"
 run_preflight_fixture "remote_preflight_local_fallback_fixture" "ok" "ready" "0" \
     "blocked" "local_fallback_forbidden" "unsupported_worker_selection"
+
+POOL_WORKERS_JSON="${LOG_DIR}/pool_workers.json"
+cat >"${POOL_WORKERS_JSON}" <<JSON
+{
+  "success": true,
+  "data": [
+    {
+      "id": "worker-a",
+      "host": "203.0.113.10",
+      "user": "ubuntu",
+      "identity_file": "${LOG_DIR}/fixture_key"
+    },
+    {
+      "id": "worker-b",
+      "host": "203.0.113.11",
+      "user": "ubuntu",
+      "identity_file": "${LOG_DIR}/fixture_key"
+    }
+  ]
+}
+JSON
+
+write_pool_probe_fixture() {
+    local output_file="$1"
+
+    cat >"${output_file}" <<'JSON'
+{
+  "success": true,
+  "data": {
+    "results": [
+      {
+        "id": "worker-a",
+        "host": "203.0.113.10",
+        "status": "ok"
+      },
+      {
+        "id": "worker-b",
+        "host": "203.0.113.11",
+        "status": "ok"
+      }
+    ]
+  }
+}
+JSON
+}
+
+write_pool_scheduler_fixture() {
+    local output_file="$1"
+
+    cat >"${output_file}" <<'JSON'
+{
+  "success": true,
+  "data": {
+    "daemon": {
+      "workers": [
+        {
+          "id": "worker-a",
+          "status": "healthy"
+        },
+        {
+          "id": "worker-b",
+          "status": "healthy"
+        }
+      ]
+    }
+  }
+}
+JSON
+}
+
+run_rch() {
+    if [[ "$*" == "--json status --workers" ]]; then
+        cat "${FAKE_RCH_STATUS_JSON}"
+        return 0
+    fi
+
+    printf 'unexpected fake run_rch invocation: %s\n' "$*" >&2
+    return 2
+}
+
+run_pool_mirror_fixture() {
+    local name="$1"
+    local mode_a="$2"
+    local mode_b="$3"
+    local min_passing="$4"
+    local require_all_checked="$5"
+    local block_on_stale="$6"
+    local expected_rc="$7"
+    local expected_status="$8"
+    local expected_reason="$9"
+    local probe_file="${LOG_DIR}/${name}_probe.json"
+    local scheduler_file="${LOG_DIR}/${name}_scheduler.json"
+    local output_file="${LOG_DIR}/${name}_mirror_preflight.json"
+    local remote_head="${HEAD_SHA}"
+    local rc
+
+    if [[ "${mode_a}" == "stale_head" || "${mode_b}" == "stale_head" ]]; then
+        remote_head="0000000000000000000000000000000000000000"
+    fi
+
+    write_pool_probe_fixture "${probe_file}"
+    write_pool_scheduler_fixture "${scheduler_file}"
+
+    _RCH_PROBE_LOG="${probe_file}"
+    _RCH_MIRROR_PREFLIGHT_LOG="${output_file}"
+    _RCH_SCHEDULER_WORKERS_LOG="${LOG_DIR}/${name}_scheduler_capture.json"
+
+    set +e
+    (
+        export RCH_MIRROR_ATTEST_WORKERS_JSON="${POOL_WORKERS_JSON}"
+        export RCH_MIRROR_ATTEST_SSH_BIN="${FAKE_SSH}"
+        export FAKE_RCH_STATUS_JSON="${scheduler_file}"
+        export FAKE_RCH_MIRROR_MODE="${mode_a}"
+        export FAKE_RCH_MIRROR_MODE_WORKER_B="${mode_b}"
+        export FAKE_RCH_MIRROR_REMOTE_HEAD="${remote_head}"
+        export FAKE_RCH_MIRROR_REPO_ROOT="${ROOT_DIR}"
+        RCH_MIRROR_REQUIRED_PATHS="Cargo.toml,crates/frankenterm-core/src/lib.rs"
+        RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS=0
+        RCH_MIRROR_MIN_PASSING_WORKERS="${min_passing}"
+        RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS="${require_all_checked}"
+        RCH_MIRROR_BLOCK_ON_STALE_HEAD="${block_on_stale}"
+        ensure_rch_mirror_preflight
+    ) >"${LOG_DIR}/${name}.stdout" 2>"${LOG_DIR}/${name}.stderr"
+    rc=$?
+    set -e
+
+    if [[ "${rc}" -ne "${expected_rc}" ]]; then
+        record_result "${name}" "false" "expected rc ${expected_rc}, got ${rc}"
+        return
+    fi
+
+    if jq -e \
+        --arg status "${expected_status}" \
+        --arg reason "${expected_reason}" \
+        '.status == $status
+         and .reason_code == $reason
+         and .scheduler_filter_active == true
+         and .total_workers_checked == 2' \
+        "${output_file}" >/dev/null; then
+        record_result "${name}" "true"
+    else
+        record_result "${name}" "false" "unexpected mirror preflight JSON shape"
+    fi
+}
+
+run_pool_mirror_fixture "mirror_pool_partial_allowed_fixture" \
+    "success" "hash_mismatch" "1" "0" "0" "0" \
+    "passed" "source_mirror_minimum_ready"
+
+run_pool_mirror_fixture "mirror_pool_require_all_checked_blocks_fixture" \
+    "success" "hash_mismatch" "1" "1" "0" "1" \
+    "blocked" "source_mirror_checked_workers_blocked"
+
+run_pool_mirror_fixture "mirror_pool_strict_stale_head_blocks_fixture" \
+    "stale_head" "success" "2" "0" "1" "1" \
+    "blocked" "source_mirror_blocked"
 
 jq -cn \
   --arg test "rch_worker_mirror_attestation" \

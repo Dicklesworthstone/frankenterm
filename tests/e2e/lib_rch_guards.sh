@@ -48,6 +48,7 @@ RCH_REMOTE_PREFLIGHT_WAIT_SECS="${RCH_REMOTE_PREFLIGHT_WAIT_SECS:-${RCH_WORKER_S
 RCH_MIRROR_REQUIRED_PATHS="${RCH_MIRROR_REQUIRED_PATHS:-}"
 RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS="${RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS:-auto}"
 RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
+RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS="${RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS:-0}"
 RCH_MIRROR_MIN_PASSING_WORKERS="${RCH_MIRROR_MIN_PASSING_WORKERS:-1}"
 RCH_GITHUB_ACTIONS_LOCAL_CARGO="${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-0}"
 
@@ -1123,6 +1124,7 @@ ensure_rch_mirror_preflight() {
 
     local worker_ids worker_id worker_dir worker_json worker_rc failures total bead_arg=()
     local block_on_stale_head="false"
+    local require_all_checked_workers="false"
     local min_passing_workers
     local scheduler_worker_ids scheduler_status_rc scheduler_filter_active="false"
     worker_ids="$(rch_extract_probe_worker_ids "${_RCH_PROBE_LOG}")"
@@ -1157,6 +1159,9 @@ ensure_rch_mirror_preflight() {
     if rch_truthy "${RCH_MIRROR_BLOCK_ON_STALE_HEAD}"; then
         block_on_stale_head="true"
     fi
+    if rch_truthy "${RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS}"; then
+        require_all_checked_workers="true"
+    fi
 
     while IFS= read -r worker_id; do
         [[ -n "${worker_id}" ]] || continue
@@ -1189,15 +1194,28 @@ ensure_rch_mirror_preflight() {
         --argjson failures "${failures}" \
         --argjson min_passing_workers "${min_passing_workers}" \
         --argjson block_on_stale_head "$(rch_json_bool "${block_on_stale_head}")" \
+        --argjson require_all_checked_workers "$(rch_json_bool "${require_all_checked_workers}")" \
         --argjson scheduler_filter_active "$(rch_json_bool "${scheduler_filter_active}")" \
         --arg probe_log "$(rch_repo_relative_path "${_RCH_PROBE_LOG}")" \
         --arg scheduler_workers_log "$(rch_repo_relative_path "${_RCH_SCHEDULER_WORKERS_LOG}")" \
         'def blocking_failure($block_on_stale_head):
-          .status != "passed"
-          and ($block_on_stale_head or .reason_code != "rch_mirror.required_files_ok_head_mismatch");
+          (.status != "passed")
+          or (
+            $block_on_stale_head
+            and (
+              .reason_code == "rch_mirror.required_files_ok_head_mismatch"
+              or .reason_code == "rch_mirror.required_files_ok_head_unavailable"
+            )
+          );
         ([.[] | select(blocking_failure($block_on_stale_head))] | length) as $blocking_failures
         | ($total - $blocking_failures) as $passing_workers
-        | ($passing_workers >= $min_passing_workers) as $pool_ready
+        | (
+            if $require_all_checked_workers then
+              $total > 0 and $blocking_failures == 0
+            else
+              $passing_workers >= $min_passing_workers
+            end
+          ) as $pool_ready
         | {
           schema_version: $schema_version,
           kind: $kind,
@@ -1206,6 +1224,7 @@ ensure_rch_mirror_preflight() {
           reason_code: (
             if $pool_ready and $blocking_failures == 0 then "source_mirror_ready"
             elif $pool_ready then "source_mirror_minimum_ready"
+            elif $require_all_checked_workers and $blocking_failures > 0 then "source_mirror_checked_workers_blocked"
             else "source_mirror_blocked" end
           ),
           detail: (
@@ -1213,6 +1232,8 @@ ensure_rch_mirror_preflight() {
               "all blocking source mirror checks passed; Git metadata drift is recorded separately when required file hashes match"
             elif $pool_ready then
               "the source mirror pool met the minimum ready-worker threshold; stale worker mirrors are retained as residual evidence"
+            elif $require_all_checked_workers and $blocking_failures > 0 then
+              "at least one checked scheduler-eligible source mirror failed blocking attestation; proof lane blocked before scheduler selection"
             else
               "too few probed workers passed blocking source mirror attestation"
             end
@@ -1223,6 +1244,7 @@ ensure_rch_mirror_preflight() {
           required_passing_workers: $min_passing_workers,
           blocking_failed_workers: $blocking_failures,
           block_on_stale_head: $block_on_stale_head,
+          require_all_checked_workers: $require_all_checked_workers,
           scheduler_filter_active: $scheduler_filter_active,
           artifacts: {
             probe_log: $probe_log,
@@ -1231,12 +1253,14 @@ ensure_rch_mirror_preflight() {
           worker_results: .
         }' "${worker_dir}"/*.json >"${_RCH_MIRROR_PREFLIGHT_LOG}"
 
-    local blocking_failures passing_workers required_passing_workers
+    local preflight_status reason_code blocking_failures passing_workers required_passing_workers
+    preflight_status="$(jq -r '.status // "blocked"' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
+    reason_code="$(jq -r '.reason_code // "unknown"' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
     blocking_failures="$(jq -r '.blocking_failed_workers // 0' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
     passing_workers="$(jq -r '.passing_workers // 0' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
     required_passing_workers="$(jq -r '.required_passing_workers // 1' "${_RCH_MIRROR_PREFLIGHT_LOG}")"
-    if [[ "${passing_workers}" -lt "${required_passing_workers}" ]]; then
-        rch_fatal "rch source mirror preflight blocked: only ${passing_workers}/${total} workers passed blocking attestation; required ${required_passing_workers}; ${blocking_failures} workers failed. See ${_RCH_MIRROR_PREFLIGHT_LOG}"
+    if [[ "${preflight_status}" != "passed" ]]; then
+        rch_fatal "rch source mirror preflight blocked: ${reason_code}; ${passing_workers}/${total} workers passed blocking attestation; required ${required_passing_workers}; ${blocking_failures} workers failed. See ${_RCH_MIRROR_PREFLIGHT_LOG}"
     fi
 }
 
