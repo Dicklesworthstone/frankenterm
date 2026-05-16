@@ -184,11 +184,26 @@
       "measurement": "atlas_rebuilds_total counter delta",
       "source_bench": "crates/frankenterm-core/benches/atlas_stability.rs",
       "structured_log": "target/criterion/slo-atlas_stability.jsonl",
-      "status": "bench_pending",
+      "status": "retained_run_validated",
       "retained_evidence": {
-        "status": "missing_source_bench",
+        "status": "retained_run_validated",
         "follow_up_bead": "ft-tf6g3.3.10",
-        "reason": "No source bench or retained target-run artifact is present in the checkout as of 2026-05-16."
+        "source_artifact_path": "crates/frankenterm-core/benches/atlas_stability.rs",
+        "source_artifact_sha256": "6789e5c652fa0a1f60137f4d212c32af8902104a5bddfb929b1508f8f6b096ab",
+        "structured_log": "target/criterion/slo-atlas_stability.jsonl",
+        "retained_artifact_path": "docs/attestations/tui/atlas-stability-rq-s10-20260516T073720Z.jsonl",
+        "retained_artifact_sha256": "66a8a0a0db91575236ce36e7173c0a286b98d1f8747064681efbee426f3cda55",
+        "row_count": 25,
+        "remote_cargo_reached": true,
+        "remote_rustc_reached": true,
+        "bench_binary_reached": true,
+        "selected_worker_id": "vmi1293453",
+        "remote_target_dir": "/data/projects/frankenterm/.rch-target-vmi1293453-job-29845053312598077-1778915094206024000-0",
+        "local_target_sync_path": "/tmp/rch-ft-tf6g3-3-10-atlas-target-v2/criterion/slo-atlas_stability.jsonl",
+        "criterion_samples": 10,
+        "criterion_measurement_time_secs": 1,
+        "criterion_time_interval_us": "[93.947, 98.314, 101.74]",
+        "reason": "Remote RCH retained target run passed on vmi1293453 with zero atlas rebuild delta, zero atlas version drift, zero glyph reuploads, and no invariant or pure-resize violations across all retained rows."
       },
       "blocked_by": ["ft-mpc9b.1.1"],
       "owner_bead": "ft-mpc9b.1.1"
@@ -319,6 +334,12 @@
       "date": "2026-05-16",
       "bead": "ft-tf6g3.3.9",
       "note": "RQ-S5 idle GPU now has a Criterion substrate at crates/frankenterm-core/benches/idle_gpu.rs emitting target/criterion/slo-idle_gpu.jsonl. The row is explicitly a scheduler/predicate proxy; retained RCH validation and platform GPU-counter proof remain pending."
+    },
+    {
+      "version": "0.1.7",
+      "date": "2026-05-16",
+      "bead": "ft-tf6g3.3.10",
+      "note": "RQ-S10 atlas stability retained release evidence passed through remote RCH on vmi1293453; retained JSONL shows zero atlas rebuild delta, zero atlas version drift, and zero glyph reuploads for the pure-resize workload."
     }
   ]
 }

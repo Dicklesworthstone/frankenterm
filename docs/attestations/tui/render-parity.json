@@ -188,12 +188,12 @@
   },
   "renderer_slo_retained_evidence": {
     "schema_version": "ft.renderer_slo_retained_evidence.v1",
-    "produced_by_bead": "ft-tf6g3.3.6",
-    "generated_at": "2026-05-16T04:50:01Z",
+    "produced_by_bead": "ft-tf6g3.3.10",
+    "generated_at": "2026-05-16T07:37:24Z",
     "source_catalog_path": "docs/perf/resize-quality-slo.json",
-    "source_catalog_sha256": "aa4d13b6613efff75521c570869bdcf3252f56c5d7904ec5ae360250a5526443",
+    "source_catalog_sha256": "5f97b7b2d5f08dac69bcba4857e8ab2f1de08d5ba2d1ea18e4c61ef6d59cb3ce",
     "closeout_status": "blocked_pending_missing_retained_runs",
-    "summary": "The renderer-SLO umbrella does not yet have five retained target-run proofs. RQ-S13 has retained remote RCH proof; RQ-S1/RQ-S2/RQ-S3/RQ-S5 are substrate-only pending target runs; RQ-S10 still lacks its declared source bench and retained artifact.",
+    "summary": "The renderer-SLO umbrella does not yet have five retained target-run proofs. RQ-S10 and RQ-S13 have retained remote RCH proof; RQ-S1/RQ-S2/RQ-S3/RQ-S5 remain substrate-only pending target runs.",
     "entries": [
       {
         "slo_id": "RQ-S1.resize_fps",
@@ -202,7 +202,7 @@
         "source_artifact_sha256": "7364ac394a0892540263a55e4bece61a7b6218e6c980d620f228b83b73a5ee24",
         "declared_structured_log": "target/criterion/slo-resize_fps.jsonl",
         "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "aa4d13b6613efff75521c570869bdcf3252f56c5d7904ec5ae360250a5526443",
+        "gap_evidence_sha256": "5f97b7b2d5f08dac69bcba4857e8ab2f1de08d5ba2d1ea18e4c61ef6d59cb3ce",
         "follow_up_bead": "ft-tf6g3.3.7"
       },
       {
@@ -230,16 +230,26 @@
         "source_artifact_sha256": "6997ac32a2eb813771c88336ec7158e774d26a1a1703c0c295a7dcd86c0cb2cd",
         "declared_structured_log": "target/criterion/slo-idle_gpu.jsonl",
         "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "aa4d13b6613efff75521c570869bdcf3252f56c5d7904ec5ae360250a5526443",
+        "gap_evidence_sha256": "5f97b7b2d5f08dac69bcba4857e8ab2f1de08d5ba2d1ea18e4c61ef6d59cb3ce",
         "follow_up_bead": "ft-tf6g3.3.9"
       },
       {
         "slo_id": "RQ-S10.atlas_rebuild_count",
-        "status": "missing_source_bench",
-        "declared_source_bench": "crates/frankenterm-core/benches/atlas_stability.rs",
+        "status": "retained_run_validated",
+        "source_artifact_path": "crates/frankenterm-core/benches/atlas_stability.rs",
+        "source_artifact_sha256": "6789e5c652fa0a1f60137f4d212c32af8902104a5bddfb929b1508f8f6b096ab",
         "declared_structured_log": "target/criterion/slo-atlas_stability.jsonl",
-        "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "aa4d13b6613efff75521c570869bdcf3252f56c5d7904ec5ae360250a5526443",
+        "retained_artifact_path": "docs/attestations/tui/atlas-stability-rq-s10-20260516T073720Z.jsonl",
+        "retained_artifact_sha256": "66a8a0a0db91575236ce36e7173c0a286b98d1f8747064681efbee426f3cda55",
+        "row_count": 25,
+        "remote_cargo_reached": true,
+        "remote_rustc_reached": true,
+        "bench_binary_reached": true,
+        "selected_worker_id": "vmi1293453",
+        "remote_target_dir": "/data/projects/frankenterm/.rch-target-vmi1293453-job-29845053312598077-1778915094206024000-0",
+        "criterion_samples": 10,
+        "criterion_measurement_time_secs": 1,
+        "criterion_time_interval_us": "[93.947, 98.314, 101.74]",
         "follow_up_bead": "ft-tf6g3.3.10"
       },
       {
@@ -257,12 +267,15 @@
     ]
   },
   "targeted_validation": {
-    "cargo_status": "not_run_for_recovery_artifact",
-    "reason": "This bead updates machine-readable attestation truth from existing retained artifacts and gap evidence; no source code changed.",
+    "cargo_status": "rch_retained_run_passed",
+    "reason": "RQ-S10 source bench passed remote RCH on vmi1293453 with retained JSONL evidence: 25 rows, all within target, zero atlas rebuild delta, zero atlas version drift, zero glyph reuploads, and no invariant or pure-resize violations.",
     "static_checks": [
+      "rustfmt --edition 2024 --check crates/frankenterm-core/benches/atlas_stability.rs",
       "jq empty docs/attestations/tui/render-parity.json",
-      "jq invariant check for six renderer_slo_retained_evidence entries and exact retained/gap statuses",
-      "git diff --check -- docs/attestations/tui/render-parity.json docs/perf/resize-quality-slo.json"
+      "jq empty docs/perf/resize-quality-slo.json",
+      "jq -s 'length, all(.[]; .claim_id == \"RQ-S10.atlas_rebuild_count\" and .metric_value == 0 and .within_target == true and .runner.rch_worker_id == \"vmi1293453\")' docs/attestations/tui/atlas-stability-rq-s10-20260516T073720Z.jsonl",
+      "env -u CARGO_TARGET_DIR RCH_WORKER=vmi1293453 RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose RCH_QUEUE_WHEN_BUSY=1 RCH_TEST_SLOTS=1 RCH_NO_SELF_HEALING=1 RCH_CANONICAL_PROJECT_ROOT=/data/projects RCH_ALIAS_PROJECT_ROOT=/dp RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=7200 RCH_STEP_TIMEOUT_SECS=3600 rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 RCH_WORKER_ID=vmi1293453 CARGO_TARGET_DIR=/tmp/rch-ft-tf6g3-3-10-atlas-target-v2 cargo bench -p frankenterm-core --bench atlas_stability -- --sample-size 10 --measurement-time 1",
+      "git diff --check -- crates/frankenterm-core/Cargo.toml crates/frankenterm-core/benches/atlas_stability.rs docs/attestations/tui/render-parity.json docs/perf/resize-quality-slo.json docs/perf/resize-quality-slo.md"
     ]
   },
   "source_documents": [
@@ -272,6 +285,8 @@
     "docs/attestations/tui/render-parity-gpu.json",
     "docs/attestations/tui/topology-parity.json",
     "tests/e2e/logs/ssim_parity_release_gate_20260516T024353Z.proof-ledger.jsonl",
+    "docs/attestations/tui/atlas-stability-rq-s10-20260516T073720Z.jsonl",
+    "crates/frankenterm-core/benches/atlas_stability.rs",
     "crates/frankenterm-core/src/tui_parity_oracle.rs",
     "crates/frankenterm-core/tests/tui_parity_oracle.rs",
     "scripts/test-gpu-harness.sh"

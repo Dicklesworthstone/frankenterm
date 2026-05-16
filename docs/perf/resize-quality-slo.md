@@ -69,7 +69,7 @@ machine-readable JSON, the README, and the attestation bundle.
 | RQ-S7 | Battery drain (24h idle, M2) | ≤5% on a healthy battery | manual lab — `docs/perf/lab/battery_drain_24h.sh` | ft-mpc9b.5.1 | bench_pending |
 | RQ-S8 | Frame skip rate (steady state) | ≥99% frames skipped on idle | `crates/frankenterm-core/benches/steady_state.rs` | ft-mpc9b.5.1 | bench_pending |
 | RQ-S9 | Reflow latency | p95 < 5ms for 1000-line scrollback, 80→200 cols | `crates/frankenterm-core/benches/reflow.rs` | ft-mpc9b.1.2 | dependency_bound (wa-1u90p.1.3) |
-| RQ-S10 | Atlas rebuild count | 0 on pure window-size resize | `crates/frankenterm-core/benches/atlas_stability.rs` | ft-mpc9b.1.1 | bench_pending |
+| RQ-S10 | Atlas rebuild count | 0 on pure window-size resize | `crates/frankenterm-core/benches/atlas_stability.rs` | ft-tf6g3.3.10 | retained_run_validated |
 | RQ-S11 | Snap-back delta (Draft → Standard) | SSIM ≥ 0.999 | `tests/renderer_golden/scenarios` | ft-mpc9b.2 | bench_pending |
 | RQ-S12 | Floating-pane overhead | < 0.5ms additional per pane vs tiled | `crates/frankenterm-core/benches/compositor_layers.rs` | ft-mpc9b.4.1 | bench_pending |
 | RQ-S13 | SSIM parity oracle corpus | SSIM ≥ 0.99, L∞ ≤ 8, changed pixels ≤ 0.1% | `crates/frankenterm-gui/tests/ssim_parity.rs` | ft-tf6g3.3.3 | retained_run_validated |
@@ -83,11 +83,10 @@ disagree, the JSON wins.
 
 `docs/attestations/tui/render-parity.json` now carries the
 `renderer_slo_retained_evidence` ledger used by the G18 umbrella. As of
-2026-05-16, the umbrella is still blocked: RQ-S13 has retained remote RCH
-proof, RQ-S1/RQ-S2/RQ-S3/RQ-S5 are substrate-only pending target runs, and
-RQ-S10 does not yet have the declared source bench or retained target-run
-artifact. The missing target-run work is split into
-`ft-tf6g3.3.7` through `ft-tf6g3.3.10`.
+2026-05-16, the umbrella is still blocked: RQ-S10 and RQ-S13 have retained
+remote RCH proof, while RQ-S1/RQ-S2/RQ-S3/RQ-S5 are substrate-only pending
+target runs. The remaining missing target-run work is split across
+`ft-tf6g3.3.7` through `ft-tf6g3.3.9`.
 
 ## Structured-log contract
 
