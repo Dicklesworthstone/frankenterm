@@ -603,6 +603,7 @@ run_rch() {
 }
 
 FAKE_DIAGNOSE_WORKER="worker-b"
+FAKE_SELECTED_WORKER_SYNC_RC=0
 run_rch_logged_with_timeout() {
     local timeout_secs="$1"
     local output_file="$2"
@@ -626,7 +627,20 @@ run_rch_logged_with_timeout() {
               },
               timeout_secs: ($timeout_secs | tonumber)
             }
-          }' >"${output_file}"
+        }' >"${output_file}"
+        return 0
+        ;;
+      *"exec -- env CARGO_TARGET_DIR="*" cargo check --help"*)
+        if [[ "${FAKE_SELECTED_WORKER_SYNC_RC}" -ne 0 ]]; then
+          printf 'selected-worker source materialization smoke failed\n' >"${output_file}"
+          return "${FAKE_SELECTED_WORKER_SYNC_RC}"
+        fi
+        {
+          printf '[RCH] remote %s: selected-worker source materialization\n' "${FAKE_DIAGNOSE_WORKER}"
+          printf 'Sync complete: fixture\n'
+          printf 'selected-worker source materialized in /data/projects/frankenterm\n'
+          printf 'Remote command finished: exit=0 in 1ms\n'
+        } >"${output_file}"
         return 0
         ;;
       *)
@@ -796,6 +810,7 @@ run_selected_worker_mirror_fixture() {
       {
         export RCH_MIRROR_ATTEST_WORKERS_JSON="${POOL_WORKERS_JSON}"
         export RCH_MIRROR_ATTEST_SSH_BIN="${FAKE_SSH}"
+        export FAKE_SELECTED_WORKER_SYNC_RC=0
         export FAKE_RCH_MIRROR_MODE="success"
         export FAKE_RCH_MIRROR_MODE_WORKER_B="${mode_b}"
         export FAKE_RCH_MIRROR_REMOTE_HEAD="${HEAD_SHA}"
@@ -836,6 +851,48 @@ run_selected_worker_mirror_fixture "selected_worker_preflight_passes_fixture" \
 
 run_selected_worker_mirror_fixture "selected_worker_preflight_missing_blocks_fixture" \
     "missing_file" "1"
+
+run_selected_worker_sync_fixture() {
+    local name="$1"
+    local sync_rc="$2"
+    local expected_rc="$3"
+    local output_file="${LOG_DIR}/${name}.log"
+    local sync_file="${LOG_DIR}/${name}.selected_worker_sync.log"
+    local rc
+
+    set +e
+    (
+        export RCH_MIRROR_ATTEST_WORKERS_JSON="${POOL_WORKERS_JSON}"
+        export RCH_MIRROR_ATTEST_SSH_BIN="${FAKE_SSH}"
+        export FAKE_SELECTED_WORKER_SYNC_RC="${sync_rc}"
+        export FAKE_RCH_MIRROR_MODE="success"
+        export FAKE_RCH_MIRROR_REMOTE_HEAD="${HEAD_SHA}"
+        export FAKE_RCH_MIRROR_REPO_ROOT="${ROOT_DIR}"
+        RCH_SELECTED_WORKER_MIRROR_PREFLIGHT=1
+        RCH_MIRROR_REQUIRED_PATHS="Cargo.toml,crates/frankenterm-core/src/lib.rs"
+        RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS=0
+        rch_attest_selected_worker_before_cargo "${output_file}" \
+          env CARGO_TARGET_DIR=target/rch-fixture cargo test -p frankenterm-gui terminal_state
+    ) >"${LOG_DIR}/${name}.stdout" 2>"${LOG_DIR}/${name}.stderr"
+    rc=$?
+    set -e
+
+    if [[ "${rc}" -ne "${expected_rc}" ]]; then
+        record_result "${name}" "false" "expected rc ${expected_rc}, got ${rc}"
+        return
+    fi
+
+    if [[ "${expected_rc}" -eq 0 ]]; then
+        record_result "${name}" "true"
+    elif [[ -f "${sync_file}" ]] && grep -Fq "selected-worker source materialization smoke failed" "${sync_file}"; then
+        record_result "${name}" "true"
+    else
+        record_result "${name}" "false" "selected-worker sync failure did not retain expected log"
+    fi
+}
+
+run_selected_worker_sync_fixture "selected_worker_sync_failure_blocks_fixture" \
+    "42" "1"
 
 jq -cn \
   --arg test "rch_worker_mirror_attestation" \

@@ -53,6 +53,7 @@ RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
 RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS="${RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS:-0}"
 RCH_MIRROR_MIN_PASSING_WORKERS="${RCH_MIRROR_MIN_PASSING_WORKERS:-1}"
 RCH_SELECTED_WORKER_MIRROR_PREFLIGHT="${RCH_SELECTED_WORKER_MIRROR_PREFLIGHT:-auto}"
+RCH_SELECTED_WORKER_SYNC_TIMEOUT_SECS="${RCH_SELECTED_WORKER_SYNC_TIMEOUT_SECS:-${RCH_SMOKE_TIMEOUT_SECS}}"
 RCH_GITHUB_ACTIONS_LOCAL_CARGO="${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-0}"
 
 # Populated by rch_init().
@@ -977,6 +978,7 @@ run_rch_logged_with_timeout() {
     local passthrough_key
     for passthrough_key in \
         RCH_WORKER \
+        RCH_REQUIRE_REMOTE \
         RCH_CANONICAL_PROJECT_ROOT \
         RCH_ALIAS_PROJECT_ROOT \
         RCH_DAEMON_RESPONSE_TIMEOUT_SECS \
@@ -1422,8 +1424,9 @@ rch_attest_selected_worker_before_cargo() {
     local attest_script="${_RCH_REPO_ROOT}/scripts/attest_rch_worker_mirror.sh"
     [[ -x "${attest_script}" ]] || rch_fatal "mirror attestation script is not executable: ${attest_script}"
 
-    local diagnose_log mirror_log diagnose_rc selected_worker would_intercept selection_reason bead_arg=()
+    local diagnose_log sync_log mirror_log diagnose_rc sync_rc selected_worker would_intercept selection_reason bead_arg=()
     diagnose_log="${output_file%.log}.rch_diagnose.json"
+    sync_log="${output_file%.log}.selected_worker_sync.log"
     mirror_log="${output_file%.log}.selected_worker_mirror.json"
 
     set +e
@@ -1455,6 +1458,27 @@ rch_attest_selected_worker_before_cargo() {
     if [[ -n "${RCH_WORKER:-}" && "${selected_worker}" != "${RCH_WORKER}" ]]; then
         rch_fatal "rch selected-worker diagnose chose ${selected_worker}, but RCH_WORKER=${RCH_WORKER}; refusing to prove on a different worker. See ${diagnose_log}"
     fi
+
+    local selected_worker_sync_target_dir
+    selected_worker_sync_target_dir="${_RCH_SMOKE_TARGET_DIR}-${selected_worker}-selected-worker-sync"
+    set +e
+    RCH_WORKER="${selected_worker}" \
+        run_rch_logged_with_timeout "${RCH_SELECTED_WORKER_SYNC_TIMEOUT_SECS}" "${sync_log}" \
+        exec -- env CARGO_TARGET_DIR="${selected_worker_sync_target_dir}" cargo check --help
+    sync_rc=$?
+    set -e
+    rch_write_meta_json "${sync_log}" "${sync_rc}"
+    rch_emit_proof_ledger_entry \
+        "RCH_WORKER=${selected_worker} rch exec -- env CARGO_TARGET_DIR=${selected_worker_sync_target_dir} cargo check --help" \
+        "${sync_log}" \
+        "${sync_rc}" \
+        "not_applicable" \
+        "not_applicable" \
+        "selected-worker source materialization sync before run_rch_cargo_logged material command"
+    if [[ "${sync_rc}" -ne 0 ]]; then
+        rch_fatal "rch selected-worker source materialization failed for ${selected_worker}. See ${sync_log}"
+    fi
+    check_rch_fallback "${sync_log}"
 
     if [[ -n "${RCH_PROOF_LEDGER_BEAD_ID:-}" ]]; then
         bead_arg=("--bead" "${RCH_PROOF_LEDGER_BEAD_ID}")
