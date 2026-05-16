@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.fixture_manifest.v1",
+  "schema_path": "docs/json-schema/ft-operating-envelope.json",
+  "contract_doc": "docs/robot-contracts/operating-envelope.md",
+  "valid_fixtures": [
+    {
+      "path": "fixtures/operating-envelope/valid/healthy.json",
+      "coverage": [
+        "capacity.green",
+        "rch.remote_cargo_reached_true",
+        "agent_mail.available",
+        "git.clean_for_scope"
+      ]
+    },
+    {
+      "path": "fixtures/operating-envelope/valid/agent-mail-unavailable.json",
+      "coverage": [
+        "agent_mail.unavailable_after_retry",
+        "fallback.beads_only"
+      ]
+    },
+    {
+      "path": "fixtures/operating-envelope/valid/rch-no-worker.json",
+      "coverage": [
+        "rch.no_workers_passed_health",
+        "rch.remote_cargo_reached_false"
+      ]
+    },
+    {
+      "path": "fixtures/operating-envelope/valid/rch-topology-failure.json",
+      "coverage": [
+        "rch.topology_preflight_failed",
+        "rch.remote_cargo_reached_false"
+      ]
+    },
+    {
+      "path": "fixtures/operating-envelope/valid/dirty-overlap.json",
+      "coverage": [
+        "dirty_overlap.present",
+        "assignee_overlap.active"
+      ]
+    },
+    {
+      "path": "fixtures/operating-envelope/valid/target-hardware-skipped.json",
+      "coverage": [
+        "target_hardware.skipped_not_proven",
+        "capacity.target_class_unproven"
+      ]
+    }
+  ],
+  "invalid_fixtures": [
+    {
+      "path": "fixtures/operating-envelope/invalid/missing-field.json",
+      "expected_failure": "missing required decision field"
+    },
+    {
+      "path": "fixtures/operating-envelope/invalid/missing-contract-id.json",
+      "expected_failure": "missing required contract_id field"
+    },
+    {
+      "path": "fixtures/operating-envelope/invalid/unknown-version.json",
+      "expected_failure": "schema_version and contract_id do not match v1"
+    },
+    {
+      "path": "fixtures/operating-envelope/invalid/malformed-path.json",
+      "expected_failure": "artifact_paths contains an absolute or parent-relative path"
+    }
+  ],
+  "static_checks": [
+    "jq empty docs/json-schema/ft-operating-envelope.json fixtures/operating-envelope/manifest.json fixtures/operating-envelope/valid/*.json fixtures/operating-envelope/invalid/*.json",
+    "jq -s 'all(.[]; .schema_version == 1 and .contract_id == \"ft.operating_envelope.v1\" and .raw_pane_content_stored == false)' fixtures/operating-envelope/valid/*.json",
+    "jq -s 'all(.[]; .side_effect_policy.dry_run_only == true and .side_effect_policy.local_cargo_proof_allowed == false and .side_effect_policy.service_mutation_allowed == false)' fixtures/operating-envelope/valid/*.json"
+  ]
+}

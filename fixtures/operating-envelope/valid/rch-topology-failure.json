@@ -1,0 +1,323 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778912280000,
+  "envelope_id": "envelope-rch-topology-failure",
+  "objective_id": "objective-rch-topology-failure",
+  "controller_mode": "dry_run",
+  "target_class": {
+    "profile": "target_64_core_256g",
+    "requested_agent_count": 64,
+    "requested_cpu_cores": 64,
+    "requested_memory_gib": 256,
+    "proof_state": "unavailable",
+    "reason_codes": [
+      "target_hardware.proof_unavailable"
+    ]
+  },
+  "input_domains": {
+    "capacity_resource": {
+      "source_id": "capacity-stale",
+      "source_kind": "capacity_resource",
+      "state": "stale",
+      "freshness_state": "stale",
+      "collected_at_ms": 1778911000000,
+      "freshness_ms": 1280000,
+      "command_or_api": "resource cockpit retained artifact",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Stale capacity lowers the envelope."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "capacity.stale",
+        "fail_closed.lower_stale"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": "Capacity snapshot is outside the freshness budget.",
+      "evidence": [
+        {
+          "evidence_id": "evidence-capacity-stale",
+          "category": "capacity_pressure",
+          "state": "stale",
+          "subject": "resource cockpit",
+          "reason_codes": [
+            "capacity.stale"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-topology-failure.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-topology-failure.json"
+      ]
+    },
+    "rch": {
+      "source_id": "rch-topology-failure",
+      "source_kind": "rch",
+      "state": "blocked",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912280000,
+      "freshness_ms": 0,
+      "command_or_api": "rch diagnose --json --dry-run",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "Topology failure is retained without build logs."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "rch.topology_preflight_failed",
+        "rch.remote_cargo_reached_false",
+        "local_cargo.forbidden"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": "RCH topology preflight failed before Cargo was reached.",
+      "evidence": [
+        {
+          "evidence_id": "evidence-rch-topology-failed",
+          "category": "rch_topology_preflight",
+          "state": "fail",
+          "subject": "topology preflight",
+          "reason_codes": [
+            "rch.topology_preflight_failed"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-topology-failure.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-topology-failure.json"
+      ]
+    },
+    "beads": {
+      "source_id": "beads-ready-but-proof-blocked",
+      "source_kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912280000,
+      "freshness_ms": 0,
+      "command_or_api": "br ready --json",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Ready work exists but proof substrate is blocked."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_available",
+        "beads.do_not_claim_until_proof_available"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-beads-proof-blocked",
+          "category": "beads_ready_queue",
+          "state": "warn",
+          "subject": "ready queue",
+          "reason_codes": [
+            "beads.do_not_claim_until_proof_available"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-topology-failure.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-topology-failure.json"
+      ]
+    },
+    "agent_mail": {
+      "source_id": "agent-mail-healthy",
+      "source_kind": "agent_mail",
+      "state": "available",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912280000,
+      "freshness_ms": 1000,
+      "command_or_api": "fetch_inbox",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "Mailbox summary only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "agent_mail.available"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-agent-mail-healthy",
+          "category": "agent_mail_availability",
+          "state": "pass",
+          "subject": "fetch_inbox",
+          "reason_codes": [
+            "agent_mail.available"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-topology-failure.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-topology-failure.json"
+      ]
+    },
+    "git": {
+      "source_id": "git-clean-for-proof",
+      "source_kind": "git",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912280000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --untracked-files=all",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "No dirty overlap."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.clean_for_scope",
+        "dirty_overlap.none"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-git-clean-proof",
+          "category": "dirty_path_overlap",
+          "state": "pass",
+          "subject": "proof lane paths",
+          "reason_codes": [
+            "dirty_overlap.none"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/rch-topology-failure.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/rch-topology-failure.json"
+      ]
+    }
+  },
+  "decision": {
+    "decision_id": "decision-rch-topology-failure",
+    "outcome": "block",
+    "envelope_tier": "black",
+    "confidence": "unavailable",
+    "target_hardware_state": "unavailable",
+    "rch_proof_state": "unavailable",
+    "agent_mail_state": "available",
+    "dirty_tree_state": "clean",
+    "max_parallel_agents": 0,
+    "max_parallel_proofs": 0,
+    "reason_codes": [
+      "rch.topology_preflight_failed",
+      "rch.remote_cargo_reached_false",
+      "fail_closed.block_contradiction"
+    ]
+  },
+  "admission_windows": [
+    {
+      "window_id": "window-rch-topology-blocked",
+      "window_class": "blocked",
+      "starts_at_ms": null,
+      "expires_at_ms": null,
+      "max_parallel_agents": 0,
+      "max_parallel_proofs": 0,
+      "permitted_action_classes": [
+        "read_status",
+        "add_beads_comment",
+        "wait"
+      ],
+      "forbidden_action_classes": [
+        "claim_bead",
+        "edit_files",
+        "run_rch_proof",
+        "local_cargo_proof",
+        "raw_pane_content",
+        "pane_mutation",
+        "service_mutation",
+        "service_restart",
+        "destructive_filesystem",
+        "destructive_git",
+        "agent_mail_repair",
+        "build_cancellation",
+        "rch_daemon_restart",
+        "worker_drain",
+        "raw_pane_content_capture"
+      ],
+      "source_ids": [
+        "rch-topology-failure",
+        "capacity-stale"
+      ],
+      "reason_codes": [
+        "envelope.block",
+        "rch.topology_preflight_failed"
+      ]
+    }
+  ],
+  "fail_closed_policy": {
+    "missing_signal_behavior": "lower_envelope",
+    "stale_signal_behavior": "lower_envelope",
+    "contradictory_signal_behavior": "block",
+    "privacy_redaction_behavior": "lower_envelope",
+    "target_hardware_gap_behavior": "defer_target_class_claim",
+    "reason_codes": [
+      "fail_closed.block_contradiction",
+      "proof.no_local_cargo_fallback"
+    ]
+  },
+  "side_effect_policy": {
+    "dry_run_only": true,
+    "raw_pane_content_allowed": false,
+    "pane_mutation_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "redaction_policy": {
+    "policy_id": "ft.redaction.operating_envelope.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Topology diagnostics are reason-coded only."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "reason_codes": [
+    "envelope.block",
+    "rch.topology_preflight_failed"
+  ],
+  "artifact_paths": [
+    "docs/json-schema/ft-operating-envelope.json",
+    "fixtures/operating-envelope/valid/rch-topology-failure.json"
+  ]
+}

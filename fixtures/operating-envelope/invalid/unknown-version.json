@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "contract_id": "ft.operating_envelope.v2",
+  "generated_at_ms": 1778912520000,
+  "envelope_id": "envelope-invalid-unknown-version",
+  "objective_id": "objective-invalid-unknown-version",
+  "controller_mode": "dry_run",
+  "raw_pane_content_stored": false,
+  "reason_codes": [
+    "invalid.unknown_version"
+  ],
+  "artifact_paths": [
+    "fixtures/operating-envelope/invalid/unknown-version.json"
+  ]
+}

@@ -1,0 +1,323 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778912160000,
+  "envelope_id": "envelope-agent-mail-unavailable",
+  "objective_id": "objective-agent-mail-unavailable",
+  "controller_mode": "dry_run",
+  "target_class": {
+    "profile": "developer_laptop",
+    "requested_agent_count": 4,
+    "requested_cpu_cores": 8,
+    "requested_memory_gib": 32,
+    "proof_state": "not_required",
+    "reason_codes": [
+      "target_hardware.not_required"
+    ]
+  },
+  "input_domains": {
+    "capacity_resource": {
+      "source_id": "capacity-yellow",
+      "source_kind": "capacity_resource",
+      "state": "available",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912160000,
+      "freshness_ms": 1000,
+      "command_or_api": "resource cockpit retained artifact",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Capacity source remains available."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "capacity.yellow",
+        "capacity.degraded_admit"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-capacity-yellow",
+          "category": "capacity_pressure",
+          "state": "warn",
+          "subject": "resource cockpit",
+          "reason_codes": [
+            "capacity.yellow"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+      ]
+    },
+    "rch": {
+      "source_id": "rch-static-only",
+      "source_kind": "rch",
+      "state": "available",
+      "freshness_state": "within_budget",
+      "collected_at_ms": 1778912160000,
+      "freshness_ms": 2000,
+      "command_or_api": "rch diagnose --dry-run",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "RCH was checked without running Cargo."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "rch.dry_run_available",
+        "rch.remote_cargo_reached_false"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-rch-dry-run",
+          "category": "rch_cargo_reached",
+          "state": "not_applicable",
+          "subject": "dry-run diagnosis",
+          "reason_codes": [
+            "rch.remote_cargo_reached_false"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+      ]
+    },
+    "beads": {
+      "source_id": "beads-fallback-ready",
+      "source_kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912160000,
+      "freshness_ms": 0,
+      "command_or_api": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Fallback Beads snapshot remains usable."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_available",
+        "fallback.beads_only"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-beads-fallback",
+          "category": "beads_ready_queue",
+          "state": "pass",
+          "subject": "fallback snapshot",
+          "reason_codes": [
+            "fallback.beads_only"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+      ]
+    },
+    "agent_mail": {
+      "source_id": "agent-mail-red",
+      "source_kind": "agent_mail",
+      "state": "unavailable",
+      "freshness_state": "not_collected",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "macro_start_session",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "Only Agent Mail error class is retained."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "agent_mail.database_error",
+        "agent_mail.unavailable_after_retry"
+      ],
+      "unavailable_reason": "Agent Mail returned a database error after the allowed retry.",
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-agent-mail-unavailable",
+          "category": "agent_mail_availability",
+          "state": "unavailable",
+          "subject": "macro_start_session",
+          "reason_codes": [
+            "agent_mail.unavailable_after_retry"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+      ]
+    },
+    "git": {
+      "source_id": "git-clean-for-scope",
+      "source_kind": "git",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778912160000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --untracked-files=all",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Only dirty-path classes are retained."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.clean_for_scope",
+        "dirty_overlap.none"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "evidence": [
+        {
+          "evidence_id": "evidence-git-clean-for-scope",
+          "category": "dirty_path_overlap",
+          "state": "pass",
+          "subject": "owned docs and fixtures",
+          "reason_codes": [
+            "dirty_overlap.none"
+          ],
+          "artifact_paths": [
+            "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+      ]
+    }
+  },
+  "decision": {
+    "decision_id": "decision-agent-mail-unavailable",
+    "outcome": "degrade",
+    "envelope_tier": "yellow",
+    "confidence": "mixed",
+    "target_hardware_state": "not_required",
+    "rch_proof_state": "not_required",
+    "agent_mail_state": "unavailable",
+    "dirty_tree_state": "clean",
+    "max_parallel_agents": 4,
+    "max_parallel_proofs": 0,
+    "reason_codes": [
+      "agent_mail.unavailable_after_retry",
+      "fallback.beads_only",
+      "envelope.degrade"
+    ]
+  },
+  "admission_windows": [
+    {
+      "window_id": "window-agent-mail-fallback",
+      "window_class": "static_only",
+      "starts_at_ms": 1778912160000,
+      "expires_at_ms": 1778912460000,
+      "max_parallel_agents": 4,
+      "max_parallel_proofs": 0,
+      "permitted_action_classes": [
+        "read_status",
+        "add_beads_comment",
+        "run_static_check"
+      ],
+      "forbidden_action_classes": [
+        "claim_bead",
+        "run_rch_proof",
+        "local_cargo_proof",
+        "raw_pane_content",
+        "pane_mutation",
+        "service_mutation",
+        "service_restart",
+        "destructive_filesystem",
+        "destructive_git",
+        "agent_mail_repair",
+        "build_cancellation",
+        "rch_daemon_restart",
+        "worker_drain",
+        "raw_pane_content_capture"
+      ],
+      "source_ids": [
+        "agent-mail-red",
+        "beads-fallback-ready",
+        "git-clean-for-scope"
+      ],
+      "reason_codes": [
+        "fallback.beads_only",
+        "proof.static_only"
+      ]
+    }
+  ],
+  "fail_closed_policy": {
+    "missing_signal_behavior": "lower_envelope",
+    "stale_signal_behavior": "lower_envelope",
+    "contradictory_signal_behavior": "block",
+    "privacy_redaction_behavior": "lower_envelope",
+    "target_hardware_gap_behavior": "not_applicable",
+    "reason_codes": [
+      "fail_closed.lower_missing",
+      "agent_mail.no_repair_action"
+    ]
+  },
+  "side_effect_policy": {
+    "dry_run_only": true,
+    "raw_pane_content_allowed": false,
+    "pane_mutation_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "redaction_policy": {
+    "policy_id": "ft.redaction.operating_envelope.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Agent Mail bodies are not retained."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "reason_codes": [
+    "envelope.degrade",
+    "agent_mail.unavailable_after_retry"
+  ],
+  "artifact_paths": [
+    "docs/json-schema/ft-operating-envelope.json",
+    "fixtures/operating-envelope/valid/agent-mail-unavailable.json"
+  ]
+}

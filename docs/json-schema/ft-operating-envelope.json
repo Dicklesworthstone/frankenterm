@@ -1,0 +1,754 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-operating-envelope.json",
+  "title": "FrankenTerm Swarm Operating Envelope",
+  "description": "Versioned read-only contract for composing Beads, Agent Mail, RCH, git, robot, and capacity signals into fail-closed swarm admission windows.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "envelope_id",
+    "objective_id",
+    "controller_mode",
+    "target_class",
+    "input_domains",
+    "decision",
+    "admission_windows",
+    "fail_closed_policy",
+    "side_effect_policy",
+    "redaction_policy",
+    "raw_pane_content_stored",
+    "reason_codes",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.operating_envelope.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "envelope_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "objective_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "controller_mode": {
+      "type": "string",
+      "enum": [
+        "dry_run",
+        "admission_preview",
+        "attestation_preview"
+      ]
+    },
+    "target_class": {
+      "$ref": "#/$defs/target_class"
+    },
+    "input_domains": {
+      "$ref": "#/$defs/input_domains"
+    },
+    "decision": {
+      "$ref": "#/$defs/envelope_decision"
+    },
+    "admission_windows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/admission_window"
+      }
+    },
+    "fail_closed_policy": {
+      "$ref": "#/$defs/fail_closed_policy"
+    },
+    "side_effect_policy": {
+      "$ref": "#/$defs/side_effect_policy"
+    },
+    "redaction_policy": {
+      "$ref": "#/$defs/redaction_policy"
+    },
+    "raw_pane_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "reason_codes": {
+      "$ref": "#/$defs/reason_codes"
+    },
+    "artifact_paths": {
+      "$ref": "#/$defs/repo_paths"
+    }
+  },
+  "$defs": {
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+"
+    },
+    "repo_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/repo_path"
+      }
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+      }
+    },
+    "target_class": {
+      "type": "object",
+      "required": [
+        "profile",
+        "requested_agent_count",
+        "requested_cpu_cores",
+        "requested_memory_gib",
+        "proof_state",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": [
+            "developer_laptop",
+            "target_64_core_256g",
+            "fixture"
+          ]
+        },
+        "requested_agent_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "requested_cpu_cores": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "requested_memory_gib": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "proof_state": {
+          "$ref": "#/$defs/proof_state"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        }
+      }
+    },
+    "input_domains": {
+      "type": "object",
+      "required": [
+        "capacity_resource",
+        "rch",
+        "beads",
+        "agent_mail",
+        "git"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "capacity_resource": {
+          "$ref": "#/$defs/source_snapshot"
+        },
+        "rch": {
+          "$ref": "#/$defs/source_snapshot"
+        },
+        "beads": {
+          "$ref": "#/$defs/source_snapshot"
+        },
+        "agent_mail": {
+          "$ref": "#/$defs/source_snapshot"
+        },
+        "git": {
+          "$ref": "#/$defs/source_snapshot"
+        },
+        "robot_inventory": {
+          "$ref": "#/$defs/source_snapshot"
+        }
+      }
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "capacity_resource",
+        "rch",
+        "beads",
+        "agent_mail",
+        "git",
+        "robot_inventory",
+        "blocker_radar",
+        "manual",
+        "fixture"
+      ]
+    },
+    "source_state": {
+      "type": "string",
+      "enum": [
+        "available",
+        "degraded",
+        "unavailable",
+        "stale",
+        "blocked",
+        "not_collected"
+      ]
+    },
+    "freshness_state": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "within_budget",
+        "stale",
+        "unknown",
+        "not_collected"
+      ]
+    },
+    "evidence_level": {
+      "type": "string",
+      "enum": [
+        "live_command",
+        "retained_artifact",
+        "fixture",
+        "manual_note",
+        "not_collected"
+      ]
+    },
+    "proof_state": {
+      "type": "string",
+      "enum": [
+        "measured",
+        "simulated",
+        "stale",
+        "unavailable",
+        "skipped_not_proven",
+        "not_required"
+      ]
+    },
+    "redaction_posture": {
+      "type": "object",
+      "required": [
+        "pane_content",
+        "secret_material",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pane_content": {
+          "type": "string",
+          "enum": [
+            "not_collected",
+            "redacted",
+            "raw_forbidden",
+            "not_applicable"
+          ]
+        },
+        "secret_material": {
+          "type": "string",
+          "enum": [
+            "not_collected",
+            "redacted",
+            "raw_forbidden",
+            "not_applicable"
+          ]
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "source_kind",
+        "state",
+        "freshness_state",
+        "collected_at_ms",
+        "freshness_ms",
+        "command_or_api",
+        "evidence_level",
+        "redacted",
+        "redaction_posture",
+        "raw_pane_content_stored",
+        "reason_codes",
+        "unavailable_reason",
+        "degraded_reason",
+        "evidence",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_kind": {
+          "$ref": "#/$defs/source_kind"
+        },
+        "state": {
+          "$ref": "#/$defs/source_state"
+        },
+        "freshness_state": {
+          "$ref": "#/$defs/freshness_state"
+        },
+        "collected_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "freshness_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "command_or_api": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_level": {
+          "$ref": "#/$defs/evidence_level"
+        },
+        "redacted": {
+          "type": "boolean",
+          "const": true
+        },
+        "redaction_posture": {
+          "$ref": "#/$defs/redaction_posture"
+        },
+        "raw_pane_content_stored": {
+          "type": "boolean",
+          "const": false
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "degraded_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/evidence_item"
+          }
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/repo_paths"
+        }
+      }
+    },
+    "evidence_category": {
+      "type": "string",
+      "enum": [
+        "capacity_pressure",
+        "target_hardware",
+        "rch_worker_selection",
+        "rch_active_project_exclusion",
+        "rch_topology_preflight",
+        "rch_cargo_reached",
+        "beads_ready_queue",
+        "beads_blocked_queue",
+        "beads_in_progress",
+        "beads_stale_candidate",
+        "agent_mail_availability",
+        "git_dirty_tree",
+        "git_untracked_paths",
+        "deletion_risk",
+        "dirty_path_overlap",
+        "robot_inventory",
+        "redaction_posture",
+        "manual_note"
+      ]
+    },
+    "evidence_state": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "warn",
+        "fail",
+        "blocked",
+        "unavailable",
+        "stale",
+        "unknown",
+        "not_applicable"
+      ]
+    },
+    "evidence_item": {
+      "type": "object",
+      "required": [
+        "evidence_id",
+        "category",
+        "state",
+        "subject",
+        "reason_codes",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "$ref": "#/$defs/evidence_category"
+        },
+        "state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/repo_paths"
+        }
+      }
+    },
+    "envelope_decision": {
+      "type": "object",
+      "required": [
+        "decision_id",
+        "outcome",
+        "envelope_tier",
+        "confidence",
+        "target_hardware_state",
+        "rch_proof_state",
+        "agent_mail_state",
+        "dirty_tree_state",
+        "max_parallel_agents",
+        "max_parallel_proofs",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "decision_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "admit",
+            "defer",
+            "degrade",
+            "shed",
+            "block",
+            "wait"
+          ]
+        },
+        "envelope_tier": {
+          "type": "string",
+          "enum": [
+            "green",
+            "yellow",
+            "orange",
+            "red",
+            "black",
+            "unknown"
+          ]
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "proven",
+            "measured",
+            "mixed",
+            "stale",
+            "unavailable"
+          ]
+        },
+        "target_hardware_state": {
+          "$ref": "#/$defs/proof_state"
+        },
+        "rch_proof_state": {
+          "$ref": "#/$defs/proof_state"
+        },
+        "agent_mail_state": {
+          "$ref": "#/$defs/source_state"
+        },
+        "dirty_tree_state": {
+          "type": "string",
+          "enum": [
+            "clean",
+            "dirty_non_overlap",
+            "dirty_overlap",
+            "unknown"
+          ]
+        },
+        "max_parallel_agents": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_parallel_proofs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        }
+      }
+    },
+    "admission_window": {
+      "type": "object",
+      "required": [
+        "window_id",
+        "window_class",
+        "starts_at_ms",
+        "expires_at_ms",
+        "max_parallel_agents",
+        "max_parallel_proofs",
+        "permitted_action_classes",
+        "forbidden_action_classes",
+        "source_ids",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "window_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "window_class": {
+          "type": "string",
+          "enum": [
+            "open",
+            "read_only",
+            "static_only",
+            "rch_proof_allowed",
+            "claim_allowed",
+            "defer",
+            "wait",
+            "blocked"
+          ]
+        },
+        "starts_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "expires_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_parallel_agents": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_parallel_proofs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "permitted_action_classes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/action_class"
+          }
+        },
+        "forbidden_action_classes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/action_class"
+          }
+        },
+        "source_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        }
+      }
+    },
+    "action_class": {
+      "type": "string",
+      "enum": [
+        "read_status",
+        "claim_bead",
+        "add_beads_comment",
+        "create_bead",
+        "edit_files",
+        "run_static_check",
+        "run_rch_proof",
+        "request_approval",
+        "wait",
+        "agent_mail_repair",
+        "build_cancellation",
+        "rch_daemon_restart",
+        "worker_drain",
+        "local_cargo_proof",
+        "raw_pane_content",
+        "raw_pane_content_capture",
+        "pane_mutation",
+        "service_mutation",
+        "service_restart",
+        "destructive_filesystem",
+        "destructive_git"
+      ]
+    },
+    "fail_closed_policy": {
+      "type": "object",
+      "required": [
+        "missing_signal_behavior",
+        "stale_signal_behavior",
+        "contradictory_signal_behavior",
+        "privacy_redaction_behavior",
+        "target_hardware_gap_behavior",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "missing_signal_behavior": {
+          "type": "string",
+          "enum": [
+            "lower_envelope",
+            "block"
+          ]
+        },
+        "stale_signal_behavior": {
+          "type": "string",
+          "enum": [
+            "lower_envelope",
+            "block"
+          ]
+        },
+        "contradictory_signal_behavior": {
+          "type": "string",
+          "enum": [
+            "lower_envelope",
+            "block"
+          ]
+        },
+        "privacy_redaction_behavior": {
+          "type": "string",
+          "enum": [
+            "lower_envelope",
+            "block",
+            "not_applicable"
+          ]
+        },
+        "target_hardware_gap_behavior": {
+          "type": "string",
+          "enum": [
+            "defer_target_class_claim",
+            "lower_envelope",
+            "not_applicable"
+          ]
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/reason_codes"
+        }
+      }
+    },
+    "side_effect_policy": {
+      "type": "object",
+      "required": [
+        "dry_run_only",
+        "raw_pane_content_allowed",
+        "pane_mutation_allowed",
+        "service_mutation_allowed",
+        "destructive_actions_allowed",
+        "local_cargo_proof_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "dry_run_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "pane_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "service_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "destructive_actions_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_cargo_proof_allowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "required": [
+        "policy_id",
+        "raw_pane_content_allowed",
+        "secret_material_allowed",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "policy_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "secret_material_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

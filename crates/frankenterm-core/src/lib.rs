@@ -388,6 +388,7 @@ pub mod ntm_importer;
 pub mod ntm_parity;
 pub mod onboarding_stress_capsule;
 pub mod onboarding_stress_capsule_doctor;
+pub mod operating_envelope;
 pub mod operator_runbooks;
 pub mod orphan_reaper;
 pub mod osc_2x_cluster;

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778912580000,
+  "envelope_id": "envelope-invalid-malformed-path",
+  "objective_id": "objective-invalid-malformed-path",
+  "controller_mode": "dry_run",
+  "raw_pane_content_stored": false,
+  "reason_codes": [
+    "invalid.malformed_path"
+  ],
+  "artifact_paths": [
+    "/tmp/frankenterm-operating-envelope.json",
+    "../outside-repo.json"
+  ]
+}

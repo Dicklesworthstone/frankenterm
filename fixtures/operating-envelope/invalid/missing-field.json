@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.operating_envelope.v1",
+  "generated_at_ms": 1778912460000,
+  "envelope_id": "envelope-invalid-missing-field",
+  "objective_id": "objective-invalid-missing-field",
+  "controller_mode": "dry_run",
+  "target_class": {
+    "profile": "developer_laptop",
+    "requested_agent_count": 1,
+    "requested_cpu_cores": 1,
+    "requested_memory_gib": 1,
+    "proof_state": "not_required",
+    "reason_codes": [
+      "target_hardware.not_required"
+    ]
+  },
+  "input_domains": {},
+  "admission_windows": [],
+  "raw_pane_content_stored": false,
+  "reason_codes": [
+    "invalid.missing_decision"
+  ],
+  "artifact_paths": [
+    "fixtures/operating-envelope/invalid/missing-field.json"
+  ]
+}

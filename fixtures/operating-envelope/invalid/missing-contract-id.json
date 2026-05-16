@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "generated_at_ms": 1810478400000,
+  "envelope_id": "invalid-missing-contract-id",
+  "scope": {
+    "objective": "negative fixture: missing required contract_id",
+    "target_class": "fixture",
+    "host_class": "fixture",
+    "dry_run_only": true,
+    "mutation_allowed": false
+  },
+  "source_policy": {
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false,
+    "unproven_signal_policy": "lower_envelope"
+  },
+  "sources": [
+    {
+      "source_id": "fixture.invalid",
+      "source_kind": "fixture",
+      "state": "blocked",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1810478400000,
+      "command_or_api": "fixture",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "unsafe_to_admit": true,
+      "reason_codes": [
+        "schema.required.contract_id_missing"
+      ],
+      "summary": "Negative fixture omits contract_id.",
+      "counters": {},
+      "degraded_reason": "missing required contract_id",
+      "artifact_paths": [
+        "fixtures/operating-envelope/invalid/missing-contract-id.json"
+      ]
+    }
+  ],
+  "admission_window": {
+    "state": "blocked",
+    "max_new_agents": 0,
+    "max_remote_proof_lanes": 0,
+    "queue_recommendation": "manual_review",
+    "reason_codes": [
+      "schema.required.contract_id_missing"
+    ],
+    "expires_at_ms": null
+  },
+  "proof_lane_policy": {
+    "cargo_required_via_rch": true,
+    "local_cargo_proof_allowed": false,
+    "remote_cargo_reached": false,
+    "remote_rustc_reached": false,
+    "test_binary_reached": false,
+    "blocker_codes": [
+      "schema.required.contract_id_missing"
+    ]
+  },
+  "guardrails": {
+    "forbidden_actions": [
+      "agent_mail_repair",
+      "build_cancellation",
+      "destructive_git",
+      "local_cargo_proof",
+      "raw_pane_content_capture",
+      "rch_daemon_restart",
+      "service_restart",
+      "worker_drain"
+    ],
+    "required_approvals": [
+      "schema_maintainer"
+    ]
+  },
+  "redaction": {
+    "redacted": true,
+    "raw_pane_content_stored": false,
+    "secret_material_stored": false,
+    "notes": [
+      "Negative fixture stores no raw pane content."
+    ]
+  },
+  "artifact_paths": [
+    "fixtures/operating-envelope/invalid/missing-contract-id.json"
+  ]
+}
