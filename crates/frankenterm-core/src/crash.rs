@@ -1364,45 +1364,652 @@ fn skipped_source(
     }
 }
 
-fn skipped_contract_source(
+fn degraded_source(
     name: &str,
-    source_surface: &str,
+    status: IncidentSourceStatus,
+    source_surface: impl Into<String>,
+    max_age_ms: Option<u64>,
+    elapsed_ms: u64,
+    warning_id: &str,
+    message: String,
     warnings: &mut Vec<IncidentBundleWarning>,
 ) -> IncidentSourceEntry {
-    let warning_id = format!("{name}.not_wired");
-    skipped_source(
-        name,
-        source_surface.to_string(),
-        Some(30_000),
-        0,
-        &warning_id,
-        "source is part of the swarm incident contract but is not wired into the core collector yet"
-            .to_string(),
-        warnings,
-    )
+    warnings.push(incident_warning(warning_id, name, message));
+    IncidentSourceEntry {
+        name: name.to_string(),
+        file: None,
+        status,
+        evidence_state: IncidentEvidenceState::Unavailable,
+        source_surface: source_surface.into(),
+        mutates_state: false,
+        generated_at: None,
+        freshness_ms: None,
+        max_age_ms,
+        redaction: IncidentRedactionState::NotApplicable,
+        privacy_tier: "default".to_string(),
+        size_bytes: 0,
+        elapsed_ms,
+        warning_ids: vec![warning_id.to_string()],
+    }
 }
 
-fn add_unwired_swarm_sources(
+struct IncidentJsonSourceMeta<'a> {
+    name: &'a str,
+    file: &'a str,
+    source_surface: &'a str,
+    evidence_state: IncidentEvidenceState,
+    max_age_ms: Option<u64>,
+    started: Instant,
+}
+
+fn write_incident_json_source(
+    meta: IncidentJsonSourceMeta<'_>,
+    payload: &serde_json::Value,
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<IncidentSourceEntry> {
+    if let Some(parent) = Path::new(meta.file).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(bundle_dir.join(parent))?;
+    }
+    let json = serde_json::to_string_pretty(payload).map_err(std::io::Error::other)?;
+    write_redacted_file(
+        meta.file,
+        &json,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
+    Ok(IncidentSourceEntry {
+        name: meta.name.to_string(),
+        file: Some(meta.file.to_string()),
+        status: IncidentSourceStatus::Collected,
+        evidence_state: meta.evidence_state,
+        source_surface: meta.source_surface.to_string(),
+        mutates_state: false,
+        generated_at: Some(exported_at.to_string()),
+        freshness_ms: Some(0),
+        max_age_ms: meta.max_age_ms,
+        redaction: redaction_state_for_file(redaction_entries, meta.file),
+        privacy_tier: "default".to_string(),
+        size_bytes: bundle_file_size(bundle_dir, meta.file),
+        elapsed_ms: elapsed_ms(meta.started),
+        warning_ids: Vec::new(),
+    })
+}
+
+fn add_swarm_incident_sources(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
+    add_robot_state_source(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
+    add_pane_text_summaries_source(sources, warnings);
+    add_tailer_capture_health_source(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
+    add_resource_pressure_source(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
+    add_proof_rch_evidence_source(sources, warnings);
+    add_beads_coordination_source(sources, warnings);
+    add_git_dirty_tree_source(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
+    add_agent_mail_source(sources, warnings);
+    Ok(())
+}
+
+fn add_robot_state_source(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
+    let started = Instant::now();
+    if let Some(snapshot) = HealthSnapshot::get_global() {
+        let payload = serde_json::json!({
+            "snapshot_timestamp_ms": snapshot.timestamp,
+            "observed_panes": snapshot.observed_panes,
+            "capture_queue_depth": snapshot.capture_queue_depth,
+            "write_queue_depth": snapshot.write_queue_depth,
+            "last_seq_pane_count": snapshot.last_seq_by_pane.len(),
+            "last_activity_pane_count": snapshot.last_activity_by_pane.len(),
+            "pane_priority_override_count": snapshot.pane_priority_overrides.len(),
+            "runtime_warnings": snapshot.warnings,
+            "ingest_lag_avg_ms": snapshot.ingest_lag_avg_ms,
+            "ingest_lag_max_ms": snapshot.ingest_lag_max_ms,
+            "db_writable": snapshot.db_writable,
+            "db_last_write_at_ms": snapshot.db_last_write_at,
+            "restart_count": snapshot.restart_count,
+            "last_crash_at_ms": snapshot.last_crash_at,
+            "consecutive_crashes": snapshot.consecutive_crashes,
+            "current_backoff_ms": snapshot.current_backoff_ms,
+            "in_crash_loop": snapshot.in_crash_loop,
+            "scheduler_present": snapshot.scheduler.is_some(),
+            "backpressure_tier": snapshot.backpressure_tier,
+            "fleet_pressure_tier": snapshot.fleet_pressure_tier,
+        });
+        sources.push(write_incident_json_source(
+            IncidentJsonSourceMeta {
+                name: "robot_state",
+                file: "sources/robot_state.json",
+                source_surface: "HealthSnapshot::get_global",
+                evidence_state: IncidentEvidenceState::Measured,
+                max_age_ms: Some(30_000),
+                started,
+            },
+            &payload,
+            exported_at,
+            bundle_dir,
+            redactor,
+            files,
+            total_size,
+            redaction_entries,
+        )?);
+    } else {
+        sources.push(degraded_source(
+            "robot_state",
+            IncidentSourceStatus::Unavailable,
+            "HealthSnapshot::get_global",
+            Some(30_000),
+            elapsed_ms(started),
+            "robot_state.snapshot_unavailable",
+            "no runtime health snapshot has been published in this process".to_string(),
+            warnings,
+        ));
+    }
+    Ok(())
+}
+
+fn add_pane_text_summaries_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
 ) {
-    for (name, surface) in [
-        ("robot_state", "not wired into core collector yet"),
-        ("pane_text_summaries", "not wired into core collector yet"),
-        ("tailer_capture_health", "not wired into core collector yet"),
-        (
+    let started = Instant::now();
+    sources.push(degraded_source(
+        "pane_text_summaries",
+        IncidentSourceStatus::Skipped,
+        "incident privacy policy pane_text_allowed=false",
+        Some(30_000),
+        elapsed_ms(started),
+        "pane_text_summaries.privacy_disabled",
+        "pane text summaries were skipped because the default incident privacy budget forbids pane text collection".to_string(),
+        warnings,
+    ));
+}
+
+fn add_tailer_capture_health_source(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
+    let started = Instant::now();
+    let streaming = crate::tailer::StreamingHealth::get_global();
+    let scheduler = HealthSnapshot::get_global().and_then(|snapshot| snapshot.scheduler);
+    if streaming.is_some() || scheduler.is_some() {
+        let payload = serde_json::json!({
+            "streaming_health": streaming,
+            "scheduler": scheduler,
+        });
+        sources.push(write_incident_json_source(
+            IncidentJsonSourceMeta {
+                name: "tailer_capture_health",
+                file: "sources/tailer_capture_health.json",
+                source_surface: "StreamingHealth::get_global + HealthSnapshot.scheduler",
+                evidence_state: if payload["streaming_health"].is_null()
+                    || payload["scheduler"].is_null()
+                {
+                    IncidentEvidenceState::Mixed
+                } else {
+                    IncidentEvidenceState::Measured
+                },
+                max_age_ms: Some(30_000),
+                started,
+            },
+            &payload,
+            exported_at,
+            bundle_dir,
+            redactor,
+            files,
+            total_size,
+            redaction_entries,
+        )?);
+    } else {
+        sources.push(degraded_source(
+            "tailer_capture_health",
+            IncidentSourceStatus::Unavailable,
+            "StreamingHealth::get_global + HealthSnapshot.scheduler",
+            Some(30_000),
+            elapsed_ms(started),
+            "tailer_capture_health.snapshot_unavailable",
+            "no streaming tailer or scheduler health snapshot has been published in this process"
+                .to_string(),
+            warnings,
+        ));
+    }
+    Ok(())
+}
+
+fn add_resource_pressure_source(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
+    let started = Instant::now();
+    if let Some(snapshot) = HealthSnapshot::get_global() {
+        let payload = serde_json::json!({
+            "pressure": {
+                "backpressure_tier": snapshot.backpressure_tier.unwrap_or_else(|| "unknown".to_string()),
+                "fleet_pressure_tier": snapshot.fleet_pressure_tier.unwrap_or_else(|| "unknown".to_string()),
+                "capture_queue_depth": snapshot.capture_queue_depth,
+                "write_queue_depth": snapshot.write_queue_depth,
+                "observed_panes": snapshot.observed_panes,
+            },
+            "swarm_capacity": snapshot.swarm_capacity,
+            "leak_risk_inventory": snapshot.leak_risk_inventory,
+        });
+        sources.push(write_incident_json_source(
+            IncidentJsonSourceMeta {
+                name: "resource_pressure_cockpit",
+                file: "sources/resource_pressure_cockpit.json",
+                source_surface: "HealthSnapshot pressure fields",
+                evidence_state: IncidentEvidenceState::Measured,
+                max_age_ms: Some(30_000),
+                started,
+            },
+            &payload,
+            exported_at,
+            bundle_dir,
+            redactor,
+            files,
+            total_size,
+            redaction_entries,
+        )?);
+    } else {
+        sources.push(degraded_source(
             "resource_pressure_cockpit",
-            "not wired into core collector yet",
-        ),
-        ("proof_rch_evidence", "not wired into core collector yet"),
-        (
-            "beads_coordination_snapshot",
-            "not wired into core collector yet",
-        ),
-        ("git_dirty_tree", "not wired into core collector yet"),
-        ("agent_mail", "not wired into core collector yet"),
-    ] {
-        sources.push(skipped_contract_source(name, surface, warnings));
+            IncidentSourceStatus::Unavailable,
+            "HealthSnapshot pressure fields",
+            Some(30_000),
+            elapsed_ms(started),
+            "resource_pressure_cockpit.snapshot_unavailable",
+            "no runtime health snapshot was available for resource pressure collection".to_string(),
+            warnings,
+        ));
+    }
+    Ok(())
+}
+
+fn add_proof_rch_evidence_source(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+) {
+    let started = Instant::now();
+    sources.push(degraded_source(
+        "proof_rch_evidence",
+        IncidentSourceStatus::Unavailable,
+        "attached RCH proof ledger metadata",
+        Some(300_000),
+        elapsed_ms(started),
+        "proof_rch_evidence.not_attached",
+        "no retained RCH proof ledger was attached; incident collection never runs proof commands and does not count sync or setup chatter as proof".to_string(),
+        warnings,
+    ));
+}
+
+fn add_beads_coordination_source(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+) {
+    let started = Instant::now();
+    sources.push(degraded_source(
+        "beads_coordination_snapshot",
+        IncidentSourceStatus::Unavailable,
+        "Beads snapshot supplied by operator handoff",
+        Some(30_000),
+        elapsed_ms(started),
+        "beads_coordination_snapshot.not_attached",
+        "no Beads coordination snapshot was supplied to the crash collector; service repair, claiming, and tracker mutation are outside the read-only incident path".to_string(),
+        warnings,
+    ));
+}
+
+fn add_git_dirty_tree_source(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
+    let started = Instant::now();
+    match run_bounded_command_stdout(
+        "git",
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        500,
+    ) {
+        Ok(stdout) => {
+            let branch = run_bounded_command_stdout("git", &["branch", "--show-current"], 250)
+                .ok()
+                .map(|branch| branch.trim().to_string())
+                .filter(|branch| !branch.is_empty());
+            let payload = git_dirty_tree_payload(&stdout, branch.as_deref());
+            sources.push(write_incident_json_source(
+                IncidentJsonSourceMeta {
+                    name: "git_dirty_tree",
+                    file: "sources/git_dirty_tree.json",
+                    source_surface: "bounded git status --porcelain=v1 --untracked-files=all",
+                    evidence_state: IncidentEvidenceState::Measured,
+                    max_age_ms: Some(30_000),
+                    started,
+                },
+                &payload,
+                exported_at,
+                bundle_dir,
+                redactor,
+                files,
+                total_size,
+                redaction_entries,
+            )?);
+        }
+        Err(BoundedCommandError::Unavailable(message)) => {
+            sources.push(degraded_source(
+                "git_dirty_tree",
+                IncidentSourceStatus::Unavailable,
+                "bounded git status --porcelain=v1 --untracked-files=all",
+                Some(30_000),
+                elapsed_ms(started),
+                "git_dirty_tree.unavailable",
+                message,
+                warnings,
+            ));
+        }
+        Err(BoundedCommandError::Timeout { timeout_ms }) => {
+            sources.push(degraded_source(
+                "git_dirty_tree",
+                IncidentSourceStatus::Failed,
+                "bounded git status --porcelain=v1 --untracked-files=all",
+                Some(30_000),
+                elapsed_ms(started),
+                "git_dirty_tree.timeout",
+                format!("git dirty-tree collection exceeded its {timeout_ms} ms timeout"),
+                warnings,
+            ));
+        }
+        Err(BoundedCommandError::Failed(message)) => {
+            sources.push(degraded_source(
+                "git_dirty_tree",
+                IncidentSourceStatus::Failed,
+                "bounded git status --porcelain=v1 --untracked-files=all",
+                Some(30_000),
+                elapsed_ms(started),
+                "git_dirty_tree.failed",
+                message,
+                warnings,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_dirty_tree_payload(stdout: &str, branch: Option<&str>) -> serde_json::Value {
+    let rows = stdout
+        .lines()
+        .filter_map(parse_git_porcelain_row)
+        .collect::<Vec<_>>();
+    let mut categories = HashSet::new();
+    let mut tracked_dirty = 0_usize;
+    let mut untracked = 0_usize;
+    let mut staged = 0_usize;
+    let mut unstaged = 0_usize;
+    let mut deleted = 0_usize;
+    for (status, path) in &rows {
+        if status == "??" {
+            untracked += 1;
+        } else {
+            tracked_dirty += 1;
+            let mut chars = status.chars();
+            let index_status = chars.next().unwrap_or(' ');
+            let worktree_status = chars.next().unwrap_or(' ');
+            if index_status != ' ' {
+                staged += 1;
+            }
+            if worktree_status != ' ' {
+                unstaged += 1;
+            }
+            if index_status == 'D' || worktree_status == 'D' {
+                deleted += 1;
+            }
+        }
+        if let Some(category) = dirty_tree_risk_category(path) {
+            categories.insert(category);
+        }
+    }
+
+    let mut category_rows = categories.into_iter().collect::<Vec<_>>();
+    category_rows.sort_unstable();
+    let mut entries = rows
+        .iter()
+        .take(200)
+        .map(|(status, path)| {
+            serde_json::json!({
+                "status": status,
+                "path": path,
+                "risk_category": dirty_tree_risk_category(path),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["path"].as_str().unwrap_or_default())
+    });
+
+    serde_json::json!({
+        "collector": "git status --porcelain=v1 --untracked-files=all",
+        "branch": branch,
+        "status": if rows.is_empty() { "clean" } else { "dirty" },
+        "counts": {
+            "total": rows.len(),
+            "tracked_dirty": tracked_dirty,
+            "untracked": untracked,
+            "staged": staged,
+            "unstaged": unstaged,
+            "deleted": deleted,
+        },
+        "risk": {
+            "dirty_tree": !rows.is_empty(),
+            "high_risk_path_count": rows
+                .iter()
+                .filter(|(_, path)| dirty_tree_risk_category(path).is_some())
+                .count(),
+            "categories": category_rows,
+        },
+        "entries_truncated": rows.len() > entries.len(),
+        "entries": entries,
+    })
+}
+
+fn parse_git_porcelain_row(line: &str) -> Option<(String, String)> {
+    if line.len() < 4 {
+        return None;
+    }
+    let status = line.get(0..2)?.to_string();
+    let path = line.get(3..)?.trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some((status, path))
+    }
+}
+
+fn dirty_tree_risk_category(path: &str) -> Option<&'static str> {
+    if path == "Cargo.toml" || path == "Cargo.lock" {
+        Some("workspace_manifest")
+    } else if path == ".beads/issues.jsonl" || path.starts_with(".beads/") {
+        Some("coordination_state")
+    } else if path.starts_with("crates/frankenterm-core/") {
+        Some("core_crate")
+    } else if path.starts_with("crates/frankenterm-gui/") {
+        Some("gui_crate")
+    } else if path.starts_with("docs/robot-contracts/")
+        || path.starts_with("docs/json-schema/")
+        || path.starts_with("docs/incident-bundles")
+    {
+        Some("operator_contracts")
+    } else if path.starts_with("fixtures/") || path.contains("/fixtures/") {
+        Some("fixtures")
+    } else {
+        None
+    }
+}
+
+fn add_agent_mail_source(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+) {
+    let started = Instant::now();
+    sources.push(degraded_source(
+        "agent_mail",
+        IncidentSourceStatus::Unavailable,
+        "Agent Mail read-only snapshot supplied by operator handoff",
+        Some(30_000),
+        elapsed_ms(started),
+        "agent_mail.not_attached",
+        "no Agent Mail snapshot was supplied to the crash collector; incident collection must not repair, restart, or kill shared Agent Mail services".to_string(),
+        warnings,
+    ));
+}
+
+#[derive(Debug)]
+enum BoundedCommandError {
+    Unavailable(String),
+    Timeout { timeout_ms: u64 },
+    Failed(String),
+}
+
+fn run_bounded_command_stdout(
+    program: &str,
+    args: &[&str],
+    timeout_ms: u64,
+) -> Result<String, BoundedCommandError> {
+    if timeout_ms == 0 {
+        return Err(BoundedCommandError::Timeout { timeout_ms });
+    }
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                BoundedCommandError::Unavailable(format!("{program} command was unavailable"))
+            } else {
+                BoundedCommandError::Failed(format!("failed to start {program}: {error}"))
+            }
+        })?;
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let output = child.wait_with_output().map_err(|error| {
+                    BoundedCommandError::Failed(format!(
+                        "failed to collect {program} output: {error}"
+                    ))
+                })?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(BoundedCommandError::Failed(format!(
+                        "{program} exited with status {}: {}",
+                        output.status,
+                        stderr.trim()
+                    )));
+                }
+                return String::from_utf8(output.stdout).map_err(|error| {
+                    BoundedCommandError::Failed(format!(
+                        "{program} output was not valid UTF-8: {error}"
+                    ))
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BoundedCommandError::Timeout { timeout_ms });
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BoundedCommandError::Failed(format!(
+                    "failed while waiting for {program}: {error}"
+                )));
+            }
+        }
     }
 }
 
@@ -1500,7 +2107,16 @@ fn collect_incident_bundle_inner(
     let exported_at = format_iso8601(ts);
     let mut sources: Vec<IncidentSourceEntry> = Vec::new();
     let mut warnings: Vec<IncidentBundleWarning> = Vec::new();
-    add_unwired_swarm_sources(&mut sources, &mut warnings);
+    add_swarm_incident_sources(
+        &mut sources,
+        &mut warnings,
+        &exported_at,
+        &bundle_dir,
+        &redactor,
+        &mut files,
+        &mut total_size,
+        &mut redaction_entries,
+    )?;
 
     // 1. Include latest crash bundle contents (if crash kind)
     let source_started = Instant::now();
@@ -3178,7 +3794,7 @@ fn enrich_incident_verification_summary(
     };
 
     match source.name.as_str() {
-        "beads_blocker_snapshot" => {
+        "beads_blocker_snapshot" | "beads_coordination_snapshot" => {
             if let Some(blocked) = value.get("blocked").and_then(serde_json::Value::as_array) {
                 for item in blocked {
                     let id = item
@@ -3206,7 +3822,7 @@ fn enrich_incident_verification_summary(
                 }
             }
         }
-        "resource_pressure_snapshot" => {
+        "resource_pressure_snapshot" | "resource_pressure_cockpit" => {
             if let Some(pressure) = value.get("pressure").and_then(serde_json::Value::as_object) {
                 let mut parts = pressure
                     .iter()
@@ -6280,11 +6896,51 @@ mod tests {
             }
         }
 
-        assert!(warning_ids.contains("robot_state.not_wired"));
+        assert!(
+            warning_ids
+                .iter()
+                .all(|warning_id| !warning_id.ends_with(".not_wired")),
+            "incident sources should report concrete reasons rather than placeholder not_wired warnings"
+        );
+        assert!(warning_ids.contains("pane_text_summaries.privacy_disabled"));
+        assert!(warning_ids.contains("proof_rch_evidence.not_attached"));
+        assert!(warning_ids.contains("beads_coordination_snapshot.not_attached"));
+        assert!(warning_ids.contains("agent_mail.not_attached"));
         assert!(warning_ids.contains("crash_bundle.skipped"));
         assert!(warning_ids.contains("config_summary.skipped"));
         assert!(warning_ids.contains("db_metadata.skipped"));
         assert!(warning_ids.contains("recent_events.db_not_configured"));
+    }
+
+    #[test]
+    fn git_dirty_tree_payload_classifies_counts_and_risk() {
+        let payload = git_dirty_tree_payload(
+            " M crates/frankenterm-core/src/crash.rs\nA  Cargo.toml\n?? fixtures/example.json\n D .beads/issues.jsonl\n",
+            Some("main"),
+        );
+
+        assert_eq!(payload["branch"], "main");
+        assert_eq!(payload["status"], "dirty");
+        assert_eq!(payload["counts"]["total"], 4);
+        assert_eq!(payload["counts"]["tracked_dirty"], 3);
+        assert_eq!(payload["counts"]["untracked"], 1);
+        assert_eq!(payload["counts"]["staged"], 2);
+        assert_eq!(payload["counts"]["unstaged"], 2);
+        assert_eq!(payload["counts"]["deleted"], 1);
+
+        let categories = payload["risk"]["categories"].as_array().unwrap();
+        assert!(categories.iter().any(|category| category == "core_crate"));
+        assert!(
+            categories
+                .iter()
+                .any(|category| category == "workspace_manifest")
+        );
+        assert!(
+            categories
+                .iter()
+                .any(|category| category == "coordination_state")
+        );
+        assert!(categories.iter().any(|category| category == "fixtures"));
     }
 
     #[test]

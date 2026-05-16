@@ -842,9 +842,30 @@ fn collect_incident_bundle_manual_kind_produces_manifest() {
             .any(|source| source.name == "crash_bundle"
                 && source.status == IncidentSourceStatus::Skipped)
     );
-    assert!(swarm.sources.iter().any(
-        |source| source.name == "robot_state" && source.status == IncidentSourceStatus::Skipped
-    ));
+    assert!(
+        swarm
+            .sources
+            .iter()
+            .any(|source| source.name == "robot_state")
+    );
+    assert!(
+        swarm
+            .warnings
+            .iter()
+            .all(|warning| !warning.id.ends_with(".not_wired"))
+    );
+    assert!(
+        swarm
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "pane_text_summaries.privacy_disabled")
+    );
+    assert!(
+        swarm
+            .warnings
+            .iter()
+            .any(|warning| warning.id == "proof_rch_evidence.not_attached")
+    );
     assert!(
         swarm
             .sources
