@@ -73,6 +73,12 @@ ft prepare workflow run <name> --pane-id <id>
 ft commit <plan_id> [--text "<text>"] [--text-file <path>] [--approval-code <code>]
 ft approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
 ft audit [--limit <n>] [--pane <id>] [--action <kind>] [--decision <allow|deny|require_approval>]
+ft history [--limit <n>] [--pane <id>] [--actor <kind>] [--workflow <id>] [--undoable]
+ft history [--action <kind>] [--decision <allow|deny|require_approval>] [--result <status>] [--since <time>] [--until <time>]
+ft history --export <json|csv>
+ft undo --list [--limit <n>]
+ft undo <action_id> [--yes]
+ft undo --all-in-workflow <id> [--yes]
 ```
 
 See `docs/approvals.md` for the prepare/commit mental model and troubleshooting.
@@ -227,13 +233,6 @@ ft tui          # requires --features tui
 ft mcp serve    # requires --features mcp
 ft web          # requires --features web; serves HTTP + SSE `/stream/*`
 ft sync         # requires --features sync
-```
-
-## Planned (not yet implemented)
-
-```text
-ft history
-ft undo
 ```
 
 ## Robot mode (stable JSON/TOON)
