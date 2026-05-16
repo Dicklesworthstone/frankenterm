@@ -5,22 +5,22 @@ use super::*;
 use crate::color::{ColorPalette, RgbColor};
 use crate::config::{BidiMode, NewlineCanon};
 use frankenterm_bidi::ParagraphDirectionHint;
-use frankenterm_cell::image::ImageData;
 use frankenterm_cell::UnicodeVersion;
+use frankenterm_cell::image::ImageData;
 use frankenterm_escape_parser::csi::{
     Cursor, CursorStyle, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
     EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
     XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
 };
-use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
+use frankenterm_escape_parser::{CSI, OneBased, OperatingSystemCommand};
 use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 use log::debug;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
-use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{Sender, channel};
 use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
 use url::Url;
@@ -271,6 +271,9 @@ pub struct TerminalState {
 
     /// https://vt100.net/docs/vt510-rm/DECAWM.html
     dec_auto_wrap: bool,
+
+    /// One-level XTSAVE/XTRESTORE cache for DEC private mode values.
+    saved_dec_private_modes: HashMap<u16, bool>,
 
     /// Reverse Wraparound Mode
     reverse_wraparound_mode: bool,
@@ -555,6 +558,7 @@ impl TerminalState {
             // We default auto wrap to true even though the default for
             // a dec terminal is false, because it is more useful this way.
             dec_auto_wrap: true,
+            saved_dec_private_modes: HashMap::new(),
             reverse_wraparound_mode: false,
             reverse_video_mode: false,
             synchronized_output: false,
@@ -1450,6 +1454,83 @@ impl TerminalState {
         self.writer.flush().ok();
     }
 
+    fn current_dec_private_mode(&self, code: &DecPrivateModeCode) -> Option<bool> {
+        match code {
+            DecPrivateModeCode::Win32InputMode => {
+                Some(self.keyboard_encoding == KeyboardEncoding::Win32)
+            }
+            DecPrivateModeCode::ReverseWraparound => Some(self.reverse_wraparound_mode),
+            DecPrivateModeCode::LeftRightMarginMode => Some(self.left_and_right_margin_mode),
+            DecPrivateModeCode::AutoWrap => Some(self.dec_auto_wrap),
+            DecPrivateModeCode::OriginMode => Some(self.dec_origin_mode),
+            DecPrivateModeCode::UsePrivateColorRegistersForEachGraphic => {
+                Some(self.use_private_color_registers_for_each_graphic)
+            }
+            DecPrivateModeCode::SynchronizedOutput => Some(self.synchronized_output),
+            DecPrivateModeCode::ReverseVideo => Some(self.reverse_video_mode),
+            DecPrivateModeCode::BracketedPaste => Some(self.bracketed_paste),
+            DecPrivateModeCode::OptEnableAlternateScreen
+            | DecPrivateModeCode::EnableAlternateScreen
+            | DecPrivateModeCode::ClearAndEnableAlternateScreen => {
+                Some(self.screen.is_alt_screen_active())
+            }
+            DecPrivateModeCode::ApplicationCursorKeys => Some(self.application_cursor_keys),
+            DecPrivateModeCode::SixelDisplayMode => Some(self.sixel_display_mode),
+            DecPrivateModeCode::DecAnsiMode => Some(self.dec_ansi_mode),
+            DecPrivateModeCode::ShowCursor => Some(self.cursor_visible),
+            DecPrivateModeCode::MouseTracking => Some(self.mouse_tracking),
+            DecPrivateModeCode::ButtonEventMouse => Some(self.button_event_mouse),
+            DecPrivateModeCode::AnyEventMouse => Some(self.any_event_mouse),
+            DecPrivateModeCode::FocusTracking => Some(self.focus_tracking),
+            DecPrivateModeCode::SGRMouse => Some(matches!(self.mouse_encoding, MouseEncoding::SGR)),
+            DecPrivateModeCode::SGRPixelsMouse => {
+                Some(matches!(self.mouse_encoding, MouseEncoding::SgrPixels))
+            }
+            DecPrivateModeCode::Utf8Mouse => {
+                Some(matches!(self.mouse_encoding, MouseEncoding::Utf8))
+            }
+            DecPrivateModeCode::SixelScrollsRight => Some(self.sixel_scrolls_right),
+            _ => None,
+        }
+    }
+
+    fn save_dec_private_mode(&mut self, code: DecPrivateModeCode) {
+        let Some(number) = code.to_u16() else {
+            log::warn!("save dec mode {:?} unimplemented", code);
+            return;
+        };
+
+        if let Some(enabled) = self.current_dec_private_mode(&code) {
+            self.saved_dec_private_modes.insert(number, enabled);
+        } else {
+            log::warn!("save dec mode {:?} unimplemented", code);
+        }
+    }
+
+    fn restore_dec_private_mode(&mut self, code: DecPrivateModeCode) {
+        let Some(number) = code.to_u16() else {
+            log::warn!("restore dec mode {:?} unimplemented", code);
+            return;
+        };
+
+        if self.current_dec_private_mode(&code).is_none() {
+            log::warn!("restore dec mode {:?} unimplemented", code);
+            return;
+        }
+
+        let Some(enabled) = self.saved_dec_private_modes.get(&number).copied() else {
+            return;
+        };
+
+        let mode = DecPrivateMode::Code(code);
+        let mode = if enabled {
+            Mode::SetDecPrivateMode(mode)
+        } else {
+            Mode::ResetDecPrivateMode(mode)
+        };
+        self.perform_csi_mode(mode);
+    }
+
     fn perform_csi_mode(&mut self, mode: Mode) {
         match mode {
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -1932,9 +2013,11 @@ impl TerminalState {
                     self.dec_restore_cursor();
                 }
             }
-            Mode::SaveDecPrivateMode(DecPrivateMode::Code(n))
-            | Mode::RestoreDecPrivateMode(DecPrivateMode::Code(n)) => {
-                log::warn!("save/restore dec mode {:?} unimplemented", n)
+            Mode::SaveDecPrivateMode(DecPrivateMode::Code(n)) => {
+                self.save_dec_private_mode(n);
+            }
+            Mode::RestoreDecPrivateMode(DecPrivateMode::Code(n)) => {
+                self.restore_dec_private_mode(n);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -2039,11 +2122,7 @@ impl TerminalState {
         // on xterm, so, to prevent a lot of noise in esctest, treat them as spaces, at least when
         // asking for the checksum of a single cell (which is what esctest does).
         // See: https://github.com/wezterm/wezterm/pull/4565
-        if checksum == 0 {
-            32u16
-        } else {
-            checksum
-        }
+        if checksum == 0 { 32u16 } else { checksum }
     }
 
     fn perform_csi_window(&mut self, window: Window) {
@@ -3300,6 +3379,104 @@ mod tests {
             "config reload should not discard an application-provided unicode override"
         );
         assert_eq!(terminal.kitty_img.image_budget_bytes, 2048);
+    }
+
+    #[test]
+    fn dec_private_mode_restore_reapplies_saved_set_state() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area: false,
+        });
+        let mut terminal = test_terminal_state(config);
+
+        assert!(terminal.cursor_visible);
+        terminal.perform_csi_mode(Mode::SaveDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )));
+        terminal.perform_csi_mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )));
+        assert!(!terminal.cursor_visible);
+
+        terminal.perform_csi_mode(Mode::RestoreDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )));
+
+        assert!(terminal.cursor_visible);
+    }
+
+    #[test]
+    fn dec_private_mode_restore_reapplies_saved_reset_state() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area: false,
+        });
+        let mut terminal = test_terminal_state(config);
+
+        assert!(!terminal.bracketed_paste);
+        terminal.perform_csi_mode(Mode::SaveDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::BracketedPaste,
+        )));
+        terminal.perform_csi_mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::BracketedPaste,
+        )));
+        assert!(terminal.bracketed_paste);
+
+        terminal.perform_csi_mode(Mode::RestoreDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::BracketedPaste,
+        )));
+
+        assert!(!terminal.bracketed_paste);
+    }
+
+    #[test]
+    fn dec_private_mode_restore_handles_alternate_screen_state() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area: false,
+        });
+        let mut terminal = test_terminal_state(config);
+
+        assert!(!terminal.screen.is_alt_screen_active());
+        terminal.perform_csi_mode(Mode::SaveDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ClearAndEnableAlternateScreen,
+        )));
+        terminal.perform_csi_mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ClearAndEnableAlternateScreen,
+        )));
+        assert!(terminal.screen.is_alt_screen_active());
+
+        terminal.perform_csi_mode(Mode::RestoreDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ClearAndEnableAlternateScreen,
+        )));
+
+        assert!(!terminal.screen.is_alt_screen_active());
+    }
+
+    #[test]
+    fn unsaved_dec_private_mode_restore_is_noop() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area: false,
+        });
+        let mut terminal = test_terminal_state(config);
+
+        terminal.perform_csi_mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )));
+        terminal.perform_csi_mode(Mode::RestoreDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )));
+
+        assert!(!terminal.cursor_visible);
     }
 
     // ── CharSet ────────────────────────────────────────────────
