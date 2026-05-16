@@ -29,8 +29,11 @@ concurrency:
 
 jobs:
   notify-acfs:
-    # Only notify on push to main, not PRs
-    if: github.event_name == 'push'
+    # Only notify on upstream pushes to main, not PRs and not forks — the
+    # repository-dispatch token (`secrets.ACFS_DISPATCH_TOKEN`) only exists
+    # on the canonical repo, so fork pushes failed the entire workflow
+    # before this guard. See #57.
+    if: github.event_name == 'push' && github.repository == 'Dicklesworthstone/frankenterm'
     runs-on: ubuntu-latest
     env:
       ACFS_DISPATCH_TOKEN: ${{ secrets.ACFS_DISPATCH_TOKEN }}
