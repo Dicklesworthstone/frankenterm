@@ -49,6 +49,7 @@ It is also the schema producers feed into:
 | `dependency_bound` | Target is reserved for refresh once measurement plumbing lands. The number is operator-provisional until then. |
 | `bench_pending` | Source bench file does not yet exist; will land alongside the sub-bead that delivers the implementation. |
 | `substrate_wired` | Source bench/test file exists and emits machine-readable measured/degraded evidence; production SLO proof still requires a retained target-run artifact. |
+| `retained_run_validated` | Source bench/test file exists and the retained target-run artifact has passed its release gate without a degraded-substrate override. |
 
 ## SLO catalog
 
@@ -71,7 +72,7 @@ machine-readable JSON, the README, and the attestation bundle.
 | RQ-S10 | Atlas rebuild count | 0 on pure window-size resize | `crates/frankenterm-core/benches/atlas_stability.rs` | ft-mpc9b.1.1 | bench_pending |
 | RQ-S11 | Snap-back delta (Draft → Standard) | SSIM ≥ 0.999 | `tests/renderer_golden/scenarios` | ft-mpc9b.2 | bench_pending |
 | RQ-S12 | Floating-pane overhead | < 0.5ms additional per pane vs tiled | `crates/frankenterm-core/benches/compositor_layers.rs` | ft-mpc9b.4.1 | bench_pending |
-| RQ-S13 | SSIM parity oracle corpus | SSIM ≥ 0.99, L∞ ≤ 8, changed pixels ≤ 0.1% | `crates/frankenterm-gui/tests/ssim_parity.rs` | ft-tf6g3.3.3 | substrate_wired |
+| RQ-S13 | SSIM parity oracle corpus | SSIM ≥ 0.99, L∞ ≤ 8, changed pixels ≤ 0.1% | `crates/frankenterm-gui/tests/ssim_parity.rs` | ft-tf6g3.3.3 | retained_run_validated |
 
 The full machine-readable catalog (with scenarios, structured-log paths, and
 `blocked_by` arrays) lives in `docs/perf/resize-quality-slo.json`. That file
@@ -114,18 +115,18 @@ the ratatui and ftui TUI backends through a retained deterministic state
 fixture, and publishes its current non-claiming status at
 `ft robot perf slo-status --slo ssim_parity`, `ft doctor --json
 .renderer_slos.ssim_parity`, and `wa://perf/renderer-slo/ssim_parity`.
-The current degradation is `retained-release-run-pending`: the byte-level
-backend driver now reaches both renderers with matched deterministic Home/Panes
-state and reports clean frames, but production evidence still requires a clean
-retained ratatui-vs-ftui release run. The retained driver
+The current degradation is `none`: the byte-level backend driver reaches both
+renderers with matched deterministic Home/Panes state and reports clean frames,
+and the retained release gate has passed both the backend-driver oracle and GUI
+SSIM corpus lanes through remote RCH proof. The retained driver
 prints one per-case divergent-cell summary in `--nocapture` RCH logs, including
 glyph-vs-style and top/body/last-row buckets if a regression reappears, so each
 release-gate run names any backend layout/style gap, with
 `docs/attestations/tui/topology-parity.json` as the topology cross-check for
-near-pixel divergences. The release-gate script fails closed for this
-degraded state after substrate validation unless
-`SSIM_PARITY_ALLOW_DEGRADED_SUBSTRATE=1` is set for an explicitly
-non-release substrate-only run.
+near-pixel divergences. The release-gate script still fails closed for any
+future non-`none` degradation after substrate validation unless
+`SSIM_PARITY_ALLOW_DEGRADED_SUBSTRATE=1` is set for an explicitly non-release
+substrate-only run.
 
 ## CI gate (deferred)
 

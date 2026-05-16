@@ -156,12 +156,9 @@ fn ssim_surface_constants_match_default_thresholds() {
     );
     assert_eq!(
         RENDERER_SSIM_PARITY_STATUS,
-        "ssim_oracle_corpus_wired_pending_retained_release_run"
+        "ssim_oracle_corpus_retained_release_run_validated"
     );
-    assert_eq!(
-        RENDERER_SSIM_PARITY_CURRENT_DEGRADATION,
-        "retained-release-run-pending"
-    );
+    assert_eq!(RENDERER_SSIM_PARITY_CURRENT_DEGRADATION, "none");
     assert!((thresholds.min_ssim - 0.99).abs() <= f64::EPSILON);
     assert_eq!(
         (thresholds.min_ssim * 1_000_000.0).round() as u32,

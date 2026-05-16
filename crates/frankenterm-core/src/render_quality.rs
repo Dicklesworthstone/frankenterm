@@ -462,11 +462,10 @@ pub const RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI: &str =
 pub const RENDERER_SSIM_PARITY_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/ssim_parity";
 /// Current non-claiming status for the input-to-photon SLO substrate.
 pub const RENDERER_INPUT_TO_PHOTON_STATUS: &str = "stage_telemetry_substrate_wired_pending_lab_run";
-/// Current non-claiming status for the SSIM parity SLO substrate.
-pub const RENDERER_SSIM_PARITY_STATUS: &str =
-    "ssim_oracle_corpus_wired_pending_retained_release_run";
+/// Current status for the SSIM parity SLO substrate.
+pub const RENDERER_SSIM_PARITY_STATUS: &str = "ssim_oracle_corpus_retained_release_run_validated";
 /// Current degradation state for the SSIM parity SLO substrate.
-pub const RENDERER_SSIM_PARITY_CURRENT_DEGRADATION: &str = "retained-release-run-pending";
+pub const RENDERER_SSIM_PARITY_CURRENT_DEGRADATION: &str = "none";
 /// macOS p95 target from `docs/perf/resize-quality-slo.json`.
 pub const RENDERER_INPUT_TO_PHOTON_MACOS_P95_TARGET_US: u64 = MACOS_P95_TARGET_US;
 /// Wayland p95 target from `docs/perf/resize-quality-slo.json`.
@@ -575,7 +574,7 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
                 "metric_threshold_exceeded".to_string(),
                 "topology_cross_check_required".to_string(),
             ],
-            pending_reason: "backend-driver oracle reaches ratatui and ftui with matched deterministic Home/Panes state and reports clean frames; retained release-run evidence remains pending"
+            pending_reason: "retained release-gate evidence has validated the backend-driver oracle and GUI SSIM corpus through remote RCH proof"
                 .to_string(),
         },
     }
@@ -867,6 +866,7 @@ mod tests {
                 .degradation_states
                 .contains(&"retained-release-run-pending".to_string())
         );
+        assert_eq!(report.ssim_parity.current_degradation, "none");
     }
 
     #[test]

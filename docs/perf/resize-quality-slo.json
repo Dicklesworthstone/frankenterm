@@ -28,7 +28,8 @@
     "frozen": "Numeric target is committed to in the epic. Bench may still be pending; target itself does not move except by a new ADR.",
     "dependency_bound": "Target is reserved for refresh once measurement plumbing lands. Number is operator-provisional until then.",
     "bench_pending": "Source bench file does not yet exist; will land alongside the sub-bead that delivers the implementation.",
-    "substrate_wired": "Source bench/test file exists and emits machine-readable measured/degraded evidence; production SLO proof still requires a retained target-run artifact."
+    "substrate_wired": "Source bench/test file exists and emits machine-readable measured/degraded evidence; production SLO proof still requires a retained target-run artifact.",
+    "retained_run_validated": "Source bench/test file exists and the retained target-run artifact has passed its release gate without a degraded-substrate override."
   },
   "slos": [
     {
@@ -183,7 +184,7 @@
       "id": "RQ-S13.ssim_parity_oracle_corpus",
       "title": "SSIM parity oracle corpus",
       "target": "SSIM ≥ 0.99, L∞ ≤ 8, changed-pixel fraction ≤ 0.001",
-      "scenario": "Retained GPU golden corpus self-compare plus adversarial floor audit now; ratatui oracle vs ftui subject retained driver reports clean deterministic Home/Panes frames pending a clean release run",
+      "scenario": "Retained GPU golden corpus self-compare plus adversarial floor audit; ratatui oracle vs ftui subject retained driver reports clean deterministic Home/Panes frames in the retained release run",
       "measurement": "Per-pixel SSIM, max L∞ channel delta, changed-pixel fraction, and G39 topology fixture cross-check via frankenterm_gui::gpu_regression::compare_images",
       "source_bench": "crates/frankenterm-gui/tests/ssim_parity.rs",
       "backend_driver_test": "crates/frankenterm-core/src/tui/mod.rs::backend_driver_harness_reaches_real_ratatui_and_ftui_renderers",
@@ -191,8 +192,8 @@
       "mcp_resource": "wa://perf/renderer-slo/ssim_parity",
       "operator_surface": "ft robot perf slo-status --slo ssim_parity; ft doctor --json .renderer_slos.ssim_parity",
       "topology_cross_check": "docs/attestations/tui/topology-parity.json",
-      "status": "substrate_wired",
-      "current_degradation": "retained-release-run-pending",
+      "status": "retained_run_validated",
+      "current_degradation": "none",
       "blocked_by": ["ft-tf6g3.3.3"],
       "owner_bead": "ft-tf6g3.3.3"
     }
@@ -242,6 +243,12 @@
       "date": "2026-05-13",
       "bead": "ft-tf6g3.3.3",
       "note": "SSIM parity oracle-corpus entry now points at the frankenterm-gui SSIM parity test, adversarial floor audit, robot/doctor/MCP operator surfaces, and the topology cross-check contract. Retained ratatui-vs-ftui release evidence remains pending."
+    },
+    {
+      "version": "0.1.3",
+      "date": "2026-05-16",
+      "bead": "ft-tf6g3.3.3",
+      "note": "SSIM parity retained release evidence passed through remote RCH for both the backend-driver oracle and GUI corpus gates; current_degradation is now none."
     }
   ]
 }
