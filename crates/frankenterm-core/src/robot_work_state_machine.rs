@@ -366,8 +366,8 @@ pub enum WorkSafetyViolation {
         prior_owner: AgentId,
         new_state: ClaimState,
     },
-    /// A `complete` or `release` succeeded under an agent who
-    /// did not own the claim — owner-exclusivity violation.
+    /// A `complete` or `release` succeeded without satisfying
+    /// the operation's owner/state preconditions.
     NonOwnerMutation {
         claim: ClaimId,
         actor: AgentId,
@@ -432,8 +432,8 @@ pub fn check_invariants(
         }
     }
 
-    // NonOwnerMutation — a successful Complete or Release
-    // implies the actor was the owner.
+    // NonOwnerMutation — a successful Complete implies the actor
+    // was the owner.
     if let (WorkAction::Complete { claim, agent }, WorkOutcome::CompleteSucceeded { .. }) =
         (last_action, last_outcome)
     {
@@ -449,18 +449,37 @@ pub fn check_invariants(
             });
         }
     }
-    if let (
-        WorkAction::Release { claim, agent },
-        WorkOutcome::ReleaseSucceeded {
-            is_duplicate: false,
-        },
-    ) = (last_action, last_outcome)
+    // ReleaseSucceeded is legitimate in exactly two prior shapes:
+    //   - `Claimed { owner == agent }` with `is_duplicate=false`
+    //     (real release: state transitions to Unclaimed).
+    //   - `Unclaimed`               with `is_duplicate=true`
+    //     (idempotent no-op release: state unchanged).
+    //
+    // Anything else — a non-owner receiving a `ReleaseSucceeded`
+    // result on a `Claimed { other_owner }` slot, a release on a
+    // `Completed` row, or `is_duplicate=true` over a still-Claimed
+    // slot — is a contract violation. A previous version of this
+    // check only fired for `is_duplicate=false`, leaving the
+    // duplicate-labeled bug class undetected and same-shaped as
+    // the dry-run gap previously fixed in the checkpoint model.
+    if let (WorkAction::Release { claim, agent }, WorkOutcome::ReleaseSucceeded { is_duplicate }) =
+        (last_action, last_outcome)
     {
-        let prior_owner = match prior.claims.get(&claim).copied() {
-            Some(ClaimState::Claimed { owner } | ClaimState::Completed { owner }) => Some(owner),
-            _ => None,
-        };
-        if prior_owner != Some(agent) {
+        let prior_state = prior.claims.get(&claim).copied();
+        let legitimate = matches!(
+            (prior_state, is_duplicate),
+            (Some(ClaimState::Claimed { owner }), false) if owner == agent,
+        ) || matches!(
+            (prior_state, is_duplicate),
+            (Some(ClaimState::Unclaimed), true),
+        );
+        if !legitimate {
+            let prior_owner = match prior_state {
+                Some(ClaimState::Claimed { owner } | ClaimState::Completed { owner }) => {
+                    Some(owner)
+                }
+                _ => None,
+            };
             out.push(WorkSafetyViolation::NonOwnerMutation {
                 claim,
                 actor: agent,
@@ -747,6 +766,98 @@ mod tests {
         let outcome = apply_action(&mut w, action);
         assert_eq!(outcome, WorkOutcome::ReleaseFailed);
         assert_eq!(w, prior);
+    }
+
+    /// Defense regression guard: if a future buggy handler ever
+    /// emits `ReleaseSucceeded { is_duplicate: false }` against a
+    /// slot the actor does not own, the invariant must fire. This
+    /// is synthesized — `apply_action` correctly denies the
+    /// scenario today — but the invariant must catch it if a
+    /// future refactor opens the gap.
+    #[test]
+    fn invariant_catches_synthetic_non_owner_release_real() {
+        let mut w = world_with_one_claim();
+        apply_action(&mut w, WorkAction::Claim { claim: 0, agent: 1 });
+        let prior = w.clone();
+        // Manually pretend a buggy handler succeeded a release for
+        // a non-owner with is_duplicate=false. apply_action would
+        // have produced `ReleaseDenied`; we feed the synthetic
+        // pair into check_invariants directly.
+        let bad_action = WorkAction::Release { claim: 0, agent: 2 };
+        let bad_outcome = WorkOutcome::ReleaseSucceeded {
+            is_duplicate: false,
+        };
+        let violations = check_invariants(&prior, &w, bad_action, bad_outcome);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, WorkSafetyViolation::NonOwnerMutation { .. })),
+            "non-owner release with is_duplicate=false must be flagged"
+        );
+    }
+
+    /// Defense regression guard: same as the previous test but
+    /// the buggy outcome lies with `is_duplicate: true` on a slot
+    /// that was actually `Claimed { other_owner }`. The prior
+    /// invariant only checked `is_duplicate: false` so this case
+    /// was silently accepted — the strengthened check must now
+    /// flag it.
+    #[test]
+    fn invariant_catches_synthetic_release_duplicate_lie_on_claimed_slot() {
+        let mut w = world_with_one_claim();
+        apply_action(&mut w, WorkAction::Claim { claim: 0, agent: 1 });
+        let prior = w.clone();
+        let bad_action = WorkAction::Release { claim: 0, agent: 2 };
+        let bad_outcome = WorkOutcome::ReleaseSucceeded { is_duplicate: true };
+        let violations = check_invariants(&prior, &w, bad_action, bad_outcome);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, WorkSafetyViolation::NonOwnerMutation { .. })),
+            "release-succeeded-duplicate over a still-Claimed slot must be flagged"
+        );
+    }
+
+    /// Legitimate idempotent release on Unclaimed must NOT fire
+    /// the invariant. Regression guard against over-firing.
+    #[test]
+    fn invariant_accepts_idempotent_release_on_unclaimed() {
+        let mut w = world_with_one_claim();
+        // Slot 0 is Unclaimed (just seeded, never claimed).
+        let prior = w.clone();
+        let action = WorkAction::Release { claim: 0, agent: 2 };
+        let outcome = apply_action(&mut w, action);
+        assert_eq!(
+            outcome,
+            WorkOutcome::ReleaseSucceeded { is_duplicate: true }
+        );
+        // Even though agent 2 was not the owner (there was none),
+        // the invariant must accept the no-op release.
+        assert!(check_invariants(&prior, &w, action, outcome).is_empty());
+    }
+
+    /// Defense regression guard: a buggy handler attempting to
+    /// "release" a Completed row should be denied; if a
+    /// regression ever emitted ReleaseSucceeded against a
+    /// Completed slot, the invariant must catch it regardless of
+    /// the is_duplicate flag.
+    #[test]
+    fn invariant_catches_synthetic_release_on_completed_slot() {
+        let mut w = world_with_one_claim();
+        apply_action(&mut w, WorkAction::Claim { claim: 0, agent: 1 });
+        apply_action(&mut w, WorkAction::Complete { claim: 0, agent: 1 });
+        let prior = w.clone();
+        let bad_action = WorkAction::Release { claim: 0, agent: 1 };
+        for is_duplicate in [false, true] {
+            let bad_outcome = WorkOutcome::ReleaseSucceeded { is_duplicate };
+            let violations = check_invariants(&prior, &w, bad_action, bad_outcome);
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, WorkSafetyViolation::NonOwnerMutation { .. })),
+                "release of a Completed slot (is_duplicate={is_duplicate}) must be flagged"
+            );
+        }
     }
 
     #[test]
