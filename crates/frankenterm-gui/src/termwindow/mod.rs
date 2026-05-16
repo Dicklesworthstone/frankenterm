@@ -556,11 +556,13 @@ pub(crate) fn record_sync_output_mux_event(
             depth_outcome,
             max_depth,
         } => record_sync_output_drain(
-            pane_id,
-            cause,
-            bytes,
-            depth_outcome,
-            max_depth,
+            SyncOutputDrainRecord {
+                pane_id,
+                cause,
+                bytes,
+                maybe_depth_outcome: depth_outcome,
+                max_depth,
+            },
             watchdog_telemetry,
             orchestrator_telemetry,
             bsu_depth_by_pane,
@@ -640,12 +642,17 @@ fn record_sync_output_depth_outcome(
     sync_output_depth_outcome_from_mux(outcome)
 }
 
-fn record_sync_output_drain(
+#[derive(Clone, Copy)]
+struct SyncOutputDrainRecord {
     pane_id: PaneId,
     cause: SynchronizedOutputDrainCause,
     bytes: u64,
     maybe_depth_outcome: Option<SynchronizedOutputDepthOutcome>,
     max_depth: u32,
+}
+
+fn record_sync_output_drain(
+    record: SyncOutputDrainRecord,
     watchdog_telemetry: &mut frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
     orchestrator_telemetry: &mut frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
     bsu_depth_by_pane: &mut HashMap<
@@ -659,13 +666,15 @@ fn record_sync_output_drain(
     };
     use frankenterm_core::sync_output_watchdog::WatchdogDecision;
 
-    let bytes = if bytes > 0 {
-        buffered_bytes_by_pane.remove(&pane_id);
-        bytes
+    let bytes = if record.bytes > 0 {
+        buffered_bytes_by_pane.remove(&record.pane_id);
+        record.bytes
     } else {
-        buffered_bytes_by_pane.remove(&pane_id).unwrap_or_default()
+        buffered_bytes_by_pane
+            .remove(&record.pane_id)
+            .unwrap_or_default()
     };
-    let drain_cause = match cause {
+    let drain_cause = match record.cause {
         SynchronizedOutputDrainCause::Esu => DrainCause::Esu,
         SynchronizedOutputDrainCause::Watchdog => DrainCause::Watchdog,
         SynchronizedOutputDrainCause::LiveResizeForce => DrainCause::LiveResizeForce,
@@ -680,21 +689,22 @@ fn record_sync_output_drain(
         BufferDrainOutcome::NoOp
     };
 
-    if matches!(cause, SynchronizedOutputDrainCause::LiveResizeForce) {
+    if matches!(record.cause, SynchronizedOutputDrainCause::LiveResizeForce) {
         orchestrator_telemetry
             .record_override(OverrideTrigger::LiveResize, OverrideAction::ForceFlushNow);
     }
     orchestrator_telemetry.record_drain(drain_outcome);
 
-    match cause {
+    match record.cause {
         SynchronizedOutputDrainCause::Esu => {
-            let depth_outcome = maybe_depth_outcome
+            let depth_outcome = record
+                .maybe_depth_outcome
                 .map(|outcome| {
-                    record_sync_output_depth_outcome(pane_id, outcome, bsu_depth_by_pane)
+                    record_sync_output_depth_outcome(record.pane_id, outcome, bsu_depth_by_pane)
                 })
                 .unwrap_or_else(|| {
                     let (outcome, should_remove) = {
-                        let depth = bsu_depth_by_pane.entry(pane_id).or_default();
+                        let depth = bsu_depth_by_pane.entry(record.pane_id).or_default();
                         let outcome = depth.close_esu();
                         let should_remove = matches!(
                             outcome,
@@ -704,30 +714,29 @@ fn record_sync_output_drain(
                         (outcome, should_remove)
                     };
                     if should_remove {
-                        bsu_depth_by_pane.remove(&pane_id);
+                        bsu_depth_by_pane.remove(&record.pane_id);
                     }
                     outcome
                 });
-            let max_observed = max_depth;
             if matches!(drain_outcome, BufferDrainOutcome::Drained { .. }) {
                 frankenterm_core::sync_output_telemetry_bridge::forward_drain(
                     drain_outcome,
                     depth_outcome,
-                    max_observed,
+                    record.max_depth,
                     watchdog_telemetry,
                 );
             } else {
-                watchdog_telemetry.record_depth_outcome(depth_outcome, max_observed);
+                watchdog_telemetry.record_depth_outcome(depth_outcome, record.max_depth);
             }
         }
         SynchronizedOutputDrainCause::Watchdog => {
             watchdog_telemetry.record_watchdog_decision(WatchdogDecision::ForceFlush);
-            if let Some(depth) = bsu_depth_by_pane.get_mut(&pane_id) {
+            if let Some(depth) = bsu_depth_by_pane.get_mut(&record.pane_id) {
                 depth.force_reset();
             }
         }
         SynchronizedOutputDrainCause::LiveResizeForce | SynchronizedOutputDrainCause::Operator => {
-            if let Some(depth) = bsu_depth_by_pane.get_mut(&pane_id) {
+            if let Some(depth) = bsu_depth_by_pane.get_mut(&record.pane_id) {
                 depth.force_reset();
             }
         }
