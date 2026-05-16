@@ -1,0 +1,69 @@
+{
+  "generated_at_ms": 1778912940000,
+  "source": "mission_objective_plan.golden_corpus",
+  "objective": "Choose the next safe Beads-ready mission-planner corpus slice.",
+  "strictness": "normal",
+  "source_snapshots": [
+    {
+      "source_id": "beads.ready.clean",
+      "kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted",
+      "reason_codes": [
+        "beads.ready_available"
+      ],
+      "evidence": [
+        {
+          "category": "beads_ready_queue",
+          "summary": "one unassigned ready bead",
+          "reason_codes": [
+            "beads.ready_available"
+          ]
+        }
+      ]
+    },
+    {
+      "source_id": "git.clean.scope",
+      "kind": "git",
+      "state": "available",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted",
+      "reason_codes": [
+        "git.clean_for_scope"
+      ],
+      "evidence": [
+        {
+          "category": "dirty_path_overlap",
+          "summary": "mission-planner corpus paths clean",
+          "reason_codes": [
+            "dirty_overlap.none"
+          ]
+        }
+      ]
+    }
+  ],
+  "dirty_paths": [],
+  "candidates": [
+    {
+      "candidate_id": "mission-objective-plan-corpus",
+      "title": "golden objective corpus and no-mock planner harness",
+      "readiness": "ready_bead",
+      "priority": 2,
+      "target_bead_id": "ft-auy2g.5",
+      "owned_paths": [
+        "fixtures/mission-planner/objective-plan-corpus",
+        "crates/frankenterm-core/tests/mission_objective_plan_golden_corpus.rs"
+      ],
+      "active_assignee": null,
+      "active_age_seconds": null,
+      "stale_after_seconds": 7200,
+      "dependency_ready": true,
+      "proof_availability": "not_required",
+      "capacity_posture": "admit",
+      "reason_codes": [
+        "scope.mission_planner_corpus"
+      ]
+    }
+  ]
+}

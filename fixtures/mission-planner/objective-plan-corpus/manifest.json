@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_plan.golden_corpus.v1",
+  "scrub_rules": [
+    {
+      "field": "generated_at_ms",
+      "replacement": "fixed corpus timestamp",
+      "reason": "wall-clock collection time must not affect planner goldens"
+    },
+    {
+      "field": "workspace_root",
+      "replacement": "unknown",
+      "reason": "developer checkout paths differ across machines"
+    },
+    {
+      "field": "elapsed_ms",
+      "replacement": "omitted from planner input",
+      "reason": "source command runtime is non-contractual"
+    },
+    {
+      "field": "worker_id",
+      "replacement": "redacted-worker",
+      "reason": "RCH worker identities are machine-local"
+    },
+    {
+      "field": "machine_id",
+      "replacement": "redacted-machine",
+      "reason": "host identity must not be part of the golden"
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "clean-ready-queue",
+      "input_path": "fixtures/mission-planner/objective-plan-corpus/inputs/clean-ready-queue.json",
+      "retained_artifacts": [
+        {
+          "artifact_path": "fixtures/mission-planner/objective-plan/ready-bead.json",
+          "artifact_kind": "objective_plan_json",
+          "source_command": "br ready --json",
+          "exit_code": 0,
+          "fixture_sha256": "568daa1074db3bab114b018156e59aa688584584b48cb5a57b8f73645ba054a7"
+        }
+      ],
+      "expected": {
+        "plan_status": "actionable",
+        "risk_level": "low",
+        "top_step_candidate_id": "ft-auy2g.5",
+        "top_step_action_kind": "choose_ready_bead",
+        "top_step_status": "actionable",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.dry_run_only",
+          "planner.status.actionable",
+          "beads.ready_available"
+        ]
+      }
+    },
+    {
+      "case_id": "no-ready-fallback",
+      "input_path": "fixtures/mission-planner/objective-plan-corpus/inputs/no-ready-fallback.json",
+      "retained_artifacts": [
+        {
+          "artifact_path": "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json",
+          "artifact_kind": "objective_plan_json",
+          "source_command": "bv --robot-triage",
+          "exit_code": 0,
+          "fixture_sha256": "9c95f59b0f91e7e667878c60fa8bfd41515fe200afb576e2cfaf4e21c0b08555"
+        }
+      ],
+      "expected": {
+        "plan_status": "no_ready_work",
+        "risk_level": "medium",
+        "top_step_candidate_id": "fallback.bv_robot_triage.1778913000000",
+        "top_step_action_kind": "inspect_artifact",
+        "top_step_status": "no_ready_work",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.no_ready_work",
+          "beads.robot_triage_fallback",
+          "planner.testing_skill_fallback"
+        ]
+      }
+    },
+    {
+      "case_id": "agent-mail-unavailable",
+      "input_path": "fixtures/mission-planner/objective-plan-corpus/inputs/agent-mail-unavailable.json",
+      "retained_artifacts": [
+        {
+          "artifact_path": "fixtures/mission-planner/objective-plan/agent-mail-red.json",
+          "artifact_kind": "objective_plan_json",
+          "source_command": "macro_start_session retry x2; scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+          "exit_code": 0,
+          "fixture_sha256": "4444ee5cc69d030cf72d3b18e5261265e1e98326d6c9093a01e5078cde4521e0"
+        }
+      ],
+      "expected": {
+        "plan_status": "degraded",
+        "risk_level": "medium",
+        "top_step_candidate_id": "ft-auy2g.5",
+        "top_step_action_kind": "choose_ready_bead",
+        "top_step_status": "actionable",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.degraded",
+          "agent_mail.fallback_required",
+          "agent_mail.beads_fallback_available"
+        ]
+      }
+    },
+    {
+      "case_id": "rch-degraded-no-worker",
+      "input_path": "fixtures/mission-planner/objective-plan-corpus/inputs/rch-degraded-no-worker.json",
+      "retained_artifacts": [
+        {
+          "artifact_path": "fixtures/mission-planner/objective-plan/rch-degraded.json",
+          "artifact_kind": "objective_plan_json",
+          "source_command": "rch diagnose --json",
+          "exit_code": 0,
+          "fixture_sha256": "08404011650ed15426009828a19bbb896fc617e7a357fe705c302425d19a7817"
+        }
+      ],
+      "expected": {
+        "plan_status": "rch_substrate_blocked",
+        "risk_level": "blocked",
+        "top_step_candidate_id": "ft-proof-rch",
+        "top_step_action_kind": "create_bead",
+        "top_step_status": "rch_substrate_blocked",
+        "top_step_proof_lane": "blocked",
+        "reason_codes_include": [
+          "planner.status.rch_substrate_blocked",
+          "rch.proof_substrate_unavailable",
+          "rch.no_workers_passed_health"
+        ]
+      }
+    },
+    {
+      "case_id": "dirty-overlapping-paths",
+      "input_path": "fixtures/mission-planner/objective-plan-corpus/inputs/dirty-overlapping-paths.json",
+      "retained_artifacts": [
+        {
+          "artifact_path": "fixtures/mission-planner/objective-plan/dirty-overlap.json",
+          "artifact_kind": "objective_plan_json",
+          "source_command": "git status --short --untracked-files=all",
+          "exit_code": 0,
+          "fixture_sha256": "175997f9a1e874ff7349f0b63309f79139bc8adffae506db5613d570ba6732d2"
+        }
+      ],
+      "expected": {
+        "plan_status": "dirty_overlap",
+        "risk_level": "blocked",
+        "top_step_candidate_id": "ft-renderer-overlap",
+        "top_step_action_kind": "wait_for_owner",
+        "top_step_status": "dirty_overlap",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.dirty_overlap",
+          "dirty_overlap.owned_surface_blocked",
+          "git.dirty_paths_present"
+        ]
+      }
+    },
+    {
+      "case_id": "stale-in-progress-candidate",
+      "input_path": "fixtures/mission-planner/objective-plan-corpus/inputs/stale-in-progress-candidate.json",
+      "retained_artifacts": [
+        {
+          "artifact_path": "fixtures/mission-planner/objective-plan-corpus/inputs/stale-in-progress-candidate.json",
+          "artifact_kind": "planner_input_json",
+          "source_command": "br show ft-stale --json",
+          "exit_code": 0,
+          "fixture_sha256": "b7e2b45111ba74a7486e284b3748d6571bc7ac80c3bff33cbbc6b8f06d5db3cd"
+        }
+      ],
+      "expected": {
+        "plan_status": "waiting_owner",
+        "risk_level": "high",
+        "top_step_candidate_id": "ft-stale",
+        "top_step_action_kind": "inspect_artifact",
+        "top_step_status": "waiting_owner",
+        "top_step_proof_lane": "not_required",
+        "reason_codes_include": [
+          "planner.status.waiting_owner",
+          "beads.stale_reopen_candidate",
+          "beads.status_check_before_reopen"
+        ]
+      }
+    },
+    {
+      "case_id": "blocked-proof-lane",
+      "input_path": "fixtures/mission-planner/objective-plan-corpus/inputs/blocked-proof-lane.json",
+      "retained_artifacts": [
+        {
+          "artifact_path": "fixtures/mission-planner/objective-plan-corpus/inputs/blocked-proof-lane.json",
+          "artifact_kind": "planner_input_json",
+          "source_command": "rch exec -- cargo test -p frankenterm-core --lib mission_objective_plan",
+          "exit_code": 1,
+          "fixture_sha256": "448f2d0c220c6c5851307b246fe845ff35f0ba7b89a90e70537e0efeea322b82"
+        }
+      ],
+      "expected": {
+        "plan_status": "rch_substrate_blocked",
+        "risk_level": "blocked",
+        "top_step_candidate_id": "ft-proof-blocked",
+        "top_step_action_kind": "create_bead",
+        "top_step_status": "rch_substrate_blocked",
+        "top_step_proof_lane": "blocked",
+        "reason_codes_include": [
+          "planner.status.rch_substrate_blocked",
+          "rch.proof_substrate_blocked",
+          "local_cargo_forbidden"
+        ]
+      }
+    }
+  ]
+}

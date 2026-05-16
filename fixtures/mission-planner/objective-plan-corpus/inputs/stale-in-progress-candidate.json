@@ -1,0 +1,56 @@
+{
+  "generated_at_ms": 1778913240000,
+  "source": "mission_objective_plan.golden_corpus",
+  "objective": "Treat stale in-progress work as a status-check lane, not a force claim.",
+  "strictness": "normal",
+  "source_snapshots": [
+    {
+      "source_id": "beads.in_progress.stale",
+      "kind": "beads",
+      "state": "stale",
+      "freshness_state": "stale",
+      "redaction_posture": "redacted",
+      "reason_codes": [
+        "beads.stale_candidate"
+      ],
+      "evidence": [
+        {
+          "category": "beads_in_progress",
+          "summary": "in-progress candidate exceeded stale threshold",
+          "reason_codes": [
+            "beads.stale_candidate"
+          ]
+        },
+        {
+          "category": "active_assignee_overlap",
+          "summary": "GreyRiver owns the stale bead until a status check confirms handoff",
+          "reason_codes": [
+            "beads.status_check_required"
+          ]
+        }
+      ]
+    }
+  ],
+  "dirty_paths": [],
+  "candidates": [
+    {
+      "candidate_id": "stale-in-progress",
+      "title": "stale in-progress candidate",
+      "readiness": "stale_reopen_candidate",
+      "priority": 2,
+      "target_bead_id": "ft-stale",
+      "owned_paths": [
+        "docs/robot-contracts/mission-objective-plan.md"
+      ],
+      "active_assignee": "GreyRiver",
+      "active_age_seconds": 8100,
+      "stale_after_seconds": 7200,
+      "dependency_ready": true,
+      "proof_availability": "not_required",
+      "capacity_posture": "admit",
+      "reason_codes": [
+        "beads.stale_reopen_candidate"
+      ]
+    }
+  ]
+}

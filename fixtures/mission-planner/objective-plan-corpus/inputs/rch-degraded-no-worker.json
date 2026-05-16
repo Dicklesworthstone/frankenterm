@@ -1,0 +1,76 @@
+{
+  "generated_at_ms": 1778913120000,
+  "source": "mission_objective_plan.golden_corpus",
+  "objective": "Detect that RCH cannot currently carry the required Cargo proof.",
+  "strictness": "normal",
+  "source_snapshots": [
+    {
+      "source_id": "rch.no_worker",
+      "kind": "rch",
+      "state": "degraded",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted_summary_only",
+      "reason_codes": [
+        "rch.no_workers_passed_health",
+        "rch.active_project_exclusion.not_evaluated"
+      ],
+      "evidence": [
+        {
+          "category": "rch_worker_selection",
+          "summary": "no attested worker passed health checks",
+          "reason_codes": [
+            "rch.no_workers_passed_health"
+          ]
+        },
+        {
+          "category": "rch_cargo_verdict",
+          "summary": "remote Cargo proof was not run",
+          "reason_codes": [
+            "rch.cargo_verdict.not_run"
+          ]
+        }
+      ]
+    },
+    {
+      "source_id": "beads.ready.rch_required",
+      "kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted",
+      "reason_codes": [
+        "beads.ready_available"
+      ],
+      "evidence": [
+        {
+          "category": "beads_ready_queue",
+          "summary": "ready code slice requires remote proof",
+          "reason_codes": [
+            "beads.ready_available"
+          ]
+        }
+      ]
+    }
+  ],
+  "dirty_paths": [],
+  "candidates": [
+    {
+      "candidate_id": "rch-required-code-change",
+      "title": "proof-required code change",
+      "readiness": "ready_bead",
+      "priority": 2,
+      "target_bead_id": "ft-proof-rch",
+      "owned_paths": [
+        "crates/frankenterm-core/src/mission_objective_plan.rs"
+      ],
+      "active_assignee": null,
+      "active_age_seconds": null,
+      "stale_after_seconds": 7200,
+      "dependency_ready": true,
+      "proof_availability": "available",
+      "capacity_posture": "admit",
+      "reason_codes": [
+        "proof.rch_required"
+      ]
+    }
+  ]
+}

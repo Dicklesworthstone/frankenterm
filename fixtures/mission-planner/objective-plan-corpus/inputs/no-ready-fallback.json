@@ -1,0 +1,48 @@
+{
+  "generated_at_ms": 1778913000000,
+  "source": "mission_objective_plan.golden_corpus",
+  "objective": "Find a safe planning-only lane when the Beads ready queue is empty.",
+  "strictness": "normal",
+  "source_snapshots": [
+    {
+      "source_id": "beads.ready.empty",
+      "kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted",
+      "reason_codes": [
+        "beads.ready_empty"
+      ],
+      "evidence": [
+        {
+          "category": "beads_ready_queue",
+          "summary": "ready queue empty after robot triage",
+          "reason_codes": [
+            "beads.ready_empty"
+          ]
+        }
+      ]
+    },
+    {
+      "source_id": "git.clean.no_ready",
+      "kind": "git",
+      "state": "available",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted",
+      "reason_codes": [
+        "git.clean_for_scope"
+      ],
+      "evidence": [
+        {
+          "category": "git_dirty_tree",
+          "summary": "no owned-path overlap for fallback planning",
+          "reason_codes": [
+            "dirty_overlap.none"
+          ]
+        }
+      ]
+    }
+  ],
+  "dirty_paths": [],
+  "candidates": []
+}

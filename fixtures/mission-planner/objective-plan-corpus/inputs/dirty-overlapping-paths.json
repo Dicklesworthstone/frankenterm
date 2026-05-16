@@ -1,0 +1,62 @@
+{
+  "generated_at_ms": 1778913180000,
+  "source": "mission_objective_plan.golden_corpus",
+  "objective": "Avoid mission-planner work when dirty renderer paths overlap the candidate.",
+  "strictness": "normal",
+  "source_snapshots": [
+    {
+      "source_id": "git.dirty.renderer",
+      "kind": "git",
+      "state": "degraded",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted_summary_only",
+      "reason_codes": [
+        "git.dirty_paths_present"
+      ],
+      "evidence": [
+        {
+          "category": "git_dirty_tree",
+          "summary": "tracked renderer paths are dirty",
+          "reason_codes": [
+            "git.dirty_paths_present"
+          ]
+        },
+        {
+          "category": "dirty_path_overlap",
+          "summary": "candidate owned path overlaps dirty renderer path",
+          "reason_codes": [
+            "git.dirty_overlap_risk"
+          ]
+        }
+      ]
+    }
+  ],
+  "dirty_paths": [
+    {
+      "path": "crates/frankenterm-gui/src/frontend.rs",
+      "status": "M",
+      "category": "tracked_overlap_risk"
+    }
+  ],
+  "candidates": [
+    {
+      "candidate_id": "renderer-overlap",
+      "title": "renderer path candidate must wait",
+      "readiness": "ready_bead",
+      "priority": 2,
+      "target_bead_id": "ft-renderer-overlap",
+      "owned_paths": [
+        "crates/frankenterm-gui"
+      ],
+      "active_assignee": null,
+      "active_age_seconds": null,
+      "stale_after_seconds": 7200,
+      "dependency_ready": true,
+      "proof_availability": "not_required",
+      "capacity_posture": "admit",
+      "reason_codes": [
+        "scope.renderer"
+      ]
+    }
+  ]
+}

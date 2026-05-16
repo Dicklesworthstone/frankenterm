@@ -1,0 +1,71 @@
+{
+  "generated_at_ms": 1778913060000,
+  "source": "mission_objective_plan.golden_corpus",
+  "objective": "Continue with Beads-only planning after Agent Mail retry failure.",
+  "strictness": "normal",
+  "source_snapshots": [
+    {
+      "source_id": "agent_mail.database_error",
+      "kind": "agent_mail",
+      "state": "unavailable",
+      "freshness_state": "not_collected",
+      "redaction_posture": "redacted",
+      "reason_codes": [
+        "agent_mail.database_error",
+        "agent_mail.unavailable_after_retry"
+      ],
+      "evidence": [
+        {
+          "category": "agent_mail_availability",
+          "summary": "macro_start_session failed twice with transient database error",
+          "reason_codes": [
+            "agent_mail.database_error",
+            "fallback.beads_only"
+          ]
+        }
+      ]
+    },
+    {
+      "source_id": "beads.ready.agent_mail_fallback",
+      "kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted",
+      "reason_codes": [
+        "beads.ready_available",
+        "fallback.beads_only"
+      ],
+      "evidence": [
+        {
+          "category": "beads_ready_queue",
+          "summary": "swarm tick fallback found one ready bead",
+          "reason_codes": [
+            "beads.ready_available"
+          ]
+        }
+      ]
+    }
+  ],
+  "dirty_paths": [],
+  "candidates": [
+    {
+      "candidate_id": "ready-under-agent-mail-fallback",
+      "title": "claim under Beads-only fallback",
+      "readiness": "ready_bead",
+      "priority": 2,
+      "target_bead_id": "ft-auy2g.5",
+      "owned_paths": [
+        "fixtures/mission-planner/objective-plan-corpus"
+      ],
+      "active_assignee": null,
+      "active_age_seconds": null,
+      "stale_after_seconds": 7200,
+      "dependency_ready": true,
+      "proof_availability": "not_required",
+      "capacity_posture": "admit",
+      "reason_codes": [
+        "fallback.beads_only"
+      ]
+    }
+  ]
+}

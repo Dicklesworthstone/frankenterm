@@ -1,0 +1,51 @@
+{
+  "generated_at_ms": 1778913300000,
+  "source": "mission_objective_plan.golden_corpus",
+  "objective": "Represent an explicitly blocked proof lane without local Cargo fallback.",
+  "strictness": "normal",
+  "source_snapshots": [
+    {
+      "source_id": "rch.proof.blocked",
+      "kind": "rch",
+      "state": "blocked",
+      "freshness_state": "fresh",
+      "redaction_posture": "redacted_summary_only",
+      "reason_codes": [
+        "rch.remote_proof_blocked",
+        "local_cargo_forbidden"
+      ],
+      "evidence": [
+        {
+          "category": "rch_cargo_verdict",
+          "summary": "remote proof lane blocked before Cargo started",
+          "reason_codes": [
+            "rch.remote_proof_blocked",
+            "local_cargo_forbidden"
+          ]
+        }
+      ]
+    }
+  ],
+  "dirty_paths": [],
+  "candidates": [
+    {
+      "candidate_id": "blocked-proof-lane",
+      "title": "blocked proof lane",
+      "readiness": "ready_bead",
+      "priority": 2,
+      "target_bead_id": "ft-proof-blocked",
+      "owned_paths": [
+        "crates/frankenterm-core/tests/mission_objective_plan_golden_corpus.rs"
+      ],
+      "active_assignee": null,
+      "active_age_seconds": null,
+      "stale_after_seconds": 7200,
+      "dependency_ready": true,
+      "proof_availability": "blocked",
+      "capacity_posture": "admit",
+      "reason_codes": [
+        "local_cargo_forbidden"
+      ]
+    }
+  ]
+}

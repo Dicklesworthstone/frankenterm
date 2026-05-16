@@ -116,6 +116,15 @@ The initial fixtures live under `fixtures/mission-planner/objective-plan/`:
 
 These fixtures are schema examples, not proof that a CLI surface exists.
 
+`fixtures/mission-planner/objective-plan-corpus/` adds the reviewed planner
+golden corpus for `ft-auy2g.5`. Its manifest records scrub rules, retained
+source commands, exit codes, fixture hashes, and expected contract fields for
+clean ready queues, no-ready fallback, Agent Mail unavailable, RCH degraded,
+dirty path overlap, stale in-progress work, and blocked proof lanes. The
+`mission_objective_plan_golden_corpus` integration test feeds those fixtures
+through the real dry-run planner, validates generated plan JSON against the
+schema, and verifies deterministic TOON encoding.
+
 ## Shipped Surface
 
 The same dry-run contract is exposed through human CLI, Robot mode, and MCP:
