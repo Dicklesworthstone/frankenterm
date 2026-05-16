@@ -79,6 +79,10 @@ pub struct ExpandedCommand {
     pub icon: Option<Cow<'static, str>>,
 }
 
+fn domain_detach_command_is_available(name: &str, state: DomainState, detachable: bool) -> bool {
+    state == DomainState::Attached && detachable && name != "local"
+}
+
 impl std::fmt::Debug for CommandDef {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         fmt.debug_struct("CommandDef")
@@ -274,10 +278,7 @@ impl CommandDef {
                 // FIXME: use domain_label here, but needs to be async
                 let label = name;
 
-                if dom.state() == DomainState::Attached {
-                    if name == "local" {
-                        continue;
-                    }
+                if domain_detach_command_is_available(name, dom.state(), dom.detachable()) {
                     result.push(ExpandedCommand {
                         brief: format!("Detach Domain {label}").into(),
                         doc: "".into(),
@@ -2340,5 +2341,30 @@ mod tests {
                 "duplicate PaneSelect default chord: {label}"
             );
         }
+    }
+
+    #[test]
+    fn detach_domain_commands_require_detachable_attached_non_local_domain() {
+        assert!(domain_detach_command_is_available(
+            "remote",
+            DomainState::Attached,
+            true,
+        ));
+
+        assert!(!domain_detach_command_is_available(
+            "remote",
+            DomainState::Attached,
+            false,
+        ));
+        assert!(!domain_detach_command_is_available(
+            "remote",
+            DomainState::Detached,
+            true,
+        ));
+        assert!(!domain_detach_command_is_available(
+            "local",
+            DomainState::Attached,
+            true,
+        ));
     }
 }
