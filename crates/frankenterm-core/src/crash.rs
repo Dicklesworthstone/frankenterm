@@ -1487,7 +1487,16 @@ fn add_swarm_incident_sources(
         redaction_entries,
     )?;
     add_proof_rch_evidence_source(sources, warnings);
-    add_beads_coordination_source(sources, warnings);
+    add_beads_coordination_source(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
     add_git_dirty_tree_source(
         sources,
         warnings,
@@ -1717,18 +1726,144 @@ fn add_proof_rch_evidence_source(
 fn add_beads_coordination_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
-) {
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
     let started = Instant::now();
-    sources.push(degraded_source(
-        "beads_coordination_snapshot",
-        IncidentSourceStatus::Unavailable,
-        "Beads snapshot supplied by operator handoff",
-        Some(30_000),
-        elapsed_ms(started),
-        "beads_coordination_snapshot.not_attached",
-        "no Beads coordination snapshot was supplied to the crash collector; service repair, claiming, and tracker mutation are outside the read-only incident path".to_string(),
-        warnings,
-    ));
+    let path = Path::new(".beads").join("issues.jsonl");
+    if path.is_file() {
+        match fs::read_to_string(&path) {
+            Ok(raw) => {
+                let payload = beads_coordination_payload(&raw);
+                sources.push(write_incident_json_source(
+                    IncidentJsonSourceMeta {
+                        name: "beads_coordination_snapshot",
+                        file: "sources/beads_coordination_snapshot.json",
+                        source_surface: "read-only .beads/issues.jsonl snapshot",
+                        evidence_state: if payload["parse_error_count"].as_u64().unwrap_or(0) > 0 {
+                            IncidentEvidenceState::Mixed
+                        } else {
+                            IncidentEvidenceState::Measured
+                        },
+                        max_age_ms: Some(30_000),
+                        started,
+                    },
+                    &payload,
+                    exported_at,
+                    bundle_dir,
+                    redactor,
+                    files,
+                    total_size,
+                    redaction_entries,
+                )?);
+            }
+            Err(error) => {
+                sources.push(degraded_source(
+                    "beads_coordination_snapshot",
+                    IncidentSourceStatus::Failed,
+                    "read-only .beads/issues.jsonl snapshot",
+                    Some(30_000),
+                    elapsed_ms(started),
+                    "beads_coordination_snapshot.read_failed",
+                    format!("failed to read Beads JSONL snapshot: {error}"),
+                    warnings,
+                ));
+            }
+        }
+    } else {
+        sources.push(degraded_source(
+            "beads_coordination_snapshot",
+            IncidentSourceStatus::Unavailable,
+            "read-only .beads/issues.jsonl snapshot",
+            Some(30_000),
+            elapsed_ms(started),
+            "beads_coordination_snapshot.unavailable",
+            "no .beads/issues.jsonl coordination snapshot was available; incident collection does not claim, reopen, sync, or mutate Beads".to_string(),
+            warnings,
+        ));
+    }
+    Ok(())
+}
+
+fn beads_coordination_payload(raw: &str) -> serde_json::Value {
+    let mut total = 0_usize;
+    let mut parse_error_count = 0_usize;
+    let mut open = 0_usize;
+    let mut in_progress = 0_usize;
+    let mut blocked = 0_usize;
+    let mut deferred = 0_usize;
+    let mut closed = 0_usize;
+    let mut active_assignees = HashSet::new();
+    let mut ready_candidates = Vec::new();
+    let mut stale_candidates = Vec::new();
+
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            parse_error_count += 1;
+            continue;
+        };
+        total += 1;
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        match status {
+            "open" => open += 1,
+            "in_progress" => in_progress += 1,
+            "blocked" => blocked += 1,
+            "deferred" => deferred += 1,
+            "closed" => closed += 1,
+            _ => {}
+        }
+        if let Some(assignee) = value.get("assignee").and_then(serde_json::Value::as_str)
+            && !assignee.trim().is_empty()
+        {
+            active_assignees.insert(assignee.to_string());
+        }
+        if status == "open" && ready_candidates.len() < 25 {
+            ready_candidates.push(bead_snapshot_row(&value));
+        }
+        if matches!(status, "in_progress" | "blocked") && stale_candidates.len() < 25 {
+            stale_candidates.push(bead_snapshot_row(&value));
+        }
+    }
+
+    let mut active_assignees = active_assignees.into_iter().collect::<Vec<_>>();
+    active_assignees.sort();
+    serde_json::json!({
+        "collector": "read-only .beads/issues.jsonl snapshot",
+        "counts": {
+            "total": total,
+            "open": open,
+            "in_progress": in_progress,
+            "blocked": blocked,
+            "deferred": deferred,
+            "closed": closed,
+            "parse_errors": parse_error_count,
+        },
+        "active_assignees": active_assignees,
+        "ready_candidates": ready_candidates,
+        "ready_candidates_truncated": open > ready_candidates.len(),
+        "stale_reopen_review_candidates": stale_candidates,
+        "stale_reopen_review_candidates_truncated": in_progress + blocked > stale_candidates.len(),
+        "parse_error_count": parse_error_count,
+        "mutated_beads": false,
+    })
+}
+
+fn bead_snapshot_row(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+        "title": value.get("title").and_then(serde_json::Value::as_str).unwrap_or(""),
+        "status": value.get("status").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+        "priority": value.get("priority").and_then(serde_json::Value::as_u64),
+        "assignee": value.get("assignee").and_then(serde_json::Value::as_str),
+        "updated_at": value.get("updated_at").and_then(serde_json::Value::as_str),
+    })
 }
 
 fn add_git_dirty_tree_source(
@@ -3794,7 +3929,7 @@ fn enrich_incident_verification_summary(
     };
 
     match source.name.as_str() {
-        "beads_blocker_snapshot" | "beads_coordination_snapshot" => {
+        "beads_blocker_snapshot" => {
             if let Some(blocked) = value.get("blocked").and_then(serde_json::Value::as_array) {
                 for item in blocked {
                     let id = item
@@ -3819,6 +3954,26 @@ fn enrich_incident_verification_summary(
                             .active_blockers
                             .push(format!("{id} blocked by {blockers}"));
                     }
+                }
+            }
+        }
+        "beads_coordination_snapshot" => {
+            if let Some(candidates) = value
+                .get("stale_reopen_review_candidates")
+                .and_then(serde_json::Value::as_array)
+            {
+                for item in candidates {
+                    let id = item
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let status = item
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    summary
+                        .active_blockers
+                        .push(format!("{id} status={status}"));
                 }
             }
         }
@@ -6904,12 +7059,43 @@ mod tests {
         );
         assert!(warning_ids.contains("pane_text_summaries.privacy_disabled"));
         assert!(warning_ids.contains("proof_rch_evidence.not_attached"));
-        assert!(warning_ids.contains("beads_coordination_snapshot.not_attached"));
         assert!(warning_ids.contains("agent_mail.not_attached"));
+        assert!(
+            swarm
+                .sources
+                .iter()
+                .any(|source| source.name == "beads_coordination_snapshot")
+        );
         assert!(warning_ids.contains("crash_bundle.skipped"));
         assert!(warning_ids.contains("config_summary.skipped"));
         assert!(warning_ids.contains("db_metadata.skipped"));
         assert!(warning_ids.contains("recent_events.db_not_configured"));
+    }
+
+    #[test]
+    fn beads_coordination_payload_counts_statuses_without_mutation() {
+        let payload = beads_coordination_payload(
+            r#"{"id":"ft-a","title":"A","status":"open","priority":2,"assignee":null,"updated_at":"2026-05-16T00:00:00Z"}
+{"id":"ft-b","title":"B","status":"in_progress","priority":1,"assignee":"Codex","updated_at":"2026-05-16T00:01:00Z"}
+{"id":"ft-c","title":"C","status":"blocked","priority":3,"assignee":"BlueLake","updated_at":"2026-05-16T00:02:00Z"}
+not-json
+"#,
+        );
+
+        assert_eq!(payload["counts"]["total"], 3);
+        assert_eq!(payload["counts"]["open"], 1);
+        assert_eq!(payload["counts"]["in_progress"], 1);
+        assert_eq!(payload["counts"]["blocked"], 1);
+        assert_eq!(payload["parse_error_count"], 1);
+        assert_eq!(payload["mutated_beads"], false);
+        assert_eq!(payload["ready_candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload["stale_reopen_review_candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
