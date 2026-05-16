@@ -1181,8 +1181,8 @@ rch_mirror_required_paths() {
 }
 
 ensure_rch_mirror_preflight() {
-    local required_paths=()
-    local workspace_member_arg=()
+    local -a required_paths=()
+    local -a workspace_member_arg=()
     local require_workspace_member_roots="false"
     local path
     while IFS= read -r path; do
@@ -1211,7 +1211,8 @@ ensure_rch_mirror_preflight() {
     local attest_script="${_RCH_REPO_ROOT}/scripts/attest_rch_worker_mirror.sh"
     [[ -x "${attest_script}" ]] || rch_fatal "mirror attestation script is not executable: ${attest_script}"
 
-    local worker_ids worker_id worker_dir worker_json worker_rc failures total bead_arg=()
+    local worker_ids worker_id worker_dir worker_json worker_rc failures total
+    local -a bead_arg=()
     local block_on_stale_head="false"
     local require_all_checked_workers="false"
     local min_passing_workers
@@ -1394,8 +1395,8 @@ rch_attest_selected_worker_before_cargo() {
 
     rch_selected_worker_mirror_preflight_enabled || return 0
 
-    local required_paths=()
-    local workspace_member_arg=()
+    local -a required_paths=()
+    local -a workspace_member_arg=()
     local require_workspace_member_roots="false"
     local path
     while IFS= read -r path; do
@@ -1424,7 +1425,8 @@ rch_attest_selected_worker_before_cargo() {
     local attest_script="${_RCH_REPO_ROOT}/scripts/attest_rch_worker_mirror.sh"
     [[ -x "${attest_script}" ]] || rch_fatal "mirror attestation script is not executable: ${attest_script}"
 
-    local diagnose_log sync_log mirror_log diagnose_rc sync_rc selected_worker would_intercept selection_reason bead_arg=()
+    local diagnose_log sync_log mirror_log diagnose_rc sync_rc selected_worker would_intercept selection_reason
+    local -a bead_arg=()
     diagnose_log="${output_file%.log}.rch_diagnose.json"
     sync_log="${output_file%.log}.selected_worker_sync.log"
     mirror_log="${output_file%.log}.selected_worker_mirror.json"
