@@ -194,7 +194,7 @@ SEE ALSO:
 NOTES:
     Uses distributed auth settings from config (`distributed.token*`).
     Aggregator endpoint defaults to --connect-addr, then `distributed.bind_addr`.
-    Connected remote panes surface through `ft status`, `ft query`, `ft robot state`, and MCP `wa.state`."#)]
+    Connected remote panes surface through `ft status`, `ft search`, `ft robot state`, and MCP `wa.state`."#)]
     Distributed {
         #[command(subcommand)]
         command: DistributedCommands,
@@ -35757,7 +35757,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 None => {
                     die(
                         &format!("Invalid duration '{last}'. Use e.g. 30s, 5m, 1h, 7d, 2w."),
-                        Some("Example: wa timeline --last 2h"),
+                        Some("Example: ft timeline --last 2h"),
                     );
                 }
             };
@@ -45068,7 +45068,7 @@ fn handle_learn_command(
                 if let Some(next) = engine.current_exercise() {
                     println!("\nNext exercise: {}", next.title);
                     if let Some(tid) = &track_id {
-                        println!("Run: wa learn {} to continue", tid);
+                        println!("Run: ft learn {} to continue", tid);
                     }
                 } else if let Some(tid) = &track_id {
                     if engine.is_track_complete(tid) {
@@ -45078,7 +45078,7 @@ fn handle_learn_command(
             }
             return Ok(());
         }
-        anyhow::bail!("No exercise in progress. Start a track first with: wa learn <track>");
+        anyhow::bail!("No exercise in progress. Start a track first with: ft learn <track>");
     }
 
     // Handle track selection or show menu
@@ -45118,7 +45118,7 @@ fn handle_learn_command(
                 for (i, step) in exercise.instructions.iter().enumerate() {
                     println!("  {}. {}", i + 1, step);
                 }
-                println!("\nWhen done, run: wa learn --complete");
+                println!("\nWhen done, run: ft learn --complete");
             }
         } else {
             // Track complete
@@ -45142,7 +45142,7 @@ fn handle_learn_command(
             println!("{}", serde_json::to_string_pretty(&status)?);
         } else {
             println!("ft learn\n");
-            println!("Welcome to the wa tutorial!\n");
+            println!("Welcome to the FrankenTerm tutorial!\n");
             println!("Available tracks:\n");
 
             for track in engine.tracks() {
@@ -45161,11 +45161,11 @@ fn handle_learn_command(
                 println!("      Progress: {}/{}", completed, total);
             }
 
-            println!("\nTo start a track, run: wa learn <track>");
-            println!("Example: wa learn basics");
+            println!("\nTo start a track, run: ft learn <track>");
+            println!("Example: ft learn basics");
 
             if let Some(current) = engine.state().current_track.as_ref() {
-                println!("\nResume your current track: wa learn {}", current);
+                println!("\nResume your current track: ft learn {}", current);
             }
         }
     }
@@ -45394,7 +45394,7 @@ async fn handle_db_command(
                     println!("Summary: Database is healthy");
                 } else {
                     println!("Problems found: {problems}");
-                    println!("Run: wa db repair --dry-run");
+                    println!("Run: ft db repair --dry-run");
                 }
             }
 
@@ -45470,7 +45470,7 @@ async fn handle_db_command(
                 if dry_run {
                     println!("No changes made. Run without --dry-run to apply.");
                 } else if report.all_succeeded() {
-                    println!("Repair complete. Run: wa db check");
+                    println!("Repair complete. Run: ft db check");
                 } else {
                     eprintln!("Some repairs failed. Check output above.");
                     std::process::exit(1);

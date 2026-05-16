@@ -885,7 +885,7 @@ impl TutorialEngine {
                             "Export captured data for offline analysis or integration with other tools."
                                 .into(),
                         instructions: vec![
-                            "Run: ft export --format jsonl".into(),
+                            "Run: ft export segments".into(),
                             "Each line is a self-contained JSON record suitable for jq, pandas, or log aggregators.".into(),
                             "Goal: integrate FrankenTerm data into your existing observability pipeline.".into(),
                         ],
