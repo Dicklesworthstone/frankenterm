@@ -4104,7 +4104,7 @@ mod tests {
                 let registry = Arc::new(ExternalSignalRegistry::new());
                 let cond = WaitCondition::external("late");
                 let signaler = Arc::clone(&registry);
-                std::thread::spawn(move || {
+                let handle = std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(80));
                     signaler.signal("late");
                 });
@@ -4120,6 +4120,7 @@ mod tests {
                 .await
                 .expect("late signal must be observed");
                 let elapsed = start.elapsed();
+                let _ = handle.join();
                 assert!(
                     elapsed < Duration::from_secs(2),
                     "signal observed too late: {elapsed:?}"

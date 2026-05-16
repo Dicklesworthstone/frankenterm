@@ -308,7 +308,7 @@ pub trait Workflow: Send + Sync {
             .iter()
             .enumerate()
             .map(|(idx, step)| {
-                let step_number = (idx + 1) as u32;
+                let step_number = (idx + 1).try_into().unwrap_or(u32::MAX);
                 crate::plan::StepPlan::new(
                     step_number,
                     crate::plan::StepAction::Custom {

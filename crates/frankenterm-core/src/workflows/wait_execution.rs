@@ -1293,7 +1293,7 @@ mod tests {
 
         let cx = crate::cx::for_testing();
         let cancel_cx = cx.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             cancel_cx.cancel_with(
                 crate::outcome::CancelKind::User,
@@ -1308,6 +1308,8 @@ mod tests {
         let err = rt
             .block_on(executor.execute_with_cx(&cx, &condition, 1, Duration::from_secs(60)))
             .expect_err("mid-flight Cx cancel should abort sleep wait");
+
+        let _ = handle.join();
 
         assert!(
             matches!(

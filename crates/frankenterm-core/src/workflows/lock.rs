@@ -195,12 +195,12 @@ impl PaneWorkflowLockManager {
     pub fn health(&self) -> LockManagerHealth {
         use std::sync::atomic::Ordering::Relaxed;
         let active_locks = match self.locks.lock() {
-            Ok(g) => g.len() as u32,
+            Ok(g) => g.len().try_into().unwrap_or(u32::MAX),
             Err(e) => {
                 self.telemetry
                     .mutex_poisoned_recoveries_total
                     .fetch_add(1, Relaxed);
-                e.into_inner().len() as u32
+                e.into_inner().len().try_into().unwrap_or(u32::MAX)
             }
         };
         LockManagerHealth {
