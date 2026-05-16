@@ -109,8 +109,7 @@ impl ResourceSnapshot {
             timestamp_secs: now,
         };
 
-        collect_process_resources(effective_pid, &mut snap);
-        Some(snap)
+        collect_process_resources(effective_pid, &mut snap).then_some(snap)
     }
 }
 
@@ -1181,10 +1180,16 @@ impl std::fmt::Debug for TelemetryCollector {
 // =============================================================================
 
 /// Populate a ResourceSnapshot with platform-specific process metrics.
+///
+/// Returns `false` when the process cannot be observed at all. Individual
+/// metric sources may still be unavailable after observation succeeds.
 #[cfg(target_os = "linux")]
-fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) {
+fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) -> bool {
+    let mut observed = false;
+
     // RSS and virtual memory from /proc/<pid>/status
     if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        observed = true;
         for line in status.lines() {
             if let Some(val) = line.strip_prefix("VmRSS:") {
                 if let Some(kb) = parse_kb_value(val) {
@@ -1200,11 +1205,13 @@ fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) {
 
     // FD count from /proc/<pid>/fd/
     if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        observed = true;
         snap.fd_count = entries.count() as u64;
     }
 
     // I/O stats from /proc/<pid>/io
     if let Ok(io_data) = std::fs::read_to_string(format!("/proc/{pid}/io")) {
+        observed = true;
         for line in io_data.lines() {
             if let Some(val) = line.strip_prefix("read_bytes: ") {
                 snap.io_read_bytes = val.trim().parse().ok();
@@ -1213,10 +1220,14 @@ fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) {
             }
         }
     }
+
+    observed
 }
 
 #[cfg(target_os = "macos")]
-fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) {
+fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) -> bool {
+    let mut observed = false;
+
     // Use ps to get RSS and VSZ for the specific PID
     if let Ok(output) = std::process::Command::new("ps")
         .args(["-o", "rss=,vsz=", "-p", &pid.to_string()])
@@ -1228,9 +1239,11 @@ fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) {
             if parts.len() >= 2 {
                 if let Ok(rss_kb) = parts[0].parse::<u64>() {
                     snap.rss_bytes = rss_kb * 1024;
+                    observed = true;
                 }
                 if let Ok(vsz_kb) = parts[1].parse::<u64>() {
                     snap.virt_bytes = vsz_kb * 1024;
+                    observed = true;
                 }
             }
         }
@@ -1239,9 +1252,10 @@ fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) {
     // FD count from /dev/fd (for self) or lsof for other PIDs
     if pid == std::process::id() {
         if let Ok(entries) = std::fs::read_dir("/dev/fd") {
+            observed = true;
             snap.fd_count = entries.count() as u64;
         }
-    } else {
+    } else if observed {
         // For other PIDs, use lsof -p <pid> | wc -l as approximation
         if let Ok(output) = std::process::Command::new("sh")
             .args(["-c", &format!("lsof -p {pid} 2>/dev/null | wc -l")])
@@ -1258,11 +1272,13 @@ fn collect_process_resources(pid: u32, snap: &mut ResourceSnapshot) {
     }
 
     // macOS has no /proc/<pid>/io equivalent; I/O stats stay None
+    observed
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn collect_process_resources(_pid: u32, _snap: &mut ResourceSnapshot) {
+fn collect_process_resources(_pid: u32, _snap: &mut ResourceSnapshot) -> bool {
     // No platform-specific collection available
+    false
 }
 
 /// Parse a value like "  12345 kB" → Some(12345).
@@ -1738,14 +1754,30 @@ mod tests {
 
     // -- ResourceSnapshot -----------------------------------------------------
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn resource_snapshot_collect_self() {
         let snap = ResourceSnapshot::collect(0).expect("should collect self");
         assert_eq!(snap.pid, std::process::id());
         assert!(snap.timestamp_secs > 0);
-        // On supported platforms, RSS should be non-zero for the current process
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(snap.rss_bytes > 0, "RSS should be non-zero for self");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn resource_snapshot_unsupported_platform_returns_none() {
+        assert!(ResourceSnapshot::collect(0).is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn resource_snapshot_missing_process_returns_none() {
+        let missing_pid = u32::MAX;
+        assert_ne!(missing_pid, std::process::id());
+        assert!(
+            ResourceSnapshot::collect(missing_pid).is_none(),
+            "unobservable process telemetry must not become a zero-filled sample"
+        );
     }
 
     #[test]
@@ -2606,6 +2638,7 @@ mod tests {
         assert!(!collector.is_shutdown());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn collector_sample_once() {
         let collector = TelemetryCollector::new(TelemetryConfig {
@@ -2620,6 +2653,20 @@ mod tests {
         assert_eq!(snap.pid, std::process::id());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn collector_sample_once_skips_missing_process() {
+        let collector = TelemetryCollector::new(TelemetryConfig {
+            mux_server_pid: u32::MAX,
+            ..Default::default()
+        });
+        collector.sample_once();
+        assert_eq!(collector.sample_count(), 0);
+        assert_eq!(collector.buffer().len(), 0);
+        assert!(collector.snapshot().resource.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn collector_snapshot() {
         let collector = TelemetryCollector::new(TelemetryConfig::default());
@@ -2647,6 +2694,7 @@ mod tests {
         assert!(collector.is_shutdown());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn collector_run_and_shutdown() {
         run_async_test(async {
@@ -2731,6 +2779,7 @@ mod tests {
         assert_eq!(snap.total_samples, 0);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn collector_multiple_samples() {
         let collector = TelemetryCollector::new(TelemetryConfig {
@@ -2744,6 +2793,7 @@ mod tests {
         assert_eq!(collector.buffer().len(), 3);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn collector_buffer_capacity_matches_config() {
         let config = TelemetryConfig {
@@ -3395,6 +3445,7 @@ mod tests {
 
     // -- NEW: Integration patterns -------------------------------------------
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn integration_snapshot_to_buffer_to_store() {
         // End-to-end: collect snapshot -> push to buffer -> flush to store
@@ -3408,6 +3459,7 @@ mod tests {
         assert_eq!(store.aggregate_count().unwrap(), 1);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn integration_collector_to_store() {
         let collector = TelemetryCollector::new(TelemetryConfig {
