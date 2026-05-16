@@ -3479,6 +3479,38 @@ mod tests {
         assert!(!terminal.cursor_visible);
     }
 
+    #[test]
+    fn full_reset_clears_saved_dec_private_modes() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area: false,
+        });
+        let mut terminal = test_terminal_state(config);
+
+        terminal.perform_csi_mode(Mode::SaveDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )));
+        terminal.perform_csi_mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )));
+        assert!(!terminal.cursor_visible);
+
+        crate::terminalstate::performer::Performer::new(&mut terminal).perform(
+            frankenterm_escape_parser::Action::Esc(frankenterm_escape_parser::Esc::Code(
+                frankenterm_escape_parser::EscCode::FullReset,
+            )),
+        );
+
+        assert!(terminal.cursor_visible);
+        terminal.perform_csi_mode(Mode::RestoreDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::ShowCursor,
+        )));
+
+        assert!(terminal.cursor_visible);
+    }
+
     // ── CharSet ────────────────────────────────────────────────
 
     #[test]
