@@ -2317,7 +2317,7 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     if to_version > SCHEMA_VERSION {
         return Err(StorageError::MigrationFailed(format!(
             "Target schema version ({to_version}) is newer than supported ({SCHEMA_VERSION}). \
-             Please upgrade wa to a newer version."
+             Please upgrade FrankenTerm to a newer version."
         ))
         .into());
     }

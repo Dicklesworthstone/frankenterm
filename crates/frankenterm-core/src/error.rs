@@ -531,7 +531,7 @@ pub enum StorageError {
     #[error("Database schema version ({current}) is newer than supported ({supported})")]
     SchemaTooNew { current: i32, supported: i32 },
 
-    #[error("Database requires wa >= {min_compatible} (current {current})")]
+    #[error("Database requires FrankenTerm >= {min_compatible} (current {current})")]
     WaTooOld {
         current: String,
         min_compatible: String,

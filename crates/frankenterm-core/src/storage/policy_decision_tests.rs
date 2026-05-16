@@ -604,7 +604,7 @@ fn ft_too_old_rejected_by_meta() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("requires wa"),
+        err.contains("requires FrankenTerm"),
         "Error should mention required ft version: {err}"
     );
 }
