@@ -27,7 +27,12 @@ fn arb_event_source() -> impl Strategy<Value = RecorderEventSource> {
     prop_oneof![
         Just(RecorderEventSource::WeztermMux),
         Just(RecorderEventSource::RobotMode),
+        Just(RecorderEventSource::Mcp),
         Just(RecorderEventSource::WorkflowEngine),
+        Just(RecorderEventSource::Beads),
+        Just(RecorderEventSource::Rch),
+        Just(RecorderEventSource::AgentMail),
+        Just(RecorderEventSource::Git),
         Just(RecorderEventSource::OperatorAction),
         Just(RecorderEventSource::RecoveryFlow),
     ]
@@ -129,6 +134,26 @@ fn recorder_metadata_enums_serialize_in_snake_case() {
     assert_eq!(
         serde_json::to_string(&RecorderEventSource::WorkflowEngine).unwrap(),
         r#""workflow_engine""#,
+    );
+    assert_eq!(
+        serde_json::to_string(&RecorderEventSource::Mcp).unwrap(),
+        r#""mcp""#,
+    );
+    assert_eq!(
+        serde_json::to_string(&RecorderEventSource::Beads).unwrap(),
+        r#""beads""#,
+    );
+    assert_eq!(
+        serde_json::to_string(&RecorderEventSource::Rch).unwrap(),
+        r#""rch""#,
+    );
+    assert_eq!(
+        serde_json::to_string(&RecorderEventSource::AgentMail).unwrap(),
+        r#""agent_mail""#,
+    );
+    assert_eq!(
+        serde_json::to_string(&RecorderEventSource::Git).unwrap(),
+        r#""git""#,
     );
     assert_eq!(
         serde_json::to_string(&RecorderRedactionLevel::Partial).unwrap(),

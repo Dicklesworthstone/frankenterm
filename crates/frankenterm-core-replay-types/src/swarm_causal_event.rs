@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// Schema version for the operational causal-event envelope.
 pub const SWARM_CAUSAL_EVENT_SCHEMA_VERSION_V1: &str = "ft.swarm.causal_event.v1";
@@ -268,7 +269,7 @@ impl SwarmCausalEvent {
                 found: self.schema_version.clone(),
             });
         }
-        if self.event_id.is_empty() {
+        if self.event_id.trim().is_empty() {
             return Err(SwarmCausalEventError::EmptyEventId);
         }
         if self.ingested_at_ms < self.occurred_at_ms {
@@ -330,8 +331,7 @@ impl SwarmCausalEvent {
                 .payload
                 .get("reason")
                 .and_then(Value::as_str)
-                .unwrap_or("")
-                .is_empty()
+                .is_none_or(|reason| reason.trim().is_empty())
         {
             return Err(SwarmCausalEventError::MissingUnavailableReason);
         }
@@ -339,7 +339,7 @@ impl SwarmCausalEvent {
         if self
             .artifacts
             .iter()
-            .any(|artifact| artifact.uri.is_empty())
+            .any(|artifact| artifact.uri.trim().is_empty())
         {
             return Err(SwarmCausalEventError::EmptyArtifactUri);
         }
@@ -353,10 +353,10 @@ fn validate_required_correlation(
 ) -> Result<(), SwarmCausalEventError> {
     let ok = match source {
         SwarmCausalEventSource::Pane => correlation.pane_id.is_some(),
-        SwarmCausalEventSource::Beads => correlation.bead_id.is_some(),
-        SwarmCausalEventSource::Rch => correlation.rch_build_id.is_some(),
-        SwarmCausalEventSource::AgentMail => correlation.thread_id.is_some(),
-        SwarmCausalEventSource::Git => correlation.git_commit.is_some(),
+        SwarmCausalEventSource::Beads => is_present(&correlation.bead_id),
+        SwarmCausalEventSource::Rch => is_present(&correlation.rch_build_id),
+        SwarmCausalEventSource::AgentMail => is_present(&correlation.thread_id),
+        SwarmCausalEventSource::Git => is_present(&correlation.git_commit),
         SwarmCausalEventSource::Robot
         | SwarmCausalEventSource::Mcp
         | SwarmCausalEventSource::Workflow
@@ -372,15 +372,55 @@ fn validate_required_correlation(
     }
 }
 
+fn is_present(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 fn payload_hash(payload: &Value) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(payload).unwrap_or_default());
+    hasher.update(canonical_json_string(payload).as_bytes());
     let digest = hasher.finalize();
     hex_bytes(&digest[..])
 }
 
 fn serialized_payload_len(payload: &Value) -> usize {
-    serde_json::to_vec(payload).map_or(usize::MAX, |bytes| bytes.len())
+    canonical_json_string(payload).len()
+}
+
+fn canonical_json_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => serde_json::to_string(value).unwrap_or_default(),
+        Value::Array(values) => {
+            let mut out = String::from("[");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&canonical_json_string(value));
+            }
+            out.push(']');
+            out
+        }
+        Value::Object(values) => {
+            let mut out = String::from("{");
+            let sorted: BTreeMap<&String, &Value> = values.iter().collect();
+            for (index, (key, value)) in sorted.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                out.push(':');
+                out.push_str(&canonical_json_string(value));
+            }
+            out.push('}');
+            out
+        }
+    }
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -442,18 +482,28 @@ mod tests {
 
     #[test]
     fn source_wire_names_cover_operational_evidence() {
-        assert_eq!(
-            serde_json::to_string(&SwarmCausalEventSource::AgentMail).unwrap(),
-            "\"agent_mail\""
-        );
-        assert_eq!(
-            serde_json::to_string(&SwarmCausalEventSource::Rch).unwrap(),
-            "\"rch\""
-        );
-        assert_eq!(
-            serde_json::to_string(&SwarmCausalEventSource::Beads).unwrap(),
-            "\"beads\""
-        );
+        for (source, wire_name) in [
+            (SwarmCausalEventSource::Pane, "pane"),
+            (SwarmCausalEventSource::Robot, "robot"),
+            (SwarmCausalEventSource::Mcp, "mcp"),
+            (SwarmCausalEventSource::Workflow, "workflow"),
+            (SwarmCausalEventSource::Policy, "policy"),
+            (SwarmCausalEventSource::Beads, "beads"),
+            (SwarmCausalEventSource::Rch, "rch"),
+            (SwarmCausalEventSource::AgentMail, "agent_mail"),
+            (SwarmCausalEventSource::Git, "git"),
+            (SwarmCausalEventSource::Operator, "operator"),
+            (SwarmCausalEventSource::Runtime, "runtime"),
+            (
+                SwarmCausalEventSource::SourceUnavailable,
+                "source_unavailable",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{wire_name}\"")
+            );
+        }
     }
 
     #[test]
@@ -523,6 +573,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_blank_ids_and_required_correlation_keys() {
+        let err = SwarmCausalEvent::new(
+            "  ",
+            SwarmCausalEventSource::Robot,
+            CausalEventClass::Informational,
+            1000,
+            1001,
+            1,
+            CausalCorrelationKeys::default(),
+            CausalLinks::default(),
+            CausalPayloadSensitivity::Structural,
+            CausalRedactionStatus::NotRequired,
+            CausalRetentionClass::Proof,
+            Vec::new(),
+            json!({"kind": "example"}),
+        )
+        .unwrap_err();
+        assert_eq!(err, SwarmCausalEventError::EmptyEventId);
+
+        let err = SwarmCausalEvent::new(
+            "rch-with-blank-build-id",
+            SwarmCausalEventSource::Rch,
+            CausalEventClass::InfrastructureFailure,
+            1000,
+            1001,
+            1,
+            CausalCorrelationKeys {
+                rch_build_id: Some("  ".to_string()),
+                ..Default::default()
+            },
+            CausalLinks::default(),
+            CausalPayloadSensitivity::Structural,
+            CausalRedactionStatus::NotRequired,
+            CausalRetentionClass::Proof,
+            Vec::new(),
+            json!({"reason": "worker_selection_refused"}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SwarmCausalEventError::MissingCorrelationKey {
+                source: SwarmCausalEventSource::Rch
+            }
+        );
+    }
+
+    #[test]
     fn unavailable_source_event_has_stable_golden_shape() {
         let event = SwarmCausalEvent::new(
             "mail-unavailable-1",
@@ -555,6 +652,51 @@ mod tests {
                 .as_str()
                 .is_some_and(|hash| hash.len() == 64)
         );
+    }
+
+    #[test]
+    fn source_golden_shapes_cover_each_event_source() {
+        for source in [
+            SwarmCausalEventSource::Pane,
+            SwarmCausalEventSource::Robot,
+            SwarmCausalEventSource::Mcp,
+            SwarmCausalEventSource::Workflow,
+            SwarmCausalEventSource::Policy,
+            SwarmCausalEventSource::Beads,
+            SwarmCausalEventSource::Rch,
+            SwarmCausalEventSource::AgentMail,
+            SwarmCausalEventSource::Git,
+            SwarmCausalEventSource::Operator,
+            SwarmCausalEventSource::Runtime,
+        ] {
+            let json = serde_json::to_value(base_event(source)).unwrap();
+            assert_eq!(json["schema_version"], SWARM_CAUSAL_EVENT_SCHEMA_VERSION_V1);
+            assert_eq!(
+                json["source"],
+                serde_json::to_value(source).unwrap(),
+                "source {source:?} changed its stable JSON shape"
+            );
+            assert_eq!(json["payload"], json!({"kind": "example"}));
+            assert_eq!(json["privacy"]["payload_bytes"], 18);
+            assert!(
+                json["privacy"]["payload_hash_sha256"]
+                    .as_str()
+                    .is_some_and(|hash| hash.len() == 64)
+            );
+        }
+    }
+
+    #[test]
+    fn payload_hash_uses_canonical_json_key_order() {
+        let first: Value = serde_json::from_str(r#"{"b":2,"a":{"d":4,"c":3}}"#).unwrap();
+        let second: Value = serde_json::from_str(r#"{"a":{"c":3,"d":4},"b":2}"#).unwrap();
+
+        assert_eq!(
+            canonical_json_string(&first),
+            r#"{"a":{"c":3,"d":4},"b":2}"#
+        );
+        assert_eq!(payload_hash(&first), payload_hash(&second));
+        assert_eq!(serialized_payload_len(&first), 25);
     }
 
     #[test]
@@ -669,5 +811,49 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, SwarmCausalEventError::MissingUnavailableReason);
+
+        let err = SwarmCausalEvent::new(
+            "blank-reason",
+            SwarmCausalEventSource::SourceUnavailable,
+            CausalEventClass::CommunicationOutage,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys::default(),
+            CausalLinks::default(),
+            CausalPayloadSensitivity::Structural,
+            CausalRedactionStatus::Unavailable,
+            CausalRetentionClass::Proof,
+            Vec::new(),
+            json!({"reason": "  "}),
+        )
+        .unwrap_err();
+        assert_eq!(err, SwarmCausalEventError::MissingUnavailableReason);
+    }
+
+    #[test]
+    fn rejects_blank_artifact_uri() {
+        let err = SwarmCausalEvent::new(
+            "blank-artifact-uri",
+            SwarmCausalEventSource::Robot,
+            CausalEventClass::Informational,
+            1,
+            2,
+            1,
+            CausalCorrelationKeys::default(),
+            CausalLinks::default(),
+            CausalPayloadSensitivity::Structural,
+            CausalRedactionStatus::NotRequired,
+            CausalRetentionClass::Proof,
+            vec![CausalArtifactRef {
+                kind: "json".to_string(),
+                uri: "  ".to_string(),
+                sha256: None,
+                size_bytes: None,
+            }],
+            json!({"kind": "example"}),
+        )
+        .unwrap_err();
+        assert_eq!(err, SwarmCausalEventError::EmptyArtifactUri);
     }
 }

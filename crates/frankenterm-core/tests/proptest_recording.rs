@@ -33,7 +33,12 @@ fn arb_event_source() -> impl Strategy<Value = RecorderEventSource> {
     prop_oneof![
         Just(RecorderEventSource::WeztermMux),
         Just(RecorderEventSource::RobotMode),
+        Just(RecorderEventSource::Mcp),
         Just(RecorderEventSource::WorkflowEngine),
+        Just(RecorderEventSource::Beads),
+        Just(RecorderEventSource::Rch),
+        Just(RecorderEventSource::AgentMail),
+        Just(RecorderEventSource::Git),
         Just(RecorderEventSource::OperatorAction),
         Just(RecorderEventSource::RecoveryFlow),
     ]
@@ -756,7 +761,7 @@ proptest! {
         match actor {
             ActorKind::Human => prop_assert_eq!(source, RecorderEventSource::OperatorAction),
             ActorKind::Robot => prop_assert_eq!(source, RecorderEventSource::RobotMode),
-            ActorKind::Mcp => prop_assert_eq!(source, RecorderEventSource::RobotMode),
+            ActorKind::Mcp => prop_assert_eq!(source, RecorderEventSource::Mcp),
             ActorKind::Workflow => prop_assert_eq!(source, RecorderEventSource::WorkflowEngine),
         }
     }
