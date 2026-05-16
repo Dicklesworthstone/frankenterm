@@ -1485,44 +1485,8 @@ impl WeztermClient {
         &self,
         pane_id: u64,
     ) -> Result<PaneTieredScrollbackSummary> {
-        #[cfg(all(feature = "vendored", unix))]
-        if let Some(ref pool) = self.mux_pool {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            if self.mux_circuit_guard() {
-                let changes_result = pool.get_pane_render_changes_with_cx(&cx, pane_id).await;
-                match changes_result {
-                    Ok(changes) => {
-                        return self.map_mux_tiered_scrollback_summary(
-                            pane_id,
-                            changes.tiered_scrollback_status,
-                        );
-                    }
-                    Err(err) => {
-                        self.mux_circuit_record_failure(&err);
-                        if !self.mux_error_should_fallback_to_cli_for_client(&err) {
-                            return Err(Self::mux_cancelled_error(
-                                "pane_tiered_scrollback_summary",
-                                err,
-                            ));
-                        }
-                        return Err(WeztermError::CommandFailed(format!(
-                            "failed to read tiered scrollback status for pane {pane_id}: {err}"
-                        ))
-                        .into());
-                    }
-                }
-            }
-
-            return Err(WeztermError::CommandFailed(format!(
-                "tiered scrollback telemetry unavailable for pane {pane_id}: vendored mux circuit breaker open and CLI fallback has no tiered scrollback surface"
-            ))
-            .into());
-        }
-
-        Err(WeztermError::CommandFailed(format!(
-            "tiered scrollback telemetry unavailable for pane {pane_id}: CLI-only backend does not expose tiered scrollback status"
-        ))
-        .into())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.pane_tiered_scrollback_summary_with_cx(&cx, pane_id).await
     }
 
     /// Get tiered-scrollback telemetry for a pane under an explicit `&Cx`
@@ -1589,7 +1553,10 @@ impl WeztermClient {
         _cx: &crate::cx::Cx,
         pane_id: u64,
     ) -> Result<PaneTieredScrollbackSummary> {
-        self.pane_tiered_scrollback_summary(pane_id).await
+        Err(WeztermError::CommandFailed(format!(
+            "tiered scrollback telemetry unavailable for pane {pane_id}: CLI-only backend does not expose tiered scrollback status"
+        ))
+        .into())
     }
 
     /// Send text to a pane using paste mode (default, faster for multi-char input)
@@ -2151,51 +2118,8 @@ impl WeztermClient {
         no_paste: bool,
         no_newline: bool,
     ) -> Result<()> {
-        #[cfg(all(feature = "vendored", unix))]
-        if let Some(ref pool) = self.mux_pool {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            if !self.mux_circuit_guard() {
-                tracing::debug!("mux connection circuit open; falling back to CLI send");
-            } else {
-                let data = if no_newline {
-                    text.to_string()
-                } else {
-                    format!("{text}\n")
-                };
-                let pool_result = if no_paste {
-                    pool.write_to_pane_with_cx(&cx, pane_id, data.into_bytes())
-                        .await
-                } else {
-                    pool.send_paste_with_cx(&cx, pane_id, data).await
-                };
-                match pool_result {
-                    Ok(_) => {
-                        self.mux_circuit_record_success();
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        self.mux_circuit_record_failure(&e);
-                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                            return Err(Self::mux_cancelled_error("send_text", e));
-                        }
-                        tracing::debug!(error = %e, "mux pool send failed, falling back to CLI");
-                    }
-                }
-            }
-        }
-
-        let pane_id_str = pane_id.to_string();
-        let mut args = vec!["cli", "send-text", "--pane-id", &pane_id_str];
-        if no_paste {
-            args.push("--no-paste");
-        }
-        if no_newline {
-            args.push("--no-newline");
-        }
-        args.push("--");
-        args.push(text);
-        self.run_cli_with_pane_check(&args, pane_id).await?;
-        Ok(())
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_text_impl_with_cx(&cx, pane_id, text, no_paste, no_newline).await
     }
 
     /// Cx-first `send_text_impl` (ft-xbnl0.2.3). The mux-pool fast
@@ -2246,12 +2170,22 @@ impl WeztermClient {
                 }
             }
         }
-        self.send_text_impl(pane_id, text, no_paste, no_newline)
-            .await
+        let pane_id_str = pane_id.to_string();
+        let mut args = vec!["cli", "send-text", "--pane-id", &pane_id_str];
+        if no_paste {
+            args.push("--no-paste");
+        }
+        if no_newline {
+            args.push("--no-newline");
+        }
+        args.push("--");
+        args.push(text);
+        self.run_cli_with_pane_check(&args, pane_id).await?;
+        Ok(())
     }
 
     /// Stub `send_text_impl_with_cx` for configurations without
-    /// vendored+unix+asupersync — delegates to the legacy impl.
+    /// vendored+unix+asupersync — delegates to the legacy cli path.
     #[cfg(not(all(feature = "vendored", unix)))]
     async fn send_text_impl_with_cx(
         &self,
@@ -2261,8 +2195,18 @@ impl WeztermClient {
         no_paste: bool,
         no_newline: bool,
     ) -> Result<()> {
-        self.send_text_impl(pane_id, text, no_paste, no_newline)
-            .await
+        let pane_id_str = pane_id.to_string();
+        let mut args = vec!["cli", "send-text", "--pane-id", &pane_id_str];
+        if no_paste {
+            args.push("--no-paste");
+        }
+        if no_newline {
+            args.push("--no-newline");
+        }
+        args.push("--");
+        args.push(text);
+        self.run_cli_with_pane_check(&args, pane_id).await?;
+        Ok(())
     }
 
     /// Run a CLI command with pane-specific error handling
