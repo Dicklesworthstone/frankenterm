@@ -1,0 +1,48 @@
+{
+  "schema_version": "ft.demo.golden.v1",
+  "scenario_id": "usage_limit",
+  "deterministic_seed": "demo-lab-v1-usage-limit-2002",
+  "status": "passed",
+  "proof_boundary": "deterministic_rate_limit_fixture_only",
+  "redaction": {
+    "tier": "t1_standard",
+    "raw_secrets_present": false
+  },
+  "scenario": {
+    "path": "fixtures/demo-lab/scenarios/usage_limit.yaml",
+    "sha256": "7c33f4ae15bace7246f67d0220c61b8bbc75e908e324f4a0b28c5232043f01d1"
+  },
+  "outputs": {
+    "human_summary": "Usage-limit text classified locally; event emitted; recovery guidance avoids external calls.",
+    "json": {
+      "ok": true,
+      "data": {
+        "scenario_id": "usage_limit",
+        "events": [
+          {
+            "event_type": "usage_limit",
+            "rule_id": "demo.usage_limit.reached",
+            "pane_id": 2001,
+            "severity": "warning",
+            "redacted": true
+          }
+        ],
+        "guidance": [
+          "pause_automation",
+          "preserve_state",
+          "notify_operator"
+        ],
+        "external_provider_called": false,
+        "artifacts": [
+          "fixtures/demo-lab/scenarios/usage_limit.yaml",
+          "fixtures/demo-lab/golden/usage_limit.json"
+        ]
+      }
+    }
+  },
+  "degradation": {
+    "agent_mail_unavailable": "degraded_beads_git_only",
+    "rch_proof_unavailable": "proof_blocked_no_local_cargo_counted",
+    "unsupported_platform": "unavailable_no_side_effects"
+  }
+}

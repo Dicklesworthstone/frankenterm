@@ -1,0 +1,51 @@
+name: compaction
+description: "Context compaction detection, classification, and handoff guidance demo"
+duration: "4s"
+metadata:
+  suite: demo_lab
+  suite_version: "1"
+  seed: "demo-lab-v1-compaction-3003"
+  scenario_id: compaction
+  redaction_tier: t1_standard
+  proof_category: e2e
+  live_services: "none"
+panes:
+  - id: 3001
+    title: "demo-long-context"
+    domain: local
+    cwd: /tmp/frankenterm-demo
+    window_id: 0
+    tab_id: 0
+    cols: 120
+    rows: 32
+    initial_content: "conversation state: long-running task with retained handoff notes\n"
+events:
+  - at: "0.200s"
+    pane: 3001
+    action: append
+    content: "context pressure: compaction requested before continuing the task\n"
+  - at: "0.500s"
+    pane: 3001
+    action: marker
+    name: compaction_detected
+  - at: "0.800s"
+    pane: 3001
+    action: append
+    content: "handoff guidance: summarize decisions, preserve blockers, and cite artifacts before truncation\n"
+  - at: "1.100s"
+    pane: 3001
+    action: marker
+    name: operator_safe_handoff
+expectations:
+  - contains:
+      pane: 3001
+      text: "compaction requested"
+  - contains:
+      pane: 3001
+      text: "[MARKER:compaction_detected]"
+  - contains:
+      pane: 3001
+      text: "summarize decisions, preserve blockers"
+  - contains:
+      pane: 3001
+      text: "[MARKER:operator_safe_handoff]"

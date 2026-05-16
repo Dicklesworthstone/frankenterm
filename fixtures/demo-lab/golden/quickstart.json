@@ -1,0 +1,58 @@
+{
+  "schema_version": "ft.demo.golden.v1",
+  "scenario_id": "quickstart",
+  "deterministic_seed": "demo-lab-v1-quickstart-1001",
+  "status": "passed",
+  "proof_boundary": "deterministic_onboarding_fixture_only",
+  "redaction": {
+    "tier": "t1_standard",
+    "raw_secrets_present": false
+  },
+  "scenario": {
+    "path": "fixtures/demo-lab/scenarios/quickstart.yaml",
+    "sha256": "7f33c947552bbecf774a3172200b44fd9e014c0a1b7365e37bbea04a9b1c845b"
+  },
+  "outputs": {
+    "human_summary": "2 panes discovered; prompt readiness detected; robot state emitted.",
+    "json": {
+      "ok": true,
+      "data": {
+        "scenario_id": "quickstart",
+        "panes": [
+          {
+            "pane_id": 1001,
+            "title": "demo-shell",
+            "domain": "local",
+            "cwd": "/tmp/frankenterm-demo",
+            "observed": true
+          },
+          {
+            "pane_id": 1002,
+            "title": "demo-agent",
+            "domain": "local",
+            "cwd": "/tmp/frankenterm-demo",
+            "observed": true
+          }
+        ],
+        "detections": [
+          {
+            "rule_id": "demo.prompt.ready",
+            "pane_id": 1002,
+            "severity": "info",
+            "redacted": true
+          }
+        ],
+        "artifacts": [
+          "fixtures/demo-lab/scenarios/quickstart.yaml",
+          "fixtures/demo-lab/golden/quickstart.json",
+          "fixtures/demo-lab/golden/quickstart.toon"
+        ]
+      }
+    }
+  },
+  "degradation": {
+    "agent_mail_unavailable": "degraded_beads_git_only",
+    "rch_proof_unavailable": "proof_blocked_no_local_cargo_counted",
+    "unsupported_platform": "unavailable_no_side_effects"
+  }
+}

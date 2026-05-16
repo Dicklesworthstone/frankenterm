@@ -1,0 +1,25 @@
+schema_version: ft.demo.golden.v1
+scenario_id: compaction
+deterministic_seed: demo-lab-v1-compaction-3003
+status: passed
+proof_boundary: deterministic_context_compaction_fixture_only
+redaction:
+  tier: t1_standard
+  raw_secrets_present: false
+scenario:
+  path: fixtures/demo-lab/scenarios/compaction.yaml
+  sha256: 9aedeec0f804e01cb24f8ad97e9960c991504957cccd7f6b0e03e3ad5d40821e
+data:
+  events[1]{event_type,rule_id,pane_id,severity,redacted}:
+    context_compaction,demo.context.compaction_requested,3001,warning,true
+  handoff_steps[3]:
+    summarize_decisions
+    preserve_blockers
+    cite_artifacts
+  artifacts[2]:
+    fixtures/demo-lab/scenarios/compaction.yaml
+    fixtures/demo-lab/golden/compaction.toon
+degradation:
+  agent_mail_unavailable: degraded_beads_git_only
+  rch_proof_unavailable: proof_blocked_no_local_cargo_counted
+  unsupported_platform: unavailable_no_side_effects
