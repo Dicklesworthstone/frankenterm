@@ -216,6 +216,7 @@ pub mod dec_2026_presentation_hold;
 pub mod degradation;
 pub mod dependency_eradication;
 pub mod desktop_notify;
+pub mod demo_scenarios;
 pub mod diagnostic;
 pub mod diagnostic_redaction;
 pub mod diagram_render;
