@@ -352,18 +352,18 @@ pub fn database_stats(db_path: &Path, retention_days: u32) -> Result<DbStatsRepo
 
     if total_events > 10_000 {
         suggestions.push(format!(
-            "{total_events} events stored. Preview cleanup: wa cleanup --dry-run"
+            "{total_events} events stored. Review ft.toml [storage] retention_days before pruning"
         ));
     }
     if total_segments > 50_000 {
         suggestions.push(format!(
-            "{total_segments} segments stored. Preview cleanup: wa cleanup --dry-run"
+            "{total_segments} segments stored. Review ft.toml [storage] retention_days before pruning"
         ));
     }
     if let Some(size) = db_size_bytes {
         if size > 100 * 1024 * 1024 {
             suggestions.push(format!(
-                "Database is {:.1} MB. Consider: wa db repair --dry-run (includes VACUUM)",
+                "Database is {:.1} MB. Consider: ft db repair --dry-run (includes VACUUM)",
                 size as f64 / 1_048_576.0
             ));
         }

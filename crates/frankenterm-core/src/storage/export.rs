@@ -1,7 +1,7 @@
 //! [ft-nsb8c / ft-dn2tu Phase 5] Export Query Functions
 //!
 //! Read-only query helpers that export segments / gaps / workflows /
-//! sessions / reservations to callers like `wa export ...` and the
+//! sessions / reservations to callers like `ft export ...` and the
 //! audit/forensics surface. Lifted out of `storage.rs` (~340 LOC) so
 //! the storage facade keeps its writer-thread + handle responsibilities
 //! and the read-side query surface lives next to its siblings under

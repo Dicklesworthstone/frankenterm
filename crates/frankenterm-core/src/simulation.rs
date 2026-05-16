@@ -1327,7 +1327,7 @@ impl TutorialSandbox {
     fn default_scenario() -> Scenario {
         Scenario {
             name: "tutorial_sandbox".to_string(),
-            description: "Pre-configured environment for wa learn exercises".to_string(),
+            description: "Pre-configured environment for ft learn exercises".to_string(),
             duration: Duration::from_secs(300),
             metadata: BTreeMap::new(),
             panes: vec![
