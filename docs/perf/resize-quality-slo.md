@@ -79,6 +79,16 @@ The full machine-readable catalog (with scenarios, structured-log paths, and
 is the single source of truth; this table is generated from it. If the two
 disagree, the JSON wins.
 
+## Umbrella Closeout Status
+
+`docs/attestations/tui/render-parity.json` now carries the
+`renderer_slo_retained_evidence` ledger used by the G18 umbrella. As of
+2026-05-16, the umbrella is still blocked: RQ-S13 has retained remote RCH
+proof, RQ-S2/RQ-S3 are substrate-only pending platform target runs, and
+RQ-S1/RQ-S5/RQ-S10 do not yet have the declared source benches or retained
+target-run artifacts. The missing target-run work is split into
+`ft-tf6g3.3.7` through `ft-tf6g3.3.10`.
+
 ## Structured-log contract
 
 Every SLO bench writes JSON-line records that the attestation pipeline

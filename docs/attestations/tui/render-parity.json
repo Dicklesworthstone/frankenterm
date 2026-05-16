@@ -186,19 +186,90 @@
     "release_bundle_slot": "tui/topology-parity.json",
     "production_evidence_rule": "release evidence requires paired oracle/subject glyph bitmap runs for tests/fixtures/terminal-conformance/expected with glyphs_compared_total > 0 and topology_failures_total == 0"
   },
+  "renderer_slo_retained_evidence": {
+    "schema_version": "ft.renderer_slo_retained_evidence.v1",
+    "produced_by_bead": "ft-tf6g3.3.6",
+    "generated_at": "2026-05-16T04:21:00Z",
+    "source_catalog_path": "docs/perf/resize-quality-slo.json",
+    "source_catalog_sha256": "683bbf3056ec1523147c6d4b4a4763bcb0bdc248015c0b3d22763d54148a78b1",
+    "closeout_status": "blocked_pending_missing_retained_runs",
+    "summary": "The renderer-SLO umbrella does not yet have five retained target-run proofs. RQ-S13 has retained remote RCH proof; RQ-S2/RQ-S3 are substrate-only pending platform target runs; RQ-S1/RQ-S5/RQ-S10 still lack their declared source benches and retained artifacts.",
+    "entries": [
+      {
+        "slo_id": "RQ-S1.resize_fps",
+        "status": "missing_source_bench",
+        "declared_source_bench": "crates/frankenterm-core/benches/resize_storm.rs",
+        "declared_structured_log": "target/criterion/slo-resize_fps.jsonl",
+        "gap_evidence_path": "docs/perf/resize-quality-slo.json",
+        "gap_evidence_sha256": "683bbf3056ec1523147c6d4b4a4763bcb0bdc248015c0b3d22763d54148a78b1",
+        "follow_up_bead": "ft-tf6g3.3.7"
+      },
+      {
+        "slo_id": "RQ-S2.input_to_photon_macos",
+        "status": "substrate_only_pending_lab_run",
+        "source_artifact_path": "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs",
+        "source_artifact_sha256": "d56e25a50a1a17691bd45d00fdaefbc73257e2d441ee35fa93deb3bd29a4e644",
+        "gap_evidence_path": "docs/attestations/perf/lindley-bounds.json",
+        "gap_evidence_sha256": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
+        "follow_up_bead": "ft-tf6g3.3.8"
+      },
+      {
+        "slo_id": "RQ-S3.input_to_photon_wayland",
+        "status": "substrate_only_pending_lab_run",
+        "source_artifact_path": "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs",
+        "source_artifact_sha256": "d56e25a50a1a17691bd45d00fdaefbc73257e2d441ee35fa93deb3bd29a4e644",
+        "gap_evidence_path": "docs/attestations/perf/lindley-bounds.json",
+        "gap_evidence_sha256": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
+        "follow_up_bead": "ft-tf6g3.3.8"
+      },
+      {
+        "slo_id": "RQ-S5.idle_gpu",
+        "status": "missing_source_bench",
+        "declared_source_bench": "crates/frankenterm-core/benches/idle_gpu.rs",
+        "declared_structured_log": "target/criterion/slo-idle_gpu.jsonl",
+        "gap_evidence_path": "docs/perf/resize-quality-slo.json",
+        "gap_evidence_sha256": "683bbf3056ec1523147c6d4b4a4763bcb0bdc248015c0b3d22763d54148a78b1",
+        "follow_up_bead": "ft-tf6g3.3.9"
+      },
+      {
+        "slo_id": "RQ-S10.atlas_rebuild_count",
+        "status": "missing_source_bench",
+        "declared_source_bench": "crates/frankenterm-core/benches/atlas_stability.rs",
+        "declared_structured_log": "target/criterion/slo-atlas_stability.jsonl",
+        "gap_evidence_path": "docs/perf/resize-quality-slo.json",
+        "gap_evidence_sha256": "683bbf3056ec1523147c6d4b4a4763bcb0bdc248015c0b3d22763d54148a78b1",
+        "follow_up_bead": "ft-tf6g3.3.10"
+      },
+      {
+        "slo_id": "RQ-S13.ssim_parity_oracle_corpus",
+        "status": "retained_run_validated",
+        "proof_ledger_path": "tests/e2e/logs/ssim_parity_release_gate_20260516T024353Z.proof-ledger.jsonl",
+        "proof_ledger_sha256": "00fab2a7344e2710e6733cb8a0f39e6638c42c100ad8ffcdf4bf667e0b9f9a50",
+        "source_artifact_path": "crates/frankenterm-gui/tests/ssim_parity.rs",
+        "source_artifact_sha256": "8a67f9eb199cac90813d159adb5b3745176d06ad41e2eba5b0d75e839b062234",
+        "remote_cargo_reached": true,
+        "remote_rustc_reached": true,
+        "test_binary_reached": true,
+        "selected_worker_id": "vmi1293453"
+      }
+    ]
+  },
   "targeted_validation": {
     "cargo_status": "not_run_for_recovery_artifact",
-    "reason": "This bead publishes the missing JSON artifact from existing checked-in docs and contracts; no source code changed.",
+    "reason": "This bead updates machine-readable attestation truth from existing retained artifacts and gap evidence; no source code changed.",
     "static_checks": [
       "jq empty docs/attestations/tui/render-parity.json",
-      "jq invariant check for category/producer/corpus/property/GPU adjunct fields",
-      "git diff --check -- docs/attestations/tui/render-parity.json"
+      "jq invariant check for six renderer_slo_retained_evidence entries and exact retained/gap statuses",
+      "git diff --check -- docs/attestations/tui/render-parity.json docs/perf/resize-quality-slo.json"
     ]
   },
   "source_documents": [
     "docs/security/tui-render-parity.md",
+    "docs/perf/resize-quality-slo.json",
+    "docs/attestations/perf/lindley-bounds.json",
     "docs/attestations/tui/render-parity-gpu.json",
     "docs/attestations/tui/topology-parity.json",
+    "tests/e2e/logs/ssim_parity_release_gate_20260516T024353Z.proof-ledger.jsonl",
     "crates/frankenterm-core/src/tui_parity_oracle.rs",
     "crates/frankenterm-core/tests/tui_parity_oracle.rs",
     "scripts/test-gpu-harness.sh"

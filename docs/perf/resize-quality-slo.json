@@ -41,9 +41,16 @@
       "measurement": "Criterion sample of presented frame intervals",
       "source_bench": "crates/frankenterm-core/benches/resize_storm.rs",
       "structured_log": "target/criterion/slo-resize_fps.jsonl",
-      "status": "bench_pending",
-      "blocked_by": ["ft-mpc9b.1.2", "ft-mpc9b.1.3"],
-      "owner_bead": "ft-mpc9b.5.1"
+      "status": "substrate_wired",
+      "retained_evidence": {
+        "status": "substrate_wired_pending_rch_target_run",
+        "follow_up_bead": "ft-tf6g3.3.7",
+        "source_bench": "crates/frankenterm-core/benches/resize_storm.rs",
+        "structured_log": "target/criterion/slo-resize_fps.jsonl",
+        "reason": "Source bench now exists and emits a structured evidence row; retained target-run artifact hash remains pending RCH proof."
+      },
+      "blocked_by": ["ft-tf6g3.3.7"],
+      "owner_bead": "ft-tf6g3.3.7"
     },
     {
       "id": "RQ-S2.input_to_photon_macos",
@@ -55,6 +62,15 @@
       "structured_log": "target/criterion/slo-input_to_photon_macos.jsonl",
       "mcp_resource": "wa://perf/renderer-slo/input_to_photon",
       "status": "substrate_wired",
+      "retained_evidence": {
+        "status": "substrate_only_pending_lab_run",
+        "follow_up_bead": "ft-tf6g3.3.8",
+        "source_artifact_path": "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs",
+        "source_artifact_sha256": "d56e25a50a1a17691bd45d00fdaefbc73257e2d441ee35fa93deb3bd29a4e644",
+        "gap_evidence_path": "docs/attestations/perf/lindley-bounds.json",
+        "gap_evidence_sha256": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
+        "reason": "The deterministic stage telemetry substrate is wired, but no retained macOS target-run artifact proves the p95 bound."
+      },
       "blocked_by": ["ft-tf6g3.3.2"],
       "owner_bead": "ft-tf6g3.3.2"
     },
@@ -68,6 +84,15 @@
       "structured_log": "target/criterion/slo-input_to_photon_wayland.jsonl",
       "mcp_resource": "wa://perf/renderer-slo/input_to_photon",
       "status": "substrate_wired",
+      "retained_evidence": {
+        "status": "substrate_only_pending_lab_run",
+        "follow_up_bead": "ft-tf6g3.3.8",
+        "source_artifact_path": "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs",
+        "source_artifact_sha256": "d56e25a50a1a17691bd45d00fdaefbc73257e2d441ee35fa93deb3bd29a4e644",
+        "gap_evidence_path": "docs/attestations/perf/lindley-bounds.json",
+        "gap_evidence_sha256": "c89fe5f6b7abecf0a13dfee4509f3419da811599a21d6597f20fcdf74a383d6a",
+        "reason": "The deterministic stage telemetry substrate is wired, but no retained Wayland target-run artifact proves the p95 bound."
+      },
       "blocked_by": ["ft-tf6g3.3.2"],
       "owner_bead": "ft-tf6g3.3.2"
     },
@@ -92,6 +117,11 @@
       "source_bench": "crates/frankenterm-core/benches/idle_gpu.rs",
       "structured_log": "target/criterion/slo-idle_gpu.jsonl",
       "status": "bench_pending",
+      "retained_evidence": {
+        "status": "missing_source_bench",
+        "follow_up_bead": "ft-tf6g3.3.9",
+        "reason": "No source bench or retained target-run artifact is present in the checkout as of 2026-05-16."
+      },
       "blocked_by": ["ft-mpc9b.5.1"],
       "owner_bead": "ft-mpc9b.5.1"
     },
@@ -153,6 +183,11 @@
       "source_bench": "crates/frankenterm-core/benches/atlas_stability.rs",
       "structured_log": "target/criterion/slo-atlas_stability.jsonl",
       "status": "bench_pending",
+      "retained_evidence": {
+        "status": "missing_source_bench",
+        "follow_up_bead": "ft-tf6g3.3.10",
+        "reason": "No source bench or retained target-run artifact is present in the checkout as of 2026-05-16."
+      },
       "blocked_by": ["ft-mpc9b.1.1"],
       "owner_bead": "ft-mpc9b.1.1"
     },
@@ -194,6 +229,21 @@
       "topology_cross_check": "docs/attestations/tui/topology-parity.json",
       "status": "retained_run_validated",
       "current_degradation": "none",
+      "retained_evidence": {
+        "status": "retained_run_validated",
+        "proof_ledger_path": "tests/e2e/logs/ssim_parity_release_gate_20260516T024353Z.proof-ledger.jsonl",
+        "proof_ledger_sha256": "00fab2a7344e2710e6733cb8a0f39e6638c42c100ad8ffcdf4bf667e0b9f9a50",
+        "core_driver_meta_path": "tests/e2e/logs/ssim_parity_release_gate_20260516T024353Z.core_driver.rch.log.rch_meta.json",
+        "core_driver_meta_sha256": "fede6bdceb3fc14395efbce96194f328ad07f3d9f28e4d6a9c424329752a75c9",
+        "gui_corpus_meta_path": "tests/e2e/logs/ssim_parity_release_gate_20260516T024353Z.gui_corpus.rch.log.rch_meta.json",
+        "gui_corpus_meta_sha256": "641cc1e6c6ba6c9018ca584f08b368c94d37475ac6df908267fde8de5252cf4e",
+        "source_artifact_path": "crates/frankenterm-gui/tests/ssim_parity.rs",
+        "source_artifact_sha256": "8a67f9eb199cac90813d159adb5b3745176d06ad41e2eba5b0d75e839b062234",
+        "remote_cargo_reached": true,
+        "remote_rustc_reached": true,
+        "test_binary_reached": true,
+        "selected_worker_id": "vmi1293453"
+      },
       "blocked_by": ["ft-tf6g3.3.3"],
       "owner_bead": "ft-tf6g3.3.3"
     }
@@ -249,6 +299,18 @@
       "date": "2026-05-16",
       "bead": "ft-tf6g3.3.3",
       "note": "SSIM parity retained release evidence passed through remote RCH for both the backend-driver oracle and GUI corpus gates; current_degradation is now none."
+    },
+    {
+      "version": "0.1.4",
+      "date": "2026-05-16",
+      "bead": "ft-tf6g3.3.6",
+      "note": "Renderer-SLO closeout truth now records retained_evidence status per umbrella SLO: RQ-S13 has retained remote proof, RQ-S2/RQ-S3 remain substrate-only pending target lab runs, and RQ-S1/RQ-S5/RQ-S10 lack source benches and retained artifacts. Follow-up beads ft-tf6g3.3.7 through ft-tf6g3.3.10 own the missing target-run evidence."
+    },
+    {
+      "version": "0.1.5",
+      "date": "2026-05-16",
+      "bead": "ft-tf6g3.3.7",
+      "note": "RQ-S1 resize FPS now has a Criterion substrate at crates/frankenterm-core/benches/resize_storm.rs emitting target/criterion/slo-resize_fps.jsonl. Retained target-run validation remains pending RCH proof."
     }
   ]
 }
