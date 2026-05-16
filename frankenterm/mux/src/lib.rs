@@ -119,6 +119,10 @@ pub const DEFAULT_WORKSPACE: &str = "default";
 #[derive(Clone, Debug)]
 pub enum MuxNotification {
     PaneOutput(PaneId),
+    SynchronizedOutput {
+        pane_id: PaneId,
+        event: SynchronizedOutputEvent,
+    },
     PaneAdded(PaneId),
     PaneRemoved(PaneId),
     WindowCreated(WindowId),
@@ -158,6 +162,48 @@ pub enum MuxNotification {
         old_workspace: String,
         new_workspace: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SynchronizedOutputEvent {
+    Depth {
+        outcome: SynchronizedOutputDepthOutcome,
+        max_depth: u32,
+    },
+    Admission {
+        decision: SynchronizedOutputAdmissionDecision,
+        bytes: u64,
+    },
+    Drain {
+        cause: SynchronizedOutputDrainCause,
+        bytes: u64,
+        depth_outcome: Option<SynchronizedOutputDepthOutcome>,
+        max_depth: u32,
+    },
+    ModeQuery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SynchronizedOutputDepthOutcome {
+    Opened { new_depth: u32 },
+    Closed { new_depth: u32 },
+    Flushed,
+    Underflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SynchronizedOutputAdmissionDecision {
+    Accepted,
+    Truncated { dropped_bytes: u64 },
+    Refused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SynchronizedOutputDrainCause {
+    Esu,
+    Watchdog,
+    LiveResizeForce,
+    Operator,
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
@@ -248,44 +294,102 @@ fn respond_to_synchronized_output_query(pane: &Weak<dyn Pane>, hold: bool) {
 struct SynchronizedOutputActionEffect {
     flush: bool,
     handled: bool,
+    depth_outcome: Option<SynchronizedOutputDepthOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct SynchronizedOutputHold {
+    depth: u32,
+    max_depth: u32,
+}
+
+impl SynchronizedOutputHold {
+    fn is_holding(self) -> bool {
+        self.depth > 0
+    }
+
+    fn max_depth(self) -> u32 {
+        self.max_depth
+    }
+
+    fn open_bsu(&mut self) -> SynchronizedOutputDepthOutcome {
+        self.depth = self.depth.saturating_add(1);
+        if self.depth > self.max_depth {
+            self.max_depth = self.depth;
+        }
+        SynchronizedOutputDepthOutcome::Opened {
+            new_depth: self.depth,
+        }
+    }
+
+    fn close_esu(&mut self) -> SynchronizedOutputDepthOutcome {
+        if self.depth == 0 {
+            return SynchronizedOutputDepthOutcome::Underflow;
+        }
+        self.depth -= 1;
+        if self.depth == 0 {
+            SynchronizedOutputDepthOutcome::Flushed
+        } else {
+            SynchronizedOutputDepthOutcome::Closed {
+                new_depth: self.depth,
+            }
+        }
+    }
+
+    fn force_reset(&mut self) -> bool {
+        let was_holding = self.is_holding();
+        self.depth = 0;
+        was_holding
+    }
 }
 
 fn handle_synchronized_output_action(
     action: &Action,
-    hold: &mut bool,
+    hold: &mut SynchronizedOutputHold,
     respond_to_query: impl FnOnce(bool),
 ) -> SynchronizedOutputActionEffect {
     let mut effect = SynchronizedOutputActionEffect {
         flush: false,
         handled: false,
+        depth_outcome: None,
     };
 
     match action {
         Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
             DecPrivateModeCode::SynchronizedOutput,
         )))) => {
-            *hold = true;
+            effect.depth_outcome = Some(hold.open_bsu());
         }
         Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
             DecPrivateModeCode::SynchronizedOutput,
         )))) => {
-            *hold = false;
-            effect.flush = true;
+            let outcome = hold.close_esu();
+            effect.flush = matches!(outcome, SynchronizedOutputDepthOutcome::Flushed);
+            effect.depth_outcome = Some(outcome);
         }
         Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
-            *hold = false;
-            effect.flush = true;
+            effect.flush = hold.force_reset();
         }
         Action::CSI(CSI::Mode(Mode::QueryDecPrivateMode(DecPrivateMode::Code(
             DecPrivateModeCode::SynchronizedOutput,
         )))) => {
-            respond_to_query(*hold);
+            respond_to_query(hold.is_holding());
             effect.handled = true;
         }
         _ => {}
     }
 
     effect
+}
+
+fn notify_synchronized_output_event(pane: &Weak<dyn Pane>, event: SynchronizedOutputEvent) {
+    let Some(pane) = pane.upgrade() else {
+        return;
+    };
+    Mux::notify_from_any_thread(MuxNotification::SynchronizedOutput {
+        pane_id: pane.pane_id(),
+        event,
+    });
 }
 
 /// This function applies parsed actions to the pane and notifies any
@@ -312,7 +416,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
-    let mut hold = false;
+    let mut hold = SynchronizedOutputHold::default();
     let mut action_size = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
     let mut deadline = None;
@@ -328,12 +432,39 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                 break;
             }
             Ok(size) => {
+                let mut chunk_touched_hold = hold.is_holding();
                 parser.parse(&buf[0..size], |action| {
-                    let was_holding = hold;
+                    let was_holding = hold.is_holding();
                     let effect = handle_synchronized_output_action(&action, &mut hold, |hold| {
                         respond_to_synchronized_output_query(&pane, hold);
                     });
-                    if !was_holding && hold && !actions.is_empty() {
+                    if was_holding || hold.is_holding() {
+                        chunk_touched_hold = true;
+                    }
+                    if let Some(depth_outcome) = effect.depth_outcome {
+                        if effect.flush {
+                            notify_synchronized_output_event(
+                                &pane,
+                                SynchronizedOutputEvent::Drain {
+                                    cause: SynchronizedOutputDrainCause::Esu,
+                                    bytes: action_size as u64,
+                                    depth_outcome: Some(depth_outcome),
+                                    max_depth: hold.max_depth(),
+                                },
+                            );
+                        } else {
+                            notify_synchronized_output_event(
+                                &pane,
+                                SynchronizedOutputEvent::Depth {
+                                    outcome: depth_outcome,
+                                    max_depth: hold.max_depth(),
+                                },
+                            );
+                        }
+                    } else if effect.handled {
+                        notify_synchronized_output_event(&pane, SynchronizedOutputEvent::ModeQuery);
+                    }
+                    if !was_holding && hold.is_holding() && !actions.is_empty() {
                         // Flush prior actions before entering BSU hold.
                         send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
                         action_size = 0;
@@ -347,22 +478,40 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                         action_size = 0;
                     }
                 });
+                if chunk_touched_hold && size > 0 {
+                    notify_synchronized_output_event(
+                        &pane,
+                        SynchronizedOutputEvent::Admission {
+                            decision: SynchronizedOutputAdmissionDecision::Accepted,
+                            bytes: size as u64,
+                        },
+                    );
+                }
                 action_size += size;
-                if hold && action_size >= max_held_synchronized_output_bytes() {
+                if hold.is_holding() && action_size >= max_held_synchronized_output_bytes() {
                     // A buggy app can enter synchronized-output mode and never
                     // send the reset sequence. Bound buffered memory in that case.
                     log::warn!(
                         "forcing synchronized-output flush after {} buffered bytes without reset",
                         action_size
                     );
-                    hold = false;
+                    hold.force_reset();
+                    notify_synchronized_output_event(
+                        &pane,
+                        SynchronizedOutputEvent::Drain {
+                            cause: SynchronizedOutputDrainCause::Watchdog,
+                            bytes: action_size as u64,
+                            depth_outcome: None,
+                            max_depth: hold.max_depth(),
+                        },
+                    );
                     if !actions.is_empty() {
                         send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
                     }
                     deadline = None;
                     action_size = 0;
                 }
-                if !actions.is_empty() && !hold {
+                if !actions.is_empty() && !hold.is_holding() {
                     // If we haven't accumulated too much data,
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
@@ -1903,9 +2052,10 @@ mod tests {
     #[test]
     fn synchronized_output_query_is_answered_from_parser_hold_state() {
         let mut parser = termwiz::escape::parser::Parser::new();
-        let mut hold = false;
+        let mut hold = SynchronizedOutputHold::default();
         let mut responses = Vec::new();
         let mut forwarded_actions = Vec::new();
+        let mut events = Vec::new();
 
         parser.parse(
             b"\x1b[?2026h\x1b[?2026$p\x1b[?2026l\x1b[?2026$p",
@@ -1913,6 +2063,15 @@ mod tests {
                 let effect = handle_synchronized_output_action(&action, &mut hold, |hold| {
                     responses.push(synchronized_output_decrqm_response(hold).to_vec());
                 });
+                if let Some(outcome) = effect.depth_outcome {
+                    events.push(SynchronizedOutputEvent::Depth {
+                        outcome,
+                        max_depth: hold.max_depth(),
+                    });
+                }
+                if effect.handled {
+                    events.push(SynchronizedOutputEvent::ModeQuery);
+                }
                 if !effect.handled {
                     forwarded_actions.push(action);
                 }
@@ -1928,6 +2087,21 @@ mod tests {
             2,
             "mode-query actions must be answered directly, not forwarded into the held action buffer",
         );
+        assert_eq!(
+            events,
+            vec![
+                SynchronizedOutputEvent::Depth {
+                    outcome: SynchronizedOutputDepthOutcome::Opened { new_depth: 1 },
+                    max_depth: 1,
+                },
+                SynchronizedOutputEvent::ModeQuery,
+                SynchronizedOutputEvent::Depth {
+                    outcome: SynchronizedOutputDepthOutcome::Flushed,
+                    max_depth: 1,
+                },
+                SynchronizedOutputEvent::ModeQuery,
+            ],
+        );
         assert!(matches!(
             &forwarded_actions[0],
             Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -1940,6 +2114,38 @@ mod tests {
                 DecPrivateModeCode::SynchronizedOutput
             ))))
         ));
+    }
+
+    #[test]
+    fn synchronized_output_hold_tracks_nested_depth_and_underflow() {
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut hold = SynchronizedOutputHold::default();
+        let mut outcomes = Vec::new();
+        let mut flushes = 0;
+
+        parser.parse(b"\x1b[?2026h\x1b[?2026h\x1b[?2026l\x1b[?2026l\x1b[?2026l", |action| {
+            let effect = handle_synchronized_output_action(&action, &mut hold, |_| {});
+            if effect.flush {
+                flushes += 1;
+            }
+            if let Some(outcome) = effect.depth_outcome {
+                outcomes.push(outcome);
+            }
+        });
+
+        assert_eq!(
+            outcomes,
+            vec![
+                SynchronizedOutputDepthOutcome::Opened { new_depth: 1 },
+                SynchronizedOutputDepthOutcome::Opened { new_depth: 2 },
+                SynchronizedOutputDepthOutcome::Closed { new_depth: 1 },
+                SynchronizedOutputDepthOutcome::Flushed,
+                SynchronizedOutputDepthOutcome::Underflow,
+            ]
+        );
+        assert_eq!(flushes, 1, "only the ESU that closes depth to zero flushes");
+        assert_eq!(hold.max_depth(), 2);
+        assert!(!hold.is_holding());
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -1971,7 +2177,7 @@ mod tests {
             ops in proptest::collection::vec(synchronized_output_wire_op_strategy(), 1..64),
             chunk_sizes in proptest::collection::vec(1usize..8, 1..128),
         ) {
-            let mut expected_hold = false;
+            let mut expected_depth = 0_u32;
             let mut expected_responses = Vec::new();
             let mut expected_forwarded = 0usize;
             let mut input = Vec::new();
@@ -1980,22 +2186,22 @@ mod tests {
                 append_synchronized_output_wire_op(&mut input, *op);
                 match op {
                     SynchronizedOutputWireOp::Set => {
-                        expected_hold = true;
+                        expected_depth = expected_depth.saturating_add(1);
                         expected_forwarded += 1;
                     }
                     SynchronizedOutputWireOp::Reset => {
-                        expected_hold = false;
+                        expected_depth = expected_depth.saturating_sub(1);
                         expected_forwarded += 1;
                     }
                     SynchronizedOutputWireOp::Query => {
                         expected_responses
-                            .push(synchronized_output_decrqm_response(expected_hold).to_vec());
+                            .push(synchronized_output_decrqm_response(expected_depth > 0).to_vec());
                     }
                 }
             }
 
             let mut parser = termwiz::escape::parser::Parser::new();
-            let mut hold = false;
+            let mut hold = SynchronizedOutputHold::default();
             let mut responses = Vec::new();
             let mut forwarded = 0usize;
             let mut offset = 0usize;
@@ -2016,7 +2222,7 @@ mod tests {
 
             prop_assert_eq!(responses, expected_responses);
             prop_assert_eq!(forwarded, expected_forwarded);
-            prop_assert_eq!(hold, expected_hold);
+            prop_assert_eq!(hold.is_holding(), expected_depth > 0);
         }
     }
 
@@ -2026,6 +2232,23 @@ mod tests {
         let dbg = format!("{:?}", n);
         assert!(dbg.contains("PaneOutput"));
         assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn mux_notification_synchronized_output_debug_and_clone() {
+        let n = MuxNotification::SynchronizedOutput {
+            pane_id: 7,
+            event: SynchronizedOutputEvent::Drain {
+                cause: SynchronizedOutputDrainCause::Watchdog,
+                bytes: 8192,
+                depth_outcome: None,
+                max_depth: 3,
+            },
+        };
+        let dbg = format!("{:?}", n.clone());
+        assert!(dbg.contains("SynchronizedOutput"));
+        assert!(dbg.contains("Watchdog"));
+        assert!(dbg.contains("7"));
     }
 
     #[test]

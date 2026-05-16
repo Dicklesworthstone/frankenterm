@@ -111,6 +111,7 @@ impl GuiFrontEnd {
                 MuxNotification::TabAddedToWindow { .. } => {}
                 MuxNotification::WindowInvalidated(_) => {}
                 MuxNotification::PaneOutput(_) => {}
+                MuxNotification::SynchronizedOutput { .. } => {}
                 MuxNotification::PaneAdded(_) => {}
                 MuxNotification::Alert {
                     pane_id,

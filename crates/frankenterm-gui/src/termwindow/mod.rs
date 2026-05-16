@@ -63,7 +63,7 @@ use mux::tab::{
     TabId,
 };
 use mux::window::WindowId as MuxWindowId;
-use mux::{Mux, MuxNotification};
+use mux::{Mux, MuxNotification, SynchronizedOutputDrainCause, SynchronizedOutputEvent};
 use mux_lua::MuxPane;
 use promise::spawn::sleep;
 use std::cell::{RefCell, RefMut};
@@ -503,6 +503,131 @@ pub struct SyncOutputDoctorSnapshot {
     pub overrides_by_trigger: frankenterm_core::sync_output_buffer_orchestrator::OverridesByTrigger,
 }
 
+pub(crate) fn record_sync_output_mux_event(
+    pane_id: PaneId,
+    event: SynchronizedOutputEvent,
+    watchdog_telemetry: &mut frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
+    orchestrator_telemetry: &mut frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
+    bsu_depth_by_pane: &mut HashMap<PaneId, frankenterm_core::sync_output_watchdog::BsuDepthCounter>,
+    buffered_bytes_by_pane: &mut HashMap<PaneId, u64>,
+) {
+    match event {
+        SynchronizedOutputEvent::Bsu => {
+            let depth = bsu_depth_by_pane.entry(pane_id).or_default();
+            let outcome = depth.open_bsu();
+            watchdog_telemetry.record_depth_outcome(outcome, depth.max_observed());
+        }
+        SynchronizedOutputEvent::Admission { bytes } => {
+            let config =
+                frankenterm_core::sync_output_buffer_orchestrator::BsuBufferConfig::default();
+            let buffered_bytes = buffered_bytes_by_pane.entry(pane_id).or_default();
+            let decision = frankenterm_core::sync_output_buffer_orchestrator::evaluate_buffer_admission(
+                *buffered_bytes,
+                bytes,
+                config,
+            );
+            orchestrator_telemetry.record_admission(decision, bytes);
+            frankenterm_core::sync_output_telemetry_bridge::forward_admission(
+                decision,
+                bytes,
+                watchdog_telemetry,
+            );
+            match decision {
+                frankenterm_core::sync_output_buffer_orchestrator::BufferAdmissionDecision::Accepted => {
+                    *buffered_bytes = buffered_bytes
+                        .saturating_add(bytes)
+                        .min(config.effective_max_bytes());
+                }
+                frankenterm_core::sync_output_buffer_orchestrator::BufferAdmissionDecision::Truncated {
+                    dropped_bytes,
+                } => {
+                    *buffered_bytes = buffered_bytes
+                        .saturating_sub(dropped_bytes)
+                        .saturating_add(bytes)
+                        .min(config.effective_max_bytes());
+                }
+                frankenterm_core::sync_output_buffer_orchestrator::BufferAdmissionDecision::Refused => {}
+            }
+        }
+        SynchronizedOutputEvent::Drain { cause } => record_sync_output_drain(
+            pane_id,
+            cause,
+            watchdog_telemetry,
+            orchestrator_telemetry,
+            bsu_depth_by_pane,
+            buffered_bytes_by_pane,
+        ),
+        SynchronizedOutputEvent::ModeQuery => {
+            frankenterm_core::sync_output_telemetry_bridge::forward_mode_query(watchdog_telemetry);
+        }
+    }
+}
+
+fn record_sync_output_drain(
+    pane_id: PaneId,
+    cause: SynchronizedOutputDrainCause,
+    watchdog_telemetry: &mut frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
+    orchestrator_telemetry: &mut frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
+    bsu_depth_by_pane: &mut HashMap<PaneId, frankenterm_core::sync_output_watchdog::BsuDepthCounter>,
+    buffered_bytes_by_pane: &mut HashMap<PaneId, u64>,
+) {
+    use frankenterm_core::sync_output_buffer_orchestrator::{
+        BufferDrainOutcome, DrainCause, OverrideAction, OverrideTrigger,
+    };
+    use frankenterm_core::sync_output_watchdog::WatchdogDecision;
+
+    let bytes = buffered_bytes_by_pane.remove(&pane_id).unwrap_or_default();
+    let drain_cause = match cause {
+        SynchronizedOutputDrainCause::Esu => DrainCause::Esu,
+        SynchronizedOutputDrainCause::Watchdog => DrainCause::Watchdog,
+        SynchronizedOutputDrainCause::LiveResizeForce => DrainCause::LiveResizeForce,
+        SynchronizedOutputDrainCause::Operator => DrainCause::Operator,
+    };
+    let drain_outcome = if bytes > 0 {
+        BufferDrainOutcome::Drained {
+            bytes,
+            cause: drain_cause,
+        }
+    } else {
+        BufferDrainOutcome::NoOp
+    };
+
+    if matches!(cause, SynchronizedOutputDrainCause::LiveResizeForce) {
+        orchestrator_telemetry
+            .record_override(OverrideTrigger::LiveResize, OverrideAction::ForceFlushNow);
+    }
+    orchestrator_telemetry.record_drain(drain_outcome);
+
+    match cause {
+        SynchronizedOutputDrainCause::Esu => {
+            let depth = bsu_depth_by_pane.entry(pane_id).or_default();
+            let depth_outcome = depth.close_esu();
+            let max_observed = depth.max_observed();
+            if matches!(drain_outcome, BufferDrainOutcome::Drained { .. }) {
+                frankenterm_core::sync_output_telemetry_bridge::forward_drain(
+                    drain_outcome,
+                    depth_outcome,
+                    max_observed,
+                    watchdog_telemetry,
+                );
+            } else {
+                watchdog_telemetry.record_depth_outcome(depth_outcome, max_observed);
+            }
+        }
+        SynchronizedOutputDrainCause::Watchdog => {
+            watchdog_telemetry.record_watchdog_decision(WatchdogDecision::ForceFlush);
+            if let Some(depth) = bsu_depth_by_pane.get_mut(&pane_id) {
+                depth.force_reset();
+            }
+        }
+        SynchronizedOutputDrainCause::LiveResizeForce | SynchronizedOutputDrainCause::Operator => {
+            if let Some(depth) = bsu_depth_by_pane.get_mut(&pane_id) {
+                depth.force_reset();
+            }
+        }
+    }
+}
+
 /// Convert a live `WatchdogedTripleBuffer` health view into the per-pane
 /// snapshot shape that `TermWindow` stores for `ft doctor --triple-buffer`.
 ///
@@ -704,9 +829,8 @@ pub struct TermWindow {
     /// SyncOutputTelemetry: BSU / ESU counts, watchdog
     /// force-flushes, mid-BSU byte count, max depth observed,
     /// mode-query count, adversarial-ESU-underflow count.
-    /// Surfaced into `sync_output_telemetry()` for ft doctor.
-    /// Bumped by the integration's BSU watchdog hooks (sub-tasks
-    /// 1 + 6 of the parent bead, deferred to follow-up).
+    /// Surfaced into `sync_output_telemetry()` for ft doctor and fed
+    /// by mux DEC 2026 BSU/ESU notifications.
     sync_output_watchdog_telemetry: frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
     /// DEC 2026 BSU buffer + override-dispatch orchestrator
     /// telemetry (ft-a9eu1). Substrate's
@@ -717,6 +841,14 @@ pub struct TermWindow {
     /// counters.
     sync_output_orchestrator_telemetry:
         frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
+    /// Per-pane BSU depth state used to translate mux DEC 2026
+    /// notifications into watchdog telemetry.
+    sync_output_bsu_depth_by_pane:
+        HashMap<PaneId, frankenterm_core::sync_output_watchdog::BsuDepthCounter>,
+    /// Per-pane bytes admitted while a BSU window is open. Drain
+    /// notifications consume this map to attribute ESU/watchdog/live-resize
+    /// bytes without making the mux crate depend on frankenterm-core.
+    sync_output_buffered_bytes_by_pane: HashMap<PaneId, u64>,
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
@@ -2004,6 +2136,8 @@ impl TermWindow {
                 frankenterm_core::sync_output_watchdog::SyncOutputTelemetry::default(),
             sync_output_orchestrator_telemetry:
                 frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry::default(),
+            sync_output_bsu_depth_by_pane: HashMap::new(),
+            sync_output_buffered_bytes_by_pane: HashMap::new(),
             quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
             quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
@@ -2628,6 +2762,9 @@ impl TermWindow {
                 MuxNotification::PaneOutput(pane_id) => {
                     self.mux_pane_output_event(pane_id);
                 }
+                MuxNotification::SynchronizedOutput { pane_id, event } => {
+                    self.mux_synchronized_output_event(pane_id, event);
+                }
                 MuxNotification::WindowInvalidated(_) => {
                     self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
                     window.invalidate();
@@ -2665,6 +2802,7 @@ impl TermWindow {
                     // u64 PaneId; cast from the mux's usize PaneId
                     // here.
                     self.forget_terminal_state_buffer_for_pane(terminal_pane_id_to_u64(pane_id));
+                    self.forget_sync_output_state_for_pane(pane_id);
                 }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
@@ -2813,6 +2951,25 @@ impl TermWindow {
         }
     }
 
+    fn mux_synchronized_output_event(&mut self, pane_id: PaneId, event: SynchronizedOutputEvent) {
+        if !self.window_contains_pane(pane_id) {
+            return;
+        }
+        record_sync_output_mux_event(
+            pane_id,
+            event,
+            &mut self.sync_output_watchdog_telemetry,
+            &mut self.sync_output_orchestrator_telemetry,
+            &mut self.sync_output_bsu_depth_by_pane,
+            &mut self.sync_output_buffered_bytes_by_pane,
+        );
+    }
+
+    fn forget_sync_output_state_for_pane(&mut self, pane_id: PaneId) {
+        self.sync_output_bsu_depth_by_pane.remove(&pane_id);
+        self.sync_output_buffered_bytes_by_pane.remove(&pane_id);
+    }
+
     fn mux_pane_output_event_callback(
         n: MuxNotification,
         window: &Window,
@@ -2848,7 +3005,8 @@ impl TermWindow {
             }
             | MuxNotification::PaneFocused(pane_id)
             | MuxNotification::PaneRemoved(pane_id)
-            | MuxNotification::PaneOutput(pane_id) => {
+            | MuxNotification::PaneOutput(pane_id)
+            | MuxNotification::SynchronizedOutput { pane_id, .. } => {
                 // Ideally we'd check to see if pane_id is part of this window,
                 // but overlays may not be 100% associated with the window
                 // in the mux and we don't want to lose the invalidation
@@ -5687,10 +5845,11 @@ mod tests {
         default_frame_budget_cost_ns, evaluate_frame_budget_reduce_motion_gate, frame_budget,
         mark_cursor_rows_dirty, mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
         pane_health_snapshot_from_watchdoged_health, record_drained_frame_budget_ops,
-        record_frame_budget_execution_outstanding, reduce_motion_state_from_preference, render,
-        run_clear_dirty_lines_after_frame, should_force_paint_for_frame_budget,
-        should_run_frame_budget_decision, should_skip_clean_line, terminal_pane_id_to_u64,
-        terminal_u16_from_stable_delta, terminal_u16_from_usize,
+        record_frame_budget_execution_outstanding, record_sync_output_mux_event,
+        reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
+        should_force_paint_for_frame_budget, should_run_frame_budget_decision,
+        should_skip_clean_line, terminal_pane_id_to_u64, terminal_u16_from_stable_delta,
+        terminal_u16_from_usize,
     };
 
     /// ft-camu6: stable→visible translation marks the right rows.
@@ -6068,6 +6227,125 @@ mod tests {
         assert_eq!(s.drains_watchdog, 1);
         // Adversarial counter stays zero — no underflow simulated.
         assert_eq!(s.adversarial_esu_underflow_count, 0);
+    }
+
+    #[test]
+    fn sync_output_mux_events_feed_watchdog_and_orchestrator_counters() {
+        let pane_id = 11;
+        let mut watchdog = frankenterm_core::sync_output_watchdog::SyncOutputTelemetry::default();
+        let mut orchestrator =
+            frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry::default();
+        let mut depth_by_pane = std::collections::HashMap::new();
+        let mut buffered_bytes_by_pane = std::collections::HashMap::new();
+
+        record_sync_output_mux_event(
+            pane_id,
+            mux::SynchronizedOutputEvent::Bsu,
+            &mut watchdog,
+            &mut orchestrator,
+            &mut depth_by_pane,
+            &mut buffered_bytes_by_pane,
+        );
+        record_sync_output_mux_event(
+            pane_id,
+            mux::SynchronizedOutputEvent::Admission { bytes: 64 },
+            &mut watchdog,
+            &mut orchestrator,
+            &mut depth_by_pane,
+            &mut buffered_bytes_by_pane,
+        );
+        record_sync_output_mux_event(
+            pane_id,
+            mux::SynchronizedOutputEvent::ModeQuery,
+            &mut watchdog,
+            &mut orchestrator,
+            &mut depth_by_pane,
+            &mut buffered_bytes_by_pane,
+        );
+        record_sync_output_mux_event(
+            pane_id,
+            mux::SynchronizedOutputEvent::Drain {
+                cause: mux::SynchronizedOutputDrainCause::Esu,
+            },
+            &mut watchdog,
+            &mut orchestrator,
+            &mut depth_by_pane,
+            &mut buffered_bytes_by_pane,
+        );
+
+        assert_eq!(watchdog.bsu_count(), 1);
+        assert_eq!(watchdog.esu_count(), 1);
+        assert_eq!(watchdog.esu_flush_count(), 1);
+        assert_eq!(watchdog.mid_bsu_byte_count(), 64);
+        assert_eq!(watchdog.mode_query_count(), 1);
+        assert_eq!(watchdog.max_bsu_depth_observed(), 1);
+        assert_eq!(orchestrator.admissions_accepted, 1);
+        assert_eq!(orchestrator.bytes_accepted, 64);
+        assert_eq!(orchestrator.drains_esu, 1);
+        assert_eq!(orchestrator.bytes_drained_total, 64);
+        assert!(!buffered_bytes_by_pane.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn sync_output_mux_events_preserve_drain_cause_classification() {
+        let pane_id = 17;
+        let mut watchdog = frankenterm_core::sync_output_watchdog::SyncOutputTelemetry::default();
+        let mut orchestrator =
+            frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry::default();
+        let mut depth_by_pane = std::collections::HashMap::new();
+        let mut buffered_bytes_by_pane = std::collections::HashMap::new();
+
+        record_sync_output_mux_event(
+            pane_id,
+            mux::SynchronizedOutputEvent::Drain {
+                cause: mux::SynchronizedOutputDrainCause::Esu,
+            },
+            &mut watchdog,
+            &mut orchestrator,
+            &mut depth_by_pane,
+            &mut buffered_bytes_by_pane,
+        );
+        assert_eq!(watchdog.adversarial_esu_underflow_count(), 1);
+        assert_eq!(orchestrator.drains_no_op, 1);
+
+        for (bytes, cause) in [
+            (10, mux::SynchronizedOutputDrainCause::Watchdog),
+            (11, mux::SynchronizedOutputDrainCause::LiveResizeForce),
+            (12, mux::SynchronizedOutputDrainCause::Operator),
+        ] {
+            record_sync_output_mux_event(
+                pane_id,
+                mux::SynchronizedOutputEvent::Bsu,
+                &mut watchdog,
+                &mut orchestrator,
+                &mut depth_by_pane,
+                &mut buffered_bytes_by_pane,
+            );
+            record_sync_output_mux_event(
+                pane_id,
+                mux::SynchronizedOutputEvent::Admission { bytes },
+                &mut watchdog,
+                &mut orchestrator,
+                &mut depth_by_pane,
+                &mut buffered_bytes_by_pane,
+            );
+            record_sync_output_mux_event(
+                pane_id,
+                mux::SynchronizedOutputEvent::Drain { cause },
+                &mut watchdog,
+                &mut orchestrator,
+                &mut depth_by_pane,
+                &mut buffered_bytes_by_pane,
+            );
+        }
+
+        assert_eq!(watchdog.watchdog_force_flush_count(), 1);
+        assert_eq!(orchestrator.drains_watchdog, 1);
+        assert_eq!(orchestrator.drains_live_resize, 1);
+        assert_eq!(orchestrator.drains_operator, 1);
+        assert_eq!(orchestrator.overrides_force_flush, 1);
+        assert_eq!(orchestrator.overrides_by_trigger.live_resize, 1);
+        assert_eq!(orchestrator.bytes_drained_total, 33);
     }
 
     /// ft-gso6n: PaneHealthSnapshot::ms_since_last_recycle returns
