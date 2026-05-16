@@ -1172,64 +1172,8 @@ impl WeztermClient {
     /// When a mux pool is configured, tries direct socket communication first
     /// and falls back to CLI subprocess spawning on failure.
     pub async fn list_panes(&self) -> Result<Vec<PaneInfo>> {
-        #[cfg(all(feature = "vendored", unix))]
-        if let Some(ref pool) = self.mux_pool {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            if self.mux_circuit_guard() {
-                let mux_result = pool.list_panes_with_cx(&cx).await;
-                match mux_result {
-                    Ok(response) => {
-                        self.mux_circuit_record_success();
-                        return Ok(pane_info_from_mux_response(&response));
-                    }
-                    Err(e) => {
-                        self.mux_circuit_record_failure(&e);
-                        if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                            return Err(Self::mux_cancelled_error("list_panes", e));
-                        }
-                        tracing::debug!(
-                            error = %e,
-                            "mux pool list_panes failed, falling back to CLI"
-                        );
-                    }
-                }
-            }
-        }
-
-        // CLI path: check the time-windowed cache before spawning a subprocess.
-        // Multiple callers (discovery, snapshot engine, watchdog) independently
-        // call list_panes() and each would spawn a separate `wezterm cli list`
-        // process.  This cache coalesces those calls within a short window.
-        let cache_window = Duration::from_millis(LIST_PANES_CLI_CACHE_MS);
-        {
-            let cache = match self.list_panes_cache.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some((ts, ref panes)) = *cache {
-                if ts.elapsed() < cache_window {
-                    tracing::trace!("list_panes: returning cached CLI result");
-                    return Ok(panes.clone());
-                }
-            }
-        }
-
-        let output = self
-            .run_cli_with_retry(&["cli", "list", "--format", "json"])
-            .await?;
-        let panes: Vec<PaneInfo> =
-            serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
-
-        // Update cache with the fresh result.
-        {
-            let mut cache = match self.list_panes_cache.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *cache = Some((Instant::now(), panes.clone()));
-        }
-
-        Ok(panes)
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_panes_with_cx(&cx).await
     }
 
     /// List all panes bound to the caller's asupersync capability
@@ -1274,12 +1218,40 @@ impl WeztermClient {
             }
         }
 
-        // CLI fallback: the retry helper's internal sleeps still use
-        // ambient Cx, but the CLI path is the slow recovery route and
-        // threading Cx through the whole retry/circuit-breaker stack
-        // is out of scope for this slice. The mux-pool fast path above
-        // IS Cx-first via pool.list_panes_with_cx.
-        self.list_panes().await
+        // CLI path: check the time-windowed cache before spawning a subprocess.
+        // Multiple callers (discovery, snapshot engine, watchdog) independently
+        // call list_panes() and each would spawn a separate `wezterm cli list`
+        // process.  This cache coalesces those calls within a short window.
+        let cache_window = Duration::from_millis(LIST_PANES_CLI_CACHE_MS);
+        {
+            let cache = match self.list_panes_cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some((ts, ref panes)) = *cache {
+                if ts.elapsed() < cache_window {
+                    tracing::trace!("list_panes: returning cached CLI result");
+                    return Ok(panes.clone());
+                }
+            }
+        }
+
+        let output = self
+            .run_cli_with_retry(&["cli", "list", "--format", "json"])
+            .await?;
+        let panes: Vec<PaneInfo> =
+            serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
+
+        // Update cache with the fresh result.
+        {
+            let mut cache = match self.list_panes_cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *cache = Some((Instant::now(), panes.clone()));
+        }
+
+        Ok(panes)
     }
 
     /// Cx-first `list_panes` fallback stub for configurations that do
@@ -1288,7 +1260,35 @@ impl WeztermClient {
     /// identically.
     #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn list_panes_with_cx(&self, _cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
-        self.list_panes().await
+        let cache_window = Duration::from_millis(LIST_PANES_CLI_CACHE_MS);
+        {
+            let cache = match self.list_panes_cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some((ts, ref panes)) = *cache {
+                if ts.elapsed() < cache_window {
+                    tracing::trace!("list_panes: returning cached CLI result");
+                    return Ok(panes.clone());
+                }
+            }
+        }
+
+        let output = self
+            .run_cli_with_retry(&["cli", "list", "--format", "json"])
+            .await?;
+        let panes: Vec<PaneInfo> =
+            serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
+
+        {
+            let mut cache = match self.list_panes_cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *cache = Some((Instant::now(), panes.clone()));
+        }
+
+        Ok(panes)
     }
 
     /// Get a specific pane by ID
@@ -1321,129 +1321,8 @@ impl WeztermClient {
     /// * `pane_id` - The pane to read from
     /// * `escapes` - Whether to include escape sequences (useful for capturing color info)
     pub async fn get_text(&self, pane_id: u64, escapes: bool) -> Result<String> {
-        // Vendored mux backend does not currently support escape-sequence text
-        // extraction; fall back to CLI for `--escapes`.
-        #[cfg(all(feature = "vendored", unix))]
-        if let Some(ref pool) = self.mux_pool {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            if escapes {
-                tracing::debug!("mux pool get_text does not support escapes; falling back to CLI");
-            } else if self.mux_circuit_guard() {
-                let mut pool_text: Option<String> = None;
-                'mux_text: {
-                    let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
-                        crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
-                        0,
-                    );
-                    let changes_result = pool.get_pane_render_changes_with_cx(&cx, pane_id).await;
-                    capacity_timer.finish_result(&changes_result);
-                    let changes = match changes_result {
-                        Ok(changes) => changes,
-                        Err(e) => {
-                            self.mux_circuit_record_failure(&e);
-                            if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                                return Err(Self::mux_cancelled_error("get_text", e));
-                            }
-                            tracing::debug!(
-                                error = %e,
-                                "mux pool get_text: render_changes failed; falling back to CLI"
-                            );
-                            break 'mux_text;
-                        }
-                    };
-
-                    let scrollback_top = changes.dimensions.scrollback_top;
-                    let scrollback_rows: isize = match changes.dimensions.scrollback_rows.try_into()
-                    {
-                        Ok(v) => v,
-                        Err(_) => {
-                            tracing::debug!(
-                                rows = changes.dimensions.scrollback_rows,
-                                "mux pool get_text: scrollback_rows overflow; falling back to CLI"
-                            );
-                            break 'mux_text;
-                        }
-                    };
-                    let scrollback_end = match scrollback_top.checked_add(scrollback_rows) {
-                        Some(v) => v,
-                        None => {
-                            tracing::debug!(
-                                top = scrollback_top,
-                                rows = scrollback_rows,
-                                "mux pool get_text: scrollback range overflow; falling back to CLI"
-                            );
-                            break 'mux_text;
-                        }
-                    };
-
-                    if scrollback_rows <= 0 || scrollback_end <= scrollback_top {
-                        pool_text = Some(String::new());
-                        break 'mux_text;
-                    }
-
-                    // Fetch the full scrollback in bounded chunks to avoid
-                    // mux frame size limits.
-                    const CHUNK_ROWS: isize = 2_000;
-                    let mut out = String::new();
-                    let mut start = scrollback_top;
-
-                    while start < scrollback_end {
-                        let chunk_end = start
-                            .checked_add(CHUNK_ROWS)
-                            .unwrap_or(scrollback_end)
-                            .min(scrollback_end);
-
-                        let capacity_timer =
-                            crate::runtime_telemetry::SwarmCapacityStageTimer::start(
-                                crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
-                                0,
-                            );
-                        #[allow(clippy::single_range_in_vec_init)]
-                        let lines_result = pool
-                            .get_lines_with_cx(&cx, pane_id, vec![start..chunk_end])
-                            .await;
-                        capacity_timer.finish_result(&lines_result);
-                        match lines_result {
-                            Ok(resp) => {
-                                let (mut lines, _images) = resp.lines.extract_data();
-                                lines.sort_by_key(|(idx, _)| *idx);
-                                for (_, line) in lines {
-                                    out.push_str(line.as_str().as_ref());
-                                    out.push('\n');
-                                }
-                            }
-                            Err(e) => {
-                                self.mux_circuit_record_failure(&e);
-                                if !self.mux_error_should_fallback_to_cli_for_client(&e) {
-                                    return Err(Self::mux_cancelled_error("get_text", e));
-                                }
-                                tracing::debug!(
-                                    error = %e,
-                                    "mux pool get_text: get_lines failed; falling back to CLI"
-                                );
-                                break 'mux_text;
-                            }
-                        }
-
-                        start = chunk_end;
-                    }
-
-                    pool_text = Some(out);
-                }
-
-                if let Some(text) = pool_text {
-                    self.mux_circuit_record_success();
-                    return Ok(text);
-                }
-            }
-        }
-
-        let pane_id_str = pane_id.to_string();
-        let mut args = vec!["cli", "get-text", "--pane-id", &pane_id_str];
-        if escapes {
-            args.push("--escapes");
-        }
-        self.run_cli_with_pane_check_retry(&args, pane_id).await
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_text_with_cx(&cx, pane_id, escapes).await
     }
 
     /// Get text content from a pane, bound to the caller's asupersync
@@ -1571,13 +1450,17 @@ impl WeztermClient {
             }
         }
 
-        // CLI fallback delegates to the legacy get_text path. Matches
-        // the pattern used by list_panes_with_cx / send_text_impl_with_cx.
-        self.get_text(pane_id, escapes).await
+        // CLI fallback delegates to the legacy cli execution path
+        let pane_id_str = pane_id.to_string();
+        let mut args = vec!["cli", "get-text", "--pane-id", &pane_id_str];
+        if escapes {
+            args.push("--escapes");
+        }
+        self.run_cli_with_pane_check_retry(&args, pane_id).await
     }
 
     /// Stub `get_text_with_cx` for configurations without
-    /// vendored+unix+asupersync — delegates to the legacy get_text.
+    /// vendored+unix+asupersync — delegates to the legacy cli path.
     #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn get_text_with_cx(
         &self,
@@ -1585,7 +1468,12 @@ impl WeztermClient {
         pane_id: u64,
         escapes: bool,
     ) -> Result<String> {
-        self.get_text(pane_id, escapes).await
+        let pane_id_str = pane_id.to_string();
+        let mut args = vec!["cli", "get-text", "--pane-id", &pane_id_str];
+        if escapes {
+            args.push("--escapes");
+        }
+        self.run_cli_with_pane_check_retry(&args, pane_id).await
     }
 
     /// Read the mux-side tiered scrollback summary for a pane when available.

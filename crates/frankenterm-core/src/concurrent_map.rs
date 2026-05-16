@@ -396,7 +396,11 @@ impl<K: Hash + Eq + Clone, V> Default for ShardedMap<K, V> {
 
 /// A sharded map optimized for `u64` keys (pane IDs).
 ///
-/// Uses Fibonacci hashing for excellent distribution of sequential IDs.
+/// Uses a SplitMix64 finalizer ([`fx_hash_u64`]) for shard
+/// selection — its high-avalanche bit mixer gives an even
+/// distribution across shards for sequential u64 keys (the common
+/// pane-id allocation pattern), without paying the cost of the
+/// generic-`Hash`-trait `DefaultHasher` used by [`ShardedMap`].
 pub struct PaneMap<V> {
     shards: Box<[Shard<u64, V>]>,
     shard_count: usize,

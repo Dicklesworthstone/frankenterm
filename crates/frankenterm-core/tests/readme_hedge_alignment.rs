@@ -129,25 +129,29 @@ fn populated_manifest_slots_do_not_carry_legacy_linked_artifact_hedges() {
             }
         }
 
-        if category_slots.iter().any(|slot| slot.path.is_some()) {
+        let mut has_path = false;
+        let mut deferred_beads = Vec::new();
+        for slot in category_slots {
+            if slot.path.is_some() {
+                has_path = true;
+            } else if let Some(ref bead_id) = slot.deferred_to_bead {
+                deferred_beads.push(bead_id.clone());
+            } else {
+                panic!(
+                    "manifest slot {} has neither path nor deferred_to_bead",
+                    pattern.category
+                );
+            }
+        }
+
+        if has_path {
             assert!(
                 matches.is_empty(),
                 "slot {} has a populated path but still carries legacy hedge text:\n{}",
                 pattern.category,
                 matches.join("\n---\n")
             );
-        } else if category_slots
-            .iter()
-            .all(|slot| slot.deferred_to_bead.is_some())
-        {
-            let deferred_beads = category_slots
-                .iter()
-                .map(|slot| {
-                    slot.deferred_to_bead
-                        .as_deref()
-                        .expect("all category slots are deferred")
-                })
-                .collect::<Vec<_>>();
+        } else {
             for entry in &matches {
                 assert!(
                     deferred_beads.iter().any(|bead_id| entry.contains(bead_id)),
@@ -157,11 +161,6 @@ fn populated_manifest_slots_do_not_carry_legacy_linked_artifact_hedges() {
                     entry
                 );
             }
-        } else {
-            panic!(
-                "manifest slot {} has neither path nor deferred_to_bead",
-                pattern.category
-            );
         }
     }
 }
