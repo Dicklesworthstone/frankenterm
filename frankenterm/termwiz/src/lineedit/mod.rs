@@ -41,8 +41,8 @@ use crate::caps::{Capabilities, ProbeHints};
 use crate::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 use crate::surface::change::ChangeSequence;
 use crate::surface::{Change, Position};
-use crate::terminal::{new_terminal, Terminal};
-use crate::{bail, ensure, Result};
+use crate::terminal::{Terminal, new_terminal};
+use crate::{Result, bail, ensure};
 
 mod actions;
 mod buffer;
@@ -611,28 +611,31 @@ impl<'term> LineEditor<'term> {
     ) {
         self.clear_completion();
 
-        if let EditorState::Searching { .. } = &self.state {
-            // Already searching
-        } else {
-            // Not yet searching, so we start a new search
-            // with an empty pattern
-            self.line.clear();
-            self.history_pos.take();
-        }
+        let already_searching = matches!(self.state, EditorState::Searching { .. });
 
-        let history_pos = match self.history_pos {
-            Some(p) => match direction.next(p) {
+        let history_pos = if already_searching {
+            match self.history_pos {
+                Some(p) => match direction.next(p) {
+                    Some(p) => p,
+                    None => return,
+                },
+                None => match host.history().last() {
+                    Some(p) => p,
+                    None => return,
+                },
+            }
+        } else {
+            match host.history().last() {
                 Some(p) => p,
                 None => return,
-            },
-            None => match host.history().last() {
-                Some(p) => p,
-                None => {
-                    // TODO: there's no way we can match anything.
-                    // Generate a failed match result?
-                    return;
-                }
-            },
+            }
+        };
+
+        if !already_searching {
+            // Not yet searching, so we start a new search
+            // with an empty pattern.
+            self.line.clear();
+            self.history_pos.take();
         };
 
         let search_result =
@@ -705,7 +708,7 @@ impl<'term> LineEditor<'term> {
             Action::EndOfFile => {
                 return Err(
                     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "End Of File").into(),
-                )
+                );
             }
             Action::Kill(movement) => {
                 self.kill_text(movement, movement);
@@ -849,6 +852,101 @@ impl<'term> LineEditor<'term> {
             }
         }
         Ok(Some(self.line.get_line().to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::{ScreenSize, TerminalWaker};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct TestTerminal {
+        input: VecDeque<InputEvent>,
+    }
+
+    impl Terminal for TestTerminal {
+        fn set_raw_mode(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_cooked_mode(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn enter_alternate_screen(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn exit_alternate_screen(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_screen_size(&mut self) -> Result<ScreenSize> {
+            Ok(ScreenSize {
+                rows: 24,
+                cols: 80,
+                xpixel: 0,
+                ypixel: 0,
+            })
+        }
+
+        fn set_screen_size(&mut self, _size: ScreenSize) -> Result<()> {
+            Ok(())
+        }
+
+        fn render(&mut self, _changes: &[Change]) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn poll_input(&mut self, _wait: Option<Duration>) -> Result<Option<InputEvent>> {
+            Ok(self.input.pop_front())
+        }
+
+        fn waker(&self) -> TerminalWaker {
+            TerminalWaker::noop()
+        }
+    }
+
+    fn editor_with_line<'term>(terminal: &'term mut TestTerminal, line: &str) -> LineEditor<'term> {
+        let mut editor = LineEditor::new(terminal);
+        editor.state = EditorState::Editing;
+        editor.set_line_and_cursor(line, line.len());
+        editor
+    }
+
+    #[test]
+    fn empty_history_backward_search_preserves_current_input() {
+        let mut terminal = TestTerminal::default();
+        let mut editor = editor_with_line(&mut terminal, "draft command");
+        let mut host = NopLineEditorHost::default();
+
+        editor
+            .apply_action(&mut host, Action::HistoryIncSearchBackwards)
+            .expect("empty history search should not fail");
+
+        assert_eq!(editor.get_line_and_cursor(), ("draft command", 13));
+        assert_eq!(editor.state, EditorState::Editing);
+    }
+
+    #[test]
+    fn empty_history_forward_search_preserves_current_input() {
+        let mut terminal = TestTerminal::default();
+        let mut editor = editor_with_line(&mut terminal, "draft command");
+        let mut host = NopLineEditorHost::default();
+
+        editor
+            .apply_action(&mut host, Action::HistoryIncSearchForwards)
+            .expect("empty history search should not fail");
+
+        assert_eq!(editor.get_line_and_cursor(), ("draft command", 13));
+        assert_eq!(editor.state, EditorState::Editing);
     }
 }
 
