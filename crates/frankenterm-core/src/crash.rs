@@ -32,6 +32,24 @@ use crate::policy::Redactor;
 /// Global health snapshot for crash reporting
 static GLOBAL_HEALTH: OnceLock<RwLock<Option<HealthSnapshot>>> = OnceLock::new();
 
+/// Latest robot-state shaped pane inventory for incident bundles.
+static GLOBAL_INCIDENT_ROBOT_STATE: OnceLock<RwLock<Option<IncidentRobotStateSnapshot>>> =
+    OnceLock::new();
+
+/// Latest privacy-bounded pane text summaries for incident bundles.
+static GLOBAL_INCIDENT_PANE_TEXT_SUMMARIES: OnceLock<
+    RwLock<Option<IncidentPaneTextSummariesSnapshot>>,
+> = OnceLock::new();
+
+/// Latest retained RCH/proof evidence supplied to incident bundles.
+static GLOBAL_INCIDENT_PROOF_RCH_EVIDENCE: OnceLock<
+    RwLock<Option<IncidentProofRchEvidenceSnapshot>>,
+> = OnceLock::new();
+
+/// Latest read-only Agent Mail evidence supplied to incident bundles.
+static GLOBAL_INCIDENT_AGENT_MAIL: OnceLock<RwLock<Option<IncidentAgentMailSnapshot>>> =
+    OnceLock::new();
+
 // ============================================================================
 // br-ft-94cdu: crash-bundle parse-drop observability
 // ============================================================================
@@ -303,6 +321,788 @@ pub struct HealthSnapshot {
     /// Leak-risk lifecycle inventory for retention debugging.
     #[serde(default)]
     pub leak_risk_inventory: LeakRiskInventorySnapshot,
+}
+
+/// Text-free pane inventory supplied to the incident-bundle robot_state source.
+///
+/// This mirrors the privacy-bounded `ft robot state` shape and intentionally
+/// omits pane text. Runtime or CLI layers can publish it before collecting an
+/// incident bundle; the collector degrades to a typed unavailable source when
+/// no publisher has supplied a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentRobotStateSnapshot {
+    /// Epoch milliseconds when this robot-state view was captured.
+    pub captured_at_ms: u64,
+    /// Read-only surface that produced the snapshot.
+    pub source_surface: String,
+    /// Pane metadata rows.
+    #[serde(default)]
+    pub panes: Vec<IncidentRobotPaneState>,
+}
+
+impl IncidentRobotStateSnapshot {
+    /// Build a snapshot from incident-specific pane rows.
+    #[must_use]
+    pub fn new(
+        captured_at_ms: u64,
+        source_surface: impl Into<String>,
+        panes: Vec<IncidentRobotPaneState>,
+    ) -> Self {
+        Self {
+            captured_at_ms,
+            source_surface: source_surface.into(),
+            panes,
+        }
+    }
+
+    /// Build a snapshot from the public robot-state DTO.
+    #[must_use]
+    pub fn from_robot_panes(
+        captured_at_ms: u64,
+        source_surface: impl Into<String>,
+        panes: Vec<crate::robot_types::PaneStateData>,
+    ) -> Self {
+        Self::new(
+            captured_at_ms,
+            source_surface,
+            panes.into_iter().map(Into::into).collect(),
+        )
+    }
+
+    /// Publish the current robot-state snapshot for future incident bundles.
+    pub fn update_global(snapshot: Self) {
+        let lock = GLOBAL_INCIDENT_ROBOT_STATE.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    /// Return the latest published incident robot-state snapshot.
+    #[must_use]
+    pub fn get_global() -> Option<Self> {
+        let lock = GLOBAL_INCIDENT_ROBOT_STATE.get_or_init(|| RwLock::new(None));
+        lock.read().ok().and_then(|guard| guard.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_global_for_test() {
+        let lock = GLOBAL_INCIDENT_ROBOT_STATE.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+    }
+}
+
+/// Text-free pane metadata row included in incident robot_state payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentRobotPaneState {
+    /// Numeric pane id.
+    pub pane_id: u64,
+    /// Stable pane UUID if the daemon has assigned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_uuid: Option<String>,
+    /// Tab id reported by the mux, or 0 for distributed persisted panes.
+    pub tab_id: u64,
+    /// Window id reported by the mux, or 0 for distributed persisted panes.
+    pub window_id: u64,
+    /// Domain label.
+    pub domain: String,
+    /// Pane title when already exposed by robot state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Current working directory when already exposed by robot state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Whether the pane is observed by the configured pane filter.
+    #[serde(default)]
+    pub observed: bool,
+    /// Human-readable visibility state derived from robot-state metadata.
+    pub state: String,
+    /// Reason the pane is ignored, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_reason: Option<String>,
+    /// Epoch milliseconds for this row when the publisher has per-pane timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    /// Epoch milliseconds of recent output activity when already known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at_ms: Option<u64>,
+}
+
+impl IncidentRobotPaneState {
+    /// Construct a text-free incident pane row.
+    #[must_use]
+    pub fn new(
+        pane_id: u64,
+        tab_id: u64,
+        window_id: u64,
+        domain: impl Into<String>,
+        observed: bool,
+    ) -> Self {
+        Self {
+            pane_id,
+            pane_uuid: None,
+            tab_id,
+            window_id,
+            domain: domain.into(),
+            title: None,
+            cwd: None,
+            observed,
+            state: pane_visibility_state(observed, None).to_string(),
+            ignore_reason: None,
+            observed_at_ms: None,
+            last_activity_at_ms: None,
+        }
+    }
+
+    /// Override title metadata for builder-style construction.
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Override cwd metadata for builder-style construction.
+    #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Override ignore metadata and recompute the derived state.
+    #[must_use]
+    pub fn with_ignore_reason(mut self, reason: impl Into<String>) -> Self {
+        self.ignore_reason = Some(reason.into());
+        self.state =
+            pane_visibility_state(self.observed, self.ignore_reason.as_deref()).to_string();
+        self
+    }
+
+    /// Override per-row timing metadata.
+    #[must_use]
+    pub fn with_timestamps(
+        mut self,
+        observed_at_ms: Option<u64>,
+        last_activity_at_ms: Option<u64>,
+    ) -> Self {
+        self.observed_at_ms = observed_at_ms;
+        self.last_activity_at_ms = last_activity_at_ms;
+        self
+    }
+}
+
+impl From<crate::robot_types::PaneStateData> for IncidentRobotPaneState {
+    fn from(pane: crate::robot_types::PaneStateData) -> Self {
+        let state = pane_visibility_state(pane.observed, pane.ignore_reason.as_deref()).to_string();
+        Self {
+            pane_id: pane.pane_id,
+            pane_uuid: pane.pane_uuid,
+            tab_id: pane.tab_id,
+            window_id: pane.window_id,
+            domain: pane.domain,
+            title: pane.title,
+            cwd: pane.cwd,
+            observed: pane.observed,
+            state,
+            ignore_reason: pane.ignore_reason,
+            observed_at_ms: None,
+            last_activity_at_ms: None,
+        }
+    }
+}
+
+fn pane_visibility_state(observed: bool, ignore_reason: Option<&str>) -> &'static str {
+    if observed {
+        "observed"
+    } else if ignore_reason.is_some_and(|reason| !reason.trim().is_empty()) {
+        "ignored"
+    } else {
+        "unobserved"
+    }
+}
+
+/// Privacy-bounded pane text summaries supplied to incident bundles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentPaneTextSummariesSnapshot {
+    /// Epoch milliseconds when these summaries were captured.
+    pub captured_at_ms: u64,
+    /// Read-only surface that produced the summaries.
+    pub source_surface: String,
+    /// Tail-line budget used by the producer.
+    pub tail_lines: usize,
+    /// Maximum bytes allowed per pane summary after redaction and truncation.
+    pub max_summary_bytes: usize,
+    /// Whether the privacy budget allowed pane text summaries in this snapshot.
+    pub privacy_allowed: bool,
+    /// Reason summaries were excluded when privacy did not allow text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_reason: Option<String>,
+    /// Per-pane bounded summaries or explicit placeholders.
+    #[serde(default)]
+    pub panes: Vec<IncidentPaneTextSummary>,
+}
+
+impl IncidentPaneTextSummariesSnapshot {
+    /// Build a snapshot with already bounded summary rows.
+    #[must_use]
+    pub fn new(
+        captured_at_ms: u64,
+        source_surface: impl Into<String>,
+        tail_lines: usize,
+        max_summary_bytes: usize,
+        privacy_allowed: bool,
+        panes: Vec<IncidentPaneTextSummary>,
+    ) -> Self {
+        Self {
+            captured_at_ms,
+            source_surface: source_surface.into(),
+            tail_lines,
+            max_summary_bytes,
+            privacy_allowed,
+            privacy_reason: None,
+            panes,
+        }
+    }
+
+    /// Attach the reason pane text summaries were withheld.
+    #[must_use]
+    pub fn with_privacy_reason(mut self, reason: impl Into<String>) -> Self {
+        self.privacy_reason = Some(reason.into());
+        self
+    }
+
+    /// Publish current pane text summaries for future incident bundles.
+    pub fn update_global(snapshot: Self) {
+        let lock = GLOBAL_INCIDENT_PANE_TEXT_SUMMARIES.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    /// Return the latest published incident pane text summaries.
+    #[must_use]
+    pub fn get_global() -> Option<Self> {
+        let lock = GLOBAL_INCIDENT_PANE_TEXT_SUMMARIES.get_or_init(|| RwLock::new(None));
+        lock.read().ok().and_then(|guard| guard.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_global_for_test() {
+        let lock = GLOBAL_INCIDENT_PANE_TEXT_SUMMARIES.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+    }
+}
+
+/// One pane's incident-bundle text summary or explicit placeholder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentPaneTextSummary {
+    /// Pane id summarized by this row.
+    pub pane_id: u64,
+    /// Row status: `summary`, `excluded`, or `error`.
+    pub status: String,
+    /// Tail-line budget used for the row.
+    pub tail_lines: usize,
+    /// Redacted, bounded summary text or a placeholder.
+    pub summary: String,
+    /// Number of redactions applied before this summary is written.
+    #[serde(default)]
+    pub redactions: usize,
+    /// Whether the row was truncated to the summary byte budget.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Truncation metadata when the row was clipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_info: Option<crate::robot_types::TruncationInfo>,
+    /// Error or exclusion code for non-summary rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Human-readable error or exclusion reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl IncidentPaneTextSummary {
+    /// Build a redacted, bounded summary row from pane tail text.
+    #[must_use]
+    pub fn from_text(
+        pane_id: u64,
+        text: &str,
+        tail_lines: usize,
+        max_summary_bytes: usize,
+        redactor: &Redactor,
+    ) -> Self {
+        let redactions = redactor.detect(text).len();
+        let redacted = redactor.redact(text);
+        let summary =
+            truncate_utf8_with_marker(&redacted, max_summary_bytes, "\n[PANE_TEXT_TRUNCATED]");
+        let truncated = summary.len() < redacted.len();
+        let truncation_info = truncated.then(|| crate::robot_types::TruncationInfo {
+            original_bytes: redacted.len(),
+            returned_bytes: summary.len(),
+            original_lines: redacted.lines().count(),
+            returned_lines: summary.lines().count(),
+        });
+        Self {
+            pane_id,
+            status: "summary".to_string(),
+            tail_lines,
+            summary,
+            redactions,
+            truncated,
+            truncation_info,
+            code: None,
+            message: None,
+        }
+    }
+
+    /// Build an explicit placeholder for privacy-excluded pane text.
+    #[must_use]
+    pub fn excluded(pane_id: u64, tail_lines: usize, reason: impl Into<String>) -> Self {
+        Self {
+            pane_id,
+            status: "excluded".to_string(),
+            tail_lines,
+            summary: "[PANE_TEXT_EXCLUDED]".to_string(),
+            redactions: 0,
+            truncated: false,
+            truncation_info: None,
+            code: Some("pane_text.privacy_disabled".to_string()),
+            message: Some(reason.into()),
+        }
+    }
+
+    /// Build an explicit placeholder for a per-pane read failure.
+    #[must_use]
+    pub fn error(
+        pane_id: u64,
+        tail_lines: usize,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            pane_id,
+            status: "error".to_string(),
+            tail_lines,
+            summary: "[PANE_TEXT_UNAVAILABLE]".to_string(),
+            redactions: 0,
+            truncated: false,
+            truncation_info: None,
+            code: Some(code.into()),
+            message: Some(message.into()),
+        }
+    }
+}
+
+fn sanitize_pane_text_summary_for_payload(
+    mut pane: IncidentPaneTextSummary,
+    max_summary_bytes: usize,
+    redactor: &Redactor,
+) -> IncidentPaneTextSummary {
+    let additional_redactions = redactor.detect(&pane.summary).len();
+    if additional_redactions > 0 {
+        pane.summary = redactor.redact(&pane.summary);
+        pane.redactions = pane.redactions.saturating_add(additional_redactions);
+    }
+    if let Some(message) = pane.message.as_mut() {
+        let message_redactions = redactor.detect(message).len();
+        if message_redactions > 0 {
+            *message = redactor.redact(message);
+            pane.redactions = pane.redactions.saturating_add(message_redactions);
+        }
+    }
+
+    if pane.summary.len() > max_summary_bytes {
+        let original_bytes = pane.summary.len();
+        let original_lines = pane.summary.lines().count();
+        pane.summary =
+            truncate_utf8_with_marker(&pane.summary, max_summary_bytes, "\n[PANE_TEXT_TRUNCATED]");
+        pane.truncated = true;
+        pane.truncation_info = Some(crate::robot_types::TruncationInfo {
+            original_bytes,
+            returned_bytes: pane.summary.len(),
+            original_lines,
+            returned_lines: pane.summary.lines().count(),
+        });
+    }
+
+    pane
+}
+
+/// Retained proof/RCH evidence supplied to incident bundles.
+///
+/// This is an attachment point for already-existing proof logs and verdict
+/// metadata. The incident collector serializes this snapshot read-only; it must
+/// not launch Cargo, RCH, or any other proof command while collecting a bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentProofRchEvidenceSnapshot {
+    /// Epoch milliseconds when the evidence was captured or assembled.
+    pub captured_at_ms: u64,
+    /// Read-only surface that supplied this evidence.
+    pub source_surface: String,
+    /// Overall proof verdict: `passed`, `failed`, `blocked`, or `no_verdict`.
+    pub verdict: String,
+    /// Stable reason code explaining the verdict.
+    pub reason_code: String,
+    /// Paths to retained proof/RCH artifacts, relative when possible.
+    #[serde(default)]
+    pub artifact_paths: Vec<String>,
+    /// Per-attempt evidence rows.
+    #[serde(default)]
+    pub attempts: Vec<IncidentProofRchAttempt>,
+    /// Whether local fallback was explicitly rejected by the proof lane.
+    #[serde(default)]
+    pub local_fallback_rejected: bool,
+    /// Whether the available artifacts are only setup/sync/queue chatter.
+    #[serde(default)]
+    pub setup_chatter_only: bool,
+}
+
+impl IncidentProofRchEvidenceSnapshot {
+    /// Build a retained proof-evidence snapshot.
+    #[must_use]
+    pub fn new(
+        captured_at_ms: u64,
+        source_surface: impl Into<String>,
+        verdict: impl Into<String>,
+        reason_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            captured_at_ms,
+            source_surface: source_surface.into(),
+            verdict: verdict.into(),
+            reason_code: reason_code.into(),
+            artifact_paths: Vec::new(),
+            attempts: Vec::new(),
+            local_fallback_rejected: false,
+            setup_chatter_only: false,
+        }
+    }
+
+    /// Attach retained proof/RCH artifact paths.
+    #[must_use]
+    pub fn with_artifact_paths(mut self, artifact_paths: Vec<String>) -> Self {
+        self.artifact_paths = artifact_paths;
+        self
+    }
+
+    /// Attach per-attempt evidence rows.
+    #[must_use]
+    pub fn with_attempts(mut self, attempts: Vec<IncidentProofRchAttempt>) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
+    /// Record that local fallback was refused rather than counted as proof.
+    #[must_use]
+    pub fn with_local_fallback_rejected(mut self, rejected: bool) -> Self {
+        self.local_fallback_rejected = rejected;
+        self
+    }
+
+    /// Record that retained artifacts are setup/sync chatter only.
+    #[must_use]
+    pub fn with_setup_chatter_only(mut self, setup_chatter_only: bool) -> Self {
+        self.setup_chatter_only = setup_chatter_only;
+        self
+    }
+
+    /// Publish retained proof/RCH evidence for future incident bundles.
+    pub fn update_global(snapshot: Self) {
+        let lock = GLOBAL_INCIDENT_PROOF_RCH_EVIDENCE.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    /// Return the latest retained proof/RCH evidence snapshot.
+    #[must_use]
+    pub fn get_global() -> Option<Self> {
+        let lock = GLOBAL_INCIDENT_PROOF_RCH_EVIDENCE.get_or_init(|| RwLock::new(None));
+        lock.read().ok().and_then(|guard| guard.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_global_for_test() {
+        let lock = GLOBAL_INCIDENT_PROOF_RCH_EVIDENCE.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+    }
+}
+
+/// One retained proof/RCH attempt summarized for incident bundles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentProofRchAttempt {
+    /// Command or proof lane label.
+    pub command: String,
+    /// Attempt status: `passed`, `failed`, `blocked`, or `no_verdict`.
+    pub status: String,
+    /// Stable reason code for the attempt.
+    pub reason_code: String,
+    /// Retained artifact path for this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    /// Whether this attempt reached remote Cargo/rustc/test execution.
+    #[serde(default)]
+    pub remote_execution_confirmed: bool,
+    /// Whether local fallback was rejected for this attempt.
+    #[serde(default)]
+    pub local_fallback_rejected: bool,
+    /// Whether this row is setup/sync chatter only and not a proof verdict.
+    #[serde(default)]
+    pub setup_chatter_only: bool,
+}
+
+impl IncidentProofRchAttempt {
+    /// Build a retained proof/RCH attempt row.
+    #[must_use]
+    pub fn new(
+        command: impl Into<String>,
+        status: impl Into<String>,
+        reason_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            status: status.into(),
+            reason_code: reason_code.into(),
+            artifact_path: None,
+            remote_execution_confirmed: false,
+            local_fallback_rejected: false,
+            setup_chatter_only: false,
+        }
+    }
+
+    /// Attach a retained artifact path.
+    #[must_use]
+    pub fn with_artifact_path(mut self, artifact_path: impl Into<String>) -> Self {
+        self.artifact_path = Some(artifact_path.into());
+        self
+    }
+
+    /// Record whether the attempt reached remote execution.
+    #[must_use]
+    pub fn with_remote_execution_confirmed(mut self, confirmed: bool) -> Self {
+        self.remote_execution_confirmed = confirmed;
+        self
+    }
+
+    /// Record that local fallback was rejected.
+    #[must_use]
+    pub fn with_local_fallback_rejected(mut self, rejected: bool) -> Self {
+        self.local_fallback_rejected = rejected;
+        self
+    }
+
+    /// Record that this row is setup/sync chatter only.
+    #[must_use]
+    pub fn with_setup_chatter_only(mut self, setup_chatter_only: bool) -> Self {
+        self.setup_chatter_only = setup_chatter_only;
+        self
+    }
+}
+
+/// Read-only Agent Mail evidence supplied to incident bundles.
+///
+/// This records already-collected health or unavailable-after-retry metadata.
+/// Incident collection serializes the snapshot and must not repair, restart,
+/// kill, register, acknowledge, or fetch message bodies from Agent Mail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentAgentMailSnapshot {
+    /// Epoch milliseconds when the evidence was captured or assembled.
+    pub captured_at_ms: u64,
+    /// Read-only surface that supplied this evidence.
+    pub source_surface: String,
+    /// Service state such as `ok`, `degraded`, or `unavailable`.
+    pub status: String,
+    /// Health level reported by Agent Mail, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_level: Option<String>,
+    /// Stable reason code for non-ok state or `agent_mail.ok`.
+    pub reason_code: String,
+    /// Number of retries already consumed by the producer.
+    #[serde(default)]
+    pub retry_count: u8,
+    /// Archive project inventory count, when already returned by health/list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_count: Option<u64>,
+    /// Agent inventory count, when already returned by health/list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_count: Option<u64>,
+    /// Message inventory count, when already returned by health/list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<u64>,
+    /// Names of active agents, when a read-only list was already supplied.
+    #[serde(default)]
+    pub active_agents: Vec<String>,
+    /// Per-attempt health/list evidence rows.
+    #[serde(default)]
+    pub attempts: Vec<IncidentAgentMailAttempt>,
+    /// Whether any forbidden repair/restart/kill action was attempted.
+    #[serde(default)]
+    pub repair_restart_kill_attempted: bool,
+}
+
+impl IncidentAgentMailSnapshot {
+    /// Build a read-only Agent Mail evidence snapshot.
+    #[must_use]
+    pub fn new(
+        captured_at_ms: u64,
+        source_surface: impl Into<String>,
+        status: impl Into<String>,
+        reason_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            captured_at_ms,
+            source_surface: source_surface.into(),
+            status: status.into(),
+            health_level: None,
+            reason_code: reason_code.into(),
+            retry_count: 0,
+            project_count: None,
+            agent_count: None,
+            message_count: None,
+            active_agents: Vec::new(),
+            attempts: Vec::new(),
+            repair_restart_kill_attempted: false,
+        }
+    }
+
+    /// Attach a health level returned by Agent Mail health_check.
+    #[must_use]
+    pub fn with_health_level(mut self, health_level: impl Into<String>) -> Self {
+        self.health_level = Some(health_level.into());
+        self
+    }
+
+    /// Record how many allowed retries were consumed.
+    #[must_use]
+    pub fn with_retry_count(mut self, retry_count: u8) -> Self {
+        self.retry_count = retry_count;
+        self
+    }
+
+    /// Attach already-returned inventory counts without message bodies.
+    #[must_use]
+    pub fn with_inventory_counts(
+        mut self,
+        project_count: Option<u64>,
+        agent_count: Option<u64>,
+        message_count: Option<u64>,
+    ) -> Self {
+        self.project_count = project_count;
+        self.agent_count = agent_count;
+        self.message_count = message_count;
+        self
+    }
+
+    /// Attach active agent names from an already-returned read-only listing.
+    #[must_use]
+    pub fn with_active_agents(mut self, active_agents: Vec<String>) -> Self {
+        self.active_agents = active_agents;
+        self
+    }
+
+    /// Attach per-attempt Agent Mail evidence rows.
+    #[must_use]
+    pub fn with_attempts(mut self, attempts: Vec<IncidentAgentMailAttempt>) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
+    /// Record whether a forbidden repair/restart/kill action was attempted.
+    #[must_use]
+    pub fn with_repair_restart_kill_attempted(mut self, attempted: bool) -> Self {
+        self.repair_restart_kill_attempted = attempted;
+        self
+    }
+
+    /// Publish read-only Agent Mail evidence for future incident bundles.
+    pub fn update_global(snapshot: Self) {
+        let lock = GLOBAL_INCIDENT_AGENT_MAIL.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    /// Return the latest read-only Agent Mail evidence snapshot.
+    #[must_use]
+    pub fn get_global() -> Option<Self> {
+        let lock = GLOBAL_INCIDENT_AGENT_MAIL.get_or_init(|| RwLock::new(None));
+        lock.read().ok().and_then(|guard| guard.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_global_for_test() {
+        let lock = GLOBAL_INCIDENT_AGENT_MAIL.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+    }
+}
+
+/// One read-only Agent Mail health/list attempt summarized for incident bundles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentAgentMailAttempt {
+    /// Read-only operation label, for example `health_check`.
+    pub operation: String,
+    /// Attempt status such as `ok`, `error`, or `timeout`.
+    pub status: String,
+    /// Stable reason code for this attempt.
+    pub reason_code: String,
+    /// Bounded diagnostic message without mailbox bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Attempt elapsed milliseconds, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+impl IncidentAgentMailAttempt {
+    /// Build a read-only Agent Mail attempt row.
+    #[must_use]
+    pub fn new(
+        operation: impl Into<String>,
+        status: impl Into<String>,
+        reason_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation: operation.into(),
+            status: status.into(),
+            reason_code: reason_code.into(),
+            message: None,
+            elapsed_ms: None,
+        }
+    }
+
+    /// Attach a bounded diagnostic message.
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Attach attempt elapsed milliseconds.
+    #[must_use]
+    pub fn with_elapsed_ms(mut self, elapsed_ms: u64) -> Self {
+        self.elapsed_ms = Some(elapsed_ms);
+        self
+    }
+}
+
+fn sanitize_agent_mail_attempt_for_payload(
+    mut attempt: IncidentAgentMailAttempt,
+    redactor: &Redactor,
+) -> (IncidentAgentMailAttempt, usize) {
+    let mut redactions = 0_usize;
+    if let Some(message) = attempt.message.as_mut() {
+        redactions = redactor.detect(message).len();
+        if redactions > 0 {
+            *message = redactor.redact(message);
+        }
+    }
+    (attempt, redactions)
 }
 
 /// Health snapshot view of a runtime pane priority override.
@@ -641,6 +1441,12 @@ fn epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Format epoch seconds as `YYYYMMDD_HHMMSS`.
@@ -1235,18 +2041,32 @@ pub fn export_incident_bundle(
         }
     }
 
-    // 3. Write incident manifest
-    let result = IncidentBundleResult {
+    // 3. Write incident manifest. The manifest is part of the bundle and lists
+    // itself, so compute total_size_bytes to a fixed point before writing it.
+    let mut manifest_files = files.clone();
+    manifest_files.push("incident_manifest.json".to_string());
+    let mut result = IncidentBundleResult {
         path: bundle_dir.clone(),
         kind,
-        files: files.clone(),
+        files: manifest_files,
         total_size_bytes: total_size,
         wa_version: crate::VERSION.to_string(),
         exported_at: format_iso8601(ts),
         swarm: None,
     };
 
-    let manifest_json = serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?;
+    let mut manifest_result = result.clone();
+    manifest_result.path = PathBuf::from(&bundle_name);
+    let manifest_json = loop {
+        let manifest_json =
+            serde_json::to_string_pretty(&manifest_result).map_err(std::io::Error::other)?;
+        let next_total = total_size.saturating_add(manifest_json.len() as u64);
+        if next_total == manifest_result.total_size_bytes {
+            break manifest_json;
+        }
+        manifest_result.total_size_bytes = next_total;
+    };
+    result.total_size_bytes = manifest_result.total_size_bytes;
     write_file_sync(
         &bundle_dir.join("incident_manifest.json"),
         manifest_json.as_bytes(),
@@ -1325,6 +2145,75 @@ fn redaction_state_for_file(
     } else {
         IncidentRedactionState::None
     }
+}
+
+fn record_file_redactions(
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+    name: &str,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+    if let Some(entry) = redaction_entries
+        .iter_mut()
+        .find(|entry| entry.file == name)
+    {
+        entry.count = entry.count.saturating_add(count);
+    } else {
+        redaction_entries.push(FileRedactionEntry {
+            file: name.to_string(),
+            count,
+        });
+    }
+}
+
+fn sanitize_manifest_source_text(
+    text: &str,
+    source_file: &str,
+    redactor: &Redactor,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> String {
+    let redaction_count = redactor.detect(text).len();
+    if redaction_count == 0 {
+        return text.to_string();
+    }
+    record_file_redactions(redaction_entries, source_file, redaction_count);
+    record_file_redactions(redaction_entries, "incident_manifest.json", redaction_count);
+    redactor.redact(text)
+}
+
+fn sanitize_incident_manifest_fields_for_payload(
+    sources: &mut [IncidentSourceEntry],
+    warnings: &mut [IncidentBundleWarning],
+    redactor: &Redactor,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) {
+    let mut manifest_redactions = 0_usize;
+    for source in sources {
+        let redaction_count = redactor.detect(&source.source_surface).len();
+        if redaction_count > 0 {
+            source.source_surface = redactor.redact(&source.source_surface);
+            manifest_redactions = manifest_redactions.saturating_add(redaction_count);
+        }
+    }
+
+    let mut warning_redactions = 0_usize;
+    for warning in warnings {
+        let redaction_count = redactor.detect(&warning.message).len();
+        if redaction_count > 0 {
+            warning.message = redactor.redact(&warning.message);
+            manifest_redactions = manifest_redactions.saturating_add(redaction_count);
+            warning_redactions = warning_redactions.saturating_add(redaction_count);
+        }
+    }
+
+    record_file_redactions(
+        redaction_entries,
+        "incident_manifest.json",
+        manifest_redactions,
+    );
+    record_file_redactions(redaction_entries, "warnings.jsonl", warning_redactions);
 }
 
 fn incident_warning(id: &str, source: &str, message: String) -> IncidentBundleWarning {
@@ -1465,7 +2354,16 @@ fn add_swarm_incident_sources(
         total_size,
         redaction_entries,
     )?;
-    add_pane_text_summaries_source(sources, warnings);
+    add_pane_text_summaries_source(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
     add_tailer_capture_health_source(
         sources,
         warnings,
@@ -1486,7 +2384,16 @@ fn add_swarm_incident_sources(
         total_size,
         redaction_entries,
     )?;
-    add_proof_rch_evidence_source(sources, warnings);
+    add_proof_rch_evidence_source(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
     add_beads_coordination_source(
         sources,
         warnings,
@@ -1507,7 +2414,16 @@ fn add_swarm_incident_sources(
         total_size,
         redaction_entries,
     )?;
-    add_agent_mail_source(sources, warnings);
+    add_agent_mail_source(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
     Ok(())
 }
 
@@ -1522,34 +2438,45 @@ fn add_robot_state_source(
     redaction_entries: &mut Vec<FileRedactionEntry>,
 ) -> std::io::Result<()> {
     let started = Instant::now();
-    if let Some(snapshot) = HealthSnapshot::get_global() {
+    if let Some(snapshot) = IncidentRobotStateSnapshot::get_global() {
+        let source_surface_raw = if snapshot.source_surface.trim().is_empty() {
+            "IncidentRobotStateSnapshot::get_global".to_string()
+        } else {
+            snapshot.source_surface.clone()
+        };
+        let source_surface = sanitize_manifest_source_text(
+            &source_surface_raw,
+            "sources/robot_state.json",
+            redactor,
+            redaction_entries,
+        );
+        let freshness_ms = epoch_millis().saturating_sub(snapshot.captured_at_ms);
+        let pane_count = snapshot.panes.len();
+        let observed_count = snapshot.panes.iter().filter(|pane| pane.observed).count();
+        let ignored_count = snapshot
+            .panes
+            .iter()
+            .filter(|pane| pane.state == "ignored")
+            .count();
+        let unobserved_count = pane_count.saturating_sub(observed_count + ignored_count);
         let payload = serde_json::json!({
-            "snapshot_timestamp_ms": snapshot.timestamp,
-            "observed_panes": snapshot.observed_panes,
-            "capture_queue_depth": snapshot.capture_queue_depth,
-            "write_queue_depth": snapshot.write_queue_depth,
-            "last_seq_pane_count": snapshot.last_seq_by_pane.len(),
-            "last_activity_pane_count": snapshot.last_activity_by_pane.len(),
-            "pane_priority_override_count": snapshot.pane_priority_overrides.len(),
-            "runtime_warnings": snapshot.warnings,
-            "ingest_lag_avg_ms": snapshot.ingest_lag_avg_ms,
-            "ingest_lag_max_ms": snapshot.ingest_lag_max_ms,
-            "db_writable": snapshot.db_writable,
-            "db_last_write_at_ms": snapshot.db_last_write_at,
-            "restart_count": snapshot.restart_count,
-            "last_crash_at_ms": snapshot.last_crash_at,
-            "consecutive_crashes": snapshot.consecutive_crashes,
-            "current_backoff_ms": snapshot.current_backoff_ms,
-            "in_crash_loop": snapshot.in_crash_loop,
-            "scheduler_present": snapshot.scheduler.is_some(),
-            "backpressure_tier": snapshot.backpressure_tier,
-            "fleet_pressure_tier": snapshot.fleet_pressure_tier,
+            "captured_at_ms": snapshot.captured_at_ms,
+            "collected_at": exported_at,
+            "freshness_ms": freshness_ms,
+            "source_surface": source_surface.clone(),
+            "pane_count": pane_count,
+            "observed_count": observed_count,
+            "ignored_count": ignored_count,
+            "unobserved_count": unobserved_count,
+            "full_text_included": false,
+            "redaction_policy": "bundle_redactor",
+            "panes": &snapshot.panes,
         });
-        sources.push(write_incident_json_source(
+        let mut entry = write_incident_json_source(
             IncidentJsonSourceMeta {
                 name: "robot_state",
                 file: "sources/robot_state.json",
-                source_surface: "HealthSnapshot::get_global",
+                source_surface: &source_surface,
                 evidence_state: IncidentEvidenceState::Measured,
                 max_age_ms: Some(30_000),
                 started,
@@ -1561,16 +2488,18 @@ fn add_robot_state_source(
             files,
             total_size,
             redaction_entries,
-        )?);
+        )?;
+        entry.freshness_ms = Some(freshness_ms);
+        sources.push(entry);
     } else {
         sources.push(degraded_source(
             "robot_state",
             IncidentSourceStatus::Unavailable,
-            "HealthSnapshot::get_global",
+            "IncidentRobotStateSnapshot::get_global",
             Some(30_000),
             elapsed_ms(started),
             "robot_state.snapshot_unavailable",
-            "no runtime health snapshot has been published in this process".to_string(),
+            "no text-free robot-state snapshot has been published in this process".to_string(),
             warnings,
         ));
     }
@@ -1580,18 +2509,176 @@ fn add_robot_state_source(
 fn add_pane_text_summaries_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
-) {
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
     let started = Instant::now();
-    sources.push(degraded_source(
-        "pane_text_summaries",
-        IncidentSourceStatus::Skipped,
-        "incident privacy policy pane_text_allowed=false",
-        Some(30_000),
-        elapsed_ms(started),
-        "pane_text_summaries.privacy_disabled",
-        "pane text summaries were skipped because the default incident privacy budget forbids pane text collection".to_string(),
-        warnings,
-    ));
+    if let Some(snapshot) = IncidentPaneTextSummariesSnapshot::get_global() {
+        let source_surface_raw = if snapshot.source_surface.trim().is_empty() {
+            "IncidentPaneTextSummariesSnapshot::get_global".to_string()
+        } else {
+            snapshot.source_surface.clone()
+        };
+        let source_surface = sanitize_manifest_source_text(
+            &source_surface_raw,
+            "sources/pane_text_summaries.json",
+            redactor,
+            redaction_entries,
+        );
+        let freshness_ms = epoch_millis().saturating_sub(snapshot.captured_at_ms);
+        let privacy_reason = snapshot.privacy_reason.clone();
+        let privacy_message = privacy_reason.clone().unwrap_or_else(|| {
+            "pane text summaries were withheld by incident privacy policy".to_string()
+        });
+        let privacy_warning_redactions = redactor.detect(&privacy_message).len();
+        let privacy_warning_message = if privacy_warning_redactions > 0 {
+            redactor.redact(&privacy_message)
+        } else {
+            privacy_message.clone()
+        };
+        let privacy_reason_for_payload = privacy_reason
+            .as_ref()
+            .map(|_| privacy_warning_message.clone());
+        let privacy_reason_redactions = if privacy_reason.is_some() {
+            privacy_warning_redactions
+        } else {
+            0
+        };
+        let panes_for_payload = if snapshot.privacy_allowed {
+            snapshot
+                .panes
+                .iter()
+                .cloned()
+                .map(|pane| {
+                    sanitize_pane_text_summary_for_payload(
+                        pane,
+                        snapshot.max_summary_bytes,
+                        redactor,
+                    )
+                })
+                .collect()
+        } else {
+            snapshot
+                .panes
+                .iter()
+                .map(|pane| {
+                    let mut excluded = IncidentPaneTextSummary::excluded(
+                        pane.pane_id,
+                        snapshot.tail_lines,
+                        privacy_warning_message.clone(),
+                    );
+                    excluded.redactions = privacy_warning_redactions;
+                    excluded
+                })
+                .collect()
+        };
+        let summary_count = panes_for_payload.len();
+        let redaction_count: usize = panes_for_payload
+            .iter()
+            .map(|pane| pane.redactions)
+            .sum::<usize>()
+            .saturating_add(privacy_reason_redactions);
+        let excluded_count = panes_for_payload
+            .iter()
+            .filter(|pane| pane.status == "excluded")
+            .count();
+        let error_count = panes_for_payload
+            .iter()
+            .filter(|pane| pane.status == "error")
+            .count();
+        let truncated_count = panes_for_payload
+            .iter()
+            .filter(|pane| pane.truncated)
+            .count();
+        let payload = serde_json::json!({
+            "generated_at": exported_at,
+            "captured_at_ms": snapshot.captured_at_ms,
+            "freshness_ms": freshness_ms,
+            "tail_lines": snapshot.tail_lines,
+            "max_summary_bytes": snapshot.max_summary_bytes,
+            "privacy_allowed": snapshot.privacy_allowed,
+            "privacy_reason": privacy_reason_for_payload,
+            "summary_count": summary_count,
+            "excluded_count": excluded_count,
+            "error_count": error_count,
+            "truncated_count": truncated_count,
+            "redaction_count": redaction_count,
+            "panes": &panes_for_payload,
+            "provenance": {
+                "mutates_state": false,
+                "source_surface": source_surface.clone(),
+            },
+        });
+        let mut entry = write_incident_json_source(
+            IncidentJsonSourceMeta {
+                name: "pane_text_summaries",
+                file: "sources/pane_text_summaries.json",
+                source_surface: &source_surface,
+                evidence_state: if snapshot.privacy_allowed {
+                    IncidentEvidenceState::Measured
+                } else {
+                    IncidentEvidenceState::Unavailable
+                },
+                max_age_ms: Some(30_000),
+                started,
+            },
+            &payload,
+            exported_at,
+            bundle_dir,
+            redactor,
+            files,
+            total_size,
+            redaction_entries,
+        )?;
+        entry.freshness_ms = Some(freshness_ms);
+        if redaction_count > 0 {
+            record_file_redactions(
+                redaction_entries,
+                "sources/pane_text_summaries.json",
+                redaction_count,
+            );
+            entry.redaction = IncidentRedactionState::Partial;
+        }
+        if snapshot.privacy_allowed {
+            sources.push(entry);
+        } else {
+            let warning_id = "pane_text_summaries.privacy_disabled";
+            record_file_redactions(
+                redaction_entries,
+                "warnings.jsonl",
+                privacy_warning_redactions,
+            );
+            record_file_redactions(
+                redaction_entries,
+                "incident_manifest.json",
+                privacy_warning_redactions,
+            );
+            warnings.push(incident_warning(
+                warning_id,
+                "pane_text_summaries",
+                privacy_warning_message,
+            ));
+            entry.status = IncidentSourceStatus::Skipped;
+            entry.warning_ids = vec![warning_id.to_string()];
+            sources.push(entry);
+        }
+    } else {
+        sources.push(degraded_source(
+            "pane_text_summaries",
+            IncidentSourceStatus::Skipped,
+            "incident privacy policy pane_text_allowed=false",
+            Some(30_000),
+            elapsed_ms(started),
+            "pane_text_summaries.privacy_disabled",
+            "pane text summaries were skipped because the default incident privacy budget forbids pane text collection".to_string(),
+            warnings,
+        ));
+    }
+    Ok(())
 }
 
 fn add_tailer_capture_health_source(
@@ -1709,18 +2796,187 @@ fn add_resource_pressure_source(
 fn add_proof_rch_evidence_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
-) {
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
     let started = Instant::now();
-    sources.push(degraded_source(
-        "proof_rch_evidence",
-        IncidentSourceStatus::Unavailable,
-        "attached RCH proof ledger metadata",
-        Some(300_000),
-        elapsed_ms(started),
-        "proof_rch_evidence.not_attached",
-        "no retained RCH proof ledger was attached; incident collection never runs proof commands and does not count sync or setup chatter as proof".to_string(),
-        warnings,
-    ));
+    if let Some(snapshot) = IncidentProofRchEvidenceSnapshot::get_global() {
+        let source_surface_raw = if snapshot.source_surface.trim().is_empty() {
+            "IncidentProofRchEvidenceSnapshot::get_global".to_string()
+        } else {
+            snapshot.source_surface.clone()
+        };
+        let source_surface = sanitize_manifest_source_text(
+            &source_surface_raw,
+            "sources/proof_rch_evidence.json",
+            redactor,
+            redaction_entries,
+        );
+        let freshness_ms = epoch_millis().saturating_sub(snapshot.captured_at_ms);
+        let attempt_count = snapshot.attempts.len();
+        let artifact_count = snapshot.artifact_paths.len();
+        let setup_chatter_attempt_count = snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.setup_chatter_only)
+            .count();
+        let remote_execution_confirmed_count = snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.remote_execution_confirmed)
+            .count();
+        let attempts = snapshot
+            .attempts
+            .iter()
+            .map(|attempt| {
+                serde_json::json!({
+                    "command": &attempt.command,
+                    "status": &attempt.status,
+                    "reason_code": &attempt.reason_code,
+                    "reason_category": proof_rch_reason_category(&attempt.reason_code),
+                    "artifact_path": &attempt.artifact_path,
+                    "remote_execution_confirmed": attempt.remote_execution_confirmed,
+                    "local_fallback_rejected": attempt.local_fallback_rejected,
+                    "setup_chatter_only": attempt.setup_chatter_only,
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({
+            "generated_at": exported_at,
+            "captured_at_ms": snapshot.captured_at_ms,
+            "freshness_ms": freshness_ms,
+            "source_surface": source_surface.clone(),
+            "verdict": &snapshot.verdict,
+            "reason_code": &snapshot.reason_code,
+            "reason_category": proof_rch_reason_category(&snapshot.reason_code),
+            "artifact_paths": &snapshot.artifact_paths,
+            "artifact_count": artifact_count,
+            "attempts": attempts,
+            "attempt_count": attempt_count,
+            "setup_chatter_attempt_count": setup_chatter_attempt_count,
+            "remote_execution_confirmed_count": remote_execution_confirmed_count,
+            "local_fallback_rejected": snapshot.local_fallback_rejected,
+            "setup_chatter_only": snapshot.setup_chatter_only,
+            "collector_launched_proof_commands": false,
+            "collector_mutated_state": false,
+            "local_cargo_counted_as_proof": false,
+            "sync_chatter_counted_as_proof": false,
+            "provenance": {
+                "collector_launched_proof_commands": false,
+                "collector_mutated_state": false,
+                "local_cargo_counted_as_proof": false,
+                "sync_chatter_counted_as_proof": false,
+                "local_fallback_rejected": snapshot.local_fallback_rejected,
+                "setup_chatter_only": snapshot.setup_chatter_only,
+                "source_surface": source_surface.clone(),
+            },
+        });
+        let mut entry = write_incident_json_source(
+            IncidentJsonSourceMeta {
+                name: "proof_rch_evidence",
+                file: "sources/proof_rch_evidence.json",
+                source_surface: &source_surface,
+                evidence_state: proof_rch_evidence_state(&snapshot),
+                max_age_ms: Some(300_000),
+                started,
+            },
+            &payload,
+            exported_at,
+            bundle_dir,
+            redactor,
+            files,
+            total_size,
+            redaction_entries,
+        )?;
+        entry.freshness_ms = Some(freshness_ms);
+        if snapshot.setup_chatter_only || setup_chatter_attempt_count > 0 {
+            let warning_id = "proof_rch_evidence.setup_chatter_only";
+            warnings.push(incident_warning(
+                warning_id,
+                "proof_rch_evidence",
+                "retained RCH artifacts were setup/sync/queue chatter only and were not counted as proof".to_string(),
+            ));
+            entry.warning_ids.push(warning_id.to_string());
+        }
+        sources.push(entry);
+    } else {
+        sources.push(degraded_source(
+            "proof_rch_evidence",
+            IncidentSourceStatus::Unavailable,
+            "IncidentProofRchEvidenceSnapshot::get_global",
+            Some(300_000),
+            elapsed_ms(started),
+            "proof_rch_evidence.not_attached",
+            "no retained RCH proof ledger was attached; incident collection never runs proof commands and does not count sync or setup chatter as proof".to_string(),
+            warnings,
+        ));
+    }
+    Ok(())
+}
+
+fn proof_rch_evidence_state(snapshot: &IncidentProofRchEvidenceSnapshot) -> IncidentEvidenceState {
+    if snapshot.setup_chatter_only
+        || snapshot.verdict == "no_verdict"
+        || snapshot
+            .attempts
+            .iter()
+            .any(|attempt| attempt.setup_chatter_only)
+    {
+        IncidentEvidenceState::Mixed
+    } else {
+        IncidentEvidenceState::Measured
+    }
+}
+
+fn proof_rch_reason_category(reason_code: &str) -> &'static str {
+    let reason = reason_code.to_ascii_lowercase();
+    if reason.contains("no_worker")
+        || reason.contains("no-workers")
+        || reason.contains("no workers")
+        || reason.contains("no_workers")
+    {
+        "no_worker"
+    } else if reason.contains("topology") {
+        "topology"
+    } else if reason.contains("local_fallback")
+        || reason.contains("local-fallback")
+        || reason.contains("local fallback")
+        || reason.contains("local_cargo")
+        || reason.contains("local-cargo")
+    {
+        "local_fallback"
+    } else if reason.contains("materialization")
+        || reason.contains("materialize")
+        || reason.contains("package")
+        || reason.contains("manifest")
+    {
+        "package_materialization"
+    } else if reason.contains("sync")
+        || reason.contains("queue")
+        || reason.contains("transfer")
+        || reason.contains("setup_chatter")
+    {
+        "setup_sync"
+    } else if reason.contains("transport")
+        || reason.contains("ssh")
+        || reason.contains("connection")
+        || reason.contains("network")
+    {
+        "transport"
+    } else if reason.contains("result")
+        || reason.contains("verifier")
+        || reason.contains("test")
+        || reason.contains("exit_status")
+        || reason.contains("exit-status")
+    {
+        "result"
+    } else {
+        "unknown"
+    }
 }
 
 fn add_beads_coordination_source(
@@ -2062,18 +3318,207 @@ fn dirty_tree_risk_category(path: &str) -> Option<&'static str> {
 fn add_agent_mail_source(
     sources: &mut Vec<IncidentSourceEntry>,
     warnings: &mut Vec<IncidentBundleWarning>,
-) {
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+) -> std::io::Result<()> {
     let started = Instant::now();
-    sources.push(degraded_source(
-        "agent_mail",
-        IncidentSourceStatus::Unavailable,
-        "Agent Mail read-only snapshot supplied by operator handoff",
-        Some(30_000),
-        elapsed_ms(started),
-        "agent_mail.not_attached",
-        "no Agent Mail snapshot was supplied to the crash collector; incident collection must not repair, restart, or kill shared Agent Mail services".to_string(),
-        warnings,
-    ));
+    if let Some(snapshot) = IncidentAgentMailSnapshot::get_global() {
+        let source_surface_raw = if snapshot.source_surface.trim().is_empty() {
+            "IncidentAgentMailSnapshot::get_global".to_string()
+        } else {
+            snapshot.source_surface.clone()
+        };
+        let source_surface = sanitize_manifest_source_text(
+            &source_surface_raw,
+            "sources/agent_mail.json",
+            redactor,
+            redaction_entries,
+        );
+        let freshness_ms = epoch_millis().saturating_sub(snapshot.captured_at_ms);
+        let sanitized_attempt_rows = snapshot
+            .attempts
+            .iter()
+            .cloned()
+            .map(|attempt| sanitize_agent_mail_attempt_for_payload(attempt, redactor))
+            .collect::<Vec<_>>();
+        let attempt_message_redactions: usize = sanitized_attempt_rows
+            .iter()
+            .map(|(_, redactions)| *redactions)
+            .sum();
+        let attempts = sanitized_attempt_rows
+            .iter()
+            .map(|(attempt, _)| attempt)
+            .map(|attempt| {
+                serde_json::json!({
+                    "operation": &attempt.operation,
+                    "status": &attempt.status,
+                    "reason_code": &attempt.reason_code,
+                    "reason_category": agent_mail_reason_category(&attempt.reason_code),
+                    "message": &attempt.message,
+                    "elapsed_ms": attempt.elapsed_ms,
+                    "mutates_state": false,
+                    "message_bodies_included": false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({
+            "generated_at": exported_at,
+            "captured_at_ms": snapshot.captured_at_ms,
+            "freshness_ms": freshness_ms,
+            "source_surface": source_surface.clone(),
+            "status": &snapshot.status,
+            "health_level": &snapshot.health_level,
+            "reason_code": &snapshot.reason_code,
+            "reason_category": agent_mail_reason_category(&snapshot.reason_code),
+            "project_count": snapshot.project_count,
+            "agent_count": snapshot.agent_count,
+            "message_count": snapshot.message_count,
+            "active_agents": &snapshot.active_agents,
+            "attempts": attempts,
+            "attempt_count": snapshot.attempts.len(),
+            "retry_count": snapshot.retry_count,
+            "max_retry_count": 1,
+            "collector_mutated_state": false,
+            "message_bodies_included": false,
+            "inbox_bodies_included": false,
+            "repair_restart_kill_attempted": snapshot.repair_restart_kill_attempted,
+            "forbidden_actions": agent_mail_forbidden_actions(),
+            "provenance": {
+                "source_surface": source_surface.clone(),
+                "collector_mutated_state": false,
+                "repair_allowed": false,
+                "restart_allowed": false,
+                "kill_allowed": false,
+                "registration_attempted": false,
+                "acknowledgement_attempted": false,
+                "message_bodies_included": false,
+                "inbox_bodies_included": false,
+            },
+        });
+        let mut entry = write_incident_json_source(
+            IncidentJsonSourceMeta {
+                name: "agent_mail",
+                file: "sources/agent_mail.json",
+                source_surface: &source_surface,
+                evidence_state: agent_mail_evidence_state(&snapshot),
+                max_age_ms: Some(30_000),
+                started,
+            },
+            &payload,
+            exported_at,
+            bundle_dir,
+            redactor,
+            files,
+            total_size,
+            redaction_entries,
+        )?;
+        entry.freshness_ms = Some(freshness_ms);
+        if attempt_message_redactions > 0 {
+            record_file_redactions(
+                redaction_entries,
+                "sources/agent_mail.json",
+                attempt_message_redactions,
+            );
+            entry.redaction = IncidentRedactionState::Partial;
+        }
+        if snapshot.status != "ok" || snapshot.repair_restart_kill_attempted {
+            let warning_id = if snapshot.repair_restart_kill_attempted {
+                "agent_mail.forbidden_action_attempted"
+            } else {
+                agent_mail_warning_id(&snapshot.reason_code)
+            };
+            warnings.push(incident_warning(
+                warning_id,
+                "agent_mail",
+                format!(
+                    "Agent Mail status {}; collector did not repair, restart, kill, acknowledge, or fetch message bodies",
+                    snapshot.status
+                ),
+            ));
+            entry.warning_ids.push(warning_id.to_string());
+        }
+        sources.push(entry);
+    } else {
+        sources.push(degraded_source(
+            "agent_mail",
+            IncidentSourceStatus::Unavailable,
+            "IncidentAgentMailSnapshot::get_global",
+            Some(30_000),
+            elapsed_ms(started),
+            "agent_mail.not_attached",
+            "no Agent Mail snapshot was supplied to the crash collector; incident collection must not repair, restart, or kill shared Agent Mail services".to_string(),
+            warnings,
+        ));
+    }
+    Ok(())
+}
+
+fn agent_mail_evidence_state(snapshot: &IncidentAgentMailSnapshot) -> IncidentEvidenceState {
+    if snapshot.status == "ok" && !snapshot.repair_restart_kill_attempted {
+        IncidentEvidenceState::Measured
+    } else {
+        IncidentEvidenceState::Unavailable
+    }
+}
+
+fn agent_mail_warning_id(reason_code: &str) -> &'static str {
+    match agent_mail_reason_category(reason_code) {
+        "database" => "agent_mail.database_error",
+        "api_unreachable" => "agent_mail.api_unreachable",
+        "timeout" => "agent_mail.timeout",
+        "recovery_mode" => "agent_mail.recovery_mode",
+        "forbidden_action" => "agent_mail.forbidden_action_attempted",
+        _ => "agent_mail.unavailable",
+    }
+}
+
+fn agent_mail_reason_category(reason_code: &str) -> &'static str {
+    let reason = reason_code.to_ascii_lowercase();
+    if reason == "agent_mail.ok" || reason.ends_with(".ok") {
+        "ok"
+    } else if reason.contains("database")
+        || reason.contains("sqlite")
+        || reason.contains("corrupt")
+        || reason.contains("enospc")
+        || reason.contains("no_space")
+    {
+        "database"
+    } else if reason.contains("recovery") || reason.contains("read_only") {
+        "recovery_mode"
+    } else if reason.contains("timeout") {
+        "timeout"
+    } else if reason.contains("unreachable")
+        || reason.contains("connection")
+        || reason.contains("http")
+        || reason.contains("api")
+    {
+        "api_unreachable"
+    } else if reason.contains("repair")
+        || reason.contains("restart")
+        || reason.contains("kill")
+        || reason.contains("forbidden")
+    {
+        "forbidden_action"
+    } else {
+        "unknown"
+    }
+}
+
+fn agent_mail_forbidden_actions() -> Vec<&'static str> {
+    vec![
+        "am service restart",
+        "am service stop",
+        "am doctor fix",
+        "am doctor repair",
+        "am doctor reconstruct",
+        "kill am",
+        "kill am serve-http",
+        "kill mcp-agent-mail",
+    ]
 }
 
 #[derive(Debug)]
@@ -2749,7 +4194,22 @@ fn collect_incident_bundle_inner(
         ));
     }
 
-    // 5. Write redaction report
+    // 5. Sanitize fields that are written directly into manifest/warnings
+    // payloads instead of going through write_redacted_file.
+    sanitize_incident_manifest_fields_for_payload(
+        &mut sources,
+        &mut warnings,
+        &redactor,
+        &mut redaction_entries,
+    );
+    let manifest_path_redactions = redactor.detect(&bundle_dir.display().to_string()).len();
+    record_file_redactions(
+        &mut redaction_entries,
+        "incident_manifest.json",
+        manifest_path_redactions,
+    );
+
+    // 6. Write redaction report
     let total_redactions: usize = redaction_entries.iter().map(|e| e.count).sum();
     let redacted_files = redaction_entries.len();
     let redaction_report = RedactionReport {
@@ -2763,7 +4223,7 @@ fn collect_incident_bundle_inner(
     write_file_sync(&bundle_dir.join("redaction_report.json"), report_bytes)?;
     files.push("redaction_report.json".to_string());
 
-    // 6. Write source warnings and README before the manifest so the manifest
+    // 7. Write source warnings and README before the manifest so the manifest
     // file list is complete.
     let warnings_body = warnings_jsonl(&warnings)?;
     let warning_bytes = warnings_body.as_bytes();
@@ -2786,7 +4246,7 @@ fn collect_incident_bundle_inner(
     total_size += readme_bytes.len() as u64;
     write_file_sync(&bundle_dir.join("README.md"), readme_bytes)?;
 
-    // 7. Write incident manifest. The manifest lists itself, so compute
+    // 8. Write incident manifest. The manifest lists itself, so compute
     // total_size_bytes to a fixed point before writing it.
     let process_sample_allowed = process_sampler.is_some();
     let mut result = IncidentBundleResult {
@@ -2827,17 +4287,25 @@ fn collect_incident_bundle_inner(
         }),
     };
 
+    let mut manifest_result = result.clone();
+    manifest_result.path = PathBuf::from(&bundle_name);
     let manifest_json = loop {
-        let manifest_json = serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?;
+        let manifest_json =
+            serde_json::to_string_pretty(&manifest_result).map_err(std::io::Error::other)?;
         let next_total = total_size.saturating_add(manifest_json.len() as u64);
-        if next_total == result.total_size_bytes {
+        if next_total == manifest_result.total_size_bytes {
             break manifest_json;
         }
-        result.total_size_bytes = next_total;
-        if let Some(swarm) = &mut result.swarm {
+        manifest_result.total_size_bytes = next_total;
+        if let Some(swarm) = &mut manifest_result.swarm {
             swarm.total_size_bytes = next_total;
         }
     };
+    result.total_size_bytes = manifest_result.total_size_bytes;
+    if let (Some(result_swarm), Some(manifest_swarm)) = (&mut result.swarm, &manifest_result.swarm)
+    {
+        result_swarm.total_size_bytes = manifest_swarm.total_size_bytes;
+    }
     write_file_sync(
         &bundle_dir.join("incident_manifest.json"),
         manifest_json.as_bytes(),
@@ -3999,12 +5467,20 @@ fn enrich_incident_verification_summary(
                 .get("verdict")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
+            let reason = value
+                .get("reason_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let category = value
+                .get("reason_category")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
             let timeout = value
                 .get("timeout_ms")
                 .and_then(serde_json::Value::as_u64)
                 .map(|timeout| format!(" after {timeout}ms"))
                 .unwrap_or_default();
-            summary.proof_rch_status = Some(format!("{verdict}{timeout}"));
+            summary.proof_rch_status = Some(format!("{verdict}:{category}:{reason}{timeout}"));
         }
         "process_sample" => {
             let process_count = value
@@ -4385,12 +5861,7 @@ fn write_redacted_file(
     *total_size += bytes.len() as u64;
     write_file_sync(&bundle_dir.join(name), bytes)?;
     files.push(name.to_string());
-    if before_count > 0 {
-        redaction_entries.push(FileRedactionEntry {
-            file: name.to_string(),
-            count: before_count,
-        });
-    }
+    record_file_redactions(redaction_entries, name, before_count);
     Ok(())
 }
 
@@ -4671,6 +6142,40 @@ impl CaptureCheckpoint {
 mod tests {
     use super::*;
 
+    static INCIDENT_ROBOT_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static INCIDENT_PROOF_RCH_EVIDENCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static INCIDENT_AGENT_MAIL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_incident_source_globals_for_test() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        (
+            INCIDENT_ROBOT_STATE_TEST_LOCK
+                .lock()
+                .expect("incident robot-state test lock"),
+            INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+                .lock()
+                .expect("incident pane text summary test lock"),
+            INCIDENT_PROOF_RCH_EVIDENCE_TEST_LOCK
+                .lock()
+                .expect("incident proof RCH evidence test lock"),
+            INCIDENT_AGENT_MAIL_TEST_LOCK
+                .lock()
+                .expect("incident agent mail test lock"),
+        )
+    }
+
+    fn clear_incident_source_globals_for_test() {
+        IncidentRobotStateSnapshot::clear_global_for_test();
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+        IncidentProofRchEvidenceSnapshot::clear_global_for_test();
+        IncidentAgentMailSnapshot::clear_global_for_test();
+    }
+
     fn test_snapshot() -> HealthSnapshot {
         HealthSnapshot {
             timestamp: 1_234_567_890,
@@ -4774,6 +6279,1171 @@ mod tests {
         let retrieved = HealthSnapshot::get_global();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().timestamp, 1000);
+    }
+
+    #[test]
+    fn incident_robot_state_source_collects_published_pane_metadata() {
+        let _guard = INCIDENT_ROBOT_STATE_TEST_LOCK
+            .lock()
+            .expect("incident robot-state test lock");
+        IncidentRobotStateSnapshot::clear_global_for_test();
+
+        let captured_at_ms = epoch_millis();
+        let snapshot = IncidentRobotStateSnapshot::from_robot_panes(
+            captured_at_ms,
+            "ft robot state test provider",
+            vec![
+                crate::robot_types::PaneStateData {
+                    pane_id: 7,
+                    pane_uuid: Some("pane-uuid-7".to_string()),
+                    tab_id: 2,
+                    window_id: 1,
+                    domain: "local".to_string(),
+                    title: Some("build pane".to_string()),
+                    cwd: Some("/repo/frankenterm".to_string()),
+                    observed: true,
+                    ignore_reason: None,
+                },
+                crate::robot_types::PaneStateData {
+                    pane_id: 8,
+                    pane_uuid: None,
+                    tab_id: 3,
+                    window_id: 1,
+                    domain: "local".to_string(),
+                    title: Some("ignored pane".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    observed: false,
+                    ignore_reason: Some("title excluded by pane filter".to_string()),
+                },
+            ],
+        );
+        IncidentRobotStateSnapshot::update_global(snapshot);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_robot_state_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("robot_state source");
+
+        IncidentRobotStateSnapshot::clear_global_for_test();
+
+        assert!(warnings.is_empty());
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "robot_state");
+        assert_eq!(source.status, IncidentSourceStatus::Collected);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Measured);
+        assert_eq!(source.source_surface, "ft robot state test provider");
+        assert!(!source.mutates_state);
+        assert_eq!(source.file.as_deref(), Some("sources/robot_state.json"));
+        assert_eq!(source.max_age_ms, Some(30_000));
+        assert!(source.freshness_ms.is_some());
+
+        let payload_path = tmp.path().join("sources/robot_state.json");
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(payload_path).expect("payload file"))
+                .expect("payload json");
+        assert_eq!(payload["full_text_included"], false);
+        assert!(payload.get("pane_text").is_none());
+        assert_eq!(payload["pane_count"], 2);
+        assert_eq!(payload["observed_count"], 1);
+        assert_eq!(payload["ignored_count"], 1);
+        assert_eq!(payload["unobserved_count"], 0);
+        assert_eq!(
+            payload["freshness_ms"].as_u64(),
+            source.freshness_ms,
+            "payload and source metadata should agree on freshness"
+        );
+
+        let panes = payload["panes"].as_array().expect("panes array");
+        assert_eq!(panes[0]["pane_id"], 7);
+        assert_eq!(panes[0]["pane_uuid"], "pane-uuid-7");
+        assert_eq!(panes[0]["title"], "build pane");
+        assert_eq!(panes[0]["cwd"], "/repo/frankenterm");
+        assert_eq!(panes[0]["state"], "observed");
+        assert_eq!(panes[1]["pane_id"], 8);
+        assert_eq!(panes[1]["state"], "ignored");
+        assert_eq!(panes[1]["ignore_reason"], "title excluded by pane filter");
+    }
+
+    #[test]
+    fn incident_robot_state_source_records_unavailable_without_provider() {
+        let _guard = INCIDENT_ROBOT_STATE_TEST_LOCK
+            .lock()
+            .expect("incident robot-state test lock");
+        IncidentRobotStateSnapshot::clear_global_for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_robot_state_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("robot_state source");
+
+        assert!(files.is_empty());
+        assert_eq!(total_size, 0);
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "robot_state");
+        assert_eq!(source.status, IncidentSourceStatus::Unavailable);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Unavailable);
+        assert_eq!(source.file, None);
+        assert_eq!(
+            source.warning_ids,
+            vec!["robot_state.snapshot_unavailable".to_string()]
+        );
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "robot_state.snapshot_unavailable");
+        assert!(!tmp.path().join("sources/robot_state.json").exists());
+    }
+
+    #[test]
+    fn incident_pane_text_summaries_collect_redacted_bounded_rows() {
+        let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+            .lock()
+            .expect("incident pane text summary test lock");
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let raw = format!(
+            "build log contained AKIAABCDEFGHIJKLMNOP and then emitted {}\n",
+            "x".repeat(200)
+        );
+        let summary = IncidentPaneTextSummary::from_text(41, &raw, 20, 96, &redactor);
+        assert_eq!(summary.redactions, 1);
+        assert!(summary.truncated);
+        IncidentPaneTextSummariesSnapshot::update_global(IncidentPaneTextSummariesSnapshot::new(
+            epoch_millis(),
+            "fixture::pane_text_summaries",
+            20,
+            96,
+            true,
+            vec![summary],
+        ));
+
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_pane_text_summaries_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("pane_text_summaries source");
+
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        assert!(warnings.is_empty());
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "pane_text_summaries");
+        assert_eq!(source.status, IncidentSourceStatus::Collected);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Measured);
+        assert_eq!(source.source_surface, "fixture::pane_text_summaries");
+        assert_eq!(source.redaction, IncidentRedactionState::Partial);
+        assert_eq!(
+            source.file.as_deref(),
+            Some("sources/pane_text_summaries.json")
+        );
+
+        let entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "sources/pane_text_summaries.json")
+            .expect("pane text redaction entry");
+        assert_eq!(entry.count, 1);
+
+        let payload_path = tmp.path().join("sources/pane_text_summaries.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(payload_text.contains("[REDACTED]"));
+        assert!(payload_text.contains("[PANE_TEXT_TRUNCATED]"));
+
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(payload["privacy_allowed"], true);
+        assert_eq!(payload["summary_count"], 1);
+        assert_eq!(payload["redaction_count"], 1);
+        assert_eq!(payload["truncated_count"], 1);
+        assert_eq!(payload["panes"][0]["pane_id"], 41);
+        assert_eq!(payload["panes"][0]["status"], "summary");
+        assert_eq!(payload["panes"][0]["redactions"], 1);
+    }
+
+    #[test]
+    fn incident_pane_text_summaries_sanitize_provider_rows_before_payload() {
+        let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+            .lock()
+            .expect("incident pane text summary test lock");
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        IncidentPaneTextSummariesSnapshot::update_global(IncidentPaneTextSummariesSnapshot::new(
+            epoch_millis(),
+            "fixture::pane_text_summaries",
+            20,
+            96,
+            true,
+            vec![IncidentPaneTextSummary {
+                pane_id: 42,
+                status: "summary".to_string(),
+                tail_lines: 20,
+                summary: "provider row accidentally included AKIAABCDEFGHIJKLMNOP".to_string(),
+                redactions: 0,
+                truncated: false,
+                truncation_info: None,
+                code: None,
+                message: None,
+            }],
+        ));
+
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_pane_text_summaries_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("pane_text_summaries source");
+
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        assert!(warnings.is_empty());
+        let source = &sources[0];
+        assert_eq!(source.redaction, IncidentRedactionState::Partial);
+
+        let payload_path = tmp.path().join("sources/pane_text_summaries.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(payload_text.contains("[REDACTED]"));
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(payload["redaction_count"], 1);
+        assert_eq!(payload["panes"][0]["redactions"], 1);
+        assert_eq!(
+            payload["panes"][0]["summary"],
+            "provider row accidentally included [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn incident_pane_text_summaries_sanitize_provider_error_messages() {
+        let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+            .lock()
+            .expect("incident pane text summary test lock");
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        IncidentPaneTextSummariesSnapshot::update_global(IncidentPaneTextSummariesSnapshot::new(
+            epoch_millis(),
+            "fixture::pane_text_summaries",
+            20,
+            96,
+            true,
+            vec![IncidentPaneTextSummary::error(
+                43,
+                20,
+                "pane.read_failed",
+                "provider diagnostic included AKIAABCDEFGHIJKLMNOP",
+            )],
+        ));
+
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_pane_text_summaries_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("pane_text_summaries source");
+
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        assert!(warnings.is_empty());
+        let source = &sources[0];
+        assert_eq!(source.redaction, IncidentRedactionState::Partial);
+        let entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "sources/pane_text_summaries.json")
+            .expect("pane text redaction entry");
+        assert_eq!(entry.count, 1);
+
+        let payload_path = tmp.path().join("sources/pane_text_summaries.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(payload_text.contains("[REDACTED]"));
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(payload["redaction_count"], 1);
+        assert_eq!(payload["panes"][0]["redactions"], 1);
+        assert_eq!(
+            payload["panes"][0]["message"],
+            "provider diagnostic included [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn incident_pane_text_summaries_redact_allowed_privacy_reason() {
+        let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+            .lock()
+            .expect("incident pane text summary test lock");
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let reason = "operator note included AKIAABCDEFGHIJKLMNOP";
+        IncidentPaneTextSummariesSnapshot::update_global(
+            IncidentPaneTextSummariesSnapshot::new(
+                epoch_millis(),
+                "fixture::pane_text_summaries",
+                20,
+                96,
+                true,
+                vec![IncidentPaneTextSummary::from_text(
+                    44,
+                    "clean output",
+                    20,
+                    96,
+                    &redactor,
+                )],
+            )
+            .with_privacy_reason(reason),
+        );
+
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_pane_text_summaries_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("pane_text_summaries source");
+
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        assert!(warnings.is_empty());
+        assert_eq!(sources[0].redaction, IncidentRedactionState::Partial);
+        let source_entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "sources/pane_text_summaries.json")
+            .expect("pane text redaction entry");
+        assert_eq!(source_entry.count, 1);
+
+        let payload_path = tmp.path().join("sources/pane_text_summaries.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("AKIAABCDEFGHIJKLMNOP"));
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(payload["redaction_count"], 1);
+        assert_eq!(
+            payload["privacy_reason"],
+            "operator note included [REDACTED]"
+        );
+        assert_eq!(payload["panes"][0]["redactions"], 0);
+    }
+
+    #[test]
+    fn incident_pane_text_summaries_redact_provider_source_surface() {
+        let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+            .lock()
+            .expect("incident pane text summary test lock");
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        IncidentPaneTextSummariesSnapshot::update_global(IncidentPaneTextSummariesSnapshot::new(
+            epoch_millis(),
+            "provider surface included AKIAABCDEFGHIJKLMNOP",
+            20,
+            96,
+            true,
+            vec![IncidentPaneTextSummary::from_text(
+                45,
+                "clean output",
+                20,
+                96,
+                &redactor,
+            )],
+        ));
+
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_pane_text_summaries_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("pane_text_summaries source");
+
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        assert!(warnings.is_empty());
+        let source = &sources[0];
+        assert_eq!(
+            source.source_surface,
+            "provider surface included [REDACTED]"
+        );
+        assert_eq!(source.redaction, IncidentRedactionState::Partial);
+        let source_entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "sources/pane_text_summaries.json")
+            .expect("pane text redaction entry");
+        assert_eq!(source_entry.count, 1);
+        let manifest_entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "incident_manifest.json")
+            .expect("manifest redaction entry");
+        assert_eq!(manifest_entry.count, 1);
+
+        let payload_path = tmp.path().join("sources/pane_text_summaries.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("AKIAABCDEFGHIJKLMNOP"));
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(
+            payload["source_surface"],
+            "provider surface included [REDACTED]"
+        );
+        assert_eq!(payload["redaction_count"], 0);
+    }
+
+    #[test]
+    fn incident_pane_text_summaries_write_privacy_excluded_placeholders() {
+        let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+            .lock()
+            .expect("incident pane text summary test lock");
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let reason = "incident privacy budget pane_text_allowed=false";
+        let accidental_summary = IncidentPaneTextSummary::from_text(
+            41,
+            "privacy disabled but producer accidentally included AKIAABCDEFGHIJKLMNOP",
+            20,
+            96,
+            &redactor,
+        );
+        IncidentPaneTextSummariesSnapshot::update_global(
+            IncidentPaneTextSummariesSnapshot::new(
+                epoch_millis(),
+                "incident privacy policy",
+                20,
+                96,
+                false,
+                vec![accidental_summary],
+            )
+            .with_privacy_reason(reason),
+        );
+
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_pane_text_summaries_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("pane_text_summaries source");
+
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "pane_text_summaries.privacy_disabled");
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "pane_text_summaries");
+        assert_eq!(source.status, IncidentSourceStatus::Skipped);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Unavailable);
+        assert_eq!(
+            source.file.as_deref(),
+            Some("sources/pane_text_summaries.json")
+        );
+        assert_eq!(
+            source.warning_ids,
+            vec!["pane_text_summaries.privacy_disabled".to_string()]
+        );
+
+        let payload_path = tmp.path().join("sources/pane_text_summaries.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(!payload_text.contains("[REDACTED]"));
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(payload["privacy_allowed"], false);
+        assert_eq!(payload["privacy_reason"], reason);
+        assert_eq!(payload["excluded_count"], 1);
+        assert_eq!(payload["redaction_count"], 0);
+        assert_eq!(payload["truncated_count"], 0);
+        assert_eq!(payload["panes"][0]["summary"], "[PANE_TEXT_EXCLUDED]");
+        assert_eq!(payload["panes"][0]["code"], "pane_text.privacy_disabled");
+        assert_eq!(payload["panes"][0]["message"], reason);
+    }
+
+    #[test]
+    fn incident_pane_text_summaries_redact_privacy_reason_warnings() {
+        let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+            .lock()
+            .expect("incident pane text summary test lock");
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let reason = "privacy disabled after seeing AKIAABCDEFGHIJKLMNOP";
+        IncidentPaneTextSummariesSnapshot::update_global(
+            IncidentPaneTextSummariesSnapshot::new(
+                epoch_millis(),
+                "incident privacy policy",
+                20,
+                96,
+                false,
+                vec![IncidentPaneTextSummary::excluded(41, 20, reason)],
+            )
+            .with_privacy_reason(reason),
+        );
+
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_pane_text_summaries_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("pane_text_summaries source");
+
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].message.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(warnings[0].message.contains("[REDACTED]"));
+        assert_eq!(sources[0].redaction, IncidentRedactionState::Partial);
+        let source_entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "sources/pane_text_summaries.json")
+            .expect("pane text redaction entry");
+        assert_eq!(source_entry.count, 2);
+        let warning_entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "warnings.jsonl")
+            .expect("warnings redaction entry");
+        assert_eq!(warning_entry.count, 1);
+        let manifest_entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "incident_manifest.json")
+            .expect("manifest redaction entry");
+        assert_eq!(manifest_entry.count, 1);
+
+        let payload_path = tmp.path().join("sources/pane_text_summaries.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("AKIAABCDEFGHIJKLMNOP"));
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(payload["redaction_count"], 2);
+        assert_eq!(
+            payload["privacy_reason"],
+            "privacy disabled after seeing [REDACTED]"
+        );
+        assert_eq!(payload["panes"][0]["redactions"], 1);
+        assert_eq!(
+            payload["panes"][0]["message"],
+            "privacy disabled after seeing [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn incident_manifest_field_sanitizer_redacts_manifest_only_fields() {
+        let redactor = Redactor::new();
+        let mut sources = vec![IncidentSourceEntry {
+            name: "db_metadata".to_string(),
+            file: None,
+            status: IncidentSourceStatus::Unavailable,
+            evidence_state: IncidentEvidenceState::Unavailable,
+            source_surface: "rusqlite read-only /tmp/AKIAABCDEFGHIJKLMNOP.sqlite".to_string(),
+            mutates_state: false,
+            generated_at: None,
+            freshness_ms: None,
+            max_age_ms: Some(300_000),
+            redaction: IncidentRedactionState::NotApplicable,
+            privacy_tier: "default".to_string(),
+            size_bytes: 0,
+            elapsed_ms: 0,
+            warning_ids: vec!["db_metadata.unavailable".to_string()],
+        }];
+        let mut warnings = vec![incident_warning(
+            "db_metadata.unavailable",
+            "db_metadata",
+            "database path included AKIAABCDEFGHIJKLMNOP".to_string(),
+        )];
+        let mut redaction_entries = Vec::new();
+
+        sanitize_incident_manifest_fields_for_payload(
+            &mut sources,
+            &mut warnings,
+            &redactor,
+            &mut redaction_entries,
+        );
+
+        assert!(!sources[0].source_surface.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(sources[0].source_surface.contains("[REDACTED]"));
+        assert!(!warnings[0].message.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(warnings[0].message.contains("[REDACTED]"));
+        let manifest_entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "incident_manifest.json")
+            .expect("manifest redaction entry");
+        assert_eq!(manifest_entry.count, 2);
+        let warning_entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "warnings.jsonl")
+            .expect("warnings redaction entry");
+        assert_eq!(warning_entry.count, 1);
+    }
+
+    #[test]
+    fn incident_proof_rch_evidence_collects_retained_snapshot_without_running_proof() {
+        let _guard = INCIDENT_PROOF_RCH_EVIDENCE_TEST_LOCK
+            .lock()
+            .expect("incident proof RCH evidence test lock");
+        IncidentProofRchEvidenceSnapshot::clear_global_for_test();
+
+        IncidentProofRchEvidenceSnapshot::update_global(
+            IncidentProofRchEvidenceSnapshot::new(
+                epoch_millis(),
+                "fixture::proof-ledger",
+                "blocked",
+                "rch.no_workers_passed_health",
+            )
+            .with_artifact_paths(vec![
+                "tests/e2e/logs/ft-zh4t3/proof_rch_evidence.log".to_string(),
+            ])
+            .with_attempts(vec![
+                IncidentProofRchAttempt::new(
+                    "cargo test -p frankenterm-core incident_bundle_tests::verify_",
+                    "no_verdict",
+                    "rch.result_capture_enospc",
+                )
+                .with_artifact_path("tests/e2e/logs/ft-zh4t3/proof_rch_evidence.log")
+                .with_remote_execution_confirmed(true)
+                .with_local_fallback_rejected(true),
+            ])
+            .with_local_fallback_rejected(true),
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_proof_rch_evidence_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("proof RCH evidence source");
+
+        IncidentProofRchEvidenceSnapshot::clear_global_for_test();
+
+        assert!(warnings.is_empty());
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "proof_rch_evidence");
+        assert_eq!(source.status, IncidentSourceStatus::Collected);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Measured);
+        assert_eq!(source.source_surface, "fixture::proof-ledger");
+        assert_eq!(
+            source.file.as_deref(),
+            Some("sources/proof_rch_evidence.json")
+        );
+        assert!(!source.mutates_state);
+        assert_eq!(source.warning_ids, Vec::<String>::new());
+        assert_eq!(source.max_age_ms, Some(300_000));
+        assert!(source.freshness_ms.is_some());
+        assert!(files.contains(&"sources/proof_rch_evidence.json".to_string()));
+        assert!(total_size > 0);
+
+        let payload_path = tmp.path().join("sources/proof_rch_evidence.json");
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(payload_path).expect("payload file"))
+                .expect("payload json");
+        assert_eq!(payload["verdict"], "blocked");
+        assert_eq!(payload["reason_code"], "rch.no_workers_passed_health");
+        assert_eq!(payload["reason_category"], "no_worker");
+        assert_eq!(payload["artifact_count"], 1);
+        assert_eq!(payload["attempt_count"], 1);
+        assert_eq!(payload["local_fallback_rejected"], true);
+        assert_eq!(payload["setup_chatter_only"], false);
+        assert_eq!(payload["collector_launched_proof_commands"], false);
+        assert_eq!(payload["collector_mutated_state"], false);
+        assert_eq!(payload["local_cargo_counted_as_proof"], false);
+        assert_eq!(payload["sync_chatter_counted_as_proof"], false);
+        assert_eq!(
+            payload["provenance"]["collector_launched_proof_commands"],
+            false
+        );
+        assert_eq!(payload["provenance"]["local_cargo_counted_as_proof"], false);
+        assert_eq!(
+            payload["provenance"]["sync_chatter_counted_as_proof"],
+            false
+        );
+        assert_eq!(
+            payload["attempts"][0]["reason_code"],
+            "rch.result_capture_enospc"
+        );
+        assert_eq!(payload["attempts"][0]["reason_category"], "result");
+        assert_eq!(payload["attempts"][0]["remote_execution_confirmed"], true);
+        assert_eq!(payload["attempts"][0]["local_fallback_rejected"], true);
+        assert_eq!(payload["attempts"][0]["setup_chatter_only"], false);
+    }
+
+    #[test]
+    fn incident_proof_rch_evidence_warns_when_only_setup_chatter_is_attached() {
+        let _guard = INCIDENT_PROOF_RCH_EVIDENCE_TEST_LOCK
+            .lock()
+            .expect("incident proof RCH evidence test lock");
+        IncidentProofRchEvidenceSnapshot::clear_global_for_test();
+
+        IncidentProofRchEvidenceSnapshot::update_global(
+            IncidentProofRchEvidenceSnapshot::new(
+                epoch_millis(),
+                "fixture::rch-sync-log",
+                "no_verdict",
+                "rch.sync_chatter_only",
+            )
+            .with_attempts(vec![
+                IncidentProofRchAttempt::new(
+                    "rch sync --no-cargo",
+                    "no_verdict",
+                    "rch.queue_sync_chatter",
+                )
+                .with_setup_chatter_only(true),
+            ])
+            .with_setup_chatter_only(true),
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_proof_rch_evidence_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("proof RCH evidence source");
+
+        IncidentProofRchEvidenceSnapshot::clear_global_for_test();
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "proof_rch_evidence.setup_chatter_only");
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "proof_rch_evidence");
+        assert_eq!(source.status, IncidentSourceStatus::Collected);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Mixed);
+        assert_eq!(
+            source.warning_ids,
+            vec!["proof_rch_evidence.setup_chatter_only".to_string()]
+        );
+
+        let payload_path = tmp.path().join("sources/proof_rch_evidence.json");
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(payload_path).expect("payload file"))
+                .expect("payload json");
+        assert_eq!(payload["setup_chatter_only"], true);
+        assert_eq!(payload["reason_category"], "setup_sync");
+        assert_eq!(payload["sync_chatter_counted_as_proof"], false);
+        assert_eq!(payload["local_cargo_counted_as_proof"], false);
+        assert_eq!(payload["collector_launched_proof_commands"], false);
+        assert_eq!(payload["attempts"][0]["setup_chatter_only"], true);
+        assert_eq!(payload["attempts"][0]["reason_category"], "setup_sync");
+    }
+
+    #[test]
+    fn proof_rch_reason_category_classifies_stable_failure_families() {
+        assert_eq!(
+            proof_rch_reason_category("rch.no_workers_passed_health"),
+            "no_worker"
+        );
+        assert_eq!(
+            proof_rch_reason_category("rch.topology_preflight_failed"),
+            "topology"
+        );
+        assert_eq!(
+            proof_rch_reason_category("proof.local_fallback_rejected"),
+            "local_fallback"
+        );
+        assert_eq!(
+            proof_rch_reason_category("rch.package_materialization_failed"),
+            "package_materialization"
+        );
+        assert_eq!(
+            proof_rch_reason_category("ssh.transport_error"),
+            "transport"
+        );
+        assert_eq!(proof_rch_reason_category("cargo.test_failed"), "result");
+    }
+
+    #[test]
+    fn incident_agent_mail_collects_available_read_only_snapshot() {
+        let _guard = INCIDENT_AGENT_MAIL_TEST_LOCK
+            .lock()
+            .expect("incident Agent Mail test lock");
+        IncidentAgentMailSnapshot::clear_global_for_test();
+
+        IncidentAgentMailSnapshot::update_global(
+            IncidentAgentMailSnapshot::new(
+                epoch_millis(),
+                "fixture::agent-mail-health",
+                "ok",
+                "agent_mail.ok",
+            )
+            .with_health_level("green")
+            .with_inventory_counts(Some(19), Some(1_261), Some(1_907))
+            .with_active_agents(vec!["BlueLake".to_string(), "GreenCastle".to_string()])
+            .with_attempts(vec![
+                IncidentAgentMailAttempt::new("health_check", "ok", "agent_mail.ok")
+                    .with_elapsed_ms(42),
+            ]),
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_agent_mail_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("agent_mail source");
+
+        IncidentAgentMailSnapshot::clear_global_for_test();
+
+        assert!(warnings.is_empty());
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "agent_mail");
+        assert_eq!(source.status, IncidentSourceStatus::Collected);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Measured);
+        assert_eq!(source.source_surface, "fixture::agent-mail-health");
+        assert_eq!(source.file.as_deref(), Some("sources/agent_mail.json"));
+        assert!(!source.mutates_state);
+        assert!(source.warning_ids.is_empty());
+        assert!(files.contains(&"sources/agent_mail.json".to_string()));
+        assert!(total_size > 0);
+
+        let payload_path = tmp.path().join("sources/agent_mail.json");
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(payload_path).expect("payload file"))
+                .expect("payload json");
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["health_level"], "green");
+        assert_eq!(payload["reason_code"], "agent_mail.ok");
+        assert_eq!(payload["reason_category"], "ok");
+        assert_eq!(payload["project_count"], 19);
+        assert_eq!(payload["agent_count"], 1_261);
+        assert_eq!(payload["message_count"], 1_907);
+        assert_eq!(payload["attempt_count"], 1);
+        assert_eq!(payload["retry_count"], 0);
+        assert_eq!(payload["max_retry_count"], 1);
+        assert_eq!(payload["collector_mutated_state"], false);
+        assert_eq!(payload["message_bodies_included"], false);
+        assert_eq!(payload["inbox_bodies_included"], false);
+        assert_eq!(payload["repair_restart_kill_attempted"], false);
+        assert_eq!(payload["provenance"]["repair_allowed"], false);
+        assert_eq!(payload["provenance"]["restart_allowed"], false);
+        assert_eq!(payload["provenance"]["kill_allowed"], false);
+        assert_eq!(payload["provenance"]["registration_attempted"], false);
+        assert_eq!(payload["provenance"]["acknowledgement_attempted"], false);
+        assert_eq!(payload["attempts"][0]["operation"], "health_check");
+        assert_eq!(payload["attempts"][0]["message_bodies_included"], false);
+        assert!(
+            payload["forbidden_actions"]
+                .as_array()
+                .expect("forbidden actions")
+                .iter()
+                .any(|action| action.as_str() == Some("am doctor repair"))
+        );
+    }
+
+    #[test]
+    fn incident_agent_mail_records_unavailable_after_allowed_retry() {
+        let _guard = INCIDENT_AGENT_MAIL_TEST_LOCK
+            .lock()
+            .expect("incident Agent Mail test lock");
+        IncidentAgentMailSnapshot::clear_global_for_test();
+
+        IncidentAgentMailSnapshot::update_global(
+            IncidentAgentMailSnapshot::new(
+                epoch_millis(),
+                "fixture::agent-mail-health",
+                "unavailable",
+                "agent_mail.database_error",
+            )
+            .with_retry_count(1)
+            .with_attempts(vec![
+                IncidentAgentMailAttempt::new("health_check", "error", "agent_mail.sqlite_enospc")
+                    .with_message("sqlite open failed: no space left on device")
+                    .with_elapsed_ms(9),
+                IncidentAgentMailAttempt::new(
+                    "health_check_retry",
+                    "error",
+                    "agent_mail.sqlite_enospc",
+                )
+                .with_message("retry failed: no space left on device")
+                .with_elapsed_ms(7),
+            ]),
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_agent_mail_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("agent_mail source");
+
+        IncidentAgentMailSnapshot::clear_global_for_test();
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "agent_mail.database_error");
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "agent_mail");
+        assert_eq!(source.status, IncidentSourceStatus::Collected);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Unavailable);
+        assert_eq!(source.file.as_deref(), Some("sources/agent_mail.json"));
+        assert_eq!(
+            source.warning_ids,
+            vec!["agent_mail.database_error".to_string()]
+        );
+
+        let payload_path = tmp.path().join("sources/agent_mail.json");
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(payload_path).expect("payload file"))
+                .expect("payload json");
+        assert_eq!(payload["status"], "unavailable");
+        assert_eq!(payload["reason_code"], "agent_mail.database_error");
+        assert_eq!(payload["reason_category"], "database");
+        assert_eq!(payload["retry_count"], 1);
+        assert_eq!(payload["max_retry_count"], 1);
+        assert_eq!(payload["attempt_count"], 2);
+        assert_eq!(payload["collector_mutated_state"], false);
+        assert_eq!(payload["repair_restart_kill_attempted"], false);
+        assert_eq!(payload["message_bodies_included"], false);
+        assert_eq!(payload["provenance"]["repair_allowed"], false);
+        assert_eq!(payload["provenance"]["restart_allowed"], false);
+        assert_eq!(payload["provenance"]["kill_allowed"], false);
+        assert_eq!(payload["attempts"][0]["reason_category"], "database");
+        assert_eq!(payload["attempts"][1]["operation"], "health_check_retry");
+    }
+
+    #[test]
+    fn incident_agent_mail_redacts_attempt_messages_before_payload() {
+        let _guard = INCIDENT_AGENT_MAIL_TEST_LOCK
+            .lock()
+            .expect("incident Agent Mail test lock");
+        IncidentAgentMailSnapshot::clear_global_for_test();
+
+        IncidentAgentMailSnapshot::update_global(
+            IncidentAgentMailSnapshot::new(
+                epoch_millis(),
+                "fixture::agent_mail_health",
+                "unavailable",
+                "agent_mail.api_unreachable",
+            )
+            .with_attempts(vec![
+                IncidentAgentMailAttempt::new(
+                    "health_check",
+                    "error",
+                    "agent_mail.http_connection_error",
+                )
+                .with_message("diagnostic included AKIAABCDEFGHIJKLMNOP")
+                .with_elapsed_ms(5),
+            ]),
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_agent_mail_source(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+        )
+        .expect("agent_mail source");
+
+        IncidentAgentMailSnapshot::clear_global_for_test();
+
+        assert_eq!(sources[0].redaction, IncidentRedactionState::Partial);
+        let entry = redaction_entries
+            .iter()
+            .find(|entry| entry.file == "sources/agent_mail.json")
+            .expect("agent mail redaction entry");
+        assert_eq!(entry.count, 1);
+
+        let payload_path = tmp.path().join("sources/agent_mail.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(payload_text.contains("[REDACTED]"));
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(
+            payload["attempts"][0]["message"],
+            "diagnostic included [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn agent_mail_reason_category_classifies_stable_failure_families() {
+        assert_eq!(agent_mail_reason_category("agent_mail.ok"), "ok");
+        assert_eq!(
+            agent_mail_reason_category("agent_mail.sqlite_enospc"),
+            "database"
+        );
+        assert_eq!(
+            agent_mail_reason_category("agent_mail.recovery_read_only"),
+            "recovery_mode"
+        );
+        assert_eq!(
+            agent_mail_reason_category("agent_mail.http_connection_error"),
+            "api_unreachable"
+        );
+        assert_eq!(agent_mail_reason_category("agent_mail.timeout"), "timeout");
+        assert_eq!(
+            agent_mail_reason_category("forbidden.agent_mail.repair"),
+            "forbidden_action"
+        );
     }
 
     // -- CrashReport tests --
@@ -5428,10 +8098,17 @@ mod tests {
         assert!(result.files.contains(&"crash_report.json".to_string()));
         assert!(result.files.contains(&"crash_manifest.json".to_string()));
         assert!(result.files.contains(&"health_snapshot.json".to_string()));
+        assert!(result.files.contains(&"incident_manifest.json".to_string()));
         assert!(result.total_size_bytes > 0);
 
         let manifest_path = result.path.join("incident_manifest.json");
         assert!(manifest_path.exists());
+        let disk_total: u64 = result
+            .files
+            .iter()
+            .map(|file| fs::metadata(result.path.join(file)).unwrap().len())
+            .sum();
+        assert_eq!(result.total_size_bytes, disk_total);
     }
 
     #[test]
@@ -5445,7 +8122,7 @@ mod tests {
 
         assert_eq!(result.kind, IncidentKind::Crash);
         assert!(result.path.exists());
-        assert!(result.files.is_empty());
+        assert_eq!(result.files, vec!["incident_manifest.json".to_string()]);
     }
 
     #[test]
@@ -5467,6 +8144,30 @@ mod tests {
                 .unwrap()
                 .starts_with("wa_incident_manual_")
         );
+    }
+
+    #[test]
+    fn export_incident_bundle_manifest_path_is_bundle_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let out_dir = tmp.path().join(format!("out-{secret}"));
+
+        let result =
+            export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Manual).unwrap();
+        assert!(result.path.to_string_lossy().contains(secret));
+
+        let manifest_text = fs::read_to_string(result.path.join("incident_manifest.json")).unwrap();
+        assert!(!manifest_text.contains(secret));
+        let manifest: IncidentBundleResult = serde_json::from_str(&manifest_text).unwrap();
+        assert!(!manifest.path.to_string_lossy().contains(secret));
+        assert!(!manifest.path.is_absolute());
+        assert!(
+            manifest
+                .files
+                .contains(&"incident_manifest.json".to_string())
+        );
+        assert_eq!(manifest.total_size_bytes, result.total_size_bytes);
     }
 
     #[test]
@@ -6985,6 +9686,9 @@ mod tests {
 
     #[test]
     fn collect_incident_bundle_manual_creates_redaction_report() {
+        let _incident_source_guards = lock_incident_source_globals_for_test();
+        clear_incident_source_globals_for_test();
+
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
         let out_dir = tmp.path().join("out");
@@ -7012,6 +9716,9 @@ mod tests {
 
     #[test]
     fn collect_incident_bundle_manual_records_skipped_source_warnings() {
+        let _incident_source_guards = lock_incident_source_globals_for_test();
+        clear_incident_source_globals_for_test();
+
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
         let out_dir = tmp.path().join("out");
@@ -7131,6 +9838,9 @@ not-json
 
     #[test]
     fn collect_incident_bundle_crash_with_existing_bundle() {
+        let _incident_source_guards = lock_incident_source_globals_for_test();
+        clear_incident_source_globals_for_test();
+
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
         let out_dir = tmp.path().join("out");
@@ -7156,6 +9866,9 @@ not-json
 
     #[test]
     fn collect_incident_bundle_with_config() {
+        let _incident_source_guards = lock_incident_source_globals_for_test();
+        clear_incident_source_globals_for_test();
+
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
         let out_dir = tmp.path().join("out");
@@ -7178,6 +9891,9 @@ not-json
 
     #[test]
     fn collect_incident_bundle_invalid_db_records_failed_recent_events() {
+        let _incident_source_guards = lock_incident_source_globals_for_test();
+        clear_incident_source_globals_for_test();
+
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
         let out_dir = tmp.path().join("out");
@@ -7218,7 +9934,61 @@ not-json
     }
 
     #[test]
+    fn collect_incident_bundle_redacts_manifest_and_warning_direct_fields() {
+        let _incident_source_guards = lock_incident_source_globals_for_test();
+        clear_incident_source_globals_for_test();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let out_dir = tmp.path().join(format!("out-{secret}"));
+        let db_path = tmp.path().join(format!("{secret}.sqlite"));
+
+        let opts = IncidentBundleOptions {
+            crash_dir: &crash_dir,
+            config_path: None,
+            out_dir: &out_dir,
+            kind: IncidentKind::Manual,
+            db_path: Some(&db_path),
+            max_events: 10,
+        };
+
+        let result = collect_incident_bundle(&opts).unwrap();
+        let manifest_text = fs::read_to_string(result.path.join("incident_manifest.json")).unwrap();
+        let warnings_text = fs::read_to_string(result.path.join("warnings.jsonl")).unwrap();
+        let report: RedactionReport = serde_json::from_str(
+            &fs::read_to_string(result.path.join("redaction_report.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!manifest_text.contains(secret));
+        assert!(!warnings_text.contains(secret));
+        assert!(manifest_text.contains("[REDACTED:aws_access_key]"));
+        assert!(warnings_text.contains("[REDACTED:aws_access_key]"));
+        assert!(result.path.to_string_lossy().contains(secret));
+        let manifest: IncidentBundleResult = serde_json::from_str(&manifest_text).unwrap();
+        assert!(!manifest.path.to_string_lossy().contains(secret));
+        assert!(!manifest.path.is_absolute());
+
+        let manifest_entry = report
+            .per_file
+            .iter()
+            .find(|entry| entry.file == "incident_manifest.json")
+            .expect("incident manifest redaction entry");
+        assert_eq!(manifest_entry.count, 4);
+        let warnings_entry = report
+            .per_file
+            .iter()
+            .find(|entry| entry.file == "warnings.jsonl")
+            .expect("warnings redaction entry");
+        assert_eq!(warnings_entry.count, 1);
+    }
+
+    #[test]
     fn collect_incident_bundle_truncates_multibyte_config_safely() {
+        let _incident_source_guards = lock_incident_source_globals_for_test();
+        clear_incident_source_globals_for_test();
+
         let tmp = tempfile::tempdir().unwrap();
         let crash_dir = tmp.path().join("crash");
         let out_dir = tmp.path().join("out");
