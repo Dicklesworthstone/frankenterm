@@ -215,10 +215,13 @@
         "state",
         "collected_at_ms",
         "freshness_ms",
+        "freshness_state",
         "command_or_api",
         "redacted",
+        "redaction_posture",
         "raw_pane_content_stored",
         "reason_codes",
+        "evidence",
         "artifact_paths"
       ],
       "additionalProperties": false,
@@ -247,6 +250,9 @@
           ],
           "minimum": 0
         },
+        "freshness_state": {
+          "$ref": "#/$defs/freshness_state"
+        },
         "command_or_api": {
           "type": "string",
           "minLength": 1
@@ -255,9 +261,128 @@
           "type": "boolean",
           "const": true
         },
+        "redaction_posture": {
+          "$ref": "#/$defs/redaction_posture"
+        },
         "raw_pane_content_stored": {
           "type": "boolean",
           "const": false
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/source_evidence"
+          }
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "freshness_state": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "within_budget",
+        "stale",
+        "unknown",
+        "not_collected"
+      ]
+    },
+    "redaction_posture": {
+      "type": "object",
+      "required": [
+        "pane_content",
+        "secret_material",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pane_content": {
+          "type": "string",
+          "enum": [
+            "not_collected",
+            "redacted",
+            "not_applicable",
+            "raw_forbidden"
+          ]
+        },
+        "secret_material": {
+          "type": "string",
+          "enum": [
+            "not_collected",
+            "redacted",
+            "not_applicable",
+            "raw_forbidden"
+          ]
+        },
+        "notes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "source_evidence_category": {
+      "type": "string",
+      "enum": [
+        "beads_ready_queue",
+        "beads_blocked_queue",
+        "beads_in_progress",
+        "active_assignee_overlap",
+        "agent_mail_availability",
+        "rch_worker_selection",
+        "rch_active_project_exclusion",
+        "rch_topology_preflight",
+        "rch_cargo_verdict",
+        "git_dirty_tree",
+        "dirty_path_overlap",
+        "capacity_pressure",
+        "robot_inventory",
+        "redaction_posture",
+        "manual_note"
+      ]
+    },
+    "source_evidence_state": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "warn",
+        "fail",
+        "blocked",
+        "unavailable",
+        "stale",
+        "unknown",
+        "not_applicable"
+      ]
+    },
+    "source_evidence": {
+      "type": "object",
+      "required": [
+        "evidence_id",
+        "category",
+        "state",
+        "subject",
+        "reason_codes",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "$ref": "#/$defs/source_evidence_category"
+        },
+        "state": {
+          "$ref": "#/$defs/source_evidence_state"
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1
         },
         "reason_codes": {
           "$ref": "#/$defs/string_array"

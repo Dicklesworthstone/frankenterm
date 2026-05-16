@@ -54,6 +54,36 @@ approval to do those things.
 | `degraded` | One or more sources are unavailable but the plan remains useful. |
 | `unavailable` | The planner cannot produce a trustworthy plan. |
 
+## Source Adapter Snapshots
+
+Every source adapter ultimately contributes an embedded `source_snapshot` to the
+objective plan. The richer standalone source bundle contract is
+`ft.mission_objective_sources.v1`; this plan-level snapshot keeps the subset the
+planner needs for ranking and explanation. It is a redacted summary of an
+existing truth surface, not a transcript. It must include the source id/kind,
+collection timestamp, freshness age and state, command or API provenance,
+redaction posture, reason codes, and at least one structured `evidence` item.
+
+Evidence categories make degraded planning auditable:
+
+| Category | Use |
+|---|---|
+| `beads_ready_queue` / `beads_blocked_queue` / `beads_in_progress` | Beads queue shape and blocker state. |
+| `active_assignee_overlap` | Whether a live assignee already owns the planned slice. |
+| `agent_mail_availability` | Agent Mail health, including red/fallback state. |
+| `rch_worker_selection` | Whether RCH selected a usable worker. |
+| `rch_active_project_exclusion` | Whether active-project exclusion blocked the worker pool. |
+| `rch_topology_preflight` | Whether topology/dependency preflight ran and passed. |
+| `rch_cargo_verdict` | Whether Cargo/test proof ran remotely and what verdict class it produced. |
+| `git_dirty_tree` / `dirty_path_overlap` | Dirty-tree presence and overlap with planned owned paths. |
+| `capacity_pressure` | Resource-cockpit or blocker-radar capacity tier. |
+| `robot_inventory` | Pane inventory only; raw pane text is not collected. |
+| `redaction_posture` | Explicit proof that raw pane content and secrets were not stored. |
+
+Agent Mail and RCH failures are data, not repair instructions. A source may be
+`unavailable` or `degraded` while the plan remains actionable through Beads and
+static checks. `service_mutation` remains forbidden by default.
+
 ## Safety Invariants
 
 1. `raw_pane_content_stored` is always `false`.
@@ -72,6 +102,14 @@ The initial fixtures live under `fixtures/mission-planner/objective-plan/`:
 - `ready-bead.json`: one safe Beads-ready contract slice.
 - `no-ready-rch-blocked.json`: no ready work, active/staged overlap, Agent Mail
   unavailable, and RCH proof blocked.
+- `healthy-sources.json`: Beads, Agent Mail, RCH, git, capacity, and robot
+  inventory sources are all available and redacted.
+- `agent-mail-red.json`: Agent Mail unavailable with Beads-only fallback still
+  actionable.
+- `rch-degraded.json`: RCH proof blocked with distinct worker-selection,
+  active-project-exclusion, topology-preflight, and Cargo-verdict evidence.
+- `dirty-overlap.json`: active assignee and dirty path overlap force a wait
+  plan instead of file edits.
 - `invalid-raw-pane-content.json`: rejection fixture showing why raw pane content
   storage must fail schema validation.
 

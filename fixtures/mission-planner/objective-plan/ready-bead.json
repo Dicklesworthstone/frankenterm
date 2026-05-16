@@ -33,11 +33,34 @@
       "state": "available",
       "collected_at_ms": 1778911200000,
       "freshness_ms": 0,
+      "freshness_state": "fresh",
       "command_or_api": "br ready --json",
       "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Beads adapter records ids, statuses, assignees, and reason codes only."
+        ]
+      },
       "raw_pane_content_stored": false,
       "reason_codes": [
         "beads.ready_one"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-beads-ready-one",
+          "category": "beads_ready_queue",
+          "state": "pass",
+          "subject": "ft-auy2g.1",
+          "reason_codes": [
+            "beads.ready_one",
+            "beads.unassigned"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/ready-bead.json"
+          ]
+        }
       ],
       "artifact_paths": [
         "fixtures/mission-planner/objective-plan/ready-bead.json"
@@ -49,11 +72,34 @@
       "state": "available",
       "collected_at_ms": 1778911200000,
       "freshness_ms": 0,
+      "freshness_state": "fresh",
       "command_or_api": "git status --short --branch --untracked-files=all",
       "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Git adapter records path-level risk only."
+        ]
+      },
       "raw_pane_content_stored": false,
       "reason_codes": [
         "git.clean_for_scope"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-git-clean-scope",
+          "category": "dirty_path_overlap",
+          "state": "pass",
+          "subject": "docs/json-schema/ft-mission-objective-plan.json",
+          "reason_codes": [
+            "git.clean_for_scope",
+            "dirty_overlap.none"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/ready-bead.json"
+          ]
+        }
       ],
       "artifact_paths": [
         "fixtures/mission-planner/objective-plan/ready-bead.json"

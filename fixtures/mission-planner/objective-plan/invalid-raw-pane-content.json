@@ -29,11 +29,34 @@
       "state": "available",
       "collected_at_ms": 1778911320000,
       "freshness_ms": 0,
+      "freshness_state": "fresh",
       "command_or_api": "ft robot get-text 1",
       "redacted": false,
+      "redaction_posture": {
+        "pane_content": "raw_forbidden",
+        "secret_material": "raw_forbidden",
+        "notes": [
+          "This expected-invalid fixture proves raw pane content is rejected."
+        ]
+      },
       "raw_pane_content_stored": true,
       "reason_codes": [
         "fixture.expected_invalid.raw_pane_content"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-raw-pane-content-forbidden",
+          "category": "redaction_posture",
+          "state": "fail",
+          "subject": "ft robot get-text 1",
+          "reason_codes": [
+            "fixture.expected_invalid.raw_pane_content",
+            "raw_pane_content_forbidden"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"
+          ]
+        }
       ],
       "artifact_paths": [
         "fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"

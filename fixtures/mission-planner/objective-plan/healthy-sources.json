@@ -1,0 +1,411 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_plan.v1",
+  "generated_at_ms": 1778911380000,
+  "objective": {
+    "objective_id": "objective-healthy-sources",
+    "requested_by": "fixture",
+    "summary": "Choose a ready mission-planner slice when Beads, Agent Mail, RCH, git, capacity, and robot inventory are healthy.",
+    "workspace_root": "/Users/jemanuel/projects/frankenterm",
+    "target_bead_ids": [
+      "ft-auy2g.2"
+    ],
+    "allowed_action_classes": [
+      "read_status",
+      "claim_bead",
+      "add_beads_comment",
+      "edit_files",
+      "run_static_check",
+      "run_rch_proof"
+    ],
+    "forbidden_action_classes": [
+      "pane_mutation",
+      "service_mutation",
+      "destructive_filesystem"
+    ],
+    "freshness_budget_ms": 300000,
+    "proof_strictness": "rch_required"
+  },
+  "plan_status": "actionable",
+  "source_snapshots": [
+    {
+      "source_id": "beads-ready-healthy",
+      "source_kind": "beads",
+      "state": "available",
+      "collected_at_ms": 1778911380000,
+      "freshness_ms": 0,
+      "freshness_state": "fresh",
+      "command_or_api": "br ready --json && br show ft-auy2g.2 --json",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Beads adapter records queue and assignee metadata only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_one",
+        "beads.unassigned",
+        "assignee_overlap.none"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-healthy-beads-ready",
+          "category": "beads_ready_queue",
+          "state": "pass",
+          "subject": "ft-auy2g.2",
+          "reason_codes": [
+            "beads.ready_one",
+            "beads.unassigned"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        },
+        {
+          "evidence_id": "evidence-healthy-assignee-overlap",
+          "category": "active_assignee_overlap",
+          "state": "pass",
+          "subject": "ft-auy2g.2",
+          "reason_codes": [
+            "assignee_overlap.none"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/healthy-sources.json"
+      ]
+    },
+    {
+      "source_id": "agent-mail-healthy",
+      "source_kind": "agent_mail",
+      "state": "available",
+      "collected_at_ms": 1778911380000,
+      "freshness_ms": 1000,
+      "freshness_state": "within_budget",
+      "command_or_api": "macro_start_session",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "Agent Mail adapter records availability, inbox counts, and ack requirements without message secrets."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "agent_mail.available"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-agent-mail-available",
+          "category": "agent_mail_availability",
+          "state": "pass",
+          "subject": "macro_start_session",
+          "reason_codes": [
+            "agent_mail.available"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/healthy-sources.json"
+      ]
+    },
+    {
+      "source_id": "rch-healthy",
+      "source_kind": "rch",
+      "state": "available",
+      "collected_at_ms": 1778911380000,
+      "freshness_ms": 1500,
+      "freshness_state": "within_budget",
+      "command_or_api": "rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo check -p frankenterm-core --lib",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "redacted",
+        "notes": [
+          "RCH adapter records scheduler and proof verdict facts without full build logs."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "rch.worker_selection.pass",
+        "rch.active_project_exclusion.pass",
+        "rch.topology_preflight.pass",
+        "rch.cargo_verdict.pass"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-rch-worker-selected",
+          "category": "rch_worker_selection",
+          "state": "pass",
+          "subject": "vmi-worker",
+          "reason_codes": [
+            "rch.worker_selection.pass"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        },
+        {
+          "evidence_id": "evidence-rch-active-project-clear",
+          "category": "rch_active_project_exclusion",
+          "state": "pass",
+          "subject": "/Users/jemanuel/projects/frankenterm",
+          "reason_codes": [
+            "rch.active_project_exclusion.pass"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        },
+        {
+          "evidence_id": "evidence-rch-topology-pass",
+          "category": "rch_topology_preflight",
+          "state": "pass",
+          "subject": "dependency preflight",
+          "reason_codes": [
+            "rch.topology_preflight.pass"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        },
+        {
+          "evidence_id": "evidence-rch-cargo-pass",
+          "category": "rch_cargo_verdict",
+          "state": "pass",
+          "subject": "cargo check",
+          "reason_codes": [
+            "rch.cargo_verdict.pass"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/healthy-sources.json"
+      ]
+    },
+    {
+      "source_id": "git-clean-healthy",
+      "source_kind": "git",
+      "state": "available",
+      "collected_at_ms": 1778911380000,
+      "freshness_ms": 0,
+      "freshness_state": "fresh",
+      "command_or_api": "git status --short --branch --untracked-files=all",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Git adapter records dirty-path classes only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.clean_for_scope",
+        "dirty_overlap.none"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-healthy-git-clean",
+          "category": "git_dirty_tree",
+          "state": "pass",
+          "subject": "owned docs and fixtures",
+          "reason_codes": [
+            "git.clean_for_scope"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        },
+        {
+          "evidence_id": "evidence-healthy-dirty-overlap-none",
+          "category": "dirty_path_overlap",
+          "state": "pass",
+          "subject": "ft-auy2g.2 owned paths",
+          "reason_codes": [
+            "dirty_overlap.none"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/healthy-sources.json"
+      ]
+    },
+    {
+      "source_id": "capacity-green",
+      "source_kind": "resource_cockpit",
+      "state": "available",
+      "collected_at_ms": 1778911380000,
+      "freshness_ms": 2000,
+      "freshness_state": "within_budget",
+      "command_or_api": "resource cockpit retained artifact",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Capacity adapter records pressure tiers and proof-state labels only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "capacity.green",
+        "capacity.measured"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-capacity-green",
+          "category": "capacity_pressure",
+          "state": "pass",
+          "subject": "resource cockpit",
+          "reason_codes": [
+            "capacity.green",
+            "capacity.measured"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/healthy-sources.json"
+      ]
+    },
+    {
+      "source_id": "robot-inventory-healthy",
+      "source_kind": "robot",
+      "state": "available",
+      "collected_at_ms": 1778911380000,
+      "freshness_ms": 2500,
+      "freshness_state": "within_budget",
+      "command_or_api": "ft robot --format toon state",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Robot adapter records pane ids and states only; include-text is not used."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "robot.inventory_available",
+        "robot.raw_text_not_requested"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-robot-inventory",
+          "category": "robot_inventory",
+          "state": "pass",
+          "subject": "pane inventory",
+          "reason_codes": [
+            "robot.inventory_available",
+            "robot.raw_text_not_requested"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/healthy-sources.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/healthy-sources.json"
+      ]
+    }
+  ],
+  "capacity_admission": {
+    "action": "admit",
+    "pressure_tier": "green",
+    "proof_state": "measured",
+    "reason_codes": [
+      "capacity.green",
+      "rch.cargo_verdict.pass"
+    ]
+  },
+  "steps": [
+    {
+      "step_id": "step-claim-ready-adapter-slice",
+      "rank": 1,
+      "action_kind": "claim_bead",
+      "status": "actionable",
+      "target": "ft-auy2g.2",
+      "side_effect_class": "beads_metadata",
+      "requires_approval": false,
+      "forbidden": false,
+      "reason_codes": [
+        "beads.ready",
+        "capacity.green",
+        "dirty_overlap.none"
+      ],
+      "proof_requirement_ids": [
+        "proof-static-json",
+        "proof-rch-cargo"
+      ]
+    }
+  ],
+  "proof_requirements": [
+    {
+      "proof_id": "proof-static-json",
+      "proof_kind": "static_json",
+      "required": true,
+      "status": "pending",
+      "command": "jq empty docs/json-schema/ft-mission-objective-plan.json fixtures/mission-planner/objective-plan/healthy-sources.json",
+      "artifact_paths": [
+        "docs/json-schema/ft-mission-objective-plan.json",
+        "fixtures/mission-planner/objective-plan/healthy-sources.json"
+      ]
+    },
+    {
+      "proof_id": "proof-rch-cargo",
+      "proof_kind": "rch_cargo",
+      "required": true,
+      "status": "passed",
+      "command": "rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo check -p frankenterm-core --lib",
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/healthy-sources.json"
+      ]
+    }
+  ],
+  "forbidden_actions": [
+    {
+      "action_class": "pane_mutation",
+      "reason": "Objective planning is read-only and cannot inject pane input."
+    },
+    {
+      "action_class": "service_mutation",
+      "reason": "Objective planning must not restart or repair Agent Mail or RCH."
+    },
+    {
+      "action_class": "destructive_filesystem",
+      "reason": "Objective planning must not delete or overwrite files."
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_plan.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Healthy adapters still record only redacted summaries and reason codes."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-plan.json",
+    "fixtures/mission-planner/objective-plan/healthy-sources.json"
+  ]
+}

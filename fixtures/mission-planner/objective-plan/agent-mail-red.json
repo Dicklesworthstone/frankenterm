@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_plan.v1",
+  "generated_at_ms": 1778911440000,
+  "objective": {
+    "objective_id": "objective-agent-mail-red",
+    "requested_by": "fixture",
+    "summary": "Continue with Beads-only planning when Agent Mail is unavailable.",
+    "workspace_root": "/Users/jemanuel/projects/frankenterm",
+    "target_bead_ids": [
+      "ft-auy2g.2"
+    ],
+    "allowed_action_classes": [
+      "read_status",
+      "claim_bead",
+      "add_beads_comment",
+      "edit_files",
+      "run_static_check"
+    ],
+    "forbidden_action_classes": [
+      "service_mutation",
+      "pane_mutation",
+      "destructive_filesystem"
+    ],
+    "freshness_budget_ms": 300000,
+    "proof_strictness": "static_only"
+  },
+  "plan_status": "degraded",
+  "source_snapshots": [
+    {
+      "source_id": "beads-ready-agent-mail-red",
+      "source_kind": "beads",
+      "state": "available",
+      "collected_at_ms": 1778911440000,
+      "freshness_ms": 0,
+      "freshness_state": "fresh",
+      "command_or_api": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Fallback adapter uses Beads and git snapshot only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_one",
+        "fallback.beads_only"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-agent-mail-red-beads-ready",
+          "category": "beads_ready_queue",
+          "state": "pass",
+          "subject": "ft-auy2g.2",
+          "reason_codes": [
+            "beads.ready_one",
+            "fallback.beads_only"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/agent-mail-red.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/agent-mail-red.json"
+      ]
+    },
+    {
+      "source_id": "agent-mail-red",
+      "source_kind": "agent_mail",
+      "state": "unavailable",
+      "collected_at_ms": 1778911440000,
+      "freshness_ms": null,
+      "freshness_state": "not_collected",
+      "command_or_api": "macro_start_session",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Planner must not repair, restart, or kill Agent Mail when this source is red."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "agent_mail.unavailable",
+        "agent_mail.retry_exhausted",
+        "fallback.beads_only"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-agent-mail-unavailable",
+          "category": "agent_mail_availability",
+          "state": "unavailable",
+          "subject": "macro_start_session",
+          "reason_codes": [
+            "agent_mail.unavailable",
+            "agent_mail.retry_exhausted",
+            "fallback.beads_only"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/agent-mail-red.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/agent-mail-red.json"
+      ]
+    },
+    {
+      "source_id": "git-clean-agent-mail-red",
+      "source_kind": "git",
+      "state": "available",
+      "collected_at_ms": 1778911440000,
+      "freshness_ms": 0,
+      "freshness_state": "fresh",
+      "command_or_api": "git status --short --branch --untracked-files=all",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Git fallback records scoped dirty-path risk only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.clean_for_scope"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-agent-mail-red-git-clean",
+          "category": "dirty_path_overlap",
+          "state": "pass",
+          "subject": "ft-auy2g.2 owned paths",
+          "reason_codes": [
+            "git.clean_for_scope",
+            "dirty_overlap.none"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/agent-mail-red.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/agent-mail-red.json"
+      ]
+    }
+  ],
+  "capacity_admission": {
+    "action": "admit",
+    "pressure_tier": "green",
+    "proof_state": "not_required",
+    "reason_codes": [
+      "capacity.static_contract_only",
+      "agent_mail.degraded_non_blocking"
+    ]
+  },
+  "steps": [
+    {
+      "step_id": "step-claim-under-beads-fallback",
+      "rank": 1,
+      "action_kind": "claim_bead",
+      "status": "actionable",
+      "target": "ft-auy2g.2",
+      "side_effect_class": "beads_metadata",
+      "requires_approval": false,
+      "forbidden": false,
+      "reason_codes": [
+        "fallback.beads_only",
+        "agent_mail.degraded_non_blocking"
+      ],
+      "proof_requirement_ids": [
+        "proof-static-json"
+      ]
+    }
+  ],
+  "proof_requirements": [
+    {
+      "proof_id": "proof-static-json",
+      "proof_kind": "static_json",
+      "required": true,
+      "status": "pending",
+      "command": "jq empty docs/json-schema/ft-mission-objective-plan.json fixtures/mission-planner/objective-plan/agent-mail-red.json",
+      "artifact_paths": [
+        "docs/json-schema/ft-mission-objective-plan.json",
+        "fixtures/mission-planner/objective-plan/agent-mail-red.json"
+      ]
+    }
+  ],
+  "forbidden_actions": [
+    {
+      "action_class": "service_mutation",
+      "reason": "Agent Mail red status is a planning input, not permission to repair or restart the service."
+    },
+    {
+      "action_class": "pane_mutation",
+      "reason": "Objective planning is read-only and cannot inject pane input."
+    },
+    {
+      "action_class": "destructive_filesystem",
+      "reason": "Objective planning must not delete or overwrite files."
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_plan.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Agent Mail unavailable state is retained as reason codes only."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-plan.json",
+    "fixtures/mission-planner/objective-plan/agent-mail-red.json"
+  ]
+}

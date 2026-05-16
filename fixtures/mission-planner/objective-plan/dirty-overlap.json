@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_plan.v1",
+  "generated_at_ms": 1778911560000,
+  "objective": {
+    "objective_id": "objective-dirty-overlap",
+    "requested_by": "fixture",
+    "summary": "Wait instead of editing when dirty paths and active assignees overlap the requested slice.",
+    "workspace_root": "/Users/jemanuel/projects/frankenterm",
+    "target_bead_ids": [
+      "ft-tf6g3.3.10"
+    ],
+    "allowed_action_classes": [
+      "read_status",
+      "wait",
+      "add_beads_comment"
+    ],
+    "forbidden_action_classes": [
+      "edit_files",
+      "run_rch_proof",
+      "pane_mutation",
+      "service_mutation",
+      "destructive_filesystem"
+    ],
+    "freshness_budget_ms": 300000,
+    "proof_strictness": "blocked_until_proof_available"
+  },
+  "plan_status": "dirty_overlap",
+  "source_snapshots": [
+    {
+      "source_id": "beads-active-assignee-overlap",
+      "source_kind": "beads",
+      "state": "degraded",
+      "collected_at_ms": 1778911560000,
+      "freshness_ms": 0,
+      "freshness_state": "fresh",
+      "command_or_api": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Beads adapter records active assignee, stale threshold, and bead id only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.in_progress_active",
+        "assignee_overlap.active_not_stale"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-beads-in-progress-active",
+          "category": "beads_in_progress",
+          "state": "warn",
+          "subject": "ft-tf6g3.3.10",
+          "reason_codes": [
+            "beads.in_progress_active"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/dirty-overlap.json"
+          ]
+        },
+        {
+          "evidence_id": "evidence-active-assignee-overlap",
+          "category": "active_assignee_overlap",
+          "state": "blocked",
+          "subject": "ft-tf6g3.3.10",
+          "reason_codes": [
+            "assignee_overlap.active_not_stale"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/dirty-overlap.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/dirty-overlap.json"
+      ]
+    },
+    {
+      "source_id": "git-dirty-overlap-fixture",
+      "source_kind": "git",
+      "state": "blocked",
+      "collected_at_ms": 1778911560000,
+      "freshness_ms": 0,
+      "freshness_state": "fresh",
+      "command_or_api": "git status --short --untracked-files=all",
+      "redacted": true,
+      "redaction_posture": {
+        "pane_content": "not_collected",
+        "secret_material": "not_collected",
+        "notes": [
+          "Git adapter stores path names and staged/unstaged classes only."
+        ]
+      },
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.dirty_paths_present",
+        "dirty_overlap.owned_surface_blocked"
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-git-dirty-tree",
+          "category": "git_dirty_tree",
+          "state": "warn",
+          "subject": "crates/frankenterm-core/benches/atlas_stability.rs",
+          "reason_codes": [
+            "git.dirty_paths_present"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/dirty-overlap.json"
+          ]
+        },
+        {
+          "evidence_id": "evidence-dirty-path-overlap",
+          "category": "dirty_path_overlap",
+          "state": "blocked",
+          "subject": "crates/frankenterm-core/Cargo.toml",
+          "reason_codes": [
+            "dirty_overlap.owned_surface_blocked"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/dirty-overlap.json"
+          ]
+        }
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/dirty-overlap.json"
+      ]
+    }
+  ],
+  "capacity_admission": {
+    "action": "defer",
+    "pressure_tier": "unknown",
+    "proof_state": "not_required",
+    "reason_codes": [
+      "dirty_overlap",
+      "assignee_overlap.active_not_stale"
+    ]
+  },
+  "steps": [
+    {
+      "step_id": "step-wait-for-owner",
+      "rank": 1,
+      "action_kind": "wait_for_owner",
+      "status": "waiting_owner",
+      "target": "ft-tf6g3.3.10",
+      "side_effect_class": "none",
+      "requires_approval": false,
+      "forbidden": false,
+      "reason_codes": [
+        "dirty_overlap.owned_surface_blocked",
+        "assignee_overlap.active_not_stale"
+      ],
+      "proof_requirement_ids": [
+        "proof-static-json"
+      ]
+    }
+  ],
+  "proof_requirements": [
+    {
+      "proof_id": "proof-static-json",
+      "proof_kind": "static_json",
+      "required": true,
+      "status": "pending",
+      "command": "jq empty docs/json-schema/ft-mission-objective-plan.json fixtures/mission-planner/objective-plan/dirty-overlap.json",
+      "artifact_paths": [
+        "docs/json-schema/ft-mission-objective-plan.json",
+        "fixtures/mission-planner/objective-plan/dirty-overlap.json"
+      ]
+    }
+  ],
+  "forbidden_actions": [
+    {
+      "action_class": "edit_files",
+      "reason": "Dirty paths and active assignee overlap the requested surface."
+    },
+    {
+      "action_class": "run_rch_proof",
+      "reason": "Proof would mix another agent's active staged work with this objective."
+    },
+    {
+      "action_class": "pane_mutation",
+      "reason": "Objective planning is read-only and cannot inject pane input."
+    },
+    {
+      "action_class": "service_mutation",
+      "reason": "Objective planning must not restart or repair Agent Mail or RCH."
+    },
+    {
+      "action_class": "destructive_filesystem",
+      "reason": "Objective planning must not delete or overwrite files."
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_plan.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Dirty-overlap fixture stores only path-level risk and bead ids."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-plan.json",
+    "fixtures/mission-planner/objective-plan/dirty-overlap.json"
+  ]
+}
