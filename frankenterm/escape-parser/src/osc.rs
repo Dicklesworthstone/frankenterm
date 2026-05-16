@@ -642,7 +642,7 @@ impl Display for OperatingSystemCommand {
     }
 }
 
-/// https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md
+/// https://gitlab.freedesktop.org/Per_Bothner/specifications/-/blob/4d2e1d75d4861a1d924895e106f8f016880e12a7/proposals/semantic-prompts.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalTermClick {
     /// Allow motion only within the single input line using left/right arrow keys
@@ -681,7 +681,7 @@ impl Display for FinalTermClick {
     }
 }
 
-/// https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md
+/// https://gitlab.freedesktop.org/Per_Bothner/specifications/-/blob/4d2e1d75d4861a1d924895e106f8f016880e12a7/proposals/semantic-prompts.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalTermPromptKind {
     /// A normal left side primary prompt
@@ -724,7 +724,7 @@ impl Display for FinalTermPromptKind {
     }
 }
 
-/// https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md
+/// https://gitlab.freedesktop.org/Per_Bothner/specifications/-/blob/4d2e1d75d4861a1d924895e106f8f016880e12a7/proposals/semantic-prompts.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalTermSemanticPrompt {
     /// Do a "fresh line"; if the cursor is at the left margin then

@@ -181,7 +181,7 @@ The README itself acknowledges the gap. Worse: `latency_stages.rs` is **29,300 L
 ft-zoxxq made the explicit "we're a wezterm-fork, not pursuing a second mux backend" commitment. Once you commit to the fork stance, finishing the rename is debt cleanup.
 
 ### Why it matters
-Brand inconsistency. Anyone running `cargo tree` or `cargo metadata` sees `wezterm-client` and gets confused about what they're depending on. Also breaks the search invariant in AGENTS.md: "if you see `master` referenced anywhere, it's a bug" — same logic applies to `wezterm-` package names after ft-zoxxq stance.
+Brand inconsistency. Anyone running `cargo tree` or `cargo metadata` sees `wezterm-client` and gets confused about what they're depending on. Also breaks the search invariant in AGENTS.md: stale default-branch references are bugs — same logic applies to `wezterm-` package names after ft-zoxxq stance.
 
 ### Bridge actions
 1. Rename each `name = "wezterm-X"` → `name = "frankenterm-X"` in the 4 Cargo.toml files.

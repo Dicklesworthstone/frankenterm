@@ -94,7 +94,7 @@ pub struct GlyphKey {
 /// so this is the borrowed version of GlyphKey.
 /// It's a bit involved to make this work; more details can be
 /// found in the excellent guide here:
-/// <https://github.com/sunshowers/borrow-complex-key-example/blob/main/src/lib.rs>
+/// <https://github.com/sunshowers-code/borrow-complex-key-example/blob/main/src/lib.rs>
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct BorrowedGlyphKey<'a> {
     pub font_idx: usize,

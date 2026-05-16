@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap;
 /// so this is the borrowed version of Value.
 /// It's a bit involved to make this work; more details can be
 /// found in the excellent guide here:
-/// <https://github.com/sunshowers/borrow-complex-key-example/blob/master/src/lib.rs>
+/// <https://github.com/sunshowers-code/borrow-complex-key-example/blob/main/src/lib.rs>
 #[derive(Copy, Clone, Debug, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum BorrowedKey<'a> {
     Value(&'a Value),

@@ -5,7 +5,7 @@
 //! follow up.
 //! Kitty has an extensive and complex graphics protocol
 //! whose docs are here:
-//! <https://github.com/kovidgoyal/kitty/blob/master/docs/graphics-protocol.rst>
+//! <https://sw.kovidgoyal.net/kitty/graphics-protocol/>
 //! Both iTerm2 and Sixel appear to have semantics that allow replacing the
 //! contents of a single chararcter cell with image data, whereas the kitty
 //! protocol appears to track the images out of band as attachments with

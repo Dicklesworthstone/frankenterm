@@ -155,7 +155,7 @@ impl RgbColor {
     /// in the range 0-100.
     /// Returns None if the supplied name is not recognized.
     /// The list of names can be found here:
-    /// <https://ogeon.github.io/docs/palette/master/palette/named/index.html>
+    /// <https://docs.rs/palette/latest/palette/named/index.html>
     pub fn from_named_or_rgb_string(s: &str) -> Option<Self> {
         RgbColor::from_rgb_str(&s).or_else(|| RgbColor::from_named(&s))
     }
