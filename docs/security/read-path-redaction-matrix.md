@@ -23,7 +23,7 @@ Column meanings:
 | `wa.get_text` | `data.text` (full pane scrollback) | ✓ | `mcp_tools.rs:1203` `engine.redact_secrets(&text)` |
 | `wa.search` | `data.results[].content`, `data.results[].snippet`, `data.query` | ✓ | `mcp_tools.rs:1601-1619` `Redactor::new()` + `.redact` on each |
 | `wa.state` | `data[].title`, `data[].cwd` | ✓ | The `wa.state` handler now redacts the assembled `McpPaneState` list immediately before serializing the envelope, covering both live panes and distributed panes merged from storage. |
-| `wa.events` | `data.events[].matched_text`, `data.events[].extracted` | indirect ✓ | Events are redacted at emission in `events.rs:280` (`normalized_extracted`) + `:321` (`redactor.redact(&rendered)`), so rows in storage are already clean; wa.events reads from storage and serves them out. Invariant depends on the emission path never being bypassed. |
+| `wa.events` | `data.events[].matched_text`, `data.events[].extracted` | ✓ | Redacted at write time in `runtime.rs:detection_to_stored_event` (Redactor + `redact_json_leaves` on matched_text + extracted string leaves) before persisting `StoredEvent`. All consumers (MCP wa.events, robot events, web /events, replay, storage queries) now see clean rows. Matrix line numbers and "emission only" claim were stale; fixed under ft-xt93w redaction gap audit. |
 | `wa.events_annotate` / `_triage` / `_label` | echoes back the note/label the caller wrote | indirect ✓ | `storage::set_event_note_sync` at `:12603` redacts on write; wa.events_annotate re-reads the stored (already-redacted) value. |
 | `wa.send` (reflects `text` back to caller on dry-run) | `data.injection.summary` | ✓ | Goes through `PolicyGatedInjector` → `policy::Redactor` before audit + summary emission. |
 

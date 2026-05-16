@@ -57,6 +57,7 @@ use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, Memory
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
+use crate::policy::Redactor;
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_async::{RwLock, mpsc, task::JoinHandle, watch};
@@ -4897,7 +4898,32 @@ fn snapshot_trigger_from_user_var(
     }
 }
 
+/// Redact all string leaves in a JSON Value (for extracted capture groups that may contain secrets).
+fn redact_json_leaves(value: &mut serde_json::Value, redactor: &Redactor) {
+    match value {
+        serde_json::Value::String(s) => {
+            *s = redactor.redact(s);
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                redact_json_leaves(v, redactor);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_json_leaves(v, redactor);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Convert a Detection to a StoredEvent for persistence.
+/// Redacts matched_text and string values inside extracted at write time so that
+/// all downstream consumers (storage rows, wa.events, ft robot events, web /events,
+/// replay, etc.) see only redacted content. This makes the "rows in storage are
+/// already clean" invariant true and closes the previous gap where only the
+/// dedupe_key was redacted.
 fn detection_to_stored_event(
     pane_id: u64,
     pane_uuid: Option<&str>,
@@ -4913,6 +4939,12 @@ fn detection_to_stored_event(
         0
     };
     let dedupe_key = format!("{identity_key}:{bucket}");
+
+    let redactor = Redactor::new();
+    let redacted_matched_text = redactor.redact(&detection.matched_text);
+    let mut redacted_extracted = detection.extracted.clone();
+    redact_json_leaves(&mut redacted_extracted, &redactor);
+
     StoredEvent {
         id: 0, // Will be assigned by storage
         pane_id,
@@ -4925,8 +4957,8 @@ fn detection_to_stored_event(
             crate::patterns::Severity::Critical => "critical".to_string(),
         },
         confidence: detection.confidence,
-        extracted: Some(detection.extracted.clone()),
-        matched_text: Some(detection.matched_text.clone()),
+        extracted: Some(redacted_extracted),
+        matched_text: Some(redacted_matched_text),
         segment_id,
         detected_at,
         dedupe_key: Some(dedupe_key),
@@ -5302,6 +5334,59 @@ mod tests {
         assert!(event.dedupe_key.is_some());
         assert_eq!(event.segment_id, Some(123));
         assert!(event.handled_at.is_none());
+    }
+
+    #[test]
+    fn detection_to_stored_event_redacts_secret_payloads_before_storage() {
+        use crate::patterns::{AgentType, Severity};
+
+        let api_key = ["sk-proj-", "abcdefghijklmnopqrstuvwxyz12345678901234567890"].concat();
+        let bearer = [
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+            "eyJzdWIiOiIxMjM0NTY3ODkwIn0.",
+            "abc123_test",
+        ]
+        .concat();
+        let detection = Detection {
+            rule_id: "test.secret".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "secret.detected".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.99,
+            extracted: serde_json::json!({
+                "header": format!("Authorization: Bearer {bearer}"),
+                "nested": {
+                    "api_key": api_key,
+                    "safe": "not-secret"
+                },
+                "array": [
+                    format!("Bearer {bearer}"),
+                    42,
+                    true
+                ]
+            }),
+            matched_text: format!("Authorization: Bearer {bearer}\nOPENAI_API_KEY={api_key}"),
+            span: (0, 1),
+        };
+
+        let event = detection_to_stored_event(7, Some("pane-secret"), &detection, Some(11));
+
+        let matched_text = event
+            .matched_text
+            .as_deref()
+            .expect("matched_text persisted");
+        assert!(!matched_text.contains(&api_key));
+        assert!(!matched_text.contains(&bearer));
+        assert!(matched_text.contains(crate::redactor::REDACTED_MARKER));
+
+        let extracted = event.extracted.expect("extracted persisted");
+        let rendered = extracted.to_string();
+        assert!(!rendered.contains(&api_key));
+        assert!(!rendered.contains(&bearer));
+        assert!(rendered.contains(crate::redactor::REDACTED_MARKER));
+        assert_eq!(extracted["nested"]["safe"], "not-secret");
+        assert_eq!(extracted["array"][1].as_i64(), Some(42));
+        assert_eq!(extracted["array"][2].as_bool(), Some(true));
     }
 
     fn test_detection(event_type: &str, severity: Severity) -> Detection {
