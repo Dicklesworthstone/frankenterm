@@ -21,16 +21,16 @@ use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
+use crate::{
+    CONFIG_DIRS, CellWidth, GpuInfo, IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig,
+    MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop, WebGpuPowerPreference,
+    default_one_point_oh, default_one_point_oh_f64, default_true,
+    default_win32_acrylic_accent_color,
+};
 #[cfg(feature = "lua")]
 use crate::{
-    default_config_with_overrides_applied, CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP,
-    HOME_DIR,
-};
-use crate::{
-    default_one_point_oh, default_one_point_oh_f64, default_true,
-    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
-    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
-    WebGpuPowerPreference, CONFIG_DIRS,
+    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    default_config_with_overrides_applied,
 };
 use anyhow::Context;
 use frankenterm_bidi::ParagraphDirectionHint;
@@ -1203,7 +1203,7 @@ impl Config {
     pub fn update_ulimit(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (no_file_soft, no_file_hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
@@ -1232,7 +1232,7 @@ impl Config {
 
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (nproc_soft, nproc_hard) = getrlimit(Resource::RLIMIT_NPROC)?;
@@ -2523,13 +2523,75 @@ pub enum VerticalWindowContentAlignment {
     Bottom,
 }
 
-#[derive(FromDynamic, ToDynamic, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(ToDynamic, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NewlineCanon {
-    // FIXME: also allow deserialziing from bool
     None,
     LineFeed,
     CarriageReturn,
     CarriageReturnAndLineFeed,
+}
+
+impl NewlineCanon {
+    pub fn variants() -> &'static [&'static str] {
+        &[
+            "None",
+            "LineFeed",
+            "CarriageReturn",
+            "CarriageReturnAndLineFeed",
+        ]
+    }
+}
+
+impl FromDynamic for NewlineCanon {
+    fn from_dynamic(
+        value: &frankenterm_dynamic::Value,
+        _options: frankenterm_dynamic::FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        match value {
+            frankenterm_dynamic::Value::Bool(true) => Ok(Self::CarriageReturnAndLineFeed),
+            frankenterm_dynamic::Value::Bool(false) => Ok(Self::None),
+            frankenterm_dynamic::Value::String(s) => match s.as_str() {
+                "None" => Ok(Self::None),
+                "LineFeed" => Ok(Self::LineFeed),
+                "CarriageReturn" => Ok(Self::CarriageReturn),
+                "CarriageReturnAndLineFeed" => Ok(Self::CarriageReturnAndLineFeed),
+                _ => Err(frankenterm_dynamic::Error::InvalidVariantForType {
+                    variant_name: s.clone(),
+                    type_name: "NewlineCanon",
+                    possible: Self::variants(),
+                }),
+            },
+            frankenterm_dynamic::Value::Object(place) => {
+                if place.len() == 1 {
+                    let (name, _value) = place.iter().next().unwrap();
+
+                    match name {
+                        frankenterm_dynamic::Value::String(name) => {
+                            Err(frankenterm_dynamic::Error::InvalidVariantForType {
+                                variant_name: name.clone(),
+                                type_name: "NewlineCanon",
+                                possible: Self::variants(),
+                            })
+                        }
+                        _ => Err(frankenterm_dynamic::Error::InvalidVariantForType {
+                            variant_name: name.variant_name().to_string(),
+                            type_name: "NewlineCanon",
+                            possible: Self::variants(),
+                        }),
+                    }
+                } else {
+                    Err(frankenterm_dynamic::Error::IncorrectNumberOfEnumKeys {
+                        type_name: "NewlineCanon",
+                        num_keys: place.len(),
+                    })
+                }
+            }
+            other => Err(frankenterm_dynamic::Error::NoConversion {
+                source_type: other.variant_name().to_string(),
+                dest_type: "NewlineCanon",
+            }),
+        }
+    }
 }
 
 #[derive(FromDynamic, ToDynamic, Clone, Copy, Debug, Default)]
@@ -3104,9 +3166,11 @@ mod tests {
 
     #[test]
     fn close_confirmation_does_not_skip_shells_by_default() {
-        assert!(Config::default_config()
-            .skip_close_confirmation_for_processes_named
-            .is_empty());
+        assert!(
+            Config::default_config()
+                .skip_close_confirmation_for_processes_named
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3261,6 +3325,40 @@ mod tests {
         assert_eq!(config.click_interval_ms, 1_500);
     }
 
+    #[test]
+    fn config_from_dynamic_accepts_canonicalize_pasted_newlines_bool_true() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("canonicalize_pasted_newlines".into()),
+            Value::Bool(true),
+        );
+        let config =
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .expect("canonicalize_pasted_newlines=true should parse");
+
+        assert_eq!(
+            config.canonicalize_pasted_newlines,
+            Some(NewlineCanon::CarriageReturnAndLineFeed)
+        );
+    }
+
+    #[test]
+    fn config_from_dynamic_accepts_canonicalize_pasted_newlines_bool_false() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("canonicalize_pasted_newlines".into()),
+            Value::Bool(false),
+        );
+        let config =
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .expect("canonicalize_pasted_newlines=false should parse");
+
+        assert_eq!(
+            config.canonicalize_pasted_newlines,
+            Some(NewlineCanon::None)
+        );
+    }
+
     // ── compute_*_dir helpers ──────────────────────────────────
 
     #[test]
@@ -3298,5 +3396,40 @@ mod tests {
             NewlineCanon::CarriageReturn,
             NewlineCanon::CarriageReturnAndLineFeed
         );
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_accepts_string_variant() {
+        let val = Value::String("LineFeed".into());
+        let result = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, NewlineCanon::LineFeed);
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_accepts_bool_true_as_crlf() {
+        let val = Value::Bool(true);
+        let result = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, NewlineCanon::CarriageReturnAndLineFeed);
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_accepts_bool_false_as_none() {
+        let val = Value::Bool(false);
+        let result = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        assert_eq!(result, NewlineCanon::None);
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_rejects_invalid_string() {
+        let val = Value::String("InvalidValue".into());
+        let result = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn newline_canon_from_dynamic_reports_type_name_for_invalid_type() {
+        let val = Value::U64(42);
+        let err = NewlineCanon::from_dynamic(&val, FromDynamicOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("NewlineCanon"));
     }
 }
