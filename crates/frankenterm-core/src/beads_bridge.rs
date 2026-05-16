@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::beads_types::{
@@ -19,7 +21,7 @@ use crate::subprocess_bridge::SubprocessBridge;
 /// High-level beads bridge wrapping the `br` CLI.
 #[derive(Debug, Clone)]
 pub struct BeadsBridge {
-    bridge: SubprocessBridge<Vec<BeadSummary>>,
+    bridge: SubprocessBridge<Value>,
 }
 
 /// Backpressure tier derived from open-bead counts.
@@ -69,10 +71,7 @@ impl BeadsBridge {
     /// Returns an empty vec on any failure (fail-open).
     pub fn list_all(&self) -> Vec<BeadSummary> {
         match self.bridge.invoke(&["list", "--json"]) {
-            Ok(beads) => {
-                debug!(bridge = "br", count = beads.len(), "listed beads");
-                beads
-            }
+            Ok(value) => self.parse_summary_rows(value, "beads list"),
             Err(err) => {
                 warn!(bridge = "br", error = %err, "beads list failed, degrading gracefully");
                 Vec::new()
@@ -83,10 +82,7 @@ impl BeadsBridge {
     /// List open beads only.
     pub fn list_open(&self) -> Vec<BeadSummary> {
         match self.bridge.invoke(&["list", "--status=open", "--json"]) {
-            Ok(beads) => {
-                debug!(bridge = "br", beads_open = beads.len(), "listed open beads");
-                beads
-            }
+            Ok(value) => self.parse_summary_rows(value, "open beads list"),
             Err(err) => {
                 warn!(bridge = "br", error = %err, unavailable = true, "open beads list failed");
                 Vec::new()
@@ -99,7 +95,14 @@ impl BeadsBridge {
     /// Returns `None` on failure (fail-open).
     pub fn show(&self, id: &str) -> Option<BeadSummary> {
         match self.bridge.invoke(&["show", id, "--json"]) {
-            Ok(mut beads) => {
+            Ok(value) => {
+                let mut beads = match parse_br_rows::<BeadSummary>(value) {
+                    Ok(beads) => beads,
+                    Err(err) => {
+                        warn!(bridge = "br", id, error = %err, "bead show parse failed");
+                        return None;
+                    }
+                };
                 if beads.is_empty() {
                     debug!(bridge = "br", id, "bead not found");
                     None
@@ -122,14 +125,7 @@ impl BeadsBridge {
             .bridge
             .invoke(&["list", "--all", "--limit", "0", "--json"])
         {
-            Ok(beads) => {
-                debug!(
-                    bridge = "br",
-                    count = beads.len(),
-                    "listed beads including closed items"
-                );
-                beads
-            }
+            Ok(value) => self.parse_summary_rows(value, "beads list --all"),
             Err(err) => {
                 warn!(
                     bridge = "br",
@@ -150,14 +146,27 @@ impl BeadsBridge {
             return Vec::new();
         }
 
-        let detail_bridge: SubprocessBridge<Vec<BeadIssueDetail>> =
+        let detail_bridge: SubprocessBridge<Value> =
             SubprocessBridge::new(self.bridge.binary_name());
         let mut details = Vec::with_capacity(summaries.len());
 
         for summary in summaries {
             let issue_id = summary.id.clone();
             match detail_bridge.invoke(&["show", &issue_id, "--json"]) {
-                Ok(mut rows) => {
+                Ok(value) => {
+                    let mut rows = match parse_br_rows::<BeadIssueDetail>(value) {
+                        Ok(rows) => rows,
+                        Err(err) => {
+                            warn!(
+                                bridge = "br",
+                                issue_id,
+                                error = %err,
+                                "detail parse failed, using partial graph fallback"
+                            );
+                            details.push(BeadIssueDetail::from_summary(summary));
+                            continue;
+                        }
+                    };
                     if let Some(mut detail) = rows.pop() {
                         detail.ingest_warning = None;
                         details.push(detail);
@@ -223,11 +232,42 @@ impl BeadsBridge {
     pub fn backpressure_default(&self) -> BeadsBackpressure {
         self.backpressure(&BeadsBackpressureConfig::default())
     }
+
+    fn parse_summary_rows(&self, value: Value, operation: &'static str) -> Vec<BeadSummary> {
+        match parse_br_rows::<BeadSummary>(value) {
+            Ok(beads) => {
+                debug!(
+                    bridge = "br",
+                    operation,
+                    count = beads.len(),
+                    "parsed beads rows"
+                );
+                beads
+            }
+            Err(err) => {
+                warn!(bridge = "br", operation, error = %err, "beads output parse failed");
+                Vec::new()
+            }
+        }
+    }
 }
 
 impl Default for BeadsBridge {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn parse_br_rows<T: DeserializeOwned>(value: Value) -> Result<Vec<T>, serde_json::Error> {
+    match value {
+        Value::Object(mut object) => {
+            if let Some(rows) = object.remove("issues") {
+                serde_json::from_value(rows)
+            } else {
+                serde_json::from_value(Value::Object(object)).map(|row| vec![row])
+            }
+        }
+        rows => serde_json::from_value(rows),
     }
 }
 
@@ -237,6 +277,7 @@ mod tests {
     use crate::beads_types::{
         BeadDependencyRef, BeadIssueDetail, BeadIssueType, BeadResolverReasonCode, BeadStatus,
     };
+    use serde_json::json;
 
     fn sample_bead(id: &str, status: BeadStatus, priority: u8) -> BeadSummary {
         BeadSummary {
@@ -465,6 +506,70 @@ mod tests {
         // With no data, actionable count is 0 → Green
         let tier = bridge.backpressure_default();
         assert_eq!(tier, BeadsBackpressure::Green);
+    }
+
+    // -------------------------------------------------------------------------
+    // br JSON output shape parsing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_br_rows_accepts_legacy_array() {
+        let rows: Vec<BeadSummary> = parse_br_rows(json!([
+            {
+                "id": "ft-a",
+                "title": "legacy array",
+                "status": "open",
+                "priority": 2,
+                "issue_type": "task"
+            }
+        ]))
+        .expect("legacy br list rows parse");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "ft-a");
+        assert_eq!(rows[0].status, BeadStatus::Open);
+    }
+
+    #[test]
+    fn test_parse_br_rows_accepts_current_issues_envelope() {
+        let rows: Vec<BeadSummary> = parse_br_rows(json!({
+            "issues": [
+                {
+                    "id": "ft-b",
+                    "title": "current envelope",
+                    "status": "in_progress",
+                    "priority": 1,
+                    "issue_type": "bug",
+                    "assignee": "Codex"
+                }
+            ],
+            "total": 1,
+            "limit": 50,
+            "offset": 0,
+            "has_more": false
+        }))
+        .expect("current br list envelope parses");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "ft-b");
+        assert_eq!(rows[0].status, BeadStatus::InProgress);
+        assert_eq!(rows[0].assignee.as_deref(), Some("Codex"));
+    }
+
+    #[test]
+    fn test_parse_br_rows_accepts_single_show_object() {
+        let rows: Vec<BeadSummary> = parse_br_rows(json!({
+            "id": "ft-c",
+            "title": "single show object",
+            "status": "blocked",
+            "priority": 3,
+            "issue_type": "task"
+        }))
+        .expect("single br show object parses");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "ft-c");
+        assert_eq!(rows[0].status, BeadStatus::Blocked);
     }
 
     // -------------------------------------------------------------------------
