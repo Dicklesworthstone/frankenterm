@@ -24,7 +24,12 @@ pub struct CircuitBreakerTelemetry {
     trips_total: u64,
     /// Total times the circuit reset from HalfOpen to Closed.
     resets_total: u64,
-    /// Total half-open probe attempts (allow() returning true in HalfOpen).
+    /// Total Open → HalfOpen transitions (one increment per
+    /// cooldown-elapsed `allow()` call that moves the breaker
+    /// out of Open). Does NOT count subsequent `allow()` calls
+    /// while already in HalfOpen — see
+    /// `tests/proptest_circuit_breaker_telemetry.rs` for the
+    /// transition-tracking contract that pins this counter.
     half_open_probes: u64,
     /// Total record_success() calls.
     successes_recorded: u64,
@@ -62,7 +67,10 @@ pub struct CircuitBreakerTelemetrySnapshot {
     pub trips_total: u64,
     /// Total times the circuit reset from HalfOpen to Closed.
     pub resets_total: u64,
-    /// Total half-open probe attempts.
+    /// Total Open → HalfOpen transitions. See the field doc on
+    /// [`CircuitBreakerTelemetry::half_open_probes`] for the
+    /// exact contract — this counts state transitions, not every
+    /// `allow()` call while in HalfOpen.
     pub half_open_probes: u64,
     /// Total record_success() calls.
     pub successes_recorded: u64,
@@ -1293,5 +1301,57 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: CircuitBreakerTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    /// `half_open_probes` counts state TRANSITIONS (Open →
+    /// HalfOpen), not every `allow()` call while in HalfOpen.
+    /// With `success_threshold > 1`, several `allow()` calls
+    /// happen within a single HalfOpen window between probes
+    /// closing the breaker — only the first transition counts.
+    /// This pins the contract described in
+    /// `tests/proptest_circuit_breaker_telemetry.rs` and the
+    /// field doc on `half_open_probes`.
+    #[test]
+    fn telemetry_half_open_probes_counts_transitions_not_calls() {
+        let mut breaker = CircuitBreaker::new(CircuitBreakerConfig::new(
+            1,
+            2, // success_threshold=2 forces multiple HalfOpen allow() calls
+            Duration::from_millis(0),
+        ));
+
+        // Trip the breaker.
+        breaker.record_failure();
+        assert!(matches!(breaker.status().state, CircuitStateKind::Open));
+
+        // First allow(): transitions Open → HalfOpen, counts.
+        assert!(breaker.allow());
+        assert!(matches!(
+            breaker.status().state,
+            CircuitStateKind::HalfOpen
+        ));
+        let snap_after_transition = breaker.telemetry().snapshot();
+        assert_eq!(snap_after_transition.half_open_probes, 1);
+
+        // Record one success — `success_threshold=2` so we stay
+        // HalfOpen and `consecutive_successes` advances to 1.
+        breaker.record_success();
+        assert!(matches!(
+            breaker.status().state,
+            CircuitStateKind::HalfOpen
+        ));
+
+        // Second `allow()` call while still in HalfOpen — must
+        // NOT bump the counter. This is the regression the
+        // strengthened doc warns about.
+        assert!(breaker.allow());
+        let snap_after_second_call = breaker.telemetry().snapshot();
+        assert_eq!(
+            snap_after_second_call.half_open_probes, 1,
+            "subsequent allow() in HalfOpen must not increment half_open_probes"
+        );
+
+        // Second success closes the breaker.
+        breaker.record_success();
+        assert!(matches!(breaker.status().state, CircuitStateKind::Closed));
     }
 }
