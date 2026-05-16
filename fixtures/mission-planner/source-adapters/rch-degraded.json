@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_sources.v1",
+  "generated_at_ms": 1778911560000,
+  "source_set_id": "rch-degraded",
+  "adapter_policy": {
+    "dry_run_only": true,
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "snapshots": [
+    {
+      "source_id": "rch-proof-posture",
+      "source_kind": "rch",
+      "state": "blocked",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778911560000,
+      "freshness_ms": 0,
+      "command_or_api": "rch diagnose --json --dry-run -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "rch.no_workers_passed_health",
+        "rch.remote_cargo_reached_false",
+        "rch.latest_release_is_installed",
+        "source.redacted_summary_only"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": "RCH cannot currently supply a trustworthy remote Cargo proof lane.",
+      "payload": {
+        "summary": "Remote proof is blocked before Cargo/rustc/test verdict.",
+        "counters": {
+          "healthy_workers_reported": 5,
+          "remote_cargo_reached": 0,
+          "test_binary_reached": 0
+        },
+        "rows": [
+          {
+            "row_id": "ft-4tp7g",
+            "state": "blocked",
+            "reason_codes": [
+              "rch.no_workers_passed_health",
+              "rch.remote_cargo_reached_false"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/rch-degraded.json"
+            ]
+          },
+          {
+            "row_id": "rch-update-check",
+            "state": "blocked",
+            "reason_codes": [
+              "rch.latest_release_is_installed",
+              "rch.source_fix_not_released"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/rch-degraded.json"
+            ]
+          }
+        ]
+      },
+      "artifact_paths": [
+        "fixtures/mission-planner/source-adapters/rch-degraded.json"
+      ]
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_sources.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "RCH adapter fixtures store worker counts and reason codes, not SSH logs."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-sources.json",
+    "fixtures/mission-planner/source-adapters/rch-degraded.json"
+  ]
+}

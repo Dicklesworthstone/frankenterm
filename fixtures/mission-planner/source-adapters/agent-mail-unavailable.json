@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_sources.v1",
+  "generated_at_ms": 1778911500000,
+  "source_set_id": "agent-mail-unavailable",
+  "adapter_policy": {
+    "dry_run_only": true,
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "snapshots": [
+    {
+      "source_id": "agent-mail-session",
+      "source_kind": "agent_mail",
+      "state": "unavailable",
+      "freshness_state": "not_collected",
+      "collected_at_ms": null,
+      "freshness_ms": null,
+      "command_or_api": "macro_start_session",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "agent_mail.database_error",
+        "agent_mail.unavailable_after_retry",
+        "fallback.beads_only",
+        "source.redacted_summary_only"
+      ],
+      "unavailable_reason": "Agent Mail returned a database error after the allowed retry.",
+      "degraded_reason": null,
+      "payload": {
+        "summary": "Agent Mail is unavailable; use Beads/git fallback and do not repair or restart the service.",
+        "counters": {
+          "attempt_count": 2,
+          "ack_required_count": null
+        },
+        "rows": [
+          {
+            "row_id": "macro_start_session",
+            "state": "unavailable",
+            "reason_codes": [
+              "agent_mail.database_error"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
+            ]
+          }
+        ]
+      },
+      "artifact_paths": [
+        "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
+      ]
+    },
+    {
+      "source_id": "beads-fallback",
+      "source_kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778911500000,
+      "freshness_ms": 0,
+      "command_or_api": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_available",
+        "fallback.beads_only",
+        "source.redacted_summary_only"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "payload": {
+        "summary": "Beads fallback can still expose ready work and stale-reopen posture.",
+        "counters": {
+          "ready_count": 1,
+          "stale_candidate_count": 0
+        },
+        "rows": [
+          {
+            "row_id": "ft-auy2g.2",
+            "state": "available",
+            "reason_codes": [
+              "beads.ready_available"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
+            ]
+          }
+        ]
+      },
+      "artifact_paths": [
+        "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
+      ]
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_sources.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Agent Mail failure payload stores the error class, not mailbox bodies."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-sources.json",
+    "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
+  ]
+}

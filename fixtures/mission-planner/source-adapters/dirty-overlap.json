@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_sources.v1",
+  "generated_at_ms": 1778911620000,
+  "source_set_id": "dirty-overlap",
+  "adapter_policy": {
+    "dry_run_only": true,
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "snapshots": [
+    {
+      "source_id": "git-dirty-overlap",
+      "source_kind": "git",
+      "state": "degraded",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778911620000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --branch --untracked-files=all",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.dirty_paths_present",
+        "git.dirty_overlap_risk",
+        "source.redacted_summary_only"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": "Tracked dirty paths overlap an active renderer proof lane and should not be touched by this planner slice.",
+      "payload": {
+        "summary": "Dirty tracked renderer and atlas paths require scoped planning work.",
+        "counters": {
+          "dirty_count": 4,
+          "tracked_dirty_count": 4,
+          "overlap_count": 4
+        },
+        "rows": [
+          {
+            "row_id": "crates/frankenterm-core/Cargo.toml",
+            "state": "degraded",
+            "reason_codes": [
+              "git.dirty_overlap_risk"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
+            ]
+          },
+          {
+            "row_id": "crates/frankenterm-core/benches/atlas_stability.rs",
+            "state": "degraded",
+            "reason_codes": [
+              "git.dirty_overlap_risk"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
+            ]
+          },
+          {
+            "row_id": "crates/frankenterm-core/src/tui/ftui_backend.rs",
+            "state": "degraded",
+            "reason_codes": [
+              "git.dirty_overlap_risk"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
+            ]
+          },
+          {
+            "row_id": "crates/frankenterm-gui/src/frontend.rs",
+            "state": "degraded",
+            "reason_codes": [
+              "git.dirty_overlap_risk"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
+            ]
+          }
+        ]
+      },
+      "artifact_paths": [
+        "fixtures/mission-planner/source-adapters/dirty-overlap.json"
+      ]
+    },
+    {
+      "source_id": "beads-active-owner",
+      "source_kind": "beads",
+      "state": "degraded",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778911620000,
+      "freshness_ms": 0,
+      "command_or_api": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.in_progress_active",
+        "beads.stale_do_not_reopen",
+        "source.redacted_summary_only"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": "Active in-progress bead is recent; no stale reopen action is allowed.",
+      "payload": {
+        "summary": "Active renderer proof bead is recent and must be treated as owned while Agent Mail is unavailable.",
+        "counters": {
+          "in_progress_count": 1,
+          "stale_candidate_count": 0
+        },
+        "rows": [
+          {
+            "row_id": "ft-tf6g3.3.10",
+            "state": "degraded",
+            "reason_codes": [
+              "beads.in_progress_active",
+              "beads.stale_do_not_reopen"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
+            ]
+          }
+        ]
+      },
+      "artifact_paths": [
+        "fixtures/mission-planner/source-adapters/dirty-overlap.json"
+      ]
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_sources.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Dirty-overlap fixture stores path ids and reason codes only."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-sources.json",
+    "fixtures/mission-planner/source-adapters/dirty-overlap.json"
+  ]
+}

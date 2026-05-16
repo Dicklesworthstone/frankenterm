@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_sources.v1",
+  "generated_at_ms": 1778911440000,
+  "source_set_id": "healthy",
+  "adapter_policy": {
+    "dry_run_only": true,
+    "raw_pane_content_allowed": false,
+    "service_mutation_allowed": false,
+    "destructive_actions_allowed": false,
+    "local_cargo_proof_allowed": false
+  },
+  "snapshots": [
+    {
+      "source_id": "beads-ready",
+      "source_kind": "beads",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778911440000,
+      "freshness_ms": 0,
+      "command_or_api": "br ready --json",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_available",
+        "source.redacted_summary_only"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "payload": {
+        "summary": "One ready mission-planner child is available.",
+        "counters": {
+          "ready_count": 1,
+          "in_progress_count": 0,
+          "stale_candidate_count": 0
+        },
+        "rows": [
+          {
+            "row_id": "ft-auy2g.2",
+            "state": "available",
+            "reason_codes": [
+              "beads.ready_available"
+            ],
+            "artifact_paths": [
+              "fixtures/mission-planner/source-adapters/healthy.json"
+            ]
+          }
+        ]
+      },
+      "artifact_paths": [
+        "fixtures/mission-planner/source-adapters/healthy.json"
+      ]
+    },
+    {
+      "source_id": "git-clean",
+      "source_kind": "git",
+      "state": "available",
+      "freshness_state": "fresh",
+      "collected_at_ms": 1778911440000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --branch --untracked-files=all",
+      "evidence_level": "fixture",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.clean_for_scope",
+        "source.redacted_summary_only"
+      ],
+      "unavailable_reason": null,
+      "degraded_reason": null,
+      "payload": {
+        "summary": "No dirty paths overlap the planned docs/fixtures slice.",
+        "counters": {
+          "dirty_count": 0,
+          "overlap_count": 0
+        },
+        "rows": []
+      },
+      "artifact_paths": [
+        "fixtures/mission-planner/source-adapters/healthy.json"
+      ]
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_sources.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Adapter fixtures store counters, ids, and reason codes only."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-sources.json",
+    "fixtures/mission-planner/source-adapters/healthy.json"
+  ]
+}

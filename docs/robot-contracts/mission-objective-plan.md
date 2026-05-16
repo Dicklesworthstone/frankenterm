@@ -15,6 +15,10 @@ assignment occurs.
 The output contract is `ft.mission_objective_plan.v1`, defined in
 `docs/json-schema/ft-mission-objective-plan.json`.
 
+Source-adapter snapshots that feed this plan are defined separately in
+`docs/robot-contracts/mission-objective-plan-adapters.md` and
+`docs/json-schema/ft-mission-objective-sources.json`.
+
 ## Contract Shape
 
 An objective plan records:

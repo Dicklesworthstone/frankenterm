@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-mission-objective-sources.json",
+  "title": "FrankenTerm Mission Objective Source Snapshots",
+  "description": "Versioned source-adapter snapshot bundle for mission objective planning.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "source_set_id",
+    "adapter_policy",
+    "snapshots",
+    "redaction_policy",
+    "raw_pane_content_stored",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.mission_objective_sources.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_set_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "adapter_policy": {
+      "$ref": "#/$defs/adapter_policy"
+    },
+    "snapshots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/source_snapshot"
+      }
+    },
+    "redaction_policy": {
+      "$ref": "#/$defs/redaction_policy"
+    },
+    "raw_pane_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "artifact_paths": {
+      "$ref": "#/$defs/string_array"
+    }
+  },
+  "$defs": {
+    "string_array": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "adapter_policy": {
+      "type": "object",
+      "required": [
+        "dry_run_only",
+        "raw_pane_content_allowed",
+        "service_mutation_allowed",
+        "destructive_actions_allowed",
+        "local_cargo_proof_allowed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "dry_run_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "service_mutation_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "destructive_actions_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_cargo_proof_allowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "beads",
+        "agent_mail",
+        "rch",
+        "git",
+        "robot",
+        "blocker_radar",
+        "resource_cockpit",
+        "manual",
+        "fixture"
+      ]
+    },
+    "source_state": {
+      "type": "string",
+      "enum": [
+        "available",
+        "degraded",
+        "unavailable",
+        "stale",
+        "blocked"
+      ]
+    },
+    "freshness_state": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "stale",
+        "unknown",
+        "not_collected"
+      ]
+    },
+    "evidence_level": {
+      "type": "string",
+      "enum": [
+        "live_command",
+        "retained_artifact",
+        "fixture",
+        "manual_note",
+        "not_collected"
+      ]
+    },
+    "snapshot_payload": {
+      "type": "object",
+      "required": [
+        "summary",
+        "counters",
+        "rows"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "counters": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "integer",
+              "number",
+              "string",
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/source_row"
+          }
+        }
+      }
+    },
+    "source_row": {
+      "type": "object",
+      "required": [
+        "row_id",
+        "state",
+        "reason_codes",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "row_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "$ref": "#/$defs/source_state"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "source_kind",
+        "state",
+        "freshness_state",
+        "collected_at_ms",
+        "freshness_ms",
+        "command_or_api",
+        "evidence_level",
+        "redacted",
+        "raw_pane_content_stored",
+        "reason_codes",
+        "unavailable_reason",
+        "degraded_reason",
+        "payload",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_kind": {
+          "$ref": "#/$defs/source_kind"
+        },
+        "state": {
+          "$ref": "#/$defs/source_state"
+        },
+        "freshness_state": {
+          "$ref": "#/$defs/freshness_state"
+        },
+        "collected_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "freshness_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "command_or_api": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_level": {
+          "$ref": "#/$defs/evidence_level"
+        },
+        "redacted": {
+          "type": "boolean",
+          "const": true
+        },
+        "raw_pane_content_stored": {
+          "type": "boolean",
+          "const": false
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        },
+        "unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "degraded_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "$ref": "#/$defs/snapshot_payload"
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "required": [
+        "policy_id",
+        "raw_pane_content_allowed",
+        "secret_material_allowed",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "policy_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "secret_material_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "notes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    }
+  }
+}
