@@ -301,7 +301,7 @@ for i, (parent, title, desc, ac) in enumerate(tasks_data):
     # To keep it simple and perfectly ordered: each subtask depends on the previous subtask.
     deps_arg = []
     if prev_id:
-        deps_arg = ["--deps", f"blocks:{prev_id}"]
+        deps_arg = ["--deps", f"blocked-by:{prev_id}"]
         
     print(f"Creating: {title}")
     
