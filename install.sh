@@ -47,12 +47,17 @@ check_requirements() {
 install_ft() {
     log_info "Installing ft (frankenterm)..."
 
+    local version_args=()
+    if [[ -n "${INSTALL_VERSION:-}" ]]; then
+        version_args=("--tag" "$INSTALL_VERSION")
+    fi
+
     # Use cargo install from git
-    if cargo install --git "$REPO_URL" frankenterm --bin "$BINARY_NAME" --locked; then
+    if cargo install --git "$REPO_URL" frankenterm --bin "$BINARY_NAME" "${version_args[@]:-}" --locked; then
         log_success "ft installed successfully"
     else
         log_warn "Locked install failed, trying without --locked"
-        cargo install --git "$REPO_URL" frankenterm --bin "$BINARY_NAME"
+        cargo install --git "$REPO_URL" frankenterm --bin "$BINARY_NAME" "${version_args[@]:-}"
     fi
 }
 
@@ -85,12 +90,12 @@ show_info() {
     echo ""
     echo "Usage:"
     echo "  ft help          - Show all commands"
-    echo "  ft spawn         - Launch agent in terminal"
-    echo "  ft list          - List active sessions"
-    echo "  ft monitor       - Real-time monitoring"
+    echo "  ft watch         - Start the daemon"
+    echo "  ft list          - List active panes"
+    echo "  ft status        - Real-time monitoring"
     echo ""
     echo "Quick start:"
-    echo "  ft spawn cc --prompt 'Hello Claude'"
+    echo "  ft watch --foreground"
     echo ""
     echo "Documentation:"
     echo "  https://github.com/Dicklesworthstone/frankenterm"
@@ -98,6 +103,19 @@ show_info() {
 }
 
 main() {
+    INSTALL_VERSION=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --version|-v)
+                INSTALL_VERSION="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
     echo "========================================="
     echo "  ft (FrankenTerm) Installer"
     echo "========================================="
