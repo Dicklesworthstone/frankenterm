@@ -499,7 +499,8 @@ pub mod render_snapshot_guard;
 pub mod render_snapshot_jsonl;
 pub mod replay_fixture_harvest;
 pub mod reports;
-pub mod repro_dedup_bug;
+#[cfg(test)]
+mod repro_dedup_bug;
 pub mod reservoir_sampler;
 pub mod resize_crash_forensics;
 pub mod resize_invariants;
