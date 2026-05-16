@@ -436,10 +436,15 @@ fn validate_relative_path(
     path: &str,
 ) -> Result<(), DemoScenarioManifestError> {
     let parsed = Path::new(path);
-    if parsed.is_absolute()
-        || parsed
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+    if path.contains('\\')
+        || path.contains(':')
+        || parsed.is_absolute()
+        || parsed.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
     {
         return Err(DemoScenarioManifestError::UnsafePath {
             scenario_id: scenario_id.to_string(),
@@ -487,9 +492,9 @@ fn reject_secret_shaped_text(
     value: &str,
 ) -> Result<(), DemoScenarioManifestError> {
     let lower = value.to_ascii_lowercase();
-    let secret_like = value.contains("sk-")
-        || value.contains("Bearer ")
-        || value.contains("BEGIN PRIVATE KEY")
+    let secret_like = lower.contains("sk-")
+        || lower.contains("bearer ")
+        || lower.contains("begin private key")
         || lower.contains("password=")
         || lower.contains("api_key")
         || lower.contains("secret=");
@@ -558,6 +563,18 @@ mod tests {
     }
 
     #[test]
+    fn platform_specific_paths_fail_closed() {
+        let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
+            .expect("demo manifest fixture should validate");
+        manifest.scenarios[0].scenario_path = r"C:\secret.yaml".to_string();
+        assert!(matches!(
+            manifest.validate(),
+            Err(DemoScenarioManifestError::UnsafePath { scenario_id, field, .. })
+                if scenario_id == "quickstart" && field == "scenario_path"
+        ));
+    }
+
+    #[test]
     fn missing_required_degradation_reason_fails_closed() {
         let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
             .expect("demo manifest fixture should validate");
@@ -576,7 +593,7 @@ mod tests {
     fn secret_shaped_text_fails_closed() {
         let mut manifest = DemoScenarioManifest::from_json(FIXTURE_MANIFEST)
             .expect("demo manifest fixture should validate");
-        manifest.scenarios[0].purpose = "prove redaction with Bearer token".to_string();
+        manifest.scenarios[0].purpose = "prove redaction with bearer token".to_string();
         assert!(matches!(
             manifest.validate(),
             Err(DemoScenarioManifestError::SecretShapedText { scenario_id, field })

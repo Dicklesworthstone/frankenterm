@@ -64,7 +64,7 @@ The core validator rejects:
 - unsupported schema versions
 - empty manifests
 - duplicate or unstable ids
-- absolute paths or paths containing `..`
+- absolute paths, paths containing `..`, or platform-specific path syntax
 - non-YAML scenario paths
 - empty required lists
 - missing degradation reason codes
