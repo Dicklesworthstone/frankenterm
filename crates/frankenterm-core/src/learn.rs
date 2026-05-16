@@ -1,8 +1,8 @@
-//! Interactive tutorial engine for wa
+//! Interactive tutorial engine for FrankenTerm
 //!
 //! Provides a guided onboarding experience with:
 //! - State machine tracking progress through exercises
-//! - Persistent progress storage in `~/.config/wa/learn.json`
+//! - Persistent progress storage in `~/.config/ft/learn.json`
 //! - CLI integration via `ft learn` commands
 //!
 //! # Example
@@ -198,7 +198,7 @@ pub const BUILTIN_ACHIEVEMENTS: &[AchievementDefinition] = &[
     AchievementDefinition {
         id: "wa_master",
         name: "ft Master",
-        description: "Completed all tracks and mastered wa",
+        description: "Completed all tracks and mastered FrankenTerm",
         icon: '\u{1F451}', // crown
         rarity: Rarity::Epic,
         secret: false,
@@ -318,7 +318,7 @@ pub enum Requirement {
     AgentPresent,
     /// The ft watcher daemon must be running.
     WatcherRunning,
-    /// The wa database must contain data (segments/events).
+    /// The FrankenTerm database must contain data (segments/events).
     DbHasData,
     /// ft configuration (ft.toml) must exist.
     WaConfigured,
@@ -469,7 +469,7 @@ impl TutorialEngine {
                         id: "basics.5".into(),
                         title: "Your first event".into(),
                         description:
-                            "Inspect detections and understand what wa records when patterns match."
+                            "Inspect detections and understand what FrankenTerm records when patterns match."
                                 .into(),
                         instructions: vec![
                             "Run: ft events".into(),
@@ -493,7 +493,7 @@ impl TutorialEngine {
                         id: "events.1".into(),
                         title: "What are events?".into(),
                         description:
-                            "Events are meaningful terminal occurrences wa detects via pattern rules."
+                            "Events are meaningful terminal occurrences FrankenTerm detects via pattern rules."
                                 .into(),
                         instructions: vec![
                             "Review: events represent things like usage limits, compaction, and errors.".into(),
@@ -535,7 +535,7 @@ impl TutorialEngine {
                         title: "Search events and output".into(),
                         description: "Use FTS queries to find relevant event context".into(),
                         instructions: vec![
-                            "Run: wa query \"compaction\"".into(),
+                            "Run: ft search \"compaction\"".into(),
                             "Try at least one alternate search term and compare results.".into(),
                         ],
                         verification_command: None,
@@ -615,7 +615,7 @@ impl TutorialEngine {
                             "Understand allow/deny/require-approval decisions before actions run."
                                 .into(),
                         instructions: vec![
-                            "Review why wa may require approval for risky actions.".into(),
+                            "Review why FrankenTerm may require approval for risky actions.".into(),
                             "Goal: understand safety checks are intentional guardrails.".into(),
                         ],
                         verification_command: None,
@@ -793,7 +793,7 @@ impl TutorialEngine {
                                 .into(),
                         instructions: vec![
                             "Review: pattern packs contain rules with anchors (fast string match) and optional regex (extraction).".into(),
-                            "User packs live in ~/.config/wa/patterns/ or .ft/patterns/ and follow the same format.".into(),
+                            "User packs live in ~/.config/ft/patterns/ or .ft/patterns/ and follow the same format.".into(),
                             "Goal: understand the pack format (name, version, rules[]) and rule fields (id, anchors, regex, severity).".into(),
                         ],
                         verification_command: None,
@@ -808,7 +808,7 @@ impl TutorialEngine {
                             "Write a custom pattern rule in TOML and save it as a user pack."
                                 .into(),
                         instructions: vec![
-                            "Create ~/.config/wa/patterns/my-rules.toml with a rule definition.".into(),
+                            "Create ~/.config/ft/patterns/my-rules.toml with a rule definition.".into(),
                             "Example rule: id=\"myorg.deploy_alert\", anchors=[\"[DEPLOY]\"], severity=\"warning\".".into(),
                             "Run: ft rules list -- your custom rule should appear.".into(),
                         ],
@@ -853,7 +853,7 @@ impl TutorialEngine {
                             "Events across panes can be correlated by timestamp to understand cross-agent interactions."
                                 .into(),
                         instructions: vec![
-                            "Run: wa timeline -- view interleaved events from all panes.".into(),
+                            "Run: ft timeline -- view interleaved events from all panes.".into(),
                             "Note how events from different agents are ordered chronologically.".into(),
                             "Goal: use timeline to diagnose cascading failures across agents.".into(),
                         ],
@@ -869,8 +869,8 @@ impl TutorialEngine {
                             "Use advanced full-text search with boolean operators to find specific output."
                                 .into(),
                         instructions: vec![
-                            "Run: wa query \"error AND codex NOT timeout\"".into(),
-                            "Try prefix matching: wa query \"deploy*\"".into(),
+                            "Run: ft search \"error AND codex NOT timeout\"".into(),
+                            "Try prefix matching: ft search \"deploy*\"".into(),
                             "Goal: learn FTS5 boolean syntax for precise searches.".into(),
                         ],
                         verification_command: None,
@@ -885,9 +885,9 @@ impl TutorialEngine {
                             "Export captured data for offline analysis or integration with other tools."
                                 .into(),
                         instructions: vec![
-                            "Run: wa export --format jsonl".into(),
+                            "Run: ft export --format jsonl".into(),
                             "Each line is a self-contained JSON record suitable for jq, pandas, or log aggregators.".into(),
-                            "Goal: integrate wa data into your existing observability pipeline.".into(),
+                            "Goal: integrate FrankenTerm data into your existing observability pipeline.".into(),
                         ],
                         verification_command: None,
                         verification_pattern: None,
@@ -898,7 +898,7 @@ impl TutorialEngine {
                         id: "advanced.8".into(),
                         title: "Explainability with ft why".into(),
                         description:
-                            "Ask wa to explain its decisions: why a detection fired, why a workflow ran."
+                            "Ask FrankenTerm to explain its decisions: why a detection fired, why a workflow ran."
                                 .into(),
                         instructions: vec![
                             "Run: ft why <event-id> -- to trace a detection back to its rule and workflow.".into(),
@@ -916,9 +916,9 @@ impl TutorialEngine {
                         description:
                             "Review everything you have learned across all five tracks.".into(),
                         instructions: vec![
-                            "Run: wa learn --status -- review your progress across all tracks.".into(),
-                            "Run: wa learn --achievements -- see your achievement collection.".into(),
-                            "You have mastered wa: watching, detection, workflows, robot mode, and advanced techniques.".into(),
+                            "Run: ft learn --status -- review your progress across all tracks.".into(),
+                            "Run: ft learn --achievements -- see your achievement collection.".into(),
+                            "You have mastered FrankenTerm: watching, detection, workflows, robot mode, and advanced techniques.".into(),
                         ],
                         verification_command: None,
                         verification_pattern: None,
@@ -1135,7 +1135,7 @@ impl TutorialEngine {
             }
         }
 
-        // wa Master — all tracks completed (same condition as completionist but Epic tier)
+        // ft Master — all tracks completed (same condition as completionist but Epic tier)
         if !has("wa_master") {
             let all_tracks = self.tracks.iter().all(|t| {
                 t.exercises
@@ -1146,7 +1146,7 @@ impl TutorialEngine {
                 to_add.push((
                     "wa_master".into(),
                     "ft Master".into(),
-                    "Completed all tracks and mastered wa".into(),
+                    "Completed all tracks and mastered FrankenTerm".into(),
                 ));
             }
         }

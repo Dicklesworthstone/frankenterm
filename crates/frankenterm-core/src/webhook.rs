@@ -126,6 +126,8 @@ impl WebhookEndpointConfig {
 /// Webhook payload type (shared with other notification senders).
 pub type WebhookPayload = NotificationPayload;
 
+const WEBHOOK_TITLE_PREFIX: &str = "FrankenTerm";
+
 /// Render a payload into the format expected by the target platform.
 #[must_use]
 pub fn render_template(template: WebhookTemplate, payload: &WebhookPayload) -> serde_json::Value {
@@ -163,7 +165,7 @@ fn render_slack(p: &WebhookPayload) -> serde_json::Value {
         _ => ":large_blue_circle:",
     };
 
-    let mut text = format!("{severity_emoji} *wa: {}*", p.summary);
+    let mut text = format!("{severity_emoji} *{WEBHOOK_TITLE_PREFIX}: {}*", p.summary);
     if p.suppressed_since_last > 0 {
         text.push_str(&format!(" (+{} suppressed)", p.suppressed_since_last));
     }
@@ -238,7 +240,7 @@ fn render_discord(p: &WebhookPayload) -> serde_json::Value {
         }));
     }
 
-    let mut title = format!("wa: {}", p.summary);
+    let mut title = format!("{WEBHOOK_TITLE_PREFIX}: {}", p.summary);
     if p.suppressed_since_last > 0 {
         title.push_str(&format!(" (+{} suppressed)", p.suppressed_since_last));
     }
@@ -782,7 +784,7 @@ mod tests {
         let p = WebhookPayload::from_detection(&d, 3, &r, 2);
         let json = render_template(WebhookTemplate::Slack, &p);
 
-        assert!(json["text"].as_str().unwrap().contains("wa:"));
+        assert!(json["text"].as_str().unwrap().contains("FrankenTerm:"));
         assert!(json["text"].as_str().unwrap().contains("suppressed"));
         assert!(json["blocks"].is_array());
         assert!(!json["blocks"].as_array().unwrap().is_empty());
@@ -808,7 +810,7 @@ mod tests {
         assert!(json["content"].is_null());
         assert!(json["embeds"].is_array());
         let embed = &json["embeds"][0];
-        assert!(embed["title"].as_str().unwrap().contains("wa:"));
+        assert!(embed["title"].as_str().unwrap().contains("FrankenTerm:"));
         assert_eq!(embed["color"], 0xFFAA00); // warning = amber
         assert!(embed["fields"].is_array());
     }

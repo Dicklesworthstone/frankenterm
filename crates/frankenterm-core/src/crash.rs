@@ -1247,9 +1247,9 @@ pub fn install_panic_hook(config: &CrashConfig) {
 
         if stderr_ok {
             if let Some(ref loc) = location {
-                eprintln!("wa: panic at {loc}: {message}");
+                eprintln!("FrankenTerm: panic at {loc}: {message}");
             } else {
-                eprintln!("wa: panic: {message}");
+                eprintln!("FrankenTerm: panic: {message}");
             }
         }
 
@@ -1279,12 +1279,12 @@ pub fn install_panic_hook(config: &CrashConfig) {
             match write_crash_bundle(dir, &report, health.as_ref(), resize_ctx.as_ref()) {
                 Ok(path) => {
                     if stderr_ok {
-                        eprintln!("wa: crash bundle written to {}", path.display());
+                        eprintln!("FrankenTerm: crash bundle written to {}", path.display());
                     }
                 }
                 Err(e) => {
                     if stderr_ok {
-                        eprintln!("wa: failed to write crash bundle: {e}");
+                        eprintln!("FrankenTerm: failed to write crash bundle: {e}");
                     }
                 }
             }

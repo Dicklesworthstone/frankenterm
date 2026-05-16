@@ -271,7 +271,7 @@ proptest! {
     ) {
         let cmd = build_command(NotifyBackend::Linux, &title, &body, urgency, false).unwrap();
         prop_assert_eq!(&cmd.program, "notify-send");
-        prop_assert!(cmd.args.contains(&"--app-name=wa".to_string()));
+        prop_assert!(cmd.args.contains(&"--app-name=FrankenTerm".to_string()));
     }
 
     /// Linux backend urgency flag matches the Urgency value

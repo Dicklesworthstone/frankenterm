@@ -1,7 +1,7 @@
-//! Setup automation for wa
+//! Setup automation for FrankenTerm
 //!
 //! Provides idempotent patching of WezTerm configuration files and shell rc files
-//! to enable wa's user-var forwarding lane and OSC 133 prompt markers.
+//! to enable FrankenTerm's user-var forwarding lane and OSC 133 prompt markers.
 //!
 //! # Architecture (v0.2.0+)
 //!
@@ -15,7 +15,7 @@
 //!
 //! # Markers
 //!
-//! Managed blocks are identified by `WA-BEGIN` and `WA-END` markers.
+//! Managed blocks are identified by `FT-BEGIN` and `FT-END` markers.
 //! The comment style adapts to the file type:
 //! - Lua: `-- FT-BEGIN` / `-- FT-END`
 //! - Shell: `# FT-BEGIN` / `# FT-END`
@@ -276,7 +276,7 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
             backup_path: None,
             modified: false,
             message: format!(
-                "{} already contains wa OSC 133 integration. No changes needed.",
+                "{} already contains FrankenTerm OSC 133 integration. No changes needed.",
                 rc_path.display()
             ),
         });
@@ -301,7 +301,7 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
         None
     };
 
-    // Append the wa block
+    // Append the ft-managed block.
     let ft_block = create_shell_ft_block(shell);
     let new_content = if content.is_empty() {
         format!("{ft_block}\n")
@@ -317,11 +317,14 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
 
     let message = match &backup_path {
         Some(bp) => format!(
-            "Added wa OSC 133 integration to {}. Backup saved to {}",
+            "Added FrankenTerm OSC 133 integration to {}. Backup saved to {}",
             rc_path.display(),
             bp.display()
         ),
-        None => format!("Created {} with wa OSC 133 integration", rc_path.display()),
+        None => format!(
+            "Created {} with FrankenTerm OSC 133 integration",
+            rc_path.display()
+        ),
     };
 
     Ok(PatchResult {
@@ -352,7 +355,7 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
             backup_path: None,
             modified: false,
             message: format!(
-                "{} does not contain wa block. No changes needed.",
+                "{} does not contain an ft-managed block. No changes needed.",
                 rc_path.display()
             ),
         });
@@ -361,7 +364,7 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
     // Create backup before modifying
     let backup_path = create_backup(rc_path)?;
 
-    // Remove the wa block (markers guaranteed present by has_shell_ft_block check above)
+    // Remove the ft-managed block (markers guaranteed present by has_shell_ft_block check above).
     let Some(begin_idx) = content.find(FT_BEGIN_MARKER_SHELL) else {
         return Err(Error::SetupError(
             "Begin marker not found in shell config".into(),
@@ -388,7 +391,7 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
         .map_err(|e| Error::SetupError(format!("Failed to write {}: {}", rc_path.display(), e)))?;
 
     let message = format!(
-        "Removed wa block from {}. Backup saved to {}",
+        "Removed ft-managed block from {}. Backup saved to {}",
         rc_path.display(),
         backup_path.display()
     );
@@ -657,31 +660,31 @@ fn redact_identity_path(path: &str) -> String {
     }
 }
 
-/// Generate a WA-managed wezterm.lua block for ssh_domains.
+/// Generate an ft-managed wezterm.lua block for ssh_domains.
 #[must_use]
 pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> String {
     let mut output = String::new();
     output.push_str(FT_BEGIN_MARKER);
     output.push('\n');
-    output.push_str("-- wa: generated ssh_domains config\n");
+    output.push_str("-- ft: generated ssh_domains config\n");
     output.push_str("config = config or {}\n");
     output.push_str(&format!("config.scrollback_lines = {scrollback_lines}\n\n"));
-    output.push_str("local wa_wezterm = wezterm or require 'wezterm'\n");
+    output.push_str("local ft_wezterm = wezterm or require 'wezterm'\n");
     output.push_str("if config.font == nil then\n");
-    output.push_str("  config.font = wa_wezterm.font_with_fallback({\n");
+    output.push_str("  config.font = ft_wezterm.font_with_fallback({\n");
     for family in DEFAULT_WEZTERM_FONT_FAMILIES {
         output.push_str(&format!("    '{}',\n", lua_escape(family)));
     }
     output.push_str("  })\n");
     output.push_str("end\n\n");
-    // Preserve any existing ssh_domains defined outside the WA block
+    // Preserve any existing ssh_domains defined outside the ft-managed block.
     output.push_str("config.ssh_domains = config.ssh_domains or {}\n");
     if hosts.is_empty() {
         output.push_str(
             "-- No SSH hosts found; add entries manually or re-run ft setup --list-hosts\n",
         );
     } else {
-        output.push_str("local wa_ssh_domains = {\n");
+        output.push_str("local ft_ssh_domains = {\n");
 
         for host in hosts {
             let name = lua_escape(&host.alias);
@@ -709,8 +712,8 @@ pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> Str
         }
 
         output.push_str("}\n");
-        // Append WA-managed domains instead of overwriting (#16)
-        output.push_str("for _, domain in ipairs(wa_ssh_domains) do\n");
+        // Append ft-managed domains instead of overwriting (#16).
+        output.push_str("for _, domain in ipairs(ft_ssh_domains) do\n");
         output.push_str("  table.insert(config.ssh_domains, domain)\n");
         output.push_str("end\n");
     }
@@ -802,7 +805,7 @@ pub fn extract_ft_block(content: &str) -> Option<String> {
     let end_idx = content.find(FT_END_MARKER)?;
 
     if end_idx > begin_idx {
-        // Include the WA-END marker line
+        // Include the FT-END marker line.
         let end_line_end = content[end_idx..]
             .find('\n')
             .map_or(content.len(), |i| end_idx + i);
@@ -908,7 +911,7 @@ fn create_backup(config_path: &Path) -> Result<PathBuf> {
     Ok(backup_path)
 }
 
-/// Idempotently patch the WezTerm config with wa's user-var forwarding snippet
+/// Idempotently patch the WezTerm config with FrankenTerm's user-var forwarding snippet.
 ///
 /// # Behavior
 ///
@@ -951,7 +954,7 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
                 backup_path: None,
                 modified: false,
                 message:
-                    "WezTerm config already contains wa user-var forwarding. No changes needed."
+                    "WezTerm config already contains FrankenTerm user-var forwarding. No changes needed."
                         .to_string(),
             });
         }
@@ -965,7 +968,7 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
                 config_path: config_path.to_path_buf(),
                 backup_path: None,
                 modified: false,
-                message: "WezTerm config already contains a wa block managed by `ft setup config`. Re-run `ft setup config --apply` to update it."
+                message: "WezTerm config already contains an ft-managed block managed by `ft setup config`. Re-run `ft setup config --apply` to update it."
                     .to_string(),
             });
         }
@@ -980,14 +983,15 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
             config_path: config_path.to_path_buf(),
             backup_path: None,
             modified: false,
-            message: "WezTerm config already contains a wa block. No changes needed.".to_string(),
+            message: "WezTerm config already contains an ft-managed block. No changes needed."
+                .to_string(),
         });
     }
 
     // Create backup before modifying
     let backup_path = create_backup(config_path)?;
 
-    // Append the wa block (insert before return if present)
+    // Append the ft-managed block (insert before return if present).
     let new_content = insert_ft_block(&content, &ft_block);
 
     // Write the modified content
@@ -997,7 +1001,7 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
 
     let backup_display = backup_path.display().to_string();
     let message = format!(
-        "Added wa user-var forwarding to {}. Backup saved to {}",
+        "Added FrankenTerm user-var forwarding to {}. Backup saved to {}",
         config_path.display(),
         backup_display
     );
@@ -1016,7 +1020,7 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
 pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Result<PatchResult> {
     if !ft_block.contains(FT_BEGIN_MARKER) || !ft_block.contains(FT_END_MARKER) {
         return Err(Error::SetupError(
-            "Generated wa block is missing WA markers.".to_string(),
+            "Generated ft block is missing FT markers.".to_string(),
         ));
     }
 
@@ -1035,7 +1039,7 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
                 backup_path: None,
                 modified: false,
                 message:
-                    "WezTerm config already contains an up-to-date wa block. No changes needed."
+                    "WezTerm config already contains an up-to-date ft-managed block. No changes needed."
                         .to_string(),
             });
         }
@@ -1071,7 +1075,7 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
 
         let backup_display = backup_path.display().to_string();
         let message = format!(
-            "Updated wa block in {}. Backup saved to {}",
+            "Updated ft-managed block in {}. Backup saved to {}",
             config_path.display(),
             backup_display
         );
@@ -1094,7 +1098,7 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
 
     let backup_display = backup_path.display().to_string();
     let message = format!(
-        "Added wa block to {}. Backup saved to {}",
+        "Added ft block to {}. Backup saved to {}",
         config_path.display(),
         backup_display
     );
@@ -1120,7 +1124,8 @@ pub fn unpatch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
             config_path: config_path.to_path_buf(),
             backup_path: None,
             modified: false,
-            message: "WezTerm config does not contain wa block. No changes needed.".to_string(),
+            message: "WezTerm config does not contain an ft-managed block. No changes needed."
+                .to_string(),
         });
     };
 
@@ -1141,7 +1146,7 @@ pub fn unpatch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
 
     let backup_display = backup_path.display().to_string();
     let message = format!(
-        "Removed wa block from {}. Backup saved to {}",
+        "Removed ft-managed block from {}. Backup saved to {}",
         config_path.display(),
         backup_display
     );
@@ -1436,7 +1441,7 @@ impl SetupWizard {
     }
 }
 
-/// Return the default config save path (~/.config/wa/ft.toml or platform equivalent).
+/// Return the default config save path (~/.config/ft/ft.toml or platform equivalent).
 #[must_use]
 pub fn default_config_save_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
@@ -1499,7 +1504,7 @@ local wezterm = require 'wezterm'
 config = {}
 
 -- FT-BEGIN (do not edit this block)
--- some wa code
+-- some ft code
 -- FT-END
 
 return config
@@ -1635,11 +1640,11 @@ return config
         assert!(block.contains(FT_BEGIN_MARKER));
         assert!(block.contains("config = config or {}"));
         assert!(block.contains("config.scrollback_lines = 50000"));
-        assert!(block.contains("local wa_wezterm = wezterm or require 'wezterm'"));
-        assert!(block.contains("config.font = wa_wezterm.font_with_fallback"));
+        assert!(block.contains("local ft_wezterm = wezterm or require 'wezterm'"));
+        assert!(block.contains("config.font = ft_wezterm.font_with_fallback"));
         assert!(block.contains("Pragmasevka NF"));
         assert!(block.contains("config.ssh_domains = config.ssh_domains or {}"));
-        assert!(block.contains("local wa_ssh_domains = {"));
+        assert!(block.contains("local ft_ssh_domains = {"));
         assert!(block.contains("name = 'box'"));
         assert!(block.contains("remote_address = 'box.example'"));
         assert!(block.contains("username = 'alice'"));
@@ -1799,7 +1804,7 @@ local config = {}
 local config = {}
 
 -- FT-BEGIN (do not edit this block)
--- some wa code
+-- some ft code
 -- FT-END
 
 return config
@@ -1831,7 +1836,7 @@ return config
 local config = {}
 
 -- FT-BEGIN (do not edit this block)
--- some wa code
+-- some ft code
 
 return config
 ";
@@ -1851,7 +1856,7 @@ return config
         let content = r"local wezterm = require 'wezterm'
 local config = {}
 
--- some wa code
+-- some ft code
 -- FT-END
 
 return config
@@ -1873,7 +1878,7 @@ return config
 local config = {}
 
 -- FT-END
--- some wa code
+-- some ft code
 -- FT-BEGIN (do not edit this block)
 
 return config
@@ -2051,7 +2056,7 @@ alias ll='ls -la'
 
     #[test]
     fn test_shell_unpatch_nonexistent_file() {
-        let path = std::path::Path::new("/tmp/nonexistent_file_wa_test_12345.bashrc");
+        let path = std::path::Path::new("/tmp/nonexistent_file_ft_test_12345.bashrc");
         let result = unpatch_shell_rc_at(path).unwrap();
 
         assert!(!result.modified);
@@ -2855,9 +2860,9 @@ alias ll='ls -la'
         let block = generate_ssh_domains_lua(&[], 50_000);
         assert!(block.contains(FT_BEGIN_MARKER));
         assert!(block.contains(FT_END_MARKER));
-        assert!(block.contains("config.font = wa_wezterm.font_with_fallback"));
+        assert!(block.contains("config.font = ft_wezterm.font_with_fallback"));
         assert!(block.contains("No SSH hosts found"));
-        assert!(!block.contains("wa_ssh_domains"));
+        assert!(!block.contains("ft_ssh_domains"));
     }
 
     #[test]

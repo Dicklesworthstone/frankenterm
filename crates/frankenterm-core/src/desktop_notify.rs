@@ -19,6 +19,8 @@ use crate::notifications::{
 };
 use crate::patterns::Detection;
 
+const DESKTOP_NOTIFICATION_APP_NAME: &str = "FrankenTerm";
+
 // ============================================================================
 // Urgency mapping
 // ============================================================================
@@ -185,7 +187,7 @@ fn build_linux_command(title: &str, body: &str, urgency: Urgency) -> NotifyComma
             title.to_string(),
             body.to_string(),
             format!("--urgency={urgency_str}"),
-            "--app-name=wa".to_string(),
+            format!("--app-name={DESKTOP_NOTIFICATION_APP_NAME}"),
         ],
     }
 }
@@ -198,9 +200,10 @@ fn build_windows_command(title: &str, body: &str) -> NotifyCommand {
          $text.Item(0).AppendChild($xml.CreateTextNode('{title}')) | Out-Null; \
          $text.Item(1).AppendChild($xml.CreateTextNode('{body}')) | Out-Null; \
          $toast = [Windows.UI.Notifications.ToastNotification]::new($xml); \
-         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('wa').Show($toast)",
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_name}').Show($toast)",
         title = escape_powershell(title),
-        body = escape_powershell(body)
+        body = escape_powershell(body),
+        app_name = escape_powershell(DESKTOP_NOTIFICATION_APP_NAME)
     );
     NotifyCommand {
         program: "powershell".to_string(),
@@ -297,7 +300,7 @@ impl DesktopNotifier {
         );
         let urgency = severity_to_urgency(detection.severity);
 
-        let title = format!("wa: {}", payload.summary);
+        let title = format!("{DESKTOP_NOTIFICATION_APP_NAME}: {}", payload.summary);
         let mut body = format!(
             "[{}] {} (pane {})",
             payload.severity, payload.event_type, payload.pane_id
@@ -443,7 +446,7 @@ impl NotificationSender for DesktopNotifier {
             }
 
             let urgency = urgency_from_str(&payload.severity);
-            let title = format!("wa: {}", payload.summary);
+            let title = format!("{DESKTOP_NOTIFICATION_APP_NAME}: {}", payload.summary);
             let mut body = format!(
                 "[{}] {} (pane {})",
                 payload.severity, payload.event_type, payload.pane_id
@@ -603,7 +606,7 @@ mod tests {
     fn build_macos_command_structure() {
         let cmd = build_command(
             NotifyBackend::MacOs,
-            "wa: test",
+            "FrankenTerm: test",
             "Event body",
             Urgency::Normal,
             false,
@@ -615,7 +618,7 @@ mod tests {
         assert_eq!(cmd.args[0], "-e");
         assert!(cmd.args[1].contains("display notification"));
         assert!(cmd.args[1].contains("Event body"));
-        assert!(cmd.args[1].contains("wa: test"));
+        assert!(cmd.args[1].contains("FrankenTerm: test"));
         assert!(!cmd.args[1].contains("sound name"));
     }
 
@@ -623,7 +626,7 @@ mod tests {
     fn build_macos_command_with_sound() {
         let cmd = build_command(
             NotifyBackend::MacOs,
-            "wa: test",
+            "FrankenTerm: test",
             "body",
             Urgency::Normal,
             true,
@@ -636,7 +639,7 @@ mod tests {
     fn build_linux_command_structure() {
         let cmd = build_command(
             NotifyBackend::Linux,
-            "wa: test",
+            "FrankenTerm: test",
             "Event body",
             Urgency::Critical,
             false,
@@ -644,10 +647,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(cmd.program, "notify-send");
-        assert!(cmd.args.contains(&"wa: test".to_string()));
+        assert!(cmd.args.contains(&"FrankenTerm: test".to_string()));
         assert!(cmd.args.contains(&"Event body".to_string()));
         assert!(cmd.args.contains(&"--urgency=critical".to_string()));
-        assert!(cmd.args.contains(&"--app-name=wa".to_string()));
+        assert!(cmd.args.contains(&"--app-name=FrankenTerm".to_string()));
     }
 
     #[test]
@@ -666,7 +669,7 @@ mod tests {
     fn build_windows_command_structure() {
         let cmd = build_command(
             NotifyBackend::Windows,
-            "wa: test",
+            "FrankenTerm: test",
             "Event body",
             Urgency::Normal,
             false,
@@ -676,8 +679,9 @@ mod tests {
         assert_eq!(cmd.program, "powershell");
         assert_eq!(cmd.args[0], "-Command");
         assert!(cmd.args[1].contains("ToastNotification"));
-        assert!(cmd.args[1].contains("wa: test"));
+        assert!(cmd.args[1].contains("FrankenTerm: test"));
         assert!(cmd.args[1].contains("Event body"));
+        assert!(cmd.args[1].contains("CreateToastNotifier('FrankenTerm')"));
     }
 
     #[test]
