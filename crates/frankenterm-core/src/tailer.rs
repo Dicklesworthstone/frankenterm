@@ -698,9 +698,10 @@ impl CaptureScheduler {
         selected.extend(high_prio.iter().take(taken_high).map(|(id, _)| *id));
         selected.extend(low_floor.iter().copied());
         if low_spillover > 0 {
+            let low_floor_set: std::collections::HashSet<u64> = low_floor.iter().copied().collect();
             let mut spillover_taken = 0usize;
             for (id, _) in low_prio {
-                if low_floor.contains(id) {
+                if low_floor_set.contains(id) {
                     continue;
                 }
                 selected.push(*id);
