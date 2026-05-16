@@ -163,9 +163,12 @@ if [[ "${RUN_RUST_PROOF}" -eq 1 ]]; then
   # shellcheck source=tests/e2e/lib_rch_guards.sh
   RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
   RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
-  RCH_CANONICAL_PROJECT_ROOT="${RCH_CANONICAL_PROJECT_ROOT:-/data/projects}"
-  RCH_ALIAS_PROJECT_ROOT="${RCH_ALIAS_PROJECT_ROOT:-/dp}"
-  export RCH_CANONICAL_PROJECT_ROOT RCH_ALIAS_PROJECT_ROOT
+  if [[ -z "${RCH_CANONICAL_PROJECT_ROOT:-}" && -d /data/projects ]]; then
+    export RCH_CANONICAL_PROJECT_ROOT="/data/projects"
+  fi
+  if [[ -n "${RCH_CANONICAL_PROJECT_ROOT:-}" && -z "${RCH_ALIAS_PROJECT_ROOT:-}" && -d /dp ]]; then
+    export RCH_ALIAS_PROJECT_ROOT="/dp"
+  fi
   source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
   rch_init "${ARTIFACT_ROOT}" "${RUN_ID}" "swarm_capacity_operator" "${ROOT_DIR}"
   ensure_rch_ready
