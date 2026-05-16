@@ -235,8 +235,8 @@ Search uses FTS5 with `snippet_max_tokens=30`, `highlight_prefix=">>"`,
 | `wezterm_accessible` | `bool` | `list_panes()` succeeds with results |
 | `wezterm_circuit` | `CircuitBreakerStatus` | Circuit breaker state for WezTerm IPC |
 | `pane_count` | `usize` | Number of WezTerm panes |
-| `event_count` | `usize` | Currently always `0` (placeholder) |
-| `last_capture_ts` | `Option<i64>` | Currently always `None` (placeholder) |
+| `event_count` | `usize` | Storage event row count, `0` without DB/read access |
+| `last_capture_ts` | `Option<i64>` | Latest `output_segments.captured_at`, `None` without DB/read access |
 
 ### Shared Types (from ui_query.rs)
 
@@ -273,8 +273,8 @@ TUI Thread                    ProductionQueryClient               frankenterm-co
 
 ### Key Design Decisions
 
-1. **Dedicated tokio runtime.** `ProductionQueryClient` owns a separate
-   `tokio::runtime::Runtime` (2 worker threads, named `tui-query-runtime`).
+1. **Dedicated runtime_async runtime.** `ProductionQueryClient` owns a separate
+   `crate::runtime_async::Runtime` (2 worker threads, named `tui-query-runtime`).
    This avoids "cannot start a runtime from within a runtime" panics when
    the TUI runs in a separate thread from the main async context.
 

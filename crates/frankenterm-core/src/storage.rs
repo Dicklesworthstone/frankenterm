@@ -3318,6 +3318,25 @@ impl StorageHandle {
         self.count_events_before_with_cx(&cx, before_ts).await
     }
 
+    /// Count all stored events.
+    pub async fn count_events(&self) -> Result<usize> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.count_events_with_cx(&cx).await
+    }
+
+    /// Cx-first sibling of [`count_events`].
+    pub async fn count_events_with_cx(&self, cx: &crate::cx::Cx) -> Result<usize> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("count_events cancelled: {err}")))?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || pooled_backend(db_path.as_str(), |backend| count_events_backend(backend)),
+        )
+        .await
+    }
+
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_events_before`].
     pub async fn count_events_before_with_cx(
         &self,
@@ -12334,6 +12353,12 @@ fn count_segments_before_backend(backend: &dyn StorageBackend, before_ts: i64) -
     )
     .map_err(|err| storage_backend_error("Failed to count segments", err))?;
     count_i64_to_usize(count, "Failed to count segments row")
+}
+
+fn count_events_backend(backend: &dyn StorageBackend) -> Result<usize> {
+    let count = count_table_where(backend, "events", "1=1", &[])
+        .map_err(|err| storage_backend_error("Failed to count events", err))?;
+    count_i64_to_usize(count, "Failed to count events row")
 }
 
 fn count_events_before_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {

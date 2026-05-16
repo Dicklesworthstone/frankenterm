@@ -1076,12 +1076,14 @@ fn storage_handle_event_lifecycle() {
 
         let event_id: i64 = handle.record_event(event).await.unwrap();
         assert!(event_id > 0);
+        assert_eq!(handle.count_events().await.unwrap(), 1);
 
         // Mark handled
         handle
             .mark_event_handled(event_id, Some("wf-123".to_string()), "completed")
             .await
             .unwrap();
+        assert_eq!(handle.count_events().await.unwrap(), 1);
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);

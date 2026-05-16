@@ -308,7 +308,7 @@ pub trait QueryClient: Send + Sync {
 /// Production implementation of QueryClient
 ///
 /// Uses the actual frankenterm-core storage and wezterm client to query data.
-/// Owns a dedicated compat runtime for async operations, avoiding
+/// Owns a dedicated runtime_async runtime for async operations, avoiding
 /// "cannot start a runtime from within a runtime" panics when the TUI
 /// runs in a separate thread from the main async context.
 pub struct ProductionQueryClient {
@@ -324,7 +324,7 @@ pub struct ProductionQueryClient {
 }
 
 impl ProductionQueryClient {
-    /// Create a new production query client with a dedicated compat runtime.
+    /// Create a new production query client with a dedicated runtime_async runtime.
     ///
     /// The runtime is used to bridge sync TUI code with async operations,
     /// avoiding "cannot start a runtime from within a runtime" panics.
@@ -346,7 +346,7 @@ impl ProductionQueryClient {
         }
     }
 
-    /// Create with an existing storage handle and a dedicated compat runtime.
+    /// Create with an existing storage handle and a dedicated runtime_async runtime.
     ///
     /// The runtime is used to bridge sync TUI code with async operations,
     /// avoiding "cannot start a runtime from within a runtime" panics.
@@ -769,6 +769,7 @@ impl QueryClient for ProductionQueryClient {
 
         let db_accessible = self.db_exists();
         let watcher_running = self.is_watcher_running();
+        let (event_count, last_capture_ts) = self.storage_health_fields();
 
         Ok(HealthStatus {
             watcher_running,
@@ -776,8 +777,8 @@ impl QueryClient for ProductionQueryClient {
             wezterm_accessible,
             wezterm_circuit: self.wezterm.circuit_status(),
             pane_count,
-            event_count: 0,
-            last_capture_ts: None,
+            event_count,
+            last_capture_ts,
         })
     }
 
@@ -971,6 +972,37 @@ impl QueryClient for ProductionQueryClient {
     }
 }
 
+impl ProductionQueryClient {
+    fn storage_health_fields(&self) -> (usize, Option<i64>) {
+        let Some(storage) = &self.storage else {
+            return (0, None);
+        };
+
+        let result = self.runtime.block_on(async {
+            let health_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let (event_count, segment_range) = crate::runtime_async::join!(
+                storage.count_events_with_cx(&health_cx),
+                storage.get_segment_time_range_with_cx(&health_cx)
+            );
+            let event_count = event_count.map_err(|e| QueryError::StorageError(e.to_string()))?;
+            let (_, last_capture_ts) =
+                segment_range.map_err(|e| QueryError::StorageError(e.to_string()))?;
+            Ok::<_, QueryError>((event_count, last_capture_ts))
+        });
+
+        match result {
+            Ok(fields) => fields,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to load TUI storage health counters",
+                );
+                (0, None)
+            }
+        }
+    }
+}
+
 fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1082,6 +1114,87 @@ mod tests {
         assert!(health.watcher_running);
         assert!(health.db_accessible);
         assert_eq!(health.pane_count, 1);
+    }
+
+    #[test]
+    fn production_health_reads_storage_counters() {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build query test runtime");
+
+        let temp_dir = tempfile::tempdir().expect("temp workspace");
+        let (layout, storage, last_capture_ts, wezterm) = runtime.block_on(async {
+            let layout = crate::config::WorkspaceLayout::new(
+                temp_dir.path().to_path_buf(),
+                &crate::config::StorageConfig::default(),
+                &crate::config::IpcConfig::default(),
+            );
+            std::fs::create_dir_all(&layout.ft_dir).expect("create .ft dir");
+            let db_path = layout.db_path.to_string_lossy().to_string();
+            let storage = StorageHandle::new(&db_path).await.expect("open storage");
+            let now = epoch_ms();
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: Some(0),
+                    tab_id: Some(0),
+                    title: Some("health-pane".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("upsert pane");
+            let segment = storage
+                .append_segment(1, "health segment", None)
+                .await
+                .expect("append segment");
+            storage
+                .record_event(crate::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 1,
+                    rule_id: "health.rule".to_string(),
+                    agent_type: "codex".to_string(),
+                    event_type: "usage".to_string(),
+                    severity: "warning".to_string(),
+                    confidence: 0.9,
+                    extracted: None,
+                    matched_text: Some("health segment".to_string()),
+                    segment_id: Some(segment.id),
+                    detected_at: segment.captured_at,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                })
+                .await
+                .expect("record event");
+
+            let mock = std::sync::Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(1).await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+
+            (layout, storage, segment.captured_at, wezterm)
+        });
+
+        let client =
+            ProductionQueryClient::with_storage_and_wezterm(layout, storage.clone(), wezterm);
+        let health = client.health().expect("query health");
+        assert_eq!(health.event_count, 1);
+        assert_eq!(health.last_capture_ts, Some(last_capture_ts));
+        assert_eq!(health.pane_count, 1);
+
+        drop(client);
+        runtime.block_on(async {
+            storage.shutdown().await.expect("shutdown storage");
+        });
     }
 
     #[test]
