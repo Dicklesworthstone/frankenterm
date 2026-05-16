@@ -252,7 +252,6 @@ impl GuiFrontEnd {
         config::reload();
 
         // And build the initial menu bar.
-        // TODO: arrange for this to happen on config reload.
         crate::commands::CommandDef::recreate_menubar(&config::configuration());
 
         Ok(front_end)

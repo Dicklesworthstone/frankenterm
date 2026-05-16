@@ -361,8 +361,20 @@ impl super::TermWindow {
             UIItemType::ScrollThumb => {
                 self.drag_scroll_thumb(item, start_event, event, context);
             }
-            _ => {
-                log::error!("drag not implemented for {:?}", item);
+            UIItemType::TabBar(
+                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus,
+            ) => {
+                context.set_window_drag_position(event.screen_coords);
+            }
+            UIItemType::TabBar(
+                TabBarItem::Tab { .. }
+                | TabBarItem::NewTabButton { .. }
+                | TabBarItem::WindowButton(_),
+            )
+            | UIItemType::CloseTab(_)
+            | UIItemType::AboveScrollThumb
+            | UIItemType::BelowScrollThumb => {
+                log::trace!("ignoring drag for non-draggable UI item: {:?}", item);
             }
         }
     }
