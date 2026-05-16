@@ -5441,7 +5441,7 @@ const ROBOT_APPROVAL_RECOVERY_HINT: &str = "Run `ft watch` so approvals can be i
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE: &str =
     "Live get-text is unavailable for distributed panes";
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_HINT: &str =
-    "Use `ft query`, `ft search`, or `ft robot search` to inspect persisted remote output.";
+    "Use `ft search` or `ft robot search` to inspect persisted remote output.";
 const ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT: usize = 16;
 /// Cooldown period between account refreshes (milliseconds)
 const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
