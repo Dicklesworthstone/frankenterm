@@ -1211,7 +1211,7 @@ ensure_rch_mirror_preflight() {
     local attest_script="${_RCH_REPO_ROOT}/scripts/attest_rch_worker_mirror.sh"
     [[ -x "${attest_script}" ]] || rch_fatal "mirror attestation script is not executable: ${attest_script}"
 
-    local worker_ids worker_id worker_dir worker_json worker_rc failures total
+    local worker_ids worker_id worker_dir worker_json worker_rc failures total nounset_was_enabled
     local -a bead_arg=()
     local block_on_stale_head="false"
     local require_all_checked_workers="false"
@@ -1272,7 +1272,12 @@ ensure_rch_mirror_preflight() {
             continue
         fi
         worker_json="${worker_dir}/${worker_id}.json"
+        case $- in
+            *u*) nounset_was_enabled="true" ;;
+            *) nounset_was_enabled="false" ;;
+        esac
         set +e
+        set +u
         "${attest_script}" \
             --worker "${worker_id}" \
             "${bead_arg[@]}" \
@@ -1282,6 +1287,9 @@ ensure_rch_mirror_preflight() {
             --json >"${worker_json}"
         worker_rc=$?
         set -e
+        if [[ "${nounset_was_enabled}" == "true" ]]; then
+            set -u
+        fi
         total=$((total + 1))
         if [[ "${worker_rc}" -ne 0 ]]; then
             failures=$((failures + 1))
@@ -1425,7 +1433,7 @@ rch_attest_selected_worker_before_cargo() {
     local attest_script="${_RCH_REPO_ROOT}/scripts/attest_rch_worker_mirror.sh"
     [[ -x "${attest_script}" ]] || rch_fatal "mirror attestation script is not executable: ${attest_script}"
 
-    local diagnose_log sync_log mirror_log diagnose_rc sync_rc selected_worker would_intercept selection_reason
+    local diagnose_log sync_log mirror_log diagnose_rc sync_rc selected_worker would_intercept selection_reason nounset_was_enabled
     local -a bead_arg=()
     diagnose_log="${output_file%.log}.rch_diagnose.json"
     sync_log="${output_file%.log}.selected_worker_sync.log"
@@ -1485,6 +1493,11 @@ rch_attest_selected_worker_before_cargo() {
     if [[ -n "${RCH_PROOF_LEDGER_BEAD_ID:-}" ]]; then
         bead_arg=("--bead" "${RCH_PROOF_LEDGER_BEAD_ID}")
     fi
+    case $- in
+        *u*) nounset_was_enabled="true" ;;
+        *) nounset_was_enabled="false" ;;
+    esac
+    set +u
     if ! "${attest_script}" \
         --worker "${selected_worker}" \
         "${bead_arg[@]}" \
@@ -1492,7 +1505,13 @@ rch_attest_selected_worker_before_cargo() {
         "${workspace_member_arg[@]}" \
         --command "selected-worker preflight for run_rch_cargo_logged" \
         --json >"${mirror_log}"; then
+        if [[ "${nounset_was_enabled}" == "true" ]]; then
+            set -u
+        fi
         rch_fatal "rch selected-worker source mirror preflight failed for ${selected_worker}. See ${mirror_log}"
+    fi
+    if [[ "${nounset_was_enabled}" == "true" ]]; then
+        set -u
     fi
 
     printf '%s\n' "${selected_worker}"

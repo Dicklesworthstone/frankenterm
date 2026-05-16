@@ -84,7 +84,7 @@ requested_paths() {
     payload_b64="$(printf '%s\n' "${command_text}" | sed -n "s/^.*-- '\([^']*\)'.*$/\1/p")"
     [[ -n "${payload_b64}" ]] || return 0
     payload="$(printf '%s' "${payload_b64}" | base64 -d 2>/dev/null || true)"
-    while IFS=$'\t' read -r kind value; do
+    while IFS=$'\t' read -r kind value _hash; do
         [[ "${kind}" == "F" && -n "${value}" ]] || continue
         printf '%s\n' "${value}"
     done <<<"${payload}"

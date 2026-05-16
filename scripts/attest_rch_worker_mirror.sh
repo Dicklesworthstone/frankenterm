@@ -619,7 +619,8 @@ for root in "${REMOTE_PROJECT_ROOTS[@]}"; do
     payload+=$'R\t'"${root}"$'\n'
 done
 for path in "${REQUIRED_PATHS[@]}"; do
-    payload+=$'F\t'"${path}"$'\n'
+    local_sha="$(jq -r --arg path "${path}" '.[] | select(.path == $path) | .local_sha256 // ""' <<<"${files_json}")"
+    payload+=$'F\t'"${path}"$'\t'"${local_sha}"$'\n'
 done
 payload_b64="$(printf '%s' "${payload}" | base64 | tr -d '\n')"
 
@@ -662,21 +663,30 @@ payload="$(printf '%s' "${payload_b64}" | base64 -d 2>/dev/null || true)"
 local_head=""
 roots=()
 paths=()
+local_hashes=()
 
-while IFS=$'\t' read -r kind value; do
+while IFS=$'\t' read -r kind value extra; do
     case "${kind}" in
         H) local_head="${value}" ;;
         R) roots+=("${value}") ;;
-        F) paths+=("${value}") ;;
+        F)
+            paths+=("${value}")
+            local_hashes+=("${extra:-}")
+            ;;
     esac
 done <<<"${payload}"
 
 selected_root=""
 first_existing_root=""
 first_all_present_root=""
+first_all_hash_match_root=""
 best_present_root=""
 best_present_count=-1
 best_manifest_present=0
+best_hash_match_root=""
+best_hash_match_count=-1
+best_hash_present_count=-1
+best_hash_manifest_present=0
 shopt -s nullglob
 for root in "${roots[@]}"; do
     expanded_roots=()
@@ -698,18 +708,39 @@ for root in "${roots[@]}"; do
         fi
 
         all_present="true"
+        all_hash_match="true"
         present_count=0
+        hash_match_count=0
         manifest_present=0
         if [[ -f "${expanded_root}/Cargo.toml" ]]; then
             manifest_present=1
         fi
-        for path in "${paths[@]}"; do
+        for path_index in "${!paths[@]}"; do
+            path="${paths[${path_index}]}"
+            local_hash="${local_hashes[${path_index}]:-}"
             if [[ -f "${expanded_root}/${path}" ]]; then
                 present_count=$((present_count + 1))
+                if [[ -n "${local_hash}" ]] \
+                    && remote_hash="$(file_sha256 "${expanded_root}/${path}" 2>/dev/null)" \
+                    && [[ "${remote_hash}" == "${local_hash}" ]]; then
+                    hash_match_count=$((hash_match_count + 1))
+                else
+                    all_hash_match="false"
+                fi
             else
                 all_present="false"
+                all_hash_match="false"
             fi
         done
+
+        if [[ "${hash_match_count}" -gt "${best_hash_match_count}" ]] \
+            || [[ "${hash_match_count}" -eq "${best_hash_match_count}" && "${present_count}" -gt "${best_hash_present_count}" ]] \
+            || [[ "${hash_match_count}" -eq "${best_hash_match_count}" && "${present_count}" -eq "${best_hash_present_count}" && "${manifest_present}" -gt "${best_hash_manifest_present}" ]]; then
+            best_hash_match_count="${hash_match_count}"
+            best_hash_present_count="${present_count}"
+            best_hash_manifest_present="${manifest_present}"
+            best_hash_match_root="${expanded_root}"
+        fi
 
         if [[ "${present_count}" -gt "${best_present_count}" ]] \
             || [[ "${present_count}" -eq "${best_present_count}" && "${manifest_present}" -gt "${best_manifest_present}" ]]; then
@@ -722,7 +753,11 @@ for root in "${roots[@]}"; do
             first_all_present_root="${expanded_root}"
         fi
 
-        if [[ "${all_present}" == "true" ]] \
+        if [[ "${all_present}" == "true" && "${all_hash_match}" == "true" && -z "${first_all_hash_match_root}" ]]; then
+            first_all_hash_match_root="${expanded_root}"
+        fi
+
+        if [[ "${all_present}" == "true" && "${all_hash_match}" == "true" ]] \
             && [[ -n "${local_head}" ]] \
             && git -C "${expanded_root}" rev-parse --verify HEAD >/dev/null 2>&1 \
             && [[ "$(git -C "${expanded_root}" rev-parse HEAD)" == "${local_head}" ]]; then
@@ -734,7 +769,7 @@ done
 shopt -u nullglob
 
 if [[ -z "${selected_root}" ]]; then
-    selected_root="${first_all_present_root:-${best_present_root:-${first_existing_root}}}"
+    selected_root="${first_all_hash_match_root:-${best_hash_match_root:-${first_all_present_root:-${best_present_root:-${first_existing_root}}}}}"
 fi
 
 if [[ -z "${selected_root}" ]]; then
