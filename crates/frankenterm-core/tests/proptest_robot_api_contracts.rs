@@ -495,8 +495,12 @@ proptest! {
 fn standard_matrix_covers_all_surfaces() {
     let matrix = standard_contract_matrix();
     let (covered, total) = matrix.surface_coverage();
-    assert_eq!(total, 34);
-    assert_eq!(covered, 34, "standard matrix should cover all surfaces");
+    let expected_total = ApiSurface::ALL.len();
+    assert_eq!(total, expected_total);
+    assert_eq!(
+        covered, expected_total,
+        "standard matrix should cover all surfaces"
+    );
     assert!(matrix.uncovered_surfaces().is_empty());
 }
 

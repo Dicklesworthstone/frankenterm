@@ -295,7 +295,6 @@ struct SynchronizedOutputActionEffect {
     flush: bool,
     handled: bool,
     depth_outcome: Option<SynchronizedOutputDepthOutcome>,
-    drain_cause: Option<SynchronizedOutputDrainCause>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -353,7 +352,6 @@ fn handle_synchronized_output_action(
         flush: false,
         handled: false,
         depth_outcome: None,
-        drain_cause: None,
     };
 
     match action {
@@ -371,9 +369,6 @@ fn handle_synchronized_output_action(
         }
         Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
             effect.flush = hold.force_reset();
-            if effect.flush {
-                effect.drain_cause = Some(SynchronizedOutputDrainCause::Operator);
-            }
         }
         Action::CSI(CSI::Mode(Mode::QueryDecPrivateMode(DecPrivateMode::Code(
             DecPrivateModeCode::SynchronizedOutput,
@@ -498,10 +493,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                             },
                         );
                     } else if effect.handled {
-                        notify_synchronized_output_event(
-                            &pane,
-                            SynchronizedOutputEvent::ModeQuery,
-                        );
+                        notify_synchronized_output_event(&pane, SynchronizedOutputEvent::ModeQuery);
                     }
                     if !was_holding && hold.is_holding() && !actions.is_empty() {
                         // Flush prior actions before entering BSU hold.
@@ -2187,6 +2179,23 @@ mod tests {
         );
         assert_eq!(flushes, 1, "only the ESU that closes depth to zero flushes");
         assert_eq!(hold.max_depth(), 2);
+        assert!(!hold.is_holding());
+    }
+
+    #[test]
+    fn synchronized_output_soft_reset_flushes_without_operator_attribution() {
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut hold = SynchronizedOutputHold::default();
+        let mut flushes = 0;
+
+        parser.parse(b"\x1b[?2026h\x1bc", |action| {
+            let effect = handle_synchronized_output_action(&action, &mut hold, |_| {});
+            if effect.flush {
+                flushes += 1;
+            }
+        });
+
+        assert_eq!(flushes, 1);
         assert!(!hold.is_holding());
     }
 
