@@ -114,12 +114,30 @@ adversarial input.
    `ntm` equivalent, run both backends against the same input stream and assert
    identical observable behavior. This preserves regression coverage after the
    "delegate to ntm" → "native impl" transition.
-4. **Per-family scoping** (now contract-driven, not vibe-driven):
-   - **checkpoint** {save, rollback, list}: Wires into existing `ft snapshot` + session_restore. Idempotent on save (content-addressed); rollback is `RequireApproval` if cross-pane state mutates.
-   - **context** {status, rotate, history}: Per-pane conversation context. New schema integrating cass + session-resume. Rotation is non-idempotent → must emit a TX-style receipt.
-   - **work** {claim, complete, status, list}: Build minimal native queue with `claim` semantics that compose with `br`'s ownership model (compatible IDs, non-conflicting reservations). Strong claim/release atomicity guaranteed via storage transaction.
-   - **fleet** {status, launch, stop, describe}: Surface `frankenterm-core-fleet` already-extracted dashboard data. `launch`/`stop` route through TX engine for prepare/commit/compensate.
-   - **profile** {show, list, set}: Lightweight CRUD on profile table. `set` is idempotent on identical input.
+4. **Per-family scoping** (now contract-driven, not vibe-driven): keep this
+   matrix aligned with `docs/robot-contracts/current-ntm-gap-dispatch.md` and
+   the README robot-mode implementation table.
+   - **checkpoint** {save, list, show, delete, rollback}: Wires into the
+     native snapshot/session adapter. `save` is content-addressable,
+     inspection/deletion are native session-table operations, and non-dry-run
+     rollback remains approval-blocked until the robot policy gate allows the
+     mutating restore path.
+   - **context** {status, rotate, history}: Uses the native SQLite
+     `pane_contexts` / `context_rotations` registry. Rotation records a durable
+     receipt, supports optional idempotency-key replay, and stores metadata
+     without persisting raw conversation content.
+   - **work** {claim, release, complete, list, ready, assign}: Uses the native
+     SQLite `work_claims` queue. Claim, release, assignment, and completion
+     semantics compose with Beads IDs and are serialized per work item.
+   - **fleet** {status, scale, rebalance, agents}: Uses native
+     agent-inventory/work-queue read paths plus the fleet mutation substrate
+     for scale/rebalance plans. Dry-run returns receipts without side effects;
+     commit paths return durable mutation receipts or typed `robot.fleet.*`
+     errors.
+   - **profile** {list, show, validate, apply}: Uses
+     `robot_profile_handler`. Read paths, validation, dry-run apply, and
+     mux-backed non-dry-run apply are shipped; apply is idempotent on identical
+     input and rolls back panes on mid-apply failure.
 5. **The `robot.not_implemented` envelope STAYS** as the typed degradation
    surface for genuinely-unbuilt features, but no graduated checkpoint,
    context, work, fleet, or profile family should route through it.
