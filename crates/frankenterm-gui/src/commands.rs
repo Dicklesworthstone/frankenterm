@@ -2147,7 +2147,6 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         }),
         CloseCurrentTab { confirm: true },
         CloseCurrentPane { confirm: true },
-        DetachDomain(SpawnTabDomain::CurrentPaneDomain),
         ResetTerminal,
         // ----------------- Edit
         #[cfg(not(target_os = "macos"))]
@@ -2366,5 +2365,16 @@ mod tests {
             DomainState::Attached,
             true,
         ));
+    }
+
+    #[test]
+    fn unqualified_current_domain_detach_is_not_a_default_palette_action() {
+        assert!(
+            !compute_default_actions()
+                .iter()
+                .any(|action| matches!(action, DetachDomain(SpawnTabDomain::CurrentPaneDomain))),
+            "CurrentPaneDomain detach depends on the active pane domain being detachable; \
+             generated domain-specific detach entries carry that runtime capability check"
+        );
     }
 }
