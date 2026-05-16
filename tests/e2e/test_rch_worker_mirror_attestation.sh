@@ -602,6 +602,40 @@ run_rch() {
     return 2
 }
 
+FAKE_DIAGNOSE_WORKER="worker-b"
+run_rch_logged_with_timeout() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+    case "$*" in
+      *"--json status --workers"*)
+        cat "${FAKE_RCH_STATUS_JSON}" >"${output_file}"
+        return 0
+        ;;
+      *"--json diagnose"*)
+        jq -cn \
+          --arg worker "${FAKE_DIAGNOSE_WORKER}" \
+          --arg timeout_secs "${timeout_secs}" \
+          '{
+            success: true,
+            data: {
+              decision: { would_intercept: true },
+              worker_selection: {
+                worker: { id: $worker },
+                reason: "fixture_selected_worker"
+              },
+              timeout_secs: ($timeout_secs | tonumber)
+            }
+          }' >"${output_file}"
+        return 0
+        ;;
+      *)
+        printf 'unexpected fake run_rch_logged_with_timeout invocation: %s\n' "$*" >&2
+        return 2
+        ;;
+    esac
+}
+
 run_pool_mirror_fixture() {
     local name="$1"
     local mode_a="$2"
@@ -747,6 +781,61 @@ run_pinned_mirror_fixture "mirror_pool_pinned_worker_only_fixture" \
 run_pinned_mirror_fixture "mirror_pool_pinned_worker_missing_blocks_fixture" \
     "worker-b" "success" "missing_file" "0" "1" \
     "blocked" "source_mirror_blocked"
+
+run_selected_worker_mirror_fixture() {
+    local name="$1"
+    local mode_b="$2"
+    local expected_rc="$3"
+    local output_file="${LOG_DIR}/${name}.log"
+    local mirror_file="${LOG_DIR}/${name}.selected_worker_mirror.json"
+    local selected=""
+    local rc
+
+    set +e
+    selected="$(
+      {
+        export RCH_MIRROR_ATTEST_WORKERS_JSON="${POOL_WORKERS_JSON}"
+        export RCH_MIRROR_ATTEST_SSH_BIN="${FAKE_SSH}"
+        export FAKE_RCH_MIRROR_MODE="success"
+        export FAKE_RCH_MIRROR_MODE_WORKER_B="${mode_b}"
+        export FAKE_RCH_MIRROR_REMOTE_HEAD="${HEAD_SHA}"
+        export FAKE_RCH_MIRROR_REPO_ROOT="${ROOT_DIR}"
+        RCH_SELECTED_WORKER_MIRROR_PREFLIGHT=1
+        RCH_MIRROR_REQUIRED_PATHS="Cargo.toml,crates/frankenterm-core/src/lib.rs"
+        RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS=0
+        rch_attest_selected_worker_before_cargo "${output_file}" \
+          env CARGO_TARGET_DIR=target/rch-fixture cargo test -p frankenterm-gui terminal_state
+      } 2>"${LOG_DIR}/${name}.stderr"
+    )"
+    rc=$?
+    set -e
+
+    if [[ "${rc}" -ne "${expected_rc}" ]]; then
+        record_result "${name}" "false" "expected rc ${expected_rc}, got ${rc}"
+        return
+    fi
+
+    if [[ "${expected_rc}" -eq 0 ]]; then
+        if [[ "${selected}" == "worker-b" ]] \
+          && jq -e '.status == "passed" and .worker.id == "worker-b"' "${mirror_file}" >/dev/null; then
+            record_result "${name}" "true"
+        else
+            record_result "${name}" "false" "selected worker was not pinned to passing mirror fixture"
+        fi
+    else
+        if jq -e '.status == "failed" and .reason_code == "rch_mirror.missing_tracked_file" and .worker.id == "worker-b"' "${mirror_file}" >/dev/null; then
+            record_result "${name}" "true"
+        else
+            record_result "${name}" "false" "failing selected-worker mirror fixture did not retain expected JSON"
+        fi
+    fi
+}
+
+run_selected_worker_mirror_fixture "selected_worker_preflight_passes_fixture" \
+    "success" "0"
+
+run_selected_worker_mirror_fixture "selected_worker_preflight_missing_blocks_fixture" \
+    "missing_file" "1"
 
 jq -cn \
   --arg test "rch_worker_mirror_attestation" \

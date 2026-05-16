@@ -80,7 +80,9 @@ run_rch_cargo_logged_with_timeout <seconds> <log-file> env CARGO_TARGET_DIR=<rep
 
 The helper forms are evidence-equivalent to direct `rch exec -- ...` because
 they route through `tests/e2e/lib_rch_guards.sh`, reject local fallback markers,
-and emit RCH metadata sidecars.
+emit RCH metadata sidecars, and, when `RCH_MIRROR_REQUIRED_PATHS` or explicit
+workspace-root mirror coverage is configured, attest and pin the scheduler
+selected worker before the material Cargo command starts.
 
 RCH status checks, worker probes, sync logs, or shell wrappers that merely echo
 `rch exec -- ...` are not proof. If the material Cargo command is local, the
@@ -178,6 +180,10 @@ Allowed during worker-specific RCH incidents:
   the selected worker's required files before starting Cargo. This keeps a
   partially stale pool from becoming a false source-test verdict when the
   daemon would otherwise choose a stale worker.
+- The shared `run_rch_cargo_logged` helpers perform that selected-worker
+  attestation automatically when mirror-required paths are configured. Set
+  `RCH_SELECTED_WORKER_MIRROR_PREFLIGHT=0` only for a deliberately documented
+  non-mirror proof lane.
 - Reopening or blocking a bead with exact artifact paths and reason codes when
   the worker-specific proof cannot be trusted.
 

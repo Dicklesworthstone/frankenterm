@@ -52,6 +52,7 @@ RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS="${RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER
 RCH_MIRROR_BLOCK_ON_STALE_HEAD="${RCH_MIRROR_BLOCK_ON_STALE_HEAD:-0}"
 RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS="${RCH_MIRROR_REQUIRE_ALL_CHECKED_WORKERS:-0}"
 RCH_MIRROR_MIN_PASSING_WORKERS="${RCH_MIRROR_MIN_PASSING_WORKERS:-1}"
+RCH_SELECTED_WORKER_MIRROR_PREFLIGHT="${RCH_SELECTED_WORKER_MIRROR_PREFLIGHT:-auto}"
 RCH_GITHUB_ACTIONS_LOCAL_CARGO="${RCH_GITHUB_ACTIONS_LOCAL_CARGO:-0}"
 
 # Populated by rch_init().
@@ -711,6 +712,16 @@ rch_log_has_worker_selection_all_busy() {
     ' "${output_file}" >/dev/null 2>&1
 }
 
+rch_diagnose_selected_worker() {
+    local output_file="$1"
+    jq -r '
+        (.data.worker_selection.worker // empty) as $worker
+        | if ($worker | type) == "object" then ($worker.id // "")
+          elif ($worker | type) == "string" then $worker
+          else "" end
+    ' "${output_file}" 2>/dev/null || true
+}
+
 rch_extract_failure_reason_code() {
     local output_file="$1"
 
@@ -1352,6 +1363,115 @@ ensure_rch_mirror_preflight() {
     fi
 }
 
+rch_selected_worker_mirror_preflight_enabled() {
+    case "${RCH_SELECTED_WORKER_MIRROR_PREFLIGHT}" in
+        1|true|TRUE|yes|YES)
+            return 0
+            ;;
+        0|false|FALSE|no|NO)
+            return 1
+            ;;
+        auto|"")
+            ;;
+        *)
+            rch_fatal "RCH_SELECTED_WORKER_MIRROR_PREFLIGHT must be auto, true, or false; got '${RCH_SELECTED_WORKER_MIRROR_PREFLIGHT}'."
+            ;;
+    esac
+
+    case "${RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS}" in
+        1|true|TRUE|yes|YES)
+            return 0
+            ;;
+    esac
+    [[ -n "${RCH_MIRROR_REQUIRED_PATHS}" ]]
+}
+
+rch_attest_selected_worker_before_cargo() {
+    local output_file="$1"
+    shift
+
+    rch_selected_worker_mirror_preflight_enabled || return 0
+
+    local required_paths=()
+    local workspace_member_arg=()
+    local require_workspace_member_roots="false"
+    local path
+    while IFS= read -r path; do
+        required_paths+=("--path" "${path}")
+    done < <(rch_mirror_required_paths)
+
+    case "${RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS}" in
+        auto)
+            [[ "${#required_paths[@]}" -gt 0 ]] && require_workspace_member_roots="true"
+            ;;
+        1|true|TRUE|yes|YES)
+            require_workspace_member_roots="true"
+            ;;
+        0|false|FALSE|no|NO|"")
+            require_workspace_member_roots="false"
+            ;;
+        *)
+            rch_fatal "RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS must be auto, true, or false; got '${RCH_MIRROR_REQUIRE_WORKSPACE_MEMBER_ROOTS}'."
+            ;;
+    esac
+    if [[ "${require_workspace_member_roots}" == "true" ]]; then
+        workspace_member_arg=("--workspace-member-roots")
+    fi
+    [[ "${#required_paths[@]}" -gt 0 || "${#workspace_member_arg[@]}" -gt 0 ]] || return 0
+
+    local attest_script="${_RCH_REPO_ROOT}/scripts/attest_rch_worker_mirror.sh"
+    [[ -x "${attest_script}" ]] || rch_fatal "mirror attestation script is not executable: ${attest_script}"
+
+    local diagnose_log mirror_log diagnose_rc selected_worker would_intercept selection_reason bead_arg=()
+    diagnose_log="${output_file%.log}.rch_diagnose.json"
+    mirror_log="${output_file%.log}.selected_worker_mirror.json"
+
+    set +e
+    run_rch_logged_with_timeout "${RCH_PROBE_TIMEOUT_SECS}" "${diagnose_log}" --json diagnose "$@"
+    diagnose_rc=$?
+    set -e
+    rch_write_meta_json "${diagnose_log}" "${diagnose_rc}"
+    rch_emit_proof_ledger_entry \
+        "rch --json diagnose $*" \
+        "${diagnose_log}" \
+        "${diagnose_rc}" \
+        "not_applicable" \
+        "not_applicable" \
+        "selected-worker mirror preflight before run_rch_cargo_logged material command"
+
+    if [[ "${diagnose_rc}" -ne 0 ]] || ! jq -e . "${diagnose_log}" >/dev/null 2>&1; then
+        rch_fatal "rch selected-worker diagnose failed before material cargo proof. See ${diagnose_log}"
+    fi
+
+    would_intercept="$(jq -r '.data.decision.would_intercept // false' "${diagnose_log}" 2>/dev/null || true)"
+    selected_worker="$(rch_diagnose_selected_worker "${diagnose_log}")"
+    selection_reason="$(jq -c '.data.worker_selection.reason // "unknown"' "${diagnose_log}" 2>/dev/null || printf '%s' '"unknown"')"
+    if [[ "${would_intercept}" != "true" ]]; then
+        rch_fatal "rch selected-worker diagnose could not prove cargo offload eligibility before material cargo proof. See ${diagnose_log}"
+    fi
+    if [[ -z "${selected_worker}" ]]; then
+        rch_fatal "rch selected-worker diagnose did not return a worker before material cargo proof: ${selection_reason}. See ${diagnose_log}"
+    fi
+    if [[ -n "${RCH_WORKER:-}" && "${selected_worker}" != "${RCH_WORKER}" ]]; then
+        rch_fatal "rch selected-worker diagnose chose ${selected_worker}, but RCH_WORKER=${RCH_WORKER}; refusing to prove on a different worker. See ${diagnose_log}"
+    fi
+
+    if [[ -n "${RCH_PROOF_LEDGER_BEAD_ID:-}" ]]; then
+        bead_arg=("--bead" "${RCH_PROOF_LEDGER_BEAD_ID}")
+    fi
+    if ! "${attest_script}" \
+        --worker "${selected_worker}" \
+        "${bead_arg[@]}" \
+        "${required_paths[@]}" \
+        "${workspace_member_arg[@]}" \
+        --command "selected-worker preflight for run_rch_cargo_logged" \
+        --json >"${mirror_log}"; then
+        rch_fatal "rch selected-worker source mirror preflight failed for ${selected_worker}. See ${mirror_log}"
+    fi
+
+    printf '%s\n' "${selected_worker}"
+}
+
 check_rch_fallback() {
     local output_file="$1"
     if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
@@ -1494,6 +1614,9 @@ run_rch_cargo_logged_with_timeout() {
     fi
 
     : >"${output_file}"
+    local selected_worker=""
+    selected_worker="$(rch_attest_selected_worker_before_cargo "${output_file}" "$@")"
+
     local rch_env=(
         "TMPDIR=${RCH_LOCAL_TMPDIR}"
         "RCH_NO_SELF_HEALING=1"
@@ -1524,6 +1647,9 @@ run_rch_cargo_logged_with_timeout() {
             rch_env+=("${passthrough_key}=${!passthrough_key}")
         fi
     done
+    if [[ -n "${selected_worker}" && -z "${RCH_WORKER:-}" ]]; then
+        rch_env+=("RCH_WORKER=${selected_worker}")
+    fi
 
     set +e
     (
