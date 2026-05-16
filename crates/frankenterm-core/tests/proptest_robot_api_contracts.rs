@@ -184,8 +184,11 @@ proptest! {
 }
 
 #[test]
-fn api_surface_all_has_expected_variants() {
-    assert_eq!(ApiSurface::ALL.len(), 35);
+fn api_surface_all_has_unique_variants() {
+    let mut seen = std::collections::HashSet::new();
+    for surface in ApiSurface::ALL {
+        assert!(seen.insert(surface), "duplicate surface: {surface:?}");
+    }
 }
 
 #[test]

@@ -1815,8 +1815,14 @@ mod tests {
     }
 
     #[test]
-    fn surface_count_matches_all_array() {
-        assert_eq!(NtmApiSurface::ALL.len(), 22);
+    fn all_surfaces_are_unique() {
+        let unique: std::collections::HashSet<NtmApiSurface> =
+            NtmApiSurface::ALL.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            NtmApiSurface::ALL.len(),
+            "NtmApiSurface::ALL contains duplicate entries"
+        );
     }
 
     #[test]

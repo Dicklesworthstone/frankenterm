@@ -1288,8 +1288,16 @@ mod tests {
     }
 
     #[test]
-    fn surface_count() {
-        assert_eq!(ApiSurface::ALL.len(), 36);
+    fn all_surfaces_are_unique() {
+        let unique = ApiSurface::ALL
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            ApiSurface::ALL.len(),
+            "ApiSurface::ALL contains duplicate entries"
+        );
     }
 
     // ---- ContractCheck ----

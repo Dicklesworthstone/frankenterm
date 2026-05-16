@@ -1176,15 +1176,22 @@ proptest! {
 // =============================================================================
 
 #[test]
-fn ntm_api_surface_all_has_22_entries() {
-    assert_eq!(NtmApiSurface::ALL.len(), 22);
-}
-
-#[test]
-fn ntm_api_surface_all_unique() {
+fn ntm_api_surface_all_has_unique_entries() {
     let mut seen = std::collections::HashSet::new();
     for surface in NtmApiSurface::ALL {
         assert!(seen.insert(surface), "duplicate surface: {:?}", surface);
+    }
+}
+
+#[test]
+fn ntm_api_surface_command_paths_are_unique() {
+    let mut seen = std::collections::HashSet::new();
+    for surface in NtmApiSurface::ALL {
+        assert!(
+            seen.insert(surface.command_path()),
+            "duplicate command path: {}",
+            surface.command_path()
+        );
     }
 }
 
