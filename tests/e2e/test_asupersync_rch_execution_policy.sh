@@ -306,6 +306,7 @@ tmp_refused_fallback_record="${tmp_dir}/fallback-refused.json"
 tmp_refused_fallback_ledger="${tmp_dir}/fallback-refused-ledger.jsonl"
 tmp_refused_fallback_report="${tmp_dir}/fallback-refused-report.json"
 tmp_timeout_record="${tmp_dir}/timeout.json"
+tmp_light_timeout_record="${tmp_dir}/light-timeout.json"
 tmp_malformed_bead="${tmp_dir}/malformed-bead.json"
 tmp_stale_schema="${tmp_dir}/stale-schema.json"
 tmp_missing_worker_id="${tmp_dir}/missing-worker-id.json"
@@ -545,7 +546,13 @@ cat >"${strict_rch_dir}/rch" <<'FAKE_RCH'
 set -euo pipefail
 : "${STRICT_RCH_ENV_LOG:?}"
 {
+  printf 'RCH_NO_SELF_HEALING=%s\n' "${RCH_NO_SELF_HEALING:-}"
   printf 'RCH_REQUIRE_REMOTE=%s\n' "${RCH_REQUIRE_REMOTE:-}"
+  printf 'RCH_WORKER=%s\n' "${RCH_WORKER:-}"
+  printf 'RCH_CANONICAL_PROJECT_ROOT=%s\n' "${RCH_CANONICAL_PROJECT_ROOT:-}"
+  printf 'RCH_ALIAS_PROJECT_ROOT=%s\n' "${RCH_ALIAS_PROJECT_ROOT:-}"
+  printf 'RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=%s\n' "${RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS:-}"
+  printf 'RCH_VISIBILITY=%s\n' "${RCH_VISIBILITY:-}"
   printf 'RCH_BUILD_SLOTS=%s\n' "${RCH_BUILD_SLOTS:-}"
   printf 'RCH_TEST_SLOTS=%s\n' "${RCH_TEST_SLOTS:-}"
   printf 'RCH_CHECK_SLOTS=%s\n' "${RCH_CHECK_SLOTS:-}"
@@ -565,11 +572,16 @@ chmod +x "${strict_rch_dir}/rch"
 
 set +e
 (
-  PATH="${strict_rch_dir}:${PATH}" \
-    STRICT_RCH_ENV_LOG="${strict_rch_env_log}" \
-    RCH_BUILD_SLOTS=8 \
-    RCH_TEST_SLOTS=8 \
-    RCH_CHECK_SLOTS=2 \
+    PATH="${strict_rch_dir}:${PATH}" \
+      STRICT_RCH_ENV_LOG="${strict_rch_env_log}" \
+      RCH_WORKER=vmi-test \
+      RCH_CANONICAL_PROJECT_ROOT=/data/projects \
+      RCH_ALIAS_PROJECT_ROOT=/dp \
+      RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=600 \
+      RCH_VISIBILITY=verbose \
+      RCH_BUILD_SLOTS=8 \
+      RCH_TEST_SLOTS=8 \
+      RCH_CHECK_SLOTS=2 \
     run_rch_cargo_logged \
       "${strict_rch_output_log}" \
       env CARGO_TARGET_DIR=target/rch-proof cargo test --workspace
@@ -578,7 +590,13 @@ strict_rch_rc=$?
 set -e
 
 if [[ "${strict_rch_rc}" -eq 0 ]] \
+  || ! grep -Fxq "RCH_NO_SELF_HEALING=1" "${strict_rch_env_log}" \
   || ! grep -Fxq "RCH_REQUIRE_REMOTE=1" "${strict_rch_env_log}" \
+  || ! grep -Fxq "RCH_WORKER=vmi-test" "${strict_rch_env_log}" \
+  || ! grep -Fxq "RCH_CANONICAL_PROJECT_ROOT=/data/projects" "${strict_rch_env_log}" \
+  || ! grep -Fxq "RCH_ALIAS_PROJECT_ROOT=/dp" "${strict_rch_env_log}" \
+  || ! grep -Fxq "RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=600" "${strict_rch_env_log}" \
+  || ! grep -Fxq "RCH_VISIBILITY=verbose" "${strict_rch_env_log}" \
   || ! grep -Fxq "RCH_BUILD_SLOTS=8" "${strict_rch_env_log}" \
   || ! grep -Fxq "RCH_TEST_SLOTS=8" "${strict_rch_env_log}" \
   || ! grep -Fxq "RCH_CHECK_SLOTS=2" "${strict_rch_env_log}" \
@@ -591,7 +609,7 @@ if [[ "${strict_rch_rc}" -eq 0 ]] \
     "strict_remote_not_enforced" \
     "wrapper_failed_open" \
     "$(basename "${strict_rch_output_log}")" \
-    "run_rch_cargo_logged must pass RCH_REQUIRE_REMOTE=1 plus slot envs and fail before local cargo fallback"
+    "run_rch_cargo_logged must pass RCH_NO_SELF_HEALING=1, RCH_REQUIRE_REMOTE=1, worker/topology, daemon, visibility, and slot envs before failing closed"
   exit 1
 fi
 
@@ -602,7 +620,58 @@ emit_log \
   "strict_remote_enforced" \
   "none" \
   "$(basename "${strict_rch_output_log}")" \
-  "run_rch_cargo_logged passes RCH_REQUIRE_REMOTE=1 plus slot envs and fails closed on fake queue_timeout fallback"
+  "run_rch_cargo_logged disables RCH self-healing, passes strict remote worker/topology envs, and fails closed on fake queue_timeout fallback"
+
+light_timeout_rch_dir="${tmp_dir}/light-timeout-bin"
+light_timeout_output_log="${tmp_dir}/light-timeout-wrapper.log"
+light_timeout_env_log="${tmp_dir}/light-timeout-env.log"
+mkdir -p "${light_timeout_rch_dir}"
+cat >"${light_timeout_rch_dir}/rch" <<'FAKE_RCH'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${LIGHT_TIMEOUT_ENV_LOG:?}"
+{
+  printf 'RCH_NO_SELF_HEALING=%s\n' "${RCH_NO_SELF_HEALING:-}"
+  printf 'args=%s\n' "$*"
+} >>"${LIGHT_TIMEOUT_ENV_LOG}"
+sleep 5
+FAKE_RCH
+chmod +x "${light_timeout_rch_dir}/rch"
+
+set +e
+(
+  PATH="${light_timeout_rch_dir}:${PATH}" \
+    LIGHT_TIMEOUT_ENV_LOG="${light_timeout_env_log}" \
+    run_rch_logged_with_timeout \
+      1 \
+      "${light_timeout_output_log}" \
+      --json workers probe --all
+) >/dev/null 2>&1
+light_timeout_rc=$?
+set -e
+
+if [[ "${light_timeout_rc}" -ne 124 ]] \
+  || ! grep -Fxq "RCH_NO_SELF_HEALING=1" "${light_timeout_env_log}" \
+  || ! grep -Fxq "args=--json workers probe --all" "${light_timeout_env_log}"; then
+  emit_log \
+    "failed" \
+    "wrapper_guard" \
+    "light_rch_timeout" \
+    "light_timeout_not_enforced" \
+    "wrapper_failed_open" \
+    "$(basename "${light_timeout_output_log}")" \
+    "run_rch_logged_with_timeout must bound light RCH preflight commands and disable RCH self-healing"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "wrapper_guard" \
+  "light_rch_timeout" \
+  "light_timeout_enforced" \
+  "none" \
+  "$(basename "${light_timeout_output_log}")" \
+  "run_rch_logged_with_timeout bounds light RCH preflight commands"
 
 nonzero_rch_dir="${tmp_dir}/nonzero-remote-bin"
 nonzero_rch_output_log="${tmp_dir}/nonzero-remote-wrapper.log"
@@ -693,6 +762,38 @@ expect_validation_failure \
   "wrapper_ledger" \
   "timeout_classification" \
   "wrapper-emitted timeout record must not validate as passing proof"
+
+light_timeout_log="${tmp_dir}/light-timeout.log"
+printf '%s\n' "rch workers probe still running" >"${light_timeout_log}"
+rch_write_meta_json "${light_timeout_log}" "124"
+RCH_PROOF_LEDGER_FILE="${wrapper_ledger}" \
+RCH_PROOF_LEDGER_BEAD_ID="ft-kvs1e" \
+RCH_PROOF_LEDGER_SCENARIO_ID="${SCENARIO_ID}" \
+  rch_emit_proof_ledger_entry \
+    "rch --json workers probe --all" \
+    "${light_timeout_log}" \
+    "124" \
+    "not_applicable" \
+    "not_applicable" \
+    "light preflight timeout fixture"
+tail -n 1 "${wrapper_ledger}" >"${tmp_light_timeout_record}"
+if [[ "$(jq -r '.runs[0].validation_status' "${tmp_light_timeout_record}")" != "timeout" ]] \
+  || [[ "$(jq -r '.runs[0].execution_mode' "${tmp_light_timeout_record}")" != "local_light" ]]; then
+  emit_log \
+    "failed" \
+    "wrapper_ledger" \
+    "light_timeout_classification" \
+    "light_timeout_not_marked" \
+    "unexpected_validation_status" \
+    "$(basename "${tmp_light_timeout_record}")" \
+    "light preflight timeout record must be local_light/timeout, not valid local proof"
+  exit 1
+fi
+expect_validation_failure \
+  "${tmp_light_timeout_record}" \
+  "wrapper_ledger" \
+  "light_timeout_classification" \
+  "wrapper-emitted light preflight timeout record must not validate as passing proof"
 
 if (
   RCH_PROOF_LEDGER_FILE="${tmp_dir}/missing-metadata.jsonl" \

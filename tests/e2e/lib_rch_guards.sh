@@ -20,6 +20,7 @@
 #   rch_init()                 - Set up variables (call once at start)
 #   ensure_rch_ready()         - Preflight: probe workers + smoke cargo check
 #   ensure_rch_remote_only_preflight() - Queue-aware remote-only proof preflight
+#   run_rch_logged_with_timeout() - Timeout-wrapped non-Cargo rch command
 #   run_rch_cargo_logged()     - Timeout-wrapped rch cargo with stall/fallback detection
 #   rch_write_meta_json()      - Persist worker/exit/timing metadata for an rch log
 #   rch_emit_proof_ledger_entry() - Optional proof-ledger JSONL emission
@@ -34,6 +35,7 @@ _LIB_RCH_GUARDS_LOADED=1
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
 RCH_SMOKE_TIMEOUT_SECS="${RCH_SMOKE_TIMEOUT_SECS:-600}"
+RCH_PROBE_TIMEOUT_SECS="${RCH_PROBE_TIMEOUT_SECS:-120}"
 RCH_LOCAL_TMPDIR="${RCH_LOCAL_TMPDIR:-/tmp}"
 RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
 # Set this to 1 for harnesses whose first material verification steps already
@@ -346,11 +348,13 @@ rch_emit_proof_ledger_entry() {
         elapsed_seconds="0"
     fi
 
-    execution_mode="remote_rch"
-    validation_status="valid"
     if [[ "${is_heavy}" == "false" && "${used_rch}" == "false" ]]; then
         execution_mode="local_light"
-    elif [[ "${fail_open}" == "true" ]]; then
+    else
+        execution_mode="remote_rch"
+    fi
+    validation_status="valid"
+    if [[ "${fail_open}" == "true" ]]; then
         if [[ "${remote_required_refused}" == "true" ]]; then
             execution_mode="refused_local_fallback"
             validation_status="fallback_refused"
@@ -607,6 +611,7 @@ rch_write_meta_json() {
         --arg timeout_bin "${TIMEOUT_BIN}" \
         --arg step_timeout_secs "${RCH_STEP_TIMEOUT_SECS}" \
         --arg smoke_timeout_secs "${RCH_SMOKE_TIMEOUT_SECS}" \
+        --arg probe_timeout_secs "${RCH_PROBE_TIMEOUT_SECS}" \
         --arg rch_skip_smoke_preflight_requested "${RCH_SKIP_SMOKE_PREFLIGHT}" \
         --argjson probe_worker_ids "${probe_worker_ids_json}" \
         --argjson skipped_smoke_preflight "${skipped_smoke_preflight}" \
@@ -630,6 +635,7 @@ rch_write_meta_json() {
           timeout_bin: (if $timeout_bin == "" then null else $timeout_bin end),
           step_timeout_secs: (if $step_timeout_secs == "" then null else ($step_timeout_secs | tonumber) end),
           smoke_timeout_secs: (if $smoke_timeout_secs == "" then null else ($smoke_timeout_secs | tonumber) end),
+          probe_timeout_secs: (if $probe_timeout_secs == "" then null else ($probe_timeout_secs | tonumber) end),
           rch_skip_smoke_preflight_requested: (if $rch_skip_smoke_preflight_requested == "" then null else ($rch_skip_smoke_preflight_requested == "1") end),
           skipped_smoke_preflight: $skipped_smoke_preflight,
           reachable_workers_detected: $reachable_workers_detected,
@@ -941,6 +947,49 @@ rch_write_remote_preflight_json() {
         }' >"${output_file}"
 }
 
+run_rch_logged_with_timeout() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+
+    if [[ -z "${TIMEOUT_BIN}" ]]; then
+        resolve_timeout_bin
+    fi
+    if [[ -z "${TIMEOUT_BIN}" ]]; then
+        rch_fatal "timeout or gtimeout is required to fail closed on stalled rch preflight commands."
+    fi
+
+    local rch_env=(
+        "TMPDIR=${RCH_LOCAL_TMPDIR}"
+        "RCH_NO_SELF_HEALING=1"
+    )
+    local passthrough_key
+    for passthrough_key in \
+        RCH_WORKER \
+        RCH_CANONICAL_PROJECT_ROOT \
+        RCH_ALIAS_PROJECT_ROOT \
+        RCH_DAEMON_RESPONSE_TIMEOUT_SECS \
+        RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS \
+        RCH_VISIBILITY \
+        RCH_LOG_LEVEL
+    do
+        if [[ -n "${!passthrough_key:-}" ]]; then
+            rch_env+=("${passthrough_key}=${!passthrough_key}")
+        fi
+    done
+
+    set +e
+    (
+        cd "${_RCH_REPO_ROOT:-.}"
+        exec env "${rch_env[@]}" \
+            "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" \
+            rch "$@"
+    ) >"${output_file}" 2>&1
+    local rc=$?
+    set -e
+    return "${rc}"
+}
+
 ensure_rch_remote_only_preflight() {
     if [[ "${RCH_SKIP_QUEUE_PREFLIGHT}" == "1" ]]; then
         printf '%s\n' "Queue preflight skipped because RCH_SKIP_QUEUE_PREFLIGHT=1" >"${_RCH_REMOTE_PREFLIGHT_LOG}"
@@ -961,7 +1010,7 @@ ensure_rch_remote_only_preflight() {
     while :; do
         attempt=$((attempt + 1))
         set +e
-        run_rch --json queue >"${_RCH_QUEUE_LOG}" 2>&1
+        run_rch_logged_with_timeout "${RCH_PROBE_TIMEOUT_SECS}" "${_RCH_QUEUE_LOG}" --json queue
         queue_rc=$?
         set -e
         rch_write_meta_json "${_RCH_QUEUE_LOG}" "${queue_rc}"
@@ -1021,7 +1070,7 @@ ensure_rch_worker_selection_preflight() {
     while :; do
         attempt=$((attempt + 1))
         set +e
-        run_rch --json diagnose --dry-run cargo check --help >"${_RCH_WORKER_SELECTION_LOG}" 2>&1
+        run_rch_logged_with_timeout "${RCH_PROBE_TIMEOUT_SECS}" "${_RCH_WORKER_SELECTION_LOG}" --json diagnose --dry-run cargo check --help
         selection_rc=$?
         set -e
         rch_write_meta_json "${_RCH_WORKER_SELECTION_LOG}" "${selection_rc}"
@@ -1059,7 +1108,7 @@ ensure_rch_worker_selection_preflight() {
 
 ensure_rch_runtime_capabilities() {
     set +e
-    run_rch --json workers capabilities >"${_RCH_CAPABILITIES_LOG}" 2>&1
+    run_rch_logged_with_timeout "${RCH_PROBE_TIMEOUT_SECS}" "${_RCH_CAPABILITIES_LOG}" --json workers capabilities
     local capabilities_rc=$?
     set -e
     rch_write_meta_json "${_RCH_CAPABILITIES_LOG}" "${capabilities_rc}"
@@ -1084,7 +1133,7 @@ ensure_rch_runtime_capabilities() {
     fi
 
     set +e
-    run_rch --json workers capabilities --refresh >"${_RCH_CAPABILITIES_REFRESH_LOG}" 2>&1
+    run_rch_logged_with_timeout "${RCH_PROBE_TIMEOUT_SECS}" "${_RCH_CAPABILITIES_REFRESH_LOG}" --json workers capabilities --refresh
     local refresh_rc=$?
     set -e
     rch_write_meta_json "${_RCH_CAPABILITIES_REFRESH_LOG}" "${refresh_rc}"
@@ -1164,7 +1213,7 @@ ensure_rch_mirror_preflight() {
     fi
 
     set +e
-    run_rch --json status --workers >"${_RCH_SCHEDULER_WORKERS_LOG}" 2>&1
+    run_rch_logged_with_timeout "${RCH_PROBE_TIMEOUT_SECS}" "${_RCH_SCHEDULER_WORKERS_LOG}" --json status --workers
     scheduler_status_rc=$?
     set -e
     scheduler_worker_ids=""
@@ -1447,6 +1496,7 @@ run_rch_cargo_logged_with_timeout() {
     : >"${output_file}"
     local rch_env=(
         "TMPDIR=${RCH_LOCAL_TMPDIR}"
+        "RCH_NO_SELF_HEALING=1"
         "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}"
         "RCH_BUILD_TIMEOUT_SEC=${RCH_BUILD_TIMEOUT_SEC:-${timeout_secs}}"
         "RCH_TEST_TIMEOUT_SEC=${RCH_TEST_TIMEOUT_SEC:-${timeout_secs}}"
@@ -1460,6 +1510,20 @@ run_rch_cargo_logged_with_timeout() {
     if [[ -n "${RCH_CHECK_SLOTS:-}" ]]; then
         rch_env+=("RCH_CHECK_SLOTS=${RCH_CHECK_SLOTS}")
     fi
+    local passthrough_key
+    for passthrough_key in \
+        RCH_WORKER \
+        RCH_CANONICAL_PROJECT_ROOT \
+        RCH_ALIAS_PROJECT_ROOT \
+        RCH_DAEMON_RESPONSE_TIMEOUT_SECS \
+        RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS \
+        RCH_VISIBILITY \
+        RCH_LOG_LEVEL
+    do
+        if [[ -n "${!passthrough_key:-}" ]]; then
+            rch_env+=("${passthrough_key}=${!passthrough_key}")
+        fi
+    done
 
     set +e
     (
@@ -1532,8 +1596,11 @@ rch_init() {
     _RCH_MIRROR_PREFLIGHT_LOG="${log_dir}/${harness_name}_${run_id}.rch_mirror_preflight.json"
     _RCH_SCHEDULER_WORKERS_LOG="${log_dir}/${harness_name}_${run_id}.rch_scheduler_workers.json"
     _RCH_WORKER_SELECTION_LOG="${log_dir}/${harness_name}_${run_id}.rch_worker_selection.json"
-    _RCH_SMOKE_TARGET_DIR="target/rch-smoke/${harness_name}/${run_id}"
-    mkdir -p "${_RCH_SMOKE_TARGET_DIR}"
+    local smoke_target_root="${RCH_SMOKE_TARGET_ROOT:-target/rch-smoke}"
+    _RCH_SMOKE_TARGET_DIR="${RCH_SMOKE_TARGET_DIR:-${smoke_target_root}/${harness_name}/${run_id}}"
+    if [[ "${RCH_SKIP_SMOKE_PREFLIGHT}" != "1" ]]; then
+        mkdir -p "${_RCH_SMOKE_TARGET_DIR}"
+    fi
 }
 
 # Preflight check: ensure rch is available, workers reachable, and remote
@@ -1568,7 +1635,7 @@ ensure_rch_ready() {
     fi
 
     set +e
-    run_rch --json workers probe --all >"${_RCH_PROBE_LOG}" 2>&1
+    run_rch_logged_with_timeout "${RCH_PROBE_TIMEOUT_SECS}" "${_RCH_PROBE_LOG}" --json workers probe --all
     local probe_rc=$?
     set -e
     rch_write_meta_json "${_RCH_PROBE_LOG}" "${probe_rc}"
