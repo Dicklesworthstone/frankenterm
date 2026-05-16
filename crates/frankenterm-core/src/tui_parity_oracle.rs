@@ -142,11 +142,6 @@ impl Rgba {
         b: 0x00,
         a: 0xFF,
     };
-
-    #[cfg(any(feature = "tui", feature = "ftui"))]
-    const fn opaque(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b, a: 0xFF }
-    }
 }
 
 /// `width × height` cell grid. Cells are row-major

@@ -3739,8 +3739,7 @@ where
             current_logical_line.push(' ');
         } else {
             current_logical_line.push_str(line);
-            logical_lines.push(current_logical_line.clone());
-            current_logical_line.clear();
+            logical_lines.push(std::mem::take(&mut current_logical_line));
         }
     }
     if !current_logical_line.is_empty() {

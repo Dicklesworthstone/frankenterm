@@ -6953,8 +6953,11 @@ fn telemetry_gap_state_for_signal(
     signal: &SwarmCapacityWorkloadAdmissionSignal,
 ) -> SwarmCapacityTelemetryGapState {
     match (signal.evidence_state, signal.pressure_tier) {
-        (SwarmCapacityWorkloadEvidenceState::Unavailable, _)
-        | (SwarmCapacityWorkloadEvidenceState::Contradictory, _)
+        (
+            SwarmCapacityWorkloadEvidenceState::Unavailable
+            | SwarmCapacityWorkloadEvidenceState::Contradictory,
+            _,
+        )
         | (_, HealthTier::Black) => SwarmCapacityTelemetryGapState::KillSwitch,
         (
             SwarmCapacityWorkloadEvidenceState::Stale
