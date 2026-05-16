@@ -16,6 +16,12 @@ use termwiz::escape::csi::{Cursor, Sgr};
 use termwiz::escape::osc::{ITermDimension, ITermFileData, ITermProprietary};
 use termwiz::escape::{CSI, OneBased, OperatingSystemCommand};
 
+const FRANKENTERM_RELEASES_API_LATEST: &str =
+    "https://api.github.com/repos/Dicklesworthstone/frankenterm/releases/latest";
+const FRANKENTERM_RELEASES_API_NIGHTLY: &str =
+    "https://api.github.com/repos/Dicklesworthstone/frankenterm/releases/tags/nightly";
+const FRANKENTERM_FORCE_UPDATE_UI_ENV: &str = "FRANKENTERM_ALWAYS_SHOW_UPDATE_UI";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Release {
     pub url: String,
@@ -41,7 +47,7 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
         .version(HttpVersion::Http10)
         .header(
             "User-Agent",
-            &format!("wezterm/wezterm-{}", wezterm_version()),
+            &format!("frankenterm/frankenterm-{}", wezterm_version()),
         )
         .send(&mut latest)
         .map_err(|e| anyhow!("failed to query github releases: {}", e))?;
@@ -56,12 +62,12 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
 }
 
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/wezterm/wezterm/releases/latest")
+    get_github_release_info(FRANKENTERM_RELEASES_API_LATEST)
 }
 
 #[allow(unused)]
 pub fn get_nightly_release_info() -> anyhow::Result<Release> {
-    get_github_release_info("https://api.github.com/repos/wezterm/wezterm/releases/tags/nightly")
+    get_github_release_info(FRANKENTERM_RELEASES_API_NIGHTLY)
 }
 
 lazy_static::lazy_static! {
@@ -81,7 +87,7 @@ pub fn load_last_release_info_and_set_banner() {
         };
 
         let current = wezterm_version();
-        let force_ui = std::env::var_os("WEZTERM_ALWAYS_SHOW_UPDATE_UI").is_some();
+        let force_ui = std::env::var_os(FRANKENTERM_FORCE_UPDATE_UI_ENV).is_some();
         if latest.tag_name.as_str() <= current && !force_ui {
             return;
         }
@@ -95,7 +101,7 @@ fn set_banner_from_release_info(latest: &Release) {
         log::debug!("Skipping update banner because the mux singleton is not available");
         return;
     };
-    let url = format!("https://wezterm.org/changelog.html#{}", latest.tag_name);
+    let url = release_browser_url(latest);
 
     let icon = ITermFileData {
         name: None,
@@ -148,6 +154,17 @@ fn schedule_set_banner_from_release_info(latest: &Release) {
     .detach();
 }
 
+fn release_browser_url(latest: &Release) -> String {
+    if latest.html_url.trim().is_empty() {
+        format!(
+            "https://github.com/Dicklesworthstone/frankenterm/releases/tag/{}",
+            latest.tag_name
+        )
+    } else {
+        latest.html_url.clone()
+    }
+}
+
 /// Returns true if the provided socket path is dead.
 fn update_checker() {
     // Compute how long we should sleep for;
@@ -157,7 +174,7 @@ fn update_checker() {
     let update_interval = Duration::from_secs(configuration().check_for_updates_interval_seconds);
     let initial_interval = Duration::from_secs(10);
 
-    let force_ui = std::env::var_os("WEZTERM_ALWAYS_SHOW_UPDATE_UI").is_some();
+    let force_ui = std::env::var_os(FRANKENTERM_FORCE_UPDATE_UI_ENV).is_some();
 
     let update_file_name = config::DATA_DIR.join("check_update");
     let delay = update_file_name
@@ -194,7 +211,7 @@ fn update_checker() {
                         current
                     );
 
-                    let url = format!("https://wezterm.org/changelog.html#{}", latest.tag_name);
+                    let url = release_browser_url(&latest);
 
                     if force_ui || socks.is_empty() || socks[0] == my_sock {
                         persistent_toast_notification_with_click_to_open_url(
@@ -234,5 +251,44 @@ pub fn start_update_checker() {
             .name("update_checker".into())
             .spawn(update_checker)
             .expect("failed to spawn update checker thread");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release_with_urls(html_url: &str, tag_name: &str) -> Release {
+        Release {
+            url: "https://api.github.com/repos/Dicklesworthstone/frankenterm/releases/1"
+                .to_string(),
+            body: String::new(),
+            html_url: html_url.to_string(),
+            tag_name: tag_name.to_string(),
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn release_browser_url_uses_github_html_url() {
+        let latest = release_with_urls(
+            "https://github.com/Dicklesworthstone/frankenterm/releases/tag/v1",
+            "v1",
+        );
+
+        assert_eq!(
+            release_browser_url(&latest),
+            "https://github.com/Dicklesworthstone/frankenterm/releases/tag/v1"
+        );
+    }
+
+    #[test]
+    fn release_browser_url_falls_back_to_frankenterm_tag_url() {
+        let latest = release_with_urls("", "v2");
+
+        assert_eq!(
+            release_browser_url(&latest),
+            "https://github.com/Dicklesworthstone/frankenterm/releases/tag/v2"
+        );
     }
 }
