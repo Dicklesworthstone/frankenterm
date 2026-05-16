@@ -732,7 +732,12 @@ impl EnvelopeFacts {
                 &sources,
                 &[
                     "rch.no_workers_passed_health",
+                    "rch.no_admissible_workers",
+                    "rch.no_admissible_workers.critical_pressure",
+                    "rch.critical_pressure",
                     "rch.worker_selection.no_available_worker",
+                    "rch.worker_selection.no_admissible_workers",
+                    "no_admissible_workers=critical_pressure=1",
                 ],
             ),
             rch_topology_failure: any_reason(
@@ -1577,6 +1582,37 @@ mod tests {
         assert_eq!(
             plan.decision.rch_proof_state,
             OperatingEnvelopeProofState::Unavailable
+        );
+        assert_eq!(
+            window_ids(&plan),
+            vec!["docs_only", "admit_after_rch_recovers"]
+        );
+    }
+
+    #[test]
+    fn rch_critical_pressure_defers_remote_proof() {
+        let mut domains = base_domains();
+        domains.rch = source(
+            "rch-critical-pressure",
+            OperatingEnvelopeSourceKind::Rch,
+            "rch.no_admissible_workers.critical_pressure",
+        )
+        .with_reason_code("rch.remote_cargo_reached_false")
+        .blocked("rch.no_admissible_workers.critical_pressure");
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Defer);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Red);
+        assert_eq!(
+            plan.decision.rch_proof_state,
+            OperatingEnvelopeProofState::Unavailable
+        );
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"rch.no_workers_passed_health".to_string())
         );
         assert_eq!(
             window_ids(&plan),
