@@ -79,6 +79,20 @@ jobs:
           FT_INSTALL_EXECUTION: github-actions-local
           FT_INSTALL_PATH: ${{ github.workspace }}/crates/frankenterm
           E2E_ARTIFACTS_BASE: ${{ github.workspace }}/e2e-artifacts
+          # GitHub-hosted runners don't have `rch` installed and don't reach the
+          # offload workers; opt into the local-cargo mode that `ensure_rch_ready`
+          # in tests/e2e/lib_rch_guards.sh checks for (line 1608). Without this
+          # the workflow fails closed with `FATAL: rch is required for this E2E
+          # harness`. See #56.
+          RCH_GITHUB_ACTIONS_LOCAL_CARGO: "1"
+        # The script uses nested heredocs that bash 3.2 (the system bash on
+        # macos-14) chokes on at parse time (`line 125: syntax error near
+        # unexpected token '('`). Run through a modern bash regardless of
+        # platform. Both ubuntu-latest and macos-14 ship bash 4+/5+ via
+        # `/usr/bin/env bash` (Linux: bash 5; macOS: Homebrew bash on PATH);
+        # the explicit shell line keeps GitHub Actions from defaulting to
+        # `/bin/bash -e` which on macOS resolves to bash 3.2.
+        shell: /usr/bin/env bash {0}
         run: bash tests/e2e/test_ft_gofz5_1_cargo_install.sh
 
       - name: Upload cargo install artifacts
