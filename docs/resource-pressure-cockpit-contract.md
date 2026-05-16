@@ -477,8 +477,8 @@ bucket to hide in a leak summary.
       "name": "rss_residency",
       "evidence_state": "unavailable",
       "pressure_tier": "unknown",
-      "summary": "residency classifier not attached",
-      "operator_action": "capture_diagnostic_bundle",
+      "summary": "residency classifier evidence is not attached to this cockpit snapshot",
+      "operator_action": "capture_residency_evidence",
       "reason_codes": ["resource.telemetry.unavailable"]
     },
     "pane_budget": {
@@ -541,12 +541,12 @@ bucket to hide in a leak summary.
   "memory_tiers": [],
   "residency_buckets": [
     {
-      "bucket": "sqlite_page_cache",
-      "bucket_name": "SQLite page cache",
+      "bucket": "unknown",
+      "bucket_name": "unknown",
       "evidence_state": "unavailable",
       "bytes": null,
       "confidence": 0,
-      "dominant": false,
+      "dominant": true,
       "reason_codes": ["resource.telemetry.unavailable"]
     }
   ],
@@ -574,7 +574,7 @@ bucket to hide in a leak summary.
     {
       "subject": "rss_residency",
       "reason_code": "resource.telemetry.unavailable",
-      "detail": "classifier is not implemented yet"
+      "detail": "residency classifier evidence was not attached to this cockpit snapshot"
     }
   ],
   "artifact_paths": [
