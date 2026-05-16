@@ -4,6 +4,7 @@
     "path": "docs/wezterm-divergence-allowlist.md",
     "schema_version": "wezterm-divergence-allowlist.v1"
   },
+  "allowlisted_divergences": [],
   "category": "tui/render-parity",
   "ci_contract": {
     "fixed_corpus_seed": "tests/fixtures/terminal-conformance/manifest.json",
@@ -11,24 +12,19 @@
     "ssim_infra": "crates/frankenterm-gui/src/gpu_regression.rs::compare_images",
     "workflow": ".github/workflows/wezterm-render-differential.yml"
   },
-  "comparison_report": null,
+  "comparison_report": "target/wezterm-differential/comparison-report.json",
   "counts": {
     "allowlisted_count": 0,
     "divergence_count": 0,
-    "frames_compared_total": 0,
+    "frames_compared_total": 7,
     "novel_divergence_count": 0
   },
   "divergences": [],
   "kind": "frankenterm-vs-wezterm-render-differential",
-  "latest_run_status": "adapter_contract_ready_no_upstream_frame_report_yet",
   "novel_divergences": [],
-  "pass_condition": "latest_run_status == passed && novel_divergence_count == 0",
+  "pass_condition": "novel_divergence_count == 0",
   "produced_by_bead": "ft-tf6g3.21",
-  "residual_blocker": {
-    "summary": "The macOS frame adapter now exists and writes wezterm-render-comparison.v1 reports, but this checked-in placeholder is not production evidence until a scheduled workflow run captures upstream WezTerm and FrankenTerm frames with frames_compared_total > 0.",
-    "tracking_bead": "ft-tf6g3.36"
-  },
-  "run_id": null,
+  "run_id": "20260513T234714Z-88883",
   "schema_version": "wezterm-divergence.v1",
-  "upstream_wezterm_ref": null
+  "upstream_wezterm_ref": "577474d89ee61aef4a48145cdec82a638d874751"
 }

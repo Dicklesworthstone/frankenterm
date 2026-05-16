@@ -50,8 +50,9 @@ wording fail-closed until a non-skipped linux target-class artifact is retained,
 `perf/atlas-packing` (`ft-gtcm9.5`). The
 `docs/attestations/tui/wezterm-divergence.json` slot (`ft-tf6g3.21`,
 under `tui/render-parity`) records the upstream-WezTerm differential gate and
-is release evidence only after a run reports `frames_compared_total > 0` and
-`novel_divergence_count == 0`. The `docs/attestations/tui/topology-parity.json`
+is release evidence when the checked-in artifact reports
+`frames_compared_total > 0` and `novel_divergence_count == 0`. The
+`docs/attestations/tui/topology-parity.json`
 slot (`ft-tf6g3.24`, also under `tui/render-parity`) occupies the logical
 release-bundle `tui/topology-parity.json` slot for persistent-homology glyph
 parity. It is release evidence only after paired oracle/subject glyph bitmap
