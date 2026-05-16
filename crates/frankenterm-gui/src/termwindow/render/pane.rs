@@ -208,6 +208,8 @@ impl crate::TermWindow {
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
+        self.publish_terminal_state_for_pane(pos);
+
         if self.config.use_box_model_render {
             return self.paint_pane_box_model(pos);
         }
@@ -605,27 +607,6 @@ impl crate::TermWindow {
                     line_idx: usize,
                     line: &&mut Line,
                 ) -> anyhow::Result<()> {
-                    // Per ft-8pcwy / ft-jvj78 slice 2: ask the
-                    // iter-dirty predicate whether this row can be
-                    // skipped. The predicate stays inert (returns
-                    // false for every row) until per-cell event
-                    // sources are wired (ft-camu6) and the gate is
-                    // flipped via TermWindow::set_iter_dirty_render_gate.
-                    // No behavior change against today's
-                    // not-yet-wired sources — the gate is off and
-                    // the predicate falls through.
-                    let gate_enabled = self.term_window.iter_dirty_render_gate_enabled();
-                    if gate_enabled {
-                        let should_skip = crate::termwindow::should_skip_clean_line(
-                            true,
-                            self.term_window.peek_dirty_lines(self.pane_id),
-                            line_idx,
-                        );
-                        if should_skip {
-                            self.term_window.record_clean_line_skipped(self.pane_id);
-                            return Ok(());
-                        }
-                    }
                     let stable_row = stable_top + line_idx as StableRowIndex;
                     let selrange = self
                         .selrange
@@ -694,29 +675,48 @@ impl crate::TermWindow {
                         reverse_video: self.dims.reverse_video,
                     };
 
-                    if let Some(cached_quad) =
-                        self.term_window.line_quad_cache.borrow_mut().get(&quad_key)
-                    {
-                        let expired = cached_quad
-                            .expires
-                            .map(|i| Instant::now() >= i)
-                            .unwrap_or(false);
-                        let hover_changed = if cached_quad.invalidate_on_hover_change {
-                            !same_hyperlink_or_both_none(
-                                cached_quad.current_highlight.as_ref(),
-                                self.term_window.current_highlight.as_ref(),
-                            )
+                    let clean_line_can_reuse_cached_quads =
+                        self.term_window.iter_dirty_render_gate_enabled()
+                            && crate::termwindow::should_skip_clean_line(
+                                true,
+                                self.term_window.peek_dirty_lines(self.pane_id),
+                                line_idx,
+                            );
+
+                    let cached_reuse_expires = {
+                        let mut line_quad_cache = self.term_window.line_quad_cache.borrow_mut();
+                        if let Some(cached_quad) = line_quad_cache.get(&quad_key) {
+                            let expired = cached_quad
+                                .expires
+                                .map(|i| Instant::now() >= i)
+                                .unwrap_or(false);
+                            let hover_changed = if cached_quad.invalidate_on_hover_change {
+                                !same_hyperlink_or_both_none(
+                                    cached_quad.current_highlight.as_ref(),
+                                    self.term_window.current_highlight.as_ref(),
+                                )
+                            } else {
+                                false
+                            };
+                            if !expired && !hover_changed {
+                                cached_quad
+                                    .layers
+                                    .apply_to(self.layers)
+                                    .context("cached_quad.layers.apply_to")?;
+                                Some(cached_quad.expires)
+                            } else {
+                                None
+                            }
                         } else {
-                            false
-                        };
-                        if !expired && !hover_changed {
-                            cached_quad
-                                .layers
-                                .apply_to(self.layers)
-                                .context("cached_quad.layers.apply_to")?;
-                            self.term_window.update_next_frame_time(cached_quad.expires);
-                            return Ok(());
+                            None
                         }
+                    };
+                    if let Some(expires) = cached_reuse_expires {
+                        if clean_line_can_reuse_cached_quads {
+                            self.term_window.record_clean_line_skipped(self.pane_id);
+                        }
+                        self.term_window.update_next_frame_time(expires);
+                        return Ok(());
                     }
 
                     let mut buf = HeapQuadAllocator::default();

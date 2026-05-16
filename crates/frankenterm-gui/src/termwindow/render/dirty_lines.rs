@@ -27,16 +27,16 @@
 //! - structured-log helpers for the `dirty_lines_per_frame` and
 //!   `clean_lines_skipped` telemetry called out in the bead
 //!
-//! ## What is deferred (continuation, see follow-up bead)
+//! ## Current integration
 //!
-//! - wiring the bitmap into `RenderState` per pane
-//! - sourcing dirty events from PTY writes, cursor moves, selection,
-//!   resize, focus, theme/font, status tiles
-//! - making the render pass iterate over `iter_dirty()` instead of
-//!   the full visible row range
-//! - migrating `quad_generation` into a lower-bound version on top
-//!   of per-line dirty
-//! - benches: 200-pane fleet @ 1 cell/frame, font-swap O(N) rebuild
+//! The GUI marks this bitmap from PTY dirty ranges, cursor moves,
+//! selection changes, and whole-screen invalidations before paint.
+//! Clean-line accounting is only recorded after the renderer has
+//! reused cached quads for that row; rows without a valid cache entry
+//! still rebuild.
+//!
+//! Remaining follow-up work is the row-indexed quad-cache model and
+//! benches: 200-pane fleet @ 1 cell/frame, font-swap O(N) rebuild.
 
 use std::iter::FusedIterator;
 

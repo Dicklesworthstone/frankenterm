@@ -45,11 +45,13 @@ use frankenterm_core::floating_panes::{
     FloatingRect, KeyboardCommand as FloatingKeyboardCommand, PanePosition,
 };
 use frankenterm_core::frame_budget_a11y_gate as frame_budget_a11y;
+use frankenterm_core::session_pane_state::TerminalState;
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::accessibility_preferences::config_with_accessibility_palette;
 use frankenterm_gui::floating_panes::{
     GuiFloatingPaneController, emit_floating_pane_a11y_messages,
 };
+use frankenterm_gui::triple_buffer_gui::TerminalStateTripleBufferRegistry;
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
@@ -66,6 +68,7 @@ use mux_lua::MuxPane;
 use promise::spawn::sleep;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -426,8 +429,7 @@ pub struct FrameBudgetTelemetrySnapshot {
     pub gate_defers: u64,
 }
 
-/// and consumed by `ft doctor` once that wiring lands under the
-/// continuation bead.
+/// and consumed by `ft doctor`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirtyLineTelemetrySnapshot {
     /// Number of panes with a registered dirty-line bitmap.
@@ -525,13 +527,11 @@ pub fn pane_health_snapshot_from_watchdoged_health(
     }
 }
 
-/// Snapshot of the workspace-wide ElasticBuffer policy state
-/// (ft-mpc9b.1.3). Read via `TermWindow::elastic_buffer_telemetry()`
-/// and consumed by `ft doctor` once that wiring lands under the
-/// continuation bead. The continuation bead replaces the
-/// placeholder `<u32>` element type with the real `<QuadInstance>`;
-/// these counters then reflect actual GPU memory rather than the
-/// passive state-machine snapshot they are today.
+/// Snapshot of the workspace-wide ElasticBuffer policy state. Read
+/// via `TermWindow::elastic_buffer_telemetry()` and consumed by `ft doctor`.
+/// Capacity and used counters come from the live `RenderState`
+/// quad allocation; growth counters advance only when the renderer
+/// performs a real quad-buffer reallocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ElasticBufferTelemetrySnapshot {
     /// Current allocated capacity in elements.
@@ -621,20 +621,16 @@ pub struct TermWindow {
     /// Per-pane render-side dirty-line bitmap (ft-tfzhy / ft-mpc9b.1.2).
     ///
     /// The TermWindow keeps one `DirtyLineBitmap` per `PaneId` so the
-    /// render pass can iterate only over visible rows that actually
-    /// changed since the last frame. Coarse whole-screen events
-    /// (resize, focus change, font/theme swap) call `mark_all` on
-    /// every entry; per-cell PTY writes will call `mark` once the
-    /// pane-render path is ported off `quad_generation`. Frame end
-    /// clears the bitmap so the next frame starts with no rows
-    /// dirty.
+    /// render pass can distinguish rows that changed since the last
+    /// frame from rows eligible for cached-quad reuse. Coarse
+    /// whole-screen events (resize, focus change, font/theme swap)
+    /// call `mark_all` on every entry; live PTY dirty ranges, cursor
+    /// moves, and selection changes mark row-level damage.
     ///
     /// The `quad_generation` counter above stays as the lower-bound
     /// version on top of per-line dirty for events that genuinely
     /// invalidate everything (font swap, theme change). Both
-    /// signals are consumed by the render path together — see the
-    /// continuation bead's wiring of `iter_dirty()` into the paint
-    /// loop.
+    /// signals are consumed by the render path together.
     dirty_lines: HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
     /// Tracks whether the last dirty-marking event observed by this
     /// TermWindow was a coarse whole-screen invalidation (font swap,
@@ -647,20 +643,19 @@ pub struct TermWindow {
     /// (cont of ft-5ykn9). Each whole-screen event source flips this
     /// flag; per-cell sources leave it false.
     last_dirty_event_was_whole_screen: bool,
-    /// Gate for the iter-dirty render-pass skip-clean-lines path
-    /// (ft-8pcwy / ft-jvj78 slice 2). Defaults to false so the
-    /// render loop iterates every line — no behavior change against
-    /// today's not-yet-wired event sources. The `set_iter_dirty_render_gate`
-    /// setter flips it on once per-cell event sources have been
-    /// wired (ft-camu6) so the bitmap actually reflects per-line
-    /// dirty state.
+    /// Gate for the iter-dirty render-pass clean-line accounting
+    /// path (ft-8pcwy / ft-jvj78 / ft-gwzrm). The live source
+    /// wiring marks PTY, cursor, selection, and whole-screen events
+    /// before paint; the render loop only records a clean-line skip
+    /// after it has reused cached quads for that row, so enabling
+    /// the gate cannot create visual holes when a cache entry is
+    /// unavailable.
     iter_dirty_render_gate_enabled: bool,
     /// Per-frame budget allocator (ft-d6nrd / ft-s0nah slice 1).
     /// Tracks the headroom left in the current frame for cosmetic
     /// ops + the deferred-cosmetic queue across frames. paint_impl
-    /// calls begin_frame at entry and end_frame after Present;
-    /// per-op `try_execute` wiring is item 1 of the bead and is
-    /// scheduled as a follow-up.
+    /// calls begin_frame at entry, routes render operations through
+    /// `try_execute`, and ends the budget after Present.
     frame_budget: frame_budget::FrameBudget,
     /// Idle frame-rate detector (ft-s8guw). Central event paths
     /// call `record_idle_event`, while the status tick polls the
@@ -668,18 +663,22 @@ pub struct TermWindow {
     /// live current state without reaching into event handlers.
     idle_detector: idle_detector::IdleDetector,
     last_idle_transition: Option<idle_detector::IdleTransitionReport>,
-    /// Cosmetic-defer aggregator (ft-d6nrd). Future per-op wiring
-    /// calls `record_deferred(op_kind)` when the budget pushes a
-    /// cosmetic op out of frame; `record_drained(op_kind)` when the
-    /// op finally executes. The redraw predicate consults
-    /// `has_outstanding()` so the next frame is forced when there
-    /// is deferred work.
+    /// Cosmetic-defer aggregator (ft-d6nrd). Per-op wiring records
+    /// a defer when the budget pushes a cosmetic op out of frame
+    /// and records a drain when queued work is admitted again. The
+    /// redraw predicate consults `has_outstanding()` so the next
+    /// frame is forced when there is deferred work.
     cosmetic_defer_outstanding: frankenterm_core::frame_budget_a11y_gate::CosmeticDeferOutstanding,
     /// A11Y reduce-motion + cosmetic-defer gate telemetry
     /// (ft-d6nrd). Aggregates the per-decision counters from the
     /// substrate's `evaluate_reduce_motion_gate` for ft doctor
     /// surface emission.
     frame_budget_gate_telemetry: frankenterm_core::frame_budget_a11y_gate::FrameBudgetGateTelemetry,
+    /// Cached reduce-motion state consumed by FrameBudget render
+    /// gates. The OS probe shells out on some platforms, so the
+    /// paint loop must read this cached value instead of probing
+    /// per render operation or per frame.
+    frame_budget_reduce_motion_state: frame_budget_a11y::ReduceMotionState,
     /// Per-source dirty-mark counters (ft-i6k6u / ft-jvj78 slice).
     /// Substrate's `MarksBySource` aggregator: 8 lifetime counts
     /// (one per `DirtyEventSource` variant). Bumped by the
@@ -687,16 +686,17 @@ pub struct TermWindow {
     /// Surfaced into `DirtyLineTelemetrySnapshot.marks_by_source`
     /// for ft-doctor's lines-redrawn-by-source breakdown.
     dirty_marks_by_source: frankenterm_core::dirty_line_telemetry::MarksBySource,
+    /// Per-pane `TerminalState` triple-buffer owners. The render
+    /// path publishes the current visible pane state here; the
+    /// ft-r9kr6 follow-up can poll these live owners into the
+    /// doctor-facing health snapshots without inventing a second
+    /// registry.
+    triple_buffer_panes: TerminalStateTripleBufferRegistry,
     /// Per-pane WatchdogedTripleBuffer health snapshots
-    /// (ft-gso6n / ft-l0oe3 slice). The integration's
-    /// frame-timer poll calls record_pane_health_snapshot per
-    /// pane each tick; ft doctor --triple-buffer aggregates via
-    /// `triple_buffer_telemetry()` into the substrate's
-    /// FleetHealthAggregate. Empty until the renderer migration
-    /// (sub-task 1) wires the actual WatchdogedTripleBuffer
-    /// instances per pane — this slice ships the doctor surface
-    /// so a future commit can flip the wiring without reshaping
-    /// TermWindow.
+    /// (ft-gso6n / ft-l0oe3 slice). `triple_buffer_telemetry()`
+    /// aggregates these into the substrate's FleetHealthAggregate.
+    /// The ft-r9kr6 follow-up owns the status-tick poll from the
+    /// live owners above into this map.
     triple_buffer_pane_health:
         HashMap<u64, frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot>,
     /// DEC 2026 Begin-Synchronized-Update watchdog telemetry
@@ -729,14 +729,12 @@ pub struct TermWindow {
     /// status-update timer to release excess capacity once the
     /// gesture has ended and the idle threshold has elapsed.
     ///
-    /// The element type is `u32` as a placeholder until the
-    /// continuation bead wraps the real `wgpu::Buffer<QuadInstance>`
-    /// with this policy. With an empty buffer the policy is a
-    /// passive state machine (gesture flag tracking, idle-shrink
-    /// no-op); when the GPU surgery lands the buffer's capacity
-    /// will reflect actual GPU memory and the shrink decisions
-    /// become load-bearing.
-    quad_buffer_policy: render::elastic_buffer::ElasticBuffer<u32>,
+    /// The policy observes the live `RenderState` quad allocation
+    /// without claiming ownership of GPU memory. A future quad-writer
+    /// continuation can still move the actual staging data into this
+    /// policy; today the telemetry is live allocation-backed while
+    /// shrink remains observational.
+    quad_buffer_policy: render::elastic_buffer::ElasticBuffer<()>,
     /// Whether `quad_buffer_policy` currently believes a live
     /// resize is in progress. The OS-side `live_resizing` boolean
     /// is sticky-on-active so we track the level transitions
@@ -801,20 +799,18 @@ pub struct TermWindow {
 /// cleared. Either way, the flag is reset to false so the next
 /// whole-screen event has to set it explicitly.
 /// Per ft-8pcwy: pure predicate the GUI render loop calls per
-/// (pane_id, line_idx) to decide whether to elide a render_line
-/// call. Free function so the truth table is unit-testable
-/// without standing up a TermWindow.
+/// (pane_id, line_idx) to decide whether a row is clean enough to
+/// reuse cached quads. Free function so the truth table is
+/// unit-testable without standing up a TermWindow.
 ///
 /// Semantics:
 /// - gate disabled → never skip (legacy iterate-all-lines).
 /// - gate enabled, no bitmap registered → never skip (no per-cell
 ///   event source has touched this pane yet; safer to render).
 /// - gate enabled, bitmap empty → never skip (bitmap was cleared
-///   at frame end and no event has marked anything since; treat
-///   as "events not wired" rather than "everything is clean" to
-///   avoid silently leaving stale rows on screen).
-/// - gate enabled, bitmap non-empty → skip iff the row index is
-///   not in the dirty set.
+///   at frame end and no event has marked anything since).
+/// - gate enabled, bitmap non-empty → cache-reuse candidate iff
+///   the row index is not in the dirty set.
 pub(crate) fn should_skip_clean_line(
     gate_enabled: bool,
     bitmap: Option<&render::dirty_lines::DirtyLineBitmap>,
@@ -853,6 +849,36 @@ pub(crate) fn mark_stable_rows_dirty<I>(
     }
 }
 
+/// Mark dirty stable-row ranges after translating them into visible
+/// row ranges for a pane-local bitmap. Ranges partially overlapping
+/// the viewport are clamped instead of dropped, which keeps live mux
+/// dirty-range events precise without expanding every row first.
+pub(crate) fn mark_stable_row_ranges_dirty<I>(
+    bitmap: &mut render::dirty_lines::DirtyLineBitmap,
+    viewport: StableRowIndex,
+    stable_ranges: I,
+) where
+    I: IntoIterator<Item = Range<StableRowIndex>>,
+{
+    for range in stable_ranges {
+        let visible_start = range.start.saturating_sub(viewport);
+        let visible_end = range.end.saturating_sub(viewport);
+        let start = if visible_start <= 0 {
+            0
+        } else {
+            usize::try_from(visible_start).unwrap_or(usize::MAX)
+        };
+        let end = if visible_end <= 0 {
+            0
+        } else {
+            usize::try_from(visible_end).unwrap_or(usize::MAX)
+        };
+        if start < end {
+            bitmap.mark_range(start..end);
+        }
+    }
+}
+
 /// Per ft-jvj78: cursor moves invalidate the previous and current
 /// cursor rows so the old cursor glyph is erased and the new one is
 /// drawn when iter-dirty rendering is enabled.
@@ -863,6 +889,36 @@ pub(crate) fn mark_cursor_rows_dirty(
     current: StableCursorPosition,
 ) {
     mark_stable_rows_dirty(bitmap, viewport, [previous.y, current.y]);
+}
+
+#[must_use]
+pub(crate) fn terminal_u16_from_usize(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+#[must_use]
+pub(crate) fn terminal_u16_from_stable_delta(value: StableRowIndex) -> u16 {
+    u16::try_from(value).unwrap_or(if value < 0 { 0 } else { u16::MAX })
+}
+
+#[must_use]
+pub(crate) fn terminal_pane_id_to_u64(pane_id: PaneId) -> u64 {
+    u64::try_from(pane_id).unwrap_or(u64::MAX)
+}
+
+#[must_use]
+pub(crate) fn terminal_state_from_rendered_pane(pane: &dyn Pane) -> TerminalState {
+    let cursor = pane.get_cursor_position();
+    let dims = pane.get_dimensions();
+
+    TerminalState {
+        rows: terminal_u16_from_usize(dims.viewport_rows),
+        cols: terminal_u16_from_usize(dims.cols),
+        cursor_row: terminal_u16_from_stable_delta(cursor.y.saturating_sub(dims.physical_top)),
+        cursor_col: terminal_u16_from_usize(cursor.x),
+        is_alt_screen: pane.is_alt_screen_active(),
+        title: pane.get_title(),
+    }
 }
 
 /// Per ft-d6nrd slice 1: pure predicate the redraw decision
@@ -916,6 +972,56 @@ pub(crate) fn a11y_op_kind_from_frame_budget_op(
         frame_budget::OpKind::Decorations => Some(frame_budget_a11y::OpKind::Decorations),
         frame_budget::OpKind::Animations => Some(frame_budget_a11y::OpKind::Animations),
         frame_budget::OpKind::Custom(_) => None,
+    }
+}
+
+#[must_use]
+pub(crate) fn default_frame_budget_cost_ns(op: frame_budget::OpKind) -> u64 {
+    let table = frankenterm_core::frame_budget_a11y_gate::OpCostTable::default();
+    match a11y_op_kind_from_frame_budget_op(op) {
+        Some(a11y_op) => table.lookup_ns(a11y_op),
+        None => frame_budget::FrameBudgetCostFeedback::CUSTOM_DEFAULT_NS,
+    }
+}
+
+#[must_use]
+pub(crate) fn should_run_frame_budget_decision(
+    decision: frame_budget_a11y::MotionGateDecision,
+) -> bool {
+    matches!(decision, frame_budget_a11y::MotionGateDecision::Execute)
+}
+
+pub(crate) fn record_drained_frame_budget_ops<I>(
+    outstanding: &mut frankenterm_core::frame_budget_a11y_gate::CosmeticDeferOutstanding,
+    drained_ops: I,
+) where
+    I: IntoIterator<Item = frame_budget::DeferredOp>,
+{
+    for op in drained_ops {
+        if let Some(a11y_op) = a11y_op_kind_from_frame_budget_op(op.kind) {
+            outstanding.record_drained(a11y_op);
+        }
+    }
+}
+
+pub(crate) fn record_frame_budget_execution_outstanding(
+    outstanding: &mut frankenterm_core::frame_budget_a11y_gate::CosmeticDeferOutstanding,
+    op: frame_budget::OpKind,
+    execution: frame_budget::ExecutionDecision,
+) {
+    match execution {
+        frame_budget::ExecutionDecision::Deferred => {
+            if let Some(a11y_op) = a11y_op_kind_from_frame_budget_op(op) {
+                outstanding.record_deferred(a11y_op);
+            }
+        }
+        frame_budget::ExecutionDecision::Dropped { evicted } => {
+            record_drained_frame_budget_ops(outstanding, [evicted]);
+            if let Some(a11y_op) = a11y_op_kind_from_frame_budget_op(op) {
+                outstanding.record_deferred(a11y_op);
+            }
+        }
+        frame_budget::ExecutionDecision::Executed { .. } => {}
     }
 }
 
@@ -1087,10 +1193,9 @@ impl TermWindow {
     ///
     /// Called at coarse-grained invalidation points (resize, focus
     /// change, font/theme swap) where the renderer can't easily
-    /// reason about per-line damage. The continuation bead's
-    /// per-paint integration replaces individual call sites with
-    /// fine-grained `mark` / `mark_range` once the dirty-event
-    /// sources from ft-mpc9b.1.2's bead body are wired in.
+    /// reason about per-line damage. Row-level sources use
+    /// `mark_stable_row_ranges_dirty` / `mark_cursor_rows_dirty`
+    /// instead.
     ///
     /// Bitmaps that have never been registered (capacity 0) absorb
     /// the call as a no-op — the next read by the render path will
@@ -1110,8 +1215,6 @@ impl TermWindow {
     /// Lazy getter for a pane's dirty bitmap. Sizes the bitmap to
     /// `visible_rows` on first access and adjusts (preserving
     /// existing marks where possible) if the row count changes.
-    /// The continuation bead's render-pass wiring uses this from
-    /// the per-pane paint hot path.
     pub fn dirty_lines_for_pane(
         &mut self,
         pane_id: PaneId,
@@ -1192,7 +1295,6 @@ impl TermWindow {
     /// Used by:
     /// - check_for_dirty_lines_and_invalidate_selection (Pty + SelectionChange)
     /// - mark_all_panes_dirty_with_source (FocusChange / ThemeSwap / FontSwap / Resize)
-    /// - future per-event-source mark sites
     pub fn record_dirty_event(
         &mut self,
         source: frankenterm_core::dirty_line_telemetry::DirtyEventSource,
@@ -1213,16 +1315,43 @@ impl TermWindow {
         self.record_dirty_event(source);
     }
 
+    pub fn publish_terminal_state_snapshot(
+        &mut self,
+        pane_id: u64,
+        state: TerminalState,
+    ) -> frankenterm_core::triple_buffer::PublishOutcome {
+        self.triple_buffer_panes.publish(pane_id, state)
+    }
+
+    fn publish_terminal_state_for_pane(
+        &mut self,
+        pos: &PositionedPane,
+    ) -> frankenterm_core::triple_buffer::PublishOutcome {
+        self.publish_terminal_state_snapshot(
+            terminal_pane_id_to_u64(pos.pane.pane_id()),
+            terminal_state_from_rendered_pane(&*pos.pane),
+        )
+    }
+
+    /// Per ft-kyail: drop the live triple-buffer owner for a closed pane and
+    /// clear the last retained health snapshot for the same pane. This keeps
+    /// ownership and doctor telemetry lifetimes aligned.
+    pub fn forget_terminal_state_buffer_for_pane(&mut self, pane_id: u64) {
+        self.triple_buffer_panes.remove(pane_id);
+        self.forget_pane_health_snapshot(pane_id);
+    }
+
+    #[must_use]
+    pub fn terminal_state_buffer_pane_count(&self) -> usize {
+        self.triple_buffer_panes.len()
+    }
+
     /// Per ft-gso6n / ft-l0oe3 slice: store the most-recent
     /// per-pane health snapshot from the WatchdogedTripleBuffer.
-    /// Called by the integration's frame-timer poll each tick;
-    /// today's TermWindow doesn't poll yet (renderer migration
-    /// is sub-task 1 of the parent bead), but the field +
-    /// helper are in place so a future commit can wire the poll
-    /// without reshaping TermWindow.
+    /// Called by the integration's frame-timer poll each tick.
     ///
     /// Pane removal: the dirty_lines forget hook also clears the
-    /// triple-buffer snapshot for the same pane.
+    /// triple-buffer owner and snapshot for the same pane.
     pub fn record_pane_health_snapshot(
         &mut self,
         pane_id: u64,
@@ -1357,17 +1486,17 @@ impl TermWindow {
         }
     }
 
-    /// Per ft-8pcwy: query the iter-dirty render-pass gate. Default
-    /// false until per-cell event sources are wired (ft-camu6).
+    /// Per ft-gwzrm: query the iter-dirty render-pass gate. The
+    /// gate controls clean-line skip telemetry; rows still rebuild
+    /// whenever cached quads are unavailable.
     #[inline]
     pub fn iter_dirty_render_gate_enabled(&self) -> bool {
         self.iter_dirty_render_gate_enabled
     }
 
-    /// Per ft-8pcwy: flip the iter-dirty render-pass gate. The
-    /// flip-the-switch is intentionally a separate commit from the
-    /// integration so the bisect log makes the behavior change
-    /// auditable.
+    /// Per ft-gwzrm: allow tests or operator plumbing to disable
+    /// clean-line skip telemetry without changing the dirty-marking
+    /// source wiring.
     pub fn set_iter_dirty_render_gate(&mut self, enabled: bool) {
         self.iter_dirty_render_gate_enabled = enabled;
     }
@@ -1411,11 +1540,33 @@ impl TermWindow {
         self.frame_budget.begin_frame()
     }
 
+    pub fn frame_budget_drain_deferred_cosmetic(&mut self) -> u32 {
+        let drained = self.frame_budget.drain_deferred_ops();
+        let drained_count = drained.len().min(u32::MAX as usize) as u32;
+        record_drained_frame_budget_ops(&mut self.cosmetic_defer_outstanding, drained);
+        drained_count
+    }
+
+    pub fn frame_budget_try_bulk_drain_cosmetic(&mut self) -> u32 {
+        let drained = self.frame_budget.try_bulk_drain_ops();
+        let drained_count = drained.len().min(u32::MAX as usize) as u32;
+        record_drained_frame_budget_ops(&mut self.cosmetic_defer_outstanding, drained);
+        drained_count
+    }
+
     /// Per ft-d6nrd slice 1: paint_impl hook called after Present.
     /// Returns the typed end-of-frame report for telemetry
     /// emission.
     pub fn frame_budget_end_frame(&mut self) -> frame_budget::FrameEndReport {
         self.frame_budget.end_frame()
+    }
+
+    pub fn frame_budget_reduce_motion_state(&self) -> frame_budget_a11y::ReduceMotionState {
+        self.frame_budget_reduce_motion_state
+    }
+
+    pub fn refresh_frame_budget_reduce_motion_state(&mut self) {
+        self.frame_budget_reduce_motion_state = probe_reduce_motion_state();
     }
 
     /// Per ft-asdza / A11Y.5: compose the current FrameBudget
@@ -1437,17 +1588,15 @@ impl TermWindow {
         if let Some(a11y_op) = a11y_op_kind_from_frame_budget_op(op) {
             self.frame_budget_gate_telemetry
                 .record_decision(a11y_op, decision);
-            if matches!(
-                decision,
-                frame_budget_a11y::MotionGateDecision::Defer
-                    | frame_budget_a11y::MotionGateDecision::DropOldest
-            ) {
-                self.cosmetic_defer_outstanding.record_deferred(a11y_op);
-            }
         }
 
         if !matches!(decision, frame_budget_a11y::MotionGateDecision::Skip) {
-            let _ = self.frame_budget.try_execute(op, priority, cost_ns);
+            let execution = self.frame_budget.try_execute(op, priority, cost_ns);
+            record_frame_budget_execution_outstanding(
+                &mut self.cosmetic_defer_outstanding,
+                op,
+                execution,
+            );
         }
 
         decision
@@ -1471,20 +1620,61 @@ impl TermWindow {
         )
     }
 
-    /// Snapshot of the workspace ElasticBuffer policy state
-    /// (ft-mpc9b.1.3). Consumed by `ft doctor` once that path
-    /// lands. Returns counters even when no GPU buffer is wrapped
-    /// — the policy state machine is exercised by the gesture
-    /// hooks regardless.
+    pub fn frame_budget_should_run_render_op(
+        &mut self,
+        op: frame_budget::OpKind,
+        priority: frame_budget::OpPriority,
+    ) -> bool {
+        let decision = self.frame_budget_try_execute_with_reduce_motion(
+            op,
+            priority,
+            default_frame_budget_cost_ns(op),
+            self.frame_budget_reduce_motion_state,
+        );
+        should_run_frame_budget_decision(decision)
+    }
+
+    pub fn frame_budget_should_run_render_op_with_reduce_motion(
+        &mut self,
+        op: frame_budget::OpKind,
+        priority: frame_budget::OpPriority,
+        motion: frame_budget_a11y::ReduceMotionState,
+    ) -> bool {
+        let decision = self.frame_budget_try_execute_with_reduce_motion(
+            op,
+            priority,
+            default_frame_budget_cost_ns(op),
+            motion,
+        );
+        should_run_frame_budget_decision(decision)
+    }
+
+    /// Snapshot of the workspace ElasticBuffer policy state.
+    /// Capacity and used counters are backed by the live RenderState
+    /// quad allocation after renderer creation or the first paint.
+    /// A zero capacity now means there is genuinely no observed live
+    /// allocation yet.
     pub fn elastic_buffer_telemetry(&self) -> ElasticBufferTelemetrySnapshot {
         ElasticBufferTelemetrySnapshot {
-            capacity: self.quad_buffer_policy.capacity() as u64,
-            used: self.quad_buffer_policy.len() as u64,
+            capacity: self.quad_buffer_policy.telemetry_capacity() as u64,
+            used: self.quad_buffer_policy.telemetry_len() as u64,
             grow_count: self.quad_buffer_policy.grow_count(),
             shrink_count: self.quad_buffer_policy.shrink_count(),
             high_water_mark: self.quad_buffer_policy.high_water_mark() as u64,
             gesture_active: self.quad_buffer_policy.is_gesture_active(),
         }
+    }
+
+    pub(crate) fn record_quad_buffer_allocation_snapshot(&mut self, reallocation_count: u64) {
+        let Some(render_state) = self.render_state.as_ref() else {
+            return;
+        };
+        let snapshot = render_state.quad_allocation_snapshot();
+        self.quad_buffer_policy.record_live_allocation(
+            snapshot.used,
+            snapshot.capacity,
+            reallocation_count,
+        );
     }
 
     /// Notify the quad-buffer policy that a live resize gesture has
@@ -1512,13 +1702,11 @@ impl TermWindow {
         }
     }
 
-    /// Driven by the periodic status-update timer. Asks the
-    /// quad-buffer policy whether the idle-shrink criteria are met
-    /// and, if a shrink fires, emits a structured-log line so
-    /// operators can correlate the event with telemetry. The
-    /// continuation bead replaces the placeholder `u32` element
-    /// type with `QuadInstance` and connects the shrink to a real
-    /// wgpu buffer resize.
+    /// Driven by the periodic status-update timer. The current
+    /// integration preserves resize-gesture gating and live
+    /// allocation telemetry, but does not shrink the GPU-owned
+    /// `RenderState` buffers until the quad-writer continuation
+    /// moves live reallocation into the policy.
     fn tick_quad_buffer_shrink(&mut self) {
         if let Some(result) = self.quad_buffer_policy.try_shrink_if_idle(Instant::now()) {
             log::trace!(
@@ -1613,6 +1801,7 @@ impl TermWindow {
             config::wezterm_version(),
         );
         self.render_state.replace(render_state);
+        self.record_quad_buffer_allocation_snapshot(0);
 
         Ok(())
     }
@@ -1791,11 +1980,10 @@ impl TermWindow {
             // event so the dirty bitmap is not silently cleared
             // before any pane has had a chance to populate it.
             last_dirty_event_was_whole_screen: true,
-            // Per ft-8pcwy: gate stays off until per-cell event
-            // sources are wired (ft-camu6). Production behavior
-            // is unchanged — the predicate falls through to legacy
-            // iterate-all-lines.
-            iter_dirty_render_gate_enabled: false,
+            // Per ft-gwzrm: live dirty sources are wired, and the
+            // render path only records a clean-line skip after a
+            // cached quad list was actually reused.
+            iter_dirty_render_gate_enabled: true,
             // Per ft-d6nrd slice 1: 60 Hz default budget; the
             // adaptive-FPS path will override this once the
             // refresh-rate probe lands. paint_impl will tick
@@ -1807,8 +1995,10 @@ impl TermWindow {
                 frankenterm_core::frame_budget_a11y_gate::CosmeticDeferOutstanding::default(),
             frame_budget_gate_telemetry:
                 frankenterm_core::frame_budget_a11y_gate::FrameBudgetGateTelemetry::default(),
+            frame_budget_reduce_motion_state: probe_reduce_motion_state(),
             dirty_marks_by_source:
                 frankenterm_core::dirty_line_telemetry::MarksBySource::default(),
+            triple_buffer_panes: TerminalStateTripleBufferRegistry::default(),
             triple_buffer_pane_health: HashMap::new(),
             sync_output_watchdog_telemetry:
                 frankenterm_core::sync_output_watchdog::SyncOutputTelemetry::default(),
@@ -2469,12 +2659,12 @@ impl TermWindow {
                     // entry per closed pane over the session
                     // lifetime.
                     self.forget_dirty_lines_for_pane(pane_id);
-                    // Per ft-gso6n: also drop the pane's
-                    // triple-buffer health snapshot. The
-                    // snapshot HashMap is keyed by the
-                    // substrate's u64 PaneId; cast from the
-                    // mux's usize PaneId here.
-                    self.forget_pane_health_snapshot(pane_id as u64);
+                    // Per ft-kyail: also drop the pane's live
+                    // triple-buffer owner and retained health
+                    // snapshot. Both are keyed by the substrate's
+                    // u64 PaneId; cast from the mux's usize PaneId
+                    // here.
+                    self.forget_terminal_state_buffer_for_pane(terminal_pane_id_to_u64(pane_id));
                 }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
@@ -2909,7 +3099,7 @@ impl TermWindow {
         let pane_id = pane.pane_id();
         let viewport_rows = dims.viewport_rows;
         let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
-        mark_stable_rows_dirty(bitmap, viewport, dirty.iter_values());
+        mark_stable_row_ranges_dirty(bitmap, viewport, dirty.iter().cloned());
         // Per ft-i6k6u: tag the mark with its source so the
         // substrate's per-source aggregator attributes
         // PTY-driven seqno bumps separately from selection /
@@ -3005,6 +3195,7 @@ impl TermWindow {
         };
         let config = config_with_accessibility_palette(config);
         self.config = config.clone();
+        self.refresh_frame_budget_reduce_motion_state();
         self.palette.take();
 
         let Some(mux) = self.mux_or_log("reload GUI configuration") else {
@@ -5493,10 +5684,13 @@ mod tests {
     use super::{
         SyncOutputDoctorSnapshot, WebGpuSurfaceErrorAction, a11y_op_kind_from_frame_budget_op,
         base_policy_for_frame_budget_state, classify_webgpu_surface_error,
-        evaluate_frame_budget_reduce_motion_gate, frame_budget, mark_cursor_rows_dirty,
-        mark_stable_rows_dirty, pane_health_snapshot_from_watchdoged_health,
-        reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
-        should_force_paint_for_frame_budget, should_skip_clean_line,
+        default_frame_budget_cost_ns, evaluate_frame_budget_reduce_motion_gate, frame_budget,
+        mark_cursor_rows_dirty, mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
+        pane_health_snapshot_from_watchdoged_health, record_drained_frame_budget_ops,
+        record_frame_budget_execution_outstanding, reduce_motion_state_from_preference, render,
+        run_clear_dirty_lines_after_frame, should_force_paint_for_frame_budget,
+        should_run_frame_budget_decision, should_skip_clean_line, terminal_pane_id_to_u64,
+        terminal_u16_from_stable_delta, terminal_u16_from_usize,
     };
 
     /// ft-camu6: stable→visible translation marks the right rows.
@@ -5561,6 +5755,36 @@ mod tests {
         assert_eq!(bm.dirty_marks_total(), 1);
     }
 
+    /// ft-gwzrm: live dirty ranges are translated as ranges, not as
+    /// an expanded list of every row. Partial viewport overlaps are
+    /// clamped so visible damage is not dropped at the edges.
+    #[test]
+    fn mark_stable_row_ranges_clamps_partial_viewport_overlap() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        mark_stable_row_ranges_dirty(&mut bm, 100, [95_isize..103, 118..130]);
+
+        for row in 0..3 {
+            assert!(bm.contains(row), "top overlap row {row} should be dirty");
+        }
+        for row in 18..24 {
+            assert!(bm.contains(row), "bottom overlap row {row} should be dirty",);
+        }
+        assert_eq!(bm.count(), 9);
+        assert_eq!(bm.dirty_marks_total(), 9);
+    }
+
+    /// ft-gwzrm: ranges wholly outside the visible viewport remain
+    /// no-ops. This keeps scrolled-away mux dirty ranges from
+    /// creating false positives in the clean-line skip predicate.
+    #[test]
+    fn mark_stable_row_ranges_drops_out_of_view_ranges() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        mark_stable_row_ranges_dirty(&mut bm, 100, [10_isize..20, 124..130]);
+
+        assert_eq!(bm.count(), 0);
+        assert_eq!(bm.dirty_marks_total(), 0);
+    }
+
     /// ft-jvj78: cursor movement invalidates both the row that lost
     /// the cursor and the row that gained it.
     #[test]
@@ -5585,6 +5809,16 @@ mod tests {
         assert!(bm.contains(10));
         assert_eq!(bm.count(), 2);
         assert_eq!(bm.dirty_marks_total(), 2);
+    }
+
+    #[test]
+    fn terminal_state_numeric_fields_saturate_for_gui_publish() {
+        assert_eq!(terminal_u16_from_usize(24), 24);
+        assert_eq!(terminal_u16_from_usize(usize::MAX), u16::MAX);
+        assert_eq!(terminal_u16_from_stable_delta(10), 10);
+        assert_eq!(terminal_u16_from_stable_delta(-1), 0);
+        assert_eq!(terminal_u16_from_stable_delta(isize::MAX), u16::MAX);
+        assert_eq!(terminal_pane_id_to_u64(7), 7);
     }
 
     /// ft-i6k6u: the substrate's MarksBySource record method
@@ -6076,8 +6310,91 @@ mod tests {
         assert_eq!(decision, MotionGateDecision::DropOldest);
     }
 
+    #[test]
+    fn frame_budget_run_predicate_only_runs_execute_decisions() {
+        use frankenterm_core::frame_budget_a11y_gate::MotionGateDecision;
+
+        assert!(should_run_frame_budget_decision(
+            MotionGateDecision::Execute
+        ));
+        assert!(!should_run_frame_budget_decision(MotionGateDecision::Defer));
+        assert!(!should_run_frame_budget_decision(MotionGateDecision::Skip));
+        assert!(!should_run_frame_budget_decision(
+            MotionGateDecision::DropOldest
+        ));
+    }
+
+    #[test]
+    fn frame_budget_default_costs_match_seed_table_for_gui_ops() {
+        assert_eq!(
+            default_frame_budget_cost_ns(frame_budget::OpKind::DirtyQuadRebuild),
+            80_000
+        );
+        assert_eq!(
+            default_frame_budget_cost_ns(frame_budget::OpKind::Decorations),
+            30_000
+        );
+        assert_eq!(
+            default_frame_budget_cost_ns(frame_budget::OpKind::Animations),
+            200_000
+        );
+        assert_eq!(
+            default_frame_budget_cost_ns(frame_budget::OpKind::Custom(9)),
+            frame_budget::FrameBudgetCostFeedback::CUSTOM_DEFAULT_NS
+        );
+    }
+
+    #[test]
+    fn drained_frame_budget_ops_decrement_matching_outstanding_kind() {
+        use frankenterm_core::frame_budget_a11y_gate::{
+            CosmeticDeferOutstanding, OpKind as A11yOpKind,
+        };
+
+        let mut outstanding = CosmeticDeferOutstanding::default();
+        outstanding.record_deferred(A11yOpKind::Ligatures);
+        outstanding.record_deferred(A11yOpKind::Decorations);
+
+        record_drained_frame_budget_ops(
+            &mut outstanding,
+            [frame_budget::DeferredOp {
+                kind: frame_budget::OpKind::Ligatures,
+                estimated_cost_ns: 1,
+            }],
+        );
+
+        assert_eq!(outstanding.deferred_ligatures, 0);
+        assert_eq!(outstanding.deferred_decorations, 1);
+        assert_eq!(outstanding.total(), 1);
+    }
+
+    #[test]
+    fn dropped_frame_budget_op_reconciles_evicted_outstanding_kind() {
+        use frankenterm_core::frame_budget_a11y_gate::{
+            CosmeticDeferOutstanding, OpKind as A11yOpKind,
+        };
+
+        let mut outstanding = CosmeticDeferOutstanding::default();
+        outstanding.record_deferred(A11yOpKind::Ligatures);
+
+        record_frame_budget_execution_outstanding(
+            &mut outstanding,
+            frame_budget::OpKind::Decorations,
+            frame_budget::ExecutionDecision::Dropped {
+                evicted: frame_budget::DeferredOp {
+                    kind: frame_budget::OpKind::Ligatures,
+                    estimated_cost_ns: 1,
+                },
+            },
+        );
+
+        assert_eq!(outstanding.deferred_ligatures, 0);
+        assert_eq!(outstanding.deferred_decorations, 1);
+        assert_eq!(outstanding.total(), 1);
+    }
+
     /// ft-8pcwy: gate disabled → never skip, regardless of bitmap
-    /// state. This is the production-default invariant.
+    /// state. This remains the manual fallback invariant even
+    /// though production now enables the gate by default.
     #[test]
     fn skip_predicate_off_when_gate_disabled() {
         let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
@@ -6099,8 +6416,7 @@ mod tests {
 
     /// ft-8pcwy: gate enabled but bitmap is empty → never skip.
     /// The bitmap was cleared at frame end and no event has marked
-    /// anything since; treat as "events not wired" rather than
-    /// "everything is clean".
+    /// anything since.
     #[test]
     fn skip_predicate_off_when_bitmap_empty() {
         let bm = render::dirty_lines::DirtyLineBitmap::new(24);

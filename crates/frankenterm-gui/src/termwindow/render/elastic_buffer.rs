@@ -1,12 +1,10 @@
 //! Elastic instance / vertex buffer with capacity-doubling growth.
 //!
 //! This module ships the policy foundation only (ft-mpc9b.1.3). The
-//! public API is exercised by tests but not yet by callers; the
-//! integration bead (continuation) wires it into `quad.rs`. Until
-//! then, the items below would fire dead-code warnings — the
-//! module-level allow is intentionally narrow and lives next to the
-//! continuation reference so the next agent removes it as part of
-//! the wiring work.
+//! public API is exercised by tests and by TermWindow's live
+//! allocation observer; the remaining staging-buffer helpers are
+//! intentionally retained for the continuation that wires the policy
+//! directly into the quad writer.
 //!
 //! Replaces the implicit-and-coupled-to-atlas-size buffer growth in
 //! `quad.rs` with an explicit policy engine inspired by rio's
@@ -30,18 +28,15 @@
 //! Decoupling the policy from the wgpu plumbing means the policy is
 //! pure-Rust testable without a GPU device handle.
 //!
-//! ## What is deferred (continuation, see follow-up bead)
+//! ## What remains deferred (continuation, see follow-up bead)
 //!
 //! - wrap a `wgpu::Buffer` with `ElasticBuffer<QuadInstance>` in
 //!   `crates/frankenterm-gui/src/quad.rs`
 //! - replace the per-cell vertex batching with one instance per
 //!   cell (cell-instance-data records); RQ-S1 / RQ-S6 SLO benches
-//! - wire `gesture_begin` / `gesture_end` into the resize path
-//! - call `try_shrink_if_idle` from the idle-tick that lives in
-//!   `crates/frankenterm-gui/src/termwindow/mod.rs`
-//! - expose `grow_count` / `shrink_count` / `high_water_mark` via
-//!   `ft doctor`
-//! - remove the `#![allow(dead_code)]` below as part of that wiring
+//! - perform live GPU shrink/reallocation through this policy
+//! - remove the remaining `#![allow(dead_code)]` once the staging
+//!   helpers are directly used by the quad writer
 
 #![allow(dead_code)]
 
@@ -84,6 +79,12 @@ pub struct ShrinkResult {
 #[derive(Debug)]
 pub struct ElasticBuffer<T> {
     data: Vec<T>,
+    /// Live allocation observer used while the GPU buffer itself is
+    /// still owned by `RenderState`. When set, telemetry methods
+    /// report the observed live allocation rather than the staging
+    /// Vec's passive capacity.
+    observed_live_used: Option<usize>,
+    observed_live_capacity: Option<usize>,
     /// Peak `data.len()` observed since the most recent successful
     /// shrink (or since construction). This is the "shrink-to-here"
     /// floor when the idle policy fires.
@@ -117,6 +118,8 @@ impl<T> ElasticBuffer<T> {
         let bucket = bucket.max(1);
         Self {
             data: Vec::with_capacity(initial_capacity),
+            observed_live_used: None,
+            observed_live_capacity: None,
             high_water_mark: 0,
             gesture_active: false,
             last_gesture_end: None,
@@ -163,16 +166,67 @@ impl<T> ElasticBuffer<T> {
         self.data.clear();
     }
 
+    /// Record the live allocation state from the GPU-owned quad
+    /// buffers without claiming ownership of the GPU memory.
+    ///
+    /// `reallocation_count` must count only real GPU buffer
+    /// reallocations the caller just performed. That keeps grow and
+    /// shrink telemetry tied to allocation decisions rather than
+    /// passive observations.
+    pub fn record_live_allocation(
+        &mut self,
+        used: usize,
+        capacity: usize,
+        reallocation_count: u64,
+    ) {
+        let previous_capacity = self.telemetry_capacity();
+        self.observed_live_used = Some(used);
+        self.observed_live_capacity = Some(capacity);
+        if used > self.high_water_mark {
+            self.high_water_mark = used;
+        }
+        if reallocation_count > 0 {
+            match capacity.cmp(&previous_capacity) {
+                std::cmp::Ordering::Greater => {
+                    self.grow_count = self.grow_count.saturating_add(reallocation_count);
+                }
+                std::cmp::Ordering::Less => {
+                    self.shrink_count = self.shrink_count.saturating_add(reallocation_count);
+                    self.high_water_mark = used;
+                    self.last_gesture_end = None;
+                }
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+    }
+
     /// Number of entries currently staged.
     #[inline]
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
+    /// Length reported to telemetry. This follows the live observed
+    /// GPU allocation when `record_live_allocation` has supplied one;
+    /// otherwise it is the staging Vec length.
+    #[inline]
+    pub fn telemetry_len(&self) -> usize {
+        self.observed_live_used.unwrap_or_else(|| self.data.len())
+    }
+
     /// Allocated capacity in entries. Always `>= len()`.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.data.capacity()
+    }
+
+    /// Capacity reported to telemetry. This follows the live observed
+    /// GPU allocation when `record_live_allocation` has supplied one;
+    /// otherwise it is the staging Vec capacity.
+    #[inline]
+    pub fn telemetry_capacity(&self) -> usize {
+        self.observed_live_capacity
+            .unwrap_or_else(|| self.data.capacity())
     }
 
     #[inline]
@@ -423,6 +477,52 @@ mod tests {
         assert_eq!(bm.capacity(), cap_before);
         // Lifetime telemetry survives clear.
         assert_eq!(bm.high_water_mark(), 32);
+    }
+
+    #[test]
+    fn live_allocation_observation_drives_telemetry_without_staging_data() {
+        let mut bm: ElasticBuffer<u32> = small_buffer(0);
+
+        bm.record_live_allocation(80, 128, 0);
+
+        assert_eq!(bm.len(), 0);
+        assert_eq!(bm.capacity(), 0);
+        assert_eq!(bm.telemetry_len(), 80);
+        assert_eq!(bm.telemetry_capacity(), 128);
+        assert_eq!(bm.high_water_mark(), 80);
+        assert_eq!(bm.grow_count(), 0);
+    }
+
+    #[test]
+    fn live_allocation_growth_counts_only_real_reallocation_decisions() {
+        let mut bm: ElasticBuffer<u32> = small_buffer(0);
+        bm.record_live_allocation(80, 128, 0);
+        bm.record_live_allocation(96, 128, 0);
+        assert_eq!(bm.grow_count(), 0);
+
+        bm.record_live_allocation(129, 256, 2);
+        assert_eq!(bm.telemetry_len(), 129);
+        assert_eq!(bm.telemetry_capacity(), 256);
+        assert_eq!(bm.high_water_mark(), 129);
+        assert_eq!(bm.grow_count(), 2);
+
+        bm.record_live_allocation(130, 256, 3);
+        assert_eq!(bm.grow_count(), 2);
+    }
+
+    #[test]
+    fn live_allocation_shrink_counts_only_real_reallocation_decisions() {
+        let mut bm: ElasticBuffer<u32> = small_buffer(0);
+        bm.record_live_allocation(200, 256, 0);
+        bm.record_live_allocation(120, 256, 0);
+        assert_eq!(bm.shrink_count(), 0);
+        assert_eq!(bm.high_water_mark(), 200);
+
+        bm.record_live_allocation(64, 128, 1);
+        assert_eq!(bm.telemetry_len(), 64);
+        assert_eq!(bm.telemetry_capacity(), 128);
+        assert_eq!(bm.high_water_mark(), 64);
+        assert_eq!(bm.shrink_count(), 1);
     }
 
     #[test]

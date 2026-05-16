@@ -630,6 +630,20 @@ pub struct RenderState {
     pub layers: RefCell<Vec<Rc<RenderLayer>>>,
 }
 
+/// Live aggregate of the quad vertex-buffer allocation owned by `RenderState`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuadAllocationSnapshot {
+    pub capacity: usize,
+    pub used: usize,
+}
+
+/// Result of a quad-buffer allocation pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuadAllocationChange {
+    pub allocated: bool,
+    pub reallocation_count: u64,
+}
+
 impl RenderState {
     pub fn new(
         context: RenderContext,
@@ -698,7 +712,13 @@ impl RenderState {
     /// Returns false if the quads were sufficient.
     /// Returns Err if we needed to allocate but failed.
     pub fn allocated_more_quads(&mut self) -> anyhow::Result<bool> {
-        let mut allocated = false;
+        Ok(self.allocate_more_quads()?.allocated)
+    }
+
+    /// Allocate any undersized quad buffers and report how many
+    /// concrete GPU-buffer reallocations were performed.
+    pub fn allocate_more_quads(&mut self) -> anyhow::Result<QuadAllocationChange> {
+        let mut result = QuadAllocationChange::default();
 
         for layer in self.layers.borrow().iter() {
             for vb_idx in 0..3 {
@@ -713,12 +733,31 @@ impl RenderState {
                         )
                     })?;
                     log::trace!("Allocated {} quads (needed {})", num_quads, need_quads);
-                    allocated = true;
+                    result.allocated = true;
+                    result.reallocation_count = result.reallocation_count.saturating_add(1);
                 }
             }
         }
 
-        Ok(allocated)
+        Ok(result)
+    }
+
+    pub fn needs_more_quads(&self) -> bool {
+        self.layers
+            .borrow()
+            .iter()
+            .any(|layer| (0..3).any(|vb_idx| layer.need_more_quads(vb_idx).is_some()))
+    }
+
+    pub fn quad_allocation_snapshot(&self) -> QuadAllocationSnapshot {
+        let mut snapshot = QuadAllocationSnapshot::default();
+        for layer in self.layers.borrow().iter() {
+            for buffer in layer.vb.borrow().iter() {
+                snapshot.capacity = snapshot.capacity.saturating_add(buffer.capacity);
+                snapshot.used = snapshot.used.saturating_add(*buffer.next_quad.borrow());
+            }
+        }
+        snapshot
     }
 
     fn compile_prog(

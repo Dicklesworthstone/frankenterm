@@ -27,23 +27,21 @@
 //!   capacity cap + drop-oldest, and the lifetime telemetry
 //!   counters.
 //! - `ExecutionDecision` — what `try_execute` did: `Executed`,
-//!   `Deferred`, or `Dropped` (queue overflow forced an oldest-
-//!   entry eviction).
+//!   `Deferred`, or `Dropped` with the oldest evicted queue entry.
 //! - `FrameStartReport` / `FrameEndReport` — typed payloads the
 //!   structured-log emission and the `ft doctor` summary
 //!   consume.
 //! - `BUDGET_DEFER_THRESHOLD` (0.9) and `BULK_DRAIN_THRESHOLD`
 //!   (0.5) — named constants matching the bead's algorithm.
 //!
-//! ## What is deferred (continuation, see follow-up bead)
+//! ## Continuation Surface
 //!
 //! - Wiring `FrameBudget::begin_frame` / `end_frame` /
-//!   `try_execute` calls into the actual paint pipeline at
+//!   `try_execute` calls is owned by the paint pipeline at
 //!   `crates/frankenterm-gui/src/termwindow/render/paint.rs`.
-//! - Per-op cost estimation (the `cost_ns` argument). Today the
-//!   continuation bead's caller passes either a measured value
-//!   or a per-op-kind table.
-//! - `ft doctor` surface for queue depth / drop rate.
+//! - Per-op cost estimation is driven by the caller's seeded
+//!   per-op-kind table or measured values.
+//! - `ft doctor` consumes the queue depth / drop rate counters.
 //! - Coupling with the redraw predicate from ft-mpc9b.5.1: when
 //!   the deferred queue is non-empty, the predicate's
 //!   `cosmetic_defer_outstanding` input fires, forcing the next
@@ -129,8 +127,10 @@ pub enum ExecutionDecision {
     /// The op was queued for a future frame.
     Deferred,
     /// The deferred queue was at capacity; the oldest entry was
-    /// dropped to make room. Telemetry counters bump.
-    Dropped,
+    /// dropped to make room. Telemetry counters bump and the
+    /// evicted entry is returned so outstanding-work accounting
+    /// can reconcile the queue.
+    Dropped { evicted: DeferredOp },
 }
 
 /// Result of a measured FrameBudget execution attempt. Deferred
@@ -367,15 +367,15 @@ impl FrameBudget {
 
     /// Drain queued ops in bulk when the frame's budget is
     /// healthy (`spent_ns / budget_ns < BULK_DRAIN_THRESHOLD`).
-    /// Returns the number of ops drained. Each drained op
+    /// Returns the drained ops. Each drained op
     /// advances `spent_ns` by its `estimated_cost_ns` and stops
     /// when either the queue is empty or the budget threshold is
     /// reached.
-    pub fn try_bulk_drain(&mut self) -> u32 {
+    pub fn try_bulk_drain_ops(&mut self) -> Vec<DeferredOp> {
         if !self.under_bulk_drain_threshold() {
-            return 0;
+            return Vec::new();
         }
-        let mut drained: u32 = 0;
+        let mut drained_ops = Vec::new();
         while let Some(front) = self.deferred.front() {
             // Stop draining if executing this op would push us
             // back over the defer threshold.
@@ -385,14 +385,19 @@ impl FrameBudget {
             }
             let op = self.deferred.pop_front().expect("front existed");
             self.spent_ns = self.spent_ns.saturating_add(op.estimated_cost_ns);
-            drained = drained.saturating_add(1);
+            drained_ops.push(op);
         }
+        let drained = drained_ops.len().min(u32::MAX as usize) as u32;
         if drained > 0 {
             self.bulk_drains_this_frame = self.bulk_drains_this_frame.saturating_add(drained);
             self.bulk_drains_lifetime =
                 self.bulk_drains_lifetime.saturating_add(u64::from(drained));
         }
-        drained
+        drained_ops
+    }
+
+    pub fn try_bulk_drain(&mut self) -> u32 {
+        self.try_bulk_drain_ops().len().min(u32::MAX as usize) as u32
     }
 
     /// Close the frame. Returns the typed report for telemetry.
@@ -410,11 +415,11 @@ impl FrameBudget {
 
     /// Drain deferred ops at the start of the next frame —
     /// caller invokes after `begin_frame` to give carry-over ops
-    /// priority over fresh cosmetic ops. Returns the number
-    /// drained. Stops when either the queue is empty or the
+    /// priority over fresh cosmetic ops. Returns the drained ops.
+    /// Stops when either the queue is empty or the
     /// budget threshold is reached.
-    pub fn drain_deferred(&mut self) -> u32 {
-        let mut drained: u32 = 0;
+    pub fn drain_deferred_ops(&mut self) -> Vec<DeferredOp> {
+        let mut drained_ops = Vec::new();
         while let Some(front) = self.deferred.front() {
             let projected = self.spent_ns.saturating_add(front.estimated_cost_ns);
             if projected as f64 / self.budget_ns as f64 >= BUDGET_DEFER_THRESHOLD {
@@ -422,9 +427,13 @@ impl FrameBudget {
             }
             let op = self.deferred.pop_front().expect("front existed");
             self.spent_ns = self.spent_ns.saturating_add(op.estimated_cost_ns);
-            drained = drained.saturating_add(1);
+            drained_ops.push(op);
         }
-        drained
+        drained_ops
+    }
+
+    pub fn drain_deferred(&mut self) -> u32 {
+        self.drain_deferred_ops().len().min(u32::MAX as usize) as u32
     }
 
     /// Whether the deferred queue is non-empty. The redraw
@@ -504,11 +513,14 @@ impl FrameBudget {
             // Drop oldest to make room for the new entry. The
             // bead specifies drop-oldest; this protects against
             // unbounded queue growth under sustained burst load.
-            let _evicted = self.deferred.pop_front();
+            let evicted = self
+                .deferred
+                .pop_front()
+                .expect("deferred queue at capacity");
             self.drops_this_frame = self.drops_this_frame.saturating_add(1);
             self.drops_lifetime = self.drops_lifetime.saturating_add(1);
             self.deferred.push_back(op);
-            return ExecutionDecision::Dropped;
+            return ExecutionDecision::Dropped { evicted };
         }
         self.deferred.push_back(op);
         self.deferrals_this_frame = self.deferrals_this_frame.saturating_add(1);
@@ -756,7 +768,18 @@ mod tests {
         b.try_execute(OpKind::SubpixelAa, OpPriority::Cosmetic, 100);
         // Third defer overflows.
         let decision = b.try_execute(OpKind::Decorations, OpPriority::Cosmetic, 100);
-        assert_eq!(decision, ExecutionDecision::Dropped);
+        assert!(
+            matches!(
+                decision,
+                ExecutionDecision::Dropped {
+                    evicted: DeferredOp {
+                        kind: OpKind::Ligatures,
+                        ..
+                    }
+                }
+            ),
+            "overflow must report the oldest evicted op; got {decision:?}",
+        );
     }
 
     #[test]
@@ -1014,7 +1037,36 @@ mod tests {
         // and check.
         b.end_frame();
         b.begin_frame();
-        let drained = b.drain_deferred();
-        assert_eq!(drained, 1);
+        let drained = b.drain_deferred_ops();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].kind, OpKind::Animations);
+        assert_eq!(drained[0].estimated_cost_ns, 12_345);
+    }
+
+    #[test]
+    fn bulk_drain_ops_returns_drained_kinds_for_telemetry() {
+        let mut b = budget_60hz();
+        b.try_execute(
+            OpKind::DirtyQuadRebuild,
+            OpPriority::Required,
+            (b.budget_ns() as f64 * 0.95) as u64,
+        );
+        let small = (b.budget_ns() as f64 * 0.05) as u64;
+        b.try_execute(OpKind::Ligatures, OpPriority::Cosmetic, small);
+        b.try_execute(OpKind::Decorations, OpPriority::Cosmetic, small);
+        b.end_frame();
+
+        b.begin_frame();
+        b.try_execute(
+            OpKind::Cursor,
+            OpPriority::Required,
+            (b.budget_ns() as f64 * 0.1) as u64,
+        );
+        let drained = b.try_bulk_drain_ops();
+        assert_eq!(
+            drained.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OpKind::Ligatures, OpKind::Decorations],
+        );
+        assert_eq!(b.queue_depth(), 0);
     }
 }

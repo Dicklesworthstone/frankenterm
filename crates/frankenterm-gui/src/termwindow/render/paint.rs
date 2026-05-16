@@ -1,7 +1,9 @@
+use crate::termwindow::frame_budget::{OpKind, OpPriority};
 use crate::termwindow::{RenderFrame, TermWindowNotif};
 use ::window::WindowOps;
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use anyhow::Context;
+use frankenterm_core::frame_budget_a11y_gate::ReduceMotionState;
 use frankenterm_font::ClearShapeCache;
 use promise::spawn::sleep;
 use std::time::{Duration, Instant};
@@ -16,13 +18,12 @@ pub enum AllowImage {
 impl crate::TermWindow {
     pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
         self.num_frames += 1;
-        // Per ft-d6nrd slice 1: tick the per-frame budget allocator
-        // at the very top of paint so per-op cost feedback (item 2
-        // of the bead) can land in a future commit without
-        // reshaping this entry point. The FrameStartReport carries
-        // the budget ceiling + carry-over depth — emitted by the
-        // structured-log path once that wiring lands.
+        // Per ft-d6nrd / ft-96uy6: tick the per-frame budget allocator
+        // at the top of paint, then reconcile any carry-over cosmetic
+        // work that drains before fresh render operations are gated.
         let _frame_start = self.frame_budget_begin_frame();
+        let _drained_carryover = self.frame_budget_drain_deferred_cosmetic();
+        let frame_reduce_motion = self.frame_budget_reduce_motion_state();
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
         *self.has_animation.borrow_mut() = None;
@@ -42,21 +43,51 @@ impl crate::TermWindow {
         }
 
         'pass: for pass in 0.. {
-            match self.paint_pass() {
+            let _dirty_quad_budget = self.frame_budget_should_run_render_op_with_reduce_motion(
+                OpKind::DirtyQuadRebuild,
+                OpPriority::Required,
+                frame_reduce_motion,
+            );
+            match self.paint_pass(frame_reduce_motion) {
                 Ok(_) => match self.render_state.as_mut() {
-                    Some(render_state) => match render_state.allocated_more_quads() {
-                        Ok(allocated) => {
-                            if !allocated {
-                                break 'pass;
-                            }
-                            self.invalidate_fancy_tab_bar();
-                            self.invalidate_modal();
-                        }
-                        Err(err) => {
-                            log::error!("{:#}", err);
+                    Some(render_state) => {
+                        if self.quad_buffer_policy.is_gesture_active()
+                            && render_state.needs_more_quads()
+                        {
+                            let snapshot = render_state.quad_allocation_snapshot();
+                            self.quad_buffer_policy.record_live_allocation(
+                                snapshot.used,
+                                snapshot.capacity,
+                                0,
+                            );
+                            log::trace!(
+                                "quad buffer growth deferred during resize gesture: used={} capacity={}",
+                                snapshot.used,
+                                snapshot.capacity,
+                            );
                             break 'pass;
                         }
-                    },
+
+                        match render_state.allocate_more_quads() {
+                            Ok(change) => {
+                                let snapshot = render_state.quad_allocation_snapshot();
+                                self.quad_buffer_policy.record_live_allocation(
+                                    snapshot.used,
+                                    snapshot.capacity,
+                                    change.reallocation_count,
+                                );
+                                if !change.allocated {
+                                    break 'pass;
+                                }
+                                self.invalidate_fancy_tab_bar();
+                                self.invalidate_modal();
+                            }
+                            Err(err) => {
+                                log::error!("{:#}", err);
+                                break 'pass;
+                            }
+                        }
+                    }
                     None => {
                         log::error!("paint_pass succeeded without initialized render state");
                         break 'pass;
@@ -125,12 +156,23 @@ impl crate::TermWindow {
         // invalidations (font/theme/resize/focus) leave the marks
         // across the boundary so the next paint still observes them.
         self.clear_dirty_lines_after_frame();
-        // Per ft-d6nrd slice 1: close out the per-frame budget
-        // allocator so the lifetime counters tick over and
-        // `frame_budget_telemetry()` reflects this frame's deferrals
-        // / drops / bulk-drains. The FrameEndReport is emitted by
-        // the structured-log path once that wiring lands.
+
+        // Scheduling the next animation frame is cosmetic: reduce-motion
+        // skips it entirely, and frame pressure defers it into the
+        // outstanding-work path that forces a follow-up paint.
+        let animation_due = *self.has_animation.borrow();
+        let should_schedule_animation = animation_due.is_some()
+            && self.frame_budget_should_run_render_op_with_reduce_motion(
+                OpKind::Animations,
+                OpPriority::Cosmetic,
+                frame_reduce_motion,
+            );
+        let _bulk_drained = self.frame_budget_try_bulk_drain_cosmetic();
+        // Per ft-d6nrd / ft-96uy6: close out the allocator after
+        // draining cosmetic carry-over so `frame_budget_telemetry()`
+        // reflects real render decisions from this frame.
         let _frame_end = self.frame_budget_end_frame();
+        let should_force_frame_budget_paint = self.frame_budget_should_force_paint();
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
@@ -143,8 +185,14 @@ impl crate::TermWindow {
         // If self.has_animation is some, then the last render detected
         // image attachments with multiple frames, so we also need to
         // invalidate the viewport when the next frame is due
-        if self.focused.is_some() {
-            if let Some(next_due) = *self.has_animation.borrow() {
+        if should_force_frame_budget_paint {
+            if let Some(window) = self.window.clone() {
+                window.invalidate();
+            }
+        }
+
+        if self.focused.is_some() && should_schedule_animation {
+            if let Some(next_due) = animation_due {
                 let prior = self.scheduled_animation.borrow_mut().take();
                 match prior {
                     Some(prior) if prior <= next_due => {
@@ -192,7 +240,7 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    pub fn paint_pass(&mut self) -> anyhow::Result<()> {
+    pub fn paint_pass(&mut self, frame_reduce_motion: ReduceMotionState) -> anyhow::Result<()> {
         {
             let gl_state = self
                 .render_state
@@ -297,6 +345,11 @@ impl crate::TermWindow {
 
         for pos in panes {
             if pos.is_active {
+                let _cursor_budget = self.frame_budget_should_run_render_op_with_reduce_motion(
+                    OpKind::Cursor,
+                    OpPriority::Required,
+                    frame_reduce_motion,
+                );
                 self.update_text_cursor(&pos);
                 if focused {
                     pos.pane.advise_focus();
@@ -308,20 +361,33 @@ impl crate::TermWindow {
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
 
-        if let Some(pane) = self.get_active_pane_or_overlay() {
-            let splits = self.get_splits();
-            for split in &splits {
-                self.paint_split(&mut layers, split, &pane)
-                    .context("paint_split")?;
+        let paint_decorations = self.frame_budget_should_run_render_op_with_reduce_motion(
+            OpKind::Decorations,
+            OpPriority::Cosmetic,
+            frame_reduce_motion,
+        );
+
+        // Splits, tab bar, and window borders are cosmetic frame
+        // decorations; deferrals enqueue follow-up paint through the
+        // frame-budget outstanding-work path.
+        if paint_decorations {
+            if let Some(pane) = self.get_active_pane_or_overlay() {
+                let splits = self.get_splits();
+                for split in &splits {
+                    self.paint_split(&mut layers, split, &pane)
+                        .context("paint_split")?;
+                }
             }
         }
 
-        if self.show_tab_bar {
+        if paint_decorations && self.show_tab_bar {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
         }
 
-        self.paint_window_borders(&mut layers)
-            .context("paint_window_borders")?;
+        if paint_decorations {
+            self.paint_window_borders(&mut layers)
+                .context("paint_window_borders")?;
+        }
         drop(layers);
         self.paint_modal().context("paint_modal")?;
 
