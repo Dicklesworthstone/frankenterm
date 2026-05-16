@@ -21,24 +21,24 @@ under this catalog must conform to the same fixture format
 
 | # | Scenario id | Existing fixture | Status | Owner bead | SLO mapping |
 |---|---|---|---|---|---|
-| 1 | `steady-typing` | — | gap | ft-mpc9b.1.6.cont (TODO) | RQ-S8 (frame skip steady state) |
-| 2 | `vim-edit` | — | gap | ft-mpc9b.1.6.cont | RQ-S6 (heavy-burst input latency) |
-| 3 | `htop-top` | — | gap | ft-mpc9b.1.6.cont | RQ-S5 (idle GPU), RQ-S8 |
-| 4 | `neofetch-banner` | — | gap | ft-mpc9b.1.6.cont | RQ-S11 (snap-back SSIM) |
-| 5 | `resize-step` | `multipane-resize-static-snapshot` (close) | partial | ft-mpc9b.1.6.cont | RQ-S1 (resize FPS) |
-| 6 | `resize-burst` | — | gap | ft-mpc9b.1.6.cont | RQ-S1, RQ-S10 (atlas rebuild count) |
+| 1 | `steady-typing` | — | gap | ft-ruona | RQ-S8 (frame skip steady state) |
+| 2 | `vim-edit` | — | gap | ft-ruona | RQ-S6 (heavy-burst input latency) |
+| 3 | `htop-top` | — | gap | ft-ruona | RQ-S5 (idle GPU), RQ-S8 |
+| 4 | `neofetch-banner` | — | gap | ft-ruona | RQ-S11 (snap-back SSIM) |
+| 5 | `resize-step` | `multipane-resize-static-snapshot` (close) | partial | ft-ruona | RQ-S1 (resize FPS) |
+| 6 | `resize-burst` | — | gap | ft-ruona | RQ-S1, RQ-S10 (atlas rebuild count) |
 | 7 | `scroll-stress` | `stress/` | shipped (verify naming) | — | RQ-S6 |
-| 8 | `selection-drag` | `selection-{char,line,word}` (close, no drag) | partial | ft-mpc9b.1.6.cont | — |
-| 9 | `scrollback-search` | — | gap | ft-mpc9b.1.6.cont | — |
+| 8 | `selection-drag` | `selection-{char,line,word}` (close, no drag) | partial | ft-ruona | — |
+| 9 | `scrollback-search` | — | gap | ft-ruona | — |
 | 10 | `multi-pane-split` | `multipane-{2split-h,2split-v,grid-4,deep-nested,floating-overlay}` | shipped | — | RQ-S12 (floating-pane overhead) |
-| 11 | `dpi-change` | — | gap | ft-mpc9b.1.6.cont | RQ-S10 |
-| 12 | `font-change` | — | gap | ft-mpc9b.1.6.cont | RQ-S10 |
-| 13 | `alt-screen` | — | gap | ft-mpc9b.1.6.cont | — |
-| 14 | `mouse-tracking` | — | gap | ft-mpc9b.1.6.cont | — |
-| 15 | `wide-gamut` | — | gap | ft-mpc9b.1.6.cont | — |
+| 11 | `dpi-change` | — | gap | ft-ruona | RQ-S10 |
+| 12 | `font-change` | — | gap | ft-ruona | RQ-S10 |
+| 13 | `alt-screen` | — | gap | ft-ruona | — |
+| 14 | `mouse-tracking` | — | gap | ft-ruona | — |
+| 15 | `wide-gamut` | — | gap | ft-ruona | — |
 | 16 | `rtl-script` | `text-rtl-arabic-hebrew` | shipped | — | — |
 | 17 | `cjk-mixed` | `text-cjk-mixed` | shipped | — | — |
-| 18 | `screen-reader-active` | — | gap; needs A11y harness | ft-mpc9b.1.6.cont | — |
+| 18 | `screen-reader-active` | — | blocked on a11y comparator | ft-0q5zm | — |
 
 Status legend:
 
@@ -46,7 +46,9 @@ Status legend:
 - **partial** — a closely related fixture exists but does not exercise
   the exact dirty-event path the bead calls out; needs an additive
   fixture or an extension to the existing one
-- **gap** — no matching fixture; the continuation bead delivers it
+- **gap** — no matching fixture; `ft-ruona` delivers the non-a11y fixture
+- **blocked** — no matching fixture; a separate harness/comparator bead is
+  needed before the fixture can be generated
 
 ## Existing fixtures not in the bead's 18
 
@@ -83,8 +85,9 @@ Docs:
 Cross-references:
 
 - the bead's 18-scenario plan is now reconciled with the existing
-  `tests/golden/gpu/` inventory; the **gap** rows above flow into the
-  continuation bead with explicit owners
+  `tests/golden/gpu/` inventory; the non-a11y **gap** and **partial**
+  rows above flow into `ft-ruona`, and `screen-reader-active` flows
+  into `ft-0q5zm`
 - RQ-S4 (24h fuzz, 0 critical artifacts) in the SLO catalog now has a
   concrete seed-generator owner — the comparator already exists
   (`compare_images`), so the integration bead is just plumbing
@@ -103,9 +106,9 @@ the contract module agree on `tests/golden/gpu/`.
   `ViolationKind` (with the 3 critical classes from
   `fuzz/README.md`), `ViolationRecord`, `RunLayout` (filesystem
   path helpers), `FuzzCliFlags` (typed CLI flag envelope),
-  `ScenarioRecord` + `scenario_manifest()` (the 19-row catalog
+  `ScenarioRecord` + `scenario_manifest()` (the 18-row catalog
   encoded in Rust, 1:1 with the table above), `coverage_snapshot()`,
-  `GpuFuzzHealth` (ft doctor surface). 17 unit tests.
+  `GpuFuzzHealth` (ft doctor surface). Unit tests cover the contract.
 - [`.github/workflows/renderer-fuzz.yml`](../../.github/workflows/renderer-fuzz.yml) —
   Nightly 24h workflow: 8 fixed seeds (`a5a5a5a5`, `deadbeef`,
   `cafebabe`, `feedface`, `12345678`, `87654321`, `0badc0de`,
@@ -129,13 +132,14 @@ the contract module agree on `tests/golden/gpu/`.
   `fuzz_mode_active()`, emits deterministic duplicate-render frames,
   and writes `runs/<run_id>/` artifacts. RQ-S4 is not proven until
   the full seed matrix completes with zero critical violations.
-- Concrete `tests/golden/gpu/<scenario>/` fixtures for every **gap**
-  row (12 scenarios). Each fixture needs `input.json`, `meta.json`,
+- Concrete `tests/golden/gpu/<scenario>/` fixtures for every non-a11y
+  **gap** row (11 scenarios) and additive coverage for the two
+  **partial** rows. Each fixture needs `input.json`, `meta.json`,
   `expected.json`, and a captured `golden.png` from the headless
-  renderer.
-- A11y harness for `screen-reader-active` (scenario 18) — needs the
-  platform accessibility tree comparator (its own sub-bead, blocked
-  on a11y substrate).
+  renderer. This corpus work is tracked by `ft-ruona`.
+- A11y harness for `screen-reader-active` (scenario 18) — tracked by
+  `ft-0q5zm` because it needs the platform accessibility tree
+  comparator before a renderer golden can be generated.
 - Per-release attestation entry at
   `docs/attestations/render-parity-<version>.json` (depends on
   `BR-RC-FOUNDATION.G3.1` / `ft-syqcz.1` attestation graph schema).

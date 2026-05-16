@@ -70,17 +70,16 @@ from `meta.json` alone. Path helpers live at
 
 ## Scenario manifest
 
-The bead's "18-scenario plan" (the bead text says 18 but
-enumerates 7+12=19; the manifest matches the enumeration)
-is encoded as `scenario_manifest()` in the contract module:
+The bead's 18-scenario plan is encoded as `scenario_manifest()` in
+the contract module:
 
 | Status | Count |
 |---|---:|
-| Shipped (golden + CI lane) | 5 |
+| Shipped (golden + CI lane) | 4 |
 | Partial (related fixture exists, additive needed) | 2 |
-| Gap (12-scenario action #3) | 11 |
-| Blocked on sub-bead | 1 (`screen-reader-active` — needs a11y harness) |
-| **Total** | **19** |
+| Gap (`ft-ruona` non-a11y fixture work) | 11 |
+| Blocked on sub-bead | 1 (`screen-reader-active` — `ft-0q5zm`) |
+| **Total** | **18** |
 
 Source of truth:
 [`tests/renderer_golden/SCENARIOS.md`](../../tests/renderer_golden/SCENARIOS.md).
@@ -159,9 +158,10 @@ the doctor wires it to a WARN-level message when
 
 | Item | Status |
 |---|---|
-| Failure-artifact contract (`runs/<run_id>/` layout, classification) | ✓ `gpu_regression_fuzz_report` module + 17 lib tests |
+| Failure-artifact contract (`runs/<run_id>/` layout, classification) | ✓ `gpu_regression_fuzz_report` module + lib tests |
 | Scenario manifest with status (shipped/partial/gap/blocked) | ✓ `scenario_manifest()` + `coverage_snapshot()` |
-| 12 missing scenario fixtures | ⏳ separate scenario-corpus follow-on; fuzz CLI wiring does not generate golden fixtures |
+| Non-a11y missing/additive scenario fixtures | ⏳ `ft-ruona`; fuzz CLI wiring does not generate golden fixtures |
+| `screen-reader-active` a11y comparator | ⏳ `ft-0q5zm`; requires the renderer golden/a11y comparator lane |
 | Harness CLI flag wiring (`--fuzz-seed`, `--fuzz-duration`, etc.) | ✓ harness binary parses `FuzzCliFlags`, dispatches to `FuzzStream`, and writes `runs/<run_id>/` artifacts |
 | GitHub Actions workflow | ✓ `.github/workflows/renderer-fuzz.yml` uses `ubuntu-24.04` llvmpipe preflight before the matrix |
 | Per-release attestation entry | ⏳ depends on `ft-syqcz.1` |

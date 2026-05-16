@@ -318,14 +318,13 @@ pub enum ScenarioStatus {
     /// Fixture (input.json + meta.json + expected.json +
     /// golden.png) shipped and runs in CI.
     Shipped,
-    /// Fixture partially shipped (e.g., golden.png missing
-    /// because the renderer wasn't on a Linux GPU CI lane
-    /// when the parent bead landed).
+    /// A related fixture exists, but it does not exercise the
+    /// exact scenario path from the renderer catalog.
     Partial,
-    /// Bead's continuation must ship this fixture.
+    /// A follow-on bead must ship this fixture.
     Gap,
     /// Cross-references another bead's harness (e.g.,
-    /// screen-reader-active needs A11y substrate).
+    /// screen-reader-active needs the A11y comparator).
     BlockedOnSubBead,
 }
 
@@ -340,7 +339,7 @@ pub struct ScenarioRecord {
     /// `RQ-S8` for the frame-skip requirement).
     pub requirements: Vec<String>,
     pub status: ScenarioStatus,
-    /// Optional follow-on bead handle for blocked entries.
+    /// Optional follow-on bead handle for partial, gap, or blocked entries.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub blocked_on: Option<String>,
 }
@@ -351,6 +350,7 @@ pub struct ScenarioRecord {
 pub fn scenario_manifest() -> Vec<ScenarioRecord> {
     use ScenarioStatus::{BlockedOnSubBead, Gap, Partial, Shipped};
     let req = |s: &str| s.to_string();
+    let scenario_corpus = Some("ft-ruona");
     let row = |slug: &str,
                reqs: &[&str],
                status: ScenarioStatus,
@@ -364,31 +364,29 @@ pub fn scenario_manifest() -> Vec<ScenarioRecord> {
         }
     };
     vec![
-        // ----- the 7 shipped/partial in the parent bead -----
-        row("bare-prompt", &["RQ-S0"], Shipped, None),
-        row("ascii-burst", &["RQ-S6"], Shipped, None),
-        row("scroll-jump", &["RQ-S2"], Shipped, None),
-        row("color-table", &["RQ-S3"], Shipped, None),
-        row("emoji-roundtrip", &["RQ-S7"], Shipped, None),
-        row("focus-toggle", &["RQ-S9"], Partial, None),
-        row("selection-extend", &["RQ-S12"], Partial, None),
-        // ----- the 12 gap fixtures the bead's action #3 ships -----
-        row("steady-typing", &["RQ-S8"], Gap, None),
-        row("vim-edit", &["RQ-S6"], Gap, None),
-        row("htop-top", &["RQ-S5", "RQ-S8"], Gap, None),
-        row("neofetch-banner", &["RQ-S11"], Gap, None),
-        row("resize-burst", &["RQ-S1", "RQ-S10"], Gap, None),
-        row("dpi-change", &["RQ-S10"], Gap, None),
-        row("font-change", &["RQ-S10"], Gap, None),
-        row("alt-screen", &[], Gap, None),
-        row("mouse-tracking", &[], Gap, None),
-        row("wide-gamut", &[], Gap, None),
-        row("scrollback-search", &[], Gap, None),
+        // ----- 18-row renderer-overhaul scenario catalog -----
+        row("steady-typing", &["RQ-S8"], Gap, scenario_corpus),
+        row("vim-edit", &["RQ-S6"], Gap, scenario_corpus),
+        row("htop-top", &["RQ-S5", "RQ-S8"], Gap, scenario_corpus),
+        row("neofetch-banner", &["RQ-S11"], Gap, scenario_corpus),
+        row("resize-step", &["RQ-S1"], Partial, scenario_corpus),
+        row("resize-burst", &["RQ-S1", "RQ-S10"], Gap, scenario_corpus),
+        row("scroll-stress", &["RQ-S6"], Shipped, None),
+        row("selection-drag", &[], Partial, scenario_corpus),
+        row("scrollback-search", &[], Gap, scenario_corpus),
+        row("multi-pane-split", &["RQ-S12"], Shipped, None),
+        row("dpi-change", &["RQ-S10"], Gap, scenario_corpus),
+        row("font-change", &["RQ-S10"], Gap, scenario_corpus),
+        row("alt-screen", &[], Gap, scenario_corpus),
+        row("mouse-tracking", &[], Gap, scenario_corpus),
+        row("wide-gamut", &[], Gap, scenario_corpus),
+        row("rtl-script", &[], Shipped, None),
+        row("cjk-mixed", &[], Shipped, None),
         row(
             "screen-reader-active",
             &[],
             BlockedOnSubBead,
-            Some("a11y-harness-substrate"),
+            Some("ft-0q5zm"),
         ),
     ]
 }
@@ -651,15 +649,12 @@ mod tests {
     }
 
     #[test]
-    fn scenario_manifest_has_19_entries() {
-        // The bead text references "the 18-scenario plan" but
-        // enumerates 7 shipped/partial + 12 gaps = 19. The
-        // enumeration is the source of truth (the "18" is an
-        // off-by-one in the bead text predating the
-        // screen-reader-active addition); the manifest matches
-        // the enumeration.
+    fn scenario_manifest_has_18_entries() {
+        // Keep the machine-readable manifest aligned with the
+        // renderer-overhaul catalog, not with stale continuation
+        // bookkeeping from older beads.
         let m = scenario_manifest();
-        assert_eq!(m.len(), 19);
+        assert_eq!(m.len(), 18);
     }
 
     #[test]
@@ -672,18 +667,78 @@ mod tests {
     }
 
     #[test]
+    fn scenario_manifest_matches_renderer_catalog_order() {
+        let manifest = scenario_manifest();
+        let slugs: Vec<&str> = manifest.iter().map(|s| s.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            vec![
+                "steady-typing",
+                "vim-edit",
+                "htop-top",
+                "neofetch-banner",
+                "resize-step",
+                "resize-burst",
+                "scroll-stress",
+                "selection-drag",
+                "scrollback-search",
+                "multi-pane-split",
+                "dpi-change",
+                "font-change",
+                "alt-screen",
+                "mouse-tracking",
+                "wide-gamut",
+                "rtl-script",
+                "cjk-mixed",
+                "screen-reader-active",
+            ]
+        );
+    }
+
+    #[test]
+    fn scenario_manifest_points_gaps_at_live_beads() {
+        for scenario in scenario_manifest() {
+            match scenario.status {
+                ScenarioStatus::Shipped => {
+                    assert!(
+                        scenario.blocked_on.is_none(),
+                        "shipped scenario {} should not point at a follow-on",
+                        scenario.slug
+                    );
+                }
+                ScenarioStatus::Partial | ScenarioStatus::Gap => {
+                    assert_eq!(
+                        scenario.blocked_on.as_deref(),
+                        Some("ft-ruona"),
+                        "scenario {} should point at the non-a11y corpus bead",
+                        scenario.slug
+                    );
+                }
+                ScenarioStatus::BlockedOnSubBead => {
+                    assert_eq!(
+                        scenario.blocked_on.as_deref(),
+                        Some("ft-0q5zm"),
+                        "scenario {} should point at the a11y comparator bead",
+                        scenario.slug
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn coverage_snapshot_counts_match_bead() {
         let s = coverage_snapshot();
-        assert_eq!(s.scenarios_total, 19);
-        // Bead description: 7 shipped/partial, 12 gaps. The
-        // shipping split is 5 fully shipped + 2 partial = 7
-        // existing; 11 gap + 1 blocked = 12 gaps.
-        assert_eq!(s.shipped, 5);
+        assert_eq!(s.scenarios_total, 18);
+        // The catalog has 4 fully shipped rows, 2 partial rows
+        // that need additive coverage, 11 non-a11y gap rows,
+        // and one a11y scenario blocked on its comparator.
+        assert_eq!(s.shipped, 4);
         assert_eq!(s.partial, 2);
         assert_eq!(s.gap, 11);
         assert_eq!(s.blocked, 1);
-        assert_eq!(s.shipped + s.partial, 7);
-        assert_eq!(s.gap + s.blocked, 12);
+        assert_eq!(s.shipped + s.partial, 6);
+        assert_eq!(s.partial + s.gap, 13);
     }
 
     /// ft-qpi11 helper: build a stub RunMeta so tests can attach
