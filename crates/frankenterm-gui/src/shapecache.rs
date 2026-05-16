@@ -57,7 +57,7 @@ impl ShapedInfo {
 /// so this is the borrowed version of ShapeCacheKey.
 /// It's a bit involved to make this work; more details can be
 /// found in the excellent guide here:
-/// <https://github.com/sunshowers/borrow-complex-key-example/blob/master/src/lib.rs>
+/// <https://github.com/sunshowers/borrow-complex-key-example/blob/main/src/lib.rs>
 #[derive(Copy, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BorrowedShapeCacheKey<'a> {
     pub style: &'a TextStyle,

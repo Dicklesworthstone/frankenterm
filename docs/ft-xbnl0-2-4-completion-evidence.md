@@ -445,7 +445,7 @@ than blocking this bead's closure.
 
 #### 6.1.1 Workspace clippy gate
 
-As of tick 356 (`cargo clippy --no-deps -p frankenterm-core --features distributed,asupersync-runtime,web --lib --tests -- -D warnings`), the `frankenterm-core` crate reports **17 clippy errors** on master. All 17 are located in files **unrelated to this bead** and unrelated to the session work on ft-xbnl0.2.4:
+As of tick 356 (`cargo clippy --no-deps -p frankenterm-core --features distributed,asupersync-runtime,web --lib --tests -- -D warnings`), the `frankenterm-core` crate reports **17 clippy errors** on `main`. All 17 are located in files **unrelated to this bead** and unrelated to the session work on ft-xbnl0.2.4:
 
 - `crates/frankenterm-core/src/ipc.rs`
 - `crates/frankenterm-core/src/robot_sdk_contracts.rs`

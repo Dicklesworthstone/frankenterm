@@ -55,7 +55,7 @@ const PATTERNS: [&str; 14] = [
 ];
 
 /// This function computes a set of labels for a given alphabet.
-/// It is derived from https://github.com/fcsonline/tmux-thumbs/blob/master/src/alphabets.rs
+/// It is derived from https://github.com/fcsonline/tmux-thumbs/blob/ae91d5f7c0d989933e86409833c46a1eca521b6a/src/alphabets.rs
 /// which is Copyright (c) 2019 Ferran Basora and provided under the MIT license
 pub fn compute_labels_for_alphabet(alphabet: &str, num_matches: usize) -> Vec<String> {
     compute_labels_for_alphabet_impl(alphabet, num_matches, true)

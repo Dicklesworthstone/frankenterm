@@ -80,7 +80,7 @@ approved follow-up is `ft-tf6g3.35`.
 Primary-source license check:
 
 - Gitleaks is MIT-licensed at
-  `https://raw.githubusercontent.com/gitleaks/gitleaks/master/LICENSE`.
+  `https://raw.githubusercontent.com/gitleaks/gitleaks/9febafb621f407ec7fd0d398783fa3a63418f694/LICENSE`.
 - TruffleHog is AGPL-3.0-licensed at
   `https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/LICENSE`.
 

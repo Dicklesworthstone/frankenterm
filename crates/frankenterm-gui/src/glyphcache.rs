@@ -94,7 +94,7 @@ pub struct GlyphKey {
 /// so this is the borrowed version of GlyphKey.
 /// It's a bit involved to make this work; more details can be
 /// found in the excellent guide here:
-/// <https://github.com/sunshowers/borrow-complex-key-example/blob/master/src/lib.rs>
+/// <https://github.com/sunshowers/borrow-complex-key-example/blob/main/src/lib.rs>
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct BorrowedGlyphKey<'a> {
     pub font_idx: usize,
@@ -457,7 +457,7 @@ impl FrameDecoder {
             anyhow::anyhow!(
                 "Unable to decode image data. Either it is corrupt, or \
                     the Image format is not fully supported by \
-                    https://github.com/image-rs/image/blob/master/README.md#supported-image-formats"
+                    https://github.com/image-rs/image/blob/main/README.md#supported-image-formats"
             )
         })?;
         let frame = frame.context("first frame result")?;

@@ -1014,7 +1014,7 @@ Each phase can be independently rolled back:
 - **Phase 4 rollback**: Remove transport configuration. Fall back to stdio-only.
 - **Phase 5 rollback**: Restore old `mcp.rs` from git history.
 
-**Critical invariant**: The `mcp-server` feature flag is the master kill switch. Disabling it removes all MCP code from the binary, which has been true since the initial integration and remains true throughout.
+**Critical invariant**: The `mcp-server` feature flag is the top-level kill switch. Disabling it removes all MCP code from the binary, which has been true since the initial integration and remains true throughout.
 
 ### Risk Mitigation
 

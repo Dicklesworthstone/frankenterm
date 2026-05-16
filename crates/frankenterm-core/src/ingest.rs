@@ -2114,7 +2114,7 @@ pub struct OutputCacheStats {
 /// These markers are emitted by shells with semantic prompt integration enabled.
 /// WezTerm supports these markers through its shell integration scripts.
 ///
-/// Reference: <https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md>
+/// Reference: <https://gitlab.freedesktop.org/Per_Bothner/specifications/-/blob/4d2e1d75d4861a1d924895e106f8f016880e12a7/proposals/semantic-prompts.md>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Osc133Marker {
     /// `A` - Fresh line / start of prompt

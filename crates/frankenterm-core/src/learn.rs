@@ -871,7 +871,7 @@ impl TutorialEngine {
                         instructions: vec![
                             "Run: wa query \"error AND codex NOT timeout\"".into(),
                             "Try prefix matching: wa query \"deploy*\"".into(),
-                            "Goal: master FTS5 boolean syntax for precise searches.".into(),
+                            "Goal: learn FTS5 boolean syntax for precise searches.".into(),
                         ],
                         verification_command: None,
                         verification_pattern: None,

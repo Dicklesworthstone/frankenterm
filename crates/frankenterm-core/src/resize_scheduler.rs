@@ -795,7 +795,7 @@ impl ResizeScheduler {
         }
     }
 
-    /// Toggle master enable for control-plane behavior.
+    /// Toggle the top-level control-plane enable flag.
     pub fn set_control_plane_enabled(&mut self, enabled: bool) {
         self.config.control_plane_enabled = enabled;
         self.publish_debug_snapshot();
