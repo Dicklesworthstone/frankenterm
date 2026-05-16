@@ -1325,20 +1325,14 @@ mod tests {
 
         // First allow(): transitions Open → HalfOpen, counts.
         assert!(breaker.allow());
-        assert!(matches!(
-            breaker.status().state,
-            CircuitStateKind::HalfOpen
-        ));
+        assert!(matches!(breaker.status().state, CircuitStateKind::HalfOpen));
         let snap_after_transition = breaker.telemetry().snapshot();
         assert_eq!(snap_after_transition.half_open_probes, 1);
 
         // Record one success — `success_threshold=2` so we stay
         // HalfOpen and `consecutive_successes` advances to 1.
         breaker.record_success();
-        assert!(matches!(
-            breaker.status().state,
-            CircuitStateKind::HalfOpen
-        ));
+        assert!(matches!(breaker.status().state, CircuitStateKind::HalfOpen));
 
         // Second `allow()` call while still in HalfOpen — must
         // NOT bump the counter. This is the regression the

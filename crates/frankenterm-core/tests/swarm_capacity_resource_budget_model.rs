@@ -54,7 +54,7 @@ fn capacity_envelope_path() -> PathBuf {
 }
 
 fn parse_json_text(path: &Path, text: &str) -> Value {
-    serde_json::from_str(&text)
+    serde_json::from_str(text)
         .unwrap_or_else(|err| panic!("failed to parse JSON {}: {err}", path.display()))
 }
 
@@ -83,10 +83,10 @@ fn load_manifest() -> Value {
     parse_json_text(&path, &text)
 }
 
-fn subsystem_budget<'a>(
-    plan: &'a SwarmCapacityResourceBudgetPlan,
+fn subsystem_budget(
+    plan: &SwarmCapacityResourceBudgetPlan,
     subsystem: SwarmCapacityBudgetSubsystem,
-) -> &'a frankenterm_core::runtime_telemetry::SwarmCapacitySubsystemBudgetRow {
+) -> &frankenterm_core::runtime_telemetry::SwarmCapacitySubsystemBudgetRow {
     plan.subsystem_budgets
         .iter()
         .find(|row| row.subsystem == subsystem)

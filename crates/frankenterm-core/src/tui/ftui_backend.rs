@@ -3068,7 +3068,7 @@ fn render_search_view(
     if row < list_end {
         let header = format!("  {:>4} {:>6}  {}", "Pane", "Rank", "Snippet");
         write_styled(frame, 0, row, &header, CellStyle::new().dim());
-        let hlen = header.len() as u16;
+        let hlen = header.len().try_into().unwrap_or(u16::MAX);
         if hlen < list_width {
             let fill = " ".repeat((list_width - hlen) as usize);
             write_styled(frame, hlen, row, &fill, CellStyle::new());

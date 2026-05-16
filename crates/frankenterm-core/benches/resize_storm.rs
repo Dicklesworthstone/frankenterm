@@ -80,11 +80,7 @@ fn append_evidence_row(p50_us: u64, p95_us: u64, p99_us: u64, sample_count: usiz
         fs::create_dir_all(parent).expect("create resize FPS evidence directory");
     }
 
-    let estimated_p99_fps_milli = if p99_us == 0 {
-        0
-    } else {
-        1_000_000_000u64 / p99_us
-    };
+    let estimated_p99_fps_milli = 1_000_000_000u64.checked_div(p99_us).unwrap_or(0);
 
     let row = json!({
         "schema_version": "ft.perf.evidence-sample.v1",
