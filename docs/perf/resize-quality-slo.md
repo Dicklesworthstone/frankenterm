@@ -60,11 +60,11 @@ machine-readable JSON, the README, and the attestation bundle.
 
 | ID | Title | Target | Source bench / test | Owner bead | Status |
 |---|---|---|---|---|---|
-| RQ-S1 | Resize FPS | ≥60 sustained on 200-pane fleet, 5s gesture (p99 frame ≤16.6ms) | `crates/frankenterm-core/benches/resize_storm.rs` | ft-mpc9b.5.1 | bench_pending |
+| RQ-S1 | Resize FPS | ≥60 sustained on 200-pane fleet, 5s gesture (p99 frame ≤16.6ms) | `crates/frankenterm-core/benches/resize_storm.rs` | ft-tf6g3.3.7 | substrate_wired |
 | RQ-S2 | Input-to-photon (macOS) | p95 < 16ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired |
 | RQ-S3 | Input-to-photon (Wayland) | p95 < 20ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired |
 | RQ-S4 | Visual artifacts (24h fuzz) | 0 critical from random resize+scroll+content | `tests/renderer_golden/fuzz` | ft-mpc9b.1.6 | bench_pending |
-| RQ-S5 | Idle GPU usage | 0% sustained when no semantic change > 500ms | `crates/frankenterm-core/benches/idle_gpu.rs` | ft-mpc9b.5.1 | bench_pending |
+| RQ-S5 | Idle GPU usage | 0% sustained when no semantic change > 500ms | `crates/frankenterm-core/benches/idle_gpu.rs` | ft-tf6g3.3.9 | substrate_wired |
 | RQ-S6 | Heavy-burst input latency | p95 < 50ms with 1MB/s output across 50 panes | `crates/frankenterm-core/benches/heavy_burst.rs` | ft-mpc9b.5.1 | bench_pending |
 | RQ-S7 | Battery drain (24h idle, M2) | ≤5% on a healthy battery | manual lab — `docs/perf/lab/battery_drain_24h.sh` | ft-mpc9b.5.1 | bench_pending |
 | RQ-S8 | Frame skip rate (steady state) | ≥99% frames skipped on idle | `crates/frankenterm-core/benches/steady_state.rs` | ft-mpc9b.5.1 | bench_pending |
@@ -84,9 +84,9 @@ disagree, the JSON wins.
 `docs/attestations/tui/render-parity.json` now carries the
 `renderer_slo_retained_evidence` ledger used by the G18 umbrella. As of
 2026-05-16, the umbrella is still blocked: RQ-S13 has retained remote RCH
-proof, RQ-S2/RQ-S3 are substrate-only pending platform target runs, and
-RQ-S1/RQ-S5/RQ-S10 do not yet have the declared source benches or retained
-target-run artifacts. The missing target-run work is split into
+proof, RQ-S1/RQ-S2/RQ-S3/RQ-S5 are substrate-only pending target runs, and
+RQ-S10 does not yet have the declared source bench or retained target-run
+artifact. The missing target-run work is split into
 `ft-tf6g3.3.7` through `ft-tf6g3.3.10`.
 
 ## Structured-log contract

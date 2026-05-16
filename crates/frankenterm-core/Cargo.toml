@@ -661,6 +661,10 @@ name = "resize_storm"
 harness = false
 
 [[bench]]
+name = "idle_gpu"
+harness = false
+
+[[bench]]
 name = "atlas_tiered_swap_frame_loop"
 harness = false
 

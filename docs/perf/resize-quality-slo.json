@@ -113,17 +113,19 @@
       "title": "Idle GPU usage",
       "target": "0% sustained when no semantic change for >500ms",
       "scenario": "Idle pane with cursor disabled, no incoming PTY traffic for 30s",
-      "measurement": "Sampled GPU counter (Metal: GPUCommandBuffer.GPUEndTime; Vulkan: VK_EXT_calibrated_timestamps)",
+      "measurement": "Core scheduler/predicate paint-submission proxy from idle_gpu.rs; final retained lab proof should pair this with sampled GPU counters (Metal: GPUCommandBuffer.GPUEndTime; Vulkan: VK_EXT_calibrated_timestamps).",
       "source_bench": "crates/frankenterm-core/benches/idle_gpu.rs",
       "structured_log": "target/criterion/slo-idle_gpu.jsonl",
-      "status": "bench_pending",
+      "status": "substrate_wired",
       "retained_evidence": {
-        "status": "missing_source_bench",
+        "status": "substrate_wired_pending_rch_target_run",
         "follow_up_bead": "ft-tf6g3.3.9",
-        "reason": "No source bench or retained target-run artifact is present in the checkout as of 2026-05-16."
+        "source_bench": "crates/frankenterm-core/benches/idle_gpu.rs",
+        "structured_log": "target/criterion/slo-idle_gpu.jsonl",
+        "reason": "Source bench now exists and emits a scheduler/predicate proxy evidence row; retained RCH target-run artifact and platform GPU-counter proof remain pending."
       },
-      "blocked_by": ["ft-mpc9b.5.1"],
-      "owner_bead": "ft-mpc9b.5.1"
+      "blocked_by": ["ft-tf6g3.3.9"],
+      "owner_bead": "ft-tf6g3.3.9"
     },
     {
       "id": "RQ-S6.heavy_burst_input_latency",
@@ -311,6 +313,12 @@
       "date": "2026-05-16",
       "bead": "ft-tf6g3.3.7",
       "note": "RQ-S1 resize FPS now has a Criterion substrate at crates/frankenterm-core/benches/resize_storm.rs emitting target/criterion/slo-resize_fps.jsonl. Retained target-run validation remains pending RCH proof."
+    },
+    {
+      "version": "0.1.6",
+      "date": "2026-05-16",
+      "bead": "ft-tf6g3.3.9",
+      "note": "RQ-S5 idle GPU now has a Criterion substrate at crates/frankenterm-core/benches/idle_gpu.rs emitting target/criterion/slo-idle_gpu.jsonl. The row is explicitly a scheduler/predicate proxy; retained RCH validation and platform GPU-counter proof remain pending."
     }
   ]
 }

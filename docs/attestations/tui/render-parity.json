@@ -189,19 +189,20 @@
   "renderer_slo_retained_evidence": {
     "schema_version": "ft.renderer_slo_retained_evidence.v1",
     "produced_by_bead": "ft-tf6g3.3.6",
-    "generated_at": "2026-05-16T04:21:00Z",
+    "generated_at": "2026-05-16T04:50:01Z",
     "source_catalog_path": "docs/perf/resize-quality-slo.json",
-    "source_catalog_sha256": "683bbf3056ec1523147c6d4b4a4763bcb0bdc248015c0b3d22763d54148a78b1",
+    "source_catalog_sha256": "aa4d13b6613efff75521c570869bdcf3252f56c5d7904ec5ae360250a5526443",
     "closeout_status": "blocked_pending_missing_retained_runs",
-    "summary": "The renderer-SLO umbrella does not yet have five retained target-run proofs. RQ-S13 has retained remote RCH proof; RQ-S2/RQ-S3 are substrate-only pending platform target runs; RQ-S1/RQ-S5/RQ-S10 still lack their declared source benches and retained artifacts.",
+    "summary": "The renderer-SLO umbrella does not yet have five retained target-run proofs. RQ-S13 has retained remote RCH proof; RQ-S1/RQ-S2/RQ-S3/RQ-S5 are substrate-only pending target runs; RQ-S10 still lacks its declared source bench and retained artifact.",
     "entries": [
       {
         "slo_id": "RQ-S1.resize_fps",
-        "status": "missing_source_bench",
-        "declared_source_bench": "crates/frankenterm-core/benches/resize_storm.rs",
+        "status": "substrate_wired_pending_rch_target_run",
+        "source_artifact_path": "crates/frankenterm-core/benches/resize_storm.rs",
+        "source_artifact_sha256": "7364ac394a0892540263a55e4bece61a7b6218e6c980d620f228b83b73a5ee24",
         "declared_structured_log": "target/criterion/slo-resize_fps.jsonl",
         "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "683bbf3056ec1523147c6d4b4a4763bcb0bdc248015c0b3d22763d54148a78b1",
+        "gap_evidence_sha256": "aa4d13b6613efff75521c570869bdcf3252f56c5d7904ec5ae360250a5526443",
         "follow_up_bead": "ft-tf6g3.3.7"
       },
       {
@@ -224,11 +225,12 @@
       },
       {
         "slo_id": "RQ-S5.idle_gpu",
-        "status": "missing_source_bench",
-        "declared_source_bench": "crates/frankenterm-core/benches/idle_gpu.rs",
+        "status": "substrate_wired_pending_rch_target_run",
+        "source_artifact_path": "crates/frankenterm-core/benches/idle_gpu.rs",
+        "source_artifact_sha256": "6997ac32a2eb813771c88336ec7158e774d26a1a1703c0c295a7dcd86c0cb2cd",
         "declared_structured_log": "target/criterion/slo-idle_gpu.jsonl",
         "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "683bbf3056ec1523147c6d4b4a4763bcb0bdc248015c0b3d22763d54148a78b1",
+        "gap_evidence_sha256": "aa4d13b6613efff75521c570869bdcf3252f56c5d7904ec5ae360250a5526443",
         "follow_up_bead": "ft-tf6g3.3.9"
       },
       {
@@ -237,7 +239,7 @@
         "declared_source_bench": "crates/frankenterm-core/benches/atlas_stability.rs",
         "declared_structured_log": "target/criterion/slo-atlas_stability.jsonl",
         "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "683bbf3056ec1523147c6d4b4a4763bcb0bdc248015c0b3d22763d54148a78b1",
+        "gap_evidence_sha256": "aa4d13b6613efff75521c570869bdcf3252f56c5d7904ec5ae360250a5526443",
         "follow_up_bead": "ft-tf6g3.3.10"
       },
       {
