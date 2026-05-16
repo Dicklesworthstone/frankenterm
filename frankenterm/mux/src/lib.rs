@@ -295,6 +295,7 @@ struct SynchronizedOutputActionEffect {
     flush: bool,
     handled: bool,
     depth_outcome: Option<SynchronizedOutputDepthOutcome>,
+    drain_cause: Option<SynchronizedOutputDrainCause>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -352,6 +353,7 @@ fn handle_synchronized_output_action(
         flush: false,
         handled: false,
         depth_outcome: None,
+        drain_cause: None,
     };
 
     match action {
@@ -369,6 +371,9 @@ fn handle_synchronized_output_action(
         }
         Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
             effect.flush = hold.force_reset();
+            if effect.flush {
+                effect.drain_cause = Some(SynchronizedOutputDrainCause::Operator);
+            }
         }
         Action::CSI(CSI::Mode(Mode::QueryDecPrivateMode(DecPrivateMode::Code(
             DecPrivateModeCode::SynchronizedOutput,
@@ -433,6 +438,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
             }
             Ok(size) => {
                 let mut chunk_touched_hold = hold.is_holding();
+                let mut chunk_admission_emitted = false;
                 parser.parse(&buf[0..size], |action| {
                     let was_holding = hold.is_holding();
                     let effect = handle_synchronized_output_action(&action, &mut hold, |hold| {
@@ -443,11 +449,21 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                     }
                     if let Some(depth_outcome) = effect.depth_outcome {
                         if effect.flush {
+                            if chunk_touched_hold && !chunk_admission_emitted && size > 0 {
+                                notify_synchronized_output_event(
+                                    &pane,
+                                    SynchronizedOutputEvent::Admission {
+                                        decision: SynchronizedOutputAdmissionDecision::Accepted,
+                                        bytes: size as u64,
+                                    },
+                                );
+                                chunk_admission_emitted = true;
+                            }
                             notify_synchronized_output_event(
                                 &pane,
                                 SynchronizedOutputEvent::Drain {
                                     cause: SynchronizedOutputDrainCause::Esu,
-                                    bytes: action_size as u64,
+                                    bytes: action_size.saturating_add(size) as u64,
                                     depth_outcome: Some(depth_outcome),
                                     max_depth: hold.max_depth(),
                                 },
@@ -461,8 +477,31 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                                 },
                             );
                         }
+                    } else if let Some(cause) = effect.drain_cause {
+                        if chunk_touched_hold && !chunk_admission_emitted && size > 0 {
+                            notify_synchronized_output_event(
+                                &pane,
+                                SynchronizedOutputEvent::Admission {
+                                    decision: SynchronizedOutputAdmissionDecision::Accepted,
+                                    bytes: size as u64,
+                                },
+                            );
+                            chunk_admission_emitted = true;
+                        }
+                        notify_synchronized_output_event(
+                            &pane,
+                            SynchronizedOutputEvent::Drain {
+                                cause,
+                                bytes: action_size.saturating_add(size) as u64,
+                                depth_outcome: None,
+                                max_depth: hold.max_depth(),
+                            },
+                        );
                     } else if effect.handled {
-                        notify_synchronized_output_event(&pane, SynchronizedOutputEvent::ModeQuery);
+                        notify_synchronized_output_event(
+                            &pane,
+                            SynchronizedOutputEvent::ModeQuery,
+                        );
                     }
                     if !was_holding && hold.is_holding() && !actions.is_empty() {
                         // Flush prior actions before entering BSU hold.
@@ -478,7 +517,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                         action_size = 0;
                     }
                 });
-                if chunk_touched_hold && size > 0 {
+                if chunk_touched_hold && !chunk_admission_emitted && size > 0 {
                     notify_synchronized_output_event(
                         &pane,
                         SynchronizedOutputEvent::Admission {
@@ -2123,15 +2162,18 @@ mod tests {
         let mut outcomes = Vec::new();
         let mut flushes = 0;
 
-        parser.parse(b"\x1b[?2026h\x1b[?2026h\x1b[?2026l\x1b[?2026l\x1b[?2026l", |action| {
-            let effect = handle_synchronized_output_action(&action, &mut hold, |_| {});
-            if effect.flush {
-                flushes += 1;
-            }
-            if let Some(outcome) = effect.depth_outcome {
-                outcomes.push(outcome);
-            }
-        });
+        parser.parse(
+            b"\x1b[?2026h\x1b[?2026h\x1b[?2026l\x1b[?2026l\x1b[?2026l",
+            |action| {
+                let effect = handle_synchronized_output_action(&action, &mut hold, |_| {});
+                if effect.flush {
+                    flushes += 1;
+                }
+                if let Some(outcome) = effect.depth_outcome {
+                    outcomes.push(outcome);
+                }
+            },
+        );
 
         assert_eq!(
             outcomes,

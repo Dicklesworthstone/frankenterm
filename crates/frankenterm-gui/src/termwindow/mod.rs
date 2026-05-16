@@ -511,16 +511,15 @@ pub(crate) fn record_sync_output_mux_event(
     event: SynchronizedOutputEvent,
     watchdog_telemetry: &mut frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
     orchestrator_telemetry: &mut frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
-    bsu_depth_by_pane: &mut HashMap<PaneId, frankenterm_core::sync_output_watchdog::BsuDepthCounter>,
+    bsu_depth_by_pane: &mut HashMap<
+        PaneId,
+        frankenterm_core::sync_output_watchdog::BsuDepthCounter,
+    >,
     buffered_bytes_by_pane: &mut HashMap<PaneId, u64>,
 ) {
     match event {
         SynchronizedOutputEvent::Depth { outcome, max_depth } => {
-            let outcome = record_sync_output_depth_outcome(
-                pane_id,
-                outcome,
-                bsu_depth_by_pane,
-            );
+            let outcome = record_sync_output_depth_outcome(pane_id, outcome, bsu_depth_by_pane);
             watchdog_telemetry.record_depth_outcome(outcome, max_depth);
         }
         SynchronizedOutputEvent::Admission { decision, bytes } => {
@@ -649,7 +648,10 @@ fn record_sync_output_drain(
     max_depth: u32,
     watchdog_telemetry: &mut frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
     orchestrator_telemetry: &mut frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
-    bsu_depth_by_pane: &mut HashMap<PaneId, frankenterm_core::sync_output_watchdog::BsuDepthCounter>,
+    bsu_depth_by_pane: &mut HashMap<
+        PaneId,
+        frankenterm_core::sync_output_watchdog::BsuDepthCounter,
+    >,
     buffered_bytes_by_pane: &mut HashMap<PaneId, u64>,
 ) {
     use frankenterm_core::sync_output_buffer_orchestrator::{
@@ -702,7 +704,6 @@ fn record_sync_output_drain(
                         (outcome, should_remove)
                     };
                     if should_remove {
-                        outcome,
                         bsu_depth_by_pane.remove(&pane_id);
                     }
                     outcome
@@ -1701,110 +1702,6 @@ impl TermWindow {
     ) -> &mut frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry
     {
         &mut self.sync_output_orchestrator_telemetry
-    }
-
-    fn record_synchronized_output_event(&mut self, event: mux::SynchronizedOutputEvent) {
-        use frankenterm_core::sync_output_buffer_orchestrator::{
-            BufferAdmissionDecision, BufferDrainOutcome, DrainCause,
-        };
-        use frankenterm_core::sync_output_telemetry_bridge::{
-            forward_admission, forward_drain, forward_mode_query,
-        };
-        use frankenterm_core::sync_output_watchdog::{BsuDepthOutcome, WatchdogDecision};
-
-        fn depth_outcome(
-            outcome: mux::SynchronizedOutputDepthOutcome,
-        ) -> BsuDepthOutcome {
-            match outcome {
-                mux::SynchronizedOutputDepthOutcome::Opened { new_depth } => {
-                    BsuDepthOutcome::Opened { new_depth }
-                }
-                mux::SynchronizedOutputDepthOutcome::Closed { new_depth } => {
-                    BsuDepthOutcome::Closed { new_depth }
-                }
-                mux::SynchronizedOutputDepthOutcome::Flushed => BsuDepthOutcome::Flushed,
-                mux::SynchronizedOutputDepthOutcome::Underflow => BsuDepthOutcome::Underflow,
-            }
-        }
-
-        fn admission_decision(
-            decision: mux::SynchronizedOutputAdmissionDecision,
-        ) -> BufferAdmissionDecision {
-            match decision {
-                mux::SynchronizedOutputAdmissionDecision::Accepted => {
-                    BufferAdmissionDecision::Accepted
-                }
-                mux::SynchronizedOutputAdmissionDecision::Truncated { dropped_bytes } => {
-                    BufferAdmissionDecision::Truncated { dropped_bytes }
-                }
-                mux::SynchronizedOutputAdmissionDecision::Refused => {
-                    BufferAdmissionDecision::Refused
-                }
-            }
-        }
-
-        fn drain_cause(cause: mux::SynchronizedOutputDrainCause) -> DrainCause {
-            match cause {
-                mux::SynchronizedOutputDrainCause::Esu => DrainCause::Esu,
-                mux::SynchronizedOutputDrainCause::Watchdog => DrainCause::Watchdog,
-                mux::SynchronizedOutputDrainCause::LiveResizeForce => DrainCause::LiveResizeForce,
-                mux::SynchronizedOutputDrainCause::Operator => DrainCause::Operator,
-            }
-        }
-
-        match event {
-            mux::SynchronizedOutputEvent::Depth { outcome, max_depth } => {
-                self.sync_output_watchdog_telemetry
-                    .record_depth_outcome(depth_outcome(outcome), max_depth);
-            }
-            mux::SynchronizedOutputEvent::Admission { decision, bytes } => {
-                let decision = admission_decision(decision);
-                self.sync_output_orchestrator_telemetry
-                    .record_admission(decision, bytes);
-                forward_admission(decision, bytes, &mut self.sync_output_watchdog_telemetry);
-            }
-            mux::SynchronizedOutputEvent::Drain {
-                cause,
-                bytes,
-                depth_outcome: maybe_depth_outcome,
-                max_depth,
-            } => {
-                let drain_outcome = if bytes == 0 {
-                    BufferDrainOutcome::NoOp
-                } else {
-                    BufferDrainOutcome::Drained {
-                        bytes,
-                        cause: drain_cause(cause),
-                    }
-                };
-
-                self.sync_output_orchestrator_telemetry
-                    .record_drain(drain_outcome);
-
-                if let Some(depth_outcome) = maybe_depth_outcome {
-                    let depth_outcome = depth_outcome(depth_outcome);
-                    if matches!(drain_outcome, BufferDrainOutcome::NoOp) {
-                        self.sync_output_watchdog_telemetry
-                            .record_depth_outcome(depth_outcome, max_depth);
-                    } else {
-                        forward_drain(
-                            drain_outcome,
-                            depth_outcome,
-                            max_depth,
-                            &mut self.sync_output_watchdog_telemetry,
-                        );
-                    }
-                }
-
-                if matches!(cause, mux::SynchronizedOutputDrainCause::Watchdog) {
-                    self.sync_output_watchdog_telemetry
-                        .record_watchdog_decision(WatchdogDecision::ForceFlush);
-                }
-            }
-            mux::SynchronizedOutputEvent::ModeQuery => {
-                forward_mode_query(&mut self.sync_output_watchdog_telemetry);
-            }
-        }
     }
 
     /// Per ft-8pcwy: read-only access to a pane's bitmap. Returns
@@ -6449,7 +6346,10 @@ mod tests {
 
         record_sync_output_mux_event(
             pane_id,
-            mux::SynchronizedOutputEvent::Bsu,
+            mux::SynchronizedOutputEvent::Depth {
+                outcome: mux::SynchronizedOutputDepthOutcome::Opened { new_depth: 1 },
+                max_depth: 1,
+            },
             &mut watchdog,
             &mut orchestrator,
             &mut depth_by_pane,
@@ -6457,7 +6357,10 @@ mod tests {
         );
         record_sync_output_mux_event(
             pane_id,
-            mux::SynchronizedOutputEvent::Admission { bytes: 64 },
+            mux::SynchronizedOutputEvent::Admission {
+                decision: mux::SynchronizedOutputAdmissionDecision::Accepted,
+                bytes: 64,
+            },
             &mut watchdog,
             &mut orchestrator,
             &mut depth_by_pane,
@@ -6475,6 +6378,9 @@ mod tests {
             pane_id,
             mux::SynchronizedOutputEvent::Drain {
                 cause: mux::SynchronizedOutputDrainCause::Esu,
+                bytes: 0,
+                depth_outcome: Some(mux::SynchronizedOutputDepthOutcome::Flushed),
+                max_depth: 1,
             },
             &mut watchdog,
             &mut orchestrator,
@@ -6508,6 +6414,9 @@ mod tests {
             pane_id,
             mux::SynchronizedOutputEvent::Drain {
                 cause: mux::SynchronizedOutputDrainCause::Esu,
+                bytes: 0,
+                depth_outcome: Some(mux::SynchronizedOutputDepthOutcome::Underflow),
+                max_depth: 0,
             },
             &mut watchdog,
             &mut orchestrator,
@@ -6524,7 +6433,10 @@ mod tests {
         ] {
             record_sync_output_mux_event(
                 pane_id,
-                mux::SynchronizedOutputEvent::Bsu,
+                mux::SynchronizedOutputEvent::Depth {
+                    outcome: mux::SynchronizedOutputDepthOutcome::Opened { new_depth: 1 },
+                    max_depth: 1,
+                },
                 &mut watchdog,
                 &mut orchestrator,
                 &mut depth_by_pane,
@@ -6532,7 +6444,10 @@ mod tests {
             );
             record_sync_output_mux_event(
                 pane_id,
-                mux::SynchronizedOutputEvent::Admission { bytes },
+                mux::SynchronizedOutputEvent::Admission {
+                    decision: mux::SynchronizedOutputAdmissionDecision::Accepted,
+                    bytes,
+                },
                 &mut watchdog,
                 &mut orchestrator,
                 &mut depth_by_pane,
@@ -6540,7 +6455,12 @@ mod tests {
             );
             record_sync_output_mux_event(
                 pane_id,
-                mux::SynchronizedOutputEvent::Drain { cause },
+                mux::SynchronizedOutputEvent::Drain {
+                    cause,
+                    bytes: 0,
+                    depth_outcome: None,
+                    max_depth: 1,
+                },
                 &mut watchdog,
                 &mut orchestrator,
                 &mut depth_by_pane,
