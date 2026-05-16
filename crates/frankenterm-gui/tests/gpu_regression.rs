@@ -7,17 +7,17 @@
 use frankenterm_core::gpu_regression_fuzz_report::FuzzCliFlags;
 #[cfg(feature = "headless-render")]
 use frankenterm_core::gpu_regression_fuzz_report::{
-    render_violations_jsonl, RunId, RunLayout, RunMeta, ViolationKind, ViolationRecord,
+    RunId, RunLayout, RunMeta, ViolationKind, ViolationRecord, render_violations_jsonl,
 };
 use frankenterm_gui::gpu_regression::{
-    compare_images, detect_macos_screen_capture_prompt_contamination, CompareResult, Thresholds,
+    CompareResult, Thresholds, compare_images, detect_macos_screen_capture_prompt_contamination,
 };
 #[cfg(feature = "headless-render")]
 use frankenterm_gui::gpu_regression_fuzz::{FuzzConfig, FuzzInputEvent, FuzzStream};
 #[cfg(feature = "headless-render")]
 use frankenterm_gui::headless_render::{
-    render_headless, smoketest_input, HeadlessCursor, HeadlessFixtureInput, HeadlessFrame,
-    HeadlessMonitor, HeadlessRenderError, HeadlessSelection, HeadlessViewport,
+    HeadlessCursor, HeadlessFixtureInput, HeadlessFrame, HeadlessMonitor, HeadlessRenderError,
+    HeadlessSelection, HeadlessViewport, render_headless, smoketest_input,
 };
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder, ImageReader, Rgba, RgbaImage};

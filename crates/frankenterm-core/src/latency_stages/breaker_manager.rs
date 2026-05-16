@@ -194,7 +194,9 @@ impl BreakerManager {
     #[allow(clippy::similar_names)]
     pub fn record_failure(&mut self, stage: LatencyStage, timestamp_us: u64) {
         let threshold = self.config.failure_threshold;
-        let Some(state) = self.states.get_mut(&stage) else { return; };
+        let Some(state) = self.states.get_mut(&stage) else {
+            return;
+        };
         match state.state {
             BreakerState::Closed => {
                 state.consecutive_failures += 1;
@@ -218,7 +220,9 @@ impl BreakerManager {
     #[allow(clippy::similar_names)]
     pub fn record_success(&mut self, stage: LatencyStage) {
         let success_threshold = self.config.half_open_success_threshold;
-        let Some(state) = self.states.get_mut(&stage) else { return; };
+        let Some(state) = self.states.get_mut(&stage) else {
+            return;
+        };
         match state.state {
             BreakerState::Closed => {
                 state.consecutive_failures = 0;
@@ -242,7 +246,9 @@ impl BreakerManager {
     pub fn allow_request(&mut self, stage: LatencyStage, current_us: u64) -> bool {
         let open_duration = self.config.open_duration_us;
         let max_probes = self.config.half_open_max_probes;
-        let Some(state) = self.states.get_mut(&stage) else { return true; };
+        let Some(state) = self.states.get_mut(&stage) else {
+            return true;
+        };
         match state.state {
             BreakerState::Closed => true,
             BreakerState::Open => {

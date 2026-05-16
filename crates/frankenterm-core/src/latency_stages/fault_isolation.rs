@@ -249,7 +249,9 @@ impl FaultIsolationManager {
         let max_restarts = contract.max_restarts;
         let auto_isolate = self.config.auto_isolate;
 
-        let Some(state) = self.states.get_mut(&domain) else { return; };
+        let Some(state) = self.states.get_mut(&domain) else {
+            return;
+        };
         state.total_faults += 1;
         state.consecutive_failures += 1;
         state.last_fault_us = timestamp_us;
@@ -277,7 +279,9 @@ impl FaultIsolationManager {
     /// Attempt restart of a crashed domain.
     pub fn attempt_restart(&mut self, domain: FaultDomain, timestamp_us: u64) -> bool {
         let contract = self.contract_for(domain);
-        let Some(state) = self.states.get_mut(&domain) else { return false; };
+        let Some(state) = self.states.get_mut(&domain) else {
+            return false;
+        };
         match state.health {
             DomainHealth::Crashed => {
                 if state.last_restart_us > 0
@@ -298,7 +302,9 @@ impl FaultIsolationManager {
 
     /// Mark restart as complete (success).
     pub fn restart_succeeded(&mut self, domain: FaultDomain) {
-        let Some(state) = self.states.get_mut(&domain) else { return; };
+        let Some(state) = self.states.get_mut(&domain) else {
+            return;
+        };
         if state.health == DomainHealth::Restarting {
             state.health = DomainHealth::Healthy;
             state.consecutive_failures = 0;
@@ -309,7 +315,9 @@ impl FaultIsolationManager {
     pub fn restart_failed(&mut self, domain: FaultDomain, timestamp_us: u64) {
         let contract = self.contract_for(domain);
         let auto_isolate = self.config.auto_isolate;
-        let Some(state) = self.states.get_mut(&domain) else { return; };
+        let Some(state) = self.states.get_mut(&domain) else {
+            return;
+        };
         if state.health == DomainHealth::Restarting {
             state.consecutive_failures += 1;
             if auto_isolate && state.consecutive_failures > contract.max_restarts {
@@ -323,7 +331,9 @@ impl FaultIsolationManager {
 
     /// Manually mark a domain as degraded.
     pub fn mark_degraded(&mut self, domain: FaultDomain) {
-        let Some(state) = self.states.get_mut(&domain) else { return; };
+        let Some(state) = self.states.get_mut(&domain) else {
+            return;
+        };
         if state.health == DomainHealth::Healthy {
             state.health = DomainHealth::Degraded;
         }
@@ -331,7 +341,9 @@ impl FaultIsolationManager {
 
     /// Manually un-isolate a domain (operator intervention).
     pub fn un_isolate(&mut self, domain: FaultDomain) {
-        let Some(state) = self.states.get_mut(&domain) else { return; };
+        let Some(state) = self.states.get_mut(&domain) else {
+            return;
+        };
         if state.health == DomainHealth::Isolated {
             state.health = DomainHealth::Crashed;
             state.consecutive_failures = 0;

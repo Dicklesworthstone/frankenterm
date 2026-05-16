@@ -33,7 +33,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -149,14 +149,13 @@ impl TestLogger {
         // to an in-memory sink AND mark output_path with the in-memory
         // sentinel so operator inspection of `output_path()` doesn't
         // promise a file that does not exist.
-        let (sink, resolved_path): (Box<dyn Write + Send>, PathBuf) =
-            match create_dir_all(&base) {
-                Ok(()) => match OpenOptions::new().create(true).append(true).open(&path) {
-                    Ok(f) => (Box::new(f), path),
-                    Err(_) => (Box::new(Vec::new()), PathBuf::from("<in-memory>")),
-                },
+        let (sink, resolved_path): (Box<dyn Write + Send>, PathBuf) = match create_dir_all(&base) {
+            Ok(()) => match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(f) => (Box::new(f), path),
                 Err(_) => (Box::new(Vec::new()), PathBuf::from("<in-memory>")),
-            };
+            },
+            Err(_) => (Box::new(Vec::new()), PathBuf::from("<in-memory>")),
+        };
         Self {
             area,
             test,
@@ -293,9 +292,7 @@ mod tests {
     #[test]
     fn row_carries_schema_version() {
         let logger = TestLogger::in_memory("test-area", "test_row_schema");
-        let row = logger
-            .assertion("ok", Value::Bool(true))
-            .expect("emit row");
+        let row = logger.assertion("ok", Value::Bool(true)).expect("emit row");
         assert_eq!(row.schema_version, ROW_SCHEMA_VERSION);
         assert_eq!(row.area, "test-area");
         assert_eq!(row.test, "test_row_schema");
@@ -308,7 +305,11 @@ mod tests {
         // v7 has version nibble = 7 in the third hex group: xxxxxxxx-xxxx-7xxx-...
         let parts: Vec<&str> = logger.run_id().split('-').collect();
         assert_eq!(parts.len(), 5);
-        assert!(parts[2].starts_with('7'), "expected v7 UUID, got {}", logger.run_id());
+        assert!(
+            parts[2].starts_with('7'),
+            "expected v7 UUID, got {}",
+            logger.run_id()
+        );
     }
 
     #[test]

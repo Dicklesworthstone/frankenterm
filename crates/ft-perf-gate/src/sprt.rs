@@ -163,8 +163,11 @@ mod tests {
             })
             .collect();
         let report = evaluate_wald_sprt(&samples, &cfg);
-        assert!(matches!(report.decision, GateDecision::Accept { .. }),
-            "expected Accept H0 under baseline mean, got {:?}", report.decision);
+        assert!(
+            matches!(report.decision, GateDecision::Accept { .. }),
+            "expected Accept H0 under baseline mean, got {:?}",
+            report.decision
+        );
     }
 
     #[test]
@@ -186,8 +189,11 @@ mod tests {
             })
             .collect();
         let report = evaluate_wald_sprt(&samples, &cfg);
-        assert!(matches!(report.decision, GateDecision::Reject { .. }),
-            "expected Reject H0 under regression mean, got {:?}", report.decision);
+        assert!(
+            matches!(report.decision, GateDecision::Reject { .. }),
+            "expected Reject H0 under regression mean, got {:?}",
+            report.decision
+        );
     }
 
     #[test]
@@ -213,8 +219,14 @@ mod tests {
         // either Continues (still in indifference region) OR returns
         // LowConfidence (exhausted budget without crossing a threshold). Both
         // are honest non-terminal outcomes; we just want to reject Accept/Reject.
-        assert!(matches!(report.decision, GateDecision::Continue { .. } | GateDecision::LowConfidence { .. }),
-            "expected Continue or LowConfidence for very-close hypotheses + small max_samples, got {:?}", report.decision);
+        assert!(
+            matches!(
+                report.decision,
+                GateDecision::Continue { .. } | GateDecision::LowConfidence { .. }
+            ),
+            "expected Continue or LowConfidence for very-close hypotheses + small max_samples, got {:?}",
+            report.decision
+        );
     }
 
     #[test]
@@ -235,8 +247,11 @@ mod tests {
             })
             .collect();
         let report = evaluate_anytime_valid_ci(&samples, &cfg);
-        assert!(matches!(report.decision, GateDecision::Accept { .. }),
-            "expected Accept when CI upper bound < threshold, got {:?}", report.decision);
+        assert!(
+            matches!(report.decision, GateDecision::Accept { .. }),
+            "expected Accept when CI upper bound < threshold, got {:?}",
+            report.decision
+        );
     }
 
     #[test]
@@ -257,8 +272,11 @@ mod tests {
             })
             .collect();
         let report = evaluate_anytime_valid_ci(&samples, &cfg);
-        assert!(matches!(report.decision, GateDecision::Reject { .. }),
-            "expected Reject when CI lower bound > threshold, got {:?}", report.decision);
+        assert!(
+            matches!(report.decision, GateDecision::Reject { .. }),
+            "expected Reject when CI lower bound > threshold, got {:?}",
+            report.decision
+        );
     }
 
     /// Deterministic Box-Muller-derived Gaussian sample via xorshift RNG.
@@ -366,7 +384,8 @@ pub fn evaluate_wald_sprt(samples: &[EvidenceSample], cfg: &WaldSprtConfig) -> W
             threshold_accept_h0: threshold_b,
             samples_consumed: 0,
             decision: GateDecision::LowConfidence {
-                reason: "wald sprt config malformed (sigma, mu, alpha, or beta out of domain)".to_string(),
+                reason: "wald sprt config malformed (sigma, mu, alpha, or beta out of domain)"
+                    .to_string(),
                 confidence: None,
             },
         };
@@ -508,7 +527,10 @@ pub struct AnytimeValidReport {
 
 /// Evaluate the Howard-et-al anytime-valid CI gate over a sample slice.
 #[must_use]
-pub fn evaluate_anytime_valid_ci(samples: &[EvidenceSample], cfg: &AnytimeValidCiConfig) -> AnytimeValidReport {
+pub fn evaluate_anytime_valid_ci(
+    samples: &[EvidenceSample],
+    cfg: &AnytimeValidCiConfig,
+) -> AnytimeValidReport {
     let claim_id = samples
         .first()
         .map_or_else(|| "unknown".to_string(), |s| s.claim_id.clone());
@@ -520,7 +542,8 @@ pub fn evaluate_anytime_valid_ci(samples: &[EvidenceSample], cfg: &AnytimeValidC
             radius: f64::NAN,
             samples_consumed: 0,
             decision: GateDecision::LowConfidence {
-                reason: "anytime-valid-ci config malformed (sigma or alpha out of domain)".to_string(),
+                reason: "anytime-valid-ci config malformed (sigma or alpha out of domain)"
+                    .to_string(),
                 confidence: None,
             },
         };
@@ -590,7 +613,8 @@ pub fn evaluate_anytime_valid_ci(samples: &[EvidenceSample], cfg: &AnytimeValidC
     let decision = terminal.unwrap_or_else(|| {
         if consumed >= cfg.max_samples {
             GateDecision::LowConfidence {
-                reason: "anytime-valid-ci exhausted max_samples with CI straddling threshold".to_string(),
+                reason: "anytime-valid-ci exhausted max_samples with CI straddling threshold"
+                    .to_string(),
                 confidence: None,
             }
         } else {

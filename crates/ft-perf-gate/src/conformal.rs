@@ -202,7 +202,8 @@ pub fn fit_split_conformal_band(
         || cfg.calibration_fraction <= 0.0
     {
         return Err(GateDecision::LowConfidence {
-            reason: "split-conformal config malformed (alpha or calibration_fraction out of (0,1))".to_string(),
+            reason: "split-conformal config malformed (alpha or calibration_fraction out of (0,1))"
+                .to_string(),
             confidence: None,
         });
     }
@@ -287,10 +288,7 @@ pub fn audit_coverage(band: &ConformalBand, test: &[EvidenceSample]) -> f64 {
     // The previous form kept non-finite samples in `test.len()` while
     // excluding them from `inside`, biasing the coverage rate downward
     // whenever the test set contained any NaN / Inf observations.
-    let finite: Vec<&EvidenceSample> = test
-        .iter()
-        .filter(|s| s.metric_value.is_finite())
-        .collect();
+    let finite: Vec<&EvidenceSample> = test.iter().filter(|s| s.metric_value.is_finite()).collect();
     if finite.is_empty() {
         return 0.0;
     }
@@ -341,7 +339,12 @@ mod tests {
         assert_eq!(band.calibration_samples, 32);
         assert!(band.upper > band.lower, "upper > lower");
         // With sigma=0.5 and ~32 calibration samples the radius should be small.
-        assert!(band.upper - band.lower < 4.0, "band too wide: {} to {}", band.lower, band.upper);
+        assert!(
+            band.upper - band.lower < 4.0,
+            "band too wide: {} to {}",
+            band.lower,
+            band.upper
+        );
         Ok(())
     }
 
@@ -361,7 +364,7 @@ mod tests {
         let cfg = SplitConformalConfig {
             alpha: 0.05,
             calibration_fraction: 0.5,
-            min_calibration_samples: 8,  // intentionally below 19
+            min_calibration_samples: 8, // intentionally below 19
         };
         match fit_split_conformal_band(&samples, &cfg) {
             Err(GateDecision::Continue { needed_samples, .. }) => {

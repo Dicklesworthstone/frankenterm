@@ -55,9 +55,17 @@ pub struct HillEstimate {
 #[must_use]
 pub fn hill_estimate(samples: &[f64], k: usize) -> HillEstimate {
     let k = k.max(2);
-    let positive: Vec<f64> = samples.iter().copied().filter(|v| *v > 0.0 && v.is_finite()).collect();
+    let positive: Vec<f64> = samples
+        .iter()
+        .copied()
+        .filter(|v| *v > 0.0 && v.is_finite())
+        .collect();
     if positive.len() < k + 1 {
-        return HillEstimate { alpha: f64::NAN, k, stderr: f64::NAN };
+        return HillEstimate {
+            alpha: f64::NAN,
+            k,
+            stderr: f64::NAN,
+        };
     }
     let mut sorted = positive.clone();
     sorted.sort_by(f64::total_cmp);
@@ -65,7 +73,11 @@ pub fn hill_estimate(samples: &[f64], k: usize) -> HillEstimate {
     // Upper k+1 order statistics: X_(n-k) is the threshold.
     let threshold = sorted[n - k - 1];
     if threshold <= 0.0 {
-        return HillEstimate { alpha: f64::NAN, k, stderr: f64::NAN };
+        return HillEstimate {
+            alpha: f64::NAN,
+            k,
+            stderr: f64::NAN,
+        };
     }
     // Hill estimator: 1/α = (1/k) * sum_{i=0..k} ln(X_(n-i) / X_(n-k))
     let mut sum = 0.0;
@@ -75,7 +87,11 @@ pub fn hill_estimate(samples: &[f64], k: usize) -> HillEstimate {
     }
     let one_over_alpha = sum / (k as f64);
     if one_over_alpha <= 0.0 {
-        return HillEstimate { alpha: f64::INFINITY, k, stderr: f64::NAN };
+        return HillEstimate {
+            alpha: f64::INFINITY,
+            k,
+            stderr: f64::NAN,
+        };
     }
     let alpha = 1.0 / one_over_alpha;
     // Asymptotic stderr: alpha / sqrt(k).
@@ -218,12 +234,17 @@ pub fn compute_snc_bound(
         .collect();
     if values.len() < hill_k + 1 {
         return SncBound::OutOfDomain {
-            reason: format!("snc needs at least hill_k+1 = {} positive finite samples", hill_k + 1),
+            reason: format!(
+                "snc needs at least hill_k+1 = {} positive finite samples",
+                hill_k + 1
+            ),
         };
     }
     let hill = hill_estimate(&values, hill_k);
     if !hill.alpha.is_finite() {
-        return SncBound::OutOfDomain { reason: "hill estimator produced non-finite alpha".to_string() };
+        return SncBound::OutOfDomain {
+            reason: "hill estimator produced non-finite alpha".to_string(),
+        };
     }
     if hill.alpha >= cfg.heavy_tail_alpha_threshold {
         return SncBound::LindleyDomain { alpha: hill.alpha };
@@ -239,7 +260,9 @@ pub fn compute_snc_bound(
 
     if !delay_ms.is_finite() || delay_ms <= 0.0 {
         return SncBound::OutOfDomain {
-            reason: format!("snc quantile computation produced non-finite or non-positive delay {delay_ms}"),
+            reason: format!(
+                "snc quantile computation produced non-finite or non-positive delay {delay_ms}"
+            ),
         };
     }
 
@@ -254,15 +277,23 @@ pub fn compute_snc_bound(
 #[must_use]
 pub fn snc_decision(bound: &SncBound, slo_ms: f64) -> GateDecision {
     match bound {
-        SncBound::HeavyTailBound { confidence, delay_ms, .. } => {
+        SncBound::HeavyTailBound {
+            confidence,
+            delay_ms,
+            ..
+        } => {
             if *delay_ms <= slo_ms {
                 GateDecision::Accept {
-                    reason: format!("snc p={confidence:.4} bound {delay_ms:.3}ms below SLO {slo_ms:.3}ms"),
+                    reason: format!(
+                        "snc p={confidence:.4} bound {delay_ms:.3}ms below SLO {slo_ms:.3}ms"
+                    ),
                     confidence: Some(*confidence),
                 }
             } else {
                 GateDecision::Reject {
-                    reason: format!("snc p={confidence:.4} bound {delay_ms:.3}ms exceeds SLO {slo_ms:.3}ms"),
+                    reason: format!(
+                        "snc p={confidence:.4} bound {delay_ms:.3}ms exceeds SLO {slo_ms:.3}ms"
+                    ),
                     confidence: Some(*confidence),
                 }
             }
@@ -329,7 +360,10 @@ mod tests {
             .collect();
         // Service rate must exceed mean arrival rate by stability_margin.
         // Exponential -ln(u) * 5 has mean ~5, so service rate 100 is generous.
-        let service = MgfServiceCurve { rate: 100.0, burst: 1.0 };
+        let service = MgfServiceCurve {
+            rate: 100.0,
+            burst: 1.0,
+        };
         let cfg = SncConfig::default();
         let bound = compute_snc_bound(&samples, &service, &cfg);
         // Exponential is light-tail; depending on Hill sample, alpha may be
@@ -353,11 +387,18 @@ mod tests {
                 EvidenceSample::new("robot.p95", v, "ms", 1, i as u64)
             })
             .collect();
-        let service = MgfServiceCurve { rate: 100.0, burst: 1.0 };
+        let service = MgfServiceCurve {
+            rate: 100.0,
+            burst: 1.0,
+        };
         let cfg = SncConfig::default();
         let bound = compute_snc_bound(&samples, &service, &cfg);
         match bound {
-            SncBound::HeavyTailBound { confidence, delay_ms, alpha: a } => {
+            SncBound::HeavyTailBound {
+                confidence,
+                delay_ms,
+                alpha: a,
+            } => {
                 assert!((0.99..=0.9999_f64).contains(&confidence));
                 assert!(delay_ms.is_finite() && delay_ms > 0.0);
                 assert!((1.0..2.0).contains(&a));
@@ -371,7 +412,10 @@ mod tests {
         let samples: Vec<EvidenceSample> = (0..10)
             .map(|i| EvidenceSample::new("robot.p95", 1.0, "ms", 1, i))
             .collect();
-        let service = MgfServiceCurve { rate: 1.0, burst: 0.0 };
+        let service = MgfServiceCurve {
+            rate: 1.0,
+            burst: 0.0,
+        };
         let cfg = SncConfig::default();
         let bound = compute_snc_bound(&samples, &service, &cfg);
         assert!(matches!(bound, SncBound::OutOfDomain { .. }));

@@ -2138,11 +2138,7 @@ mod tests {
         for p in [&a, &b, &c, &d] {
             g.register_principal(p.clone()).unwrap();
         }
-        for (id, from, to) in [
-            ("d1", &a, &b),
-            ("d2", &b, &c),
-            ("d3", &c, &d),
-        ] {
+        for (id, from, to) in [("d1", &a, &b), ("d2", &b, &c), ("d3", &c, &d)] {
             g.add_delegation(Delegation {
                 delegation_id: id.into(),
                 delegator: from.clone(),

@@ -379,7 +379,10 @@ mod tests {
             "expected Accept on stationary baseline, got {:?}",
             report.decision
         );
-        assert!(report.alarm_at.is_none(), "stationary baseline should not alarm");
+        assert!(
+            report.alarm_at.is_none(),
+            "stationary baseline should not alarm"
+        );
     }
 
     #[test]
