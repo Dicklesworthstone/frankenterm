@@ -63,14 +63,14 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -91,7 +91,7 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -472,26 +472,6 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                                 },
                             );
                         }
-                    } else if let Some(cause) = effect.drain_cause {
-                        if chunk_touched_hold && !chunk_admission_emitted && size > 0 {
-                            notify_synchronized_output_event(
-                                &pane,
-                                SynchronizedOutputEvent::Admission {
-                                    decision: SynchronizedOutputAdmissionDecision::Accepted,
-                                    bytes: size as u64,
-                                },
-                            );
-                            chunk_admission_emitted = true;
-                        }
-                        notify_synchronized_output_event(
-                            &pane,
-                            SynchronizedOutputEvent::Drain {
-                                cause,
-                                bytes: action_size.saturating_add(size) as u64,
-                                depth_outcome: None,
-                                max_depth: hold.max_depth(),
-                            },
-                        );
                     } else if effect.handled {
                         notify_synchronized_output_event(&pane, SynchronizedOutputEvent::ModeQuery);
                     }
@@ -2057,8 +2037,8 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::MutexGuard as StdMutexGuard;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn global_test_lock() -> StdMutexGuard<'static, ()> {
         crate::MUX_TEST_LOCK
