@@ -636,7 +636,7 @@ impl<'term> LineEditor<'term> {
             // with an empty pattern.
             self.line.clear();
             self.history_pos.take();
-        };
+        }
 
         let search_result =
             host.history()
@@ -923,29 +923,31 @@ mod tests {
 
     #[test]
     fn empty_history_backward_search_preserves_current_input() {
+        let line = "draft command";
         let mut terminal = TestTerminal::default();
-        let mut editor = editor_with_line(&mut terminal, "draft command");
+        let mut editor = editor_with_line(&mut terminal, line);
         let mut host = NopLineEditorHost::default();
 
         editor
             .apply_action(&mut host, Action::HistoryIncSearchBackwards)
             .expect("empty history search should not fail");
 
-        assert_eq!(editor.get_line_and_cursor(), ("draft command", 13));
+        assert_eq!(editor.get_line_and_cursor(), (line, line.len()));
         assert_eq!(editor.state, EditorState::Editing);
     }
 
     #[test]
     fn empty_history_forward_search_preserves_current_input() {
+        let line = "draft command";
         let mut terminal = TestTerminal::default();
-        let mut editor = editor_with_line(&mut terminal, "draft command");
+        let mut editor = editor_with_line(&mut terminal, line);
         let mut host = NopLineEditorHost::default();
 
         editor
             .apply_action(&mut host, Action::HistoryIncSearchForwards)
             .expect("empty history search should not fail");
 
-        assert_eq!(editor.get_line_and_cursor(), ("draft command", 13));
+        assert_eq!(editor.get_line_and_cursor(), (line, line.len()));
         assert_eq!(editor.state, EditorState::Editing);
     }
 }
