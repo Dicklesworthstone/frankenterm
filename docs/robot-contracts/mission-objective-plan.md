@@ -1,8 +1,9 @@
 # Robot Family Contract: `mission objective-plan`
 
-**Bead:** `ft-auy2g.1`
-**Status:** planning contract only. No CLI, Robot, or MCP surface is shipped by
-this document.
+**Bead:** `ft-auy2g.4`
+**Status:** dry-run CLI, Robot, and MCP surfaces are shipped. Source adapters
+are still caller-supplied summaries; this surface does not collect raw pane text
+or mutate Beads, panes, services, or proof infrastructure.
 
 ## Purpose
 
@@ -115,14 +116,17 @@ The initial fixtures live under `fixtures/mission-planner/objective-plan/`:
 
 These fixtures are schema examples, not proof that a CLI surface exists.
 
-## Future Surface
+## Shipped Surface
 
-Candidate commands for a later bead:
+The same dry-run contract is exposed through human CLI, Robot mode, and MCP:
 
 ```text
 ft mission objective-plan --objective "<text>" --format json
 ft robot mission objective-plan --objective "<text>"
+wa.mission_objective_plan {"objective":"<text>"}
+wa://mission/objective-plan/{objective}
 ```
 
-MCP should mirror Robot semantics if it is added. Human output should be a
-compact projection of the same fields, not a separate truth source.
+Human output is a compact projection of the same fields, not a separate truth
+source. Passing `--execute` or MCP `execute=true` is rejected because
+objective-plan is a dry-run planning surface only.

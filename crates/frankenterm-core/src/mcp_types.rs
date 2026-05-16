@@ -416,6 +416,51 @@ pub(super) struct McpTxShowData {
 // ── Mission MCP params/data types ────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]
+pub(super) struct MissionObjectivePlanParams {
+    pub objective: String,
+    #[serde(default)]
+    pub strictness: Option<String>,
+    #[serde(default)]
+    pub target_bead: Option<String>,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
+    #[serde(default)]
+    pub candidate_title: Option<String>,
+    #[serde(default)]
+    pub owned_paths: Vec<String>,
+    #[serde(default)]
+    pub dirty_paths: Vec<String>,
+    #[serde(default)]
+    pub source_unavailable: Vec<String>,
+    #[serde(default)]
+    pub source_degraded: Vec<String>,
+    #[serde(default)]
+    pub source_stale: Vec<String>,
+    #[serde(default)]
+    pub proof_availability: Option<String>,
+    #[serde(default)]
+    pub capacity_posture: Option<String>,
+    #[serde(default)]
+    pub dependency_blocked: bool,
+    #[serde(default)]
+    pub active_assignee: Option<String>,
+    #[serde(default)]
+    pub active_age_seconds: Option<u64>,
+    #[serde(default)]
+    pub stale_after_seconds: Option<u64>,
+    #[serde(default)]
+    pub testing_skill_lane: bool,
+    #[serde(default)]
+    pub generated_at_ms: Option<u64>,
+    #[serde(default)]
+    pub explain_step: Option<String>,
+    #[serde(default)]
+    pub explain_reason: Option<String>,
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct MissionStateParams {
     #[serde(default)]
     pub mission_file: Option<String>,

@@ -16,6 +16,13 @@ use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
     FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
 };
+use crate::mission_objective_plan::{
+    MissionObjectiveCandidateReadiness, MissionObjectiveCandidateWork,
+    MissionObjectiveCapacityPosture, MissionObjectiveDirtyPath, MissionObjectiveEvidenceCategory,
+    MissionObjectiveEvidenceItem, MissionObjectivePlannerInput, MissionObjectiveProofAvailability,
+    MissionObjectiveSourceKind, MissionObjectiveSourceSnapshot, MissionObjectiveStrictness,
+    build_mission_objective_plan_surface_data, plan_mission_objective,
+};
 use crate::policy::PolicySurface;
 use crate::robot_types::{
     WorkflowActionPlan, WorkflowStatusData, WorkflowStatusDetailData, WorkflowStatusListData,
@@ -34,11 +41,11 @@ use super::mcp_types::{
     McpReservationsData, McpReserveData, McpRuleItem, McpRuleMatchItem, McpRuleTraceInfo,
     McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData, McpTxPlanData,
     McpTxRollbackData, McpTxRunData, McpTxShowData, McpWaitForData, McpWorkflowRunData,
-    MissionAbortParams, MissionExplainParams, MissionPauseParams, MissionResumeParams,
-    MissionStateParams, ReleaseParams, ReservationsParams, ReserveParams, RulesListParams,
-    RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
-    TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
-    apply_tail_truncation, now_ms,
+    MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
+    MissionResumeParams, MissionStateParams, ReleaseParams, ReservationsParams, ReserveParams,
+    RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams,
+    TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
+    WorkflowStatusParams, apply_tail_truncation, now_ms,
 };
 #[allow(unused_imports)]
 use super::{
@@ -5150,6 +5157,370 @@ impl ToolHandler for WaAccountsRefreshTool {
 
 // ── Mission MCP tools (ft-1i2ge.5.3) ────────────────────────────────────
 
+fn parse_mission_objective_strictness(
+    raw: Option<&str>,
+) -> std::result::Result<MissionObjectiveStrictness, McpToolError> {
+    match raw.unwrap_or("normal").trim().to_ascii_lowercase().as_str() {
+        "advisory" => Ok(MissionObjectiveStrictness::Advisory),
+        "normal" => Ok(MissionObjectiveStrictness::Normal),
+        "strict" => Ok(MissionObjectiveStrictness::Strict),
+        other => Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("Invalid strictness '{other}'"),
+            Some("Use advisory, normal, or strict.".to_string()),
+        )),
+    }
+}
+
+fn parse_mission_objective_source(
+    raw: &str,
+) -> std::result::Result<MissionObjectiveSourceKind, McpToolError> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "beads" => Ok(MissionObjectiveSourceKind::Beads),
+        "agent_mail" => Ok(MissionObjectiveSourceKind::AgentMail),
+        "rch" => Ok(MissionObjectiveSourceKind::Rch),
+        "git" => Ok(MissionObjectiveSourceKind::Git),
+        "robot" => Ok(MissionObjectiveSourceKind::Robot),
+        "blocker_radar" => Ok(MissionObjectiveSourceKind::BlockerRadar),
+        "resource_cockpit" => Ok(MissionObjectiveSourceKind::ResourceCockpit),
+        "manual" => Ok(MissionObjectiveSourceKind::Manual),
+        other => Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("Invalid source domain '{other}'"),
+            Some("Use beads, agent-mail, rch, git, robot, blocker-radar, resource-cockpit, or manual.".to_string()),
+        )),
+    }
+}
+
+fn parse_mission_objective_proof_availability(
+    raw: Option<&str>,
+) -> std::result::Result<MissionObjectiveProofAvailability, McpToolError> {
+    match raw
+        .unwrap_or("available")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "not_required" => Ok(MissionObjectiveProofAvailability::NotRequired),
+        "available" => Ok(MissionObjectiveProofAvailability::Available),
+        "blocked" => Ok(MissionObjectiveProofAvailability::Blocked),
+        "unavailable" => Ok(MissionObjectiveProofAvailability::Unavailable),
+        other => Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("Invalid proof_availability '{other}'"),
+            Some("Use not-required, available, blocked, or unavailable.".to_string()),
+        )),
+    }
+}
+
+fn parse_mission_objective_capacity_posture(
+    raw: Option<&str>,
+) -> std::result::Result<MissionObjectiveCapacityPosture, McpToolError> {
+    match raw.unwrap_or("admit").trim().to_ascii_lowercase().as_str() {
+        "admit" => Ok(MissionObjectiveCapacityPosture::Admit),
+        "defer" => Ok(MissionObjectiveCapacityPosture::Defer),
+        "pause" => Ok(MissionObjectiveCapacityPosture::Pause),
+        "unknown" => Ok(MissionObjectiveCapacityPosture::Unknown),
+        other => Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("Invalid capacity_posture '{other}'"),
+            Some("Use admit, defer, pause, or unknown.".to_string()),
+        )),
+    }
+}
+
+fn mission_objective_source_slug(kind: MissionObjectiveSourceKind) -> &'static str {
+    match kind {
+        MissionObjectiveSourceKind::Beads => "beads",
+        MissionObjectiveSourceKind::AgentMail => "agent_mail",
+        MissionObjectiveSourceKind::Rch => "rch",
+        MissionObjectiveSourceKind::Git => "git",
+        MissionObjectiveSourceKind::Robot => "robot",
+        MissionObjectiveSourceKind::BlockerRadar => "blocker_radar",
+        MissionObjectiveSourceKind::ResourceCockpit => "resource_cockpit",
+        MissionObjectiveSourceKind::Manual => "manual",
+        MissionObjectiveSourceKind::Fixture => "fixture",
+    }
+}
+
+fn mission_objective_evidence_category(
+    kind: MissionObjectiveSourceKind,
+) -> MissionObjectiveEvidenceCategory {
+    match kind {
+        MissionObjectiveSourceKind::Beads => MissionObjectiveEvidenceCategory::BeadsReadyQueue,
+        MissionObjectiveSourceKind::AgentMail => {
+            MissionObjectiveEvidenceCategory::AgentMailAvailability
+        }
+        MissionObjectiveSourceKind::Rch => MissionObjectiveEvidenceCategory::RchWorkerSelection,
+        MissionObjectiveSourceKind::Git => MissionObjectiveEvidenceCategory::GitDirtyTree,
+        MissionObjectiveSourceKind::Robot => MissionObjectiveEvidenceCategory::RobotInventory,
+        MissionObjectiveSourceKind::BlockerRadar | MissionObjectiveSourceKind::ResourceCockpit => {
+            MissionObjectiveEvidenceCategory::CapacityPressure
+        }
+        MissionObjectiveSourceKind::Manual | MissionObjectiveSourceKind::Fixture => {
+            MissionObjectiveEvidenceCategory::Manual
+        }
+    }
+}
+
+fn mission_objective_source_snapshot(
+    raw_source: &str,
+    state: &'static str,
+) -> std::result::Result<MissionObjectiveSourceSnapshot, McpToolError> {
+    let kind = parse_mission_objective_source(raw_source)?;
+    let slug = mission_objective_source_slug(kind);
+    let reason_code = format!("source.{slug}.{state}");
+    let snapshot = MissionObjectiveSourceSnapshot::new(format!("{slug}.{state}"), kind)
+        .with_evidence(
+            MissionObjectiveEvidenceItem::new(
+                mission_objective_evidence_category(kind),
+                format!("{slug} source reported {state} by MCP caller"),
+            )
+            .with_reason_code(reason_code.clone()),
+        );
+    Ok(match state {
+        "unavailable" => snapshot.unavailable(reason_code),
+        "degraded" => snapshot.degraded(reason_code),
+        "stale" => snapshot.stale(reason_code),
+        _ => snapshot.with_reason_code(reason_code),
+    })
+}
+
+fn mcp_non_empty_option(
+    raw: Option<String>,
+    field_name: &'static str,
+) -> std::result::Result<Option<String>, McpToolError> {
+    match raw {
+        Some(value) if value.trim().is_empty() => Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("{field_name} cannot be empty"),
+            None,
+        )),
+        Some(value) => Ok(Some(value.trim().to_string())),
+        None => Ok(None),
+    }
+}
+
+fn build_mcp_mission_objective_plan_input(
+    params: MissionObjectivePlanParams,
+) -> std::result::Result<MissionObjectivePlannerInput, McpToolError> {
+    if params.execute {
+        return Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            "wa.mission_objective_plan is dry-run only and cannot execute actions".to_string(),
+            Some(
+                "Remove execute=true; use the plan as input to a separate reviewed workflow."
+                    .to_string(),
+            ),
+        ));
+    }
+    if params.objective.trim().is_empty() {
+        return Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            "objective cannot be empty".to_string(),
+            Some("Provide an objective string.".to_string()),
+        ));
+    }
+    if params.explain_step.is_some() && params.explain_reason.is_some() {
+        return Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            "use either explain_step or explain_reason, not both".to_string(),
+            None,
+        ));
+    }
+
+    let target_bead = mcp_non_empty_option(params.target_bead, "target_bead")?;
+    let candidate_id = mcp_non_empty_option(params.candidate_id, "candidate_id")?;
+    let candidate_title = mcp_non_empty_option(params.candidate_title, "candidate_title")?;
+    let active_assignee = mcp_non_empty_option(params.active_assignee, "active_assignee")?;
+    let proof_availability =
+        parse_mission_objective_proof_availability(params.proof_availability.as_deref())?;
+    let capacity_posture =
+        parse_mission_objective_capacity_posture(params.capacity_posture.as_deref())?;
+
+    let mut input = MissionObjectivePlannerInput::new(
+        params.generated_at_ms.unwrap_or_else(now_ms),
+        "wa.mission_objective_plan",
+        params.objective.trim(),
+    )
+    .strictness(parse_mission_objective_strictness(
+        params.strictness.as_deref(),
+    )?)
+    .with_source_snapshot(
+        MissionObjectiveSourceSnapshot::new(
+            "wa.mission_objective_plan.manual",
+            MissionObjectiveSourceKind::Manual,
+        )
+        .with_evidence(
+            MissionObjectiveEvidenceItem::new(
+                MissionObjectiveEvidenceCategory::Manual,
+                "objective supplied as redacted MCP argument",
+            )
+            .with_reason_code("objective.input.redacted_summary"),
+        ),
+    );
+
+    for source in &params.source_unavailable {
+        input =
+            input.with_source_snapshot(mission_objective_source_snapshot(source, "unavailable")?);
+    }
+    for source in &params.source_degraded {
+        input = input.with_source_snapshot(mission_objective_source_snapshot(source, "degraded")?);
+    }
+    for source in &params.source_stale {
+        input = input.with_source_snapshot(mission_objective_source_snapshot(source, "stale")?);
+    }
+    for dirty_path in &params.dirty_paths {
+        if !dirty_path.trim().is_empty() {
+            input = input.with_dirty_path(
+                MissionObjectiveDirtyPath::new(dirty_path.trim(), "modified")
+                    .category("mcp_dirty_tree"),
+            );
+        }
+    }
+
+    let should_create_candidate = target_bead.is_some()
+        || candidate_id.is_some()
+        || params.testing_skill_lane
+        || params.dependency_blocked
+        || active_assignee.is_some();
+
+    if should_create_candidate {
+        let readiness = if params.dependency_blocked {
+            MissionObjectiveCandidateReadiness::BlockedDependency
+        } else if active_assignee.is_some() {
+            MissionObjectiveCandidateReadiness::ActiveSameDomain
+        } else if params.testing_skill_lane {
+            MissionObjectiveCandidateReadiness::TestingSkillLane
+        } else if target_bead.is_some() {
+            MissionObjectiveCandidateReadiness::ReadyBead
+        } else {
+            MissionObjectiveCandidateReadiness::PlanningOnly
+        };
+        let resolved_candidate_id = candidate_id
+            .clone()
+            .or_else(|| target_bead.clone())
+            .unwrap_or_else(|| "objective.manual_candidate".to_string());
+        let mut candidate = MissionObjectiveCandidateWork::new(resolved_candidate_id, readiness)
+            .title(
+                candidate_title
+                    .clone()
+                    .or_else(|| target_bead.clone())
+                    .unwrap_or_else(|| params.objective.trim().to_string()),
+            )
+            .dependency_ready(!params.dependency_blocked)
+            .proof_availability(proof_availability)
+            .capacity_posture(capacity_posture);
+        if let Some(target_bead) = target_bead {
+            candidate = candidate.target_bead_id(target_bead);
+        }
+        if let Some(active_assignee) = active_assignee {
+            candidate =
+                candidate.active_owner(active_assignee, params.active_age_seconds.unwrap_or(0));
+        }
+        if let Some(stale_after_seconds) = params.stale_after_seconds {
+            candidate = candidate.stale_after_seconds(stale_after_seconds);
+        }
+        for owned_path in &params.owned_paths {
+            if !owned_path.trim().is_empty() {
+                candidate = candidate.with_owned_path(owned_path.trim());
+            }
+        }
+        input = input.with_candidate(candidate);
+    }
+
+    Ok(input)
+}
+
+// wa.mission_objective_plan tool
+pub(super) struct WaMissionObjectivePlanTool;
+
+impl ToolHandler for WaMissionObjectivePlanTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.mission_objective_plan".to_string(),
+            description: Some(
+                "Compile an operator objective into a dry-run mission plan without mutating panes, services, or Beads (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "objective": { "type": "string", "description": "Operator objective to plan" },
+                    "strictness": { "type": "string", "enum": ["advisory", "normal", "strict"], "default": "normal" },
+                    "target_bead": { "type": "string", "description": "Ready Beads id to rank" },
+                    "candidate_id": { "type": "string", "description": "Planner candidate id when no Beads target exists" },
+                    "candidate_title": { "type": "string", "description": "Human label for the candidate" },
+                    "owned_paths": { "type": "array", "items": { "type": "string" } },
+                    "dirty_paths": { "type": "array", "items": { "type": "string" } },
+                    "source_unavailable": { "type": "array", "items": { "type": "string" } },
+                    "source_degraded": { "type": "array", "items": { "type": "string" } },
+                    "source_stale": { "type": "array", "items": { "type": "string" } },
+                    "proof_availability": { "type": "string", "enum": ["not-required", "available", "blocked", "unavailable"], "default": "available" },
+                    "capacity_posture": { "type": "string", "enum": ["admit", "defer", "pause", "unknown"], "default": "admit" },
+                    "dependency_blocked": { "type": "boolean", "default": false },
+                    "active_assignee": { "type": "string" },
+                    "active_age_seconds": { "type": "integer", "minimum": 0 },
+                    "stale_after_seconds": { "type": "integer", "minimum": 60 },
+                    "testing_skill_lane": { "type": "boolean", "default": false },
+                    "generated_at_ms": { "type": "integer", "minimum": 0 },
+                    "explain_step": { "type": "string" },
+                    "explain_reason": { "type": "string" },
+                    "execute": { "type": "boolean", "default": false, "description": "Always rejected; objective plans are dry-run only" }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "mission".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: MissionObjectivePlanParams = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some(
+                        "Expected object with objective and optional objective-plan hints"
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let explain_step = params.explain_step.clone();
+        let explain_reason = params.explain_reason.clone();
+
+        let result = build_mcp_mission_objective_plan_input(params).map(|input| {
+            let plan = plan_mission_objective(&input);
+            build_mission_objective_plan_surface_data(
+                plan,
+                explain_step.as_deref(),
+                explain_reason.as_deref(),
+            )
+        });
+
+        match result {
+            Ok(data) => envelope_to_content(McpEnvelope::success(data, elapsed_ms(start))),
+            Err(err) => envelope_to_content(McpEnvelope::<()>::error(
+                err.code,
+                err.message,
+                err.hint,
+                elapsed_ms(start),
+            )),
+        }
+    }
+}
+
 // wa.mission_state tool
 pub(super) struct WaMissionStateTool {
     config: Arc<Config>,
@@ -6583,18 +6954,19 @@ mod tests {
         McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool,
         ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool,
         WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool,
-        WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool,
-        WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
-        WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
-        WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
-        WaWorkflowStatusTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
-        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
-        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
-        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
-        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
-        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
-        redact_mcp_pane_state_fields, serialize_mcp_audit_decision_context,
-        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
+        WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool,
+        WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaReleaseTool,
+        WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
+        WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
+        WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
+        authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
+        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
+        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
+        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
+        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
+        validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
@@ -7085,7 +7457,7 @@ mod tests {
         }
     }
 
-    /// Collect definitions for all 30 tools. Guarantees no panics during construction.
+    /// Collect definitions for all 31 tools. Guarantees no panics during construction.
     fn all_definitions() -> Vec<Tool> {
         let db = db_path();
         let cfg = config();
@@ -7112,6 +7484,7 @@ mod tests {
             WaReleaseTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaAccountsTool::new(Arc::clone(&db)).definition(),
             WaAccountsRefreshTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaMissionObjectivePlanTool.definition(),
             WaMissionStateTool::new(Arc::clone(&cfg)).definition(),
             WaMissionExplainTool::new(Arc::clone(&cfg)).definition(),
             WaMissionPauseTool::new(Arc::clone(&cfg)).definition(),
@@ -7128,8 +7501,8 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn tool_count_is_30() {
-        assert_eq!(all_definitions().len(), 30);
+    fn tool_count_is_31() {
+        assert_eq!(all_definitions().len(), 31);
     }
 
     // ========================================================================
@@ -7853,6 +8226,7 @@ mod tests {
     #[test]
     fn mission_tool_names_stable() {
         let expected = [
+            "wa.mission_objective_plan",
             "wa.mission_state",
             "wa.mission_explain",
             "wa.mission_pause",
@@ -7867,6 +8241,59 @@ mod tests {
                 expected_name
             );
         }
+    }
+
+    #[test]
+    fn mission_objective_plan_tool_returns_dry_run_surface() {
+        let tool = WaMissionObjectivePlanTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "objective": "ship next safe slice",
+                    "target_bead": "ft-auy2g.4",
+                    "owned_paths": ["crates/frankenterm/src/main.rs"],
+                    "source_unavailable": ["agent-mail"],
+                    "generated_at_ms": 123,
+                    "explain_step": "ft-auy2g.4"
+                }),
+            )
+            .expect("mission objective plan call"),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["dry_run"], true);
+        assert_eq!(envelope["data"]["side_effects_executed"], false);
+        assert_eq!(
+            envelope["data"]["contract_id"],
+            crate::mission_objective_plan::MISSION_OBJECTIVE_PLAN_CONTRACT_ID
+        );
+        assert_eq!(envelope["data"]["explain"]["matched"], true);
+        assert_eq!(envelope["data"]["plan"]["steps"][0]["target"], "ft-auy2g.4");
+    }
+
+    #[test]
+    fn mission_objective_plan_tool_rejects_execute_attempt() {
+        let tool = WaMissionObjectivePlanTool;
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "objective": "ship next safe slice",
+                    "execute": true
+                }),
+            )
+            .expect("mission objective plan call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"],
+            crate::mcp_error::MCP_ERR_INVALID_ARGS
+        );
+        assert!(envelope["error"].as_str().unwrap().contains("dry-run only"));
     }
 
     #[test]

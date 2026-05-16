@@ -512,6 +512,38 @@ pub struct MissionObjectivePlan {
     pub reason_codes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionObjectivePlanExplainMode {
+    Step,
+    Reason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissionObjectivePlanExplainData {
+    pub mode: MissionObjectivePlanExplainMode,
+    pub query: String,
+    pub matched: bool,
+    pub matches: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<MissionObjectivePlanStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissionObjectivePlanSurfaceData {
+    pub contract_id: String,
+    pub schema_version: u16,
+    pub dry_run: bool,
+    pub side_effects_executed: bool,
+    pub raw_pane_content_stored: bool,
+    pub plan_status: MissionObjectivePlanStatus,
+    pub risk_level: MissionObjectiveRiskLevel,
+    pub reason_codes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<MissionObjectivePlanExplainData>,
+    pub plan: MissionObjectivePlan,
+}
+
 impl Serialize for MissionObjectivePlan {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -891,6 +923,96 @@ pub fn plan_mission_objective(input: &MissionObjectivePlannerInput) -> MissionOb
         plan_steps,
         fallback_steps,
         reason_codes,
+    }
+}
+
+#[must_use]
+pub fn build_mission_objective_plan_surface_data(
+    plan: MissionObjectivePlan,
+    explain_step: Option<&str>,
+    explain_reason: Option<&str>,
+) -> MissionObjectivePlanSurfaceData {
+    let explain = explain_step
+        .map(|query| explain_plan_step(&plan, query))
+        .or_else(|| explain_reason.map(|query| explain_plan_reason(&plan, query)));
+
+    MissionObjectivePlanSurfaceData {
+        contract_id: plan.contract_id.clone(),
+        schema_version: plan.schema_version,
+        dry_run: plan.dry_run,
+        side_effects_executed: plan.side_effects_executed,
+        raw_pane_content_stored: plan.raw_pane_content_stored,
+        plan_status: plan.plan_status,
+        risk_level: plan.risk_level,
+        reason_codes: plan.reason_codes.clone(),
+        explain,
+        plan,
+    }
+}
+
+fn explain_plan_step(plan: &MissionObjectivePlan, query: &str) -> MissionObjectivePlanExplainData {
+    let query = query.trim();
+    let step = ordered_steps(plan).into_iter().find(|step| {
+        step.candidate_id == query
+            || step
+                .target_bead_id
+                .as_deref()
+                .is_some_and(|target| target == query)
+            || step.rank.to_string() == query
+    });
+    let matches = step
+        .as_ref()
+        .map(|step| {
+            vec![
+                format!("step.rank:{}", step.rank),
+                format!("step.candidate_id:{}", step.candidate_id),
+            ]
+        })
+        .unwrap_or_default();
+
+    MissionObjectivePlanExplainData {
+        mode: MissionObjectivePlanExplainMode::Step,
+        query: query.to_string(),
+        matched: step.is_some(),
+        matches,
+        step,
+    }
+}
+
+fn explain_plan_reason(
+    plan: &MissionObjectivePlan,
+    query: &str,
+) -> MissionObjectivePlanExplainData {
+    let query = query.trim();
+    let mut matches = Vec::new();
+    if plan.reason_codes.iter().any(|reason| reason == query) {
+        matches.push("plan.reason_codes".to_string());
+    }
+    for snapshot in &plan.source_snapshots {
+        if snapshot.reason_codes.iter().any(|reason| reason == query) {
+            matches.push(format!("source_snapshots.{}", snapshot.source_id));
+        }
+        for (index, evidence) in snapshot.evidence.iter().enumerate() {
+            if evidence.reason_codes.iter().any(|reason| reason == query) {
+                matches.push(format!(
+                    "source_snapshots.{}.evidence.{}",
+                    snapshot.source_id, index
+                ));
+            }
+        }
+    }
+    for step in ordered_steps(plan) {
+        if step.reason_codes.iter().any(|reason| reason == query) {
+            matches.push(format!("steps.{}.reason_codes", step.candidate_id));
+        }
+    }
+
+    MissionObjectivePlanExplainData {
+        mode: MissionObjectivePlanExplainMode::Reason,
+        query: query.to_string(),
+        matched: !matches.is_empty(),
+        matches,
+        step: None,
     }
 }
 
@@ -2381,6 +2503,68 @@ mod tests {
                             | "raw_pane_content"
                     )
                 ))
+        );
+    }
+
+    #[test]
+    fn surface_data_preserves_contract_and_step_explain() {
+        let plan = plan_mission_objective(
+            &input_with_sources().with_candidate(
+                MissionObjectiveCandidateWork::new(
+                    "ft-ready",
+                    MissionObjectiveCandidateReadiness::ReadyBead,
+                )
+                .target_bead_id("ft-ready"),
+            ),
+        );
+
+        let surface = build_mission_objective_plan_surface_data(plan, Some("ft-ready"), None);
+
+        assert_eq!(surface.contract_id, MISSION_OBJECTIVE_PLAN_CONTRACT_ID);
+        assert!(surface.dry_run);
+        assert!(!surface.side_effects_executed);
+        assert!(!surface.raw_pane_content_stored);
+        let explain = surface.explain.expect("step explanation");
+        assert_eq!(explain.mode, MissionObjectivePlanExplainMode::Step);
+        assert!(explain.matched);
+        assert_eq!(
+            explain
+                .step
+                .as_ref()
+                .and_then(|step| step.target_bead_id.as_deref()),
+            Some("ft-ready")
+        );
+    }
+
+    #[test]
+    fn surface_data_explains_reason_locations() {
+        let plan = plan_mission_objective(
+            &input_with_sources().with_candidate(
+                MissionObjectiveCandidateWork::new(
+                    "ft-ready",
+                    MissionObjectiveCandidateReadiness::ReadyBead,
+                )
+                .target_bead_id("ft-ready"),
+            ),
+        );
+
+        let surface =
+            build_mission_objective_plan_surface_data(plan, None, Some("beads.ready_available"));
+
+        let explain = surface.explain.expect("reason explanation");
+        assert_eq!(explain.mode, MissionObjectivePlanExplainMode::Reason);
+        assert!(explain.matched);
+        assert!(
+            explain
+                .matches
+                .iter()
+                .any(|location| location == "plan.reason_codes")
+        );
+        assert!(
+            explain
+                .matches
+                .iter()
+                .any(|location| location == "steps.ft-ready.reason_codes")
         );
     }
 

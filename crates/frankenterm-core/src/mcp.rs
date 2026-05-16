@@ -114,9 +114,9 @@ pub use mcp_proxy::{
 use mcp_resources::{
     WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
     WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
-    WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
-    WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
-    WaRendererInputToPhotonResource, WaRendererSsimParityResource,
+    WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaMissionObjectivePlanTemplateResource,
+    WaPanesResource, WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
+    WaProofHistoryTemplateResource, WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
     WaRulesResource, WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource,
     WaWorkflowsResource,
@@ -124,20 +124,21 @@ use mcp_resources::{
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
     WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
-    WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool,
-    WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
-    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
-    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+    WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
+    WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
+    WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
+    WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+    WaWorkflowStatusTool,
 };
 pub use mcp_tools::{mcp_clock_anomaly_count, mcp_workflow_plan_serde_drop_count};
 #[cfg(feature = "fuzz")]
 use mcp_types::{
     AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams, CassViewParams,
     EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams, GetTextParams,
-    MissionAbortParams, MissionExplainParams, MissionPauseParams, MissionResumeParams,
-    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
-    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
-    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
+    MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
+    MissionResumeParams, ReleaseParams, ReservationsParams, ReserveParams, RulesListParams,
+    RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
+    TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
 };
 use mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
@@ -220,6 +221,7 @@ fn fuzz_parse_tool_arguments(tool_name: &str, arguments: Value) -> &'static str 
                 fuzz_parse_params::<AccountsRefreshParams>(arguments)
             }
         }
+        "wa.mission_objective_plan" => fuzz_parse_params::<MissionObjectivePlanParams>(arguments),
         "wa.mission_state" => fuzz_parse_params_or_default::<MissionStateParams>(arguments),
         "wa.mission_explain" => fuzz_parse_params_or_default::<MissionExplainParams>(arguments),
         "wa.mission_pause" => fuzz_parse_params::<MissionPauseParams>(arguments),

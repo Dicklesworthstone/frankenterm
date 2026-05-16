@@ -10,7 +10,8 @@ use super::{
     WaContextHorizonResource, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsResource,
     WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool, WaEventsUnhandledTemplateResource,
     WaGetTextTool, WaHerdWaveResource, WaMissionAbortTool, WaMissionExplainTool,
-    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaPanesResource,
+    WaMissionObjectivePlanTemplateResource, WaMissionObjectivePlanTool, WaMissionPauseTool,
+    WaMissionResumeTool, WaMissionStateTool, WaPanesResource,
     WaProofHistoryReleaseBlockingResource, WaProofHistoryResource, WaProofHistoryTemplateResource,
     WaReleaseTool, WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
@@ -44,6 +45,7 @@ pub const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
     "wa.cass_status",
     "wa.tx_plan",
     "wa.tx_show",
+    "wa.mission_objective_plan",
     "wa.mission_state",
     "wa.mission_explain",
     "wa.get_text",
@@ -261,6 +263,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         .tool(FormatAwareToolHandler::new(WaTxShowTool::new(Arc::clone(
             &config,
         ))))
+        .tool(FormatAwareToolHandler::new(WaMissionObjectivePlanTool))
         .tool(FormatAwareToolHandler::new(WaMissionStateTool::new(
             Arc::clone(&config),
         )))
@@ -273,6 +276,7 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         ))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaHerdWaveResource)
+        .resource(WaMissionObjectivePlanTemplateResource)
         .resource(WaSwarmCapacityCurrentResource)
         .resource(WaSwarmCapacityRunTemplateResource)
         .resource(WaRendererInputToPhotonResource)

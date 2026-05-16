@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_core::blocker_radar::{
@@ -3828,6 +3828,12 @@ enum RobotReservationCommands {
 
 #[derive(Subcommand)]
 enum RobotMissionCommands {
+    /// Compile an operator objective into a read-only dry-run plan
+    ObjectivePlan {
+        #[command(flatten)]
+        args: RobotMissionObjectivePlanArgs,
+    },
+
     /// Get mission state with assignment-level filtering
     State {
         /// Mission JSON file (default: .ft/mission/active.json)
@@ -4255,6 +4261,12 @@ enum WorkflowCommands {
 
 #[derive(Subcommand)]
 enum MissionCommands {
+    /// Compile an operator objective into a read-only dry-run plan
+    ObjectivePlan {
+        #[command(flatten)]
+        args: MissionObjectivePlanArgs,
+    },
+
     /// Validate mission contract and compute deterministic planning summary
     Plan {
         /// Mission JSON file (default: .ft/mission/active.json)
@@ -5627,6 +5639,199 @@ enum RobotMissionActionState {
     Ready,
     Blocked,
     Completed,
+}
+
+#[derive(Debug, Clone, Args)]
+struct MissionObjectivePlanArgs {
+    #[command(flatten)]
+    common: MissionObjectivePlanInputArgs,
+
+    /// Output format for human mission objective-plan output
+    #[arg(long, default_value = "plain", value_parser = ["plain", "json"])]
+    format: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RobotMissionObjectivePlanArgs {
+    #[command(flatten)]
+    common: MissionObjectivePlanInputArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct MissionObjectivePlanInputArgs {
+    /// Operator objective to compile into a read-only plan
+    #[arg(long)]
+    objective: String,
+
+    /// Planning strictness for degraded/unavailable source handling
+    #[arg(long, value_enum, default_value = "normal")]
+    strictness: MissionObjectiveStrictnessArg,
+
+    /// Candidate Beads id to rank as ready work
+    #[arg(long)]
+    target_bead: Option<String>,
+
+    /// Candidate id when planning without a Beads target
+    #[arg(long)]
+    candidate_id: Option<String>,
+
+    /// Candidate title for the surfaced step
+    #[arg(long)]
+    candidate_title: Option<String>,
+
+    /// Owned path for dirty-overlap checks; repeat or comma-separate
+    #[arg(long = "owned-path", value_delimiter = ',')]
+    owned_paths: Vec<String>,
+
+    /// Dirty path observed by the caller; repeat or comma-separate
+    #[arg(long = "dirty-path", value_delimiter = ',')]
+    dirty_paths: Vec<String>,
+
+    /// Source domains that were unavailable during collection
+    #[arg(long = "source-unavailable", value_enum, value_delimiter = ',')]
+    source_unavailable: Vec<MissionObjectiveSourceArg>,
+
+    /// Source domains that were degraded during collection
+    #[arg(long = "source-degraded", value_enum, value_delimiter = ',')]
+    source_degraded: Vec<MissionObjectiveSourceArg>,
+
+    /// Source domains whose snapshot was stale
+    #[arg(long = "source-stale", value_enum, value_delimiter = ',')]
+    source_stale: Vec<MissionObjectiveSourceArg>,
+
+    /// Candidate proof substrate state
+    #[arg(long, value_enum, default_value = "available")]
+    proof_availability: MissionObjectiveProofAvailabilityArg,
+
+    /// Capacity posture supplied by the caller
+    #[arg(long, value_enum, default_value = "admit")]
+    capacity_posture: MissionObjectiveCapacityPostureArg,
+
+    /// Mark the candidate dependency graph as blocked
+    #[arg(long)]
+    dependency_blocked: bool,
+
+    /// Active assignee currently owning the candidate surface
+    #[arg(long)]
+    active_assignee: Option<String>,
+
+    /// Age in seconds of the active assignee signal
+    #[arg(long)]
+    active_age_seconds: Option<u64>,
+
+    /// Staleness threshold in seconds for active assignee handoff checks
+    #[arg(long)]
+    stale_after_seconds: Option<u64>,
+
+    /// Mark the candidate as a testing-skill planning lane
+    #[arg(long)]
+    testing_skill_lane: bool,
+
+    /// Deterministic generation timestamp for fixtures and replay
+    #[arg(long)]
+    generated_at_ms: Option<u64>,
+
+    /// Explain a single plan step by rank, candidate id, or target bead id
+    #[arg(long)]
+    explain_step: Option<String>,
+
+    /// Explain where a reason code appears in the plan
+    #[arg(long)]
+    explain_reason: Option<String>,
+
+    /// Rejected guard: objective-plan is dry-run only
+    #[arg(long)]
+    execute: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MissionObjectiveStrictnessArg {
+    Advisory,
+    Normal,
+    Strict,
+}
+
+impl From<MissionObjectiveStrictnessArg>
+    for frankenterm_core::mission_objective_plan::MissionObjectiveStrictness
+{
+    fn from(value: MissionObjectiveStrictnessArg) -> Self {
+        match value {
+            MissionObjectiveStrictnessArg::Advisory => Self::Advisory,
+            MissionObjectiveStrictnessArg::Normal => Self::Normal,
+            MissionObjectiveStrictnessArg::Strict => Self::Strict,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MissionObjectiveSourceArg {
+    Beads,
+    AgentMail,
+    Rch,
+    Git,
+    Robot,
+    BlockerRadar,
+    ResourceCockpit,
+    Manual,
+}
+
+impl From<MissionObjectiveSourceArg>
+    for frankenterm_core::mission_objective_plan::MissionObjectiveSourceKind
+{
+    fn from(value: MissionObjectiveSourceArg) -> Self {
+        match value {
+            MissionObjectiveSourceArg::Beads => Self::Beads,
+            MissionObjectiveSourceArg::AgentMail => Self::AgentMail,
+            MissionObjectiveSourceArg::Rch => Self::Rch,
+            MissionObjectiveSourceArg::Git => Self::Git,
+            MissionObjectiveSourceArg::Robot => Self::Robot,
+            MissionObjectiveSourceArg::BlockerRadar => Self::BlockerRadar,
+            MissionObjectiveSourceArg::ResourceCockpit => Self::ResourceCockpit,
+            MissionObjectiveSourceArg::Manual => Self::Manual,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MissionObjectiveProofAvailabilityArg {
+    NotRequired,
+    Available,
+    Blocked,
+    Unavailable,
+}
+
+impl From<MissionObjectiveProofAvailabilityArg>
+    for frankenterm_core::mission_objective_plan::MissionObjectiveProofAvailability
+{
+    fn from(value: MissionObjectiveProofAvailabilityArg) -> Self {
+        match value {
+            MissionObjectiveProofAvailabilityArg::NotRequired => Self::NotRequired,
+            MissionObjectiveProofAvailabilityArg::Available => Self::Available,
+            MissionObjectiveProofAvailabilityArg::Blocked => Self::Blocked,
+            MissionObjectiveProofAvailabilityArg::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MissionObjectiveCapacityPostureArg {
+    Admit,
+    Defer,
+    Pause,
+    Unknown,
+}
+
+impl From<MissionObjectiveCapacityPostureArg>
+    for frankenterm_core::mission_objective_plan::MissionObjectiveCapacityPosture
+{
+    fn from(value: MissionObjectiveCapacityPostureArg) -> Self {
+        match value {
+            MissionObjectiveCapacityPostureArg::Admit => Self::Admit,
+            MissionObjectiveCapacityPostureArg::Defer => Self::Defer,
+            MissionObjectiveCapacityPostureArg::Pause => Self::Pause,
+            MissionObjectiveCapacityPostureArg::Unknown => Self::Unknown,
+        }
+    }
 }
 
 impl From<SearchModeArg> for frankenterm_core::query_contract::UnifiedSearchMode {
@@ -29611,6 +29816,29 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
 
                             match command {
+                                RobotMissionCommands::ObjectivePlan { args } => {
+                                    let surface = match build_mission_objective_plan_surface(
+                                        &args.common,
+                                        "ft.robot.mission",
+                                    ) {
+                                        Ok(surface) => surface,
+                                        Err(err) => {
+                                            let response = RobotResponse::<
+                                                    frankenterm_core::mission_objective_plan::MissionObjectivePlanSurfaceData,
+                                                >::error_with_code(
+                                                    robot_mission_error_code(err.error_code),
+                                                    err.message,
+                                                    err.hint,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+                                    let response =
+                                        RobotResponse::success(surface, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+                                }
                                 RobotMissionCommands::State {
                                     mission_file,
                                     mission_state,
@@ -46755,6 +46983,13 @@ fn robot_mission_error_code(mission_error_code: &str) -> &'static str {
         "mission.assignment_id_empty" => ROBOT_ERR_INVALID_ARGS,
         "mission.limit_invalid" => ROBOT_ERR_INVALID_ARGS,
         "mission.assignee_empty" => ROBOT_ERR_INVALID_ARGS,
+        "mission.objective_plan.execution_forbidden" => "robot.objective_plan_execution_forbidden",
+        "mission.objective_plan.objective_empty"
+        | "mission.objective_plan.explain_conflict"
+        | "mission.objective_plan.target_bead_empty"
+        | "mission.objective_plan.candidate_id_empty"
+        | "mission.objective_plan.candidate_title_empty"
+        | "mission.objective_plan.active_assignee_empty" => ROBOT_ERR_INVALID_ARGS,
         _ => "robot.mission_error",
     }
 }
@@ -46767,6 +47002,303 @@ fn robot_tx_error_code(tx_error_code: &str) -> &'static str {
         "mission.tx.validation_failed" => "robot.tx_validation_failed",
         _ => "robot.tx_error",
     }
+}
+
+fn mission_objective_source_slug(source: MissionObjectiveSourceArg) -> &'static str {
+    match source {
+        MissionObjectiveSourceArg::Beads => "beads",
+        MissionObjectiveSourceArg::AgentMail => "agent_mail",
+        MissionObjectiveSourceArg::Rch => "rch",
+        MissionObjectiveSourceArg::Git => "git",
+        MissionObjectiveSourceArg::Robot => "robot",
+        MissionObjectiveSourceArg::BlockerRadar => "blocker_radar",
+        MissionObjectiveSourceArg::ResourceCockpit => "resource_cockpit",
+        MissionObjectiveSourceArg::Manual => "manual",
+    }
+}
+
+fn mission_objective_non_empty(
+    value: &Option<String>,
+    field_name: &'static str,
+    error_code: &'static str,
+) -> Result<Option<String>, MissionCommandError> {
+    match value {
+        Some(raw) if raw.trim().is_empty() => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code,
+            message: format!("{field_name} cannot be empty"),
+            hint: None,
+        }),
+        Some(raw) => Ok(Some(raw.trim().to_string())),
+        None => Ok(None),
+    }
+}
+
+fn validate_mission_objective_plan_args(
+    args: &MissionObjectivePlanInputArgs,
+) -> Result<(), MissionCommandError> {
+    if args.execute {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.objective_plan.execution_forbidden",
+            message: "mission objective-plan is dry-run only and cannot execute actions".to_string(),
+            hint: Some(
+                "Remove --execute; use the emitted plan as an input to a separate reviewed workflow."
+                    .to_string(),
+            ),
+        });
+    }
+    if args.objective.trim().is_empty() {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.objective_plan.objective_empty",
+            message: "objective cannot be empty".to_string(),
+            hint: Some("Pass --objective with the operator goal to plan.".to_string()),
+        });
+    }
+    if args.explain_step.is_some() && args.explain_reason.is_some() {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.objective_plan.explain_conflict",
+            message: "use either --explain-step or --explain-reason, not both".to_string(),
+            hint: None,
+        });
+    }
+    Ok(())
+}
+
+fn mission_objective_source_snapshot(
+    source: MissionObjectiveSourceArg,
+    state: &'static str,
+) -> frankenterm_core::mission_objective_plan::MissionObjectiveSourceSnapshot {
+    use frankenterm_core::mission_objective_plan::{
+        MissionObjectiveEvidenceCategory, MissionObjectiveEvidenceItem,
+        MissionObjectiveSourceSnapshot,
+    };
+
+    let slug = mission_objective_source_slug(source);
+    let reason_code = format!("source.{slug}.{state}");
+    let evidence = MissionObjectiveEvidenceItem::new(
+        match source {
+            MissionObjectiveSourceArg::Beads => MissionObjectiveEvidenceCategory::BeadsReadyQueue,
+            MissionObjectiveSourceArg::AgentMail => {
+                MissionObjectiveEvidenceCategory::AgentMailAvailability
+            }
+            MissionObjectiveSourceArg::Rch => MissionObjectiveEvidenceCategory::RchWorkerSelection,
+            MissionObjectiveSourceArg::Git => MissionObjectiveEvidenceCategory::GitDirtyTree,
+            MissionObjectiveSourceArg::Robot => MissionObjectiveEvidenceCategory::RobotInventory,
+            MissionObjectiveSourceArg::BlockerRadar
+            | MissionObjectiveSourceArg::ResourceCockpit => {
+                MissionObjectiveEvidenceCategory::CapacityPressure
+            }
+            MissionObjectiveSourceArg::Manual => MissionObjectiveEvidenceCategory::Manual,
+        },
+        format!("{slug} source reported {state} by the caller"),
+    )
+    .with_reason_code(reason_code.clone());
+
+    let snapshot = MissionObjectiveSourceSnapshot::new(
+        format!("{slug}.{state}"),
+        frankenterm_core::mission_objective_plan::MissionObjectiveSourceKind::from(source),
+    )
+    .with_evidence(evidence);
+
+    match state {
+        "unavailable" => snapshot.unavailable(reason_code),
+        "degraded" => snapshot.degraded(reason_code),
+        "stale" => snapshot.stale(reason_code),
+        _ => snapshot.with_reason_code(reason_code),
+    }
+}
+
+fn build_mission_objective_planner_input(
+    args: &MissionObjectivePlanInputArgs,
+    source: &'static str,
+) -> Result<
+    frankenterm_core::mission_objective_plan::MissionObjectivePlannerInput,
+    MissionCommandError,
+> {
+    use frankenterm_core::mission_objective_plan::{
+        MissionObjectiveCandidateReadiness, MissionObjectiveCandidateWork,
+        MissionObjectiveDirtyPath, MissionObjectiveEvidenceCategory, MissionObjectiveEvidenceItem,
+        MissionObjectivePlannerInput, MissionObjectiveSourceKind, MissionObjectiveSourceSnapshot,
+    };
+
+    validate_mission_objective_plan_args(args)?;
+    let target_bead = mission_objective_non_empty(
+        &args.target_bead,
+        "target_bead",
+        "mission.objective_plan.target_bead_empty",
+    )?;
+    let candidate_id = mission_objective_non_empty(
+        &args.candidate_id,
+        "candidate_id",
+        "mission.objective_plan.candidate_id_empty",
+    )?;
+    let candidate_title = mission_objective_non_empty(
+        &args.candidate_title,
+        "candidate_title",
+        "mission.objective_plan.candidate_title_empty",
+    )?;
+    let active_assignee = mission_objective_non_empty(
+        &args.active_assignee,
+        "active_assignee",
+        "mission.objective_plan.active_assignee_empty",
+    )?;
+
+    let generated_at_ms = args.generated_at_ms.unwrap_or_else(now_ms);
+    let mut input =
+        MissionObjectivePlannerInput::new(generated_at_ms, source, args.objective.trim())
+            .strictness(args.strictness.into())
+            .with_source_snapshot(
+                MissionObjectiveSourceSnapshot::new(
+                    format!("{source}.manual"),
+                    MissionObjectiveSourceKind::Manual,
+                )
+                .with_evidence(
+                    MissionObjectiveEvidenceItem::new(
+                        MissionObjectiveEvidenceCategory::Manual,
+                        "objective supplied as redacted summary argument",
+                    )
+                    .with_reason_code("objective.input.redacted_summary"),
+                ),
+            );
+
+    for source in &args.source_unavailable {
+        input =
+            input.with_source_snapshot(mission_objective_source_snapshot(*source, "unavailable"));
+    }
+    for source in &args.source_degraded {
+        input = input.with_source_snapshot(mission_objective_source_snapshot(*source, "degraded"));
+    }
+    for source in &args.source_stale {
+        input = input.with_source_snapshot(mission_objective_source_snapshot(*source, "stale"));
+    }
+    for dirty_path in &args.dirty_paths {
+        if !dirty_path.trim().is_empty() {
+            input = input.with_dirty_path(
+                MissionObjectiveDirtyPath::new(dirty_path.trim(), "modified")
+                    .category("caller_dirty_tree"),
+            );
+        }
+    }
+
+    let should_create_candidate = target_bead.is_some()
+        || candidate_id.is_some()
+        || args.testing_skill_lane
+        || args.dependency_blocked
+        || active_assignee.is_some();
+
+    if should_create_candidate {
+        let readiness = if args.dependency_blocked {
+            MissionObjectiveCandidateReadiness::BlockedDependency
+        } else if active_assignee.is_some() {
+            MissionObjectiveCandidateReadiness::ActiveSameDomain
+        } else if args.testing_skill_lane {
+            MissionObjectiveCandidateReadiness::TestingSkillLane
+        } else if target_bead.is_some() {
+            MissionObjectiveCandidateReadiness::ReadyBead
+        } else {
+            MissionObjectiveCandidateReadiness::PlanningOnly
+        };
+        let resolved_candidate_id = candidate_id
+            .clone()
+            .or_else(|| target_bead.clone())
+            .unwrap_or_else(|| "objective.manual_candidate".to_string());
+        let mut candidate = MissionObjectiveCandidateWork::new(resolved_candidate_id, readiness)
+            .title(
+                candidate_title
+                    .clone()
+                    .or_else(|| target_bead.clone())
+                    .unwrap_or_else(|| args.objective.trim().to_string()),
+            )
+            .dependency_ready(!args.dependency_blocked)
+            .proof_availability(args.proof_availability.into())
+            .capacity_posture(args.capacity_posture.into());
+        if let Some(target_bead) = target_bead {
+            candidate = candidate.target_bead_id(target_bead);
+        }
+        if let Some(active_assignee) = active_assignee {
+            candidate =
+                candidate.active_owner(active_assignee, args.active_age_seconds.unwrap_or(0));
+        }
+        if let Some(stale_after_seconds) = args.stale_after_seconds {
+            candidate = candidate.stale_after_seconds(stale_after_seconds);
+        }
+        for owned_path in &args.owned_paths {
+            if !owned_path.trim().is_empty() {
+                candidate = candidate.with_owned_path(owned_path.trim());
+            }
+        }
+        input = input.with_candidate(candidate);
+    }
+
+    Ok(input)
+}
+
+fn build_mission_objective_plan_surface(
+    args: &MissionObjectivePlanInputArgs,
+    source: &'static str,
+) -> Result<
+    frankenterm_core::mission_objective_plan::MissionObjectivePlanSurfaceData,
+    MissionCommandError,
+> {
+    let input = build_mission_objective_planner_input(args, source)?;
+    let plan = frankenterm_core::mission_objective_plan::plan_mission_objective(&input);
+    Ok(
+        frankenterm_core::mission_objective_plan::build_mission_objective_plan_surface_data(
+            plan,
+            args.explain_step.as_deref(),
+            args.explain_reason.as_deref(),
+        ),
+    )
+}
+
+fn mission_objective_label<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn mission_objective_plain_lines(
+    surface: &frankenterm_core::mission_objective_plan::MissionObjectivePlanSurfaceData,
+) -> Vec<String> {
+    let mut lines = vec![
+        "Mission objective plan".to_string(),
+        format!("  Objective: {}", surface.plan.objective),
+        format!("  Status: {}", mission_objective_label(surface.plan_status)),
+        format!("  Risk: {}", mission_objective_label(surface.risk_level)),
+        format!("  Dry run: {}", surface.dry_run),
+        format!("  Side effects executed: {}", surface.side_effects_executed),
+        format!("  Reason codes: {}", surface.reason_codes.join(", ")),
+    ];
+    if let Some(step) = surface
+        .plan
+        .plan_steps
+        .first()
+        .or_else(|| surface.plan.fallback_steps.first())
+    {
+        lines.push(format!(
+            "  Top step: rank={} candidate={} action={} status={}",
+            step.rank,
+            step.candidate_id,
+            mission_objective_label(step.action_kind),
+            mission_objective_label(step.status)
+        ));
+        if let Some(target) = &step.target_bead_id {
+            lines.push(format!("  Target bead: {target}"));
+        }
+    }
+    if let Some(explain) = &surface.explain {
+        lines.push(format!(
+            "  Explain: mode={} query={} matched={}",
+            mission_objective_label(explain.mode),
+            explain.query,
+            explain.matched
+        ));
+    }
+    lines
 }
 
 fn build_robot_mission_filters(
@@ -47787,6 +48319,17 @@ fn handle_mission_command(
     layout: &frankenterm_core::config::WorkspaceLayout,
 ) -> anyhow::Result<()> {
     match command {
+        MissionCommands::ObjectivePlan { args } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&args.format);
+            let surface = match build_mission_objective_plan_surface(&args.common, "ft.mission.cli")
+            {
+                Ok(surface) => surface,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let plain_lines = mission_objective_plain_lines(&surface);
+            emit_mission_success(output_format, serde_json::to_value(&surface)?, &plain_lines)?;
+        }
+
         MissionCommands::Plan {
             mission_file,
             include_dispatch_contracts,
@@ -55863,6 +56406,98 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn mission_cli_command_family_parses_all_subcommands() {
+        let objective_args = MissionObjectivePlanInputArgs {
+            objective: "ship the next safe slice".to_string(),
+            strictness: MissionObjectiveStrictnessArg::Normal,
+            target_bead: Some("ft-auy2g.4".to_string()),
+            candidate_id: None,
+            candidate_title: Some("Robot and MCP objective-plan surfaces".to_string()),
+            owned_paths: vec!["crates/frankenterm/src/main.rs".to_string()],
+            dirty_paths: Vec::new(),
+            source_unavailable: vec![MissionObjectiveSourceArg::AgentMail],
+            source_degraded: Vec::new(),
+            source_stale: Vec::new(),
+            proof_availability: MissionObjectiveProofAvailabilityArg::Available,
+            capacity_posture: MissionObjectiveCapacityPostureArg::Admit,
+            dependency_blocked: false,
+            active_assignee: None,
+            active_age_seconds: None,
+            stale_after_seconds: None,
+            testing_skill_lane: false,
+            generated_at_ms: Some(123),
+            explain_step: Some("ft-auy2g.4".to_string()),
+            explain_reason: None,
+            execute: false,
+        };
+        let surface = build_mission_objective_plan_surface(&objective_args, "ft.robot.mission")
+            .expect("mission objective-plan surface");
+        let robot_envelope = RobotResponse::success(surface, 7);
+        let robot_json = serde_json::to_value(&robot_envelope).expect("robot envelope json");
+        assert_eq!(robot_json["ok"], true);
+        assert_eq!(
+            robot_json["data"]["contract_id"],
+            frankenterm_core::mission_objective_plan::MISSION_OBJECTIVE_PLAN_CONTRACT_ID
+        );
+        assert_eq!(robot_json["data"]["dry_run"], true);
+        assert_eq!(robot_json["data"]["side_effects_executed"], false);
+        assert_eq!(robot_json["data"]["raw_pane_content_stored"], false);
+        assert_eq!(robot_json["data"]["explain"]["mode"], "step");
+        assert_eq!(robot_json["data"]["explain"]["matched"], true);
+        assert_eq!(
+            robot_json["data"]["plan"]["steps"][0]["target"],
+            "ft-auy2g.4"
+        );
+        let toon = toon_rust::encode(robot_json, None);
+        assert!(toon.contains("ft.mission_objective_plan.v1"));
+
+        let mut execute_args = objective_args;
+        execute_args.execute = true;
+        let err = build_mission_objective_plan_surface(&execute_args, "ft.mission.cli")
+            .expect_err("objective-plan must reject execution");
+        assert_eq!(err.error_code, "mission.objective_plan.execution_forbidden");
+        assert_eq!(
+            robot_mission_error_code(err.error_code),
+            "robot.objective_plan_execution_forbidden"
+        );
+
+        let objective_cli = Cli::try_parse_from([
+            "ft",
+            "mission",
+            "objective-plan",
+            "--objective",
+            "ship the next safe slice",
+            "--target-bead",
+            "ft-auy2g.4",
+            "--owned-path",
+            "crates/frankenterm/src/main.rs",
+            "--source-unavailable",
+            "agent-mail",
+            "--explain-step",
+            "ft-auy2g.4",
+            "--format",
+            "json",
+        ])
+        .expect("mission objective-plan should parse");
+        match objective_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Mission {
+                command: MissionCommands::ObjectivePlan { args },
+            }) => {
+                assert_eq!(args.common.objective, "ship the next safe slice");
+                assert_eq!(args.common.target_bead.as_deref(), Some("ft-auy2g.4"));
+                assert_eq!(
+                    args.common.owned_paths,
+                    vec!["crates/frankenterm/src/main.rs".to_string()]
+                );
+                assert_eq!(
+                    args.common.source_unavailable,
+                    vec![MissionObjectiveSourceArg::AgentMail]
+                );
+                assert_eq!(args.common.explain_step.as_deref(), Some("ft-auy2g.4"));
+                assert_eq!(args.format, "json");
+            }
+            _ => panic!("unexpected mission objective-plan parse result"),
+        }
+
         let plan_cli = Cli::try_parse_from([
             "ft",
             "mission",
@@ -56470,6 +57105,48 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn mission_robot_command_family_parses_all_subcommands() {
+        let objective_cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "mission",
+            "objective-plan",
+            "--objective",
+            "continue current bead",
+            "--target-bead",
+            "ft-auy2g.4",
+            "--proof-availability",
+            "blocked",
+            "--source-stale",
+            "git",
+            "--explain-reason",
+            "rch.proof_substrate_blocked",
+        ])
+        .expect("robot mission objective-plan should parse");
+        match objective_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Mission {
+                    command: RobotMissionCommands::ObjectivePlan { args },
+                }) => {
+                    assert_eq!(args.common.objective, "continue current bead");
+                    assert_eq!(args.common.target_bead.as_deref(), Some("ft-auy2g.4"));
+                    assert_eq!(
+                        args.common.proof_availability,
+                        MissionObjectiveProofAvailabilityArg::Blocked
+                    );
+                    assert_eq!(
+                        args.common.source_stale,
+                        vec![MissionObjectiveSourceArg::Git]
+                    );
+                    assert_eq!(
+                        args.common.explain_reason.as_deref(),
+                        Some("rch.proof_substrate_blocked")
+                    );
+                }
+                _ => panic!("expected RobotCommands::Mission::ObjectivePlan"),
+            },
+            _ => panic!("expected robot command"),
+        }
+
         let state_cli = Cli::try_parse_from([
             "ft",
             "robot",

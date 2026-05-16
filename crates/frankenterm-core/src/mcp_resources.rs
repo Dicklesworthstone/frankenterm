@@ -35,7 +35,8 @@ use crate::swarm_scheduler::{
 };
 
 use super::mcp_tools::{
-    WaAccountsTool, WaEventsTool, WaReservationsTool, WaRulesListTool, WaStateTool,
+    WaAccountsTool, WaEventsTool, WaMissionObjectivePlanTool, WaReservationsTool, WaRulesListTool,
+    WaStateTool,
 };
 use super::{McpEnvelope, McpWorkflowItem, McpWorkflowsData, builtin_workflows, elapsed_ms};
 use crate::config::{Config, PaneFilterConfig};
@@ -115,6 +116,22 @@ fn read_rules_resource(
     };
     let tool = WaRulesListTool;
     let contents = tool.call(ctx, args)?;
+    tool_output_as_resource(uri, contents)
+}
+
+fn read_mission_objective_plan_resource(
+    ctx: &McpContext,
+    uri: &str,
+    objective: &str,
+) -> McpResult<Vec<ResourceContent>> {
+    let tool = WaMissionObjectivePlanTool;
+    let contents = tool.call(
+        ctx,
+        serde_json::json!({
+            "objective": objective,
+            "source_unavailable": ["agent-mail", "rch"],
+        }),
+    )?;
     tool_output_as_resource(uri, contents)
 }
 
@@ -684,6 +701,58 @@ impl ResourceHandler for WaRulesByAgentTemplateResource {
         params: &HashMap<String, String>,
     ) -> McpResult<Vec<ResourceContent>> {
         read_rules_resource(ctx, uri, params.get("agent_type").map(String::as_str))
+    }
+}
+
+pub(super) struct WaMissionObjectivePlanTemplateResource;
+
+impl ResourceHandler for WaMissionObjectivePlanTemplateResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: "wa://mission/objective-plan/template".to_string(),
+            name: "ft mission objective plan template".to_string(),
+            description: Some("Template for dry-run mission objective planning".to_string()),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "mission".to_string(), "robot".to_string()],
+        }
+    }
+
+    fn template(&self) -> Option<ResourceTemplate> {
+        Some(ResourceTemplate {
+            uri_template: "wa://mission/objective-plan/{objective}".to_string(),
+            name: "ft mission objective plan".to_string(),
+            description: Some(
+                "Compile an objective into the same dry-run surface as wa.mission_objective_plan"
+                    .to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "mission".to_string(), "robot".to_string()],
+        })
+    }
+
+    fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        read_mission_objective_plan_resource(
+            ctx,
+            "wa://mission/objective-plan",
+            "continue current operator objective",
+        )
+    }
+
+    fn read_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        params: &HashMap<String, String>,
+    ) -> McpResult<Vec<ResourceContent>> {
+        let objective = params
+            .get("objective")
+            .map(String::as_str)
+            .unwrap_or("continue current operator objective");
+        read_mission_objective_plan_resource(ctx, uri, objective)
     }
 }
 
@@ -1441,7 +1510,8 @@ mod tests {
     use super::{
         WaAccountsByServiceTemplateResource, WaAccountsResource, WaAttestationRetractionsResource,
         WaContextHorizonResource, WaEventsResource, WaEventsTemplateResource,
-        WaEventsUnhandledTemplateResource, WaHerdWaveResource, WaPanesResource,
+        WaEventsUnhandledTemplateResource, WaHerdWaveResource,
+        WaMissionObjectivePlanTemplateResource, WaPanesResource,
         WaProofHistoryReleaseBlockingResource, WaProofHistoryResource,
         WaProofHistoryTemplateResource, WaRendererInputToPhotonResource,
         WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
@@ -1613,6 +1683,19 @@ mod tests {
         assert_eq!(def.uri, "wa://herd-wave");
         assert!(def.tags.contains(&"herd-wave".to_string()));
         assert!(def.tags.contains(&"operator".to_string()));
+    }
+
+    #[test]
+    fn mission_objective_plan_template_resource_uri() {
+        let resource = WaMissionObjectivePlanTemplateResource;
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://mission/objective-plan/template");
+        assert!(def.tags.contains(&"mission".to_string()));
+        let template = resource.template().expect("objective-plan template");
+        assert_eq!(
+            template.uri_template,
+            "wa://mission/objective-plan/{objective}"
+        );
     }
 
     #[test]
@@ -2090,6 +2173,7 @@ mod tests {
             WaProofHistoryReleaseBlockingResource::new(Arc::clone(&config)).definition(),
             WaProofHistoryTemplateResource::new(Arc::clone(&config)).definition(),
             WaAttestationRetractionsResource::new(Arc::new(Config::default())).definition(),
+            WaMissionObjectivePlanTemplateResource.definition(),
             WaContextHorizonResource::new(Arc::clone(&db)).definition(),
             WaReservationsResource::new(Arc::clone(&db)).definition(),
         ];
