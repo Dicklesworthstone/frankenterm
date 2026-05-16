@@ -176,7 +176,12 @@
       "enum": [
         "wezterm_mux",
         "robot_mode",
+        "mcp",
         "workflow_engine",
+        "beads",
+        "rch",
+        "agent_mail",
+        "git",
         "operator_action",
         "recovery_flow"
       ]

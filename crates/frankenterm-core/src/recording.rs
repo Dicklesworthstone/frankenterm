@@ -984,7 +984,7 @@ pub fn actor_to_source(actor: crate::policy::ActorKind) -> RecorderEventSource {
     match actor {
         ActorKind::Human => RecorderEventSource::OperatorAction,
         ActorKind::Robot => RecorderEventSource::RobotMode,
-        ActorKind::Mcp => RecorderEventSource::RobotMode,
+        ActorKind::Mcp => RecorderEventSource::Mcp,
         ActorKind::Workflow => RecorderEventSource::WorkflowEngine,
     }
 }
@@ -2245,10 +2245,7 @@ mod tests {
             actor_to_source(ActorKind::Robot),
             RecorderEventSource::RobotMode
         );
-        assert_eq!(
-            actor_to_source(ActorKind::Mcp),
-            RecorderEventSource::RobotMode
-        );
+        assert_eq!(actor_to_source(ActorKind::Mcp), RecorderEventSource::Mcp);
         assert_eq!(
             actor_to_source(ActorKind::Workflow),
             RecorderEventSource::WorkflowEngine
@@ -2402,7 +2399,12 @@ mod tests {
         for src in [
             RecorderEventSource::WeztermMux,
             RecorderEventSource::RobotMode,
+            RecorderEventSource::Mcp,
             RecorderEventSource::WorkflowEngine,
+            RecorderEventSource::Beads,
+            RecorderEventSource::Rch,
+            RecorderEventSource::AgentMail,
+            RecorderEventSource::Git,
             RecorderEventSource::OperatorAction,
             RecorderEventSource::RecoveryFlow,
         ] {
@@ -2963,7 +2965,12 @@ mod tests {
         let variants = [
             RecorderEventSource::WeztermMux,
             RecorderEventSource::RobotMode,
+            RecorderEventSource::Mcp,
             RecorderEventSource::WorkflowEngine,
+            RecorderEventSource::Beads,
+            RecorderEventSource::Rch,
+            RecorderEventSource::AgentMail,
+            RecorderEventSource::Git,
             RecorderEventSource::OperatorAction,
             RecorderEventSource::RecoveryFlow,
         ];

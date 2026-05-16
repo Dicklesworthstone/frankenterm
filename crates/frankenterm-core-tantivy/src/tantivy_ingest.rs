@@ -216,12 +216,18 @@ fn redacted_text(text: &str, level: RecorderRedactionLevel) -> String {
 
 fn format_source(s: frankenterm_core::recording::RecorderEventSource) -> String {
     use frankenterm_core::recording::RecorderEventSource::{
-        OperatorAction, RecoveryFlow, RobotMode, WeztermMux, WorkflowEngine,
+        AgentMail, Beads, Git, Mcp, OperatorAction, Rch, RecoveryFlow, RobotMode, WeztermMux,
+        WorkflowEngine,
     };
     match s {
         WeztermMux => "wezterm_mux",
         RobotMode => "robot_mode",
+        Mcp => "mcp",
         WorkflowEngine => "workflow_engine",
+        Beads => "beads",
+        Rch => "rch",
+        AgentMail => "agent_mail",
+        Git => "git",
         OperatorAction => "operator_action",
         RecoveryFlow => "recovery_flow",
     }
@@ -2915,10 +2921,15 @@ mod tests {
             "wezterm_mux"
         );
         assert_eq!(format_source(RecorderEventSource::RobotMode), "robot_mode");
+        assert_eq!(format_source(RecorderEventSource::Mcp), "mcp");
         assert_eq!(
             format_source(RecorderEventSource::WorkflowEngine),
             "workflow_engine"
         );
+        assert_eq!(format_source(RecorderEventSource::Beads), "beads");
+        assert_eq!(format_source(RecorderEventSource::Rch), "rch");
+        assert_eq!(format_source(RecorderEventSource::AgentMail), "agent_mail");
+        assert_eq!(format_source(RecorderEventSource::Git), "git");
         assert_eq!(
             format_source(RecorderEventSource::OperatorAction),
             "operator_action"

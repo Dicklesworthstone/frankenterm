@@ -23,3 +23,4 @@
 
 pub mod recorder_metadata;
 pub mod replay_decision_graph;
+pub mod swarm_causal_event;

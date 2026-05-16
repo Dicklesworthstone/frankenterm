@@ -23,7 +23,12 @@ pub const RECORDER_EVENT_SCHEMA_VERSION_V1: &str = "ft.recorder.event.v1";
 pub enum RecorderEventSource {
     WeztermMux,
     RobotMode,
+    Mcp,
     WorkflowEngine,
+    Beads,
+    Rch,
+    AgentMail,
+    Git,
     OperatorAction,
     RecoveryFlow,
 }
@@ -81,7 +86,12 @@ mod tests {
         prop_oneof![
             Just(RecorderEventSource::WeztermMux),
             Just(RecorderEventSource::RobotMode),
+            Just(RecorderEventSource::Mcp),
             Just(RecorderEventSource::WorkflowEngine),
+            Just(RecorderEventSource::Beads),
+            Just(RecorderEventSource::Rch),
+            Just(RecorderEventSource::AgentMail),
+            Just(RecorderEventSource::Git),
             Just(RecorderEventSource::OperatorAction),
             Just(RecorderEventSource::RecoveryFlow),
         ]
@@ -155,6 +165,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&RecorderEventSource::WeztermMux).unwrap(),
             "\"wezterm_mux\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecorderEventSource::Mcp).unwrap(),
+            "\"mcp\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecorderEventSource::AgentMail).unwrap(),
+            "\"agent_mail\""
         );
         assert_eq!(
             serde_json::to_string(&RecorderTextEncoding::Utf8).unwrap(),

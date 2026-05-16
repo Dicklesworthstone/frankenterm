@@ -738,7 +738,12 @@ mod tests {
         let sources = [
             RecorderEventSource::WeztermMux,
             RecorderEventSource::RobotMode,
+            RecorderEventSource::Mcp,
             RecorderEventSource::WorkflowEngine,
+            RecorderEventSource::Beads,
+            RecorderEventSource::Rch,
+            RecorderEventSource::AgentMail,
+            RecorderEventSource::Git,
             RecorderEventSource::OperatorAction,
             RecorderEventSource::RecoveryFlow,
         ];
