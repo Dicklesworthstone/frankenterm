@@ -1,6 +1,5 @@
 use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
 use crate::selection::SelectionRange;
-use crate::termwindow::box_model::*;
 use crate::termwindow::render::compositor::{DirtyRect, DrawCmd, Layer, LayerKind};
 use crate::termwindow::render::dirty_lines::DirtyLineBitmap;
 use crate::termwindow::render::{
@@ -8,8 +7,8 @@ use crate::termwindow::render::{
     RenderScreenLineParams, same_hyperlink_or_both_none,
 };
 use crate::termwindow::{ScrollHit, UIItem, UIItemType};
-use ::window::DeadKeyStatus;
 use ::window::bitmaps::TextureRect;
+use ::window::{DeadKeyStatus, RectF};
 use anyhow::Context;
 use config::VisualBellTarget;
 use frankenterm_gui::accessibility_preferences::{
@@ -192,15 +191,40 @@ impl crate::TermWindow {
         ))
     }
 
-    fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
-        let computed = self.build_pane(pos)?;
-        let mut ui_items = computed.ui_items();
-        self.ui_items.append(&mut ui_items);
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("render_state not initialized during paint"))?;
-        self.render_element(&computed, gl_state, None)
+    fn draw_pane_border(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        width: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let max_width = rect.size.width.max(0.0).min(rect.size.height.max(0.0));
+        let border_w = width.max(1.0).min(max_width);
+        if border_w <= 0.0 {
+            return Ok(());
+        }
+
+        let (x, y, w, h) = (
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+        );
+        self.filled_rectangle(layers, 2, euclid::rect(x, y, w, border_w), color)?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(x, y + h - border_w, w, border_w),
+            color,
+        )?;
+        self.filled_rectangle(layers, 2, euclid::rect(x, y, border_w, h), color)?;
+        self.filled_rectangle(
+            layers,
+            2,
+            euclid::rect(x + w - border_w, y, border_w, h),
+            color,
+        )?;
+        Ok(())
     }
 
     pub fn paint_pane(
@@ -209,10 +233,6 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
         self.publish_terminal_state_for_pane(pos);
-
-        if self.config.use_box_model_render {
-            return self.paint_pane_box_model(pos);
-        }
 
         self.check_for_dirty_lines_and_invalidate_selection(&pos.pane);
         /*
@@ -422,32 +442,18 @@ impl crate::TermWindow {
                         b as f32 / 255.0,
                         a as f32 / 255.0,
                     );
-                    let (bx, by, bw, bh) = (
-                        background_rect.origin.x,
-                        background_rect.origin.y,
-                        background_rect.size.width,
-                        background_rect.size.height,
-                    );
-                    // Top edge
-                    self.filled_rectangle(layers, 2, euclid::rect(bx, by, bw, border_w), color)?;
-                    // Bottom edge
-                    self.filled_rectangle(
-                        layers,
-                        2,
-                        euclid::rect(bx, by + bh - border_w, bw, border_w),
-                        color,
-                    )?;
-                    // Left edge
-                    self.filled_rectangle(layers, 2, euclid::rect(bx, by, border_w, bh), color)?;
-                    // Right edge
-                    self.filled_rectangle(
-                        layers,
-                        2,
-                        euclid::rect(bx + bw - border_w, by, border_w, bh),
-                        color,
-                    )?;
+                    self.draw_pane_border(layers, background_rect, border_w, color)?;
                 }
             }
+        }
+
+        if let Some(border_w) = self.focused_floating_pane_border_width(pane_id) {
+            self.draw_pane_border(
+                layers,
+                background_rect,
+                border_w,
+                palette.cursor_border.to_linear(),
+            )?;
         }
 
         // TODO: we only have a single scrollbar in a single position.
@@ -832,120 +838,6 @@ impl crate::TermWindow {
         log::trace!("lines elapsed {:?}", start.elapsed());
 
         Ok(())
-    }
-
-    pub fn build_pane(&mut self, pos: &PositionedPane) -> anyhow::Result<ComputedElement> {
-        // First compute the bounds for the pane background
-
-        let cell_width = self.render_metrics.cell_size.width as f32;
-        let cell_height = self.render_metrics.cell_size.height as f32;
-        let (padding_left, padding_top) = self.padding_left_top();
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        };
-        let (top_bar_height, _bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
-
-        let border = self.get_os_border();
-        let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
-
-        // We want to fill out to the edges of the splits
-        let (x, width_delta) = if pos.left == 0 {
-            (
-                0.,
-                padding_left + border.left.get() as f32 + (cell_width / 2.0),
-            )
-        } else {
-            (
-                padding_left + border.left.get() as f32 - (cell_width / 2.0)
-                    + (pos.left as f32 * cell_width),
-                cell_width,
-            )
-        };
-
-        let (y, height_delta) = if pos.top == 0 {
-            (
-                (top_pixel_y - padding_top),
-                padding_top + (cell_height / 2.0),
-            )
-        } else {
-            (
-                top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
-                cell_height,
-            )
-        };
-
-        let background_rect = euclid::rect(
-            x,
-            y,
-            // Go all the way to the right edge if we're right-most
-            if pos.left + pos.width >= self.terminal_size.cols as usize {
-                self.dimensions.pixel_width as f32 - x
-            } else {
-                (pos.width as f32 * cell_width) + width_delta
-            },
-            // Go all the way to the bottom if we're bottom-most
-            if pos.top + pos.height >= self.terminal_size.rows as usize {
-                self.dimensions.pixel_height as f32 - y
-            } else {
-                (pos.height as f32 * cell_height) + height_delta as f32
-            },
-        );
-
-        // Bounds for the terminal cells
-        let content_rect = euclid::rect(
-            padding_left + border.left.get() as f32 - (cell_width / 2.0)
-                + (pos.left as f32 * cell_width),
-            top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
-            pos.width as f32 * cell_width,
-            pos.height as f32 * cell_height,
-        );
-
-        let palette = pos.pane.palette();
-        let focus_border_width = self.focused_floating_pane_border_width(pos.pane.pane_id());
-        let focus_border = focus_border_width.map(|width| PixelDimension {
-            left: width,
-            top: width,
-            right: width,
-            bottom: width,
-        });
-
-        // TODO: visual bell background layer
-        // TODO: scrollbar
-
-        Ok(ComputedElement {
-            item_type: None,
-            zindex: 0,
-            bounds: background_rect,
-            border: focus_border.unwrap_or_default(),
-            border_rect: background_rect,
-            border_corners: None,
-            colors: ElementColors {
-                border: focus_border_width
-                    .map(|_| BorderColor::new(palette.cursor_border.to_linear()))
-                    .unwrap_or_default(),
-                bg: if self.window_background.is_empty() {
-                    palette
-                        .background
-                        .to_linear()
-                        .mul_alpha(self.config.window_background_opacity)
-                        .into()
-                } else {
-                    InheritableColor::Inherited
-                },
-                text: InheritableColor::Inherited,
-            },
-            hover_colors: None,
-            padding: background_rect,
-            content_rect,
-            baseline: 1.0,
-            content: ComputedElementContent::Children(vec![]),
-        })
     }
 }
 

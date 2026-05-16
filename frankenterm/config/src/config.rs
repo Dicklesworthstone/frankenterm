@@ -934,7 +934,10 @@ pub struct Config {
     #[dynamic(default)]
     pub launch_menu: Vec<SpawnCommand>,
 
-    #[dynamic(default)]
+    #[dynamic(
+        default,
+        deprecated = "the abandoned box-model pane renderer is disabled because it rendered no terminal content"
+    )]
     pub use_box_model_render: bool,
 
     /// When true, watch the config file and reload it automatically
