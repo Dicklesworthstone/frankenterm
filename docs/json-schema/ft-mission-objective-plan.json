@@ -154,6 +154,8 @@
         "run_rch_proof",
         "request_approval",
         "wait",
+        "local_cargo_proof",
+        "raw_pane_content",
         "pane_mutation",
         "service_mutation",
         "destructive_filesystem"
