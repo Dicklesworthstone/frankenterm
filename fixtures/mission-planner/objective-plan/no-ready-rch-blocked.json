@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_plan.v1",
+  "generated_at_ms": 1778911260000,
+  "objective": {
+    "objective_id": "objective-no-ready-rch-blocked",
+    "requested_by": "fixture",
+    "summary": "Find useful work when no Beads-ready task is available and RCH proof is blocked.",
+    "workspace_root": "/Users/jemanuel/projects/frankenterm",
+    "target_bead_ids": [
+      "ft-4tp7g"
+    ],
+    "allowed_action_classes": [
+      "read_status",
+      "add_beads_comment",
+      "create_bead",
+      "wait"
+    ],
+    "forbidden_action_classes": [
+      "run_rch_proof",
+      "pane_mutation",
+      "service_mutation",
+      "destructive_filesystem"
+    ],
+    "freshness_budget_ms": 300000,
+    "proof_strictness": "blocked_until_proof_available"
+  },
+  "plan_status": "rch_substrate_blocked",
+  "source_snapshots": [
+    {
+      "source_id": "beads-ready-empty",
+      "source_kind": "beads",
+      "state": "available",
+      "collected_at_ms": 1778911260000,
+      "freshness_ms": 0,
+      "command_or_api": "br ready --json",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_empty"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
+      ]
+    },
+    {
+      "source_id": "agent-mail-db-error",
+      "source_kind": "agent_mail",
+      "state": "unavailable",
+      "collected_at_ms": 1778911260000,
+      "freshness_ms": null,
+      "command_or_api": "macro_start_session",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "agent_mail.database_error",
+        "fallback.beads_only"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
+      ]
+    },
+    {
+      "source_id": "rch-update-stale-release",
+      "source_kind": "rch",
+      "state": "blocked",
+      "collected_at_ms": 1778911260000,
+      "freshness_ms": 0,
+      "command_or_api": "rch update --check --json",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "rch.latest_release_is_installed",
+        "rch.source_fix_not_released",
+        "rch.remote_proof_blocked"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
+      ]
+    },
+    {
+      "source_id": "git-dirty-overlap",
+      "source_kind": "git",
+      "state": "degraded",
+      "collected_at_ms": 1778911260000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --branch --untracked-files=all",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.dirty_paths_present",
+        "git.avoid_renderer_overlap"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
+      ]
+    }
+  ],
+  "capacity_admission": {
+    "action": "defer",
+    "pressure_tier": "unknown",
+    "proof_state": "unavailable",
+    "reason_codes": [
+      "capacity.no_remote_proof_available",
+      "rch_substrate_blocked"
+    ]
+  },
+  "steps": [
+    {
+      "step_id": "step-record-blocker",
+      "rank": 1,
+      "action_kind": "add_beads_comment",
+      "status": "planning_only",
+      "target": "ft-4tp7g",
+      "side_effect_class": "beads_metadata",
+      "requires_approval": false,
+      "forbidden": false,
+      "reason_codes": [
+        "coordination.beads_only",
+        "rch.release_not_available"
+      ],
+      "proof_requirement_ids": [
+        "proof-static-json"
+      ]
+    },
+    {
+      "step_id": "step-do-not-run-local-cargo",
+      "rank": 2,
+      "action_kind": "run_rch_proof",
+      "status": "rch_substrate_blocked",
+      "target": "ft-4tp7g",
+      "side_effect_class": "proof_run",
+      "requires_approval": false,
+      "forbidden": true,
+      "reason_codes": [
+        "rch.installed_hook_old",
+        "local_cargo_forbidden"
+      ],
+      "proof_requirement_ids": [
+        "proof-rch-cargo"
+      ]
+    }
+  ],
+  "proof_requirements": [
+    {
+      "proof_id": "proof-static-json",
+      "proof_kind": "static_json",
+      "required": true,
+      "status": "pending",
+      "command": "jq empty docs/json-schema/ft-mission-objective-plan.json fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json",
+      "artifact_paths": [
+        "docs/json-schema/ft-mission-objective-plan.json",
+        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
+      ]
+    },
+    {
+      "proof_id": "proof-rch-cargo",
+      "proof_kind": "rch_cargo",
+      "required": false,
+      "status": "blocked",
+      "command": "rch exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
+      "artifact_paths": [
+        "ft-4tp7g"
+      ]
+    }
+  ],
+  "forbidden_actions": [
+    {
+      "action_class": "run_rch_proof",
+      "reason": "RCH proof is forbidden for this plan until the substrate can select an attested worker."
+    },
+    {
+      "action_class": "pane_mutation",
+      "reason": "Objective planning is read-only and cannot inject pane input."
+    },
+    {
+      "action_class": "service_mutation",
+      "reason": "Objective planning must not restart or repair Agent Mail or RCH."
+    },
+    {
+      "action_class": "destructive_filesystem",
+      "reason": "Objective planning must not delete or overwrite files."
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_plan.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Planner fixtures record reason codes and artifact ids, not pane contents."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-plan.json",
+    "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
+  ]
+}

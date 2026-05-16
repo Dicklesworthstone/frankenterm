@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_plan.v1",
+  "generated_at_ms": 1778911200000,
+  "objective": {
+    "objective_id": "objective-ready-bead",
+    "requested_by": "fixture",
+    "summary": "Choose the next safe Beads-ready mission-planner contract slice.",
+    "workspace_root": "/Users/jemanuel/projects/frankenterm",
+    "target_bead_ids": [
+      "ft-auy2g.1"
+    ],
+    "allowed_action_classes": [
+      "read_status",
+      "claim_bead",
+      "add_beads_comment",
+      "edit_files",
+      "run_static_check"
+    ],
+    "forbidden_action_classes": [
+      "pane_mutation",
+      "service_mutation",
+      "destructive_filesystem"
+    ],
+    "freshness_budget_ms": 300000,
+    "proof_strictness": "static_only"
+  },
+  "plan_status": "actionable",
+  "source_snapshots": [
+    {
+      "source_id": "beads-ready",
+      "source_kind": "beads",
+      "state": "available",
+      "collected_at_ms": 1778911200000,
+      "freshness_ms": 0,
+      "command_or_api": "br ready --json",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "beads.ready_one"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/ready-bead.json"
+      ]
+    },
+    {
+      "source_id": "git-clean",
+      "source_kind": "git",
+      "state": "available",
+      "collected_at_ms": 1778911200000,
+      "freshness_ms": 0,
+      "command_or_api": "git status --short --branch --untracked-files=all",
+      "redacted": true,
+      "raw_pane_content_stored": false,
+      "reason_codes": [
+        "git.clean_for_scope"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/ready-bead.json"
+      ]
+    }
+  ],
+  "capacity_admission": {
+    "action": "admit",
+    "pressure_tier": "green",
+    "proof_state": "not_required",
+    "reason_codes": [
+      "capacity.static_contract_only"
+    ]
+  },
+  "steps": [
+    {
+      "step_id": "step-claim-contract",
+      "rank": 1,
+      "action_kind": "claim_bead",
+      "status": "actionable",
+      "target": "ft-auy2g.1",
+      "side_effect_class": "beads_metadata",
+      "requires_approval": false,
+      "forbidden": false,
+      "reason_codes": [
+        "beads.ready",
+        "scope.contract_only"
+      ],
+      "proof_requirement_ids": [
+        "proof-static-json"
+      ]
+    }
+  ],
+  "proof_requirements": [
+    {
+      "proof_id": "proof-static-json",
+      "proof_kind": "static_json",
+      "required": true,
+      "status": "pending",
+      "command": "jq empty docs/json-schema/ft-mission-objective-plan.json fixtures/mission-planner/objective-plan/ready-bead.json",
+      "artifact_paths": [
+        "docs/json-schema/ft-mission-objective-plan.json",
+        "fixtures/mission-planner/objective-plan/ready-bead.json"
+      ]
+    }
+  ],
+  "forbidden_actions": [
+    {
+      "action_class": "pane_mutation",
+      "reason": "Objective planning is read-only and cannot inject pane input."
+    },
+    {
+      "action_class": "service_mutation",
+      "reason": "Objective planning must not restart or repair Agent Mail or RCH."
+    },
+    {
+      "action_class": "destructive_filesystem",
+      "reason": "Objective planning must not delete or overwrite files."
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_plan.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "Planner fixtures use ids and reason codes only."
+    ]
+  },
+  "raw_pane_content_stored": false,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-plan.json",
+    "fixtures/mission-planner/objective-plan/ready-bead.json"
+  ]
+}

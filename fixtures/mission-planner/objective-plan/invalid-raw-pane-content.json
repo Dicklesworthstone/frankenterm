@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.mission_objective_plan.v1",
+  "generated_at_ms": 1778911320000,
+  "objective": {
+    "objective_id": "objective-invalid-raw-pane-content",
+    "requested_by": "fixture",
+    "summary": "Expected-invalid fixture: raw pane content was included in a source snapshot.",
+    "workspace_root": "/Users/jemanuel/projects/frankenterm",
+    "target_bead_ids": [
+      "ft-auy2g.1"
+    ],
+    "allowed_action_classes": [
+      "read_status"
+    ],
+    "forbidden_action_classes": [
+      "pane_mutation",
+      "service_mutation",
+      "destructive_filesystem"
+    ],
+    "freshness_budget_ms": 300000,
+    "proof_strictness": "static_only"
+  },
+  "plan_status": "unavailable",
+  "source_snapshots": [
+    {
+      "source_id": "raw-pane-content",
+      "source_kind": "robot",
+      "state": "available",
+      "collected_at_ms": 1778911320000,
+      "freshness_ms": 0,
+      "command_or_api": "ft robot get-text 1",
+      "redacted": false,
+      "raw_pane_content_stored": true,
+      "reason_codes": [
+        "fixture.expected_invalid.raw_pane_content"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"
+      ]
+    }
+  ],
+  "capacity_admission": {
+    "action": "unavailable",
+    "pressure_tier": "unknown",
+    "proof_state": "not_required",
+    "reason_codes": [
+      "fixture.expected_invalid"
+    ]
+  },
+  "steps": [
+    {
+      "step_id": "step-reject-raw-pane-content",
+      "rank": 1,
+      "action_kind": "no_op",
+      "status": "unavailable",
+      "target": "raw-pane-content",
+      "side_effect_class": "none",
+      "requires_approval": false,
+      "forbidden": true,
+      "reason_codes": [
+        "raw_pane_content_forbidden"
+      ],
+      "proof_requirement_ids": [
+        "proof-schema-rejects-raw-pane-content"
+      ]
+    }
+  ],
+  "proof_requirements": [
+    {
+      "proof_id": "proof-schema-rejects-raw-pane-content",
+      "proof_kind": "static_schema",
+      "required": true,
+      "status": "pending",
+      "command": "schema validator should reject this fixture because redacted=false and raw_pane_content_stored=true",
+      "artifact_paths": [
+        "docs/json-schema/ft-mission-objective-plan.json",
+        "fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"
+      ]
+    }
+  ],
+  "forbidden_actions": [
+    {
+      "action_class": "pane_mutation",
+      "reason": "Objective planning is read-only and cannot inject pane input."
+    },
+    {
+      "action_class": "service_mutation",
+      "reason": "Objective planning must not restart or repair Agent Mail or RCH."
+    },
+    {
+      "action_class": "destructive_filesystem",
+      "reason": "Objective planning must not delete or overwrite files."
+    }
+  ],
+  "redaction_policy": {
+    "policy_id": "ft.redaction.objective_plan.v1",
+    "raw_pane_content_allowed": false,
+    "secret_material_allowed": false,
+    "notes": [
+      "This fixture is intentionally invalid and should be rejected."
+    ]
+  },
+  "raw_pane_content_stored": true,
+  "artifact_paths": [
+    "docs/json-schema/ft-mission-objective-plan.json",
+    "fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"
+  ]
+}

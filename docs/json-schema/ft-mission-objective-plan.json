@@ -1,0 +1,485 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-mission-objective-plan.json",
+  "title": "FrankenTerm Mission Objective Plan",
+  "description": "Versioned dry-run contract for compiling an operator objective into a safe, auditable swarm mission plan.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_id",
+    "generated_at_ms",
+    "objective",
+    "plan_status",
+    "source_snapshots",
+    "capacity_admission",
+    "steps",
+    "proof_requirements",
+    "forbidden_actions",
+    "redaction_policy",
+    "raw_pane_content_stored",
+    "artifact_paths"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "contract_id": {
+      "type": "string",
+      "const": "ft.mission_objective_plan.v1"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "objective": {
+      "$ref": "#/$defs/objective"
+    },
+    "plan_status": {
+      "$ref": "#/$defs/plan_status"
+    },
+    "source_snapshots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/source_snapshot"
+      }
+    },
+    "capacity_admission": {
+      "$ref": "#/$defs/capacity_admission"
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/plan_step"
+      }
+    },
+    "proof_requirements": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/proof_requirement"
+      }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/forbidden_action"
+      }
+    },
+    "redaction_policy": {
+      "$ref": "#/$defs/redaction_policy"
+    },
+    "raw_pane_content_stored": {
+      "type": "boolean",
+      "const": false
+    },
+    "artifact_paths": {
+      "$ref": "#/$defs/string_array"
+    }
+  },
+  "$defs": {
+    "string_array": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "objective": {
+      "type": "object",
+      "required": [
+        "objective_id",
+        "requested_by",
+        "summary",
+        "workspace_root",
+        "target_bead_ids",
+        "allowed_action_classes",
+        "forbidden_action_classes",
+        "freshness_budget_ms",
+        "proof_strictness"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "objective_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_bead_ids": {
+          "$ref": "#/$defs/string_array"
+        },
+        "allowed_action_classes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/action_class"
+          }
+        },
+        "forbidden_action_classes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/action_class"
+          }
+        },
+        "freshness_budget_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "proof_strictness": {
+          "$ref": "#/$defs/proof_strictness"
+        }
+      }
+    },
+    "action_class": {
+      "type": "string",
+      "enum": [
+        "read_status",
+        "claim_bead",
+        "add_beads_comment",
+        "create_bead",
+        "edit_files",
+        "run_static_check",
+        "run_rch_proof",
+        "request_approval",
+        "wait",
+        "pane_mutation",
+        "service_mutation",
+        "destructive_filesystem"
+      ]
+    },
+    "proof_strictness": {
+      "type": "string",
+      "enum": [
+        "static_only",
+        "rch_required",
+        "target_hardware_required",
+        "blocked_until_proof_available"
+      ]
+    },
+    "plan_status": {
+      "type": "string",
+      "enum": [
+        "actionable",
+        "planning_only",
+        "blocked",
+        "waiting_owner",
+        "waiting_external",
+        "dirty_overlap",
+        "no_ready_work",
+        "rch_substrate_blocked",
+        "degraded",
+        "unavailable"
+      ]
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "beads",
+        "agent_mail",
+        "rch",
+        "git",
+        "robot",
+        "blocker_radar",
+        "resource_cockpit",
+        "manual",
+        "fixture"
+      ]
+    },
+    "source_state": {
+      "type": "string",
+      "enum": [
+        "available",
+        "degraded",
+        "unavailable",
+        "stale",
+        "blocked"
+      ]
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "source_kind",
+        "state",
+        "collected_at_ms",
+        "freshness_ms",
+        "command_or_api",
+        "redacted",
+        "raw_pane_content_stored",
+        "reason_codes",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_kind": {
+          "$ref": "#/$defs/source_kind"
+        },
+        "state": {
+          "$ref": "#/$defs/source_state"
+        },
+        "collected_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "freshness_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "command_or_api": {
+          "type": "string",
+          "minLength": 1
+        },
+        "redacted": {
+          "type": "boolean",
+          "const": true
+        },
+        "raw_pane_content_stored": {
+          "type": "boolean",
+          "const": false
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "capacity_admission": {
+      "type": "object",
+      "required": [
+        "action",
+        "pressure_tier",
+        "proof_state",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "admit",
+            "defer",
+            "degrade",
+            "shed",
+            "unavailable"
+          ]
+        },
+        "pressure_tier": {
+          "type": "string",
+          "enum": [
+            "green",
+            "yellow",
+            "orange",
+            "red",
+            "black",
+            "unknown"
+          ]
+        },
+        "proof_state": {
+          "type": "string",
+          "enum": [
+            "measured",
+            "simulated",
+            "stale",
+            "unavailable",
+            "not_required"
+          ]
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "side_effect_class": {
+      "type": "string",
+      "enum": [
+        "none",
+        "beads_metadata",
+        "source_edit",
+        "proof_run",
+        "pane_mutation",
+        "service_mutation",
+        "destructive"
+      ]
+    },
+    "plan_step": {
+      "type": "object",
+      "required": [
+        "step_id",
+        "rank",
+        "action_kind",
+        "status",
+        "target",
+        "side_effect_class",
+        "requires_approval",
+        "forbidden",
+        "reason_codes",
+        "proof_requirement_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "step_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action_kind": {
+          "type": "string",
+          "enum": [
+            "choose_ready_bead",
+            "claim_bead",
+            "add_beads_comment",
+            "create_bead",
+            "run_static_check",
+            "run_rch_proof",
+            "inspect_artifact",
+            "wait_for_owner",
+            "request_approval",
+            "no_op"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/plan_status"
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "side_effect_class": {
+          "$ref": "#/$defs/side_effect_class"
+        },
+        "requires_approval": {
+          "type": "boolean"
+        },
+        "forbidden": {
+          "type": "boolean"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/string_array"
+        },
+        "proof_requirement_ids": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "proof_requirement": {
+      "type": "object",
+      "required": [
+        "proof_id",
+        "proof_kind",
+        "required",
+        "status",
+        "command",
+        "artifact_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "proof_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "proof_kind": {
+          "type": "string",
+          "enum": [
+            "static_json",
+            "static_schema",
+            "golden_fixture",
+            "rch_cargo",
+            "target_hardware",
+            "manual_review"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "passed",
+            "failed",
+            "blocked",
+            "not_required"
+          ]
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_paths": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "forbidden_action": {
+      "type": "object",
+      "required": [
+        "action_class",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action_class": {
+          "$ref": "#/$defs/action_class"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "required": [
+        "policy_id",
+        "raw_pane_content_allowed",
+        "secret_material_allowed",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "policy_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_pane_content_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "secret_material_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "notes": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    }
+  }
+}
