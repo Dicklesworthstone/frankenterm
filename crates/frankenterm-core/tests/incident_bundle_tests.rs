@@ -499,13 +499,32 @@ fn incident_bundle_result_includes_all_files_list() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
 
-    // All listed files should exist on disk (plus incident_manifest.json)
-    for f in &result.files {
-        assert!(
-            on_disk.contains(f),
-            "Listed file '{f}' not found on disk. On disk: {on_disk:?}"
-        );
-    }
+    let disk_total: u64 = on_disk
+        .iter()
+        .map(|file| fs::metadata(result.path.join(file)).unwrap().len())
+        .sum();
+    let manifest_json = fs::read_to_string(result.path.join("incident_manifest.json")).unwrap();
+    let manifest: IncidentBundleResult = serde_json::from_str(&manifest_json).unwrap();
+
+    let result_listed: HashSet<String> = result.files.iter().cloned().collect();
+    assert_eq!(
+        result_listed, on_disk,
+        "Result files should exactly match files on disk"
+    );
+    assert_eq!(
+        result.total_size_bytes, disk_total,
+        "Result total size should match files on disk"
+    );
+
+    let manifest_listed: HashSet<String> = manifest.files.iter().cloned().collect();
+    assert_eq!(
+        manifest_listed, on_disk,
+        "Serialized manifest files should exactly match files on disk"
+    );
+    assert_eq!(
+        manifest.total_size_bytes, disk_total,
+        "Serialized manifest total size should match files on disk"
+    );
 }
 
 #[test]
@@ -1273,16 +1292,14 @@ fn collect_incident_bundle_files_list_matches_disk() {
 
     let result = collect_incident_bundle(&opts).unwrap();
 
-    // Every file in the files list should exist on disk
+    // The manifest lists itself, and every listed file should exist on disk.
+    assert!(result.files.contains(&"incident_manifest.json".to_string()));
     for file in &result.files {
         assert!(
             result.path.join(file).exists(),
             "File listed but not on disk: {file}"
         );
     }
-
-    // incident_manifest.json should also exist (written after files list)
-    assert!(result.path.join("incident_manifest.json").exists());
 }
 
 #[test]
